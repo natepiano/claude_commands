@@ -71,11 +71,10 @@ whose cargo locks a build holds is never touched. One sweep holds the floor at
 a time and keeps every idle target's cargo locks while scanning and removing,
 so a build starting there waits.
 --floor-only skips the workspace sweep for disk-floor.nix's 2-minute timer.
-Each floor pass, over the floor or under it, first deletes Claude Code session
-scratch: a /tmp/claude-<uid>/<project>/<session id>/ folder (scratchpad/,
-tasks/) whose session no running process holds and where nothing changed in
-the last 24 hours. Gate copies and scratch builds there had stayed until the
-disk filled.
+Each such pass first runs tmp_sweep.py once an hour, which deletes agent
+scratch under /tmp/claude and /tmp/claude-<uid>/<project>/ that no process
+uses and where nothing changed in 4 hours, before the floor takes any build
+cache. Gate copies and scratch builds there had stayed until the disk filled.
 CI's targets are outside FLOOR_ROOTS, and its accounts cannot read lint.conf.
 By 15:23 PDT on 2026-10-06 that timer had taken 801 GiB, from units last
 used a median 3.0 h earlier. In a 60 GiB shortfall simulation, target-first order spared the
@@ -142,7 +141,6 @@ import fcntl
 import json
 import math
 import os
-import re
 import shutil
 import socket
 import subprocess
@@ -158,8 +156,12 @@ from typing import TYPE_CHECKING, Literal, TypeGuard, TypedDict, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone  # noqa: E402
 if TYPE_CHECKING:
+    from . import tmp_sweep
     from ..notify.push_texts import RenderedPush
     from ..notify import review
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import tmp_sweep
 
 GIB = 1 << 30
 MIB = 1 << 20
@@ -172,6 +174,7 @@ DEFAULT_CONFIG = os.path.join("~", ".claude", "config", "lint.conf")
 GIT_DIR = ".git"
 GITDIR_PREFIX = "gitdir:"
 COMMONDIR_FILE = "commondir"
+ALTERNATES_FILE = os.path.join("objects", "info", "alternates")
 DEFAULT_DOC_INDEX_MIB = 250.0
 DOC_INDEX_ENV = "LINT_SWEEP_DOC_INDEX_MIB"
 DOC_DIR = "doc"
@@ -182,6 +185,9 @@ TARGET_DIR_FLAG = "--target-dir"
 LOCK_NAMES = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
 PROC_DIR = "/proc"
 PROC_LOCKS = "/proc/locks"
+# The kernel writes /proc/locks one page per read and drops its lock between pages; a lock freed earlier in the
+# list moves the next page past one line. Each extra read gives a skipped line another chance to show.
+PROC_LOCKS_READS = 3
 # The kernel adds this to an exe, cwd or maps path whose file was removed.
 DELETED_SUFFIX = " (deleted)"
 # cargo runs a subcommand as `cargo-nextest nextest …`; a wrapper may rename argv[0].
@@ -211,9 +217,6 @@ SCRATCH_ROOTS = ("/tmp", "~/.cache/trace-targets")
 FLOOR_LOCK = os.path.join("~", ".local", "state", "lint-sweep", "floor.lock")
 # Claude Code keeps each session's scratch (scratchpad/, tasks/) in <root>/<project>/<session id>/,
 # where <project> is the session's working directory with every / as -.
-SESSION_SCRATCH_ROOT = os.path.join("/tmp", f"claude-{os.getuid()}")
-SESSION_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-SESSION_SCRATCH_IDLE_SECONDS = DAY_SECONDS
 FLOOR_STATE_ENV = "LINT_SWEEP_STATE_DIR"
 BUILDLOG_DIR_ENV = "BUILDLOG_DIR"
 CI_TARGETS = ("/var/lib/hana-ci/hana-linux-1", "/var/lib/hana-ci/hana-linux-2")
@@ -549,19 +552,26 @@ def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, Targ
 
 
 def lock_holder(lock: str, locks: str = PROC_LOCKS) -> int | None:
-    """The pid that holds flock() on lock, read from /proc/locks; None without /proc or holder."""
+    """The pid that holds flock() on lock, read from /proc/locks; None without /proc or holder.
+
+    A read under load can skip a line (PROC_LOCKS_READS), so no holder is the answer only after every read agrees.
+    """
     try:
         stat = os.stat(lock)
-        with open(locks, encoding="ascii", errors="replace") as handle:
-            lines = handle.read().splitlines()
     except OSError:
         return None
     # "1: FLOCK  ADVISORY  WRITE <pid> <major>:<minor>:<inode> 0 EOF"; a waiter's line has "->".
     device = f"{os.major(stat.st_dev):02x}:{os.minor(stat.st_dev):02x}:{stat.st_ino}"
-    for line in lines:
-        fields = line.split()
-        if len(fields) > 5 and fields[1] == "FLOCK" and fields[5] == device and fields[4].isdigit():
-            return int(fields[4])
+    for _ in range(PROC_LOCKS_READS):
+        try:
+            with open(locks, encoding="ascii", errors="replace") as handle:
+                lines = handle.read().splitlines()
+        except OSError:
+            return None
+        for line in lines:
+            fields = line.split()
+            if len(fields) > 5 and fields[1] == "FLOCK" and fields[5] == device and fields[4].isdigit():
+                return int(fields[4])
     return None
 
 
@@ -1430,109 +1440,6 @@ def send_floor_alert(message: str, channels: FloorAlertChannels, *,
     return delivered
 
 
-def running_session_ids() -> frozenset[str] | None:
-    """The id of every session whose process runs; None when a session record cannot be read, since
-    that session can be live."""
-    if TYPE_CHECKING:
-        from ..message import sessions
-    else:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-        import sessions
-    registry = sessions.read_registry()
-    if registry.unreadable:
-        return None
-    return frozenset(entry.record["sessionId"] for entry in registry.entries
-                     if sessions.running_session(entry.record))
-
-
-def scratch_change(directory: str, since: float) -> tuple[float, int] | None:
-    """The newest change in directory and its disk blocks; None when something in it changed at or
-    after since, or could not be read. A change is the newer of mtime and ctime: a copy made with
-    its times kept (cp -a) still sets ctime. Symbolic links are never followed."""
-    seen: set[InodeKey] = set()
-    try:
-        top = os.lstat(directory)
-    except OSError:
-        return None
-    newest = max(top.st_mtime, top.st_ctime)
-    if newest >= since:
-        return None
-    total = 0
-    frontier = [directory]
-    while frontier:
-        try:
-            with os.scandir(frontier.pop()) as entries:
-                listed = list(entries)
-            for entry in listed:
-                info = entry.stat(follow_symlinks=False)
-                newest = max(newest, info.st_mtime, info.st_ctime)
-                if newest >= since:
-                    return None
-                if entry.is_dir(follow_symlinks=False):
-                    frontier.append(entry.path)
-                elif (info.st_dev, info.st_ino) not in seen:
-                    seen.add((info.st_dev, info.st_ino))
-                    total += info.st_blocks * 512
-        except OSError:
-            return None
-    return newest, total
-
-
-def delete_tree(path: str) -> None:
-    """shutil.rmtree, then once more after making each folder writable: a copy of a read-only tree
-    (a nix store path, a Go module cache) keeps its modes, and rmtree cannot empty such a folder."""
-    try:
-        shutil.rmtree(path)
-    except PermissionError:
-        for folder, _, _ in os.walk(path):
-            os.chmod(folder, 0o700)
-        shutil.rmtree(path)
-
-
-def remove_session_scratch(dry_run: bool, root: str = SESSION_SCRATCH_ROOT, now: float | None = None) -> int:
-    """Delete each Claude Code session's scratch under root once its session has ended and nothing
-    in it has changed for SESSION_SCRATCH_IDLE_SECONDS, then each project folder that left empty."""
-    projects = [entry.path for entry in listing(root)
-                if entry.name.startswith("-") and entry.is_dir(follow_symlinks=False)]
-    if not projects:
-        return 0
-    live = running_session_ids()
-    if live is None:
-        print("lint sweep: a session record cannot be read; all session scratch kept")
-        return 0
-    since = (time.time() if now is None else now) - SESSION_SCRATCH_IDLE_SECONDS
-    verb = "would delete" if dry_run else "deleted"
-    failures = 0
-    for project in projects:
-        deleted = False
-        for entry in listing(project):
-            if (SESSION_ID.fullmatch(entry.name) is None or entry.name in live
-                    or not entry.is_dir(follow_symlinks=False)):
-                continue
-            change = scratch_change(entry.path, since)
-            if change is None:
-                continue
-            newest, size = change
-            if not dry_run:
-                try:
-                    delete_tree(entry.path)
-                except OSError as error:
-                    # Another sweep can delete the same folder first.
-                    if os.path.lexists(entry.path):
-                        failures += 1
-                        print(f"lint sweep: could not delete {entry.path}: {error}", file=sys.stderr)
-                    continue
-                deleted = True
-            print(f"lint sweep: {verb} {entry.path} ({gib(size)}), scratch of an ended session,"
-                  + f" last changed {when(newest)}")
-        if deleted:
-            try:
-                os.rmdir(project)
-            except OSError:
-                pass
-    return 1 if failures else 0
-
-
 def hold_floor(
     floor: int,
     dry_run: bool,
@@ -1587,23 +1494,36 @@ def hold_floor(
         ci_bytes = sum(directory_blocks(path) for path in CI_TARGETS)
         unchanged_caches = held_bytes + ci_bytes
         before_caches = total + unchanged_caches
+        # The growth check compares this pair with the previous record. The scan takes minutes, so
+        # free is read again after it: a target another process deletes during the scan is then out
+        # of both figures, not out of before_caches alone. On 2026-10-25 the read from before the
+        # scan reported a 122.6 GiB fall while 123 GiB was freed.
+        scanned_free = free_bytes(home)
         print(
             f"lint sweep: {gib(free)} free, under the {gib(floor)} floor; choosing from {len(idle)}"
             + f" target dirs ({gib(total)}), {len(busy)} left alone while a build or test run uses them"
         )
-        budget = total - (floor - free)
-        ordered_at = time.time()
-        left, failures, chosen = shrink(
-            scan,
-            total,
-            budget,
-            dry_run,
-            lambda group: (
-                0.0 if scratch_targets[tree_targets[group.build_tree]] else 1.0,
-                target_uses[tree_targets[group.build_tree]],
-                *unit_age(group, ordered_at),
-            ),
-        )
+        # The shortfall comes from the read after the scan too: on 2026-10-25 the read from before it
+        # took 6.5 GiB of cache while another process had lifted free from 293.5 to 416 GiB.
+        budget = total - max(0, floor - scanned_free)
+        left, failures = total, 0
+        chosen: list[tuple[Group, int]] = []
+        if scanned_free < floor:
+            ordered_at = time.time()
+            left, failures, chosen = shrink(
+                scan,
+                total,
+                budget,
+                dry_run,
+                lambda group: (
+                    0.0 if scratch_targets[tree_targets[group.build_tree]] else 1.0,
+                    target_uses[tree_targets[group.build_tree]],
+                    *unit_age(group, ordered_at),
+                ),
+            )
+        else:
+            print(f"lint sweep: {gib(scanned_free)} free after the scan, not under the {gib(floor)} floor;"
+                  + " nothing taken")
         taken: dict[str, int] = {}
         for group, freed in chosen:
             root = tree_targets[group.build_tree]
@@ -1617,6 +1537,8 @@ def hold_floor(
         print(f"lint sweep: {gib(after_free)} free")
         if not dry_run:
             now = time.time()
+            # The record's free is read before its caches and the next sweep's free after its scan,
+            # so a deletion during either walk can only make the computed fall smaller.
             after_caches = sum(directory_blocks(path) for path in idle) + unchanged_caches
             removed = max(0, before_caches - after_caches)
             history = previous.alert_history if isinstance(previous, FloorRecord) else NoDeliveredAlert()
@@ -1641,7 +1563,7 @@ def hold_floor(
                 if delivered or told:
                     push_history = DeliveredAlert(time.time())
             elif removed > 0 and (isinstance(history, NoDeliveredAlert) or now - history.at >= ALERT_INTERVAL_SECONDS):
-                free_fall = previous.free_bytes - free if isinstance(previous, FloorRecord) else 0
+                free_fall = previous.free_bytes - scanned_free if isinstance(previous, FloorRecord) else 0
                 cache_growth = before_caches - previous.build_cache_bytes if isinstance(previous, FloorRecord) else 0
                 recent = isinstance(previous, FloorRecord) and 0 <= now - previous.measured_at <= GROWTH_WINDOW_SECONDS
                 growth_fired = recent and free_fall - cache_growth > UNEXPLAINED_FALL_BYTES
@@ -1693,8 +1615,17 @@ def config_values(path: str) -> dict[str, str]:
 
 def repo_name(directory: str) -> str | None:
     """Name of the directory holding the git common dir of the repo directory is
-    in: every worktree of a repo shares it. Read from the .git files rather than
-    from git, which a bare PATH may not reach."""
+    in: every worktree of a repo shares it, and a scratch clone takes the name of
+    the repo it was cloned from (source_git_dir). Read from the .git files rather
+    than from git, which a bare PATH may not reach."""
+    common = git_common_dir(directory)
+    if common is None:
+        return None
+    return os.path.basename(os.path.dirname(source_git_dir(common))) or None
+
+
+def git_common_dir(directory: str) -> str | None:
+    """The git dir every worktree of directory's repo shares."""
     current = os.path.abspath(directory)
     while not os.path.lexists(os.path.join(current, GIT_DIR)):
         parent = os.path.dirname(current)
@@ -1720,7 +1651,53 @@ def repo_name(directory: str) -> str | None:
             pass
         except OSError:
             return None
-    return os.path.basename(os.path.dirname(os.path.normpath(common))) or None
+    return os.path.normpath(common)
+
+
+def source_git_dir(common: str) -> str:
+    """The git dir a scratch clone came from, followed to its end: a
+    `git clone --shared` copy borrows its objects (alternates), and a plain local
+    clone names its source as a local origin. A merge check's clone of hana is
+    hana for the Mac mirror and the sweep budget. A git dir with neither is its
+    own answer."""
+    seen = {common}
+    while True:
+        source = borrowed_git_dir(common) or local_origin_git_dir(common)
+        if source is None or source in seen:
+            return common
+        seen.add(source)
+        common = source
+
+
+def borrowed_git_dir(common: str) -> str | None:
+    try:
+        with open(os.path.join(common, ALTERNATES_FILE), encoding="utf-8") as handle:
+            objects = handle.readline().strip()
+    except OSError:
+        return None
+    if not objects:
+        return None
+    return os.path.dirname(os.path.normpath(os.path.join(common, "objects", objects)))
+
+
+def local_origin_git_dir(common: str) -> str | None:
+    """The shared git dir of origin when origin is a directory on this machine."""
+    try:
+        with open(os.path.join(common, "config"), encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return None
+    in_origin = False
+    for line in lines:
+        text = line.strip()
+        if text.startswith("["):
+            in_origin = text == '[remote "origin"]'
+        elif in_origin and text.partition("=")[0].strip() == "url":
+            url = text.partition("=")[2].strip().removeprefix("file://")
+            if not os.path.isabs(url) or not os.path.isdir(url):
+                return None
+            return git_common_dir(url)
+    return None
 
 
 def budget_bytes(environ: dict[str, str], config: str, repo: str | None) -> tuple[int | None, str]:
@@ -1767,8 +1744,9 @@ def main(argv: list[str]) -> int:
         print(f"lint sweep: {floor_key} in {config} must be a non-negative number of GiB", file=sys.stderr)
         return 2
     status = 0 if floor_only else sweep_workspace(target_dir, config, dry_run)
+    if floor_only:
+        status = tmp_sweep.run_if_due(dry_run) or status
     if floor is not None:
-        status = remove_session_scratch(dry_run) or status
         status = hold_floor(floor, dry_run) or status
     return status
 

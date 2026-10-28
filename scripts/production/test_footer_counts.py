@@ -88,6 +88,12 @@ class FooterCountsTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(showrunners, "timer_docs", side_effect=lambda: self.tree))
         _ = self.enterContext(mock.patch.object(showrunners, "descendants_of",
                                                 side_effect=self.productions_below))
+        # Each production below a root reports to that root.
+        _ = self.enterContext(mock.patch.object(showrunners, "edges", side_effect=self.parents))
+
+    def parents(self, slugs: set[str] | None = None) -> dict[str, str]:
+        del slugs
+        return {child: parent for parent, children in self.below.items() for child in children}
 
     def productions_below(self, slug: str) -> list[str]:
         return self.below.get(slug, [])
@@ -149,7 +155,7 @@ class FooterCountsTests(unittest.TestCase):
         self.assertEqual(footer_counts.sources(doc), [doc, listing, folder, ledger, folder / "wanted.md"])
         self.assertEqual(footer_counts.sources(self.doc()), [self.root / "production.md"])
 
-    def test_a_shared_folder_counts_only_the_proposals_of_the_production_and_those_below_it(self) -> None:
+    def test_a_shared_folder_counts_only_the_productions_own_proposals(self) -> None:
         folder = self.root / "issues"
         folder.mkdir()
         for name, proposer in (("own", "trunk-unit"), ("by the production", "tool-based-ui"),
@@ -165,14 +171,31 @@ class FooterCountsTests(unittest.TestCase):
         other = production_doc(self.root, "build-followups", folder, "followups-unit")
         self.tree = {"tool-based-ui": top, "cargo-liner-style": child, "build-followups": other}
         self.below = {"tool-based-ui": ["cargo-liner-style"]}
-        own = ["by a child", "by a unit below", "by the production", "named with its production", "own", "quoted link"]
-        self.assertEqual(sorted(found.path.stem for found in proposals_folder.open_proposals(top)), own)
-        self.assertEqual(footer_counts.proposals(top), 6)
+        # The child's showrunner counts the child's proposals; the root never does (user, 2026-10-27).
+        self.assertEqual(sorted(found.path.stem for found in proposals_folder.open_proposals(top)),
+                         ["by the production", "own", "quoted link"])
+        self.assertEqual(footer_counts.proposals(top), 3)
         self.assertEqual(footer_counts.proposals(child), 3)
         self.assertEqual(footer_counts.proposals(other), 2)
-        # A unit added below changes the count, so the child's doc is a source.
-        self.assertIn(child, footer_counts.sources(top))
-        self.assertNotIn(folder / "other production.md", footer_counts.sources(top))
+        self.assertNotIn(child, footer_counts.sources(top))
+        self.assertNotIn(folder / "by a child.md", footer_counts.sources(top))
+
+    def test_each_production_counts_its_own_rows_of_the_roots_change_list(self) -> None:
+        listing = self.root / "change-review.md"
+        _ = listing.write_text(LIST.replace("| How to check |", "| How to check | Production |")
+                               .replace("| --- | --- | --- |", "| --- | --- | --- | --- |")
+                               .replace("| look |\n| C2", "| look | top |\n| C2").replace("| second | look |", "| second | look | kid |")
+                               + "| C3 | third | look | grandkid |\n| C4 | older | look | |\n", encoding="utf-8")
+        top = self.root / "top-production.md"
+        _ = top.write_text(f"# top\n\n- **Change review:** `{listing}`\n", encoding="utf-8")
+        kid, grandkid = self.root / "kid-production.md", self.root / "grandkid-production.md"
+        for doc in (kid, grandkid):
+            _ = doc.write_text(f"# {doc.stem}\n", encoding="utf-8")
+        self.tree = {"top": top, "kid": kid, "grandkid": grandkid}
+        self.below = {"top": ["kid", "grandkid"]}
+        # A row without a Production cell is the root's; a child with no list line reads the root's list.
+        self.assertEqual([footer_counts.changes(doc) for doc in (top, kid, grandkid)], [2, 1, 1])
+        self.assertIn(listing, footer_counts.sources(kid))
 
     def test_the_proposal_count_leaves_out_approved_and_active_proposals(self) -> None:
         folder = self.root / "issues"
@@ -193,8 +216,8 @@ class FooterCountsTests(unittest.TestCase):
         issue(folder, "plain", "open", "issue, proposal", "production", "stage: backlog")
         doc = self.doc(f"- **Proposals:** {folder}")
         self.assertEqual(footer_counts.proposals(doc), 1)
-        with contextlib.redirect_stdout(io.StringIO()):
-            code = proposal_issue.main(["approve", str(folder / "plain.md"), "--showrunner", "s", "--unit", "u", "--plan", "p"])
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(proposal_issue, "calling_showrunner", return_value="s"):
+            code = proposal_issue.main(["approve", str(folder / "plain.md"), "--by", "user", "--showrunner", "s", "--unit", "u", "--plan", "p"])
         self.assertEqual(code, 0)
         self.assertEqual(footer_counts.proposals(doc), 0)
 

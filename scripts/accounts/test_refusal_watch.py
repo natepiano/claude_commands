@@ -4,13 +4,14 @@ from __future__ import annotations
 from scripts.whoami.note_file import note_name
 
 import io
+import fcntl
 import json
 import os
 import socket
 import subprocess
 import tempfile
 import unittest
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from collections.abc import Generator, Mapping
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone, tzinfo
@@ -31,9 +32,10 @@ send_no_room_notice = refusal_watch._notify_no_room  # pyright: ignore[reportPri
 deliver_notice_jobs = quota_alert.deliver_and_record
 
 if TYPE_CHECKING:
-    from scripts.shutdown import inventory, record, restart, settle
+    from scripts.shutdown import inventory, launch_permission, record, restart, settle
     from scripts.message import sessions
 else:
+    launch_permission = import_module("launch_permission")
     inventory = import_module("inventory")
     record = import_module("record")
     restart = import_module("restart")
@@ -76,6 +78,7 @@ class RefusalWatchTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()))
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.home), "PATH": os.defpath, "AGENT_NOTES_DIR": str(self.home / "notes"),
@@ -270,6 +273,106 @@ class RefusalWatchTests(unittest.TestCase):
                   minutes: float = 10) -> next_moves.ClaudeGroupMove:
         return next_moves.ClaudeGroupMove(name, "units", 1, minutes, target, NOW)
 
+    def expired_login(self, login: str = "main@example.invalid") -> None:
+        usage_store.save([agent_accounts.Report("Claude", email=login,
+            usage_read_outcome=agent_accounts.UsageReadOutcome.STALE_TOKEN)], NOW)
+
+    def test_expired_target_renews_before_the_queue_lock_and_moves_in_the_same_pass(self) -> None:
+        path = self.groups()
+        self.next_entries(self.low_rule())
+        self.expired_login()
+        report = agent_accounts.Report("Claude", email="main@example.invalid",
+            usage_read_outcome=agent_accounts.UsageReadOutcome.OK,
+            quotas=[agent_accounts.Quota("Weekly", 10, NOW + timedelta(days=6))])
+
+        def probe(_command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            # A second descriptor must take the queue lock without blocking.
+            with next_moves.next_moves_file().with_suffix(".lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            WatchTime.at = NOW + timedelta(seconds=2)
+            return subprocess.CompletedProcess([], 0, "private", "private")
+
+        with (patch.object(subprocess, "run", side_effect=probe) as started,
+              patch.object(agent_accounts, "claude_live", return_value=report) as read):
+            lines = refusal_watch.run(NOW)
+        self.assertIn("claude2 login renewed", lines)
+        renewed_usage = usage_store.load()[usage_store.key("Claude", "main@example.invalid")]
+        assert "weekly" in renewed_usage
+        self.assertEqual(renewed_usage["weekly"]["at"], (NOW + timedelta(seconds=2)).isoformat())
+        self.assertTrue(any("move from claude1 to claude2" in line for line in lines))
+        self.assertEqual(stored_group_labels(path)["units"], "claude2")
+        self.assertEqual(next_moves.read_next_moves(), ())
+        started.assert_called_once()
+        read.assert_called_once_with(accounts.account_dir("claude2"))
+        self.assertEqual(self.head_deliveries, [])
+        attempt = accounts.login_renewal_attempts()["claude2"]
+        self.assertEqual(attempt, accounts.LoginRenewalAttempt(NOW, accounts.LoginRenewed()))
+
+    def test_damaged_login_renewal_state_does_not_stop_the_pass(self) -> None:
+        self.expired_login()
+        path = accounts.login_renewals_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text('{"claude2":')
+        with (patch.object(accounts, "renew_login", return_value=accounts.LoginRenewed()) as probe,
+              patch.object(agent_accounts, "claude_live", side_effect=AssertionError("unexpected live usage"))):
+            self.assertIn("claude2 login renewed", refusal_watch.run(NOW))
+        probe.assert_called_once_with("claude2")
+        self.assertEqual(accounts.login_renewal_attempts(),
+                         {"claude2": accounts.LoginRenewalAttempt(NOW, accounts.LoginRenewed())})
+
+    def test_expired_login_wait_keeps_the_last_reading_time(self) -> None:
+        _ = self.groups()
+        self.next_entries(self.low_rule())
+        self.reading("main@example.invalid", 80, at=NOW - timedelta(hours=3, minutes=55))
+        self.expired_login()
+        lines = refusal_watch.run_auto_moves(NOW)
+        self.assertIn("units 1 → claude2 due, claude2 has no fresh reading since 04:05", lines)
+
+    def test_failed_login_renewal_blocks_once_and_does_not_probe_again_within_an_hour(self) -> None:
+        path = self.groups()
+        self.next_entries(self.low_rule())
+        self.expired_login()
+        with (patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 7, "private", "private")) as probe,
+              patch.object(agent_accounts, "claude_live", side_effect=AssertionError("failed probe read usage"))):
+            first = refusal_watch.run(NOW)
+            later = refusal_watch.run(NOW + timedelta(minutes=59))
+        probe.assert_called_once()
+        self.assertIn("claude2 login renewal failed: probe exited with status 7", first)
+        blocked = ("units 1 → claude2 due, claude2's login expired, and a probe session on it failed "
+                   "(probe exited with status 7). Log in on claude2 by hand.")
+        self.assertIn(blocked, first)
+        self.assertNotIn("login renewal failed:", "\n".join(later))
+        self.assertEqual(stored_group_labels(path)["units"], "claude1")
+        self.assertEqual(len(self.head_deliveries), 1)
+        self.assertEqual(self.head_deliveries[0][0].text, blocked)
+        self.assertEqual(accounts.login_renewal_attempts()["claude2"].result,
+                         accounts.LoginRenewalFailed("probe exited with status 7"))
+
+    def test_expired_login_dry_run_and_fresh_account_do_not_probe(self) -> None:
+        self.expired_login()
+        before = self.snapshot()
+        with (patch.object(accounts, "renew_login", side_effect=AssertionError("dry run started a probe")),
+              patch.object(agent_accounts, "claude_live", side_effect=AssertionError("dry run read usage"))):
+            self.assertEqual(refusal_watch.renew_expired_logins(NOW, True), ["would renew claude2"])
+        self.assertEqual(self.snapshot(), before)
+        self.reading("main@example.invalid", 80)
+        with (patch.object(accounts, "renew_login", side_effect=AssertionError("fresh account started a probe")),
+              patch.object(agent_accounts, "claude_live", side_effect=AssertionError("fresh account read usage"))):
+            self.assertEqual(refusal_watch.renew_expired_logins(NOW, False), [])
+        self.assertFalse(accounts.login_renewals_file().exists())
+
+    def test_login_renewal_retries_at_an_hour_on_the_other_machine_too(self) -> None:
+        self.expired_login()
+        with (patch.object(accounts, "renew_login", return_value=accounts.LoginRenewalFailed("probe could not start")) as probe,
+              patch.object(agent_accounts, "claude_live", side_effect=AssertionError("unexpected live usage")),
+              patch.object(socket, "gethostname", return_value="macbook")):
+            self.assertEqual(refusal_watch.renew_expired_logins(NOW, False),
+                             ["claude2 login renewal failed: probe could not start"])
+            self.assertEqual(refusal_watch.renew_expired_logins(NOW + timedelta(minutes=59), False), [])
+            self.assertEqual(refusal_watch.renew_expired_logins(NOW + timedelta(minutes=60), False),
+                             ["claude2 login renewal failed: probe could not start"])
+        self.assertEqual(probe.call_count, 2)
+
     def test_list_and_runner_share_the_current_hold_verdict_for_every_selection_state(self) -> None:
         entry = self.hold_rule("shared-verdict", minutes=30)
         self.next_entries(entry)
@@ -453,7 +556,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.groups()
         unit = self.hold_rule("units", minutes=30)
         runner = next_moves.ClaudeGroupMove("runners", "showrunners", 1, 30, "claude2", NOW)
-        worker = next_moves.WorkersMove("workers", 1, next_moves.DelegateToClaude(), NOW)
+        worker = next_moves.WorkersMove("workers", 1, next_moves.WorkersToClaude(), NOW)
         self.next_entries(unit, runner, worker)
         duration = next_moves.ResolvedHold(30, next_moves.FixedHold(30))
         refusal_watch._save_state(refusal_watch.WatchState(sessions={}, notices={},  # pyright: ignore[reportPrivateUsage]
@@ -684,9 +787,9 @@ class RefusalWatchTests(unittest.TestCase):
                 with self.subTest(group=group, edit=edit):
                     if group == "workers":
                         head: next_moves.NextMove = next_moves.WorkersMove("old-worker-head", 1,
-                            next_moves.DelegateToClaude(), NOW)
+                            next_moves.WorkersToClaude(), NOW)
                         later: next_moves.NextMove = next_moves.WorkersMove("next-worker-head", 1,
-                            next_moves.DelegateToClaude(), NOW)
+                            next_moves.WorkersToClaude(), NOW)
                     else:
                         head = self.low_rule("old-head", group=group)
                         later = self.low_rule("next-head", group=group, target="claude3")
@@ -1205,6 +1308,160 @@ class RefusalWatchTests(unittest.TestCase):
                    for line in accounts.roles_history_file().read_text().splitlines()]
         self.assertEqual([saved["why"] for saved in history], ["auto: units-low", "operator return"])
 
+    def test_auto_move_relays_a_cleared_hold_once_to_showrunners(self) -> None:
+        for released in (None, launch_permission.ReleasedHold(label="claude2", then="stop",
+                requested_at=NOW.isoformat(), session_id="b1f5ca98-rest")):
+            with self.subTest(released=released):
+                _ = self.groups()
+                self.next_entries(self.low_rule("cleared-hold" if released else "no-hold"))
+                self.reading(SOURCE_LOGIN, 1)
+                self.head_deliveries.clear()
+                with patch.object(launch_permission, "launch_permission",
+                        return_value=launch_permission.AllowedByShutdownState(released)):
+                    code, _, error = self.cli()
+                    _ = self.cli()
+                self.assertEqual((code, error), (0, ""))
+                notices = [job for jobs in self.head_deliveries for job in jobs
+                           if "cleared a finished" in job.text]
+                self.assertEqual(len(notices), int(released is not None))
+                if notices:
+                    self.assertEqual(notices[0].recipient, "fixture-showrunner")
+                    self.assertIn("units move to claude2: cleared a finished stop hold on claude2", notices[0].text)
+                    self.assertIn("session b1f5ca98", notices[0].text)
+
+    def test_committed_auto_group_move_relays_its_cleared_hold(self) -> None:
+        _ = self.groups()
+        _ = self.owner("committed-unit", host="unit")
+        self.reading(TARGET_LOGIN, 80)
+        _ = accounts.set_group_account("units", "claude3", why="auto: committed", now=NOW, origin=accounts.AutoOrigin())
+        released = launch_permission.ReleasedHold(label="claude3", then="stop",
+            requested_at=NOW.isoformat(), session_id="b1f5ca98-rest")
+        with patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState(released)):
+            code, _, error = self.cli()
+            _ = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(len(self.commands), 1)
+        self.assertIn("--no-alert", self.commands[0])
+        notices = [job for jobs in self.head_deliveries for job in jobs if "cleared a finished" in job.text]
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(notices[0].recipient, "fixture-showrunner")
+        self.assertIn("units move to claude3: cleared a finished stop hold on claude3", notices[0].text)
+        self.assertIn("session b1f5ca98", notices[0].text)
+        self.assertEqual(self.commands[0][self.commands[0].index("--why") + 1], "auto: committed")
+
+    def test_refusal_group_move_relays_its_cleared_hold(self) -> None:
+        _ = self.groups()
+        owner = self.owner("refused-unit", host="unit")
+        _ = self.transcript(owner["session_id"])
+        self.reading(TARGET_LOGIN, 0)
+        released = launch_permission.ReleasedHold(label="claude2", then="stop",
+            requested_at=NOW.isoformat(), session_id=None)
+        with patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState(released)):
+            code, _, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(len(self.commands), 1)
+        notices = [job for jobs in self.head_deliveries for job in jobs if "cleared a finished" in job.text]
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(notices[0].recipient, "fixture-showrunner")
+        self.assertIn("units move to claude2: cleared a finished stop hold on claude2", notices[0].text)
+
+    def test_cleared_hold_retries_only_failed_recipients_after_the_move_is_consumed(self) -> None:
+        _ = self.groups()
+        self.next_entries(self.low_rule())
+        self.reading(SOURCE_LOGIN, 1)
+        released = launch_permission.ReleasedHold(label="claude2", then="stop",
+            requested_at=NOW.isoformat(), session_id="b1f5ca98-rest")
+        deliveries = 0
+        def attempt(jobs: list[quota_alert.Job], stamp: str) -> list[str]:
+            nonlocal deliveries
+            deliveries += 1
+            if deliveries == 2:
+                return [f"quota {job.kind} {job.name} -> {job.recipient}: not delivered: fixture failed" for job in jobs]
+            return self.deliver_head_notice(jobs, stamp)
+        with (patch.object(quota_alert, "recipients", return_value=["first-showrunner", "second-showrunner"]),
+              patch.object(quota_alert, "deliver_and_record", side_effect=attempt) as deliver):
+            with patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState(released)):
+                code, _, error = self.cli()
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(next_moves.read_next_moves(), ())
+            path = self.home / ".local/state/accounts/pending_cleared_holds.json"
+            pending = cast(dict[str, dict[str, object]], json.loads(path.read_text()))
+            self.assertEqual([notice["recipients"] for notice in pending.values()], [["second-showrunner"]])
+            _ = self.cli("--dry-run")
+            self.assertEqual(deliver.call_count, 2)
+            _ = self.cli()
+            _ = self.cli()
+        jobs = [cast(list[quota_alert.Job], call.args[0])[0] for call in deliver.call_args_list]
+        self.assertEqual([job.recipient for job in jobs], ["first-showrunner", "second-showrunner", "second-showrunner"])
+        self.assertEqual(jobs[1].text, jobs[2].text)
+        self.assertTrue(jobs[1].name)
+        self.assertEqual(jobs[1].name, jobs[2].name)
+        self.assertEqual(json.loads(path.read_text()), {})
+
+    def test_cleared_hold_queue_handoff_uses_real_delivery_and_enqueue_once(self) -> None:
+        from scripts.message import send
+
+        queued: list[send.QueuedMessage] = []
+        commands: list[list[str]] = []
+        deliveries: list[str] = []
+        def deliver(jobs: list[quota_alert.Job], stamp: str) -> list[str]:
+            result = deliver_notice_jobs(jobs, stamp)
+            deliveries.extend(result)
+            return result
+        def store(_path: Path, contents: str) -> None:
+            queued[:] = cast(list[send.QueuedMessage], [json.loads(line) for line in contents.splitlines()])
+        def read_queue(_path: Path) -> list[send.QueuedMessage]:
+            return list(queued)
+        def relay(command: list[str], *, input: str, **_options: object) -> subprocess.CompletedProcess[str]:
+            commands.append(command)
+            if len(commands) == 1:
+                return subprocess.CompletedProcess(command, 3, "FAILED: fixture offline", "")
+            recipient = command[command.index("--to") + 1]
+            key = command[command.index("--key") + 1]
+            send.enqueue(send.Message(recipient, "quota_alert", "", input, key), "fixture queued", NOW)
+            return subprocess.CompletedProcess(command, 1, "QUEUED: fixture offline", "")
+
+        notify = refusal_watch._notify_cleared_hold  # pyright: ignore[reportPrivateUsage]
+        retry = refusal_watch._retry_cleared_hold_notices  # pyright: ignore[reportPrivateUsage]
+        with (patch.object(quota_alert, "deliver_and_record", side_effect=deliver),
+              patch.object(subprocess, "run", side_effect=relay),
+              patch.object(send, "queue_for", return_value=self.home / "memory/queue"),
+              patch.object(send, "locked", side_effect=nullcontext),
+              patch.object(send, "read_queue", side_effect=read_queue),
+              patch.object(send, "write_atomic", side_effect=store)):
+            notify("units", "claude2", ("cleared a finished stop hold",), NOW)
+            retry(NOW + timedelta(minutes=2))
+            retry(NOW + timedelta(minutes=4))
+        self.assertEqual(len(commands), 2, deliveries)
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]["text"], "units move to claude2: cleared a finished stop hold")
+        self.assertTrue(queued[0]["key"])
+        self.assertEqual(commands[0][commands[0].index("--key") + 1], queued[0]["key"])
+        self.assertEqual(json.loads((self.home / ".local/state/accounts/pending_cleared_holds.json").read_text()), {})
+
+    def test_released_hold_does_not_change_the_auto_id_used_after_interrupted_consumption(self) -> None:
+        path = self.groups()
+        head = self.low_rule()
+        self.next_entries(head)
+        self.reading(SOURCE_LOGIN, 1)
+        released = launch_permission.ReleasedHold(label="claude2", then="stop",
+            requested_at=NOW.isoformat(), session_id="b1f5ca98-rest")
+        with (patch.object(launch_permission, "launch_permission",
+                           return_value=launch_permission.AllowedByShutdownState(released)),
+              patch.object(next_moves, "write_next_moves", side_effect=OSError("interrupted consumption"))):
+            with self.assertRaises(OSError):
+                _ = self.cli()
+        self.assertEqual(stored_group_labels(path)["units"], "claude2")
+        self.assertEqual(next_moves.read_next_moves(), (head,))
+        _ = accounts.set_group_account("units", "claude1", why="operator return", now=NOW)
+        code, _, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(next_moves.read_next_moves(), ())
+        self.assertEqual(stored_group_labels(path)["units"], "claude1")
+        history = [cast(dict[str, object], json.loads(line))
+                   for line in accounts.roles_history_file().read_text().splitlines()]
+        self.assertEqual([item["why"] for item in history], ["auto: units-low", "operator return"])
+
     def test_failed_consumption_cannot_replay_a_recorded_move_when_role_history_becomes_malformed(self) -> None:
         path = self.groups()
         entry = self.low_rule()
@@ -1587,6 +1844,40 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(stored_group_labels(path)["units"], "claude1")
         _ = self.cli()
         self.assertEqual(stored_group_labels(path)["units"], "claude2")
+
+    def test_auto_move_held_target_keeps_group_and_head_and_names_the_hold(self) -> None:
+        path = self.groups()
+        _ = self.owner("unit", host="unit")
+        head = self.low_rule()
+        self.next_entries(head)
+        reason = "claude2 is held by a shutdown, requested by session b1f5ca98"
+        for permission in (launch_permission.BlockedByShutdown(reason),
+                           launch_permission.ShutdownStateUnreadable("broken state")):
+            with (self.subTest(permission=permission),
+                  patch.object(launch_permission, "launch_permission", return_value=permission)):
+                lines = refusal_watch.run_auto_moves(NOW)
+            self.assertEqual(stored_group_labels(path)["units"], "claude1")
+            self.assertEqual(next_moves.read_next_moves(), (head,))
+            self.assertEqual(self.commands, [])
+            self.assertTrue(any("no session was stopped" in line for line in lines), lines)
+        self.assertTrue(self.head_deliveries)
+        self.assertIn(reason, self.head_deliveries[0][0].text)
+
+    def test_refusal_and_committed_group_paths_check_the_shutdown_hold(self) -> None:
+        for committed in (False, True):
+            with self.subTest(committed=committed):
+                self.owners.clear()
+                self.live.clear()
+                _ = self.groups(units="claude3" if committed else "claude1")
+                owner = self.owner("held-unit", host="unit")
+                self.reading(TARGET_LOGIN, 80)
+                if not committed:
+                    _ = self.transcript(owner["session_id"])
+                with patch.object(launch_permission, "launch_permission", return_value=launch_permission.BlockedByShutdown("target held")):
+                    lines = refusal_watch.run(NOW)
+                self.assertEqual(self.commands, [])
+                self.assertTrue(any("target held" in line for line in lines), lines)
+                self.assertTrue(any("target held" in text for text in self.notifications))
 
     def test_automatic_low_rule_holds_at_two_percent_and_moves_at_one_with_one_transition(self) -> None:
         path = self.groups()
@@ -1979,7 +2270,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = other.write_text(json.dumps({"uuid": "unrelated", "timestamp": NOW.isoformat(),
             "window": "weekly", "reset": ""}))
         routing: moves.RoutedToClaude = {"kind": "routed to claude", "at": NOW.isoformat(),
-            "tool": "codex", "fallback_at": NOW.isoformat(), "owner": "codex1", "cause": "refusal", "why": "Codex refused work for quota", "moved": ["delegate"]}
+            "tool": "codex", "fallback_at": NOW.isoformat(), "owner": "codex1", "cause": "refusal", "why": "Codex refused work for quota", "moved": ["direct"]}
         moves.append_routing(routing)
         WatchTime.at = NOW + timedelta(minutes=19)
         # Other is not live on the continuation tick; its proof file must survive.
@@ -2135,7 +2426,8 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertIsInstance(result, accounts.GroupMoveDryRun)
         assert isinstance(result, accounts.GroupMoveDryRun)
         self.assertEqual(result.session_ids, ())
-        self.assertEqual(result.lines, ("units: would select claude1", "units: no live session moves"))
+        self.assertEqual(result.lines, ("claude1: would check the shutdown hold",
+            "units: would select claude1", "units: no live session moves"))
         self.assertEqual(self.snapshot(), before)
         self.assertEqual(self.commands, [])
 
@@ -2885,7 +3177,8 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertIn("owner second: refused; move from claude3 to claude2", preview)
         self.assertEqual(self.snapshot(), before)
         _, actual, _ = self.cli()
-        self.assertEqual("\n".join(preview.splitlines()[1:]) + "\n", actual)
+        self.assertEqual("\n".join(line for line in preview.splitlines()[1:]
+            if ": would check the shutdown hold" not in line) + "\n", actual)
         self.assertEqual(len(self.commands), 2)
         self.assertTrue(all(command[command.index("--to") + 1] == "claude2" for command in self.commands))
 

@@ -566,7 +566,7 @@ for index in range(20):
                             for assignment in assignments))
         self.assertTrue(all(record["approximate"] is True for record in self.records()))
 
-    def test_remote_role_reader_loads_without_a_delegate_checkout(self) -> None:
+    def test_remote_role_reader_loads_without_a_worker_checkout(self) -> None:
         program = """import sys, types
 for name in ('scripts', 'scripts.usage'):
     package = types.ModuleType(name)

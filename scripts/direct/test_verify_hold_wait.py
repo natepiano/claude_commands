@@ -64,7 +64,7 @@ def grant_call(path: Path) -> None:
     with mock.patch.dict(os.environ, {
         "BUILD_HOLD_DIR": str(release.parent / "build-hold"),
         "BUILD_HOLD_RELEASE_DIR": str(release),
-        "PLAN_DELEGATE_ACTIVE_DIR": str(release.parent / "active"),
+        "UNIT_ACTIVE_DIR": str(release.parent / "active"),
     }), mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test/socket")), \
          mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()):
         with build_hold.release_lock():
@@ -81,7 +81,7 @@ def change_cycle(path: Path, change: Callable[[build_hold.HoldCycle], None]) -> 
     with mock.patch.dict(os.environ, {
         "BUILD_HOLD_DIR": str(release.parent / "build-hold"),
         "BUILD_HOLD_RELEASE_DIR": str(release),
-        "PLAN_DELEGATE_ACTIVE_DIR": str(release.parent / "active"),
+        "UNIT_ACTIVE_DIR": str(release.parent / "active"),
     }), build_hold.release_lock():
         cycle = build_hold.read_cycle()
         assert cycle is not None
@@ -140,9 +140,9 @@ class VerifyHoldWaitTests(unittest.TestCase):
         self.fixture.environment.update({
             "CLAUDE_PYTHON": sys.executable,
             "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
-            "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
-            "PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": "",
-            "PLAN_DELEGATE_TEAM_ROLE": "", "CLAUDE_CODE_SESSION_ID": "",
+            "UNIT_ACTIVE_DIR": str(root / "active"),
+            "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
+            "UNIT_TEAM_ROLE": "", "CLAUDE_CODE_SESSION_ID": "",
             "NOTIFIER_SESSIONS_DIR": str(root / "sessions"),
             "MAC_TEST_STATE_DIR": str(root / "mac-state"),
             "BUILD_TARGETS_POLL_S": "0.01", "BUILD_TARGETS_NOW": "",
@@ -326,10 +326,10 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
         self.hold()
         active = self.fixture.root / "active"
         active.mkdir()
-        run = self.fixture.root / "delegate-run"
+        run = self.fixture.root / "unit-run"
         run.mkdir()
         _ = (active / "owner").write_text(str(run))
-        self.fixture.environment.update({"PLAN_DELEGATE_BOARD_DIR": str(run), "CLAUDE_CODE_SESSION_ID": "stale-session"})
+        self.fixture.environment.update({"UNIT_RUN_DIR": str(run), "CLAUDE_CODE_SESSION_ID": "stale-session"})
         process = self.start("test", "sample", "--local", "local admission test", "--filter", "smoke")
         entry = self.wait_for_call(process)
         self.assertEqual(entry["session_id"], "owner")

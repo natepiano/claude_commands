@@ -35,9 +35,7 @@ class LocalSources:
         roots = os.environ.get("GUILD_DAILY_RUN_ROOTS")
         return cls(tuple(Path(part).expanduser() for part in roots.split(os.pathsep) if part)
                    if roots is not None else unit_runs.run_roots(),
-                   Path(os.environ.get("GUILD_DAILY_HISTORY_ROOT") or
-                        str(Path(os.environ.get("PLAN_DELEGATE_HISTORY_DIR") or
-                                 "~/.local/state/plan-delegate").expanduser() / "runs")).expanduser(),
+                   Path(os.environ.get("GUILD_DAILY_HISTORY_ROOT") or str(unit_runs.history_root() / "runs")).expanduser(),
                    Path(os.environ.get("GUILD_DAILY_ASTRA_ROOT") or
                         os.environ.get("ASTRA_REVIEW_DIR") or "/tmp/claude/astra").expanduser(),
                    Path(os.environ.get("GUILD_DAILY_ROLES_ROOT") or
@@ -315,7 +313,7 @@ def phase_rows(events: list[SourcedEvent], measured: tuple[phase_process.Event, 
         selected.intersection_update(members)
     else:
         director_runs = {text(event.fields, "run_id") for event in events
-                         if text(event.fields, "skill") == progress_history.SKILL_NAME}
+                         if text(event.fields, "skill") in (progress_history.SKILL_NAME, progress_history.FORMER_SKILL_NAME)}
         selected = {key for key in selected if guild == "units" and key[0] in director_runs}
         directors = {text(event.fields, "run_id"): text(cast(dict[str, object], event.fields["main_agent"]), "session_id")
                      for event in events if text(event.fields, "event_type") == "run_started"

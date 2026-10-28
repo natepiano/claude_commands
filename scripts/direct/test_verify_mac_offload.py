@@ -587,12 +587,12 @@ class VerifyMacOffloadTests(unittest.TestCase):
                 for name, value in os.environ.items()
                 if name
                 not in {
-                    "PLAN_DELEGATE_BOARD_DIR",
-                    "PLAN_DELEGATE_SESSION_DIR",
-                    "PLAN_DELEGATE_TEAM_ROLE",
+                    "UNIT_RUN_DIR",
+                    "UNIT_SESSION_DIR",
+                    "UNIT_TEAM_ROLE",
                     "CODEX_THREAD_ID",
                     "CODEX_SESSION_ID",
-                    "PLAN_DELEGATE_DETACHED_RUN",
+                    "UNIT_DETACHED_RUN",
                     "BUILDLOG_MAC",
                     "BUILDLOG_MAC_REASON",
                     "BUILDLOG_LOCAL_REASON",
@@ -617,7 +617,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
             "BUILDLOG_SCOPE": "0",
             "BUILD_HOLD_DIR": str(self.root / "build-hold"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
-            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
+            "UNIT_ACTIVE_DIR": str(self.root / "active"),
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
             "BUILD_TARGETS_SCRIPT": str(VERIFY.parent.parent / "build_targets" / "build_targets.py"),
             "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
@@ -631,8 +631,8 @@ class VerifyMacOffloadTests(unittest.TestCase):
             "BUILD_TARGETS_POLL_S": "0.05",
             "LINT_CONFIG_READER": str(reader),
             "LINT_CONFIG_FILE": str(reader),
-            "PLAN_DELEGATE_BOARD_DIR": str(self.board),
-            "PLAN_DELEGATE_TEAM_ROLE": "test",
+            "UNIT_RUN_DIR": str(self.board),
+            "UNIT_TEAM_ROLE": "test",
             "VERIFY_MAC_RUNNER": str(self.runner),
             "VERIFY_MAC_COPY_WATCH": str(VERIFY.parent.parent / "mac_test" / "copy_watch.py"),
             "VERIFY_MAC_TEST_SCRIPT": str(self.root / "free-now.py"),
@@ -886,9 +886,9 @@ signal.pause()
 
         with mock.patch.dict(os.environ, {name: self.environment[name] for name in (
             "HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME",
-            "BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR", "PLAN_DELEGATE_ACTIVE_DIR",
+            "BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR", "UNIT_ACTIVE_DIR",
             "BUILDLOG_DIR", "MAC_TEST_STATE_DIR", "NOTIFIER_SESSIONS_DIR")}), \
-             mock.patch.dict(os.environ, {"PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": "",
+             mock.patch.dict(os.environ, {"UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
                                           "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": ""}), \
              mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test/socket")), \
              mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()), \
@@ -1983,6 +1983,11 @@ local_release_wait.wait_for_local_release(float(sys.argv[1]), sys.argv[2])
         # The step runs in its own process group, so a kill of verify's group alone misses it.
         self.assertNotEqual(os.getpgid(cargo), process.pid)
         self.assertTrue({cargo, copy} <= processes_carrying(self.child_marker()))
+        # Both folders carry the run's pid, and the copy folder sits in the hold folder, so
+        # tmp_sweep.py can tie a folder a kill leaves behind to its run.
+        holds = list((self.root / "tmp").glob(f"verify-hold.{process.pid}.*"))
+        self.assertEqual(len(holds), 1, list((self.root / "tmp").iterdir()))
+        self.assertEqual(len(list(holds[0].glob(f"verify-copy.{process.pid}.*"))), 1)
         self.stop_verify(process)
         self.assertEqual(processes_carrying(self.child_marker()), set())
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
@@ -1066,6 +1066,117 @@ class SelectorTests(HanaShotTest):
         self.assertEqual([attempt["status"] for attempt in attempts], ["success", "failure"])
 
 
+class FailureGuidanceTests(HanaShotTest):
+    def in_process_shot(self, *args: str) -> subprocess.CompletedProcess[str]:
+        argv = ["shot", "--port", str(self.port), "--out", str(self.scratch / "shot.png"), *args]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        handlers = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+        try:
+            with (
+                mock.patch.dict(os.environ, self.script_environment(), clear=True),
+                redirect_stdout(stdout), redirect_stderr(stderr),
+            ):
+                returncode = hana_shot.main(argv)
+        finally:
+            for number, handler in handlers.items():
+                _ = signal.signal(number, handler)
+        return subprocess.CompletedProcess(argv, returncode, stdout.getvalue(), stderr.getvalue())
+
+    def assert_recorded_error(self, result: subprocess.CompletedProcess[str]) -> str:
+        [line] = self.timing_lines()
+        self.assertEqual(line["status"], "failure")
+        error = cast(str, line["error"])
+        self.assertIn(error, result.stderr)
+        [attempt] = cast(list[dict[str, object]], line["attempts"])
+        self.assertEqual(attempt["error"], error)
+        return error
+
+    def test_settle_timeout_names_retry_then_pose_recovery(self) -> None:
+        settle = hana_shot.Session.settle
+
+        def settle_with_short_limit(
+            session: hana_shot.Session, before: hana_shot.CameraState, extra_frames: int,
+        ) -> hana_shot.Settled:
+            return settle(session, before, extra_frames, limit=0.01)
+
+        with mock.patch.object(hana_shot.Session, "settle", settle_with_short_limit):
+            result = self.in_process_shot("--target", "name:Log", "--mode", "fit", "--settle", "1000000")
+
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        error = self.assert_recorded_error(result)
+        self.assertIn("the camera did not settle within", error)
+        self.assertRegex(error.lower(), r"(?:rerun|retry).*same command.*once")
+        self.assertRegex(error.lower(), r"if.*(?:fails|times out).*again")
+        for detail in ("hana_shot.py pose", "--mode pose", "--focus", "--radius"):
+            self.assertIn(detail, error)
+        self.assertRegex(error.lower(), r"(?:no|without|needs no).*fit move")
+        self.assertEqual(self.fake.methods("brp_extras/screenshot"), [])
+
+    def test_setup_missing_target_names_nearby_selectors_and_targets_command(self) -> None:
+        candidates = ["Panel", "PanelLeft", "PanelRight", "PanelTop", "PanelBase", "PanelRear", "Unrelated"]
+        self.fake.named_entities = [
+            {"entity": 100 + index, "components": {NAME: name}, "has": {AABB: True}}
+            for index, name in enumerate(candidates)
+        ]
+        for selector, expected in (("name:Panle", "Panel"), ("tool:Grayscal", "Grayscale")):
+            with self.subTest(selector=selector):
+                with mock.patch.object(hana_shot, "SETUP_LIMIT", 0.01):
+                    result = self.in_process_shot("--target", selector, "--mode", "hana-frame",
+                                                  "--setup", "scene::spawn")
+
+                self.assertEqual(result.returncode, 1, result.stderr)
+                line = self.timing_lines()[-1]
+                error = cast(str, line["error"])
+                self.assertIn(error, result.stderr)
+                [attempt] = cast(list[dict[str, object]], line["attempts"])
+                self.assertEqual(attempt["error"], error)
+                self.assertRegex(error, r"setup.*scene::spawn.*ran but")
+                self.assertIn(selector, error)
+                self.assertIn("did not appear within", error)
+                self.assertIn(expected, error)
+                self.assertIn("hana_shot.py targets", error)
+                self.assertRegex(error.lower(), r"list.*selectors.*resolve now")
+                if selector.startswith("name:"):
+                    suggested = [name for name in candidates if re.search(rf"\b{re.escape(name)}\b", error)]
+                    self.assertGreater(len(suggested), 1)
+                    self.assertLessEqual(len(suggested), 5)
+                    self.assertNotIn("Unrelated", suggested)
+        self.assertEqual(self.fake.methods("hana/invoke_command"), [{"command": "scene::spawn"}] * 2)
+        self.assertEqual(self.fake.methods("brp_extras/screenshot"), [])
+
+    def test_missing_crop_bounds_names_nearest_cached_parent_and_uncropped_flag(self) -> None:
+        transform = face_transforms()["identity"]
+        for has_ancestor in (True, False):
+            with self.subTest(has_ancestor=has_ancestor):
+                self.fake.named_entities = [
+                    {"entity": 101, "components": {NAME: "Leaf", CHILD_OF: 102, GLOBAL_TRANSFORM: transform},
+                     "has": {AABB: False}},
+                    {"entity": 102, "components": {NAME: "Branch", CHILD_OF: 103, GLOBAL_TRANSFORM: transform},
+                     "has": {AABB: False}},
+                    {"entity": 103, "components": {NAME: "Inner", CHILD_OF: 104, GLOBAL_TRANSFORM: transform},
+                     "has": {AABB: has_ancestor}},
+                    {"entity": 104, "components": {NAME: "Outer", GLOBAL_TRANSFORM: transform},
+                     "has": {AABB: has_ancestor}},
+                ]
+                result = self.shot("--target", "name:Leaf", "--mode", "hana-frame", "--crop", "entity")
+
+                self.assertEqual(result.returncode, 1, result.stderr)
+                line = self.timing_lines()[-1]
+                error = cast(str, line["error"])
+                self.assertIn(error, result.stderr)
+                [attempt] = cast(list[dict[str, object]], line["attempts"])
+                self.assertEqual(attempt["error"], error)
+                self.assertIn("the target has no visible mesh bounds to crop to", error)
+                self.assertIn("--crop none", error)
+                if has_ancestor:
+                    self.assertIn("--target entity:103", error)
+                else:
+                    self.assertNotIn("--target entity:103", error)
+                self.assertNotIn("--target entity:102", error)
+                self.assertNotIn("--target entity:104", error)
+        self.assertEqual(self.fake.methods("brp_extras/screenshot"), [])
+
+
 class ViewsTests(HanaShotTest):
     def test_signal_after_a_failed_view_preserves_its_reason_and_appends_signal_text(self) -> None:
         views_path = self.scratch / "views.toml"
@@ -1392,6 +1503,25 @@ class ShotTests(HanaShotTest):
                          (self.port, "invalid_request", 2))
         self.assertIn("--mode", cast(str, line["error"]))
         self.assertIn(cast(str, line["error"]), result.stderr)
+        for key in ("view", "target", "mode"):
+            self.assertNotIn(key, line)
+
+    def test_failed_invocation_records_the_parsed_shot_fields(self) -> None:
+        views = self.scratch / "views.toml"
+        _ = views.write_text('[views.missing]\ntarget = "name:Absent"\nmode = "hana-frame"\n')
+        self.fake.screenshot = "error"
+        for flags, expected in (
+            (("--view", "missing", "--views-file", str(views)), ("missing", "name:Absent", "hana-frame")),
+            (("--target", "name:Absent", "--mode", "fit"), (None, "name:Absent", "fit")),
+            (("--mode", "home"), (None, None, "home")),
+        ):
+            with self.subTest(flags=flags):
+                result = self.shot(*flags)
+
+                self.assertEqual(result.returncode, 1, result.stderr)
+                line = self.timing_lines()[-1]
+                self.assertEqual(line["status"], "failure")
+                self.assertEqual((line["view"], line["target"], line["mode"]), expected)
 
     def test_multi_view_failure_keeps_earlier_attempt(self) -> None:
         views = self.scratch / "views.toml"

@@ -11,6 +11,9 @@ an observed overshoot makes the run red. This is admission on samples, not an
 OS allocation limit; growth between samples can still exceed the cap. A job whose
 own sampled memory goes over the cap is killed at that sample and fails the run, and so is
 a job still running at the module time limit (default 1800 s).
+After the parallel pass, up to eight failed test modules run once more, alone.
+Runner-killed jobs and the type check do not run again. Each test module uses a
+builds.slice scope when its probe succeeds, unless disabled or already in that slice.
 --tests-only runs the same suite runner without performing any git operations.
 A unit checkpoint commit without its Change-Review line is refused before the merge. After the
 push, each visible change becomes a row in the change-review list that --change-review names, or
@@ -46,16 +49,18 @@ from scripts.production import change_review  # noqa: E402
 
 TEST_SUITES = (
     "lib", "hooks", "message", "accounts", "whoami", "agents", "build_hold",
-    "mac_test", "usage", "bevy_upgrade", "production", "direct", "buildlog",
+    "mac_test", "usage", "bevy_upgrade", "bevy_migration_plan", "production", "direct", "buildlog",
     "lint", "nightly_review", "build_targets", "shutdown", "feature_log",
-    "model_study", "herdr", "notify", "statusline", "astra", "style", "history", "guilds",
+    "model_study", "herdr", "notify", "statusline", "astra", "style", "history", "guilds", "issue_score",
 )
 DEFAULT_MEMORY_CAP_MIB = 4096
+DEFAULT_MAX_RUNNING_JOBS = max(1, (os.cpu_count() or 2) // 2)
 MODULE_MEMORY_MIB = 48
 # A module still running this long is killed and the run is red: a hung module holds every gate
 # behind it. The slowest measured module took 387 s at load 152 (direct/test_verify_mac_offload.py,
 # 2026-10-18); the limit is about 4.6 times that.
 DEFAULT_MODULE_TIME_LIMIT_S = 1800
+RERUN_LIMIT = 8
 # basedpyright resolves bpy (Blender's interpreter only) and PIL (a PEP 723 dependency) from this
 # type-check-only venv, so the full tree reports 0/0. The stub date matches the 2026-08-23 sweep;
 # later dates report new diagnostics in bake_textures.py.
@@ -107,6 +112,7 @@ class GateArguments(argparse.Namespace):
     memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB
     module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S
     tests_only: bool = False
+    promote_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -116,6 +122,7 @@ class GateJobResult:
     returncode: int
     seconds: float
     output: str
+    killed_for: str = ""
 
 
 @dataclass(frozen=True)
@@ -138,7 +145,7 @@ class RunningGateJob:
     started: float
     output: TextIO
     log: Path
-    # Set when the runner kills the job for its sampled memory; the job's result names it.
+    # Set when the runner kills the job for its memory or time limit.
     killed_for: str = ""
 
 
@@ -377,12 +384,80 @@ def one_minute_load() -> float:
     return float(Path("/proc/loadavg").read_text().split()[0])
 
 
+def module_order(modules: Sequence[tuple[str, Path]], timings: dict[str, float]) -> list[tuple[str, Path]]:
+    """`modules` in start order: modules with no recorded time first, then the slowest recorded first."""
+    return sorted(modules, key=lambda item: (f"{item[0]}/{item[1].name}" in timings,
+                                             -timings.get(f"{item[0]}/{item[1].name}", 0)))
+
+
+def in_builds_slice() -> bool:
+    try:
+        return "/builds.slice/" in Path("/proc/self/cgroup").read_text()
+    except OSError:
+        return False
+
+
+def suite_scope_prefix() -> list[str]:
+    if os.environ.get("BUILDLOG_SCOPE") == "0":
+        print("Module scope skipped: BUILDLOG_SCOPE=0", flush=True)
+        return []
+    if in_builds_slice():
+        print("Module scope skipped: gate already runs in builds.slice", flush=True)
+        return []
+    prefix = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+              "--expand-environment=no", "--slice=builds.slice", "--"]
+    try:
+        probe = subprocess.run([*prefix, "true"], stdin=subprocess.DEVNULL,
+                               capture_output=True, timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"Module scope skipped: probe failed ({error})", flush=True)
+        return []
+    if probe.returncode:
+        print(f"Module scope skipped: probe failed (exit {probe.returncode})", flush=True)
+        return []
+    print("Module scope: builds.slice", flush=True)
+    return prefix
+
+
+def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
+                   environment: dict[str, str], log: Path) -> RunningGateJob:
+    output = log.open("w+")
+    started = time.monotonic()
+    try:
+        process = subprocess.Popen(argv, cwd=repo, env=environment, stdin=subprocess.DEVNULL,
+                                   stdout=output, stderr=subprocess.STDOUT, text=True,
+                                   start_new_session=True)
+    except BaseException:
+        output.close()
+        raise
+    return RunningGateJob(suite, path, process, started, output, log)
+
+
+def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
+    seconds = time.monotonic() - job.started
+    kill_job_group(job)
+    job.output.close()
+    captured = job.log.read_text(errors="replace")
+    job.log.unlink()
+    if job.killed_for:
+        captured = f"{job.killed_for}\n{captured}"
+    # Python 3.13 returns 5 for empty helper modules; import errors still return 1.
+    if status == 5 and re.search(r"^Ran 0 tests in", captured, re.MULTILINE) and "NO TESTS RAN" in captured:
+        status = 0
+    if job.suite == "types":
+        status = 0 if status in (0, 3) and re.search(r"^0 errors, 0 warnings, 0 notes\s*$", captured, re.MULTILINE) else 1
+    return GateJobResult(job.suite, job.path.name, status, seconds, captured, job.killed_for)
+
+
 def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_dirs: Sequence[str] = (),
-               module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S) -> GateRun:
+               module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S,
+               max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS) -> GateRun:
     if memory_cap_mib <= 0:
         raise GateRefused("memory cap must be positive")
     if module_time_limit_s <= 0:
         raise GateRefused("module time limit must be positive")
+    if max_running_jobs <= 0:
+        raise GateRefused("running job limit must be positive")
     absent = [name for name in type_dirs if not (repo / name).exists()]
     if absent:
         raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
@@ -397,6 +472,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
         raise GateRefused("the test runner requires writable tmpfs at /dev/shm")
     print(f"Runner: {len(modules)} modules, sampled memory cap {memory_cap_mib} MiB", flush=True)
+    scope_prefix = suite_scope_prefix()
     timings_path = gate_state_dir() / "module_seconds.json"
     timings = read_measures(timings_path)
     types_peaks_path = gate_state_dir() / "types_peak_mib.json"
@@ -406,11 +482,11 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     slow_modules: list[str] = []
     history_path = gate_state_dir() / "module_history.json"
     history = read_history(history_path)
-    modules.sort(key=lambda item: (f"{item[0]}/{item[1].name}" in timings,
-                                  -timings.get(f"{item[0]}/{item[1].name}", 0)))
-    pending = deque(modules)
+    pending = deque(module_order(modules, timings))
     running: list[RunningGateJob] = []
     results: list[GateJobResult] = []
+    first_runs: dict[tuple[str, str], GateJobResult] = {}
+    rerunning = False
     types_python = typecheck_python() if type_dirs else ""
     if isinstance(types_python, Path):
         pending.appendleft(("types", repo / "basedpyright"))
@@ -449,28 +525,18 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                                               + f"{memory_cap_mib / 1024:.3f} GiB cap")
                             print(f"{job.suite}/{job.path.name} {job.killed_for}", flush=True)
                             kill_job_group(job)
-                while pending and admission.admits(bool(running)):
+                while (pending and len(running) < max_running_jobs
+                       and admission.admits(bool(running)) and (not rerunning or not running)):
                     suite, path = pending.popleft()
                     log = Path(temporary) / f"{suite}-{path.stem}.log"
-                    output = log.open("w+")
-                    started = time.monotonic()
-                    _ = suite_started.setdefault(suite, started)
-                    try:
-                        argv = ([os.environ.get("MERGE_GATE_BASEDPYRIGHT", "basedpyright"), "--pythonpath", str(types_python),
-                                 *type_dirs]
-                                if suite == "types" else
-                                [python, "-c", SUITE_BOOTSTRAP, "-m", "unittest", "discover", "-s", str(path.parent), "-p", path.name])
-                        process = subprocess.Popen(
-                            argv, cwd=repo, env=environment,
-                            stdin=subprocess.DEVNULL,
-                            stdout=output, stderr=subprocess.STDOUT, text=True,
-                            start_new_session=True,
-                        )
-                    except BaseException:
-                        output.close()
-                        raise
-                    running.append(RunningGateJob(suite, path, process, started, output, log))
-                    admission.reserve(process.pid, (types_peaks[types_key] * TYPES_PEAK_MARGIN
+                    argv = ([os.environ.get("MERGE_GATE_BASEDPYRIGHT", "basedpyright"), "--pythonpath", str(types_python),
+                             *type_dirs]
+                            if suite == "types" else
+                            [*scope_prefix, python, "-c", SUITE_BOOTSTRAP, "-m", "unittest", "discover", "-s", str(path.parent), "-p", path.name])
+                    job = start_gate_job(suite, path, argv, repo, environment, log)
+                    running.append(job)
+                    _ = suite_started.setdefault(suite, job.started)
+                    admission.reserve(job.process.pid, (types_peaks[types_key] * TYPES_PEAK_MARGIN
                                                     if types_key in types_peaks else TYPES_MEMORY_MIB)
                                       if suite == "types" else 0.0)
                 for job in running[:]:
@@ -482,34 +548,38 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                         status = job.process.poll()
                     if status is None:
                         continue
-                    finished = time.monotonic()
-                    kill_job_group(job)
-                    job.output.close()
-                    captured = job.log.read_text(errors="replace")
-                    job.log.unlink()
-                    if job.killed_for:
-                        captured = f"{job.killed_for}\n{captured}"
-                    # Python 3.13's unittest CLI exits 5 for an empty module. Helper
-                    # modules were also empty within whole-suite discovery; no tests
-                    # are discarded, and import errors still return 1.
-                    if status == 5 and re.search(r"^Ran 0 tests in", captured, re.MULTILINE) and "NO TESTS RAN" in captured:
-                        status = 0
+                    result = finish_gate_job(job, status)
                     if job.suite == "types":
                         if not job.killed_for and types_peak_mib:
                             types_peaks[types_key] = types_peak_mib
-                        status = 0 if status in (0, 3) and re.search(r"^0 errors, 0 warnings, 0 notes\s*$", captured, re.MULTILINE) else 1
-                    else:
-                        key, seconds = f"{job.suite}/{job.path.name}", finished - job.started
+                    elif not rerunning:
+                        key, seconds = f"{job.suite}/{job.path.name}", result.seconds
                         past = history.get(key) or ([timings[key]] if key in timings else [])
                         if past and slower_than_recorded(seconds, statistics.median(past)):
                             slow_modules.append(f"{key} {seconds:.0f} s, median of the last {len(past)} runs "
                                                 + f"{statistics.median(past):.0f} s")
                         history[key] = [*past, seconds][-MODULE_HISTORY_RUNS:]
                         timings[key] = seconds
-                    results.append(GateJobResult(job.suite, job.path.name, status, finished - job.started, captured))
-                    suite_finished[job.suite] = finished
+                    if rerunning:
+                        first = first_runs[(result.suite, result.module)]
+                        results[results.index(first)] = result
+                        if result.returncode == 0:
+                            print(f"Rerun alone: {result.suite}/{result.module} passed "
+                                  + f"(first run exit {first.returncode}, {first.seconds:.2f} s)", flush=True)
+                    else:
+                        results.append(result)
+                    suite_finished[job.suite] = job.started + result.seconds
                     running.remove(job)
                     admission.release(job.process.pid)
+                if not pending and not running and not rerunning:
+                    failed = [result for result in results
+                              if result.suite != "types" and result.returncode and not result.killed_for]
+                    rerunning = True
+                    if len(failed) > RERUN_LIMIT:
+                        print(f"{len(failed)} modules failed; this is a real breakage, not load; no reruns", flush=True)
+                    else:
+                        first_runs = {(result.suite, result.module): result for result in failed}
+                        pending.extend((result.suite, repo / "scripts" / result.suite / result.module) for result in failed)
                 if running or pending:
                     time.sleep(0.05)
         finally:
@@ -526,14 +596,22 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     for suite in TEST_SUITES:
         failed = [module for module in results if module.suite == suite and module.returncode]
         print(f"{suite}: {'RED' if failed else 'OK'} {suite_finished[suite] - suite_started[suite]:.2f}s", flush=True)
-        for module in failed:
-            print(f"--- {suite}/{module.module} exit={module.returncode} ---\n{module.output}", flush=True)
+        for module in (result for result in results if result.suite == suite):
+            key = (suite, module.module)
+            if key in first_runs:
+                first = first_runs[key]
+                label = "passed on rerun alone; first run" if module.returncode == 0 else "first run"
+                print(f"--- {suite}/{module.module} {label} exit={first.returncode} ---\n{first.output}", flush=True)
+            if module.returncode:
+                label = "rerun alone " if key in first_runs else ""
+                print(f"--- {suite}/{module.module} {label}exit={module.returncode} ---\n{module.output}", flush=True)
     for result in results:
         if result.suite == "types":
             print(f"basedpyright: {'RED' if result.returncode else 'OK'}\n{result.output}", flush=True)
     for slow in slow_modules:
         print(f"Slow module: {slow} ({SLOW_MODULE_FACTOR:g}x or more)", flush=True)
-    print(f"Gate tests: {elapsed:.2f}s; peak memory: {admission.peak_mib / 1024:.3f} GiB (sampled memory); cap: {memory_cap_mib / 1024:.3f} GiB", flush=True)
+    print(f"Gate tests: {elapsed:.2f}s; at most {max_running_jobs} modules at once; "
+          + f"peak memory: {admission.peak_mib / 1024:.3f} GiB (sampled memory); cap: {memory_cap_mib / 1024:.3f} GiB", flush=True)
     print(f"Largest module peak: {largest_module_peak_mib / 1024:.3f} GiB (sampled memory); module: {largest_module or '(not sampled)'}", flush=True)
     print(f"One-minute load: start={starting_load:.2f} max={maximum_load:.2f} end={ending_load:.2f}", flush=True)
     if admission.peak_mib > memory_cap_mib:
@@ -579,7 +657,7 @@ def promote(args: GateArguments) -> None:
     print(result.stdout, end="", flush=True)
     statuses = re.findall(r"^ff_rc=(\d+)\s*$", result.stdout, re.MULTILINE)
     if result.returncode or statuses != ["0"]:
-        raise GateRefused(f"main promoted to {promoted}; Mac fast-forward failed: ssh exit={result.returncode}, ff_rc={statuses}; {result.stderr.strip()}")
+        raise GateRefused(f"main promoted to {promoted}; Mac fast-forward failed: ssh exit={result.returncode}, ff_rc={statuses}; {result.stderr.strip()}; the claude-sync job on the Mac retries within 15 minutes")
 
 
 def rollback_merge(repo: Path, baseline: str) -> None:
@@ -716,8 +794,9 @@ def record_changes(repo: Path, review_list: Path, production: Path, commits: lis
     merged = checked_git(repo, "rev-parse", f"--short={change_review.SHORT}", "HEAD")
     try:
         rows = change_review.append_rows(review_list, change_review.visible(commits), change_review.today(), merged,
-                                         production)
-        drifted = change_review.drift(repo, merge_branch, change_review.read(review_list), change_review.LANDED)
+                                         production, owners=change_review.visible_owners(commits, production))
+        drifted = change_review.drift(repo, merge_branch, change_review.read(review_list), change_review.LANDED,
+                                      change_review.foreign_units(production))
     except (change_review.ChangeReviewError, OSError) as error:
         raise GateRefused(f"pushed {merged}; change review list {review_list} not written: {error}") from error
     if rows:
@@ -751,8 +830,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     _ = parser.add_argument("--module-time-limit-s", type=float, default=DEFAULT_MODULE_TIME_LIMIT_S,
                             help="kill a module still running after this many seconds (default: 1800); slowest measured: 387 s at load 152")
     _ = parser.add_argument("--tests-only", action="store_true")
+    _ = parser.add_argument("--promote-only", action="store_true",
+                            help="only promote origin/<merge-branch> to main and the Mac (needs --merge-branch)")
     args = cast(GateArguments, parser.parse_args(argv))
-    if not args.tests_only:
+    if args.promote_only and not args.merge_branch:
+        parser.error("--promote-only needs --merge-branch")
+    if not args.tests_only and not args.promote_only:
         required = ("merge_branch", "unit_branch", "checkpoint", "previous_checkpoint", "unit", "phase")
         missing = [name.replace("_", "-") for name in required if not getattr(args, name)]
         if missing:
@@ -762,6 +845,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.tests_only:
                 return 0 if run_suites(Path(str(args.repo)).resolve(), int(args.memory_cap_mib),
                                        module_time_limit_s=float(args.module_time_limit_s)).passed else 1
+            if args.promote_only:
+                promote(args)
+                return 0
             return merge_checkpoint(args)
     except (GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)

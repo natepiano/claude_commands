@@ -34,6 +34,8 @@ import usage_store
 from quota_alert import (RefusedAt, _refusal_window, blocked_next_move_line, blocked_next_move_reason_key, notify_blocked_next_move,  # pyright: ignore[reportPrivateUsage]
                          BlockedHeadReason as BlockedHeadReason, NoTargetReading as NoTargetReading,
                          TargetReadingUnavailable as TargetReadingUnavailable,
+                         TargetLoginRenewalFailed as TargetLoginRenewalFailed,
+                         TargetHeldByShutdown as TargetHeldByShutdown,
                          TargetAccountUnavailable as TargetAccountUnavailable,
                          TargetAtOrBelowThreshold as TargetAtOrBelowThreshold,
                          TargetUnresolvedRefusal as TargetUnresolvedRefusal,
@@ -587,6 +589,65 @@ def _notify_no_room(text: str, now: datetime) -> bool:
 
 
 
+class PendingClearedHoldNotice(TypedDict):
+    text: str
+    recipients: NotRequired[list[str]]
+
+
+def _pending_cleared_holds() -> dict[str, PendingClearedHoldNotice]:
+    pending: dict[str, PendingClearedHoldNotice] = {}
+    for key, raw in _object(state_root() / "pending_cleared_holds.json").items():
+        if not isinstance(raw, dict):
+            continue
+        value = cast(dict[str, object], raw)
+        text = value.get("text")
+        if not isinstance(text, str):
+            continue
+        notice = PendingClearedHoldNotice(text=text)
+        recipients = value.get("recipients")
+        if isinstance(recipients, list) and all(isinstance(item, str) for item in cast(list[object], recipients)):
+            notice["recipients"] = cast(list[str], recipients)
+        pending[key] = notice
+    return pending
+
+
+def _retry_cleared_hold_notices(now: datetime) -> None:
+    import quota_alert
+    path = state_root() / "pending_cleared_holds.json"
+    pending = _pending_cleared_holds()
+    for key, notice in list(pending.items()):
+        if "recipients" not in notice:
+            recipients = quota_alert.recipients(quota_alert.load_config())
+            if not recipients:
+                continue
+            notice["recipients"] = list(dict.fromkeys(recipients))
+            _atomic_json(path, pending)
+        for recipient in list(notice["recipients"]):
+            job = quota_alert.Job(key, recipient, notice["text"], "account move")
+            outcomes = quota_alert.deliver_and_record([job], now.isoformat())
+            prefix = f"quota {job.kind} {job.name} -> {job.recipient}: "
+            # A queued message belongs to send.py now; its stable key prevents another copy.
+            if outcomes and all(line == prefix + "sent" or line.startswith(prefix + "not delivered: QUEUED:")
+                                for line in outcomes):
+                notice["recipients"].remove(recipient)
+                if not notice["recipients"]:
+                    del pending[key]
+                _atomic_json(path, pending)
+
+
+def _notify_cleared_hold(group: str, target: str, notices: tuple[str, ...], now: datetime) -> None:
+    if not notices:
+        return
+    pending = _pending_cleared_holds()
+    for notice in notices:
+        text = f"{group} move to {target}: {notice}"
+        key = hashlib.sha256(text.encode()).hexdigest()
+        _ = pending.setdefault(key, PendingClearedHoldNotice(text=text))
+    # Save before delivery, so consuming the move cannot lose a failed relay.
+    _atomic_json(state_root() / "pending_cleared_holds.json", pending)
+    _retry_cleared_hold_notices(now)
+
+
 def _blocked_head_line(rule: AutoMoveRule, reason: BlockedHeadReason) -> str:
     return blocked_next_move_line(rule.group, rule.to, rule.entry_id, reason)
 
@@ -865,6 +926,17 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                     if _notify_no_room(text, now):
                         state["notices"][notice_key] = fingerprint
             continue
+        shutdown_hold = accounts.check_move_target_hold(chosen.label, dry_run=dry_run)
+        if isinstance(shutdown_hold, accounts.MoveRefused):
+            lines.append(shutdown_hold.reason)
+            if group_name != "ungrouped":
+                no_room_groups.add(group_name)
+            if not dry_run:
+                _ = _notify_no_room(shutdown_hold.reason, now)
+            continue
+        lines.extend(shutdown_hold.notices)
+        if not dry_run:
+            _notify_cleared_hold(group_name, chosen.label, shutdown_hold.notices, now)
         if group_name != "ungrouped":
             lines.extend(f"{session.name}: refused group {group_name}; move to {chosen.label}" for session in all_members[group_name]
                          if session.session_id not in {item[0]["session_id"] for item in group})
@@ -949,6 +1021,15 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
             if held is not None and not refusals.resolved(held, refusals.stored_reading("claude", identity.login, now), now):
                 lines.append(f"{group_name}: move refused: {target} holds an unresolved refusal")
                 continue
+            shutdown_hold = accounts.check_move_target_hold(target, dry_run=dry_run)
+            if isinstance(shutdown_hold, accounts.MoveRefused):
+                lines.append(f"{group_name}: {shutdown_hold.reason}")
+                if not dry_run:
+                    _ = _notify_no_room(shutdown_hold.reason, now)
+                continue
+            lines.extend(shutdown_hold.notices)
+            if not dry_run:
+                _notify_cleared_hold(group_name, target, shutdown_hold.notices, now)
             prepared = (accounts.prepared_account_preview(target, resume=True) if dry_run
                         else accounts.prepared_account(target, resume=True))
             if isinstance(prepared, accounts.AccountRefused):
@@ -1078,9 +1159,17 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
                 TargetAccountUnavailable("no readable login"), now, dry_run))
             continue
         target = refusals.stored_reading("claude", target_identity.login, now)
+        last_read = (target.weekly.at if isinstance(target, (refusals.FreshReading, refusals.StaleReading))
+                     and isinstance(target.weekly, refusals.ReadingWindow) else NoTargetReading())
+        target_usage = usage_store.load().get(usage_store.key("Claude", target_identity.login), {})
+        if usage_store.latest_read_outcome(target_usage) == agent_accounts.UsageReadOutcome.STALE_TOKEN:
+            attempt = accounts.login_renewal_attempts().get(rule.to)
+            reason = (TargetLoginRenewalFailed(attempt.result.detail)
+                      if attempt is not None and isinstance(attempt.result, accounts.LoginRenewalFailed)
+                      else TargetReadingUnavailable(last_read))
+            lines.append(_record_blocked_head(state, rule, reason, now, dry_run))
+            continue
         if not isinstance(target, refusals.FreshReading):
-            last_read = (target.weekly.at if isinstance(target, refusals.StaleReading)
-                         and isinstance(target.weekly, refusals.ReadingWindow) else NoTargetReading())
             lines.append(_record_blocked_head(state, rule, TargetReadingUnavailable(last_read), now, dry_run))
             continue
         if target.weekly.left <= rule.when.percent:
@@ -1091,6 +1180,13 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
         if held is not None and not refusals.resolved(held, target, now):
             lines.append(_record_blocked_head(state, rule, TargetUnresolvedRefusal(), now, dry_run))
             continue
+        shutdown_hold = accounts.check_move_target_hold(rule.to, dry_run=dry_run)
+        if isinstance(shutdown_hold, accounts.MoveRefused):
+            lines.append(_record_blocked_head(state, rule, TargetHeldByShutdown(shutdown_hold.reason), now, dry_run))
+            continue
+        lines.extend(shutdown_hold.notices)
+        if not dry_run:
+            _notify_cleared_hold(rule.group, rule.to, shutdown_hold.notices, now)
         prepared = (accounts.prepared_account_preview(rule.to, resume=True) if dry_run
                     else accounts.prepared_account(rule.to, resume=True))
         if isinstance(prepared, accounts.AccountRefused):
@@ -1133,13 +1229,51 @@ def run_auto_moves(now: datetime, *, dry_run: bool = False,
         return _run_auto_moves_locked(now, moved_groups=moved_groups)
 
 
+def renew_expired_logins(now: datetime, dry_run: bool) -> list[str]:
+    """Probe local noted accounts before any move takes the queue lock."""
+    stored = usage_store.load()
+    attempts = accounts.login_renewal_attempts()
+    lines: list[str] = []
+    for named in accounts.checked_named_accounts():
+        identity = accounts.account_identity(named.dir)
+        if not isinstance(identity, agent_accounts.NumberedAccount):
+            continue
+        usage = stored.get(usage_store.key("Claude", identity.login), {})
+        if usage_store.latest_read_outcome(usage) != agent_accounts.UsageReadOutcome.STALE_TOKEN:
+            continue
+        previous = attempts.get(named.label)
+        if previous is not None and now - previous.at < timedelta(minutes=60):
+            continue
+        if dry_run:
+            lines.append(f"would renew {named.label}")
+            continue
+        result = accounts.renew_login(named.label)
+        attempts[named.label] = accounts.LoginRenewalAttempt(now, result)
+        _atomic_json(accounts.login_renewals_file(), {
+            label: {"at": attempt.at.isoformat(),
+                    "outcome": "renewed" if isinstance(attempt.result, accounts.LoginRenewed) else "failed",
+                    "detail": attempt.result.detail if isinstance(attempt.result, accounts.LoginRenewalFailed) else ""}
+            for label, attempt in attempts.items()})
+        lines.append(f"{named.label} login renewed" if isinstance(result, accounts.LoginRenewed)
+                     else f"{named.label} login renewal failed: {result.detail}")
+    return lines
+
+
 @role_map.role_map_command
 def run(now: datetime | None = None, *, dry_run: bool = False, proof_group: frozenset[str] = NO_SESSION_FILTER) -> list[str]:
+    from scripts.accounts import unit_watchdog
+
     at = now or datetime.now(timezone.utc)
     if dry_run:
-        return _run(at, True, proof_group)
+        return [*renew_expired_logins(at, True), *_run(at, True, proof_group),
+                *(unit_watchdog.run(at, dry_run=True) if not proof_group else [])]
     with _watch_lock():
-        return _run(at, False, proof_group)
+        _retry_cleared_hold_notices(at)
+        renewed = renew_expired_logins(at, False)
+        # A probe can save a reading after the pass started.
+        after_renewal = max(at, datetime.now(timezone.utc)) if renewed else at
+        return [*renewed, *_run(after_renewal, False, proof_group),
+                *(unit_watchdog.run(after_renewal, dry_run=False) if not proof_group else [])]
 
 
 class WatchCommandLine(argparse.Namespace):

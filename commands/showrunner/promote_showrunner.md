@@ -33,7 +33,7 @@ What it does:
 1. **Checks**, and refuses with the cause, stopping nothing:
    - the unit has no live session under your production;
    - it is mid-turn, or its pane shows a form, prompt or draft;
-   - it has a `/unit:delegate` run open, which keeps its workers, so the run finishes first;
+   - it has a `/unit:direct` run open, which keeps its workers, so the run finishes first;
    - it has uncommitted work, so it checkpoints first;
    - the doc is missing, uncommitted or not a production doc;
    - the new production already has a showrunner;

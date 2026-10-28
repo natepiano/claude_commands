@@ -122,8 +122,8 @@ esac
         _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
         self.environment = {
             **{name: value for name, value in os.environ.items()
-               if name not in {"PLAN_DELEGATE_BOARD_DIR", "PLAN_DELEGATE_TEAM_ROLE", "CODEX_THREAD_ID",
-                               "CODEX_SESSION_ID", "PLAN_DELEGATE_DETACHED_RUN"}},
+               if name not in {"UNIT_RUN_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID",
+                               "CODEX_SESSION_ID", "UNIT_DETACHED_RUN"} and not name.startswith("PLAN_DELEGATE_")},
             "PATH": f"{stubs}:{os.environ['PATH']}",
             "HOME": str(home),
             "RUSTUP_HOME": str(Path.home() / ".rustup"),
@@ -145,7 +145,7 @@ esac
             "BUILDLOG_SCOPE": "0",
             "BUILD_HOLD_DIR": str(self.root / "build-hold"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "hold-release"),
-            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
+            "UNIT_ACTIVE_DIR": str(self.root / "active"),
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
             "BUILD_TARGETS_SCRIPT": str(VERIFY.parent.parent / "build_targets" / "build_targets.py"),
             "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
@@ -156,7 +156,7 @@ esac
             "VERIFY_MAC_RUNNER": str(self.root / "no-mac-runner"),
             "LINT_CONFIG_READER": str(reader),
             "LINT_CONFIG_FILE": str(reader),
-            "PLAN_DELEGATE_SESSION_DIR": str(self.root / "session"),
+            "UNIT_SESSION_DIR": str(self.root / "session"),
             "TEST_RUNNING": str(self.root / "running"),
             "TEST_RELEASE": str(self.root / "release"),
             "TEST_WAIT_HELPER": str(VERIFY.parent / "wait_for_test_state.py"),
@@ -171,14 +171,30 @@ esac
         self.temporary.cleanup()
 
     def live_group_processes(self, group: int) -> list[int]:
+        """The live processes in the group, and in the session a started call leads.
+
+        verify.sh runs each step in a group of its own (run()'s `set -m`), in the
+        call's session; a kill of the call's group alone left a step waiting for the
+        token for 45 h (2026-10-20).
+        """
         found: list[int] = []
         result = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "pgid=", "-o", "stat="],
                                 capture_output=True, text=True, check=True)
         for line in result.stdout.splitlines():
             parts = line.split()
-            if len(parts) == 3 and int(parts[1]) == group and not parts[2].startswith("Z"):
-                found.append(int(parts[0]))
+            if len(parts) != 3 or parts[2].startswith("Z"):
+                continue
+            pid = int(parts[0])
+            if int(parts[1]) == group or self.session_of(pid) == group:
+                found.append(pid)
         return found
+
+    @staticmethod
+    def session_of(pid: int) -> int | None:
+        try:
+            return os.getsid(pid)
+        except OSError:
+            return None
 
     def end_group(self, group: int) -> None:
         try:
@@ -187,6 +203,11 @@ esac
             pass
         deadline = time.monotonic() + 300
         while pids := self.live_group_processes(group):
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             descriptors: list[int] = []
             poll_pids = False
             try:
@@ -241,7 +262,7 @@ esac
     def test_no_token_records_zero(self) -> None:
         # A session dir alone makes this a director's run, which takes the token.
         environment = {name: value for name, value in self.environment.items()
-                       if name != "PLAN_DELEGATE_SESSION_DIR"}
+                       if name != "UNIT_SESSION_DIR"}
         result = self.verify(environment)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(self.records()), 1)
@@ -252,8 +273,8 @@ esac
     def test_director_run_takes_the_token_as_slot_director(self) -> None:
         clock = self.root / "director-clock"
         _ = clock.write_text("100\n")
-        session = Path(self.environment["PLAN_DELEGATE_SESSION_DIR"])
-        result = self.verify({**self.environment, "PLAN_DELEGATE_TOKEN_CLOCK_FILE": str(clock)})
+        session = Path(self.environment["UNIT_SESSION_DIR"])
+        result = self.verify({**self.environment, "UNIT_TOKEN_CLOCK_FILE": str(clock)})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.records()[0]["token_wait_s"], 0)
         self.assertIn("[director] claim: token cargo acquired", (session / "board.log").read_text())
@@ -263,19 +284,19 @@ esac
         # Copy the board boundary into a disposable HOME; acquire deliberately
         # crosses a whole second, so scheduling can only increase the wait.
         home = self.root / "clock-home"
-        delegate = home / ".claude/scripts/direct"
-        delegate.mkdir(parents=True)
+        direct_dir = home / ".claude/scripts/direct"
+        direct_dir.mkdir(parents=True)
         for source in VERIFY.parent.parent.iterdir():
             if source.name != "direct":
-                (delegate.parent / source.name).symlink_to(source, target_is_directory=source.is_dir())
-        board = delegate / "board.sh"
+                (direct_dir.parent / source.name).symlink_to(source, target_is_directory=source.is_dir())
+        board = direct_dir / "board.sh"
         _ = board.write_text('#!/bin/bash\nif [[ "$1" == acquire ]]; then sleep 1.1; fi\n'
                              + 'exec bash "$TEST_REAL_BOARD" "$@"\n')
         environment = {**self.environment, "HOME": str(home),
-                       "PLAN_DELEGATE_BOARD_DIR": str(self.root / "clock-board"),
-                       "PLAN_DELEGATE_TEAM_ROLE": "clock", "TEST_REAL_BOARD": str(BOARD)}
-        for key in ("PLAN_DELEGATE_WORKER_POLL_SECS", "PLAN_DELEGATE_WORKER_WAIT_ATTEMPTS",
-                    "PLAN_DELEGATE_EARLY_POLL_SECS", "PLAN_DELEGATE_TOKEN_CLOCK_FILE"):
+                       "UNIT_RUN_DIR": str(self.root / "clock-board"),
+                       "UNIT_TEAM_ROLE": "clock", "TEST_REAL_BOARD": str(BOARD)}
+        for key in ("UNIT_WORKER_POLL_SECS", "UNIT_WORKER_WAIT_ATTEMPTS",
+                    "UNIT_EARLY_POLL_SECS", "UNIT_TOKEN_CLOCK_FILE"):
             _ = environment.pop(key, None)
         result = self.verify(environment)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -283,6 +304,17 @@ esac
         self.assertGreaterEqual(cast(int, self.records()[0]["token_wait_s"]), 1)
 
     def test_step_group_is_recorded_before_cargo_starts(self) -> None:
+        board = self.root / "board"
+        environment = {**self.environment, "UNIT_RUN_DIR": str(board),
+                       "UNIT_TEAM_ROLE": "first", "TEST_REQUIRE_OWNED": "1",
+                       "TEST_OWNED_RECORD": str(board / "locks" / "cargo.d" / "owned"),
+                       "TEST_OWNED_CONFIRMED": str(self.root / "owned-confirmed"),
+                       "TEST_CALLER_GROUP": str(os.getpgrp())}
+        result = self.verify(environment)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.root / "owned-confirmed").exists())
+
+    def test_a_seat_with_only_the_names_before_the_rename_takes_its_run_token(self) -> None:
         board = self.root / "board"
         environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
                        "PLAN_DELEGATE_TEAM_ROLE": "first", "TEST_REQUIRE_OWNED": "1",
@@ -295,8 +327,8 @@ esac
 
     def test_failed_release_reports_reason_and_fails_successful_step(self) -> None:
         board = self.root / "board"
-        environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
-                       "PLAN_DELEGATE_TEAM_ROLE": "first", "TEST_CORRUPT_OWNER": "1",
+        environment = {**self.environment, "UNIT_RUN_DIR": str(board),
+                       "UNIT_TEAM_ROLE": "first", "TEST_CORRUPT_OWNER": "1",
                        "TEST_OWNED_RECORD": str(board / "locks" / "cargo.d" / "owned"),
                        "TEST_STEP_GROUP": str(self.root / "step-group")}
         result = self.verify(environment)
@@ -309,8 +341,8 @@ esac
 
     def test_failed_release_preserves_step_failure(self) -> None:
         board = self.root / "board"
-        environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
-                       "PLAN_DELEGATE_TEAM_ROLE": "first", "TEST_CORRUPT_OWNER": "1",
+        environment = {**self.environment, "UNIT_RUN_DIR": str(board),
+                       "UNIT_TEAM_ROLE": "first", "TEST_CORRUPT_OWNER": "1",
                        "TEST_CARGO_STATUS": "42",
                        "TEST_OWNED_RECORD": str(board / "locks" / "cargo.d" / "owned"),
                        "TEST_STEP_GROUP": str(self.root / "step-group")}
@@ -341,14 +373,14 @@ fi
 exec "$TEST_REAL_SLEEP" "$@"
 ''')
         sleep.chmod(0o755)
-        first_environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
-                             "PLAN_DELEGATE_TEAM_ROLE": "first", "TEST_BLOCK": "1",
+        first_environment = {**self.environment, "UNIT_RUN_DIR": str(board),
+                             "UNIT_TEAM_ROLE": "first", "TEST_BLOCK": "1",
                              "TEST_REAL_SLEEP": real_sleep,
-                             "PLAN_DELEGATE_TOKEN_CLOCK_FILE": str(first_clock)}
-        second_environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
-                              "PLAN_DELEGATE_TEAM_ROLE": "second", "TEST_WAITING": str(waiting),
+                             "UNIT_TOKEN_CLOCK_FILE": str(first_clock)}
+        second_environment = {**self.environment, "UNIT_RUN_DIR": str(board),
+                              "UNIT_TEAM_ROLE": "second", "TEST_WAITING": str(waiting),
                               "TEST_REAL_SLEEP": real_sleep, "TEST_WAIT_GATE": str(resume),
-                              "PLAN_DELEGATE_TOKEN_CLOCK_FILE": str(second_clock)}
+                              "UNIT_TOKEN_CLOCK_FILE": str(second_clock)}
         first = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
                                  env=first_environment, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True, start_new_session=True)
@@ -407,10 +439,10 @@ exec "$TEST_REAL_SLEEP" "$@"
         assert real_sleep is not None
         polls = self.root / "reclaim-polls"
         board = self.root / "board"
-        first_environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
-                             "PLAN_DELEGATE_TEAM_ROLE": "first", "TEST_BLOCK": "1"}
-        second_environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
-                              "PLAN_DELEGATE_TEAM_ROLE": "second", "TEST_RECLAIM_POLLS": str(polls),
+        first_environment = {**self.environment, "UNIT_RUN_DIR": str(board),
+                             "UNIT_TEAM_ROLE": "first", "TEST_BLOCK": "1"}
+        second_environment = {**self.environment, "UNIT_RUN_DIR": str(board),
+                              "UNIT_TEAM_ROLE": "second", "TEST_RECLAIM_POLLS": str(polls),
                               "TEST_REAL_SLEEP": real_sleep}
         first_environment["TEST_REAL_SLEEP"] = real_sleep
         first = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
@@ -448,10 +480,10 @@ exec "$TEST_REAL_SLEEP" "$@"
 
     def test_reclaim_stops_old_build_before_next_build(self) -> None:
         board = self.root / "board"
-        first_environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
-                             "PLAN_DELEGATE_TEAM_ROLE": "first", "TEST_BLOCK": "1"}
-        second_environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
-                              "PLAN_DELEGATE_TEAM_ROLE": "second", "TEST_RECLAIM_CHECK": "1"}
+        first_environment = {**self.environment, "UNIT_RUN_DIR": str(board),
+                             "UNIT_TEAM_ROLE": "first", "TEST_BLOCK": "1"}
+        second_environment = {**self.environment, "UNIT_RUN_DIR": str(board),
+                              "UNIT_TEAM_ROLE": "second", "TEST_RECLAIM_CHECK": "1"}
         first = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
                                  env=first_environment, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL, start_new_session=True)
@@ -475,8 +507,8 @@ exec "$TEST_REAL_SLEEP" "$@"
 
     def test_expired_live_holder_reclaim_keeps_its_build_running(self) -> None:
         board = self.root / "board"
-        environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
-                       "PLAN_DELEGATE_TEAM_ROLE": "first", "TEST_BLOCK": "1"}
+        environment = {**self.environment, "UNIT_RUN_DIR": str(board),
+                       "UNIT_TEAM_ROLE": "first", "TEST_BLOCK": "1"}
         first = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
                                  env=environment, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.PIPE, text=True, start_new_session=True)
@@ -540,8 +572,8 @@ exec "$TEST_REAL_SLEEP" "$@"
         second_release = self.root / "second-release"
         first_running = self.root / "first-running"
         second_running = self.root / "second-running"
-        first_environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
-                             "PLAN_DELEGATE_TEAM_ROLE": "holder", "TEST_BLOCK": "1",
+        first_environment = {**self.environment, "UNIT_RUN_DIR": str(board),
+                             "UNIT_TEAM_ROLE": "holder", "TEST_BLOCK": "1",
                              "TEST_RELEASE": str(first_release),
                              "TEST_RUNNING": str(first_running),
                              "TEST_CARGO_PID": str(self.root / "first-cargo-pid")}
@@ -633,8 +665,8 @@ exec "$TEST_REAL_SLEEP" "$@"
         _ = meminfo.write_text("MemAvailable: 0 kB\n")
         peer_meminfo = self.root / "peer-meminfo"
         _ = peer_meminfo.write_text("MemAvailable: 50331648 kB\n")
-        environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
-                       "PLAN_DELEGATE_TEAM_ROLE": "impl", "BUILDLOG_MEM_POLL_S": "1"}
+        environment = {**self.environment, "UNIT_RUN_DIR": str(board),
+                       "UNIT_TEAM_ROLE": "impl", "BUILDLOG_MEM_POLL_S": "1"}
         phase_16_errors = self.root / "phase-16.err"
         phase_16 = self.start_memory_waiter(environment, phase_16_errors)
         phase_15: subprocess.Popen[bytes] | None = None
@@ -696,8 +728,8 @@ exec "$TEST_REAL_SLEEP" "$@"
                              + 'if [ "$1" = 3 ] && [ -n "${TEST_WAITING:-}" ]; then : > "$TEST_WAITING"; fi\n'
                              + 'exec "$TEST_REAL_SLEEP" "$@"\n')
         sleep.chmod(0o755)
-        environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
-                       "PLAN_DELEGATE_TEAM_ROLE": "impl", "BUILDLOG_MEM_POLL_S": "1",
+        environment = {**self.environment, "UNIT_RUN_DIR": str(board),
+                       "UNIT_TEAM_ROLE": "impl", "BUILDLOG_MEM_POLL_S": "1",
                        "TEST_REAL_SLEEP": real_sleep}
         output = self.root / "waiter.out"
         waiter = self.start_memory_waiter({**environment, "TEST_WAITING": str(waiting)}, output)
@@ -720,6 +752,11 @@ exec "$TEST_REAL_SLEEP" "$@"
             self.assertEqual(waiter.wait(timeout=300), 0, output.read_text())
             self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 2)
             self.assertEqual(list(admission.glob("*.reservation")), [])
+            # The wait after the memory wait shows in the log; on 2026-10-22 its
+            # log ended on "starting anyway" for hours.
+            text = output.read_text(errors="replace")
+            self.assertIn("waiting for the cargo token since", text)
+            self.assertIn("took the cargo token after 0 min", text)
         finally:
             _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
             _ = (self.root / "release").touch()
@@ -729,11 +766,50 @@ exec "$TEST_REAL_SLEEP" "$@"
                         self.end_group(process.pid)
                     _ = process.wait(timeout=300)
 
-    def test_a_token_wait_does_not_start_a_new_memory_wait_limit(self) -> None:
+    def test_a_step_whose_call_is_gone_stops_waiting_for_the_token(self) -> None:
+        # On 2026-10-20 a test killed a call's group and left its step, in a
+        # group of its own, trying for the token for 45 h. The step gives the
+        # token back for its memory wait, a peer takes it, and the call is
+        # killed while its step waits for the token again.
+        board = self.root / "board"
+        waiting = self.root / "waiting-for-token"
+        meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
+        _ = meminfo.write_text("MemAvailable: 0 kB\n")
+        real_sleep = shutil.which("sleep")
+        if real_sleep is None:
+            self.fail("the token wait test needs sleep on PATH")
+        sleep = self.root / "stubs" / "sleep"
+        _ = sleep.write_text("#!/bin/sh\n"
+                             + 'if [ "$1" = 3 ] && [ -n "${TEST_WAITING:-}" ]; then : > "$TEST_WAITING"; fi\n'
+                             + 'exec "$TEST_REAL_SLEEP" "$@"\n')
+        sleep.chmod(0o755)
+        environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
+                       "PLAN_DELEGATE_TEAM_ROLE": "impl", "BUILDLOG_MEM_POLL_S": "1",
+                       "TEST_REAL_SLEEP": real_sleep, "TEST_WAITING": str(waiting)}
+        output = self.root / "waiter.out"
+        call = self.start_memory_waiter(environment, output)
+        peer = subprocess.Popen([real_sleep, "600"], start_new_session=True)
+        self.started_groups.add(peer.pid)
+        self.addCleanup(peer.wait, 300)
+        taken = subprocess.run(["bash", str(BOARD), "acquire", str(board), "peer", "cargo", "--pid", str(peer.pid),
+                                "--hold", "3600", "--wait", "0"],
+                               capture_output=True, text=True, check=False, timeout=300)
+        self.assertEqual(taken.returncode, 0, taken.stderr)
+        _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
+        self.wait_for_running(waiting, call)
+        os.kill(call.pid, signal.SIGKILL)
+        _ = call.wait(timeout=300)
+        deadline = time.monotonic() + 60
+        while (left := self.live_group_processes(call.pid)) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertEqual(left, [], output.read_text(errors="replace"))
+        self.assertIn("the call that started this step is gone", output.read_text(errors="replace"))
+
+    def test_a_token_wait_keeps_the_steps_place_and_never_starts_without_memory(self) -> None:
         # On 2026-10-21 a step waited 15 min for memory, 24 min for the token,
-        # then 15 min for memory again. The forced start counts the step's
-        # whole memory wait, so the pass after the token wait gets only what
-        # is left of the limit: here nothing, so it starts with no poll sleep.
+        # then 15 min for memory again. No pass starts a step without memory now:
+        # the first poll sleep frees memory, the step's token try fails, and the
+        # pass after the token wait admits at once, in the first pass's place.
         # The board wrapper makes the step's one try for the token fail, and
         # logs each other acquire next to the sleep calls.
         home = self.root / "busy-home"
@@ -755,25 +831,102 @@ exec "$TEST_REAL_SLEEP" "$@"
             self.fail("the memory wait test needs sleep on PATH")
         sleep = self.root / "stubs" / "sleep"
         _ = sleep.write_text('#!/bin/sh\nprintf "sleep %s\\n" "$*" >> "$TEST_SLEEP_LOG"\n'
+                             + 'printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO"\n'
                              + 'exec "$TEST_REAL_SLEEP" "$@"\n')
         sleep.chmod(0o755)
         _ = Path(self.environment["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 0 kB\n")
         log = self.root / "sleep-log"
         environment = {**self.environment, "HOME": str(home),
-                       "PLAN_DELEGATE_BOARD_DIR": str(self.root / "board"),
-                       "PLAN_DELEGATE_TEAM_ROLE": "impl", "TEST_REAL_BOARD": str(BOARD),
+                       "UNIT_RUN_DIR": str(self.root / "board"),
+                       "UNIT_TEAM_ROLE": "impl", "TEST_REAL_BOARD": str(BOARD),
                        "TEST_REAL_SLEEP": real_sleep, "TEST_SLEEP_LOG": str(log),
                        "BUILDLOG_MEM_POLL_S": "1", "BUILDLOG_MEM_WAIT_LIMIT_S": "2"}
         result = self.verify(environment)
         output = result.stdout + result.stderr
         self.assertEqual(result.returncode, 0, output)
-        self.assertEqual(output.count("memory wait limit reached"), 2, output)
+        self.assertNotIn("memory wait limit reached", output)
+        self.assertNotIn("starting anyway", output)
         lines = log.read_text().splitlines()
         self.assertIn("token", lines)
         # The step's acquire after its failed try is the last one in the log.
         last_token = len(lines) - 1 - lines[::-1].index("token")
-        self.assertIn("sleep 1", lines[:last_token], "the first memory wait polls until its limit")
-        self.assertNotIn("sleep 1", lines[last_token:], "the pass after the token wait started a new limit")
+        self.assertIn("sleep 1", lines[:last_token], "the first memory wait polls until memory is free")
+        self.assertNotIn("sleep 1", lines[last_token:], "the pass after the token wait waited again")
+
+    def build_stub(self, targets: list[dict[str, object]]) -> dict[str, str]:
+        """A cargo whose metadata lists `targets` for sample and whose build makes each bin and example."""
+        metadata = json.dumps({"packages": [{"name": "sample", "targets": targets, "features": {}}],
+                               "target_directory": str(self.root / "target")})
+        cargo = self.root / "stubs" / "cargo"
+        _ = cargo.write_text("#!/bin/sh\n"
+                             + 'if [ "$1" = metadata ]; then printf "%s\\n" "$TEST_METADATA"; exit 0; fi\n'
+                             + 'printf "%s\\n" "$*" >> "$CARGO_CALLS"\n'
+                             + 'profile=debug; kind=""\n'
+                             + 'for word in "$@"; do case "$word" in --release) profile=release ;; esac; done\n'
+                             + 'for word in "$@"; do\n'
+                             + '    case "$kind" in\n'
+                             + '        bin) mkdir -p "$CARGO_TARGET_DIR/$profile"; : > "$CARGO_TARGET_DIR/$profile/$word"; chmod +x "$CARGO_TARGET_DIR/$profile/$word" ;;\n'
+                             + '        example) mkdir -p "$CARGO_TARGET_DIR/$profile/examples"; : > "$CARGO_TARGET_DIR/$profile/examples/$word"; chmod +x "$CARGO_TARGET_DIR/$profile/examples/$word" ;;\n'
+                             + '    esac\n'
+                             + '    case "$word" in --bin) kind=bin ;; --example) kind=example ;; *) kind="" ;; esac\n'
+                             + 'done\n')
+        return {**self.environment, "TEST_METADATA": metadata,
+                "PLAN_DELEGATE_BOARD_DIR": str(self.root / "board"), "PLAN_DELEGATE_TEAM_ROLE": "impl"}
+
+    def build(self, environment: dict[str, str], *words: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["bash", str(VERIFY), "build", "sample", *words], cwd=self.root, env=environment,
+                              capture_output=True, text=True, check=False, timeout=300)
+
+    def test_build_makes_the_packages_binaries_under_the_token_and_prints_their_paths(self) -> None:
+        # A smoke or live-shot helper ran raw `cargo build` before it launched
+        # the app, and the user approved it by hand (2026-10-23).
+        environment = self.build_stub([{"name": "sample", "kind": ["lib"]},
+                                       {"name": "sample-app", "kind": ["bin"]},
+                                       {"name": "demo", "kind": ["example"]}])
+        result = self.build(environment)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"binary: {self.root / 'target' / 'debug' / 'sample-app'}\n", result.stdout)
+        self.assertNotIn("demo", result.stdout)
+        self.assertEqual((self.root / "cargo-calls").read_text(), "build --workspace --bin sample-app\n")
+        self.assertIn("claim: token cargo acquired", (self.root / "board" / "board.log").read_text())
+        self.assertFalse((self.root / "board" / "locks" / "cargo.d").exists())
+
+    def test_check_keep_going_reaches_cargo_in_either_order_with_features(self) -> None:
+        # A migration phase that fixes only some crates reads every crate's result (hana, 2026-10-26).
+        environment = self.build_stub([{"name": "sample", "kind": ["lib"]}])
+        for words, expected in ((("--keep-going",), "check --workspace --lib --bins --keep-going\n"),
+                                (("--features", "fast", "--keep-going"),
+                                 "check --workspace --lib --bins --keep-going --features sample/fast\n"),
+                                (("--keep-going", "--features", "fast"),
+                                 "check --workspace --lib --bins --keep-going --features sample/fast\n"),
+                                ((), "check --workspace --lib --bins\n")):
+            with self.subTest(words=words):
+                (self.root / "cargo-calls").unlink(missing_ok=True)
+                result = subprocess.run(["bash", str(VERIFY), "check", "sample", *words], cwd=self.root,
+                                        env=environment, capture_output=True, text=True, check=False, timeout=300)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual((self.root / "cargo-calls").read_text(), expected)
+
+    def test_build_of_an_example_turns_on_its_required_features(self) -> None:
+        environment = self.build_stub([{"name": "sample-app", "kind": ["bin"]},
+                                       {"name": "demo", "kind": ["example"], "required-features": ["extra"]}])
+        result = self.build(environment, "--example", "demo", "--release", "--features", "fast")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.root / "cargo-calls").read_text(),
+                         "build --workspace --example demo --release --features sample/fast,sample/extra\n")
+        self.assertIn(f"binary: {self.root / 'target' / 'release' / 'examples' / 'demo'}\n", result.stdout)
+
+    def test_build_refuses_a_package_with_no_binary_and_a_target_it_lacks(self) -> None:
+        environment = self.build_stub([{"name": "sample", "kind": ["lib"]}])
+        result = self.build(environment)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("package sample has no binary; name an example with --example <name>", result.stderr)
+        result = self.build(environment, "--bin", "other")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("package sample has no bin other", result.stderr)
+        result = self.build(environment, "--bin", "a", "--example", "b")
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse((self.root / "cargo-calls").exists())
 
     def hold_environment(self, board: Path, wait_status: int) -> dict[str, str]:
         """A held natedev for the step's hold wait only.
@@ -800,8 +953,8 @@ if sys.argv[1] == "wait-local":
             time.sleep(0.01)
         raise SystemExit(int(os.environ["TEST_HOLD_STATUS"]))
 """)
-        return {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
-                "PLAN_DELEGATE_TEAM_ROLE": "impl", "BUILD_TARGETS_SCRIPT": str(stub),
+        return {**self.environment, "UNIT_RUN_DIR": str(board),
+                "UNIT_TEAM_ROLE": "impl", "BUILD_TARGETS_SCRIPT": str(stub),
                 "TEST_HOLD_ROOT": str(self.root), "TEST_HOLD_STATUS": str(wait_status)}
 
     def start_hold_waiter(self, environment: dict[str, str], output: Path) -> subprocess.Popen[bytes]:
@@ -869,8 +1022,8 @@ if sys.argv[1] == "wait-local":
     def test_no_hold_gives_nothing_back(self) -> None:
         board = self.root / "board"
         (self.root / "build-hold").mkdir()
-        result = self.verify({**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
-                              "PLAN_DELEGATE_TEAM_ROLE": "impl"})
+        result = self.verify({**self.environment, "UNIT_RUN_DIR": str(board),
+                              "UNIT_TEAM_ROLE": "impl"})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         log = (board / "board.log").read_text()
         # The first take, then the memory gate's give-back and take; the hold wait adds none.
@@ -895,13 +1048,13 @@ if sys.argv[1] == "wait-local":
 
     def test_a_newer_call_supersedes_an_older_call_still_waiting_for_the_token(self) -> None:
         board = self.root / "board"
-        shared = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board)}
-        holder = self.start_check({**shared, "PLAN_DELEGATE_TEAM_ROLE": "peer", "TEST_BLOCK": "1"})
+        shared = {**self.environment, "UNIT_RUN_DIR": str(board)}
+        holder = self.start_check({**shared, "UNIT_TEAM_ROLE": "peer", "TEST_BLOCK": "1"})
         try:
             self.wait_for_running(self.root / "running", holder)
-            older = self.start_check({**shared, "PLAN_DELEGATE_TEAM_ROLE": "impl"})
+            older = self.start_check({**shared, "UNIT_TEAM_ROLE": "impl"})
             self.wait_for_waiter(board, older)
-            newer = self.start_check({**shared, "PLAN_DELEGATE_TEAM_ROLE": "impl"})
+            newer = self.start_check({**shared, "UNIT_TEAM_ROLE": "impl"})
             older_output, older_errors = older.communicate(timeout=300)
             self.assertEqual(older.returncode, 76, older_output + older_errors)
             self.assertIn("superseded by a newer check call", older_output)
@@ -920,7 +1073,7 @@ if sys.argv[1] == "wait-local":
 
     def test_a_call_that_holds_the_token_runs_on_when_a_newer_call_starts(self) -> None:
         board = self.root / "board"
-        shared = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board), "PLAN_DELEGATE_TEAM_ROLE": "impl"}
+        shared = {**self.environment, "UNIT_RUN_DIR": str(board), "UNIT_TEAM_ROLE": "impl"}
         holder = self.start_check({**shared, "TEST_BLOCK": "1"})
         try:
             self.wait_for_running(self.root / "running", holder)
@@ -936,23 +1089,57 @@ if sys.argv[1] == "wait-local":
             _ = (self.root / "release").touch()
         self.assertEqual(sorted(cast(str, record["outcome"]) for record in self.records()), ["ran", "ran"])
 
+    def test_the_token_goes_to_the_call_that_waited_longest(self) -> None:
+        # On 2026-10-22 about 25 calls polled one board's token, any of them
+        # took it when it came free, and two calls waited 3 and 3.5 h. A call
+        # now waits while an older call that still runs verify.sh waits.
+        board = self.root / "board"
+        waiters = board / "token_waiters"
+        waiters.mkdir(parents=True)
+        older = subprocess.Popen(["bash", "-c", "sleep 600; :", "verify.sh"], start_new_session=True)
+        self.started_groups.add(older.pid)
+        older_entry = waiters / f"peer.0123456789abcdef.1000000.{older.pid}.again"
+        older_entry.touch()
+        output = self.root / "queued.out"
+        with output.open("wb") as stream:
+            call = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
+                                    env={**self.environment, "UNIT_RUN_DIR": str(board),
+                                         "UNIT_TEAM_ROLE": "impl"},
+                                    stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+        self.started_groups.add(call.pid)
+        try:
+            self.wait_for_output(output, "calls ahead of this one: 1", call)
+            self.assertIn("it is free and goes to an earlier call", output.read_text())
+            self.assertFalse((board / "locks" / "cargo.d").exists(), "the newer call took the token")
+            self.end_group(older.pid)
+            _ = older.wait(timeout=300)
+            self.assertEqual(call.wait(timeout=300), 0, output.read_text())
+        finally:
+            for process in (older, call):
+                if process.poll() is None:
+                    self.end_group(process.pid)
+                _ = process.wait(timeout=300)
+        self.assertIn("took the cargo token after 0 min", output.read_text())
+        self.assertEqual(list(waiters.iterdir()), [], "an ended waiter's file stays in the queue")
+        self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 1)
+
     def test_a_long_token_wait_never_gives_up(self) -> None:
         # Each refused acquire moves the clock past the old 1800 s limit.
         home = self.root / "busy-home"
-        delegate = home / ".claude/scripts/direct"
-        delegate.mkdir(parents=True)
+        direct_dir = home / ".claude/scripts/direct"
+        direct_dir.mkdir(parents=True)
         for source in VERIFY.parent.parent.iterdir():
             if source.name != "direct":
-                (delegate.parent / source.name).symlink_to(source, target_is_directory=source.is_dir())
+                (direct_dir.parent / source.name).symlink_to(source, target_is_directory=source.is_dir())
         for source in VERIFY.parent.iterdir():
             if source.name != "board.sh":
-                (delegate / source.name).symlink_to(source, target_is_directory=source.is_dir())
-        _ = (delegate / "board.sh").write_text('''#!/bin/bash
+                (direct_dir / source.name).symlink_to(source, target_is_directory=source.is_dir())
+        _ = (direct_dir / "board.sh").write_text('''#!/bin/bash
 if [[ "$1" == acquire ]]; then
     count=$(( $(cat "$TEST_ACQUIRES" 2>/dev/null || echo 0) + 1 ))
     printf '%s\\n' "$count" > "$TEST_ACQUIRES"
     if (( count <= 3 )); then
-        printf '%s\\n' $(( $(cat "$PLAN_DELEGATE_TOKEN_CLOCK_FILE") + 1800 )) > "$PLAN_DELEGATE_TOKEN_CLOCK_FILE"
+        printf '%s\\n' $(( $(cat "$UNIT_TOKEN_CLOCK_FILE") + 1800 )) > "$UNIT_TOKEN_CLOCK_FILE"
         echo "busy cargo held by peer" >&2
         exit 1
     fi
@@ -963,9 +1150,9 @@ exec bash "$TEST_REAL_BOARD" "$@"
         _ = clock.write_text("100\n")
         acquires = self.root / "acquires"
         environment = {**self.environment, "HOME": str(home),
-                       "PLAN_DELEGATE_BOARD_DIR": str(self.root / "busy-board"),
-                       "PLAN_DELEGATE_TEAM_ROLE": "impl", "TEST_REAL_BOARD": str(BOARD),
-                       "TEST_ACQUIRES": str(acquires), "PLAN_DELEGATE_TOKEN_CLOCK_FILE": str(clock)}
+                       "UNIT_RUN_DIR": str(self.root / "busy-board"),
+                       "UNIT_TEAM_ROLE": "impl", "TEST_REAL_BOARD": str(BOARD),
+                       "TEST_ACQUIRES": str(acquires), "UNIT_TOKEN_CLOCK_FILE": str(clock)}
         result = self.verify(environment)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("did not get it", result.stderr)
@@ -977,8 +1164,8 @@ exec bash "$TEST_REAL_BOARD" "$@"
         board = self.root / "board"
         lock = board / "locks" / "cargo.d"
         first = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
-                                 env={**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
-                                      "PLAN_DELEGATE_TEAM_ROLE": "first", "TEST_BLOCK": "1"},
+                                 env={**self.environment, "UNIT_RUN_DIR": str(board),
+                                      "UNIT_TEAM_ROLE": "first", "TEST_BLOCK": "1"},
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                  start_new_session=True)
         self.started_groups.add(first.pid)
@@ -986,8 +1173,8 @@ exec bash "$TEST_REAL_BOARD" "$@"
         try:
             self.wait_for_running(self.root / "running", first)
             second = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
-                                      env={**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
-                                           "PLAN_DELEGATE_TEAM_ROLE": "second"},
+                                      env={**self.environment, "UNIT_RUN_DIR": str(board),
+                                           "UNIT_TEAM_ROLE": "second"},
                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                       start_new_session=True)
             self.started_groups.add(second.pid)
@@ -1032,10 +1219,10 @@ exec bash "$TEST_REAL_BOARD" "$@"
 
     def assert_interrupted_holder_stops_step_before_release(self, interruption: signal.Signals) -> None:
         board = self.root / "board"
-        first_environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
-                             "PLAN_DELEGATE_TEAM_ROLE": "first", "TEST_BLOCK": "1"}
-        second_environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
-                              "PLAN_DELEGATE_TEAM_ROLE": "second", "TEST_RECLAIM_CHECK": "1"}
+        first_environment = {**self.environment, "UNIT_RUN_DIR": str(board),
+                             "UNIT_TEAM_ROLE": "first", "TEST_BLOCK": "1"}
+        second_environment = {**self.environment, "UNIT_RUN_DIR": str(board),
+                              "UNIT_TEAM_ROLE": "second", "TEST_RECLAIM_CHECK": "1"}
         first = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
                                  env=first_environment, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL, start_new_session=True,
@@ -1106,7 +1293,7 @@ exec bash "$TEST_REAL_BOARD" "$@"
                 self.assertEqual("could not detach" in result.stderr, note, result.stderr)
 
     def test_the_detached_run_itself_does_not_detach_again(self) -> None:
-        environment = {**self.detach_environment(0), "PLAN_DELEGATE_DETACHED_RUN": "1"}
+        environment = {**self.detach_environment(0), "UNIT_DETACHED_RUN": "1"}
         result = self.verify(environment)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.mesh_runs_calls(), [])

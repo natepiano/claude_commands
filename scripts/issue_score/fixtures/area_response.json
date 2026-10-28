@@ -1,0 +1,31 @@
+{
+  "model": "jev-1.14.0",
+  "answers": {
+    "area_reverse": {
+      "type": "choice",
+      "choice": "rendering",
+      "confidence": 0.9,
+      "probabilities": {
+        "tooling": 0.1,
+        "rendering": 0.9
+      }
+    },
+    "area_fits": {
+      "type": "noul",
+      "noul": 0.95
+    },
+    "area": {
+      "type": "choice",
+      "choice": "rendering",
+      "confidence": 0.85,
+      "probabilities": {
+        "rendering": 0.85,
+        "tooling": 0.15
+      }
+    }
+  },
+  "usage": {
+    "input_tokens": 500,
+    "output_tokens": 100
+  }
+}

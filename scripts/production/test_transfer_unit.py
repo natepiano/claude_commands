@@ -12,6 +12,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, final, override
+from unittest import mock
+
+from scripts.guilds import roles
 
 SCRIPT = Path(__file__).with_name("transfer_unit.py")
 
@@ -49,8 +52,8 @@ class UnitTransferTests(unittest.TestCase):
             "RENAME_UNIT_STOP_WAIT": "0", "RENAME_UNIT_LIVE_WAIT": "0",
             "REVIEW_POOL_STATE": str(self.root / "state/review-pool"),
             "SHOWRUNNERS_CONFIG": str(config / "showrunners.json"),
-            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
-            "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
+            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "UNIT_HISTORY_DIR": str(self.root / "history"),
             "PROGRESS_SESSION_ROOTS": str(self.root / "sessions"),
             "PHASE_TABLE_VAULT": str(self.root / "vault/showrunners"),
             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
@@ -58,7 +61,7 @@ class UnitTransferTests(unittest.TestCase):
             "HERDR_PLATFORM": "linux",
             "FAKE_HERDR_LOG": str(self.root / "herdr.jsonl"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
-            "CLAUDE_CODE_SESSION_ID": "", "USER_ZONE": "UTC", "PLAN_DELEGATE_SYNC_WRITES": "0",
+            "CLAUDE_CODE_SESSION_ID": "", "USER_ZONE": "UTC", "UNIT_SYNC_WRITES": "0",
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0",
         })
@@ -212,6 +215,36 @@ class UnitTransferTests(unittest.TestCase):
         self.assertEqual(self.stall_path("other", "alpha-unit").read_text(encoding="utf-8"), '{"stretch": 17}\n')
         pool = (self.root / "state/review-pool/demo/pool.json").read_text(encoding="utf-8")
         self.assertNotIn("alpha-unit", pool)
+        self.assert_ok(self.transfer("verify"))
+
+    def test_a_held_role_moves_to_the_receiving_holder_and_keeps_its_thread_and_paths(self) -> None:
+        config = self.root / "guilds.conf"
+        self.write(config, "[ownership]\nhost=fixture-host\n")
+        self.env.update({"GUILD_CONFIG_FILE": str(config), "GUILD_ROLES_HOST": "fixture-host",
+                         "GUILD_ROLES_STATE": str(self.root / "state/guilds/roles"),
+                         "GUILD_OWNERSHIP_STATE": str(self.root / "state/guilds/ownership")})
+        document = str(self.unit / "docs/plans/alpha.md")
+        with mock.patch.dict(os.environ, self.env):
+            roles.register_repository("fixture-repo", {"fixture-host": str(self.unit)}, inventory_complete=True)
+            placement = roles.authority_request("reserve", {"repository_id": "fixture-repo",
+                "document": "docs/plans/alpha.md", "host": "fixture-host", "request_id": "transfer-fixture"})
+            design = roles.HeldDesign(roles.DesignPlacement(str(placement["design_id"]), "fixture-host", 1),
+                "fixture-repo", str(self.unit), document, "design", "2026-10-22T12:00:00+00:00",
+                roles.UnitHolder("demo", "alpha-unit"), roles.DesignUnbound(),
+                (roles.RoleInstance("designer", "demo-design-astra-designer", roles.RoleOpen("designer-thread")),
+                 roles.RoleInstance("reviewer", "demo-design-astra-reviewer", roles.RoleNotOpened())))
+            roles._save(design)  # pyright: ignore[reportPrivateUsage]
+            mesh = roles.mesh_directory(design.placement.design_id)
+        self.write(mesh / "mesh_roster.json", json.dumps({"demo-design-astra-designer": {
+            "thread_id": "designer-thread", "status": "done", "cwd": str(self.unit)}}))
+        self.assert_ok(self.transfer("apply"))
+        with mock.patch.dict(os.environ, self.env):
+            moved = roles.read_design(design.placement.design_id)
+        self.assertEqual(moved.holder, roles.UnitHolder("other", "alpha-unit"))
+        self.assertEqual((moved.repository, moved.document, moved.roles), (design.repository, design.document, design.roles))
+        self.assertEqual(moved.placement.generation, 2)
+        roster = cast(dict[str, dict[str, str]], json.loads((mesh / "mesh_roster.json").read_text(encoding="utf-8")))
+        self.assertEqual(roster["demo-design-astra-designer"]["cwd"], str(self.unit))
         self.assert_ok(self.transfer("verify"))
 
     def test_work_in_progress_stays_and_only_the_header_is_committed(self) -> None:

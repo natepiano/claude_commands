@@ -44,7 +44,7 @@ class UnitLookupTests(unittest.TestCase):
                             "HOME": str(self.root / "home"),
                             "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
                             "NOTIFIER_SESSIONS_DIR": str(self.records),
-                            "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
+                            "UNIT_HISTORY_DIR": str(self.root / "history"),
                             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
                             "HERDR_PROC": str(self.root / "proc"),
                             "HERDR_PLATFORM": "linux",
@@ -413,6 +413,77 @@ class UnitLookupTests(unittest.TestCase):
         (self.root / "history/runs/unreadable.jsonl").mkdir(parents=True)
         with self.assertRaises(OSError):
             _ = unit_lookup.run_state(self.root / "trunk")
+
+    def test_only_the_first_and_last_events_are_parsed(self) -> None:
+        tree = self.root / "trunk"
+        path = self.record("run", tree, 1.0)
+        first = path.read_text(encoding="utf-8").strip()
+        last = json.dumps({"event_type": "run_finished"})
+        _ = path.write_text(first + "\nnot JSON\n[also broken\n" + last + "\n", encoding="utf-8")
+        with mock.patch.object(json, "loads", wraps=json.loads) as parses:
+            self.assertIs(unit_lookup.run_state(tree), UnitState.RUN_FINISHED)
+        self.assertEqual(parses.call_args_list, [mock.call(first + "\n"), mock.call(last)])
+
+    def test_last_event_larger_than_a_read_block(self) -> None:
+        tree = self.root / "trunk"
+        path = self.record("run", tree, 1.0)
+        with path.open("a", encoding="utf-8") as handle:
+            _ = handle.write(json.dumps({"event_type": "run_finished", "detail": "界" * (64 * 1024)},
+                                        ensure_ascii=False) + "\n")
+        self.assertIs(unit_lookup.run_state(tree), UnitState.RUN_FINISHED)
+
+    def test_partial_last_line_uses_the_previous_complete_object(self) -> None:
+        tree = self.root / "trunk"
+        path = self.record("run", tree, 1.0, "run_finished")
+        with path.open("a", encoding="utf-8") as handle:
+            _ = handle.write('[]\nnull\n{"event_type": "phase_star')
+        self.assertIs(unit_lookup.run_state(tree), UnitState.RUN_FINISHED)
+
+    def test_empty_partial_and_non_start_first_lines_are_skipped(self) -> None:
+        runs = self.root / "history/runs"
+        runs.mkdir(parents=True)
+        for name, first in (("empty", ""), ("partial", '{"event_type": "run_star'),
+                            ("object", '{}\n'), ("array", '[]\n')):
+            with self.subTest(name=name):
+                _ = (runs / f"{name}.jsonl").write_text(first, encoding="utf-8")
+        # A later valid run_started cannot rescue a partial or unrelated first line.
+        for path in runs.iterdir():
+            if path.name == "empty.jsonl":
+                continue
+            with path.open("a", encoding="utf-8") as handle:
+                _ = handle.write('\n' + json.dumps({"event_type": "run_started",
+                    "working_dir": str(self.root / "trunk"), "run_started_at": 10}) + '\n')
+        self.assertEqual(unit_lookup.read_run_states().records, {})
+
+    def test_one_snapshot_answers_for_several_worktrees_without_rereading(self) -> None:
+        first, second = self.root / "first", self.root / "second"
+        old = self.record("old", first, 1.0, "run_finished")
+        newest = self.record("new", first, 2.0, "phase_started")
+        finished = self.record("second", second, 3.0, "run_finished")
+        with mock.patch.object(unit_lookup, "runs_dir", wraps=unit_lookup.runs_dir) as reads:
+            runs = unit_lookup.read_run_states()
+            # An already-built value keeps the tick's view, even when records change.
+            old.unlink()
+            newest.unlink()
+            finished.unlink()
+            self.assertIs(runs.state(first), UnitState.RUNNING)
+            self.assertIs(runs.state(second), UnitState.RUN_FINISHED)
+            self.assertIs(runs.state(self.root / "absent"), UnitState.STANDING_BY)
+            self.assertIs(runs.state(first / ".." / "first"), UnitState.RUNNING)
+            self.assertEqual(runs.records[str(first)], unit_lookup.RunRecord(newest, UnitState.RUNNING))
+            reads.assert_called_once_with()
+
+    def test_bad_utf8_in_first_or_last_line_is_an_error(self) -> None:
+        for where in ("first", "last"):
+            with self.subTest(where=where):
+                path = self.record("run", self.root / "trunk", 1.0)
+                if where == "first":
+                    _ = path.write_bytes(b'\xff\n')
+                else:
+                    with path.open("ab") as handle:
+                        _ = handle.write(b'\xff\n')
+                with self.assertRaises(UnicodeError):
+                    _ = unit_lookup.read_run_states()
 
 
 if __name__ == "__main__":

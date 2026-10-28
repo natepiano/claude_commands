@@ -19,7 +19,7 @@ import add_style
 import add_unit
 import rules
 import style_ledger
-import style_plan
+import unit_plans
 import style_rules
 from add_unit import read_production
 from production_units import production_field
@@ -86,7 +86,7 @@ def run_script(script, *arguments):
     return real_run_script(script, *arguments)
 
 with mock.patch.object(add_style, "_run_script", side_effect=run_script), mock.patch.object(
-    add_style, "herdr_session_running", side_effect=lambda name:
+    add_style, "herdr_tab_open", side_effect=lambda name:
     (Path(os.environ["TEST_LIVE_SESSIONS"]) / name).exists()
 ):
     raise SystemExit(add_style.main(sys.argv[2:]))
@@ -239,12 +239,12 @@ class AddStyleTests(unittest.TestCase):
             self.assertLess(scope_index, lines.index("## Phases"))
         for unit in ("values", "modules"):
             self.assertNotIn("**Pilot scope:**", launched["plans"][f"sample-style-{unit}-unit.md"])
-        self.assertEqual(style_plan.parse_pilot_scope(launched["plans"]["sample-style-names-unit.md"], self.repo),
-                         style_plan.PilotCrates(frozenset({"crates/handler", "crates/port"})))
-        self.assertEqual(style_plan.parse_pilot_scope(launched["plans"]["sample-style-types-unit.md"], self.repo),
-                         style_plan.PilotCrates(frozenset({"crates/port"})))
-        self.assertEqual(style_plan.parse_pilot_scope(launched["plans"]["sample-style-modules-unit.md"], self.repo),
-                         style_plan.AllCrates())
+        self.assertEqual(unit_plans.parse_pilot_scope(launched["plans"]["sample-style-names-unit.md"], self.repo),
+                         unit_plans.PilotCrates(frozenset({"crates/handler", "crates/port"})))
+        self.assertEqual(unit_plans.parse_pilot_scope(launched["plans"]["sample-style-types-unit.md"], self.repo),
+                         unit_plans.PilotCrates(frozenset({"crates/port"})))
+        self.assertEqual(unit_plans.parse_pilot_scope(launched["plans"]["sample-style-modules-unit.md"], self.repo),
+                         unit_plans.AllCrates())
 
     def test_pilot_is_refused_for_an_existing_production_without_changing_it(self) -> None:
         _ = self.run_bootstrap()
@@ -546,8 +546,9 @@ class AddStyleTests(unittest.TestCase):
         result = self.run_bootstrap(success=False)
 
         guidance = (
-            "look at it with herdr session attach sample-style; once it has its update timer, "
-            "rerun add_style, which attaches it; if it never gets one, end that session and rerun"
+            "look at it with herdr session attach agents, workspace sample-style, tab sample-style; "
+            "once it has its update timer, rerun add_style, which attaches it; "
+            "if it never gets one, end that session and rerun"
         )
         self.assertEqual(result.returncode, 3, result.stderr)
         self.assertIn("add_style: sample-style was left open by add_showrunner.py (exit 3); " + guidance, result.stderr)

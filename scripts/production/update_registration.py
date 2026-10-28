@@ -3,10 +3,13 @@
 
 `open` lists what waits on the user and `next` prints the one item /next question shows, both in
 urgency.py's order. `mark-important --item <words>` marks an item the user called important.
+`ask` files one question without a reply to the user (/unit:question, /showrunner:question), and
+`answer --item <words>` removes one item and names who asked it, so the answer goes back there.
 """
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -14,6 +17,8 @@ import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from collections.abc import Generator
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, cast
 
 from add_unit import Production, read_production
@@ -57,6 +62,7 @@ class OutstandingItem(TypedDict):
     due: NotRequired[str]
     marked: NotRequired[str]
     follows: NotRequired[str]
+    asked_by: NotRequired[str]
 
 
 class QuestionRegistration(TypedDict):
@@ -215,6 +221,10 @@ def register(production: Production) -> None:
     session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     if not session_id:
         raise RegistrationFailure("register", "CLAUDE_CODE_SESSION_ID is required")
+    # An account move restarts a showrunner on its own, so a name that differs only warns; attach refuses it
+    # for a new production.
+    if why := showrunners.name_refusal(production.slug, showrunners.session_name(session_id)):
+        report("register", "warn", why)
     try:
         agents_log.append(session_id, "showrunner", None, datetime.now(timezone.utc))
     except Exception as exc:
@@ -404,6 +414,24 @@ def outstanding_path(production: Production) -> Path:
     return outstanding_file(production.slug)
 
 
+@contextmanager
+def outstanding_lock(outstanding: Path) -> Generator[None]:
+    """Hold the list's lock while it is read and written: a unit's `ask` and the showrunner's
+    `questions` can run at the same time. Never take it twice in one process: flock does not nest."""
+    outstanding.parent.mkdir(parents=True, exist_ok=True)
+    with outstanding.with_suffix(".lock").open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def stored_entries(outstanding: Path) -> list[OutstandingItem]:
+    """The list as stored, each entry kept whole; read_outstanding checks it first."""
+    if not outstanding.exists():
+        return []
+    _ = read_outstanding(outstanding)
+    return cast(list[OutstandingItem], json.loads(outstanding.read_text(encoding="utf-8")))
+
+
 # An item can wait longer than a week, so the day is named in full.
 WHEN = "%a %b %d %H:%M"
 
@@ -416,7 +444,8 @@ class OpenItem(NamedTuple):
         """The item in full, led by its production and any level it has."""
         text = self.item.text if isinstance(self.item, OutstandingReminder) else self.item.question
         level = urgency.cell(self.item.rank.urgency)
-        return f"{self.slug}{f' [{level}]' if level else ''}, since {self.item.since:{WHEN}}: {text}"
+        asker = "" if isinstance(self.item, OutstandingReminder) or not self.item.asked_by else f", asked by {self.item.asked_by}"
+        return f"{self.slug}{f' [{level}]' if level else ''}, since {self.item.since:{WHEN}}{asker}: {text}"
 
 
 class OpenLists(NamedTuple):
@@ -425,22 +454,34 @@ class OpenLists(NamedTuple):
     unreadable: list[str]
 
 
-def question_queue(production: Production) -> str:
+# The /next word that adds every production below the showrunner's own.
+ALL_BELOW = "all-below"
+
+
+def scope_queue(name: str, below: bool) -> str:
+    """The pin name of a list: an all-below show keeps its own pin, so it never moves the default's."""
+    return f"{name}-{ALL_BELOW}" if below else name
+
+
+def question_queue(production: Production, below: bool = False) -> str:
     """The name urgency.py pins the question /next showed under."""
-    return f"question-{production.slug}"
+    return scope_queue(f"question-{production.slug}", below)
 
 
 def item_key(slug: str, text: str) -> str:
     return f"{slug}: {text}"
 
 
-def open_lists(production: Production) -> OpenLists:
-    """What waits on the user now, in urgency.py's order, then what the user deferred and the lists not read."""
+def open_lists(production: Production, below: bool = False) -> OpenLists:
+    """What waits on the user now, in urgency.py's order, then what the user deferred and the lists not read.
+
+    The production's own list, and with `below` the list of each production below it.
+    """
     now = datetime.now(production.zone).replace(tzinfo=None)
     due: list[urgency.Entry[OpenItem]] = []
     deferred: list[OpenItem] = []
     unreadable: list[str] = []
-    for slug in showrunners.user_facing(production.slug):
+    for slug in showrunners.user_facing(production.slug, below):
         try:
             items = read_outstanding(outstanding_file(slug))
         except (InputError, OSError, ValueError):
@@ -453,11 +494,11 @@ def open_lists(production: Production) -> OpenLists:
                 due.append(urgency.Entry(item_key(slug, item.text), OpenItem(slug, item), item.rank.urgency,
                                          item.since, after=item_key(slug, item.rank.follows) if item.rank.follows else ""))
     deferred.sort(key=lambda found: (cast(DeferredUntil, found.item.timing).at, found.slug))
-    return OpenLists(urgency.order(due, urgency.pinned(question_queue(production))), deferred, unreadable)
+    return OpenLists(urgency.queue_order(due, question_queue(production, below)), deferred, unreadable)
 
 
 def open_items(production: Production) -> None:
-    """Print in full what waits on the user: this production's items and, for a root, every lower one's.
+    """Print in full what waits on the user: this production's own items.
 
     Replies show only the count, so this list is what the showrunner gives when the user asks what
     the open questions are. Each line is led by the production that owns the item.
@@ -487,7 +528,8 @@ def mark_important(production: Production, words: str) -> None:
     wanted = words.strip()
     exact: list[tuple[Path, str]] = []
     partial: list[tuple[Path, str]] = []
-    for slug in showrunners.user_facing(production.slug):
+    # The item the user names may come from an all-below /next, so the lists below are searched too.
+    for slug in showrunners.user_facing(production.slug, below=True):
         for item in read_outstanding(outstanding_file(slug)):
             full = item.text if isinstance(item, OutstandingReminder) else item.question
             if item.text == wanted:
@@ -498,13 +540,97 @@ def mark_important(production: Production, words: str) -> None:
     if len(found) != 1:
         raise RegistrationFailure("mark-important", f"{len(found)} open items match {wanted!r}; name one by its text")
     path, text = found[0]
-    entries = cast(list[dict[str, object]], json.loads(path.read_text(encoding="utf-8")))
-    entry = next(entry for entry in entries if entry.get("text") == text)
-    for key in ("urgency", "due", "marked"):
-        _ = entry.pop(key, None)
-    entry.update(urgency.fields(urgency.mark(datetime.now(production.zone).replace(tzinfo=None))))
-    _ = path.write_text(json.dumps(entries) + "\n", encoding="utf-8")
+    with outstanding_lock(path):
+        entries = cast(list[dict[str, object]], json.loads(path.read_text(encoding="utf-8")))
+        entry = next(entry for entry in entries if entry.get("text") == text)
+        for key in ("urgency", "due", "marked"):
+            _ = entry.pop(key, None)
+        entry.update(urgency.fields(urgency.mark(datetime.now(production.zone).replace(tzinfo=None))))
+        _ = path.write_text(json.dumps(entries) + "\n", encoding="utf-8")
     report("mark-important", "ok", text)
+
+
+# What `ask` records as the asker when the showrunner files its own question.
+SHOWRUNNER_ASKER = "showrunner"
+
+
+def production_units(production: Production) -> list[str]:
+    return [cell_value(cells.get("Unit", "")) for cells in unit_table(production.doc.read_text(encoding="utf-8").splitlines())]
+
+
+def ask(production: Production, text: str, question: str, unit: str, rank: Ranking) -> None:
+    """File one question on the production's list without a reply to the user: the review runs as it
+    does for `questions`, the status-line count and /next question show it, and `answer` names `unit`."""
+    if unit and unit not in production_units(production):
+        raise RegistrationFailure("ask", f"{unit} is not a unit of {production.slug}; name it as the Units table does")
+    if not text.strip() or "\n" in text:
+        raise RegistrationFailure("ask", "--text must be one nonempty line")
+    if not question.strip():
+        raise RegistrationFailure("ask", "--question must hold the full question")
+    problem = plumbing(text)
+    if problem is not None:
+        raise RegistrationFailure("ask", f"{text}: {problem}")
+    outstanding = outstanding_path(production)
+    if any(entry["text"] == text for entry in stored_entries(outstanding)):
+        raise RegistrationFailure("ask", f"{text}: an item with this text is already open")
+    # The review can take a minute, so it runs before the lock: `questions` is not held up by it.
+    accepted = review_open_question(production.slug, QuestionForReview(text, "", question, rank))
+    if isinstance(accepted, HeldRegistrationQuestion):
+        raise RegistrationFailure("ask", f"question held for review: {text}: {accepted.details}")
+    now = datetime.now(production.zone)
+    entry = OutstandingItem(since=now.strftime("%Y-%m-%dT%H:%M"), text=text, question=question,
+                            asked_by=unit or SHOWRUNNER_ASKER)
+    if isinstance(accepted, ReviewedQuestion):
+        entry["reviewed"] = accepted.reviewed
+    else:
+        entry["review_unavailable"] = accepted.reason
+    store_ranking(entry, rank)
+    with outstanding_lock(outstanding):
+        entries = stored_entries(outstanding)
+        if any(stored["text"] == text for stored in entries):
+            raise RegistrationFailure("ask", f"{text}: an item with this text is already open")
+        record_question_history(outstanding, [entry], now)
+        _ = outstanding.write_text(json.dumps([*entries, entry]) + "\n", encoding="utf-8")
+    filed = accepted.reviewed if isinstance(accepted, ReviewedQuestion) else question
+    print("filed question: " + filed)
+    report("ask", "ok", f"{text}: on the open-questions list of {production.slug}, not shown to the user")
+
+
+def answer(production: Production, words: str) -> None:
+    """Remove the one open item whose text is `words`, or holds them, from this production's list or one
+    below it, and name who asked it: the answer goes back to that unit through its production's showrunner."""
+    wanted = words.strip()
+    exact: list[tuple[str, str]] = []
+    partial: list[tuple[str, str]] = []
+    for slug in showrunners.user_facing(production.slug, below=True):
+        for item in read_outstanding(outstanding_file(slug)):
+            full = item.text if isinstance(item, OutstandingReminder) else item.question
+            if item.text == wanted:
+                exact.append((slug, item.text))
+            elif wanted and (wanted in item.text or wanted in full):
+                partial.append((slug, item.text))
+    found = exact or partial
+    if len(found) != 1:
+        raise RegistrationFailure("answer", f"{len(found)} open items match {wanted!r}; name one by its text")
+    slug, text = found[0]
+    path = outstanding_file(slug)
+    with outstanding_lock(path):
+        entries = stored_entries(path)
+        removed = next((entry for entry in entries if entry["text"] == text), None)
+        if removed is None:
+            raise RegistrationFailure("answer", f"{text}: no longer open in {slug}")
+        _ = path.write_text(json.dumps([entry for entry in entries if entry["text"] != text]) + "\n", encoding="utf-8")
+    asker = removed.get("asked_by", "")
+    owner = "this production" if slug == production.slug else f"{slug}, below this production"
+    if not asker:
+        print(f"relay: none; the item belongs to {owner}")
+    elif slug != production.slug:
+        print(f"relay: to the showrunner of {slug}, for {asker}")
+    elif asker == SHOWRUNNER_ASKER:
+        print("relay: none; this showrunner asked it")
+    else:
+        print(f"relay: to {asker}")
+    report("answer", "ok", f"{slug}: {text}")
 
 
 def state_block(production: Production, state: ShowrunnerState, timestamp: str) -> str:
@@ -595,6 +721,8 @@ def store_ranking(entry: OutstandingItem, rank: Ranking) -> None:
 def keep_question_fields(entry: OutstandingItem, previous: Outstanding) -> None:
     if not isinstance(previous, OutstandingReminder):
         entry["question"] = previous.question
+        if previous.asked_by:
+            entry["asked_by"] = previous.asked_by
     if isinstance(previous, ReviewedOutstandingQuestion):
         entry["reviewed"] = previous.reviewed
     elif isinstance(previous, ReviewUnavailableOutstandingQuestion):
@@ -640,59 +768,8 @@ def questions(production: Production, path: Path | None) -> None:
     state = judgment_state(path, "questions")
     outstanding = outstanding_path(production)
     if isinstance(state.outstanding, ReplaceOutstanding):
-        previous = {item.text: item for item in read_outstanding(outstanding)} if outstanding.exists() else {}
-        now = datetime.now(production.zone)
-        since = now.strftime("%Y-%m-%dT%H:%M")
-        entries: list[OutstandingItem] = []
-        pending: list[AcceptedQuestion] = []
-        held: list[str] = []
-        items_by_text: dict[str, OpenForUserItem] = {}
-        for item in state.outstanding.items:
-            if item.text not in items_by_text:
-                items_by_text[item.text] = item
-        # Validate all new object questions before starting any review.
-        for item in items_by_text.values():
-            if item.text not in previous and isinstance(item, OpenQuestionWithoutText):
-                raise RegistrationFailure("questions", f"{item.text}: a new question needs its full text in `question`")
-        # A new or changed item must pass the plumbing check; a stored one that fails is only named.
-        refused: list[str] = []
-        for text in items_by_text:
-            problem = plumbing(text)
-            if problem is not None and text in previous:
-                report("questions", "reword", f"{text}: {problem}")
-            elif problem is not None:
-                refused.append(f"{text}: {problem}")
-        if refused:
-            raise RegistrationFailure("questions", "; ".join(refused))
-        for item in items_by_text.values():
-            entry = OutstandingItem(since=previous[item.text].since.strftime("%Y-%m-%dT%H:%M")
-                                    if item.text in previous else since, text=item.text)
-            if item.after:
-                entry["after"] = item.after
-            old = previous[item.text].rank.urgency if item.text in previous else urgency.Urgency()
-            store_ranking(entry, Ranking(urgency.keep_mark(item.rank.urgency, old, now.replace(tzinfo=None)),
-                                         item.rank.follows))
-            if item.text in previous:
-                keep_question_fields(entry, previous[item.text])
-            elif isinstance(item, QuestionForReview):
-                accepted = review_open_question(production.slug, item)
-                if isinstance(accepted, ReviewedQuestion):
-                    entry["question"], entry["reviewed"] = item.question, accepted.reviewed
-                    pending.append(accepted)
-                elif isinstance(accepted, ReviewUnavailableQuestion):
-                    entry["question"], entry["review_unavailable"] = item.question, accepted.reason
-                    pending.append(accepted)
-                else:
-                    held.append(f"{item.text}: {accepted.details}")
-            entries.append(entry)
-        if held:
-            raise RegistrationFailure("questions", "question held for review: " + "; ".join(held))
-        outstanding.parent.mkdir(parents=True, exist_ok=True)
-        record_question_history(outstanding, [entry for entry in entries if entry["text"] not in previous], now)
-        _ = outstanding.write_text(json.dumps(entries) + "\n", encoding="utf-8")
-        for item in pending:
-            accepted_text = item.reviewed if isinstance(item, ReviewedQuestion) else item.question
-            print("reviewed question: " + accepted_text)
+        with outstanding_lock(outstanding):
+            replace_outstanding(production, outstanding, state.outstanding)
     if isinstance(state.reports, ReplaceReports):
         reports = reports_path(production.slug)
         reports.parent.mkdir(parents=True, exist_ok=True)
@@ -700,10 +777,71 @@ def questions(production: Production, path: Path | None) -> None:
     report("questions", "ok", "recorded")
 
 
+def replace_outstanding(production: Production, outstanding: Path, replacement: ReplaceOutstanding) -> None:
+    """Write the showrunner's new list; a question someone filed with `ask` leaves only through `answer`."""
+    previous = {item.text: item for item in read_outstanding(outstanding)} if outstanding.exists() else {}
+    now = datetime.now(production.zone)
+    since = now.strftime("%Y-%m-%dT%H:%M")
+    entries: list[OutstandingItem] = []
+    pending: list[AcceptedQuestion] = []
+    held: list[str] = []
+    items_by_text: dict[str, OpenForUserItem] = {}
+    for item in replacement.items:
+        if item.text not in items_by_text:
+            items_by_text[item.text] = item
+    # Validate all new object questions before starting any review.
+    for item in items_by_text.values():
+        if item.text not in previous and isinstance(item, OpenQuestionWithoutText):
+            raise RegistrationFailure("questions", f"{item.text}: a new question needs its full text in `question`")
+    # A new or changed item must pass the plumbing check; a stored one that fails is only named.
+    refused: list[str] = []
+    for text in items_by_text:
+        problem = plumbing(text)
+        if problem is not None and text in previous:
+            report("questions", "reword", f"{text}: {problem}")
+        elif problem is not None:
+            refused.append(f"{text}: {problem}")
+    if refused:
+        raise RegistrationFailure("questions", "; ".join(refused))
+    for item in items_by_text.values():
+        entry = OutstandingItem(since=previous[item.text].since.strftime("%Y-%m-%dT%H:%M")
+                                if item.text in previous else since, text=item.text)
+        if item.after:
+            entry["after"] = item.after
+        old = previous[item.text].rank.urgency if item.text in previous else urgency.Urgency()
+        store_ranking(entry, Ranking(urgency.keep_mark(item.rank.urgency, old, now.replace(tzinfo=None)),
+                                     item.rank.follows))
+        if item.text in previous:
+            keep_question_fields(entry, previous[item.text])
+        elif isinstance(item, QuestionForReview):
+            accepted = review_open_question(production.slug, item)
+            if isinstance(accepted, ReviewedQuestion):
+                entry["question"], entry["reviewed"] = item.question, accepted.reviewed
+                pending.append(accepted)
+            elif isinstance(accepted, ReviewUnavailableQuestion):
+                entry["question"], entry["review_unavailable"] = item.question, accepted.reason
+                pending.append(accepted)
+            else:
+                held.append(f"{item.text}: {accepted.details}")
+        entries.append(entry)
+    if held:
+        raise RegistrationFailure("questions", "question held for review: " + "; ".join(held))
+    for stored in stored_entries(outstanding):
+        asker = stored.get("asked_by", "")
+        if asker and stored["text"] not in items_by_text:
+            entries.append(stored)
+            report("questions", "kept", f"{stored['text']}: asked by {asker}; it leaves only through `answer`")
+    record_question_history(outstanding, [entry for entry in entries if entry["text"] not in previous], now)
+    _ = outstanding.write_text(json.dumps(entries) + "\n", encoding="utf-8")
+    for item in pending:
+        accepted_text = item.reviewed if isinstance(item, ReviewedQuestion) else item.question
+        print("reviewed question: " + accepted_text)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
-    for action in ("register", "time", "log", "questions", "open", "next", "mark-important"):
+    for action in ("register", "time", "log", "questions", "open", "next", "mark-important", "ask", "answer"):
         subcommand = commands.add_parser(action)
         _ = subcommand.add_argument("--production", type=Path, required=True)
         if action == "register":
@@ -717,8 +855,15 @@ def main() -> int:
             _ = subcommand.add_argument("--before-compaction", action="store_true")
         elif action == "questions":
             _ = subcommand.add_argument("--state", type=Path)
-        elif action == "mark-important":
+        elif action in ("mark-important", "answer"):
             _ = subcommand.add_argument("--item", required=True)
+        elif action == "ask":
+            _ = subcommand.add_argument("--text", required=True, help="the one-line item the count and lists name")
+            _ = subcommand.add_argument("--question", required=True,
+                                        help="what is asked, why, each choice and what it does, the recommended choice")
+            _ = subcommand.add_argument("--unit", default="", help="the asking unit; absent, the showrunner asks")
+            _ = subcommand.add_argument("--urgency", default="", help="user, blocks, soon (with --due), normal or later")
+            _ = subcommand.add_argument("--due", default="")
     args = parser.parse_args()
     action = cast(str, args.action)
     try:
@@ -737,6 +882,14 @@ def main() -> int:
             next_item(production)
         elif action == "mark-important":
             mark_important(production, cast(str, args.item))
+        elif action == "answer":
+            answer(production, cast(str, args.item))
+        elif action == "ask":
+            try:
+                level = urgency.read(cast(str, args.urgency), cast(str, args.due))
+            except urgency.UrgencyError:
+                raise RegistrationFailure("ask", "--urgency is user, blocks, soon with --due, normal or later") from None
+            ask(production, cast(str, args.text), cast(str, args.question), cast(str, args.unit), Ranking(level))
         else:
             questions(production, cast(Path | None, args.state))
         return 0

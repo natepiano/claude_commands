@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 from datetime import datetime
@@ -47,6 +48,9 @@ DELETE_CALL = {"command": f"rm -f {SAVED}/b1e4yc8b9.txt",
                "description": "Write the 212 enrolled state; confirm the prompt names the worktree"}
 
 DELETE_REQUEST = "delete its saved tool output b1e4yc8b9.txt, which is outside its allowed folders"
+# unit-one's prompt alert key in the showrunner production, and the retire that cancels its repeats.
+PROMPT_KEY = "stall-watch:prompt:showrunner:unit-one"
+RETIRE = {"command": "retire", "to": "user", "from": "stall-watch", "key": PROMPT_KEY}
 
 
 def tool_call(name: str, arguments: dict[str, str], at: float, call_id: str = "toolu_1") -> str:
@@ -86,6 +90,7 @@ class StallWatchTests(unittest.TestCase):
         self.state: Path = Path()
         self.ps_file: Path = Path()
         self.send_log: Path = Path()
+        self.rca_log: Path = Path()
         self.fail_file: Path = Path()
         self.environment: dict[str, str] = {}
         self.panes: dict[str, dict[str, str | int]] = {}
@@ -134,17 +139,23 @@ raise SystemExit(1)
         self.state = self.root / "stall-state"
         self.ps_file = self.root / "ps.txt"
         self.send_log = self.root / "sends.jsonl"
+        self.rca_log = self.root / "rca-sends.jsonl"
         self.fail_file = self.root / "fail-targets.json"
         _ = self.fail_file.write_text("[]")
         self.config = self.root / "showrunners.json"
         self.configure({"showrunner": ["unit-one"]})
         self.addCleanup(self.close_processes)
+        # Runs before the temporary folder is removed, so no detached owner message writes into it after.
+        self.addCleanup(self.owner_messages)
         executable(self.bin / "ps", "#!/bin/sh\ncat \"$STALL_TEST_PS_FILE\"\n")
         executable(self.bin / "send.py", """#!/usr/bin/env python3
 import json, os, sys, time
 args = sys.argv[1:]
+retire = args[:1] == ['retire']
 record = {name: args[args.index('--' + name) + 1] for name in ('to', 'from', 'key', 'text', 'text-id', 'need')
           if '--' + name in args}
+if retire:
+    record['command'] = 'retire'
 if '--value' in args:
     record['values'] = dict(args[i + 1].split('=', 1) for i, arg in enumerate(args) if arg == '--value')
 line = (json.dumps(record) + '\\n').encode()
@@ -158,7 +169,18 @@ while expected and len(open(os.environ['STALL_TEST_SEND_LOG']).readlines()) < ex
         raise SystemExit('send barrier did not receive every concurrent delivery')
     time.sleep(0.01)
 fail = json.load(open(os.environ['STALL_TEST_FAIL_FILE']))
+# A failed retire is send.py's FAILED, exit 3; "retire" in the fail list fails only retires.
+if retire:
+    raise SystemExit(3 if 'retire' in fail else 0)
 raise SystemExit(1 if record['to'] in fail else 0)
+""")
+        # rca.py's own sends: the owner message and its reminder.
+        executable(self.bin / "rca-send.py", """#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+record = {name: args[args.index('--' + name) + 1] for name in ('to', 'from', 'key', 'text') if '--' + name in args}
+with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
+    log.write(json.dumps(record) + '\\n')
 """)
         self.environment = {
             **os.environ,
@@ -166,7 +188,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
             "PATH": f"{self.bin}:{os.environ.get('PATH', '')}",
             "SHOWRUNNERS_CONFIG": str(self.config),
             "NOTIFIER_STATE_DIR": str(self.notifier),
-            "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
+            "UNIT_HISTORY_DIR": str(self.root / "history"),
             "NOTIFIER_SESSIONS_DIR": str(self.sessions),
             "SHOWRUNNERS_SESSIONS": str(self.sessions_script),
             "STALL_WATCH_STATE_DIR": str(self.state),
@@ -176,6 +198,9 @@ raise SystemExit(1 if record['to'] in fail else 0)
             "STALL_WATCH_SEND": str(self.bin / "send.py"),
             "STALL_TEST_PS_FILE": str(self.ps_file),
             "STALL_TEST_SEND_LOG": str(self.send_log),
+            "XDG_STATE_HOME": str(self.root / "state"),
+            "RCA_SEND": str(self.bin / "rca-send.py"),
+            "STALL_TEST_RCA_LOG": str(self.rca_log),
             "STALL_TEST_FAIL_FILE": str(self.fail_file),
             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
             "HERDR_PROC": str(self.root / "proc"),
@@ -298,10 +323,54 @@ raise SystemExit(1 if record['to'] in fail else 0)
             capture_output=True, text=True, check=False,
         )
 
+    def owner_messages(self) -> list[dict[str, str]]:
+        """rca.py's owner messages, once each one it started has landed.
+
+        rca.py starts each owner message detached and writes "<time> <key>" to owner.log first, so the
+        stub's log is read after it has one line per started key, for at most 10 s.
+        """
+        started = self.root / "state/message/rca/owner.log"
+        deadline = time.monotonic() + 10
+        while True:
+            keys = [line for line in started.read_text().splitlines()
+                    if line.partition(" ")[2].startswith("rca-")] if started.exists() else []
+            lines = self.rca_log.read_text().splitlines() if self.rca_log.exists() else []
+            if len(lines) >= len(keys) or time.monotonic() >= deadline:
+                return [cast(dict[str, str], json.loads(line)) for line in lines]
+            time.sleep(0.01)
+
     def sent(self) -> list[dict[str, str]]:
         if not self.send_log.exists():
             return []
         return [json.loads(line) for line in self.send_log.read_text().splitlines()]
+
+    def test_one_tick_reads_run_records_once_across_productions_and_units(self) -> None:
+        import stall_watch
+        import showrunners
+        import unit_lookup as lookup
+        runners: list[showrunners.Showrunner] = []
+        for slug in ("first", "second"):
+            doc = self.root / f"{slug}-production.md"
+            _ = doc.write_text("\n".join(("# Production", f"- **Production slug:** {slug}", "## Units",
+                               "| Unit | Plan | Worktree |", "| --- | --- | --- |",
+                               f"| alpha | docs/alpha.md | {self.root / 'alpha'} |",
+                               f"| beta | docs/beta.md | {self.root / 'beta'} |", "")))
+            runners.append(showrunners.Showrunner(session=slug, socket="/fixture.sock",
+                            slug=slug, zone="UTC", doc=str(doc)))
+        marked = {name: lookup.MarkedUnit(name, lookup.ClaudeNotRunning(), lookup.Place("fixture", name))
+                  for name in ("alpha", "beta")}
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(stall_watch, "processes", return_value=[]),
+              mock.patch.object(showrunners, "load_settings", return_value={}),
+              mock.patch.object(showrunners, "registered_showrunners", return_value=runners),
+              mock.patch.object(lookup, "marked_units", return_value=marked),
+              mock.patch.object(lookup, "read_run_states", wraps=lookup.read_run_states) as reads,
+              mock.patch.object(stall_watch, "forget", return_value=None) as forget,
+              mock.patch.object(stall_watch, "send_all") as send):
+            stall_watch.tick(START)
+            reads.assert_called_once_with()
+            self.assertEqual(forget.call_count, 4)
+            send.assert_called_once_with([], START)
 
     def test_a_herdr_unit_is_watched_through_a_joined_400_line_read(self) -> None:
         self.panes["unit-one"]["label"] = "native"
@@ -395,17 +464,21 @@ raise SystemExit(1 if record['to'] in fail else 0)
         self.assertEqual(alerts[-1]["need"], "blocked")
         values = cast(dict[str, dict[str, str]], json.loads(self.send_log.read_text().splitlines()[-1]))["values"]
         self.assertEqual((values["unit"], values["request"], values["since"]), ("unit-one", "edit panes.py", "12:00 PDT"))
+        # The alert has the unit's key, which a retire cancels it by.
+        self.assertEqual(alerts[-1]["key"], PROMPT_KEY)
         # No bump and no tell while it waits on the user.
         self.assertNotIn("uds:", " ".join(item["to"] for item in alerts))
-        # The prompt is answered: the idle clock starts again, and a new prompt alerts again.
+        # The prompt is answered: the alert is retired, the idle clock starts again, and a new prompt alerts again.
         self.panes["unit-one"]["agent_status"] = "idle"
         self.panes["unit-one"]["pane"] = "— holding: ready for next step\n"
         self.assertEqual(self.tick(START + 960).returncode, 0)
-        self.assertEqual(len(self.sent()), 2)
+        self.assertEqual(self.sent()[2:], [RETIRE])
+        self.assertFalse(self.prompt_state().exists())
         self.panes["unit-one"]["agent_status"] = "blocked"
         self.assertEqual(self.tick(START + 1000).returncode, 0)
         self.assertEqual(self.tick(START + 1060).returncode, 0)
-        self.assertEqual([item["to"] for item in self.sent()[2:]], ["user"])
+        self.assertEqual([(item["to"], item["key"], item.get("command")) for item in self.sent()[3:]],
+                         [("user", PROMPT_KEY, None)])
 
     def test_a_unit_at_a_prompt_with_the_auto_deny_banner_gets_no_alert_and_no_bump(self) -> None:
         self.panes["unit-one"]["agent_status"] = "blocked"
@@ -443,33 +516,15 @@ raise SystemExit(1 if record['to'] in fail else 0)
     def test_the_request_comes_from_the_pending_tool_call_in_the_transcript(self) -> None:
         import stall_watch
         call = stall_watch.PendingTool("toolu_1", "Bash", dict(DELETE_CALL), START)
-        self.assertEqual(stall_watch.prompt_request(BASH_PROMPT, call),
-                         "run a shell command to write the 212 enrolled state and confirm the prompt names the worktree")
-        # The warning on screen names the file the prompt is for: the request is what the command does to it.
-        self.assertEqual(stall_watch.prompt_request(OUTSIDE_PROMPT, call),
-                         DELETE_REQUEST)
-        reading = stall_watch.PendingTool("toolu_1", "Bash", {"command": f"x=1 /bin/cat {SAVED}/b1e4yc8b9.txt"}, START)
-        self.assertEqual(stall_watch.prompt_request(OUTSIDE_PROMPT, reading),
-                         DELETE_REQUEST.replace("delete", "use"))
-        # A command without a description is named by its program and its target.
-        bare = stall_watch.PendingTool("toolu_1", "Bash", {"command": DELETE_CALL["command"]}, START)
-        self.assertEqual(stall_watch.prompt_request("", bare), "run the rm command on b1e4yc8b9.txt")
+        # A Bash call reads as its command with each path shown by its file name, never as its description,
+        # also when the screen shows a description or the outside warning.
+        for pane in ("", BASH_PROMPT, OUTSIDE_PROMPT):
+            self.assertEqual(stall_watch.prompt_request(pane, call), "run rm -f b1e4yc8b9.txt")
         edit = stall_watch.PendingTool("toolu_1", "Edit", {"file_path": "/home/natepiano/rust/x/src/panes.py"}, START)
         self.assertEqual(stall_watch.prompt_request("", edit), "edit panes.py")
         # A tool the transcript cannot word falls back to the prompt on screen.
         other = stall_watch.PendingTool("toolu_1", "WebFetch", {"url": "https://example.com"}, START)
         self.assertEqual(stall_watch.prompt_request(EDIT_PROMPT, other), "edit panes.py")
-
-    def test_a_long_description_is_never_cut(self) -> None:
-        import stall_watch
-        description = ("Read the saved board output, find every reservation the run still holds for phase 212, "
-                       + "and write each one with its phase, its unit and the time it was made to the run's state "
-                       + "file so the next phase starts from a known list")
-        call = stall_watch.PendingTool("toolu_1", "Bash", {"command": "jq . /tmp/board.json", "description": description},
-                                       START)
-        request = stall_watch.prompt_request(BASH_PROMPT, call)
-        self.assertGreater(len(request), 200)
-        self.assertEqual(request, f"run a shell command to {description[:1].lower()}{description[1:]}")
 
     def test_a_wrapped_prompt_with_the_outside_warning_reads_as_a_whole_sentence(self) -> None:
         import stall_watch
@@ -497,14 +552,125 @@ raise SystemExit(1 if record['to'] in fail else 0)
         self.assertEqual(self.tick(START + 60).returncode, 0)
         self.assertEqual(self.tick(START + 900).returncode, 0)
         self.assertEqual(len(self.sent()), 1)
-        # The call is answered and the next call waits at a new prompt, with herdr blocked the whole time.
+        # The call is answered and the next call waits at a new prompt, with herdr blocked the whole time:
+        # the first alert is retired, and the new prompt gets its own alert.
         _ = transcript.write_text(tool_call("Bash", DELETE_CALL, made) + tool_result()
                                   + tool_call("Bash", DELETE_CALL, START + 950, "toolu_2"))
         self.assertEqual(self.tick(START + 960).returncode, 0)
-        self.assertEqual(len(self.sent()), 1)
+        self.assertEqual(self.sent()[1:], [RETIRE])
         self.assertEqual(self.tick(START + 1020).returncode, 0)
         values = cast(dict[str, dict[str, str]], json.loads(self.send_log.read_text().splitlines()[-1]))["values"]
-        self.assertEqual((len(self.sent()), values["since"]), (2, "12:15 PDT"))
+        self.assertEqual((len(self.sent()), self.sent()[-1]["key"], values["since"]), (3, PROMPT_KEY, "12:15 PDT"))
+
+    def prompt_state(self) -> Path:
+        import stall_watch
+        with mock.patch.object(stall_watch, "STATE_DIR", self.state):
+            return stall_watch.prompt_path("showrunner", "unit-one")
+
+    def alerted_at_a_prompt(self) -> None:
+        """unit-one waits at an edit prompt, and its alert goes out at START + 60."""
+        self.panes["unit-one"]["agent_status"] = "blocked"
+        self.panes["unit-one"]["pane"] = EDIT_PROMPT
+        _ = self.tick(START)
+        self.assertEqual(self.tick(START + 60).returncode, 0)
+        self.assertEqual([item["key"] for item in self.sent()], [PROMPT_KEY])
+
+    def test_a_failed_retire_is_sent_again_next_tick_and_no_new_alert_goes(self) -> None:
+        self.alerted_at_a_prompt()
+        _ = self.fail_file.write_text('["retire"]')
+        self.panes["unit-one"]["agent_status"] = "idle"
+        failed = self.tick(START + 120)
+        self.assertIn("stall-watch: retire:", failed.stderr)
+        self.assertTrue(self.prompt_state().exists())
+        # Blocked again while the retire still fails: the retire is sent again, and no alert.
+        self.panes["unit-one"]["agent_status"] = "blocked"
+        _ = self.tick(START + 180)
+        _ = self.fail_file.write_text("[]")
+        self.assertEqual(self.tick(START + 240).returncode, 0)
+        self.assertEqual(self.sent()[1:], [RETIRE, RETIRE, RETIRE])
+        self.assertFalse(self.prompt_state().exists())
+
+    def test_an_auto_denied_prompt_after_its_alert_retires_the_alert(self) -> None:
+        self.alerted_at_a_prompt()
+        self.panes["unit-one"]["pane"] = AUTO_DENY_PROMPT
+        self.assertEqual(self.tick(START + 120).returncode, 0)
+        self.assertEqual(self.sent()[1:], [RETIRE])
+        self.assertFalse(self.prompt_state().exists())
+
+    def test_a_finished_run_after_a_prompt_alert_retires_the_alert(self) -> None:
+        self.alerted_at_a_prompt()
+        self.states["unit-one"] = "run-finished"
+        self.assertEqual(self.tick(START + 120).returncode, 0)
+        self.assertEqual(self.sent()[1:], [RETIRE])
+        self.assertFalse(self.prompt_state().exists())
+
+    def test_a_prompt_that_never_alerted_sends_no_retire(self) -> None:
+        self.panes["unit-one"]["agent_status"] = "blocked"
+        self.panes["unit-one"]["pane"] = EDIT_PROMPT
+        _ = self.tick(START)
+        self.assertTrue(self.prompt_state().exists())
+        self.panes["unit-one"]["agent_status"] = "idle"
+        self.assertEqual(self.tick(START + 30).returncode, 0)
+        self.assertEqual(self.sent(), [])
+        self.assertFalse(self.prompt_state().exists())
+
+    def test_a_sent_prompt_alert_opens_one_rca_case_and_its_owner_is_reminded_once(self) -> None:
+        transcript = self.projects / "project" / "sid-unit-one.jsonl"
+        _ = transcript.write_text(tool_call("Bash", DELETE_CALL, START - 60))
+        self.panes["unit-one"]["agent_status"] = "blocked"
+        self.panes["unit-one"]["pane"] = OUTSIDE_PROMPT
+        # A failed alert opens no case; the alert sent on the next tick opens one.
+        _ = self.fail_file.write_text('["user"]')
+        _ = self.tick(START)
+        self.assertEqual(self.owner_messages(), [])
+        _ = self.fail_file.write_text("[]")
+        result = self.tick(START + 60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("rca: opened 261006-1", result.stdout)
+        case = cast(dict[str, object], json.loads((self.root / "state/message/rca/261006-1.json").read_text()))
+        self.assertEqual((case["session"], case["production"], case["kind"], case["status"], case["commands"],
+                          case["transcript"]),
+                         ("unit-one", "showrunner", "prompt", "open", [DELETE_CALL["command"]], str(transcript)))
+        # The case keeps when the wait began (the pending call's time), and the alert's sender and key,
+        # which `rca.py fixed` retires it by.
+        self.assertEqual((case["stopped"], case["alert_source"], case["alert_key"], case["waits"]),
+                         (datetime.fromtimestamp(START - 60, ZoneInfo("UTC")).isoformat(), "stall-watch",
+                          "stall-watch:prompt:showrunner:unit-one", ""))
+        owner = self.owner_messages()
+        self.assertEqual([(item["to"], item["from"], item["key"]) for item in owner],
+                         [(f"uds:{self.root / 'show-id.sock'}", "rca", "rca-261006-1")])
+        self.assertIn(DELETE_CALL["command"], owner[0]["text"])
+        self.assertIn("rca.py start 261006-1 --owner", owner[0]["text"])
+        # The same prompt opens nothing more; 30 minutes after the case opened its owner gets one reminder.
+        _ = self.tick(START + 120)
+        _ = self.tick(START + 60 + 1799)
+        self.assertEqual(len(self.owner_messages()), 1)
+        _ = self.tick(START + 60 + 1800)
+        _ = self.tick(START + 60 + 1900)
+        self.assertEqual([item["key"] for item in self.owner_messages()], ["rca-261006-1", "rca-261006-1-remind"])
+
+    def test_a_helpers_pending_bash_call_names_its_command_cut_to_90_characters(self) -> None:
+        import stall_watch
+        import push_texts
+        helpers = self.projects / "project" / "sid-unit-one" / "subagents"
+        helpers.mkdir(parents=True)
+        _ = (self.projects / "project" / "sid-unit-one.jsonl").write_text(
+            tool_call("Bash", {"command": "ls"}, START - 600) + tool_result())
+        _ = (helpers / "agent-a1.jsonl").write_text(tool_call("Bash", {"command": "git status"}, START - 300, "toolu_a"))
+        _ = (helpers / "agent-a2.jsonl").write_text(tool_call(
+            "Bash", {"command": "cargo build -p cargo-handler", "description": "Build the handler crate"}, START - 60, "toolu_b"))
+        with mock.patch.object(stall_watch, "PROJECTS_DIR", self.projects):
+            pending = stall_watch.pending_tool("sid-unit-one")
+        assert pending is not None
+        self.assertEqual(pending.id, "toolu_b")
+        # The command, never the description.
+        self.assertEqual(stall_watch.prompt_request(BASH_PROMPT, pending), "run cargo build -p cargo-handler")
+        long = stall_watch.PendingTool("x", "Bash", {"command": "echo " + "y" * 120}, START)
+        self.assertEqual(stall_watch.prompt_request("", long), "run echo " + "y" * 84 + "…")
+        rendered = push_texts.render(stall_watch.PROMPT_TEXT_ID, unit="handler", machine="natedev",
+                                     since="09:01 AST", request="run cargo build -p cargo-handler")
+        self.assertEqual(rendered.body, "handler asks to run cargo build -p cargo-handler. It has waited since 09:01 AST."
+                         + "\n\nYes: it does that and goes on.\n\nNo: it does not, and asks you what to do instead.")
 
     def test_blocked_turn_end_waits_for_a_new_unblocked_status(self) -> None:
         self.configure({"showrunner": ["unit-one"]}, stall_minutes=10)
@@ -696,7 +862,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
         _ = self.tick(START + 480)
         self.assertEqual(len(self.sent()), 4)
 
-    def test_running_shell_or_delegate_launcher_prevents_a_bump(self) -> None:
+    def test_running_shell_or_worker_launcher_prevents_a_bump(self) -> None:
         for command in ("bash", "implement.sh"):
             with self.subTest(command=command):
                 self.state.mkdir(exist_ok=True)
@@ -806,15 +972,15 @@ raise SystemExit(1 if record['to'] in fail else 0)
         self.assertEqual(len(retry), 1)
         self.assertEqual(retry[0]["key"], next(item["key"] for item in first if item["key"].endswith(":tell")))
 
-    def test_stale_delegate_status_does_not_count_as_running_work(self) -> None:
-        status = self.root / "delegate" / "status"
+    def test_stale_worker_status_does_not_count_as_running_work(self) -> None:
+        status = self.root / "run" / "status"
         status.parent.mkdir()
         _ = status.write_text("implementing\n")
         _ = self.tick(START)
         _ = self.tick(START + 300)
         self.assertEqual(len(self.sent()), 2)
 
-    def test_defunct_delegate_process_does_not_count_as_running_work(self) -> None:
+    def test_defunct_worker_process_does_not_count_as_running_work(self) -> None:
         _ = self.tick(START)
         claude_pid = self.children[0].pid
         self.process_rows.append(f"999999 {claude_pid} implement.sh <defunct>")

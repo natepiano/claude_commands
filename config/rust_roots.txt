@@ -1,0 +1,54 @@
+# Folder names expected in ~/rust on natedev and on the Mac, one per line. folder_audit.py names
+# every other folder there that is idle for a day. Add a name here when a long-lived checkout or
+# worktree comes; scratch goes in ~/rust/repro through scratch.py, never here.
+.claude
+bevy
+bevy-0.20.0
+bevy_brp
+bevy_hana
+cargo-handler
+cargo-liner
+cargo-liner-berth
+cargo-liner-berth-parallel
+cargo-liner-experiments
+cargo-liner-handler
+cargo-liner-style
+cargo-liner-style-modules
+cargo-liner-style-names
+cargo-liner-style-types
+cargo-liner-style-values
+cargo-liner-tile
+gltf-ibl-sampler-egui
+graft-trial
+hana
+hana_catalyst
+hana_catalyst-assembly
+hana_catalyst-cables
+hana_catalyst-inspectors
+hana_catalyst-lfo
+hana_catalyst-merge-gate
+hana_catalyst-research
+hana_catalyst-review-build
+hana_demo
+hanadocs
+nateroids
+nate_style
+obsidian_knife
+rust-template
+tool-based-ui-demo
+tool-based-ui-frame-time
+tool-based-ui-frame-time-benchmark
+tool-based-ui-frame-time-frame-cost
+tool-based-ui-frame-time-metrics-gathering
+tool-based-ui-frame-time-metrics-visualization
+tool-based-ui-geometry-material
+tool-based-ui-startup
+tool-based-ui-trunk
+widget-enhancements
+# Mac only
+bevy_enhanced_input
+blender
+cache-apt-pkgs-action
+hana videos
+hana_catalyst_mac  # mac_run.sh standing clone: it fetches and builds here on every Mac run
+worktrees

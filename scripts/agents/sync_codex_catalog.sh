@@ -4,6 +4,9 @@
 set -euo pipefail
 
 AGENTS_CONFIG_FILE="${AGENTS_CONFIG_FILE:-$HOME/.claude/config/agents.conf}"
+# The catalog is read from, and stored to, the registry with its local overlay.
+# shellcheck source=/dev/null
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/agents_overlay.sh"
 CODEX_CONFIG_FILE="${CODEX_CONFIG_FILE:-$HOME/.codex/config.toml}"
 CODEX_MODELS_CACHE_FILE="${CODEX_MODELS_CACHE_FILE:-$HOME/.codex/models_cache.json}"
 CODEX_CATALOG_SYNC_STATE_FILE="${CODEX_CATALOG_SYNC_STATE_FILE:-$HOME/.local/state/codex-agent-catalog-sync/last_success}"
@@ -24,32 +27,9 @@ fail() {
     exit 1
 }
 
-# The replacement is built in a `mktemp` file, which is 0600, so the config's own
-# mode has to be read and restored before the `mv` or every reader loses access.
-# GNU and BSD `stat` spell the query differently and neither is quiet about the
-# other's spelling: GNU reads `-f` as --file-system and prints a block of
-# filesystem statistics on *stdout* before failing, so chaining the two forms with
-# `||` and capturing both feeds that block to chmod as if it were a mode. Each
-# form is therefore tried on its own and its answer checked to be an octal mode
-# before it is used.
-config_file_mode() {
-    local mode
-    for mode in \
-        "$(stat -c '%a' "$AGENTS_CONFIG_FILE" 2>/dev/null)" \
-        "$(stat -f '%Lp' "$AGENTS_CONFIG_FILE" 2>/dev/null)"; do
-        if [[ "$mode" =~ ^[0-7]{3,4}$ ]]; then
-            printf '%s\n' "$mode"
-            return 0
-        fi
-    done
-    # Neither spelling answered. 0644 keeps the file readable, which is the
-    # failure worth having: a sync that widens nothing and blocks nobody.
-    printf '644\n'
-}
-
 # One writer at a time. The sync is triggered implicitly by anything that sources
 # agents_config.sh, so a stale freshness gate fires it once per caller -- and a
-# delegate phase sources it three times at once. `mv` is atomic, so no reader
+# worker phase sources it three times at once. `mv` is atomic, so no reader
 # ever sees a torn file, but concurrent syncs still do identical work three times
 # over, and the last to finish writes a copy it read before the others started:
 # a row changed by `/agent` inside that window is silently reverted.
@@ -120,7 +100,7 @@ registry_section_rows() {
             sub(/[[:space:]]*$/, "", row)
             if (row != "") print row
         }
-    ' "$AGENTS_CONFIG_FILE"
+    ' "$REGISTRY_VIEW"
 }
 
 refreshed_catalog_has_agent() {
@@ -206,6 +186,9 @@ command -v jq >/dev/null || fail "jq is required"
 [[ -f "$AGENTS_CONFIG_FILE" ]] || fail "agent registry not found: $AGENTS_CONFIG_FILE"
 [[ -f "$CODEX_CONFIG_FILE" ]] || fail "Codex config not found: $CODEX_CONFIG_FILE"
 [[ -f "$CODEX_MODELS_CACHE_FILE" ]] || fail "Codex model cache not found: $CODEX_MODELS_CACHE_FILE"
+REGISTRY_VIEW="$(mktemp "${AGENTS_CONFIG_FILE}.view.XXXXXX")"
+agents_registry_text > "$REGISTRY_VIEW"
+trap 'rm -f "$REGISTRY_VIEW"; release_lock' EXIT
 
 codex_model="$({
     awk '
@@ -370,7 +353,7 @@ assigned_rows="$(
                 if (family == "codex") print task "\t" pairs[i]
             }
         }
-    ' "$AGENTS_CONFIG_FILE"
+    ' "$REGISTRY_VIEW"
 )"
 
 while IFS=$'\t' read -r task pair; do
@@ -392,7 +375,7 @@ warn_missing_claude_aliases
 
 tmp_file="$(mktemp "${AGENTS_CONFIG_FILE}.XXXXXX")"
 cleanup() {
-    rm -f "$tmp_file"
+    rm -f "$tmp_file" "$REGISTRY_VIEW"
     release_lock
 }
 trap cleanup EXIT
@@ -422,11 +405,11 @@ while IFS= read -r line || [[ -n "$line" ]]; do
         continue
     fi
     printf '%s\n' "$line" >> "$tmp_file"
-done < "$AGENTS_CONFIG_FILE"
+done < "$REGISTRY_VIEW"
 
 [[ "$saw_codex_agents" == true ]] || fail "[codex.agents] section not found in $AGENTS_CONFIG_FILE"
 
-if cmp -s "$tmp_file" "$AGENTS_CONFIG_FILE"; then
+if cmp -s "$tmp_file" "$REGISTRY_VIEW"; then
     if [[ "$CHECK_ONLY" == false ]]; then
         checkpoint_sync_state
     fi
@@ -439,8 +422,8 @@ if [[ "$CHECK_ONLY" == true ]]; then
     exit 1
 fi
 
-chmod "$(config_file_mode)" "$tmp_file"
-mv "$tmp_file" "$AGENTS_CONFIG_FILE"
+agents_registry_store "$tmp_file"
+rm -f "$REGISTRY_VIEW"
 trap release_lock EXIT
 checkpoint_sync_state
 echo "Updated Codex agent catalog: $AGENTS_CONFIG_FILE"

@@ -109,12 +109,12 @@ other_names = ["production document"]
 name = "unit plan"
 kind = "document"
 defined_in = "docs/production_format.md#Words (Unit)"
-other_names = ["delegate-ready plan"]
+other_names = ["direct-ready plan"]
 
 [[terms]]
 name = "Work Order"
 kind = "document"
-defined_in = "docs/delegate_plan_format.md#Document structure / Work Order"
+defined_in = "docs/direct_plan_format.md#Document structure / Work Order"
 other_names = []
 
 [[terms]]
@@ -163,7 +163,7 @@ other_names = []
 [[terms]]
 name = "phase review"
 kind = "step"
-defined_in = "docs/delegate/run_phase_review.md#<RunPhaseReview/>"
+defined_in = "docs/direct/run_phase_review.md#<RunPhaseReview/>"
 other_names = ["plan review"]
 
 [[terms]]
@@ -177,7 +177,7 @@ name = "/unit:direct"
 kind = "step"
 defined_in = "commands/unit/direct.md#Direct"
 other_names = ["/unit:delegate"]
-kept = ["docs/delegate/", "scripts/direct/", "scripts/delegate/"]
+kept = ["docs/direct/", "scripts/direct/"]
 
 [[terms]]
 name = "astra-designer"
@@ -200,7 +200,7 @@ other_names = ["subagent", "helper"]
 [[terms]]
 name = "pending decision"
 kind = "record"
-defined_in = "docs/delegate_plan_format.md#Pending decisions"
+defined_in = "docs/direct_plan_format.md#Pending decisions"
 other_names = ["Pending decision block"]
 
 [[terms]]
@@ -212,7 +212,7 @@ other_names = ["issue"]
 [[terms]]
 name = "reservation"
 kind = "record"
-defined_in = "commands/unit/direct.md#<DelegatedPhaseReservationContract/>"
+defined_in = "commands/unit/direct.md#<PhaseReservationContract/>"
 other_names = ["phase reservation", "delegated phase reservation"]
 
 [[terms]]

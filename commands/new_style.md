@@ -24,6 +24,7 @@ Write the fields in this order. Required fields come first.
 | `input_scope` | `file` `crate` `manifest` | Default `crate`. Use `file` when one file alone shows a violation. Use `manifest` for a Cargo.toml rule. |
 | `mechanism` | `clippy` `mend` `rustfmt` `llm` | Required. Tier A requires a tool; every other tier uses `llm`. |
 | `mode` | `auto` `propose` `flag` | `propose` holds every finding for the user and files it as a restructure proposal. Use it when a fix changes types, files or public API. `auto` on a tool rule means `/rust_style` skips it. Omit for an ordinary `llm` rule. |
+| `approval` | `always` | Filing approves each decision under the rule for its family's unit, so the user never sees it. Needs a family. Omit to ask the user. Only on the user's word. |
 | `lint` | a lint name, or a `[list]` | Tier A only: the tool lint that enforces the rule. |
 | `candidates` | a block | Tier B: the generator that lists every possible site. See below. |
 | `pre_filter` | a quoted regex | Tier B without a generator: lines that can hold a violation. |

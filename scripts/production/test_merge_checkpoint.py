@@ -22,6 +22,9 @@ import merge_checkpoint
 from merge_checkpoint import (ChildHandoffEntry, CodeCheckpoint, LastMerged, MergeEntry, NoMerge, ShrinkCommit,
                               check_parallel, merge_branch_history, merge_history, promote, request_from)
 
+# Importable once merge_checkpoint has put scripts/lib on the path.
+import scratch
+
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("merge_checkpoint.py")
@@ -35,12 +38,12 @@ REAL_OWNS = ("`docs/plans/build-followups-enh-showrunner.md`; `scripts/productio
              "`commands/showrunner/produce.md`, `commands/showrunner/promote_unit.md`, "
              "`scripts/production/showrunners.py`, `scripts/production/stall_watch.py` and their tests "
              "(hub rows); from its Phase 5 (the user, 2026-10-06 15:25 PDT, the phase-end split): "
-             "`commands/unit/delegate.md`, `commands/unit/checkpoint.md`, "
-             "`docs/delegate/run_phase_review.md`, `docs/production_format.md`, "
+             "`commands/unit/direct.md`, `commands/unit/checkpoint.md`, "
+             "`docs/direct/run_phase_review.md`, `docs/production_format.md`, "
              "`commands/unit/add_ons.md`, `commands/plan/shrink.md`, "
-             "`commands/plan/phase_review.md`, `docs/delegate/phase_end.md`, "
-             "`docs/delegate_plan_format.md`, `commands/unit/eta_breakdown.md`, "
-             "`docs/delegate/final_gate_commit.md`")
+             "`commands/plan/phase_review.md`, `docs/direct/phase_end.md`, "
+             "`docs/direct_plan_format.md`, `commands/unit/eta_breakdown.md`, "
+             "`docs/direct/final_gate_commit.md`")
 SIMPLE_MERGE_TESTS = "- **Merge tests:** `checkpoint-test`"
 REAL_MERGE_TESTS = ("- **Merge tests:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` "
                     "and `basedpyright scripts/buildlog` (pass is its `0 errors, 0 warnings` line: it exits 3 "
@@ -69,6 +72,10 @@ if name == "style_sync.py":
                               capture_output=True, text=True, check=True).stdout.split()[0]
     (state / "notified-tip").write_text(observed)
 if name == "verify.sh":
+    fail_rows = state / "fail-rows"
+    if fail_rows.exists() and "--filter" not in args:
+        print(fail_rows.read_text(), end="")
+        raise SystemExit(1)
     key = "_".join(args).replace("/", "_")
     if args[:1] == ["test"]:
         package_key = "test-" + args[1] if len(args) > 1 else "test"
@@ -95,8 +102,13 @@ if name == "basedpyright":
 
 
 def setUpModule() -> None:
-    """The times these tests expect are Pacific; the user's zone setting must not change them."""
-    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+    """The times these tests expect are Pacific; the user's zone setting must not change them. The
+    scratch folders a merge removes are in a temporary folder, never /tmp/claude/scratch or ~/rust/repro."""
+    folder = tempfile.TemporaryDirectory()
+    unittest.addModuleCleanup(folder.cleanup)
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {
+        "USER_ZONE": "America/Los_Angeles", "SCRATCH_ROOT": f"{folder.name}/scratch",
+        "SCRATCH_VISIBLE_ROOT": f"{folder.name}/repro"}))
 
 
 class MergeResult(NamedTuple):
@@ -122,6 +134,7 @@ class MergeCheckpointTests(unittest.TestCase):
         self.push = "git"
         self.promotions = ""
         self.known_flakes = ""
+        self.known_flaky_tests = ""
         self.gate = True
 
     @override
@@ -219,6 +232,8 @@ class MergeCheckpointTests(unittest.TestCase):
             rows.append(f"- **Promote:** {self.promotions}")
         if self.known_flakes:
             rows.append(f"- **Known flakes:** {self.known_flakes}")
+        if self.known_flaky_tests:
+            rows.append(f"- **Known flaky tests:** {self.known_flaky_tests}")
         rows.extend([
             "", "## Units", "",
             "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
@@ -320,6 +335,16 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertEqual(accepted.process.returncode, 0, accepted.process.stderr + accepted.process.stdout)
         self.assertIn("scope: ok", accepted.process.stdout)
 
+    def test_a_code_checkpoint_removes_its_phases_scratch_folders(self) -> None:
+        with mock.patch.dict(os.environ, self.env):
+            done = [scratch.new("phase:alpha-unit/2", word) for word in ("gate", "copy")]
+            later = scratch.new("phase:alpha-unit/3")
+        result = self.run_checkpoint(self.checkpoint())
+        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+        self.assertIn("scratch: ok — removed 2 folder(s) of phase:alpha-unit/2: ", result.process.stdout)
+        self.assertFalse(any(path.exists() for path in done))
+        self.assertTrue(later.is_dir())
+
     def assert_real_owns_path_allowed(self, relative: str) -> None:
         self.production_doc(owns_cell=REAL_OWNS, hub_files=False)
         sha = self.checkpoint(relative, relative + "\n", subject="own " + relative)
@@ -342,8 +367,8 @@ class MergeCheckpointTests(unittest.TestCase):
     def test_real_owns_cell_still_reads_a_bare_name_as_a_root_file(self) -> None:
         self.assert_real_owns_path_allowed("merge_checkpoint.py")
 
-    def test_real_owns_cell_allows_delegate_path_in_last_group(self) -> None:
-        self.assert_real_owns_path_allowed("commands/unit/delegate.md")
+    def test_real_owns_cell_allows_a_path_in_the_last_group(self) -> None:
+        self.assert_real_owns_path_allowed("commands/unit/direct.md")
 
     def test_real_owns_cell_holds_an_outside_path(self) -> None:
         self.production_doc(owns_cell=REAL_OWNS, hub_files=False)
@@ -566,7 +591,7 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
         merged = self.git("rev-parse", "--short=8", "HEAD")
         self.assertRegex(review.read_text(encoding="utf-8").splitlines()[-1],
-                         rf"^\| C8 \| The grid fades gently \| \d{{4}}-\d\d-\d\d · {merged} \| not yet \| Run `hana` in a natedev terminal\. You see: The grid lines fade out farther away \|$")
+                         rf"^\| C8 \| The grid fades gently \| \d{{4}}-\d\d-\d\d · {merged} \| not yet \| Run `hana` in a natedev terminal\. You see: The grid lines fade out farther away \| example \|$")
         self.assertIn("change review: ok — 1 row(s) added", result.process.stdout)
         self.assertNotIn("change review: drift", result.process.stdout)
         self.assertEqual(self.git("status", "--porcelain"), "")
@@ -721,6 +746,33 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertIn("known flake crate-a", self.log.read_text(encoding="utf-8"))
         self.assertIn("known flake crate-b", self.log.read_text(encoding="utf-8"))
         self.assertEqual(len(self.events("verify.sh")), 4)
+
+    def test_known_flaky_tests_rerun_alone_and_an_unlisted_failure_stays_red(self) -> None:
+        """cargo-liner-style: a whole verify.sh merge test where two known flaky tests failed."""
+        reader = "shim_registration::reader_scenarios::reader_attributes_compiler_cache"
+        locale = "shim_registration::reader_scenarios::reader_accepts_live_writer_under_different_locale"
+        rows = "".join(f"        FAIL [  12.202s] ({count}/1067) cargo-tile::unit_tests {test}\n"
+                       for count, test in ((1012, reader), (1013, locale)))
+        # nextest prints each failure again after its Summary line.
+        _ = (self.state / "fail-rows").write_text(rows + "     Summary [ 80.1s] 1067 tests run\n" + rows)
+        sha = self.checkpoint()
+        self.known_flaky_tests = f"`{reader}`"
+        self.production_doc(merge_tests_line="- **Merge tests:** `verify.sh test cargo-tile`")
+        failed = self.run_checkpoint(sha)
+        self.assertIn("red: failed", failed.process.stdout)
+        self.assertEqual(self.git("rev-parse", "HEAD"), failed.before)
+        self.assertEqual(self.events("verify.sh"), [["test", "cargo-tile"], ["test", "cargo-tile"]])
+        (self.state / "events.jsonl").unlink()
+        self.known_flaky_tests = f"`{reader}`, `{locale}` — red only under load"
+        self.production_doc(merge_tests_line="- **Merge tests:** `verify.sh test cargo-tile`")
+        passed = self.run_checkpoint(sha)
+        self.assertEqual(passed.process.returncode, 0, passed.process.stderr + passed.process.stdout)
+        self.assertEqual(self.events("verify.sh"), [
+            ["test", "cargo-tile"],
+            ["test", "cargo-tile", "--filter", locale, "--filter", reader],
+        ])
+        self.assertIn(f"known flaky tests {locale}, {reader}: red in merge test 1, green alone",
+                      self.log.read_text(encoding="utf-8"))
 
     def test_rerun_after_origin_main_moves_skips_merge_branch_push_and_promotes_pushed_tip(self) -> None:
         self.promotions = str(self.promote)
