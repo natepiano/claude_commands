@@ -36,6 +36,16 @@ def style_family(unit: str) -> Family | NotStyleUnit:
     return NotStyleUnit()
 
 
+# The ranked families, highest first. On each file a family's work waits while a family ranked above it has open work
+# there. modules has no rank: structure blocking orders it.
+FAMILY_RANKS: tuple[Family, ...] = ("types", "values", "names")
+
+
+def ranked_above(family: Family) -> tuple[Family, ...]:
+    """The families ranked above family, highest first; none for the top family or an unranked one."""
+    return FAMILY_RANKS[:FAMILY_RANKS.index(family)] if family in FAMILY_RANKS else ()
+
+
 @dataclass(frozen=True)
 class RepoReach:
     """The rule governs the entire repository."""

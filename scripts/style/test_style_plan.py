@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import approved_renames
 import style_footprint
 import style_plan
+import unit_plans
 import style_proposals
 import proposal_issue
 from issues import frontmatter
@@ -227,7 +228,7 @@ class StylePlanTests(unittest.TestCase):
         _ = self.doc.write_text(prefix + "## Units\n\n| Unit | Plan | Worktree | Branch |\n"
                                 + "| --- | --- | --- | --- |\n" + "\n".join(rows) + "\n")
 
-        self.assertEqual(dict(style_plan.family_plan_texts(self.doc)), expected)
+        self.assertEqual(dict(unit_plans.family_plan_texts(self.doc)), expected)
 
     def test_next_phase_keeps_the_declared_plan_path_for_old_and_full_ids(self) -> None:
         _ = self.rule("read")
@@ -252,6 +253,8 @@ class StylePlanTests(unittest.TestCase):
                 self.ledger().ticket_drop(f"{unit}-1")
 
     def test_concurrent_refills_read_committed_tickets_and_choose_disjoint_files(self) -> None:
+        # The families here share files, so no rank holds one family back for another.
+        _ = self.enterContext(mock.patch.object(rules, "FAMILY_RANKS", ()))
         _ = self.rule("read")
         _ = self.rule("types-read", "tier: C\nfamily: types\ninput_scope: file\n")
         types = self.root / "types"
@@ -307,6 +310,75 @@ class StylePlanTests(unittest.TestCase):
                 self.assertTrue(first_ticket["files"])
                 self.assertTrue(second_ticket["files"])
                 self.assertTrue(set(first_ticket["files"]).isdisjoint(second_ticket["files"]))
+
+    def types_unit(self) -> Path:
+        """Add the types unit's worktree, branch and Units row at the main tip, and return its plan."""
+        types = self.root / "types"
+        _ = self.git("worktree", "add", "-q", "-b", "demo-style-types", str(types))
+        plan = types / "docs/style-production/units/types-unit.md"
+        plan.parent.mkdir(parents=True)
+        _ = plan.write_text(self.plan_header().replace("names-unit", "types-unit"))
+        _ = self.doc.write_text(self.doc.read_text() +
+                                f"| types-unit | docs/style-production/units/types-unit.md | {types} | demo-style-types |\n")
+        return plan
+
+    def names_files(self) -> set[str]:
+        return {path for ticket in self.candidates("names") for path in ticket.files}
+
+    def test_a_lower_rank_cell_waits_while_a_higher_rank_cell_on_its_file_is_open(self) -> None:
+        _ = self.types_unit()
+        _ = self.rule("read")
+        types = self.rule("types-read", "tier: C\nfamily: types\ninput_scope: file\n")
+        self.sync()
+        first = self.sources[0]
+        for path in self.sources[1:]:
+            self.record(types, path, self.tip)
+        # A file with no open types work is planned as before.
+        self.assertEqual(self.names_files(), set(self.sources[1:]))
+        code, output, errors = self.run_next()
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(output.splitlines().count(f"waiting names: {first} has open types work"), 1)
+        self.assertNotIn(first, self.ledger().ticket_open("names-unit")[0]["files"])
+        # The rank is read from the one table: with names ranked above types, names no longer waits.
+        with mock.patch.object(rules, "FAMILY_RANKS", ("names", "types", "values")):
+            self.assertEqual(self.names_files(), set(self.sources))
+
+    def test_a_lower_rank_cell_waits_while_a_higher_rank_decision_on_its_file_is_unbuilt(self) -> None:
+        _ = self.rule("read")
+        types = self.rule("types-read", "tier: C\nfamily: types\ninput_scope: file\n")
+        self.sync()
+        for path in self.sources:
+            self.record(types, path, self.tip)
+        self.assertEqual(self.names_files(), set(self.sources))
+        ledger = self.ledger()
+        blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == types)
+        finding = ledger.hold(types, self.sources[0], 1, "change", "type", "before", "after", blob, "outside")
+        ledger.file_held(finding.finding_id, self.root / "types-decision.md")
+        self.assertEqual(self.names_files(), set(self.sources[1:]))
+
+    def test_a_queued_lower_rank_ticket_is_dropped_while_a_higher_rank_cell_on_its_file_is_open(self) -> None:
+        _ = self.types_unit()
+        rule = self.rule("read")
+        types = self.rule("types-read", "tier: C\nfamily: types\ninput_scope: file\n")
+        self.sync()
+        first = self.sources[0]
+        for path in self.sources[1:]:
+            self.record(types, path, self.tip)
+        self.ledger().ticket_add("names-unit-1", "names-unit", "read", "names", "crates/alpha", [first], [rule])
+        code, output, errors = self.run_next()
+        self.assertEqual(code, 0, errors)
+        self.assertIn(f"dropped names-unit-1: {first} has open types work", output)
+        self.assertNotIn(first, self.ledger().ticket_open("names-unit")[0]["files"])
+
+    def test_a_filed_higher_rank_finding_holds_its_file_when_its_rule_has_no_cell(self) -> None:
+        types = self.rule("types-read", "tier: C\nfamily: types\ninput_scope: file\n")
+        self.sync()
+        ledger = self.ledger()
+        blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == types)
+        finding = ledger.hold(types, self.sources[0], 1, "change", "type", "before", "after", blob, "outside")
+        ledger.file_held(finding.finding_id, self.root / "types-decision.md")
+        scopes: dict[rules.Family, unit_plans.PilotScope] = {"types": unit_plans.AllCrates(), "names": unit_plans.AllCrates()}
+        self.assertEqual(set(style_proposals.ranked_work(ledger, (), scopes).waits("names")), {self.sources[0]})
 
     def test_full_id_queue_reads_retained_plan_settings_and_only_declared_units(self) -> None:
         _ = self.rule("read")
@@ -571,7 +643,7 @@ class StylePlanTests(unittest.TestCase):
                           list(self.sources[:2]), [rule], cells=tuple((rule, path) for path in self.sources[:2]))
         ticket = ledger.queued_tickets("modules-unit")[0]
         text = style_plan.phase_text(ticket, ledger.pinned_rule_texts(ticket["id"]), self.plan,
-                                     style_plan.delegation_context(self.plan.read_text()))
+                                     unit_plans.delegation_context(self.plan.read_text()))
         self.assertNotIn("A site that breaks more than one rule above", text)
         self.assertIn(
             "A defect several rules name is held once, under the rule it breaks most directly, "
@@ -587,7 +659,7 @@ class StylePlanTests(unittest.TestCase):
                           cells=tuple((rule, path) for rule in (structure, split) for path in self.sources[:2]))
         ticket = ledger.queued_tickets("modules-unit")[0]
         texts = ledger.pinned_rule_texts(ticket["id"])
-        context = style_plan.delegation_context(self.plan.read_text())
+        context = unit_plans.delegation_context(self.plan.read_text())
         baseline = style_plan.phase_text(ticket, tuple(pin for pin in texts if pin.rule_id != split),
                                          self.plan, context)
         self.assertNotIn("type clusters", baseline)
@@ -1311,7 +1383,7 @@ class StylePlanTests(unittest.TestCase):
     def test_comma_separated_scope_names_allow_each_named_member(self) -> None:
         _ = self.rule("read")
         self.sync()
-        scope = style_plan.parse_pilot_scope(
+        scope = unit_plans.parse_pilot_scope(
             self.plan_header().replace("## Phases", "**Pilot scope:** beta, alpha\n\n## Phases"), self.repo)
         ledger = self.ledger()
         tickets = style_plan.candidate_tickets(self.repo, ledger, style_plan.BusyFiles(self.board(), frozenset()), "names", scope,
@@ -1944,7 +2016,7 @@ class StylePlanTests(unittest.TestCase):
         ])
         ledger = self.ledger()
         scoped = style_plan.candidate_tickets(self.repo, ledger, style_plan.BusyFiles(self.board(), frozenset()),
-                                             "modules", style_plan.PilotCrates(frozenset({"crates/alpha"})),
+                                             "modules", unit_plans.PilotCrates(frozenset({"crates/alpha"})),
                                              base=self.base("modules"))
         self.assertEqual([(ticket.crate, ticket.kind) for ticket in scoped], [("crates/alpha", "structure")])
 
@@ -1961,8 +2033,8 @@ class StylePlanTests(unittest.TestCase):
 
         tickets = style_plan.candidate_tickets(
             self.repo, ledger, busy, "modules",
-            family_scopes={"modules": style_plan.AllCrates(),
-                           "names": style_plan.PilotCrates(frozenset({"crates/alpha"}))},
+            family_scopes={"modules": unit_plans.AllCrates(),
+                           "names": unit_plans.PilotCrates(frozenset({"crates/alpha"}))},
             base=self.base("modules"))
 
         self.assertEqual([ticket.crate for ticket in tickets], ["crates/alpha", "crates/beta"])
@@ -1985,7 +2057,7 @@ class StylePlanTests(unittest.TestCase):
         self.assertEqual(style_plan.candidate_tickets(self.repo, ledger, busy, "modules", base=self.base("modules"))[0].crate, "crates/beta")
 
         tickets = style_plan.candidate_tickets(
-            self.repo, ledger, busy, "modules", family_scopes=style_plan.family_pilot_scopes(self.doc, self.repo),
+            self.repo, ledger, busy, "modules", family_scopes=unit_plans.family_pilot_scopes(self.doc, self.repo),
             base=self.base("modules"))
 
         self.assertEqual([ticket.crate for ticket in tickets], ["crates/alpha", "crates/beta"])
@@ -1996,12 +2068,12 @@ class StylePlanTests(unittest.TestCase):
         _ = template.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** beta\n\n## Phases"))
         _ = self.doc.write_text(self.doc.read_text() + f"| product-unit | docs/product.md | {self.root / 'product'} | product |\n")
 
-        self.assertEqual(style_plan.family_pilot_scopes(self.doc, self.repo), {
-            "names": style_plan.PilotCrates(frozenset({"crates/alpha"})), "modules": style_plan.AllCrates(),
+        self.assertEqual(unit_plans.family_pilot_scopes(self.doc, self.repo), {
+            "names": unit_plans.PilotCrates(frozenset({"crates/alpha"})), "modules": unit_plans.AllCrates(),
         })
         self.plan.unlink()
-        self.assertEqual(style_plan.family_pilot_scopes(self.doc, self.repo), {
-            "names": style_plan.AllCrates(), "modules": style_plan.AllCrates(),
+        self.assertEqual(unit_plans.family_pilot_scopes(self.doc, self.repo), {
+            "names": unit_plans.AllCrates(), "modules": unit_plans.AllCrates(),
         })
 
     def test_modules_refill_and_queue_prioritize_the_crate_blocking_a_pilot_unit(self) -> None:
@@ -2057,6 +2129,8 @@ class StylePlanTests(unittest.TestCase):
         self.assertEqual([ticket.crate for ticket in self.candidates("modules")], ["crates/beta", "crates/alpha"])
 
     def test_other_family_keeps_stale_order_and_skips_pending_structure(self) -> None:
+        # The families here share files, so no rank holds one family back for another.
+        _ = self.enterContext(mock.patch.object(rules, "FAMILY_RANKS", ()))
         self.write("Cargo.toml", '[workspace]\nmembers = ["crates/alpha", "crates/beta", "crates/gamma"]\n')
         self.write("crates/gamma/Cargo.toml", '[package]\nname = "gamma"\nversion = "0.1.0"\n')
         gamma = "crates/gamma/src/lib.rs"
@@ -2161,7 +2235,7 @@ class StylePlanTests(unittest.TestCase):
                                   finding_ids=(finding.finding_id,) if kind == "proposal" else ())
                 ticket = ledger.queued_tickets("names-unit")[-1]
                 phase = style_plan.phase_text(ticket, ledger.pinned_rule_texts(ticket_id), self.plan,
-                                              style_plan.delegation_context(self.plan.read_text()),
+                                              unit_plans.delegation_context(self.plan.read_text()),
                                               file_windows={self.sources[0]: (style_plan.ReadWindow(1, 1),)})
                 self.assertIn("Read only these pinned rule texts.", phase)
                 self.assertIn("#uncovered rule is the parent rule's uncovered read.", phase)
@@ -2858,6 +2932,45 @@ class StylePlanTests(unittest.TestCase):
             _ = self.git("merge", "--ff-only", "main", cwd=checkout)
         self.sync()
 
+    def test_no_magic_decision_tickets_take_one_file_and_all_its_findings(self) -> None:
+        rule = self.rule("no-magic-values")
+        self.sync()
+        issue = self.approved_decision(rule, self.sources[:2], "restructure")
+        ledger = self.ledger()
+        blob = next(rule_.blob for rule_ in rules.load_rules(self.repo) if rule_.rule_id == rule)
+        second = ledger.hold(rule, self.sources[0], 1, "another value", "restructure", "42", "LIMIT", blob, "outside")
+        ledger.file_held(second.finding_id, issue)
+        _ = self.refill_decisions()
+        ticket, = ledger.ticket_open("names-unit")
+        self.assertEqual(ticket["files"], [self.sources[0]])
+        self.assertEqual(set(ticket["finding_ids"]), {f.finding_id for f in ledger.proposal_findings(issue) if f.path == self.sources[0]})
+
+    def test_decision_b_refill_and_queued_ticket_keep_only_rank_exempt_bindings(self) -> None:
+        _ = self.types_unit()
+        _ = self.rule("types-read", "tier: C\nfamily: types\ninput_scope: file\n")
+        rule = self.rule("prefer-type-named-fields-and-bindings")
+        source = "pub struct Parent { old: u32 }\nfn f() {\n    let old = 1;\n    consume(old);\n}\n"
+        self.commit_files({self.sources[0]: source})
+        issue, findings = self.judged_findings(rule, ((self.sources[0], 1, source.splitlines()[0]),
+                                                     (self.sources[0], 3, source.splitlines()[2])),
+                                              kind="rename", before="old", after="fresh")
+        _ = self.refill_decisions()
+        ledger = self.ledger()
+        ticket, = ledger.ticket_open("names-unit")
+        self.assertEqual((ticket["kind"], ticket["finding_ids"]), ("proposal", [findings[1].finding_id]))
+        ledger.ticket_drop(ticket["id"])
+        ledger.ticket_add("names-unit-99", "names-unit", "proposal", "names", "crates/alpha", [self.sources[0]], [rule],
+                          proposal=str(issue), finding_ids=(findings[1].finding_id,))
+        _ = self.refill_decisions()
+        self.assertEqual(ledger.ticket_open("names-unit")[0]["id"], "names-unit-99")
+        # The exemption never lifts the separate changed-since-judgment gate.
+        ledger.ticket_drop("names-unit-99")
+        self.commit_files({self.sources[0]: source + "fn unrelated() {}\n"})
+        with mock.patch.object(style_proposals, "proposal_command"):
+            _, output, _ = self.run_next()
+        self.assertIn(f"{findings[1].finding_id} {self.sources[0]} changed since it was judged", output)
+        self.assertFalse(any(t["kind"] == "proposal" for t in ledger.ticket_open("names-unit")))
+
     def test_decision_refill_makes_two_read_limit_tickets_for_twenty_six_type_files(self) -> None:
         rule = self.rule("types-decision")
         files = tuple(f"crates/alpha/src/piece_{index:02}.rs" for index in range(26))
@@ -3051,6 +3164,100 @@ class StylePlanTests(unittest.TestCase):
             code, output, errors = self.run_next()
         self.assertEqual(code, 0, errors)
         return output
+
+    def approved_then_changed(self) -> tuple[Path, style_ledger.HeldFinding, str]:
+        """A types unit runs. A names finding on the first source, judged by its ticket, is approved; a merge then
+        changes its file, and the decisions refill."""
+        _ = self.types_unit()
+        rule = self.rule("read")
+        site = self.sources[0]
+        self.commit_files({site: "pub struct Parent {\n    old: u32,\n}\n"})
+        issue, (finding,) = self.judged_findings(rule, ((site, 2, "old: u32,"),))
+        self.record(rule, site, self.tip, "modules-unit-1")
+        self.commit_files({site: "pub struct Parent {\n    old: u32,\n}\n\npub struct Typed;\n"})
+        output = self.refill_decisions()
+        # The merge made the finding's cell stale, so the refill gives its file to a ticket that judges it again.
+        ledger = self.ledger()
+        reading = ledger.ticket_open("names-unit")[0]
+        self.assertEqual(reading["kind"], "read")
+        self.assertIn(site, reading["files"])
+        ledger.ticket_drop(reading["id"])
+        return issue, finding, output
+
+    def rejudge(self, finding: style_ledger.HeldFinding, *, holds: bool) -> None:
+        """A later read ticket judges the finding's changed file, and holds its change again or records it clean."""
+        ledger = self.ledger()
+        ledger.ticket_add("modules-unit-2", "modules-unit", "read", "names", "crates/alpha", [finding.path], [finding.rule])
+        ledger.ticket_assign("modules-unit-2", "style/main")
+        _ = ledger.ticket_base("modules-unit-2")
+        if holds:
+            _ = ledger.hold(finding.rule, finding.path, finding.line, finding.text, finding.kind, finding.before,
+                            finding.after, finding.rule_blob, "modules-unit-2")
+        else:
+            self.record(finding.rule, finding.path, self.tip, "modules-unit-2")
+        ledger.ticket_drop("modules-unit-2")
+
+    def test_an_approved_lower_rank_finding_at_a_changed_file_builds_once_the_judgment_of_that_file_holds_it_again(self) -> None:
+        issue, finding, output = self.approved_then_changed()
+        self.assertIn(f"waiting {issue}: {finding.finding_id} {finding.path} changed since it was judged", output)
+        self.assertEqual(self.ledger().proposal_tickets(), ())
+        self.rejudge(finding, holds=True)
+        _ = self.refill_decisions()
+        ticket = self.ledger().ticket_open("names-unit")[0]
+        self.assertEqual((ticket["kind"], ticket["finding_ids"]), ("proposal", [finding.finding_id]))
+
+    def test_an_approved_lower_rank_finding_at_a_changed_file_is_waived_when_the_judgment_of_that_file_does_not_hold_it(self) -> None:
+        issue, finding, _ = self.approved_then_changed()
+        self.rejudge(finding, holds=False)
+        output = self.refill_decisions()
+        self.assertRegex(output, rf"waived 1 findings in {re.escape(str(issue))}: {re.escape(finding.path)} judged again in judgment \d+ without it")
+        row, = self.ledger().proposal_findings(issue)
+        self.assertEqual(row.state, style_ledger.Waived())
+        self.assertEqual(self.ledger().proposal_tickets(), ())
+
+    def test_a_queued_proposal_for_a_lower_rank_finding_judged_at_an_older_file_is_dropped(self) -> None:
+        issue, finding, _ = self.approved_then_changed()
+        self.ledger().ticket_add("names-unit-9", "names-unit", "proposal", "names", "crates/alpha", [finding.path],
+                                 [finding.rule], proposal=str(issue), finding_ids=(finding.finding_id,))
+        output = self.refill_decisions()
+        self.assertIn(f"dropped names-unit-9: {finding.finding_id} {finding.path} changed since it was judged", output)
+        self.assertEqual([ticket["id"] for ticket in self.ledger().proposal_tickets() if ticket["state"] != "dropped"], [])
+
+    def test_a_followed_finding_is_settled_by_a_later_judgment_of_its_new_file(self) -> None:
+        rule = self.rule("read")
+        site = self.sources[0]
+        self.commit_files({site: "pub struct Parent {\n    old: u32,\n}\n"})
+        issue, (finding,) = self.judged_findings(rule, ((site, 2, "old: u32,"),))
+        self.record(rule, site, self.tip, "modules-unit-1")
+        self.write_generated_body(issue)
+        _ = self.git("rm", "-q", site)
+        self.commit_files({"crates/alpha/src/moved.rs": "pub struct Parent {\n    old: u32,\n}\n"})
+        _ = self.refill_decisions()
+        followed, = self.ledger().proposal_findings(issue)
+        self.assertEqual((followed.finding_id, followed.path), (finding.finding_id, "crates/alpha/src/moved.rs"))
+        definition = next(item for item in rules.load_rules(self.repo) if item.rule_id == rule)
+        self.assertEqual(self.ledger().judged_again_without(followed, definition), style_ledger.NotJudgedAgain())
+        self.record(rule, followed.path, self.tip, "modules-unit-2")
+        self.assertIsInstance(self.ledger().judged_again_without(followed, definition), style_ledger.SupersedingJudgment)
+
+    def test_a_followed_finding_is_not_settled_by_a_later_judgment_of_an_older_new_file(self) -> None:
+        rule = self.rule("read")
+        site = self.sources[0]
+        self.commit_files({site: "pub struct Parent {\n    old: u32,\n}\n"})
+        issue, _ = self.judged_findings(rule, ((site, 2, "old: u32,"),))
+        self.record(rule, site, self.tip, "modules-unit-1")
+        self.write_generated_body(issue)
+        _ = self.git("rm", "-q", site)
+        self.commit_files({"crates/alpha/src/moved.rs": "pub struct Parent {\n    old: u32,\n}\n"})
+        _ = self.refill_decisions()
+        followed, = self.ledger().proposal_findings(issue)
+        moved = self.tip
+        self.commit_files({"crates/alpha/src/moved.rs": "pub struct Parent {\n    old: u32,\n}\n\npub struct Typed;\n"})
+        definition = next(item for item in rules.load_rules(self.repo) if item.rule_id == rule)
+        self.record(rule, followed.path, moved, "modules-unit-2")
+        self.assertEqual(self.ledger().judged_again_without(followed, definition), style_ledger.NotJudgedAgain())
+        self.record(rule, followed.path, self.tip, "modules-unit-3")
+        self.assertIsInstance(self.ledger().judged_again_without(followed, definition), style_ledger.SupersedingJudgment)
 
     def test_refill_uses_an_outside_follow_and_names_an_unproved_mapped_declaration(self) -> None:
         site, destination = self.sources[:2]
@@ -3697,6 +3904,62 @@ class StylePlanTests(unittest.TestCase):
             self.write(self.sources[0], "".join(f"enum {parent} {{ {', '.join(names)} }}\n"
                                                 for parent, names in declared.items()))
         return "names-unit-1"
+
+    def approved_binding_ticket(self, source: str, pairs: tuple[tuple[int, str, str], ...],
+                                save_base: bool = False) -> tuple[str, tuple[str, ...]]:
+        self.write(self.sources[0], source)
+        _ = self.commit()
+        rule = self.rule("prefer-type-named-fields-and-bindings")
+        issue = self.root / "binding-approval.md"
+        ledger = self.ledger()
+        blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+        ids: list[str] = []
+        for line, old, new in pairs:
+            finding = ledger.hold(rule, self.sources[0], line, source.splitlines()[line - 1], "rename",
+                                  old, new, blob, "outside")
+            ledger.file_held(finding.finding_id, issue)
+            ids.append(finding.finding_id)
+        _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names-unit\nplan: approved\n"
+                             + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
+        ticket = "names-unit-1"
+        ledger.ticket_add(ticket, "names-unit", "proposal", "names", "crates/alpha", [self.sources[0]], [rule],
+                          proposal=str(issue), finding_ids=tuple(ids))
+        if save_base:
+            ledger.ticket_assign(ticket, "main")
+            _ = ledger.ticket_base(ticket)
+        return ticket, tuple(ids)
+
+    def test_binding_gate_reports_an_unapplied_rename_from_head_until_its_scope_is_changed(self) -> None:
+        source = "fn f() {\n    let old = input;\n    consume(old);\n}\n"
+        ticket, (identity,) = self.approved_binding_ticket(source, ((2, "old", "fresh"),))
+        expected = f"review: {identity}: old -> fresh not applied in {self.sources[0]}\n"
+        self.assertEqual(self.reference_gate(ticket), (1, expected))
+        self.write(self.sources[0], source.replace("old", "fresh"))
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+
+    def test_binding_gate_checks_all_pairs_together_from_saved_base_after_head_changes(self) -> None:
+        source = "fn f() {\n    let old = input;\n    let second = old;\n    consume(second);\n}\n"
+        ticket, ids = self.approved_binding_ticket(source, ((2, "old", "fresh"), (3, "second", "next")), save_base=True)
+        self.write(self.sources[0], source.replace("old", "fresh"))
+        _ = self.commit()
+        self.assertEqual(self.reference_gate(ticket),
+                         (1, f"review: {ids[1]}: second -> next not applied in {self.sources[0]}\n"))
+        self.write(self.sources[0], source.replace("old", "fresh").replace("second", "next"))
+        with mock.patch.object(style_plan, "binding_rename_check", wraps=approved_renames.binding_rename_check) as proof:
+            self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+            self.assertEqual(proof.call_count, 1)
+            self.assertEqual(len(cast(tuple[approved_renames.BindingRename, ...], proof.call_args.args[3])), 2)
+
+    def test_binding_gate_keeps_identical_pairs_in_different_paths_separate(self) -> None:
+        source = "fn f() {\n    let old = input;\n    consume(old);\n}\n"
+        for path in self.sources[:2]:
+            self.write(path, source)
+        _ = self.commit()
+        rename = approved_renames.BindingRename(2, source.splitlines()[1], "old", "fresh")
+        self.write(self.sources[0], source.replace("old", "fresh"))
+        checks = style_plan.binding_worktree_checks(self.repo, {p: (rename,) for p in self.sources[:2]}, "")
+        self.assertEqual(checks[self.sources[0]][rename], approved_renames.AppliedInCode())
+        self.assertEqual(checks[self.sources[1]][rename], approved_renames.RenameNotApplied(self.sources[1]))
 
     def write_approved_phase(self) -> None:
         """Write the phase of the queued approved ticket at a synced tip, where the ledger finds the cells that record takes."""

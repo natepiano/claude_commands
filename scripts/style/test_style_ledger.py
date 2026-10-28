@@ -25,7 +25,8 @@ from unittest import mock
 
 import rules
 import style_ledger
-from approved_renames import AppliedCheck, AppliedInCode, Folder, NoAppliedCheck, RenameNotApplied
+from approved_renames import (AppliedCheck, AppliedInCode, BindingRename, Folder, NoAppliedCheck, RenameNotApplied,
+                              binding_rename_check)
 import style_plan
 import style_rules
 import berth_board
@@ -423,6 +424,181 @@ class StyleLedgerTests(unittest.TestCase):
         ledger.file_held(finding.finding_id, issue)
         return finding, issue
 
+    def binding_ticket(self, source: str, pairs: tuple[tuple[int, str, str], ...]) -> tuple[style_ledger.Ledger, Path, str]:
+        rule = self.rule("prefer-type-named-fields-and-bindings")
+        path = self.sources[0]
+        self.write(path, source)
+        base = self.commit("Binding declarations before the ticket")
+        ledger = self.ledger()
+        issue = self.root / "bindings.md"
+        ids: list[str] = []
+        for line, old, new in pairs:
+            finding = ledger.hold(rule, path, line, source.splitlines()[line - 1], "rename", old, new, self.blob(rule), "outside")
+            ledger.file_held(finding.finding_id, issue)
+            ids.append(finding.finding_id)
+        ledger.ticket_add("names-1", "names", "proposal", "names", "crates/alpha", [path], [rule],
+                          proposal=str(issue), finding_ids=tuple(ids))
+        ledger.ticket_assign("names-1", "main")
+        self.assertEqual(ledger.ticket_base("names-1"), base)
+        return ledger, issue, base
+
+    def test_binding_carry_restamps_types_and_follows_open_sites_through_reflow(self) -> None:
+        source = "fn f() {\n    let old = input;\n    consume(old);\n}\n"
+        ledger, _, base = self.binding_ticket(source, ((2, "old", "fresh"),))
+        path = self.sources[0]
+        types = self.rule("types-read", "tier: C\nfamily: types\ninput_scope: file\n")
+        # The types read predates the rename ticket but reads exactly the base blob.
+        ledger.ticket_add("types-1", "types", "read", "types", "crates/alpha", [path], [types])
+        ledger.ticket_assign("types-1", "main")
+        _ = ledger.ticket_base("types-1")
+        ledger.ticket_drop("types-1")
+        findings = tuple(ledger.hold(types, path, line, source.splitlines()[line - 1], "type", "u32", "Count",
+                                     self.blob(types), "types-1") for line in (2, 3))
+        ledger.file_held(findings[1].finding_id, self.root / "types.md")
+        ledger.record(types, path, base, self.blob(types), "held", ticket="types-1", worker="judge",
+                      input_scope=style_ledger.DeclaredInputScope.RULE)
+        crate_types = self.rule("crate-types", "tier: C\nfamily: types\ninput_scope: crate\n")
+        reads_types = self.rule("reads-types", "tier: C\nfamily: types\ninput_scope: crate\n")
+        for rule in (crate_types, reads_types):
+            ledger.record(rule, path, base, self.blob(rule), "clean", ticket="outside", worker="judge",
+                          input_scope=style_ledger.DeclaredInputScope.RULE,
+                          reads=(self.sources[1],) if rule == reads_types else style_ledger.NO_READ_FILES)
+        self.write(path, source.replace("old", "fresh").replace("    let", "\n    let"))
+        checkpoint = self.commit("Rename and reflow")
+        ledger.set_tip(checkpoint, "main")
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        self.assertTrue(all(isinstance(f.follow, style_ledger.NotFollowed) for f in ledger.named_held([f.finding_id for f in findings])))
+        _ = ledger.ticket_merge("names-1")
+        moved = tuple(sorted(ledger.named_held([f.finding_id for f in findings]), key=lambda f: f.line))
+        self.assertEqual([f.line for f in moved], [3, 4])
+        self.assertEqual([f.text for f in moved], ["    let fresh = input;", "    consume(fresh);"])
+        self.assertEqual([f.follow for f in moved], [style_ledger.FollowedDeclaration(path, line, checkpoint) for line in (2, 3)])
+        self.assertEqual([style_ledger.held_state_name(f.state) for f in moved], ["unfiled", "filed"])
+        self.assertEqual([f.ticket for f in moved], ["types-1", "types-1"])
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            rows = connection.execute('SELECT "commit",ticket,worker,verdict FROM judgments WHERE rule=? ORDER BY id', (types,)).fetchall()
+        self.assertEqual(rows, [(base, "types-1", "judge", "held"), (checkpoint, "types-1", "judge", "held")])
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            carried_rules = connection.execute('SELECT rule FROM judgments WHERE "commit"=? ORDER BY rule', (checkpoint,)).fetchall()
+        self.assertEqual(carried_rules, [(rule,) for rule in sorted((types, crate_types, reads_types))])
+        self.assertEqual(next(ledger.cells(rule=types)).state, "current")
+        # A repeated merge cannot restamp or follow twice.
+        _ = ledger.ticket_merge("names-1")
+        self.assertEqual(tuple(sorted(ledger.named_held([f.finding_id for f in findings]), key=lambda f: f.line)), moved)
+
+    def test_binding_carry_rejects_a_late_judgment_before_deletion_and_identical_restore(self) -> None:
+        source = "fn f() {\n    let old = input;\n    consume(old);\n}\n"
+        path = self.sources[0]
+        types = self.rule("types-read", "tier: C\nfamily: types\ninput_scope: file\n")
+        self.write(path, source)
+        original = self.commit("Original binding before deletion")
+        ledger = self.ledger()
+        ledger.ticket_add("types-1", "types", "read", "types", "crates/alpha", [path], [types])
+        ledger.ticket_assign("types-1", "main")
+        self.assertEqual(ledger.ticket_base("types-1"), original)
+        (self.repo / path).unlink()
+        deleting = self.commit("Delete the types cell")
+        self.record_removed(ledger, types, path, deleting, ticket="types-1")
+        # The rename ticket starts at a byte-identical restoration of the deleted file.
+        ledger, _, base = self.binding_ticket(source, ((2, "old", "fresh"),))
+        self.assertEqual(self.git("rev-parse", f"{original}:{path}"), self.git("rev-parse", f"{base}:{path}"))
+        ledger.record(types, path, original, self.blob(types), "clean", ticket="types-1", worker="late-judge",
+                      input_scope=style_ledger.DeclaredInputScope.RULE)
+        ledger.set_tip(base, "main")
+        self.assertEqual(next(ledger.cells(rule=types)).state, "open")
+        self.write(path, source.replace("old", "fresh"))
+        checkpoint = self.commit("Proven binding rename after restoration")
+        ledger.set_tip(checkpoint, "main")
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        ticket, = ledger.proposal_tickets()
+        self.assertEqual(ledger.binding_carry_forward(ticket, checkpoint), style_ledger.BindingCarryForward())
+        self.assertEqual(ledger.ticket_merge("names-1"), ())
+        self.assertEqual(self.cell_rows(ledger, path), [(deleting, "removed"), (original, "clean")])
+        self.assertEqual(next(ledger.cells(rule=types)).state, "open")
+
+    def test_binding_carry_requires_whole_file_proof_current_rule_and_unchanged_other_inputs(self) -> None:
+        source = "fn f() {\n    let old = input;\n    consume(old);\n}\n"
+        ledger, _, base = self.binding_ticket(source, ((2, "old", "fresh"),))
+        path, other = self.sources[:2]
+        carried = self.rule("carried-types", "tier: C\nfamily: types\ninput_scope: file\n")
+        reads = self.rule("reads-types", "tier: C\nfamily: types\ninput_scope: crate\n")
+        crate = self.rule("crate-types", "tier: C\nfamily: types\ninput_scope: crate\n")
+        changed = self.rule("changed-types", "tier: C\nfamily: types\ninput_scope: file\n")
+        old_blob = self.rule("older-file-types", "tier: C\nfamily: types\ninput_scope: file\n")
+        ledger.record(old_blob, path, self.initial_tip, self.blob(old_blob), "clean", ticket="types", worker="judge",
+                      input_scope=style_ledger.DeclaredInputScope.RULE)
+        for rule in (carried, crate, changed):
+            ledger.record(rule, path, base, self.blob(rule), "clean", ticket="types", worker="judge",
+                          input_scope=style_ledger.DeclaredInputScope.RULE)
+        ledger.record(reads, path, base, self.blob(reads), "clean", ticket="types", worker="judge",
+                      input_scope=style_ledger.DeclaredInputScope.RULE, reads=(other,))
+        _ = self.rule("changed-types", "tier: C\nfamily: types\ninput_scope: file\nmode: propose\n")
+        self.write(path, source.replace("old", "fresh"))
+        self.write(other, "fn another_change() {}\n")
+        checkpoint = self.commit("Rename plus another input changed")
+        ledger.set_tip(checkpoint, "main")
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        _ = ledger.ticket_merge("names-1")
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            restamped = connection.execute('SELECT rule FROM judgments WHERE "commit"=?', (checkpoint,)).fetchall()
+        self.assertEqual(restamped, [(carried,)])
+        # A proof that applies one rename but cannot explain another token never carries types work.
+        # Use the same public planning operation on a fresh checkpoint; it must refuse the whole path.
+        self.write(path, source.replace("old", "fresh").replace("input", "different"))
+        unproved = self.commit("Unexplained token change")
+        ticket = ledger.proposal_tickets()[0]
+        self.assertEqual(ledger.binding_carry_forward(ticket, unproved), style_ledger.BindingCarryForward())
+
+    def test_binding_applied_check_groups_the_ticket_path_and_caches_each_commit(self) -> None:
+        source = "fn f() {\n    let old = input;\n    let second = old;\n    consume(second);\n}\n"
+        ledger, issue, base = self.binding_ticket(source, ((2, "old", "fresh"), (3, "second", "next")))
+        findings = ledger.proposal_findings(issue)
+        self.write(self.sources[0], source.replace("old", "fresh").replace("second", "next"))
+        checkpoint = self.commit("Rename both bindings")
+        with mock.patch.object(style_ledger, "binding_rename_check", wraps=binding_rename_check) as proof:
+            self.assertEqual([ledger.applied_check(finding, checkpoint) for finding in findings], [AppliedInCode()] * 2)
+            self.assertEqual(proof.call_count, 1)
+            self.assertEqual(len(cast(tuple[BindingRename, ...], proof.call_args.args[3])), 2)
+            self.assertEqual([ledger.applied_check(finding, base) for finding in findings],
+                             [RenameNotApplied(self.sources[0])] * 2)
+            self.assertEqual(proof.call_count, 2)
+        ledger.set_tip(checkpoint, "main")
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        self.assertEqual(ledger.ticket_merge("names-1"), ())
+        self.assertTrue(all(isinstance(f.state, style_ledger.Built) for f in ledger.proposal_findings(issue)))
+        self.assertTrue(all(isinstance(f.reading, style_ledger.NotReadByPerson) for f in ledger.proposal_findings(issue)))
+        # A fresh ledger must group built findings too.
+        fresh = self.ledger()
+        self.assertEqual([fresh.applied_check(f, checkpoint) for f in fresh.proposal_findings(issue)], [AppliedInCode()] * 2)
+
+    def test_binding_merge_keeps_unapplied_and_unproved_findings_filed(self) -> None:
+        source = "fn f() {\n    let old = input;\n    consume(old);\n    let second = input;\n    consume(second);\n}\n"
+        ledger, issue, _ = self.binding_ticket(source, ((2, "old", "fresh"), (4, "second", "next")))
+        # One declaration changed without its use; the other rename was never attempted.
+        self.write(self.sources[0], source.replace("let old", "let fresh"))
+        checkpoint = self.commit("Incomplete rename")
+        findings = ledger.proposal_findings(issue)
+        by_old = {f.before: ledger.applied_check(f, checkpoint) for f in findings}
+        self.assertEqual(by_old, {"old": NoAppliedCheck("rename"), "second": RenameNotApplied(self.sources[0])})
+        ledger.set_tip(checkpoint, "main")
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        _ = ledger.ticket_merge("names-1")
+        self.assertTrue(all(isinstance(f.state, style_ledger.Filed) for f in ledger.proposal_findings(issue)))
+
+    def test_binding_check_needs_a_build_ticket_with_a_saved_base(self) -> None:
+        source = "fn f() {\n    let old = input;\n    consume(old);\n}\n"
+        ledger, issue, _ = self.binding_ticket(source, ((2, "old", "fresh"),))
+        self.write(self.sources[0], source.replace("old", "fresh"))
+        checkpoint = self.commit("Rename without a saved base")
+        finding, = ledger.proposal_findings(issue)
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE tickets SET base='' WHERE id='names-1'")
+        self.assertEqual(ledger.applied_check(finding, checkpoint), NoAppliedCheck("rename"))
+        ledger.ticket_drop("names-1")
+        finding, = ledger.proposal_findings(issue)
+        self.assertIsInstance(finding.build_ticket, style_ledger.NoBuildTicket)
+        self.assertEqual(ledger.applied_check(finding, checkpoint), NoAppliedCheck("rename"))
+
     def test_a_file_rename_check_reads_which_file_is_at_the_commit(self) -> None:
         finding, _ = self.file_rename_finding()
         old, new = "crates/alpha/src/ledger/lock.rs", "crates/alpha/src/ledger/mutation_lock.rs"
@@ -816,6 +992,7 @@ class StyleLedgerTests(unittest.TestCase):
             _ = connection.execute("DROP TABLE ticket_widened_paths")
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_session_dir")
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_phase")
+            _ = connection.execute("ALTER TABLE processed_tips DROP COLUMN reason")
             _ = connection.execute("UPDATE schema_version SET version=18")
         migrated = self.ledger()
         finding, = migrated.named_held((finding_id,))
@@ -4664,6 +4841,7 @@ class StyleLedgerTests(unittest.TestCase):
             _ = connection.execute("DROP TABLE ticket_widened_paths")
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_session_dir")
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_phase")
+            _ = connection.execute("ALTER TABLE processed_tips DROP COLUMN reason")
             _ = connection.execute("UPDATE schema_version SET version=8")
             connection.commit()
         migrated = self.ledger()
@@ -7007,6 +7185,21 @@ class StyleLedgerTests(unittest.TestCase):
         _ = self.git("commit", "--allow-empty", "-q", "-m", "New tip with same tree")
         self.assertEqual(self.cli("tip", "seen", "--tip", "HEAD").stdout.strip(), "new")
 
+    def test_migration_23_preserves_processed_tips_as_linted(self) -> None:
+        database = self.root / "legacy.sqlite"
+        with closing(sqlite3.connect(database)) as connection, connection:
+            for number, migration in sorted(style_ledger.MIGRATIONS.items()):
+                if number < 23:
+                    _ = connection.executescript(migration)
+            _ = connection.execute("CREATE TABLE schema_version(version INTEGER NOT NULL)")
+            _ = connection.execute("INSERT INTO schema_version VALUES (22)")
+            _ = connection.execute("INSERT INTO processed_tips VALUES (?,?)", (self.initial_tip, "2026-10-27"))
+        with style_ledger.Ledger(self.repo, database) as ledger:
+            self.assertEqual(ledger.tip_seen(self.initial_tip), "linted")
+        with closing(sqlite3.connect(database)) as connection:
+            self.assertEqual(connection.execute("SELECT * FROM processed_tips").fetchone(),
+                             (self.initial_tip, "2026-10-27", "linted"))
+
     def test_handoffs_require_ancestry_and_keep_sent_items_pending(self) -> None:
         self.set_tip(self.initial_tip)
         _ = self.git("checkout", "-q", "-b", "style/main")
@@ -7840,6 +8033,7 @@ class StyleLedgerTests(unittest.TestCase):
             _ = connection.execute("DROP TABLE rule_candidates")
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_session_dir")
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_phase")
+            _ = connection.execute("ALTER TABLE processed_tips DROP COLUMN reason")
             _ = connection.execute("UPDATE schema_version SET version=6")
             connection.commit()
         with style_ledger.open_ledger(self.repo) as migrated:

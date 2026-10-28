@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -21,11 +22,13 @@ from typing import Literal, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS / "production"))
+sys.path.insert(0, str(SCRIPTS / "lib"))
 
 from add_style import NoStyleProduction, standing_style_production
 from production_units import Refusal
 import showrunners
 import style_ledger
+import scratch
 
 PYTHON = SCRIPTS / "lib/py"
 SEND = SCRIPTS / "message/send.py"
@@ -122,6 +125,20 @@ def git(repo: Path, *arguments: str) -> str:
     if result.returncode:
         raise Refusal(result.stderr.strip() or f"git {' '.join(arguments)} failed")
     return result.stdout.strip()
+
+
+def own_handoff(repo: Path, tip: str, style_branch: str) -> int:
+    """Finish a tip holding the style branch's own tree without a new lint run."""
+    tip = git(repo, "rev-parse", "--verify", f"{tip}^{{commit}}")
+    style_branch = "refs/heads/" + style_branch.removeprefix("refs/heads/")
+    tree = git(repo, "rev-parse", "--verify", f"{tip}^{{tree}}")
+    if tree != git(repo, "rev-parse", "--verify", f"{style_branch}^{{tree}}"):
+        return 1
+    with style_ledger.open_ledger(repo) as ledger:
+        ledger.set_tip(tip, style_branch)
+        ledger.tip_done(tip, "own hand-off")
+    print("seen (own hand-off: synced with no lint run)")
+    return 0
 
 
 class LintStopped(BaseException):
@@ -249,7 +266,8 @@ def remove_lint_dir(repo: Path, directory: Path) -> bool:
     git removes the registration of a deleted checkout, also one without its `.git` file, which it
     refuses to validate while the checkout exists. `--force` twice also removes a locked registration,
     which a killed `worktree add` leaves and `git worktree prune` keeps. When either step fails,
-    the dir keeps its owner record, so the next sweep retries it.
+    the dir keeps its owner record, so the next sweep retries it. rmtree unlinks checkout/target
+    without following it, keeping the repo's warm target.
     """
     snapshot = directory / "checkout"
     # git lists the real path of the dir it was given; only the lint dir is resolved, never the checkout.
@@ -309,6 +327,23 @@ def sweep_stale_lint_dirs() -> None:
             print(f"style_sync: sweep {directory}: " + " ".join(str(error).splitlines()))
 
 
+def lint_target(common_dir: Path) -> Path:
+    """One Cargo target per main repo, held until its standing style production wraps."""
+    target = common_dir / "style-sync-target"
+    target.mkdir(exist_ok=True)
+    _ = scratch.hold(target, f"run:{common_dir.parent.name}-style", "standing style production sync lint target")
+    return target
+
+
+@contextmanager
+def locked_lint_target(common_dir: Path) -> Generator[Path]:
+    """Serialize checkout creation through cleanup, so source times postdate prior fingerprints."""
+    target = lint_target(common_dir)
+    with (target / "sync.lock").open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        yield target
+
+
 def lint(repo: Path, checkout: Path, tip: str) -> int:
     """Judge the requested commit, never a style branch with additional fixes."""
     tip = git(checkout, "rev-parse", "--verify", f"{tip}^{{commit}}")
@@ -317,16 +352,20 @@ def lint(repo: Path, checkout: Path, tip: str) -> int:
         raise Refusal("--repo and --checkout must belong to the same repository")
     sweep_stale_lint_dirs()
     # Signals stay held outside the work, so the dir never exists without its record and its cleanup path.
-    with stop_signals_raise(), signal_mask(signal.SIG_BLOCK):
+    with stop_signals_raise(), locked_lint_target(Path(common_dir)) as target, signal_mask(signal.SIG_BLOCK):
         directory = Path(tempfile.mkdtemp(prefix=LINT_PREFIX, dir=LINT_TEMP_PARENT))
         snapshot = directory / "checkout"
         try:
             OwnerRecord(os.getpid(), Path(common_dir)).write(directory)
             with signal_mask(signal.SIG_UNBLOCK):
                 _ = git(checkout, "worktree", "add", "--detach", str(snapshot), tip)
+                target_link = snapshot / "target"
+                target_link.symlink_to(target, target_is_directory=True)
                 returncode, output = verify_lint(directory)
                 print(output, end="")
-                rewritten = bool(git(snapshot, "status", "--porcelain"))
+                # The generated target link is ours, including in a repo without a target ignore rule.
+                rewritten = bool(git(snapshot, "status", "--porcelain", "--", ".", ":(exclude)target"))
+                rewritten = rewritten or not target_link.is_symlink() or target_link.readlink() != target
                 records = lint_records(output, snapshot)
                 for record in records:
                     passed = record.passed and not rewritten
@@ -514,6 +553,10 @@ def main(argv: list[str] | None = None) -> int:
     _ = run_lint.add_argument("--repo", type=Path, required=True)
     _ = run_lint.add_argument("--checkout", type=Path, required=True)
     _ = run_lint.add_argument("--tip", required=True)
+    own = commands.add_parser("own-handoff")
+    _ = own.add_argument("--repo", type=Path, required=True)
+    _ = own.add_argument("--tip", required=True)
+    _ = own.add_argument("--style-branch", required=True)
     replay = commands.add_parser("resume")
     handoff = commands.add_parser("send-handoff")
     wake = commands.add_parser("wake-waiters")
@@ -530,6 +573,8 @@ def main(argv: list[str] | None = None) -> int:
         notify(cast(Path, args.repo_dir), cast(str, args.branch), cast(str, args.tip))
         return 0
     try:
+        if cast(str, args.command) == "own-handoff":
+            return own_handoff(cast(Path, args.repo), cast(str, args.tip), cast(str, args.style_branch))
         if cast(str, args.command) == "wake-waiters":
             wake_waiters(cast(Path, args.repo), cast(str, args.ticket))
             return 0
@@ -542,7 +587,7 @@ def main(argv: list[str] | None = None) -> int:
     except LintStopped as stopped:
         print(f"style_sync: {stopped}", file=sys.stderr)
         return 128 + stopped.signum
-    except (Refusal, style_ledger.LedgerError, OSError, ValueError, subprocess.TimeoutExpired) as error:
+    except (Refusal, style_ledger.LedgerError, scratch.ScratchError, OSError, ValueError, subprocess.TimeoutExpired) as error:
         print("style_sync: " + " ".join(str(error).splitlines()), file=sys.stderr)
         return 2
 

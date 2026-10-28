@@ -242,6 +242,34 @@ class ActionTest(unittest.TestCase):
         self.assertEqual(run("add", "--production", DOC, "--list", str(self.fresh), "--change", "A", "--check", "B", "--see", "C")[1], "C1\n")
         self.assertIn(f"| C1 | A | {day} | B. You see: C |", self.fresh.read_text(encoding="utf-8"))
 
+    def test_add_refuses_a_second_row_for_the_same_merge_and_change_in_a_short_or_long_hash(self) -> None:
+        add = ("add", "--production", DOC, "--list", str(self.path), "--change", "Tabs", "--check", "Look", "--see", "It")
+        self.assertEqual(run(*add, "--merged", "216c4e1")[:2], (0, "C81\n"))
+        before = self.path.read_text(encoding="utf-8")
+        for merged in ("216c4e1d", "216c4e1"):
+            with self.subTest(merged=merged):
+                code, output, error = run(*add, "--merged", merged)
+                self.assertEqual((code, output), (1, ""))
+                self.assertIn(f"C81 already holds that change from merge {merged}", error)
+                self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+        # Another merge of the same change, and another change of the same merge, are new rows.
+        self.assertEqual(run(*add, "--merged", "9e03c9ad")[:2], (0, "C82\n"))
+        self.assertEqual(run(*add[:-6], "--change", "Spaces", "--check", "Look", "--see", "It", "--merged", "216c4e1d")[:2],
+                         (0, "C83\n"))
+
+    def test_a_style_productions_change_is_credited_to_its_parent(self) -> None:
+        parent = self.path.parent / "parent-production.md"
+        _ = parent.write_text("- **Merge branch:** main\n", encoding="utf-8")
+        style = self.path.parent / "parent-style-production.md"
+        _ = style.write_text(f"- **Kind:** style\n- **Parent production:** {parent}\n", encoding="utf-8")
+        self.assertEqual(change_review.credited(style), parent)
+        self.assertEqual(change_review.credited(parent), parent)
+        rows = change_review.append_rows(self.path, [Visible("A", "B", "C")], date(2026, 10, 27), "216c4e1d", style,
+                                         owners=[style])
+        self.assertTrue(rows[0].endswith("| parent |"), rows)
+        rows = change_review.append_rows(self.path, [Visible("D", "B", "C")], date(2026, 10, 27), "", style)
+        self.assertTrue(rows[0].endswith("| parent |"), rows)
+
     def test_add_holds_each_folder_by_the_new_row(self) -> None:
         held = self.path.parent / "shown-repo"
         held.mkdir()
@@ -649,6 +677,24 @@ class RepositoryTest(unittest.TestCase):
         self.assertEqual(rows, {"C1": "kid", "C2": "top", "C3": ""})
         # A second run finds nothing left to fill.
         self.assertEqual(change_review.backfill(path, tree, write=False), ({}, {"C3": "no merge hash"}))
+
+    def test_backfill_credits_a_style_childs_hand_off_change_to_the_parent_that_merged_it(self) -> None:
+        _ = self.commit("a.py", f"checkpoint(u): grid\n\n{SEE}")
+        handoff = self.merged("unit", "Merge style hand-off")
+        folder = self.repo / "docs"
+        folder.mkdir()
+        top = folder / "top-production.md"
+        _ = top.write_text(f"- **Repository:** {self.repo}\n- **Merge branch:** merge\n\n## Units\n\n", encoding="utf-8")
+        style = folder / "top-style-production.md"
+        _ = style.write_text(f"- **Repository:** {self.repo}\n- **Merge branch:** style/main\n- **Kind:** style\n"
+                             + f"- **Parent production:** {top}\n\n## Units\n\n"
+                             + "| Unit | Plan | Worktree | Branch |\n| --- | --- | --- | --- |\n"
+                             + "| u-unit | docs/u-plan.md | /nowhere/u | `u` |\n", encoding="utf-8")
+        path = folder / "change-review - top.md"
+        _ = path.write_text("## To review\n\n| # | Change | Merged | How to check |\n| --- | --- | --- | --- |\n"
+                            + f"| C1 | {GRID.change} | 2026-10-15 · {handoff} | x |\n\n"
+                            + "## Reviewed\n\n| # | Change | Verdict | Date |\n| --- | --- | --- | --- |\n", encoding="utf-8")
+        self.assertEqual(change_review.backfill(path, change_review.Tree([top, style]), write=True), ({"C1": "top"}, {}))
 
     def test_a_root_merge_stamps_each_change_with_the_production_of_its_checkpoints_unit(self) -> None:
         folder = self.repo / "docs"

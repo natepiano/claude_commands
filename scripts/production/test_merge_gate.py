@@ -601,14 +601,16 @@ class MergeGateTests(unittest.TestCase):
         self.assertFalse(any(call["tool"] in ("basedpyright", "ssh") for call in self.calls()))
 
     def test_smaller_memory_cap_serializes_modules_without_dropping_any(self) -> None:
-        result = self.run_gate("--tests-only", "--memory-cap-mib", "48")
+        # Two jobs need two 96 MiB reservations, so a cap under 192 MiB runs one module at a time;
+        # 128 MiB stays far above the measured peak of the runner and one module (about 48 MiB).
+        result = self.run_gate("--tests-only", "--memory-cap-mib", "128")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         events = self.module_events()
         self.assertEqual(len(events), 2 * MODULES)
         for start, finish in zip(events[::2], events[1::2], strict=True):
             self.assertEqual((start["event"], finish["event"]), ("start", "finish"))
             self.assertEqual(start["pid"], finish["pid"])
-        self.assertIn("sampled memory cap 48 MiB", result.stdout)
+        self.assertIn("sampled memory cap 128 MiB", result.stdout)
 
     def test_nonpositive_memory_cap_refuses_without_running_modules(self) -> None:
         result = self.run_gate("--tests-only", "--memory-cap-mib", "0")
@@ -744,11 +746,14 @@ class MergeGateTests(unittest.TestCase):
         timings = {f"{suite}/test_first.py": 1.0 for suite in EXPECTED_SUITES}
         timings["direct/test_first.py"] = 100.0
         self.write(self.state / "runner" / "module_seconds.json", json.dumps(timings))
-        result = self.run_gate("--tests-only", "--memory-cap-mib", "48")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        starts = [event for event in self.module_events() if event["event"] == "start"]
-        self.assertEqual([(event["suite"], event["module"]) for event in starts[:2]],
+        scripts = self.checkout / "scripts"
+        modules = [*((suite, scripts / suite / "test_first.py") for suite in EXPECTED_SUITES),
+                   ("lib", scripts / "lib" / "test_second.py")]
+        ordered = merge_gate.module_order(modules, timings)
+        self.assertEqual([(suite, path.name) for suite, path in ordered[:2]],
                          [("lib", "test_second.py"), ("direct", "test_first.py")])
+        result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         updated = cast(object, json.loads((self.state / "runner" / "module_seconds.json").read_text()))
         self.assertIsInstance(updated, dict)
         assert isinstance(updated, dict)

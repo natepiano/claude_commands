@@ -1861,6 +1861,47 @@ def _folder_exists(folder: str) -> bool:
     return Path(folder).is_dir()
 
 
+class CheckoutMover(Protocol):
+    def move(self, old: Path, new: Path) -> None: ...
+
+
+def _under(path: str, old: str, folder: str) -> str:
+    """`path` with the leading folder `old` replaced by `folder`; any other path as it is."""
+    return folder + path[len(old):] if path == old or path.startswith(old.rstrip("/") + "/") else path
+
+
+def move_checkout(record: SessionShutdown, *, dry_run: bool) -> SessionShutdown:
+    """Move a stopped showrunner's checkout before its launch, as `rename.py checkout` asked
+    (`checkout_move`), and point the record at the folder that holds it: the new one once git moved the
+    worktree, else the old one. A move that fails part way never keeps the session down (showrunner,
+    2026-10-27): the launch goes on in whichever folder holds the checkout."""
+    move = record.get("checkout_move")
+    if move is None or dry_run:
+        return record
+    old, new = move["old"], move["new"]
+    try:
+        cast(CheckoutMover, cast(object, import_module("rename_checkout"))).move(Path(old), Path(new))
+    except Exception as error:
+        print(f"{record['session']['name']}: checkout move {old} -> {new} failed: {' '.join(str(error).splitlines())}")
+    folder = new if (Path(new) / ".git").exists() else old
+
+    def change(saved: SessionShutdown) -> None:
+        _ = saved.pop("checkout_move", None)
+        for session in (saved["session"], *saved["workers"]):
+            fields = cast(dict[str, object], cast(object, session))
+            if isinstance(cwd := fields.get("cwd"), str):
+                fields["cwd"] = _under(cwd, old, folder)
+            for part, key in (("checkout", "path"), ("host", "doc")):
+                inner = cast(dict[str, object], fields.get(part, {}))
+                if isinstance(value := inner.get(key), str):
+                    inner[key] = _under(value, old, folder)
+
+    try:
+        return recovery_store.update_session(record["login"], record["session"]["session_id"], change)
+    except NoLiveRecord:
+        return record
+
+
 def drop_restore_without_folder(record: SessionShutdown, *, dry_run: bool) -> bool:
     """True when the session's folder is gone, and archive its record.
 
@@ -2923,6 +2964,7 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
         or (record["progress"]["kind"] == "restarting" and
             (at - datetime.fromisoformat(record["progress"]["at"])).total_seconds() >= CLAIM_STALE_SECONDS)
     ]
+    eligible = [move_checkout(record, dry_run=dry_run) for record in eligible]
     dropped = {record["session"]["session_id"] for record in eligible if drop_restore_without_folder(record, dry_run=dry_run)}
     if dropped:
         eligible = [record for record in eligible if record["session"]["session_id"] not in dropped]

@@ -25,6 +25,7 @@ import rules
 import coverage_report
 import style_ledger
 import style_proposals
+import unit_plans
 import add_style
 import approved_renames
 import style_rules
@@ -793,6 +794,115 @@ class StyleProposalsTests(unittest.TestCase):
         standing = add_style.StandingStyleProduction(self.repo, "sample-style", doc.parent.parent, doc, "main")
         _ = self.enterContext(mock.patch.object(style_proposals, "standing_style_production", return_value=standing))
         _ = self.enterContext(mock.patch.object(style_proposals, "unit_file_holders", return_value={}))
+        scopes: dict[str, unit_plans.PilotScope] = {family: unit_plans.AllCrates() for family in families}
+        _ = self.enterContext(mock.patch.object(style_proposals, "family_pilot_scopes", return_value=scopes))
+
+    types: str = "global:rust/types.md"
+
+    def ranked_hold(self, ledger: style_ledger.Ledger) -> style_ledger.HeldFinding:
+        """A types unit and a names unit run, and a names ticket judges a finding in alpha/src/lib.rs at the tip."""
+        _ = (self.catalog / "types.md").write_text("---\ntier: C\nfamily: types\ninput_scope: file\n---\n# Types\n")
+        self.standing_units("types", "names")
+        ticket = self.assign_ticket(ledger, "names-unit")
+        _ = ledger.ticket_base(ticket)
+        finding = self.hold(ledger, ticket=ticket, kind="restructure")
+        ledger.ticket_drop(ticket)
+        return finding
+
+    def test_decision_b_files_only_local_bindings_while_types_work_is_open(self) -> None:
+        with self.ledger() as ledger:
+            _ = (self.catalog / "types.md").write_text("---\ntier: C\nfamily: types\ninput_scope: file\n---\n# Types\n")
+            self.standing_units("types", "names")
+            source = "pub struct Parent { field: u32 }\npub fn public_item() {}\nfn f() {\n    let old = 1;\n    consume(old);\n}\n"
+            _ = self.commit_tip(ledger, {"alpha/src/lib.rs": source})
+            blob = next(rule.blob for rule in rules.load_rules(self.repo) if rule.rule_id == self.rename)
+            targets = {1: "field", 2: "public_item", 4: "old", 5: "old"}
+            findings = tuple(ledger.hold(self.rename, "alpha/src/lib.rs", line, source.splitlines()[line - 1],
+                                         "rename", old, "fresh", blob, "outside") for line, old in targets.items())
+            decisions = self.file(ledger)
+            self.assertEqual(len(decisions), 1)
+            filed, = decisions
+            self.assertEqual([f.line for f in ledger.proposal_findings(filed)], [4])
+            self.assertTrue(all(isinstance(f.state, style_ledger.Unfiled) for f in ledger.named_held(
+                [finding.finding_id for finding in findings if finding.line != 4])))
+
+    def test_decision_b_magic_exemption_tracks_test_modules_and_open_types_sites(self) -> None:
+        magic = "global:rust/no-magic-values.md"
+        _ = (self.catalog / "no-magic-values.md").write_text("---\ntier: C\nfamily: values\ninput_scope: file\n---\n# Values\n")
+        _ = (self.catalog / "types.md").write_text("---\ntier: C\nfamily: types\ninput_scope: file\n---\n# Types\n")
+        self.standing_units("types", "values")
+        source = ("fn production() { consume(11); }\n#[cfg(test)]\nmod first {\n    fn one() { consume(22); }\n}\n"
+                  "#[cfg(test)]\nmod second {\n    fn two() { consume(33); }\n}\n")
+        with self.ledger() as ledger:
+            _ = self.commit_tip(ledger, {"alpha/src/lib.rs": source, "alpha/src/tests.rs": "fn check() { consume(44); }\n",
+                                         "alpha/tests/example.rs": "fn integration() { consume(55); }\n"})
+            blobs = {rule.rule_id: rule.blob for rule in rules.load_rules(self.repo)}
+            held = [ledger.hold(magic, "alpha/src/lib.rs", line, source.splitlines()[line - 1], "restructure", "value", "constant",
+                                blobs[magic], "outside") for line in (1, 4, 8)]
+            for path in ("alpha/src/tests.rs", "alpha/tests/example.rs"):
+                held.append(ledger.hold(magic, path, 1, (self.repo / path).read_text().strip(), "restructure", "value", "constant",
+                                        blobs[magic], "outside"))
+            blocker = ledger.hold(self.types, "alpha/src/lib.rs", 8, source.splitlines()[7], "type", "u32", "Count",
+                                  blobs[self.types], "outside")
+            # Both unfiled and filed types work block just the containing test module.
+            for filed in (False, True):
+                if filed:
+                    ledger.file_held(blocker.finding_id, self.proposals / "types.md")
+                exemptions = style_proposals.RankExemptions(ledger, self.tip)
+                self.assertEqual([exemptions.allows(finding, "values") for finding in held], [False, True, False, True, True])
+            issue, = self.file(ledger)
+            self.assertEqual({finding.finding_id for finding in ledger.proposal_findings(issue)},
+                             {finding.finding_id for finding in (held[1], held[3], held[4])})
+
+    def judge_types(self, ledger: style_ledger.Ledger, path: str) -> None:
+        """The types work on path is done: its cell is judged at the tip."""
+        blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == self.types)
+        ledger.record(self.types, path, self.tip, blob, "clean", ticket="types-unit-1", worker="test",
+                      input_scope=style_ledger.DeclaredInputScope.RULE)
+
+    def ranked_hold_at_changed_file(self, ledger: style_ledger.Ledger) -> style_ledger.HeldFinding:
+        """The names finding's file changes after it was judged, and the types work on the new file is done."""
+        finding = self.ranked_hold(ledger)
+        _ = self.commit_tip(ledger, {finding.path: "pub fn changed() {}\n"})
+        self.judge_types(ledger, finding.path)
+        result, lines = self.file_lines(ledger)
+        self.assertEqual(result.filed, ())
+        self.assertIn(f"waiting {finding.finding_id}: {finding.path} changed since it was judged", lines)
+        return finding
+
+    def test_a_lower_rank_finding_reaches_no_decision_while_higher_rank_work_on_its_file_is_open(self) -> None:
+        with self.ledger() as ledger:
+            finding = self.ranked_hold(ledger)
+            result, lines = self.file_lines(ledger)
+            self.assertEqual((result.filed, lines.count(f"waiting names: {finding.path} has open types work")), ((), 1))
+            self.judge_types(ledger, finding.path)
+            result, _ = self.file_lines(ledger)
+            issue, = result.filed
+            self.assertEqual([row.finding_id for row in ledger.proposal_findings(issue)], [finding.finding_id])
+
+    def test_a_lower_rank_finding_at_a_changed_file_is_filed_once_the_judgment_of_that_file_holds_it_again(self) -> None:
+        with self.ledger() as ledger:
+            finding = self.ranked_hold_at_changed_file(ledger)
+            ledger.ticket_add("names-unit-2", "names-unit", "read", "names", "alpha", [finding.path], [self.rename])
+            ledger.ticket_assign("names-unit-2", "main")
+            _ = ledger.ticket_base("names-unit-2")
+            _ = self.hold(ledger, ticket="names-unit-2", kind="restructure")
+            ledger.ticket_drop("names-unit-2")
+            issue, = self.file(ledger)
+            self.assertEqual([row.finding_id for row in ledger.proposal_findings(issue)], [finding.finding_id])
+
+    def test_a_lower_rank_finding_at_a_changed_file_is_withdrawn_by_the_judgment_of_that_file_that_does_not_hold_it(self) -> None:
+        with self.ledger() as ledger:
+            finding = self.ranked_hold_at_changed_file(ledger)
+            blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == self.rename)
+            ledger.record(self.rename, finding.path, self.tip, blob, "clean", ticket="names-unit-2", worker="test",
+                          input_scope=style_ledger.DeclaredInputScope.RULE)
+            result, lines = self.file_lines(ledger)
+            self.assertEqual(result.filed, ())
+            self.assertTrue(any(line.startswith(f"withdraw {finding.finding_id} ") for line in lines), lines)
+            row, = ledger.named_held([finding.finding_id])
+            self.assertIsInstance(row.state, style_ledger.Withdrawn)
+            self.assertIsInstance(cast(style_ledger.Withdrawn, row.state).by, style_ledger.JudgedAgain)
 
     def file_lines(self, ledger: style_ledger.Ledger) -> tuple[FilingResult, list[str]]:
         with redirect_stdout(io.StringIO()) as output:
@@ -1745,6 +1855,7 @@ class StyleProposalsTests(unittest.TestCase):
                 original(path, text)
             with (mock.patch.object(style_proposals, "standing_style_production", return_value=standing),
                   mock.patch.object(style_proposals, "unit_file_holders", return_value=holders),
+                  mock.patch.object(style_proposals, "family_pilot_scopes", return_value={}),
                   mock.patch.object(proposal_issue, "_write", side_effect=record)):
                 with redirect_stdout(io.StringIO()):
                     style_proposals.migrate(ledger, self.proposals, "parent")
@@ -2157,6 +2268,7 @@ class StyleProposalsTests(unittest.TestCase):
         with self.ledger() as ledger:
             finding = self.hold(ledger)
             with (mock.patch.object(style_proposals, "standing_style_production", return_value=standing),
+                  mock.patch.object(style_proposals, "family_pilot_scopes", return_value={}),
                   mock.patch.object(style_proposals, "unit_file_holders", return_value={"product-unit": frozenset({finding.path})}) as holders):
                 issue = self.file(ledger)[0]
                 holders.assert_called_once_with(self.repo, standing.doc, ledger)
