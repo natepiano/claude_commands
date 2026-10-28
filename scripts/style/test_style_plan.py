@@ -13,9 +13,10 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import chdir, closing, redirect_stderr, redirect_stdout
+from contextlib import chdir, closing, nullcontext, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast, final, override
@@ -3843,7 +3844,7 @@ class StylePlanTests(unittest.TestCase):
                 record.assert_not_called()
                 self.assertEqual(ledger.database.read_bytes(), before)
 
-    def test_a_timeout_during_the_split_write_keeps_the_previous_split(self) -> None:
+    def test_split_write_stops_at_its_deadline_on_a_locked_ledger(self) -> None:
         _ = self.rule("write-time-limit")
         self.sync()
         ledger = self.ledger()
@@ -3852,30 +3853,47 @@ class StylePlanTests(unittest.TestCase):
             before = tuple(connection.iterdump())
         output, errors = io.StringIO(), io.StringIO()
 
-        write_split = style_ledger.record_split
-
-        def write_with_expiring_limit(repo: Path, unit: str, split: style_ledger.RecordedSplit) -> None:
-            self.assertGreater(signal.getitimer(signal.ITIMER_REAL)[0], 0, "the write must remain inside the scan time limit")
-            # Expire while the real write waits for the other connection's lock.
-            _ = signal.setitimer(signal.ITIMER_REAL, 0.01)
-            write_split(repo, unit, split)
-
+        limit_seconds = 0.25
         with (closing(sqlite3.connect(ledger.database)) as writer,
               mock.patch.object(style_plan, "style_document", return_value=self.doc),
               mock.patch.object(style_plan, "busy_files", return_value=style_plan.BusyFiles(self.board(), frozenset())),
               mock.patch.object(style_plan, "classify_split", return_value=style_ledger.RecordedSplit(
                   1, 2, 3, 4, "2026-10-28T12:00:00+00:00")),
-              mock.patch.object(style_ledger, "BUSY_TIMEOUT_SECONDS", 0.05),
-              mock.patch.object(style_ledger, "record_split", side_effect=write_with_expiring_limit) as record,
+              mock.patch.object(style_ledger, "record_split", wraps=style_ledger.record_split) as record,
               redirect_stdout(output), redirect_stderr(errors)):
             _ = writer.execute("BEGIN IMMEDIATE")
-            code = style_plan.main(["split", "--unit", "names-unit", "--repo", str(self.unit), "--timeout-minutes", "1"])
+            began = time.monotonic()
+            code = style_plan.main(["split", "--unit", "names-unit", "--repo", str(self.unit),
+                                    "--timeout-minutes", str(limit_seconds / 60)])
+            elapsed = time.monotonic() - began
             writer.rollback()
         self.assertEqual((code, output.getvalue()), (1, ""))
-        self.assertIn("split names-unit: time limit", errors.getvalue())
+        self.assertRegex(errors.getvalue(), r"^split names-unit: (time limit.*|database is locked)\n$")
+        self.assertLess(elapsed, limit_seconds + 1)
         record.assert_called_once()
         with closing(sqlite3.connect(ledger.database)) as connection:
             self.assertEqual(tuple(connection.iterdump()), before)
+
+    def test_split_write_is_refused_after_its_deadline(self) -> None:
+        _ = self.rule("expired-write")
+        self.sync()
+        ledger = self.ledger()
+        style_ledger.record_split(self.repo, "names-unit", style_ledger.RecordedSplit(9, 8, 7, 6, "2026-10-27T12:00:00+00:00"))
+        before = ledger.database.read_bytes()
+        deadline = style_plan.SplitDeadline(time.monotonic() - 1, 1)
+        output, errors = io.StringIO(), io.StringIO()
+        with (mock.patch.object(style_plan, "split_time_limit", return_value=nullcontext(deadline)),
+              mock.patch.object(style_plan, "style_document", return_value=self.doc),
+              mock.patch.object(style_plan, "busy_files", return_value=style_plan.BusyFiles(self.board(), frozenset())),
+              mock.patch.object(style_plan, "classify_split", return_value=style_ledger.RecordedSplit(
+                  1, 2, 3, 4, "2026-10-28T12:00:00+00:00")),
+              mock.patch.object(style_ledger, "record_split", wraps=style_ledger.record_split) as record,
+              redirect_stdout(output), redirect_stderr(errors)):
+            code = style_plan.main(["split", "--unit", "names-unit", "--repo", str(self.unit)])
+        self.assertEqual((code, output.getvalue(), errors.getvalue()),
+                         (1, "", "split names-unit: time limit of 1 min reached\n"))
+        record.assert_not_called()
+        self.assertEqual(ledger.database.read_bytes(), before)
 
     def test_a_ledger_without_refill_results_is_refused_before_any_scan_or_migration(self) -> None:
         _ = self.rule("old-schema-split")

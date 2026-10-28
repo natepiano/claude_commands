@@ -378,6 +378,23 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertTrue(all(any(option.startswith("-") and "r" in option for option in arguments[1:-1])
                             for arguments in trees))
 
+    def test_split_write_uses_a_small_busy_timeout_on_a_locked_ledger(self) -> None:
+        ledger = self.ledger()
+        previous = style_ledger.RecordedSplit(9, 8, 7, 6, "2026-10-27T12:00:00+00:00")
+        style_ledger.record_split(self.repo, "names-unit", previous)
+        before = self.refill_result(ledger.database)
+        with closing(sqlite3.connect(ledger.database)) as writer:
+            _ = writer.execute("BEGIN IMMEDIATE")
+            began = time.monotonic()
+            with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
+                style_ledger.record_split(self.repo, "names-unit",
+                                          style_ledger.RecordedSplit(1, 2, 3, 4, "2026-10-28T12:00:00+00:00"),
+                                          busy_timeout_seconds=0.05)
+            elapsed = time.monotonic() - began
+            writer.rollback()
+        self.assertLess(elapsed, 0.75)
+        self.assertEqual(self.refill_result(ledger.database), before)
+
     def test_a_later_split_preserves_the_refill_and_a_refill_preserves_the_split(self) -> None:
         ledger = self.ledger()
         first_at = "2026-10-27T12:00:00+00:00"

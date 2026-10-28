@@ -5854,11 +5854,12 @@ def require_split_table(repo: Path) -> None:
             raise LedgerError("ledger has no refill_results (schema below 25)")
 
 
-def record_split(repo: Path, unit: str, split: RecordedSplit) -> None:
+def record_split(repo: Path, unit: str, split: RecordedSplit, *,
+                 busy_timeout_seconds: float = BUSY_TIMEOUT_SECONDS) -> None:
     """Save a complete split without changing the last refill result."""
     database = ledger_location(repo).database
     with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=rw", uri=True,
-                                timeout=BUSY_TIMEOUT_SECONDS)) as connection, connection:
+                                timeout=busy_timeout_seconds)) as connection, connection:
         _ = connection.execute(
             "INSERT INTO refill_results(unit,at,outcome,split_at,ready,changed,structure,other) "
             + "VALUES (?,'','',?,?,?,?,?) ON CONFLICT(unit) DO UPDATE SET "

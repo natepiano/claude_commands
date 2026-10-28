@@ -2392,19 +2392,36 @@ def classify_split(ledger: style_ledger.Ledger, unit: str, doc: Path, base: Unit
     return style_ledger.RecordedSplit(counts["ready"], counts["changed"], counts["structure"], counts["other"], measured_at)
 
 
+@dataclass(frozen=True)
+class SplitDeadline:
+    at: float
+    timeout_minutes: float
+
+    def timeout_error(self) -> TimeoutError:
+        return TimeoutError(f"time limit of {self.timeout_minutes:g} min reached")
+
+    def remaining_seconds(self) -> float:
+        remaining = self.at - time.monotonic()
+        if remaining <= 0:
+            raise self.timeout_error()
+        return remaining
+
+
 @contextmanager
-def split_time_limit(minutes: float) -> Generator[None]:
+def split_time_limit(minutes: float) -> Generator[SplitDeadline]:
     if not math.isfinite(minutes) or minutes <= 0:
         raise style_ledger.LedgerError("timeout-minutes must be positive and finite")
 
+    began = time.monotonic()
+    deadline = SplitDeadline(began + minutes * 60, minutes)
+
     def expired(_signum: int, _frame: FrameType | None) -> None:
-        raise TimeoutError(f"time limit of {minutes:g} min reached")
+        raise deadline.timeout_error()
 
     previous_handler = signal.signal(signal.SIGALRM, expired)
     previous_timer = signal.setitimer(signal.ITIMER_REAL, minutes * 60)
-    began = time.monotonic()
     try:
-        yield
+        yield deadline
     finally:
         _ = signal.setitimer(signal.ITIMER_REAL, 0)
         _ = signal.signal(signal.SIGALRM, previous_handler)
@@ -2416,7 +2433,7 @@ def split_time_limit(minutes: float) -> Generator[None]:
 def split(unit: str, repo: Path, timeout_minutes: float = 90) -> style_ledger.RecordedSplit:
     """Scan a backup copy, then store only a complete split on the original ledger."""
     measured_at = datetime.now(UTC).isoformat()
-    with split_time_limit(timeout_minutes):
+    with split_time_limit(timeout_minutes) as deadline:
         repo = repo.expanduser().resolve()
         style_ledger.require_split_table(repo)
         doc = style_document(repo)
@@ -2434,7 +2451,8 @@ def split(unit: str, repo: Path, timeout_minutes: float = 90) -> style_ledger.Re
             definitions = {rule.rule_id: rule for rule in rules.load_rules(repo)}
             result = classify_split(ledger, unit, doc, unit_base(repo, row.branch), scope, busy, definitions, cache,
                                     measured_at)
-        style_ledger.record_split(repo, unit, result)
+        style_ledger.record_split(repo, unit, result,
+                                  busy_timeout_seconds=min(style_ledger.BUSY_TIMEOUT_SECONDS, deadline.remaining_seconds()))
     return result
 
 

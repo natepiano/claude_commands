@@ -532,7 +532,7 @@ Source: the user via the showrunner, 2026-10-20: the two views should "show basi
 
 **Ruled out:** Classifying inside refill (11–40 min per unit); wrapping or replacing another module's functions at run time to cache git reads.
 
-### Phase 23 — a timed-out split writes nothing past its limit  · status: todo
+### Phase 23 — a timed-out split writes nothing past its limit  · status: done
 
 **Depends on:** Phase 22
 
