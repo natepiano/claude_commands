@@ -86,13 +86,16 @@ every fix.
    prefer-events-over-messages, prefer-observers-over-polling,
    system-params-carry-their-behavior. These values rules change types and
    registration, so they go before types.
-2. Types, in this order: dont-create-traits-for-single-implementations,
+2. Types, in this order: no-duplicate-implementations,
+   one-mechanism-per-behavior, crate-apis-expose-behavior,
+   dont-create-traits-for-single-implementations,
    make-invalid-states-unrepresentable, public-failures-return-named-errors,
    enums-over-bool-for-owned-booleans, enums-over-option-when-none-has-meaning,
    if-else-chains-signal-missing-types, prefer-from-impl-over-named-constructors,
    use-bevy_kana-in-all-bevy-crates, bevy-reflection-registration,
    extract-observer-run-conditions, bevy-plugin-ownership. Then tier A cleanup.
-3. Module placement: types-live-with-their-behavior, when-to-split-a-module,
+3. Module placement: behavior-lives-in-its-most-cohesive-crate,
+   types-live-with-their-behavior, when-to-split-a-module,
    split-by-type-ownership, module-roots-as-table-of-contents. Then `mend --fix`.
 4. Values: tests-live-with-the-type-under-test, no-magic-values,
    derive-test-values-from-production-constants, import-constants-at-the-top,
@@ -107,6 +110,12 @@ every fix.
 6. Layout, sort only: constants-file-organization, module-structure.
    workspace-dependencies takes any position after use-bevy_kana-in-all-bevy-crates.
 7. Tier A final: rustfmt, clippy, mend.
+
+**Ownership first.** Duplication removal and crate placement go first in
+their layers: delete the copies and move code to the crate that owns it before
+any other rule touches that code, so no later fix is written twice or in the
+wrong place. behavior-lives-in-its-most-cohesive-crate is a modules rule, and
+structure blocking already runs it before types, values and names on a file.
 
 **Module moves** go after types and before values (layer 3): they read the final
 set of types, and tests and constants read the final file shape.
@@ -655,6 +664,11 @@ proof and its rules, and the unit text and the ticket gate read it. The classes:
   `#[cfg(test)]` item) when its pattern has no match in the attribute's scope,
   the same check as the `test_allow_boilerplate` generator. The whole attribute
   may go when it keeps no lint name. The reason and the other lint names stay.
+- `binding-rename` (proof `binding_rename`; rule `prefer-type-named-fields-and-bindings`):
+  a local binding, parameter or pattern name changes to its approved name at its
+  declaration and each use in its scope. The proof accounts for struct shorthand
+  and format captures, excludes shadowed bindings, and refuses collisions and
+  macros whose names it cannot check.
   `prove_lint_removals` finds that only lint names were removed. An `expect`
   attribute is not in this class.
 

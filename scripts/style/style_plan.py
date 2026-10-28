@@ -30,9 +30,10 @@ sys.path.insert(0, str(SCRIPTS / "production"))
 import berth_board
 import coverage_report
 import mechanical_classes
-from approved_renames import (AppliedCheck, ApprovedRename, Declarations, FileRename, Folder, InlineModule,
-                              MissingFile, RenameNotApplied, UncertainScan, applied_check,
-                              approved_rename, declaration_sites, enclosing, file_rename, inline_modules)
+from approved_renames import (AppliedCheck, ApprovedRename, BindingRename, Declarations, FileRename, Folder, InlineModule,
+                              MissingFile, NoAppliedCheck, RenameNotApplied, UncertainScan, applied_check,
+                              approved_rename, binding_rename, binding_rename_check, declaration_sites, enclosing,
+                              file_rename, inline_modules)
 from add_style import StandingStyleProduction, standing_style_production
 import rules
 import style_ledger
@@ -869,6 +870,32 @@ def worktree_check(repo: Path, finding: style_ledger.HeldFinding) -> AppliedChec
     return applied_check(finding.kind, finding.before, finding.after, finding.path, lambda path: worktree_file(repo, path))
 
 
+def binding_pairs(findings: tuple[style_ledger.HeldFinding, ...]) -> Mapping[str, tuple[BindingRename, ...]]:
+    """The approved local name pairs grouped by their original file."""
+    paths: dict[str, list[BindingRename]] = defaultdict(list)
+    for finding in findings:
+        rename = binding_rename(finding.kind, finding.before, finding.after, finding.line, finding.text)
+        if isinstance(rename, BindingRename):
+            paths[finding.path].append(rename)
+    return {path: tuple(renames) for path, renames in paths.items()}
+
+
+def binding_worktree_checks(repo: Path, renames: Mapping[str, tuple[BindingRename, ...]],
+                            base: str) -> Mapping[str, Mapping[BindingRename, AppliedCheck]]:
+    """Check each file once, from the ticket's saved base (or HEAD before its base is saved)."""
+    if not renames:
+        return {}
+    original = style_footprint.RevisionTree(repo, base or "HEAD")
+    checks: dict[str, Mapping[BindingRename, AppliedCheck]] = {}
+    for path, pairs in renames.items():
+        edited = worktree_file(repo, path)
+        if path not in original.paths or not isinstance(edited, bytes):
+            checks[path] = {pair: NoAppliedCheck("rename") for pair in pairs}
+            continue
+        checks[path] = binding_rename_check(path, original.text(path), edited.decode(errors="replace"), pairs).checks
+    return checks
+
+
 @dataclass(frozen=True)
 class ApprovedTicket:
     """The findings of a proposal ticket whose decision is approved, their approved file renames, and the paths that
@@ -940,9 +967,10 @@ def gate(repo: Path, ticket_id: str) -> int:
             # A widened path is allowed as it is; the rename and move checks below do not read it.
             outside = changed_files(repo) - allowed - set(origin.widened)
             pairs = approved_rename_pairs(findings)
+            bindings = binding_pairs(findings)
             if outside:
                 outside -= mechanical_files(repo, frozenset(PurePosixPath(finding.rule.partition(":")[2]).stem
-                                                            for finding in findings))
+                                                            for finding in findings), bindings)
             if outside:
                 unique = unique_rename_mentions(repo, pairs, allowed) if pairs else frozenset[ApprovedRename]()
                 modified = modified_reference_files(repo)
@@ -962,7 +990,11 @@ def gate(repo: Path, ticket_id: str) -> int:
             if changed:
                 raise style_ledger.LedgerError("renamed files with other changes: " + ", ".join(
                     f"{moved.new} (renamed from {moved.old}: change is not only the rename)" for moved in changed))
-            unapplied = tuple(finding for finding in findings if isinstance(worktree_check(repo, finding), RenameNotApplied))
+            binding_checks = binding_worktree_checks(repo, bindings, origin.base)
+            unapplied = tuple(finding for finding in findings if isinstance(
+                binding_checks[finding.path][rename] if isinstance(rename := binding_rename(
+                    finding.kind, finding.before, finding.after, finding.line, finding.text), BindingRename)
+                else worktree_check(repo, finding), RenameNotApplied))
             if unapplied:
                 for finding in unapplied:
                     print(f"review: {finding.finding_id}: {finding.before} -> {finding.after} not applied in {finding.path}")
@@ -1109,15 +1141,16 @@ def workspace_edition(manifests: list[dict[str, object]]) -> object:
     return None
 
 
-def mechanical_files(repo: Path, ticket_rules: frozenset[str]) -> frozenset[str]:
+def mechanical_files(repo: Path, ticket_rules: frozenset[str],
+                     renames: Mapping[str, tuple[BindingRename, ...]] = mechanical_classes.NO_BINDING_RENAMES) -> frozenset[str]:
     """The changed files of the worktree that the proof of a class in `mechanical_classes.toml` explains, for a class
     with a rule in ticket_rules (the rule names of the ticket's findings). Such a change needs no approval. A proven
     item move gives the file each item leaves, the file it moves to, the parent file that gains the new `mod` line,
     and each file with a re-pointed path or a use line of the move. A proven lint removal gives each file whose whole
-    edit removes stale lint names. `style_footprint.judge` must find the whole change mechanical, so the gate and judge
-    read the change the same way, and a changed file that no proof explains stays outside."""
+    edit removes stale lint names. A binding proof accounts for every edit at a path using its approved local name
+    pairs. A changed file that no proof explains stays outside."""
     changes = style_footprint.changes_between(repo, "HEAD", style_footprint.worktree_commit(repo))
-    return mechanical_classes.explained_files(changes, style_footprint.RevisionTree(repo, "HEAD"), ticket_rules)
+    return mechanical_classes.explained_files(changes, style_footprint.RevisionTree(repo, "HEAD"), ticket_rules, renames)
 
 
 def synced_tip(ledger: style_ledger.Ledger) -> str:
@@ -1890,11 +1923,14 @@ def _rank_waits(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord, 
                 waits: Mapping[str, style_proposals.RankWait], scopes: Mapping[rules.Family, PilotScope], tip: str) -> tuple[str, ...]:
     """Why the family rank holds a queued ticket: each file with open higher-rank work, and each finding judged at an
     older file where a family ranked above has a unit."""
-    held = tuple(f"{path} has open {waits[path].higher} work" for path in ticket["files"] if path in waits)
+    exemptions = style_proposals.RankExemptions(ledger, tip)
+    findings = ledger.named_held(ticket["finding_ids"])
+    held = tuple(f"{path} has open {waits[path].higher} work" for path in ticket["files"] if path in waits
+                 and (not findings or any(f.path == path and not exemptions.allows(f, family) for f in findings)))
     if not ticket["finding_ids"] or not style_proposals.ranked_below_unit(family, ticket["crate"], scopes):
         return held
     return held + tuple(f"{finding.finding_id} {finding.path} changed since it was judged"
-                        for finding in ledger.named_held(ticket["finding_ids"])
+                        for finding in findings
                         if not style_proposals.judged_at_current_file(ledger, finding, tip))
 
 
@@ -1918,6 +1954,7 @@ def _select_phase(
     cells = tuple(ledger.cells())
     scopes = family_pilot_scopes(doc, repo)
     waits = style_proposals.ranked_work(ledger, cells, scopes).waits(family)
+    exemptions = style_proposals.RankExemptions(ledger, tip)
     for index, ticket in enumerate(queued):
         in_scope = crate_in_scope(scope, ticket["crate"])
         # A file rename whose edit the gate cannot prove is dropped, and its finding waits on the decision path below.
@@ -2045,7 +2082,9 @@ def _select_phase(
         outside = {path for path in by_file if not crate_in_scope(scope, style_proposals.crate_for(directories, path))}
         if outside:
             print(f"waiting {issue.path}: outside pilot scope")
-        held = {path for path in by_file if path not in outside and (path in waits or busy.contains(path))}
+        for path in by_file.keys() & waits.keys():
+            by_file[path] = [finding for finding in by_file[path] if exemptions.allows(finding, family)]
+        held = {path for path in by_file if path not in outside and (not by_file[path] or busy.contains(path))}
         for path in sorted(held - set(waits)):
             print(f"waiting {issue.path}: {path} busy")
         # A file that a commit on the unit base changed waits for the sync that reads it.
@@ -2073,7 +2112,8 @@ def _select_phase(
             continue
         limits = (_STRUCTURE_LIMITS if any(style_proposals.proposal_kind(finding, definition) == "restructure"
                                            for finding in findings) else _READ_LIMITS)
-        files = read_slices(repo, tip, available, limits)[0]
+        files = ((available[0],) if PurePosixPath(rule.partition(":")[2]).stem == "no-magic-values"
+                 else read_slices(repo, tip, available, limits)[0])
         selected_findings = tuple(finding for path in files for finding in by_file[path])
         ticket_id = ledger.next_ticket_id(unit)
         ledger.ticket_add(ticket_id, unit, "proposal", family, style_proposals.crate_for(directories, files[0]),

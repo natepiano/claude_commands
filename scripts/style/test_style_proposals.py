@@ -809,6 +809,51 @@ class StyleProposalsTests(unittest.TestCase):
         ledger.ticket_drop(ticket)
         return finding
 
+    def test_decision_b_files_only_local_bindings_while_types_work_is_open(self) -> None:
+        with self.ledger() as ledger:
+            _ = (self.catalog / "types.md").write_text("---\ntier: C\nfamily: types\ninput_scope: file\n---\n# Types\n")
+            self.standing_units("types", "names")
+            source = "pub struct Parent { field: u32 }\npub fn public_item() {}\nfn f() {\n    let old = 1;\n    consume(old);\n}\n"
+            _ = self.commit_tip(ledger, {"alpha/src/lib.rs": source})
+            blob = next(rule.blob for rule in rules.load_rules(self.repo) if rule.rule_id == self.rename)
+            targets = {1: "field", 2: "public_item", 4: "old", 5: "old"}
+            findings = tuple(ledger.hold(self.rename, "alpha/src/lib.rs", line, source.splitlines()[line - 1],
+                                         "rename", old, "fresh", blob, "outside") for line, old in targets.items())
+            decisions = self.file(ledger)
+            self.assertEqual(len(decisions), 1)
+            filed, = decisions
+            self.assertEqual([f.line for f in ledger.proposal_findings(filed)], [4])
+            self.assertTrue(all(isinstance(f.state, style_ledger.Unfiled) for f in ledger.named_held(
+                [finding.finding_id for finding in findings if finding.line != 4])))
+
+    def test_decision_b_magic_exemption_tracks_test_modules_and_open_types_sites(self) -> None:
+        magic = "global:rust/no-magic-values.md"
+        _ = (self.catalog / "no-magic-values.md").write_text("---\ntier: C\nfamily: values\ninput_scope: file\n---\n# Values\n")
+        _ = (self.catalog / "types.md").write_text("---\ntier: C\nfamily: types\ninput_scope: file\n---\n# Types\n")
+        self.standing_units("types", "values")
+        source = ("fn production() { consume(11); }\n#[cfg(test)]\nmod first {\n    fn one() { consume(22); }\n}\n"
+                  "#[cfg(test)]\nmod second {\n    fn two() { consume(33); }\n}\n")
+        with self.ledger() as ledger:
+            _ = self.commit_tip(ledger, {"alpha/src/lib.rs": source, "alpha/src/tests.rs": "fn check() { consume(44); }\n",
+                                         "alpha/tests/example.rs": "fn integration() { consume(55); }\n"})
+            blobs = {rule.rule_id: rule.blob for rule in rules.load_rules(self.repo)}
+            held = [ledger.hold(magic, "alpha/src/lib.rs", line, source.splitlines()[line - 1], "restructure", "value", "constant",
+                                blobs[magic], "outside") for line in (1, 4, 8)]
+            for path in ("alpha/src/tests.rs", "alpha/tests/example.rs"):
+                held.append(ledger.hold(magic, path, 1, (self.repo / path).read_text().strip(), "restructure", "value", "constant",
+                                        blobs[magic], "outside"))
+            blocker = ledger.hold(self.types, "alpha/src/lib.rs", 8, source.splitlines()[7], "type", "u32", "Count",
+                                  blobs[self.types], "outside")
+            # Both unfiled and filed types work block just the containing test module.
+            for filed in (False, True):
+                if filed:
+                    ledger.file_held(blocker.finding_id, self.proposals / "types.md")
+                exemptions = style_proposals.RankExemptions(ledger, self.tip)
+                self.assertEqual([exemptions.allows(finding, "values") for finding in held], [False, True, False, True, True])
+            issue, = self.file(ledger)
+            self.assertEqual({finding.finding_id for finding in ledger.proposal_findings(issue)},
+                             {finding.finding_id for finding in (held[1], held[3], held[4])})
+
     def judge_types(self, ledger: style_ledger.Ledger, path: str) -> None:
         """The types work on path is done: its cell is judged at the tip."""
         blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == self.types)
