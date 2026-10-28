@@ -19,16 +19,16 @@ Add-on, 2026-10-16 (the showrunner, approved by the user): an accounts view in t
 - **Worktree:** `/home/natepiano/worktrees/claude-build-followups-unit-board`, branch `build-followups-unit-board`. Every path below is relative to it.
 - **Stack:** Python 3 (stdlib only, `unittest`, basedpyright strict); TypeScript Claude Code mod API (early access, Claude Code 2.1.296), JSX with `h` as the factory, no DOM, no Node — everything outside the module goes through `$`.
 - **Layout:**
-  - `scripts/delegate/` — `progress_history.py` (recorder), `phase_table.py` (phase table, chain and vault note), `plan_history.py` (plan and run readers both share), `findings.py`, new `board_json.py`; tests beside them.
+  - `scripts/direct/` — `progress_history.py` (recorder), `phase_table.py` (phase table, chain and vault note), `plan_history.py` (plan and run readers both share), `findings.py`, new `board_json.py`; tests beside them.
   - `scripts/production/` — `production_units.py`, `unit_run.py`, `unit_lookup.py`, `units_table.py`, `showrunners.py` (read only by this plan's code).
   - `scripts/accounts/` — `accounts.py` and its notes readers (the accounts view's data).
   - `mods/unit-board/` — new mod. `mods/postmaster/` is the house example of a mod: copy its `tsconfig.json`, `.claude-plugin/plugin.json` shape and test style (`tests/kit.test.ts`, `tests/register.test.ts`).
   - Reference only, outside the repo: the prototype `~/.local/state/plan-backlog/2026-10-16-unit-report-mod/prototype/unit-board/` (`hooks/register.tsx`, `types/index.d.ts`, `data/board.json`), the mockups `mockup-A-board.txt` and `mockup-B-unit.txt` beside it (open the `.ansi` twins with `less -R`), and the engine API `prototype/source/claude-code.d.ts`, `reference.md`, `SKILL.md`, `examples/pane.tsx`.
 - **Key files:**
-  - `scripts/delegate/progress_history.py` — subcommands at `_build_parser` 4774–4945; `eta` subcommand 4891, `_eta` 4506–4545 writes `eta_stated` (`eta_at`, `basis`, `eta_earliest_at`, `eta_latest_at`, epochs) and refuses with no active phase; `_local_eta_epoch` 402; `_event` 1183 (common fields); `_append_event` 498; `_write_state` 439 (atomic); `_refresh_phase_table` 455 (subprocess, 10 s timeout, only for plans holding `> **Production:`); `_summary_table` 4025–4068 (Project and Phase rows), `_eta_cell` 3735, `_eta_seconds` 2238 (`elapsed*(100-percent)/percent`), `_eta_band_cells` 3760, `eta_band_seconds` 3802; `_report_progress` 4260 (assembles the clocks table and round table at 4458–4481); `_print_last_recorded` 4207; `_phase_section` 4071, `_round_table` 3469 (line numbers from before Phase 2; search by name). Events in `runs/<run_id>.jsonl` under the history root, `run_id` = session dir name.
-  - `scripts/delegate/plan_history.py` — `history_root()` 65 (`$PLAN_DELEGATE_HISTORY_DIR`, else `~/.local/state/plan-delegate`), `now_epoch()` 72 (tests patch it for the clock), `resolve_plan_path` 79, `plan_phases` 132 (`PlanPhase`, with `blocked_by` from `BLOCKED_BY_PATTERN` 38), `plan_runs` 156, `eta_band_seconds` 200.
-  - `scripts/delegate/phase_table.py` — imports `plan_history`, never `progress_history` (`progress_history` imports `phase_table` only inside `_project_chain_eta`). `PhaseHistory` 128 (the per-phase record: `first_eta`, `moves`, `eta_trail`, `finished_at`, `delta_minutes`, `fix_rounds`, `findings`); gates `NoGate` 140, `TimedGate` 144, `UntimedGate` 152, `GateBlockedFinish` 213; `_plan_finish` 880; `_phase_history` 915 (reads only the row's own title family); `_production_gates` 980; `build_plan(plan_path)` 1023 (the chain from the open phase's stated ETA, gates applied); `build(session_dir)` 1201; `show_production(doc)` 1485; `refresh(session_dir)` 1861. `show --json` omits gates and turns `GateBlockedFinish` into null.
-  - `scripts/delegate/findings.py` — `SEVERITIES = ("blocker", "minor", "nit")` 74; writes `finding_opened` (786, carries `severity`), `finding_verdict` 843 into the same run stream.
+  - `scripts/direct/progress_history.py` — subcommands at `_build_parser` 4774–4945; `eta` subcommand 4891, `_eta` 4506–4545 writes `eta_stated` (`eta_at`, `basis`, `eta_earliest_at`, `eta_latest_at`, epochs) and refuses with no active phase; `_local_eta_epoch` 402; `_event` 1183 (common fields); `_append_event` 498; `_write_state` 439 (atomic); `_refresh_phase_table` 455 (subprocess, 10 s timeout, only for plans holding `> **Production:`); `_summary_table` 4025–4068 (Project and Phase rows), `_eta_cell` 3735, `_eta_seconds` 2238 (`elapsed*(100-percent)/percent`), `_eta_band_cells` 3760, `eta_band_seconds` 3802; `_report_progress` 4260 (assembles the clocks table and round table at 4458–4481); `_print_last_recorded` 4207; `_phase_section` 4071, `_round_table` 3469 (line numbers from before Phase 2; search by name). Events in `runs/<run_id>.jsonl` under the history root, `run_id` = session dir name.
+  - `scripts/direct/plan_history.py` — `history_root()` (returns `unit_runs.history_root()`), `now_epoch()` 72 (tests patch it for the clock), `resolve_plan_path` 79, `plan_phases` 132 (`PlanPhase`, with `blocked_by` from `BLOCKED_BY_PATTERN` 38), `plan_runs` 156, `eta_band_seconds` 200.
+  - `scripts/direct/phase_table.py` — imports `plan_history`, never `progress_history` (`progress_history` imports `phase_table` only inside `_project_chain_eta`). `PhaseHistory` 128 (the per-phase record: `first_eta`, `moves`, `eta_trail`, `finished_at`, `delta_minutes`, `fix_rounds`, `findings`); gates `NoGate` 140, `TimedGate` 144, `UntimedGate` 152, `GateBlockedFinish` 213; `_plan_finish` 880; `_phase_history` 915 (reads only the row's own title family); `_production_gates` 980; `build_plan(plan_path)` 1023 (the chain from the open phase's stated ETA, gates applied); `build(session_dir)` 1201; `show_production(doc)` 1485; `refresh(session_dir)` 1861. `show --json` omits gates and turns `GateBlockedFinish` into null.
+  - `scripts/direct/findings.py` — `SEVERITIES = ("blocker", "minor", "nit")` 74; writes `finding_opened` (786, carries `severity`), `finding_verdict` 843 into the same run stream.
   - `scripts/production/production_units.py` — `live_unit_table(lines, slug)` 101 (rows with `Unit`, `Plan`, `Worktree`, `Branch`), `cell_value` 15.
   - `scripts/production/unit_run.py` — `local_run(root, worktree) -> RunFound(run_id, started_at) | NoMatchingRun` 49.
   - `scripts/production/unit_lookup.py` — `run_state(worktree) -> UnitState` 112 (`running`, `run-finished`, `standing-by`).
@@ -37,12 +37,12 @@ Add-on, 2026-10-16 (the showrunner, approved by the user): an accounts view in t
   - `scripts/lib/unit_runs.py` — `run_roots()` 30 (`/tmp/claude/unit`, then `/tmp/claude/delegate`).
   - `scripts/agents/codex_mesh.py` — `<session_dir>/mesh_roster.json` (`ROSTER_FILE` 177): per worker `status`, `role`, `thread_id`, `turn_id`; `<session_dir>/impl_worker_<slot>.json` holds `{name, slot, family, model, worker_id}`; `<session_dir>/board.log` lines `ISO [agent] kind: body`.
   - `docs/production_format.md` 225–250 — the checkpoint notice with `Phase <next> ETA: <HH:MM zone>`; 161–190 and 298 — the Gates table and `**Blocked by:** G<k>`.
-  - `docs/delegate/phase_end.md` 20–21 — step 2 sends that notice.
+  - `docs/direct/phase_end.md` 20–21 — step 2 sends that notice.
   - `commands/unit/eta.md` 24–28 — already records with `progress_history.py eta`; `commands/unit/report.md` — the tick report (step 5, 69–115, prints the two recorder tables; step 8 the summary).
-- **Test lanes:** `scripts/delegate/test_*.py` (Python phases); `mods/unit-board/tests/*.test.ts` (mod phases).
+- **Test lanes:** `scripts/direct/test_*.py` (Python phases); `mods/unit-board/tests/*.test.ts` (mod phases).
 - **Build:** none for Python. Mod: `nix shell nixpkgs#typescript --command tsc --noEmit -p mods/unit-board` (natedev has no `tsc`, `node` or `bun` on `PATH`; the engine writes `mods/unit-board/.claude-plugin/types/` only when a live session loads the folder, so a fresh checkout reports `TS2307` for `claude-code` until one does).
 - **Test:** `HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo <tree> --tests-only` from the repo root (`<tree>` may be a `git archive` export in the scratchpad; there `shutdown/test_inventory`'s `test_git_checkout_observations_disable_optional_index_locks` always fails, rerun it in the worktree). Mod: `command claude plugin test mods/unit-board` (the bare `claude` is a shell alias).
-- **Lint:** `basedpyright scripts/delegate scripts/accounts` — pass is its `0 errors, 0 warnings` line (it exits 3: pyrightconfig names a `.venv` no checkout has). Mod: `command claude plugin validate --strict mods/unit-board`.
+- **Lint:** `basedpyright scripts/direct scripts/accounts` — pass is its `0 errors, 0 warnings` line (it exits 3: pyrightconfig names a `.venv` no checkout has). Mod: `command claude plugin validate --strict mods/unit-board`.
 - **Invariants:**
   - Nothing opens by itself (the user, 2026-10-16): no pane opened at `session.start`, no `AbovePrompt` band, no status line, no toast. A pane opens only from its slash command or a press inside an open pane, and closes from its command, its close mark or Escape.
   - No work while closed (the user, 2026-10-16): with no pane open the mod runs no timer, no `$.fs` call and no `$.process.run`; its `turn.complete` hook passes straight to `next`. While open it refreshes by `$.fs.stat` of existing files, and starts a process only when a stat shows a change (or once on open).
@@ -473,86 +473,39 @@ Source: the user via the showrunner, 2026-10-20: the two views should "show basi
 
 ### Phase 21 — /showrunner:units shows a ticket table for style work  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `/showrunner:units` gives the showrunner a snapshot of where each unit is with its work. A phase-based production gets the current table without the full-id column. A style production (`- **Kind:** style`) gets a ticket table that reads the style ledger and the run records.
-
-**Source:** the user via cargo-liner-style and the showrunner, 2026-10-28: "my purpose of running units from a showrunner is to get a snapshot with where the unit is at with its work … we need this units report to output a version that is suitable for style work which is ticket based versus other work which is phase based." Earlier the same day: "unit column is unnecessary and session column header can be renamed to be Unit because that's how i think of it". Showrunner ruling, the same day: take both parts in one commit. Fix the gaps where they live: each refill stores its per-unit result, and `held_findings` gets `built_at`, set once.
-
-**Showrunner ruling, 11:3x EDT (this overrides items 3 and 4 below):** the measured classify-only pass costs 11–40 min per refill (names 2,393 s, types 665 s with the cache), so this phase ships without it. Item 4 is dropped: refill keeps today's loop and records only its outcome (item 5), with the split columns left at their defaults. In item 3, Left is `<total>` only, with no split text. The split comes in the next phase, a read-only `style_plan.py split --unit <u>` run by a nightly timer. The units command must not wrap or replace another module's functions at run time; any cache is an explicit object passed in.
-
-**Spec:**
-
-1. **Phase-based table.** The table is `| Unit | Phase | Task |`. The full-id column is removed. Unit is the column that was Session, with the same values: the session name, `gone`, `not running` or `unknown`. Phase and Task do not change.
-2. **Production kind.** A production whose doc has `production_field(lines, "Kind") == "style"` (`scripts/production/production_units.py`) gets the ticket table in item 3. Every other production, and a doc with no Kind field, gets item 1.
-3. **Ticket table.** The table is `| Unit | Ticket | Step | Built | Left |`, with one row per live unit. After the table comes one total line. Each unit's ledger is at `style_ledger.ledger_location(<unit plan's folder>).database`. Open every ledger read-only (`sqlite3.connect(<uri>?mode=ro, uri=True)`), never through `Ledger` or `open_ledger` (they lock and migrate). Open one connection per distinct database. A missing database or table reads as no data and is never an error. The family of a unit is `rules.style_family(unit)`.
-   - **Unit:** as in item 1.
-   - **Ticket:** the unit's open ticket (`tickets.unit = <unit>`, `state IN ('assigned','checkpointed')`, oldest first). Show it as `#<n> · <rule> · <crate> · <count>`.
-     - `<n>` is the id less the `<unit>-` prefix.
-     - `<rule>` is the stem of the rule id (`global:rust/comments-name-code-constructs.md` → `comments-name-code-constructs`). For a ticket with an empty `rule` column, use its `rules` list: the first stem, plus `+<k>` when there are more.
-     - `<crate>` is `tickets.crate`.
-     - `<count>`: a `proposal` ticket shows `<len(finding_ids)> findings`, a `listed` ticket `<len(sites)> sites`, and a `read` or `structure` ticket `<len(files)> files`. Use the singular form for 1.
-     - With no open ticket, show `idle — <outcome> (<HH:MM>)` from the unit's refill record (item 5), or `idle` when there is no record.
-   - **Step:** the label of the open step of the unit's newest run, from `units_table.open_step` (the pass kind or the activity label, never its long text).
-     - With no open step and a `checkpointed` ticket, show `checkpoint sent`. With nothing open, show `—`.
-     - When the phase record has `current.eta.time`, add ` · ETA <HH:MM>`.
-     - Every time in the table is in the production zone (`phase_table` gives ISO times with an offset).
-   - **Built:** the unit family's findings with `state='built'`: `<all time> (<n> in 24 h)`. "In 24 h" counts by `built_at` (item 6).
-   - **Left:** the unit family's findings with `state='filed'` whose decision is approved: `<total>`, then `: ready <a> · changed <b> · structure <c> · other <d> (<HH:MM>)` from the unit's latest recorded split (item 5). With no recorded split, show `<total> (split not recorded)`.
-     - To decide approval and family, read each distinct `held_findings.proposal` decision file once. A decision is approved when `proposal_issue.decision_answer` returns `ApprovedDecision`. Its family is `rules.style_family(<the decision's unit>)`.
-     - A built finding with no decision file takes its family from its `build_ticket`'s `tickets.family`.
-   - **Total line:** one line for all families: `All families: <built> built · <left> left · <r> built in the last 24 h · ETA at that rate <YYYY-MM-DD>`.
-     - The ETA is now + left / r days.
-     - When r is 0, end the line with `no ETA: nothing built in 24 h`.
-     - Numbers use thousands commas.
-   - The command must finish in under 3 s on the live production.
-4. **Refill classification** (`scripts/style/style_plan.py`, `_select_phase`). Each refill that reaches the decision loop sorts every unbuilt finding of every approved decision for the unit. A finding takes the first category that holds it, in the loop's own order:
-   - `changed`: it waits because "changed since it was judged", or its file has an unsynced change on the unit base.
-   - `structure`: its file has a rank wait (a family ranked above it has open work there) and `RankExemptions` does not exempt it.
-   - `ready`: it reaches `available`. This includes the findings that the refill puts into the new ticket.
-   - `other`: every other wait. That covers a rule not in the catalog, skipped by the declaration step, no longer approved, every declaration wait, outside pilot scope, a busy file, an uncertain path attribute, and edits a busy file.
-   - A finding that this refill waives, or that is in a decision this refill closes, is not counted.
-   - Today the loop `break`s after it writes a ticket. Now, after a ticket is written, the loop continues through the remaining decisions in classify-only mode. That mode makes no write: no waive, no close, no ticket add or assign, no `proposal_command`, no `write_phase`, no renumber. A finding that this mode would waive counts as `other`.
-   - The phase that is written and every printed line stay exactly as today. The only change is the extra classify-only pass and the counts.
-   - **Cost:** the classify-only pass must not make a refill on the live ledger noticeably slower. Batch and cache the git blob reads behind `judged_at_current_file` (for example one `git ls-tree -r` per commit, cached for the refill). Measure the full classification on a copy of the live ledger (`cp ~/.local/state/style/cargo-liner/ledger.sqlite` into `/tmp/claude/<dir>/`, point `STYLE_LEDGER_STATE_DIR` at it, and use only read paths). Delete the copy after. Never run refill, `next_phase` or any write against the live ledger or the live plans.
-5. **Refill record** (`scripts/style/style_ledger.py`).
-   - Migration 25 adds the table `refill_results(unit TEXT PRIMARY KEY, at TEXT NOT NULL, outcome TEXT NOT NULL, split_at TEXT NOT NULL DEFAULT '', ready INTEGER NOT NULL DEFAULT 0, changed INTEGER NOT NULL DEFAULT 0, structure INTEGER NOT NULL DEFAULT 0, other INTEGER NOT NULL DEFAULT 0)`.
-   - `style_plan.py main` records every `next_phase` outcome after `next_phase` returns. This includes `RepairFirst` and a board that is unavailable. Use one function, `style_ledger.record_refill(repo, unit, outcome, split)`. It opens its own short connection with the busy timeout, loads no rule catalog and runs no migration. It does nothing when the table is missing.
-   - `outcome` is short words: `phase written`, `resumed`, `repair first`, `waiting for merge`, `waiting for sync`, `waiting for structure: <crates>`, `waiting for branch-point sync`, `merge the style branch first`, `no work`, `board unavailable`.
-   - When classification ran, the split from item 4 travels out of `next_phase` with its result and replaces the stored counts and `split_at`. Otherwise the stored counts stay.
-   - An exception from `next_phase` records nothing.
-6. **`built_at`.**
-   - Migration 25 also adds `held_findings.built_at TEXT NOT NULL DEFAULT ''`.
-   - It backfills every built finding: the `updated_at` of its build ticket when that ticket is merged, else the finding's own `updated_at`.
-   - Each transition to `built` sets `built_at` to now only when it is `''`, so a later write never moves it. The transitions are the proposal ticket merge (`building`), the declaration follow, `held built` and `mark_built_at_merge`.
-   - A finding that leaves `built` clears `built_at`, if any path does that.
-7. **Docs** in the same commit:
-   - `commands/showrunner/units.md`: both tables, every cell form, and the total line.
-   - `docs/as-built/showrunner-automation.md`: the Units table entry.
-   - `docs/as-built/style-showrunner.md`: `refill_results`, `record_refill`, the classification and `built_at`.
+- A phase-based production gets `| Unit | Phase | Task |`. Unit holds the session name, `gone`, `not running` or `unknown`. The full-id column is gone.
+- A production whose doc has `production_field(lines, "Kind") == "style"` gets `| Unit | Ticket | Step | Built | Left |`, one row per live unit, then one total line. All times are in the production zone.
+  - Ticket: the oldest `assigned`/`checkpointed` ticket of the unit, as `#<n> · <rule stem> · <crate> · <count>`. An empty `rule` uses the first `rules` stem plus `+<k>`. Count is findings (proposal), sites (listed) or files (read, structure), singular for 1. With no ticket: `idle — <outcome> (<HH:MM>)` from `refill_results`, or `idle`.
+  - Step: the label from `open_step` of the newest run, else `checkpoint sent` for a `checkpointed` ticket, else `—`; ` · ETA <HH:MM>` when `current.eta.time` is set.
+  - Built: family findings with `state='built'`, as `<all time> (<n> in 24 h)`, counted by `built_at`. Left: family findings with `state='filed'` and an approved decision (`decision_answer` returns `ApprovedDecision`), as `<total>` only. Each decision file is read once; a built finding with no decision takes the family of its `build_ticket`.
+  - Total line: `All families: <built> built · <left> left · <r> built in the last 24 h · ETA at that rate <YYYY-MM-DD>`, or `no ETA: nothing built in 24 h` when r is 0. Numbers use thousands commas.
+- Ledger migration 25 adds `refill_results(unit PK, at, outcome, split_at '', ready, changed, structure, other)` and `held_findings.built_at TEXT NOT NULL DEFAULT ''`, backfilled from the merged build ticket's `updated_at`, else the finding's own.
+- `style_plan.py main` calls `style_ledger.record_refill(repo, unit, outcome)` after each `next_phase` return, `RepairFirst` and board unavailable included. An exception records nothing. `refill_outcome` gives nine words: `phase written`, `resumed`, `repair first`, `waiting for merge`, `waiting for sync`, `waiting for structure: <crates>`, `waiting for branch-point sync`, `merge the style branch first`, `board unavailable`.
+- `built_at` is set to now on each transition to built only when it is `''` (proposal ticket merge, declaration follow, `held built`, `mark_built_at_merge`), and cleared when a finding leaves built.
 
 **Files:**
-- `scripts/style/style_ledger.py`, `scripts/style/style_plan.py`: items 4–6.
-- `scripts/production/units_table.py`, plus a new `scripts/production/style_units.py` for the ticket table and its ledger reads: items 1–3. `pyrightconfig.json`: add `scripts/style` to the `scripts/production` paths.
-- Docs: item 7.
-- Tests:
-  - `scripts/style/test_style_ledger.py`
-  - `scripts/style/test_style_plan.py`
-  - `scripts/production/test_units_table.py`
-  - a new `scripts/production/test_style_units.py`
+- `scripts/production/style_units.py` — ticket table, read-only ledger reads, shared step/cell helpers (`OpenStep`, `NoOpenStep`, `open_step`, `run_events`, `session_cell`, `escaped`, `NONE`).
+- `scripts/production/units_table.py` — phase table, Kind switch, re-exports of the shared helpers.
+- `scripts/style/style_ledger.py` — migration 25, `record_refill`, `built_at` transitions.
+- `scripts/style/style_plan.py` — `refill_outcome`, the record call in `main`.
+- `pyrightconfig.json` — `scripts/style` on the `scripts/production` paths.
+- `commands/showrunner/units.md`, `docs/as-built/showrunner-automation.md`, `docs/as-built/style-showrunner.md` — both tables, cell forms, total line, `refill_results`, `record_refill`, `built_at`.
 
-**Workers:** 2 writers + 1 tester.
-- `impl` writes `style_ledger.py` and `style_plan.py`: items 4–6, the live-copy measurement, and the style as-built.
-- `impl2` writes `units_table.py`, `style_units.py`, `pyrightconfig.json`, `units.md` and `showrunner-automation.md`: items 1–3 and 7, against the schema that `impl` posts.
-- `test` writes the four test files from this Spec alone.
+**Binds later work:**
+- `record_refill(repo, unit, outcome)` writes only `unit`, `at`, `outcome`. It opens its own short connection with the busy timeout, loads no rule catalog, runs no migration, and does nothing when the table is missing.
+- The `refill_results` split columns and `split_at` exist with their defaults and have no producer yet; the nightly split command fills them, and `split_at = ''` means no split.
+- `style_units.py` opens each ledger read-only (`sqlite3.connect(<uri>?mode=ro, uri=True)`), one connection per distinct database, never through `Ledger`/`open_ledger` (they lock and migrate). A missing database or table reads as no data.
+- The shared step/cell helpers live in `style_units.py`; `units_table.py` re-exports them to break a static import cycle. A test that patches `units_table.open_step` does not reach `style_units`.
+- The units command never wraps or replaces another module's functions at run time; any cache is an explicit object passed in.
+- The live table runs under 3 s (1.5–2.1 s measured).
 
-**Constraints from prior phases:** none of the earlier phases touch these files. The style ledger is shared with four live style units. Never write to `~/.local/state/style/` or to any plan or decision under `~/rust/`. Read the live data only through a copy or a read-only connection.
+**Gotchas:**
+- A style unit's plan folder comes from its phase record; an unreadable phase record shows `idle` with no ledger read.
+- `test_bulk_rename.py` compares the schema version with `max(style_ledger.MIGRATIONS)`, not a fixed number.
 
-**Acceptance gate:**
-- basedpyright on every touched file
-- the four test modules
-- `python3 scripts/production/units_table.py --production ~/rust/cargo-liner-style/docs/cargo-liner-style-production.md` on the live production, read-only, in under 3 s
-- the full merge gate
+**Ruled out:** a classify-only pass inside refill (11–40 min per refill on the live ledger, blob reads in `judged_at_current_file` dominate); a `no work` outcome (`next_phase` never returns `NoAvailableWork`); split text in the Left cell.
 
 ### Phase 22 — the ticket table shows each unit's split, read by a nightly command  · status: todo
 
@@ -560,17 +513,64 @@ Source: the user via the showrunner, 2026-10-20: the two views should "show basi
 
 #### Work Order
 
-**Goal:** the Left cell of the style ticket table shows the split of the findings left (`ready`, `changed`, `structure`, `other`) with its age, without making refill slower.
+**Goal:** the Left cell of the style ticket table shows how the findings left split into `ready`, `changed`, `structure` and `other`, with the age of that split. A separate read-only command measures the split, so refill does not get slower.
 
 **Source:** showrunner ruling, 2026-10-28 11:3x EDT (option A): "a read-only `style_plan.py split --unit <u>` that writes its refill_results row with its time, run from a nightly timer, and the table shows the split with its age." Review findings moved here from phase 21 under the landing call: F008 and F009.
 
 **Spec:**
 
-1. **Split command.** `style_plan.py split --unit <u> --repo <unit worktree>` sorts every unbuilt finding of every approved decision for the unit into `changed`, `structure`, `ready` and `other`, in the decision loop's own order (phase 21 item 4 text). It makes no ticket, waive, close, phase write or renumber. It writes only the unit's `refill_results` split columns and `split_at`, through one short connection like `record_refill`.
-2. **Cost.** It runs at nice 19 in `builds.slice` with a time limit. Batch and cache the git blob reads (one `git ls-tree -r` per commit). Measure it on a copy of the live ledger under `/tmp/claude/`, at nice 19, once, and delete the copy.
-3. **Nightly timer.** A user timer runs the command for each live unit of a style production once a night.
-4. **Table.** Left shows `<total>: ready <a> · changed <b> · structure <c> · other <d> (<age>)` when a split is recorded, else `<total>`.
-5. **F008.** A unit whose phase record is unavailable still reads its ledger: resolve the ledger folder from the production's Units row, not from the phase record.
-6. **F009.** Move `OpenStep`, `NoOpenStep`, `session_cell`, `open_step`, `run_events`, `escaped` and `NONE` from `style_units.py` to a neutral module that both `units_table.py` and `style_units.py` import. Remove the re-exports.
+1. **Split command.** `style_plan.py split --unit <u> --repo <unit worktree> [--timeout-minutes <n>]` (default 90).
+   - **Population.** The split partitions the unit's Left total from the ticket table: every finding of the unit's family with `state='filed'` whose decision is approved (`proposal_issue.decision_answer` returns `ApprovedDecision`). The four counts always add up to that total.
+   - **Order.** Each finding takes the first category that holds it, in the decision loop's own order (`_select_phase` in `style_plan.py`):
+     - `changed`: it waits because "changed since it was judged" (`style_proposals.judged_at_current_file` is false), or its file has an unsynced change on the unit base.
+     - `structure`: its file has a rank wait (a family ranked above it has open work there) and `RankExemptions` does not exempt it.
+     - `ready`: it reaches `available`, or an open build ticket already holds it.
+     - `other`: every other case. That covers a decision that `style_proposals.approved_decisions` does not select, a rule not in the catalog, a declaration wait, outside pilot scope, a busy file, an uncertain path attribute, edits a busy file, and a finding that refill would waive.
+   - **Read only.** It reads through `style_ledger.preview_ledger(repo)` (a backup copy; the stored ledger never changes) and holds no refill lock while it scans. It makes no ticket, waive, close, declaration follow, `proposal_command`, phase write or renumber. Its only write is item 4's, at the end.
+   - **Cost.** Batch and cache the git blob reads: one `git ls-tree -r` per commit, held in an explicit cache object passed in. Never wrap or replace another module's functions at run time.
+   - **Time limit.** At the limit, or on any error, it writes nothing, keeps the last split, prints `split <unit>: <cause>` to stderr and exits 1.
+2. **Split for a production.** `style_plan.py split-all --production <production doc>` runs `split` for each live unit of the production, one unit at a time, never in parallel. Each child runs at nice 19 in `builds.slice` (the `systemd-run --user --scope --slice=builds.slice` prefix and probe of `merge_gate.suite_scope_prefix`, skipped when already in that slice). The worktree of each unit comes from the production's Units row (`production_units.unit_table`) and its plan from `unit_plans.unit_plan_path`. A unit that fails does not stop the others. A production with no style units prints `no style units` and exits 0. The command exits 1 when any unit failed and prints one line per unit: `<unit>: <ready>/<changed>/<structure>/<other> in <m> min` or `<unit>: failed: <cause>`.
+3. **Measure once.** Run `split` once for one unit on a copy of the live ledger under `/tmp/claude/` (`STYLE_LEDGER_STATE_DIR` pointed at it), at nice 19, and delete the copy. Report the minutes in the summary.
+4. **Record.** `style_ledger.record_split(repo, unit, split)` opens one short connection with the busy timeout, like `record_refill`. It sets the four counts and `split_at` only. When the unit has no row, it inserts one with `at=''` and `outcome=''`. `record_refill` keeps the split columns as they are. `split_at` is the time the scan started (UTC ISO with offset). Use domain types: `RecordedSplit(ready, changed, structure, other, measured_at)` or `NoSplitRecorded()`, and a refill row with `outcome=''` reads as no refill record. Never use a bare `None` or all-zero counts to mean "no split".
+5. **Table.** Left shows `<total>: ready <a> · changed <b> · structure <c> · other <d> (<age>)` with a recorded split, else `<total>`. `<age>` is the time since `split_at`: `<n> min`, `<n> h` or `<n> d`. A unit with no refill record and no open ticket still shows `idle`, also when it has a split.
+6. **F008.** A unit whose phase record is unavailable still reads its ledger. `units_table.main` resolves each style unit's ledger folder from the production's Units row and `unit_plans.unit_plan_path`, and passes that explicit path map to `style_units.table`; it does not take the folder from the phase record.
+7. **F009.** Move `OpenStep`, `NoOpenStep`, `session_cell`, `open_step`, `run_events`, `escaped` and `NONE` from `style_units.py` to a new neutral module `scripts/production/unit_table_cells.py`. `units_table.py`, `style_units.py` and `scripts/direct/board_json.py` import them from there. Remove the re-exports from `units_table.py`.
+8. **Nightly timer (another repository).** The showrunner adds the timer in `/etc/nixos` once this phase merges: `split-all` for each style production at 02:00 EDT, `Nice=19`, in `builds.slice`, skipped on a night when a build hold is in force. This phase does not write it. The 2026-10-16 "No new process" rule in Delegation Context covers the board mod only (showrunner, 2026-10-28).
+9. **Docs** in the same commit: `docs/as-built/style-showrunner.md` (`split`, `split-all`, `record_split`, the categories), `commands/showrunner/units.md` and `docs/as-built/showrunner-automation.md` (the Left cell with its split and age).
 
-**Files:** `scripts/style/style_plan.py`, `scripts/style/style_ledger.py`, `scripts/production/style_units.py`, `scripts/production/units_table.py`, a new neutral helper module, the timer unit, their tests and docs.
+**Files:**
+- `scripts/style/style_plan.py`
+- `scripts/style/style_ledger.py`
+- `scripts/production/units_table.py`
+- `scripts/production/style_units.py`
+- `scripts/production/unit_table_cells.py`
+- `scripts/direct/board_json.py`
+- `docs/as-built/style-showrunner.md`
+- `commands/showrunner/units.md`
+- `docs/as-built/showrunner-automation.md`
+- `scripts/style/test_style_plan.py`
+- `scripts/style/test_style_ledger.py`
+- `scripts/production/test_units_table.py`
+- `scripts/production/test_style_units.py`
+- `scripts/direct/test_board_json.py`
+
+**Workers:** 2 writers + 1 tester.
+- `impl` writes `style_plan.py` and `style_ledger.py`: items 1–4, and `docs/as-built/style-showrunner.md`.
+- `impl2` writes `units_table.py`, `style_units.py`, `unit_table_cells.py` and `board_json.py`: items 5–7, `commands/showrunner/units.md` and `docs/as-built/showrunner-automation.md`.
+- `test` writes the five test files from this Spec alone.
+
+**Constraints from prior phases:**
+- Phase 21 shipped migration 25 (`refill_results`, `held_findings.built_at`) and `record_refill(repo, unit, outcome)`, which writes only `unit`, `at` and `outcome`. The split columns exist and stay at their defaults until this phase.
+- The phase 21 classify pass was removed: no classification code is in the tree. On the live ledger it cost 11–40 min per unit (names 2,393 s, types 665 s with a blob cache), which is why it runs nightly.
+- `style_units.py` opens every ledger read-only (`?mode=ro`), never through `Ledger` or `open_ledger`. The live table must stay under 3 s; it was 1.5–2.1 s after phase 21.
+- Tests patch `style_units.table` and the helpers by module name; after item 7 they patch `unit_table_cells`.
+- The style ledger is shared with four live style units. Never write to `~/.local/state/style/` or to any plan or decision under `~/rust/`. Read live data only through a copy or a read-only connection. Never run refill, `next_phase`, `split` or `split-all` against live data.
+- The worktree has no `.venv`; basedpyright needs a temporary venv under `/tmp/claude` (`--venvpath`).
+
+**Acceptance gate:**
+- basedpyright on each slot's touched files, footer `0 errors, 0 warnings, 0 notes`
+- `scripts/style`: `test_style_plan`, `test_style_ledger`; `scripts/production`: `test_units_table`, `test_style_units`; `scripts/direct`: `test_board_json`
+- tests show: the four counts add up to the Left total; only `refill_results` changes after `split`; a timeout or error keeps the last split; the first split creates a row that reads as idle; refill output is unchanged
+- `python3 scripts/production/units_table.py --production ~/rust/cargo-liner-style/docs/cargo-liner-style-production.md` on the live production, read-only, in under 3 s
+- the one `split` measurement on a copy (item 3)
+- the full merge gate
