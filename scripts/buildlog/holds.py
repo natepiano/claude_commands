@@ -32,7 +32,6 @@ class CurrentHold:
 @dataclass(frozen=True)
 class NatedevHoldsNow:
     in_force: tuple[CurrentHold, ...]
-    releasing: tuple[CurrentHold, ...]
 
 
 @dataclass(frozen=True)
@@ -59,10 +58,7 @@ def read_current_holds() -> CurrentHolds:
         holders = build_hold.natedev_holds(build_hold.holder_directory())
         natedev = NatedevHoldsNow(
             tuple(CurrentHold(item.key, item.name, item.purpose, item.since) for item in holders.in_force),
-            tuple(CurrentHold(item.key, item.name, item.purpose, item.since) for item in holders.releasing),
         )
-    except build_hold.ReleaseRecordReadError as error:
-        natedev = HoldStateUnreadable(build_hold.release_record_error_line(error))
     except (OSError, UnicodeError, mac_test.StateReadError) as error:
         natedev = HoldStateUnreadable(str(error))
     try:
@@ -91,8 +87,6 @@ def now_lines(current: CurrentHolds) -> list[str]:
     else:
         for hold in current.natedev.in_force:
             lines.append(f"Now: natedev held by {hold.holder} for {hold.reason} since {shown_time(hold.since)}")
-        for hold in current.natedev.releasing:
-            lines.append(f"Now: natedev releasing (held by {hold.holder} for {hold.reason} since {shown_time(hold.since)})")
     return lines
 
 
@@ -174,7 +168,7 @@ def key_is_present(current: CurrentHolds, host: str, target: HoldTarget, key: st
         return False
     if target == "natedev":
         return isinstance(current.natedev, NatedevHoldsNow) and any(
-            item.key == key for item in (*current.natedev.in_force, *current.natedev.releasing)
+            item.key == key for item in current.natedev.in_force
         )
     if not isinstance(current.mac, MacHoldsNow):
         return False

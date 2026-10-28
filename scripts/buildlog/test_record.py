@@ -747,6 +747,32 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.records()[-1]["until"], "")
 
+    def test_hold_build_deduplicates_lifetimes_and_holds_in_permanent_log(self) -> None:
+        since = "2026-10-28T12:00:00+00:00"
+        arguments = ["hold-build", "holder", since, "boot-one", "123", "456", "other_session",
+                     "session", "cargo test", "/repo"]
+        for _ in range(2):
+            result = self.record(*arguments)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        row, = self.records()
+        self.assertEqual((row["kind"], row["hold_key"], row["pid"], row["proc_start"], row["class"]),
+                         ("hold_build", "holder", 123, "456", "other_session"))
+        self.assertEqual((row["session"], row["command"], row["cwd"]), ("session", "cargo test", "/repo"))
+        arguments[3] = "boot-two"
+        _ = self.record(*arguments)
+        arguments[5] = "457"
+        _ = self.record(*arguments)
+        arguments[2] = "2026-10-28T13:00:00+00:00"
+        _ = self.record(*arguments)
+        self.assertEqual(len(self.records()), 4)
+
+    def test_hold_build_refuses_holder_and_admitted_rows(self) -> None:
+        for classification in ("holder", "admitted"):
+            result = self.record("hold-build", "holder", "2026-10-28T12:00:00Z", "boot", "123", "456",
+                                 classification, "session", "cargo test", "/repo")
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.records(), [])
+
     def test_call_records_mac_result_and_local_reason(self) -> None:
         local_reason = 'needs Linux path handling with a "quoted" mount'
         result = self.record(
