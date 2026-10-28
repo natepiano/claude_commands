@@ -134,14 +134,14 @@ Model, in the user's words (2026-10-21): the goal of a guild is to help guild me
 
 | # | Item | Decision |
 | --- | --- | --- |
-| PH1 | Goal and plan: measure how a phase and the doc pipeline run, find where time and tokens go, change one step at a time; done 1 (measure); in 2 (recommend); next 3 (build first step), 4 (measure it) | |
-| PH2 | Step 1: tokens first (cheap A) or dispatch time first (C, then cheap A) | |
+| PH1 | Goal and plan: measure how a phase and the doc pipeline run, find where time and tokens go, change one step at a time; done 1 (measure); in 2 (recommend); next 3 (build first step), 4 (measure it) || Approved (the user, 2026-10-28). |
+| PH2 | Step 1: tokens first (cheap A) or dispatch time first (C, then cheap A) || Tokens first: cheap A, each step reads only its own rule file (the user, 2026-10-28). |
 
 ### hierarchies-unit (moving into sdlc)
 
 | # | Item | Decision |
 | --- | --- | --- |
-| HI1 | Goal and plan: the organization that ships Hana fastest under the user's constraints; recommends A (repair today's tree) | |
+| HI1 | Goal and plan: the organization that ships Hana fastest under the user's constraints; recommends A (repair today's tree) || A, as an experiment (the user, 2026-10-28: "i think of this all as experimental and you should treat it as such"). Each rule, the cargo Hana-cost test included, is a trial with a measure and a review point, and it is dropped if it does not help. |
 | HI2 | Q3 must build-followups and sdlc cut a measured Hana cost, or get a fixed share | |
 | HI3 | Q4 the user's daily review budget; may old unreviewed changes close | |
 | HI4 | Q5 is the account count fixed | |
