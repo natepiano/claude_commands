@@ -141,10 +141,10 @@ Model, in the user's words (2026-10-21): the goal of a guild is to help guild me
 
 | # | Item | Decision |
 | --- | --- | --- |
-| HI1 | Goal and plan: the organization that ships Hana fastest under the user's constraints; recommends A (repair today's tree) | |
-| HI2 | Q3 must build-followups and sdlc cut a measured Hana cost, or get a fixed share | |
-| HI3 | Q4 the user's daily review budget; may old unreviewed changes close | |
-| HI4 | Q5 is the account count fixed | |
+| HI1 | Goal and plan: the organization that ships Hana fastest under the user's constraints; recommends A (repair today's tree) || A, as an experiment (the user, 2026-10-28: "i think of this all as experimental and you should treat it as such"). Each rule, the cargo Hana-cost test included, is a trial with a measure and a review point, and it is dropped if it does not help. |
+| HI2 | Q3 must build-followups and sdlc cut a measured Hana cost, or get a fixed share || Revised and approved (the user, 2026-10-28: "all of this work is at the very least transitively supportive... we use natedev as a test bed for ideas for hana"). Every new piece of work in build-followups, sdlc and cargo names its link to Hana, direct or indirect. No measured Hana cost and no fixed share. Record the links; review later which paid off. This softens HI1's cargo rule to the same link rule. |
+| HI3 | Q4 the user's daily review budget; may old unreviewed changes close || Part 1, budget: no daily budget (the user, 2026-10-28). The user wants what is being built: a Jev-driven mechanism (scripts/issue_score) that always sorts every item for review by importance, so each review gives the most decision value. Part 2: keep open; no change closes without the user's check (the user: "i was on vacation for 7 days and things accumulated - that's why i want priority sorting"). |
+| HI4 | Q5 is the account count fixed || Fixed, with proposals: the account count stays; when records show one more account ships more Hana work, the showrunner brings a proposal with the numbers; cost per phase alone is no case (the user, 2026-10-28). |
 | HI5 | Q6 where each newly created showrunner and unit sits in the tree | |
 | HI6 | Q7 push-authorization audit | |
 | HI7 | Q8 record waits and merge receipts | |

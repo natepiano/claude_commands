@@ -25,7 +25,7 @@ at `~/.claude/scripts/production/transfer_unit.py`:
    A running unit is not a refusal: apply stops it itself, at step 1, as a rename does.
 2. Run `apply` once, in the background. It waits for the unit to stop and for the relaunched unit to
    come up. It journals each step, so a rerun after a refusal resumes from the step that stopped. The steps are:
-   1. stop the unit and its Codex seats through the shutdown path;
+   1. stop the unit and its Codex workers through the shutdown path;
    2. commit the plan's `> **Production:**` header on the unit branch, so that it names the receiving
       production, and push the branch;
    3. commit the Units row into the receiving doc, on the receiving merge branch;

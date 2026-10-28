@@ -794,7 +794,7 @@ class UnitRenameTests(unittest.TestCase):
         _ = self.mark_live("alpha-unit", "sid-alpha")
         planned = self.rename("plan")
         self.assert_ok(planned)
-        self.assertIn("1. stop alpha-unit and its Codex seats at once through the shutdown path", planned.stdout)
+        self.assertIn("1. stop alpha-unit and its Codex workers at once through the shutdown path", planned.stdout)
         applied = self.rename("apply")
         self.assertEqual(applied.returncode, 2, applied.stdout + applied.stderr)
         self.assertIn("alpha-unit is still stopping after 0 s; rerun apply once it has stopped", applied.stderr)
