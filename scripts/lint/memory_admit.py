@@ -76,7 +76,7 @@ class Reservation(TypedDict):
 @dataclass(frozen=True)
 class ExpectedPeak:
     bytes: int
-    source: Literal["measured", "buildlog", "fallback"]
+    source: Literal["measured", "buildlog", "pooled", "fallback"]
     count: int
 
 
@@ -167,17 +167,23 @@ def expected_peak(repo: str, step: str, host: str, now: datetime, root: Path,
     cutoff = store.utc_iso((now - timedelta(days=HISTORY_DAYS)).timestamp())
     before = store.utc_iso(now.timestamp())
     measured: list[int] = []
+    # Every repo's runs of this step on this host: a checkout with fewer than 5 runs of its own (a gate
+    # copy, a clone) uses their p90, not FALLBACK. Doc steps held 2157 of 4702 wait minutes in the week
+    # to 2026-10-28 on that fallback; the measured doc p90 over all repos was 4.15 GiB.
+    pooled: list[int] = []
     try:
         with (root / "admission/anon_peaks.jsonl").open() as lines:
             for line in lines:
                 try:
                     item = cast(dict[str, object], json.loads(line))
-                    if ((item.get("host"), item.get("repo"), item.get("step")) == (host, repo, step)
+                    if ((item.get("host"), item.get("step")) == (host, step)
                             and (test_threads is None or item.get("test_threads") == test_threads)
                             and cutoff <= str(item.get("ended_at", "")) < before):
                         peak = item.get("anon_peak_bytes")
                         if isinstance(peak, int) and peak > 0:
-                            measured.append(peak)
+                            pooled.append(peak)
+                            if item.get("repo") == repo:
+                                measured.append(peak)
                 except (ValueError, TypeError, AttributeError):
                     continue
     except OSError:
@@ -201,6 +207,8 @@ def expected_peak(repo: str, step: str, host: str, now: datetime, root: Path,
         pass
     if len(peaks) >= 5:
         return ExpectedPeak(int(percentile(peaks) * ANON_SHARE), "buildlog", len(peaks))
+    if len(pooled) >= 5:
+        return ExpectedPeak(percentile(pooled), "pooled", len(pooled))
     return ExpectedPeak(FALLBACK, "fallback", 0)
 
 

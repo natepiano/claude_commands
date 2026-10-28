@@ -145,6 +145,7 @@ buildlog_memory_line() {
     case "$source" in
         measured) description="the 90th percentile of $count measured runs" ;;
         buildlog) description="0.65 of the 90th percentile peak of $count runs" ;;
+        pooled) description="the 90th percentile of $count measured runs of this step in every repo" ;;
         *) description="no history, so the fallback" ;;
     esac
     if [[ "$kind" == first ]]; then

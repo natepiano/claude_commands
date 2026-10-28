@@ -92,11 +92,20 @@ class HistoryTests(unittest.TestCase):
         self.add_measured(1)
         self.assertEqual(self.peak(), gate.ExpectedPeak(4 * GIB, "measured", 5))
 
-    def test_stale_other_repo_and_other_host_are_excluded(self) -> None:
+    def test_stale_and_other_host_are_excluded(self) -> None:
         self.add_measured(5, at=NOW - timedelta(days=15))
-        self.add_measured(5, repo="other")
         self.add_measured(5, host="other-host")
         self.assertEqual(self.peak(), gate.ExpectedPeak(gate.FALLBACK, "fallback", 0))
+
+    def test_a_repo_with_few_runs_uses_the_step_p90_over_every_repo(self) -> None:
+        self.add_measured(3, repo="other")
+        self.add_measured(4, start_gib=10)
+        self.assertEqual(self.peak(), gate.ExpectedPeak(13 * GIB, "pooled", 7))
+
+    def test_own_buildlog_history_comes_before_the_pooled_p90(self) -> None:
+        self.add_index()
+        self.add_measured(5, repo="other")
+        self.assertEqual(self.peak(), gate.ExpectedPeak(int(5 * GIB * gate.ANON_SHARE), "buildlog", 5))
 
     def test_missing_index_or_history_is_fallback(self) -> None:
         self.assertEqual(self.peak().source, "fallback")
