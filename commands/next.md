@@ -115,3 +115,16 @@ The current open question. Mark: `update_registration.py mark-important
 --production PRODUCTION_DOC --item "<its text>"`. Ask it in full: what is asked,
 why, and the answer choices. Act on the user's answer as `/showrunner:produce` →
 Throughout says, and remove the item through its Open-questions list.
+
+An item shown with `asked by <unit>` was filed with `/unit:question` or
+`/showrunner:question`. When the user answers it, run `update_registration.py
+answer --production PRODUCTION_DOC --item "<its text>"`. It removes the item and
+prints whom the answer goes to:
+
+- `relay: to <unit>`: send the unit the answer, beginning
+  `From the user (via the showrunner): `, with the question's one-line text.
+- `relay: to the showrunner of <slug>, for <unit>`: the item is a production
+  below this one (`all-below`). Send the answer to that production's
+  showrunner, beginning `From the user (via <your name>): `, naming the unit
+  and the item. That showrunner relays it to its unit.
+- `relay: none`: act on the answer here.

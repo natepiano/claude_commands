@@ -3109,8 +3109,12 @@ class RestartTests(ShutdownTestCase):
 
     def test_herdr_restart_starts_a_stopped_server_under_its_named_unit(self) -> None:
         owner, responses, log = self.herdr_restart_fixture()
-        transient = ["--user", "--unit=herdr-writing.service", "--collect", str(self.root / "fake-herdr"),
-                     "--session", "writing", "server"]
+        # An empty SHELL makes the pane shell /bin/sh; the wrapper goes under HOME.
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"SHELL": "", "XDG_STATE_HOME": ""})))
+        transient = ["--user", "--unit=herdr-writing.service", "--collect",
+                     "-p", "CPUWeight=1000", "-p", "MemoryLow=1G", "-p", "MemorySwapMax=0",
+                     f"--setenv=SHELL={self.root}/.local/state/herdr/pane-shell", "--setenv=HERDR_PANE_SHELL=/bin/sh",
+                     str(self.root / "fake-herdr"), "--session", "writing", "server"]
         for fragment, started in (("\n", transient),
                                   ("/home/u/.config/systemd/user/herdr-writing.service\n",
                                    ["--user", "start", "herdr-writing.service"])):

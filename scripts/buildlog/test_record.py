@@ -292,7 +292,7 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertRegex(result.stderr, r"waiting for memory since \d\d:\d\d P[DS]T: the machine has 10\.5 GiB free; a build starts at 12\.0")
         self.assertEqual(result.stderr.count("waiting for memory since "), 1)
-        self.assertIn("memory wait limit reached after 15 min; starting anyway", result.stderr)
+        self.assertIn("memory wait limit reached after 15 min; starting the launch anyway", result.stderr)
         self.assertGreaterEqual(int(result.stdout.strip()), 1)
 
     def test_memory_admission_skips_unreadable_or_invalid_meminfo(self) -> None:
