@@ -6362,6 +6362,25 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(self.ledger().reconcile("main", "main"), ())
         self.assertEqual(self.berth_calls(), calls)
 
+    def test_ticket_merge_takes_a_release_at_a_later_merge_once_the_style_branch_contains_it(self) -> None:
+        session = self.held_reservation("modules-unit-1")
+        self.checkpointed_structure_ticket("modules-unit-1", "--session-dir", str(session), "--phase", "7")
+        # The unit merges style/main after its checkpoint and berth releases there (cargo-liner ticket 90).
+        _ = self.git("checkout", "-q", "-b", "unit")
+        self.write("README.md", "merged style/main\n")
+        later = self.commit("Merge style/main into the unit")
+        _ = (self.root / "board.json").write_text(json.dumps({"r1": {"status": "released_after_checkpoint", "protected_tip": later}}))
+        refused = self.cli("ticket", "merge", "--id", "modules-unit-1", success=False)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn(f"or at a later commit that {self.initial_tip[:7]} contains; it stays held; rerun ticket merge", refused.stderr)
+        self.assertEqual(self.ticket_row("modules-unit-1"), ("merged", str(session), "7"))
+        _ = self.git("checkout", "-q", "main")
+        _ = self.git("merge", "-q", "--ff-only", "unit")
+        self.assertEqual(self.cli("ticket", "merge", "--id", "modules-unit-1").stdout,
+                         "ticket modules-unit-1: phase 7: released reservation r1\n")
+        self.assertEqual(self.ticket_row("modules-unit-1"), ("merged", "", ""))
+        self.assertEqual({call[0] for call in self.berth_calls()}, {"board"})
+
     def test_read_checkpoint_names_only_the_missing_rule_and_file_pair(self) -> None:
         first, last = self.rule("read-first"), self.rule("read-last")
         self.set_tip(self.initial_tip)
