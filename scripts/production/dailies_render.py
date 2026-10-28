@@ -299,6 +299,8 @@ class OutstandingQuestion:
     question: str
     timing: OutstandingTiming = DueNow()
     rank: Ranking = Ranking()
+    # The unit (or showrunner) that filed it with `update_registration.py ask`; the answer goes back to it.
+    asked_by: str = ""
 
 
 @dataclass(frozen=True)
@@ -309,6 +311,8 @@ class ReviewedOutstandingQuestion:
     reviewed: str
     timing: OutstandingTiming = DueNow()
     rank: Ranking = Ranking()
+    # The unit (or showrunner) that filed it with `update_registration.py ask`; the answer goes back to it.
+    asked_by: str = ""
 
 
 @dataclass(frozen=True)
@@ -319,6 +323,8 @@ class ReviewUnavailableOutstandingQuestion:
     reason: str
     timing: OutstandingTiming = DueNow()
     rank: Ranking = Ranking()
+    # The unit (or showrunner) that filed it with `update_registration.py ask`; the answer goes back to it.
+    asked_by: str = ""
 
 
 Outstanding = (OutstandingReminder | OutstandingQuestion | ReviewedOutstandingQuestion
@@ -1022,7 +1028,7 @@ def read_outstanding(path: Path | None) -> list[Outstanding]:
             raise InputError(f"{where}: expected an object")
         fields = cast(dict[str, object], entry)
         check_keys(fields, {"since", "text", "after", "question", "reviewed", "review_unavailable", "urgency", "due",
-                            "marked", "follows"}, where)
+                            "marked", "follows", "asked_by"}, where)
         rank = read_ranking(fields, where)
         since, text, after = fields.get("since"), fields.get("text"), fields.get("after")
         if not isinstance(since, str) or not STARTED.match(since):
@@ -1037,9 +1043,12 @@ def read_outstanding(path: Path | None) -> list[Outstanding]:
         since_at = datetime.fromisoformat(since)
         question = fields.get("question")
         reviewed, unavailable = fields.get("reviewed"), fields.get("review_unavailable")
+        asked_by = fields.get("asked_by", "")
+        if not isinstance(asked_by, str) or "\n" in asked_by or ("asked_by" in fields and not asked_by.strip()):
+            raise InputError(f"{where}.asked_by: expected one non-empty line")
         if "question" not in fields:
-            if "reviewed" in fields or "review_unavailable" in fields:
-                raise InputError(f"{where}: question required for a review result")
+            if "reviewed" in fields or "review_unavailable" in fields or "asked_by" in fields:
+                raise InputError(f"{where}: question required for a review result or an asker")
             items.append(OutstandingReminder(since_at, text, timing, rank))
             continue
         if not isinstance(question, str) or not question.strip():
@@ -1047,13 +1056,13 @@ def read_outstanding(path: Path | None) -> list[Outstanding]:
         if "reviewed" in fields:
             if not isinstance(reviewed, str) or not reviewed.strip() or "review_unavailable" in fields:
                 raise InputError(f"{where}.reviewed: expected completed review without an unavailable result")
-            items.append(ReviewedOutstandingQuestion(since_at, text, question, reviewed, timing, rank))
+            items.append(ReviewedOutstandingQuestion(since_at, text, question, reviewed, timing, rank, asked_by))
         elif "review_unavailable" in fields:
             if not isinstance(unavailable, str):
                 raise InputError(f"{where}.review_unavailable: expected reason text")
-            items.append(ReviewUnavailableOutstandingQuestion(since_at, text, question, unavailable, timing, rank))
+            items.append(ReviewUnavailableOutstandingQuestion(since_at, text, question, unavailable, timing, rank, asked_by))
         else:
-            items.append(OutstandingQuestion(since_at, text, question, timing, rank))
+            items.append(OutstandingQuestion(since_at, text, question, timing, rank, asked_by))
     return sorted(items, key=lambda item: item.since)
 
 

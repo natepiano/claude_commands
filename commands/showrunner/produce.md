@@ -251,8 +251,17 @@ State:
   where it first comes up: what is asked, why, and the answer choices. Set it
   in `open_for_user` in that turn (**Open-questions list** below). After that turn no reply
   restates the question or its choices. The user sees only their count n, where n counts every `OUTSTANDING` item now due: everything that
-  waits on the user, a step only they can run included. A root's n also counts
-  every due item of every production below it (**Nested showrunners** above).
+  waits on the user, a step only they can run included. n counts this
+  production's items only; the showrunners below count theirs
+  (**Nested showrunners** above).
+  A question for the user that a unit director sends you is not asked in a
+  reply: file it with `/showrunner:question` for that unit, and say nothing of
+  it to the user. A unit can also file its own with `/unit:question`. The count
+  and `/next question` show it, and its answer goes back to the unit through
+  `update_registration.py answer` (`/next` → question). A filed item stays on
+  the list when `open_for_user` leaves it out; it leaves only through `answer`.
+  User, 2026-10-28: "i asked it to add it to your question list not to bring
+  it directly to my attention".
   A change waiting for the user's check is never an open question: it goes on
   the change review list through `/change_review` add, never into
   `open_for_user` or the count, and the user asks for "change review" when
@@ -518,7 +527,7 @@ whatever arrived:
 | a unit waiting on another unit | <Dependencies/> |
 | a unit blocked on the showrunner | <ClearGate/>, <LandingCall/>, or answer it |
 | a unit director's design choice, Pending decision or add-ons | settle it and tell the unit (<Throughout/> → Designs and add-ons) |
-| a unit director's decision only the user can settle | show it to the user; relay the answer |
+| a unit director's decision only the user can settle | file it for that unit with `/showrunner:question`, never in a reply; relay the answer that `answer` names (<Throughout/> → Open questions) |
 | the user asks for a status | `/showrunner:dailies`, `gantt` unless they name a length |
 | the user asks which phase or task each unit is on | `/showrunner:units` |
 | the user asks which proposals are open | `/showrunner:proposals` |

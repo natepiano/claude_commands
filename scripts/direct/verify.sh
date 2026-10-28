@@ -3,14 +3,16 @@
 #
 # Work Orders list exact invocations of this script; the worker composes no
 # cargo flags and makes no scope choices. `check` pins lib and bin targets;
-# `test` selects the package's test targets, including examples with test = true.
+# `test` selects the package's test targets; examples are never test targets.
 # `build` builds one package's binaries, or one bin or example, so a smoke run
 # or live shot can launch it, and prints each binary's path.
 # `lint` runs clippy with --all-targets --all-features to match CI, and mend
 # also uses --all-targets. It checks TOML formatting with taplo at the workspace
 # root. `example` runs clippy on one named example while
 # iterating. `final` is the plan-final full gate, run by the unit director,
-# never by a phase worker.
+# never by a phase worker. It checks all targets, including examples, then
+# runs nextest with --tests so no example is linked. No tests are lost:
+# the scan first refuses examples that hold a test or set test = true.
 #
 # Package selection is always --workspace. Commands use default features unless
 # the Work Order supplies --features; `lint`'s clippy always uses all features.
@@ -89,6 +91,7 @@
 #   verify.sh test <package>               the package's unit + integration tests
 #                                          (package targets; workspace libs if any);
 #                                          refuse examples that hold a test
+#                                          or set test = true
 #   verify.sh test <package> <int_test>    one named integration test target,
 #                                          for re-running it alone
 #   verify.sh test <package> --filter <name> [--filter <name> …]
@@ -140,8 +143,11 @@
 #                                          binary's path (`binary: <path>`);
 #                                          an example's required features are
 #                                          turned on. Accepts --features <list>
-#   verify.sh final                        full workspace gate; refuse examples
-#                                          that hold a test (unit director only)
+#   verify.sh final                        full workspace gate (unit director only);
+#                                          check all targets; nextest uses --tests
+#                                          so no example is linked; refuse examples
+#                                          that hold a test or set test = true
+#                                          so no tests are lost
 #   verify.sh --session-dir <dir> …        any of the above inside a worker
 #                                          session; same as setting
 #                                          UNIT_SESSION_DIR=<dir>
@@ -339,7 +345,7 @@ while pending:
     if name in features and name not in enabled:
         enabled.add(name)
         pending += features[name]
-flags = {"bin": "--bin", "test": "--test", "example": "--example", "bench": "--bench"}
+flags = {"bin": "--bin", "test": "--test", "bench": "--bench"}
 shared = {
     (target["kind"][0], target["name"])
     for other in meta["packages"]
@@ -381,6 +387,9 @@ for package in packages:
     for target in package["targets"]:
         if "example" not in target["kind"]:
             continue
+        example_name = target["name"]
+        owner_package = package["name"]
+        manifest_path = package["manifest_path"]
         source = Path(target["src_path"])
         if source.name == "main.rs" and source.parent.parent.name == "examples":
             sources = sorted(source.parent.rglob("*.rs"))
@@ -389,20 +398,25 @@ for package in packages:
         for path in sources:
             for line_number, line in enumerate(path.read_text().splitlines(), 1):
                 if match := test_marker.match(line):
-                    offenders.append((target["name"], path, line_number, match.group(1), package["name"]))
+                    offenders.append((
+                        f"example {example_name} holds a test: {path}:{line_number} has {match.group(1)}, and examples carry no tests.",
+                        f"move it into {owner_package}\x27s src/ or tests/, or delete it.",
+                    ))
                     break
             else:
                 continue
             break
+        if target.get("test", False):
+            offenders.append((
+                f"example {example_name} sets test = true in {manifest_path}, and examples carry no tests.",
+                "remove test = true from its [[example]] entry.",
+            ))
 
-for index, (name, path, line_number, attribute, package_name) in enumerate(offenders):
+for index, (reason, fix) in enumerate(offenders):
     if index:
         print(file=sys.stderr)
-    print(
-        f"example {name} holds a test: {path}:{line_number} has {attribute}, and examples carry no tests.",
-        file=sys.stderr,
-    )
-    print(f"move it into {package_name}\x27s src/ or tests/, or delete it.", file=sys.stderr)
+    print(reason, file=sys.stderr)
+    print(fix, file=sys.stderr)
 if offenders:
     sys.exit(2)
 '
@@ -2125,12 +2139,8 @@ buildlog_wait_for_memory() {
         buildlog_release_memory 0
         acquire_token
         memory_wait=$BUILDLOG_MEM_WAIT_S
-        # The forced start counts the step's whole memory wait: a new full
-        # limit here made one step wait 15 min twice (2026-10-21).
-        limit="${BUILDLOG_MEM_WAIT_LIMIT_S:-900}"
-        [[ "$limit" =~ ^[0-9]+$ ]] || limit=900
-        BUILDLOG_MEM_WAIT_LIMIT_S=$(( limit > memory_wait ? limit - memory_wait : 0 )) \
-            buildlog_wait_for_memory_only "$@"
+        # The second pass keeps the step's place in the memory queue from its first wait.
+        BUILDLOG_MEM_WAIT_SINCE=$BUILDLOG_MEM_WAIT_FROM buildlog_wait_for_memory_only "$@"
         BUILDLOG_MEM_WAIT_S=$(( memory_wait + BUILDLOG_MEM_WAIT_S ))
         if [[ "$BUILDLOG_MEM_OUTCOME" == LeftQueue ]]; then
             if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then
@@ -2493,7 +2503,7 @@ case "$CMD" in
         ;;
     final)
         run cargo check --workspace --all-targets
-        run_nextest --workspace
+        run_nextest --workspace --tests
         ;;
     *)
         usage

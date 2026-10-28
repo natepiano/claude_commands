@@ -88,7 +88,6 @@ class CheckpointDocGateTests(unittest.TestCase):
         self.assertEqual(decision.get("hookEventName"), "PreToolUse")
         reason = decision.get("permissionDecisionReason", "")
         self.assertIn(DOC_COMMAND, reason)
-        self.assertIn("last", reason.lower())
         return reason
 
     def test_other_commits_and_commands_bypass_broken_record_storage(self) -> None:
@@ -105,6 +104,41 @@ class CheckpointDocGateTests(unittest.TestCase):
         self.assert_allowed(CHECKPOINT)
         self.assert_allowed(CHECKPOINT, cwd=self.root)
 
+    def test_non_cargo_checkpoint_requires_its_own_call_without_a_doc_record(self) -> None:
+        _ = self.git("rm", "Cargo.toml")
+        _ = self.git("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
+                     "commit", "-q", "-m", "remove Cargo manifest")
+        _ = (self.repo / "x").write_text("staged later\n", encoding="utf-8")
+        reason = self.assert_denied("git add x && " + CHECKPOINT)
+        self.assertIn("first command of its own Bash call", reason)
+        self.assertIn("In a repo with a Cargo.toml at its top", reason)
+        self.assertNotIn("as the last command before the commit", reason)
+        self.assertEqual(list(self.records.iterdir()), [])
+        self.assertEqual(self.decision(CHECKPOINT), {})
+
+    def test_uncertain_repository_refusals_make_doc_guidance_conditional(self) -> None:
+        (self.repo / "Cargo.toml").unlink()
+        commands = (
+            "GIT_DIR=.git " + CHECKPOINT,
+            'echo ready && git commit -m "$SUBJECT"',
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                reason = self.assert_denied(command)
+                self.assertIn("first command of its own Bash call", reason)
+                self.assertIn("In a repo with a Cargo.toml at its top", reason)
+                self.assertNotIn("as the last command before the commit", reason)
+                if "$SUBJECT" in command:
+                    self.assertIn("or, in a repo with a Cargo.toml at its top, run " + DOC_COMMAND, reason)
+
+    def test_unknown_commit_directory_only_adds_conditional_doc_guidance(self) -> None:
+        (self.repo / "Cargo.toml").unlink()
+        reason = self.assert_denied('git -C "$REPO" commit -m "checkpoint(efficiency): phase 1"')
+        self.assertIn("use a literal directory", reason)
+        self.assertIn("In a repo with a Cargo.toml at its top, also run " + DOC_COMMAND + " in an earlier call.", reason)
+        self.assertNotIn("first command of its own Bash call", reason)
+        self.assertNotIn("as the last command before the commit", reason)
+
     def test_checkpoint_with_a_pass_for_the_index_tree_is_allowed(self) -> None:
         _ = self.record()
         before = (self.repo / ".git/index").read_bytes()
@@ -114,6 +148,7 @@ class CheckpointDocGateTests(unittest.TestCase):
     def test_checkpoint_without_a_record_is_denied(self) -> None:
         reason = self.assert_denied(CHECKPOINT)
         self.assertIn("tree", reason.lower())
+        self.assertIn("Run " + DOC_COMMAND + " as the last command before the commit.", reason)
 
     def test_pass_for_a_different_tree_does_not_authorize_the_index(self) -> None:
         _ = self.record(tree=self.git("rev-parse", "HEAD^{tree}"))
@@ -196,7 +231,7 @@ class CheckpointDocGateTests(unittest.TestCase):
         for prefix in ("git add -A && ", "git add lib.rs; "):
             with self.subTest(prefix=prefix):
                 reason = self.assert_denied(prefix + CHECKPOINT)
-                self.assertIn("own Bash command", reason)
+                self.assertIn("first command of its own Bash call", reason)
                 self.assertIn("earlier calls", reason)
 
     def test_directory_changes_before_checkpoints_are_denied_outside_cargo(self) -> None:
@@ -204,7 +239,7 @@ class CheckpointDocGateTests(unittest.TestCase):
         for prefix in (f"cd {shlex.quote(str(self.repo))} && ", "echo ready; "):
             with self.subTest(prefix=prefix):
                 reason = self.assert_denied(prefix + CHECKPOINT, cwd=self.root)
-                self.assertIn("own Bash command", reason)
+                self.assertIn("first command of its own Bash call", reason)
 
     def test_commands_after_a_checked_checkpoint_are_allowed(self) -> None:
         _ = self.record()
@@ -343,7 +378,7 @@ class CheckpointDocGateTests(unittest.TestCase):
         _ = self.record()
         command = 'echo "check""point(x): example" && git commit -m "fix: ordinary"'
         reason = self.assert_denied(command)
-        self.assertIn("own Bash command", reason)
+        self.assertIn("first command of its own Bash call", reason)
 
     def test_checkpoint_text_in_either_of_two_heredocs_requires_the_record(self) -> None:
         checkpoint = "checkpoint(efficiency): phase 1"
@@ -365,7 +400,7 @@ class CheckpointDocGateTests(unittest.TestCase):
         for directory in (self.repo, self.root):
             with self.subTest(cwd=directory):
                 reason = self.assert_denied(command, cwd=directory)
-                self.assertIn("own Bash command", reason)
+                self.assertIn("first command of its own Bash call", reason)
 
     def test_checkpoint_text_after_a_commit_still_requires_its_record(self) -> None:
         command = 'git commit -m "fix: ordinary" && echo "checkpoint(efficiency): example"'
@@ -430,13 +465,13 @@ class CheckpointDocGateTests(unittest.TestCase):
 
     def test_unreadable_subject_after_another_command_is_denied_without_cargo(self) -> None:
         reason = self.assert_denied('echo ready && git commit -m "$VAR"', cwd=self.root)
-        self.assertIn("own Bash command", reason)
+        self.assertIn("first command of its own Bash call", reason)
 
     def test_message_file_after_another_command_cannot_hide_a_checkpoint(self) -> None:
         message = self.root / "message.txt"
         _ = message.write_text("fix: current text\n", encoding="utf-8")
         reason = self.assert_denied(f'echo changed > {message} && git commit -F {message}')
-        self.assertIn("own Bash command", reason)
+        self.assertIn("first command of its own Bash call", reason)
 
     def test_amend_and_reused_messages_check_checkpoint_subjects(self) -> None:
         _ = self.git("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
@@ -494,7 +529,7 @@ class CheckpointDocGateTests(unittest.TestCase):
         # Raw checkpoint text now gates every commit. The first commit still
         # matches the index record; the second must be made in its own call.
         reason = self.assert_denied(CHECKPOINT + ' && git commit -am "fix: later"')
-        self.assertIn("own Bash command", reason)
+        self.assertIn("first command of its own Bash call", reason)
 
     def test_invalid_or_unreadable_matching_record_fails_closed(self) -> None:
         path = self.record()

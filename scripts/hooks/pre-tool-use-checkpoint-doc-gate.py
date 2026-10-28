@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Require a durable rustdoc pass for the exact tree of every Rust checkpoint.
+In every repo, a checkpoint commit must be the first command of its own Bash call.
 
 Commit and message recognition comes from the change-review hook. Unlike other
 hooks, an error checking a Rust checkpoint refuses it: this gate fails closed.
@@ -116,9 +117,11 @@ class UnknownCommitDirectory:
 
 SHELL_WORD = re.compile(r'''(?:'[^']*'|"(?:\\.|[^"\\])*"|`(?:\\.|[^`\\])*`|\$\([^)]*\)|\\.|[^\s;&|'"`\\])+''')
 SUBJECT_FIX = ("Write the subject as literal -m text, a -F file or the heredoc form, "
-               "or run ~/.claude/scripts/direct/verify.sh doc first.")
-OWN_CALL = ("Run the checkpoint commit as its own Bash command; stage and run "
-            "~/.claude/scripts/direct/verify.sh doc in earlier calls.")
+               "or, in a repo with a Cargo.toml at its top, run ~/.claude/scripts/direct/verify.sh doc first.")
+OWN_CALL_FIX = ("Run the checkpoint commit as the first command of its own Bash call; "
+                "put cd, git add and other commands in earlier calls.")
+CARGO_DOC_FIX = ("In a repo with a Cargo.toml at its top, also run "
+                 "~/.claude/scripts/direct/verify.sh doc in an earlier call.")
 
 
 def raw_commit_words(invocation: str, offset: int) -> list[str]:
@@ -321,12 +324,12 @@ def refusal(command: str, cwd: Path) -> str:
             continue
         if redirected:
             return ("Checkpoint refused: --git-dir, --work-tree and GIT_DIR= / GIT_INDEX_FILE= / "
-                    f"GIT_WORK_TREE= overrides prevent judging the commit repository. {OWN_CALL} {FIX}")
+                    f"GIT_WORK_TREE= overrides prevent judging the commit repository. {OWN_CALL_FIX} {CARGO_DOC_FIX}")
         if prefix:
             unknown = f" {SUBJECT_FIX}" if isinstance(message, UnreadableCommitMessage) else ""
-            return f"Checkpoint refused: an earlier command can change the directory or index. {OWN_CALL}{unknown} {FIX}"
+            return f"Checkpoint refused: an earlier command can change the directory or index. {OWN_CALL_FIX} {CARGO_DOC_FIX}{unknown}"
         if isinstance(location, UnknownCommitDirectory):
-            return f"Checkpoint refused: {location.cause}. {FIX}"
+            return f"Checkpoint refused: {location.cause}. {CARGO_DOC_FIX}"
         try:
             top = Path(git(directory, "rev-parse", "--show-toplevel")).resolve()
         except Exception as error:

@@ -86,6 +86,8 @@ class WaitingAgentCLI:
         self.returncode = -9
 
 
+# The probe that each transient server start runs before it gives panes their own scopes.
+SCOPE_PROBE = ["--user", "--scope", "--quiet", "--collect", "--", "true"]
 REAL_SUBMIT_OPENING_PROMPT = herdr.Herdr.submit_opening_prompt
 REAL_LOAD_FACTOR = herdr.load_factor
 REQUIRE_SHARED = herdr._require_shared  # pyright: ignore[reportPrivateUsage]
@@ -1017,6 +1019,13 @@ class HerdrTests(unittest.TestCase):
     def commands(self) -> list[list[str]]:
         return [cast(list[str], json.loads(line)) for line in self.log.read_text().splitlines()] if self.log.exists() else []
 
+    def server_creation(self, session: str = "fixture", *, scopes: bool = True) -> list[str]:
+        """The transient server unit's systemd-run argv; with pane scopes, the server's SHELL is the wrapper."""
+        shell = [f"--setenv=SHELL={self.root}/home/.local/state/herdr/pane-shell",
+                 "--setenv=HERDR_PANE_SHELL=/bin/sh"] if scopes else []
+        return ["--user", f"--unit=herdr-{session}.service", "--collect", "-p", "CPUWeight=1000", "-p", "MemoryLow=1G",
+                "-p", "MemorySwapMax=0", *shell, str(self.fake), "--session", session, "server"]
+
     def start_commands(self) -> list[list[str]]:
         """Startup commands, excluding read-only lifecycle observations."""
         return [command for command in self.commands()
@@ -1748,18 +1757,17 @@ class HerdrTests(unittest.TestCase):
 
     def test_server_start_does_not_poll_after_a_unit_creation_failure(self) -> None:
         self.configure_herdr(["status", "server"], "status: stopped\n")
-        creation = ["--user", "--unit=herdr-fixture.service", "--collect", str(self.fake),
-                    "--session", "fixture", "server"]
+        creation = self.server_creation()
         self.configure(creation, code=1, stderr="fixture manager unavailable")
         with self.assertRaisesRegex(herdr.HerdrFailure, "fixture manager unavailable"):
             _ = herdr.start_server("fixture", 10_000)
-        self.assertEqual(self.commands(), [["--session", "fixture", "status", "server"], creation])
+        self.assertEqual(self.commands(), [["--session", "fixture", "status", "server"], SCOPE_PROBE, creation])
 
     def test_server_start_deadline(self) -> None:
         self.configure_herdr(["status", "server"], "status: stopped\n")
         with self.assertRaisesRegex(herdr.HerdrFailure, "server fixture not answering after 0 ms"):
             _ = herdr.start_server("fixture", 0)
-        self.assertEqual(self.commands()[-1], ["--user", "--unit=herdr-fixture.service", "--collect", str(self.fake), "--session", "fixture", "server"])
+        self.assertEqual(self.commands()[-1], self.server_creation())
 
     def test_server_start_polls_after_launch(self) -> None:
         self.responses["--session fixture status server"] = [
@@ -1770,7 +1778,8 @@ class HerdrTests(unittest.TestCase):
         self.assertIsInstance(outcome, herdr.ServerCreated)
         self.assertEqual(self.commands(), [
             ["--session", "fixture", "status", "server"],
-            ["--user", "--unit=herdr-fixture.service", "--collect", str(self.fake), "--session", "fixture", "server"],
+            SCOPE_PROBE,
+            self.server_creation(),
             ["--session", "fixture", "status", "server"],
             ["--user", "is-active", "herdr-fixture.service"],
             ["--session", "fixture", "workspace", "list"],
@@ -1793,7 +1802,8 @@ class HerdrTests(unittest.TestCase):
         _ = herdr.start_server("fixture", 10_000)
         self.assertEqual(self.commands(), [
             ["--session", "fixture", "status", "server"],
-            ["--user", "--unit=herdr-fixture.service", "--collect", str(self.fake), "--session", "fixture", "server"],
+            SCOPE_PROBE,
+            self.server_creation(),
             ["--session", "fixture", "status", "server"],
             ["--user", "is-active", "herdr-fixture.service"],
             ["--session", "fixture", "workspace", "list"],
@@ -1828,6 +1838,8 @@ class HerdrTests(unittest.TestCase):
             {"stdout": "status: stopped\n", "code": 0}, {"stdout": "status: running\n", "code": 0}]}))
         _ = herdr.start_server("fixture", 10_000)
         self.assertEqual(self.commands(), started)
+        # The boot unit sets its own properties and shell: no probe, no wrapper.
+        self.assertFalse((self.root / "home/.local/state/herdr").exists())
 
     def test_spawned_servers_report_session_and_workspace_when_close_fails(self) -> None:
         self.configure_herdr(["workspace", "list"], json.dumps({
@@ -1856,7 +1868,8 @@ class HerdrTests(unittest.TestCase):
         self.assertIsInstance(herdr.start_server("fixture", 10_000), herdr.ServerAdopted)
         self.assertEqual(self.commands(), [
             ["--session", "fixture", "status", "server"],
-            ["--user", "--unit=herdr-fixture.service", "--collect", str(self.fake), "--session", "fixture", "server"],
+            SCOPE_PROBE,
+            self.server_creation(),
             ["--session", "fixture", "status", "server"],
             ["--user", "is-active", "herdr-fixture.service"],
         ])
@@ -2140,7 +2153,7 @@ class HerdrTests(unittest.TestCase):
             _ = herdr.start_server("a-b", 0)
         herdr.stop_session("a-b")
         commands = self.commands()
-        self.assertIn(["--user", "--unit=herdr-a-b.service", "--collect", str(self.fake), "--session", "a-b", "server"], commands)
+        self.assertIn(self.server_creation("a-b"), commands)
         self.assertIn(["--user", "stop", "herdr-a-b.service"], commands)
         self.assertTrue(all("herdr-a b" not in part for command in commands for part in command))
 
@@ -2149,7 +2162,7 @@ class HerdrTests(unittest.TestCase):
             self.configure(["--session", name, "status", "server"], "status: stopped")
             with self.assertRaises(herdr.HerdrFailure):
                 _ = herdr.start_server(name, 0)
-        self.assertEqual([command[1] for command in self.commands() if command[0] == "--user"],
+        self.assertEqual([command[1] for command in self.commands() if command[0] == "--user" and command != SCOPE_PROBE],
                          ["--unit=herdr-foo.service", "--unit=herdr-foo.service.service"])
         self.log.unlink()
         herdr.stop_session("foo.service")
@@ -2317,6 +2330,97 @@ class HerdrTests(unittest.TestCase):
                                      {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "unit"})
                     self.assertEqual(herdr.herdr_place_of(12), herdr.HerdrPlace("writing", "w1:p1"))
                     self.assertEqual(herdr.herdr_places(), {row.pid: row.place for row in rows})
+
+    def test_handoff_survivors_in_pane_scopes_keep_their_unit_server(self) -> None:
+        server = self.process(30, 1, ["herdr", "server", "--handoff-import", "/fixture/import", "token"], {})
+        self.unix_socket(self.root / "config/herdr/sessions/writing/herdr.sock", 100)
+        self.socket_fd(server, 100)
+        shell = self.process(11, 1, ["zsh"], {"HERDR_PANE_ID": "w1:p1"})
+        claude = self.process(12, 11, ["claude"], {"HERDR_PANE_ID": "w1:p1", "HERDR_SESSION": "stale"})
+        # A pane process whose parent exited: only its scope still names the pane.
+        daemon = self.process(13, 1, ["daemon"], {"HERDR_PANE_ID": "w1:p1"})
+        unrelated = self.process(20, 1, ["claude"], {"HERDR_PANE_ID": "w1:p1"})
+        _ = self.process(5, 1, ["subreaper"], {})
+        self.configure(["--session", "writing", "pane", "list"],
+                       json.dumps({"result": {"panes": [{"pane_id": "w1:p1"}]}}))
+        self.configure(["--session", "writing", "pane", "process-info", "--pane", "w1:p1"],
+                       json.dumps({"result": {"process_info": {"shell_pid": 11}}}))
+        slice_path = "/user.slice/user-1000.slice/user@1000.service/app.slice"
+        expected = {pid: herdr.HerdrPlace("writing", "w1:p1") for pid in (11, 12, 13)}
+        for membership in ("0::", "1:name=systemd:"):
+            _ = (server / "cgroup").write_text(f"{membership}{slice_path}/herdr-writing.service\n")
+            for process in (shell, claude, daemon):
+                _ = (process / "cgroup").write_text(f"{membership}{slice_path}/{herdr.PANE_SLICE}/run-p11.scope\n")
+            _ = (unrelated / "cgroup").write_text(f"{membership}{slice_path}/{herdr.PANE_SLICE}/run-p20.scope\n")
+            for parent in (1, 5):
+                _ = (shell / "stat").write_text(f"11 (zsh) S {parent} 0 0\n")
+                with self.subTest(orphan_parent=parent, membership=membership):
+                    rows = herdr.herdr_processes()
+                    self.assertEqual({row.pid: row.place for row in rows}, expected)
+                    self.assertEqual(herdr.herdr_place_of(13), herdr.HerdrPlace("writing", "w1:p1"))
+                    self.assertEqual(herdr.herdr_places(), expected)
+            # Without a handoff the parent walk explains each scope, and herdr is not asked for its panes.
+            _ = (shell / "stat").write_text("11 (zsh) S 30 0 0\n")
+            _ = (unrelated / "cgroup").write_text(f"{membership}/user.slice/session-7.scope\n")
+            self.log.unlink(missing_ok=True)
+            with self.subTest(handoff=False, membership=membership):
+                self.assertEqual(herdr.herdr_places(), expected)
+                self.assertFalse(any(command[2:4] == ["pane", "list"] for command in self.commands()))
+
+    def test_server_start_gives_each_pane_shell_a_scope_through_the_wrapper(self) -> None:
+        real = self.root / "bin/zsh"
+        real.parent.mkdir()
+        _ = real.write_text("#!/bin/sh\n")
+        real.chmod(0o755)
+        for state in ("", str(self.root / "state")):
+            with self.subTest(state=state), patch.dict(os.environ, {"SHELL": str(real), "XDG_STATE_HOME": state}):
+                self.log.unlink(missing_ok=True)
+                self.configure_herdr(["status", "server"], "status: stopped\n")
+                with self.assertRaises(herdr.HerdrFailure):
+                    _ = herdr.start_server("fixture", 0)
+                wrapper = Path(state or self.root / "home/.local/state") / "herdr/pane-shell"
+                creation = [*self.server_creation()[:9], f"--setenv=SHELL={wrapper}",
+                            f"--setenv=HERDR_PANE_SHELL={real}", *self.server_creation()[11:]]
+                self.assertEqual(self.commands()[-2:], [SCOPE_PROBE, creation])
+                self.assertEqual(wrapper.stat().st_mode & 0o777, 0o755)
+                self.assertEqual(wrapper.read_text(), "\n".join([
+                    "#!/bin/sh",
+                    "real=${HERDR_PANE_SHELL:-/bin/sh}",
+                    "unset HERDR_PANE_SHELL",
+                    "SHELL=$real; export SHELL",
+                    f'exec {self.fake} --user --scope --quiet --collect --slice=app-agents.slice -- "$real" "$@"',
+                    "",
+                ]))
+                self.assertEqual([path.name for path in wrapper.parent.iterdir()], ["pane-shell"])
+                self.log.unlink()
+                _ = subprocess.run([str(wrapper), "-l"], check=True, env={
+                    "HERDR_PANE_SHELL": str(real), "FAKE_HERDR_LOG": str(self.log),
+                    "FAKE_HERDR_RESPONSES": str(self.responses_path)})
+                self.assertEqual(self.commands(), [["--user", "--scope", "--quiet", "--collect",
+                                                    "--slice=app-agents.slice", "--", str(real), "-l"]])
+
+    def test_pane_shell_falls_back_to_bin_sh(self) -> None:
+        plain = self.root / "not-executable"
+        _ = plain.write_text("")
+        wrapper = self.root / "home/.local/state/herdr/pane-shell"
+        for shell in (None, "zsh", str(plain), str(self.root / "missing"), str(wrapper)):
+            with self.subTest(shell=shell):
+                with patch.dict(os.environ, {} if shell is None else {"SHELL": shell}):
+                    self.log.unlink(missing_ok=True)
+                    self.configure_herdr(["status", "server"], "status: stopped\n")
+                    with self.assertRaises(herdr.HerdrFailure):
+                        _ = herdr.start_server("fixture", 0)
+                self.assertEqual(self.commands()[-1], self.server_creation())
+
+    def test_server_start_without_pane_scopes_runs_the_plain_shell_and_says_so_once(self) -> None:
+        self.configure(SCOPE_PROBE, code=1, stderr="Failed to connect to bus\nsecond line\n")
+        self.configure_herdr(["status", "server"], "status: stopped\n")
+        with redirect_stderr(io.StringIO()) as errors, self.assertRaises(herdr.HerdrFailure):
+            _ = herdr.start_server("fixture", 0)
+        self.assertEqual(self.commands()[-2:], [SCOPE_PROBE, self.server_creation(scopes=False)])
+        self.assertEqual(errors.getvalue().splitlines(), [
+            "herdr fixture: pane scopes unavailable, panes stay in the server unit: Failed to connect to bus second line"])
+        self.assertFalse((self.root / "home/.local/state/herdr").exists())
 
     def test_a_slow_start_on_a_loaded_machine_still_gets_its_opening_prompt(self) -> None:
         # Claude is ready for input 200 s after the start: past the 90 s limit, inside it scaled by load.
