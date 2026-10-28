@@ -57,6 +57,7 @@ class BrpLaunchGateTests(unittest.TestCase):
         _ = (release / "current").write_text(CYCLE_ID + "\n")
         self.cycle_file = release / CYCLE_ID / "cycle.json"
         self.write_cycle()
+        (holders / "holder").unlink(missing_ok=True)
         meminfo = self.root / "meminfo"
         _ = meminfo.write_text("MemAvailable: 67108864 kB\n")
         self.environment = {
@@ -64,9 +65,7 @@ class BrpLaunchGateTests(unittest.TestCase):
             "HOME": str(self.root),
             "BUILD_HOLD_DIR": str(holders),
             "BUILD_HOLD_RELEASE_DIR": str(release),
-            "BUILDLOG_HOLD_REGISTRATION_FILE": str(self.root / "registration"),
-            "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-            "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+            "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
             "BUILD_TARGETS_SCRIPT": str(HOOK.parent.parent / "build_targets" / "build_targets.py"),
             "BUILDLOG_MEMINFO": str(meminfo),
             "BUILDLOG_MEM_POLL_S": "0.01",
@@ -105,7 +104,7 @@ class BrpLaunchGateTests(unittest.TestCase):
             capture_output=True, text=True, check=False, env=self.environment, timeout=10,
         )
 
-    def test_low_memory_marks_wait_then_return_before_launch(self) -> None:
+    def test_low_memory_wait_leaves_old_release_record_unchanged(self) -> None:
         meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
         _ = meminfo.write_text("MemAvailable: 8388608 kB\n")
         stubs = self.root / "stubs"
@@ -125,33 +124,13 @@ printf "MemAvailable: 67108864 kB\n" > "$BUILDLOG_MEMINFO"
         self.environment["CYCLE_FILE"] = str(self.cycle_file)
         self.environment["WAIT_STATE_LOG"] = str(self.root / "wait-states")
 
+        before = self.cycle_file.read_bytes()
         result = self.run_hook()
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("waiting for memory", result.stderr)
-        self.assertEqual((self.root / "wait-states").read_text().splitlines(), ["WaitingForMemory"])
-        entry = self.entry()
-        self.assertEqual(entry["state"], "MemoryGateReturned")
-        self.assertEqual(entry["outcome"], "Granted")
-        ended = datetime.fromisoformat(cast(str, entry["wait_ended_at"]))
-        self.assertIsNotNone(ended.tzinfo)
-        self.assertNotIn("wait_started_at", entry)
-        self.assertEqual(self.entry()["state"], "MemoryGateReturned")
-
-    def test_timeout_and_unavailable_memory_have_distinct_outcomes(self) -> None:
-        meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
-        _ = meminfo.write_text("MemAvailable: 8388608 kB\n")
-        self.environment["BUILDLOG_MEM_WAIT_LIMIT_S"] = "0"
-        timed_out = self.run_hook()
-        self.assertEqual(timed_out.returncode, 0, timed_out.stderr)
-        self.assertEqual(self.entry()["outcome"], "TimedOut")
-
-        self.write_cycle()
-        _ = meminfo.write_text("MemFree: 8388608 kB\n")
-        unavailable = self.run_hook()
-        self.assertEqual(unavailable.returncode, 0, unavailable.stderr)
-        self.assertEqual(self.entry()["outcome"], "MeminfoUnavailable")
-        self.assertNotIn("wait_started_at", self.entry())
+        self.assertEqual((self.root / "wait-states").read_text().splitlines(), ["ReleasedAwaitingAdmission"])
+        self.assertEqual(self.cycle_file.read_bytes(), before)
 
     def assert_denied(self, result: subprocess.CompletedProcess[str], reason: str) -> None:
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -163,6 +142,10 @@ printf "MemAvailable: 67108864 kB\n" > "$BUILDLOG_MEMINFO"
         self.assertNotIn("waiting for memory", result.stderr)
 
     def prepare_hold_before_release(self) -> None:
+        _ = (Path(self.environment["BUILD_HOLD_DIR"]) / "holder").write_text(json.dumps({
+            "holder": "holder", "since": datetime.now().astimezone().isoformat(),
+            "for": "the test", "release_eta": "unknown",
+        }))
         cycle = cast(PendingLaunchCycle, json.loads(self.cycle_file.read_text()))
         cycle["release_started_at"] = ""
         cycle["entries"] = [{"session_id": "unit-worker", "name": "unit", "state": "AwaitingRelease"}]
@@ -178,7 +161,7 @@ printf "MemAvailable: 67108864 kB\n" > "$BUILDLOG_MEMINFO"
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "")
         self.assertEqual((self.cycle_file.read_bytes(), holder_file.read_bytes()), before)
-        self.assertEqual(self.entry()["state"], "AwaitingRelease")
+        self.assertEqual(self.entry().get("delivery", "NotAttempted"), "NotAttempted")
         self.assertNotIn("outcome", self.entry())
 
     def test_another_session_launch_is_denied_without_memory_wait_or_mark(self) -> None:
@@ -186,21 +169,23 @@ printf "MemAvailable: 67108864 kB\n" > "$BUILDLOG_MEMINFO"
         _ = Path(self.environment["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 1 kB\n")
         self.assert_denied(self.run_hook("unit-worker"),
                            "natedev is held by holder for the test; launch after the release.")
-        self.assertEqual(self.entry()["state"], "AwaitingRelease")
+        self.assertEqual(self.entry().get("delivery", "NotAttempted"), "NotAttempted")
         self.assertNotIn("outcome", self.entry())
         self.assertNotIn("wait_started_at", self.entry())
 
     def test_unreleased_session_is_denied_without_memory_wait_or_mark(self) -> None:
+        self.prepare_hold_before_release()
         cycle = cast(dict[str, object], json.loads(self.cycle_file.read_text()))
         entries = cast(list[dict[str, object]], cycle["entries"])
         entries[0] = {"session_id": "unit-worker", "name": "unit", "state": "AwaitingRelease"}
         _ = self.cycle_file.write_text(json.dumps(cycle))
         _ = Path(self.environment["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 1 kB\n")
         self.assert_denied(self.run_hook(), "natedev is held by holder for the test; launch after the release.")
-        self.assertEqual(self.entry()["state"], "AwaitingRelease")
+        self.assertEqual(self.entry().get("delivery", "NotAttempted"), "NotAttempted")
         self.assertNotIn("outcome", self.entry())
 
     def test_missing_session_id_before_release_is_denied_without_memory_wait_or_mark(self) -> None:
+        self.prepare_hold_before_release()
         self.environment["CLAUDE_CODE_SESSION_ID"] = "unit-worker"
         cycle = cast(dict[str, object], json.loads(self.cycle_file.read_text()))
         cycle["release_started_at"] = ""
@@ -218,14 +203,14 @@ printf "MemAvailable: 67108864 kB\n" > "$BUILDLOG_MEMINFO"
         self.assertEqual(self.cycle_file.read_bytes(), before)
 
     def test_unheld_launch_passes_through(self) -> None:
-        (Path(self.environment["BUILD_HOLD_DIR"]) / "holder").unlink()
+        (Path(self.environment["BUILD_HOLD_DIR"]) / "holder").unlink(missing_ok=True)
         result = self.run_hook()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "")
 
     def test_unreadable_hold_state_denies_launch_without_memory_admission(self) -> None:
         holders = Path(self.environment["BUILD_HOLD_DIR"])
-        (holders / "holder").unlink()
+        (holders / "holder").unlink(missing_ok=True)
         holders.rmdir()
         _ = holders.write_text("not a directory")
         result = self.run_hook()
@@ -238,11 +223,17 @@ printf "MemAvailable: 67108864 kB\n" > "$BUILDLOG_MEMINFO"
         self.assertEqual(self.entry()["state"], "ReleasedAwaitingAdmission")
 
     def test_unreadable_release_record_denies_launch_without_repairing_it(self) -> None:
+        self.prepare_hold_before_release()
         _ = self.cycle_file.write_text("{broken")
+        release = Path(self.environment["BUILD_HOLD_RELEASE_DIR"])
+        holder = Path(self.environment["BUILD_HOLD_DIR"]) / "holder"
+        before = (holder.read_bytes(), (release / "current").read_bytes())
         result = self.run_hook()
         response = cast(HookResponse, json.loads(result.stdout))
         self.assertEqual(response["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertEqual(self.cycle_file.read_text(), "{broken")
+        self.assertEqual((holder.read_bytes(), (release / "current").read_bytes()), before)
+        self.assertEqual(list(release.rglob("*.damaged-*")), [])
         self.assertNotIn("waiting for memory", result.stderr)
 
     def test_failed_hold_check_without_output_denies_with_a_reason(self) -> None:
@@ -258,27 +249,6 @@ printf "MemAvailable: 67108864 kB\n" > "$BUILDLOG_MEMINFO"
         self.assertTrue(decision["permissionDecisionReason"].strip())
         self.assertNotIn("waiting for memory", result.stderr)
         self.assertEqual(self.cycle_file.read_bytes(), before)
-
-    def test_worker_call_turn_admits_its_owners_launch_without_marking_the_call(self) -> None:
-        cycle = cast(dict[str, object], json.loads(self.cycle_file.read_text()))
-        entries = cast(list[dict[str, object]], cycle["entries"])
-        cycle["holder_generation"] = 1
-        entries[0].update({
-            "calls": [{"call_id": "worker-call", "pid": os.getpid(), "proc_start": Path(f"/proc/{os.getpid()}/stat").read_text().rsplit(")", 1)[1].split()[19], "started": False, "admitted_generation": 1}],
-            "active_call_id": "worker-call", "session_pending": False,
-            "session_admitted_generation": 1,
-            "active_released_at": entries[0]["released_at"],
-            "delivery": {"generation": 1, "outcome": "Delivered"},
-        })
-        _ = self.cycle_file.write_text(json.dumps(cycle))
-        before = self.cycle_file.read_bytes()
-        result = self.run_hook()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "")
-        self.assertEqual(self.cycle_file.read_bytes(), before)
-        self.assertEqual(self.entry()["state"], "ReleasedAwaitingAdmission")
-        self.assertEqual(self.entry()["active_call_id"], "worker-call")
-        self.assertNotIn("outcome", self.entry())
 
     def test_settings_registers_hook_with_long_enough_timeout(self) -> None:
         settings = cast(dict[str, object], json.loads(SETTINGS.read_text()))
