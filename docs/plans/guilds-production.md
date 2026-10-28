@@ -1,6 +1,6 @@
 # Production — guilds
 
-> **Status: PRODUCTION — planned.** Four lasting guild heads maintain tips and read daily member evidence.
+> **Status: PRODUCTION — running.** Four lasting guild heads maintain tips and read daily member evidence.
 
 ## Production Context
 
