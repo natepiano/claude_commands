@@ -24,7 +24,7 @@ list_skills() {
 usage() {
     local fn="${1:-}" switched="${2:-}"
     local ex_fn="direct" ex_other="claude" ex_row="direct.review"
-    local ex_pair="gpt-6.1-sol:max" family row_line
+    local ex_pair="sol:max" family row_line
     if [[ -n "$switched" ]]; then
         [[ "$switched" == "codex" ]] && ex_other="claude" || ex_other="codex"
     fi
@@ -52,6 +52,7 @@ usage() {
 Usage: agent_admin.sh [skills | <function> | <family> | <agent> | <tier>] | <function> <codex|claude|agent|tier> | <function>.<subtask> <agent>[:<effort>|tier]
 
   (no args)                print every function, its family, and its resolved rows
+                           (word=<family word>, agent=<current slug>)
   skills                   print the list of configured skills for use with agents
   <function>               print just that function's rows
   <family>                 switch every function to the codex or claude family
@@ -91,7 +92,10 @@ Examples:
   agent_admin.sh $ex_row inherit   # the row follows its function's tier
 
 Functions/subtasks come from [assignments] and [<function>.<family>] in
-config/agents.conf; valid agents and efforts from [<family>.agents].
+config/agents.conf; model words from [<family>.families], slugs and efforts
+from [<family>.agents]. Codex words take the newest visible cached version
+with a known effort row; unresolved words show their reason in function status.
+Claude words stay CLI aliases that Claude resolves at launch.
 EOF
 }
 

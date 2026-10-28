@@ -18,7 +18,7 @@ Relay the script's stdout and stderr exactly, except status output — see below
 
 ## Status
 
-No arguments prints every function's active family and resolved rows (one `task=… family=… agent=… effort=… tier=…` line per row); `/agent <function>` prints that function's rows for **both** families — each carrying an extra `active=yes|no` field before `tier` — followed by a `# current family: X` comment line, with examples tuned to it. Both forms are followed by a blank line and the usage/examples block. **Always render the row lines as a markdown table** — never relay them raw. Use columns `task | family | agent | effort | tier` for the no-argument form, and `task | family | agent | effort | active | tier` for the `/agent <function>` form. Render the `# current family: X` line as plain text immediately after the table. An empty effort field means the agent CLI default; `tier` is the codex speed tier — `inherit(<x>)` means no registry tier, so `~/.codex/config.toml` gives `<x>`, and `-` marks a claude row, which never takes one; `active=no` means the row is stored but dormant — switching the function's family is what makes it live. Relay the usage/examples block after the table in a code block, and any warnings or errors exactly as printed.
+No arguments prints every function's active family and resolved rows (one `task=… family=… agent=… effort=… tier=…` line per row); `/agent <function>` prints that function's rows for **both** families — each carrying an extra `active=yes|no` field before `tier` — followed by a `# current family: X` comment line, with examples tuned to it. Both forms are followed by a blank line and the usage/examples block. **Always render the row lines as a markdown table** — never relay them raw. Use columns `task | family | word | agent | effort | tier` for the no-argument form, and `task | family | word | agent | effort | active | tier` for the `/agent <function>` form. Render the `# current family: X` line as plain text immediately after the table. `word` is the configured model-family word; `agent` is its current resolved slug. Rows naming a full slug omit `word`; use the slug in both columns. Codex words resolve to the highest visible version in `~/.codex/models_cache.json` with a known `[codex.agents]` effort row. Equal numeric versions use slug order. An unresolved word appears as `<word> (unresolved: <reason>)`; status keeps printing the remaining rows. Claude words remain CLI aliases that Claude resolves to the latest model. An empty effort field means the agent CLI default; `tier` is the codex speed tier — `inherit(<x>)` means no registry tier, so `~/.codex/config.toml` gives `<x>`, and `-` marks a claude row, which never takes one; `active=no` means the row is stored but dormant — switching the function's family is what makes it live. Relay the usage/examples block after the table in a code block, and any warnings or errors exactly as printed.
 
 `/agent skills` prints the unique list of configured skills (one per line, no usage block) — relay it as-is.
 
@@ -44,7 +44,7 @@ The switch is rejected if any row in the target family set is invalid.
 
 A bare family name — no function — moves every switchable `[assignments]` entry to that family, exact-task overrides included. One-family functions stay pinned. It is validated wholesale first: one switchable function missing a set for that family, or one invalid row in any of them, rejects the whole switch and leaves the registry untouched.
 
-On success it prints `# switched every function to <family>` followed by the no-argument status output (rows in `task | family | agent | effort | tier` form) and the usage block. Render the `# switched …` line as plain text first, then the rows per the Status rules above.
+On success it prints `# switched every function to <family>` followed by the no-argument status output (rows in `task | family | word | agent | effort | tier` form) and the usage block. Render the `# switched …` line as plain text first, then the rows per the Status rules above.
 
 ## Put functions on one agent
 
@@ -63,7 +63,7 @@ On success it prints `# switched every function to <agent> (<family>), efforts k
 /agent <function>.<subtask> <agent>[:<effort>]
 ```
 
-The agent names its own family — `[codex.agents]` and `[claude.agents]` share no names — so this edits whichever family's row the agent belongs to, active or not. Naming a dormant family's agent is not an error: the row is written and reported dormant. Editing a row never changes which family is live; only `/agent <function> <family>` or `/agent <family>` does that. The effort must exist in that agent's catalog entry.
+The agent names its own family through `[<family>.families]` or `[<family>.agents]` — the Codex and Claude catalogs share no names — so this edits whichever family's row the agent belongs to, active or not. Naming a dormant family's agent is not an error: the row is written and reported dormant. Editing a row never changes which family is live; only `/agent <function> <family>` or `/agent <family>` does that. The effort must exist in that agent's catalog entry.
 
 On success the edit prints a `# updated [<function>.<family>] <task> — live|dormant` line, then the affected function's rows and usage (same output as `/agent <function>`). Render the `# updated …` line as plain text first, then the rows per the Status rules above.
 
@@ -87,13 +87,13 @@ It prints a `# set …` or `# cleared …` line, then `/agent <function>` output
 /agent                                    show all assignments and rows
 /agent module_review                      show just module_review's rows
 /agent claude                             every function switches to the claude family
-/agent gpt-6-sol                          every function on gpt-6-sol (codex), efforts kept
-/agent worker gpt-6-sol                 /unit:direct on gpt-6-sol, efforts kept
-/agent worker claude                    /unit:direct switches to the claude family
-/agent direct.review gpt-5.6-sol:max     set agent and effort for one subtask
-/agent cli.commit_prep sonnet             set agent, keep the CLI default effort
-/agent worker fast                      every codex worker row on the fast tier
-/agent direct.review inherit            review follows worker's tier again
+/agent sol                                every function on the newest sol, efforts kept
+/agent direct sol                         /unit:direct on the newest sol, efforts kept
+/agent direct claude                      /unit:direct switches to the claude family
+/agent direct.review sol:max              set agent and effort for one subtask
+/agent cli.commit_prep sonnet              set agent, keep the CLI default effort
+/agent direct fast                        every codex worker row on the fast tier
+/agent direct.review inherit              review follows direct's tier again
 ```
 
 `sonnet` is a claude agent, so that last example edits `[cli.claude]` even while `cli` runs on codex — it reports the row dormant and leaves the live codex row alone. To make it live: `/agent cli claude`.
