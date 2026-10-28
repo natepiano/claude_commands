@@ -2512,22 +2512,24 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - Known minor residual: an old alert claimed inside the one registry read that sees the unit live survives the clear; a new crash before the next watchdog live pass (about 2 minutes) then sends no push.
 - `scripts.agents.test_mesh_runs` `test_a_live_supervisor_is_not_ended` failed once under the full parallel gate and passed alone and on the rerun: a load flake outside this unit.
 
-### Phase 91 — The account notes cost less CPU  · status: done
+### Phase 91 — The account notes cost less CPU  · status: done (b0c06054)
 
 **Depends on:** Phase 90
 
-#### Work Order
+#### As-built
 
-Showrunner request, 2026-10-28 (builds-unit measured it): `scripts/whoami/agent_notes.py`, which the agent-sessions-snapshot timer runs every 2 minutes, is the largest CPU user on a quiet natedev. Cut that cost where it is written: run less often, skip work when nothing changed, or read less.
+- The 2-minute timer pass of `agent_notes.py` reuses a usage reading younger than 10 minutes (`usage_store.recent_timer_usage`/`save_timer_usage`, file `timer-usage.json`, keyed by `timer_usage_signature` over logins, homes and the account selection). A reused pass keeps the original reading times and skips the quota note apply, the usage store save and the readings log.
+- A pass reads live when it is `agent_notes.py refresh`, a next-moves queue waits on the role-map host, an in-use account (Claude in use, or the selected Codex workers account) is at or below `LIVE_USAGE_REMAINING_THRESHOLD` (10%) weekly or 5-hour remaining, a Codex fallback is active, a reset passed, or a login or selection changed.
+- The refusal watch, the unit watchdog, the session table and the note sessions sections run on every pass. `refusal_watch.run(refresh_usage=…)` reads usage before it places a new refusal on a reused pass. Refusals already open, cancelled, continued or group-selected do not cause a read. A failed read is reported and never stops placement or the watchdog. The refresh saves with the same login labels as the main pass.
+- `live_reports` passes `use_disk_identity=True`: `claude_live` takes the login and `subscriptionType` from the stored credentials and starts no `claude auth status`. Without a stored plan it keeps the CLI read, so `/whoami` and the notes show the same plan as before.
+- Measured before: one timer run of `agent_notes.py` used 43.4 s CPU in 39.5 s wall, and the service used 42–64 s per run. The figures after promotion come from the real timer runs.
 
-Measured on the timer run of 10:54 EDT: `agent_notes.py` used 43.4 s CPU in 39.5 s wall (1.1 cores while it runs, 0.36 cores over the 2-minute cadence). That is about 95% of the service's 42–64 s per run. Its children, by start time: three `codex app-server --listen stdio://` at 0.3 s, `ssh mac … roster.py --here --snapshot` at 1.8 s, `herdr … pane process-info` at 17 s and 28 s; the script ended at 44.5 s.
+#### Files
 
-- Showrunner, 11:5x EDT (builds-unit): nearly all the cost is `live_reports`; the service averages 58 s CPU per run, 0.44 core all day. Read live usage (`live_reports`) at most once per 10 minutes; the passes between reuse the last stored readings. Keep the 2-minute work on the 2-minute timer: the refusal watch, the unit watchdog, the session table and the note sessions sections. A pass that must have a fresh reading (for example a refusal or an exhausted account that a move depends on) still reads at once; name each such case. Then profile `live_reports` and cut its own cost.
-- Find where the CPU goes in the alert pass (`update_alert_pass`, `live_reports`, `codex_alert_pass`, `session_table.live_sessions`, `five_hour.watch`, `quota_alert.alert`, `codex_pacer.tick`, `refusal_watch.run` and the unit watchdog). Profile the Python with fakes in a scratch HOME, and read the code for the subprocess costs. Record what you found per part on the board.
-- Cut the largest costs first. Examples: reuse a recent usage reading instead of starting a Codex server on every pass, start each Codex server once per pass (not once per home or per request), skip a note write or a probe when its input did not change, keep the 11-second gaps between herdr probes out of the pass.
-- Keep every refusal, watchdog and move promise: a refusal, a unit restart and a moved session must not come later than now. A weekly or 5-hour usage alert may come up to 10 minutes later (showrunner). If a cut makes another reading older, give its new maximum age and why that is safe.
-- State each cut and the CPU it saves in your summary. The unit director measures the cores before and after.
+`scripts/whoami/agent_notes.py`, `agent_accounts.py`, `usage_store.py`, `scripts/accounts/refusal_watch.py`; tests `test_agent_notes.py`, `test_agent_accounts.py`, `test_usage_store.py`, `test_session_table.py`, `test_codex_homes.py`, `test_quota_alert.py`, `scripts/accounts/test_refusal_watch.py`; `docs/accounts.md`.
 
-**Files:** `scripts/whoami/agent_notes.py`, `agent_accounts.py`, `quota_alert.py`, `five_hour.py`, `session_table.py`, `codex_pacer.py`, `usage_store.py`, `scripts/accounts/refusal_watch.py`, `unit_watchdog.py`, their tests, `docs/accounts.md`.
+#### Gotchas
 
-**Verification:** `scripts.whoami` tests, `scripts.accounts.test_refusal_watch scripts.accounts.test_unit_watchdog scripts.accounts.test_accounts scripts.lib.test_user_zone`, basedpyright on `scripts/whoami scripts/accounts`, then the full merge gate; the director measures one run before and after.
+- Weekly and 5-hour usage alerts can come up to 10 minutes later. The showrunner accepted this, because those alerts only give information.
+- An in-use account that runs out from above 10% inside the 10 minutes is not moved from the reading. It moves on its first refusal: Codex at once through `codex_mesh`'s `blocked` path, Claude on the next 2-minute refusal pass. The worst case is one refused request before the move.
+- Measure a timer cut on the real timer runs (`journalctl --user -u agent-sessions-snapshot.service`, "Consumed … CPU time"). A by-hand `refresh` always reads live, so it shows no reuse.
