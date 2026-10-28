@@ -300,6 +300,10 @@ def units_from_doc(lines: list[str], slug: str) -> tuple[UnitRow, ...]:
         marked = unit_lookup.marked_units(slug)
     except OSError as error:
         raise DailiesFailure("production", f"the unit sessions could not be looked up: {error}") from error
+    try:
+        runs = unit_lookup.read_run_states()
+    except OSError as error:
+        raise DailiesFailure("production", f"the run records of {slug} could not be read: {error}") from error
     units: list[UnitRow] = []
     for cells in live_rows:
         name = cell_value(cells.get("Unit", ""))
@@ -307,10 +311,7 @@ def units_from_doc(lines: list[str], slug: str) -> tuple[UnitRow, ...]:
             raise DailiesFailure("production", f"invalid Units row: {cells}")
         found = marked.get(name)
         claude = found.claude if found is not None else None
-        try:
-            run = unit_lookup.run_state(Path(cell_value(cells.get("Worktree", ""))))
-        except OSError as error:
-            raise DailiesFailure("production", f"the run records of {name} could not be read: {error}") from error
+        run = runs.state(Path(cell_value(cells.get("Worktree", ""))))
         units.append(UnitRow(name, claude.name if isinstance(claude, unit_lookup.LiveClaude) else "", run))
     return tuple(units)
 
