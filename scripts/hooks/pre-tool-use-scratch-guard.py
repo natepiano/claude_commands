@@ -13,7 +13,7 @@ exist yet. Folders in the roots that stay allowed: the session scratchpads (/tmp
 /tmp/claude/unit, /tmp/claude/delegate, the session temp roots (/tmp/claude/session) and the two
 scratch roots (/tmp/claude/scratch, ~/rust/repro). A TMPDIR inside a session temp root or a run
 folder is the session's or run's own, so it is no root, and mktemp -d there is allowed; this hook
-also makes that TMPDIR again when the sweep removed it. ~/worktrees is no root, and a
+also restores the session temp folder from the hook input's session id. ~/worktrees is no root, and a
 make_a_worktree command is never judged. A path this scanner cannot follow (a variable other
 than HOME or TMPDIR, a command substitution, a command inside `bash -c` or ssh) is allowed: the
 hourly tmp sweep is the backstop.
@@ -24,6 +24,7 @@ from a PreToolUse hook, so an allow is an exit 0 with no output.
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import re
@@ -31,7 +32,18 @@ import shlex
 import sys
 from collections.abc import Iterator
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import Protocol, TypedDict, cast
+
+
+class SessionTempPaths(Protocol):
+    """The session-start hook's path and session id rules."""
+
+    SESSION_ID: re.Pattern[str]
+
+    def temp_root(self, session_id: str) -> Path: ...
+
+
+SESSION_TEMP = cast(SessionTempPaths, cast(object, importlib.import_module("session-start-temp-root")))
 
 PUNCTUATION = ";&|(){}\n"
 HEREDOC = re.compile(r"(?<!<)<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
@@ -62,6 +74,7 @@ class HookInput(TypedDict, total=False):
     tool_name: str
     tool_input: BashInput
     cwd: str
+    session_id: str
 
 
 def real(path: str) -> Path:
@@ -340,22 +353,33 @@ def bash_input(raw: str) -> tuple[str, Path] | None:
     return command, real(cwd)
 
 
-def remake_own_temp() -> None:
-    """Make this session's TMPDIR again when the sweep removed it, so mktemp works."""
-    temp = os.environ.get("TMPDIR")
-    if temp and own_temp(temp) and not os.path.lexists(temp):
+def remake_session_temp(raw: str) -> None:
+    """Restore only the input session's temp folder; an error leaves the call allowed."""
+    try:
+        hook_input = cast(HookInput, json.loads(raw))
+        session_id = hook_input.get("session_id")
+    except (ValueError, AttributeError):
+        return
+    if not isinstance(session_id, str) or not SESSION_TEMP.SESSION_ID.fullmatch(session_id):
+        return
+    path = SESSION_TEMP.temp_root(session_id)
+    try:
+        _ = os.stat(path)
+    except FileNotFoundError:
         try:
-            os.makedirs(temp, mode=0o700, exist_ok=True)
+            path.mkdir(mode=0o700, parents=True, exist_ok=True)
         except OSError:
             pass
+    except OSError:
+        pass
 
 
 def main() -> None:
-    remake_own_temp()
     try:
         raw = sys.stdin.read()
     except UnicodeDecodeError:
         return
+    remake_session_temp(raw)
     found = bash_input(raw)
     folders = loose_folders(*found) if found is not None else written_folders(raw)
     if not folders:

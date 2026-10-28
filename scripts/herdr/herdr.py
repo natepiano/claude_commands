@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime, timezone
 from pathlib import Path
-from collections.abc import Sequence
+from collections.abc import Sequence, Set
 from typing import NamedTuple, NotRequired, TypedDict, cast, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
@@ -44,6 +44,7 @@ _PLATFORM = sys.platform
 # The marks that name a production unit. Only a unit's own launch sets them; a probe, or a herdr
 # server started from inside a unit, drops them so that the unit's lookup never finds a second session.
 UNIT_MARKS = ("SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID")
+_NO_NEW_UNIT_DIRECTOR_TITLES: frozenset[str] = frozenset()
 SHARED_SESSION = "agents"
 # The slice of the pane scopes. A pane shell in its own scope keeps the agent load out of the server's cgroup.
 PANE_SLICE = "app-agents.slice"
@@ -885,6 +886,10 @@ class SavedLayout(TypedDict):
     workspaces: list[SavedSpace]
 
 
+class WorkspacesKeptForSplitTabs(NamedTuple):
+    labels: list[str]
+
+
 class _LiveSpace(NamedTuple):
     workspace_id: str
     label: str
@@ -957,14 +962,18 @@ def merged_layout(saved: SavedLayout, live: list[_LiveSpace], now: float) -> Sav
         for entry in order])
 
 
-def tab_order(space: str, titles: list[str], saved: list[SavedName]) -> list[int]:
+def tab_order(space: str, titles: list[str], saved: list[SavedName], unit_director_titles: Set[str]) -> list[int]:
     """The indexes of `titles` in the order the workspace `space` shows them.
 
-    Saved tabs keep their saved order. A tab not saved goes by the A-Z rule: the showrunner's tab,
-    titled with the workspace's own name, first, else before the first saved tab that sorts after it.
+    Saved tabs keep their saved order. For other tabs, the showrunner comes first, then unit
+    directors A-Z, then other tabs A-Z. The first tab stays first. `sort-tabs` ignores saved order.
     """
-    def rule(title: str) -> tuple[bool, str]:
-        return (title != space, title)
+    showrunner_title = space
+    if titles and not saved and space not in titles:
+        showrunner_title = titles[0]
+
+    def rule(title: str) -> tuple[bool, bool, str]:
+        return (title != showrunner_title, title not in unit_director_titles, title)
 
     places = {entry["name"]: place for place, entry in enumerate(saved)}
     order = sorted((index for index, title in enumerate(titles) if title in places), key=lambda index: places[titles[index]])
@@ -1083,7 +1092,8 @@ class Herdr:
             _ = self.run("pane", "rename", pane, title)
             if workspace is not None:
                 self._close_placeholders(workspace)
-                pane = self.order_tabs(workspace, saved).get(pane, pane)
+                unit_director_titles = {title} if has_unit_marks(environment) else _NO_NEW_UNIT_DIRECTOR_TITLES
+                pane = self.order_tabs(workspace, saved, unit_director_titles).get(pane, pane)
             self.save_layout()
             return pane
 
@@ -1177,37 +1187,47 @@ class Herdr:
                 self.save_layout()
         return True
 
-    def order_tabs(self, workspace: str, saved: SavedLayout) -> dict[str, str]:
-        """Put the workspace's tabs in their saved order, and each tab not saved in its A-Z place (`tab_order`).
+    def order_tabs(self, workspace: str, saved: SavedLayout,
+                   new_unit_director_titles: Set[str] = _NO_NEW_UNIT_DIRECTOR_TITLES) -> dict[str, str]:
+        """Keep saved order; sort other tabs by showrunner, unit directors A-Z, then other tabs A-Z.
 
+        `sort-tabs` passes an empty saved layout to sort all tabs. The first tab stays first.
         herdr 0.9.5 cannot move a tab, but a
         pane moved into a new tab puts that tab last: so every tab from the first one out of place
         moves, in order. Each pane keeps its process, and focus goes back where it was. A tab with
-        several panes leaves the order as it is. Returns each moved pane's new id by its old one.
+        several panes stops the sort only when it must move. Returns each moved pane's new id by its old one.
         """
         spaces = [json_object(item, "herdr workspace") for item in json_items(
             self.result("workspace", "list").get("workspaces"), "herdr workspace list")]
         name = next((item.get("label") for item in spaces if item.get("workspace_id") == workspace), None)
         tabs = [json_object(item, "herdr tab") for item in json_items(
             self.result("tab", "list", "--workspace", workspace).get("tabs"), "herdr tab list")]
-        titles = [json_text(tab.get("label"), "herdr tab label") for tab in tabs]
-        unsaved: list[SavedName] = []
-        kept = next((space["tabs"] for space in saved["workspaces"] if space["name"] == name), unsaved)
-        order = tab_order(name if isinstance(name, str) else "", titles, kept)
-        start = next((place for place, index in enumerate(order) if index != place), len(tabs))
-        if start == len(tabs) or any(tabs[index].get("pane_count") != 1 for index in order[start:]):
+        if len(tabs) < 2:
             return {}
         rows = [json_object(item, "herdr pane") for item in json_items(
             self.result("pane", "list").get("panes"), "herdr pane list")]
-        pane_of = {json_text(row.get("tab_id"), "herdr pane tab id"): json_text(row.get("pane_id"), "herdr pane id")
-                   for row in rows}
+        panes_of: dict[str, list[str]] = {}
+        for row in rows:
+            tab = json_text(row.get("tab_id"), "herdr pane tab id")
+            panes_of.setdefault(tab, []).append(json_text(row.get("pane_id"), "herdr pane id"))
+        unit_panes = unit_director_panes(self.session, herdr_processes())
+        unit_director_titles = new_unit_director_titles | {
+            json_text(tab.get("label"), "herdr tab label") for tab in tabs
+            if any(pane in unit_panes for pane in panes_of.get(json_text(tab.get("tab_id"), "herdr tab id"), []))}
+        titles = [json_text(tab.get("label"), "herdr tab label") for tab in tabs]
+        unsaved: list[SavedName] = []
+        kept = next((space["tabs"] for space in saved["workspaces"] if space["name"] == name), unsaved)
+        order = tab_order(name if isinstance(name, str) else "", titles, kept, unit_director_titles)
+        start = next((place for place, index in enumerate(order) if index != place), len(tabs))
+        if start == len(tabs) or any(tabs[index].get("pane_count") != 1 for index in order[start:]):
+            return {}
         focused = next((item for item in spaces if item.get("focused") is True), None)
         active = next((item.get("active_tab_id") for item in spaces if item.get("workspace_id") == workspace), None)
         moved: dict[str, str] = {}
         active_tab = active
         for index in order[start:]:
             tab = json_text(tabs[index].get("tab_id"), "herdr tab id")
-            pane = pane_of[tab]
+            pane = panes_of[tab][0]
             result = json_object(self.result("pane", "move", pane, "--new-tab", "--workspace", workspace)
                                  .get("move_result"), "herdr pane move")
             created = json_text(json_object(result.get("created_tab"), "herdr moved tab").get("tab_id"), "herdr tab id")
@@ -1220,6 +1240,20 @@ class Herdr:
         if focused is not None and focused.get("workspace_id") != workspace:
             self.focus_workspace(json_text(focused.get("workspace_id"), "herdr workspace id"))
         return moved
+
+    def sort_tabs(self) -> WorkspacesKeptForSplitTabs:
+        """Sort each workspace by showrunner, units A-Z, then other tabs A-Z; save and return split workspaces kept."""
+        kept: list[str] = []
+        with _LayoutLock(self.session):
+            for space in self.live_layout():
+                tabs = [json_object(item, "herdr tab") for item in json_items(
+                    self.result("tab", "list", "--workspace", space.workspace_id).get("tabs"), "herdr tab list")]
+                if any(tab.get("pane_count") != 1 for tab in tabs):
+                    kept.append(space.label)
+                    continue
+                _ = self.order_tabs(space.workspace_id, SavedLayout(at=0.0, workspaces=[]))
+            self.save_layout()
+        return WorkspacesKeptForSplitTabs(kept)
 
     def close_tab_of(self, pane: str) -> None:
         """Close the tab holding `pane`; a pane already gone leaves nothing to close."""
@@ -2889,6 +2923,16 @@ def _darwin_herdr_processes() -> list[HerdrProcess]:
         except (HerdrFailure, subprocess.TimeoutExpired):
             continue
     return processes
+
+
+def has_unit_marks(environment: dict[str, str]) -> bool:
+    return all(environment.get(mark) for mark in UNIT_MARKS)
+
+
+def unit_director_panes(session: str, processes: Sequence[HerdrProcess]) -> set[str]:
+    """The session's pane ids whose processes carry both unit marks."""
+    return {process.place.pane for process in processes
+            if process.place.session == session and has_unit_marks(process.marks)}
 
 
 def herdr_processes() -> list[HerdrProcess]:

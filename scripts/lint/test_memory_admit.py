@@ -372,9 +372,7 @@ class ShellTests(unittest.TestCase):
                            "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
                            "UNIT_ACTIVE_DIR": str(root / "active"),
                            "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-                           "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-                           "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
-                           "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                           "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                            "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_MEMINFO": str(meminfo),
                            "BUILDLOG_OFF": "1", "BUILDLOG_SCOPE": "0",
                            "LINT_CONFIG_READER": str(config)}
@@ -399,9 +397,7 @@ class ShellTests(unittest.TestCase):
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
                                          "UNIT_ACTIVE_DIR": str(root / "active"),
                                          "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
-                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                                          "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
                      "BUILDLOG_MEMINFO": str(meminfo)},
             )
@@ -434,9 +430,7 @@ class ShellTests(unittest.TestCase):
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
                                          "UNIT_ACTIVE_DIR": str(root / "active"),
                                          "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
-                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                                          "MAC_TEST_STATE_DIR": str(root / "mac-state"), "BUILDLOG_OFF": "1"})
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(maximum.read_text().strip(), str(GIB))
@@ -458,9 +452,7 @@ class ShellTests(unittest.TestCase):
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
                                          "UNIT_ACTIVE_DIR": str(root / "active"),
                                          "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
-                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                                          "MAC_TEST_STATE_DIR": str(root / "mac-state"), "BUILDLOG_DIR": str(root),
                                          "BUILDLOG_MEMINFO": str(meminfo), "BUILDLOG_MEM_POLL_S": "1",
                                          "BUILDLOG_MEM_WAIT_LIMIT_S": "1"})
@@ -488,9 +480,7 @@ class ShellTests(unittest.TestCase):
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
                                          "UNIT_ACTIVE_DIR": str(root / "active"),
                                          "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
-                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                                          "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
                                          "BUILDLOG_MEMINFO": str(meminfo)})
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -520,9 +510,7 @@ class ShellTests(unittest.TestCase):
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
                                          "UNIT_ACTIVE_DIR": str(root / "active"),
                                          "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
-                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                                          "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
                                          "BUILDLOG_MEMINFO": str(meminfo), "BUILDLOG_MEM_WAIT_LIMIT_S": "0"})
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -547,9 +535,7 @@ class ShellTests(unittest.TestCase):
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
                                          "UNIT_ACTIVE_DIR": str(root / "active"),
                                          "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
-                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                                          "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
                                          "BUILDLOG_MEMINFO": str(meminfo), "BUILDLOG_MEM_WAIT_LIMIT_S": "1"})
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -572,9 +558,7 @@ class ShellTests(unittest.TestCase):
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
                                          "UNIT_ACTIVE_DIR": str(root / "active"),
                                          "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
-                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                                          "MAC_TEST_STATE_DIR": str(root / "mac-state"), "BUILDLOG_MEMINFO": str(meminfo)})
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "MeminfoUnavailable\n")
@@ -597,9 +581,7 @@ class ShellTests(unittest.TestCase):
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
                                          "UNIT_ACTIVE_DIR": str(root / "active"),
                                          "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
-                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                                          "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
                              "BUILDLOG_MEMINFO": str(meminfo)},
                     )
@@ -621,9 +603,7 @@ class ShellTests(unittest.TestCase):
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
                                          "UNIT_ACTIVE_DIR": str(root / "active"),
                                          "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
-                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                                          "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
                                          "BUILDLOG_MEMINFO": str(meminfo)})
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -663,9 +643,7 @@ class QueueLeaveTests(unittest.TestCase):
                             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
                             "UNIT_ACTIVE_DIR": str(self.root / "active"),
                             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-                            "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-                            "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
-                            "BUILDLOG_HOLD_REGISTRATION_FILE": str(self.root / "registration"),
+                            "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                             "MAC_TEST_STATE_DIR": str(self.root / "mac-state"), "HOME": str(self.root),
                             "BUILDLOG_DIR": str(self.root / "log"), "BUILDLOG_MEMINFO": str(self.meminfo),
                             "BUILDLOG_SCOPE": "0", "BUILDLOG_SYNC": "1", "LINT_SKIP_SWEEP": "1",
@@ -693,15 +671,11 @@ class QueueLeaveTests(unittest.TestCase):
         return list((self.root / "log/admission").glob("*.reservation"))
 
     def test_hook_leaves_a_held_step_before_it_starts(self) -> None:
-        started = self.root / "started"
-        self.environment["BUILDLOG_HOLD_STARTED_FILE"] = str(started)
-        result = self.run_step(f'test -e "{started}"', ":;")
+        result = self.run_step(":", ":;")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines()[-1], "75|LeftQueue|")
         self.assertFalse(self.ran.exists())
-        # The hook saw the started mark; leaving takes it back.
         self.assertEqual(self.hook_calls(), 1)
-        self.assertFalse(started.exists())
         self.assertEqual(self.reservations(), [])
         self.assertEqual(self.recorder_actions(), ["key"])
         # The wait is measured in whole seconds of SECONDS, so a loaded machine
