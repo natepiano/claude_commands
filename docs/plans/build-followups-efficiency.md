@@ -23,7 +23,7 @@ The two hana proposals in the same request went to hana's production (assembly-u
 - **Stack:** Bash (`verify.sh`), Python 3 standard library checked by basedpyright, Claude Code PreToolUse hooks.
 - **Layout:** `scripts/direct/verify.sh` and its tests in `scripts/direct/`; hooks and their tests in `scripts/hooks/`; hook registration in `settings.json`; procedure docs in `docs/direct/`, `commands/unit/`, `config/lint.conf`, `docs/as-built/`.
 - **Key files:**
-  - `scripts/direct/verify.sh` (2,434 lines). `lint` runs mend, fmt, taplo, clippy fix, fmt, clippy judgment, then rustdoc on the members that differ from HEAD (`CHANGED_MEMBERS_PY`, `invoke_doc`, near line 2395). Stages are gated by `config/lint.conf` through `lint_config_enabled` and `lint_config_skip_notice`. The header (lines 1–135) documents every verb, the pass records under `<session>/verify_cache/` (keyed by the judged tree, arguments, rustc, lint.conf, verify.sh, invoke.sh and environment), the build-log call record (`note_event`), and the Mac offload. `final` runs `cargo check --workspace --all-targets` and `run_nextest --workspace`.
+  - `scripts/direct/verify.sh` (2,502 lines). `lint` runs mend, fmt, taplo, clippy fix, fmt, clippy judgment; clippy is `invoke_clippy --workspace --all-targets --all-features` (near line 2455), and only fmt is scoped to changed members (`CHANGED_MEMBERS_PY`). `lint` refuses `--features`. `doc` runs `invoke_doc --workspace` and writes the doc pass record (`doc_tree`, `doc_record`) to `~/.local/state/verify/doc_pass/<tree>.json`. Stages are gated by `config/lint.conf` through `lint_config_enabled` and `lint_config_skip_notice`; `doc` ignores the switch. The header (lines 1–150) documents every verb, the pass records under `<session>/verify_cache/` (keyed by the judged tree, arguments, rustc, lint.conf, verify.sh, invoke.sh and environment), the build-log call record (`note_event`), and the Mac offload. `final` (near line 2494) runs `cargo check --workspace --all-targets` and `run_nextest --workspace`.
   - `scripts/hooks/pre-tool-use-change-review-gate.py` — the model for the new hook: it finds `git commit` with a `checkpoint(...)` subject in a Bash call (`COMMIT`, `SUBJECT`, `DIRECTORY`, `ALL`, `staged()`), reads `-m`, heredoc and `-F` text, and denies through `hookSpecificOutput.permissionDecision`. It is registered in `settings.json` near line 261. Its tests: `scripts/hooks/test_change_review_gate.py`.
   - `docs/direct/phase_checks.md` — `<PhaseChecks/>`: the table puts rustdoc in "the workers' last `verify.sh lint`". `commands/unit/checkpoint.md` — `<CheckpointCommit/>` (the commit message format at line ~155). `config/lint.conf` — `doc=on` (line 46). `commands/unit/direct.md`, `docs/as-built/nextest-width-and-lint-scope.md`, `docs/as-built/phase-checks.md`, `docs/as-built/build-followups-mul-add.md` mention rustdoc in lint.
   - Tests: `scripts/direct/test_verify_lint_scope.py` (lint scope), other `scripts/direct/test_verify_*.py`.
@@ -32,74 +32,55 @@ The two hana proposals in the same request went to hana's production (assembly-u
 ## Phases
 
 ### Phase 1 — Rustdoc once per phase, enforced at the checkpoint  · status: done
-**Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** No phase of a Rust repository can be checkpointed without a passing rustdoc run on the exact tree it commits. `verify.sh lint` no longer runs rustdoc.
-
-**Spec:** Decisions, settled; do not reopen.
-1. **New verb `verify.sh doc`.** It runs `cargo doc --workspace --no-deps` with warnings denied (the same flags and features handling `invoke_doc` uses today), over the whole workspace, through the same cargo token and memory gate as `lint`. Whole workspace, not changed members: a change in one member can break another member's intra-doc links. It ignores `config/lint.conf`'s `doc` switch. If the switch is off, it prints one line saying that the phase rustdoc check cannot be switched off. Measure and report one hana workspace run's wall time and memory peak from the build log.
-2. **The doc pass record.** When `verify.sh doc` exits 0, it writes a durable record to `~/.local/state/verify/doc_pass/`. The record is keyed by the git tree id of the judged tree: the working tree with untracked, non-ignored files included, computed with a temporary index (`GIT_INDEX_FILE`, `git add -A`, `git write-tree`). It is never the real index, and the real index must not change. The record holds the repo top level, the tree id, the time and the build-log call id. A run whose tree changed while it ran writes no record, the same rule as the existing pass records. These records do not live in the session folder, so `end_session.sh` does not delete them. Prune records older than 14 days on each write.
-3. **`lint` drops rustdoc.** Remove the rustdoc stage, `CHANGED_MEMBERS_PY` if nothing else uses it, and the lint usage text that names rustdoc. `--features` handling moves to `doc`. Existing lint pass records stay valid only if the key machinery says so; do not special-case them.
-4. **New hook `scripts/hooks/pre-tool-use-checkpoint-doc-gate.py`, registered in `settings.json` beside the change-review gate.**
-   - It acts on a Bash `git commit` whose subject is `checkpoint(...)`. Reuse the change-review gate's parsing. Share it by import if that is clean, and never by copying it.
-   - It acts only when the commit's repository top level has a `Cargo.toml`.
-   - It computes the tree the commit writes: the index, or with `-a`/`--all` a temporary index holding every tracked change. It allows the commit only when a doc pass record exists for that tree id and the same repo top level.
-   - **It fails closed.** In a Cargo repository, any error (git failure, unreadable record, parse error) denies, with a reason that names the cause and the fix. This is the one hook allowed to block on its own failure, because the user made this check non-negotiable. Outside a Cargo repository, and for every other commit, it allows without reading anything.
-   - The denial reason says to run `~/.claude/scripts/direct/verify.sh doc` as the last command before the commit. When the working tree holds untracked or unstaged files that the commit leaves out, it also says to commit or remove them, because the judged tree must equal the committed tree.
-5. **Procedure docs say the same thing everywhere** (user rule: docs match current reality).
-   - `<PhaseChecks/>`: the rustdoc row becomes "`verify.sh doc`, run by the unit director as the last command before the checkpoint commit | the workspace". State that `lint.conf` cannot switch it off. The paragraph "`config/lint.conf` switches each check off" excepts rustdoc.
-   - `<CheckpointCommit/>`: one step in a Rust repository, `verify.sh doc` after staging and before `git commit`. On failure, it is a repair round through `<FixDispatch/>`, then `doc` again. The hook refuses the commit otherwise. A rerun after a plan-doc edit compiles nothing new and takes seconds.
-   - `verify.sh` header and usage, `config/lint.conf` comment, `commands/unit/direct.md`, and every as-built doc that says lint runs rustdoc.
-   - Grep the repository for `rustdoc` and `invoke_doc` and fix every stale sentence.
-6. **Workers may run `verify.sh doc` any time.** The Work Order template does not require it. The unit director runs it at the checkpoint.
-
-Tests the `test` worker writes:
-- verify.sh: `doc` writes a record keyed by the judged tree, writes none on failure or when the tree changes mid-run, and ignores `doc=off`. `lint` no longer invokes rustdoc. Use the existing `test_verify_*.py` fake-cargo patterns.
-- Hook: it allows a non-checkpoint commit and a checkpoint outside a Cargo repo. In a Cargo repo it allows a checkpoint whose index tree has a record. It denies a checkpoint with no record, with a record for another tree, with `-a` and an unstaged change, and on an internal error. It handles `-C <dir>`, heredoc and `-F` messages, and a call that has two commands.
+- `verify.sh doc` runs `cargo doc --workspace --no-deps` with warnings denied over the whole workspace, through the cargo token and memory gate. It sets `LINT_CONFIG_FORCE=1`, so `lint.conf`'s `doc=off` cannot switch it off.
+- On exit 0 it writes a doc pass record to `~/.local/state/verify/doc_pass/<tree>.json` with keys `repo_top`, `tree_id`, `time` and `call_id`. The tree id comes from a private index (`GIT_INDEX_FILE`, `git add -A`, `git write-tree`), so untracked files count and the real index does not change. A tree that changes during the run writes no record. Each write prunes records older than 14 days.
+- `verify.sh lint` does not run rustdoc and refuses `--features`.
+- The PreToolUse hook `pre-tool-use-checkpoint-doc-gate.py` sits beside the change-review gate in `settings.json`. In a repo with a `Cargo.toml`, it allows a checkpoint commit only when a record matches the commit's tree (the index, or a private index for `-a`) and repo top. It fails closed. Its refusal names the cause and the fix: run `verify.sh doc` last, and commit or remove files the commit leaves out.
 
 **Files:**
-- `scripts/direct/verify.sh` — the `doc` verb, its record, and `lint` without rustdoc
-- `scripts/direct/test_verify_doc.py` — new: `doc` record and switch tests
-- `scripts/direct/test_verify_lint_scope.py` — `lint` no longer runs rustdoc
-- `scripts/hooks/pre-tool-use-checkpoint-doc-gate.py` — new hook
-- `scripts/hooks/test_checkpoint_doc_gate.py` — new hook tests
-- `settings.json` — register the hook
-- `docs/direct/phase_checks.md` — the rustdoc row
-- `commands/unit/checkpoint.md` — the `verify.sh doc` step
-- `commands/unit/direct.md` — sentences that say lint runs rustdoc
-- `config/lint.conf` — the `doc` comment
-- `docs/as-built/` — every as-built doc the grep finds
+- `scripts/direct/verify.sh` — the `doc` verb, `doc_tree`, `doc_record`, and `lint` without rustdoc
+- `scripts/hooks/pre-tool-use-checkpoint-doc-gate.py` — the checkpoint doc gate
+- `scripts/hooks/pre-tool-use-change-review-gate.py` — commit, subject, directory and heredoc patterns that both hooks share
+- `commands/unit/checkpoint.md`, `docs/direct/final_gate_commit.md`, `docs/direct/phase_checks.md` — the doc step and the own-call rule
 
-**Workers:** 1 writer + 1 tester. The tests depend on the behavior and not on the code, so they split cleanly.
-- `impl` — `scripts/direct/verify.sh`, `scripts/hooks/pre-tool-use-checkpoint-doc-gate.py`, `settings.json`, and every doc file above
-- `test` — `scripts/direct/test_verify_doc.py`, the `test_verify_lint_scope.py` update, `scripts/hooks/test_checkpoint_doc_gate.py`, all written from the Spec alone
+**Binds later work:** the `doc` verb, `doc_tree`, `doc_record`, the `doc` usage lines and `lint`'s refusal of `--features` live in `scripts/direct/verify.sh`; edits there keep them. `test_verify_doc.py`, `test_verify_lint_scope.py` and `test_checkpoint_doc_gate.py` pin them. This repo has no `Cargo.toml`, so its checkpoints need only the own-call rule and no doc record.
 
-**Constraints from prior phases:** none.
+**Gotchas:**
+- In every repo, the checkpoint commit is the first command in its own Bash call. An earlier command can change the directory or the index.
+- After quote removal, any `checkpoint(` text in the call makes every commit in that call a checkpoint.
+- A shell expansion in a commit message counts as unreadable, and unreadable counts as a checkpoint in a Cargo repo.
+- The change-review hook refuses Bash text that holds example checkpoint commit text. Write such text with file tools.
+- The memory gate can hold a doc step for minutes: a one-file crate waited 15 min for a 2.6 s rustdoc run.
 
-**Acceptance gate:** the gate passes, basedpyright is clean on touched folders, and a live check in a throwaway Cargo repo under `/tmp/claude` shows both paths: a checkpoint commit is refused before `verify.sh doc` and allowed after it.
+**Ruled out:** a git commit-msg hook (it needs an install in each repo); rustdoc on changed members only (a change in one member can break the intra-doc links of another member).
 
 ### Phase 2 — `verify.sh final` stops linking examples  · status: todo
 **Depends on:** Phase 1 (same file, `scripts/direct/verify.sh`)
 
 #### Work Order
 
-**Goal:** `verify.sh final` no longer builds and links workspace examples, and every phase still compiles every example.
+**Goal:** `verify.sh final` no longer builds and links workspace examples, and every example is still compiled at the final gate.
 
 **Spec:**
-- Showrunner and hana request, 2026-10-27: `final` runs `cargo check --workspace --all-targets` and `run_nextest --workspace`. nextest's default target selection follows `cargo test`, so it builds and links every example; hana has 3. Pass `--lib --bins --tests` to the nextest build in `final` so examples are not linked.
-- Keep the check that a broken example is still caught. `verify.sh lint` runs `cargo clippy --workspace --all-targets --all-features` in every phase, so clippy still type-checks every example. Confirm this in the code. Leave `final`'s `cargo check --all-targets` as it is.
-- Measure the gain on hana from the build log (`buildlog`): wall time and build time of `final` before and after, on the same tree and under similar load. Report the numbers in the summary.
+- Showrunner and hana request, 2026-10-27: `final` runs `cargo check --workspace --all-targets` and `run_nextest --workspace`. nextest's default target selection follows `cargo test`, so it builds and links every example; hana has 3. Pass `--lib --bins --tests` to the nextest run in `final` (`run_nextest --workspace --lib --bins --tests`) so examples are not linked. No test is lost: `final` first runs `UNTESTED_EXAMPLES_PY` (near line 1660) and exits 2 when any example holds a test.
+- Examples stay compiled. `final`'s `cargo check --workspace --all-targets` type-checks every example at the final gate; leave it as it is. In a phase with Rust changes and clippy enabled, `verify.sh lint`'s `invoke_clippy --workspace --all-targets --all-features` also type-checks every example. Do not change the switch policy.
+- Update `final`'s header and usage text (near line 143) to say its nextest run skips example targets and why no test is lost.
+- Procedure text for the checkpoint hook: in `commands/unit/checkpoint.md`, say that the hook treats a call as a checkpoint when its text holds `checkpoint(` anywhere after quote removal (a body line or an example counts too), and that it refuses `--git-dir`/`--work-tree`/`GIT_DIR=`-style overrides and `-C` directories it cannot resolve (shell expansion, glob). Each refusal names the fix. Check the wording against `scripts/hooks/test_checkpoint_doc_gate.py`.
+- Measurement (unit director, after the phase lands): on `~/rust/hana`, same tree, compare `final` with the installed verifier (`~/.claude/scripts/direct/verify.sh`, links examples) against the worktree verifier. Before each run, touch the same workspace source file so both rebuild the same set. Take wall time and build time from the build log (`~/.local/state/buildlog/index.sqlite`, table `steps`); report memory-gate and build-lock waits separately from build time. Record before and after in this plan's as-built and in the efficiency line of `~/.local/state/nightly-review/ledger.md`. Memory-gate repairs are outside this phase (sent to the showrunner 2026-10-27).
 
 **Files:**
-- `scripts/direct/verify.sh` — `final` nextest target selection, and its usage text
-- `scripts/direct/test_verify_final_targets.py` — new: `final` passes `--lib --bins --tests` to nextest
+- `scripts/direct/verify.sh` — `final` nextest target selection, and its header and usage text
+- `commands/unit/checkpoint.md` — the hook's recognition and refusal rules
+- `scripts/direct/test_verify_final_targets.py` — new: `final` passes `--lib --bins --tests` to nextest; still runs `cargo check --workspace --all-targets`; a failed check stops before nextest; an example with a test still exits 2 before any build
+- `scripts/direct/test_verify_untested_examples.py` — its exact `nextest run --workspace` assertion (near line 377) takes the new flags
 
 **Workers:** 1 writer + 1 tester.
-- `impl` — `scripts/direct/verify.sh`
-- `test` — `scripts/direct/test_verify_final_targets.py`
+- `impl` — `scripts/direct/verify.sh`, `commands/unit/checkpoint.md`
+- `test` — `scripts/direct/test_verify_final_targets.py`, `scripts/direct/test_verify_untested_examples.py`
 
-**Constraints from prior phases:** Phase 1 owns the `doc` verb and the `lint` changes in the same file.
+**Constraints from prior phases:** Phase 1 owns the `doc` verb, `doc_tree`, `doc_record`, the `doc` usage lines and `lint`'s refusal of `--features` in the same file; keep them unchanged, and keep `scripts/direct/test_verify_doc.py`, `scripts/direct/test_verify_lint_scope.py` and `scripts/hooks/test_checkpoint_doc_gate.py` green. This repository has no `Cargo.toml`: its checkpoint needs the own-call rule but no doc record.
 
 **Acceptance gate:** the gate passes, basedpyright is clean on the touched files, and the measured before and after times are recorded in the plan and the efficiency ledger line.
