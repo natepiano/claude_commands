@@ -2071,9 +2071,7 @@ def _select_phase(
                 where += "; " + style_ledger.outside_evidence_line(outcome.evidence)
             print(f"waiting {issue.path}: {finding_id} {where}")
         read = {outcome.finding.finding_id for outcome in own if not isinstance(outcome, style_ledger.DeclarationNotRead)}
-        withdrew = any(isinstance(outcome, style_ledger.DeclarationRemoved)
-                       or isinstance(outcome, style_ledger.FindingSite) and isinstance(outcome.evidence, style_ledger.GoneSite)
-                       for outcome in own)
+        withdrew = any(isinstance(outcome, style_ledger.DeclarationRemoved) for outcome in own)
         built = any(isinstance(outcome, style_ledger.DeclarationRenamed) for outcome in own)
         findings = tuple(finding for finding in _unbuilt_findings(ledger, issue.path) if finding.finding_id not in left)
         # The gone-file and moved-site waives read only the findings whose declaration the step could not read.

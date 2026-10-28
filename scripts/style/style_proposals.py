@@ -1540,7 +1540,7 @@ class FollowRun:
     def count(self, kinds: type[style_ledger.DeclarationOutcome] | UnionType) -> int:
         return sum(isinstance(outcome, kinds) for outcome in self.reading.outcomes)
 
-    def sites(self, kind: type[style_ledger.UnchangedSite | style_ledger.GoneSite | style_ledger.NeedsJudgment]) -> int:
+    def sites(self, kind: type[style_ledger.SiteEvidence]) -> int:
         return sum(isinstance(outcome, style_ledger.FindingSite) and isinstance(outcome.evidence, kind)
                    for outcome in self.reading.outcomes)
 
@@ -1548,7 +1548,7 @@ class FollowRun:
 def follow_totals(run: FollowRun) -> str:
     return (f"totals: follow {run.count(style_ledger.DeclarationMoved) + run.sites(style_ledger.UnchangedSite)}, "
             + f"built {run.count(style_ledger.DeclarationRenamed)}, "
-            + f"withdraw {run.count(style_ledger.DeclarationRemoved) + run.sites(style_ledger.GoneSite)}, "
+            + f"withdraw {run.count(style_ledger.DeclarationRemoved)}, "
             + f"left {run.count(style_ledger.DeclarationLeft) + run.sites(style_ledger.NeedsJudgment)}, "
             + f"kept {run.count(style_ledger.KeptForOpenBuild)}, close {len(run.closes)}")
 
@@ -1568,8 +1568,6 @@ def follow_line(outcome: DeclarationChange, tip: str) -> str:
         match outcome.evidence:
             case style_ledger.UnchangedSite(path, line):
                 return f"follow {site} -> {path}:{line}: unchanged source site"
-            case style_ledger.GoneSite(reason):
-                return f"withdraw {site}: {reason}"
             case style_ledger.NeedsJudgment(reason):
                 return f"left {site}: needs judgment: {reason}"
     suffix = (style_ledger.outside_evidence_suffix(outcome.evidence)
@@ -1667,8 +1665,7 @@ def run_follow(writer: DecisionWriter, findings: Iterable[style_ledger.HeldFindi
                                     style_ledger.RenameAwaitingApproval)):
             print(follow_line(outcome, reading.tip))
     plan = plan_withdrawal(ledger, {outcome.finding.finding_id: (outcome.finding.state.proposal, style_ledger.DeclarationGone(reading.tip))
-                                    for outcome in reading.outcomes if (isinstance(outcome, style_ledger.DeclarationRemoved)
-                                    or isinstance(outcome, style_ledger.FindingSite) and isinstance(outcome.evidence, style_ledger.GoneSite))
+                                    for outcome in reading.outcomes if isinstance(outcome, style_ledger.DeclarationRemoved)
                                     and isinstance(outcome.finding.state, style_ledger.Filed)})
     closes: list[Path] = []
     for close in plan.closes:

@@ -31,7 +31,7 @@ import rules as rule_catalog
 import style_footprint
 import declarations
 import finding_sites
-from finding_sites import (GoneSite as GoneSite, NeedsJudgment as NeedsJudgment,
+from finding_sites import (NeedsJudgment as NeedsJudgment,
                            SiteEvidence as SiteEvidence, UnchangedSite as UnchangedSite)
 import style_rules
 from approved_renames import (AppliedCheck, AppliedInCode, BindingProof, BindingRename, FileRename, Folder, MissingFile,
@@ -1987,8 +1987,6 @@ class Ledger:
         self._site_rows_version: tuple[int, int] = (-1, -1)
         self._site_rows: dict[tuple[str, str], tuple[Judgment, ...]] = {}
         self._site_holding_rows: dict[tuple[str, str], list[tuple[str, Judgment]]] = {}
-        self._site_words: dict[str, tuple[frozenset[str], frozenset[str]]] = {}
-        self._site_expanding_crates: dict[str, frozenset[str]] = {}
         self._site_rule_families: dict[str, str] = {}
         self._file_modules: dict[tuple[str, str], dict[str, RootedFileModule]] = {}
         self._outside_diffs: dict[tuple[str, str, str, str], str] = {}
@@ -4407,31 +4405,6 @@ class Ledger:
                 self._site_sources[blob] = finding_sites.SourceSites(content.decode())
         return self._site_sources[blob]
 
-    def _subject_words(self, tip: RepositoryTip) -> tuple[frozenset[str], frozenset[str]]:
-        if tip.tree not in self._site_words:
-            words: set[str] = set()
-            literals: set[str] = set()
-            expanding: set[str] = set()
-            # Include all Rust blobs, including ignored/vendor files, to rule out ordinary moves.
-            blobs = {blob: blob for path, blob in tip.blobs.items() if path.endswith(".rs")
-                     and blob not in self._site_sources}
-            for blob, content in blob_contents(self.repo, blobs):
-                self._site_sources[blob] = finding_sites.SourceSites(content.decode())
-            for path, blob in tip.blobs.items():
-                if path.endswith(".rs"):
-                    if tip.entries[path].mode not in REGULAR_FILE_MODES:
-                        raise LedgerError(f"{path}: nonregular Rust source cannot prove absence")
-                    indexed = self._site_sources[blob]
-                    source = indexed.source
-                    words.update(re.findall(r"[A-Za-z_][A-Za-z_0-9]*", source))
-                    tokens = tuple(span.token for span in indexed.spans)
-                    if indexed.expands_source:
-                        expanding.add(tip.crate(path))
-                    literals.update(token.value for token in tokens if token.kind == "literal")
-            self._site_words[tip.tree] = frozenset(words), frozenset(literals)
-            self._site_expanding_crates[tip.tree] = frozenset(expanding)
-        return self._site_words[tip.tree]
-
     def _original_site_inputs(self, finding: HeldFinding, read: RepositoryTip, tip: RepositoryTip,
                               *, line_local: bool = False) -> bool:
         """Retain the original judgment's scope even when today's rule has narrowed it."""
@@ -4556,12 +4529,7 @@ class Ledger:
             if old.same_item(finding.line, new, mapped):
                 return UnchangedSite(finding.path, mapped)
             return NeedsJudgment("enclosing item, owner, imports or original inputs changed")
-        if family in ("names", "values"):
-            words, literals = self._subject_words(tip)
-            if tip.crate(finding.path) in self._site_expanding_crates[tip.tree]:
-                return NeedsJudgment("crate source expansion prevents disappearance proof")
-            return finding_sites.absent_subject(finding.kind, finding.rule, finding.before, line, words, literals)
-        return NeedsJudgment("unchanged enclosing item not proved")
+        return NeedsJudgment("unchanged source site not proved")
 
     def _declaration_outcome(self, finding: HeldFinding, tip: RepositoryTip, rust_files: frozenset[str],
                              approved: Callable[[Path], bool], renames: tuple[BuiltRename, ...],
@@ -4969,7 +4937,7 @@ class Ledger:
             elif isinstance(outcome, DeclarationMoved):
                 evidence = UnchangedSite(outcome.path, outcome.line)
             elif isinstance(outcome, DeclarationRemoved):
-                evidence = GoneSite("existing declaration disappearance proof")
+                evidence = NeedsJudgment("no source site after proved declaration removal")
             elif isinstance(outcome, DeclarationNotRead) and isinstance(self.judged_commit(finding), NoJudgedCommit):
                 # Existing untracked findings are eligible for filing; this is not a new carry.
                 evidence = UnchangedSite(finding.path, finding.line)
@@ -5010,10 +4978,9 @@ class Ledger:
             moves = [item for item in plan.outcomes if isinstance(item, DeclarationMoved)]
             sites = [item for item in plan.outcomes if isinstance(item, FindingSite)]
             follows = [(item.finding, item.evidence) for item in sites if isinstance(item.evidence, UnchangedSite)]
-            gone = [item for item in sites if isinstance(item.evidence, GoneSite)]
             renames = [item for item in plan.outcomes if isinstance(item, DeclarationRenamed)]
             removals = [item for item in plan.outcomes if isinstance(item, DeclarationRemoved)]
-            if not moves and not renames and not removals and not follows and not gone:
+            if not moves and not renames and not removals and not follows:
                 return plan
             with self._connection:
                 _ = self._connection.execute("BEGIN IMMEDIATE")
@@ -5038,7 +5005,7 @@ class Ledger:
                 )
                 _ = self._connection.executemany(
                     "UPDATE held_findings SET state='withdrawn',declaration_gone_at=?,updated_at=? WHERE finding_id=?",
-                    [(tip.commit, now, item.finding.finding_id) for item in (*removals, *gone)],
+                    [(tip.commit, now, item.finding.finding_id) for item in removals],
                 )
             return plan
 

@@ -227,16 +227,35 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.NeedsJudgment)
         self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.NeedsJudgment)
 
-    def test_magic_site_refuses_withdrawal_when_crate_can_include_or_construct_rust(self) -> None:
-        ledger, _, finding = self.site_fixture("values", rule_name="no-magic-values", kind="restructure")
-        for expansion in ('include!("body.inc");', '#[path = "body.inc"] mod body;',
-                          'paste! { fn made() {} }', 'concat_idents!(na, me);', 'concat!("7", "91");'):
+    def test_site_proof_never_withdraws_removed_or_indirectly_included_literals(self) -> None:
+        ledger, rule, finding = self.site_fixture("values", rule_name="no-magic-values", kind="restructure")
+        judgments = self.judgment_rows(ledger.database)
+        for expansion in ('use std::include as load; load!("body.inc");',
+                          '#[cfg_attr(all(), path = "body.inc")] mod body;', ''):
             with self.subTest(expansion=expansion):
                 tip = self.commit_tip(ledger, {PARENT_FILE: "fn work() {}\n",
                                                MOVED_FILE: expansion + "\n",
                                                "crates/alpha/src/body.inc": "fn included() { consume(791); }\n"})
                 self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.NeedsJudgment)
                 self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.NeedsJudgment)
+                _ = ledger.follow_declarations([finding.finding_id], tip, lambda _: True)
+                self.assertEqual(ledger.named_held([finding.finding_id])[0], finding)
+                self.assertEqual(self.judgment_rows(ledger.database), judgments)
+                self.assertEqual(self.states(rule)[PARENT_FILE], "stale")
+
+    def test_site_owner_ignores_function_types_and_inline_const_expressions(self) -> None:
+        source = "fn work(callback: fn()) {\n    let old = 791;\n    let value = const { 1 };\n}\n"
+        ledger, rule, finding = self.site_fixture(source=source)
+        tip = self.commit_tip(ledger, {PARENT_FILE: "// header comment\n" + source})
+        self.assertEqual(self.strict_site(ledger, finding, tip), style_ledger.UnchangedSite(PARENT_FILE, 3))
+        self.assertEqual(ledger.finding_site(finding, tip), style_ledger.UnchangedSite(PARENT_FILE, 3))
+        judgments = self.judgment_rows(ledger.database)
+        _ = ledger.follow_declarations([finding.finding_id], tip, lambda _: True)
+        followed = ledger.named_held([finding.finding_id])[0]
+        self.assertEqual(followed.follow, style_ledger.FollowedDeclaration(PARENT_FILE, 2, tip))
+        self.assertEqual(followed.line, 3)
+        self.assertEqual(self.judgment_rows(ledger.database), judgments)
+        self.assertEqual(self.states(rule)[PARENT_FILE], "stale")
 
     def test_site_proof_refuses_unicode_token_failure_instead_of_empty_parse(self) -> None:
         source = "fn café() {\n    let old = 791;\n}\n"
@@ -333,25 +352,6 @@ class StyleLedgerTests(unittest.TestCase):
         tip = self.commit_tip(ledger, {PARENT_FILE: "fn sibling() {}\n" + (self.repo / PARENT_FILE).read_text(),
                                        self.sources[1]: "fn changed_dependency() {}\n"})
         self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.NeedsJudgment)
-
-    def test_site_withdraws_only_proved_gone_identifier_and_keeps_emptied_held_cell_stale(self) -> None:
-        ledger, rule, finding = self.site_fixture()
-        tip = self.commit_tip(ledger, {PARENT_FILE: "fn work() {}\n", MOVED_FILE: "// old remains in a comment\n"})
-        self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.NeedsJudgment)
-        tip = self.commit_tip(ledger, {MOVED_FILE: "// subject gone\n"})
-        self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.GoneSite)
-        judgments = self.judgment_rows(ledger.database)
-        _ = ledger.follow_declarations([finding.finding_id], tip, lambda _: True)
-        self.assertIsInstance(ledger.named_held([finding.finding_id])[0].state, style_ledger.Withdrawn)
-        self.assertEqual(self.states(rule)[PARENT_FILE], "stale")
-        self.assertEqual(self.judgment_rows(ledger.database), judgments)
-
-    def test_magic_site_withdrawal_checks_all_literals_and_cross_file_reflow(self) -> None:
-        ledger, _, finding = self.site_fixture("values", rule_name="no-magic-values", kind="restructure")
-        tip = self.commit_tip(ledger, {PARENT_FILE: "fn work() {}\n", MOVED_FILE: "fn moved() { consume(\n791\n); }\n"})
-        self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.NeedsJudgment)
-        tip = self.commit_tip(ledger, {MOVED_FILE: "fn moved() { consume(LIMIT); }\n"})
-        self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.GoneSite)
 
     def test_site_follow_rejects_late_pre_deletion_judgment_after_identical_restore(self) -> None:
         ledger, rule, finding = self.site_fixture()

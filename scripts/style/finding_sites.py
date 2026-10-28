@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from bisect import bisect_right
 from collections import Counter
 from dataclasses import dataclass
@@ -22,17 +21,11 @@ class UnchangedSite:
 
 @final
 @dataclass(frozen=True)
-class GoneSite:
-    reason: str
-
-
-@final
-@dataclass(frozen=True)
 class NeedsJudgment:
     reason: str
 
 
-SiteEvidence = UnchangedSite | GoneSite | NeedsJudgment
+SiteEvidence = UnchangedSite | NeedsJudgment
 
 
 @dataclass(frozen=True)
@@ -96,15 +89,6 @@ class SourceSites:
         return reading
 
     @cached_property
-    def expands_source(self) -> bool:
-        """An expansion can hide a subject outside the tracked Rust token stream."""
-        words = tuple(span.token.value.removeprefix("r#") for span in self.spans)
-        return (any(word in {"include", "paste", "concat_idents", "concat"} and words[index + 1:index + 2] == ("!",)
-                    for index, word in enumerate(words))
-                or any(style_footprint.attribute_name(words, start) == "path"
-                       for start, _ in style_footprint.attribute_spans(words)))
-
-    @cached_property
     def item_reading(self) -> tuple[EnclosingItem, ...] | UnreadableSourceItems:
         try:
             spans = self.spans
@@ -112,6 +96,7 @@ class SourceSites:
             return UnreadableSourceItems("unreadable Rust tokens")
         words = tuple(span.token.value for span in spans)
         ends = style_footprint.delimiter_ends(words)
+        attributes = dict(style_footprint.attribute_spans(words))
         offsets = [0]
         for line in self.lines:
             offsets.append(offsets[-1] + len(line))
@@ -133,19 +118,39 @@ class SourceSites:
                         return False
                     if item.kind in {"mod", "impl", "trait"} and words[cursor] == "{" and close == last - 1:
                         return visit(cursor + 1, close, identity)
-                    if not nested(cursor + 1, close, identity):
+                    if not nested(cursor + 1, close, identity, at_item=words[cursor] == "{"):
                         return False
                     cursor = close + 1
                 else:
                     cursor += 1
             return True
 
-        def nested(start: int, end: int, owner: tuple[str, ...]) -> bool:
+        def nested(start: int, end: int, owner: tuple[str, ...], *, at_item: bool) -> bool:
             cursor = start
             while cursor < end:
-                word = words[cursor]
-                if word in {"fn", "impl", "trait", "mod", "struct", "enum", "union", "type", "const", "static"}:
-                    last = style_footprint.item_end(words, ends, cursor + 1,
+                keyword = cursor
+                if at_item:
+                    # Attributes, visibility and function qualifiers belong to the item that follows.
+                    while keyword in attributes:
+                        keyword = attributes[keyword]
+                    if words[keyword:keyword + 1] == ("pub",):
+                        keyword += 1
+                        if words[keyword:keyword + 1] == ("(",):
+                            keyword = ends.get(keyword, end) + 1
+                    while keyword < end:
+                        word = words[keyword]
+                        following = words[keyword + 1:keyword + 2]
+                        if word in {"unsafe", "async", "auto", "default"} or (
+                                word == "const" and following in (("fn",), ("unsafe",), ("async",), ("extern",))):
+                            keyword += 1
+                        elif word == "extern" and following and following[0].startswith('"'):
+                            keyword += 2
+                        else:
+                            break
+                word = words[keyword] if keyword < end else ""
+                if (at_item and word in {"fn", "impl", "trait", "mod", "struct", "enum", "union", "type", "const", "static"}
+                        and not (word == "const" and words[keyword + 1:keyword + 2] == ("{",))):
+                    last = style_footprint.item_end(words, ends, keyword + 1,
                                                     body=word not in {"type", "const", "static"})
                     if last is None or last > end:
                         return False
@@ -153,12 +158,16 @@ class SourceSites:
                     if items is None or len(items) != 1 or not record(items[0], cursor, owner):
                         return False
                     cursor = last
-                elif word in {"{", "(", "["}:
+                    at_item = True
+                elif words[cursor] in {"{", "(", "["}:
                     close = ends.get(cursor)
-                    if close is None or close >= end or not nested(cursor + 1, close, owner):
+                    block = words[cursor] == "{"
+                    if close is None or close >= end or not nested(cursor + 1, close, owner, at_item=block):
                         return False
                     cursor = close + 1
+                    at_item = block
                 else:
+                    at_item = words[cursor] == ";"
                     cursor += 1
             return True
 
@@ -263,14 +272,3 @@ def unchanged_lines(patch: str, before: SourceSites, after: SourceSites) -> dict
     return {old: new for old, new in result.items()
             if 1 <= new <= len(after.lines) and before.lines[old - 1] == after.lines[new - 1]}
 
-
-def absent_subject(kind: str, rule: str, before: str, line: str,
-                   words: frozenset[str], literals: frozenset[str]) -> SiteEvidence:
-    if (kind == 'rename' and re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*', before)
-            and re.search(r'\b' + re.escape(before) + r'\b', line) and before not in words):
-        return GoneSite('before identifier absent from all current Rust code and comments')
-    if rule == 'global:rust/no-magic-values.md':
-        original = {token.value for token in style_footprint.tokens(line) if token.kind == 'literal'}
-        if original and not original.intersection(literals):
-            return GoneSite('all original literal spellings absent from current Rust tokens')
-    return NeedsJudgment('source subject disappearance not proved')
