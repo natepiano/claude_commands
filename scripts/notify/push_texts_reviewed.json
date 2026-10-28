@@ -82,17 +82,21 @@
     "long_sender": {
       "objections": [
         {
-          "quote": "cargo-liner-style renames",
+          "quote": "the tile and handler renames",
           "rule": "reader-starts-cold"
         },
         {
           "quote": "both units run under their new names",
           "rule": "before-and-after"
+        },
+        {
+          "quote": "cargo-liner-style renames are done",
+          "rule": "title-names-the-stake"
         }
       ],
-      "reviewer": "user-spec: user, 2026-10-20: /nate adhoc, Title: {sender} {short title}, Description: {description}, then {template-name}; reviewer: opus",
-      "sha256": "390381a8d16ef457ffe8a43abbbec0900086c06dee156e1c8a0ec8312fe3a1dd",
-      "time": "2026-10-20T14:23:00.784022-04:00"
+      "reviewer": "user-spec: User 2026-10-27 via showrunner: every push carries its sender and its template name on its own last line; pushover.py's Template line now names the template, so the body's own 'adhoc' line is removed (it showed the name twice). Earlier: user spec 2026-10-20 /nate templates.; reviewer: opus",
+      "sha256": "34c6056666af87aa9e1690e5954230c489128561e5648a26c115e0db7eb215fb",
+      "time": "2026-10-27T11:40:43.485823-04:00"
     },
     "typical": {
       "objections": [
@@ -101,9 +105,9 @@
           "rule": "title-names-the-stake"
         }
       ],
-      "reviewer": "user-spec: user, 2026-10-20: /nate adhoc, Title: {sender} {short title}, Description: {description}, then {template-name}; reviewer: opus",
-      "sha256": "390381a8d16ef457ffe8a43abbbec0900086c06dee156e1c8a0ec8312fe3a1dd",
-      "time": "2026-10-20T14:22:51.437039-04:00"
+      "reviewer": "user-spec: User 2026-10-27 via showrunner: every push carries its sender and its template name on its own last line; pushover.py's Template line now names the template, so the body's own 'adhoc' line is removed (it showed the name twice). Earlier: user spec 2026-10-20 /nate templates.; reviewer: opus",
+      "sha256": "34c6056666af87aa9e1690e5954230c489128561e5648a26c115e0db7eb215fb",
+      "time": "2026-10-27T11:40:34.667654-04:00"
     }
   },
   "nixos.disk_low": {

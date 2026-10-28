@@ -263,6 +263,15 @@
         ]
       },
       {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/pre-tool-use-checkpoint-doc-gate.py\""
+          }
+        ]
+      },
+      {
         "matcher": "mcp__brp__brp_launch",
         "hooks": [
           {

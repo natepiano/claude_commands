@@ -4,7 +4,7 @@
     change_review.py check --repo R --checkpoint C --previous P --merge-branch B
     change_review.py append --repo R [--production DOC] [--list L] --merged M --checkpoint C --previous P --merge-branch B
     change_review.py drift --repo R --merge-branch B [--production DOC] [--list L] --since YYYY-MM-DD
-    change_review.py add [--production DOC] [--list L] --change "<what changed for you>" --check "<how to try it>" --see "<what you see>" [--merged M] [--urgency user|blocks|soon|normal|later] [--due ISO] [--after C<n>]
+    change_review.py add [--production DOC] [--list L] --change "<what changed for you>" --check "<how to try it>" --see "<what you see>" [--merged M] [--urgency user|blocks|soon|normal|later] [--due ISO] [--after C<n>] [--hold <folder> ...]
     change_review.py edit [--production DOC] [--list L] --row C<n> --change "<what changed for you>" --check "<how to try it>" --see "<what you see>"
     change_review.py show [--production DOC] [--list L]
     change_review.py verdict [--production DOC] [--list L] --row C<n> --verdict "<the user's words>"
@@ -27,8 +27,9 @@ the next C number, the push date and the merged hash, the How to check cell `<ho
 see: <what you see>`, and "not yet" when the table has an "On the Mac build" column. `add` writes one
 row for a change no checkpoint line carries; `edit` rewrites one row still to review in place and keeps
 its id, Merged cell and position; `show` prints the current row and how many wait after it; `verdict` moves a row to "## Reviewed" with the user's verdict and today's
-date, and removes the row's scratch folders (task `row:<showrunner>-C<n>`, scripts/lib/scratch.py)
-whichever way the verdict goes; `mark-important` marks a row the user called important.
+date, and removes the row's scratch folders and held folders (task `row:<showrunner>-C<n>`,
+scripts/lib/scratch.py) whichever way the verdict goes; `add --hold <folder>` holds a folder the user
+checks the row in, where it is, until that verdict; `mark-important` marks a row the user called important.
 
 Each row's Production cell names the production whose change it is: the production whose Units
 table names the branch of the checkpoint that carries the row's line (`visible_owners`), else the
@@ -76,7 +77,7 @@ from user_zone import user_zone  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import issues  # noqa: E402
 from production_units import Refusal, cell_value, production_field, unit_table  # noqa: E402
-from proposals_folder import owner_docs, slug_of  # noqa: E402
+from proposals_folder import owner_docs, scope_docs, slug_of  # noqa: E402
 
 TRAILER = "Change-Review"
 LIST_HEADER = "- **Change review:**"
@@ -527,7 +528,9 @@ def append_rows(path: Path, changes: list[Visible], day: date, merged: str, prod
         if rank:
             _add_column(path, lines, SECTION, URGENCY)
         _add_column(path, lines, SECTION, PRODUCTION)
-        columns, _, end = _table(path, lines, SECTION)
+        columns, first, end = _table(path, lines, SECTION)
+        if merged and (held := _held(columns, lines[first:end], changes, merged)):
+            raise ChangeReviewError(f"{held} already holds that change from merge {merged}; no row added")
         number = next_number("".join(lines))
         when = f"{day.isoformat()} · {_cell(merged)}" if merged else day.isoformat()
         rows = [_row(path, columns, {"#": f"C{number + offset}", "Change": _cell(item.change), "Merged": when,
@@ -547,6 +550,20 @@ def append_rows(path: Path, changes: list[Visible], day: date, merged: str, prod
     return _edit(path, production, day, write, what)
 
 
+def _held(columns: list[str], rows: list[str], changes: list[Visible], merged: str) -> str:
+    """The To review row that already holds one of `changes` from the merge `merged`, or empty. A short
+    hash and a longer one of the same merge match: on 2026-10-22 rows written with 8-character hashes
+    repeated rows written with 7 (C94-C99 of C74-C79)."""
+    wanted = {item.change for item in changes}
+    for line in rows:
+        row = dict(zip(columns, (_plain(cell) for cell in _cells(line))))
+        found = _HASH.search(row.get("Merged", ""))
+        if (found is not None and row.get("Change") in wanted
+                and (found[0].startswith(merged) or merged.startswith(found[0]))):
+            return row["#"]
+    return ""
+
+
 def pending(path: Path) -> list[dict[str, str]]:
     """Each row still to review, as its cells by column name. Reads only."""
     lines = read(path).splitlines(keepends=True)
@@ -554,9 +571,57 @@ def pending(path: Path) -> list[dict[str, str]]:
     return [dict(zip(columns, (_plain(cell) for cell in _cells(line)))) for line in lines[first:end]]
 
 
+def scope_list(doc: Path) -> Path:
+    """The list that takes the production's rows: the one its Change review line names, else its root's."""
+    import showrunners
+
+    slug = slug_of(doc)
+    root = showrunners.root_of(slug)
+    try:
+        return production_list(str(doc))
+    except ChangeReviewError:
+        if slug == root:
+            raise
+        return production_list(str(showrunners.timer_docs().get(root, doc)))
+
+
+def scope_rows(path: Path, doc: Path, below: bool = False) -> list[dict[str, str]]:
+    """The rows still to review on `path`, the production's list (scope_list), that its showrunner shows.
+
+    A row is the production's when its Production cell names the production, and a row without
+    one is its list's root's. Only the production's own rows are shown, and with `below` also the
+    rows of each production below it (user, 2026-10-27).
+    """
+    import showrunners
+
+    root = showrunners.root_of(slug_of(doc))
+    scope = {slug_of(each) for each in scope_docs(doc, below)}
+    return [row for row in pending(path) if (row.get(PRODUCTION) or root) in scope]
+
+
 def row_production(production: Path) -> str:
-    """The Production cell for a change of the production doc `production`: its slug."""
-    return slug_of(production)
+    """The Production cell for a change of the production doc `production`: the slug of the production
+    it is credited to (`credited`)."""
+    return slug_of(credited(production))
+
+
+def credited(production: Path) -> Path:
+    """The production a change of `production` belongs to. A style production's work lands on its parent's
+    merge branch through a hand-off, so its changes are its parent's, and its showrunner does not show them
+    (user, 2026-10-27). Any other production is its own."""
+    seen = {production}
+    while True:
+        try:
+            lines = production.read_text(encoding="utf-8").splitlines()
+            if production_field(lines, "Kind") != "style":
+                return production
+            parent = Path(production_field(lines, "Parent production")).expanduser()
+        except (OSError, UnicodeError, Refusal):
+            return production
+        if parent in seen:
+            return production
+        seen.add(parent)
+        production = parent
 
 
 def unit_branches(docs: Iterable[Path]) -> dict[str, Path]:
@@ -737,6 +802,30 @@ def backfill(path: Path, tree: Tree, write: bool) -> tuple[dict[str, str], dict[
     return filled, untraced
 
 
+def rename_production(path: Path, production: Path, old: str, new: str) -> list[str]:
+    """Rewrite each Production cell under To review that names `old` to `new`; return the rows changed.
+
+    A production rename keeps its rows on the list (`/showrunner:rename`). `production` is the renamed
+    doc, which stamps the write. A list with no such cell is not written.
+    """
+    if not path.exists() or not any(row.get(PRODUCTION) == old for row in pending(path)):
+        return []
+
+    def rewrite(lines: list[str]) -> list[str]:
+        columns, first, end = _table(path, lines, SECTION)
+        at = columns.index(PRODUCTION)
+        changed: list[str] = []
+        for index in range(first, end):
+            cells = _cells(lines[index])
+            if at < len(cells) and _plain(cells[at]) == old:
+                cells[at] = _cell(new)
+                lines[index] = "| " + " | ".join(cells) + " |\n"
+                changed.append(cells[0])
+        return changed
+
+    return _edit(path, production, today(), rewrite, lambda rows: f"production {old} renamed {new} in {len(rows)} rows")
+
+
 def describe(row: dict[str, str]) -> str:
     """One row in plain lines: its id and change, how to check it, then each other column that has a value."""
     rest = [f"  {column}: {value}" for column, value in row.items() if column not in ("#", "Change", CHECK) and value]
@@ -812,6 +901,19 @@ def end_row_scratch(path: Path, row: str) -> list[str]:
         return [f"removed {folder}" for folder in scratch.end(f"row:{_owner(path)}-{row}")]
     except (scratch.ScratchError, OSError) as error:
         return [f"scratch not removed: {error}"]
+
+
+def hold_for_row(path: Path, row: str, folders: list[str]) -> list[str]:
+    """Hold each folder the user checks `row` in until the row's verdict; return one line per folder."""
+    lines: list[str] = []
+    for folder in folders:
+        try:
+            task = scratch.hold(Path(folder).expanduser(), f"row:{_owner(path)}-{row}", f"change review {row}")
+        except (scratch.ScratchError, OSError) as error:
+            lines.append(f"not held: {error}")
+            continue
+        lines.append(f"held {folder} for {task}")
+    return lines
 
 
 def production_doc(production: str) -> Path:
@@ -940,6 +1042,7 @@ class CommandLine(argparse.Namespace):
     due: str = ""
     after: str = ""
     write: bool = False
+    hold: list[str] | None = None
 
 
 def _list(options: CommandLine) -> Path:
@@ -979,9 +1082,12 @@ def _run(options: CommandLine) -> int:
     match options.action:
         case "add":
             item, rank = _visible(options), _rank_option(options)
-            rows = append_rows(_list(options), [item], today(), options.merged.strip(),
-                               production_doc(options.production), rank)
-            print(row_id(rows[0]))
+            path = _list(options)
+            rows = append_rows(path, [item], today(), options.merged.strip(), production_doc(options.production), rank)
+            row = row_id(rows[0])
+            print(row)
+            for line in hold_for_row(path, row, options.hold or []):
+                print(line)
         case "edit":
             row, item = _row_option(options), _visible(options)
             print(edit_row(_list(options), row, item, today(), production_doc(options.production)))
@@ -1053,6 +1159,7 @@ def main(argv: list[str]) -> int:
                  "row", "verdict", "production", "urgency", "due", "after"):
         _ = parser.add_argument(f"--{name}", default="")
     _ = parser.add_argument("--write", action="store_true")
+    _ = parser.add_argument("--hold", action="append")
     try:
         return _run(cast(CommandLine, parser.parse_args(argv)))
     except (ChangeReviewError, OSError) as error:

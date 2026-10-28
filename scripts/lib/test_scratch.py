@@ -28,7 +28,42 @@ class ScratchTests(unittest.TestCase):
         self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(mock.patch.dict(os.environ, {
             scratch.ROOT_ENV: str(self.base / "scratch"), scratch.VISIBLE_ROOT_ENV: str(self.base / "repro"),
-            "CLAUDE_CODE_SESSION_ID": "maker-session"}))
+            scratch.HOLDS_ENV: str(self.base / "holds.json"), "CLAUDE_CODE_SESSION_ID": "maker-session"}))
+
+    def git(self, repo: Path, *arguments: str) -> None:
+        _ = subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", *arguments],
+                           check=True, capture_output=True)
+
+    def test_no_task_lasts_a_day_and_until_ends_at_its_time(self) -> None:
+        path = scratch.new(now=1_000_000.0)
+        task = scratch.task_of(path) or ""
+        self.assertEqual(scratch.task_end(task), 1_000_000.0 + scratch.DEFAULT_LIFE_SECONDS - 40)
+        self.assertFalse(scratch.ended(task, 1_000_000.0))
+        self.assertTrue(scratch.ended(task, 1_000_000.0 + scratch.DEFAULT_LIFE_SECONDS))
+        self.assertFalse(scratch.ended(RUN, 9e12))
+        self.assertTrue(scratch.parsed_until("2026-10-28 09:30").startswith("until:2026-10-28T"))
+        with self.assertRaises(scratch.ScratchError):
+            _ = scratch.parsed_until("tomorrow")
+
+    def test_a_held_folder_goes_with_its_task_unless_a_repo_in_it_has_unsaved_work(self) -> None:
+        saved, unsaved = self.base / "saved", self.base / "unsaved" / "repo"
+        for repo in (saved, unsaved):
+            repo.mkdir(parents=True)
+            self.git(repo, "init", "-q")
+        _ = (unsaved / "a").write_text("x")
+        self.git(unsaved, "add", "a")
+        self.git(unsaved, "commit", "-qm", "a")
+        task = "row:natedev-C9"
+        for folder in (saved, unsaved.parent):
+            _ = scratch.hold(folder, task, "change review C9")
+        self.assertEqual(scratch.holds()[str(saved)]["maker"], "maker-session")
+        self.assertEqual(scratch.unsaved_work(unsaved.parent), f"{unsaved}: it has commits and no remote")
+        self.assertEqual(scratch.end(task), [saved])
+        self.assertFalse(saved.exists())
+        self.assertTrue(unsaved.is_dir())
+        self.assertGreater(scratch.holds()[str(unsaved.parent)]["ended"], 0)
+        self.assertTrue(scratch.release(unsaved.parent))
+        self.assertEqual(scratch.holds(), {})
 
     def test_new_makes_a_recorded_folder_for_its_task(self) -> None:
         path = scratch.new(RUN, "gate")

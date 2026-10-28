@@ -102,6 +102,11 @@ class FakeReviewer:
         return subprocess.CompletedProcess(argv, 0, json.dumps(envelope), "")
 
 
+def with_footer(message: str, sender: str, template: str = "none (free text)") -> str:
+    """A posted push: the message, then its "Sent by" and "Template" lines last."""
+    return f"{message}\n\nSent by: {sender}\nTemplate: {template}"
+
+
 def verdict(draft: review.Draft, decision: str = "send", /, **changes: object) -> VerdictJSON:
     value: VerdictJSON = {
         "verdict": decision, "title": draft.title,
@@ -870,7 +875,7 @@ class LocalReviewTests(unittest.TestCase):
             self.assertEqual(pushover.send(["--priority", "2", "--source", draft.source,
                 "--action", cast(ActionRequired, draft.action).text, draft.title, draft.body], keys_file=keys, post=post), 0)
         form = urllib.parse.parse_qs(cast(bytes, post.call_args.args[1]).decode())
-        self.assertEqual(form["message"], [first_line(revised.action) + "\n" + revised.body])
+        self.assertEqual(form["message"], [with_footer(first_line(revised.action) + "\n" + revised.body, draft.source)])
         self.assertIn("sent despite failed review", str(self.entries()[0]["detail"]))
 
     def test_texts_reviews_every_example_and_approves_only_unchanged_send_results(self) -> None:
@@ -1043,7 +1048,7 @@ class LocalReviewTests(unittest.TestCase):
                     with redirect_stdout(io.StringIO()):
                         self.assertEqual(pushover.deliver(result.version, keys, post), 0)
                     form = urllib.parse.parse_qs(cast(bytes, post.call_args.args[1]).decode())
-                    self.assertEqual(form["message"], [header + "\n" + expected_body])
+                    self.assertEqual(form["message"], [with_footer(header + "\n" + expected_body, draft.source)])
                     self.assertEqual(form["message"][0].splitlines().count(header), 1)
 
     def test_review_action_prefix_is_removed_before_body_validation(self) -> None:
@@ -1264,7 +1269,8 @@ class LocalReviewTests(unittest.TestCase):
                 self.assertEqual(len(posted), 1)
                 form = urllib.parse.parse_qs(posted[0].decode())
                 self.assertEqual(form["title"], [self.draft.title])
-                self.assertEqual(form["message"], [first_line(self.draft.action) + "\n" + self.draft.body])
+                self.assertEqual(form["message"], [with_footer(first_line(self.draft.action) + "\n" + self.draft.body,
+                                                               self.draft.source)])
                 self.assertIn(outcome.why, str(self.entries()[-1]["verdict"]))
 
     def test_missing_or_unreadable_guide_never_starts_claude(self) -> None:

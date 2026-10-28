@@ -2467,4 +2467,47 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 - Run the full merge gate after every origin merge: shutdown 61459ed7 (restore dropped when its folder is gone) turned five watchdog tests red only after the merge; give restored sessions a real scratch folder.
 - `test_launch_accounts` requires every Claude launcher to pick its account through `account_for_group_launch`, and `scripts/lib/test_user_zone` requires `astimezone(user_zone())`; neither is in the accounts suites, so run them.
-- Known residual: a worker can deliver `move_failed` and a later missing-folder retry archives the record, so a second, different `restart_failed` push follows for that outage.
+- Residual (fixed in Phase 89): a worker could deliver `move_failed` and a later missing-folder retry archived the record, so a second, different `restart_failed` push followed for that outage.
+
+### Phase 89 — One outage sends at most one phone push  · status: done (936445e3)
+
+**Depends on:** Phase 88
+
+#### As-built
+
+- `scripts/accounts/outage_alerts.py` (new) is a per-session outage ledger in `~/.local/state/accounts/unit_outage_alerts.json`, under a file lock: `claim` → `delivered` or `release`, `reserve` for the sessions of one push, `clear` when the session is live. It survives the shutdown record's archive.
+- Every per-session outage push uses it: `settle.report_stop`, the `shutdown.py restart` CLI, the restart fallback and the watchdog's crash, move and missing-folder alerts (`restart.send_failure_pushes` is shared). A sender claims one push's sessions just before it sends, names only the sessions it holds, marks delivery only after a sent push and releases the claim otherwise.
+- A claim stores its owner pid and time; a dead owner or a claim older than 15 minutes is taken over with a new token, and the old token can no longer deliver or release.
+- The machine that owns a session sends its pushes: the peer's `up --here --json` run sends from its own ledger (unless `--no-alert`, which `shutdown.py` now forwards); the calling CLI only prints the peer's lines.
+- Every place that settles a record because its session is live clears the ledger: `clear_running_on_target`, `_record_timer_restore_progress`, `confirm_entry`, `_confirm_entries`, `settle._archive_finished`, the live skips in `launch_entry`/`relaunch_session`/`_up`, and the watchdog's live observation. `drop_restore_without_folder` keeps it. Phase 90 changed this: timer settlement and archives no longer clear, and each clear removes only alerts claimed before its observation.
+- Not per-session outage pushes, left outside the ledger: `restart_incomplete`, `shutdown.stop_failed`, the holdout notice.
+
+#### Files
+
+`scripts/accounts/outage_alerts.py` (new), `unit_watchdog.py`, `scripts/shutdown/restart.py`, `settle.py`, `shutdown.py`; tests `test_unit_watchdog.py`, `test_restart.py`, `test_settle.py`; docs `docs/accounts.md`, `docs/as-built/shutdown-and-restart.md`.
+
+#### Gotchas
+
+- Copying the record's `restore_alerted` mark into the watchdog outage fails both ways: an unfinished claim reads as delivered, and an archive before the next pass loses the mark. The ledger must be separate from the record.
+- Reserving all of a report's pushes up front lets a late claim pass its lease behind slow sends; claim per push.
+- Residual (fixed in Phase 90): a slow batch confirm could clear a newer outage's entry and allow a second push.
+
+### Phase 90 — A slow batch restart does not clear a newer outage's alert  · status: done (7e92e7b5)
+
+**Depends on:** Phase 89
+
+#### As-built
+
+- `outage_alerts.clear(session_id, observed_at)` removes only an alert claimed strictly before `observed_at`; an alert claimed at or after it belongs to a newer outage and stays. A delivered entry keeps its claim time. `clear` returns whether the outage ended, and the record mark `restore_alerted` is cleared only then.
+- Every live clear passes the time its liveness read started (`time.time()`): `_up`'s cached `live_ids`, the shared registry confirmation (`RegistryConfirmation.observed_at`, used by `confirm_entry`, `_confirm_entries` and `settle._confirm_relaunch_pass`), `clear_running_on_target`, the live skips in `launch_entry`/`relaunch_session`, the source fallback and the watchdog's probe.
+- Later timer settlement (`_record_timer_restore_progress`) and record archives (`_confirm_entries`, `settle._archive_finished`) no longer clear the ledger.
+
+#### Files
+
+`scripts/accounts/outage_alerts.py`, `unit_watchdog.py`, `scripts/shutdown/restart.py`, `settle.py`; tests `test_unit_watchdog.py`, `test_restart.py`, `test_settle.py`; docs `docs/accounts.md`, `docs/as-built/shutdown-and-restart.md`.
+
+#### Gotchas
+
+- A clear must use the time of the observation it acts on, never the time of the clear: a cached reading is old by the time a slow loop reaches it.
+- Known minor residual: an old alert claimed inside the one registry read that sees the unit live survives the clear; a new crash before the next watchdog live pass (about 2 minutes) then sends no push.
+- `scripts.agents.test_mesh_runs` `test_a_live_supervisor_is_not_ended` failed once under the full parallel gate and passed alone and on the rerun: a load flake outside this unit.

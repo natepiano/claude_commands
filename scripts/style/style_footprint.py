@@ -25,7 +25,8 @@ from typing import Literal, TypedDict, cast
 from candidate_generators import boilerplate_allows, mask_source
 
 RAW_STRING = re.compile(r'(?:br|cr|r)(#*)"')
-QUOTED_LITERAL = re.compile(r'''(?:b|c)?"(?:\\.|[^"\\])*"|b?'(?:\\.|[^'\\\n])' ''', re.VERBOSE | re.DOTALL)
+QUOTED_LITERAL = re.compile(r'''(?:b|c)?"(?:\\.|[^"\\])*"|b?'(?:\\u\{[0-9A-Fa-f_]+\}|\\x[0-9A-Fa-f]{2}|\\.|[^'\\\n])' ''',
+                            re.VERBOSE | re.DOTALL)
 NUMBER = re.compile(r"\d[\w.]*(?:[+-]\d+)?")
 IDENTIFIER = re.compile(r"(?:r#)?[A-Za-z_][A-Za-z_0-9]*")
 PUNCTUATION = re.compile(r"::|->|=>|==|!=|<=|>=|&&|\|\||[{}()\[\];:,.<>!&|+*/%=\-?#@'$^~]")

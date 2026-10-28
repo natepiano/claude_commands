@@ -20,7 +20,7 @@ import silence
 from user_zone import user_zone
 
 PUSH: silence.KeptPush = {"source": "build", "priority": "0", "title": "Build done",
-                          "message": "No action needed.\nThe build passed.", "detail": "", "key": ""}
+                          "message": "No action needed.\nThe build passed.", "detail": "", "key": "", "text_id": ""}
 
 
 class SilenceTests(unittest.TestCase):
@@ -109,9 +109,14 @@ class SilenceTests(unittest.TestCase):
         # Drop works with silence off too, and leaves silence as it was.
         self.assertIn("silence on", self.main("status"))
 
-    def test_a_line_kept_before_pushes_had_a_key_reads_with_an_empty_key(self) -> None:
-        old = {name: value for name, value in PUSH.items() if name != "key"}
+    def test_a_line_kept_before_pushes_had_a_key_or_text_id_reads_as_free_text_with_no_key(self) -> None:
+        old = {name: value for name, value in PUSH.items() if name not in ("key", "text_id")}
         self.assertEqual(silence.parse_push(json.dumps(old)), PUSH)
+
+    def test_a_kept_push_keeps_its_text_id(self) -> None:
+        _ = self.main("on")
+        _ = silence.keep({**PUSH, "text_id": "nixos.ups_battery"}, "Linux")
+        self.assertEqual([push["text_id"] for push in silence.read_kept()], ["nixos.ups_battery"])
 
     def test_until_makes_a_timer_that_runs_off_and_a_new_end_stops_the_old_timer(self) -> None:
         end = (datetime.now() + timedelta(days=1)).replace(hour=7, minute=0, second=0, microsecond=0)

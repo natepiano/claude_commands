@@ -145,8 +145,8 @@ raise SystemExit(1)
         self.assertEqual(result.stdout, "")
         return result.stderr
 
-    def showrunner(self, slug: str, *, running: bool = True, formerly: tuple[str, ...] = ()) -> None:
-        """One production with an update timer, its showrunner named `<slug>-name` when it runs."""
+    def showrunner(self, slug: str, *, running: bool = True, formerly: tuple[str, ...] = (), name: str = "") -> None:
+        """One production with an update timer, its showrunner named `name`, else its slug, when it runs."""
         doc = self.root / f"{slug}-production.md"
         self.instance(f"showrunner-{slug}", target=f"session:{slug}-id", doc=doc)
         if formerly:
@@ -154,7 +154,7 @@ raise SystemExit(1)
             _ = doc.write_text(f"# Production\n\n## Production Context\n\n- **Formerly:** {names}\n",
                                encoding="utf-8")
         if running:
-            _ = self.record(f"{slug}-name", f"{slug}-id")
+            _ = self.record(name or slug, f"{slug}-id")
 
     def messages(self) -> list[tuple[str, str]]:
         """Each message sent, as the socket it went to and its text."""
@@ -223,7 +223,7 @@ raise SystemExit(1)
         self.assertIn("show\ton-demand\t", self.successful("list"))
 
     def test_former_slug_reaches_the_current_showrunner_by_name_and_address(self) -> None:
-        self.showrunner("new", formerly=("old",))
+        self.showrunner("new", formerly=("old",), name="new-name")
         address = f"uds:{self.root / 'new-id.sock'}"
         self.assertEqual(self.successful("address", "old"), f"{address}\n")
         self.assertEqual(self.successful("name", "old"), "new-name\n")
@@ -234,8 +234,15 @@ raise SystemExit(1)
             self.assertEqual(showrunners.current_address("old"), address)
             self.assertEqual(showrunners.current_name("old"), "new-name")
 
+    def test_attach_refuses_a_running_showrunner_not_named_for_its_production(self) -> None:
+        self.showrunner("top")
+        self.showrunner("mid", name="mid-name")
+        stderr = self.refused("attach", "mid", "top")
+        self.assertIn("production mid has showrunner mid-name", stderr)
+        self.assertFalse((self.state / "mid/parent").exists())
+
     def test_named_accepts_a_live_session_name_and_a_former_production_slug(self) -> None:
-        self.showrunner("new", formerly=("old",))
+        self.showrunner("new", formerly=("old",), name="new-name")
         with (mock.patch.dict(os.environ, self.environment()),
               mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
               mock.patch.object(showrunners, "SESSIONS_DIR", self.sessions),
@@ -391,7 +398,7 @@ raise SystemExit(1)
         self.assertEqual(self.successful("children", "leaf"), "")
         self.assertEqual([self.successful("root", slug) for slug in ("top", "mid", "leaf")], ["top\n"] * 3)
         self.assertEqual(self.successful("tree").splitlines(),
-                         ["top\ttop-name", "  mid\tmid-name", "    leaf\t<not running>"])
+                         ["top\ttop", "  mid\tmid", "    leaf\t<not running>"])
         sockets = [socket for socket, _ in self.messages()]
         self.assertEqual(sockets, [f"uds:{self.root / f'{slug}-id.sock'}" for slug in ("mid", "top", "mid")])
         to_child, to_parent, to_leafs_parent = (text for _, text in self.messages())
@@ -472,7 +479,7 @@ raise SystemExit(1)
         self.stored_parent("mid", "wrapped")
         self.assertEqual(self.successful("parent", "mid"), "")
         self.assertEqual(self.successful("root", "mid"), "mid\n")
-        self.assertEqual(self.successful("tree").splitlines(), ["mid\tmid-name", "top\ttop-name"])
+        self.assertEqual(self.successful("tree").splitlines(), ["mid\tmid", "top\ttop"])
         # The dead edge does not hold the child: it attaches again without a detach.
         _ = self.successful("attach", "mid", "top")
         self.assertEqual(self.successful("parent", "mid"), "top\n")
@@ -493,21 +500,21 @@ raise SystemExit(1)
         for lookup in ("children", "root"):
             self.assertIn("gone has no update timer", self.refused(lookup, "gone"))
 
-    def test_a_root_s_place_holds_every_level_below_it_and_a_lower_one_names_its_root(self) -> None:
+    def test_a_showrunner_faces_its_own_production_and_with_below_every_level_under_it(self) -> None:
         self.stored_parent("mid", "top")
         self.stored_parent("other", "top")
         self.stored_parent("leaf", "mid")
         known = {"top", "mid", "other", "leaf", "alone"}
         with (mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", self.state),
               mock.patch.object(showrunners, "timer_slugs", return_value=known)):
-            self.assertEqual(showrunners.place_of("top"), showrunners.Place("", ["mid", "other", "leaf"]))
-            self.assertEqual(showrunners.place_of("mid"), showrunners.Place("top", []))
-            self.assertEqual(showrunners.place_of("leaf"), showrunners.Place("top", []))
-            self.assertEqual(showrunners.place_of("alone"), showrunners.Place("", []))
+            self.assertEqual([showrunners.root_of(slug) for slug in ("top", "mid", "leaf", "alone")],
+                             ["top", "top", "top", "alone"])
             self.assertEqual(showrunners.descendants_of("mid"), ["leaf"])
-            self.assertEqual(showrunners.user_facing("top"), ["top", "mid", "other", "leaf"])
-            self.assertEqual(showrunners.user_facing("mid"), ["mid", "leaf"])
-            self.assertEqual(showrunners.user_facing("leaf"), ["leaf"])
+            for slug in ("top", "mid", "leaf", "alone"):
+                self.assertEqual(showrunners.user_facing(slug), [slug])
+            self.assertEqual(showrunners.user_facing("top", below=True), ["top", "mid", "other", "leaf"])
+            self.assertEqual(showrunners.user_facing("mid", below=True), ["mid", "leaf"])
+            self.assertEqual(showrunners.user_facing("leaf", below=True), ["leaf"])
 
     def test_what_all_must_hear_once_goes_to_the_highest_running_showrunner_of_each_tree(self) -> None:
         def runner(slug: str, *, running: bool) -> showrunners.Showrunner:

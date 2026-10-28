@@ -27,22 +27,19 @@
 # with it. `test` builds the named package's test targets, plus workspace libs
 # when the package has a lib.
 #
-# rustdoc is the exception: `lint` documents only the members that differ from
-# HEAD, found here rather than named by the worker (CHANGED_MEMBERS_PY). A
-# workspace rustdoc starts one process per member at 1 to 5 GB each, and
-# overlapping runs ran natedev out of memory on 2026-09-30. Each distinct member
-# set pays its own dependency compile for that; the push gate still documents
-# the whole workspace.
+# `doc` documents the whole workspace with warnings denied, as the unit
+# director's last command before a Rust checkpoint. Workers may run it too.
+# Unlike lint stages, this phase check cannot be switched off in lint.conf.
+# A pass is stored in ~/.local/state/verify/doc_pass/<tree>.json, keyed by a
+# temporary index of all tracked and untracked, non-ignored working files.
+# The real index is unchanged. A tree changed during the run records nothing.
+# Records outlive worker sessions and are pruned after 14 days on each write.
 #
-# The lint stages — mend, fmt, clippy fix, fmt, clippy judgment, doc — use
-# config/lint.conf (edit it with /lint_config). One switch controls a check in
-# the lint CLI and every worker phase. `lint` also always runs taplo fmt --check at the
-# workspace root, using its taplo.toml. A phase runs all five; its unit director
-# runs the style review in the main review. A gated-off check
-# prints a SKIPPED line and the command still exits 0. Scope is never
-# configurable: the target pinning and the single package selection above are
-# correctness and cache constraints, not preferences. cargo check and cargo
-# nextest are never gated — a phase that compiles nothing has verified nothing.
+# The lint stages — mend, fmt, clippy fix, fmt, clippy judgment — use
+# config/lint.conf (edit it with /lint_config). Taplo fmt --check always runs
+# at the workspace root. A gated-off check prints a SKIPPED line and exits 0.
+# Scope is never configurable. cargo check, cargo nextest and the checkpoint
+# rustdoc check are correctness gates and cannot be switched off.
 #
 # A worker session remembers passes. With UNIT_RUN_DIR or
 # UNIT_SESSION_DIR set, a `test` or `lint` that exits 0 is recorded in
@@ -68,10 +65,10 @@
 # usage error, the sandbox or a kill. A lint failure is not recorded when the
 # third clippy fix and format pass still changed the tree. The judged tree is
 # the tree when the run starts, or for `lint` the tree invoke_clippy_fix and formatting leave
-# for clippy judgment and rustdoc. A run that ends on any other tree (for `test`,
+# for clippy judgment. A run that ends on any other tree (for `test`,
 # any other part of it the package is built from) records nothing: an edit
 # landed while it ran, and its verdict belongs to neither tree.
-# A run outside a worker session is never cached.
+# A test or lint run outside a worker session is never cached.
 # end_session.sh deletes the records when the run ends.
 #
 # Each record carries what a repeat would cost: the run's wall time minus
@@ -110,19 +107,20 @@
 #                                          workspace taplo fmt --check,
 #                                          workspace clippy fix, fmt, then clippy
 #                                          judgment on all targets with all features
-#                                          (warnings denied), then
-#                                          rustdoc on the members that differ
+#                                          (warnings denied)
 #                                          — cargo stages gated by config/lint.conf;
 #                                          taplo always checks TOML formatting
 #   verify.sh lint --workspace [--check]   the same gate with fmt over all members;
 #                                          emits style-lint tool boundaries for records
 #                                          --check reports mend findings and checks
 #                                          formatting without applying fixes
-#   … [--features <list>]                  check, test, and lint accept one trailing
+#   verify.sh doc [--features <list>]      workspace rustdoc, warnings denied;
+#                                          mandatory before a Rust checkpoint,
+#                                          regardless of lint.conf; workspace
+#                                          feature names pass through unchanged
+#   … [--features <list>]                  check and test accept one trailing
 #                                          `--features a,b` when the Work Order names
-#                                          it. For lint, the list reaches mend and
-#                                          rustdoc; clippy always checks all features.
-#                                          Names without a `/` are qualified as
+#                                          it. Names without a `/` are qualified as
 #                                          <package>/<name>
 #   … --no-cache                           test and lint: run even when this
 #                                          exact call already passed (or lint
@@ -414,8 +412,7 @@ if offenders:
 # checkpoint, so HEAD is where the phase started and this is the whole phase's
 # work, not its last edit. A file belongs to the member whose folder holds it,
 # the deepest one when members nest; a file outside every member (the root
-# manifest, Cargo.lock, docs/) adds none. A non-empty argv[1] is always
-# included: --features names that package, so cargo needs it selected.
+# manifest, Cargo.lock, docs/) adds none. Used only for fmt scope.
 CHANGED_MEMBERS_PY='
 import json
 import os
@@ -445,7 +442,7 @@ roots = sorted(
 top = os.path.realpath(git("rev-parse", "--show-toplevel").strip())
 paths = git("-C", top, "diff", "--name-only", "--no-renames", "-z", "HEAD").split("\0")
 paths += git("-C", top, "ls-files", "--others", "--exclude-standard", "-z").split("\0")
-changed = {sys.argv[1]} if sys.argv[1] else set()
+changed = set()
 for path in filter(None, paths):
     full = os.path.join(top, path)
     for root, name in roots:
@@ -645,7 +642,7 @@ qualify_features() {
     printf '%s' "$out"
 }
 
-# Optional trailing `--features <list>` on check, test, and lint. The Work Order
+# Optional trailing `--features <list>` on check and test. The Work Order
 # names the exact list; the worker still composes no flags of its own. Any
 # other leftover argument is a usage error rather than something to pass through.
 # The caller sets PKG before calling this.
@@ -800,6 +797,10 @@ VERIFY_ORIGINAL_ARGS=("$@")
 if [[ "${1:-}" == "--session-dir" ]]; then
     export UNIT_SESSION_DIR="${2:?verify.sh --session-dir <dir> <command> ...}"
     shift 2
+    # Test temp folders land in the run folder and end with it (tmp_sweep.py judges each entry).
+    if mkdir -p "${UNIT_SESSION_DIR}/tmp" 2>/dev/null; then
+        export TMPDIR="${UNIT_SESSION_DIR}/tmp"
+    fi
 fi
 
 # A Codex mesh worker's command dies with its turn, and a worker that waits on
@@ -989,6 +990,79 @@ tree_key() {
     "$PY" -c "$TREE_KEY_PY" ${scope[@]+"${scope[@]}"} "${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh" \
         "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}" -- "${words[@]}" \
         <<< "${GATE_METADATA}" 2>/dev/null || true
+}
+
+# Git's own tree identity, including every non-ignored working file. Initialize
+# from the real index to retain tracked files even when they are now ignored.
+doc_tree() {
+    "$PY" - <<'PYDOC'
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import shutil
+
+with tempfile.TemporaryDirectory(prefix="verify-doc-", dir="/tmp") as temporary:
+    top = subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip()
+    original = Path(subprocess.check_output(["git", "rev-parse", "--git-path", "index"], text=True).strip())
+    private_index = Path(temporary) / "index"
+    if original.exists():
+        shutil.copyfile(original, private_index)
+    environment = {**os.environ, "GIT_INDEX_FILE": str(private_index)}
+    def git(*arguments: str) -> str:
+        return subprocess.check_output(["git", "-C", top, *arguments], env=environment, text=True).strip()
+    git("add", "-A", "--", ".")
+    print(git("write-tree"))
+PYDOC
+}
+
+doc_record() {
+    local current_tree
+    current_tree="$(doc_tree)" || return
+    if [[ "$current_tree" != "$DOC_TREE" ]]; then
+        echo 'verify.sh: the tree changed while doc ran; no doc pass record was written.'
+        return 0
+    fi
+    "$PY" - "$DOC_REPO_TOP" "$DOC_TREE" "$BUILDLOG_CALL_ID" <<'PYDOC'
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+
+records = Path.home() / ".local/state/verify/doc_pass"
+records.mkdir(parents=True, exist_ok=True)
+cutoff = time.time() - 14 * 24 * 60 * 60
+for old in records.glob("*.json"):
+    try:
+        if old.stat().st_mtime < cutoff:
+            old.unlink()
+    except FileNotFoundError:
+        pass
+record = dict(repo_top=str(Path(sys.argv[1]).resolve()), tree_id=sys.argv[2],
+              time=datetime.now(timezone.utc).isoformat(), call_id=sys.argv[3])
+with tempfile.NamedTemporaryFile(mode="w", dir=records, prefix=".doc-", delete=False) as output:
+    temporary = Path(output.name)
+    try:
+        json.dump(record, output)
+        output.flush()
+        os.fsync(output.fileno())
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+try:
+    temporary.replace(records / (sys.argv[2] + ".json"))
+    directory_fd = os.open(records, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+finally:
+    temporary.unlink(missing_ok=True)
+print("verify.sh: doc pass recorded for tree " + sys.argv[2])
+PYDOC
 }
 
 # note_event OUTCOME WAIT WALL BUILD SAVED STATUS: this call's one record in
@@ -1308,9 +1382,11 @@ route_test() {
 
 # Starts copy_watch.py beside the natedev step run() is about to start: while
 # the step compiles, it may run a copy of the same test on the Mac, and the
-# first result wins (see docs/as-built/mac-test-offload.md).
+# first result wins (see docs/as-built/mac-test-offload.md). Its folder sits in
+# the run's hold folder, so the EXIT trap removes both, and both names carry
+# the run's pid for tmp_sweep.py when a kill skips the trap.
 start_copy_watch() {
-    COPY_WATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-copy.XXXXXX")"
+    COPY_WATCH_DIR="$(mktemp -d "${HOLD_WAIT_DIR:-${TMPDIR:-/tmp}}/verify-copy.$$.XXXXXX")"
     VERIFY_STEP_INFO_FILE="$COPY_WATCH_DIR/step"
     local watch_args=(--info "$VERIFY_STEP_INFO_FILE" --result "$COPY_WATCH_DIR/result"
         --runner "$MAC_RUNNER" --settings "$MAC_LEAVE_SETTINGS"
@@ -1602,7 +1678,7 @@ if cache_lookup; then
     exit "${LOOKUP_STATUS}"
 fi
 
-HOLD_WAIT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-hold.XXXXXX")"
+HOLD_WAIT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-hold.$$.XXXXXX")"
 export BUILDLOG_HOLD_WAIT_FILE="$HOLD_WAIT_DIR/seconds"
 export BUILDLOG_HOLD_ADMISSION_FILE="$HOLD_WAIT_DIR/admission"
 export BUILDLOG_HOLD_STARTED_FILE="$HOLD_WAIT_DIR/started"
@@ -2233,7 +2309,7 @@ case "$CMD" in
             CHECK_LINT=1
             shift
         fi
-        take_features "$@"
+        [[ $# -eq 0 ]] || { usage; exit 2; }
         if [[ "$PKG" != --workspace ]]; then
             require_member "$PKG"
         fi
@@ -2279,7 +2355,7 @@ case "$CMD" in
             fi
             exit "$lint_status"
         fi
-        # Order: mend, fmt, taplo, clippy fix, fmt, clippy judgment, rustdoc.
+        # Order: mend, fmt, taplo, clippy fix, fmt, clippy judgment.
         # Cargo stages are gated by lint.conf; the Taplo check always runs.
         # mend passes --all-targets because it needs the test and example
         # targets to see every import and visibility site. It covers the
@@ -2321,7 +2397,7 @@ case "$CMD" in
         else
             FMT_SCOPE=(-p "$PKG")
             FMT_MEMBERS="$(cargo metadata --no-deps --format-version 1 \
-            | "$PY" -c "$CHANGED_MEMBERS_PY" "")"
+            | "$PY" -c "$CHANGED_MEMBERS_PY")"
             while IFS= read -r member; do
                 if [[ -n "$member" && "$member" != "$PKG" ]]; then
                     FMT_SCOPE+=(-p "$member")
@@ -2381,24 +2457,22 @@ case "$CMD" in
         else
             invoke_clippy --workspace --all-targets --all-features
         fi
-        # Found after mend, so a member its --fix rewrote is documented too.
-        FEATURE_MEMBER=""
-        if [[ ${#FEATURE_FLAGS[@]} -gt 0 ]]; then
-            FEATURE_MEMBER="$PKG"
+        ;;
+    doc)
+        DOC_FEATURE_FLAGS=()
+        if [[ $# -eq 2 && "$1" == --features && -n "$2" ]]; then
+            DOC_FEATURE_FLAGS=(--features "$2")
+        elif [[ $# -ne 0 ]]; then
+            usage
+            exit 2
         fi
-        DOC_MEMBERS="$(cargo metadata --no-deps --format-version 1 \
-            | "$PY" -c "$CHANGED_MEMBERS_PY" "$FEATURE_MEMBER")"
-        DOC_SCOPE=()
-        while IFS= read -r member; do
-            if [[ -n "$member" ]]; then
-                DOC_SCOPE+=(-p "$member")
-            fi
-        done <<< "$DOC_MEMBERS"
-        if [[ ${#DOC_SCOPE[@]} -gt 0 ]]; then
-            invoke_doc "${DOC_SCOPE[@]}" "${FEATURE_FLAGS[@]}"
-        else
-            echo "verify.sh: no workspace member differs from HEAD; rustdoc skipped"
+        DOC_REPO_TOP="$(git rev-parse --show-toplevel)"
+        DOC_TREE="$(doc_tree)"
+        if ! lint_config_enabled doc; then
+            echo 'verify.sh: the phase rustdoc check cannot be switched off; ignoring doc=off.'
         fi
+        LINT_CONFIG_FORCE=1 invoke_doc --workspace "${DOC_FEATURE_FLAGS[@]}"
+        doc_record
         ;;
     example)
         PKG="${1:?verify.sh example <package> <name>}"

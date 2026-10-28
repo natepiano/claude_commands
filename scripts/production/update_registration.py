@@ -215,6 +215,10 @@ def register(production: Production) -> None:
     session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     if not session_id:
         raise RegistrationFailure("register", "CLAUDE_CODE_SESSION_ID is required")
+    # An account move restarts a showrunner on its own, so a name that differs only warns; attach refuses it
+    # for a new production.
+    if why := showrunners.name_refusal(production.slug, showrunners.session_name(session_id)):
+        report("register", "warn", why)
     try:
         agents_log.append(session_id, "showrunner", None, datetime.now(timezone.utc))
     except Exception as exc:
@@ -425,22 +429,34 @@ class OpenLists(NamedTuple):
     unreadable: list[str]
 
 
-def question_queue(production: Production) -> str:
+# The /next word that adds every production below the showrunner's own.
+ALL_BELOW = "all-below"
+
+
+def scope_queue(name: str, below: bool) -> str:
+    """The pin name of a list: an all-below show keeps its own pin, so it never moves the default's."""
+    return f"{name}-{ALL_BELOW}" if below else name
+
+
+def question_queue(production: Production, below: bool = False) -> str:
     """The name urgency.py pins the question /next showed under."""
-    return f"question-{production.slug}"
+    return scope_queue(f"question-{production.slug}", below)
 
 
 def item_key(slug: str, text: str) -> str:
     return f"{slug}: {text}"
 
 
-def open_lists(production: Production) -> OpenLists:
-    """What waits on the user now, in urgency.py's order, then what the user deferred and the lists not read."""
+def open_lists(production: Production, below: bool = False) -> OpenLists:
+    """What waits on the user now, in urgency.py's order, then what the user deferred and the lists not read.
+
+    The production's own list, and with `below` the list of each production below it.
+    """
     now = datetime.now(production.zone).replace(tzinfo=None)
     due: list[urgency.Entry[OpenItem]] = []
     deferred: list[OpenItem] = []
     unreadable: list[str] = []
-    for slug in showrunners.user_facing(production.slug):
+    for slug in showrunners.user_facing(production.slug, below):
         try:
             items = read_outstanding(outstanding_file(slug))
         except (InputError, OSError, ValueError):
@@ -453,11 +469,11 @@ def open_lists(production: Production) -> OpenLists:
                 due.append(urgency.Entry(item_key(slug, item.text), OpenItem(slug, item), item.rank.urgency,
                                          item.since, after=item_key(slug, item.rank.follows) if item.rank.follows else ""))
     deferred.sort(key=lambda found: (cast(DeferredUntil, found.item.timing).at, found.slug))
-    return OpenLists(urgency.queue_order(due, question_queue(production)), deferred, unreadable)
+    return OpenLists(urgency.queue_order(due, question_queue(production, below)), deferred, unreadable)
 
 
 def open_items(production: Production) -> None:
-    """Print in full what waits on the user: this production's items and those of every production below it.
+    """Print in full what waits on the user: this production's own items.
 
     Replies show only the count, so this list is what the showrunner gives when the user asks what
     the open questions are. Each line is led by the production that owns the item.
@@ -487,7 +503,8 @@ def mark_important(production: Production, words: str) -> None:
     wanted = words.strip()
     exact: list[tuple[Path, str]] = []
     partial: list[tuple[Path, str]] = []
-    for slug in showrunners.user_facing(production.slug):
+    # The item the user names may come from an all-below /next, so the lists below are searched too.
+    for slug in showrunners.user_facing(production.slug, below=True):
         for item in read_outstanding(outstanding_file(slug)):
             full = item.text if isinstance(item, OutstandingReminder) else item.question
             if item.text == wanted:

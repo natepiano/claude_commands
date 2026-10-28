@@ -845,6 +845,9 @@ class WaitLocalTests(IsolatedTargetTest):
     def test_finish_local_on_admitted_unmarked_call_ends_its_turn_without_another_notice(self) -> None:
         self.begin_hold()
         build_hold.record_recipients([("owner", "owner"), ("peer", "peer")])
+        # Waits keep both in the release, in entry order; a session only told would hold nothing.
+        for key in ("owner", "peer"):
+            _ = build_hold.register_wait(key)
         cycle = build_hold.read_cycle()
         assert cycle is not None
         cycle["release_started_at"] = NOW.isoformat()

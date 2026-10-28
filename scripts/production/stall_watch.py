@@ -613,7 +613,8 @@ def prompt_alert(slug: str, unit: str, pane: str, since: float, zone: ZoneInfo,
     rendered = push_texts.render(PROMPT_TEXT_ID, unit=unit.removesuffix("-unit"), machine=machine_name(),
                                  since=datetime.fromtimestamp(since, zone).strftime("%H:%M %Z"),
                                  request=prompt_request(pane, pending))
-    command = push_texts.user_send_argv(rendered, sender=SENDER, key=prompt_key(slug, unit))
+    # end_prompt() retires the alert when its prompt is gone.
+    command = push_texts.user_send_argv(rendered, sender=SENDER, key=prompt_key(slug, unit), self_clearing=True)
     # The send script is the one this watcher is set to use, so a test's stands in for it.
     return Delivery(prompt_path(slug, unit), "alert", [sys.executable, str(SEND), *command[2:]], report)
 

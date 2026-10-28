@@ -4,7 +4,7 @@
 #
 # name: the class name that the unit text and the doc use.
 # proof: the proof that clears the change: `item_move` (`style_footprint.moved_files`) or `lint_removal`
-#   (`style_footprint.lint_removal_files`).
+#   (`style_footprint.lint_removal_files`), or `binding_rename` (`approved_renames.binding_rename_check`).
 # rules: the catalog rule names whose findings the class covers.
 # summary: one sentence in Simplified Technical English that the unit reads.
 
@@ -21,3 +21,10 @@ proof = "lint_removal"
 rules = ["test-module-allow-boilerplate"]
 summary = """A stale lint removal removes, from an allow attribute in test code, a lint name whose pattern has \
 no match in the scope of the attribute, or removes the whole attribute when it keeps no lint name."""
+
+[[class]]
+name = "binding-rename"
+proof = "binding_rename"
+rules = ["prefer-type-named-fields-and-bindings"]
+summary = """A binding rename changes one local binding, parameter or pattern name from its old name to its \
+approved new name, at its declaration and at each use in its scope, and changes no other token."""

@@ -7,16 +7,39 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal, TypedDict, cast
 
 import rules
-from style_footprint import FileChange, RevisionTree, lint_removal_files, moved_files
+from approved_renames import AppliedInCode, BindingRename, binding_rename_check
+from style_footprint import FileChange, FileStatus, RevisionTree, lint_removal_files, moved_files
 
 CLASSES = Path(__file__).with_name("mechanical_classes.toml")
-ProofKind = Literal["item_move", "lint_removal"]
-Proof = Callable[[tuple[FileChange, ...], RevisionTree], frozenset[str]]
-# Each proof gives the files of a change that it explains, and no file unless `judge` finds the whole change mechanical.
-PROOFS: Mapping[ProofKind, Proof] = {"item_move": moved_files, "lint_removal": lint_removal_files}
+NO_BINDING_RENAMES: Mapping[str, tuple[BindingRename, ...]] = MappingProxyType({})
+ProofKind = Literal["item_move", "lint_removal", "binding_rename"]
+Proof = Callable[[tuple[FileChange, ...], RevisionTree, Mapping[str, tuple[BindingRename, ...]]], frozenset[str]]
+
+
+def binding_rename_files(changes: tuple[FileChange, ...], _before: RevisionTree,
+                         renames: Mapping[str, tuple[BindingRename, ...]]) -> frozenset[str]:
+    """Files whose entire token change is explained by at least one approved binding rename."""
+    explained: set[str] = set()
+    for change in changes:
+        pairs = renames.get(change.path, ())
+        if not pairs or change.status != FileStatus.MODIFIED or not change.path.endswith(".rs"):
+            continue
+        proof = binding_rename_check(change.path, change.before, change.after, pairs)
+        if proof.explained and any(isinstance(check, AppliedInCode) for check in proof.checks.values()):
+            explained.add(change.path)
+    return frozenset(explained)
+
+
+# Each proof returns only files whose edits it fully accounts for.
+PROOFS: Mapping[ProofKind, Proof] = {
+    "item_move": lambda changes, before, _renames: moved_files(changes, before),
+    "lint_removal": lambda changes, before, _renames: lint_removal_files(changes, before),
+    "binding_rename": binding_rename_files,
+}
 
 
 class ClassRow(TypedDict):
@@ -93,9 +116,10 @@ def classes() -> tuple[MechanicalClass, ...]:
 
 
 def explained_files(changes: tuple[FileChange, ...], before: RevisionTree,
-                    ticket_rules: frozenset[str]) -> frozenset[str]:
+                    ticket_rules: frozenset[str],
+                    renames: Mapping[str, tuple[BindingRename, ...]] = NO_BINDING_RENAMES) -> frozenset[str]:
     """The files of the change that the proof of a listed class explains, for a ticket whose findings name the rules
-    ticket_rules (catalog rule names). Only a class with one of those rules counts. A proof gives files only when it
-    passes on the whole change, so a change that adds an allow or changes code beyond the proof gives none."""
+    ticket_rules (catalog rule names). Only a class with one of those rules counts. Each returned file's entire edit
+    must pass its class's proof; binding proofs also require approved pairs for that path."""
     kinds: dict[ProofKind, None] = dict.fromkeys(entry.proof for entry in classes() if ticket_rules & set(entry.rules))
-    return frozenset(path for kind in kinds for path in PROOFS[kind](changes, before))
+    return frozenset(path for kind in kinds for path in PROOFS[kind](changes, before, renames))

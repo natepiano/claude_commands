@@ -11,6 +11,7 @@ from typing import final, override
 
 import mechanical_classes
 import style_footprint
+from approved_renames import BindingRename
 
 DOC = Path(__file__).resolve().parents[2] / "docs/style_production.md"
 ENTRY = 'name = "{name}"\nproof = "{proof}"\nrules = [{rules}]\nsummary = "{summary}"\n'
@@ -82,8 +83,9 @@ class LoaderTests(unittest.TestCase):
         mechanical_classes.classes.cache_clear()
         self.addCleanup(mechanical_classes.classes.cache_clear)
         listed = mechanical_classes.classes()
-        self.assertEqual([item.name for item in listed], ["pure-move", "stale-allow-lint"])
+        self.assertEqual([item.name for item in listed], ["pure-move", "stale-allow-lint", "binding-rename"])
         self.assertEqual(listed[1].rules, ("test-module-allow-boilerplate",))
+        self.assertEqual(listed[2].rules, ("prefer-type-named-fields-and-bindings",))
         self.assertIs(mechanical_classes.classes(), listed)
 
     def test_the_doc_lists_each_class_of_the_toml_by_name(self) -> None:
@@ -98,7 +100,7 @@ class LoaderTests(unittest.TestCase):
 
 
 @final
-class LintRemovalProofTests(unittest.TestCase):
+class MechanicalProofTests(unittest.TestCase):
     repo: Path = Path()
     base: str = ""
 
@@ -136,6 +138,39 @@ class LintRemovalProofTests(unittest.TestCase):
         before = style_footprint.RevisionTree(self.repo, self.base)
         finding = style_footprint.Finding(style_footprint.WholeDiff(), changes)
         return style_footprint.lint_removal_files(changes, before), style_footprint.judge(finding, before)
+
+    def test_binding_class_requires_approved_pairs_and_accounts_for_every_edit_in_each_file(self) -> None:
+        source = "fn f() {\n    let old = 1;\n    consume(old);\n}\n"
+        self.write("src/lib.rs", source)
+        base = self.commit()
+        tree = style_footprint.RevisionTree(self.repo, base)
+        rename = BindingRename(2, source.splitlines()[1], "old", "fresh")
+        renames = {"src/lib.rs": (rename,)}
+        names = frozenset({"prefer-type-named-fields-and-bindings"})
+        cases: tuple[tuple[str, frozenset[str]], ...] = (
+            (source, frozenset()), (source.replace("old", "fresh"), frozenset({"src/lib.rs"})),
+            (source.replace("let old", "let fresh"), frozenset()),
+            (source.replace("old", "fresh").replace("1", "2"), frozenset()))
+        for edited, expected in cases:
+            self.write("src/lib.rs", edited)
+            changes = style_footprint.changes_between(self.repo, base, self.commit())
+            with self.subTest(edited=edited):
+                self.assertEqual(mechanical_classes.explained_files(changes, tree, names, renames), expected)
+                self.assertEqual(mechanical_classes.explained_files(changes, tree, names), frozenset())
+                self.assertEqual(mechanical_classes.explained_files(changes, tree, frozenset({"module-structure"}), renames),
+                                 frozenset())
+
+    def test_binding_class_explains_only_paths_with_proven_pairs(self) -> None:
+        source = "fn f() {\n    let old = 1;\n    consume(old);\n}\n"
+        for path in ("src/lib.rs", "src/other.rs"):
+            self.write(path, source)
+        base = self.commit()
+        for path in ("src/lib.rs", "src/other.rs"):
+            self.write(path, source.replace("old", "fresh"))
+        changes = style_footprint.changes_between(self.repo, base, self.commit())
+        rename = BindingRename(2, source.splitlines()[1], "old", "fresh")
+        self.assertEqual(mechanical_classes.PROOFS["binding_rename"](
+            changes, style_footprint.RevisionTree(self.repo, base), {"src/lib.rs": (rename,)}), frozenset({"src/lib.rs"}))
 
     def test_a_stale_lint_name_removal_is_applied(self) -> None:
         removed = TESTS.replace("clippy::panic, ", "")
