@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Delete a wrapped production's own state files: its footer switch, review pause, open questions and state folder.
+"""Delete a wrapped production's own state files: its footer switch, review pause, open questions, footer counts,
+footer report and state folder.
 
 Usage: tidy_wrapped.py <production doc>...
 
@@ -18,7 +19,7 @@ from pathlib import Path
 STATE_DIR = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
 NOTIFIER_STATE_DIR = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier")
 # The state folder holds these shared folders beside each production's own; a slug never names one.
-SHARED = frozenset(("footers-off", "review-paused", "outstanding"))
+SHARED = frozenset(("footers-off", "review-paused", "outstanding", "counts", "reports"))
 SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 WRAPPED = "> **Status: PRODUCTION — wrapped.**"
 
@@ -31,7 +32,8 @@ def owned_paths(slug: str) -> tuple[Path, ...]:
     if not SLUG.fullmatch(slug) or slug in SHARED:
         raise TidyRefused(f"{slug!r} is not a production slug")
     return (STATE_DIR / "footers-off" / slug, STATE_DIR / "review-paused" / f"{slug}.json",
-            STATE_DIR / "outstanding" / f"{slug}.json", STATE_DIR / slug)
+            STATE_DIR / "outstanding" / f"{slug}.json", STATE_DIR / "counts" / slug,
+            STATE_DIR / "reports" / f"{slug}.json", STATE_DIR / slug)
 
 
 def tidy(slug: str) -> list[Path]:

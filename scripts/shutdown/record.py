@@ -473,6 +473,11 @@ class PausedSeat(TypedDict):
     launcher_command: list[str]
 
 
+class CheckoutMove(TypedDict):
+    old: str
+    new: str
+
+
 class SessionShutdown(TypedDict):
     move_id: NotRequired[str]
     login: str
@@ -514,6 +519,8 @@ class SessionShutdown(TypedDict):
     renamed: NotRequired[str]
     # A move stopped the session mid-turn; its last tool call, or "" when the transcript showed none.
     cut_off: NotRequired[str]
+    # Set by `rename.py checkout` for a stopped showrunner: the launch moves its checkout first (restart.move_checkout).
+    checkout_move: NotRequired[CheckoutMove]
 
 
 class AccountHold(TypedDict):
@@ -1174,6 +1181,10 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
     for field in ("source_label", "why", "renamed", "cut_off"):
         if field in values:
             _ = _string(values[field], f"{place}.{field}")
+    if "checkout_move" in values:
+        move = _mapping(values["checkout_move"], f"{place}.checkout_move")
+        values["checkout_move"] = {key: _string(_required(move, key, f"{place}.checkout_move"), f"{place}.checkout_move.{key}")
+                                   for key in ("old", "new")}
     for field, allowed in (
         ("hold", {"account", "session"}),
         ("force", {"wait for ready", "now"}),

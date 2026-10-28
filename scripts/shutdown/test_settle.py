@@ -446,7 +446,7 @@ class SettleTests(ShutdownTestCase):
                 ):
                     self.assertEqual(shutdown.main(argv[2:]), 0)
                 request.assert_called_once_with(account, here, ids, then=then, alerts=alerts,
-                    requested_by=None, request_id="", target=target, why=why, report=report, origin=accounts.HandOrigin(), move_id="")
+                    requested_by=None, request_id="", target=target, why=why, report=report, origin=accounts.HandOrigin(), move_id="", checkout_move=None)
                 if ids:
                     resolve.assert_called_once_with(LOGIN, ids, here=here)
                 else:
@@ -1819,6 +1819,15 @@ class SettleTests(ShutdownTestCase):
         self.assertEqual(saved[0].get("why"), "weekly limit reached")
         self.assertEqual(record.session_records(LOGIN)[0].get("source_label"), LABEL)
         self.assertEqual(record.session_records(LOGIN)[0].get("why"), "weekly limit reached")
+
+    def test_begin_saves_a_checkout_move_on_the_record(self) -> None:
+        with (
+            patch.object(settle, "run_inventory", return_value=machine_inventory([top_level("owner", "Owner")])),
+            redirect_stdout(io.StringIO()),
+        ):
+            _ = settle.begin(LOGIN, only=["owner"], request_id="checkout", then="restart",
+                checkout_move={"old": "/w/old", "new": "/w/new"})
+        self.assertEqual(record.session_records(LOGIN)[0].get("checkout_move"), {"old": "/w/old", "new": "/w/new"})
 
     def test_down_to_defaults_its_saved_reason_to_source_label_out_of_usage(self) -> None:
         with (
