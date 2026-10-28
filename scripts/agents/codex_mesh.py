@@ -2110,12 +2110,23 @@ def _server_environment(session_dir: str, workers_home: Path) -> dict[str, str]:
         environment["GUILD_BINDING_GENERATION"] = str(context.get("generation"))
         binding = _as_dict(context.get("binding"))
         if binding.get("kind") == "DesignBoundToPhase":
-            environment["UNIT_RUN_DIR"] = _as_str(binding.get("run_directory"))
+            _set_run(environment, _as_str(binding.get("run_directory")))
         return environment
     run = Path(session_dir).absolute()
     if run.resolve().parent in {root.resolve() for root in RUN_ROOTS}:
-        environment["UNIT_RUN_DIR"] = str(run)
+        _set_run(environment, str(run))
     return environment
+
+
+def _set_run(environment: dict[str, str], run: str) -> None:
+    """Name the run, and point TMPDIR into its folder so test temp folders end with the run."""
+    environment["UNIT_RUN_DIR"] = run
+    temp = Path(run) / "tmp"
+    try:
+        temp.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    environment["TMPDIR"] = str(temp)
 
 
 def _start_server(session_dir: str, workers_home: Path) -> int:

@@ -105,9 +105,15 @@ Loop/verbose only:
    `git status --porcelain`, handling renamed paths as pairs; never name the
    plan doc, `docs/style-production/` or pinned rule files in `git add`.
    Commit exactly the gated tree once using the message below, then capture
-   and persist its full id through the durable transition below. Before marking
+   and persist its full id through the durable transition below, adding
+   `--ticket <ticket>`: the record then holds the reservation for that
+   ticket's merge, and this checkpoint releases nothing. Before marking
    the phase done, run
-   `~/.claude/scripts/lib/py ~/.claude/scripts/style/style_ledger.py ticket checkpoint --repo . --id <ticket> --commit <captured code commit>`.
+   `~/.claude/scripts/lib/py ~/.claude/scripts/style/style_ledger.py ticket checkpoint --repo . --id <ticket> --commit <captured code commit> --session-dir "${SESSION_DIR}" --phase <phase id>`.
+   The ledger keeps the run folder and phase, and `ticket merge` releases the
+   held reservation from them. berth's release counts when its protected tip
+   is the checkpoint, or a later commit of the unit's branch, such as a merge
+   of style/main, that the style branch tip contains.
    If recording fails, retain the commit and reservation, repair the ticket
    record, and do not create another commit.
 
@@ -118,22 +124,26 @@ Loop/verbose only:
    The standing-unit fast-forward exception in `docs/production_format.md`
    item 5 keeps HEAD on the style merge branch's history after a phase-start sync.
    On failure, report one line to the style showrunner and leave the ticket
-   assigned until it answers. On success, run `style_ledger.py ticket checkpoint
-   --repo . --id <ticket> --commit <captured HEAD>` then
-   `style_ledger.py ticket merge --repo . --id <ticket>` through
-   `~/.claude/scripts/lib/py ~/.claude/scripts/style/style_ledger.py`.
+   assigned until it answers. On success, from `Active`, replace the durable
+   record with `CheckpointCommittedAwaitingReleaseConfirmation` carrying that
+   same captured full id as `checkpoint_commit`, with `phase_reservation.py
+   committed --session-dir "${SESSION_DIR}" --phase <phase id> --commit <captured HEAD> --ticket <ticket>`,
+   and read it back. `--commit` takes any name of that commit, a short hash
+   too, and the record keeps its full id. This is the one case where
+   that state carries a commit the phase did not make. A failed transition or
+   read-back retains the valid durable state and runs no ticket merge. Then run
+   `style_ledger.py ticket checkpoint --repo . --id <ticket> --commit <captured HEAD> --session-dir "${SESSION_DIR}" --phase <phase id>`
+   then `style_ledger.py ticket merge --repo . --id <ticket>` through
+   `~/.claude/scripts/lib/py ~/.claude/scripts/style/style_ledger.py`. The
+   merge releases the held reservation and clears the record. An exit `2`
+   that ends `rerun ticket merge` keeps the reservation held: report its line
+   and rerun the merge after the cause is fixed.
    For each `has no applied check` line that merge prints, check the change in
    the code and run the printed `held built` command when the change is there.
    A finding whose change is not there waits for a person, who makes the change
    and runs that command, or waives the finding with `style_ledger.py held waive --person <name>`.
-   From `Active`, replace the durable record with
-   `CheckpointCommittedAwaitingReleaseConfirmation` carrying that same captured
-   full id as `checkpoint_commit`, with `phase_reservation.py committed
-   --session-dir "${SESSION_DIR}" --phase <phase id> --commit <captured HEAD>`,
-   and read it back. This is the one case where
-   that state carries a commit the phase did not make. A failed transition or
-   read-back retains the valid durable state and invokes no release. Run step
-   7 unchanged; inactive states release nothing. After confirmation, mark the
+   Run step 7; a record the merge cleared, and an inactive state, release
+   nothing. After confirmation, mark the
    phase done, skip staging, <PushCheckpoint/> and the merge request, send
    `From <unit>: ticket <id> closed with no code change; <n> held.`, and refill
    at once through <StandingPlanRefill/>.
@@ -149,6 +159,37 @@ Loop/verbose only:
    Change-Review: <what changed for you> | <how to try it: where and what to type> | <what you see>
    Claude-Session: <session url>
    ```
+
+   **Cargo repositories:** every `checkpoint(...)` commit needs this check:
+   phase checkpoints, the final gate, one-off fix commits, and merges concluded
+   with a checkpoint subject. After staging, run
+   `~/.claude/scripts/direct/verify.sh doc` as its own command and as the last
+   command before `git commit`. Include every
+   untracked or unstaged file in the commit or remove it: the judged working
+   tree must equal the committed tree. On failure, repair through
+   <FixDispatch/>, stage the repairs, then run `doc` again. The checkpoint
+   hook refuses a commit without a passing record for its exact tree;
+   `lint.conf` cannot disable this gate. A rerun after a plan-doc edit compiles
+   nothing new and takes seconds. Workers may run `doc` at any time; their
+   Work Orders do not require it.
+
+   **Every repository:** run the checkpoint commit as the first command in
+   its own Bash call. Put `cd`, `git add`, and all other commands in earlier
+   calls. Commands after the commit, such as a push, are allowed.
+
+   The hook treats every commit in a Bash call as a checkpoint when the call's
+   text contains `checkpoint(` after quote removal: backslash-newline pairs,
+   then quotes and backslashes are removed. A body line or example counts too.
+   Use literal `-m` text, a `-F` file, or the `"$(cat <<'EOF' … EOF)"` heredoc
+   form. A subject it cannot read, such as shell expansion or `$'…'`, counts
+   as a checkpoint and needs the record in a Cargo repository. It also scans
+   message files, reused commit subjects (`--amend`, `-C`/`-c`), and
+   `MERGE_MSG`/`SQUASH_MSG`, including merges concluded with `--no-edit`.
+
+   For these commits, the hook refuses `--git-dir`, `--work-tree`, `GIT_DIR=`,
+   `GIT_INDEX_FILE=`, and `GIT_WORK_TREE=` overrides, and `git -C` directories
+   it cannot resolve, including shell expansions and unquoted globs. Each
+   refusal names the fix: remove overrides or use a literal directory.
 
    Every `checkpoint(...)` commit that changes more than Markdown carries
    `Change-Review: <what changed for you> | <how to try it: where and what to type> | <what you see>`, one line per visible change, or
@@ -174,7 +215,9 @@ Loop/verbose only:
    phase_reservation.py committed --session-dir "${SESSION_DIR}" --phase <phase id> --commit <captured commit>
    ```
 
-   Then read the new record back. Never write the record by hand. That durable transition
+   `--commit` takes any name of the commit, and the record keeps its full id;
+   a name that is no commit is refused with exit `2`. A standing ticket adds
+   `--ticket <ticket>`, as above. Then read the new record back. Never write the record by hand. That durable transition
    must succeed before release is invoked, and its value comes only from the
    commit that just succeeded (or the ancestry-checked, captured HEAD of the
    no-change standing ticket above), never from conversation or from a later
@@ -184,13 +227,15 @@ Loop/verbose only:
 7. Read and validate the durable record again.
 
    For a standing ticket with a pending release record, finish any interrupted
-   `ticket checkpoint` using that record's `checkpoint_commit` before release
-   and before marking the phase done; repeating the same checkpoint is safe.
+   `ticket checkpoint` using that record's `checkpoint_commit` before marking
+   the phase done; repeating the same checkpoint is safe.
    A no-change ticket is already `merged` and needs no repeated transition.
 
    | State | Action |
    | --- | --- |
+   | `CheckpointCommittedAwaitingReleaseConfirmation` naming `held_for_ticket` | A standing ticket's reservation stays held: invoke no release and keep the record. `style_ledger.py ticket merge` releases it. Mark the phase done and continue at step 8. |
    | `CheckpointCommittedAwaitingReleaseConfirmation` | Read its reservation id and `checkpoint_commit` from the read-back `CheckpointReleaseConfirmationPending`, then invoke `/sync release` exactly once. |
+   | No record, and `reservation_released` names the checkpoint | A no-change ticket's merge released it: invoke no release. |
    | `Active` | Step 6's durable transition did not complete: do not invoke release; apply <RetainPhaseReservation/>. |
    | Either inactive state | Invoke no release. |
 
@@ -252,6 +297,10 @@ Loop/verbose only:
    ```sh
    phase_reservation.py clear --session-dir "${SESSION_DIR}" --phase <phase id> --released <read-back checkpoint_commit>
    ```
+
+   `--released` also takes any other name that git resolves in `--repo`
+   (default `.`) to that commit; a name git refuses, an ambiguous short hash
+   among them, keeps the record with exit `2`.
 
    An ordinary failed release did not append anything because transaction
    validation precedes the journal write; it is not recovery, and the original

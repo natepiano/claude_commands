@@ -151,7 +151,7 @@ class AddShowrunnerTests(unittest.TestCase):
             _ = (accounts.account_dir("claude2") / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "main@example.invalid"}}))
         _ = self.configure_groups()
         self.timer("top", PARENT_SESSION)
-        self.live(PARENT_SESSION)
+        self.live(PARENT_SESSION, "top")
 
     def configure_groups(self, *, units: str = "claude2", showrunners: str = "claude2") -> Path:
         path = Path(self.env["HOME"]) / ".local/state/accounts/groups.json"
@@ -192,21 +192,22 @@ class AddShowrunnerTests(unittest.TestCase):
             process.terminate()
             _ = process.wait(timeout=2)
 
-    def record(self, session: str) -> tuple[str, str]:
-        """A live session's record: where it is kept and what it holds. Its name is read from a live process's."""
+    def record(self, session: str, name: str = "") -> tuple[str, str]:
+        """A live session's record: where it is kept and what it holds. Its name is read from a live process's;
+        a showrunner's name is its production's slug."""
         process = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.processes.append(process)
         return (str(self.root / "sessions" / f"{process.pid}.json"),
-                json.dumps({"pid": process.pid, "name": f"{session}-name", "sessionId": session,
+                json.dumps({"pid": process.pid, "name": name or f"{session}-name", "sessionId": session,
                             "messagingSocketPath": str(self.root / f"{session}.sock")}))
 
-    def live(self, session: str) -> None:
-        path, text = self.record(session)
+    def live(self, session: str, name: str = "") -> None:
+        path, text = self.record(session, name)
         _ = Path(path).write_text(text, encoding="utf-8")
 
     def starts(self, session: str, *, registers: str = "") -> None:
         """The started session comes up as `session`, and registers `registers`'s update timer when named."""
-        path, text = self.record(session)
+        path, text = self.record(session, registers)
         self.on_start[path] = text
         if registers:
             self.on_start[str(self.timer_conf(registers))] = self.timer_text(registers, session)

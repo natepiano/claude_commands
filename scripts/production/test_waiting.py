@@ -340,7 +340,7 @@ class WaitingTests(unittest.TestCase):
         request = merge_checkpoint.MergeRequest(
             production._replace(log=producer_log), unit, phase, unit_tip, (),
             merge_checkpoint.ShrinkCommit(), merge_checkpoint.ValidateAndPush(),
-            merge_checkpoint.NoPromotion(), (), frozenset(), (unit,), (), self.root,
+            merge_checkpoint.NoPromotion(), (), frozenset(), frozenset(), (unit,), (), self.root,
             (), merge_checkpoint.NoReviewTrial(), "", False, "", "", 0, 0, "",
         )
         with redirect_stdout(io.StringIO()):
@@ -957,7 +957,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         self.assertNotIn("held quota alerts", dailies)
         nested = " ".join(produce.split("- **Nested showrunners.**", 1)[1].split("- **What reaches the user:**", 1)[0].split())
         self.assertIn("never copy a lower showrunner's item into your own `open_for_user`", nested)
-        self.assertIn("The root's count drops by itself: send the root nothing to drop it.", nested)
+        self.assertIn("Do not send it to the root, which shows only its own production", nested)
         agenda = " ".join(produce.split("<Agenda>", 1)[1].split("</Agenda>", 1)[0].split())
         self.assertIn("`- HH:MM <zone>: agenda: <item>`", agenda)
         self.assertEqual(agenda.count("`For discussion with you`"), 1)

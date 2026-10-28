@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import io
+from types import SimpleNamespace
 import json
 from datetime import datetime, timezone, tzinfo
 import os
@@ -33,6 +34,7 @@ import sessions
 import remote_control
 from user_action import ActionRequired
 from push_texts import RenderedPush
+from session_types import GitCheckout
 import restart
 import unit_lookup
 import launch_permission as restore_permission
@@ -3107,8 +3109,12 @@ class RestartTests(ShutdownTestCase):
 
     def test_herdr_restart_starts_a_stopped_server_under_its_named_unit(self) -> None:
         owner, responses, log = self.herdr_restart_fixture()
-        transient = ["--user", "--unit=herdr-writing.service", "--collect", str(self.root / "fake-herdr"),
-                     "--session", "writing", "server"]
+        # An empty SHELL makes the pane shell /bin/sh; the wrapper goes under HOME.
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"SHELL": "", "XDG_STATE_HOME": ""})))
+        transient = ["--user", "--unit=herdr-writing.service", "--collect",
+                     "-p", "CPUWeight=1000", "-p", "MemoryLow=1G", "-p", "MemorySwapMax=0",
+                     f"--setenv=SHELL={self.root}/.local/state/herdr/pane-shell", "--setenv=HERDR_PANE_SHELL=/bin/sh",
+                     str(self.root / "fake-herdr"), "--session", "writing", "server"]
         for fragment, started in (("\n", transient),
                                   ("/home/u/.config/systemd/user/herdr-writing.service\n",
                                    ["--user", "start", "herdr-writing.service"])):
@@ -3374,6 +3380,32 @@ class RestartTests(ShutdownTestCase):
         assert progress["kind"] == "restart failed"
         self.assertEqual(progress.get("trust_command"), command)
         self.assertFalse(log.exists())
+
+    def test_a_checkout_move_that_fails_launches_in_whichever_folder_holds_the_checkout(self) -> None:
+        old, new = self.root / "demo-old-trunk", self.root / "demo-new-trunk"
+        for moved in (False, True):
+            with self.subTest(moved=moved), patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / f"move-{moved}")}):
+                old.mkdir(exist_ok=True)
+                saved = entry(top_level("mover", name="natedev", cwd=str(old)))
+                saved["checkout_move"] = {"old": str(old), "new": str(new)}
+                checkout: GitCheckout = {"kind": "git", "path": str(old), "head": {"kind": "branch", "name": "trunk"},
+                                         "upstream": {"kind": "no upstream"}, "dirty": []}
+                saved["session"]["checkout"] = checkout
+                self.create([saved])
+
+                def fail(_old: Path, _new: Path, moved: bool = moved) -> None:
+                    if moved:
+                        (new / ".git").mkdir(parents=True, exist_ok=True)
+                    raise RuntimeError("trust copy refused")
+
+                mover = SimpleNamespace(move=fail)
+                with patch.object(restart, "import_module", return_value=mover), redirect_stdout(io.StringIO()) as output:
+                    updated = restart.move_checkout(saved, dry_run=False)
+                self.assertEqual(updated["session"]["cwd"], str(new if moved else old))
+                self.assertEqual(updated["session"]["checkout"].get("path"), str(new if moved else old))
+                self.assertNotIn("checkout_move", updated)
+                self.assertEqual(record.session_records(LOGIN)[0]["session"]["cwd"], str(new if moved else old))
+                self.assertIn("checkout move", output.getvalue())
 
     def test_a_restore_whose_folder_is_gone_is_dropped_and_frees_the_account_hold(self) -> None:
         for dry_run in (True, False):

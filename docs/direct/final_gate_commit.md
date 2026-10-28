@@ -17,7 +17,12 @@ phase review, so the run leaves no uncommitted work behind.
    <PhaseEnd/> step 3). Anything else stays uncommitted and is reported
    instead; never sweep an unrelated path into this commit.
 3. The repair workers' `lint` covers formatting; do not repeat it here.
-4. Stage those paths and commit exactly once:
+4. Stage those paths. In a Cargo repository, run
+   `~/.claude/scripts/direct/verify.sh doc` as its own command. On failure,
+   repair through <FixDispatch/>, stage the repairs, and run `doc` again.
+5. Commit exactly once. Run the commit first in its Bash call, with no command
+   before it. Follow the subject and exact-tree rules in <CheckpointCommit/>
+   (`commands/unit/checkpoint.md`):
 
    ```
    checkpoint(<plan-slug>): final gate
@@ -31,7 +36,7 @@ phase review, so the run leaves no uncommitted work behind.
    Its `Change-Review:` lines follow <CheckpointCommit/>
    (`commands/unit/checkpoint.md`) step 6.
 
-5. This commit holds no phase reservation, so it invokes no drift check and no
+6. This commit holds no phase reservation, so it invokes no drift check and no
    release. Run <PushCheckpoint/> (`commands/unit/checkpoint.md`), then
    report `Final gate <short hash> — style review and closing repairs.` with its
    push note, if any.

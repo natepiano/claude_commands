@@ -19,7 +19,7 @@ HANG_SECONDS = 300
 REAL_CARGO = shutil.which("cargo")
 
 
-class UntestedExampleTests(unittest.TestCase):
+class ExampleWorkspaceFixture(unittest.TestCase):
     temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     calls: Path  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -42,11 +42,36 @@ if [ "$1" = metadata ]; then
     exec "$REAL_CARGO" "$@"
 fi
 printf "%s\n" "$*" >> "$CARGO_CALLS"
+if [ "$1 $2" = "nextest run" ]; then
+    case " $* " in
+        *" --lib "*)
+            python3 - <<'PY' || exit $?
+import json
+import os
+import subprocess
+import sys
+
+metadata = json.loads(subprocess.check_output(
+    [os.environ["REAL_CARGO"], "metadata", "--no-deps", "--format-version", "1"],
+    text=True,
+))
+members = [package for package in metadata["packages"] if package["id"] in metadata["workspace_members"]]
+if not any(
+    set(target["kind"]) & {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}
+    for package in members for target in package["targets"]
+):
+    print(f"error: no library targets found in package `{members[0]['name']}`", file=sys.stderr)
+    sys.exit(101)
+PY
+            ;;
+    esac
+fi
 if [ "$1 $2" = "nextest run" ] && [ -n "$EDIT_DURING_TEST" ]; then
     printf "// changed during the test run\n" >> "$PACKAGE_ROOT/${EDIT_DURING_TEST_PATH:-src/lib.rs}"
 fi
 case "$1 $2" in
-    "nextest --version"|"nextest run"|"+nightly fmt"|"check --workspace") exit 0 ;;
+    "check --workspace") exit "$FAKE_CHECK_EXIT" ;;
+    "nextest --version"|"nextest run"|"+nightly fmt") exit 0 ;;
     *) exit 97 ;;
 esac
 ''')
@@ -85,6 +110,7 @@ esac
             "PACKAGE_ROOT": str(self.root),
             "CARGO_CALLS": str(self.calls),
             "METADATA_CALLS": str(self.metadata_calls),
+            "FAKE_CHECK_EXIT": "0",
             "CARGO_TARGET_DIR": str(self.root / "target"),
             "CARGO_HOME": str(self.root / "cargo-home"),
             "TMPDIR": str(self.root / "tmp"),
@@ -162,6 +188,12 @@ esac
             f"move it into {package}'s src/ or tests/, or delete it."
         )
 
+    def enabled_example_refusal(self, name: str, manifest: Path) -> str:
+        return (
+            f"example {name} sets test = true in {manifest}, and examples carry no tests.\n"
+            "remove test = true from its [[example]] entry."
+        )
+
     def assert_refused(
         self,
         result: subprocess.CompletedProcess[str],
@@ -179,6 +211,8 @@ esac
         self.assertEqual(self.calls_made(), [])
         self.assertEqual(self.metadata_count(), metadata_count)
 
+
+class UntestedExampleTests(ExampleWorkspaceFixture):
     def test_false_example_with_test_module_is_refused(self) -> None:
         _ = self.package(manifest_extra='\n[[example]]\nname = "demo"\ntest = false\n')
         example = self.example(source="fn main() {}\n\n#[cfg(test)]\nmod tests {}\n")
@@ -186,12 +220,70 @@ esac
         self.assert_refused(self.verify("test", "sample"), "demo", example, 3, "#[cfg(test)]")
 
     def test_true_example_with_test_module_is_refused(self) -> None:
-        _ = self.package(manifest_extra='\n[[example]]\nname = "demo"\ntest = true\n')
+        manifest = self.package(manifest_extra='\n[[example]]\nname = "demo"\ntest = true\n')
         example = self.example(source="#[cfg(test)]\nmod tests {}\nfn main() {}\n")
 
-        self.assert_refused(
-            self.verify("test", "sample", "--features", "default"), "demo", example, 1, "#[cfg(test)]"
+        result = self.verify("test", "sample", "--features", "default")
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(
+            result.stderr,
+            self.refusal("demo", example, 1, "#[cfg(test)]")
+            + "\n\n" + self.enabled_example_refusal("demo", manifest) + "\n",
         )
+        self.assertEqual(self.calls_made(), [])
+        self.assertEqual(self.metadata_count(), 1)
+
+    def test_test_enabled_example_without_marker_is_refused_for_package_tests(self) -> None:
+        manifest = self.package(manifest_extra='\n[[example]]\nname = "demo"\ntest = true\n')
+        _ = self.example(source="fn main() {}\n")
+
+        result = self.verify("test", "sample")
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, self.enabled_example_refusal("demo", manifest) + "\n")
+        self.assertEqual(self.calls_made(), [])
+        self.assertEqual(self.metadata_count(), 1)
+
+    def test_test_disabled_example_without_marker_is_accepted_for_package_tests(self) -> None:
+        _ = self.package(manifest_extra='\n[[example]]\nname = "demo"\ntest = false\n')
+        _ = self.example(source="fn main() {}\n")
+
+        result = self.verify("test", "sample")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(any(call.startswith("nextest run ") for call in self.calls_made()))
+
+    def test_refusals_follow_metadata_package_then_target_order(self) -> None:
+        _ = (self.root / "Cargo.toml").write_text(
+            '[workspace]\nmembers = ["alpha", "beta"]\nresolver = "2"\n'
+        )
+        alpha_manifest = self.package(
+            "alpha", root=self.root / "alpha",
+            manifest_extra=(
+                '\n[[example]]\nname = "first"\ntest = true\n'
+                + '\n[[example]]\nname = "second"\ntest = true\n'
+            ),
+        )
+        beta_manifest = self.package(
+            "beta", root=self.root / "beta",
+            manifest_extra='\n[[example]]\nname = "third"\ntest = true\n',
+        )
+        first = self.example("first", root=self.root / "alpha", source="#[test]\nfn check() {}\nfn main() {}\n")
+        _ = self.example("second", root=self.root / "alpha", source="fn main() {}\n")
+        _ = self.example("third", root=self.root / "beta", source="fn main() {}\n")
+
+        result = self.verify("final")
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "\n\n".join([
+            self.refusal("first", first, 1, "#[test]", package="alpha"),
+            self.enabled_example_refusal("first", alpha_manifest),
+            self.enabled_example_refusal("second", alpha_manifest),
+            self.enabled_example_refusal("third", beta_manifest),
+        ]) + "\n")
+        self.assertEqual(self.calls_made(), [])
+        self.assertEqual(self.metadata_count(), 1)
 
     def test_plain_test_attribute_is_refused(self) -> None:
         _ = self.package()
@@ -310,6 +402,18 @@ esac
         self.assertNotIn("PASS (recorded)", result.stdout)
         self.assertEqual(len(list((self.root / "session" / "verify_cache").glob("*.pass"))), 1)
 
+    def test_a_write_to_the_session_folder_in_the_worktree_keeps_the_pass(self) -> None:
+        _ = self.package()
+        _ = (self.root / "session" / "board.log").write_text("")
+        self.environment.update({
+            "TREE_DIRTY": "1", "TREE_DIRTY_PATHS": "src/lib.rs session/board.log",
+            "EDIT_DURING_TEST": "1", "EDIT_DURING_TEST_PATH": "session/board.log",
+        })
+        result = self.verify("test", "sample")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("the tree changed while test ran", result.stdout)
+        self.assertEqual(len(list((self.root / "session" / "verify_cache").glob("*.pass"))), 1)
+
     def side_by_side_phases(self, edited: str) -> subprocess.CompletedProcess[str]:
         """Test alpha, which depends on gamma, while another phase edits `edited`."""
         _ = (self.root / "Cargo.toml").write_text('[workspace]\nmembers = ["alpha", "beta", "gamma"]\nresolver = "2"\n')
@@ -372,7 +476,7 @@ esac
         self.assertEqual(self.calls_made(), [
             "check --workspace --all-targets",
             "nextest --version",
-            "nextest run --workspace",
+            "nextest run --workspace --tests",
         ])
 
     def test_removed_example_test_runs_no_cargo(self) -> None:

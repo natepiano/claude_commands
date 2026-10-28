@@ -32,6 +32,179 @@ A unit id is `<style slug>-<family>-unit`, where the style slug is `<repo>-style
 Old `<family>-unit` ids remain valid. Every partial B rule also has a C read
 in its own family.
 
+## Family rank
+
+`FAMILY_RANKS` in `scripts/style/rules.py` is the one rank table: `types`,
+`values`, `names`, highest first. The planner and filing compare ranks only
+through `rules.ranked_above`. A new family takes its rank in that table.
+`modules` has no rank; structure blocking orders it, as below.
+
+**Hold.** On each file, a family waits while a family ranked above it has open
+work at that file. Only a family with a unit counts, and only in that unit's
+pilot scope. Open work at a file is:
+
+- a cell in state `open`, `stale` or `awaiting merge`;
+- a filed finding, whose decision is unanswered, or approved and not built;
+- an unfiled finding judged at the file that the synced tip has.
+
+A waiting cell gets no ticket, and a waiting approved finding gets no proposal
+ticket. Neither is dropped. A queued ticket that the rank holds is dropped
+(`dropped <id>: <file> has open <higher family> work`), and its cells and
+findings wait as above. Refill prints one line for each waiting file that
+holds the unit's work: `waiting <family>: <file> has open <higher family> work`.
+Filing keeps a waiting finding unfiled and prints the same line, so its decision
+does not go to the user.
+
+**Judge again.** When the higher work lands, the file's blob changes and every
+cell at the file goes `stale`. The higher family judges the file again first,
+then the lower cell gets a ticket. Where a family above has a unit, a
+lower-rank finding judged at an older file is not filed or built: filing prints
+`waiting <finding>: <file> changed since it was judged`, and refill prints
+`waiting <decision>: <finding> <file> changed since it was judged`. A finding
+counts as judged at the file that its holding ticket read, or that its last
+declaration follow read. A ticket that holds the same change again takes the
+finding over, so the finding is judged at the new file and goes on. A judgment
+of the changed file by another ticket that does not hold the finding (for a
+followed finding, any later judgment of its new file) settles
+it: filing withdraws an unfiled finding (`judged again in judgment <id>`), and
+refill waives an approved one (`<file> judged again in judgment <id> without
+it`). The withdrawal applies to every unfiled finding, of any family.
+
+## Fix sequencing
+
+Fixes run in the order that makes each fix simplest to write: a rule whose fix
+changes code that another rule reads goes first. The planner enforces only the
+family rank and structure blocking today. The order below is the target. Each
+edge is a hypothesis until pilot data supports it.
+
+**Order.** Tier E (`fix-root-causes-never-workarounds`,
+`public-api-changes-require-explicit-approval`) has no position; it governs
+every fix.
+
+0. Tier A baseline: rustfmt, `clippy --fix`, `mend --fix`.
+1. Dead code and Bevy flow: never-prefix-unused-fields-or-variables-with,
+   prefer-events-over-messages, prefer-observers-over-polling,
+   system-params-carry-their-behavior. These values rules change types and
+   registration, so they go before types.
+2. Types, in this order: no-duplicate-implementations,
+   one-mechanism-per-behavior, crate-apis-expose-behavior,
+   dont-create-traits-for-single-implementations,
+   make-invalid-states-unrepresentable, public-failures-return-named-errors,
+   enums-over-bool-for-owned-booleans, enums-over-option-when-none-has-meaning,
+   if-else-chains-signal-missing-types, prefer-from-impl-over-named-constructors,
+   use-bevy_kana-in-all-bevy-crates, bevy-reflection-registration,
+   extract-observer-run-conditions, bevy-plugin-ownership. Then tier A cleanup.
+3. Module placement: behavior-lives-in-its-most-cohesive-crate,
+   types-live-with-their-behavior, when-to-split-a-module,
+   split-by-type-ownership, module-roots-as-table-of-contents. Then `mend --fix`.
+4. Values: tests-live-with-the-type-under-test, no-magic-values,
+   derive-test-values-from-production-constants, import-constants-at-the-top,
+   prefer-functional-patterns, test-module-allow-boilerplate,
+   agent-must-review-allows (last). always-use-nextest takes any position.
+   Then tier A cleanup.
+5. Names: spell-out-names, dont-repeat-enum-domain-in-variant-names,
+   name-submodules-after-anchor-types, prefer-type-named-fields-and-bindings,
+   dont-repeat-type-name-in-fields, avoid-repeated-field-affixes,
+   name-bindings-to-match-parameters, comments-name-code-constructs,
+   forbidden-words.
+6. Layout, sort only: constants-file-organization, module-structure.
+   workspace-dependencies takes any position after use-bevy_kana-in-all-bevy-crates.
+7. Tier A final: rustfmt, clippy, mend.
+
+**Ownership first.** Duplication removal and crate placement go first in
+their layers: delete the copies and move code to the crate that owns it before
+any other rule touches that code, so no later fix is written twice or in the
+wrong place. behavior-lives-in-its-most-cohesive-crate is a modules rule, and
+structure blocking already runs it before types, values and names on a file.
+
+**Module moves** go after types and before values (layer 3): they read the final
+set of types, and tests and constants read the final file shape.
+name-submodules-after-anchor-types runs with names, after the type renames.
+module-structure runs last, on the final content. A module move changes paths in
+every file that uses the moved items, so it holds its crate.
+
+**Tier A tool fixes** run first, after each layer, and last. They are cheap and
+give the same result when run again. mend runs after layer 3, because a module
+move changes every path and visibility that mend reads. agent-must-review-allows
+deletes an allow and runs clippy, so clippy follows it.
+
+**Pilot data.** `order_waste.py` on the cargo-liner pilot (ledger copy of
+2026-10-27, 1,182 merged tickets, 133 with code changes) counts two kinds of
+waste for a rule pair (A, B). A ticket's change is its net change from its base
+to its checkpoint. Work that its merges brought in is not part of it. A stale
+finding is a finding of B that ended because its file changed: withdrawn as
+judged again, withdrawn as declaration gone, or waived by the ledger, with a
+merged fix of A to its file between its creation and its end. A reworked hunk
+is a hunk of A that changed lines a merged fix of B wrote earlier. Person, unit
+and unrecorded waives, exception withdrawals and bare rename duplicates are
+decisions or bookkeeping, so they do not count.
+
+| A first | then B | stale | reworked | analysis |
+| --- | --- | ---: | ---: | --- |
+| make-invalid-states-unrepresentable | if-else-chains-signal-missing-types | 0 | 67 | position only |
+| make-invalid-states-unrepresentable | names family reads | 0 | 12 | family rank |
+| if-else-chains-signal-missing-types | names family reads | 0 | 7 | family rank |
+| enums-over-bool-for-owned-booleans | if-else-chains-signal-missing-types | 0 | 5 | position only |
+| module-roots-as-table-of-contents | prefer-type-named-fields-and-bindings | 5 | 0 | layer 3 before 5 |
+| make-invalid-states-unrepresentable | comments-name-code-constructs | 0 | 3 | edge |
+| comments-name-code-constructs | forbidden-words | 0 | 1 | edge |
+| dont-repeat-enum-domain-in-variant-names | forbidden-words | 1 | 0 | edge |
+| split-by-type-ownership | comments-name-code-constructs | 1 | 0 | edge |
+
+The data supports these orders. The strongest is new: in layer 2,
+make-invalid-states-unrepresentable and enums-over-bool-for-owned-booleans go
+before if-else-chains-signal-missing-types. The types unit ran if-else-chains
+tickets on cargo-mend files first; make-invalid-states tickets then rewrote
+the enums and matches those tickets wrote, 67 hunks in 12 files. The analysis
+gives this only by list position, not by an edge.
+
+Two pairs go against the order. derive-test-values-from-production-constants
+changed 4 hunks in 2 files that if-else-chains-signal-missing-types wrote
+(types go first): its fix put constants into new test lines, which running it
+first would not have prevented. One module-roots-as-table-of-contents move made one
+make-invalid-states-unrepresentable finding stale (types go first).
+
+Every other edge is logical only. 8 edges have both sides in the pilot data and
+no waste, among them make-invalid-states-unrepresentable before
+enums-over-bool-for-owned-booleans. 53 edges have a side with no merged fix or
+ended finding in the pilot, so the data cannot see them: both user pairs
+(enums-over-option-when-none-has-meaning before prefer-functional-patterns;
+tests-live-with-the-type-under-test before derive-test-values-from-production-constants
+and the test reuse line of no-magic-values), every tier A edge (tier A has no
+tickets), and every edge between two values rules. Names read tickets record
+no rule for most changes, so their waste counts as `names read`.
+
+**Conflicts.**
+
+1. prefer-type-named-fields-and-bindings and name-bindings-to-match-parameters
+   flip a binding passed straight to a parameter. Run type-named first, and
+   skip such bindings in it; name-bindings wins there.
+2. prefer-type-named-fields-and-bindings, dont-repeat-type-name-in-fields and
+   avoid-repeated-field-affixes settle each case by an exception only in that
+   order; another order can change a field twice.
+3. derive-test-values-from-production-constants, or the test reuse line of
+   no-magic-values, before tests-live-with-the-type-under-test loops: the
+   writer widens a constant for a test (forbidden), mend narrows it, the test
+   fails. Only tests-live-with first avoids it.
+4. when-to-split-a-module before types-live-with-their-behavior: a split, then
+   a relocation that empties a submodule, then a collapse. Each fix is undone once.
+5. prefer-functional-patterns before the bool and Option type rules: a
+   combinator hides the state the type rule names, and the type rule undoes it.
+6. public-failures-return-named-errors changes a public signature each time, so
+   each fix needs approval under public-api-changes-require-explicit-approval.
+
+**Each roll-out checks the order.** After the pilot of every new repository,
+run:
+
+```bash
+~/.claude/scripts/lib/py ~/.claude/scripts/style/order_waste.py --ledger <copy of the ledger> --repo <checkout> [--json]
+```
+
+It reads both and writes nothing. It prints one row per rule pair, sorted by
+total waste, with where the analysis puts A, then the analysis edges with no
+observed waste, split into seen and not seen. Add an order only when that
+repository's data supports it, and record the counts here.
+
 ## Ticket queue
 
 One ticket per phase:
@@ -80,15 +253,24 @@ sends that wake to every unit waiting for sync. Refill records its wait before
 checking once more for work; delivery clears only that wait, preserving a later one.
 
 A ticket with no code changes makes no commit: record its cells at HEAD, verify
-`git merge-base --is-ancestor HEAD refs/heads/<style merge branch>`, then run
-`style_ledger.py ticket checkpoint --repo <unit-worktree> --id <ticket> --commit <HEAD>`
-and `style_ledger.py ticket merge --repo <unit-worktree> --id <ticket>`. Act on
-its `not built` lines as after a showrunner's `ticket merge` (**Merging back**). Follow
-the checkpoint procedure's atomic committed-awaiting-release record using that
-ancestry-checked HEAD and release confirmation. Mark the unit's phase done,
+`git merge-base --is-ancestor HEAD refs/heads/<style merge branch>`, then write
+the checkpoint procedure's atomic committed-awaiting-release record for that
+ancestry-checked HEAD with `--ticket <ticket>`, run
+`style_ledger.py ticket checkpoint --repo <unit-worktree> --id <ticket> --commit <HEAD> --session-dir <run folder> --phase <phase>`
+and `style_ledger.py ticket merge --repo <unit-worktree> --id <ticket>`, which
+releases the held reservation. Act on
+its `not built` lines as after a showrunner's `ticket merge` (**Merging back**). Mark the unit's phase done,
 report `From <unit>: ticket <id> closed with no code change; <n> held.` and
 refill at once. If ancestry fails, leave the ticket assigned and report it.
-The gate and `ticket checkpoint` refuse any ticket with owned cells unjudged and name each one.
+The gate and `ticket checkpoint` refuse any ticket with an owned cell that is neither recorded nor removed, and name each one.
+When the ticket's own commits delete a cell's file, record that cell with `style_ledger.py record --verdict removed`
+(same flags as any record). The ledger finds the deleting commit with git and prints the cell's line,
+`<rule> <path>: removed by ticket <id> at <commit7>`; the cell reads the same in `ticket open` and the style report.
+Edits to the file that a sync merge brought in before the delete do not matter. The record refuses a file still in
+the tree, a file deleted before the ticket's start, a delete that a merge brought in, a cell outside the
+ticket, and a crate folder. A removed cell is closed, not clean; a later file at that path is a new cell. A delete
+by any ticket counts: no verdict on a commit before it judges the new file, and the gate and `ticket checkpoint`
+name the cell as unjudged until the ticket records it again.
 
 Refill only the unit worktree's own plan copy:
 
@@ -141,7 +323,8 @@ offer the cell again; it adds no skip based on waived findings alone.
 The ticket stores its rule text. Workers read the pinned files under the unit
 worktree's `docs/style-production/rules/`, including after an interruption;
 later rule edits cannot change an assigned ticket's Work Order. A queued ticket
-is recovered under the same id if its files remain free; otherwise it is dropped
+is recovered under the same id if its files, and for a proposal ticket each file
+its findings' changes edit, remain free; otherwise it is dropped
 before selecting fresh work. Merged and dropped ticket phases are discarded on
 refill; a checkpointed ticket waits for the style showrunner to merge it.
 Refill writes plans and pinned texts atomically. Resume checks every pin's blob
@@ -270,7 +453,11 @@ A missing production or another branch point sends nothing. Notification
 failure reports one line and never fails the parent's merge.
 
 On a sync message, run `style_ledger.py tip seen --repo <checkout> --tip <tip>`;
-`seen` skips the following five steps:
+`seen` (including a reason) skips the following five steps. For a new tip, run `~/.claude/scripts/lib/py ~/.claude/scripts/style/style_sync.py own-handoff --repo <checkout> --tip <tip> --style-branch <style merge branch>`.
+Exit 0 means the tip has the style branch's own tree (our hand-off merged back): it is now the synced tip and seen,
+recorded with reason `own hand-off` (`tip seen` prints `seen (own hand-off: synced with no lint run)`). Merge the tip
+into the style merge branch with no Merge tests (the tree does not change), wake sync waiters, and skip the five steps.
+Exit 1 means the trees differ; run the five steps:
 
 1. Merge the new tip into the style merge branch and run its Merge tests.
 2. Run `~/.claude/scripts/lib/py ~/.claude/scripts/style/style_sync.py lint --repo <checkout> --checkout <style checkout> --tip <branch-point tip>`.
@@ -278,11 +465,30 @@ On a sync message, run `style_ledger.py tip seen --repo <checkout> --tip <tip>`;
    at the exact requested commit in a disposable checkout, with workspace mend,
    rustfmt and clippy (`--all-targets --all-features`, workspace lint config).
    Nothing rewrites the tree: mend runs in report mode and rustfmt with `--check`.
+   Before verify starts, `checkout/target` links to `<main git dir>/style-sync-target`
+   (about 2-3 GiB), shared by all syncs of that repo. `scratch.py hold` owns it under
+   `run:<repo>-style` until the style production itself wraps (see Lifetime).
+   Checkout cleanup unlinks the symlink and keeps the target. A missing or swept
+   target is recreated for a cold run. Each sync takes a blocking exclusive flock
+   on `style-sync-target/sync.lock` before creating its checkout and holds it
+   through lint and cleanup. This keeps source timestamps newer than the previous
+   sync's Cargo fingerprints. Cargo's build lock also serializes builds on the
+   target; this starts no extra parallel build. The link avoids setting `CARGO_TARGET_DIR`,
+   which would change sccache's key.
    It records per-file diagnostics once per tool; disabled or incomplete checks
    grant no successful coverage. Exit 0 means clean, every tool recorded passing;
    continue the sync. Exit 1 means diagnostics recorded or a tool did not pass;
    continue to `set-tip` and `tip done`. Exit 2 means an error (refusal, failed
-   `lint-record` or unreadable checkout); stop the sync.
+   `lint-record` or unreadable checkout); stop the sync. Exit 143 or 129 means
+   SIGTERM or SIGHUP stopped the run; stop the sync.
+   Every exit the run can catch stops verify.sh and its processes, then deletes the
+   checkout and removes its worktree registration, also a locked one. Each
+   `style-sync-lint-*` dir holds `owner.json` (the run's pid and repo) and
+   `verifier.pgid` (written by verify.sh's own process, which then starts verify.sh
+   only while the owner runs). The owner
+   record goes last; if the registration step fails, the dir keeps it and the next
+   run retries. A run first removes the dir and registration of a run whose owner and
+   verify.sh group are both gone; the dir stays while a killed run's verify.sh runs.
 3. Run `style_ledger.py set-tip --repo <checkout> --tip <branch-point tip> --style-branch <style merge branch>`,
    then `style_ledger.py status --repo <checkout>`: changed inputs become stale,
    new files open. Report a nonzero unclassified count to the parent with
@@ -306,14 +512,17 @@ remaining finding touches, rerun the gate and leave dropped cells stale.
 ## Merging back
 
 Merge each unit checkpoint into the style merge branch as soon as it arrives;
-that clears its berth protection. Use the ordinary
+the `ticket merge` after it releases its berth reservation. Use the ordinary
 `merge_checkpoint.py --production <style doc> <unit> <phase> <hash> --started …`
 with one `--also <path>` for each entry of the unit's open ticket's `files`
 (`style_ledger.py ticket open --repo <checkout> --unit <unit>`). Its Owns is
 `none — takes what the board leaves free`; paths outside that ticket stay refused.
 
+A style ticket's checkpoint does not release its berth reservation: the unit's
+reservation record holds it for the ticket, and `ticket checkpoint` keeps the
+record's run folder and phase on the ticket.
 After the merge, run `style_ledger.py ticket merge --repo <checkout> --id <ticket>`
-to wake every unit waiting for sync, and send the owning unit director
+to release that reservation and wake every unit waiting for sync, and send the owning unit director
 `From the showrunner of <style slug>: ticket <id> merged; refill.`
 For each `has no applied check` line that merge prints, check the change in the
 code, and run the printed `held built` command when the change is there. A rerun
@@ -321,12 +530,19 @@ of `ticket merge` on a merged ticket prints these lines again. A finding whose
 change is not there waits for a person, who makes the change and
 runs that command, or waives the finding with
 `style_ledger.py held waive --repo <checkout> --id <finding id> --person <name>`.
+A merge that cannot release the reservation (the unit worktree moved off the
+checkpoint, or berth did not confirm the release) exits 2 with
+`ticket <id>: ... stays held; rerun ticket merge` and keeps it held; fix the
+cause and run `ticket merge` again, or let the next `reconcile` retry it. A
+merge after the release is confirmed releases nothing more.
 The ledger accepts only a checkpoint contained by its stored style merge branch.
 Then run
 `style_sync.py send-handoff --repo <checkout> --slug <style slug> --checkpoint <style branch tip>`.
 It adds the hand-off, sends
 `From the showrunner of <style slug>: hand-off <hash>` to the current parent's
 `showrunners.py address <parent>`, then records `handoff send`.
+A send that send.py queued (`QUEUED:`, exit 1) is sent too: send.py delivers
+it later. The command prints `hand-off <hash7>: queued for <parent>`.
 Style work never waits for a sync to go home.
 
 The parent correctness-reviews the hand-off's diff against the branch point
@@ -340,10 +556,11 @@ hand-off as merged in the style ledger with its merge commit, then sends
 `From the showrunner of <parent slug>: hand-off <hash7> merged as <merge7>.`
 The acknowledgment is a notice; only after a `hand-off ledger:` line run
 `style_ledger.py handoff merged --repo <checkout> --checkpoint <hash> --merge-commit <merge>`;
-ancestry on the branch point is the evidence. The receiver decides delivery
-state once. A local merge missing from origin is pushed, notified and promoted
-before acknowledgment, without merging again. A checkpoint already on origin
-merges, pushes, notifies and promotes nothing: it prints
+ancestry on the branch point is the evidence, so it also takes a pending row.
+The receiver decides delivery state once. A local merge missing from origin is
+pushed, notified and promoted before acknowledgment, without merging again. A
+checkpoint already on origin merges, pushes, notifies and promotes nothing: it
+prints
 `hand-off <hash7> already merged as <merge7>` and acknowledges again.
 A failed first push undoes the unpushed merge; no acknowledgment precedes a
 successful push. Hand-offs run the same package and Merge tests and test log
@@ -356,7 +573,8 @@ after `ticket merge`. Reconcile stores the branch
 point before any acknowledgment and marks merged hand-offs by ancestry.
 Replay proceeds oldest first: pending notices are sent then recorded; sent
 notices are sent again; a notice sent to another parent is sent to the current
-parent then rerouted. Failed sends leave the row unchanged.
+parent then rerouted. A queued send counts as sent; failed sends leave the row
+unchanged.
 `style_ledger.py handoff reroute --repo <checkout> --checkpoint <hash> --to <parent>`
 accepts only sent rows, preserving their checkpoint and creation time; the
 same parent is a no-op. `handoff send` still refuses a second parent.
@@ -391,6 +609,26 @@ finding touches, rerun the gate, and leave dropped cells stale for later work.
 Record each dropped file with `style_ledger.py ticket yield --repo <unit-worktree>
 --id <ticket> --path <file>`; this clears the ticket's verdicts and unfiled held
 findings on it, leaving its cells for later work.
+A proposal ticket yields the file of a finding whose file, or a file its change
+edits, is blocked. Its findings at that file stay filed under their decision with
+no build ticket, and the ticket no longer lists them. The gate and `ticket merge`
+skip them, and a later proposal ticket takes them. The command prints
+`yielded <finding id>: it stays filed for a later ticket` for each. It refuses a
+file with no finding of the ticket, a file that holds every finding the ticket has
+left (drop the ticket), and a kept finding that can need a yielded one. A `path`
+attribute that mounts a file across crates refuses when either crate holds a
+finding of the ticket, and a `path` attribute that mounts a file not named
+`.rs` refuses anywhere. A `path` attribute on an inline module names the folder
+its `mod` items read from; it refuses only when that folder is in another crate.
+The module's own name stays a reading too, because a `cfg_attr` attribute can be
+inactive.
+Otherwise a kept finding in another crate passes. In a shared crate, each finding of both sides
+must be a plain file rename; the yielded file must not name a kept module; the
+new names must differ, and neither can be the other's old name; and no file of
+the crate can re-export a renamed module, glob-import its parent, or hold an
+`include`, `macro_rules` or `macro` word. The acceptance gate's `verify.sh` run
+on the unit branch proves that the kept work builds without the yielded change.
+A structure ticket cannot yield.
 Style units obey build holds and memory admission like any unit.
 
 ## Big changes
@@ -426,6 +664,11 @@ proof and its rules, and the unit text and the ticket gate read it. The classes:
   `#[cfg(test)]` item) when its pattern has no match in the attribute's scope,
   the same check as the `test_allow_boilerplate` generator. The whole attribute
   may go when it keeps no lint name. The reason and the other lint names stay.
+- `binding-rename` (proof `binding_rename`; rule `prefer-type-named-fields-and-bindings`):
+  a local binding, parameter or pattern name changes to its approved name at its
+  declaration and each use in its scope. The proof accounts for struct shorthand
+  and format captures, excludes shadowed bindings, and refuses collisions and
+  macros whose names it cannot check.
   `prove_lint_removals` finds that only lint names were removed. An `expect`
   attribute is not in this class.
 
@@ -627,6 +870,18 @@ Approve with `proposal_issue.py approve <issue> --by user --showrunner <parent>
 --unit <unit> --plan <unit's own plan copy>`. Do not add phase numbers.
 Approval sets the decision's stage active (in progress), so it leaves the
 footer's proposal count.
+A rule whose frontmatter says `approval: always` never asks the user: `file`
+creates each new decision under it approved, with the fields a user approval
+writes. The unit and plan are the live family unit's Units row of the standing
+production, `showrunner` and `approved_in` are the style slug, and `approved_by`
+is `rule <rule id>`. It prints `approved <decision>: rule <rule id> is always
+approved`. With no live unit of the rule's family, `file` prints `skipped
+<decision>: rule <rule id> is always approved, but no <family> unit builds it`.
+Each `file` also approves, the same way, every open decision under such a rule
+that still waits for the user, whatever rule text it was filed under.
+A decision that inherits an approval keeps it, a declined decision stays
+declined, and reopen keeps the rule's approval. `unapprove` reads a rule
+approval as the user's. Any other `approval` value stops the catalog loading.
 Change an answered decision only with `proposal_issue.py unapprove`, `proposal_issue.py decline-answer` or
 `proposal_issue.py reopen`; never edit its stage, unit or answer by hand.
 Refill builds approved findings in small tickets before coverage work.
@@ -646,6 +901,24 @@ that the step leaves gets `waiting <decision>: <finding> declared in <n> files`,
 `waiting <decision>: <finding> declared in another crate: <file>`,
 `waiting <decision>: <finding> declaration gone` or
 `waiting <decision>: <finding> its function moved to <file>; <reason>`, and stays out of the ticket.
+Each busy file of a decision gets `waiting <decision>: <path> busy`, and its free
+files are still planned in the same run.
+A finding whose change edits a busy file other than its own (for a file rename,
+a file that names the renamed module; for a qualified rename, a `.rs` or `.md`
+file that holds the old name; for a restructure of a `.rs` file, a file whose
+`mod` line or `#[path]` string declares it, such as the owner of a test file, or
+whose `path` attribute the planner cannot read with certainty)
+gets `waiting <decision>: <finding> edits <file>, busy`
+and stays out of the ticket; the other findings of its file stay available.
+A file rename whose old module a file, its own file included, may declare by a
+`path` attribute the planner cannot read with certainty gets
+`waiting <decision>: <finding> <file> has a path attribute the rename gate cannot read`
+and stays out of the ticket, busy or not: the gate refuses an edit to that file,
+so a person renames the module. A queued ticket that holds such a rename is dropped
+with `dropped <id>: <file> has a path attribute the rename gate cannot read`. A
+`path` string with an escape or a raw string (`#[path = "pro\u{62}e.rs"]`) can name
+the module without its name, so the planner also reads every file that has one, and
+such a file counts as one it cannot read with certainty.
 A finding on a statement line follows its moved function only when its text is on
 exactly one body line there, and that line is a statement of the function. Refill
 builds no ticket on a file that a commit on the unit base, not in the synced tip,
@@ -758,9 +1031,13 @@ outside the crate (where `alpha` is the library's name), a `pub use lock::...`
 re-export, and `lock::` where a `mod` line, import or glob binds the module. A
 `#[path = "../src/ledger/lock.rs"]` string changes only its file name, and only when
 its path, read from the file's own folder, is the old file; the `mod lock;` line it
-marks changes with it. A `mod lock;` line with a `path` attribute in any other form
-stays, and so does a `mod` or `use` line inside a macro (`stringify!(…)`, a
-`macro_rules!` body), where the words are tokens, not items. When the ticket also renames an item, its qualified references there change
+marks changes with it. A `mod lock;` line whose `path` string names another file
+stays. A file with a `path` attribute the gate cannot read with certainty (one in an
+inline module, a `cfg_attr` that holds `path`, or a `path` on an inline module, which
+mounts a folder) takes no change at all. A raw name reads as its plain word, so
+`mod r#lock;` and `#[r#path = "../src/ledger/lock.rs"]` change as their plain forms do, and
+a raw name keeps its `r#` (`mod r#mutation_lock;`). A `mod` or `use` line inside a macro (`stringify!(…)`, a
+`macro_rules!` body) stays: there the words are tokens, not items. When the ticket also renames an item, its qualified references there change
 too. The `use` and `mod` lines may take the order rustfmt gives them, with their
 attributes, and a call's trailing comma may change, except inside a macro or an attribute,
 which can match `[1,]` and not `[1]`. The gate refuses every other
@@ -886,6 +1163,14 @@ own hand-offs (docs/style_production.md, Merging back).` Product children still
 hold the wrap. The style checkout, unit worktrees with their own plan copies
 and pinned rule files, and ledger remain in place. A later `/showrunner:add_style`
 from a new parent attaches through `resume`, which handles pending hand-offs.
+
+The sync target at `<main git dir>/style-sync-target` belongs to the production-wide
+scratch task `run:<repo>-style`, using the main repository's basename. This is the
+standing production's task, not a unit's phase or run. When the style production
+itself wraps, after its sync processes finish, run
+`~/.claude/scripts/lib/py ~/.claude/scripts/lib/scratch.py end --task run:<repo>-style`
+to remove the target and its hold. A parent's wrap keeps this target with the
+detached style production.
 
 ## Report
 

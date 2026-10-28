@@ -73,6 +73,7 @@ class KeptPush(TypedDict):
     message: str
     detail: str
     key: str
+    text_id: str
 
 
 @dataclass(frozen=True)
@@ -149,8 +150,9 @@ def parse_push(text: str) -> KeptPush | None:
     if not isinstance(value, dict):
         return None
     record = cast(dict[str, object], value)
-    # A line kept before pushes had a key reads as key "".
-    found = {name: record.get(name) for name in KeptPush.__annotations__} | {"key": record.get("key", "")}
+    # A line kept before pushes had a key or a text id reads as key "" and text id "" (free text).
+    found = {name: record.get(name) for name in KeptPush.__annotations__} | {
+        "key": record.get("key", ""), "text_id": record.get("text_id", "")}
     if not all(isinstance(item, str) for item in found.values()):
         return None
     return cast(KeptPush, cast(object, found))

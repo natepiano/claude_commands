@@ -33,7 +33,7 @@ import note_file
 from inventory import Inventory, Session, inventory, last_tool_call
 from launch_permission import shutdown_state_root
 import record as store
-from record import SessionShutdown, SessionStopIssue, TimerRestore, ShutdownContinuation, ReadinessCheck
+from record import CheckoutMove, SessionShutdown, SessionStopIssue, TimerRestore, ShutdownContinuation, ReadinessCheck
 from remote import other_machine, run_remote
 import showrunners
 import sessions
@@ -756,7 +756,7 @@ def begin(
     login: str, requested_by: str | None = None, only: Iterable[str] = (), *,
     then: ShutdownContinuation = "stop", alerts: Literal["user", "none"] = "user",
     request_id: str,
-    target: str = "", why: str = "", move_id: str = "",
+    target: str = "", why: str = "", move_id: str = "", checkout_move: CheckoutMove | None = None,
     report: Inventory | InventoryNeeded = _INVENTORY_NEEDED,
 ) -> list[SessionShutdown]:
     """Add independent owners, leaving every existing request intact."""
@@ -793,6 +793,8 @@ def begin(
         )
         if move_id:
             saved["move_id"] = move_id
+        if checkout_move is not None:
+            saved["checkout_move"] = checkout_move
         if target:
             saved["target"] = target
             saved["source_label"] = report["label"]
@@ -1278,7 +1280,8 @@ def down(account: Account, here: bool = False, only: Iterable[str] = (), *,
          then: ShutdownContinuation = "stop", alerts: Literal["user", "none"] = "user",
          requested_by: str | None = None, request_id: str = "", target: str = "", why: str = "",
          report: Inventory | InventoryNeeded = _INVENTORY_NEEDED,
-         origin: accounts.MoveOrigin = HAND_ORIGIN, move_id: str = "") -> int:
+         origin: accounts.MoveOrigin = HAND_ORIGIN, move_id: str = "",
+         checkout_move: CheckoutMove | None = None) -> int:
     """Start local work immediately and ask the peer to conduct its own owners."""
     from scripts.accounts import accounts
     origin_arguments = accounts.move_origin_arguments(origin)
@@ -1304,7 +1307,8 @@ def down(account: Account, here: bool = False, only: Iterable[str] = (), *,
         report = run_inventory(account.login, ids)
     local_ids: set[str] = ({saved["session"]["session_id"] for saved in store.session_records(account.login)}
                  | {session["session_id"] for session in report["sessions"]}) if ids else set()
-    added = begin(account.login, request_origin, ids, then=then, alerts=alerts, request_id=identity, target=target, why=why, move_id=move_id, report=report)
+    added = begin(account.login, request_origin, ids, then=then, alerts=alerts, request_id=identity, target=target, why=why, move_id=move_id,
+                  checkout_move=checkout_move, report=report)
     if target:
         for saved in added:
             _carry_trust(saved, target)
@@ -1924,6 +1928,7 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown],
                     archive(result)
 
             def start_launch(saved: SessionShutdown) -> None:
+                saved = restart_work.move_checkout(saved, dry_run=False)
                 if restart_work.drop_restore_without_folder(saved, dry_run=False):
                     return
                 if restart_work.launches_window(saved["session"]["host"]):

@@ -190,6 +190,7 @@ class MergeRequest(NamedTuple):
     promotion: NoPromotion | PromoteTo
     merge_tests: tuple[tuple[str, ...], ...]
     flakes: frozenset[str]
+    flaky_tests: frozenset[str]
     units: tuple[Unit, ...]
     lines: tuple[str, ...]
     scratch: Path
@@ -250,6 +251,16 @@ def optional_field(lines: list[str], field: str) -> FieldPresent | FieldAbsent:
         if line.startswith(prefix):
             return FieldPresent(line[len(prefix):].removeprefix(" "))
     return FieldAbsent()
+
+
+def listed_names(lines: list[str], field: str) -> frozenset[str]:
+    """A doc field's names: the backtick-quoted ones, else a comma list before " — "."""
+    present = optional_field(lines, field)
+    if isinstance(present, FieldAbsent):
+        return frozenset()
+    quoted = re.findall(r"`([^`]+)`", present.text)
+    names = quoted if quoted else present.text.split(" — ", 1)[0].split(",")
+    return frozenset(name.strip() for name in names if name.strip())
 
 
 def promotion_from_doc(lines: list[str]) -> NoPromotion | PromoteTo:
@@ -358,12 +369,8 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
         for checkout in promotion.checkouts:
             if not checkout.is_dir():
                 raise Refusal(f"Promote checkout {checkout} does not exist; name an existing checkout, or none")
-    flakes_field = optional_field(lines, "Known flakes")
-    flakes: frozenset[str] = frozenset()
-    if isinstance(flakes_field, FieldPresent):
-        quoted = re.findall(r"`([^`]+)`", flakes_field.text)
-        names = quoted if quoted else flakes_field.text.split(" — ", 1)[0].split(",")
-        flakes = frozenset(name.strip() for name in names if name.strip())
+    flakes = listed_names(lines, "Known flakes")
+    flaky_tests = listed_names(lines, "Known flaky tests")
     if cast(bool, args.shrink) and cast(bool, args.as_built):
         raise Refusal("--shrink and --as-built are separate checkpoints")
     kind: CodeCheckpoint | ShrinkCommit | AsBuiltCommit = (
@@ -385,7 +392,7 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
                    or tempfile.gettempdir()).expanduser()
     return MergeRequest(production, unit, cast(str, args.phase), cast(str, args.hash),
                         tuple(cast(list[str], args.also)), kind, push, promotion,
-                        parse_merge_tests(lines, production.checkout), flakes, units, tuple(lines), scratch,
+                        parse_merge_tests(lines, production.checkout), flakes, flaky_tests, units, tuple(lines), scratch,
                         tuple(cast(list[str], args.trailer)), review_trial, delivers or "",
                         cast(bool, args.cancel_prior), cast(str, args.started),
                         cast(str, args.regime), cast(int, args.holds), cast(int, args.merge_defects),
@@ -727,16 +734,32 @@ def tests(request: MergeRequest, paths: tuple[str, ...], merge_head: str) -> str
         report("test", "ok", f"{'shrink' if isinstance(request.kind, ShrinkCommit) else 'as-built'} has no package tests")
         return "no tests"
     return checkpoint_tests(request.production, paths, request.commit, request.merge_tests,
-                            request.flakes, request.scratch, merge_head)
+                            request.flakes, request.scratch, merge_head, request.flaky_tests)
+
+
+# A nextest failure row: `FAIL [  12.2s] (1012/1067) <binary> <test>`.
+NEXTEST_FAIL = re.compile(r"^\s+FAIL \[[^]]*\] \([^)]*\) \S+ (\S+)\s*$", re.MULTILINE)
+
+
+def failed_tests(output: str) -> frozenset[str]:
+    """The names of the tests nextest reports failed; each row is printed twice, so a set."""
+    return frozenset(NEXTEST_FAIL.findall(output))
+
+
+def only_tests(command: list[str], names: frozenset[str]) -> list[str]:
+    """The command narrowed to the named tests: verify.sh --filter, else nextest -E test(=name)."""
+    if any(Path(word).name == "verify.sh" for word in command):
+        return [*command, *(word for name in sorted(names) for word in ("--filter", name))]
+    return [*command, *(word for name in sorted(names) for word in ("-E", f"test(={name})"))]
 
 
 def checkpoint_tests(production: Production, paths: tuple[str, ...], checkpoint: str,
                      merge_tests: tuple[tuple[str, ...], ...], flakes: frozenset[str], scratch: Path,
-                     merge_head: str) -> str:
+                     merge_head: str, flaky_tests: frozenset[str]) -> str:
     steps = test_steps(production, paths, merge_tests)
     scratch.mkdir(parents=True, exist_ok=True)
     log = scratch / f"merge_{checkpoint[:7]}_test.log"
-    failed: list[tuple[str, list[str]]] = []
+    failed: list[tuple[str, list[str], frozenset[str]]] = []
     with log.open("w", encoding="utf-8") as output:
         for name, command in steps:
             result = run_test_command(command, production.checkout)
@@ -744,17 +767,20 @@ def checkpoint_tests(production: Production, paths: tuple[str, ...], checkpoint:
             _ = output.write(f"{name.replace(' ', '_')}_EXIT={result.returncode}\n")
             output.flush()
             if not test_passed(command, result):
-                failed.append((name, command))
+                failed.append((name, command, failed_tests(result.stdout + result.stderr)))
     report("test", "ok", f"{len(steps)} commands ran; {len(failed)} red; log {log}")
     unresolved: list[str] = []
-    for name, command in failed:
+    for name, command, tests in failed:
+        # Only known flaky tests failed: rerun those alone, not the whole command.
+        alone = bool(tests) and tests <= flaky_tests
         with log.open("a", encoding="utf-8") as output:
-            result = run_test_command(command, production.checkout)
+            result = run_test_command(only_tests(command, tests) if alone else command, production.checkout)
             _ = output.write(result.stdout + result.stderr)
             _ = output.write(f"{name.replace(' ', '_')}_RERUN_EXIT={result.returncode}\n")
         package = name.removeprefix("package ")
-        if test_passed(command, result) and package in flakes:
-            note = f"known flake {package}: red in batch, green alone"
+        if test_passed(command, result) and (alone or package in flakes):
+            note = (f"known flaky tests {', '.join(sorted(tests))}: red in {name}, green alone" if alone
+                    else f"known flake {package}: red in batch, green alone")
             production.log.parent.mkdir(parents=True, exist_ok=True)
             with production.log.open("a", encoding="utf-8") as ledger:
                 _ = ledger.write(f"- {datetime.now(production.zone):%H:%M %Z}: {note}\n")
@@ -1098,6 +1124,7 @@ class ChildHandoffRequest(NamedTuple):
     promotion: NoPromotion | PromoteTo
     root_self: bool
     flakes: frozenset[str]
+    flaky_tests: frozenset[str]
     scratch: Path
 
 
@@ -1164,16 +1191,12 @@ def child_request(args: argparse.Namespace) -> ChildHandoffRequest:
         for destination in promotion.checkouts:
             if not destination.is_dir():
                 raise Refusal(f"Promote checkout {destination} does not exist; name an existing checkout, or none")
-    flakes_field = optional_field(parent_lines, "Known flakes")
-    flakes = frozenset[str]()
-    if isinstance(flakes_field, FieldPresent):
-        quoted = re.findall(r"`([^`]+)`", flakes_field.text)
-        names = quoted if quoted else flakes_field.text.split(" — ", 1)[0].split(",")
-        flakes = frozenset(name.strip() for name in names if name.strip())
+    flakes = listed_names(parent_lines, "Known flakes")
+    flaky_tests = listed_names(parent_lines, "Known flaky tests")
     scratch = Path(os.environ.get("MERGE_CHECKPOINT_SCRATCH") or tempfile.gettempdir()).expanduser()
     return ChildHandoffRequest(production, child, checkpoint, GitPush() if raw == "git" else ValidateAndPush(),
                                parse_merge_tests(parent_lines, production.checkout), cast(str, args.started), delivery, promotion,
-                               root_self, flakes, scratch)
+                               root_self, flakes, flaky_tests, scratch)
 
 
 def handoff_merge_evidence(production: Production, child: str, checkpoint: str) -> str:
@@ -1253,7 +1276,7 @@ def run_handoff(request: ChildHandoffRequest) -> int:
         merge_head = good(git(checkout, "rev-parse", "HEAD"), "merge")
         try:
             _ = checkpoint_tests(request.production, paths, checkpoint, request.merge_tests,
-                                 request.flakes, request.scratch, merge_head)
+                                 request.flakes, request.scratch, merge_head, request.flaky_tests)
         except (OSError, ValueError) as error:
             undo_unpushed_merge(request.production, merge_head)
             raise Stop("red", "failed", str(error), "repair the test logging failure and send a new checkpoint") from error
