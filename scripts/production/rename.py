@@ -22,6 +22,7 @@ import tidy_wrapped  # noqa: E402
 import unit_lookup  # noqa: E402
 import unit_move  # noqa: E402
 from unit_move import PathMove  # noqa: E402
+import rename_checkout  # noqa: E402
 import rename_outside  # noqa: E402
 import rename_state  # noqa: E402
 from rename_state import RenameRefused, read_json, write_json, write_text  # noqa: E402
@@ -719,6 +720,9 @@ def main(argv: list[str]) -> int:
     _ = command.add_argument("unit")
     command = actions.add_parser("finish")
     _ = command.add_argument("new")
+    command = actions.add_parser("checkout", help="move the showrunner checkout through a shutdown restart")
+    _ = command.add_argument("new", metavar="slug")
+    _ = command.add_argument("path", nargs="?", default="")
     args = parser.parse_args(argv)
     action, new = cast(str, args.action), cast(str, args.new)
     try:
@@ -726,6 +730,8 @@ def main(argv: list[str]) -> int:
             unit(new, cast(str, args.unit))
         elif action == "finish":
             finish(new)
+        elif action == "checkout":
+            rename_checkout.checkout(new, cast(str, args.path))
         else:
             old = cast(str, args.old)
             result = plan(old, new) if action == "plan" else apply(old, new)

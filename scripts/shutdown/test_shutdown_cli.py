@@ -1412,7 +1412,26 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
             self.assertEqual(shutdown.main(["down", LABEL, "--here", "--only", "move-id",
                 "--restart", "--to", "claude3"]), 0)
         down.assert_called_once_with(selected, True, ("move-id",), then="restart", alerts="user",
-            requested_by=None, request_id="", target="claude3", why="", report=report, origin=accounts.HandOrigin(), move_id="")
+            requested_by=None, request_id="", target="claude3", why="", report=report, origin=accounts.HandOrigin(), move_id="", checkout_move=None)
+
+    def test_down_checkout_move_reaches_settle_and_needs_one_here_restart_session(self) -> None:
+        selected = Account("claude", LOGIN, LABEL)
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL,
+            sessions=[unit_session("showrunner")], unattributed=[])
+        with (
+            patch.object(shutdown, "named_claude_account", return_value=selected),
+            patch.object(settle, "down", return_value=0) as down,
+            patch.object(shutdown, "resolve_sessions", return_value=shutdown.ResolvedSessions(("showrunner",), report)),
+            patch("sys.stderr", new_callable=io.StringIO) as error,
+        ):
+            self.assertEqual(shutdown.main(["down", LABEL, "--here", "--only", "showrunner",
+                "--checkout-move", "/w/old", "/w/new"]), 2)
+            self.assertIn("--checkout-move needs", error.getvalue())
+            self.assertEqual(shutdown.main(["down", LABEL, "--here", "--only", "showrunner", "--restart",
+                "--checkout-move", "/w/old", "/w/new"]), 0)
+        down.assert_called_once_with(selected, True, ("showrunner",), then="restart", alerts="user",
+            requested_by=None, request_id="", target="", why="", report=report, origin=accounts.HandOrigin(), move_id="",
+            checkout_move={"old": "/w/old", "new": "/w/new"})
 
     def test_down_to_passes_custom_move_reason_through_the_cli_to_settle(self) -> None:
         selected = Account("claude", LOGIN, LABEL)
@@ -1426,7 +1445,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
             self.assertEqual(shutdown.main(["down", LABEL, "--here", "--only", "move-id",
                 "--restart", "--to", "claude3", "--why", "weekly limit reached"]), 0)
         down.assert_called_once_with(selected, True, ("move-id",), then="restart", alerts="user",
-            requested_by=None, request_id="", target="claude3", why="weekly limit reached", report=report, origin=accounts.HandOrigin(), move_id="")
+            requested_by=None, request_id="", target="claude3", why="weekly limit reached", report=report, origin=accounts.HandOrigin(), move_id="", checkout_move=None)
 
     def test_down_restart_passes_the_selected_scope_and_intent(self) -> None:
         selected = Account("claude", LOGIN, LABEL)
@@ -1441,7 +1460,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                 "down", LABEL, "--restart", "--only", "unit-a,unit-b,unit-a", "--here",
             ]), 0)
         down.assert_called_once_with(
-            selected, True, ("unit-a", "unit-b"), then="restart", alerts="user", requested_by=None, request_id="", target="", why="", report=report, origin=accounts.HandOrigin(), move_id=""
+            selected, True, ("unit-a", "unit-b"), then="restart", alerts="user", requested_by=None, request_id="", target="", why="", report=report, origin=accounts.HandOrigin(), move_id="", checkout_move=None
         )
 
 
@@ -1481,7 +1500,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
             patch.object(shutdown, "inventory", return_value=report),
         ):
             self.assertEqual(shutdown.main(["down", LABEL]), 0)
-        down.assert_called_once_with(selected, True, (), then="stop", alerts="user", requested_by=None, request_id="", target="", why="", report=report, origin=accounts.HandOrigin(), move_id="")
+        down.assert_called_once_with(selected, True, (), then="stop", alerts="user", requested_by=None, request_id="", target="", why="", report=report, origin=accounts.HandOrigin(), move_id="", checkout_move=None)
 
 
 
@@ -1937,7 +1956,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
         with patch.object(shutdown, "named_claude_account", return_value=selected), patch.object(settle, "down", return_value=0) as down, patch.object(shutdown, "inventory", return_value=report):
             self.assertEqual(shutdown.main(["down", LOGIN, "--here", "--restart", "--no-alert", "--requested-by", "requester", "--request-id", "same-request"]), 0)
-        down.assert_called_once_with(selected, True, (), then="restart", alerts="none", requested_by="requester", request_id="same-request", target="", why="", report=report, origin=accounts.HandOrigin(), move_id="")
+        down.assert_called_once_with(selected, True, (), then="restart", alerts="none", requested_by="requester", request_id="same-request", target="", why="", report=report, origin=accounts.HandOrigin(), move_id="", checkout_move=None)
 
     def test_stopping_session_restore_is_held_by_name(self) -> None:
         self.assertTrue(record.create_session(session_shutdown(record.SessionStopping(kind="stopping", at=OCTOBER))))
