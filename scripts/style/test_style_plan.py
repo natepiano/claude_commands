@@ -2932,6 +2932,45 @@ class StylePlanTests(unittest.TestCase):
             _ = self.git("merge", "--ff-only", "main", cwd=checkout)
         self.sync()
 
+    def test_no_magic_decision_tickets_take_one_file_and_all_its_findings(self) -> None:
+        rule = self.rule("no-magic-values")
+        self.sync()
+        issue = self.approved_decision(rule, self.sources[:2], "restructure")
+        ledger = self.ledger()
+        blob = next(rule_.blob for rule_ in rules.load_rules(self.repo) if rule_.rule_id == rule)
+        second = ledger.hold(rule, self.sources[0], 1, "another value", "restructure", "42", "LIMIT", blob, "outside")
+        ledger.file_held(second.finding_id, issue)
+        _ = self.refill_decisions()
+        ticket, = ledger.ticket_open("names-unit")
+        self.assertEqual(ticket["files"], [self.sources[0]])
+        self.assertEqual(set(ticket["finding_ids"]), {f.finding_id for f in ledger.proposal_findings(issue) if f.path == self.sources[0]})
+
+    def test_decision_b_refill_and_queued_ticket_keep_only_rank_exempt_bindings(self) -> None:
+        _ = self.types_unit()
+        _ = self.rule("types-read", "tier: C\nfamily: types\ninput_scope: file\n")
+        rule = self.rule("prefer-type-named-fields-and-bindings")
+        source = "pub struct Parent { old: u32 }\nfn f() {\n    let old = 1;\n    consume(old);\n}\n"
+        self.commit_files({self.sources[0]: source})
+        issue, findings = self.judged_findings(rule, ((self.sources[0], 1, source.splitlines()[0]),
+                                                     (self.sources[0], 3, source.splitlines()[2])),
+                                              kind="rename", before="old", after="fresh")
+        _ = self.refill_decisions()
+        ledger = self.ledger()
+        ticket, = ledger.ticket_open("names-unit")
+        self.assertEqual((ticket["kind"], ticket["finding_ids"]), ("proposal", [findings[1].finding_id]))
+        ledger.ticket_drop(ticket["id"])
+        ledger.ticket_add("names-unit-99", "names-unit", "proposal", "names", "crates/alpha", [self.sources[0]], [rule],
+                          proposal=str(issue), finding_ids=(findings[1].finding_id,))
+        _ = self.refill_decisions()
+        self.assertEqual(ledger.ticket_open("names-unit")[0]["id"], "names-unit-99")
+        # The exemption never lifts the separate changed-since-judgment gate.
+        ledger.ticket_drop("names-unit-99")
+        self.commit_files({self.sources[0]: source + "fn unrelated() {}\n"})
+        with mock.patch.object(style_proposals, "proposal_command"):
+            _, output, _ = self.run_next()
+        self.assertIn(f"{findings[1].finding_id} {self.sources[0]} changed since it was judged", output)
+        self.assertFalse(any(t["kind"] == "proposal" for t in ledger.ticket_open("names-unit")))
+
     def test_decision_refill_makes_two_read_limit_tickets_for_twenty_six_type_files(self) -> None:
         rule = self.rule("types-decision")
         files = tuple(f"crates/alpha/src/piece_{index:02}.rs" for index in range(26))
@@ -3865,6 +3904,62 @@ class StylePlanTests(unittest.TestCase):
             self.write(self.sources[0], "".join(f"enum {parent} {{ {', '.join(names)} }}\n"
                                                 for parent, names in declared.items()))
         return "names-unit-1"
+
+    def approved_binding_ticket(self, source: str, pairs: tuple[tuple[int, str, str], ...],
+                                save_base: bool = False) -> tuple[str, tuple[str, ...]]:
+        self.write(self.sources[0], source)
+        _ = self.commit()
+        rule = self.rule("prefer-type-named-fields-and-bindings")
+        issue = self.root / "binding-approval.md"
+        ledger = self.ledger()
+        blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+        ids: list[str] = []
+        for line, old, new in pairs:
+            finding = ledger.hold(rule, self.sources[0], line, source.splitlines()[line - 1], "rename",
+                                  old, new, blob, "outside")
+            ledger.file_held(finding.finding_id, issue)
+            ids.append(finding.finding_id)
+        _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names-unit\nplan: approved\n"
+                             + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
+        ticket = "names-unit-1"
+        ledger.ticket_add(ticket, "names-unit", "proposal", "names", "crates/alpha", [self.sources[0]], [rule],
+                          proposal=str(issue), finding_ids=tuple(ids))
+        if save_base:
+            ledger.ticket_assign(ticket, "main")
+            _ = ledger.ticket_base(ticket)
+        return ticket, tuple(ids)
+
+    def test_binding_gate_reports_an_unapplied_rename_from_head_until_its_scope_is_changed(self) -> None:
+        source = "fn f() {\n    let old = input;\n    consume(old);\n}\n"
+        ticket, (identity,) = self.approved_binding_ticket(source, ((2, "old", "fresh"),))
+        expected = f"review: {identity}: old -> fresh not applied in {self.sources[0]}\n"
+        self.assertEqual(self.reference_gate(ticket), (1, expected))
+        self.write(self.sources[0], source.replace("old", "fresh"))
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+
+    def test_binding_gate_checks_all_pairs_together_from_saved_base_after_head_changes(self) -> None:
+        source = "fn f() {\n    let old = input;\n    let second = old;\n    consume(second);\n}\n"
+        ticket, ids = self.approved_binding_ticket(source, ((2, "old", "fresh"), (3, "second", "next")), save_base=True)
+        self.write(self.sources[0], source.replace("old", "fresh"))
+        _ = self.commit()
+        self.assertEqual(self.reference_gate(ticket),
+                         (1, f"review: {ids[1]}: second -> next not applied in {self.sources[0]}\n"))
+        self.write(self.sources[0], source.replace("old", "fresh").replace("second", "next"))
+        with mock.patch.object(style_plan, "binding_rename_check", wraps=approved_renames.binding_rename_check) as proof:
+            self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+            self.assertEqual(proof.call_count, 1)
+            self.assertEqual(len(cast(tuple[approved_renames.BindingRename, ...], proof.call_args.args[3])), 2)
+
+    def test_binding_gate_keeps_identical_pairs_in_different_paths_separate(self) -> None:
+        source = "fn f() {\n    let old = input;\n    consume(old);\n}\n"
+        for path in self.sources[:2]:
+            self.write(path, source)
+        _ = self.commit()
+        rename = approved_renames.BindingRename(2, source.splitlines()[1], "old", "fresh")
+        self.write(self.sources[0], source.replace("old", "fresh"))
+        checks = style_plan.binding_worktree_checks(self.repo, {p: (rename,) for p in self.sources[:2]}, "")
+        self.assertEqual(checks[self.sources[0]][rename], approved_renames.AppliedInCode())
+        self.assertEqual(checks[self.sources[1]][rename], approved_renames.RenameNotApplied(self.sources[1]))
 
     def write_approved_phase(self) -> None:
         """Write the phase of the queued approved ticket at a synced tip, where the ledger finds the cells that record takes."""
