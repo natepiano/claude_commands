@@ -42,6 +42,7 @@
 
 - The main review opens each style violation with `findings.py open --caught-by main` (severity, title, file, line) and keeps the returned ids for `<Synthesize/>`, which does not open them again.
 - A lint failure is fixed by the worker that ran `lint`, before it reports done.
+- Workers start `test` as soon as the code is ready. Lint and test can run in either order, and both must pass before the phase is done. A test counts only if no later lint changed a file; when `git diff --stat` shows that a later lint changed a file, the worker runs test once more. Neither runs again on an unchanged tree. `<VerificationContract/>` defines these rules.
 - PhaseChecks findings pass the ledger's severity gate like any other finding: round 1 gates blockers and minors, later rounds gate blockers only, nits never gate.
 - A `dispatch` verdict sends `<FixDispatch/>` repair rounds to the phase's workers. A repair prompt's Verification includes `lint` after the worker's last edit, when the phase has a lint run.
 - `lint` never reruns on an unchanged tree: in a run session `verify.sh` caches a pass or failure keyed on the tree and replays it.
