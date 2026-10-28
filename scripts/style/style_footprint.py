@@ -262,6 +262,14 @@ class TokenSpan:
     end: int
 
 
+class MoveRefused(Exception):
+    """The change is not a proven item move; the message says why."""
+
+
+class UnreadableTokenSpans(MoveRefused):
+    """Code tokens could not be located; an empty, readable source is a different result."""
+
+
 def token_spans(text: str) -> tuple[TokenSpan, ...]:
     """Locate code tokens without treating comments as replacement sites."""
     result: list[TokenSpan] = []
@@ -288,7 +296,7 @@ def token_spans(text: str) -> tuple[TokenSpan, ...]:
             else:
                 break
         if token.kind == "unknown" or not text.startswith(token.value, cursor):
-            return ()
+            raise UnreadableTokenSpans("source token offsets are unavailable")
         end = cursor + len(token.value)
         result.append(TokenSpan(token, cursor, end))
         cursor = end
@@ -1960,7 +1968,10 @@ def erase_proven_parameters(change: FileChange) -> FileChange:
     erasures = prove_parameter_erasures(tokens(change.before), tokens(change.after))
     if not erasures:
         return change
-    spans = token_spans(change.before)
+    try:
+        spans = token_spans(change.before)
+    except UnreadableTokenSpans:
+        return change
     if not spans:
         return change
     before = change.before
@@ -2276,10 +2287,6 @@ class ItemMoves:
 @dataclass(frozen=True)
 class NoItemMoves:
     reason: str
-
-
-class MoveRefused(Exception):
-    """The change is not a proven item move; the message says why."""
 
 
 @dataclass(frozen=True)
@@ -3802,7 +3809,10 @@ def stale_lint_removal(change: FileChange, before: RevisionTree) -> bool:
     if not removes_only_lint_names(change, proof) or OTHER_LINE_BREAKS & set(change.before):
         return False
     allows = {(allow.line, allow.column): allow for allow in boilerplate_allows(mask_source(change.before))}
-    spans = token_spans(change.before)
+    try:
+        spans = token_spans(change.before)
+    except UnreadableTokenSpans:
+        return False
     old, new = tokens(change.before), tokens(change.after)
     words = tuple(token.value.removeprefix("r#") for token in old)
     tests = cfg_test_items(words)

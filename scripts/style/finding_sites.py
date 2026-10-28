@@ -82,9 +82,33 @@ class SourceSites:
         return tuple(text for line, text in enumerate(self.lines, 1) if line not in covered)
 
     @cached_property
+    def span_reading(self) -> tuple[style_footprint.TokenSpan, ...] | style_footprint.UnreadableTokenSpans:
+        try:
+            return style_footprint.token_spans(self.source)
+        except style_footprint.UnreadableTokenSpans as error:
+            return error
+
+    @property
+    def spans(self) -> tuple[style_footprint.TokenSpan, ...]:
+        reading = self.span_reading
+        if isinstance(reading, style_footprint.UnreadableTokenSpans):
+            raise reading
+        return reading
+
+    @cached_property
+    def expands_source(self) -> bool:
+        """An expansion can hide a subject outside the tracked Rust token stream."""
+        words = tuple(span.token.value.removeprefix("r#") for span in self.spans)
+        return (any(word in {"include", "paste", "concat_idents", "concat"} and words[index + 1:index + 2] == ("!",)
+                    for index, word in enumerate(words))
+                or any(style_footprint.attribute_name(words, start) == "path"
+                       for start, _ in style_footprint.attribute_spans(words)))
+
+    @cached_property
     def item_reading(self) -> tuple[EnclosingItem, ...] | UnreadableSourceItems:
-        spans = style_footprint.token_spans(self.source)
-        if any(span.token.kind == "unknown" for span in spans):
+        try:
+            spans = self.spans
+        except style_footprint.UnreadableTokenSpans:
             return UnreadableSourceItems("unreadable Rust tokens")
         words = tuple(span.token.value for span in spans)
         ends = style_footprint.delimiter_ends(words)
@@ -93,21 +117,58 @@ class SourceSites:
             offsets.append(offsets[-1] + len(line))
         result: list[EnclosingItem] = []
 
+        def record(item: style_footprint.SourceItem, start: int, owner: tuple[str, ...]) -> bool:
+            first, keyword, last = start + item.start, start + item.keyword, start + item.end
+            identity = (*owner, item.title)
+            result.append(EnclosingItem(identity, item.kind,
+                                        bisect_right(offsets, spans[first].start),
+                                        bisect_right(offsets, spans[last - 1].end - 1)))
+            # Container bodies consist of items. Function, type and initializer bodies also
+            # contain statements, but any nested item still belongs to this complete chain.
+            cursor = keyword + 1
+            while cursor < last:
+                if words[cursor] in {"{", "(", "["}:
+                    close = ends.get(cursor)
+                    if close is None or close >= last:
+                        return False
+                    if item.kind in {"mod", "impl", "trait"} and words[cursor] == "{" and close == last - 1:
+                        return visit(cursor + 1, close, identity)
+                    if not nested(cursor + 1, close, identity):
+                        return False
+                    cursor = close + 1
+                else:
+                    cursor += 1
+            return True
+
+        def nested(start: int, end: int, owner: tuple[str, ...]) -> bool:
+            cursor = start
+            while cursor < end:
+                word = words[cursor]
+                if word in {"fn", "impl", "trait", "mod", "struct", "enum", "union", "type", "const", "static"}:
+                    last = style_footprint.item_end(words, ends, cursor + 1,
+                                                    body=word not in {"type", "const", "static"})
+                    if last is None or last > end:
+                        return False
+                    items = style_footprint.source_items(words[cursor:last])
+                    if items is None or len(items) != 1 or not record(items[0], cursor, owner):
+                        return False
+                    cursor = last
+                elif word in {"{", "(", "["}:
+                    close = ends.get(cursor)
+                    if close is None or close >= end or not nested(cursor + 1, close, owner):
+                        return False
+                    cursor = close + 1
+                else:
+                    cursor += 1
+            return True
+
         def visit(start: int, end: int, owner: tuple[str, ...]) -> bool:
             parsed = style_footprint.source_items(words[start:end])
             if parsed is None:
                 return False
             for item in parsed:
-                first, keyword, last = start + item.start, start + item.keyword, start + item.end
-                identity = (*owner, item.title)
-                result.append(EnclosingItem(identity, item.kind,
-                                            bisect_right(offsets, spans[first].start),
-                                            bisect_right(offsets, spans[last - 1].end - 1)))
-                if item.kind in {"mod", "impl", "trait"}:
-                    opening = next((word for word in range(keyword, last) if words[word] == "{" and ends.get(word) == last - 1), -1)
-                    if opening >= 0:
-                        if not visit(opening + 1, last - 1, identity):
-                            return False
+                if not record(item, start, owner):
+                    return False
             return True
 
         if spans and not visit(0, len(words), ()):
@@ -121,13 +182,16 @@ class SourceSites:
             raise reading
         return reading
 
-    def module_owner(self, line: int) -> tuple[tuple[str, ...], ...]:
-        return tuple(item.identity for item in self.items if item.kind == "mod" and item.first <= line <= item.last)
+    def owner_chain(self, line: int) -> tuple[tuple[str, ...], ...]:
+        return tuple(item.identity for item in self.items if item.first <= line <= item.last)
 
     def same_owner(self, old_line: int, other: SourceSites, new_line: int) -> bool:
         old = self.owner(old_line)
         new = other.owner(new_line)
-        if self.module_owner(old_line) != other.module_owner(new_line):
+        chain = self.owner_chain(old_line)
+        if (chain != other.owner_chain(new_line)
+                or any(sum(item.identity == identity for item in self.items) != 1
+                       or sum(item.identity == identity for item in other.items) != 1 for identity in chain)):
             return False
         text = self.lines[old_line - 1].strip()
         if isinstance(old, declarations.DeclaredItem) and isinstance(new, declarations.DeclaredItem):

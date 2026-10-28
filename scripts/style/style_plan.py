@@ -373,7 +373,10 @@ def approved_word_swaps(
 def approved_reference_tokens(
     before: str, after: str, pairs: tuple[ApprovedRename, ...], unique: frozenset[ApprovedRename],
 ) -> bool:
-    old, new = style_footprint.token_spans(before), style_footprint.token_spans(after)
+    try:
+        old, new = style_footprint.token_spans(before), style_footprint.token_spans(after)
+    except style_footprint.UnreadableTokenSpans:
+        return False
     if (before == after or len(old) != len(new)
             or len(old) != len(style_footprint.tokens(before))
             or len(new) != len(style_footprint.tokens(after))):
@@ -738,7 +741,10 @@ class RenamedText:
 
     def matches(self, after: str) -> bool:
         """Whether the worktree text has this code and these comment lines in canonical order."""
-        spans = style_footprint.token_spans(after)
+        try:
+            spans = style_footprint.token_spans(after)
+        except style_footprint.UnreadableTokenSpans:
+            return False
         return (len(spans) == len(style_footprint.tokens(after))
                 and self.code == style_footprint.canonical_code(
                     tuple(span.token.value for span in spans),
@@ -765,7 +771,10 @@ def renamed_text(repo: Path, path: str, before: str, moves: tuple[FileRename, ..
     which reads its parent from the HEAD words. The scan reads the file's `plain_words`, and a raw site keeps its `r#`,
     so `mod r#lock;` takes `mod r#mutation_lock;`. In comments, each `crate` path to a renamed module is renamed.
     """
-    old = style_footprint.token_spans(before)
+    try:
+        old = style_footprint.token_spans(before)
+    except style_footprint.UnreadableTokenSpans:
+        return NoRenamedText()
     if len(old) != len(style_footprint.tokens(before)):
         return NoRenamedText()
     words, plain = tuple(span.token.value for span in old), plain_words(old)
@@ -798,7 +807,10 @@ def renamed_text(repo: Path, path: str, before: str, moves: tuple[FileRename, ..
 def declares_module(repo: Path, path: str, text: str, file: str) -> bool:
     """Whether the Rust file at path, read as text, declares the module file, or has a token the scan cannot read, or
     the module file is not in a crate whose modules it can name."""
-    spans = style_footprint.token_spans(text)
+    try:
+        spans = style_footprint.token_spans(text)
+    except style_footprint.UnreadableTokenSpans:
+        return True
     root = crate_root(repo, file)
     if len(spans) != len(style_footprint.tokens(text)) or isinstance(root, NoCrateRoot):
         return True

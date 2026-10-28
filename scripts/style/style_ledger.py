@@ -1755,7 +1755,10 @@ def _rust_code(content: bytes) -> RustCode | NotTokenized:
     except UnicodeDecodeError:
         return NOT_TOKENIZED
     code = style_footprint.tokens(text)
-    spans = style_footprint.token_spans(text)
+    try:
+        spans = style_footprint.token_spans(text)
+    except style_footprint.UnreadableTokenSpans:
+        return NOT_TOKENIZED
     if len(spans) != len(code):
         return NOT_TOKENIZED
     # Only whitespace and comments lie between two code tokens, so each gap holds the comments at one code position.
@@ -1985,6 +1988,7 @@ class Ledger:
         self._site_rows: dict[tuple[str, str], tuple[Judgment, ...]] = {}
         self._site_holding_rows: dict[tuple[str, str], list[tuple[str, Judgment]]] = {}
         self._site_words: dict[str, tuple[frozenset[str], frozenset[str]]] = {}
+        self._site_expanding_crates: dict[str, frozenset[str]] = {}
         self._site_rule_families: dict[str, str] = {}
         self._file_modules: dict[tuple[str, str], dict[str, RootedFileModule]] = {}
         self._outside_diffs: dict[tuple[str, str, str, str], str] = {}
@@ -4407,6 +4411,7 @@ class Ledger:
         if tip.tree not in self._site_words:
             words: set[str] = set()
             literals: set[str] = set()
+            expanding: set[str] = set()
             # Include all Rust blobs, including ignored/vendor files, to rule out ordinary moves.
             blobs = {blob: blob for path, blob in tip.blobs.items() if path.endswith(".rs")
                      and blob not in self._site_sources}
@@ -4416,27 +4421,37 @@ class Ledger:
                 if path.endswith(".rs"):
                     if tip.entries[path].mode not in REGULAR_FILE_MODES:
                         raise LedgerError(f"{path}: nonregular Rust source cannot prove absence")
-                    source = self._site_sources[blob].source
+                    indexed = self._site_sources[blob]
+                    source = indexed.source
                     words.update(re.findall(r"[A-Za-z_][A-Za-z_0-9]*", source))
-                    tokens = style_footprint.tokens(source)
-                    if any(token.kind == "unknown" for token in tokens):
-                        raise LedgerError(f"{path}: unreadable Rust tokens cannot prove absence")
+                    tokens = tuple(span.token for span in indexed.spans)
+                    if indexed.expands_source:
+                        expanding.add(tip.crate(path))
                     literals.update(token.value for token in tokens if token.kind == "literal")
             self._site_words[tip.tree] = frozenset(words), frozenset(literals)
+            self._site_expanding_crates[tip.tree] = frozenset(expanding)
         return self._site_words[tip.tree]
 
-    def _original_site_inputs(self, finding: HeldFinding, read: RepositoryTip, tip: RepositoryTip) -> bool:
+    def _original_site_inputs(self, finding: HeldFinding, read: RepositoryTip, tip: RepositoryTip,
+                              *, line_local: bool = False) -> bool:
         """Retain the original judgment's scope even when today's rule has narrowed it."""
         candidates = [(path, row) for path, row in self._site_holding_rows.get((finding.rule, finding.ticket), ())
                       if _under(finding.path, path)]
+        contextual = finding.rule in {
+            "global:rust/no-duplicate-implementations.md", "global:rust/one-mechanism-per-behavior.md",
+            "global:rust/crate-apis-expose-behavior.md", "global:rust/behavior-lives-in-its-most-cohesive-crate.md",
+        }
         if not candidates:
-            return False
+            return line_local and not contextual
         longest = max(len(path) for path, _ in candidates)
         path, row = next((path, row) for path, row in candidates if len(path) == longest)
         if (row.rule_blob != finding.rule_blob or not self._is_ancestor(row.commit, tip.commit)
                 or row not in self._rows_after_removals(self._site_rows[(finding.rule, path)], tip.commit)):
             return False
         scope = _comparison_scope(row.declared_scope, row.input_scope)
+        whole_inputs = contextual or row.input_scope in (CellInputScope.CRATE, CellInputScope.MANIFEST)
+        if line_local and not whole_inputs:
+            return True
         original = self._tip(row.commit)
         if not self._judgment_inputs_match(row, original, scope, path, None):
             return False
@@ -4444,6 +4459,8 @@ class Ledger:
                else self._scope_inputs(original, scope, path))
         new = (_read_inputs(tip, path, row.reads) if isinstance(row.reads, ReadFiles)
                else self._scope_inputs(tip, scope, path))
+        if whole_inputs:
+            return old == new and self._is_ancestor(row.commit, read.commit)
         # A prior follow is site provenance, not authority to reset broader input evidence.
         return ({name: entry for name, entry in old.items() if name != finding.path}
                 == {name: entry for name, entry in new.items() if name != finding.path}
@@ -4472,7 +4489,7 @@ class Ledger:
         if key not in self._site_evidence:
             try:
                 self._site_evidence[key] = self._finding_site(finding, tip)
-            except (LedgerError, UnicodeDecodeError, finding_sites.UnreadableSourceItems):
+            except (LedgerError, UnicodeDecodeError, finding_sites.UnreadableSourceItems, style_footprint.UnreadableTokenSpans):
                 self._site_evidence[key] = NeedsJudgment("source or input proof unreadable")
         return self._site_evidence[key]
 
@@ -4505,14 +4522,14 @@ class Ledger:
                 return NeedsJudgment("not a regular source file")
         if family not in ("names", "values", "types", "modules"):
             return NeedsJudgment("pinned rule family unreadable")
+        if not self._original_site_inputs(finding, before, tip, line_local=family in ("names", "values")):
+            return NeedsJudgment("original context inputs changed or missing")
         old = self._site_source(before, finding.path)
         new = self._site_source(tip, finding.path)
         # A partial item parse cannot establish an unambiguous owner, even on an equal line.
         _ = old.items, new.items
         if before.blobs.get(finding.path) == tip.blobs.get(finding.path) and finding.path in tip.blobs:
             # The file gate itself is satisfied; context rules also retain their original external inputs.
-            if family in ("types", "modules") and not self._original_site_inputs(finding, before, tip):
-                return NeedsJudgment("original context inputs changed or missing")
             return UnchangedSite(finding.path, finding.line)
         if not (1 <= finding.line <= len(old.lines)):
             return NeedsJudgment("old source coordinate unreadable")
@@ -4536,11 +4553,13 @@ class Ledger:
                 and old.same_owner(finding.line, new, mapped)):
             if family in ("names", "values"):
                 return UnchangedSite(finding.path, mapped)
-            if old.same_item(finding.line, new, mapped) and self._original_site_inputs(finding, before, tip):
+            if old.same_item(finding.line, new, mapped):
                 return UnchangedSite(finding.path, mapped)
             return NeedsJudgment("enclosing item, owner, imports or original inputs changed")
         if family in ("names", "values"):
             words, literals = self._subject_words(tip)
+            if tip.crate(finding.path) in self._site_expanding_crates[tip.tree]:
+                return NeedsJudgment("crate source expansion prevents disappearance proof")
             return finding_sites.absent_subject(finding.kind, finding.rule, finding.before, line, words, literals)
         return NeedsJudgment("unchanged enclosing item not proved")
 

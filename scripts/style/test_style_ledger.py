@@ -32,6 +32,7 @@ import style_rules
 import berth_board
 import coverage_report
 import declarations
+import style_footprint
 
 
 PARENT_FILE = "crates/alpha/src/a.rs"
@@ -208,6 +209,45 @@ class StyleLedgerTests(unittest.TestCase):
         proof = cast(Callable[[style_ledger.HeldFinding, str], style_ledger.SiteEvidence], getattr(ledger, "_site_proof"))
         return proof(finding, at)
 
+    def test_context_site_refuses_deleted_same_file_duplicate_in_original_crate_scope(self) -> None:
+        source = "fn first() {\n    consume(791);\n}\nfn duplicate() {\n    consume(791);\n}\n"
+        ledger, _, finding = self.site_fixture("types", rule_name="no-duplicate-implementations",
+                                              scope="crate", source=source, before="791", kind="type")
+        tip = self.commit_tip(ledger, {PARENT_FILE: source[:source.index("fn duplicate")]})
+        self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.NeedsJudgment)
+        self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.NeedsJudgment)
+        _ = ledger.follow_declarations([finding.finding_id], tip, lambda _: True)
+        self.assertEqual(ledger.named_held([finding.finding_id])[0].follow, style_ledger.NotFollowed())
+
+    def test_site_owner_refuses_nested_function_moved_between_enclosing_functions(self) -> None:
+        source = "fn first() {\n    fn work() {\n        let old = 791;\n    }\n}\nfn second() {\n}\n"
+        ledger, _, finding = self.site_fixture(source=source, line=3)
+        moved = "fn first() {\n}\nfn second() {\n    fn work() {\n        let old = 791;\n    }\n}\n"
+        tip = self.commit_tip(ledger, {PARENT_FILE: moved})
+        self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.NeedsJudgment)
+        self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.NeedsJudgment)
+
+    def test_magic_site_refuses_withdrawal_when_crate_can_include_or_construct_rust(self) -> None:
+        ledger, _, finding = self.site_fixture("values", rule_name="no-magic-values", kind="restructure")
+        for expansion in ('include!("body.inc");', '#[path = "body.inc"] mod body;',
+                          'paste! { fn made() {} }', 'concat_idents!(na, me);', 'concat!("7", "91");'):
+            with self.subTest(expansion=expansion):
+                tip = self.commit_tip(ledger, {PARENT_FILE: "fn work() {}\n",
+                                               MOVED_FILE: expansion + "\n",
+                                               "crates/alpha/src/body.inc": "fn included() { consume(791); }\n"})
+                self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.NeedsJudgment)
+                self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.NeedsJudgment)
+
+    def test_site_proof_refuses_unicode_token_failure_instead_of_empty_parse(self) -> None:
+        source = "fn café() {\n    let old = 791;\n}\n"
+        ledger, _, finding = self.site_fixture(source=source)
+        tip = self.commit_tip(ledger, {PARENT_FILE: "// shift\n" + source})
+        self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.NeedsJudgment)
+        self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.NeedsJudgment)
+        with self.assertRaises(style_footprint.UnreadableTokenSpans):
+            _ = style_footprint.token_spans(source)
+        self.assertEqual(style_footprint.token_spans("// no code\n"), ())
+
     def test_site_follow_preserves_line_evidence_and_pinned_fields_without_restamping_cells(self) -> None:
         ledger, rule, finding = self.site_fixture()
         # A substantive rule edit must remain separate coverage work after the follow.
@@ -274,9 +314,15 @@ class StyleLedgerTests(unittest.TestCase):
         ledger, _, finding = self.site_fixture("types", scope="crate", kind="type")
         source = (self.repo / PARENT_FILE).read_text()
         tip = self.commit_tip(ledger, {PARENT_FILE: "fn sibling() {}\n" + source})
-        _ = ledger.follow_declarations([finding.finding_id], tip, lambda _: True)
+        self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.NeedsJudgment)
+        self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.NeedsJudgment)
+        tip = self.commit_tip(ledger, {PARENT_FILE: "fn sibling() {}\n", MOVED_FILE: "// moved\n" + source})
+        outcomes = ledger.follow_declarations([finding.finding_id], tip, lambda _: True)
+        self.assertIsInstance(outcomes.outcomes[0], style_ledger.DeclarationMoved)
         followed = ledger.named_held([finding.finding_id])[0]
         self.assertEqual(followed.line, 3)
+        self.assertEqual(followed.path, MOVED_FILE)
+        self.assertEqual(followed.follow, style_ledger.FollowedDeclaration(PARENT_FILE, 2, tip))
         _ = (self.rule_dir / "site-rule.md").write_text("---\ntier: C\nfamily: types\ninput_scope: file\n---\n# Narrowed\n")
         tip = self.commit_tip(ledger, {self.sources[1]: "fn changed_dependency() {}\n"})
         self.assertIsInstance(self.strict_site(ledger, followed, tip), style_ledger.NeedsJudgment)
