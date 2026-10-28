@@ -312,15 +312,17 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertEqual(self.notifier_calls(), [])
         self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
 
-    def test_register_refuses_a_session_not_named_for_the_production(self) -> None:
+    def test_register_warns_for_a_session_not_named_for_the_production_and_still_registers(self) -> None:
         record = self.state / "sessions" / f"{os.getpid()}.json"
         _ = record.write_text(json.dumps({"pid": os.getpid(), "sessionId": "current-session-id", "name": "other"}),
                               encoding="utf-8")
         result = self.run_command("register")
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("register: warn", result.stdout)
         self.assertIn("production example has showrunner other", result.stdout)
         self.assertIn("/showrunner:rename plan example other", result.stdout)
-        self.assertEqual(self.notifier_calls(), [])
+        self.assertIn("register: ok", result.stdout)
+        self.assertNotEqual(self.notifier_calls(), [])
 
     def test_missing_prompt_markers_fail_before_registration_changes(self) -> None:
         for marker in ("The prompt:", "**A tick**"):
