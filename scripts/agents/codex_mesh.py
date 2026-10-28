@@ -59,12 +59,14 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import ctypes
 import errno
 import fcntl
 import json
 import os
 import re
 import secrets
+import select
 import shlex
 import shutil
 import signal
@@ -81,7 +83,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NoReturn, NotRequired, NamedTuple, TextIO, TypedDict, cast, final
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.accounts.role_map import role_map_command, RoleMapUnavailable, RoleAccountUnavailable  # noqa: E402
+from scripts.accounts.role_map import is_role_map_host, role_map_command, RoleMapUnavailable, RoleAccountUnavailable  # noqa: E402
 from scripts.direct import plan_history
 from scripts.lib import unit_runs
 from scripts.guilds.roles import PhaseBoundDesigner, ReadOnlyReviewer, ThreadAccessPolicy
@@ -272,9 +274,9 @@ AUTO_COMPACT_TOKENS = 200_000
 BACKGROUND_TERMINAL_MAX_TIMEOUT_MS = 300_000
 # How long to keep watching after a turn ends for a queued turn already in flight.
 QUEUE_GRACE_SECS = 3.0
-# A resident worker sits between turns with nothing on the socket, so its loop
-# wakes this often to look for the end marker.
-RESIDENT_POLL_SECS = 1.0
+# Remote role changes have no local file notification. Check only that role
+# every five seconds off the authority; detached runs still use sixty seconds.
+REMOTE_ROLE_CHECK_SECS = 5.0
 # The SandboxMode strings a thread starts with: workers write, standing reviewers only read.
 WORKER_SANDBOX = "danger-full-access"
 READ_ONLY_SANDBOX = "read-only"
@@ -287,6 +289,7 @@ REAP_POLL_SECS = 0.2
 PAUSE_INTERRUPT_SECS = 15.0
 # A launcher waiting on a turn wakes this often to check that the turn has not ended unseen.
 UNSEEN_END_CHECK_SECS = 60.0
+DETACHED_RUN_CHECK_SECS = 60.0
 UNSEEN_END_CALL_SECS = 10.0
 # How fast a failure has to arrive to be read as this machine's fault rather
 # than the provider's. An app-server that has wedged answers from what it
@@ -714,6 +717,298 @@ def _parse_frame(text: str) -> RpcMessage | None:
 # ---------------------------------------------------------------------------
 
 
+class SessionStateChanged(Exception):
+    """A marker or inbox changed while the launcher was waiting for a frame."""
+
+
+@dataclass(frozen=True)
+class SocketOnlyWait:
+    """RPC replies must finish even when local state changes during the call."""
+
+
+SOCKET_ONLY_WAIT = SocketOnlyWait()
+
+
+class SocketReady(Enum):
+    """The watched connection can be read without blocking."""
+
+    READY = "ready"
+
+
+class WaitDeadlineExpired(Enum):
+    """No relevant event arrived before the monotonic wait deadline."""
+
+    EXPIRED = "expired"
+
+
+@dataclass(frozen=True)
+class StateFilesChanged:
+    paths: frozenset[Path]
+
+
+FileWaitResult = SocketReady | StateFilesChanged | WaitDeadlineExpired
+
+# inotify's parent watches discover replacements; only file watches subscribe
+# to content writes. Unrelated logs and heartbeats never enter our event queue.
+_IN_MODIFY = 0x00000002
+_IN_ATTRIB = 0x00000004
+_IN_MOVED_FROM = 0x00000040
+_IN_MOVED_TO = 0x00000080
+_IN_CREATE = 0x00000100
+_IN_DELETE = 0x00000200
+_IN_DELETE_SELF = 0x00000400
+_IN_MOVE_SELF = 0x00000800
+_IN_Q_OVERFLOW = 0x00004000
+_IN_IGNORED = 0x00008000
+_IN_REPLACEMENT = _IN_MOVED_FROM | _IN_MOVED_TO | _IN_CREATE | _IN_DELETE
+_IN_INVALIDATED = _IN_DELETE_SELF | _IN_MOVE_SELF | _IN_IGNORED
+
+
+@final
+class LinuxFileChanges:
+    """Watch state files directly, and names in parents only for replacements."""
+
+    def __init__(self, paths: set[Path]) -> None:
+        library = ctypes.CDLL(None, use_errno=True)
+        initialize = cast(Callable[[int], int], library.inotify_init1)
+        self._add_watch = cast(Callable[[int, bytes, int], int], library.inotify_add_watch)
+        self._remove_watch = cast(Callable[[int, int], int], library.inotify_rm_watch)
+        self.descriptor: int = initialize(os.O_CLOEXEC | os.O_NONBLOCK)
+        if self.descriptor < 0:
+            raise OSError(ctypes.get_errno(), "cannot watch follower state")
+        self.paths: set[Path] = paths
+        self.watches: dict[int, Path] = {}
+        self.directories: set[Path] = set()
+        try:
+            self._arm()
+        except BaseException:
+            self.close()
+            raise
+
+    def _arm(self) -> None:
+        wanted: dict[Path, int] = {}
+        for path in self.paths:
+            directory = path.parent
+            while not directory.is_dir():
+                directory = directory.parent
+            self.directories.add(directory)
+            wanted[directory] = _IN_REPLACEMENT | _IN_DELETE_SELF | _IN_MOVE_SELF
+            if path.is_file():
+                # ensure_server touches its record to extend the server lease.
+                # That metadata-only write does not change its serving identity.
+                wanted[path] = _IN_MODIFY | _IN_DELETE_SELF | _IN_MOVE_SELF
+                if path.name != SERVER_FILE:
+                    wanted[path] |= _IN_ATTRIB
+        for path, mask in wanted.items():
+            if path in self.watches.values():
+                continue
+            watch = self._add_watch(self.descriptor, os.fsencode(path), mask)
+            if watch < 0:
+                if ctypes.get_errno() == errno.ENOENT:
+                    continue  # The already armed parent reports the next creation.
+                raise OSError(ctypes.get_errno(), f"cannot watch {path}")
+            self.watches[watch] = path
+
+    def wait(self, connection: socket.socket, deadline: float) -> FileWaitResult:
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select(
+                [connection, self.descriptor], [], [], max(0.0, deadline - time.monotonic()))
+            changed: set[Path] = set()
+            if self.descriptor in ready:
+                data = os.read(self.descriptor, 65536)
+                offset = 0
+                while offset < len(data):
+                    watch, mask, _cookie, length = struct.unpack_from("iIII", data, offset)
+                    name = os.fsdecode(data[offset + 16:offset + 16 + length].split(b"\0", 1)[0])
+                    offset += 16 + length
+                    path = self.watches.get(watch)
+                    if mask & _IN_Q_OVERFLOW:
+                        changed.update(self.paths)
+                    if path is None:
+                        continue
+                    if path in self.directories:
+                        target = path / name
+                        changed.update(wanted for wanted in self.paths
+                                       if target == wanted or target in wanted.parents)
+                        # A replacement's pathname now names a different inode.
+                        for old_watch, old_path in tuple(self.watches.items()):
+                            if old_path == target and old_path not in self.directories:
+                                _ = self._remove_watch(self.descriptor, old_watch)
+                                _ = self.watches.pop(old_watch, None)
+                    else:
+                        changed.add(path)
+                    if mask & _IN_INVALIDATED:
+                        _ = self.watches.pop(watch, None)
+                self._arm()
+            if changed:
+                return StateFilesChanged(frozenset(changed))
+            if connection in ready:
+                return SocketReady.READY
+        return WaitDeadlineExpired.EXPIRED
+
+    def close(self) -> None:
+        os.close(self.descriptor)
+
+
+@dataclass(frozen=True)
+class WatchedFileVersion:
+    """The identity and content-write timestamp of a named state file."""
+
+    inode: int
+    size: int
+    modified_ns: int
+
+
+class MissingWatchedFile(Enum):
+    MISSING = "missing"
+
+
+def _watched_file_version(path: Path) -> WatchedFileVersion | MissingWatchedFile:
+    try:
+        record = path.stat()
+        return WatchedFileVersion(record.st_ino, record.st_size, record.st_mtime_ns)
+    except FileNotFoundError:
+        return MissingWatchedFile.MISSING
+
+
+@final
+class KqueueFileChanges:
+    """Filter parent vnode events through the versions of the watched files."""
+
+    def __init__(self, paths: set[Path]) -> None:
+        self.paths: set[Path] = paths
+        self.queue: select.kqueue = select.kqueue()
+        self.watches: dict[Path, int] = {}
+        self.versions: dict[Path, WatchedFileVersion | MissingWatchedFile] = {
+            path: _watched_file_version(path) for path in paths}
+        try:
+            self._arm()
+        except BaseException:
+            self.close()
+            raise
+
+    def _arm(self) -> None:
+        wanted = set(self.paths)
+        for path in self.paths:
+            directory = path.parent
+            while not directory.is_dir():
+                directory = directory.parent
+            wanted.add(directory)
+        for path in wanted - self.watches.keys():
+            try:
+                descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            except FileNotFoundError:
+                continue
+            self.watches[path] = descriptor
+            flags = select.KQ_NOTE_WRITE | select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME
+            if path in self.paths and path.name != SERVER_FILE:
+                flags |= select.KQ_NOTE_ATTRIB
+            _ = self.queue.control([select.kevent(descriptor, filter=select.KQ_FILTER_VNODE,
+                flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR, fflags=flags)], 0)
+
+    def wait(self, connection: socket.socket, deadline: float) -> FileWaitResult:
+        descriptor = connection.fileno()
+        _ = self.queue.control([select.kevent(descriptor, filter=select.KQ_FILTER_READ,
+            flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR)], 0)
+        try:
+            while time.monotonic() < deadline:
+                events = self.queue.control([], 64, max(0.0, deadline - time.monotonic()))
+                changed: set[Path] = set()
+                if any(event.filter == select.KQ_FILTER_VNODE for event in events):
+                    for path in self.paths:
+                        version = _watched_file_version(path)
+                        if version != self.versions[path]:
+                            self.versions[path] = version
+                            changed.add(path)
+                            old_descriptor = self.watches.pop(path, -1)
+                            if old_descriptor >= 0:
+                                os.close(old_descriptor)
+                    for event in events:
+                        if (event.filter == select.KQ_FILTER_VNODE
+                                and event.fflags & (select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME)):
+                            for path, watched_descriptor in tuple(self.watches.items()):
+                                if watched_descriptor == event.ident:
+                                    os.close(self.watches.pop(path))
+                    self._arm()
+                if changed:
+                    return StateFilesChanged(frozenset(changed))
+                if any(event.filter == select.KQ_FILTER_READ and event.ident == descriptor for event in events):
+                    return SocketReady.READY
+            return WaitDeadlineExpired.EXPIRED
+        finally:
+            # No READ registration for an earlier connection may wake a moved worker.
+            with contextlib.suppress(OSError):
+                _ = self.queue.control([select.kevent(descriptor, filter=select.KQ_FILTER_READ,
+                    flags=select.KQ_EV_DELETE)], 0)
+
+    def close(self) -> None:
+        self.queue.close()
+        for descriptor in self.watches.values():
+            os.close(descriptor)
+
+
+@final
+class FollowEvents:
+    """One follower's relevant file changes, multiplexed with its current socket."""
+
+    def __init__(self, session_dir: str, name: str) -> None:
+        from scripts.accounts.worker_names import accounts_config_file
+        from scripts.accounts.role_map import groups_file
+
+        folder = Path(session_dir)
+        paths = {folder / filename for filename in (
+            ROSTER_FILE, SERVER_FILE, plan_history.STATE_FILENAME,
+            f"{name}.pending.json", f"{name}.end", f"{name}.account-move.json",
+        )}
+        paths.update((accounts_config_file(), groups_file()))
+        self.roster_path: Path = folder / ROSTER_FILE
+        self.server_path: Path = folder / SERVER_FILE
+        self.name: str = name
+        self._changes: LinuxFileChanges | KqueueFileChanges = (
+            LinuxFileChanges(paths) if sys.platform.startswith("linux") else KqueueFileChanges(paths))
+        self.roster_state: dict[str, object] = self._roster_state()
+        self.server_state: dict[str, object] = _read_json_object(self.server_path)
+
+    def _roster_state(self) -> dict[str, object]:
+        entry = _as_dict(_read_json_object(self.roster_path).get(self.name))
+        return {key: entry.get(key) for key in (
+            "thread_id", "turn_id", "status", "port", "launcher_pid", "continuation_owed")}
+
+    def wait(self, connection: socket.socket, deadline: float) -> FileWaitResult:
+        while time.monotonic() < deadline:
+            result = self._changes.wait(connection, deadline)
+            if not isinstance(result, StateFilesChanged):
+                return result
+            relevant = set(result.paths)
+            if self.roster_path in relevant:
+                roster = self._roster_state()
+                if roster == self.roster_state:
+                    relevant.remove(self.roster_path)
+                self.roster_state = roster
+            if self.server_path in relevant:
+                server = _read_json_object(self.server_path)
+                if server == self.server_state:
+                    relevant.remove(self.server_path)
+                self.server_state = server
+            if relevant:
+                return StateFilesChanged(frozenset(relevant))
+        return WaitDeadlineExpired.EXPIRED
+
+    def close(self) -> None:
+        self._changes.close()
+
+
+# These deltas are never consumed by the launcher. Match only the top-level
+# method, before decoding potentially large output text; replies and completions
+# still go through the JSON decoder unchanged.
+_IGNORED_DELTA = re.compile(b"".join((
+    rb'^[{]\s*(?:"jsonrpc"\s*:\s*"2\.0"\s*,\s*)?"method"\s*:\s*"(?:',
+    rb'item/(?:commandExecution/outputDelta|agentMessage/delta|reasoning/[^"\\]*Delta|',
+    rb'plan/delta)|',
+    rb'thread/realtime/[^"\\]*delta)"\s*[,}]',
+)))
+
+
 @final
 class WebSocket:
     def __init__(self, port: int, host: str = "127.0.0.1", timeout: float = CONNECT_TIMEOUT_SECS) -> None:
@@ -727,7 +1022,12 @@ class WebSocket:
             ).encode()
         )
         buffer = b""
+        expires = time.monotonic() + timeout
         while b"\r\n\r\n" not in buffer:
+            remaining = expires - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("app-server handshake timed out")
+            self._sock.settimeout(remaining)
             chunk = self._sock.recv(4096)
             if not chunk:
                 raise ConnectionError("app-server closed during handshake")
@@ -736,7 +1036,7 @@ class WebSocket:
         if b" 101 " not in head.split(b"\r\n")[0]:
             detail = head.decode(errors="replace")[:200]
             raise ConnectionError(f"handshake refused: {detail}")
-        self._buffer: bytes = rest
+        self._buffer: bytearray = bytearray(rest)
 
     def settimeout(self, seconds: float) -> None:
         self._sock.settimeout(seconds)
@@ -758,33 +1058,56 @@ class WebSocket:
         frame += bytes(byte ^ mask[index % 4] for index, byte in enumerate(data))
         self._sock.sendall(bytes(frame))
 
-    def _fill(self, count: int) -> None:
+    def _fill(self, count: int, wake: FollowEvents | SocketOnlyWait) -> None:
+        expires = time.monotonic() + (self._sock.gettimeout() or CALL_TIMEOUT_SECS)
         while len(self._buffer) < count:
-            chunk = self._sock.recv(65536)
+            remaining = expires - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("app-server frame timed out")
+            self._sock.settimeout(remaining)
+            if isinstance(wake, FollowEvents):
+                result = wake.wait(self._sock, expires)
+                if isinstance(result, StateFilesChanged):
+                    raise SessionStateChanged()
+                if result is WaitDeadlineExpired.EXPIRED:
+                    raise TimeoutError("app-server frame timed out")
+            chunk = self._sock.recv(262144)
             if not chunk:
                 raise ConnectionError("app-server closed the connection")
-            self._buffer += chunk
+            self._buffer.extend(chunk)
 
-    def recv(self) -> RpcMessage | None:
-        """Read one frame. None means a non-JSON or non-text frame."""
-        self._fill(2)
+    @property
+    def has_pending_frames(self) -> bool:
+        """Bytes already read or ready on the socket must precede lifecycle readbacks."""
+        return bool(self._buffer) or bool(select.select([self._sock], [], [], 0)[0])
+
+    def wait_for_activity(self, wake: FollowEvents, deadline: float) -> None:
+        """Wake for unread bytes or file changes without consuming a notice."""
+        if not self._buffer:
+            _ = wake.wait(self._sock, deadline)
+
+    def recv(self, wake: FollowEvents | SocketOnlyWait = SOCKET_ONLY_WAIT) -> RpcMessage | None:
+        """Read one frame; None skips ignored deltas and non-JSON frames."""
+        self._fill(2, wake)
         opcode = self._buffer[0] & 0x0F
         length = self._buffer[1] & 0x7F
         offset = 2
         if length == 126:
-            self._fill(4)
-            length = _unpack_len(">H", self._buffer[2:4])
+            self._fill(4, wake)
+            length = _unpack_len(">H", bytes(self._buffer[2:4]))
             offset = 4
         elif length == 127:
-            self._fill(10)
-            length = _unpack_len(">Q", self._buffer[2:10])
+            self._fill(10, wake)
+            length = _unpack_len(">Q", bytes(self._buffer[2:10]))
             offset = 10
-        self._fill(offset + length)
-        payload = self._buffer[offset : offset + length]
-        self._buffer = self._buffer[offset + length :]
+        self._fill(offset + length, wake)
+        payload = bytes(self._buffer[offset : offset + length])
+        del self._buffer[:offset + length]
         if opcode == 0x8:
             raise ConnectionError("app-server sent close")
         if opcode not in (0x1, 0x2):
+            return None
+        if _IGNORED_DELTA.match(payload):
             return None
         return _parse_frame(payload.decode(errors="replace"))
 
@@ -809,6 +1132,7 @@ class Client:
         self._name: str = name
         self._counter: int = 0
         self._pending: list[RpcMessage] = []
+        self.wake: FollowEvents | SocketOnlyWait = SOCKET_ONLY_WAIT
         # experimentalApi is what unlocks thread/queue/*; without it those calls
         # fail with a bare -32600 that never mentions a capability.
         _ = self.call(
@@ -830,11 +1154,12 @@ class Client:
             )
         )
         deadline = time.time() + self._bounded(timeout)
-        while time.time() < deadline:
+        expires = time.monotonic() + max(0.0, deadline - time.time())
+        while time.monotonic() < expires:
             for index, message in enumerate(self._pending):
                 if message.get("id") == request_id:
                     return self._pending.pop(index)
-            frame = self._read(deadline)
+            frame = self._read(time.time() + max(0.0, expires - time.monotonic()))
             if frame is None:
                 continue
             if frame.get("id") == request_id:
@@ -847,13 +1172,22 @@ class Client:
             return timeout
         return max(0.1, min(timeout, self._deadline - time.time()))
 
-    def _read(self, deadline: float) -> RpcMessage | None:
-        remaining = max(0.1, deadline - time.time())
-        self._ws.settimeout(remaining)
-        try:
-            return self._ws.recv()
-        except TimeoutError:
-            return None
+    def _read(self, deadline: float, wake: FollowEvents | SocketOnlyWait = SOCKET_ONLY_WAIT) -> RpcMessage | None:
+        expires = time.monotonic() + max(0.0, deadline - time.time())
+        while time.monotonic() < expires:
+            self._ws.settimeout(max(0.001, expires - time.monotonic()))
+            try:
+                frame = self._ws.recv(wake)
+            except (TimeoutError, SessionStateChanged):
+                return None
+            if frame is not None:
+                return frame
+        return None
+
+    @property
+    def has_pending_frames(self) -> bool:
+        """Whether an RPC read buffered notices that the stream still must handle."""
+        return bool(self._pending) or self._ws.has_pending_frames
 
     def next_frame(self, deadline: float) -> RpcMessage | None:
         """Next frame of any kind, or None once `deadline` passes."""
@@ -861,11 +1195,19 @@ class Client:
             return self._pending.pop(0)
         if time.time() >= deadline:
             return None
-        return self._read(deadline)
+        return self._read(deadline, self.wake)
 
     def push_back(self, frame: RpcMessage) -> None:
         """Return a frame to the head of the stream for the next reader."""
         self._pending.insert(0, frame)
+
+    def wait_for_activity(self, wake: FollowEvents, deadline: float) -> None:
+        """Wait for new input, leaving RPC-buffered notices for the stream.
+
+        Pending notices deliberately do not wake this wait: the next state RPC
+        reads new socket bytes and preserves their order behind those notices.
+        """
+        self._ws.wait_for_activity(wake, deadline)
 
     def close(self) -> None:
         self._ws.close()
@@ -1339,13 +1681,17 @@ def _restore_follow_claim(session_dir: str, name: str, launcher_pid: int,
 def _wait_for_claimed_peer(client: Client, thread_id: str, turn_id: str,
                            deadline: float) -> bool:
     """Keep the claimed peer turn active until it finishes or the wait expires."""
-    while time.time() < deadline:
-        frame = client.next_frame(min(deadline, time.time() + RESIDENT_POLL_SECS))
+    expires = time.monotonic() + max(0.0, deadline - time.time())
+    while time.monotonic() < expires:
+        frame = client.next_frame(time.time() + min(
+            UNSEEN_END_CHECK_SECS, max(0.0, expires - time.monotonic())))
         if frame is not None and frame.get("method") in ("turn/completed", "turn/failed"):
             params = _as_dict(frame.get("params"))
             notice_id = _as_str(_as_dict(params.get("turn")).get("id"))
             if _as_str(params.get("threadId")) in ("", thread_id) and notice_id == turn_id:
                 return True
+        if client.has_pending_frames:
+            continue
         live = _read_live_turn(client, thread_id)
         if isinstance(live, ThreadIdle):
             return True
@@ -1597,15 +1943,30 @@ def _write_pending(handle: TextIO, thread_id: str, messages: list[str], *, accep
         "thread_id": thread_id, "messages": messages, "accepting_messages": accepting_messages,
     }
     _ = handle.seek(0)
+    if _as_dict(_loads(handle.read())) == stored:
+        return
+    _ = handle.seek(0)
     _ = handle.truncate()
     _ = handle.write(json.dumps(stored))
     handle.flush()
 
 
-def _close_messages_if_empty(session_dir: str, name: str, thread_id: str) -> bool:
+@dataclass(frozen=True)
+class FreshDetachedRunScan:
+    """A command outside a follower requests a new, uncached run observation."""
+
+
+FRESH_DETACHED_RUN_SCAN = FreshDetachedRunScan()
+
+
+def _close_messages_if_empty(
+    session_dir: str, name: str, thread_id: str,
+    runs: DetachedRunWatch | FreshDetachedRunScan = FRESH_DETACHED_RUN_SCAN,
+) -> bool:
     """Exclude senders while claiming an empty inbox and closing its launcher."""
     with _pending_file(session_dir, name) as handle:
-        if _pending_for_thread(handle, thread_id) or _detached_run_live(session_dir, name):
+        current = _run_watch(session_dir, name, runs).current()
+        if _pending_for_thread(handle, thread_id) or current.live or current.dead:
             return False
         _write_pending(handle, thread_id, [], accepting_messages=False)
         return True
@@ -1619,57 +1980,104 @@ def _close_messages_and_keep_pending(session_dir: str, name: str, thread_id: str
         return len(messages)
 
 
-def _detached_run_live(session_dir: str, name: str) -> bool:
-    """Whether a run the worker started with mesh_runs.py is still going.
-
-    A record with no pid yet counts as live for its first minute: `start` writes the record
-    before it spawns the supervisor and fills the pid in after.
-    """
-    folder = _session_path(session_dir, DETACHED_RUNS_DIR)
-    if not folder.is_dir():
-        return False
-    now = time.time()
-    for path in folder.glob("*.json"):
-        record = _read_json_object(path)
-        if record.get("worker") != name or record.get("status") != "running":
-            continue
-        pid = _as_int(record.get("pid"))
-        if pid > 0 and _pid_alive(pid):
-            return True
-        if pid == 0 and now - _as_float(record.get("started_at"), 0.0) < DETACHED_RUN_START_GRACE_SECS:
-            return True
-    return False
+def _detached_run_live(
+    session_dir: str, name: str,
+    runs: DetachedRunWatch | FreshDetachedRunScan = FRESH_DETACHED_RUN_SCAN,
+) -> bool:
+    """Refresh the watch before reporting whether a supervisor is live."""
+    return _run_watch(session_dir, name, runs).current().live
 
 
-def _end_dead_runs(session_dir: str, name: str) -> None:
-    """End the worker's runs whose supervisor is gone, so its launcher gets their FAIL result
-    instead of closing on nothing. The launcher calls this outside the inbox lock, which the
-    delivery takes."""
-    folder = _session_path(session_dir, DETACHED_RUNS_DIR)
-    if not folder.is_dir():
-        return
-    now = time.time()
-    for path in folder.glob("*.json"):
-        record = _read_json_object(path)
-        if record.get("worker") != name or record.get("status") != "running":
-            continue
-        pid = _as_int(record.get("pid"))
-        if (pid > 0 and not _pid_alive(pid)) or (
-                pid == 0 and now - _as_float(record.get("started_at"), now) >= DETACHED_RUN_START_GRACE_SECS):
-            try:
-                _ = subprocess.run([sys.executable, str(MESH_RUNS_SCRIPT), "reap", "--session-dir", session_dir,
-                                    "--worker", name], stdin=subprocess.DEVNULL, capture_output=True,
-                                   timeout=DEAD_RUN_END_TIMEOUT_SECS, check=False)
-            except (OSError, subprocess.SubprocessError):
-                pass
+def _end_dead_runs(
+    session_dir: str, name: str,
+    runs: DetachedRunWatch | FreshDetachedRunScan = FRESH_DETACHED_RUN_SCAN,
+) -> None:
+    """Reap dead supervisors outside the inbox lock, sharing the follower's one scan."""
+    watch = _run_watch(session_dir, name, runs)
+    watch.refresh()
+    watch.reap()
+
+
+@dataclass(frozen=True)
+class LastObservedDetachedRuns:
+    """A safety scan's liveness, which may be stale until the next scan."""
+
+    live: bool = False
+    dead: bool = False
+
+
+@dataclass(frozen=True)
+class CurrentDetachedRuns:
+    """Liveness scanned for the lifecycle decision the caller is making now."""
+
+    live: bool
+    dead: bool
+
+
+@dataclass
+class DetachedRunWatch:
+    """One launcher's run liveness, retaining immutable finished record names."""
+
+    session_dir: str
+    name: str
+    finished: set[str] = field(default_factory=set)
+    next_check: float = 0.0
+    last_observed: LastObservedDetachedRuns = field(default_factory=LastObservedDetachedRuns)
+
+    def refresh(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now < self.next_check:
             return
+        self.next_check = now + DETACHED_RUN_CHECK_SECS
+        live = dead = False
+        wall_now = time.time()
+        for path in _session_path(self.session_dir, DETACHED_RUNS_DIR).glob("*.json"):
+            if path.name in self.finished:
+                continue
+            record = _read_json_object(path)
+            if record.get("status") == "finished":
+                self.finished.add(path.name)
+                continue
+            if record.get("worker") != self.name or record.get("status") != "running":
+                continue
+            pid = _as_int(record.get("pid"))
+            alive = (_pid_alive(pid) if pid > 0 else
+                     wall_now - _as_float(record.get("started_at"), 0.0) < DETACHED_RUN_START_GRACE_SECS)
+            live |= alive
+            dead |= not alive
+        self.last_observed = LastObservedDetachedRuns(live, dead)
+
+    def current(self) -> CurrentDetachedRuns:
+        """Force discovery before a launcher closes or classifies a turn."""
+        self.refresh(force=True)
+        return CurrentDetachedRuns(self.last_observed.live, self.last_observed.dead)
+
+    def reap(self) -> None:
+        if not self.last_observed.dead:
+            return
+        self.last_observed = LastObservedDetachedRuns(self.last_observed.live, False)
+        try:
+            _ = subprocess.run([sys.executable, str(MESH_RUNS_SCRIPT), "reap", "--session-dir", self.session_dir,
+                                "--worker", self.name], stdin=subprocess.DEVNULL, capture_output=True,
+                               timeout=DEAD_RUN_END_TIMEOUT_SECS, check=False)
+        except (OSError, subprocess.SubprocessError):
+            pass
 
 
-def _waiting_on_detached_run(session_dir: str, name: str, thread_id: str) -> bool:
+def _run_watch(session_dir: str, name: str, runs: DetachedRunWatch | FreshDetachedRunScan) -> DetachedRunWatch:
+    return runs if isinstance(runs, DetachedRunWatch) else DetachedRunWatch(session_dir, name)
+
+
+def _waiting_on_detached_run(
+    session_dir: str, name: str, thread_id: str,
+    runs: DetachedRunWatch | FreshDetachedRunScan = FRESH_DETACHED_RUN_SCAN,
+) -> bool:
     """A live run with nothing held yet: the launcher stays attached and makes no calls."""
     with _pending_file(session_dir, name) as handle:
         held = bool(_pending_for_thread(handle, thread_id))
-    return not held and _detached_run_live(session_dir, name)
+    watch = _run_watch(session_dir, name, runs)
+    live = _detached_run_live(session_dir, name, watch)
+    return not held and (live or watch.last_observed.dead)
 
 
 @dataclass(frozen=True)
@@ -2445,14 +2853,16 @@ def _more_work_coming(client: Client, thread_id: str, deadline: float) -> bool:
     # returned to the buffer is the next thing `next_frame` hands out, so
     # push-as-you-go would re-serve the same frame and never reach the socket.
     grace = min(time.time() + QUEUE_GRACE_SECS, deadline)
+    expires = time.monotonic() + max(0.0, grace - time.time())
     held: list[RpcMessage] = []
     started = False
-    while time.time() < grace:
-        frame = client.next_frame(grace)
+    while time.monotonic() < expires:
+        frame = client.next_frame(time.time() + max(0.0, expires - time.monotonic()))
         if frame is None:
             continue
         held.append(frame)
-        if frame.get("method") == "turn/started":
+        if (frame.get("method") == "turn/started"
+                and _as_str(_as_dict(frame.get("params")).get("threadId")) in ("", thread_id)):
             started = True
             break
     for frame in reversed(held):
@@ -2635,6 +3045,7 @@ def _turn_outcome(method: str, params: dict[str, object]) -> TurnOutcome:
 
 def _interrupted_for_held_work(
     method: str, params: dict[str, object], session_dir: str, name: str, thread_id: str,
+    runs: DetachedRunWatch | FreshDetachedRunScan = FRESH_DETACHED_RUN_SCAN,
 ) -> bool:
     """An interrupted turn with no error while a run is live or a message is held.
 
@@ -2648,7 +3059,8 @@ def _interrupted_for_held_work(
         return False
     with _pending_file(session_dir, name) as handle:
         held = bool(_pending_for_thread(handle, thread_id))
-    return held or _detached_run_live(session_dir, name)
+    current = _run_watch(session_dir, name, runs).current()
+    return held or current.live or current.dead
 
 
 def _retry_warranted(outcome: RunOutcome, fresh_server: bool, resident: bool) -> bool:
@@ -2965,13 +3377,13 @@ def _compact_thread(client: Client, thread_id: str) -> KnownContextSize:
         client.call("thread/compact/start", {"threadId": thread_id}),
         "thread/compact/start",
     )
-    deadline = time.time() + CALL_TIMEOUT_SECS
+    expires = time.monotonic() + CALL_TIMEOUT_SECS
     compacted_turn = ""
     started_turn = ""
     sizes_by_turn: dict[str, KnownContextSize] = {}
     completed_turns: set[str] = set()
-    while time.time() < deadline:
-        frame = client.next_frame(deadline)
+    while time.monotonic() < expires:
+        frame = client.next_frame(time.time() + max(0.0, expires - time.monotonic()))
         if frame is None:
             continue
         params = _as_dict(frame.get("params"))
@@ -3016,10 +3428,11 @@ def _compact_thread(client: Client, thread_id: str) -> KnownContextSize:
 
 def _wait_for_idle(client: Client, thread_id: str) -> ThreadState:
     """Read the thread until it is idle or `COMPACT_IDLE_WAIT_SECS` pass; returns the last state read."""
-    deadline = time.time() + COMPACT_IDLE_WAIT_SECS
+    expires = time.monotonic() + COMPACT_IDLE_WAIT_SECS
     while True:
         state = _read_live_turn(client, thread_id)
-        if isinstance(state, (ThreadIdle, ThreadStateUnknown)) or time.time() >= deadline:
+        if (isinstance(state, (ThreadIdle, ThreadStateUnknown))
+                or time.monotonic() >= expires):
             return state
         time.sleep(COMPACT_IDLE_POLL_SECS)
 
@@ -3325,6 +3738,7 @@ class TurnStream:
     port: int
     thread_id: str
     failure_serving: CodexServingState
+    runs: DetachedRunWatch
     turn_id: str = ""
     # The turn a follow watches; empty between its turns.
     followed_turn: str = ""
@@ -3335,6 +3749,8 @@ class TurnStream:
     capacity_waited: float = 0.0
     capacity_retries: int = 0
     resume_owed: bool = False
+    # A peer turn or an actual backoff satisfies the refused turn's wait.
+    capacity_backoff_owed: bool = False
     # Whether the owed capacity resume continues an earlier quota continuation.
     capacity_submission: QuotaContinuationTurn | UnrelatedWorkerTurn = UNRELATED_WORKER_TURN
     waiting_for_progress_after_overflow: bool = False
@@ -3342,6 +3758,8 @@ class TurnStream:
     pending_refusal: PendingQuotaRefusal | NoPendingQuotaRefusal = field(default_factory=NoPendingQuotaRefusal)
     reported_turns: set[tuple[CodexServingState, str, str]] = field(default_factory=set)
     room_wait_logged: bool = False
+    events: FollowEvents | SocketOnlyWait = SOCKET_ONLY_WAIT
+    state_change_owed: bool = False
 
 
 class StreamStep(Enum):
@@ -3429,11 +3847,13 @@ def _stream_turn(
         reply_path=Path(reply_file) if reply_file else None,
         end_marker=end_marker, director=director,
         client=client, port=initial_port, thread_id=initial_thread_id, failure_serving=failure_serving,
+        runs=DetachedRunWatch(session_dir, name),
     )
     with _pending_file(session_dir, name) as handle:
         _write_pending(handle, initial_thread_id, _pending_for_thread(handle, initial_thread_id))
     try:
-        with log_path.open("a", encoding="utf-8") as log:
+        with contextlib.closing(FollowEvents(session_dir, name)) as events, log_path.open("a", encoding="utf-8") as log:
+            stream.events = events
             _ = log.write(f"[{_now_stamp()}] mesh: {name} thread {stream.thread_id}\n")
             log.flush()
             started = _start_streamed_turn(stream, prompt, log)
@@ -3487,15 +3907,43 @@ def _stream_frames(stream: TurnStream, log: TextIO) -> FailedWithThread | None:
 
     Returns the outcome of a capacity launcher that stopped without a resume turn.
     """
-    while time.time() < stream.deadline:
-        # A resident thread must wake to see `end` between turns. Any other
-        # wakes to check that its turn has not ended without the notice.
-        # Account-move intent can arrive while a completion notice is lost.
-        # Wake on the resident cadence so moves and held detached-run results
-        # open their continuation promptly, including one-turn launchers.
-        poll = min(RESIDENT_POLL_SECS, UNSEEN_END_CHECK_SECS)
-        frame = stream.client.next_frame(min(stream.deadline, time.time() + poll))
+    run_watch = stream.runs
+    run_watch.refresh()
+    next_check = time.monotonic() + UNSEEN_END_CHECK_SECS
+    expires = time.monotonic() + max(0.0, stream.deadline - time.time())
+    next_role_check = (time.monotonic() + REMOTE_ROLE_CHECK_SECS
+                       if stream.resident and not is_role_map_host() else expires)
+    while time.monotonic() < expires:
+        # File events wake immediately; the one-minute deadline only repairs
+        # missing server notices and checks detached supervisors. Streaming
+        # output cannot postpone those checks indefinitely.
+        # Run maintenance never waits for notices to drain. In particular its
+        # next deadline cannot remain expired while bytes await a socket read.
+        runs_due = time.monotonic() >= run_watch.next_check
+        if runs_due:
+            _end_dead_runs(stream.session_dir, stream.name, run_watch)
+        if time.monotonic() >= next_role_check:
+            _check_remote_role(stream, log)
+            next_role_check = time.monotonic() + REMOTE_ROLE_CHECK_SECS
+        if (time.monotonic() >= next_check or runs_due
+                or (stream.state_change_owed and not stream.client.has_pending_frames)):
+            step = _on_quiet_poll(stream, log)
+            next_check = time.monotonic() + UNSEEN_END_CHECK_SECS
+            if isinstance(step, FailedWithThread):
+                return step
+            if step is StreamStep.FINISH:
+                break
+        stream.client.wake = stream.events
+        read_until = min(expires, next_check, run_watch.next_check, next_role_check)
+        frame = stream.client.next_frame(time.time() + max(0.0, read_until - time.monotonic()))
+        if frame is None:
+            if time.monotonic() >= next_role_check:
+                # A remote role tick performs no thread/read or run scan.
+                continue
+            stream.state_change_owed = True
         step = _on_quiet_poll(stream, log) if frame is None else _on_frame(stream, log, frame)
+        if frame is None and time.monotonic() >= next_check:
+            next_check = time.monotonic() + UNSEEN_END_CHECK_SECS
         if isinstance(step, FailedWithThread):
             return step
         if step is StreamStep.FINISH:
@@ -3587,30 +4035,53 @@ def _wait_for_room(stream: TurnStream, log: TextIO, waiting: WorkerWaitingForRoo
     return StreamStep.FINISH
 
 
-def _on_quiet_poll(stream: TurnStream, log: TextIO) -> StreamStep:
-    """No frame arrived within one poll: catch a move, an unseen end or a resident off its server."""
+def _on_quiet_poll(stream: TurnStream, log: TextIO) -> StreamStep | FailedWithThread:
+    """A file changed or the safety deadline passed: check lifecycle and owed work."""
+    # Notifications can be in the WebSocket buffer after an RPC reply, rather
+    # than Client's notice queue. Drain both before a readback can infer idle or
+    # consume a queued peer's completion. Keep the file wake owed until then.
+    _end_dead_runs(stream.session_dir, stream.name, stream.runs)
+    if stream.client.has_pending_frames:
+        stream.state_change_owed = True
+        return StreamStep.NEXT_FRAME
+    stream.state_change_owed = False
     if not stream.resume_owed:
         stream.pending_refusal = _pending_after_completion_readback(stream.pending_refusal, stream.client)
     account_move = _read_account_move(stream.session_dir, stream.name, stream.thread_id)
     if (isinstance(account_move, AccountMoveMarker) and not stream.end_marker.exists()
             and _ended_unseen(stream.client, stream.thread_id)):
         return _resume_marked_account_move(stream, log, account_move)
+    if stream.resume_owed:
+        return _resume_owed_turn(stream, log, refused_for_capacity=stream.capacity_backoff_owed)
     if not stream.resident and time.time() < stream.deadline:
         return _finish_if_ended_unseen(stream, log)
     if stream.end_marker.exists():
         return StreamStep.FINISH
     if stream.resident:
+        entry = _as_dict(_read_json_object(_session_path(stream.session_dir, ROSTER_FILE)).get(stream.name))
+        if (_finished_run(stream.session_dir) or entry.get("status") in ("done", "failed", "paused", "ended")):
+            if _ended_unseen(stream.client, stream.thread_id):
+                if stream.client.has_pending_frames:
+                    stream.state_change_owed = True
+                    return StreamStep.NEXT_FRAME
+                if _close_messages_if_empty(stream.session_dir, stream.name, stream.thread_id, stream.runs):
+                    return StreamStep.FINISH
         _keep_resident_on_selected_server(stream, log)
     return StreamStep.NEXT_FRAME
 
 
 def _finish_if_ended_unseen(stream: TurnStream, log: TextIO) -> StreamStep:
     """Finish a one-turn launcher whose thread went idle without a completion notice."""
-    _end_dead_runs(stream.session_dir, stream.name)
-    if _waiting_on_detached_run(stream.session_dir, stream.name, stream.thread_id):
+    _end_dead_runs(stream.session_dir, stream.name, stream.runs)
+    if _waiting_on_detached_run(stream.session_dir, stream.name, stream.thread_id, stream.runs):
         return StreamStep.NEXT_FRAME
     quota_owed = _continuation_is_owed(stream.session_dir, stream.name)
     if stream.resume_owed or not _ended_unseen(stream.client, stream.thread_id):
+        return StreamStep.NEXT_FRAME
+    # The read-back RPC may have received the completion or answer ahead of
+    # its reply. Process those frames before inferring a missing notice.
+    if stream.client.has_pending_frames:
+        stream.state_change_owed = True
         return StreamStep.NEXT_FRAME
     # A move can write its marker and interrupt after the first marker read.
     if (isinstance(_read_account_move(stream.session_dir, stream.name, stream.thread_id), AccountMoveMarker)
@@ -3626,17 +4097,28 @@ def _finish_if_ended_unseen(stream: TurnStream, log: TextIO) -> StreamStep:
             return StreamStep.NEXT_FRAME
         if isinstance(moved, MovedWorker) and _adopt_moved_worker(stream, moved):
             return StreamStep.NEXT_FRAME
-        if not _close_messages_if_empty(stream.session_dir, stream.name, stream.thread_id):
+        if not _close_messages_if_empty(stream.session_dir, stream.name, stream.thread_id, stream.runs):
             return StreamStep.NEXT_FRAME
     if quota_owed:
         return StreamStep.NEXT_FRAME
     _ = log.write(f"[{_now_stamp()}] mesh: {stream.name} thread is idle and no "
                   + "completion notice arrived; finishing\n")
     log.flush()
-    stream.failure = stream.followed_failure or (
+    stream.failure = stream.followed_failure or stream.failure or (
         "" if stream.final_answer
         else "the thread went idle with no completion notice and no answer")
     return StreamStep.FINISH
+
+
+@role_map_command
+def _check_remote_role(stream: TurnStream, log: TextIO) -> None:
+    """A remote role tick checks selection only; unchanged roles do no RPCs."""
+    if not stream.resident:
+        return
+    selected_home = workers_home()
+    record = _read_json_object(_session_path(stream.session_dir, SERVER_FILE))
+    if server_record_home(record) != selected_home or record.get("port") != stream.port:
+        _keep_resident_on_selected_server(stream, log)
 
 
 def _keep_resident_on_selected_server(stream: TurnStream, log: TextIO) -> None:
@@ -3687,6 +4169,8 @@ def _on_turn_started(stream: TurnStream, params: dict[str, object]) -> None:
     live = _as_str(_as_dict(params.get("turn")).get("id"))
     if live and (not stream.follow or not stream.followed_turn or live == stream.followed_turn):
         stream.turn_id = live
+        if stream.resume_owed:
+            stream.capacity_backoff_owed = False
         if stream.follow:
             stream.followed_turn = live
         _ = _update_roster_if_expected(
@@ -3744,7 +4228,7 @@ def _on_turn_end(
     if (isinstance(account_move, AccountMoveMarker) and not stream.end_marker.exists()
             and (not notice_turn or notice_turn == account_move.turn_id)):
         return _resume_marked_account_move(stream, log, account_move)
-    if _interrupted_for_held_work(method, params, stream.session_dir, stream.name, stream.thread_id):
+    if _interrupted_for_held_work(method, params, stream.session_dir, stream.name, stream.thread_id, stream.runs):
         turn_outcome = TurnCompleted()
     if isinstance(turn_outcome, TurnFailed):
         _record_turn_failure(stream, notice_turn, turn_outcome)
@@ -3754,6 +4238,7 @@ def _on_turn_end(
         return _on_capacity_refusal(stream, log, notice_turn)
     stream.capacity_waited = 0.0
     stream.capacity_retries = 0
+    stream.capacity_backoff_owed = False
     stream.waiting_for_progress_after_overflow = False
     if stream.resume_owed:
         return _resume_owed_turn(stream, log, refused_for_capacity=False)
@@ -3832,6 +4317,7 @@ def _on_capacity_refusal(stream: TurnStream, log: TextIO, notice_turn: str) -> S
         stream.capacity_submission = _quota_retry_submission(
             stream.pending_refusal, stream.thread_id, notice_turn or stream.turn_id)
     stream.resume_owed = True
+    stream.capacity_backoff_owed = True
     thread_id = stream.thread_id
     _move_queue_to_pending(
         stream.client, thread_id, lambda message: _add_pending(stream.session_dir, stream.name, thread_id, message))
@@ -3858,9 +4344,18 @@ def _on_capacity_refusal(stream: TurnStream, log: TextIO, notice_turn: str) -> S
         stopped = _capacity_launcher_stopped(stream, log)
         if stopped is not None:
             return stopped
-    if not isinstance(_read_known_turn(stream), ThreadIdle):
+    live = _read_known_turn(stream)
+    if isinstance(live, ThreadLive) and live.turn_id != stream.turn_id:
+        stream.capacity_backoff_owed = False
+    # The readback can overtake the stream's dispatch of a peer's start/end.
+    # Those notices decide whether a backoff is still owed. Keep this check
+    # owed until they drain, even when this read already says idle.
+    if stream.client.has_pending_frames:
+        stream.state_change_owed = True
         return StreamStep.NEXT_FRAME
-    return _resume_owed_turn(stream, log, refused_for_capacity=True)
+    if not isinstance(live, ThreadIdle):
+        return _watch_turn_opened_while_owed(stream, log, live)
+    return _resume_owed_turn(stream, log, refused_for_capacity=stream.capacity_backoff_owed)
 
 
 def _capacity_launcher_stopped(stream: TurnStream, log: TextIO) -> FailedWithThread | None:
@@ -3887,6 +4382,11 @@ def _resume_owed_turn(stream: TurnStream, log: TextIO, *, refused_for_capacity: 
     if refused_for_capacity and not _wait_out_capacity(stream, log):
         return StreamStep.NEXT_FRAME
     live = _read_known_turn(stream)
+    if isinstance(live, ThreadLive) and live.turn_id != stream.turn_id:
+        stream.capacity_backoff_owed = False
+    if stream.client.has_pending_frames:
+        stream.state_change_owed = True
+        return StreamStep.NEXT_FRAME
     if not isinstance(live, ThreadIdle):
         return _watch_turn_opened_while_owed(stream, log, live)
     with _pending_file(stream.session_dir, stream.name):
@@ -3903,6 +4403,7 @@ def _resume_owed_turn(stream: TurnStream, log: TextIO, *, refused_for_capacity: 
         return _wait_for_room(stream, log, started)
     _adopt_started_turn(stream, started)
     stream.resume_owed = False
+    stream.capacity_backoff_owed = False
     return StreamStep.NEXT_FRAME
 
 
@@ -3911,7 +4412,6 @@ def _wait_out_capacity(stream: TurnStream, log: TextIO) -> bool:
     remaining = CAPACITY_BUDGET_SECS - stream.capacity_waited
     wait = min(CAPACITY_WAIT_SECS * 2.0 ** stream.capacity_retries,
                CAPACITY_MAX_WAIT_SECS, remaining)
-    stream.capacity_retries += 1
     with _pending_file(stream.session_dir, stream.name):
         _ = _update_roster_if_expected(
             stream.session_dir,
@@ -3923,8 +4423,15 @@ def _wait_out_capacity(stream: TurnStream, log: TextIO) -> bool:
             },
             RosterOnThread(stream.thread_id),
         )
-    if not isinstance(_read_known_turn(stream), ThreadIdle):
+    live = _read_known_turn(stream)
+    if isinstance(live, ThreadLive) and live.turn_id != stream.turn_id:
+        stream.capacity_backoff_owed = False
+    if stream.client.has_pending_frames:
+        stream.state_change_owed = True
         return False
+    if not isinstance(live, ThreadIdle):
+        return False
+    stream.capacity_retries += 1
     next_at = datetime.now().astimezone().timestamp() + wait
     next_stamp = datetime.fromtimestamp(next_at).astimezone().isoformat(timespec="seconds")
     _ = log.write(f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] capacity retry {stream.capacity_retries}: next turn at {next_stamp}\n")
@@ -3932,6 +4439,7 @@ def _wait_out_capacity(stream: TurnStream, log: TextIO) -> bool:
     wait_started = _capacity_clock()
     _capacity_sleep(wait)
     stream.capacity_waited += max(wait, _capacity_clock() - wait_started)
+    stream.capacity_backoff_owed = False
     return True
 
 
@@ -4001,7 +4509,6 @@ def _after_turn_end(stream: TurnStream, log: TextIO, turn_outcome: TurnOutcome) 
         if isinstance(moved, MovedWorker) and _adopt_moved_worker(stream, moved):
             return StreamStep.NEXT_FRAME
         if owed and isinstance(moved, WorkerWaitingOnLiveTurn):
-            time.sleep(RESIDENT_POLL_SECS)
             return StreamStep.NEXT_FRAME
     if not stream.resident:
         return _finish_one_turn_launch(stream, log)
@@ -4016,14 +4523,21 @@ def _after_turn_end(stream: TurnStream, log: TextIO, turn_outcome: TurnOutcome) 
 
 def _finish_one_turn_launch(stream: TurnStream, log: TextIO) -> StreamStep:
     """Finish a one-turn launcher unless more work is coming to its thread."""
+    # A run may have started since the last safety scan. Discover it before
+    # claiming an empty inbox; finished records are still never reopened.
+    _ = stream.runs.current()
     # A finished turn may have a peer turn opening behind it.
-    if _more_work_coming(stream.client, stream.thread_id, stream.deadline):
+    if (_more_work_coming(stream.client, stream.thread_id, stream.deadline)
+            or stream.client.has_pending_frames):
+        # An idle readback can arrive before dispatch of a peer's completion.
+        # Finish only after every notice it buffered has had its turn.
+        stream.state_change_owed = True
         return StreamStep.NEXT_FRAME
-    _end_dead_runs(stream.session_dir, stream.name)
-    if _close_messages_if_empty(stream.session_dir, stream.name, stream.thread_id):
+    _end_dead_runs(stream.session_dir, stream.name, stream.runs)
+    if _close_messages_if_empty(stream.session_dir, stream.name, stream.thread_id, stream.runs):
         return StreamStep.FINISH
     # The turn ended on a run still going: stay attached until its result is held.
-    if _waiting_on_detached_run(stream.session_dir, stream.name, stream.thread_id):
+    if _waiting_on_detached_run(stream.session_dir, stream.name, stream.thread_id, stream.runs):
         return StreamStep.NEXT_FRAME
     moved = _move_worker(stream)
     if isinstance(moved, WorkerWaitingForRoom):
@@ -4542,28 +5056,34 @@ def _start_workers_turn(
     quota_recovery: WorkerAwaitingQuotaRecovery | NoSubmissionQuotaRefusal = NoSubmissionQuotaRefusal()
     try:
         deadline = time.monotonic() + _as_float(_attr(args, "timeout"), 86400.0)
-        while time.monotonic() < deadline:
-            result = _move_resident(args, session_dir, name, thread_id, client, message=message)
-            if isinstance(result, WorkerWaitingForRoom):
-                return result
-            if isinstance(result, WorkerThreadStateUnknown):
-                raise WorkerMoveUncertain(thread_id, result)
-            if isinstance(result, MovedWorker) and not isinstance(result, WorkerAwaitingQuotaRecovery):
-                if isinstance(submission, QuotaContinuationTurn):
-                    result = replace(result, submission=submission)
-                if isinstance(quota_recovery, WorkerAwaitingQuotaRecovery):
-                    refusal = quota_recovery.refusal
-                    return replace(result, pending_refusal=PendingQuotaRefusal(refusal.serving, str(refusal)))
-                return result
-            if isinstance(result, WorkerAwaitingQuotaRecovery):
-                quota_recovery = result
-                client, thread_id = result.client, result.thread_id
-            if _continuation_is_owed(session_dir, name):
-                # A rejected submission's prompt was already handed to Codex; only the continuation is owed.
-                message = ""
-            if _end_marker_path(session_dir, name).exists():
-                raise SystemExit(f"thread {thread_id}: ended while waiting; no turn started")
-            time.sleep(RESIDENT_POLL_SECS)
+        # Arm before submission: the refusal reporter may synchronously change
+        # the selected account. Its notification must survive until we wait.
+        with contextlib.closing(FollowEvents(session_dir, name)) as events:
+            while time.monotonic() < deadline:
+                result = _move_resident(args, session_dir, name, thread_id, client, message=message)
+                if isinstance(result, WorkerWaitingForRoom):
+                    return result
+                if isinstance(result, WorkerThreadStateUnknown):
+                    raise WorkerMoveUncertain(thread_id, result)
+                if isinstance(result, MovedWorker) and not isinstance(result, WorkerAwaitingQuotaRecovery):
+                    if isinstance(submission, QuotaContinuationTurn):
+                        result = replace(result, submission=submission)
+                    if isinstance(quota_recovery, WorkerAwaitingQuotaRecovery):
+                        refusal = quota_recovery.refusal
+                        return replace(result, pending_refusal=PendingQuotaRefusal(refusal.serving, str(refusal)))
+                    return result
+                if isinstance(result, WorkerAwaitingQuotaRecovery):
+                    quota_recovery = result
+                    client, thread_id = result.client, result.thread_id
+                if _continuation_is_owed(session_dir, name):
+                    # A rejected submission's prompt was already handed to Codex; only the continuation is owed.
+                    message = ""
+                if _end_marker_path(session_dir, name).exists():
+                    raise SystemExit(f"thread {thread_id}: ended while waiting; no turn started")
+                # The following stream owns every notice, including ones the
+                # move's RPCs buffered. Waiting must neither pop those notices
+                # nor let their continued presence trigger a busy retry loop.
+                client.wait_for_activity(events, min(deadline, time.monotonic() + UNSEEN_END_CHECK_SECS))
         raise SystemExit(f"thread {thread_id}: still live at the timeout; no new turn started")
 
     except (ConnectionError, OSError, SystemExit) as error:
