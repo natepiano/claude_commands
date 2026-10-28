@@ -155,6 +155,37 @@ key and unrelated settings. Each atomic write is read back after two seconds,
 with at most three attempts if the new key disappears. Persistent loss refuses
 and names the file; the next launch needs a trust prompt.
 
+## Showrunner checkout
+
+`rename.py checkout <slug> [<path>]` (`rename_checkout.checkout`) moves the
+showrunner's own checkout, a linked worktree, to a new path. The default path
+is the checkout's basename with a Formerly name replaced by the slug
+(`claude-build-followups-trunk` becomes `claude-natedev-trunk`); a basename
+with no Formerly name in it needs the path argument. The showrunner cannot
+move the folder it runs in, so the move happens in the shutdown conductor
+between its stop and its launch:
+
+1. The first run refuses an existing destination, a main worktree, and a
+   showrunner that already has a shutdown record. It then runs
+   `shutdown.py down --only <session> --restart --here --checkout-move OLD NEW`
+   for the session the update timer's `TARGET` names, and refuses when the
+   record it made does not carry `checkout_move`.
+2. The conductor's launch (`restart.move_checkout`) calls
+   `rename_checkout.move(old, new)`: `git worktree move` and `git worktree
+   repair`, the Claude project folder and each account's folder trust, every
+   timer's `CHECK` and `RUN` line, each child doc's Parent production line,
+   herdr pane `cwd` keys, and a commit on the merge branch of the doc's
+   Showrunner checkout line. The git move refuses processes still inside the
+   folder before it moves anything; every later part repeats safely.
+3. A run after the restart finds the doc naming the new path. It commits the
+   Showrunner checkout line if the callback could not, then pushes the merge
+   branch when its tip is that commit.
+
+When the callback fails part way, the showrunner still launches: in the new
+folder when the git move happened, else in the old one (see
+`shutdown-and-restart.md`). Only the doc line states where the checkout is;
+logs and design docs that name the old path are history and keep it.
+
 ## Journal and recovery
 
 `SHOWRUNNER_STATE_DIR/<new>/rename.json` stores `version: 1`, the recorded
@@ -221,11 +252,10 @@ and 2 for invalid arguments.
 - Every path honors the state-dir environment variables; never run the verbs
   against live state when testing.
 - Rename moves only the per-slug state listed above. These stay under the old
-  slug: `outstanding/<slug>.history.jsonl`, the `review-health-<slug>` and
-  `bevy-upgrade-<slug>` notifier instances, the
-  `BEVY_UPGRADE_STATE_DIR/<slug>.json` record, and the holder `production_slug`
-  of each held design role in `~/.local/state/guilds/roles/` (`docs/as-built/guilds.md`):
-  `rename.py` calls no `roles.py` verb.
+  slug: `outstanding/<slug>.history.jsonl` and the `review-health-<slug>`
+  notifier instance. Step 4 moves the `bevy-upgrade-<slug>` instance and the
+  `BEVY_UPGRADE_STATE_DIR/<slug>.json` record, and each held design role
+  through `roles.move_holder` (`docs/as-built/guilds.md`).
 
 ## Why
 
@@ -258,11 +288,13 @@ and 2 for invalid arguments.
 
 `test_rename.py` covers moves, kept history, interrupted steps, branch
 changes, account data, trust retries, refusals and repeated completion.
+`test_rename_checkout.py` moves a real linked worktree and repeats the move,
+refuses before the git move, and runs the `checkout` verb's stop and push.
 `test_showrunners.py`, `test_unit_lookup.py` and `test_stall_watch.py` cover
 Formerly resolution, old session marks, strict discovery and detached work.
 
 ```sh
-python3 -m unittest scripts.production.test_rename scripts.production.test_unit_lookup scripts.production.test_showrunners scripts.production.test_stall_watch
+python3 -m unittest scripts.production.test_rename scripts.production.test_rename_checkout scripts.production.test_unit_lookup scripts.production.test_showrunners scripts.production.test_stall_watch
 ```
 
 `unit_lookup.py` is shared: the shutdown inventory

@@ -1,6 +1,6 @@
 ---
 description: Rename a production, move its units between runs, and retire its old merge branch.
-argument-hint: "plan <old> <new> | apply <old> <new> | unit <new> <unit> | finish <new>"
+argument-hint: "plan <old> <new> | apply <old> <new> | unit <new> <unit> | finish <new> | checkout <new> [<path>]"
 ---
 
 # Rename production
@@ -42,6 +42,13 @@ Show the output. On a nonzero exit, show the refusal and stop. Use this order:
    it deletes the old merge branch on origin and locally; a kept merge branch
    is not touched. Then it marks the rename done. Repeating a completed
    `finish` does nothing.
+5. `checkout <new> [<path>]` moves the showrunner checkout to `<path>`, by
+   default its folder name with the old slug replaced by `<new>`. It stops
+   this showrunner session and restarts it in the new folder, so end the turn
+   after it prints. After the restart, run the same command again: it pushes
+   the merge-branch commit that names the new checkout. If the move fails part
+   way, the showrunner restarts in whichever folder holds the checkout; show
+   the printed reason.
 
 `unit` and `finish` require `apply` to have finished, through its merge-branch
 push. A live Claude, an
