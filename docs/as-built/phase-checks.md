@@ -55,7 +55,7 @@
 
 **Run end.**
 
-- `<FinalGate/>` runs `verify.sh final` once: `cargo check --workspace --all-targets` plus the full workspace tests, with no fmt, no lint and no style review.
+- `<FinalGate/>` runs `verify.sh final` once: `cargo check --workspace --all-targets`, then nextest `--workspace --tests`, which links no example. It has no fmt, no lint and no style review.
 - On failure, a synthetic `final` phase opens the failures in the ledger and repairs them through `<FixDispatch/>`, then the gate reruns.
 - `<FinalGateCommit/>` commits only synthetic-phase repairs and source-comment edits from the last plan review. After staging in a Cargo repository, it runs `verify.sh doc` as its own command. On failure, it repairs through `<FixDispatch/>`, stages, and runs `doc` again. It does not reformat; the repair workers' `lint` covers formatting.
 
