@@ -122,7 +122,7 @@ The JSON carries no gates and writes a `GateBlockedFinish` plan finish as `null`
 
 `current.repair_rounds_since_first_stated_eta` is the `FirstStatedEtaTarget`'s count when a first stated target exists, else `null`, and is present even when `current.eta` is `null`. The Markdown shows no count.
 
-`show --production-doc` prints one object keyed by unit id, with an entry for every live Units row (`add_unit.live_unit_table`). Each entry is that unit's record or `{"unavailable": "<reason>"}`. `ProductionUnitPlan(unit, plan)` takes the path from the Plan cell (`cell_value(cell).split(" ", 1)[0]`), resolved against the Worktree cell when relative.
+`show --production-doc` prints one object keyed by unit id, with an entry for every live Units row (`production_units.live_unit_table`). Each entry is that unit's record or `{"unavailable": "<reason>"}`. `ProductionUnitPlan(unit, plan)` takes the path from the Plan cell (`cell_value(cell).split(" ", 1)[0]`), resolved against the Worktree cell when relative.
 
 ### The note
 

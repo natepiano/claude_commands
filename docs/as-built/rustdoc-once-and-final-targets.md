@@ -2,7 +2,7 @@
 
 ## What it is
 
-Rustdoc runs once per phase, as the unit director's last command before a Rust checkpoint commit. It does not run in every `verify.sh lint` call. A PreToolUse hook refuses a checkpoint commit in a Cargo repository unless a passing rustdoc run exists for the exact tree that the commit writes, so the check cannot be skipped. `lint.conf` cannot switch it off. `verify.sh final` type-checks every example once with `cargo check --all-targets`. Its nextest build no longer builds and links the examples again. A scan before any build refuses an example that holds a test or sets `test = true`, so no test is lost. The reason is fewer and shorter builds with the same guarantees: rustdoc used much seat time on each lint call and caught few errors, and the second example build in `final` added work but no checks.
+Rustdoc runs once per phase, as the unit director's last command before a Rust checkpoint commit. It does not run in every `verify.sh lint` call. A PreToolUse hook refuses a checkpoint commit in a Cargo repository unless a passing rustdoc run exists for the exact tree that the commit writes, so the check cannot be skipped. `lint.conf` cannot switch it off. `verify.sh final` type-checks every example once with `cargo check --all-targets`. Its nextest build no longer builds and links the examples again. A scan before any build refuses an example that holds a test or sets `test = true`, so no test is lost. The reason is fewer and shorter builds with the same guarantees: rustdoc used much worker time on each lint call and caught few errors, and the second example build in `final` added work but no checks.
 
 ## How it works
 
@@ -126,7 +126,7 @@ One example can get both refusals; the test refusal comes first. Offenders follo
 
 ## Why
 
-Rustdoc ran in every `verify.sh lint` call. It used much seat time and caught few errors. One run per phase, at the checkpoint, keeps the check and removes the repeats. The user required that it be impossible to skip rustdoc in a phase, so a hook enforces it, and the record is keyed to the exact committed tree. Rustdoc runs on a checkout of the staged tree, so it judges what a plain commit writes and nothing else. A staged edit after the doc run makes the record not match. An unstaged or untracked file is in neither tree, so it cannot change the verdict.
+Rustdoc ran in every `verify.sh lint` call. It used much worker time and caught few errors. One run per phase, at the checkpoint, keeps the check and removes the repeats. The user required that it be impossible to skip rustdoc in a phase, so a hook enforces it, and the record is keyed to the exact committed tree. Rustdoc runs on a checkout of the staged tree, so it judges what a plain commit writes and nothing else. A staged edit after the doc run makes the record not match. An unstaged or untracked file is in neither tree, so it cannot change the verdict.
 
 The hook is a Claude Code PreToolUse hook, not a git commit-msg hook. A commit-msg hook needs an install in each repo; the PreToolUse hook covers every repo from one `settings.json` entry.
 
