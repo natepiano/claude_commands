@@ -520,24 +520,8 @@ class RankExemptions:
 
 
 def judged_at_current_file(ledger: style_ledger.Ledger, finding: style_ledger.HeldFinding, tip: str) -> bool:
-    """Whether the file at the synced tip is the file that the finding's holding ticket judged, or that its last
-    declaration follow read.
-
-    A finding with no judged commit reads as judged at the current file, as filing read every finding before.
-    """
-    judged = ledger.judged_commit(finding)
-    if isinstance(judged, style_ledger.NoJudgedCommit):
-        return True
-    read = (judged.commit, *((finding.follow.commit,) if isinstance(finding.follow, style_ledger.FollowedDeclaration) else ()))
-
-    def blob(commit: str) -> str:
-        try:
-            return git(ledger.repo, "rev-parse", "--verify", f"{commit}:{finding.path}")
-        except style_ledger.LedgerError:
-            return ""
-
-    current = blob(tip)
-    return bool(current) and any(blob(commit) == current for commit in read)
+    """Whether the shared declaration evidence retains this finding's source site."""
+    return isinstance(ledger.finding_site(finding, tip), style_ledger.UnchangedSite)
 
 
 def ranked_work(ledger: style_ledger.Ledger, cells: Iterable[style_ledger.Cell],
@@ -1556,10 +1540,16 @@ class FollowRun:
     def count(self, kinds: type[style_ledger.DeclarationOutcome] | UnionType) -> int:
         return sum(isinstance(outcome, kinds) for outcome in self.reading.outcomes)
 
+    def sites(self, kind: type[style_ledger.UnchangedSite | style_ledger.GoneSite | style_ledger.NeedsJudgment]) -> int:
+        return sum(isinstance(outcome, style_ledger.FindingSite) and isinstance(outcome.evidence, kind)
+                   for outcome in self.reading.outcomes)
+
 
 def follow_totals(run: FollowRun) -> str:
-    return (f"totals: follow {run.count(style_ledger.DeclarationMoved)}, built {run.count(style_ledger.DeclarationRenamed)}, "
-            + f"withdraw {run.count(style_ledger.DeclarationRemoved)}, left {run.count(style_ledger.DeclarationLeft)}, "
+    return (f"totals: follow {run.count(style_ledger.DeclarationMoved) + run.sites(style_ledger.UnchangedSite)}, "
+            + f"built {run.count(style_ledger.DeclarationRenamed)}, "
+            + f"withdraw {run.count(style_ledger.DeclarationRemoved) + run.sites(style_ledger.GoneSite)}, "
+            + f"left {run.count(style_ledger.DeclarationLeft) + run.sites(style_ledger.NeedsJudgment)}, "
             + f"kept {run.count(style_ledger.KeptForOpenBuild)}, close {len(run.closes)}")
 
 
@@ -1567,13 +1557,21 @@ def follow_totals(run: FollowRun) -> str:
 DeclarationChange = (style_ledger.DeclarationMoved | style_ledger.DeclarationRemoved | style_ledger.DeclaredInSeveralFiles
                      | style_ledger.DeclaredInAnotherCrate | style_ledger.DeclarationRenamed | style_ledger.DeclarationGoneFromFile
                      | style_ledger.KeptForOpenBuild | style_ledger.TraitIdentityUncertain | style_ledger.OutsideRenameUnresolved
-                     | style_ledger.StatementNotFollowed)
+                     | style_ledger.StatementNotFollowed | style_ledger.FindingSite)
 
 
 def follow_line(outcome: DeclarationChange, tip: str) -> str:
     """The line that names what the step does to the finding."""
     finding = outcome.finding
     site = f"{finding.finding_id} {finding.rule} {finding.path}:{finding.line}"
+    if isinstance(outcome, style_ledger.FindingSite):
+        match outcome.evidence:
+            case style_ledger.UnchangedSite(path, line):
+                return f"follow {site} -> {path}:{line}: unchanged source site"
+            case style_ledger.GoneSite(reason):
+                return f"withdraw {site}: {reason}"
+            case style_ledger.NeedsJudgment(reason):
+                return f"left {site}: needs judgment: {reason}"
     suffix = (style_ledger.outside_evidence_suffix(outcome.evidence)
               if isinstance(outcome, (style_ledger.DeclarationRemoved, style_ledger.DeclarationGoneFromFile,
                                       style_ledger.DeclaredInSeveralFiles, style_ledger.DeclaredInAnotherCrate))
@@ -1636,7 +1634,8 @@ def run_follow(writer: DecisionWriter, findings: Iterable[style_ledger.HeldFindi
     planned = ledger.declaration_reading(ids, approved_decision)
     skipped: list[Path] = []
     for issue in sorted({outcome.finding.state.proposal for outcome in planned.outcomes
-                         if isinstance(outcome, (style_ledger.DeclarationMoved, style_ledger.DeclarationRemoved))
+                         if (isinstance(outcome, (style_ledger.DeclarationMoved, style_ledger.DeclarationRemoved))
+                             or isinstance(outcome, style_ledger.FindingSite) and not isinstance(outcome.evidence, style_ledger.NeedsJudgment))
                          and isinstance(outcome.finding.state, style_ledger.Filed)}):
         if not open_decision(issue):
             continue
@@ -1646,6 +1645,15 @@ def run_follow(writer: DecisionWriter, findings: Iterable[style_ledger.HeldFindi
         except (style_ledger.LedgerError, Refusal) as error:
             skipped.append(issue)
             print(skip_line(issue, error))
+            # The source proof cannot refresh a decision without its generated body. Keep the
+            # changed-file wait visible for these findings, rather than silently losing that work.
+            for outcome in planned.outcomes:
+                if (isinstance(outcome, style_ledger.FindingSite)
+                        and isinstance(outcome.finding.state, style_ledger.Filed)
+                        and outcome.finding.state.proposal == issue):
+                    finding = outcome.finding
+                    print(f"waiting {issue}: {finding.finding_id} {finding.path} changed since it was judged; "
+                          + "source follow could not refresh the decision")
     refused = {outcome.finding.finding_id for outcome in planned.outcomes
                if isinstance(outcome.finding.state, style_ledger.Filed) and outcome.finding.state.proposal in skipped}
     # Built means approved and in the code, so the ledger builds a rename only when its decision is approved, reading
@@ -1659,7 +1667,8 @@ def run_follow(writer: DecisionWriter, findings: Iterable[style_ledger.HeldFindi
                                     style_ledger.RenameAwaitingApproval)):
             print(follow_line(outcome, reading.tip))
     plan = plan_withdrawal(ledger, {outcome.finding.finding_id: (outcome.finding.state.proposal, style_ledger.DeclarationGone(reading.tip))
-                                    for outcome in reading.outcomes if isinstance(outcome, style_ledger.DeclarationRemoved)
+                                    for outcome in reading.outcomes if (isinstance(outcome, style_ledger.DeclarationRemoved)
+                                    or isinstance(outcome, style_ledger.FindingSite) and isinstance(outcome.evidence, style_ledger.GoneSite))
                                     and isinstance(outcome.finding.state, style_ledger.Filed)})
     closes: list[Path] = []
     for close in plan.closes:
@@ -1789,7 +1798,7 @@ def main(argv: list[str]) -> int:
                 writer = decision_writer(ledger, args.proposals.expanduser().resolve(), "")
                 follow = run_follow(writer, unfiled_and_filed(ledger), dry_run=args.dry_run)
                 print(follow_totals(follow))
-                left = follow.count(style_ledger.DeclarationLeft)
+                left = follow.count(style_ledger.DeclarationLeft) + follow.sites(style_ledger.NeedsJudgment)
                 if follow.skipped:
                     print(f"style_proposals: skipped {len(follow.skipped)} decisions", file=sys.stderr)
                 if left:

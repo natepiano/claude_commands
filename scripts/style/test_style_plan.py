@@ -2945,6 +2945,44 @@ class StylePlanTests(unittest.TestCase):
         self.assertEqual(ticket["files"], [self.sources[0]])
         self.assertEqual(set(ticket["finding_ids"]), {f.finding_id for f in ledger.proposal_findings(issue) if f.path == self.sources[0]})
 
+    def test_queued_and_new_decisions_share_unchanged_site_proof_and_followed_coordinates(self) -> None:
+        _ = self.types_unit()
+        rule = self.rule("read")
+        site = self.sources[0]
+        source = "fn work() {\n    consume(791);\n}\n"
+        self.commit_files({site: source})
+        issue, (finding,) = self.judged_findings(rule, ((site, 2, source.splitlines()[1]),), kind="restructure")
+        self.write_generated_body(issue)
+        ledger = self.ledger()
+        self.record(rule, site, self.tip, "modules-unit-1")
+        self.commit_files({site: "fn sibling() {}\n" + source})
+        _ = self.refill_decisions()
+        ticket, = ledger.ticket_open("names-unit")
+        self.assertEqual((ticket["kind"], ticket["finding_ids"]), ("proposal", [finding.finding_id]))
+        self.assertEqual(ledger.named_held([finding.finding_id])[0].line, 3)
+        ledger.ticket_drop(ticket["id"])
+        ledger.ticket_add("names-unit-99", "names-unit", "proposal", "names", "crates/alpha", [site], [rule],
+                          proposal=str(issue), finding_ids=(finding.finding_id,))
+        self.commit_files({site: "fn another() {}\nfn sibling() {}\n" + source})
+        _ = self.refill_decisions()
+        ticket, = ledger.ticket_open("names-unit")
+        self.assertEqual(ticket["id"], "names-unit-99")
+        self.assertEqual(ledger.named_held([finding.finding_id])[0].line, 4)
+
+    def test_site_follow_does_not_clear_clean_cell_after_a_new_literal_is_added(self) -> None:
+        rule = self.rule("no-magic-values", "tier: C\nfamily: values\ninput_scope: file\n")
+        names = self.rule("read")
+        path = self.sources[0]
+        source = "fn work() {\n    consume(LIMIT);\n}\n"
+        self.commit_files({path: source})
+        _, (finding,) = self.judged_findings(names, ((path, 2, source.splitlines()[1]),), kind="restructure")
+        ledger = self.ledger()
+        self.record(rule, path, self.tip, "outside")
+        self.commit_files({path: "fn newly_bad() { consume(8675309); }\n" + source})
+        _ = ledger.follow_declarations([finding.finding_id], ledger.synced_commit(), lambda _: True)
+        self.assertEqual(ledger.named_held([finding.finding_id])[0].line, 3)
+        self.assertEqual(next(cell.state for cell in ledger.cells(rule=rule) if cell.path == path), "stale")
+
     def test_decision_b_refill_and_queued_ticket_keep_only_rank_exempt_bindings(self) -> None:
         _ = self.types_unit()
         _ = self.rule("types-read", "tier: C\nfamily: types\ninput_scope: file\n")

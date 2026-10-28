@@ -178,6 +178,228 @@ class StyleLedgerTests(unittest.TestCase):
         self.addCleanup(ledger.close)
         return ledger
 
+    def judgment_rows(self, database: Path) -> list[tuple[object, ...]]:
+        with sqlite3.connect(database) as connection:
+            return cast(list[tuple[object, ...]], connection.execute("SELECT * FROM judgments ORDER BY id").fetchall())
+
+    def site_fixture(self, family: rules.Family = "names", *, rule_name: str = "site-rule",
+                     scope: str = "file", source: str = "fn work() {\n    let old = 791;\n}\n",
+                     line: int = 2, before: str = "old", kind: style_ledger.FindingKind = "rename",
+                     ) -> tuple[style_ledger.Ledger, str, style_ledger.HeldFinding]:
+        rule = self.rule(rule_name, f"tier: C\nfamily: {family}\ninput_scope: {scope}\n")
+        self.write(PARENT_FILE, source)
+        tip = self.commit("Source site")
+        ledger = self.ledger()
+        ledger.set_tip(tip)
+        ledger.ticket_add("judge-1", "judge", "read", family, "crates/alpha", [PARENT_FILE], [rule])
+        ledger.ticket_assign("judge-1", "main")
+        _ = ledger.ticket_base("judge-1")
+        finding = ledger.hold(rule, PARENT_FILE, line, source.splitlines()[line - 1], kind, before, "fresh",
+                              self.blob(rule), "judge-1")
+        ledger.record(rule, PARENT_FILE, tip, self.blob(rule), "held", ticket="judge-1", worker="test",
+                      input_scope=style_ledger.DeclaredInputScope.RULE)
+        ledger.ticket_drop("judge-1")
+        ledger.file_held(finding.finding_id, self.root / "decision.md")
+        return ledger, rule, ledger.named_held([finding.finding_id])[0]
+
+    def strict_site(self, ledger: style_ledger.Ledger, finding: style_ledger.HeldFinding,
+                    at: str) -> style_ledger.SiteEvidence:
+        # Exercise the additive proof independently of earlier proved declaration transitions.
+        proof = cast(Callable[[style_ledger.HeldFinding, str], style_ledger.SiteEvidence], getattr(ledger, "_site_proof"))
+        return proof(finding, at)
+
+    def test_site_follow_preserves_line_evidence_and_pinned_fields_without_restamping_cells(self) -> None:
+        ledger, rule, finding = self.site_fixture()
+        # A substantive rule edit must remain separate coverage work after the follow.
+        _ = (self.rule_dir / "site-rule.md").write_text((self.rule_dir / "site-rule.md").read_text() + "New requirement\n")
+        tip = self.commit_tip(ledger, {PARENT_FILE: "// inserted\nfn work() {\n    let old = 791;\n}\nfn sibling() {}\n"})
+        judgments = self.judgment_rows(ledger.database)
+        _ = ledger.follow_declarations([finding.finding_id], tip, lambda _: True)
+        followed = ledger.named_held([finding.finding_id])[0]
+        self.assertEqual((followed.finding_id, followed.rule_blob, followed.before, followed.after, followed.state),
+                         (finding.finding_id, finding.rule_blob, finding.before, finding.after, finding.state))
+        self.assertEqual((followed.path, followed.line), (PARENT_FILE, 3))
+        self.assertEqual(followed.follow, style_ledger.FollowedDeclaration(PARENT_FILE, 2, tip))
+        self.assertEqual(self.judgment_rows(ledger.database), judgments)
+        self.assertEqual(self.states(rule)[PARENT_FILE], "stale")
+        rows = self.held_rows(ledger.database)
+        _ = ledger.follow_declarations([finding.finding_id], tip, lambda _: True)
+        self.assertEqual(self.held_rows(ledger.database), rows)
+
+    def test_site_follow_requires_exact_line_and_unambiguous_owner(self) -> None:
+        ledger, _, finding = self.site_fixture()
+        for source in ("fn renamed() {\n    let old = 791;\n}\n",
+                       "fn work() {\n    let old = 791;\n    let old = 791;\n}\n",
+                       "fn work() {\n    let old =\n        791;\n}\n",
+                       "fn work() {}\nfn moved() {\n    let old = 791;\n}\n"):
+            with self.subTest(source=source):
+                tip = self.commit_tip(ledger, {PARENT_FILE: source})
+                self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.NeedsJudgment)
+
+    def test_context_site_follows_whole_function_but_rejects_body_attributes_imports_and_owner_changes(self) -> None:
+        original = "use crate::Other;\nstruct Parent;\nimpl Parent {\n    #[inline]\n    fn work() {\n        consume(791);\n    }\n}\n"
+        ledger, _, finding = self.site_fixture("types", source=original, line=6, before="791", kind="type")
+        tip = self.commit_tip(ledger, {PARENT_FILE: original + "fn sibling() {}\n"})
+        self.assertEqual(self.strict_site(ledger, finding, tip), style_ledger.UnchangedSite(PARENT_FILE, 6))
+        for source in (original.replace("consume(791);", "consume(791);\n        other();"),
+                       original.replace("#[inline]", "#[cold]"), original.replace("crate::Other", "crate::Changed"),
+                       original.replace("impl Parent", "impl Other")):
+            with self.subTest(source=source):
+                tip = self.commit_tip(ledger, {PARENT_FILE: source})
+                self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.NeedsJudgment)
+
+    def test_context_site_proves_complete_impl_including_its_attributes_and_body(self) -> None:
+        source = "struct Parent;\n#[allow(dead_code)]\nimpl Parent {\n    fn work() { consume(791); }\n}\n"
+        ledger, _, finding = self.site_fixture("types", source=source, line=3, kind="type", before="impl Parent")
+        tip = self.commit_tip(ledger, {PARENT_FILE: source + "fn sibling() {}\n"})
+        self.assertEqual(self.strict_site(ledger, finding, tip), style_ledger.UnchangedSite(PARENT_FILE, 3))
+        tip = self.commit_tip(ledger, {PARENT_FILE: source.replace("consume(791)", "consume(792)")})
+        self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.NeedsJudgment)
+        tip = self.commit_tip(ledger, {PARENT_FILE: source.replace("allow(dead_code)", "deny(dead_code)")})
+        self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.NeedsJudgment)
+
+    def test_site_owner_includes_inline_module_identity(self) -> None:
+        source = "mod first {\n    fn work() {\n        let old = 791;\n    }\n}\n"
+        ledger, _, finding = self.site_fixture(source=source, line=3)
+        tip = self.commit_tip(ledger, {PARENT_FILE: source.replace("mod first", "mod renamed")})
+        self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.NeedsJudgment)
+
+    def test_site_follow_requires_byte_identical_line_endings(self) -> None:
+        source = "fn work() {\r\n    let old = 791;\r\n}\r\n"
+        ledger, _, finding = self.site_fixture(source=source)
+        tip = self.commit_tip(ledger, {PARENT_FILE: source.replace("\r\n", "\n")})
+        self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.NeedsJudgment)
+
+    def test_context_site_keeps_original_crate_scope_when_rule_narrows_and_after_prior_follow(self) -> None:
+        ledger, _, finding = self.site_fixture("types", scope="crate", kind="type")
+        source = (self.repo / PARENT_FILE).read_text()
+        tip = self.commit_tip(ledger, {PARENT_FILE: "fn sibling() {}\n" + source})
+        _ = ledger.follow_declarations([finding.finding_id], tip, lambda _: True)
+        followed = ledger.named_held([finding.finding_id])[0]
+        self.assertEqual(followed.line, 3)
+        _ = (self.rule_dir / "site-rule.md").write_text("---\ntier: C\nfamily: types\ninput_scope: file\n---\n# Narrowed\n")
+        tip = self.commit_tip(ledger, {self.sources[1]: "fn changed_dependency() {}\n"})
+        self.assertIsInstance(self.strict_site(ledger, followed, tip), style_ledger.NeedsJudgment)
+
+    def test_context_site_rejects_changed_explicit_reads(self) -> None:
+        ledger, rule, finding = self.site_fixture("modules", kind="restructure", scope="crate")
+        self.record_reads(rule, PARENT_FILE, ledger.synced_commit(), (self.sources[1],), verdict="held", ticket="judge-1")
+        tip = self.commit_tip(ledger, {PARENT_FILE: "fn sibling() {}\n" + (self.repo / PARENT_FILE).read_text(),
+                                       self.sources[1]: "fn changed_dependency() {}\n"})
+        self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.NeedsJudgment)
+
+    def test_site_withdraws_only_proved_gone_identifier_and_keeps_emptied_held_cell_stale(self) -> None:
+        ledger, rule, finding = self.site_fixture()
+        tip = self.commit_tip(ledger, {PARENT_FILE: "fn work() {}\n", MOVED_FILE: "// old remains in a comment\n"})
+        self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.NeedsJudgment)
+        tip = self.commit_tip(ledger, {MOVED_FILE: "// subject gone\n"})
+        self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.GoneSite)
+        judgments = self.judgment_rows(ledger.database)
+        _ = ledger.follow_declarations([finding.finding_id], tip, lambda _: True)
+        self.assertIsInstance(ledger.named_held([finding.finding_id])[0].state, style_ledger.Withdrawn)
+        self.assertEqual(self.states(rule)[PARENT_FILE], "stale")
+        self.assertEqual(self.judgment_rows(ledger.database), judgments)
+
+    def test_magic_site_withdrawal_checks_all_literals_and_cross_file_reflow(self) -> None:
+        ledger, _, finding = self.site_fixture("values", rule_name="no-magic-values", kind="restructure")
+        tip = self.commit_tip(ledger, {PARENT_FILE: "fn work() {}\n", MOVED_FILE: "fn moved() { consume(\n791\n); }\n"})
+        self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.NeedsJudgment)
+        tip = self.commit_tip(ledger, {MOVED_FILE: "fn moved() { consume(LIMIT); }\n"})
+        self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.GoneSite)
+
+    def test_site_follow_rejects_late_pre_deletion_judgment_after_identical_restore(self) -> None:
+        ledger, rule, finding = self.site_fixture()
+        source = (self.repo / PARENT_FILE).read_text()
+        before = ledger.synced_commit()
+        deletion = self.commit_tip(ledger, {PARENT_FILE: None})
+        with sqlite3.connect(ledger.database) as connection:
+            _ = connection.execute('INSERT INTO judgments(rule,rule_blob,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,worker,recorded_at,input_scope,declared_scope) '
+                                   + "VALUES (?,?, '',?,?,'removed','','removal','test','2000','file','rule')",
+                                   (rule, self.blob(rule), PARENT_FILE, deletion))
+        tip = self.commit_tip(ledger, {PARENT_FILE: source})
+        # Recorded after restoration, but still judges the pre-deletion file.
+        ledger.record(rule, PARENT_FILE, before, self.blob(rule), "held", ticket="judge-1", worker="late",
+                      input_scope=style_ledger.DeclaredInputScope.RULE)
+        self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.NeedsJudgment)
+        _ = ledger.follow_declarations([finding.finding_id], tip, lambda _: True)
+        self.assertEqual(ledger.named_held([finding.finding_id])[0].follow, style_ledger.NotFollowed())
+
+    def test_site_follow_rechecks_rows_under_lock_and_never_overwrites_new_text(self) -> None:
+        ledger, _, finding = self.site_fixture()
+        tip = self.commit_tip(ledger, {PARENT_FILE: "// shift\n" + (self.repo / PARENT_FILE).read_text()})
+        original = cast(Callable[[tuple[str, ...], style_ledger.RepositoryTip, Callable[[Path], bool]], style_ledger.DeclarationReading],
+                        getattr(ledger, "_declaration_reading"))
+        raced = False
+
+        def racing_read(ids: tuple[str, ...], snapshot: style_ledger.RepositoryTip,
+                        approved: Callable[[Path], bool]) -> style_ledger.DeclarationReading:
+            nonlocal raced
+            reading = original(ids, snapshot, approved)
+            if not raced:
+                raced = True
+                with sqlite3.connect(ledger.database) as connection:
+                    _ = connection.execute("UPDATE held_findings SET text='changed by another writer' WHERE finding_id=?", (finding.finding_id,))
+            return reading
+
+        with mock.patch.object(ledger, "_declaration_reading", side_effect=racing_read):
+            _ = ledger.follow_declarations([finding.finding_id], tip, lambda _: True)
+        current = ledger.named_held([finding.finding_id])[0]
+        self.assertEqual((current.text, current.follow), ("changed by another writer", style_ledger.NotFollowed()))
+
+    def test_site_follow_refuses_tip_race_before_writing(self) -> None:
+        ledger, _, finding = self.site_fixture()
+        tip = self.commit_tip(ledger, {PARENT_FILE: "// shift\n" + (self.repo / PARENT_FILE).read_text()})
+        original = cast(Callable[[tuple[str, ...], style_ledger.RepositoryTip, Callable[[Path], bool]], style_ledger.DeclarationReading],
+                        getattr(ledger, "_declaration_reading"))
+        raced = False
+
+        def racing_read(ids: tuple[str, ...], snapshot: style_ledger.RepositoryTip,
+                        approved: Callable[[Path], bool]) -> style_ledger.DeclarationReading:
+            nonlocal raced
+            reading = original(ids, snapshot, approved)
+            if not raced:
+                raced = True
+                _ = self.commit_tip(ledger, {MOVED_FILE: "fn new_tip() {}\n"})
+            return reading
+
+        with mock.patch.object(ledger, "_declaration_reading", side_effect=racing_read):
+            with self.assertRaisesRegex(style_ledger.LedgerError, "synced tip moved"):
+                _ = ledger.follow_declarations([finding.finding_id], tip, lambda _: True)
+        self.assertEqual(ledger.named_held([finding.finding_id])[0].follow, style_ledger.NotFollowed())
+
+    def test_site_proof_requires_a_type_proposals_before_subject_in_its_item(self) -> None:
+        ledger, _, finding = self.site_fixture(kind="type", before="unlocated subject")
+        tip = self.commit_tip(ledger, {PARENT_FILE: "// shift\n" + (self.repo / PARENT_FILE).read_text()})
+        self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.NeedsJudgment)
+
+    def test_site_proof_rejects_partly_unreadable_item_parse(self) -> None:
+        ledger, _, finding = self.site_fixture()
+        source = (self.repo / PARENT_FILE).read_text()
+        tip = self.commit_tip(ledger, {PARENT_FILE: source + "fn sibling() {}\n"})
+        self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.UnchangedSite)
+        tip = self.commit_tip(ledger, {PARENT_FILE: source + "mod nested { unsupported; }\n"})
+        self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.NeedsJudgment)
+        _ = ledger.follow_declarations([finding.finding_id], tip, lambda _: True)
+        self.assertEqual(ledger.named_held([finding.finding_id])[0].follow, style_ledger.NotFollowed())
+
+    def test_site_proof_rejects_non_utf8_pinned_rule_text(self) -> None:
+        ledger, _, finding = self.site_fixture()
+        tip = self.commit_tip(ledger, {PARENT_FILE: "// shift\n" + (self.repo / PARENT_FILE).read_text()})
+        self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.UnchangedSite)
+        with sqlite3.connect(ledger.database) as connection:
+            _ = connection.execute("UPDATE rule_texts SET text=? WHERE blob=?", (b"family: names\n\xff", finding.rule_blob))
+        self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.NeedsJudgment)
+
+    def test_site_proof_rejects_non_utf8_source(self) -> None:
+        ledger, _, finding = self.site_fixture()
+        source = (self.repo / PARENT_FILE).read_bytes()
+        _ = (self.repo / PARENT_FILE).write_bytes(source + b"// unreadable: \xff\n")
+        tip = self.commit("Non-UTF-8 source")
+        ledger.set_tip(tip)
+        self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.NeedsJudgment)
+        _ = ledger.follow_declarations([finding.finding_id], tip, lambda _: True)
+        self.assertEqual(ledger.named_held([finding.finding_id])[0].follow, style_ledger.NotFollowed())
+
     def test_refill_lock_blocks_another_worktree_until_the_body_exits(self) -> None:
         worktree = self.root / "other-checkout"
         _ = self.git("worktree", "add", "-q", "-b", "other", str(worktree))

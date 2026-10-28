@@ -1925,6 +1925,8 @@ def _rank_waits(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord, 
     older file where a family ranked above has a unit."""
     exemptions = style_proposals.RankExemptions(ledger, tip)
     findings = ledger.named_held(ticket["finding_ids"])
+    if any(not isinstance(finding.state, style_ledger.Filed) for finding in findings):
+        return ("a queued finding is no longer filed",)
     held = tuple(f"{path} has open {waits[path].higher} work" for path in ticket["files"] if path in waits
                  and (not findings or any(f.path == path and not exemptions.allows(f, family) for f in findings)))
     if not ticket["finding_ids"] or not style_proposals.ranked_below_unit(family, ticket["crate"], scopes):
@@ -1955,28 +1957,6 @@ def _select_phase(
     scopes = family_pilot_scopes(doc, repo)
     waits = style_proposals.ranked_work(ledger, cells, scopes).waits(family)
     exemptions = style_proposals.RankExemptions(ledger, tip)
-    for index, ticket in enumerate(queued):
-        in_scope = crate_in_scope(scope, ticket["crate"])
-        # A file rename whose edit the gate cannot prove is dropped, and its finding waits on the decision path below.
-        uncertain = edits.uncertain_of_ticket(ticket) if index == 0 and in_scope else ()
-        # A ticket that the family rank holds is dropped too; its cells and findings wait on the paths below.
-        ranked = _rank_waits(ledger, ticket, family, waits, scopes, tip) if index == 0 and in_scope and not uncertain else ()
-        if (index == 0 and in_scope and not uncertain and not ranked
-                and not any(busy.contains(path) for path in edits.of_ticket(ticket))):
-            ledger.ticket_assign(ticket["id"], branch)
-            for extra in queued[1:]:
-                ledger.ticket_drop(extra["id"])
-                print(f"dropped {extra['id']}: files busy")
-            origin = ledger.ticket_origin(ticket["id"])
-            if isinstance(origin, style_ledger.ApprovedProposal):
-                style_proposals.proposal_command("start", str(origin.issue))
-            write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
-            return PhaseWritten(ticket["id"])
-        ledger.ticket_drop(ticket["id"])
-        reason = ((f"{uncertain[0]} has a path attribute the rename gate cannot read" if uncertain
-                   else ranked[0] if ranked else "files busy")
-                  if in_scope else "outside pilot scope")
-        print(f"dropped {ticket['id']}: {reason}")
     try:
         folder = Path(production_field(doc.read_text().splitlines(), "Proposals")).expanduser()
     except Refusal:
@@ -1995,10 +1975,43 @@ def _select_phase(
     # whose declaration moved tickets at its new file, a rename whose new name is declared is built, and one whose
     # declaration is gone waits for a person or is withdrawn with its file. Each refresh keeps the parent its decision
     # names, and the step renumbers after its own closes.
-    follow = (style_proposals.run_follow(style_proposals.decision_writer(ledger, next(iter(unbuilt)).parent, ""),
-                                         (finding for findings in unbuilt.values() for finding in findings), dry_run=False)
-              if any(unbuilt.values()) else style_proposals.FollowRun(style_ledger.DeclarationReading(tip, ()), (), ()))
+    following = {finding.finding_id: finding for findings in unbuilt.values() for finding in findings}
+    following.update({finding.finding_id: finding for ticket in queued
+                      for finding in ledger.named_held(ticket["finding_ids"])})
+    follow = (style_proposals.run_follow(style_proposals.decision_writer(
+                  ledger, next(finding.state.proposal.parent for finding in following.values()
+                               if isinstance(finding.state, style_ledger.Filed)), ""), following.values(), dry_run=False)
+              if any(isinstance(finding.state, style_ledger.Filed) for finding in following.values())
+              else style_proposals.FollowRun(style_ledger.DeclarationReading(tip, ()), (), ()))
     outcomes = {outcome.finding.finding_id: outcome for outcome in follow.reading.outcomes}
+    for index, ticket in enumerate(queued):
+        in_scope = crate_in_scope(scope, ticket["crate"])
+        # A file rename whose edit the gate cannot prove is dropped, and its finding waits on the decision path below.
+        uncertain = edits.uncertain_of_ticket(ticket) if index == 0 and in_scope else ()
+        # A ticket that the family rank holds is dropped too; its cells and findings wait on the paths below.
+        skipped = ticket["proposal"] and Path(ticket["proposal"]) in follow.skipped
+        ranked = (("skipped by the declaration step",) if skipped else
+                  _rank_waits(ledger, ticket, family, waits, scopes, tip)) if index == 0 and in_scope and not uncertain else ()
+        if (index == 0 and in_scope and not uncertain and not ranked
+                and not any(busy.contains(path) for path in edits.of_ticket(ticket))):
+            ledger.ticket_assign(ticket["id"], branch)
+            for extra in queued[1:]:
+                ledger.ticket_drop(extra["id"])
+                print(f"dropped {extra['id']}: files busy")
+            origin = ledger.ticket_origin(ticket["id"])
+            if isinstance(origin, style_ledger.ApprovedProposal):
+                style_proposals.proposal_command("start", str(origin.issue))
+            write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
+            return PhaseWritten(ticket["id"])
+        ledger.ticket_drop(ticket["id"])
+        reason = ((f"{uncertain[0]} has a path attribute the rename gate cannot read" if uncertain
+                   else ranked[0] if ranked else "files busy")
+                  if in_scope else "outside pilot scope")
+        print(f"dropped {ticket['id']}: {reason}")
+    # Dropping a queued ticket releases its findings for decision selection below.
+    if queued:
+        unbuilt = {issue.path: _unbuilt_findings(ledger, issue.path) for issue in decisions
+                   if issue.value("style_rule") in definitions}
     # One line for each waiting file that holds the unit's own work: a pending cell in scope or an unbuilt finding.
     own = {cell.path for cell in cells if cell.family == family and cell.state in ("open", "stale")
            and crate_in_scope(scope, cell.crate)} | {finding.path for findings in unbuilt.values() for finding in findings}
@@ -2046,7 +2059,9 @@ def _select_phase(
                 where += "; " + style_ledger.outside_evidence_line(outcome.evidence)
             print(f"waiting {issue.path}: {finding_id} {where}")
         read = {outcome.finding.finding_id for outcome in own if not isinstance(outcome, style_ledger.DeclarationNotRead)}
-        withdrew = any(isinstance(outcome, style_ledger.DeclarationRemoved) for outcome in own)
+        withdrew = any(isinstance(outcome, style_ledger.DeclarationRemoved)
+                       or isinstance(outcome, style_ledger.FindingSite) and isinstance(outcome.evidence, style_ledger.GoneSite)
+                       for outcome in own)
         built = any(isinstance(outcome, style_ledger.DeclarationRenamed) for outcome in own)
         findings = tuple(finding for finding in _unbuilt_findings(ledger, issue.path) if finding.finding_id not in left)
         # The gone-file and moved-site waives read only the findings whose declaration the step could not read.

@@ -62,7 +62,10 @@ lower-rank finding judged at an older file is not filed or built: filing prints
 `waiting <finding>: <file> changed since it was judged`, and refill prints
 `waiting <decision>: <finding> <file> changed since it was judged`. A finding
 counts as judged at the file that its holding ticket read, or that its last
-declaration follow read. A ticket that holds the same change again takes the
+declaration follow read. A finding whose own site is proved unchanged (the same line
+and owner; for types and modules the whole unchanged item) follows to the new
+file and goes on; a finding whose subject is proved gone is withdrawn. Every
+other changed finding waits for judgment. A cell verdict never carries this way. A ticket that holds the same change again takes the
 finding over, so the finding is judged at the new file and goes on. A judgment
 of the changed file by another ticket that does not hold the finding (for a
 followed finding, any later judgment of its new file) settles
