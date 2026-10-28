@@ -54,6 +54,7 @@ TEST_SUITES = (
     "model_study", "herdr", "notify", "statusline", "astra", "style", "history", "guilds", "issue_score",
 )
 DEFAULT_MEMORY_CAP_MIB = 4096
+DEFAULT_MAX_RUNNING_JOBS = max(1, (os.cpu_count() or 2) // 2)
 MODULE_MEMORY_MIB = 48
 # A module still running this long is killed and the run is red: a hung module holds every gate
 # behind it. The slowest measured module took 387 s at load 152 (direct/test_verify_mac_offload.py,
@@ -449,11 +450,14 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
 
 
 def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_dirs: Sequence[str] = (),
-               module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S) -> GateRun:
+               module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S,
+               max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS) -> GateRun:
     if memory_cap_mib <= 0:
         raise GateRefused("memory cap must be positive")
     if module_time_limit_s <= 0:
         raise GateRefused("module time limit must be positive")
+    if max_running_jobs <= 0:
+        raise GateRefused("running job limit must be positive")
     absent = [name for name in type_dirs if not (repo / name).exists()]
     if absent:
         raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
@@ -521,7 +525,8 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                                               + f"{memory_cap_mib / 1024:.3f} GiB cap")
                             print(f"{job.suite}/{job.path.name} {job.killed_for}", flush=True)
                             kill_job_group(job)
-                while pending and admission.admits(bool(running)) and (not rerunning or not running):
+                while (pending and len(running) < max_running_jobs
+                       and admission.admits(bool(running)) and (not rerunning or not running)):
                     suite, path = pending.popleft()
                     log = Path(temporary) / f"{suite}-{path.stem}.log"
                     argv = ([os.environ.get("MERGE_GATE_BASEDPYRIGHT", "basedpyright"), "--pythonpath", str(types_python),
@@ -605,7 +610,8 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
             print(f"basedpyright: {'RED' if result.returncode else 'OK'}\n{result.output}", flush=True)
     for slow in slow_modules:
         print(f"Slow module: {slow} ({SLOW_MODULE_FACTOR:g}x or more)", flush=True)
-    print(f"Gate tests: {elapsed:.2f}s; peak memory: {admission.peak_mib / 1024:.3f} GiB (sampled memory); cap: {memory_cap_mib / 1024:.3f} GiB", flush=True)
+    print(f"Gate tests: {elapsed:.2f}s; at most {max_running_jobs} modules at once; "
+          + f"peak memory: {admission.peak_mib / 1024:.3f} GiB (sampled memory); cap: {memory_cap_mib / 1024:.3f} GiB", flush=True)
     print(f"Largest module peak: {largest_module_peak_mib / 1024:.3f} GiB (sampled memory); module: {largest_module or '(not sampled)'}", flush=True)
     print(f"One-minute load: start={starting_load:.2f} max={maximum_load:.2f} end={ending_load:.2f}", flush=True)
     if admission.peak_mib > memory_cap_mib:
