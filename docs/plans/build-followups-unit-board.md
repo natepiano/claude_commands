@@ -292,184 +292,100 @@ Add-on, 2026-10-16 (the showrunner, approved by the user): an accounts view in t
 
 ### Phase 16 — The accounts table has no Login column  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `/accounts-board` shows no login column and no units/showrunners line, and never receives a login address.
-
-**Spec:**
-
-Source: the user via the showrunner, 2026-10-19 10:33: "the /accounts-board has limited space - ask it to remove the "login" column - which should free it up". The showrunner: "This also means the pane no longer shows login addresses."
-
-1. **No Login column.** The headings are `Label`, `Roles`, `Left`, `Resets`, `Credits`, `Read`. Cell forms, colours, `width` rules and the last-column rule from phase 15 do not change.
-2. **No login in the data.** The accounts run is `[~/.claude/scripts/lib/py, ~/.claude/scripts/accounts/accounts.py, "status", "--json", "--stored"]` (no `--with-login`): without the flag, `accounts.py` omits `login`. Remove `login` from `StoredAccount` (`types/accounts.d.ts`, and its doc comment) and from `AccountDisplay`/`accountDisplay`. `accounts.py` does not change.
-
-3. **No units/showrunners line.** Source: the user via the showrunner, 2026-10-19: the top line `units: claude1, showrunners: claude3` "is unnecessary as this is spelled out clearly in the table". Remove it and the `assignments` helper; the table is the first thing in the pane, with no top margin. Problems stay under the table.
+- `/accounts-board` never receives a login address. The accounts run is `[~/.claude/scripts/lib/py, ~/.claude/scripts/accounts/accounts.py, "status", "--json", "--stored"]` with no `--with-login`, so `accounts.py` omits `login`. `StoredAccount`, `AccountDisplay` and `accountDisplay` have no `login` field. A status that still carries `login` draws no address.
+- The table had six headings, `Label`, `Roles`, `Left`, `Resets`, `Credits`, `Read`, and no `Login` column. The column set is now the shared table described under “The accounts board and cargo-handler show the same table”.
+- The `units: …, showrunners: …` top line and its `assignments` helper are gone. The table is the first thing in the pane, with no top margin. Problems stay under the table.
 
 **Files:**
-- `mods/unit-board/hooks/accounts.tsx` — the column, the display field and the top line.
-- `mods/unit-board/hooks/data.ts` — the argv.
-- `mods/unit-board/types/accounts.d.ts` — the wire type.
-- `mods/unit-board/tests/accounts.test.ts` — tests.
+- `mods/unit-board/hooks/data.ts` — the accounts argv, without `--with-login`.
+- `mods/unit-board/types/accounts.d.ts` — `StoredAccount`, with no `login`.
+- `mods/unit-board/hooks/accounts.tsx` — `AccountDisplay`, `accountDisplay` and the view, with no login and no top line.
+- `mods/unit-board/tests/accounts.test.ts` — no address drawn, the argv on open and refresh, the table is the first line.
 
-**Workers:** 1 writer + 1 tester.
-- `impl` — `mods/unit-board/hooks/accounts.tsx`, `mods/unit-board/hooks/data.ts`, `mods/unit-board/types/accounts.d.ts`.
-- `test` — `mods/unit-board/tests/accounts.test.ts`, from this Spec alone: the six headings and no `Login`; the argv on open and on refresh has no `--with-login`; a status that still carries a `login` field draws no address; `width` for the realistic accounts (roles `unit directors, showrunners`, credits `unlimited in use`) is the six column widths plus 10 and at most 90; the wide-character test moves from the login to the label, so it still proves `cellWidth`. Tests that checked an address is drawn now check none is. No drawn line starts with `units:` and the heading row is the first line.
-
-**Constraints from prior phases:** phases 6 and 15 hold: a closed pane does no work, the mod never opens a credential file, a failed run shows a fixed reason, never process output. Never capture the live accounts pane; check the layout with fixture accounts only.
-
-**Acceptance gate:** mod tsc, mod tests, strict validate, the full merge gate.
+**Gotchas:** never capture the live accounts pane; check the layout with fixture accounts only.
 
 ### Phase 17 — The board is alphabetical, readable and never cut off  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** the unit board lists units by name, gives each unit at most three short lines, uses color for meaning, draws every fact in readable text, and cuts nothing off.
-
-**Spec:**
-
-Source: the user, 2026-10-19 15:44, with a screenshot of the board: "i want unit_board to be alphabetical - but send this screenshot to a design review team to get feedback on how to make it succinct, anbd more readable - you could be using color more intelligently i think - the dim text is hard to read - nothing should be cut off also". Three design reviewers (layout, color, what a reader needs) agreed on the items below; the unit director took the choices where they differed.
-
-1. **Alphabetical.** Every unit of a production is in one list sorted by `key` (`localeCompare` with `sensitivity: 'base'`). No state-first sort. No `Done:` or `Standing by:` fold lines: each unit is in its place in the list.
-2. **The name opens the unit.** The unit name is the `Button` (plain, name in bold). No `open` label on any row.
-3. **A unit with an open phase has at most three lines** (plus a gate line, plus wrap lines):
-   - Line 1: `● <key>  Phase <id>  <title>`, or `● <key>  Ticket <id> · <n> merged  <title>`. No `/<of>` after the phase id (it read `Phase 32/31` when a plan grew).
-   - Line 2, left: the strip, then `<done>/<total>` (total = `phases.length`), then the stage, then ` · fix rounds <n>` when `n > 0` (` + 1 running` when one runs; the fix part in `warning` at 3 or more). Drop the stage when it is `Phase <id> running` or `Ticket <id> running`: the heading says it. Line 2, right: `ETA <time> · in 2h 16m` in the default color, or `ETA <time> · late 2h 29m` in `error`, or `no ETA` in `warning`. No `on its first ETA`, no `moved N×` on the board (the detail view keeps the ETA history).
-   - Gate line, when a phase is gated: `Phase <id> waits on <gate>: <waits_on>`, timed form `Phase <id> waits on <gate> until <time>: <waits_on>`, in `warning`.
-   - Line 3, left: `workers ` (in `inactive`) then counts by state, `3 running · 4 idle · 5 paused`, in the order running, idle, paused, then any other state; `running` in `suggestion`, `paused` in `warning`, the rest in the default color. No roles, no slot names (the detail view has them). Line 3, right: `run ends <time>` (predicted; in `error` with ` · late <elapsed>` when past), `run ended <time>` (finished), `run ends after <gate>` (after_gate), nothing (unknown).
-4. **A unit with no open phase is one line:** `● <key>  <stage>` then ` · <done>/<total>` when it has phases, then ` · run ends <time>` / ` · run ended <time>` when known.
-5. **The strip is always a bar.** One cell per phase up to 20 phases. Above 20, 20 cells: cell `i` covers phases `[floor(i*n/20), floor((i+1)*n/20))` and shows `open` if any of them is open, else `gated` if any is gated, else `todo` if any is todo, else `done`. Colors do not change: done `success`, open `suggestion`, todo `inactive`, gated `warning`.
-6. **Short times** from `at` and `utc_offset_minutes` (never from `text`): the same local day as now is `18:00`; within six days before or after is `Sat 18:41`; else `24 Oct`. Elapsed and remaining use the `overdueText` units (`2h 29m`, `1d 10h`, `45m`).
-7. **No ruler on the board.** It moves to the detail view only (it is already there).
-8. **The dot color is the unit's health:** `error` when the ETA or the predicted run end is past; else `warning` when a phase is gated or an open phase has no ETA; else `suggestion` when the unit runs; `success` when the run finished; `inactive` otherwise.
-9. **Header:** production name in bold on the left; on the right `11 units · 2 late · as of 15:44`, with `· N late` only when N > 0 (N = units with an `error` dot, the count in `error`), the rest in `inactive`.
-10. **Readable text.** Remove `subtle` from the mod (board, detail view, geometry `Tone`). Every fact draws in the default color. `inactive` is the only grey, used only for labels (`workers`, `as of`), separators and the header counts. No `dimColor`. In the detail view (`unit.tsx`) every `subtle` becomes `inactive` for labels and secondary history, or the default color for facts (plan path, summary, ETA trail, step times, record cells). Ruler: future track `inactive`; now mark `│` in the default color (red is only for late); ETA dot `success` before it is reached, `error` after; ETA label colored like its dot.
-11. **Nothing is cut off.** No line that carries text uses `truncate-end` or `fitText` on the board. Move `wrappedLines` from `unit.tsx` to `geometry.ts` and wrap: a title wraps to more lines indented 2 cells under line 1; when the right part of line 2 or 3 does not fit beside the left part with 2 spaces between, it goes on its own next line, indented 2. Every drawn line is at most `width` cells (`cellWidth`).
-12. **Height budget** (when the pane is shorter than the board): first drop line 3 of units from the bottom up; then the gaps between units; then whole units from the bottom, named in one `+N more: a, b` line (`doneText`). Wrapped lines count at their real height.
+- `BoardView` lists every unit of a production in one list, sorted by `key` with `localeCompare(…, { sensitivity: 'base' })`. There is no state-first sort and no `Done:`/`Standing by:` fold line. The unit name is a plain `Button` (bold) that opens the detail view; no row has an `open` label.
+- A unit with an open phase (`unitBlock`) has at most three lines plus wrap lines. Line 1: `● <key>  Phase <id>  <title>` or `● <key>  Ticket <id> · <n> merged  <title>`, with no `/<of>`. Line 2: the strip, `<done>/<total>`, the stage (left out when it is `Phase <id> running` or `Ticket <id> running`), ` · fix rounds <n>` (` + 1 running`; `warning` at 3 or more); on the right `ETA <time> · in <elapsed>`, or `· late <elapsed>` in `error`, or `no ETA` in `warning`. A gated phase adds `Phase <id> waits on <gate>[ until <time>]: <waits_on>` in `warning`. Line 3: `workers ` (`inactive`) and counts by state in the order running, idle, paused, then others (`running` `suggestion`, `paused` `warning`); on the right `run ends <time>` (`error` with ` · late <elapsed>` when past), `run ended <time>` or `run ends after <gate>`.
+- A unit with no open phase is one line: `● <key>  <stage>`, then ` · <done>/<total>` and ` · run ends|ended <time>` when known.
+- The dot (`healthTone`) is `error` when the ETA or predicted run end is past, else `warning` when a phase is gated or an open phase has no ETA, else `suggestion` when the unit runs, `success` when the run finished, `inactive` otherwise. The header has the production name in bold and `N units · M late · as of HH:MM` on the right; `· M late` shows only when M > 0, in `error`, the rest `inactive`.
+- `stripCells` draws one cell per phase up to 20 phases; above 20, cell `i` covers phases `[floor(i*n/20), floor((i+1)*n/20))` and shows open, else gated, else todo, else done. `shortTime(time, now, utcOffsetMinutes)` reads `at` and the offset, never `text`: `18:00` on the same local day, `Sat 18:41` within six days either way, else `24 Oct`. Elapsed text uses the `overdueText` units.
+- Nothing on the board is cut off: no board line uses `truncate-end` or `fitText`. Titles wrap with a 2-cell indent, and `pairedLines` moves a right part that does not fit beside its left part (2 spaces apart) to its own line, indented 2. Every line is at most `width` cells by `cellWidth`. When the pane is too short, line 3 goes first from the bottom up, then the gaps between units, then whole units from the bottom, named in one `+N more: a, b` line (`doneText`); wrapped lines count at their real height.
+- The `subtle` tone is gone from the mod (board, detail view and `Tone`), with no `dimColor`. `inactive` is the only grey, for labels, separators and header counts. The ruler is in the detail view only: future track `inactive`, now mark `│` in the default color, ETA dot and label `success` before the ETA and `error` after.
 
 **Files:**
-- `mods/unit-board/hooks/board.tsx` — list, block lines, header, height budget.
-- `mods/unit-board/hooks/geometry.ts` — `Tone`, `stripCells`, ruler colors, short times, `wrappedLines`.
-- `mods/unit-board/hooks/unit.tsx` — colors only, and the shared `wrappedLines`.
-- `mods/unit-board/tests/board.test.tsx`, `mods/unit-board/tests/geometry.test.ts` — tests.
+- `mods/unit-board/hooks/board.tsx` — `BoardView`, `unitBlock`, `healthTone`, `span`, `wrapLine`, `pairedLines`, the header and the height budget.
+- `mods/unit-board/hooks/geometry.ts` — `Tone`, `stripCells`, `shortTime`, `elapsedText`, `wrappedLines`, ruler colors.
+- `mods/unit-board/hooks/unit.tsx` — the detail view: the ruler, colors only, and `wrappedLines` from `geometry.ts`.
+- `mods/unit-board/tests/board.test.tsx`, `mods/unit-board/tests/geometry.test.ts` — order, line forms, tones, bar compression, short times, no `…` and no line wider than 40, 60 or 85, height budget order.
 
-**Workers:** 1 writer + 1 tester.
-- `impl` — `mods/unit-board/hooks/board.tsx`, `mods/unit-board/hooks/geometry.ts`, `mods/unit-board/hooks/unit.tsx`.
-- `test` — `mods/unit-board/tests/board.test.tsx`, `mods/unit-board/tests/geometry.test.ts`, from this Spec alone: units in name order whatever their state; no `open` label and no `Done:`/`Standing by:` line; a running unit with workers and an ETA takes 3 lines; heading has no `/<of>`; a 132-phase plan draws a 20-cell bar and `74/132`; late ETA text and its tone are `error`, `no ETA` is `warning`; worker counts by state with tones; `run ends`/`run ended`/`run ends after G1`; short time forms on the same day, within six days and later; the dot tone for each health case; the header late count; no element anywhere in board or detail view has color `subtle`; at widths 40, 60 and 85 with a long title, a long gate reason and many workers, no drawn line has `…` and none is wider than the width; height budget order. Existing tests that pin the old layout change to the new one.
+**Gotchas:** the mod never computes ETAs; `in 2h 16m` is display arithmetic on recorded times. The detail view still uses `truncate-end` and keeps its fold order; only the board is free of cut-offs.
 
-**Constraints from prior phases:** a closed pane does no work; the mod reads the board JSON and never computes ETAs (relative times like `in 2h 16m` are display arithmetic on recorded times, not predictions); the detail view keeps its fold order from phase 10.
-
-**Acceptance gate:** mod tsc, mod tests, strict validate, the full merge gate.
+**Ruled out:** the `/<of>` phase total (it read `Phase 32/31` when a plan grew); `on its first ETA` and `moved N×` on the board (the detail view keeps the ETA history); worker roles and slot names on the board.
 
 ### Phase 18 — The accounts board fits the pane  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `/accounts-board` is readable at every pane width: each account is one short line, colors show how much room is left, and nothing is cut off or broken across columns.
-
-**Spec:**
-
-Source: the user via the showrunner, 2026-10-20: "the /accounts-board can't be read". The cause, found in the code: `AccountsView` draws a fixed table (about 88 columns wide with real roles and credits) and ignores the pane width. In a narrower docked pane, each row wraps through its columns and the table breaks apart. The unit director made the design choices below, to match the phase 17 board.
-
-1. **Use the pane width.** `AccountsView(elements, columns, status, zone, now)` takes `e.props.bodyColumns` from `register.tsx`. Every drawn line is at most `columns` cells (`cellWidth`). No `…`, no `truncate-end`, no `fitText`.
-2. **No table.** Remove the heading row and the padded columns (`accountsTable`, `AccountsTable`, `widths`, `width`). Each account is one paired line (move `span`, `wrapLine`, `pairedLines` and their types from `board.tsx` to a shared place both views import, or export them from `board.tsx`; do not copy them):
-   - Left: `● <label>`, then `  <roles joined with ', '>` when it has roles. The label is bold.
-   - Right: `<n>% left` (rounded), then ` · resets <time>`, then for an account with credits ` · credits <amount|unlimited>` with ` in use` when `use_credits`, then ` · read <time>`. A missing weekly reading is `no reading`; a missing reset, credit or read part is left out (never `—`, never 0).
-   - When the right part does not fit beside the left part with 2 spaces between, it goes on its own next line, indented 2, and wraps there (the `pairedLines` rule).
-3. **Order:** by label, `localeCompare` with `sensitivity: 'base'`.
-4. **Colors** (no `subtle`, no `dimColor`; `inactive` only for the words `resets`, `credits`, `read` and the ` · ` separators):
-   - Dot and `<n>% left`: `error` under 10 %, `warning` under 25 %; at 25 % or more the dot is `success` and the text the default color. `no reading`: dot `inactive`, text default.
-   - ` in use`: `warning`.
-   - Label, roles, numbers and times: the default color.
-5. **Short times** in the resolved zone, from `now`: the same local day as now is `14:00`; within six days before or after is `Sat 14:00`; else `24 Oct`. `AccountsPaneState` `accounts` gains `now` (seconds, from `$.clock.now() / 1000`), set at each load; each 10 s tick sets a fresh `now` with no process run (as the board does).
-6. **Problems:** after one blank line, `Problems` in bold, then each problem as `• <text>` in `warning`, wrapped at `columns` with continuation lines indented 2.
-7. **Nothing else changes:** the argv, the refresh rules, the fixed failure reason and the loading text stay as they are.
+- `AccountsView(elements, columns, status, zone, now)` takes `e.props.bodyColumns` from `register.tsx`. Every drawn line is at most `columns` cells (`cellWidth`), with no `…`, `truncate-end` or `fitText`. Accounts sort by label with `localeCompare(…, { sensitivity: 'base' })`.
+- The view drew each account as one paired line with no table: `● <label>  <roles>` on the left and the facts on the right, moved to its own indented line when it does not fit. This form is now only the narrow fallback described under “The accounts board has column headers”, with its facts as described under “The accounts board and cargo-handler show the same table”.
+- The line helpers `span`, `wrapLine`, `pairedLines`, `BoardLine` and `PaneElements` are exported from `board.tsx` and imported by `accounts.tsx`, never copied.
+- Times use the resolved zone and `now`: `14:00` on the same local day, `Sat 14:00` within six days either way, else `24 Oct`. `AccountsPaneState` `accounts` has `now` (seconds, `$.clock.now() / 1000`), set at each load; each 10 s tick sets a fresh `now` with no process run.
+- `Problems` (bold) follows one blank line, then each problem as `• <text>` in `warning`, wrapped at `columns` with continuation lines indented 2.
+- No `subtle` and no `dimColor`; `inactive` is for fact words and ` · ` separators only. The low-quota tone is `error` under 10 % and `warning` under 25 %; the dot now shows access only, as described under “The accounts board and cargo-handler show the same table”.
 
 **Files:**
-- `mods/unit-board/hooks/accounts.tsx` — the view.
-- `mods/unit-board/hooks/board.tsx` — export or move the line helpers only; no board change.
-- `mods/unit-board/hooks/register.tsx` — pass `bodyColumns` and `now`; set `now` on load and tick.
+- `mods/unit-board/hooks/accounts.tsx` — `AccountsView`, short times, problems block.
+- `mods/unit-board/hooks/board.tsx` — exports the line helpers; no board change.
+- `mods/unit-board/hooks/register.tsx` — passes `bodyColumns` and `now`; sets `now` on load and tick.
 - `mods/unit-board/types/index.d.ts` — `now` in `AccountsPaneState`.
-- `mods/unit-board/tests/accounts.test.ts`, `mods/unit-board/tests/register.test.ts` — tests.
+- `mods/unit-board/tests/accounts.test.ts`, `mods/unit-board/tests/register.test.ts` — widths 40 to 120, order, tones, short times, tick moves `now` with no run, problem wrap.
 
-**Workers:** 1 writer + 1 tester.
-- `impl` — `accounts.tsx`, `board.tsx`, `register.tsx`, `types/index.d.ts`.
-- `test` — `accounts.test.ts`, `register.test.ts`, from this Spec alone: with seven realistic fixture accounts (four Claude, three Codex; roles `showrunners, unit directors`, `workers`, `spare`; credits `unlimited` in use, `42`; one account at 8 %, one at 20 %, one with no reading; long problems) at widths 40, 60, 85 and 120: no line wider than the width, no `…`, every label and every fact present; at 120 each account is one line; at 40 the right part is on its own indented line; accounts in label order; dot and percent tones at 8 %, 20 %, 60 % and no reading; ` in use` is `warning`; no element has color `subtle`; short time forms on the same day, within six days and later; the right part leaves out a missing reset, credit or read; a tick moves `now` with no process run; problems wrap with `• ` and indent 2. Tests that pin the old table change to the new layout.
+**Gotchas:** measure with `cellWidth`, never `.length`. A closed pane does no work; the mod never opens a credential file or asks for a login; a failed run shows a fixed reason, never process output. Never capture or read the live accounts pane.
 
-**Constraints from prior phases:** phases 6, 15 and 16 hold: a closed pane does no work; the mod never opens a credential file and never asks for a login; a failed run shows a fixed reason, never process output. Never capture or read the live accounts pane; check the layout with fixture accounts only. Measure with `cellWidth`, never `.length`.
-
-**Acceptance gate:** mod tsc, mod tests, strict validate, the full merge gate.
+**Ruled out:** a fixed-width table that ignores the pane width (each row wrapped through its columns in a narrow docked pane).
 
 ### Phase 19 — The accounts board has column headers  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `/accounts-board` is a real table again, with a header row and every column aligned, and it still fits the pane and cuts nothing off.
-
-**Spec:**
-
-Source: the user via the showrunner, 2026-10-20, after phase 18 reached main: "it should have column headers and alignment in columns". The showrunner's description of the screenshot: one line per account, no header row; the `resets` values have different widths and Codex rows add a credits part, so the ` · ` separators and `read` sit in different columns; the codex2 line runs to the right edge; under Problems, each line reads `• * claude2: login token expired; …`, with a stray `* `.
-
-1. **Columns.** The columns are a dot column (no header), `Label`, `Roles`, `Left`, `Resets`, `Credits`, `Read`. Each column is as wide as its widest cell or header (`cellWidth`), with 2 spaces between columns and no padding after the last column. `Credits` is shown only when at least one account has a credit balance. The header row is bold, in the default color.
-2. **Cells.** No words in the cells: the header names the column. `Label` is bold. `Roles` is the roles joined with `, `. `Left` is `60%` (rounded), or `—` when there is no reading. `Resets` and `Read` are the phase 18 short times (`14:00`, `Sat 14:00`, `24 Oct`). `Credits` is the balance rounded with thousands separators (`13,446`, `42`, `unlimited`), then ` in use` (in `warning`) when the account uses credits. A missing reset, credit or read cell is blank.
-3. **Alignment.** `Label`, `Roles` and `Credits` are left-aligned. `Left`, `Resets` and `Read` are right-aligned, so the clock times line up (`Mon 02:00` over `    13:00`). Headers align like their cells.
-4. **Colors** do not change from phase 18: the dot and `Left` are `error` under 10 % and `warning` under 25 %; at 25 % or more the dot is `success` and `Left` the default color; no reading gives an `inactive` dot. ` in use` is `warning`. No `subtle`, no `dimColor`.
-5. **Forms**, picked once for the whole list:
-   - **Table**, when the full table width fits the pane: the header row, then one row per account.
-   - **Two-row table**, when it does not: each account takes two rows. Row 1 holds the dot, `Label`, `Roles` and `Left`; row 2, indented 2, holds `Resets`, `Credits` and `Read`. The header is two rows in the same shape. Columns align across accounts in each row kind.
-   - **Narrow fallback**, when a row of the two-row table is wider than the pane: the phase 18 narrow form (no header, facts with their words, a break only between facts).
-6. **No stray star.** `accounts.py status --json` sends each problem as a plain sentence, without the `* ` list mark that the text table uses (`render_status_json` in `scripts/accounts/accounts.py`). The text table output does not change. The mod draws each problem as `• <text>` as before.
-7. **Nothing else changes:** order, short times, problems block, argv, refresh rules, failure text.
+- `/accounts-board` is a table again: a bold header row in the default color, then one row per account. Each column is as wide as its widest cell or header (`cellWidth`), with 2 spaces between columns and no padding after the last. Cells hold no words; the header names the column. Right-aligned columns (`Left`, `Resets`, `Read`) line up the clock times, and headers align like their cells.
+- One form is picked for the whole list: the one-row table when it fits the pane; else a two-row table (row 1 dot, label, roles, left; row 2, indented 2, the rest, with a two-row header of the same shape); else the narrow fallback with no header and worded facts, breaking only between facts.
+- The column set, headers, cells and right-aligned columns are now the shared table described under “The accounts board and cargo-handler show the same table”; this phase shipped `Label`, `Roles`, `Left`, `Resets`, `Credits` (shown only when an account has a balance), `Read`.
+- Credit balances round with thousands separators (`13,446`, `42`, `unlimited`). `Left` is `60%` or `—`. A missing cell is blank.
+- `render_status_json` in `scripts/accounts/accounts.py` sends each problem as a plain sentence, `note.removeprefix("* ")`; the text table keeps its `* ` mark. The mod draws each problem as `• <text>`.
 
 **Files:**
-- `mods/unit-board/hooks/accounts.tsx` — the table and its forms.
-- `scripts/accounts/accounts.py` — `render_status_json` problems only.
-- `mods/unit-board/tests/accounts.test.ts`, `scripts/accounts/test_accounts.py` — tests.
+- `mods/unit-board/hooks/accounts.tsx` — `tableColumns`, `tableLine`, `accountLines`: the table and its three forms.
+- `scripts/accounts/accounts.py` — `render_status_json` problems without `* `.
+- `mods/unit-board/tests/accounts.test.ts` — exact drawn lines of `readableFixture()` (America/New_York) per form, column starts, alignment, tones.
+- `scripts/accounts/test_accounts.py` — JSON problems carry no `* `; the text table still does.
 
-**Workers:** 1 writer + 1 tester.
-- `impl` — `mods/unit-board/hooks/accounts.tsx`, `scripts/accounts/accounts.py`.
-- `test` — `mods/unit-board/tests/accounts.test.ts`, `scripts/accounts/test_accounts.py`, from this Spec alone: pin the exact drawn lines of `readableFixture()` (America/New_York) in the table form at 120 columns, the two-row form at 60 and the narrow fallback at 30; a header row with the six headings (five when no account has credits); every column starts at the same cell in every row; right-aligned `Left`, `Resets` and `Read`; `13,446`; `—` for no reading; blank missing cells; no line wider than the pane and no `…`; the tones from item 4. In `test_accounts.py`, the JSON problems carry no `* ` mark, and the text table still does.
-
-**Constraints from prior phases:** phases 6, 15, 16 and 18 hold. Never capture or read the live accounts pane; check the layout with fixture accounts only. Never run `accounts.py` on real accounts; its tests use their own fixtures.
-
-**Acceptance gate:** mod tsc, mod tests, strict validate, basedpyright on `scripts/accounts`, the full merge gate.
+**Gotchas:** never run `accounts.py` on real accounts; its tests use their own fixtures. Never capture or read the live accounts pane.
 
 ### Phase 20 — The accounts board and cargo-handler show the same table  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `/accounts-board` and the cargo-handler accounts table show the same columns, in the same order and format, from the same `accounts.py` JSON.
-
-**Spec:**
-
-Source: the user via the showrunner, 2026-10-20: the two views should "show basically the same thing"; the user likes the green/red mark for "whether or not we are able to access the account"; "in use vs enabled should be columns". The shared spec was settled with cargo-liner's showrunner. handler-enh builds the cargo-handler side (its phase 19) to the same spec. Any later change goes to handler-enh too, so both views change together.
-
-1. **JSON.** `accounts.py status --json` adds two fields to each account (`StatusAccountDocument`, `render_status_json`): `read_ok: bool`, true when the account has a stored reading (`read_at` set) and its latest read outcome is `OK` or `HELD`; `credits_in_use: bool`, true when the account spends credits now (`on_credits == "yes"`). Nothing else in the JSON or the text table changes. Tests in `test_accounts.py` pin both fields in every case (a good read, a failed read, no reading, credits in use, credits enabled and not in use).
-2. **Columns, in this order:** the mark (no header), `account`, `role`, `left`, `resets`, `credits`, `enabled`, `in use`, `read`. Headers are all lower case, bold. Every column is always shown.
-3. **Cells.**
-   - mark: `●`, `success` when `read_ok`, `error` when not. It is the only access signal.
-   - account: the label, bold. role: the roles joined with `, `.
-   - left: `60%` or `—` with no reading. `error` under 10 %, `warning` under 25 %, else the default color. Low quota colors only this cell.
-   - resets: the phase 18 short time. credits: `13,446` or `unlimited`; no ` in use` text in this cell.
-   - enabled: `yes` when `use_credits`, else blank. in use: `yes` (in `warning`) when `credits_in_use`, else blank.
-   - read: the age of the reading at `now`, floored: `45s` under a minute, `12m` under an hour, `2h` under a day, else `3d`. Blank with no reading.
-   - A missing value is blank, except `left`.
-4. **Alignment.** `account`, `role`, `enabled` and `in use` are left-aligned. `left`, `resets`, `credits` and `read` are right-aligned, so the `%` signs line up. Headers align like their cells.
-5. **Forms** as in phase 19: the table when it fits; else the two-row table (row 1 the mark, `account`, `role`, `left`; row 2, indented 2, `resets`, `credits`, `enabled`, `in use`, `read`, with a two-row header in the same shape); else the narrow form with no header (`● <label>  <roles>`, then the facts with their words: `60% left · resets Sat 14:00 · credits 42 · enabled · in use · read 12m ago`).
-6. **Mod types.** `StoredAccount` gains `read_ok` and `credits_in_use`; `AccountDisplay` carries them. A status from an older `accounts.py` with no `read_ok` draws a red mark; with no `credits_in_use`, a blank in use cell.
-7. Nothing else changes: order by label, problems block, argv, refresh rules, failure text.
+- `accounts.py status --json` gives each account two more fields (`StatusAccountDocument`, `render_status_json`): `read_ok`, true when `read_at` is set and the latest read outcome is `OK` or `HELD`; and `credits_in_use`, true when `on_credits == "yes"`. The text table does not change.
+- `/accounts-board` and the cargo-handler accounts table use one shared spec. A change to one view goes to handler-enh too, so both views change together.
+- Columns, in order: mark (no header), `account`, `role`, `left`, `resets`, `credits`, `enabled`, `in use`, `read`. Headers are lower case and bold. Every column is always shown. `left`, `resets`, `credits` and `read` align right, so the `%` signs line up; the other columns align left.
+- Cells: mark `●` is `success` when `readOk`, else `error`; it is the only access signal. `left` is `60%` or `—`, and only this cell takes the low-quota tone. `credits` is `13,446` or `unlimited`. `enabled` is `yes` when `use_credits`; `in use` is `yes` in `warning` when `creditsInUse`. `read` is the floored age (`45s`, `12m`, `2h`, `3d`) from `readAge`. Other missing values are blank.
+- Forms: the one-row table when it fits; else a two-row table (row 2 indented 2, `resets` to `read`); else the narrow form with no header and worded facts (`60% left · resets Sat 14:00 · credits 42 · enabled · in use · read 12m ago`).
+- `StoredAccount` has optional `read_ok` and `credits_in_use`; `accountDisplay` maps them to `readOk` and `creditsInUse` with `=== true`. A status from an older `accounts.py` draws a red mark and a blank `in use` cell.
 
 **Files:**
-- `scripts/accounts/accounts.py` — `StatusAccountDocument`, `render_status_json`.
-- `mods/unit-board/hooks/accounts.tsx`, `mods/unit-board/types/accounts.d.ts` — the table.
-- `scripts/accounts/test_accounts.py`, `mods/unit-board/tests/accounts.test.ts`, `mods/unit-board/tests/register.test.ts` — tests.
+- `scripts/accounts/accounts.py` — `StatusAccountDocument` and `render_status_json` emit `read_ok` and `credits_in_use`.
+- `mods/unit-board/hooks/accounts.tsx` — `accountDisplay`, `readAge`, `accountRow`, `tableColumns`, `tableLine`: the cells, column order, alignment and the three forms.
+- `mods/unit-board/types/accounts.d.ts` — `StoredAccount` with the two optional fields.
+- `scripts/accounts/test_accounts.py`, `mods/unit-board/tests/accounts.test.ts`, `mods/unit-board/tests/register.test.ts` — the JSON fields in each case, and the drawn lines at 140, 60 and 30 columns.
 
-**Workers:** 1 writer + 1 tester.
-- `impl` — `accounts.py`, `accounts.tsx`, `types/accounts.d.ts`.
-- `test` — `test_accounts.py`, `accounts.test.ts`, `register.test.ts`, from this Spec alone: the JSON fields in every case above, and that the text table is unchanged; the exact drawn lines of `readableFixture()` (extended with `read_ok` and `credits_in_use`, and one failed read) at 140, 60 and 30 columns; lower case headers in order; mark tones; `left` tones; `yes`/blank; read ages at 45 s, 12 min, 2 h and 3 d; `%` signs in one column; no line wider than the pane and no `…`; an older status without the new fields.
-
-**Constraints from prior phases:** phases 6, 15, 16, 18 and 19 hold. Never capture or read the live accounts pane; never run `accounts.py` on real accounts. accounts-unit owns `accounts.py`; the showrunner gave this edit to unit-board-unit, kept to the JSON document.
-
-**Acceptance gate:** mod tsc, mod tests, strict validate, basedpyright on `scripts/accounts`, the full merge gate.
+**Gotchas:** accounts-unit owns `accounts.py`; this change is limited to the JSON document. Never read the live accounts pane or run `accounts.py` on real accounts in tests.
 
 ### Phase 21 — /showrunner:units shows a ticket table for style work  · status: done
 
@@ -534,36 +450,16 @@ Source: the user via the showrunner, 2026-10-20: the two views should "show basi
 
 ### Phase 23 — a timed-out split writes nothing past its limit  · status: done
 
-**Depends on:** Phase 22
+#### As-built
 
-#### Work Order
-
-**Goal:** `style_plan.py split` never writes after its time limit. Today the limit's alarm cannot fire while SQLite waits on a busy ledger, so the final write can run up to 30 s past the limit.
-
-**Source:** phase 22 review finding F005 (minor, open at the phase 22 checkpoint), moved here under the landing rule.
-
-**Spec:**
-
-1. **Deadline.** `split_time_limit` gives the code inside it the deadline (a `time.monotonic()` value) as a domain type, for example `SplitDeadline(at: float)` with `remaining_seconds()`. Do not use a bare float or `None`.
-2. **Bounded write.** `style_ledger.record_split(repo, unit, split, *, busy_timeout_seconds: float)` uses that value as the connection's busy timeout in place of `BUSY_TIMEOUT_SECONDS`. `split` passes `min(BUSY_TIMEOUT_SECONDS, deadline.remaining_seconds())`. When no time remains, `split` raises the same `TimeoutError` as the alarm and writes nothing.
-3. **Behavior kept.** A busy ledger that stays locked past the deadline makes `split` exit 1 with `split <unit>: <cause>` on stderr and keep the last split. `record_refill` and every other caller keep `BUSY_TIMEOUT_SECONDS`.
+- `style_plan.SplitDeadline(at, timeout_minutes)` is a frozen domain type. `split_time_limit` yields it. `remaining_seconds()` returns the time left on the `time.monotonic()` deadline. When no time remains, it raises the alarm's `TimeoutError` with the same message.
+- `split` calls `style_ledger.record_split(repo, unit, split, *, busy_timeout_seconds=min(BUSY_TIMEOUT_SECONDS, deadline.remaining_seconds()))` inside the alarm context. A split that reaches its deadline writes nothing. It exits 1 with `split <unit>: time limit of N min reached` on stderr and keeps the last split.
+- `record_split` takes the keyword-only `busy_timeout_seconds` (default `BUSY_TIMEOUT_SECONDS`) as the connection's busy timeout. `record_refill` and all other callers keep `BUSY_TIMEOUT_SECONDS`.
 
 **Files:**
-- `scripts/style/style_plan.py`
-- `scripts/style/style_ledger.py`
-- `scripts/style/test_style_plan.py`
-- `scripts/style/test_style_ledger.py`
+- `scripts/style/style_plan.py` — `SplitDeadline`, `split_time_limit`, `split`
+- `scripts/style/style_ledger.py` — `record_split` busy-timeout argument
+- `scripts/style/test_style_plan.py` — locked-ledger deadline test and expired-deadline test
+- `scripts/style/test_style_ledger.py` — `record_split` small busy-timeout test on a locked ledger
 
-**Workers:** 1 writer.
-- `impl` writes items 1–3 and the regression tests: a ledger held by a second connection's open write transaction past a short limit makes `split` fail within about one second of the limit and leaves the last split unchanged; `record_split` with a small busy timeout fails fast on a locked ledger.
-
-**Constraints from prior phases:**
-- Phase 22 shipped `split`, `split-all`, `split_time_limit` (SIGALRM) and `record_split`; `record_split` already runs inside the time limit.
-- The style ledger is shared with four live style units. Never write to `~/.local/state/style/` or to any plan or decision under `~/rust/`. Never run refill, `next_phase`, `split` or `split-all` against live data; tests use temporary ledgers only.
-- The worktree has no `.venv`; basedpyright needs a temporary venv under `/tmp/claude` (`--venvpath`).
-
-**Acceptance gate:**
-- basedpyright on the four files, footer `0 errors, 0 warnings, 0 notes`
-- `scripts/style`: `test_style_plan`, `test_style_ledger`
-- tests show: a split blocked on a locked ledger ends within about one second of its limit and writes nothing; the last split is kept
-- the full merge gate
+**Gotchas:** A Python SIGALRM handler cannot run while sqlite3 waits in its C busy handler. The busy timeout must have its own limit, because the alarm alone cannot stop the write.
