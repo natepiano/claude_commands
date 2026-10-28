@@ -30,7 +30,7 @@ from urllib.parse import quote
 
 import store
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 # Step and call fields under a former name, renamed in the file on its next read.
 FORMER_FIELDS = (("seat", "worker"), ("delegate_session", "unit_session"))
 LOCK_NAME = "index.lock"
@@ -275,7 +275,24 @@ HOLD_EVENT_COLUMNS: list[Column] = [
     ("until", "TEXT", "the planned end; empty when none was given"),
 ]
 
+HOLD_BUILD_COLUMNS: list[Column] = [
+    ("src", "TEXT", "source file for this hold's audit rows"),
+    ("id", "TEXT", "build identity from boot id, pid and process start time"),
+    ("at", "TEXT", "UTC instant when the audit first recorded this build for this hold"),
+    ("host", "TEXT", "machine that ran the build"),
+    ("hold_key", "TEXT", "holder file key"),
+    ("hold_since", "TEXT", "holder file since instant; a new hold gets new rows"),
+    ("boot_id", "TEXT", "kernel boot id; process start times are relative to this boot"),
+    ("pid", "INTEGER", "top cargo or nextest pid, or a compiler with no cargo ancestor"),
+    ("proc_start", "TEXT", "process start time in clock ticks since boot; guards pid reuse"),
+    ("class", "TEXT", "other_session or no_session; holder and admitted builds are not recorded"),
+    ("session", "TEXT", "owning session id or ancestor identity; empty for no_session"),
+    ("command", "TEXT", "build arguments as shell text"),
+    ("cwd", "TEXT", "build working directory; empty when it cannot be read"),
+]
+
 TABLES: dict[str, tuple[list[Column], str, str]] = {
+    "hold_builds": (HOLD_BUILD_COLUMNS, "", "one row per other_session or no_session build per hold; audit only"),
     "hold_events": (HOLD_EVENT_COLUMNS, "", "one row per began or ended event; current holds come from coordination files"),
     "steps": (STEP_COLUMNS, "", "one row per step invoke.sh's run() ran: clippy, mend, doc, fmt, nextest, check, sweep"),
     "tests": (
@@ -574,7 +591,11 @@ def add_hold_event(connection: sqlite3.Connection, record: dict[str, object], sr
     insert(connection, "hold_events", pick({**record, "src": src}, HOLD_EVENT_COLUMNS))
 
 
-ADDERS = {"hold_event": add_hold_event, "step": add_step, "call": add_call, "ci_run": add_ci_run, "sample": add_sample,
+def add_hold_build(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
+    insert(connection, "hold_builds", pick({**record, "src": src}, HOLD_BUILD_COLUMNS))
+
+
+ADDERS = {"hold_build": add_hold_build, "hold_event": add_hold_event, "step": add_step, "call": add_call, "ci_run": add_ci_run, "sample": add_sample,
           "memory_snapshot": add_memory_snapshot}
 
 

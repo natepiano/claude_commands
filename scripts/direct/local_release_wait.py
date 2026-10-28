@@ -1,4 +1,4 @@
-"""Wake a routing retry on a local hold/admission change, or its retry deadline."""
+"""Wake a routing retry on a local hold change, or its retry deadline."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_targets")
 
 @final
 class LocalReleaseEvents(AbstractContextManager["LocalReleaseEvents"]):
-    """Own Linux directory watches for one local admission wait."""
+    """Own Linux directory watches for one local hold wait."""
 
     def __init__(self, holders: Path, release: Path) -> None:
         library = ctypes.CDLL(None, use_errno=True)
@@ -37,7 +37,7 @@ class LocalReleaseEvents(AbstractContextManager["LocalReleaseEvents"]):
 
     def arm(self) -> None:
         # Watch existing parents too: an absent holder directory or a new cycle
-        # must wake us so we can attach its watch before reading admission again.
+        # must wake us so we can attach its watch before reading hold state again.
         paths = set(self.directories)
         for directory in self.directories:
             if directory.is_dir():
@@ -123,6 +123,7 @@ def local_release_waiter(holders: Path, release: Path) -> LocalReleaseEvents | I
 
 
 def wait_for_local_release(seconds: float, call_id: str) -> None:
+    _ = call_id
     from scripts.build_targets import build_targets
     from scripts.build_targets.targets import Held, target_state
     from scripts.build_hold import build_hold
@@ -130,18 +131,14 @@ def wait_for_local_release(seconds: float, call_id: str) -> None:
     target = build_targets.local_target()
     holders = build_hold.holder_directory()
     release = build_hold.release_directory()
-    key = build_hold.waiter_key(call_id)
     deadline = time.monotonic() + seconds
     with local_release_waiter(holders, release) as events:
         while True:
             events.arm()
-            # Arm before reading state: a release between registration and this
+            # Arm before reading state: a release before this
             # helper's startup is observed here, and a later release queues an event.
             state = target_state(target)
             if not isinstance(state, Held):
-                return
-            admission = build_hold.read_admission(key, call_id)
-            if isinstance(admission, (build_hold.AdmittedTurn, build_hold.AdmissionReadError)):
                 return
             remaining = deadline - time.monotonic()
             if remaining <= 0:

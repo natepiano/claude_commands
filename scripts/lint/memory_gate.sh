@@ -23,7 +23,6 @@ source "$BUILD_OVERRIDE_GUARD_DIR/../build_hold/override_guard.sh" || exit 2
 build_override_refusal "${BASH_SOURCE[0]}" lint/memory_gate.sh || exit 2
 UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
-BUILD_HOLD_MARK_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_hold" && pwd)/build_hold.py"
 BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_targets" && pwd)/build_targets.py}"
 BUILDLOG_MEM_ADMIT_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/memory_admit.py"
 USER_ZONE_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/user_zone.py"
@@ -34,37 +33,6 @@ buildlog_memory_python() {
     else
         python3 "$@"
     fi
-}
-
-build_hold_mark() {
-    local holder_dir="${BUILD_HOLD_DIR:-$HOME/.local/state/build-hold}" holder=""
-    for holder in "$holder_dir"/* "$holder_dir"/.[!.]* "$holder_dir"/..?*; do
-        [[ -f "$holder" ]] && break
-    done
-    [[ -f "$holder" ]] || return 0
-    local arguments=(mark --state "$1") cycle_id="" generation=""
-    if [[ -n "${2:-}" ]]; then arguments+=(--outcome "$2"); fi
-    # An app launch is no build: it never ends a turn a queued run holds.
-    if [[ "${3:-}" == launch ]]; then arguments+=(--launch); fi
-    # Another caller's call id goes to mark only when no session owns the run
-    # (build_hold.owning_session reads these variables). Then the queue keys the
-    # call as verify:<id>, and only its id ends its turn. A session's build
-    # marks the session's entry with no call id, as before.
-    local call_id=""
-    if [[ -n "${BUILDLOG_CALL_ID:-}" && "${BUILDLOG_CALLER:-}" == verify ]]; then
-        call_id=$BUILDLOG_CALL_ID
-    elif [[ -z "${CLAUDE_CODE_SESSION_ID:-}${UNIT_RUN_DIR:-}${UNIT_SESSION_DIR:-}" ]]; then
-        call_id="${BUILDLOG_HOLD_CALL_ID:-}"
-    fi
-    if [[ -n "$call_id" ]]; then
-        arguments+=(--call-id "$call_id")
-        if [[ -n "${BUILDLOG_HOLD_ADMISSION_FILE:-}" && -r "$BUILDLOG_HOLD_ADMISSION_FILE" ]]; then
-            IFS=' ' read -r cycle_id generation < "$BUILDLOG_HOLD_ADMISSION_FILE" || true
-            [[ -z "$cycle_id" ]] || arguments+=(--cycle-id "$cycle_id")
-            [[ -z "$generation" ]] || arguments+=(--generation "$generation")
-        fi
-    fi
-    python3 "$BUILD_HOLD_MARK_SCRIPT" "${arguments[@]}" >/dev/null 2>&1 || true
 }
 
 # Status 0 only when the holder directory is a readable directory with no
@@ -82,7 +50,7 @@ build_hold_nothing_held() {
     return 0
 }
 
-# natedev's hold queue knows each waiting step by a call id. A verify.sh step
+# A waiting step has a call id for its wait-time and interrupt records. A verify.sh step
 # uses verify's BUILDLOG_CALL_ID. A step from any other caller (cargo-port, an
 # agent that runs lint) gets an id of the same form, made once per shell when
 # a hold is first seen. The id stays in this shell and is not exported: build
@@ -129,18 +97,11 @@ build_hold_wait_local() {
     return "$status"
 }
 
-build_hold_check_admission() {
+build_hold_check_local() {
     build_hold_applies || return 0
     if build_hold_nothing_held; then return 0; fi
     build_hold_call
-    local arguments=(check-admission --call-id "$BUILDLOG_HOLD_CALL_ID")
-    if [[ -n "$BUILDLOG_HOLD_CALLER" ]]; then arguments+=(--caller "$BUILDLOG_HOLD_CALLER"); fi
-    python3 "$BUILD_TARGETS_SCRIPT" "${arguments[@]}"
-}
-
-build_hold_step_started() {
-    [[ -n "${BUILDLOG_HOLD_STARTED_FILE:-}" ]] || return 0
-    : > "$BUILDLOG_HOLD_STARTED_FILE"
+    python3 "$BUILD_TARGETS_SCRIPT" check-local --caller "${BUILDLOG_HOLD_CALLER:-verify}"
 }
 
 buildlog_memory_line() {
@@ -225,7 +186,6 @@ buildlog_wait_for_memory() {
             started=$SECONDS
             announced=1
             buildlog_memory_line first "$available" "$threshold" "$need" "$source" "$count" "$promised" "$running" "$reserve" "$summary" "$repo" "$step"
-            build_hold_mark WaitingForMemory
         elif [[ -n "${LINT_QUEUE_LEAVE_HOOK:-}" ]] \
               && /bin/sh -c "$LINT_QUEUE_LEAVE_HOOK" </dev/null >/dev/null 2>&1; then
             BUILDLOG_MEM_OUTCOME=LeftQueue

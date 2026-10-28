@@ -385,7 +385,7 @@ class IndexTests(unittest.TestCase):
             _ = connection.execute("UPDATE samples SET power_profile = NULL, power_profile_since = NULL")
             connection.commit()
         self.assertEqual(index.update(), 1)
-        self.assertEqual(self.rows("PRAGMA user_version"), [(18,)])
+        self.assertEqual(self.rows("PRAGMA user_version"), [(19,)])
         self.assertEqual(self.rows("SELECT power_profile, power_profile_since FROM samples"), [("power-saver", STAMP)])
 
     def test_reindex_reads_everything_again(self) -> None:
@@ -591,7 +591,7 @@ class IndexTests(unittest.TestCase):
                 ("old", None, None, None, None),
             ],
         )
-        self.assertEqual(index.SCHEMA_VERSION, 18)
+        self.assertEqual(index.SCHEMA_VERSION, 19)
 
     def test_copy_call_fields_reach_index_and_old_records_read_as_null(self) -> None:
         self.write(
@@ -614,7 +614,7 @@ class IndexTests(unittest.TestCase):
             _ = connection.execute("UPDATE calls SET copy = NULL, copy_s = NULL")
             connection.commit()
         self.assertEqual(index.update(), 1)
-        self.assertEqual(self.rows("PRAGMA user_version"), [(18,)])
+        self.assertEqual(self.rows("PRAGMA user_version"), [(19,)])
         self.assertEqual(self.rows("SELECT copy, copy_s, copy_count FROM calls"), [("gave_way", 12.0, 1)])
 
     def test_natedev_nextest_stopped_by_a_copy_win_is_not_a_failure(self) -> None:
@@ -687,6 +687,27 @@ class IndexTests(unittest.TestCase):
             result.stdout,
             r"hold_wait_s\s+REAL\s+seconds waited on a held target, each declined Mac retry included; memory waits are not counted",
         )
+
+    def test_hold_build_rows_reach_index_rebuild_and_schema(self) -> None:
+        path = self.root / "natedev" / "hold-builds-test.jsonl"
+        self.write(path, {
+            "kind": "hold_build", "id": "build", "host": "natedev", "at": STAMP,
+            "hold_key": "holder", "hold_since": STAMP, "boot_id": "boot", "pid": 123,
+            "proc_start": "456", "class": "no_session", "session": "", "command": "cargo test", "cwd": "/repo",
+        })
+        self.assertEqual(index.update(), 1)
+        self.assertEqual(index.update(), 0)
+        self.assertEqual(self.rows("SELECT hold_key, pid, proc_start, class, session, command FROM hold_builds"),
+                         [("holder", 123, "456", "no_session", "", "cargo test")])
+        self.assertEqual(index.reindex(), 1)
+        self.assertEqual(self.rows("SELECT src FROM hold_builds"), [("natedev/hold-builds-test.jsonl",)])
+        result = subprocess.run([sys.executable, str(CLI), "schema"], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("TABLE hold_builds", result.stdout)
+        self.assertIn("one row per other_session or no_session build per hold; audit only", result.stdout)
+        path.unlink()
+        _ = index.update()
+        self.assertEqual(self.rows("SELECT count(*) FROM hold_builds"), [(0,)])
 
     def test_ci_skipped_and_zero_queue_jobs_have_distinct_states(self) -> None:
         same_stamp = "2026-10-02T12:00:00Z"
