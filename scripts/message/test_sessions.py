@@ -127,6 +127,15 @@ class SessionLookupTests(ShutdownTestCase):
         self.assertEqual(self.run_cli("socket", "same").stdout.strip(), str(other_path))
         self.assertEqual(self.run_cli("socket", "session:same-id").stdout.strip(), str(other_path))
 
+    def test_a_unit_id_and_its_bare_name_find_the_same_session(self) -> None:
+        def record(name: str, session_id: str) -> sessions.SessionRecord:
+            return sessions.SessionRecord(pid=1, sessionId=session_id, name=name, messagingSocketPath="", updatedAt=1,
+                                          tmux="", formerNames=[])
+        records = [record("handler", "bare"), record("modules-unit", "suffixed"), record("modules", "exact")]
+        found = [sessions.named(name, records) for name in ("handler-unit", "handler", "modules-unit", "modules", "gone")]
+        self.assertEqual([None if item is None else item["sessionId"] for item in found],
+                         ["bare", "bare", "suffixed", "exact", None])
+
     def test_dead_pid_and_missing_socket_return_absent(self) -> None:
         self.record("dead.json", pid=2**29 + os.getpid())
         self.record("missing-socket.json", socket_path=self.root / "absent.sock")

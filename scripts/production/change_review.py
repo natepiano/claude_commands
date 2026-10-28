@@ -4,13 +4,14 @@
     change_review.py check --repo R --checkpoint C --previous P --merge-branch B
     change_review.py append --repo R [--production DOC] [--list L] --merged M --checkpoint C --previous P --merge-branch B
     change_review.py drift --repo R --merge-branch B [--production DOC] [--list L] --since YYYY-MM-DD
-    change_review.py add [--production DOC] [--list L] --change "<what changed for you>" --check "<how to try it>" --see "<what you see>" [--merged M] [--urgency user|blocks|soon|normal|later] [--due ISO] [--after C<n>]
+    change_review.py add [--production DOC] [--list L] --change "<what changed for you>" --check "<how to try it>" --see "<what you see>" [--merged M] [--urgency user|blocks|soon|normal|later] [--due ISO] [--after C<n>] [--hold <folder> ...]
     change_review.py edit [--production DOC] [--list L] --row C<n> --change "<what changed for you>" --check "<how to try it>" --see "<what you see>"
     change_review.py show [--production DOC] [--list L]
     change_review.py verdict [--production DOC] [--list L] --row C<n> --verdict "<the user's words>"
     change_review.py mark-important [--production DOC] [--list L] --row C<n>
     change_review.py list-path [--production DOC]
     change_review.py showrunner [--production DOC]
+    change_review.py backfill-production [--list L] [--write]
 
 A checkpoint(...) commit tells a person with no context what changed, how to try it and what they
 see, one line each: `Change-Review: <what changed for you> | <how to try it: where and what to type> |
@@ -26,7 +27,16 @@ the next C number, the push date and the merged hash, the How to check cell `<ho
 see: <what you see>`, and "not yet" when the table has an "On the Mac build" column. `add` writes one
 row for a change no checkpoint line carries; `edit` rewrites one row still to review in place and keeps
 its id, Merged cell and position; `show` prints the current row and how many wait after it; `verdict` moves a row to "## Reviewed" with the user's verdict and today's
-date; `mark-important` marks a row the user called important.
+date, and removes the row's scratch folders and held folders (task `row:<showrunner>-C<n>`,
+scripts/lib/scratch.py) whichever way the verdict goes; `add --hold <folder>` holds a folder the user
+checks the row in, where it is, until that verdict; `mark-important` marks a row the user called important.
+
+Each row's Production cell names the production whose change it is: the production whose Units
+table names the branch of the checkpoint that carries the row's line (`visible_owners`), else the
+merging one. `backfill-production` fills the empty cells of older rows under To review, in the list
+--list names or in every list, from the row's merge hash: the checkpoint that names the row's
+change, else the one production of every checkpoint the merge brought in. It prints each cell it
+fills and each row it cannot trace, with why, and writes only with --write.
 
 To review keeps the order of urgency.py, rewritten on every write: the row `show` last printed
 first until its verdict, then by urgency, then by C number. A row's Urgency cell holds its level,
@@ -52,19 +62,22 @@ import os
 import re
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import TypeVar, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import scratch  # noqa: E402
 import urgency  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 
 # The merge gate imports this module as scripts.production.change_review; its siblings still resolve.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import issues  # noqa: E402
+from production_units import Refusal, cell_value, production_field, unit_table  # noqa: E402
+from proposals_folder import owner_docs, scope_docs, slug_of  # noqa: E402
 
 TRAILER = "Change-Review"
 LIST_HEADER = "- **Change review:**"
@@ -72,6 +85,8 @@ SECTION = "## To review"
 REVIEWED = "## Reviewed"
 CHECK = "How to check"
 URGENCY = "Urgency"
+# The production a row's change is from: its slug. A row from before the column is the root's.
+PRODUCTION = "Production"
 NOT_YET = "not yet"
 FORM = "<what changed for you> | <how to try it: where and what to type> | <what you see>"
 SEPARATOR = " | "
@@ -84,9 +99,14 @@ _LINE = re.compile(rf"^{TRAILER}:\s*(?P<value>.*)$", re.MULTILINE)
 _COVERS = re.compile(rf"^{TRAILER}-Covers:\s*(?P<sha>[0-9a-f]{{7,40}})\s*$", re.MULTILINE)
 _NUMBER = re.compile(r"^\| C(\d+) \|", re.MULTILINE)
 _ROW = re.compile(r"^[A-Z]\d+$")
-_LANDS = re.compile(r"^(works|fine)\b", re.IGNORECASE)
+_LANDS = re.compile(r"\b(works|fine)\b", re.IGNORECASE)
+_FAILS = re.compile(r"\b(not|no|never|still|fails?|failed|broken|wrong|doesn't|don't|isn't)\b", re.IGNORECASE)
 # A cell boundary is a `|` that _cell did not escape.
 _BOUNDARY = re.compile(r"(?<!\\)\|")
+_CHECKPOINT = re.compile(r"^checkpoint\((?P<branch>[^)]+)\):")
+_HASH = re.compile(r"\b[0-9a-f]{7,40}\b")
+# The columns an older row keeps its merge hash in, in the order they are read.
+HASH_COLUMNS = ("Merged", "On the Mac build")
 LISTS = Path(os.environ.get("CHANGE_REVIEW_DIR") or Path.home() / "rust/hanadocs/change-review")
 PREFIX = "change-review - "
 FENCE = "---"
@@ -459,13 +479,27 @@ def _number(row_text: str) -> int:
     return int(found.group(1)) if found else 0
 
 
-def ordered(rows: list[dict[str, str]], current: str) -> list[dict[str, str]]:
-    """The rows in urgency.py's order: `current` first while it waits, then by urgency, then by C number."""
+def _merged_day(row: dict[str, str]) -> datetime | None:
+    """The day the row's Merged cell starts with: the row's age."""
+    try:
+        return datetime.fromisoformat(row.get("Merged", "").split(" ", 1)[0])
+    except ValueError:
+        return None
+
+
+def row_entries(rows: list[dict[str, str]]) -> list[urgency.Entry[dict[str, str]]]:
+    """The rows as urgency.py entries, by C number: each with its level, merge day and prerequisite."""
     entries: list[urgency.Entry[dict[str, str]]] = []
     for row in sorted(rows, key=lambda row: _number(row.get("#", ""))):
         level, after = _rank(row)
-        entries.append(urgency.Entry(row.get("#", ""), row, level, after=after))
-    return [entry.item for entry in urgency.order(entries, current)]
+        entries.append(urgency.Entry(row.get("#", ""), row, level, _merged_day(row), after=after))
+    return entries
+
+
+def ordered(rows: list[dict[str, str]], path: Path) -> list[dict[str, str]]:
+    """The rows in urgency.py's order: the pinned row first while it waits, then by urgency, then by C
+    number; a row the user moved to the end last."""
+    return [entry.item for entry in urgency.queue_order(row_entries(rows), queue(path))]
 
 
 def _sort(path: Path, lines: list[str]) -> None:
@@ -473,16 +507,19 @@ def _sort(path: Path, lines: list[str]) -> None:
     columns, first, end = _table(path, lines, SECTION)
     rows = {_cells(line)[0]: line for line in lines[first:end]}
     named = [dict(zip(columns, (_plain(cell) for cell in _cells(line)))) for line in lines[first:end]]
-    lines[first:end] = [rows[row["#"]] for row in ordered(named, urgency.pinned(queue(path)))]
+    lines[first:end] = [rows[row["#"]] for row in ordered(named, path)]
 
 
 def append_rows(path: Path, changes: list[Visible], day: date, merged: str, production: Path,
-                rank: str = "") -> list[str]:
+                rank: str = "", owners: Sequence[Path] = ()) -> list[str]:
     """Add one row per change to the To review table; return the rows written.
 
     `merged` is the merge's hash, or empty for a change no merge names. The Mac build column is
     written only when the table has one. `production` is the doc whose change the rows are.
-    `rank` is the rows' Urgency cell; empty is a normal row.
+    `rank` is the rows' Urgency cell; empty is a normal row. The Production column takes the
+    production's slug, so /next in a showrunner below the root shows only its own rows. `owners`,
+    when given, holds each change's own production doc (`visible_owners`); else every row is
+    `production`'s.
     """
     if not changes:
         return []
@@ -490,11 +527,15 @@ def append_rows(path: Path, changes: list[Visible], day: date, merged: str, prod
     def write(lines: list[str]) -> list[str]:
         if rank:
             _add_column(path, lines, SECTION, URGENCY)
-        columns, _, end = _table(path, lines, SECTION)
+        _add_column(path, lines, SECTION, PRODUCTION)
+        columns, first, end = _table(path, lines, SECTION)
+        if merged and (held := _held(columns, lines[first:end], changes, merged)):
+            raise ChangeReviewError(f"{held} already holds that change from merge {merged}; no row added")
         number = next_number("".join(lines))
         when = f"{day.isoformat()} · {_cell(merged)}" if merged else day.isoformat()
         rows = [_row(path, columns, {"#": f"C{number + offset}", "Change": _cell(item.change), "Merged": when,
-                                     "On the Mac build": NOT_YET, CHECK: _cell(item.how()), URGENCY: _cell(rank)})
+                                     "On the Mac build": NOT_YET, CHECK: _cell(item.how()), URGENCY: _cell(rank),
+                                     PRODUCTION: _cell(row_production(owners[offset] if owners else production))})
                 for offset, item in enumerate(changes)]
         _insert(lines, end, rows)
         return rows
@@ -509,11 +550,280 @@ def append_rows(path: Path, changes: list[Visible], day: date, merged: str, prod
     return _edit(path, production, day, write, what)
 
 
+def _held(columns: list[str], rows: list[str], changes: list[Visible], merged: str) -> str:
+    """The To review row that already holds one of `changes` from the merge `merged`, or empty. A short
+    hash and a longer one of the same merge match: on 2026-10-22 rows written with 8-character hashes
+    repeated rows written with 7 (C94-C99 of C74-C79)."""
+    wanted = {item.change for item in changes}
+    for line in rows:
+        row = dict(zip(columns, (_plain(cell) for cell in _cells(line))))
+        found = _HASH.search(row.get("Merged", ""))
+        if (found is not None and row.get("Change") in wanted
+                and (found[0].startswith(merged) or merged.startswith(found[0]))):
+            return row["#"]
+    return ""
+
+
 def pending(path: Path) -> list[dict[str, str]]:
     """Each row still to review, as its cells by column name. Reads only."""
     lines = read(path).splitlines(keepends=True)
     columns, first, end = _table(path, lines, SECTION)
     return [dict(zip(columns, (_plain(cell) for cell in _cells(line)))) for line in lines[first:end]]
+
+
+def scope_list(doc: Path) -> Path:
+    """The list that takes the production's rows: the one its Change review line names, else its root's."""
+    import showrunners
+
+    slug = slug_of(doc)
+    root = showrunners.root_of(slug)
+    try:
+        return production_list(str(doc))
+    except ChangeReviewError:
+        if slug == root:
+            raise
+        return production_list(str(showrunners.timer_docs().get(root, doc)))
+
+
+def scope_rows(path: Path, doc: Path, below: bool = False) -> list[dict[str, str]]:
+    """The rows still to review on `path`, the production's list (scope_list), that its showrunner shows.
+
+    A row is the production's when its Production cell names the production, and a row without
+    one is its list's root's. Only the production's own rows are shown, and with `below` also the
+    rows of each production below it (user, 2026-10-27).
+    """
+    import showrunners
+
+    root = showrunners.root_of(slug_of(doc))
+    scope = {slug_of(each) for each in scope_docs(doc, below)}
+    return [row for row in pending(path) if (row.get(PRODUCTION) or root) in scope]
+
+
+def row_production(production: Path) -> str:
+    """The Production cell for a change of the production doc `production`: the slug of the production
+    it is credited to (`credited`)."""
+    return slug_of(credited(production))
+
+
+def credited(production: Path) -> Path:
+    """The production a change of `production` belongs to. A style production's work lands on its parent's
+    merge branch through a hand-off, so its changes are its parent's, and its showrunner does not show them
+    (user, 2026-10-27). Any other production is its own."""
+    seen = {production}
+    while True:
+        try:
+            lines = production.read_text(encoding="utf-8").splitlines()
+            if production_field(lines, "Kind") != "style":
+                return production
+            parent = Path(production_field(lines, "Parent production")).expanduser()
+        except (OSError, UnicodeError, Refusal):
+            return production
+        if parent in seen:
+            return production
+        seen.add(parent)
+        production = parent
+
+
+def unit_branches(docs: Iterable[Path]) -> dict[str, Path]:
+    """Each name a checkpoint can carry for a unit of the docs, with the doc whose Units table lists it.
+
+    A checkpoint is named for the unit's branch or its plan, so both count, and so do the unit's name
+    and its worktree's folder name, which a merge subject can carry.
+    """
+    found: dict[str, Path] = {}
+    for doc in docs:
+        try:
+            rows = unit_table(doc.read_text(encoding="utf-8").splitlines())
+        except (Refusal, OSError):
+            continue
+        for row in rows:
+            names = (cell_value(row.get("Branch", "")), Path(cell_value(row.get("Plan", ""))).stem,
+                     cell_value(row.get("Unit", "")), Path(cell_value(row.get("Worktree", ""))).name)
+            for name in names:
+                if name:
+                    _ = found.setdefault(name, doc)
+    return found
+
+
+def _owner_of(commit: Commit, branches: dict[str, Path]) -> Path | None:
+    """The production of the unit whose branch the checkpoint names, or None for another commit."""
+    found = _CHECKPOINT.match(commit.subject)
+    return branches.get(found["branch"]) if found else None
+
+
+def visible_owners(commits: list[Commit], production: Path) -> list[Path]:
+    """The production doc of each change `visible` gives, in its order: the production whose Units table
+    names the checkpoint's branch, at `production` or below it, else `production` itself.
+
+    A root's gate merges its children's merge branches too, and their rows belong to the child.
+    """
+    branches = unit_branches(owner_docs(production))
+    return [_owner_of(commit, branches) or production for commit in reversed(commits)
+            if commit.subject.startswith("checkpoint(")
+            for item in entries(commit.message) if isinstance(item, Visible)]
+
+
+def merge_commits(repo: Path, merge: str) -> list[Commit]:
+    """The commits a merge brought in, without merges; none for a commit that is no merge."""
+    parents = _git(repo, "rev-list", "--parents", "-n", "1", merge).split()[1:]
+    if len(parents) < 2:
+        return []
+    records = _git(repo, "log", "--no-merges", "--format=%x1e%H%x1f%B", parents[1], f"^{parents[0]}", "--")
+    commits: list[Commit] = []
+    for record in records.split("\x1e")[1:]:
+        sha, message = record.split("\x1f", 1)
+        commits.append(Commit(sha, message.split("\n", 1)[0], message, ()))
+    return commits
+
+
+def _found_repo(repos: Iterable[Path], sha: str) -> Path | None:
+    """The first repository that holds the commit."""
+    return next((repo for repo in repos if subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"],
+        capture_output=True, check=False).returncode == 0), None)
+
+
+class Tree:
+    """The productions one list belongs to: the units they list, their repositories and merge branches."""
+
+    def __init__(self, docs: Iterable[Path]) -> None:
+        self.docs: list[Path] = list(dict.fromkeys(docs))
+        self.branches: dict[str, Path] = unit_branches(self.docs)
+        self.repos: list[Path] = []
+        self.targets: dict[tuple[Path, str], Path] = {}
+        self._chains: dict[tuple[Path, str], set[str]] = {}
+        for doc in self.docs:
+            try:
+                lines = doc.read_text(encoding="utf-8").splitlines()
+                repo = Path(production_field(lines, "Repository")).expanduser()
+            except (Refusal, OSError):
+                continue
+            if repo not in self.repos:
+                self.repos.append(repo)
+            try:
+                _ = self.targets.setdefault((repo, production_field(lines, "Merge branch")), doc)
+            except Refusal:
+                pass
+
+    def landed_on(self, repo: Path, sha: str) -> Path | None:
+        """The production whose merge branch has the commit on its first-parent line: where it merged.
+
+        A child merges its parent's branch in and the parent merges the child's, so plain ancestry
+        names both; the first-parent line names only the branch the merge was made on.
+        """
+        full = _git(repo, "rev-parse", f"{sha}^{{commit}}").strip()
+        for (where, branch), doc in self.targets.items():
+            if where != repo:
+                continue
+            if (where, branch) not in self._chains:
+                try:
+                    self._chains[(where, branch)] = set(_git(repo, "rev-list", "--first-parent", branch, "--").split())
+                except ChangeReviewError:
+                    self._chains[(where, branch)] = set()
+            if full in self._chains[(where, branch)]:
+                return doc
+        return None
+
+
+def trace(row: dict[str, str], tree: Tree) -> Path | str:
+    """The production of an older row, from its merge. In order: the checkpoint that names the row's
+    change; else the one production of every checkpoint the merge brought in; else the production
+    whose merge branch the merge landed on. A string says why it cannot be traced."""
+    found = next((match.group(0) for column in HASH_COLUMNS
+                  if (match := _HASH.search(row.get(column, ""))) is not None), None)
+    if found is None:
+        return "no merge hash"
+    repo = _found_repo(tree.repos, found)
+    if repo is None:
+        return f"{found} is in no repository of this list's productions"
+    commits = merge_commits(repo, found)
+    change = row.get("Change", "")
+    named = {owner for commit in commits if (owner := _owner_of(commit, tree.branches)) is not None
+             and any(isinstance(item, Visible) and item.change == change for item in entries(commit.message))}
+    if len(named) == 1:
+        return named.pop()
+    every = {owner for commit in commits if (owner := _owner_of(commit, tree.branches)) is not None}
+    if len(every) == 1:
+        return every.pop()
+    if (target := tree.landed_on(repo, found)) is not None:
+        return target
+    if every:
+        return f"{found} brings in checkpoints of {len(every)} productions"
+    return f"{found} brings in no checkpoint of a listed unit and lands on no listed merge branch"
+
+
+def list_tree(path: Path, docs: Iterable[Path]) -> Tree:
+    """The productions whose root keeps the list `path`, with every production below each root."""
+    import showrunners
+
+    owned: list[Path] = []
+    for doc in docs:
+        slug = slug_of(doc)
+        try:
+            if showrunners.root_of(slug) != slug or list_path(doc) != path:
+                continue
+        except OSError:
+            continue
+        owned.extend(owner_docs(doc))
+    return Tree(owned)
+
+
+def backfill(path: Path, tree: Tree, write: bool) -> tuple[dict[str, str], dict[str, str]]:
+    """Fill each empty Production cell under To review from the row's merge; return the cells filled, by
+    row id, and the rows that cannot be traced, with why. Without `write` the list is only read.
+
+    `tree` holds the productions the list belongs to (`list_tree`); a row traces only to one of them.
+    """
+    filled: dict[str, str] = {}
+    untraced: dict[str, str] = {}
+    owners: dict[str, Path] = {}
+    for row in pending(path):
+        if row.get(PRODUCTION, "").strip():
+            continue
+        found = trace(row, tree)
+        if isinstance(found, Path):
+            filled[row["#"]], owners[row["#"]] = row_production(found), found
+        else:
+            untraced[row["#"]] = found
+    if not write or not filled:
+        return filled, untraced
+
+    def fill(lines: list[str]) -> None:
+        _add_column(path, lines, SECTION, PRODUCTION)
+        columns, first, end = _table(path, lines, SECTION)
+        at = columns.index(PRODUCTION)
+        for index in range(first, end):
+            cells = _cells(lines[index])
+            if cells[0] in filled and at < len(cells) and not cells[at]:
+                cells[at] = _cell(filled[cells[0]])
+                lines[index] = "| " + " | ".join(cells) + " |\n"
+
+    _edit(path, next(iter(owners.values())), today(), fill, lambda _: f"production cells for {len(filled)} rows")
+    return filled, untraced
+
+
+def rename_production(path: Path, production: Path, old: str, new: str) -> list[str]:
+    """Rewrite each Production cell under To review that names `old` to `new`; return the rows changed.
+
+    A production rename keeps its rows on the list (`/showrunner:rename`). `production` is the renamed
+    doc, which stamps the write. A list with no such cell is not written.
+    """
+    if not path.exists() or not any(row.get(PRODUCTION) == old for row in pending(path)):
+        return []
+
+    def rewrite(lines: list[str]) -> list[str]:
+        columns, first, end = _table(path, lines, SECTION)
+        at = columns.index(PRODUCTION)
+        changed: list[str] = []
+        for index in range(first, end):
+            cells = _cells(lines[index])
+            if at < len(cells) and _plain(cells[at]) == old:
+                cells[at] = _cell(new)
+                lines[index] = "| " + " | ".join(cells) + " |\n"
+                changed.append(cells[0])
+        return changed
+
+    return _edit(path, production, today(), rewrite, lambda rows: f"production {old} renamed {new} in {len(rows)} rows")
 
 
 def describe(row: dict[str, str]) -> str:
@@ -523,8 +833,9 @@ def describe(row: dict[str, str]) -> str:
 
 
 def lands(verdict: str) -> bool:
-    """A verdict beginning `works` or `fine` lands the row; any other returns it to its unit."""
-    return _LANDS.match(verdict.strip()) is not None
+    """A verdict that says `works` or `fine` and no word of failure (`not`, `still`, `broken` ...) lands
+    the row ("okay c17 works"); any other returns it to its unit."""
+    return _LANDS.search(verdict) is not None and _FAILS.search(verdict) is None
 
 
 def _to_review(path: Path, lines: list[str], row: str) -> tuple[list[str], int]:
@@ -581,6 +892,30 @@ def record_verdict(path: Path, row: str, verdict: str, day: date, production: Pa
     return _edit(path, production, day, write, lambda _: f"verdict {row}")
 
 
+def end_row_scratch(path: Path, row: str) -> list[str]:
+    """Remove the scratch folders of `row` on the list at `path`; return one line per folder.
+
+    A verdict ends the row either way: a row returned to its unit comes back as a new row.
+    """
+    try:
+        return [f"removed {folder}" for folder in scratch.end(f"row:{_owner(path)}-{row}")]
+    except (scratch.ScratchError, OSError) as error:
+        return [f"scratch not removed: {error}"]
+
+
+def hold_for_row(path: Path, row: str, folders: list[str]) -> list[str]:
+    """Hold each folder the user checks `row` in until the row's verdict; return one line per folder."""
+    lines: list[str] = []
+    for folder in folders:
+        try:
+            task = scratch.hold(Path(folder).expanduser(), f"row:{_owner(path)}-{row}", f"change review {row}")
+        except (scratch.ScratchError, OSError) as error:
+            lines.append(f"not held: {error}")
+            continue
+        lines.append(f"held {folder} for {task}")
+    return lines
+
+
 def production_doc(production: str) -> Path:
     """The production doc given; without one, the calling showrunner's."""
     if production:
@@ -627,20 +962,59 @@ def _words(name: str, value: str) -> str:
     return value.strip()
 
 
-def drift(repo: Path, merge_branch: str, text: str, since: str) -> list[str]:
-    """Each merge on the merge branch since `since` whose visible changes have no row with its hash."""
+def drift(repo: Path, merge_branch: str, text: str, since: str, foreign: Collection[str] = ()) -> list[str]:
+    """Each merge on the merge branch since `since` whose visible changes have no row: none with its hash
+    and none, under To review or Reviewed, with one of its changes. A checkpoint named in `foreign`
+    (`foreign_units`) is another list's: a merge of main brings such changes in, and they are left out."""
     lines: list[str] = []
+    changes = _changes(text)
     for record in _git(repo, "log", "--first-parent", "--merges", f"--since={since}",
                        "--format=%H %P", f"origin/{merge_branch}", "--").splitlines():
         merge, *parents = record.split()
         if len(parents) < 2:
             continue
-        commits = [Commit(sha, *_described(repo, sha)) for sha in
-                   _git(repo, "log", "--no-merges", "--format=%H", parents[1], f"^{parents[0]}", "--").split()]
+        commits = [commit for sha in
+                   _git(repo, "log", "--no-merges", "--format=%H", parents[1], f"^{parents[0]}", "--").split()
+                   if not _named_in(commit := Commit(sha, *_described(repo, sha)), foreign)]
         short = _git(repo, "rev-parse", f"--short={SHORT}", merge).strip()
-        if visible(commits) and f"· {short}" not in text:
+        if visible(commits) and f"· {short}" not in text and not any(item.change in changes for item in visible(commits)):
             lines.append(f"{short}: {len(visible(commits))} visible change(s) and no row in the list")
     return lines
+
+
+def _named_in(commit: Commit, names: Collection[str]) -> bool:
+    """Whether the commit is a checkpoint named for one of `names`."""
+    found = _CHECKPOINT.match(commit.subject)
+    return found is not None and found["branch"] in names
+
+
+def foreign_units(production: Path) -> set[str]:
+    """The checkpoint names of the units of every production outside the tree of `production`'s root.
+
+    Empty when the productions cannot be read: drift then counts every checkpoint.
+    """
+    import showrunners
+
+    try:
+        docs = list(showrunners.timer_docs().values())
+        root = showrunners.root_of(slug_of(production))
+        top = next((doc for doc in docs if slug_of(doc) == root), production)
+        return set(unit_branches(docs)) - set(unit_branches(owner_docs(top)))
+    except (OSError, ValueError, Refusal):
+        return set()
+
+
+def _changes(text: str) -> set[str]:
+    """The Change cell of every row in the list, under To review and under Reviewed alike.
+
+    A reviewed row keeps no Merged cell, so drift knows a settled merge by its rows' changes.
+    """
+    found: set[str] = set()
+    for line in text.splitlines():
+        cells = _cells(line) if _NUMBER.match(line) else []
+        if len(cells) > 1:
+            found.add(_plain(cells[1]))
+    return found
 
 
 def _described(repo: Path, sha: str) -> tuple[str, str, tuple[str, ...]]:
@@ -667,6 +1041,8 @@ class CommandLine(argparse.Namespace):
     urgency: str = ""
     due: str = ""
     after: str = ""
+    write: bool = False
+    hold: list[str] | None = None
 
 
 def _list(options: CommandLine) -> Path:
@@ -706,9 +1082,12 @@ def _run(options: CommandLine) -> int:
     match options.action:
         case "add":
             item, rank = _visible(options), _rank_option(options)
-            rows = append_rows(_list(options), [item], today(), options.merged.strip(),
-                               production_doc(options.production), rank)
-            print(row_id(rows[0]))
+            path = _list(options)
+            rows = append_rows(path, [item], today(), options.merged.strip(), production_doc(options.production), rank)
+            row = row_id(rows[0])
+            print(row)
+            for line in hold_for_row(path, row, options.hold or []):
+                print(line)
         case "edit":
             row, item = _row_option(options), _visible(options)
             print(edit_row(_list(options), row, item, today(), production_doc(options.production)))
@@ -716,8 +1095,7 @@ def _run(options: CommandLine) -> int:
             # One row only: the user asks for the next one when they want it (user, 2026-10-20).
             path = _list(options)
             waiting = pending(path)
-            entries = [urgency.Entry(row["#"], row) for row in ordered(waiting, urgency.pinned(queue(path)))]
-            shown = urgency.top(entries, queue(path))
+            shown = urgency.top(row_entries(waiting), queue(path))
             print(describe(shown.item) + (f"\n\n{len(waiting) - 1} more to review" if len(waiting) > 1 else "")
                   if shown is not None else "nothing to review")
         case "mark-important":
@@ -727,14 +1105,35 @@ def _run(options: CommandLine) -> int:
         case "verdict":
             row = _row_option(options)
             verdict = _words("verdict", options.verdict)
-            merged = record_verdict(_list(options), row, verdict, today(), production_doc(options.production))
+            path = _list(options)
+            merged = record_verdict(path, row, verdict, today(), production_doc(options.production))
             print(f"{row} landed" if lands(verdict) else f"{row} returns to its unit (merged {merged})")
+            for line in end_row_scratch(path, row):
+                print(line)
         case "list-path":
             print(production_list(options.production))
         case "showrunner":
             print(showrunner_of(production_doc(options.production)))
+        case "backfill-production":
+            import showrunners
+
+            docs = list(showrunners.timer_docs().values())
+            lists = [Path(options.list).expanduser()] if options.list else sorted(LISTS.glob(f"{PREFIX}*.md"))
+            for path in lists:
+                filled, untraced = backfill(path, list_tree(path, docs), options.write)
+                print(f"{path.name}: {len(filled)} {'filled' if options.write else 'to fill'}, "
+                      + f"{len(untraced)} untraced")
+                for row, slug in filled.items():
+                    print(f"  {row}: {slug}")
+                for row, why in untraced.items():
+                    print(f"  {row}: untraced, {why}")
         case "drift":
-            found = drift(Path(options.repo).resolve(), options.merge_branch, read(_list(options)), options.since)
+            try:
+                foreign = foreign_units(production_doc(options.production))
+            except ChangeReviewError:
+                foreign = set[str]()
+            found = drift(Path(options.repo).resolve(), options.merge_branch, read(_list(options)), options.since,
+                          foreign)
             print("\n".join(found) if found else "no drift")
             return 1 if found else 0
         case _:
@@ -753,11 +1152,14 @@ def _run(options: CommandLine) -> int:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     _ = parser.add_argument("action", choices=("check", "append", "drift", "add", "edit", "show", "verdict",
-                                                   "mark-important", "list-path", "showrunner"))
+                                                   "mark-important", "list-path", "showrunner",
+                                                   "backfill-production"))
     _ = parser.add_argument("--repo", default=".")
     for name in ("checkpoint", "previous", "merge-branch", "list", "merged", "since", "change", "check", "see",
                  "row", "verdict", "production", "urgency", "due", "after"):
         _ = parser.add_argument(f"--{name}", default="")
+    _ = parser.add_argument("--write", action="store_true")
+    _ = parser.add_argument("--hold", action="append")
     try:
         return _run(cast(CommandLine, parser.parse_args(argv)))
     except (ChangeReviewError, OSError) as error:

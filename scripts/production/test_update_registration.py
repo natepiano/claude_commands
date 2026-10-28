@@ -107,7 +107,12 @@ class RegistrationTests(unittest.TestCase):
                     "NOTIFIER_STATE_DIR": str(self.state / "notifier"), "SHOWRUNNERS_CONFIG": str(self.config),
                     "USAGE_STATE_DIR": str(self.state / "usage"),
                     "MAC_TEST_STATE_DIR": str(self.state / "mac-test"), "NEXT_STATE_DIR": str(self.state / "next"),
-                    "CLAUDE_CODE_SESSION_ID": "current-session-id"}
+                    "CLAUDE_CODE_SESSION_ID": "current-session-id", "NOTIFIER_SESSIONS_DIR": str(self.state / "sessions")}
+        # Register refuses a session not named for its production's slug: both live sessions are named example.
+        (self.state / "sessions").mkdir()
+        for pid, session in ((os.getpid(), "current-session-id"), (os.getppid(), "resume-session-id")):
+            _ = (self.state / "sessions" / f"{pid}.json").write_text(
+                json.dumps({"pid": pid, "sessionId": session, "name": "example"}), encoding="utf-8")
         _ = self.git("init", "-b", "production", str(self.checkout), cwd=self.root)
         _ = self.git("config", "user.name", "Registration Test")
         _ = self.git("config", "user.email", "registration@example.invalid")
@@ -306,6 +311,18 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertFalse(self.config.exists())
         self.assertEqual(self.notifier_calls(), [])
         self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
+
+    def test_register_warns_for_a_session_not_named_for_the_production_and_still_registers(self) -> None:
+        record = self.state / "sessions" / f"{os.getpid()}.json"
+        _ = record.write_text(json.dumps({"pid": os.getpid(), "sessionId": "current-session-id", "name": "other"}),
+                              encoding="utf-8")
+        result = self.run_command("register")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("register: warn", result.stdout)
+        self.assertIn("production example has showrunner other", result.stdout)
+        self.assertIn("/showrunner:rename plan example other", result.stdout)
+        self.assertIn("register: ok", result.stdout)
+        self.assertNotEqual(self.notifier_calls(), [])
 
     def test_missing_prompt_markers_fail_before_registration_changes(self) -> None:
         for marker in ("The prompt:", "**A tick**"):
@@ -791,7 +808,7 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         return listed.stdout.splitlines()
 
 
-    def test_open_lists_every_item_below_a_root_in_full_oldest_first(self) -> None:
+    def test_open_lists_only_the_productions_own_items_in_full_never_those_below(self) -> None:
         for slug in ("example", "kid", "grandkid", "stranger"):
             self.timer(slug)
         self.attach("kid", "example")
@@ -801,27 +818,22 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.write_open_for("kid", {"since": "2026-10-06T08:00", "text": "merge today, or after the release?"})
         self.write_open_for("grandkid", {"since": "2026-09-28T10:30", "text": "keep the old key binding?"})
         self.write_open_for("stranger", {"since": "2026-10-01T08:00", "text": "not this tree's"})
-        self.assertEqual(self.open_lines(), [
-            "1. grandkid, since Mon Sep 28 10:30: keep the old key binding?",
-            "2. kid, since Tue Oct 06 08:00: merge today, or after the release?",
-            "3. example, since Tue Oct 06 09:00: choose layout",
-            "deferred until Fri Jan 02 08:00: example: review colors",
-            "open: ok — 3 due, 1 deferred",
-        ])
-
-    def test_open_names_an_unreadable_list_and_still_lists_the_rest(self) -> None:
-        for slug in ("example", "kid"):
-            self.timer(slug)
-        self.attach("kid", "example")
-        self.write_open_for("example", {"since": "2026-10-06T09:00", "text": "choose layout"})
-        _ = self.outstanding().with_name("kid.json").write_text("{bad", encoding="utf-8")
+        # The showrunners below answer for their own items (user, 2026-10-27).
         self.assertEqual(self.open_lines(), [
             "1. example, since Tue Oct 06 09:00: choose layout",
-            "kid: needs-user list unreadable",
-            "open: ok — 1 due, 0 deferred, 1 unreadable",
+            "deferred until Fri Jan 02 08:00: example: review colors",
+            "open: ok — 1 due, 1 deferred",
         ])
 
-    def test_open_below_a_root_lists_only_its_own_items(self) -> None:
+    def test_open_names_an_unreadable_list(self) -> None:
+        self.timer("example")
+        _ = self.outstanding().write_text("{bad", encoding="utf-8")
+        self.assertEqual(self.open_lines(), [
+            "example: needs-user list unreadable",
+            "open: ok — 0 due, 0 deferred, 1 unreadable",
+        ])
+
+    def test_a_middle_showrunner_lists_its_own_items_and_marks_one_below_never_above(self) -> None:
         for slug in ("top", "example", "kid"):
             self.timer(slug)
         self.attach("example", "top")
@@ -833,6 +845,10 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
             "1. example, since Tue Oct 06 09:00: choose layout",
             "open: ok — 1 due, 0 deferred",
         ])
+        # `/next all-below` can show the kid's item, so it can be marked from here; the top's never.
+        marked = self.run_command("mark-important", "--item", "merge today?")
+        self.assertEqual(marked.stdout.strip(), "mark-important: ok — merge today?", marked.stdout + marked.stderr)
+        self.assertNotEqual(self.run_command("mark-important", "--item", "ship it?").returncode, 0)
 
     def test_open_with_nothing_attached_lists_its_own_items_or_none(self) -> None:
         self.assertEqual(self.open_lines(), ["open: ok — 0 due, 0 deferred"])

@@ -6,7 +6,7 @@ fault arrives wearing the exact words of a usage limit. What the code can check
 is not the message but the circumstances -- who started the server, how fast it
 failed, and whether a thread already exists.
 
-ReplyDeliveryTests covers the other silent failure: a delegate's own summary
+ReplyDeliveryTests covers the other silent failure: a worker's own summary
 file replaced by its last chat reply.
 """
 
@@ -386,7 +386,7 @@ class MeshCommandTests(unittest.TestCase):
         # resolve(): macOS /tmp is a link to /private/tmp, and the mesh records resolved paths.
         self.session_dir = Path(self.temporary.name).resolve() / "run"
         self.session_dir.mkdir()
-        _ = (self.session_dir / "prompt.txt").write_text("Original delegate task", encoding="utf-8")
+        _ = (self.session_dir / "prompt.txt").write_text("Original worker task", encoding="utf-8")
         self.outcomes = []
         self.turn_starts = 0
         self.turn_inputs = []
@@ -989,6 +989,131 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(self.methods("thread/unsubscribe"), [])
         self.assertFalse((self.session_dir / "serving_home.json").exists())
         self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+
+    def test_sweep_or_idle_stop_of_a_held_design_server_resumes_same_thread_with_pending_text(self) -> None:
+        fixture_root = self.session_dir
+        for stop_route in ("idle-stop", "sweep"):
+            with self.subTest(stop_route=stop_route):
+                design_id = "00000000-0000-4000-8000-000000000027"
+                self.session_dir = roles.mesh_directory(design_id)
+                self.session_dir.mkdir(parents=True, exist_ok=True)
+                directory = roles.design_directory(design_id)
+                prompt = directory / "prompts/assignment.md"
+                reply = directory / "replies/assignment.md"
+                prompt.parent.mkdir(exist_ok=True)
+                reply.parent.mkdir(exist_ok=True)
+                binding = roles.DesignBoundToPhase(str(fixture_root / "phase-run"), "1",
+                                                  str(fixture_root), ("design.md",))
+                design = roles.HeldDesign(roles.DesignPlacement(design_id, "fixture-host", 3),
+                    "fixture-repo", str(fixture_root), str(fixture_root / "design.md"), "design",
+                    "2026-10-21T12:00:00+00:00", roles.UnitHolder("demo", "design-unit"), binding,
+                    (roles.RoleInstance("designer", "worker", roles.RoleOpen(THREAD_ID), str(prompt)),
+                     roles.RoleInstance("reviewer", "unused-reviewer", roles.RoleNotOpened())))
+                roles._save(design)  # pyright: ignore[reportPrivateUsage]
+                header = astra_work.AstraWork("astra-designer", "worker", design.document,
+                    design.created_at_utc, str(reply), astra_work.StandaloneWork())
+                _ = prompt.write_text(astra_work.header_line(header) + "\nContinue the authorized design.\n")
+                _ = reply.write_text("Previous saved reply.\n")
+                policy = {"kind": "PhaseBoundDesigner", "binding_generation": 3,
+                          "launch_sandbox": "danger-full-access"}
+                self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done", "role": "impl",
+                    "held_design_id": design_id, "held_role": "designer", "access_policy": policy,
+                    "authorized_generation": 3, "authorized_holder": "fixture-holder",
+                    "authorized_prompt": str(prompt), "port": self.server.port}})
+                context = {"design_id": design_id, "generation": 3, "holder_session": "fixture-holder",
+                           "cwd": design.repository, "binding": {"kind": "DesignBoundToPhase",
+                                                                   **dataclasses.asdict(binding)}}
+                _ = (self.session_dir / "guild_context.json").write_text(json.dumps(context))
+                pending = self.session_dir / "worker.pending.json"
+                _ = pending.write_text(json.dumps({"thread_id": THREAD_ID,
+                    "messages": ["Keep this pending design correction."], "accepting_messages": True}))
+                _ = roles.queue_message(design_id, "designer", "fixture-holder", "Keep this holder message.",
+                                        message_id="00000000-0000-4000-8000-000000000028")
+                process = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
+                                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                           stderr=subprocess.DEVNULL)
+                # Reap this child as soon as the real stop code signals it, so kill(0) sees it gone.
+                reaper = threading.Thread(target=process.wait, daemon=True)
+                reaper.start()
+                server_path = self.session_dir / codex_mesh.SERVER_FILE
+                _ = server_path.write_text(json.dumps({"pid": process.pid, "port": self.server.port,
+                    "codex_home": str(agent_accounts.workers_home()),
+                    "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS, "guild_context": context}))
+                old = codex_mesh.SERVER_IDLE_SECS + 60
+                for name in codex_mesh.SWEEP_ACTIVITY_FILES:
+                    path = self.session_dir / name
+                    if path.exists():
+                        os.utime(path, (time.time() - old, time.time() - old))
+                preserved = {path: path.read_bytes() for path in directory.rglob("*") if path.is_file()
+                             and path != server_path and path.name != "lock"}
+                outside_roots = fixture_root / "ordinary-runs"
+                outside_roots.mkdir(exist_ok=True)
+                try:
+                    with (
+                        patch.object(codex_mesh, "_running_servers", return_value=[(process.pid, self.server.port, old)]),
+                        patch.object(codex_mesh, "_client_counts", return_value={}),
+                        patch.object(codex_mesh, "_running_daemons", return_value=[]),
+                        patch.object(codex_mesh, "_server_folder", return_value=codex_mesh.MeshServerLog(self.session_dir)),
+                        contextlib.redirect_stdout(io.StringIO()),
+                    ):
+                        if stop_route == "idle-stop":
+                            code = codex_mesh.command_idle_stop(argparse.Namespace(
+                                session_dir=str(self.session_dir), pid=process.pid, port=self.server.port))
+                        else:
+                            code = codex_mesh.command_sweep(argparse.Namespace(root=str(outside_roots), stop=True))
+                    self.assertEqual(code, 0)
+                    reaper.join(timeout=5)
+                    self.assertFalse(reaper.is_alive(), "the stopped child was not reaped")
+                    self.assertIsNotNone(process.poll())
+                    self.assertFalse(codex_mesh._pid_alive(process.pid))  # pyright: ignore[reportPrivateUsage]
+                    self.assertFalse(server_path.exists())
+                    for path, contents in preserved.items():
+                        self.assertEqual(path.read_bytes(), contents, str(path))
+                    self.assertFalse((directory / "transition.json").exists())
+                    self.assertEqual(list(self.session_dir.glob("*.account-move.json")), [])
+
+                    started: list[dict[str, str]] = []
+
+                    def start_fixture_server(session_dir: str, home: Path) -> int:
+                        self.assertFalse(server_path.exists())
+                        self.server.close()
+                        self.server = StubAppServer(self.respond)
+                        started.append(codex_mesh._server_environment(session_dir, home))  # pyright: ignore[reportPrivateUsage]
+                        _ = server_path.write_text(json.dumps({"pid": os.getpid(), "port": self.server.port,
+                            "codex_home": str(home), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS,
+                            "guild_context": context}))
+                        return self.server.port
+
+                    args = self.start_args()
+                    args.to = "worker"
+                    args.message_file = str(prompt)
+                    args.summary_file = str(reply)
+                    with (
+                        patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "fixture-holder", "GUILD_ROLES_HOST": "fixture-host"}),
+                        patch.object(roles, "resolve_holder", return_value=roles.HolderReach("fixture-holder")),
+                        patch.object(codex_mesh, "_start_server", start_fixture_server),
+                        contextlib.redirect_stderr(io.StringIO()) as errors,
+                    ):
+                        self.assertEqual(codex_mesh.command_follow(args), 0, errors.getvalue())
+                    self.assertEqual(len(started), 1)
+                    self.assertEqual(started[0]["GUILD_DESIGN_ID"], design_id)
+                    self.assertEqual(started[0]["UNIT_RUN_DIR"], binding.run_directory)
+                    self.assertEqual([_as_test_dict(request["params"])["threadId"]
+                                      for request in self.methods("thread/resume")], [THREAD_ID])
+                    self.assertEqual(self.methods("thread/start"), [])
+                    turn = _as_test_dict(self.methods("turn/start")[0]["params"])
+                    self.assertIn("Keep this pending design correction.", json.dumps(turn["input"]))
+                    self.assertEqual(turn["sandboxPolicy"], {"type": "dangerFullAccess"})
+                    entry = self.worker_record()
+                    self.assertEqual((entry["thread_id"], entry["held_design_id"], entry["access_policy"]),
+                                     (THREAD_ID, design_id, policy))
+                    self.assertEqual([message.text for message in roles.pending_messages(design_id, "designer")],
+                                     ["Keep this holder message."])
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                    reaper.join(timeout=5)
+                self.session_dir = fixture_root
 
     def test_account_move_resume_refuses_a_fenced_source_before_touching_its_queue(self) -> None:
         _ = self.held_reviewer_record(roles.RoleOpen(THREAD_ID))
@@ -1973,7 +2098,7 @@ class MeshCommandTests(unittest.TestCase):
         })
         self.assertEqual(self.methods("turn/start")[0]["params"], {
             "threadId": THREAD_ID,
-            "input": [{"type": "text", "text": "Original delegate task"}],
+            "input": [{"type": "text", "text": "Original worker task"}],
             "model": "gpt-test", "effort": "high", "sandboxPolicy": WRITE_POLICY, "serviceTier": "default",
         })
 
@@ -3335,7 +3460,7 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(
             self.turn_inputs,
-            ["Original delegate task", "Continue where you stopped."],
+            ["Original worker task", "Continue where you stopped."],
         )
         board = (self.session_dir / "board.log").read_text(encoding="utf-8")
         self.assertEqual(board.count("context window filled; sent"), 1)
@@ -3779,7 +3904,7 @@ class MeshCommandTests(unittest.TestCase):
                 pending_refusal=codex_mesh.PendingQuotaRefusal(serving, USAGE_LIMIT),
                 director=codex_mesh.KnownWorkerDirector("old-director"))
 
-        with (patch.object(codex_mesh, "_run_delegate", side_effect=finish_old),
+        with (patch.object(codex_mesh, "_run_worker", side_effect=finish_old),
               patch.object(codex_mesh, "_marker_sessions", return_value=["old-director"]),
               patch.object(codex_mesh, "_launcher_sessions", return_value=()),
               patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as report):
@@ -4080,7 +4205,7 @@ class MeshCommandTests(unittest.TestCase):
                                                    return_value=codex_mesh.NonMeshServerStderr()))
         run = self.session_dir / "scratch-runs" / "run"
         run.mkdir(parents=True)
-        _ = (run / "prompt.txt").write_text("Original delegate task")
+        _ = (run / "prompt.txt").write_text("Original worker task")
         self.session_dir = run
         target, new = self.prepare_workers_move()
         active = run.parent / "active"
@@ -4706,7 +4831,7 @@ class MeshCommandTests(unittest.TestCase):
                 }))
         args = self.start_args()
         with patch.object(codex_mesh, "_report_quota_refusal", side_effect=move_on_refusal) as report:
-            outcome = codex_mesh._run_delegate(args, self.server.port, started_here=True)  # pyright: ignore[reportPrivateUsage]
+            outcome = codex_mesh._run_worker(args, self.server.port, started_here=True)  # pyright: ignore[reportPrivateUsage]
         self.assertIsInstance(outcome, codex_mesh.RunCompleted)
         report.assert_called_once()
         self.assertIsInstance(reported_stopped_context(report),
@@ -4810,7 +4935,7 @@ class MeshCommandTests(unittest.TestCase):
             _ = config.write_text(json.dumps({"workers": next_label}))
         with (patch.object(codex_mesh, "_start_server", side_effect=start),
               patch.object(codex_mesh, "_report_quota_refusal", side_effect=move_on_refusal) as report):
-            outcome = codex_mesh._run_delegate(self.start_args(), self.server.port, started_here=True)  # pyright: ignore[reportPrivateUsage]
+            outcome = codex_mesh._run_worker(self.start_args(), self.server.port, started_here=True)  # pyright: ignore[reportPrivateUsage]
         self.assertIsInstance(outcome, codex_mesh.RunCompleted)
         self.assertEqual(report.call_count, 2)
         self.assertTrue(all(isinstance(call.kwargs.get("stopped", codex_mesh.REFUSAL_WITHOUT_COMMAND_EXIT),
@@ -4885,10 +5010,10 @@ class MeshCommandTests(unittest.TestCase):
         target, new = self.prepare_workers_move()
         stamp = datetime.now(timezone.utc).isoformat()
         moves.append_routing(moves.RoutedToClaude(kind="routed to claude", at=stamp, tool="codex",
-            fallback_at=stamp, owner="codex1", cause="refusal", why="Codex refused work for quota", moved=["delegate"]))
+            fallback_at=stamp, owner="codex1", cause="refusal", why="Codex refused work for quota", moved=["direct"]))
         self.request_workers_move("codex9", "codex1", "pending-among-routing")
         moves.append_routing(moves.RoutedBack(kind="routed back", at=stamp, tool="codex",
-            fallback_at=stamp, owner="codex1", restored=["delegate"], kept=[]))
+            fallback_at=stamp, owner="codex1", restored=["direct"], kept=[]))
         before = moves.store_file().read_bytes()
         self.assertEqual(accounts.main(["set-role", "workers", "codex1"]), 0)
         self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
@@ -4988,7 +5113,7 @@ class MeshCommandTests(unittest.TestCase):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
             listener.bind(("127.0.0.1", 0))
             port = cast(tuple[str, int], listener.getsockname())[1]
-        outcome = codex_mesh._run_delegate(self.start_args(), port)  # pyright: ignore[reportPrivateUsage]
+        outcome = codex_mesh._run_worker(self.start_args(), port)  # pyright: ignore[reportPrivateUsage]
         self.assertIsInstance(outcome, codex_mesh.FailedBeforeThread)
         assert isinstance(outcome, codex_mesh.FailedBeforeThread)
         self.assertIn("refused", outcome.failure.lower())
@@ -5368,7 +5493,7 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(
             self.turn_inputs,
-            ["Original delegate task", "Continue where you stopped."],
+            ["Original worker task", "Continue where you stopped."],
         )
         self.assertIn("context window filled twice in a row without progress", errors)
         board = (self.session_dir / "board.log").read_text(encoding="utf-8")
@@ -5383,7 +5508,7 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(
             self.turn_inputs,
             [
-                "Original delegate task",
+                "Original worker task",
                 "Continue where you stopped.",
                 "Continue where you stopped.",
             ],
@@ -5795,8 +5920,8 @@ class MeshCommandTests(unittest.TestCase):
         resumed = cast("dict[str, object]", starts[1]["params"])
         self.assertEqual(first["threadId"], THREAD_ID)
         self.assertEqual(resumed["threadId"], THREAD_ID)
-        self.assertIn("Original delegate task", str(first["input"]))
-        self.assertNotIn("Original delegate task", str(resumed["input"]))
+        self.assertIn("Original worker task", str(first["input"]))
+        self.assertNotIn("Original worker task", str(resumed["input"]))
         self.assertIn("capacity", str(resumed["input"]).lower())
         self.assertEqual(self.waits, [30.0])
         self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
@@ -5832,7 +5957,7 @@ class MeshCommandTests(unittest.TestCase):
         args = self.start_args()
         args.resident = True
 
-        outcome = codex_mesh._run_delegate(args, self.server.port)  # pyright: ignore[reportPrivateUsage]
+        outcome = codex_mesh._run_worker(args, self.server.port)  # pyright: ignore[reportPrivateUsage]
 
         self.assertIsInstance(outcome, codex_mesh.CapacityRetriesExhausted)
         self.assertEqual(self.waits, [30.0, 30.0, 60.0, 120.0, 240.0, 300.0, 300.0, 150.0])
@@ -5882,7 +6007,7 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(len(self.methods("thread/start")), 1)
         starts = self.methods("turn/start")
         self.assertEqual(len(starts), 1)
-        self.assertIn("Original delegate task", str(starts[0]["params"]))
+        self.assertIn("Original worker task", str(starts[0]["params"]))
         self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
 
     def test_capacity_waits_stop_at_twenty_minutes_and_name_the_thread(self) -> None:
@@ -6342,7 +6467,7 @@ class MeshCommandTests(unittest.TestCase):
         """Retry exhaustion is control state, not failure text."""
         self.outcomes = ["capacity"] * 20
         port = self.server.port
-        outcome = codex_mesh._run_delegate(self.start_args(), port)  # pyright: ignore[reportPrivateUsage]
+        outcome = codex_mesh._run_worker(self.start_args(), port)  # pyright: ignore[reportPrivateUsage]
         assert isinstance(outcome, codex_mesh.CapacityRetriesExhausted)
         self.assertEqual(outcome.thread_id, THREAD_ID)
         self.assertEqual(outcome.retries, len(self.waits))
@@ -6426,7 +6551,7 @@ class MeshCommandTests(unittest.TestCase):
         self.write_pool_roster({"peer": {"thread_id": THREAD_ID, "status": "done"}})
         with self.assertRaises(SystemExit) as refused:
             _ = self.run_mesh(["send", "--to", "worker", "--message", "No recipient"])
-        self.assertEqual(str(refused.exception.code), "codex_mesh: no delegate named 'worker'. Known: peer")
+        self.assertEqual(str(refused.exception.code), "codex_mesh: no worker named 'worker'. Known: peer")
         self.assertNotIn("No recipient", "".join(
             path.read_text() for path in self.session_dir.glob("*.pending.json")))
         self.assertEqual(self.server.requests, [])
@@ -6537,7 +6662,7 @@ class MeshCommandTests(unittest.TestCase):
             code, errors = self.run_start()
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(sent, [0])
-        self.assertEqual(self.turn_inputs, ["Original delegate task", "late peer message"])
+        self.assertEqual(self.turn_inputs, ["Original worker task", "late peer message"])
         pending = cast(dict[str, object], json.loads((self.session_dir / "worker.pending.json").read_text()))
         self.assertEqual(pending["messages"], [])
         self.assertIs(pending["accepting_messages"], False)
@@ -6616,7 +6741,7 @@ class MeshCommandTests(unittest.TestCase):
             deliver(name, index, answer, failure, summary, replies, log)
             _ = (self.session_dir / "worker.end").write_text("end")
         with patch.object(codex_mesh, "_deliver_reply", side_effect=reply) as sent, contextlib.redirect_stdout(io.StringIO()):
-            outcome = codex_mesh._run_delegate(args, self.server.port)  # pyright: ignore[reportPrivateUsage]
+            outcome = codex_mesh._run_worker(args, self.server.port)  # pyright: ignore[reportPrivateUsage]
         self.assertIsInstance(outcome, codex_mesh.RunCompleted)
         sent.assert_called_once()
         self.assertEqual(self.worker_record()["status"], "done")
@@ -6634,7 +6759,7 @@ class MeshCommandTests(unittest.TestCase):
                     _ = (self.session_dir / "worker.end").write_text("end")
             return frame
         with patch.object(codex_mesh.Client, "next_frame", poll), patch.object(codex_mesh, "_move_resident", wraps=codex_mesh._move_resident) as move, contextlib.redirect_stdout(io.StringIO()):  # pyright: ignore[reportPrivateUsage]
-            outcome = codex_mesh._run_delegate(args, self.server.port)  # pyright: ignore[reportPrivateUsage]
+            outcome = codex_mesh._run_worker(args, self.server.port)  # pyright: ignore[reportPrivateUsage]
         self.assertIsInstance(outcome, codex_mesh.RunCompleted)
         self.assertEqual(empty[0], 3)
         self.assertEqual(move.call_count, 2)
@@ -6689,7 +6814,7 @@ class MeshCommandTests(unittest.TestCase):
             return frame
 
         with patch.object(codex_mesh.Client, "call", rpc), patch.object(codex_mesh.Client, "next_frame", poll), patch.object(codex_mesh, "_stop_unused", return_value=False), contextlib.redirect_stdout(io.StringIO()):
-            outcome = codex_mesh._run_delegate(args, self.server.port)  # pyright: ignore[reportPrivateUsage]
+            outcome = codex_mesh._run_worker(args, self.server.port)  # pyright: ignore[reportPrivateUsage]
         self.assertIsInstance(outcome, codex_mesh.RunCompleted)
         self.assertEqual(resumes, [new.port, new.port])
         self.assertIn("cannot move: resume connection failed before any turn; waiting", (self.session_dir / "worker.log").read_text())
@@ -7036,7 +7161,7 @@ class MeshCommandTests(unittest.TestCase):
             return result
 
         with patch.object(codex_mesh, "_move_resident", side_effect=retry), patch.object(codex_mesh, "_deliver_reply", wraps=delivered) as replies, contextlib.redirect_stdout(io.StringIO()):
-            outcome = codex_mesh._run_delegate(args, self.server.port)  # pyright: ignore[reportPrivateUsage]
+            outcome = codex_mesh._run_worker(args, self.server.port)  # pyright: ignore[reportPrivateUsage]
         self.assertIsInstance(outcome, codex_mesh.RunCompleted)
         replies.assert_called_once()
         self.assertEqual(attempts[0], 3)
@@ -7143,7 +7268,7 @@ class RetryDecisionTests(unittest.TestCase):
             errors = io.StringIO()
             with patch.object(codex_mesh, "ensure_server", side_effect=[(4001, False), (4002, True)]), \
                  patch.object(codex_mesh, "_retire_server", return_value=True) as retire, \
-                 patch.object(codex_mesh, "_run_delegate", side_effect=outcomes) as run, \
+                 patch.object(codex_mesh, "_run_worker", side_effect=outcomes) as run, \
                  contextlib.redirect_stderr(errors):
                 code = codex_mesh.command_start(args)
         self.assertEqual(code, 0, errors.getvalue())
@@ -7161,7 +7286,7 @@ class RetryDecisionTests(unittest.TestCase):
             )
         )
 
-    def test_a_resident_delegate_is_never_retried(self) -> None:
+    def test_a_resident_worker_is_never_retried(self) -> None:
         # Its caller is already holding replies; a silent second attempt would
         # arrive behind them.
         self.assertFalse(
@@ -7285,14 +7410,14 @@ class QuotaRefusalTests(unittest.TestCase):
     def test_the_report_runs_the_blocked_verb_and_survives_its_failure(self) -> None:
         identity = agent_accounts.KnownCodexAccount(Path.home() / ".codex", "serving@example.invalid", "codex1")
         serving = codex_mesh.ServingCodexServer(4001, 99, identity.home, identity)
-        done = subprocess.CompletedProcess([], 0, "switched to claude for codex1: delegate\n", "")
+        done = subprocess.CompletedProcess([], 0, "switched to claude for codex1: worker\n", "")
         with patch.object(subprocess, "run", return_value=done) as run, \
                 contextlib.redirect_stderr(io.StringIO()) as errors:
             codex_mesh._report_quota_refusal("worker", serving)  # pyright: ignore[reportPrivateUsage]
         command = cast("list[str]", run.call_args.args[0])
         self.assertEqual(command[1:6], [str(codex_mesh.QUOTA_REPORT), "blocked", str(identity.home), identity.login, identity.label])
         self.assertTrue(codex_mesh.QUOTA_REPORT.is_file())
-        self.assertIn("codex_mesh: worker: quota: switched to claude for codex1: delegate", errors.getvalue())
+        self.assertIn("codex_mesh: worker: quota: switched to claude for codex1: worker", errors.getvalue())
         with patch.object(subprocess, "run", side_effect=OSError("no interpreter")), \
                 contextlib.redirect_stderr(io.StringIO()) as errors:
             codex_mesh._report_quota_refusal("worker", serving)  # pyright: ignore[reportPrivateUsage]
@@ -7323,7 +7448,7 @@ class ThreadStartTests(unittest.TestCase):
 
 
 class ReplyDeliveryTests(unittest.TestCase):
-    """Where a delegate's replies land, and whose file the summary is."""
+    """Where a worker's replies land, and whose file the summary is."""
 
     temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
     summary: Path  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -7348,7 +7473,7 @@ class ReplyDeliveryTests(unittest.TestCase):
         )
         self.assertEqual(self.summary.read_text(encoding="utf-8"), "the answer\n")
 
-    def test_the_delegates_own_summary_survives_its_last_reply(self) -> None:
+    def test_the_workers_own_summary_survives_its_last_reply(self) -> None:
         # The incident: every worker's summary came back as its one-line
         # acknowledgement, because the reply had been written over it.
         _ = self.summary.write_text("files, doubts, unverified\n", encoding="utf-8")
@@ -7360,9 +7485,9 @@ class ReplyDeliveryTests(unittest.TestCase):
         )
         self.assertIn("Done.", self.replies.read_text(encoding="utf-8"))
 
-    def test_a_summary_the_delegate_never_wrote_is_filled_from_the_reply(self) -> None:
+    def test_a_summary_the_worker_never_wrote_is_filled_from_the_reply(self) -> None:
         # implement.sh truncates the file at launch, so empty at exit means the
-        # delegate skipped its last act and the reply is all there is.
+        # worker skipped its last act and the reply is all there is.
         _ = self.summary.write_text("", encoding="utf-8")
         codex_mesh._finish_summary(  # pyright: ignore[reportPrivateUsage]
             self.summary, self.replies, "worker", 1, "Done."
@@ -7370,7 +7495,7 @@ class ReplyDeliveryTests(unittest.TestCase):
         self.assertEqual(self.summary.read_text(encoding="utf-8"), "Done.\n")
 
     def test_resident_replies_accumulate_in_order(self) -> None:
-        _ = self.summary.write_text("the delegate's summary\n", encoding="utf-8")
+        _ = self.summary.write_text("the worker's summary\n", encoding="utf-8")
         with contextlib.redirect_stdout(io.StringIO()), io.StringIO() as log:
             for index, text in enumerate(("first", "second"), start=1):
                 codex_mesh._deliver_reply(  # pyright: ignore[reportPrivateUsage]
@@ -7379,7 +7504,7 @@ class ReplyDeliveryTests(unittest.TestCase):
         delivered = self.replies.read_text(encoding="utf-8")
         self.assertLess(delivered.index("first"), delivered.index("second"))
         self.assertEqual(
-            self.summary.read_text(encoding="utf-8"), "the delegate's summary\n"
+            self.summary.read_text(encoding="utf-8"), "the worker's summary\n"
         )
 
 
@@ -9876,15 +10001,15 @@ class WorkersHomeTests(unittest.TestCase):
     def test_a_run_folders_server_names_its_run_whatever_the_caller_carries(self) -> None:
         # implement.sh's claim step can start the server before the launcher exports the run.
         with patch.object(codex_mesh, "RUN_ROOTS", (self.session_dir.parent,)):
-            for caller in ({}, {"PLAN_DELEGATE_BOARD_DIR": str(self.home / "other-run")}):
+            for caller in ({}, {"UNIT_RUN_DIR": str(self.home / "other-run")}):
                 with self.subTest(caller=caller):
                     environment = self.started_environment(caller)
-                    self.assertEqual(environment["PLAN_DELEGATE_BOARD_DIR"], str(self.session_dir))
+                    self.assertEqual(environment["UNIT_RUN_DIR"], str(self.session_dir))
 
     def test_a_server_outside_the_run_roots_keeps_the_callers_environment(self) -> None:
         # A review pool's mesh directory serves many units' turns, so it names no run.
         with patch.object(codex_mesh, "RUN_ROOTS", (self.home,)):
-            self.assertNotIn("PLAN_DELEGATE_BOARD_DIR", self.started_environment({}))
+            self.assertNotIn("UNIT_RUN_DIR", self.started_environment({}))
 
     def test_home_change_retires_server_even_when_sign_in_timestamps_are_unchanged(self) -> None:
         home = self.select()
@@ -10607,6 +10732,40 @@ class ServerRecordTests(unittest.TestCase):
         ))
         self.assertEqual(roster["project-impl"]["status"], "ended")
         self.assertEqual(roster["project-impl"]["role"], "impl")
+
+    def test_pause_reaps_a_server_that_never_answers_inside_the_shutdown_limit(self) -> None:
+        # The 10-26 move: a hung server kept the pause waiting past the 30 s a
+        # shutdown gives the stop, so the stop died before the reap.
+        silent = socket.socket()
+        self.addCleanup(silent.close)
+        silent.bind(("127.0.0.1", 0))
+        silent.listen()
+        port = cast(int, silent.getsockname()[1])
+        server_pid = self.sleeper()
+        self.write_server(port, server_pid)
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            "project-impl": {
+                "thread_id": "thread-impl", "status": "running", "role": "impl",
+                "turn_id": "turn-impl", "port": port,
+            },
+        }), encoding="utf-8")
+
+        started = time.monotonic()
+        with patch.object(codex_mesh, "PAUSE_INTERRUPT_SECS", 0.5), \
+                contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            code = codex_mesh.command_stop(
+                argparse.Namespace(session_dir=str(self.session_dir), pause=True)
+            )
+
+        self.assertEqual(code, 0)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertIsNotNone(self.spawned[0].wait(timeout=5), "app-server outlived stop --pause")
+        self.assertFalse((self.session_dir / codex_mesh.SERVER_FILE).exists())
+        roster = cast("dict[str, dict[str, object]]", json.loads(
+            (self.session_dir / codex_mesh.ROSTER_FILE).read_text(encoding="utf-8")
+        ))
+        self.assertEqual(roster["project-impl"]["status"], "paused")
+        self.assertIs(roster["project-impl"]["paused_turn"], True)
 
 
 

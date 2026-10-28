@@ -59,13 +59,16 @@ The user receives:
 Title: <sender> <title>
 Description: <description>
 
-<template>
+Sent by: <sender>
+Template: nate.<template>
 ```
+
+Every push ends with these `Sent by` and `Template` lines; a push with no text id shows `Template: none (free text)`.
 
 ## silence
 
 Sends no message. While silence is on, pushes are kept and go out when it ends; blocked (priority 2)
-pushes always go through. The delay says when silence starts. Act on the instructions:
+pushes always go through, and each is cancelled when its `--clears-when` check passes. The delay says when silence starts. Act on the instructions:
 
 - None: `on` (lasts until `off`).
 - An end (`until 7am`): `on --until "YYYY-MM-DD HH:MM"`; a length (`for an hour`): `on --for 1h`.

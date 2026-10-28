@@ -30,7 +30,9 @@ from urllib.parse import quote
 
 import store
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
+# Step and call fields under a former name, renamed in the file on its next read.
+FORMER_FIELDS = (("seat", "worker"), ("delegate_session", "unit_session"))
 LOCK_NAME = "index.lock"
 MARK_BYTES = 256
 BUSY_TIMEOUT_MS = 30_000
@@ -77,8 +79,8 @@ STEP_COLUMNS: list[Column] = [
     ),
     ("tree_changed", "INTEGER", "1 when the files changed during the step (fmt, mend --fix, an edit), 0 when not, NULL when unknown"),
     ("caller", "TEXT", "verify, cargo-port, validate_ci (push gate), brp-launch (build and app start), agent, alias, unknown"),
-    ("worker", "TEXT", "delegate worker (PLAN_DELEGATE_TEAM_ROLE)"),
-    ("delegate_session", "TEXT", "delegate session folder name"),
+    ("worker", "TEXT", "worker role (UNIT_TEAM_ROLE)"),
+    ("unit_session", "TEXT", "unit session folder name"),
     ("session", "TEXT", "Claude Code session id or Codex thread id"),
     ("call_id", "TEXT", "calls.id of the verify.sh call that ran this step"),
     ("tty", "INTEGER", "1 when a terminal watched it; then no log facts are recorded"),
@@ -138,7 +140,7 @@ CALL_COLUMNS: list[Column] = [
         + " superseded (a newer call of the same verb from the same worker replaced it in the token queue)",
     ),
     ("status", "INTEGER", "exit status, NULL when unknown or interrupted"),
-    ("cached", "INTEGER", "1 when the call could use a pass record (a delegate session's test or lint)"),
+    ("cached", "INTEGER", "1 when the call could use a pass record (a worker session's test or lint)"),
     ("wait_s", "INTEGER", "seconds from script start until the run began"),
     ("token_wait_s", "INTEGER", "seconds spent acquiring the cargo token, a wait that timed out included; 0 when verify.sh sought none"),
     ("mac", "TEXT", "passed (natedev confirmed it; before 2026-10-16), passed_filter, passed_full (ended the call), failed, lost or declined when Mac offload ran or was considered"),
@@ -175,8 +177,8 @@ CALL_COLUMNS: list[Column] = [
     ("worktree_name", "TEXT", "worktree folder name"),
     ("branch", "TEXT", "branch"),
     ("sha", "TEXT", "short commit"),
-    ("worker", "TEXT", "delegate worker"),
-    ("delegate_session", "TEXT", "delegate session folder name"),
+    ("worker", "TEXT", "worker role"),
+    ("unit_session", "TEXT", "unit session folder name"),
     ("session", "TEXT", "Claude Code session or Codex thread"),
     ("backfilled", "INTEGER", "1 when copied from the old events.jsonl ledger"),
 ]
@@ -607,9 +609,11 @@ def migrate_worker_fields(path: Path) -> None:
                 continue
             if isinstance(value, dict):
                 fields = cast(dict[str, object], value)
-                if fields.get("kind") in ("step", "call") and "seat" in fields:
-                    _ = fields.setdefault("worker", fields["seat"])
-                    del fields["seat"]
+                renamed = [(old, new) for old, new in FORMER_FIELDS if old in fields]
+                if fields.get("kind") in ("step", "call") and renamed:
+                    for old, new in renamed:
+                        _ = fields.setdefault(new, fields[old])
+                        del fields[old]
                     raw = (json.dumps(fields, ensure_ascii=False) + "\n").encode()
                     changed = True
             lines.append(raw)

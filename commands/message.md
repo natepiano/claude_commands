@@ -22,7 +22,7 @@ description: Rules every message between Claude sessions or Codex workers follow
 
 Load `/message_style` before the first message to the user in a session.
 
-Message the user with `send.py --to user --summary "<title>" --text "<message>" --action "<what the user does>"`, or `--no-action` when nothing is needed. Action flags go only with `--to user`. `--need decision` and `--need blocked` require `--action`; emergency (`--need blocked`) is only for an action the user must take now because work cannot continue.
+Message the user with `send.py --to user --summary "<title>" --text "<message>" --action "<what the user does>"`, or `--no-action` when nothing is needed. Action flags go only with `--to user`. `--need decision` and `--need blocked` require `--action`; emergency (`--need blocked`) is only for an action the user must take now because work cannot continue. A `--need blocked` push also takes `--clears-when "<command that exits 0 when fixed>"`, such as `--clears-when github-warm-status`: send.py cancels the push when that command exits 0. Without it, send.py refuses the push (`REFUSED`, exit 2).
 
 ### Outcomes and recovery
 
@@ -30,7 +30,7 @@ Message the user with `send.py --to user --summary "<title>" --text "<message>" 
 - `SENT: to the user, rewritten:` (exit 0) shows exactly what the user received on the following lines.
 - `HELD: not sent, failed review: <rules>` (exit 4): revise and resend. No PushNotification fallback is allowed; this push never goes out on expiry. Emergency blocked pushes and registered script pushes are sent despite review failure, named in `SENT` and the review log.
 - `REPLACED: <why>` (exit 0): a newer version replaced this push, and that version carries the message; nothing was sent. No PushNotification fallback.
-- `REFUSED: <why>` (exit 2): fix the action flags as the line says and send again. No PushNotification fallback.
+- `REFUSED: <why>` (exit 2): fix the action flags, or add `--clears-when`, as the line says and send again. No PushNotification fallback.
 - `not sent: probe sessions never push to the phone` (exit 0): this session was started with `accounts.py exec --probe`; nothing was sent. No PushNotification fallback.
 - `send.py: <name> cannot take messages (<reason>); contact its unit director <director> or wait` (exit 2): a worker between turns is resumed only by its unit director; contact that director or wait. With no director running, the reason says so and has no contact tail.
 - `send.py: <name> cannot take messages (no messaging socket); wait for it to open its messaging socket, then read the roster again and send again` (exit 2): that Claude session has not opened its messaging socket yet; follow the line.

@@ -487,10 +487,10 @@ class Busy:
 
 def owning_session() -> OwningSession | NoOwningSession:
     """Find the session that owns this run before using the shell's session id."""
-    run = os.environ.get("PLAN_DELEGATE_BOARD_DIR", "") or os.environ.get("PLAN_DELEGATE_SESSION_DIR", "")
+    run = unit_runs.environ("RUN_DIR") or unit_runs.environ("SESSION_DIR")
     if run:
         markers: list[Path] = []
-        for active in unit_runs.active_dirs(os.environ.get("PLAN_DELEGATE_ACTIVE_DIR")):
+        for active in unit_runs.active_dirs(unit_runs.environ("ACTIVE_DIR") or None):
             try:
                 markers.extend(active.iterdir())
             except OSError:
@@ -1315,10 +1315,16 @@ def socket_for(session_id: str) -> RecipientLive | RecipientGone | RecipientLook
 
 
 def send_release(entry: ReleaseEntry, socket: str) -> ReleaseDelivered | ReleaseQueued | ReleaseSendFailed:
+    """Send the release notice. A session that was only told of the hold, with no call or wait
+    pending, is told it may resume; nothing waits on its answer, so it is not asked for one."""
     script = Path(__file__).resolve().parent.parent / "message" / "send.py"
-    notice = ("/build:hold: your hold has been released. Start your next build or BRP launch now; its memory gate records admission. "
-              "With nothing to build, run python3 ~/.claude/scripts/build_hold/build_hold.py nothing-to-build now, so the release stops waiting for you. "
-              f"Session {entry['session_id']}.")
+    if not entry["active_call_id"] and not entry["session_pending"]:
+        notice = ("/build:hold: the build hold has been released; builds and BRP launches may resume. "
+                  f"The release does not wait for you, so no answer is needed. Session {entry['session_id']}.")
+    else:
+        notice = ("/build:hold: your hold has been released. Start your next build or BRP launch now; its memory gate records admission. "
+                  "With nothing to build, run python3 ~/.claude/scripts/build_hold/build_hold.py nothing-to-build now, so the release stops waiting for you. "
+                  f"Session {entry['session_id']}.")
     try:
         result = subprocess.run([sys.executable, str(script), "--to", f"uds:{socket}", "--text", notice], capture_output=True, text=True)
     except OSError as error:
@@ -1354,18 +1360,34 @@ def has_pending_call(entry: ReleaseEntry, generation: int) -> bool:
     return any(call["admitted_generation"] != generation for call in entry["calls"])
 
 
+def holds_release(entry: ReleaseEntry, generation: int) -> bool:
+    """Whether the release waits for this session: its turn is open and it has a build pending, from
+    a registered wait, a queued or active call, or a build in its memory gate. A session the hold
+    only told has none, so it never holds the release and owes no nothing-to-build."""
+    return in_progress(entry) and (bool(entry["active_call_id"]) or entry["session_pending"]
+                                   or has_pending_call(entry, generation)
+                                   or isinstance(read_release_state(entry), WaitingForMemory))
+
+
 def queue_told_sessions(cycle: HoldCycle) -> None:
-    """Every session the hold told gets its own release, registered or not, in the same pass as the rest."""
+    """Every session the hold told gets the release notice, registered or not, in the same pass as the rest.
+
+    Telling a session does not make it pending: only a registered wait (register_wait) or a queued
+    call does, so a session that never builds does not hold the release open (postmaster answered
+    40+ notices with nothing-to-build before 2026-10-27).
+    """
     entries = cycle["entries"]
     generation = cycle.get("holder_generation", 1)
     registered = {entry["session_id"] for entry in entries}
     for entry in entries:
         if (entry["session_id"] in cycle["recipients"] and not entry["session_id"].startswith("verify:")
-            and entry["delivery"]["generation"] != generation and not in_progress(entry)):
-            entry["session_pending"] = True
+            and entry["delivery"]["generation"] != generation and not holds_release(entry, generation)):
             store_release_state(entry, AwaitingRelease())
-    entries.extend(new_entry(session_id, name) for session_id, name in cycle["recipients"].items()
-                   if session_id not in registered and not session_id.startswith("verify:"))
+    for session_id, name in cycle["recipients"].items():
+        if session_id not in registered and not session_id.startswith("verify:"):
+            told = new_entry(session_id, name)
+            told["session_pending"] = False
+            entries.append(told)
 
 
 def not_reached_detail(cycle: HoldCycle) -> str:
@@ -1419,7 +1441,9 @@ def end_lapsed_turn(entry: ReleaseEntry, now: datetime, release_start: datetime,
 
 
 def release_entry(cycle: HoldCycle, entry: ReleaseEntry, clock: Callable[[], datetime]) -> None:
-    """Admit the session's next pending call, or its session wait, and send its release notice once per generation."""
+    """Admit the session's next pending call, or its session wait, and send its release notice once per
+    generation. A session with neither, that the hold told, gets the notice too; its open turn lets a
+    later call build at once, and it holds the release only once it has one (holds_release)."""
     generation = cycle.get("holder_generation", 1)
     pending_calls = sorted((call for call in entry["calls"] if call["admitted_generation"] != generation),
                            key=lambda call: not call["started"])
@@ -1432,7 +1456,6 @@ def release_entry(cycle: HoldCycle, entry: ReleaseEntry, clock: Callable[[], dat
         if entry["session_id"] not in cycle["recipients"] or entry["delivery"]["generation"] == generation:
             store_release_state(entry, NoPendingTurn())
             return
-        entry["session_pending"] = True
     entry["active_released_at"] = clock().isoformat()
     if entry["session_id"].startswith("verify:") or entry["delivery"]["generation"] == generation:
         store_release_state(entry, ReleasedAwaitingAdmission(clock()))
@@ -1510,7 +1533,7 @@ def advance_release(cycle: HoldCycle, now: datetime, *, clock: Callable[[], date
             save_cycle(cycle)
             release_entry(cycle, entry, clock)
     save_cycle(cycle)
-    waiting = [entry_text(entry) for entry in entries if in_progress(entry)]
+    waiting = [entry_text(entry) for entry in entries if holds_release(entry, generation)]
     if waiting:
         return False, "; ".join(waiting)
     if not cycle["recipients"] and (now - release_start).total_seconds() < NO_REGISTRATION_S:

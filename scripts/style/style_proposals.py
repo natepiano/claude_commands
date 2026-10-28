@@ -26,15 +26,19 @@ sys.path.insert(0, str(SCRIPTS / "production"))
 
 import coverage_report
 import rules
+import style_footprint
 import style_ledger
 import style_rules
-from approved_renames import ApprovedRename, NoAppliedCheck, RenameNotApplied, approved_rename
-from add_style import StandingStyleProduction, standing_style_production
+from approved_renames import (ApprovedRename, BindingRename, BindingScope, NoAppliedCheck, RenameNotApplied,
+                              approved_rename, binding_rename, binding_scope)
+from add_style import NoStyleProduction, StandingStyleProduction, standing_style_production
 from declarations import declaration_line
 from issues import Issue, frontmatter, open_issues, plain
+from production_units import cell_value, plan_cell_is_retired, unit_table
 from proposal_issue import (GOAL, INHERITED_FIELDS, STAR, ApprovedDecision, DeclinedDecision, Refusal,
-                            UnansweredDecision, decision_answer, fill_ranking, refresh_decision, require_generated_body)
+                            UnansweredDecision, approve_unanswered, decision_answer, fill_ranking, refresh_decision, require_generated_body)
 from unit_files import file_text, git, unit_file_holders
+from unit_plans import PilotScope, crate_in_scope, family_pilot_scopes
 from user_zone import user_zone
 
 
@@ -286,6 +290,22 @@ def decision_kind(findings: tuple[style_ledger.HeldFinding, ...],
     return "restructure" if "restructure" in kinds else "type" if "type" in kinds else "rename"
 
 
+@dataclass(frozen=True)
+class FamilyUnit:
+    """The live unit of the standing style production that builds one family's decisions, with its Plan cell."""
+    unit: str
+    plan: str
+
+
+def family_units(doc: Path) -> dict[rules.Family, FamilyUnit]:
+    units: dict[rules.Family, FamilyUnit] = {}
+    for row in unit_table(doc.read_text().splitlines()):
+        family = rules.style_family(cell_value(row["Unit"]))
+        if not isinstance(family, rules.NotStyleUnit) and not plan_cell_is_retired(row.get("Plan", "")):
+            units[family] = FamilyUnit(cell_value(row["Unit"]), cell_value(row["Plan"]))
+    return units
+
+
 @dataclass
 class DecisionWriter:
     """What one command run loads once and shares for every decision it writes."""
@@ -296,6 +316,7 @@ class DecisionWriter:
     holders: Mapping[str, frozenset[str]]
     linker: RuleLinker
     repository: str
+    standing: StandingStyleProduction | NoStyleProduction
     goals: dict[str, str] = field(default_factory=dict)
 
     def goal(self, project: str) -> str:
@@ -324,9 +345,38 @@ class DecisionWriter:
         body.append("Recommended answer: approve the described changes under this rule text.")
         return "\n".join(body) + "\n"
 
+    def rule_approval(self, key: DecisionKey, inherited: Mapping[str, str]) -> dict[str, str]:
+        """The approval fields of a rule that is always approved, as a user approval writes them, for a new decision
+        that inherits no approval. Refuse when no live unit of the rule's family builds it."""
+        definition = self.definitions.get(key.rule)
+        if (definition is None or not isinstance(definition.approval, rules.AlwaysApproved)
+                or isinstance(decision_answer(Issue(Path(), {name: [value] for name, value in inherited.items()})),
+                              ApprovedDecision)):
+            return {}
+        units = family_units(self.standing.doc) if isinstance(self.standing, StandingStyleProduction) else {}
+        unit = units.get(definition.approval.family)
+        if unit is None:
+            raise style_ledger.LedgerError(f"rule {key.rule} is always approved, but no {definition.approval.family} unit builds it")
+        slug = style_slug(self.ledger.repo)
+        return {"showrunner": slug, "unit": unit.unit, "plan": unit.plan, "approved_by": f"rule {key.rule}",
+                "approved_in": slug}
+
+    def approve_by_rule(self, decision: Issue) -> None:
+        """Approve an open decision still waiting for the user when its rule, whatever the blob, is always approved."""
+        if not isinstance(decision_answer(decision), UnansweredDecision):
+            return
+        rule = decision.value("style_rule")
+        approval = self.rule_approval(DecisionKey(rule, decision.value("style_crate"), decision.value("style_rule_blob")), {})
+        if approval:
+            # The answer is read again under the issue lock, so an approval written since the read above is kept.
+            if approve_unanswered(decision.path, {name: approval[name] for name in ("showrunner", "unit", "plan")},
+                                  approval["approved_by"], approval["approved_in"], datetime.now(user_zone()).date()):
+                    print(f"approved {decision.path}: rule {rule} is always approved")
+
     def create(self, key: DecisionKey, findings: tuple[style_ledger.HeldFinding, ...],
                inherited: Mapping[str, str]) -> Path:
         issue = self.proposals / batch_name(key)
+        approval = self.rule_approval(key, inherited)
         project = issue_project(self.ledger.repo, key.crate, self.proposals.parent)
         ranking = proposed_ranking(decision_kind(findings, self.definitions), len(findings), self.goal(project.project))
         with tempfile.TemporaryDirectory(prefix="style-decision-") as scratch:
@@ -336,8 +386,10 @@ class DecisionWriter:
                              "--proposed-by", style_slug(self.ledger.repo), "--extra-tags", "style",
                              "--rule", key.rule, "--crate", key.crate, "--rule-blob", key.blob,
                              "--count", str(len(findings)), "--body-file", str(body),
-                             "--proposed-ranking", ranking, "--initial-fields", json.dumps(dict(inherited)),
+                             "--proposed-ranking", ranking, "--initial-fields", json.dumps({**inherited, **approval}),
                              "--rules", ",".join(self.linker.urls(findings)))
+        if approval:
+            print(f"approved {issue}: rule {key.rule} is always approved")
         return issue
 
     def refresh(self, decision: Issue) -> None:
@@ -354,7 +406,7 @@ def decision_writer(ledger: style_ledger.Ledger, proposals: Path, parent: str) -
     standing = standing_style_production(ledger.repo)
     holders = unit_file_holders(ledger.repo, standing.doc, ledger) if isinstance(standing, StandingStyleProduction) else {}
     return DecisionWriter(ledger, proposals, parent, {rule.rule_id: rule for rule in rules.load_rules(ledger.repo)},
-                          holders, RuleLinker(ledger.repo), repository_name(ledger.repo))
+                          holders, RuleLinker(ledger.repo), repository_name(ledger.repo), standing)
 
 
 def find_decision(proposals: Path, key: DecisionKey) -> Path:
@@ -373,6 +425,149 @@ def find_decision(proposals: Path, key: DecisionKey) -> Path:
 BUILT_REASON = "built in "
 NOTHING_LEFT_REASON = "nothing left to build: "
 FINISHED_REASONS = (BUILT_REASON, NOTHING_LEFT_REASON)
+
+
+@dataclass(frozen=True)
+class RankWait:
+    """The family's work at the file waits: a family ranked above it has open work there."""
+    family: rules.Family
+    path: str
+    higher: rules.Family
+
+    def line(self) -> str:
+        return f"waiting {self.family}: {self.path} has open {self.higher} work"
+
+
+def ranked_below_unit(family: rules.Family, crate: str, scopes: Mapping[rules.Family, PilotScope]) -> bool:
+    """Whether a family ranked above family has a unit whose pilot scope holds crate."""
+    return any(higher in scopes and crate_in_scope(scopes[higher], crate) for higher in rules.ranked_above(family))
+
+
+@dataclass(frozen=True)
+class RankedWork:
+    """The families with open work at each file."""
+    families: Mapping[str, frozenset[rules.Family]]
+
+    def waits(self, family: rules.Family) -> dict[str, RankWait]:
+        """Each file where family waits, with the highest family ranked above it that has open work there."""
+        above = rules.ranked_above(family)
+        return {path: RankWait(family, path, next(higher for higher in above if higher in present))
+                for path, present in self.families.items() if not present.isdisjoint(above)}
+
+
+# A cell in one of these states has work that has not landed in the synced tip.
+OPEN_CELL_STATES: frozenset[style_ledger.CellState] = frozenset({"open", "stale", "awaiting merge"})
+
+
+class RankExemptions:
+    """Decision B's finding-level exceptions, located in the synced file, shared by one planning or filing run."""
+
+    def __init__(self, ledger: style_ledger.Ledger, tip: str) -> None:
+        self.ledger: style_ledger.Ledger = ledger
+        self.tip: str = tip
+        self.sources: dict[str, str] = {}
+        self.test_ranges: dict[str, tuple[tuple[int, int], ...]] = {}
+        self.types: dict[str, list[style_ledger.HeldFinding]] = {}
+        self.types_loaded: bool = False
+
+    def source(self, path: str) -> str:
+        if path not in self.sources:
+            try:
+                self.sources[path] = git(self.ledger.repo, "show", f"{self.tip}:{path}")
+            except style_ledger.LedgerError:
+                self.sources[path] = ""
+        return self.sources[path]
+
+    def located_line(self, finding: style_ledger.HeldFinding) -> int:
+        lines = self.source(finding.path).splitlines()
+        matches = [line for line, text in enumerate(lines, 1) if text.strip() == finding.text.strip()]
+        if not matches:
+            return 0
+        distance = min(abs(line - finding.line) for line in matches)
+        nearest = [line for line in matches if abs(line - finding.line) == distance]
+        return nearest[0] if len(nearest) == 1 else 0
+
+    def allows(self, finding: style_ledger.HeldFinding, family: rules.Family) -> bool:
+        if family == "names":
+            rename = binding_rename(finding.kind, finding.before, finding.after, finding.line, finding.text)
+            return (isinstance(rename, BindingRename)
+                    and isinstance(binding_scope(self.source(finding.path), rename), BindingScope))
+        if family != "values" or PurePosixPath(finding.rule.partition(":")[2]).stem != "no-magic-values":
+            return False
+        if finding.path not in self.test_ranges:
+            source = self.source(finding.path)
+            tokenized = style_footprint.tokenized_text(source)
+            path = PurePosixPath(finding.path)
+            self.test_ranges[finding.path] = (
+                ((1, len(source.splitlines())),) if "tests" in path.parts or path.name == "tests.rs" else
+                tuple((tokenized.lines[start], tokenized.lines[end - 1])
+                      for start, end in style_footprint.cfg_test_items(tuple(t.value for t in tokenized.tokens))))
+        line = self.located_line(finding)
+        modules = [(start, end) for start, end in self.test_ranges[finding.path] if start <= line <= end]
+        if not modules:
+            return False
+        if not self.types_loaded:
+            definitions = {rule.rule_id: rule for rule in rules.load_rules(self.ledger.repo)}
+            for held in self.ledger.held_findings(style_ledger.AllHeldFindings()):
+                definition = definitions.get(held.rule.removesuffix("#uncovered"))
+                if (definition is not None and definition.family == "types"
+                        and isinstance(held.state, style_ledger.Unfiled | style_ledger.Filed)):
+                    self.types.setdefault(held.path, []).append(held)
+            self.types_loaded = True
+        # An unlocated types site cannot establish that the module is free of types work.
+        occupied = [self.located_line(held) for held in self.types.get(finding.path, ())]
+        return 0 not in occupied and any(not any(start <= other <= end for other in occupied) for start, end in modules)
+
+
+def judged_at_current_file(ledger: style_ledger.Ledger, finding: style_ledger.HeldFinding, tip: str) -> bool:
+    """Whether the file at the synced tip is the file that the finding's holding ticket judged, or that its last
+    declaration follow read.
+
+    A finding with no judged commit reads as judged at the current file, as filing read every finding before.
+    """
+    judged = ledger.judged_commit(finding)
+    if isinstance(judged, style_ledger.NoJudgedCommit):
+        return True
+    read = (judged.commit, *((finding.follow.commit,) if isinstance(finding.follow, style_ledger.FollowedDeclaration) else ()))
+
+    def blob(commit: str) -> str:
+        try:
+            return git(ledger.repo, "rev-parse", "--verify", f"{commit}:{finding.path}")
+        except style_ledger.LedgerError:
+            return ""
+
+    current = blob(tip)
+    return bool(current) and any(blob(commit) == current for commit in read)
+
+
+def ranked_work(ledger: style_ledger.Ledger, cells: Iterable[style_ledger.Cell],
+                scopes: Mapping[rules.Family, PilotScope]) -> RankedWork:
+    """The open work of each family that has a unit, in that unit's pilot scope.
+
+    Open work at a file is a cell in OPEN_CELL_STATES, a filed finding (its decision unanswered or approved and not
+    built), or an unfiled finding judged at the file the synced tip has. A finding takes its family from its own rule
+    in the catalog, so it counts also when its rule has no cell.
+    """
+
+    def counts(family: rules.Family, crate: str) -> bool:
+        return family in scopes and crate_in_scope(scopes[family], crate)
+
+    work: dict[str, set[rules.Family]] = defaultdict(set)
+    for cell in cells:
+        if cell.family is not None and cell.state in OPEN_CELL_STATES and counts(cell.family, cell.crate):
+            work[cell.path].add(cell.family)
+    findings = tuple(finding for finding in ledger.held_findings(style_ledger.AllHeldFindings())
+                     if isinstance(finding.state, style_ledger.Filed | style_ledger.Unfiled))
+    if findings:
+        families: dict[str, rules.Family | None] = {rule.rule_id: rule.family for rule in rules.load_rules(ledger.repo)}
+        directories = workspace_directories(ledger)
+        tip = ledger.synced_commit()
+        for finding in findings:
+            family = families.get(finding.rule.removesuffix("#uncovered"))
+            if family is not None and counts(family, crate_for(directories, finding.path)) and (
+                    isinstance(finding.state, style_ledger.Filed) or judged_at_current_file(ledger, finding, tip)):
+                work[finding.path].add(family)
+    return RankedWork({path: frozenset(present) for path, present in work.items()})
 
 
 @dataclass(frozen=True)
@@ -463,13 +658,38 @@ def file_proposals(ledger: style_ledger.Ledger, proposals: Path, parent: str) ->
         print(f"held for open ticket {ticket}: {count} findings")
     waiting_ids = {finding.finding_id for finding in waiting}
     batches: dict[DecisionKey, list[style_ledger.HeldFinding]] = defaultdict(list)
+    candidates: list[tuple[style_ledger.HeldFinding, rules.Family | None]] = []
     for finding in ledger.held_findings(style_ledger.HeldFindingsInState("unfiled")):
         if finding.finding_id in waiting_ids:
             continue
         if style_ledger.rule_changed_since_judged(finding, writer.definitions):
             print(f"skipped {finding.finding_id}: rule changed since judged")
         else:
-            batches[decision_key(finding, directories)].append(finding)
+            candidates.append((finding, writer.definitions[finding.rule.removesuffix("#uncovered")].family))
+    # The units and cells are read only when a finding of a family ranked below another can wait.
+    scopes: Mapping[rules.Family, PilotScope] = {}
+    work = RankedWork({})
+    if isinstance(writer.standing, StandingStyleProduction) and any(
+            family is not None and rules.ranked_above(family) for _, family in candidates):
+        scopes = family_pilot_scopes(writer.standing.doc, ledger.repo)
+        work = ranked_work(ledger, ledger.cells(), scopes)
+    family_waits = {family: work.waits(family) for family in rules.FAMILY_RANKS}
+    tip = ledger.synced_commit()
+    exemptions = RankExemptions(ledger, tip)
+    waits: set[str] = set()
+    for finding, family in candidates:
+        if family is not None and ranked_below_unit(family, crate_for(directories, finding.path), scopes):
+            wait = family_waits[family].get(finding.path)
+            if wait is not None and not exemptions.allows(finding, family):
+                waits.add(wait.line())
+                continue
+            # A lower-rank finding judged at an older file waits for the judgment that reads the file again.
+            if not judged_at_current_file(ledger, finding, tip):
+                print(f"waiting {finding.finding_id}: {finding.path} changed since it was judged")
+                continue
+        batches[decision_key(finding, directories)].append(finding)
+    for line in sorted(waits):
+        print(line)
     written: list[Path] = []
     for key, items in sorted(batches.items()):
         issue = proposals / batch_name(key)
@@ -485,10 +705,14 @@ def file_proposals(ledger: style_ledger.Ledger, proposals: Path, parent: str) ->
             print(skip_line(issue, error))
     # Also finish a refresh interrupted after all ledger moves reached disk.
     # Only an open decision can get new findings, so a closed one needs no repair.
+    # An open decision filed before its rule was always approved leaves the user's list here, whatever its blob.
     for decision in open_issues(proposals, "style"):
-        if decision.path not in skipped and is_decision(decision) and issue_findings(ledger, decision.path):
+        if decision.path not in skipped and is_decision(decision):
             try:
-                writer.refresh(decision)
+                # Only a decision whose findings this ledger holds is this production's own.
+                if issue_findings(ledger, decision.path):
+                    writer.approve_by_rule(decision)
+                    writer.refresh(Issue(decision.path, frontmatter(decision.path)))
             except (style_ledger.LedgerError, Refusal) as error:
                 skipped.append(decision.path)
                 print(skip_line(decision.path, error))
@@ -1342,7 +1566,8 @@ def follow_totals(run: FollowRun) -> str:
 # The outcomes that print a line: each one changes the finding, or names why the step leaves it.
 DeclarationChange = (style_ledger.DeclarationMoved | style_ledger.DeclarationRemoved | style_ledger.DeclaredInSeveralFiles
                      | style_ledger.DeclaredInAnotherCrate | style_ledger.DeclarationRenamed | style_ledger.DeclarationGoneFromFile
-                     | style_ledger.KeptForOpenBuild | style_ledger.TraitIdentityUncertain | style_ledger.OutsideRenameUnresolved)
+                     | style_ledger.KeptForOpenBuild | style_ledger.TraitIdentityUncertain | style_ledger.OutsideRenameUnresolved
+                     | style_ledger.StatementNotFollowed)
 
 
 def follow_line(outcome: DeclarationChange, tip: str) -> str:
@@ -1365,6 +1590,8 @@ def follow_line(outcome: DeclarationChange, tip: str) -> str:
             return f"left {site}: {declaration_line(outcome.declaration)} declared in {', '.join(outcome.paths)}" + suffix
         case style_ledger.TraitIdentityUncertain():
             return f"left {site}: {declaration_line(outcome.declaration)} trait identity uncertain"
+        case style_ledger.StatementNotFollowed():
+            return f"left {site}: {declaration_line(outcome.declaration)} moved to {outcome.path}; {outcome.reason}"
         case style_ledger.DeclaredInAnotherCrate():
             return f"left {site}: {declaration_line(outcome.declaration)} declared in another crate: {outcome.path}" + suffix
         case style_ledger.DeclarationRenamed():

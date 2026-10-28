@@ -15,7 +15,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, final, override
+from unittest import mock
 
+from scripts.guilds import roles
 
 SCRIPT = Path(__file__).with_name("rename.py")
 OLD = "old"
@@ -208,8 +210,8 @@ class ProductionRenameTests(unittest.TestCase):
             "SHOWRUNNER_STATE_DIR": str(self.state),
             "STALL_WATCH_STATE_DIR": str(self.stall), "REVIEW_POOL_STATE": str(self.pool),
             "SHOWRUNNERS_CONFIG": str(config / "showrunners.json"),
-            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
-            "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
+            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "UNIT_HISTORY_DIR": str(self.root / "history"),
             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
             "HERDR_PROC": str(self.root / "proc"),
             "HERDR_PLATFORM": "linux",
@@ -524,6 +526,72 @@ class ProductionRenameTests(unittest.TestCase):
         self.assert_success(self.run_rename("apply"))
         self.assert_applied()
 
+    def test_apply_moves_pins_change_cells_child_parent_line_and_bevy_watch(self) -> None:
+        listed = self.root / "lists/change-review - old.md"
+        self.write(self.doc, self.doc.read_text().replace(
+            "## Production Context\n", f"## Production Context\n\n- **Change review:** `{listed}`\n").replace(
+            "- **Log:** `production.log`", "- **Log:** `docs/plans/old-log.md` — git-excluded"))
+        # A production log is never committed and stands untracked, as in a checkout whose .gitignore re-includes docs/.
+        self.write(self.checkout / "docs/plans/old-log.md", "one line per event\n")
+        self.write(self.checkout / "docs/plans/old-log-recovered.md", "recovered lines\n")
+        _ = self.git("add", str(self.doc))
+        _ = self.git("commit", "-m", "Name the change review list")
+        _ = self.git("push", "origin", OLD)
+        rows = ["| # | Change | Merged | How to check | Production |", "| --- | --- | --- | --- | --- |",
+                "| C1 | own | m | try | old |", "| C2 | child's | m | try | child |", "| C3 | root's | m | try |  |"]
+        self.write(listed, "\n".join([
+            "---", "date_created: 2026-10-27", "date_modified: 2026-10-27", "---", "",
+            "# old showrunner: changes to review", "", "## To review", "", *rows, "",
+            "## Reviewed", "", "| # | Change | Verdict | Date |", "| --- | --- | --- | --- |", ""]))
+        pins = self.home / ".local/state/next"
+        question = {"current": "old: first", "ended": {"old: earlier": "2026-10-27T01:00:00"}, "moved": ["oldish: kept"]}
+        self.write(pins / "question-old.json", json.dumps(question))
+        self.write(pins / "next-old-all-below.json", json.dumps({"current": "C1", "source": "change-old"}))
+        child_doc = self.root / "child/docs/child-production.md"
+        self.write(child_doc, f"# Child\n\n## Production Context\n\n- **Parent production:** {self.doc}\n")
+        self.write(self.notifier / "showrunner-child/conf",
+                   "EVERY=15\nTARGET=session:test-child\nCHECK="
+                   + shlex.join(["zsh", "/scripts/production_check.sh", str(child_doc)]) + "\n")
+        bevy = self.home / ".local/state/bevy-upgrade"
+        self.write(bevy / "old.json", json.dumps({"slug": OLD, "production": str(self.doc), "entries": 3}))
+        self.write(bevy / "old.lock", "")
+        self.write(self.notifier / "bevy-upgrade-old/conf", "EVERY=240\nRUN=py bevy_upgrade.py --production "
+                   + shlex.quote(str(self.doc)) + " check --scheduled\nFROM=bevy-upgrade-old\n")
+        board = self.root / "state/unit-board/old.json"
+        self.write(board, "{}\n")
+        planned = self.run_rename("plan")
+        self.assert_success(planned)
+        for expected in ("/next pin", "change review", "in 1 rows", f"Parent production {child_doc}",
+                         "bevy upgrade watch", "remove derived unit board", "production log"):
+            self.assertIn(expected, planned.stdout)
+        self.assert_success(self.run_rename("apply"))
+        self.assertFalse((pins / "question-old.json").exists())
+        self.assertEqual(json.loads((pins / "question-new.json").read_text()),
+                         {"current": "new: first", "ended": {"new: earlier": "2026-10-27T01:00:00"},
+                          "moved": ["oldish: kept"]})
+        self.assertEqual(json.loads((pins / "next-new-all-below.json").read_text()),
+                         {"current": "C1", "source": "change-old"})
+        text = listed.read_text()
+        self.assertIn("| C1 | own | m | try | new |", text)
+        self.assertIn("| C2 | child's | m | try | child |", text)
+        self.assertRegex(text, r"\| C3 \| root's \| m \| try \| *\|")
+        self.assertIn(f"- **Parent production:** {self.new_doc}\n", child_doc.read_text())
+        self.assertFalse((bevy / "old.json").exists())
+        self.assertFalse((bevy / "old.lock").exists())
+        self.assertEqual(json.loads((bevy / "new.json").read_text()),
+                         {"slug": NEW, "production": str(self.new_doc), "entries": 3})
+        self.assertFalse((self.notifier / "bevy-upgrade-old").exists())
+        conf = (self.notifier / "bevy-upgrade-new/conf").read_text()
+        self.assertIn(f"--production {shlex.quote(str(self.new_doc))} check", conf)
+        self.assertIn("FROM=bevy-upgrade-new\n", conf)
+        self.assertFalse(board.exists())
+        self.assertFalse((self.checkout / "docs/plans/old-log.md").exists())
+        self.assertEqual((self.checkout / "docs/plans/new-log.md").read_text(), "one line per event\n")
+        self.assertIn("- **Log:** `docs/plans/new-log.md` — git-excluded", self.new_doc.read_text())
+        self.assertEqual((self.checkout / "docs/plans/new-log-recovered.md").read_text(), "recovered lines\n")
+        self.assertEqual(self.git("status", "--porcelain").splitlines(),
+                         ["?? docs/plans/new-log-recovered.md", "?? docs/plans/new-log.md"])
+
     def test_timer_keeps_a_readable_document_through_doc_and_instance_moves(self) -> None:
         result = subprocess.run([sys.executable, "-c", CHECK_TIMER_HANDOFF, str(SCRIPT), "apply", OLD, NEW],
                                 cwd=self.checkout, env=self.env, capture_output=True, text=True,
@@ -811,6 +879,52 @@ class ProductionRenameTests(unittest.TestCase):
         self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
         self.assert_unit_moved("alpha-unit")
 
+    def held_design(self, repository_id: str, checkout: Path, holder: roles.Holder) -> roles.HeldDesign:
+        """A design `holder` holds, with an open designer whose roster entry runs in `checkout`."""
+        with mock.patch.dict(os.environ, self.env):
+            roles.register_repository(repository_id, {"fixture-host": str(checkout)}, inventory_complete=True)
+            placement = roles.authority_request("reserve", {"repository_id": repository_id, "document": "design.md",
+                                                            "host": "fixture-host", "request_id": repository_id})
+            design = roles.HeldDesign(
+                roles.DesignPlacement(str(placement["design_id"]), "fixture-host", 1), repository_id, str(checkout),
+                str(checkout / "design.md"), "design", "2026-10-22T12:00:00+00:00", holder, roles.DesignUnbound(),
+                (roles.RoleInstance("designer", f"old-{repository_id}-astra-designer", roles.RoleOpen("designer-thread")),
+                 roles.RoleInstance("reviewer", f"old-{repository_id}-astra-reviewer", roles.RoleNotOpened())))
+            roles._save(design)  # pyright: ignore[reportPrivateUsage]
+            self.write(roles.mesh_directory(design.placement.design_id) / "mesh_roster.json", json.dumps(
+                {design.roles[0].name: {"thread_id": "designer-thread", "status": "done", "cwd": str(checkout)}}))
+        return design
+
+    def read_held(self, design: roles.HeldDesign) -> tuple[roles.HeldDesign, str]:
+        """The design as saved now, and its designer's launch directory."""
+        with mock.patch.dict(os.environ, self.env):
+            current = roles.read_design(design.placement.design_id)
+            roster = cast(dict[str, dict[str, str]], json.loads(
+                (roles.mesh_directory(design.placement.design_id) / "mesh_roster.json").read_text()))
+        return current, roster[design.roles[0].name]["cwd"]
+
+    def test_held_roles_move_to_the_new_slug_with_the_showrunner_and_each_unit(self) -> None:
+        self.prepare_unit_moves()
+        config = self.root / "guilds.conf"
+        self.write(config, "[ownership]\nhost=fixture-host\n")
+        self.env.update({"GUILD_CONFIG_FILE": str(config), "GUILD_ROLES_HOST": "fixture-host",
+                         "GUILD_ROLES_STATE": str(self.root / "state/guilds/roles"),
+                         "GUILD_OWNERSHIP_STATE": str(self.root / "state/guilds/ownership")})
+        old_unit, new_unit = self.unit_worktree(OLD, "alpha-unit"), self.unit_worktree(NEW, "alpha-unit")
+        showrunner = self.held_design("showrunner-repo", self.checkout, roles.ShowrunnerHolder(OLD))
+        unit = self.held_design("unit-repo", old_unit, roles.UnitHolder(OLD, "alpha-unit"))
+        self.assert_success(self.run_rename("apply"))
+        current, cwd = self.read_held(showrunner)
+        self.assertEqual(current.holder, roles.ShowrunnerHolder(NEW))
+        self.assertEqual((current.repository, current.roles, cwd), (str(self.checkout), showrunner.roles, str(self.checkout)))
+        self.assertEqual(self.read_held(unit)[0].holder, roles.UnitHolder(OLD, "alpha-unit"))
+        self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
+        self.assert_unit_moved("alpha-unit")
+        current, cwd = self.read_held(unit)
+        self.assertEqual(current.holder, roles.UnitHolder(NEW, "alpha-unit"))
+        self.assertEqual((current.repository, current.document, cwd), (str(new_unit), str(new_unit / "design.md"), str(new_unit)))
+        self.assertEqual((current.roles, current.placement.generation), (unit.roles, 2))
+
     def test_unit_and_finish_wait_for_apply_to_complete(self) -> None:
         failed = self.run_rename("apply", fail_state=True)
         self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
@@ -927,7 +1041,7 @@ class ProductionRenameTests(unittest.TestCase):
         self.assertIs(current["done"], False)
         self.assertEqual(current["step"], 7)
 
-    def test_finish_deletes_the_recorded_merge_branch_and_ignores_retired_units(self) -> None:
+    def test_a_merge_branch_not_named_for_the_production_is_kept(self) -> None:
         self.prepare_unit_moves()
         _ = self.git("branch", "-m", "merge-main")
         _ = self.git("branch", OLD)
@@ -940,6 +1054,11 @@ class ProductionRenameTests(unittest.TestCase):
         _ = self.git("push", "origin", "merge-main", OLD)
         preserved = self.git("rev-parse", OLD)
         self.assert_success(self.run_rename("apply"))
+        self.assertEqual(self.git("branch", "--show-current"), "merge-main")
+        self.assertEqual(self.git("for-each-ref", "--format=%(refname)", f"refs/heads/{NEW}"), "")
+        self.assertEqual(self.git("ls-remote", "origin", f"refs/heads/{NEW}"), "")
+        self.assertEqual(self.git("rev-parse", "merge-main"), self.git("rev-parse", "origin/merge-main"))
+        self.assertIn("- **Merge branch:** `merge-main`", self.new_doc.read_text())
         before = self.snapshot()
         refused = self.run_command("unit", NEW, "retired-unit")
         self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
@@ -947,9 +1066,11 @@ class ProductionRenameTests(unittest.TestCase):
         self.assertEqual(self.snapshot(), before)
         for unit in UNITS:
             self.assert_success(self.run_command("unit", NEW, unit))
-        self.assert_success(self.run_command("finish", NEW))
-        self.assertEqual(self.git("for-each-ref", "--format=%(refname)", "refs/heads/merge-main"), "")
-        self.assertEqual(self.git("ls-remote", "origin", "refs/heads/merge-main"), "")
+        finished = self.run_command("finish", NEW)
+        self.assert_success(finished)
+        self.assertIn("kept merge branch merge-main", finished.stdout)
+        tip = self.git("rev-parse", "merge-main")
+        self.assertEqual(self.git("ls-remote", "origin", "refs/heads/merge-main"), f"{tip}\trefs/heads/merge-main")
         self.assertEqual(self.git("rev-parse", OLD), preserved)
         self.assertEqual(self.git("ls-remote", "origin", "refs/heads/old"), f"{preserved}\trefs/heads/old")
         self.assertIn(retired, self.new_doc.read_text())

@@ -22,6 +22,13 @@ Verbs:
              names that run, whose result still arrives as the seat's next message.
   supervise  <record>
              Run the command, wait for it, deliver its result, then mark the record finished.
+  reap       --session-dir D [--worker NAME]
+             End the running records whose supervisor is gone (see below).
+
+A record that says running while no supervisor runs it lost its supervisor to a kill or a crash,
+so nothing delivered its result. `start` and the worker's launcher end such a record: it is
+marked finished and the worker gets a FAIL result with no exit status, unless a newer run of the
+same command in the same folder answers for it.
 
 Delivery: when the worker's launcher is attached, the result is held for it and opens the
 worker's next turn. When none is, the result goes to the run's unit director through send.py,
@@ -68,6 +75,9 @@ RESULT_TAIL_CHARS = 20_000
 SUPERSEDED_STATUS = 76
 SUPERSEDED_VERDICT = ("SUPERSEDED (exit 76): a newer call of the same verb replaced this one before it built. "
                       + "Nothing failed and nothing needs a repair; read the newer call's result.")
+# The verdict of a run whose supervisor is gone: it reported no exit status.
+ORPHAN_VERDICT = ("FAIL (no exit status): the run's supervisor process is gone, so the command was killed or "
+                  + "crashed before it reported. Start the run again if you still need its result.")
 # Where run folders and their active markers live; tests point this at a temporary folder.
 RUN_ROOTS: tuple[Path, ...] = unit_runs.run_roots()
 SEND_SCRIPT = codex_mesh.SEND_SCRIPT
@@ -101,6 +111,8 @@ class RunRecord(TypedDict):
     exit_code: NotRequired[int]
     finished_at: NotRequired[str]
     delivery: NotRequired[str]
+    # Set when the run ended without its supervisor: "supervisor gone".
+    ended: NotRequired[str]
 
 
 @dataclass(frozen=True)
@@ -183,15 +195,80 @@ def seat_name(session_dir: str, name: str) -> str:
     return matches[0] if len(matches) == 1 else name
 
 
+def _process_args(pid: int) -> list[str]:
+    """The pid's command line; ps where there is no /proc (the Mac). Empty when it is gone."""
+    if Path("/proc/self").exists():
+        try:
+            return Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace").split("\0")
+        except OSError:
+            return []
+    shown = subprocess.run(["ps", "-p", str(pid), "-o", "args="], capture_output=True, text=True, check=False)
+    return shown.stdout.split()
+
+
 def _supervises(pid: int, record_path: Path) -> bool:
     """Whether pid is the `supervise` process of this record, so a reused pid does not match."""
     if pid <= 0:
         return False
-    try:
-        parts = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace").split("\0")
-    except OSError:
-        return False
+    parts = _process_args(pid)
     return "supervise" in parts and str(record_path) in parts and any(part.endswith("mesh_runs.py") for part in parts)
+
+
+def _orphaned(path: Path, raw: dict[str, object], now: float) -> bool:
+    """A running record that no supervisor runs. A record with no pid yet is still starting for its
+    first minute: `start` writes the record before it spawns the supervisor."""
+    if raw.get("status") != "running":
+        return False
+    pid = codex_mesh._as_int(raw.get("pid"))  # pyright: ignore[reportPrivateUsage]
+    if pid > 0:
+        return not _supervises(pid, path)
+    started = codex_mesh._as_float(raw.get("started_at"), now)  # pyright: ignore[reportPrivateUsage]
+    return now - started >= codex_mesh.DETACHED_RUN_START_GRACE_SECS
+
+
+def reap_orphans(session_dir: str, worker: str = "") -> list[str]:
+    """End each running record whose supervisor is gone, of one worker or of all, and return their run ids.
+
+    Its worker gets a FAIL result with no exit status, unless a newer run of the same command in
+    the same folder answers for it. On 2026-10-22 a unit stopped 23 queued runs by their process
+    group; a supervisor that dies that way delivers nothing, and its worker waited for a result
+    that never came. A claim file keeps two callers from delivering one result twice.
+    """
+    runs = _runs_dir(session_dir)
+    if not runs.is_dir():
+        return []
+    now = time.time()
+    records = [(path, raw) for path in sorted(runs.glob("*.json"))
+               if (raw := codex_mesh._read_json_object(path)).get("run_id")]  # pyright: ignore[reportPrivateUsage]
+    reaped: list[str] = []
+    for path, raw in records:
+        if (worker and raw.get("worker") != worker) or not _orphaned(path, raw, now):
+            continue
+        claim = path.with_suffix(".reap")
+        try:
+            os.close(os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+        except FileExistsError:
+            continue
+        try:
+            record = _read_record(path)
+            if record["status"] != "running":
+                continue
+            newer = any(other.get("worker") == record["worker"] and other.get("command") == record["command"]
+                        and other.get("cwd") == record["cwd"]
+                        and codex_mesh._as_float(other.get("started_at"), 0.0) > record["started_at"]  # pyright: ignore[reportPrivateUsage]
+                        for _, other in records)
+            delivery = ("nothing delivered: the supervisor is gone and a newer run of the same command answers"
+                        if newer else deliver(record, None))
+            record = _read_record(path)
+            record.update({
+                "status": "finished", "ended": "supervisor gone", "delivery": delivery,
+                "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            })
+            _write_record(path, record)
+            reaped.append(record["run_id"])
+        finally:
+            claim.unlink(missing_ok=True)
+    return reaped
 
 
 def live_twin(runs: Path, worker: str, command: list[str], cwd: str, tree_key: str) -> RunRecord | None:
@@ -234,6 +311,7 @@ def command_start(args: argparse.Namespace) -> int:
     director_dir = str(getattr(args, "director_dir", "") or "") or session_dir
     runs = _runs_dir(session_dir)
     runs.mkdir(parents=True, exist_ok=True)
+    _ = reap_orphans(session_dir)
     cwd = os.getcwd()
     tree_key = treekey.tree_key(cwd) or ""
     if twin := live_twin(runs, name, command, cwd, tree_key):
@@ -290,10 +368,16 @@ def _tail(path: Path, count: int) -> list[str]:
     return kept[::-1]
 
 
-def result_text(record: RunRecord, exit_code: int) -> str:
-    verdict = ("PASS (exit 0)" if exit_code == 0 else SUPERSEDED_VERDICT if exit_code == SUPERSEDED_STATUS
-               else f"FAIL (exit {exit_code})")
-    lines = [f"Run finished: {record['label']}", f"Result: {verdict}", f"Log: {record['log']}"]
+def _exit_words(exit_code: int | None) -> str:
+    """`exit N`, or `no exit status` for a run whose supervisor is gone."""
+    return "no exit status" if exit_code is None else f"exit {exit_code}"
+
+
+def result_text(record: RunRecord, exit_code: int | None) -> str:
+    verdict = (ORPHAN_VERDICT if exit_code is None else "PASS (exit 0)" if exit_code == 0
+               else SUPERSEDED_VERDICT if exit_code == SUPERSEDED_STATUS else f"FAIL (exit {exit_code})")
+    heading = "Run ended with no result" if exit_code is None else "Run finished"
+    lines = [f"{heading}: {record['label']}", f"Result: {verdict}", f"Log: {record['log']}"]
     tail = _tail(Path(record["log"]), RESULT_TAIL_LINES)
     if tail:
         lines.extend(["", f"Last {len(tail)} log lines (lines over {RESULT_LINE_CHARS} characters are cut):", *tail])
@@ -327,14 +411,14 @@ def _director_sessions(record: RunRecord) -> list[str]:
     return [*marked, recorded] if recorded and recorded not in marked else marked
 
 
-def deliver(record: RunRecord, exit_code: int) -> str:
+def deliver(record: RunRecord, exit_code: int | None) -> str:
     """Hand the result to the worker's attached launcher, else to its unit director.
 
-    Returns the delivery outcome the record keeps.
+    exit_code is None for a run whose supervisor is gone. Returns the delivery outcome the record keeps.
     """
     done_file = record["done_message_file"]
     if done_file and exit_code not in (0, SUPERSEDED_STATUS):
-        return f"nothing delivered: exit {exit_code} with a done message"
+        return f"nothing delivered: {_exit_words(exit_code)} with a done message"
     if done_file and exit_code == 0:
         try:
             text = Path(done_file).read_text(encoding="utf-8")
@@ -364,12 +448,12 @@ def deliver(record: RunRecord, exit_code: int) -> str:
     if isinstance(held, (codex_mesh.HeldForLauncher, codex_mesh.HeldForNextDispatch)):
         return f"held for {name}'s attached launcher on thread {held.thread_id}"
     state = held.reason if isinstance(held, codex_mesh.WorkerEnded) else f"{name} is {held.status or 'unknown'}"
-    note = (f"Seat {name}'s run {record['label']} finished (exit {exit_code}); no launcher is attached "
+    note = (f"Seat {name}'s run {record['label']} finished ({_exit_words(exit_code)}); no launcher is attached "
             + f"({state}), so the result comes to you. Dispatch the seat (implement.sh --to {name}) "
             + "when it should act on it.")
     message = "\n".join([note, f"Seat: {name}", f"Command: {' '.join(record['command'])}", "", text])
     told = [session for session in _director_sessions(record)
-            if send_to_director(session, f"{name}: run {record['label']} finished (exit {exit_code})", message)]
+            if send_to_director(session, f"{name}: run {record['label']} finished ({_exit_words(exit_code)})", message)]
     if told:
         return "sent to director " + ", ".join(told)
     if isinstance(held, codex_mesh.WorkerEnded):
@@ -416,9 +500,9 @@ def command_supervise(args: argparse.Namespace) -> int:
     record = _read_record(record_path)
     environment = dict(os.environ)
     environment.update({
-        "PLAN_DELEGATE_DETACHED_RUN": "1",
-        "PLAN_DELEGATE_BOARD_DIR": record["session_dir"],
-        "PLAN_DELEGATE_TEAM_ROLE": record["worker"].rsplit("-", 1)[-1],
+        "UNIT_DETACHED_RUN": "1",
+        "UNIT_RUN_DIR": record["session_dir"],
+        "UNIT_TEAM_ROLE": record["worker"].rsplit("-", 1)[-1],
     })
     log = Path(record["log"])
     marker = log.with_suffix(".scope")
@@ -439,6 +523,12 @@ def command_supervise(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_reap(args: argparse.Namespace) -> int:
+    for run_id in reap_orphans(str(getattr(args, "session_dir", "")), str(getattr(args, "worker", "") or "")):
+        print(f"run {run_id} ended: its supervisor is gone")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     verbs = parser.add_subparsers(dest="verb", required=True)
@@ -453,6 +543,10 @@ def main(argv: list[str] | None = None) -> int:
     supervise = verbs.add_parser("supervise", help="run one recorded command and deliver its result")
     _ = supervise.add_argument("record")
     supervise.set_defaults(handler=command_supervise)
+    reap = verbs.add_parser("reap", help="end the running records whose supervisor is gone")
+    _ = reap.add_argument("--session-dir", required=True)
+    _ = reap.add_argument("--worker", default="")
+    reap.set_defaults(handler=command_reap)
     args = parser.parse_args(argv)
     handler = cast("Callable[[argparse.Namespace], int]", getattr(args, "handler"))
     return handler(args)

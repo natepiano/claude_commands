@@ -17,6 +17,9 @@ from zoneinfo import ZoneInfo
 import candidates
 from candidates import Candidate, TimeGain, TokenGain, Unmeasured
 
+# Importable once candidates has put scripts/lib on the path.
+import urgency
+
 
 def setUpModule() -> None:
     """The times these tests expect are Eastern; the user's zone setting must not change them."""
@@ -67,7 +70,8 @@ class CandidatesTests(unittest.TestCase):
         self.root = Path(folder.name)
         self.note = self.root / "nightly improvement list.md"
         with contextlib.ExitStack() as environment:
-            _ = cast(object, environment.enter_context(mock.patch.dict(os.environ, {"NIGHTLY_REVIEW_NOTE": str(self.note)})))
+            _ = cast(object, environment.enter_context(mock.patch.dict(
+                os.environ, {"NIGHTLY_REVIEW_NOTE": str(self.note), "NEXT_STATE_DIR": str(self.root / "next")})))
             self.addCleanup(environment.pop_all().close)
         patch = mock.patch.object(candidates, "ROOT", self.root)
         _ = patch.start()
@@ -93,15 +97,28 @@ class CandidatesTests(unittest.TestCase):
         self.assertNotIn("Put cargo on the job PATH", [each.title for each in found])
         self.assertNotIn("The reload tests share one port", [each.title for each in found])
 
-    def test_time_ranks_before_tokens_and_unmeasured_comes_last_in_ledger_order(self) -> None:
+    def test_time_ranks_before_tokens_and_unmeasured_comes_last_oldest_night_first(self) -> None:
         self.assertEqual([each.title for each in candidates.ranked(LEDGER.splitlines())], [
             "Build CI tests without debug info",
             "Run the GPU tests 8 at a time",
             "Turn off the Artifact tool: 10.5k tokens, never called",
             "Duplicate CLAUDE.md in worktrees",
-            "Say the handoff instruction once",
             "Allow read-only Bash",
+            "Say the handoff instruction once",
         ])
+
+    def test_next_shows_one_candidate_until_its_outcome_and_a_moved_one_goes_last(self) -> None:
+        _ = (self.root / "ledger.md").write_text(LEDGER, encoding="utf-8")
+        first = "- 2026-10-05 rust/nateroids: Build CI tests without debug info [gain/week: 2.5 h red CI] — deferred"
+        self.assertEqual(self.run_main(["next"]), (0, first + "\n", ""))
+        urgency.move_to_end(candidates.QUEUE, "- 2026-10-05 rust/nateroids: Build CI tests without debug info",
+                                       datetime(2026, 10, 22, 10, 0))
+        second = "- 2026-10-12 rust/hana: Run the GPU tests 8 at a time [gain/week: 38 min waiting] — proposed"
+        self.assertEqual(self.run_main(["next"]), (0, second + "\n", ""))
+        titles = [each.title for each in candidates.ordered(LEDGER.splitlines())]
+        self.assertEqual((titles[0], titles[-1]), ("Run the GPU tests 8 at a time", "Build CI tests without debug info"))
+        code, out, _ = self.run_main([])
+        self.assertEqual((code, out.splitlines()[2].split(" | ")[0]), (0, "| recommended"))
 
     def test_a_line_gives_its_night_area_gain_and_state(self) -> None:
         self.assertEqual(

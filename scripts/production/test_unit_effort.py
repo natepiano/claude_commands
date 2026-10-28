@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,6 +19,9 @@ import herdr
 from fake_herdr import CommandResponse
 from fake_unit_host import HostedUnit
 from unit_effort import Ready, Skipped
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import agents_registry  # noqa: E402
 
 RULE_TOP = "──── review-pool ──────────"
 RULE = "───────────────────────────"
@@ -78,6 +82,7 @@ class UnitEffortTests(unittest.TestCase):
             "HERDR_BIN": str(Path(__file__).parents[1] / "herdr/fake_herdr.py"),
             "HERDR_PROC": str(self.root / "proc"),
             "HERDR_PLATFORM": "linux",
+            "CONVERSATION_PAUSE_STATE_DIR": str(self.root / "conversation-pause"),
             "FAKE_HERDR_LOG": str(self.root / "herdr.log"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
             "NOTIFIER_SESSIONS_DIR": str(self.records), "AGENTS_CONFIG_FILE": str(self.registry),
@@ -108,7 +113,7 @@ class UnitEffortTests(unittest.TestCase):
         return [call for call in fake_unit_host.calls(os.environ) if call[2:4] == ["agent", "prompt"]]
 
     def director_row(self) -> str:
-        return next(line for line in self.registry.read_text(encoding="utf-8").splitlines()
+        return next(line for line in agents_registry.registry_text(self.registry).splitlines()
                     if line.startswith("director="))
 
     def test_the_dry_run_sends_nothing_and_changes_nothing(self) -> None:

@@ -146,6 +146,11 @@ def checked_doc(instance: Path) -> CheckedDoc | NoCheckedDoc:
     return CheckedDoc(path)
 
 
+def session_name(session_id: str) -> str:
+    """The live Claude session's name, or empty when it has none or is not running."""
+    return _session_name(session_id)
+
+
 def _session_name(session_id: str) -> str:
     for path in SESSIONS_DIR.glob("*.json"):
         try:
@@ -424,25 +429,14 @@ def _root_in(slug: str, tree: dict[str, str]) -> str:
     return slug
 
 
-class Place(NamedTuple):
-    """Where a production sits in its tree, for what its showrunner shows the user."""
-    root: str  # the root it is under; empty when it is a root itself
-    below: list[str]  # for a root, every production below it; empty otherwise
-
-
-def place_of(slug: str) -> Place:
-    """`slug`'s place in its tree, from one reading of the edges."""
-    tree = edges()
-    return Place(_root_in(slug, tree), []) if slug in tree else Place("", _below(slug, tree))
-
-
-def user_facing(slug: str) -> list[str]:
+def user_facing(slug: str, below: bool = False) -> list[str]:
     """The productions whose items for the user `slug`'s showrunner counts and lists.
 
-    A root answers for itself and every production below it. Any other showrunner answers for its
-    own items alone.
+    Each showrunner answers for its own production only: the showrunner above it and the
+    showrunners below it answer for theirs (user, 2026-10-27). `below` adds every production
+    below it, at any depth (`/next all-below`). A production above or beside it never counts.
     """
-    return [slug, *place_of(slug).below]
+    return [slug, *descendants_of(slug)] if below else [slug]
 
 
 def root_of(slug: str) -> str:
@@ -492,6 +486,20 @@ def own_slug() -> str:
     return production_slug(str(doc)) if doc is not None else ""
 
 
+def name_refusal(slug: str, name: str) -> str:
+    """Why a showrunner session called `name` cannot run production `slug`; empty when it can.
+
+    One name per production (user, 2026-10-27): the slug is the showrunner's name, so a production
+    whose showrunner has another name is renamed first.
+    """
+    if name == slug:
+        return ""
+    if not name:
+        return f"the showrunner of {slug} has no session name; name the session {slug}"
+    return (f"production {slug} has showrunner {name}, and a production's slug must be its showrunner's name; "
+            + f"rename the production first: `/showrunner:rename plan {slug} {name}`")
+
+
 def attach(child: str, parent: str) -> None:
     """Store that `child` reports to `parent`. Raises ValueError naming why it cannot."""
     child = canonical_slug(child)
@@ -502,6 +510,9 @@ def attach(child: str, parent: str) -> None:
             raise ValueError(f"{slug} has no update timer, so it has no showrunner to attach")
     if child == parent:
         raise ValueError(f"{child} cannot report to itself")
+    for runner in registered_showrunners():
+        if runner["slug"] in (child, parent) and runner["socket"] and (why := name_refusal(runner["slug"], runner["session"])):
+            raise ValueError(why)
     tree = edges(known)
     if child in tree:
         raise ValueError(f"{child} already reports to {tree[child]}; detach it first")

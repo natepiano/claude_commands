@@ -50,13 +50,11 @@ def row(instance: Path) -> tuple[str, str, list[Path]]:
         return "", "", sources
     import footer_counts
 
-    below = showrunner_footer.place_of(production.slug).below
-    slugs = [production.slug, *below]
     sources.extend(footer_counts.sources(production.doc))
-    sources.extend(showrunner_footer.outstanding_path(slug) for slug in slugs)
-    questions = showrunner_footer.open_questions([production], {production.slug: below})
+    sources.append(showrunner_footer.outstanding_path(production.slug))
+    questions = showrunner_footer.open_questions([production])
     line = showrunner_footer.counts_line([production], questions or 0) or ""
-    due = showrunner_footer.deferred_until(slugs, production.zone)
+    due = showrunner_footer.deferred_until([production.slug], production.zone)
     return line, "" if due is None else str(int(due.timestamp())), sources
 
 

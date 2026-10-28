@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# prepare_session.sh — Create a unique delegate session directory.
+# prepare_session.sh — Create a unique unit session directory.
 #
 # Usage: prepare_session.sh
 #

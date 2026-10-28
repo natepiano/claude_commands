@@ -1,5 +1,5 @@
 ---
-description: Multi-agent API review — ergonomics, performance, simplicity, duplication removal, module structure/naming, and judicious trait/generic use — across a crate or workspace member's public + internal API. Five review agents, an adversarial validation pass, then a delegate-compatible phased implementation plan written to the docs directory.
+description: Multi-agent API review — ergonomics, performance, simplicity, duplication removal, module structure/naming, and judicious trait/generic use — across a crate or workspace member's public + internal API. Five review agents, an adversarial validation pass, then a worker-compatible phased implementation plan written to the docs directory.
 ---
 
 **IMPORTANT**: Do NOT modify any source code. This command produces a review doc with an implementation plan — implementation happens via `/plan:to_phased_plan` + `/unit:direct` or a follow-up turn.
@@ -60,7 +60,7 @@ Capture as `${INVENTORY}` — item list plus file paths. Every agent prompt gets
 <ReviewPass>
 **Goal:** five agents review the API along five lenses.
 
-Launch **5 external CLI agents in parallel** through `~/.claude/scripts/agents/agent_exec.sh` using the `api_review.reviewer` registry task and `readonly` mode. Readonly mode is the delegate-review contract: codex uses `--sandbox read-only`; claude uses `--permission-mode plan`.
+Launch **5 external CLI agents in parallel** through `~/.claude/scripts/agents/agent_exec.sh` using the `api_review.reviewer` registry task and `readonly` mode. Readonly mode is the readonly review contract: codex uses `--sandbox read-only`; claude uses `--permission-mode plan`.
 
 Create an absolute `${SESSION_DIR}` under `/tmp/claude/api_review/<uuid>/`, set `${WORKING_DIR}=${CRATE_ROOT}`, and create `${WAVE_DIR}=${SESSION_DIR}/reviewer`. Before backgrounding any reviewer:
 

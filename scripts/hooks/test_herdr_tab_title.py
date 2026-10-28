@@ -52,6 +52,12 @@ class HerdrTabTitleTests(unittest.TestCase):
         self.assertTrue(herdr_tab_title.sync({"session_id": "session-a"}, pane))
         self.assertEqual(self.retitled, [("w3:p7", "showrunner-fixer")])
 
+    def test_a_pane_of_the_default_shared_session_takes_its_session_name_with_no_file(self) -> None:
+        with patch.dict("os.environ", {"XDG_CONFIG_HOME": str(self.records.parent / "unset")}):
+            self.assertTrue(herdr_tab_title.sync({"session_id": "session-a"},
+                                                 {"HERDR_PANE_ID": "w3:p7", "HERDR_SESSION": herdr.SHARED_SESSION}))
+        self.assertEqual(self.retitled, [("w3:p7", "showrunner-fixer")])
+
     def test_other_places_and_unknown_sessions_change_nothing(self) -> None:
         cases: tuple[tuple[StopPayload, dict[str, str]], ...] = (
             ({"session_id": "session-a"}, {}),

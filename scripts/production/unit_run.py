@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Literal, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import unit_runs
 from scripts.usage import collect
 from production_units import Refusal, cell_value, unit_table
 
@@ -75,8 +76,7 @@ def local_run(root: Path, worktree: str) -> RunFound | NoMatchingRun:
 def remote_command(root: str, worktree: str) -> str:
     script = '''import json, os, sys
 from pathlib import Path
-root = Path(sys.argv[1] or os.environ.get('PLAN_DELEGATE_HISTORY_DIR') or '~/.local/state/plan-delegate').expanduser()
-wanted = os.path.normpath(sys.argv[2])
+''' + unit_runs.REMOTE_HISTORY_ROOT + '''wanted = os.path.normpath(sys.argv[2])
 for path in sorted(root.glob('runs/*.jsonl')):
  try:
   with path.open(encoding='utf-8') as stream:
@@ -144,8 +144,7 @@ def main(arguments: list[str]) -> int:
         return 1
     worktree = cell_value(row.get("Worktree", ""))
     root_argument = cast(str, args.root)
-    root = Path(root_argument or os.environ.get("PLAN_DELEGATE_HISTORY_DIR")
-                or "~/.local/state/plan-delegate").expanduser()
+    root = Path(root_argument).expanduser() if root_argument else unit_runs.history_root()
     found = local_run(root, worktree)
     machine: Literal["natedev", "mac"] = "natedev"
     if isinstance(found, NoMatchingRun) and not cast(bool, args.no_mac):

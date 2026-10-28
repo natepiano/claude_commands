@@ -125,9 +125,12 @@ State:
 - **Nested showrunners.** A showrunner may report to another
   (`/showrunner:attach`). `showrunners.py parent|children|root <slug>` and
   `showrunners.py tree` say where a production sits; look it up each time, as
-  an attachment can change. The top of a tree is its root, the user's one
-  place to see everything below it: its count and its list cover every item that needs the user. The user may still work with any showrunner
-  directly, and one below a root answers them in its own pane as a root does.
+  an attachment can change. The top of a tree is its root. Each showrunner's
+  count and `/next` cover its own production only: the showrunners below it
+  count and show their own, so each level's review is complete for that level
+  (user, 2026-10-27). `/next all-below` adds every production below it. The
+  user may still work with any showrunner directly, and one below a root
+  answers them in its own pane as a root does.
   User, 2026-10-09: "showrunners manage showrunners - ad hoc depth"; and
   2026-10-12: "have them available for direct interaction from me but also
   have a natural home under an L1".
@@ -149,15 +152,12 @@ State:
     That child relays them to its unit or to its own child. One level at a
     time.
   - **An item for the user**, when you are not the root, is asked in your own
-    reply as always and also goes to the root, so the root shows it once:
-    `showrunners.py root <your slug>`, then `showrunners.py address <root>`,
-    and SendMessage beginning `From the showrunner of <your slug>, for the
-    user: `. Set it in your own `open_for_user` as always: the root's count
-    covers it from there. Clear it the moment it is answered or no longer
-    needed, wherever the answer came from, the user typing in your own pane
-    included. The root's count drops by itself: send the root nothing to drop
-    it. A phone alert for it (<Notify/>) is still yours to send, as before. If
-    the root is not running, keep it there and say so in your next reply.
+    reply as always and set in your own `open_for_user`: your own count and
+    `/next` show it. Do not send it to the root, which shows only its own
+    production (user, 2026-10-27). Clear it the moment it is answered or no
+    longer needed, wherever the answer came from, the user typing in your own
+    pane included. A phone alert for it (<Notify/>) is still yours to send, as
+    before.
   - **A question between productions** (a Mac window, the order of two
     promotions) goes to your parent, not to the root.
   - **Who decides a shared resource:**
@@ -181,14 +181,11 @@ State:
     (`showrunners.py detach <child>`). Once it runs, wrap removes your link
     to your parent and every link to you, and tells your parent and each
     production below you, which is a root from then on.
-  - **As a root or a parent**, show the user each item a child sends in the
-    child's words, and relay the answer back to that child.
-  - **As a root**, never copy a lower showrunner's item into your own
-    `open_for_user`. It stays in its owner's list; your count and your
-    dailies' `nothing needed` already cover every list below you. When its
-    owner clears it, your count drops with no message to you and nothing for
-    you to remove (live check, 2026-10-12: an item answered in the lower
-    showrunner's own pane had to be dropped at the root by hand).
+  - **As a root or a parent**, never copy a lower showrunner's item into your own `open_for_user`.
+    It stays in its owner's list, and its owner's count and `/next` show it;
+    yours do not (user, 2026-10-27). When its owner clears it, nothing changes
+    for you. If a child sends you an item for the user, tell the child to keep
+    it in its own list.
   - **Two dailies bullets come from the tree.** Under a root, your dailies'
     closing bullets carry `reports to <root>`. As a root, `<slug>: needs-user list
     unreadable` means that production's list could not be counted: tell its
@@ -398,7 +395,7 @@ For each unit without a live unit director, run
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC <name> --plan <unit plan>`.
 `<name>` is the Units row's Unit value without `-unit`; the existing row is adopted.
 Use `--standby` for a unit waiting for an assignment. Tell the user one line
-per unit director: its session name and `herdr session attach <session>`.
+per unit director: its session name and the place add_unit printed (its tab in `agents`).
 
 When a unit director is blocked on a full context, first read its pane with
 `~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py read unit <slug> <unit> --ansi`
@@ -429,6 +426,11 @@ At the start and on every resume, run:
 
 This session's name is written nowhere: the update timer is addressed to its
 Claude session id, and every tool looks the name up from that when it needs it.
+The production's slug must be this session's name (user, 2026-10-27). Register
+warns for a session with another name, names the `/showrunner:rename` to run,
+and registers it: an account move restarts a showrunner on its own, so register
+must not fail. `attach` refuses that name for a new production.
+`add_showrunner.py` and `promote_showrunner.py` name a new showrunner for its slug.
 The command writes `PROMPT_FILE`,
 retargets `UPDATES` with `NOTIFIER new` without moving its clock, creates
 stall-watch only when absent, and prints `next_due`. Use the
@@ -975,10 +977,11 @@ it needs. Every other wait is yours to clear, and fast.
       a phone: the session, the exact words to type or the exact allow rule
       to add, and why the check refused it, in a few words. Put it in
       `needed:` and send it as a <Notify/> `blocked` alert. An auto-mode refusal
-      goes as `send.py --to user --need blocked --text-id auto_mode.refused` with its
+      goes as `send.py --to user --need blocked --clears-when "<check>" --text-id auto_mode.refused` with its
       `--value`s (`send.py --help`); free text about it is held. A session that waits
-      for the user to type a go goes as `send.py --to user --need blocked --text-id
-      session.needs_go` with its `--value`s; free text about it is held.
+      for the user to type a go goes as `send.py --to user --need blocked --clears-when "<check>" --text-id
+      session.needs_go` with its `--value`s; free text about it is held. `<check>` is a
+      command that exits 0 once the unit no longer waits; with none, drop `--need blocked`.
    4. **Rule 4's limit holds.** Each hour, run
       `~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py read unit <slug> <unit>`
       and repeat 1–3.
@@ -1003,8 +1006,10 @@ push notifications:
 On the Mac, add `--machine natedev`; the keys exist only on natedev. The
 message is the one action or fact, under 500 characters, per the message guide. Every message says
 what the user does with `--action`, or says nothing is needed with
-`--no-action`. Emergency (`--need blocked`) is only for an action the user must
-take now. Exit 0 means sent. On `FAILED` (exit 3), fall back to PushNotification
+`--no-action`. An update to an earlier user push on the same subject reuses that
+push's `--key`, so silence keeps only the newest. Emergency (`--need blocked`) is
+only for an action the user must take now. A `--need blocked` push also takes `--clears-when "<command that exits 0 when fixed>"`, such as `--clears-when github-warm-status`: send.py cancels the push when that command exits 0. Without it, send.py refuses the push (`REFUSED`, exit 2). With no such command, send the push at its own need. A repeat with the key of a live emergency
+push is skipped; to send an update, first `send.py retire --to user --from <sender> --key <key>`. Exit 0 means sent. On `FAILED` (exit 3), fall back to PushNotification
 with the `fallback text:` that `send.py` printed, and say so in the log. Never
 read or print `~/.config/pushover/env`. Every attempt is logged in
 `~/.local/state/message/log.jsonl`.
@@ -1061,7 +1066,7 @@ phase that has been through more than two repair rounds. First apply
 repair, unless the waiting unit needs the fix in repair.
 
 Otherwise, read the gating unit director's pane and the findings files in its
-delegate session directory. If its latest round fixes only new edge cases, as the
+unit session directory. If its latest round fixes only new edge cases, as the
 landing rule in <ProductionUnit/> defines them, send:
 
 `From the showrunner: <waiting unit> waits on your phase <N> (G<k>). Apply the landing rule: finish this round, move the new edge cases to a follow-up phase, checkpoint.`

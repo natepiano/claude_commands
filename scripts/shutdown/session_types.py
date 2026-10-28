@@ -243,7 +243,7 @@ class SnapshotClaudeSession(TypedDict):
     timers: list[TimerRestore]
     last_seen: str
     boot_id: NotRequired[str]
-    crash: NotRequired[Literal["reboot", "host gone"]]
+    crash: NotRequired[Literal["reboot", "host gone", "agent exited"]]
     host_process: NotRequired[RecoveryHostProcess | RecoveryHostUnrecorded]
     state: Literal["running", "unresolved"]
 

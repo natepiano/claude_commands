@@ -1,4 +1,4 @@
-"""Regression tests for the delegate run's terminal cleanup."""
+"""Regression tests for the unit run's terminal cleanup."""
 
 from __future__ import annotations
 
@@ -51,16 +51,16 @@ class EndSessionTests(unittest.TestCase):
         self.runs.mkdir()
 
         scripts = self.root / "scripts"
-        delegate = scripts / "direct"
+        direct_dir = scripts / "direct"
         agents = scripts / "agents"
-        delegate.mkdir(parents=True)
+        direct_dir.mkdir(parents=True)
         agents.mkdir()
         (scripts / "lib").mkdir()
         _ = shutil.copy2(UNIT_RUNS, scripts / "lib" / "unit_runs.py")
-        self.script = delegate / "end_session.sh"
+        self.script = direct_dir / "end_session.sh"
         _ = shutil.copy2(END_SESSION, self.script)
-        _ = shutil.copy2(REMOVE_RUN_SCRATCH, delegate / "remove_run_scratch.py")
-        _ = (delegate / "remove_workers.py").write_text("", encoding="utf-8")
+        _ = shutil.copy2(REMOVE_RUN_SCRATCH, direct_dir / "remove_run_scratch.py")
+        _ = (direct_dir / "remove_workers.py").write_text("", encoding="utf-8")
         _ = (agents / "codex_mesh.py").write_text("", encoding="utf-8")
 
         python_shim = self.root / ".claude" / "scripts" / "lib" / "py"
@@ -86,8 +86,8 @@ class EndSessionTests(unittest.TestCase):
             "HOME": str(self.root),
             "CLAUDE_CODE_SESSION_ID": self.session_id,
             "END_SESSION_CALLS": str(self.calls),
-            "PLAN_DELEGATE_ACTIVE_DIR": str(self.marker.parent),
-            "PLAN_DELEGATE_RUN_ROOT": str(self.runs),
+            "UNIT_ACTIVE_DIR": str(self.marker.parent),
+            "UNIT_RUN_ROOT": str(self.runs),
         })
         return environment
 
@@ -105,13 +105,14 @@ class EndSessionTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(calls), 5)
         self.assertTrue(calls[0].endswith(f"guilds/roles.py unbind-run {self.session_dir}"))
         self.assertIn("remove_workers.py --session-dir", calls[1])
         self.assertIn("codex_mesh.py stop --session-dir", calls[2])
         self.assertIn(str(self.session_dir), calls[2])
         self.assertIn("codex_mesh.py sweep --root", calls[3])
         self.assertIn(f"{self.root} --stop", calls[3])
+        self.assertTrue(calls[4].endswith(f"lib/scratch.py end --task run:{self.session_dir.name}"))
         self.assertFalse(self.marker.exists())
 
     def make_run(self, name: str, director: str) -> Path:

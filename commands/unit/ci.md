@@ -39,7 +39,7 @@ git rev-list --count --grep='^checkpoint(<plan-slug>): ' HEAD
 ```
 
 **CI branch.** The branch <PushCheckpoint/> pushes: the current branch, or
-`delegate/<plan-slug>` on the default branch. It is already on origin.
+`direct/<plan-slug>` on the default branch. It is already on origin.
 
 **A red point blocks the next.** A regular or final point cannot start while an
 earlier one is unresolved; repair it first (step 4).
@@ -97,10 +97,10 @@ This is a `gate` under <TurnEndGate/>; nothing else waits on it.
 
 On `merge`:
 
-1. **Run on the default branch** (the CI branch was `delegate/<plan-slug>`): run
+1. **Run on the default branch** (the CI branch was `direct/<plan-slug>`): run
    `/validate_and_push` here with no options; its own PR path applies when branch
    rules require one. After its push succeeds, delete the CI branch with
-   `git push origin --delete delegate/<plan-slug>`, since no worktree owns it.
+   `git push origin --delete direct/<plan-slug>`, since no worktree owns it.
 2. **Run on its own branch:** never switch this worktree's branch. Find the
    worktree holding the default branch with `git worktree list`. If it is clean,
    merge there — `git -C <that worktree> merge --ff-only <run branch>`, or

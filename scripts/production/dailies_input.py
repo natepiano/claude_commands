@@ -242,7 +242,7 @@ class UnitRow(NamedTuple):
     # The unit's session name at this moment, read from its live session; empty when none runs.
     # It addresses the unit and is never a key: every record is kept under the unit's name.
     session: str
-    # Read from the records of the unit's /unit:delegate runs.
+    # Read from the records of the unit's /unit:direct runs.
     run: unit_lookup.UnitState
 
 
@@ -1025,8 +1025,8 @@ def run(args: argparse.Namespace) -> int:
     report("merge branch", "ok", "pushed" if pushed else "not pushed")
     result: JsonMap = {"length": length, "zone": str(production.zone), "units": units_out, "topics": topics_out,
                        "doc": str(production.doc)}
-    root = showrunners.place_of(production.slug).root
-    if root:
+    root = showrunners.root_of(production.slug)
+    if root != production.slug:
         result["reports_to"] = root
     children = showrunners.children_of(production.slug)
     strangers = [name for name in expand if name != EXPAND_ALL and name not in children]

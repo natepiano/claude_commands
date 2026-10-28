@@ -29,6 +29,7 @@ import shutdown
 import showrunners
 import stop as stop_work
 import restart
+import launch_permission
 from importlib import import_module
 import account
 import agent_accounts
@@ -71,6 +72,7 @@ class AccountMoveTests(ShutdownTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = self.enterContext(patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         notes = self.root / "notes"
         notes.mkdir()
@@ -103,6 +105,49 @@ class AccountMoveTests(ShutdownTestCase):
         _ = self.enterContext(patch.object(refusals, "stored_reading", return_value=refusals.FreshReading(
             refusals.ReadingWindow(80, refusals.NoResetKnown(), at), refusals.NoWindow(), "")))
         _ = self.enterContext(patch.object(settle, "prompt_state", return_value=settle.TakesPrompts("room")))
+
+    def test_target_shutdown_hold_refuses_group_and_single_move_before_any_write(self) -> None:
+        reason = "claude3 is held by a shutdown (since 10-18), requested by session b1f5ca98"
+        for permission in (launch_permission.BlockedByShutdown(reason),
+                           launch_permission.ShutdownStateUnreadable("bad shutdown state")):
+            for subject in ("units", "move-id"):
+                with self.subTest(permission=permission, subject=subject):
+                    before = self.disk_state()
+                    with (patch.object(launch_permission, "launch_permission", return_value=permission),
+                          patch.object(accounts, "move_sessions") as move,
+                          patch.object(accounts, "set_group_account") as select):
+                        result, output, error = self.cli(subject)
+                    self.assertEqual(result, 1)
+                    self.assertEqual(output, "")
+                    self.assertIn("no session was stopped", error)
+                    move.assert_not_called()
+                    select.assert_not_called()
+                    self.assertEqual(before, self.disk_state())
+
+    def test_released_target_hold_is_named_and_dry_run_does_not_call_the_check(self) -> None:
+        for session_id, requester in (
+            ("b1f5ca98-rest", "session b1f5ca98"),
+            (None, "requested in a terminal or by a recovery snapshot"),
+        ):
+            with self.subTest(session_id=session_id):
+                hold = launch_permission.ReleasedHold(
+                    label="claude3", then="stop", requested_at="2026-10-18T12:00:00+00:00",
+                    session_id=session_id)
+                with (patch.object(launch_permission, "launch_permission",
+                                   return_value=launch_permission.AllowedByShutdownState(hold)),
+                      patch.object(accounts, "move_sessions", return_value=()),
+                      patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": []})):
+                    outcome = accounts.move_group("units", "claude3")
+                self.assertIsInstance(outcome, accounts.GroupMoveStarted)
+                assert isinstance(outcome, accounts.GroupMoveStarted)
+                self.assertIn(
+                    f"cleared a finished stop hold on claude3 from 2026-10-18 12:00 UTC ({requester})",
+                    outcome.stdout)
+        with patch.object(launch_permission, "launch_permission") as check:
+            result = accounts.check_move_target("claude3", datetime.now(timezone.utc), repair=False)
+        check.assert_not_called()
+        assert isinstance(result, accounts.MoveTargetReady)
+        self.assertIn("would check the shutdown hold", result.notices[0])
 
     def listed(self, report: inventory.Inventory) -> list[inventory.ListedSession]:
         return [inventory.ListedSession(session_id=item["session_id"], pid=item["pid"],
