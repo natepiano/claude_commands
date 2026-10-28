@@ -416,7 +416,7 @@ cmd_release() {
   holder="$(lock_holder "$dir")"
   holder_pid="$(cat "$dir/holder_pid" 2>/dev/null || true)"
   # A release that names no pid cannot tell its own hold from a live process's
-  # under the same agent name: two phases' seats share role names, and a
+  # under the same agent name: two phases' workers share role names, and a
   # launcher's closing release once removed a peer phase's token mid-build. A
   # live recorded holder releases itself by pid; once it is gone, this frees it.
   if [[ -z "$release_pid" && "$holder_pid" =~ ^[1-9][0-9]*$ ]] && ! pid_is_gone "$holder_pid"; then

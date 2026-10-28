@@ -371,7 +371,7 @@ worker, per <WritePromptContract/> item 3. A live run keeps the worker's
 launcher attached, so the dispatch finishes only when the worker is done.
 Records are in `${SESSION_DIR}/mesh_runs/`, each log beside its record; cancel
 a run with `kill -TERM -- -<pid>`. A message from a worker's run saying no
-launcher is attached carries the result to you: dispatch that seat
+launcher is attached carries the result to you: dispatch that worker
 (`implement.sh --to <full worker name>`) when it should act on it.
 </WorkerRuns>
 
@@ -471,7 +471,7 @@ at once, in the turn it arrives; it never waits for a better moment:
 
 The session is resumed with that line, on the account the message names; continue
 from it. Before any dispatch, run the resume commands in the shutdown message;
-never open a new seat for a role a paused seat holds. A forced stop without this
+never open a new worker for a role a paused worker holds. A forced stop without this
 message is a separate command the user gives.
 </PauseForMove>
 
@@ -860,7 +860,7 @@ durable before dispatch. The verbs:
 | Change | Verb |
 | --- | --- |
 | Initial state from `/sync board` | `phase_reservation.py enroll --session-dir "${SESSION_DIR}" --phase <id> --board <board_ready\|unconfigured>` |
-| First touch to `Active` | The Codex seat hook, or `phase_reservation.py record-active` at <CheckpointCommit/> step 5 |
+| First touch to `Active` | The Codex worker hook, or `phase_reservation.py record-active` at <CheckpointCommit/> step 5 |
 | Lost open phase record | `phase_reservation.py repair --session-dir "${SESSION_DIR}" --phase <id> --repo <repository>` requires a recorder-open phase, validates berth's mapped reservation on its live board and restores `Active` from the phase baseline; no live reservation exits 2 with enroll/claim commands. A finished phase exits 2 with `progress_history.py start-phase` to reopen it; a checkpoint-released phase refuses repair. |
 | `Active` to pending release | `phase_reservation.py committed --session-dir "${SESSION_DIR}" --phase <id> --commit <checkpoint commit>`; a style ticket adds `--ticket <ticket>`, and the record then also names the ticket and the worktree, so the reservation stays held until that ticket's merge |
 | Held reservation released at ticket merge | `style_ledger.py ticket merge` runs `phase_reservation.py release-held --session-dir <run> --phase <id> --ticket <ticket> --merged <style branch tip>`: it releases an `active` reservation from the recorded worktree at the checkpoint, confirms on the board a release whose protected tip is the checkpoint, or a later commit that descends from it and that the merged commit contains, and clears the record as `clear --released` does; a record not held for that ticket is a no-op, and a moved worktree or an unconfirmed release exits 2 and keeps it |
@@ -883,7 +883,7 @@ leaves that state as it is. The domain states and on-disk shapes are:
 | --- | --- | --- |
 | `RepositoryNotEnrolled` | `/sync board` returning `unconfigured` | Owns no reservation; supplies no release argument. |
 | `EnrolledAwaitingFirstTouch` | `/sync board` returning `board_ready` | The registered edit hook still owns first-touch acquisition; supplies no release argument. |
-| `Active` | A clear check that acquired or already held the scopes: the Codex seat hook, or the checkpoint backstop for a first touch no hook recorded. A later clear check that names another reservation of the same phase replaces it, as after berth released the recorded one. `repair` may restore it from berth's session map only after the board confirms it is active | Copies the returned reservation and coordination-run ids, phase, and protected phase-start HEAD; supplies a release argument. |
+| `Active` | A clear check that acquired or already held the scopes: the Codex worker hook, or the checkpoint backstop for a first touch no hook recorded. A later clear check that names another reservation of the same phase replaces it, as after berth released the recorded one. `repair` may restore it from berth's session map only after the board confirms it is active | Copies the returned reservation and coordination-run ids, phase, and protected phase-start HEAD; supplies a release argument. |
 | `CheckpointCommittedAwaitingReleaseConfirmation` | <CheckpointCommit/> step 6, atomically replacing `Active` once that step's commit succeeds | Copies the active fields plus the full object id captured immediately from that commit; supplies a release argument, and resumes only at release confirmation. A style ticket's record also names the ticket and the worktree; it supplies no release argument, and only `release-held` at that ticket's merge releases it. |
 
 These are
@@ -951,8 +951,8 @@ Do not dispatch until this contract reaches one of its four persisted states.
 1. When no state exists yet, create `${PHASE_DIR}` and write its `files` list
    from the Work Order's Files field: one repository-relative path per line, a
    trailing `/` covering the tree below it. A phase alone needs no list; with
-   two open, it is how a seat's edit finds its phase, so keep each path in
-   exactly one phase's list and add a path a seat's refusal names. Then invoke
+   two open, it is how a worker's edit finds its phase, so keep each path in
+   exactly one phase's list and add a path a worker's refusal names. Then invoke
    the shared `/sync board` entry point once, under <BerthDecisions/>:
 
    ```sh
@@ -970,7 +970,7 @@ Do not dispatch until this contract reaches one of its four persisted states.
    | `ledger_unreadable` | Stop the run; it is never opt-out. |
    | `busy` | Stop with “the ledger is busy, try again” and the exact board command to rerun; do not retry. |
 2. The registered PreToolUse edit hooks own the next transition. A clear check
-   atomically acquires exact `file:` scopes before the edit. A Codex seat's
+   atomically acquires exact `file:` scopes before the edit. A Codex worker's
    `apply_patch` runs `scripts/hooks/pre-tool-use-berth.py`, which gives each
    path to its open phase (the only one, else the one whose `files` list covers
    it, refusing a path no single list owns), checks as that phase's own berth
@@ -987,7 +987,7 @@ Do not dispatch until this contract reaches one of its four persisted states.
    phases holding reservations, your own edit is refused as ambiguous until you
    name its phase: `cargo-berth check <path> --reservation <that phase's
    reservation id> --json` acquires the path for it, and the edit then clears. A blocked check refuses the edit and
-   leaves the pending state intact; a seat reports the refusal to you, and you
+   leaves the pending state intact; a worker reports the refusal to you, and you
    answer the overlap under <BerthDecisions/>. An unreadable ledger stops
    without facts. Beyond those answers, do not call `cargo-berth claim` on
    behalf of a Work Order.

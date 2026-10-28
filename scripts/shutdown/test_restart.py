@@ -821,7 +821,7 @@ class RestartTests(ShutdownTestCase):
                 text = argv[argv.index("--text") + 1]
                 lines = text.splitlines()
                 self.assertEqual(lines[0], "Resume your Codex workers; do not open new ones.")
-                self.assertEqual(lines[-1], "Each seat continues its own thread; after resuming, send later work with --to as usual.")
+                self.assertEqual(lines[-1], "Each worker continues its own thread; after resuming, send later work with --to as usual.")
                 work_line = next(line for line in lines if line.startswith("impl (impl, was working):"))
                 expected = list(launcher) if moved else [*launcher[:4], "--to", "impl", *launcher[4:]]
                 expected[expected.index(old_prompt)] = str(run / "impl.resume-prompt.md")

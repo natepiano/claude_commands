@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from contextlib import redirect_stdout
+from io import StringIO
 import json
 from pathlib import Path
 import tempfile
@@ -13,8 +15,26 @@ import showrunners
 
 
 def term(name: str, *others: str, defined_in: tuple[str, ...] = ("docs/words.md#Words",),
-         kept: tuple[str, ...] = (), other_meaning_files: tuple[str, ...] = ()) -> audit.Term:
-    return audit.Term(name, "role", defined_in, others, kept, other_meaning_files)
+         kept: tuple[str, ...] = (), other_meaning_files: tuple[str, ...] = (),
+         inflected_forms: tuple[audit.NameInflection, ...] = (), retired: tuple[str, ...] = (),
+         kept_contexts: tuple[audit.KeptContext, ...] = ()) -> audit.Term:
+    return audit.Term(name, "role", defined_in, others, kept, other_meaning_files,
+                      inflected_forms, retired, kept_contexts)
+
+
+WORKER_TERMS = '''[[terms]]
+name = "worker"
+kind = "role"
+defined_in = "docs/words.md#Words"
+other_names = ["seat", "Codex seat", "delegate", "Codex worker"]
+retired = ["seat", "seats", "Codex seat", "Codex seats"]
+[terms.inflected_forms]
+worker = ["workers"]
+seat = ["seats"]
+"Codex seat" = ["Codex seats"]
+delegate = ["delegates"]
+"Codex worker" = ["Codex workers"]
+'''
 
 
 def message(at: datetime, sender: str = "alpha", recipient: str = "user", **fields: str) -> str:
@@ -23,6 +43,75 @@ def message(at: datetime, sender: str = "alpha", recipient: str = "user", **fiel
 
 
 class NameTests(unittest.TestCase):
+    def test_names_count_forms_independently_and_check_reports_longest_once(self) -> None:
+        terms = (*audit.parse_terms(WORKER_TERMS), term("gate", "/unit:direct"))
+        files = (audit.LiveFile("docs/a.md", "worker workers seat seats CODEX SEAT Codex seats "
+                                + "delegate delegates Codex worker Codex workers gate gates "
+                                + "/unit:direct /unit:directs seatbelt seats-unit"),)
+        rows = audit.measure_names(terms, files)
+        self.assertEqual([(row.name, row.hits) for row in rows], [
+            ("worker", 2), ("workers", 2), ("seat", 2), ("seats", 2),
+            ("Codex seat", 1), ("Codex seats", 1), ("delegate", 1), ("delegates", 1),
+            ("Codex worker", 1), ("Codex workers", 1), ("gate", 1), ("/unit:direct", 1),
+        ])
+        uses = audit.check_retired(terms, files)
+        self.assertEqual([(use.name, use.replacement) for use in uses],
+                         [("seat", "worker"), ("seats", "worker"),
+                          ("CODEX SEAT", "worker"), ("Codex seats", "worker")])
+
+    def test_scoped_protocol_history_and_legacy_contexts_keep_lexical_counts(self) -> None:
+        data = WORKER_TERMS + '''
+[[terms.kept_contexts]]
+path = "docs/protocol.md"
+text = "Stored field `seat`; send --to <seat>."
+reason = "Stored field and command placeholder."
+[[terms.kept_contexts]]
+path = "docs/history.md"
+text = "2026-10-16: two Codex seats resumed."
+reason = "Dated probe history."
+[[terms.kept_contexts]]
+path = "scripts/migrate.py"
+text = "DELETE FROM changes WHERE role = 'seats'"
+reason = "Legacy migration input."
+'''
+        terms = audit.parse_terms(data)
+        files = (audit.LiveFile("docs/protocol.md", "Stored field `seat`; send --to <seat>."),
+                 audit.LiveFile("docs/history.md", "2026-10-16: two Codex seats resumed."),
+                 audit.LiveFile("scripts/migrate.py", "DELETE FROM changes WHERE role = 'seats'"))
+        self.assertEqual(audit.check_retired(terms, files), ())
+        self.assertEqual(sum(row.hits for row in audit.measure_names(terms, files)), 5)
+        self.assertEqual(terms[0].kept_contexts[1].reason, "Dated probe history.")
+
+    def test_copied_changed_and_repeated_contexts_do_not_hide_retired_uses(self) -> None:
+        data = WORKER_TERMS + '''
+[[terms.kept_contexts]]
+path = "docs/protocol.md"
+text = "Send --to <seat>."
+reason = "Command placeholder."
+'''
+        terms = audit.parse_terms(data)
+        for path, text, expected in (
+            ("docs/copied.md", "Send --to <seat>.", [(1, "seat")]),
+            ("docs/protocol.md", "Dispatch --to <seat>.", [(1, "seat")]),
+            ("docs/protocol.md", "Send --to <seats>.", [(1, "seats")]),
+            ("docs/protocol.md", "Send --to <seat>.\nSend --to <seat>.", [(2, "seat")]),
+            ("docs/protocol.md", "Send --to <seat>.\nDispatch a Codex seat and two seats.",
+             [(2, "Codex seat"), (2, "seats")]),
+        ):
+            with self.subTest(path=path, text=text):
+                uses = audit.check_retired(terms, (audit.LiveFile(path, text),))
+                self.assertEqual([(use.line, use.name) for use in uses], expected)
+                self.assertTrue(all(use.path == path for use in uses))
+
+    def test_term_data_rejects_undeclared_forms_retirement_and_unexplained_context(self) -> None:
+        for invalid in (
+            WORKER_TERMS.replace('worker = ["workers"]', 'unknown = ["workers"]'),
+            WORKER_TERMS.replace('retired = ["seat",', 'retired = ["unlisted",'),
+            WORKER_TERMS + '\n[[terms.kept_contexts]]\npath = "docs/a.md"\ntext = "seat"\n',
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                _ = audit.parse_terms(invalid)
+
     def test_counts_phrases_files_and_boundaries_but_not_paths_or_kept_commands(self) -> None:
         terms = (term("worker", "seat", kept=("/keep:seat", "docs/seat/")), term("/unit:direct", "/unit:delegate"))
         files = (audit.LiveFile("commands/a.md", "Worker worker. seat seatbelt worker-unit /tmp/worker.md "
@@ -49,13 +138,13 @@ if value == "worker":
     pass
 '''
         rows = audit.measure_names((term("worker", "seat"),),
-                                   (audit.LiveFile("scripts/a.py", audit.python_strings(source)),))
+                                   (audit.LiveFile("scripts/a.py", audit.python_prose(source).text),))
         self.assertEqual([(r.name, r.hits) for r in rows], [("worker", 2), ("seat", 2)])
 
     def test_shell_output_excludes_comments_and_assignments(self) -> None:
         text = '# echo "worker"\nWORKER="worker"\necho "worker has a seat" >&2\nprintf "%s\\n" "seat"\n'
         rows = audit.measure_names((term("worker", "seat"),),
-                                   (audit.LiveFile("scripts/a.sh", audit.shell_strings(text)),))
+                                   (audit.LiveFile("scripts/a.sh", audit.shell_prose(text).text),))
         self.assertEqual([row.hits for row in rows], [1, 2])
 
     def test_python_output_follows_variable_labels_and_function_returns(self) -> None:
@@ -67,7 +156,7 @@ print(labels["worker"], choose())
 subprocess.run(["echo", "worker has a seat"])
 '''
         rows = audit.measure_names((term("worker", "seat"),),
-                                   (audit.LiveFile("scripts/a.py", audit.python_strings(source)),))
+                                   (audit.LiveFile("scripts/a.py", audit.python_prose(source).text),))
         self.assertEqual([row.hits for row in rows], [1, 1])
 
     def test_python_output_uses_its_own_scope_and_visible_module_bindings(self) -> None:
@@ -82,7 +171,7 @@ def module_label():
 def shadowed(label):
     print(label)
 '''
-        strings = audit.python_strings(source)
+        strings = audit.python_prose(source).text
         self.assertEqual(set(strings.splitlines()), {"worker", "showrunner"})
 
     def test_python_helper_call_arguments_are_not_followed_into_parameters(self) -> None:
@@ -91,7 +180,7 @@ def display(label):
     print(label)
 display("worker")
 '''
-        self.assertEqual(audit.python_strings(source), "")
+        self.assertEqual(audit.python_prose(source).text, "")
 
     def test_shell_counts_output_heredocs_but_does_not_parse_input_bodies_as_commands(self) -> None:
         text = '''cat <<'EOF'
@@ -106,7 +195,7 @@ echo "worker"
 INPUT
 '''
         rows = audit.measure_names((term("worker", "seat"),),
-                                   (audit.LiveFile("scripts/a.sh", audit.shell_strings(text)),))
+                                   (audit.LiveFile("scripts/a.sh", audit.shell_prose(text).text),))
         self.assertEqual([row.hits for row in rows], [1, 2])
 
     def test_shell_counts_only_output_arguments_on_lines_with_test_operands(self) -> None:
@@ -116,7 +205,7 @@ test "$role" = "worker" && printf "%s" "seat"
 echo "seat"; test "$role" = "worker"
 '''
         rows = audit.measure_names((term("worker", "seat"),),
-                                   (audit.LiveFile("scripts/a.sh", audit.shell_strings(text)),))
+                                   (audit.LiveFile("scripts/a.sh", audit.shell_prose(text).text),))
         self.assertEqual([row.hits for row in rows], [0, 4])
 
     def test_reader_excludes_plans_tests_fixtures_and_non_script_data(self) -> None:
@@ -175,6 +264,86 @@ kept = ["docs/seat/"]
                         text.replace('["seat"]', '[2]'), text + text):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 _ = audit.parse_terms(invalid)
+
+
+class SourceCheckTests(unittest.TestCase):
+    def test_formatted_string_fragments_keep_prose_when_they_cannot_tokenize(self) -> None:
+        sources = {
+            "scripts/apostrophe.py": 'print(f"Dispatch a seat\'s work to {name}.")\n',
+            "scripts/parenthesis.py": 'print(f"Dispatch a seat ({name})")\n',
+            "scripts/spanning.py": 'print(\n    f"{name} — dispatch a seat: "\n    f"add ~/rust/hanadocs/agents/{name}"\n)\n',
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, source in sources.items():
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                _ = path.write_text(source, encoding="utf-8")
+            files, issues = audit.read_live_files(root)
+            terms = audit.parse_terms(WORKER_TERMS)
+            uses = audit.check_retired(terms, files)
+            rows = audit.measure_names(terms, files)
+        self.assertEqual(issues, ())
+        self.assertEqual([(use.path, use.line, use.name) for use in uses], [
+            ("scripts/apostrophe.py", 1, "seat"),
+            ("scripts/parenthesis.py", 1, "seat"),
+            ("scripts/spanning.py", 2, "seat"),
+        ])
+        self.assertEqual(next(row.hits for row in rows if row.name == "seat"), 3)
+
+    def test_script_findings_report_source_lines_after_excluded_text(self) -> None:
+        sources = {
+            "scripts/concatenated.py": 'print(\n    "Dispatch "\n    "a seat."\n)\n',
+            "scripts/concatenated_parts.py": 'print(\n    "A seat, "\n    "then seats."\n)\n',
+            "scripts/concatenated_path.py": 'print(\n    "Read docs/workers.md: "\n    "dispatch a seat."\n)\n',
+            "scripts/dispatch.py": '# A dispatch helper.\n\nprint("Dispatch a seat.")\n',
+            "scripts/dispatch.sh": '# A dispatch helper.\n\necho "Dispatch a seat."\n',
+            "scripts/prompt.sh": '# A dispatch helper.\n\ncat <<\'PROMPT\'\nDispatch Codex seats.\nPROMPT\n',
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, source in sources.items():
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                _ = path.write_text(source, encoding="utf-8")
+            files, issues = audit.read_live_files(root)
+            uses = audit.check_retired(audit.parse_terms(WORKER_TERMS), files)
+        self.assertEqual(issues, ())
+        self.assertEqual([(use.path, use.line, use.name) for use in uses], [
+            ("scripts/concatenated.py", 3, "seat"),
+            ("scripts/concatenated_parts.py", 2, "seat"),
+            ("scripts/concatenated_parts.py", 3, "seats"),
+            ("scripts/concatenated_path.py", 3, "seat"),
+            ("scripts/dispatch.py", 3, "seat"),
+            ("scripts/dispatch.sh", 3, "seat"),
+            ("scripts/prompt.sh", 4, "Codex seats"),
+        ])
+
+    def test_source_check_detects_a_returning_use_without_reading_home_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = root / "scripts/production/role_terms.toml"
+            data.parent.mkdir(parents=True)
+            _ = data.write_text(WORKER_TERMS, encoding="utf-8")
+            source = root / "docs/words.md"
+            source.parent.mkdir()
+            _ = source.write_text("A worker keeps its thread.\n", encoding="utf-8")
+            with patch.object(Path, "home", side_effect=AssertionError("source check must not read home")), \
+                    patch.object(showrunners, "timer_docs", side_effect=AssertionError("source check must not read productions")):
+                self.assertEqual(audit.check_sources(root), ())
+                _ = source.write_text("A worker keeps its thread.\nDispatch Codex seats.\n", encoding="utf-8")
+                output = StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(audit.main(["check", "--root", str(root)]), 1)
+                self.assertIn("docs/words.md:2: retired 'Codex seats'; use 'worker'", output.getvalue())
+                _ = source.write_text("Dispatch workers.\n", encoding="utf-8")
+                with redirect_stdout(StringIO()):
+                    self.assertEqual(audit.main(["check", "--root", str(root)]), 0)
+
+    def test_repository_sources_have_no_unkept_retired_names(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        issues = audit.check_sources(root)
+        self.assertEqual(issues, (), "\n".join(issues))
 
 
 class ProductionNameTests(unittest.TestCase):
