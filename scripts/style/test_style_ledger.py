@@ -227,6 +227,34 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.NeedsJudgment)
         self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.NeedsJudgment)
 
+    def assert_extern_owner_move_refused(self, work: str) -> None:
+        source = ("fn container() {\n    extern fn first() {\n        " + work
+                  + " work() {\n            let old = 791;\n        }\n    }\n    extern fn second() {}\n}\n")
+        ledger, _, finding = self.site_fixture(source=source, line=4)
+        # Establish that the qualified items are readable, rather than merely refusing the whole file.
+        tip = self.commit_tip(ledger, {PARENT_FILE: "// header\n" + source})
+        self.assertEqual(self.strict_site(ledger, finding, tip), style_ledger.UnchangedSite(PARENT_FILE, 5))
+        moved = ("fn container() {\n    extern fn first() {}\n    extern fn second() {\n        " + work
+                 + " work() {\n            let old = 791;\n        }\n    }\n}\n")
+        tip = self.commit_tip(ledger, {PARENT_FILE: moved})
+        self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.NeedsJudgment)
+        self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.NeedsJudgment)
+        _ = ledger.follow_declarations([finding.finding_id], tip, lambda _: True)
+        self.assertEqual(ledger.named_held([finding.finding_id])[0].follow, style_ledger.NotFollowed())
+
+    def test_site_owner_refuses_work_moved_between_nested_extern_functions(self) -> None:
+        self.assert_extern_owner_move_refused("fn")
+
+    def test_site_owner_refuses_qualified_work_moved_between_nested_extern_functions(self) -> None:
+        self.assert_extern_owner_move_refused('pub(crate) const unsafe extern "C" fn')
+
+    def test_site_owner_refuses_unknown_item_prefix_instead_of_skipping_it(self) -> None:
+        source = "fn container() {\n    unrecognized fn first() {\n        fn work() {\n            let old = 791;\n        }\n    }\n}\n"
+        ledger, _, finding = self.site_fixture(source=source, line=4)
+        tip = self.commit_tip(ledger, {PARENT_FILE: "// header\n" + source})
+        self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.NeedsJudgment)
+        self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.NeedsJudgment)
+
     def test_site_proof_never_withdraws_removed_or_indirectly_included_literals(self) -> None:
         ledger, rule, finding = self.site_fixture("values", rule_name="no-magic-values", kind="restructure")
         judgments = self.judgment_rows(ledger.database)

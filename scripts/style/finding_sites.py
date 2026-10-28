@@ -118,12 +118,37 @@ class SourceSites:
                         return False
                     if item.kind in {"mod", "impl", "trait"} and words[cursor] == "{" and close == last - 1:
                         return visit(cursor + 1, close, identity)
-                    if not nested(cursor + 1, close, identity, at_item=words[cursor] == "{"):
+                    if not nested(cursor + 1, close, identity,
+                                  at_item=words[cursor] == "{" and item.kind not in {"struct", "enum", "union"}):
                         return False
                     cursor = close + 1
                 else:
                     cursor += 1
             return True
+
+        def statement_start(start: int, keyword: int, end: int) -> bool:
+            """Only recognized expressions/statements may occupy a non-item boundary."""
+            word = words[start]
+            if keyword != start:
+                # These qualifiers can lead block/closure expressions as well as items.
+                prefix = words[start:keyword]
+                return (all(part in {"async", "unsafe", "const"} for part in prefix)
+                        and words[keyword:keyword + 1] in (("{",), ("move",), ("|",), ("||",)))
+            if word in {"let", "if", "else", "match", "while", "for", "loop", "return", "break", "continue",
+                        "yield", "move", "try", "const", "{", "(", "[", ";", "&", "&&", "*", "!", "-", "|", "||"}:
+                return True
+            if word == "'":
+                return (start + 2 < end and spans[start + 1].token.kind == "identifier"
+                        and words[start + 2] == ":")
+            if spans[start].token.kind == "literal":
+                return True
+            # A plain name starts a path, call, macro, operator expression or a bare value.
+            # An unknown modifier followed by an item keyword is none of these: refuse it.
+            return (spans[start].token.kind == "identifier" and word not in style_footprint.RUST_KEYWORDS - {"self", "super", "crate", "Self", "true", "false"}
+                    and (start + 1 == end or words[start + 1] in {
+                        "::", "(", "[", "{", "!", ".", "?", ";", "=", "+", "-", "*", "/", "%", "&", "&&", "|", "||",
+                        "^", "<", ">", "==", "!=", "<=", ">=",
+                    }))
 
         def nested(start: int, end: int, owner: tuple[str, ...], *, at_item: bool) -> bool:
             cursor = start
@@ -133,20 +158,7 @@ class SourceSites:
                     # Attributes, visibility and function qualifiers belong to the item that follows.
                     while keyword in attributes:
                         keyword = attributes[keyword]
-                    if words[keyword:keyword + 1] == ("pub",):
-                        keyword += 1
-                        if words[keyword:keyword + 1] == ("(",):
-                            keyword = ends.get(keyword, end) + 1
-                    while keyword < end:
-                        word = words[keyword]
-                        following = words[keyword + 1:keyword + 2]
-                        if word in {"unsafe", "async", "auto", "default"} or (
-                                word == "const" and following in (("fn",), ("unsafe",), ("async",), ("extern",))):
-                            keyword += 1
-                        elif word == "extern" and following and following[0].startswith('"'):
-                            keyword += 2
-                        else:
-                            break
+                    keyword, _ = style_footprint.item_prefix(words, ends, keyword)
                 word = words[keyword] if keyword < end else ""
                 if (at_item and word in {"fn", "impl", "trait", "mod", "struct", "enum", "union", "type", "const", "static"}
                         and not (word == "const" and words[keyword + 1:keyword + 2] == ("{",))):
@@ -159,6 +171,8 @@ class SourceSites:
                         return False
                     cursor = last
                     at_item = True
+                elif at_item and not statement_start(cursor, keyword, end):
+                    return False
                 elif words[cursor] in {"{", "(", "["}:
                     close = ends.get(cursor)
                     block = words[cursor] == "{"
