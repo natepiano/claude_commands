@@ -1942,6 +1942,18 @@ MIGRATIONS = {
             PRIMARY KEY(finding_id, ticket)
         );
     """,
+    25: """
+        CREATE TABLE refill_results (
+            unit TEXT PRIMARY KEY, at TEXT NOT NULL, outcome TEXT NOT NULL,
+            split_at TEXT NOT NULL DEFAULT '', ready INTEGER NOT NULL DEFAULT 0,
+            changed INTEGER NOT NULL DEFAULT 0, structure INTEGER NOT NULL DEFAULT 0,
+            other INTEGER NOT NULL DEFAULT 0
+        );
+        ALTER TABLE held_findings ADD COLUMN built_at TEXT NOT NULL DEFAULT '';
+        UPDATE held_findings SET built_at=COALESCE(
+            (SELECT updated_at FROM tickets WHERE id=held_findings.build_ticket AND state='merged'), updated_at
+        ) WHERE state='built';
+    """,
 }
 
 
@@ -2691,7 +2703,7 @@ class Ledger:
                         if isinstance(check, AppliedInCode):
                             # A person's reading was of the old build, so a new build clears it.
                             _ = self._connection.execute(
-                                "UPDATE held_findings SET state='built',person_read_by='',updated_at=? WHERE finding_id=?", (now, finding_id),
+                                "UPDATE held_findings SET state='built',person_read_by='',built_at=CASE WHEN built_at='' THEN ? ELSE built_at END,updated_at=? WHERE finding_id=?", (now, now, finding_id),
                             )
                             continue
                         if isinstance(check, RenameNotApplied):
@@ -3338,7 +3350,7 @@ class Ledger:
                         raise LedgerError(f"{duplicate.finding_id}: build ticket {ticket['id']} still holds the finding")
                 source = finding.state.proposal
                 _ = self._connection.execute(
-                    "UPDATE held_findings SET state='withdrawn',duplicate_of=?,withdrawn_by=0,proposal=?,"
+                    "UPDATE held_findings SET state='withdrawn',built_at='',duplicate_of=?,withdrawn_by=0,proposal=?,"
                     + "moved_from=CASE WHEN ?=proposal THEN moved_from ELSE ? END,updated_at=? WHERE finding_id=?",
                     (duplicate.qualified, str(duplicate.decision), str(duplicate.decision), str(source), now, duplicate.finding_id),
                 )
@@ -3427,7 +3439,7 @@ class Ledger:
                         or any(self.newest_held_judgment(*cell) != read for cell, read in reads.items())):
                     raise ChangedBeforeLock("the findings or their judgments changed while they were declined; rerun")
                 now = _now()
-                _ = self._connection.executemany("UPDATE held_findings SET state='waived',waive_provenance=?,waived_by=?,updated_at=? WHERE finding_id=?",
+                _ = self._connection.executemany("UPDATE held_findings SET state='waived',built_at='',waive_provenance=?,waived_by=?,updated_at=? WHERE finding_id=?",
                                                  [(provenance, by, now, finding.finding_id) for finding in findings])
                 for cell, read in reads.items():
                     if isinstance(read, NewestHeldJudgment) and isinstance(decisions[cell], CellWaived):
@@ -4768,8 +4780,8 @@ class Ledger:
                 # declaration, in its own file too, so reopen checks that site and its line reads at the tip.
                 _ = self._connection.executemany(
                     "UPDATE held_findings SET state='built',person_read_by='',path=?,line=?,followed_from=?,followed_from_line=?,"
-                    + "followed_at=?,updated_at=? WHERE finding_id=?",
-                    [(item.path, item.line, item.finding.path, item.finding.line, tip.commit, now, item.finding.finding_id)
+                    + "followed_at=?,built_at=CASE WHEN built_at='' THEN ? ELSE built_at END,updated_at=? WHERE finding_id=?",
+                    [(item.path, item.line, item.finding.path, item.finding.line, tip.commit, now, now, item.finding.finding_id)
                      for item in renames],
                 )
                 _ = self._connection.executemany(
@@ -4816,8 +4828,9 @@ class Ledger:
                 if current != finding or merged_build_ticket(current) != ticket:
                     raise ChangedBeforeLock(f"{finding_id}: the finding changed while it was marked built; rerun")
                 # A person's reading was of the old build, so a new build clears it.
-                _ = self._connection.execute("UPDATE held_findings SET state='built',person_read_by='',updated_at=? WHERE finding_id=?",
-                                             (_now(), finding_id))
+                now = _now()
+                _ = self._connection.execute("UPDATE held_findings SET state='built',person_read_by='',built_at=CASE WHEN built_at='' THEN ? ELSE built_at END,updated_at=? WHERE finding_id=?",
+                                             (now, now, finding_id))
 
         return retry_on_change(attempt)
 
@@ -4878,8 +4891,8 @@ class Ledger:
                 for item in built:
                     by = item.reading.by if isinstance(item.reading, ReadByPerson) else ""
                     _ = self._connection.execute(
-                        "UPDATE held_findings SET state='built',person_read_by=?,updated_at=? WHERE finding_id=?",
-                        (by, now, item.finding_id),
+                        "UPDATE held_findings SET state='built',person_read_by=?,built_at=CASE WHEN built_at='' THEN ? ELSE built_at END,updated_at=? WHERE finding_id=?",
+                        (by, now, now, item.finding_id),
                     )
             return tuple(built)
 
@@ -4938,7 +4951,7 @@ class Ledger:
         cells = {(finding.rule, _finding_cell(self._component_rule(finding.rule), finding.path, tip)) for finding in findings}
         now = _now()
         _ = self._connection.executemany(
-            "UPDATE held_findings SET state='unfiled',proposal='',build_ticket='',moved_from='',updated_at=? WHERE finding_id=?",
+            "UPDATE held_findings SET state='unfiled',proposal='',build_ticket='',moved_from='',built_at='',updated_at=? WHERE finding_id=?",
             [(now, finding.finding_id) for finding in findings],
         )
         for rule, path in sorted(cells):
@@ -5019,7 +5032,7 @@ class Ledger:
                 if not isinstance(self._held(finding_id).state, Built):
                     raise LedgerError(f"{finding_id}: finding is not built")
                 _ = self._connection.execute(
-                    "UPDATE held_findings SET state='filed',build_ticket='',updated_at=? WHERE finding_id=?", (now, finding_id),
+                    "UPDATE held_findings SET state='filed',build_ticket='',built_at='',updated_at=? WHERE finding_id=?", (now, finding_id),
                 )
                 reading = refilings[finding_id]
                 if isinstance(reading, ReadByPerson):
@@ -5050,7 +5063,7 @@ class Ledger:
             # A unit cannot relabel an existing waive. A person's explicit waive protects it from replacement.
             if isinstance(finding.state, Withdrawn) or isinstance(finding.state, Waived) and isinstance(actor, WaiveByUnit):
                 return
-            _ = self._connection.execute("UPDATE held_findings SET state='waived',waive_provenance=?,waived_by=?,updated_at=? WHERE finding_id=?",
+            _ = self._connection.execute("UPDATE held_findings SET state='waived',built_at='',waive_provenance=?,waived_by=?,updated_at=? WHERE finding_id=?",
                                          (provenance, by, _now(), finding_id))
 
     def reconcile(self, branch_point: str, style_branch: str) -> tuple[str, ...]:
@@ -5722,6 +5735,23 @@ def ledger_location(repo: Path) -> LedgerLocation:
 def open_ledger(repo: Path) -> Ledger:
     location = ledger_location(repo)
     return Ledger(location.repo, location.database)
+
+
+def record_refill(repo: Path, unit: str, outcome: str) -> None:
+    """Save a refill result without loading rules or changing the schema."""
+    database = ledger_location(repo).database
+    if not database.is_file():
+        return
+    with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=rw", uri=True,
+                                timeout=BUSY_TIMEOUT_SECONDS)) as connection, connection:
+        if not connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='refill_results'").fetchone():
+            return
+        now = _now()
+        _ = connection.execute(
+            "INSERT INTO refill_results(unit,at,outcome) VALUES (?,?,?) "
+            + "ON CONFLICT(unit) DO UPDATE SET at=excluded.at,outcome=excluded.outcome",
+            (unit, now, outcome),
+        )
 
 
 @contextmanager

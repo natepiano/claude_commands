@@ -27,7 +27,7 @@ import style_plan
 import unit_plans
 import style_proposals
 import proposal_issue
-from issues import frontmatter
+from issues import Issue, frontmatter
 
 import berth_board
 import fake_fmt
@@ -2594,7 +2594,8 @@ class StylePlanTests(unittest.TestCase):
         self.sync()
         unavailable = berth_board.BoardUnavailable("second read failed")
         with mock.patch.object(berth_board, "read_board", side_effect=[self.board(), unavailable]):
-            self.assertEqual(style_plan.next_phase("names-unit", self.plan, self.repo), unavailable)
+            result = style_plan.next_phase("names-unit", self.plan, self.repo)
+        self.assertEqual(result, unavailable)
         self.assertEqual([row[0] for row in self.sync_wait_rows()], ["names-unit"])
         self.assertEqual(self.ledger().ticket_open("names-unit"), ())
 
@@ -3524,6 +3525,80 @@ class StylePlanTests(unittest.TestCase):
         opened = ledger.ticket_open("names-unit")[0]
         self.assertNotEqual(opened["id"], "names-unit-1")
         self.assertEqual(opened["finding_ids"], [finding.finding_id])
+
+    def test_refill_stops_after_its_first_ticket_with_the_same_phase_and_output(self) -> None:
+        rule = self.rule("first-ticket")
+        paths = {name: f"crates/alpha/src/{name}.rs" for name in
+                 ("first", "ready", "judged_changed", "unsynced", "structure", "busy", "gone")}
+        self.commit_files({path: "pub fn work() {}\n" for name, path in paths.items() if name != "gone"})
+        first = self.approved_decision(rule, (paths["first"],), "type")
+        ledger = self.ledger()
+        first_finding, = ledger.proposal_findings(first)
+        decisions = [Issue(first, frontmatter(first))]
+        later: list[style_ledger.HeldFinding] = []
+        for name in ("ready", "judged_changed", "unsynced", "structure", "busy", "gone"):
+            issue = first.with_name(name + ".md")
+            _ = issue.write_text(first.read_text())
+            finding = ledger.hold(rule, paths[name], 1, "change", "type", "before", "after",
+                                  first_finding.rule_blob, "outside")
+            ledger.file_held(finding.finding_id, issue)
+            later.append(finding)
+            decisions.append(Issue(issue, frontmatter(issue)))
+        definitions = {definition.rule_id: definition for definition in rules.load_rules(self.repo)}
+        busy = style_plan.BusyFiles(self.board(), frozenset({paths["busy"]}))
+        original = self.plan.read_text()
+        outcomes = tuple(style_ledger.DeclarationNotRead(finding) for finding in (first_finding, *later))
+        follow = style_proposals.FollowRun(style_ledger.DeclarationReading(self.tip, outcomes), (), ())
+        rank = style_proposals.RankedWork({paths["structure"]: frozenset({"types"})})
+        baseline_output = io.StringIO()
+        with (mock.patch.object(style_proposals, "approved_decisions", return_value=tuple(decisions[:1])),
+              mock.patch.object(style_proposals, "run_follow", return_value=follow),
+              mock.patch.object(style_proposals, "ranked_work", return_value=rank),
+              mock.patch.object(style_proposals, "ranked_below_unit", return_value=False),
+              mock.patch.object(style_proposals, "proposal_command"), redirect_stdout(baseline_output)):
+            baseline = style_plan._select_phase(ledger, "names-unit", "demo-style-names", self.plan, self.repo,  # pyright: ignore[reportPrivateUsage]
+                                               self.doc, original, unit_plans.AllCrates(), busy, frozenset(), definitions)
+        self.assertIsInstance(baseline, style_plan.PhaseWritten)
+        expected_phase = self.plan.read_bytes()
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE held_findings SET build_ticket=''")
+            _ = connection.execute("DELETE FROM tickets WHERE unit='names-unit'")
+        _ = self.plan.write_text(original)
+        output = io.StringIO()
+
+        with (mock.patch.object(style_proposals, "approved_decisions", return_value=tuple(decisions)),
+              mock.patch.object(style_proposals, "run_follow", return_value=follow),
+              mock.patch.object(style_proposals, "ranked_work", return_value=rank),
+              mock.patch.object(style_proposals, "ranked_below_unit", return_value=False),
+              mock.patch.object(style_proposals, "files_at", wraps=style_proposals.files_at) as read_paths,
+              mock.patch.object(style_plan, "unsynced_changes", return_value={
+                  paths["unsynced"]: style_plan.UnsyncedChange(paths["unsynced"], self.tip)}),
+              mock.patch.object(style_proposals.RankExemptions, "allows", return_value=False),
+              mock.patch.object(ledger, "decline_findings", wraps=ledger.decline_findings) as waive,
+              mock.patch.object(style_proposals, "close_finished_decision", return_value=False) as close,
+              mock.patch.object(ledger, "ticket_add", wraps=ledger.ticket_add) as add,
+              mock.patch.object(ledger, "ticket_assign", wraps=ledger.ticket_assign) as assign,
+              mock.patch.object(style_plan, "write_phase", wraps=style_plan.write_phase) as write,
+              mock.patch.object(style_proposals, "proposal_command") as command,
+              mock.patch.object(style_proposals, "renumber") as renumber, redirect_stdout(output)):
+            result = style_plan._select_phase(ledger, "names-unit", "demo-style-names", self.plan, self.repo,  # pyright: ignore[reportPrivateUsage]
+                                             self.doc, original, unit_plans.AllCrates(), busy, frozenset(), definitions)
+        self.assertIsInstance(result, style_plan.PhaseWritten)
+        read_paths.assert_called_once_with(self.repo, self.tip, (paths["first"],))
+        self.assertEqual(self.plan.read_bytes(), expected_phase)
+        self.assertEqual(baseline_output.getvalue(), f"waiting names: {paths['structure']} has open types work\n")
+        self.assertEqual(output.getvalue(), baseline_output.getvalue())
+        self.assertEqual(ledger.ticket_open("names-unit")[0]["finding_ids"], [first_finding.finding_id])
+        self.assertEqual([(finding.state, finding.build_ticket) for issue in decisions[1:]
+                          for finding in ledger.proposal_findings(issue.path)],
+                         [(style_ledger.Filed(issue.path), style_ledger.NoBuildTicket()) for issue in decisions[1:]])
+        waive.assert_not_called()
+        close.assert_not_called()
+        self.assertEqual(add.call_count, 1)
+        self.assertEqual(assign.call_count, 1)
+        self.assertEqual(write.call_count, 1)
+        command.assert_called_once_with("start", str(first))
+        renumber.assert_not_called()
 
     def test_decision_refill_prints_each_wait_once_and_builds_the_available_files(self) -> None:
         rule = self.rule("read")
@@ -5411,6 +5486,56 @@ class UnsyncedChangeTests(unittest.TestCase):
             # A base inside the synced tip, and no unit branch, change no file.
             self.assertEqual(dict(style_plan.unsynced_changes(repo, style_plan.UnitBranchTip(tip), newest)), {})
             self.assertEqual(dict(style_plan.unsynced_changes(repo, style_plan.NoUnitBranch(), tip)), {})
+
+
+class RefillRecordingTests(unittest.TestCase):
+    def test_main_records_every_outcome_after_next_phase_returns(self) -> None:
+        cases: tuple[tuple[object, str, int, str], ...] = (
+            (style_plan.PhaseWritten("names-unit-1"), "phase written", 0, "phase written: names-unit-1\n"),
+            (style_plan.Resumed("names-unit-1"), "resumed", 0, "resume names-unit-1\n"),
+            (style_plan.RepairFirst(), "repair first", 0, "repair first\n"),
+            (style_plan.WaitingForMerge("names-unit-1", "abcdef123"), "waiting for merge", 5,
+             "waiting for merge: names-unit-1 checkpointed at abcdef1\n"),
+            (style_plan.WaitingForSync(0), "waiting for sync", 3, "waiting for sync\n"),
+            (style_plan.WaitingForStructure(("alpha", "beta"), 0), "waiting for structure: alpha, beta", 3,
+             "waiting for structure: alpha, beta\n"),
+            (style_plan.WaitingForBranchPointSync("main", "abcdef123", "765432123"),
+             "waiting for branch-point sync", 3, "waiting for sync: main abcdef1 is not in the synced tip 7654321\n"),
+            (style_plan.MergeStyleBranchFirst(1, "abcdef123", "refs/heads/style/main"),
+             "merge the style branch first", 6, "merge the style branch first: 1 cell judged at abcdef1 wait for style/main\n"),
+            (berth_board.BoardUnavailable("offline"), "board unavailable", 4, "board unavailable: offline\n"),
+        )
+        for result, words, code, printed in cases:
+            with self.subTest(outcome=words, result=result):
+                output = io.StringIO()
+                calls: list[str] = []
+
+                def next_result(_unit: str, _plan: Path, _repo: Path) -> object:
+                    calls.append("returned")
+                    return result
+
+                def record(_repo: Path, _unit: str, _outcome: str) -> None:
+                    calls.append("recorded")
+
+                with (mock.patch.object(style_plan, "next_phase", side_effect=next_result),
+                      mock.patch.object(style_ledger, "record_refill", side_effect=record) as recorded,
+                      redirect_stdout(output)):
+                    self.assertEqual(style_plan.main(["next-phase", "--unit", "names-unit", "--plan", "/tmp/claude/plan.md",
+                                                      "--repo", "/tmp/claude/repo"]), code)
+                recorded.assert_called_once_with(Path("/tmp/claude/repo"), "names-unit", words)
+                self.assertEqual(calls, ["returned", "recorded"])
+                self.assertEqual(output.getvalue(), printed)
+
+    def test_an_exception_from_next_phase_records_nothing(self) -> None:
+        for error in (OSError("cannot read"), ValueError("invalid plan"), sqlite3.OperationalError("database error")):
+            with self.subTest(error=error):
+                output = io.StringIO()
+                with (mock.patch.object(style_plan, "next_phase", side_effect=error),
+                      mock.patch.object(style_ledger, "record_refill") as recorded, redirect_stderr(output)):
+                    self.assertEqual(style_plan.main(["next-phase", "--unit", "names-unit", "--plan", "/tmp/claude/plan.md",
+                                                      "--repo", "/tmp/claude/repo"]), 2)
+                recorded.assert_not_called()
+                self.assertIn(str(error), output.getvalue())
 
 
 if __name__ == "__main__":

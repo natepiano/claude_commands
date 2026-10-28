@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Print a showrunner's units as one Markdown table: each unit's session, current phase and task.
+"""Print a showrunner's phase table or style ticket table.
 
 Usage: units_table.py [--production <production doc>]
 
@@ -12,42 +12,26 @@ from __future__ import annotations
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import NamedTuple, cast
+from typing import cast
 
 import live_units
 import showrunners
-import unit_lookup
-from production_units import Refusal
+from production_units import Refusal, production_field
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
 import phase_table
 from scripts.direct import plan_history
 
-NONE = "—"
+from style_units import (
+    NONE as NONE, NoOpenStep as NoOpenStep, OpenStep as OpenStep,
+    escaped as escaped, open_step as open_step, run_events as run_events,
+    session_cell as session_cell,
+)
+
 # A task longer than this is cut, so one verification command cannot widen the whole table.
 TASK_WIDTH = 80
-
-
-class OpenStep(NamedTuple):
-    label: str
-    text: str
-
-
-class NoOpenStep(NamedTuple):
-    pass
-
-
-def session_cell(unit: live_units.LiveUnit) -> str:
-    """The unit's session name now, or why there is none."""
-    if unit.session is None:
-        return "gone"
-    claude = unit.session.claude
-    if isinstance(claude, unit_lookup.LiveClaude):
-        return claude.name
-    if isinstance(claude, unit_lookup.ClaudeUnknown):
-        return "unknown"
-    return "not running"
 
 
 def phase_cell(record: object) -> str:
@@ -72,47 +56,6 @@ def phase_cell(record: object) -> str:
     return f"{phase.get('phase')} of {phase.get('of')} · {phase.get('title')}"
 
 
-def open_step(events: list[dict[str, object]]) -> OpenStep | NoOpenStep:
-    """The step a run has open in its open phase: the newest open activity, else the newest open pass."""
-    passes: dict[str, OpenStep] = {}
-    activities: dict[str, OpenStep] = {}
-    for event in events:
-        kind = event.get("event_type")
-        if kind in ("phase_started", "phase_finished", "run_finished"):
-            passes.clear()
-            activities.clear()
-        elif kind == "pass_started":
-            passes[str(event.get("pass_instance_id"))] = OpenStep(
-                str(event.get("pass_kind", "")), str(event.get("pass_activity", "")))
-        elif kind == "pass_finished":
-            _ = passes.pop(str(event.get("pass_instance_id")), None)
-        elif kind == "activity_started":
-            activities[str(event.get("activity_instance_id"))] = OpenStep(
-                str(event.get("activity_label", "")), str(event.get("activity_text", "")))
-        elif kind == "activity_finished":
-            _ = activities.pop(str(event.get("activity_instance_id")), None)
-    for steps in (activities, passes):
-        if steps:
-            return list(steps.values())[-1]
-    return NoOpenStep()
-
-
-def run_events(path: Path) -> list[dict[str, object]]:
-    events: list[dict[str, object]] = []
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
-        return events
-    for line in lines:
-        try:
-            event = cast(object, json.loads(line))
-        except json.JSONDecodeError:
-            continue
-        if isinstance(event, dict):
-            events.append(cast(dict[str, object], event))
-    return events
-
-
 def task_cell(record: object) -> str:
     """The open step of the newest run of the unit's plan, when a phase is open."""
     if not isinstance(record, dict):
@@ -129,17 +72,20 @@ def task_cell(record: object) -> str:
     return task if len(task) <= TASK_WIDTH else task[: TASK_WIDTH - 1].rstrip() + "…"
 
 
-def escaped(cell: str) -> str:
-    return " ".join(cell.split()).replace("|", "\\|")
-
-
 def table(units: list[live_units.LiveUnit], records: dict[str, object]) -> str:
-    lines = ["| Unit | Session | Phase | Task |", "| --- | --- | --- | --- |"]
+    lines = ["| Unit | Phase | Task |", "| --- | --- | --- |"]
     for unit in units:
         record = records.get(unit.unit)
-        cells = (unit.unit, session_cell(unit), phase_cell(record), task_cell(record))
+        cells = (session_cell(unit), phase_cell(record), task_cell(record))
         lines.append("| " + " | ".join(escaped(cell) for cell in cells) + " |")
     return "\n".join(lines)
+
+
+def is_style_production(doc: Path) -> bool:
+    try:
+        return production_field(doc.read_text(encoding="utf-8").splitlines(), "Kind") == "style"
+    except Refusal:
+        return False
 
 
 def main(arguments: list[str]) -> int:
@@ -156,15 +102,22 @@ def main(arguments: list[str]) -> int:
             print("usage: units_table.py [--production <production doc>]", file=sys.stderr)
             return 2
     try:
-        units = live_units.production_units(doc)
-        records = cast(dict[str, object], json.loads(phase_table.show_production(doc)))
+        style = is_style_production(doc)
+        render = table
+        with ThreadPoolExecutor(max_workers=2) as reads:
+            sessions = reads.submit(live_units.production_units, doc)
+            if style:
+                import style_units
+                render = style_units.table
+            records = cast(dict[str, object], json.loads(phase_table.show_production(doc)))
+            units = sessions.result()
     except (OSError, ValueError, Refusal) as error:
         print(f"units_table: {error}", file=sys.stderr)
         return 1
     if not units:
         print("no live units")
         return 0
-    print(table(units, records))
+    print(render(units, records))
     return 0
 
 

@@ -15,6 +15,7 @@ import showrunners
 import unit_lookup
 from herdr import HerdrPlace
 import units_table
+import style_units
 
 # Importable once units_table has put scripts/direct on the path.
 import phase_table
@@ -127,14 +128,49 @@ class UnitsTableTests(unittest.TestCase):
     def test_table_has_one_row_per_unit_and_escapes_pipes(self) -> None:
         records: dict[str, object] = {"one-unit": {"current": None, "phases": phase_rows("todo")}}
         self.assertEqual(units_table.table([unit("one-unit", live("a|b")), unit("two-unit", None)], records), "\n".join([
-            "| Unit | Session | Phase | Task |",
-            "| --- | --- | --- | --- |",
-            "| one-unit | a\\|b | not started | — |",
-            "| two-unit | gone | — | — |",
+            "| Unit | Phase | Task |",
+            "| --- | --- | --- |",
+            "| a\\|b | not started | — |",
+            "| gone | — | — |",
         ]))
+
+    def test_main_keeps_plan_history_functions_intact_while_it_reads_and_renders(self) -> None:
+        doc = self.root / "production.md"
+        _ = doc.write_text("# Production\n", encoding="utf-8")
+        headers = plan_history.run_started_event
+        paths = plan_history.resolve_plan_path
+        scans = plan_history.plan_runs
+        calls: list[str] = []
+
+        def records(_doc: Path) -> str:
+            self.assertIs(plan_history.run_started_event, headers)
+            self.assertIs(plan_history.resolve_plan_path, paths)
+            self.assertIs(plan_history.plan_runs, scans)
+            calls.append("records")
+            return "{}"
+
+        def render(_units: list[live_units.LiveUnit], _records: dict[str, object]) -> str:
+            self.assertIs(plan_history.run_started_event, headers)
+            self.assertIs(plan_history.resolve_plan_path, paths)
+            self.assertIs(plan_history.plan_runs, scans)
+            calls.append("table")
+            return "phase table"
+
+        output = io.StringIO()
+        with (patch.object(live_units, "production_units", return_value=[unit("one-unit", live("one"))]),
+              patch.object(phase_table, "show_production", side_effect=records),
+              patch.object(units_table, "table", side_effect=render),
+              contextlib.redirect_stdout(output)):
+            self.assertEqual(units_table.main(["--production", str(doc)]), 0)
+        self.assertEqual(calls, ["records", "table"])
+        self.assertEqual(output.getvalue(), "phase table\n")
+        self.assertIs(plan_history.run_started_event, headers)
+        self.assertIs(plan_history.resolve_plan_path, paths)
+        self.assertIs(plan_history.plan_runs, scans)
 
     def test_without_a_production_the_callers_timer_names_it(self) -> None:
         doc = self.root / "show-production.md"
+        _ = doc.write_text("# Production\n", encoding="utf-8")
         out = io.StringIO()
         with (patch.dict("os.environ", {"CLAUDE_CODE_SESSION_ID": "caller"}),
               patch.object(showrunners, "production_of", return_value=doc) as found,
@@ -143,7 +179,7 @@ class UnitsTableTests(unittest.TestCase):
               contextlib.redirect_stdout(out)):
             self.assertEqual(units_table.main([]), 0)
         found.assert_called_once_with("caller")
-        self.assertIn("| a-unit | a | — | — |", out.getvalue())
+        self.assertIn("| a | — | — |", out.getvalue())
 
     def test_a_session_that_is_no_showrunner_is_told_to_name_the_production(self) -> None:
         err = io.StringIO()
@@ -151,6 +187,36 @@ class UnitsTableTests(unittest.TestCase):
               contextlib.redirect_stderr(err)):
             self.assertEqual(units_table.main([]), 1)
         self.assertIn("pass --production", err.getvalue())
+
+    def test_style_kind_routes_to_the_ticket_table(self) -> None:
+        doc = self.root / "style-production.md"
+        _ = doc.write_text("# Production\n- **Kind:** style\n", encoding="utf-8")
+        units = [unit("names-unit", live("names"))]
+        records: dict[str, object] = {"names-unit": {"plan": "/tmp/claude/names.md"}}
+        output = io.StringIO()
+        with (patch.object(live_units, "production_units", return_value=units),
+              patch.object(phase_table, "show_production", return_value=json.dumps(records)),
+              patch.object(style_units, "table", return_value="ticket table") as tickets,
+              patch.object(units_table, "table") as phases,
+              contextlib.redirect_stdout(output)):
+            self.assertEqual(units_table.main(["--production", str(doc)]), 0)
+        tickets.assert_called_once_with(units, records)
+        phases.assert_not_called()
+        self.assertEqual(output.getvalue(), "ticket table\n")
+
+    def test_other_or_absent_kind_keeps_the_phase_table(self) -> None:
+        for kind in ("", "- **Kind:** feature\n"):
+            with self.subTest(kind=kind):
+                doc = self.root / "phase-production.md"
+                _ = doc.write_text("# Production\n" + kind, encoding="utf-8")
+                units = [unit("a-unit", live("a"))]
+                output = io.StringIO()
+                with (patch.object(live_units, "production_units", return_value=units),
+                      patch.object(phase_table, "show_production", return_value="{}"),
+                      patch.object(style_units, "table") as tickets, contextlib.redirect_stdout(output)):
+                    self.assertEqual(units_table.main(["--production", str(doc)]), 0)
+                tickets.assert_not_called()
+                self.assertEqual(output.getvalue(), "| Unit | Phase | Task |\n| --- | --- | --- |\n| a | — | — |\n")
 
     def test_production_of_reads_the_timer_addressed_to_the_session(self) -> None:
         doc = self.root / "show-production.md"

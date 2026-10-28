@@ -2239,6 +2239,28 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
             return WaitingForSync(len(ledger.unclassified_rules()))
 
 
+def refill_outcome(result: NextPhase) -> str:
+    match result:
+        case PhaseWritten():
+            return "phase written"
+        case Resumed():
+            return "resumed"
+        case RepairFirst():
+            return "repair first"
+        case WaitingForMerge():
+            return "waiting for merge"
+        case WaitingForSync():
+            return "waiting for sync"
+        case WaitingForStructure(crates):
+            return f"waiting for structure: {', '.join(crates)}"
+        case WaitingForBranchPointSync():
+            return "waiting for branch-point sync"
+        case MergeStyleBranchFirst():
+            return "merge the style branch first"
+        case berth_board.BoardUnavailable():
+            return "board unavailable"
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -2287,6 +2309,7 @@ def main(argv: list[str]) -> int:
                         print(f"{unit}: {ticket.kind} {ticket.crate} {ticket.rule or ','.join(ticket.rules)} — {len(ticket.files)} files: {', '.join(ticket.files)}")
             return 0
         result = next_phase(args.unit, args.plan, args.repo)
+        style_ledger.record_refill(args.repo, args.unit, refill_outcome(result))
         match result:
             case PhaseWritten(ticket_id):
                 print(f"phase written: {ticket_id}")
