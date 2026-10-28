@@ -6,6 +6,7 @@ from __future__ import annotations
 import fcntl
 import importlib
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -58,6 +59,10 @@ HISTORY_DAYS = 14
 # older than 208631b3 held 94.5 GiB that way while they waited for the cargo token, and every
 # waiting step reached the 15-minute limit.
 SCOPE_GRACE_SECONDS = 120
+# Builds admitted within this many seconds of each other grow together: their gaps add up.
+GROUP_SECONDS = 60
+# A step held this long is first in line: every other step must leave room for its need too.
+HEAD_SECONDS = 900
 
 
 class Reservation(TypedDict):
@@ -76,7 +81,7 @@ class Reservation(TypedDict):
 @dataclass(frozen=True)
 class ExpectedPeak:
     bytes: int
-    source: Literal["measured", "buildlog", "fallback"]
+    source: Literal["measured", "buildlog", "pooled", "fallback"]
     count: int
 
 
@@ -84,6 +89,14 @@ class ExpectedPeak:
 class RunningMemory:
     need: int
     anon: int
+    admitted_at: float = 0.0
+
+
+class Waiter(TypedDict):
+    pid: int
+    start_time: str
+    need: int
+    since: float
 
 
 @dataclass(frozen=True)
@@ -124,11 +137,31 @@ class CheckResult:
     profile: StepProfile
 
 
-def decide(available: int, total: int | None, need: int, running: list[RunningMemory]) -> AdmissionDecision:
-    """All inputs are bytes; anon already in use remains in MemAvailable."""
-    promised = sum(max(0, row.need - row.anon) for row in running)
+def joint_promise(running: list[RunningMemory]) -> int:
+    """The growth still to come in the running builds, as one figure.
+
+    Builds admitted within GROUP_SECONDS of each other grow together, so their gaps (need - anon) add up.
+    Separate groups do not peak at once, so the groups combine as a root sum of squares. The sum of every
+    gap held over 90% of wait ticks (2026-10-28 replay: 240 waits, 1863 min, 25 short starts, all at the
+    old 15 min forced start); this rule waits 1221 min with 0 short.
+    """
+    groups: list[int] = []
+    previous: float | None = None
+    for row in sorted(running, key=lambda item: item.admitted_at):
+        if previous is None or row.admitted_at - previous > GROUP_SECONDS:
+            groups.append(0)
+        groups[-1] += max(0, row.need - row.anon)
+        previous = row.admitted_at
+    return math.isqrt(sum(gap * gap for gap in groups))
+
+
+def decide(available: int, total: int | None, need: int, running: list[RunningMemory],
+           head_need: int = 0) -> AdmissionDecision:
+    """All inputs are bytes; anon already in use remains in MemAvailable. `head_need` is the need of a step
+    held HEAD_SECONDS or more ahead of this one: this step leaves room for it."""
+    promised = joint_promise(running)
     reserve = total * 5 // 100 if total is not None else 0
-    threshold = need + promised + reserve if running else min(need + reserve, FALLBACK)
+    threshold = (need + promised + reserve if running else min(need + reserve, FALLBACK)) + head_need
     return AdmissionDecision("admit" if available >= threshold else "hold", threshold, promised, reserve)
 
 
@@ -167,17 +200,23 @@ def expected_peak(repo: str, step: str, host: str, now: datetime, root: Path,
     cutoff = store.utc_iso((now - timedelta(days=HISTORY_DAYS)).timestamp())
     before = store.utc_iso(now.timestamp())
     measured: list[int] = []
+    # Every repo's runs of this step on this host: a checkout with fewer than 5 runs of its own (a gate
+    # copy, a clone) uses their p90, not FALLBACK. Doc steps held 2157 of 4702 wait minutes in the week
+    # to 2026-10-28 on that fallback; the measured doc p90 over all repos was 4.15 GiB.
+    pooled: list[int] = []
     try:
         with (root / "admission/anon_peaks.jsonl").open() as lines:
             for line in lines:
                 try:
                     item = cast(dict[str, object], json.loads(line))
-                    if ((item.get("host"), item.get("repo"), item.get("step")) == (host, repo, step)
+                    if ((item.get("host"), item.get("step")) == (host, step)
                             and (test_threads is None or item.get("test_threads") == test_threads)
                             and cutoff <= str(item.get("ended_at", "")) < before):
                         peak = item.get("anon_peak_bytes")
                         if isinstance(peak, int) and peak > 0:
-                            measured.append(peak)
+                            pooled.append(peak)
+                            if item.get("repo") == repo:
+                                measured.append(peak)
                 except (ValueError, TypeError, AttributeError):
                     continue
     except OSError:
@@ -201,6 +240,8 @@ def expected_peak(repo: str, step: str, host: str, now: datetime, root: Path,
         pass
     if len(peaks) >= 5:
         return ExpectedPeak(int(percentile(peaks) * ANON_SHARE), "buildlog", len(peaks))
+    if len(pooled) >= 5:
+        return ExpectedPeak(percentile(pooled), "pooled", len(pooled))
     return ExpectedPeak(FALLBACK, "fallback", 0)
 
 
@@ -271,6 +312,20 @@ def live_reservations(directory: Path) -> list[tuple[Path, Reservation]]:
     return live
 
 
+def live_waiters(directory: Path) -> list[tuple[Path, Waiter]]:
+    live: list[tuple[Path, Waiter]] = []
+    for path in directory.glob("*.waiting"):
+        try:
+            row = cast(Waiter, json.loads(path.read_text()))
+            if process_start_time(row["pid"]) == row["start_time"]:
+                live.append((path, row))
+                continue
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        path.unlink(missing_ok=True)
+    return live
+
+
 def git_identity(argv: list[str], cwd: str) -> tuple[str, str]:
     if not argv:
         return "", ""
@@ -279,9 +334,11 @@ def git_identity(argv: list[str], cwd: str) -> tuple[str, str]:
     return (Path(repo_path).name if repo_path else "", Path(facts["worktree"] or cwd).name)
 
 
-def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], force: bool = False,
+def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float = 0.0,
           root: Path | None = None, now: datetime | None = None,
           profile: StepProfile | None = None) -> CheckResult:
+    """Admit or hold one step. A held step is a waiter from `since` (epoch seconds; 0 means now), so a
+    step that gave its reservation back for the cargo token keeps its place."""
     root = root if root is not None else store.root()
     now = now if now is not None else datetime.now(UTC)
     width = test_threads(argv)
@@ -299,12 +356,23 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], force: bool = 
     with (directory / "lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         live = live_reservations(directory)
-        running = [RunningMemory(row["need"], cgroup_anon(row["sidecar"])) for _, row in live if building(row, now)]
+        running = [RunningMemory(row["need"], cgroup_anon(row["sidecar"]), _epoch(row["admitted_at"]))
+                   for _, row in live if building(row, now)]
+        start = process_start_time(pid)
+        mine = directory / f"{pid}-{start}.waiting"
+        waiters = [row for path, row in live_waiters(directory) if path != mine]
+        heads = sorted((row for row in waiters if now.timestamp() - row["since"] >= HEAD_SECONDS),
+                       key=lambda row: row["since"])
+        waited_from = since or now.timestamp()
+        head_need = heads[0]["need"] if heads and heads[0]["since"] < waited_from else 0
         available, total = read_meminfo(meminfo)
-        decision = decide(available, total, peak.bytes, running)
+        decision = decide(available, total, peak.bytes, running, head_need)
         reservation: Reserved | NotReserved = NotReserved("held" if argv else "launch")
-        if argv and (decision.state == "admit" or force):
-            start = process_start_time(pid)
+        if argv and decision.state == "hold" and start is not None:
+            waiter: Waiter = {"pid": pid, "start_time": start, "need": peak.bytes, "since": waited_from}
+            _ = mine.write_text(json.dumps(waiter, separators=(",", ":")))
+        if argv and decision.state == "admit":
+            mine.unlink(missing_ok=True)
             if start is not None:
                 path = directory / f"{pid}-{start}-{time.time_ns()}.reservation"
                 row: Reservation = {"pid": pid, "start_time": start, "need": peak.bytes,
@@ -359,6 +427,13 @@ def set_width(path: Path, width: int, root: Path | None = None) -> None:
         _ = path.write_text(json.dumps(row, separators=(",", ":")))
 
 
+def _epoch(instant: str) -> float:
+    try:
+        return datetime.fromisoformat(instant.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
 def clean_field(value: str) -> str:
     return value.replace("|", " ").replace("\n", " ")
 
@@ -371,12 +446,12 @@ def main() -> None:
     if action == "width":
         set_width(Path(sys.argv[2]), int(sys.argv[3]))
         return
-    _, _, meminfo, pid, sidecar, forced, cached_repo, cached_step, cached_worktree, cached_need, cached_source, cached_count, *argv = sys.argv
+    _, _, meminfo, pid, sidecar, since, cached_repo, cached_step, cached_worktree, cached_need, cached_source, cached_count, *argv = sys.argv
     profile = None
     if cached_need != "-":
         profile = StepProfile(cached_repo, cached_step, cached_worktree,
                               ExpectedPeak(int(cached_need), cast(Literal["measured", "buildlog", "fallback"], cached_source), int(cached_count)))
-    result = check(Path(meminfo), int(pid), sidecar, argv, forced == "1", profile=profile)
+    result = check(Path(meminfo), int(pid), sidecar, argv, float(since or 0), profile=profile)
     decision, peak, live = result.decision, result.peak, result.live
     summary = ", ".join(f"{row['repo']} {row['step']} in {row['worktree']}" for row in live)
     reservation = result.reservation

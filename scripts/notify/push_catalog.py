@@ -246,9 +246,10 @@ ENTRIES = (
         + "Work cannot resume until it starts again. It should start automatically when mains power returns.",
         (PushExample("typical", {}),),
         purpose="Power is out, and the battery is low. natedev shuts down."),
-    # /nate templates (user spec, 2026-10-20): the sending agent fills each value; the last body line names the template.
+    # /nate templates (user spec, 2026-10-20): the sending agent fills each value. The user asked that the template
+    # name close each push; pushover.py's "Template:" line now does that for every push (user, 2026-10-27).
     PushText("nate.adhoc", "{sender}", "note", "{sender} {title}", NoActionNeeded(),
-        "{description}\n\nadhoc",
+        "{description}",
         (PushExample("typical", {"sender": "natedev", "title": "the /nate skill is ready",
                                  "description": "You asked to be told when the /nate skill is ready. It is ready now: "
                                  + "/nate adhoc <instructions> sends you an update like this one."}),

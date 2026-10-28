@@ -139,7 +139,8 @@ class IsolatedBuildHoldTest(unittest.TestCase):
     def reap_recorders(self) -> None:
         for thread in threading.enumerate():
             if thread.name == "hold-event-recorder":
-                thread.join(timeout=5)
+                # A recorder runs a short subprocess; under load it can take far longer than its usual second.
+                thread.join(timeout=60)
                 self.assertFalse(thread.is_alive())
 
 
@@ -482,71 +483,157 @@ class RenameHolderTests(IsolatedBuildHoldTest):
         return cycle
 
 class QuietTests(IsolatedBuildHoldTest):
+    def write_process_stat(self, process: build_hold.Process, utime: int, stime: int, started: int = 1) -> Path:
+        path = self.scratch / "proc" / str(process.pid) / "stat"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fields = ["0"] * 20
+        fields[0] = "R"
+        fields[11], fields[12], fields[19] = str(utime), str(stime), str(started)
+        _ = path.write_text(f"{process.pid} ({process.command} worker)) " + " ".join(fields) + "\n")
+        return path
+
     def test_long_username_cargo_keeps_quiet_check_busy(self) -> None:
         user = "natepiano"
 
         def fake_ps(command: list[str], *, text: bool) -> str:
             self.assertTrue(text)
-            self.assertEqual(command[:2], ["ps", "-eo"])
-            shown_user = user if "user:32=" in command[2] else user[:7] + "+"
-            return f"77 {shown_user} 2.0 cargo\n"
+            self.assertEqual(command, ["ps", "-eo", "pid=,user:32=,comm="])
+            return f"77 {user} cargo\n"
 
         with mock.patch.object(subprocess, "check_output", side_effect=fake_ps):
             processes = build_hold.read_processes()
-        verdict = build_hold.quiet_verdict(1.0, build_hold.KnownCores(32), processes, user)
-        self.assertIsInstance(verdict, build_hold.Busy)
-        assert isinstance(verdict, build_hold.Busy)
-        self.assertIn("1 cargo", "; ".join(verdict.reasons))
-        high_load = build_hold.quiet_verdict(8.0, build_hold.KnownCores(32), processes, user)
-        assert isinstance(high_load, build_hold.Busy)
-        self.assertIn("natepiano cargo", "; ".join(high_load.reasons))
+        self.assertEqual(build_hold.quiet_verdict(processes, user),
+                         build_hold.Busy(("your builds still running: 1 cargo",)))
 
-    def test_quiet_requires_both_low_load_and_no_user_build(self) -> None:
-        others = [build_hold.Process(41, "ci", "cargo", 80.0)]
-        self.assertIsInstance(build_hold.quiet_verdict(7.99, build_hold.KnownCores(32), others, "nate"), build_hold.Quiet)
-        self.assertIsInstance(build_hold.quiet_verdict(8.0, build_hold.KnownCores(32), others, "nate"), build_hold.Busy)
-        own = [build_hold.Process(42, "nate", "rustc", 12.0)]
-        self.assertIsInstance(build_hold.quiet_verdict(1.0, build_hold.KnownCores(32), own, "nate"), build_hold.Busy)
-        nextest = [build_hold.Process(43, "nate", "cargo-nextest", 1.0)]
-        self.assertIsInstance(build_hold.quiet_verdict(1.0, build_hold.KnownCores(32), nextest, "nate"), build_hold.Busy)
+    def test_any_users_build_is_busy(self) -> None:
+        for owner in ("nate", "ci-runner"):
+            for command in ("cargo", "rustc", "cargo-nextest"):
+                with self.subTest(owner=owner, command=command):
+                    processes = [build_hold.Process(41, owner, command)]
+                    label = "your builds still running" if owner == "nate" else owner
+                    self.assertEqual(build_hold.quiet_verdict(processes, "nate"),
+                                     build_hold.Busy((f"{label}: 1 {command}",)))
 
-    def test_unknown_cores_names_uncertainty_while_known_cores_are_quiet(self) -> None:
-        with tempfile.TemporaryDirectory() as scratch, mock.patch.dict(os.environ, {"BUILD_HOLD_DIR": scratch}):
-            unknown = build_hold.wait_for_quiet(
-                0, clock=lambda: 0.0, load=lambda: 1.0,
-                cores=lambda: build_hold.UnknownCores(), processes=lambda: [], user="nate",
+    def test_high_load_without_builds_is_quiet_without_waiting(self) -> None:
+        processes = [build_hold.Process(41, "ci-runner", "python3")]
+        with mock.patch.object(os, "getloadavg", return_value=(14.0, 12.0, 10.0)):
+            verdict = build_hold.wait_for_quiet(
+                600, clock=lambda: 0.0,
+                sleep=lambda seconds: self.fail(f"unexpected sleep: {seconds}"),
+                processes=lambda: processes, user="nate",
             )
-            known = build_hold.wait_for_quiet(
-                0, clock=lambda: 0.0, load=lambda: 1.0,
-                cores=lambda: build_hold.KnownCores(32), processes=lambda: [], user="nate",
-            )
-        self.assertEqual(unknown, build_hold.Busy(("core count unavailable, so the load limit cannot be judged",)))
-        self.assertIsInstance(known, build_hold.Quiet)
+        self.assertEqual(verdict, build_hold.Quiet(tuple(processes)))
 
-    def test_cpu_count_is_converted_to_a_core_state(self) -> None:
-        with tempfile.TemporaryDirectory() as scratch, mock.patch.dict(os.environ, {"BUILD_HOLD_DIR": scratch}):
-            with mock.patch.object(os, "cpu_count", return_value=None):
-                self.assertIsInstance(build_hold.read_cores(), build_hold.UnknownCores)
-            with mock.patch.object(os, "cpu_count", return_value=32):
-                self.assertEqual(build_hold.read_cores(), build_hold.KnownCores(32))
-
-    def test_own_builds_are_grouped_by_command_largest_first(self) -> None:
+    def test_success_line_has_load_and_five_heaviest_by_current_cpu(self) -> None:
+        idle = build_hold.Process(1, "nate", "cargo-port")
         processes = [
-            *[build_hold.Process(pid, "nate", "rustc", 1.0) for pid in range(34)],
-            *[build_hold.Process(pid, "nate", "cargo-nextest", 1.0) for pid in range(34, 37)],
-            *[build_hold.Process(pid, "nate", "cargo", 1.0) for pid in range(37, 43)],
-            build_hold.Process(43, "ci", "rustc", 1.0),
+            idle,
+            build_hold.Process(2, "nate", "python3"),
+            build_hold.Process(3, "nate", "cargo-berth"),
+            build_hold.Process(4, "ci-runner", "agent"),
+            build_hold.Process(5, "nate", "claude"),
+            build_hold.Process(6, "nate", "helper"),
+            build_hold.Process(7, "nate", "cargo-tile"),
         ]
-        verdict = build_hold.quiet_verdict(1.0, build_hold.KnownCores(32), processes, "nate")
-        self.assertEqual(verdict, build_hold.Busy(("your builds still running: 34 rustc, 6 cargo, 3 cargo-nextest",)))
+        for process in processes:
+            _ = self.write_process_stat(process, 1_000_000 if process == idle else 100, 50)
+        sleeps: list[float] = []
 
-    def test_high_load_for_entire_wait_names_ci_and_other_session(self) -> None:
+        def sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            # Two elapsed seconds test the actual clock interval, including delayed sleep.
+            for process, percent in zip(processes[1:], (99, 130, 20, 60, 1, 30), strict=True):
+                _ = self.write_process_stat(process, 100 + percent, 50 + percent)
+
+        clock = iter((10.0, 12.0))
+        sample = build_hold.heaviest_processes
+
+        def heaviest(processes: tuple[build_hold.Process, ...]) -> tuple[build_hold.CurrentProcessCpu, ...]:
+            return sample(processes, proc_root=self.scratch / "proc", clock=lambda: next(clock), sleep=sleep)
+
+        verdict = build_hold.wait_for_quiet(0, clock=lambda: 0.0, processes=lambda: processes, user="nate")
+        output = io.StringIO()
+        with mock.patch.object(build_hold, "wait_for_quiet", return_value=verdict), \
+             mock.patch.object(build_hold, "heaviest_processes", side_effect=heaviest), \
+             mock.patch.object(os, "sysconf", return_value=100) as sysconf, \
+             mock.patch.object(os, "getloadavg", return_value=(12.3, 10.0, 9.0)), redirect_stdout(output):
+            self.assertEqual(build_hold.main(["quiet"]), 0)
+        sysconf.assert_called_once_with("SC_CLK_TCK")
+        self.assertEqual(sleeps, [1])
+        self.assertEqual(output.getvalue(),
+            "builds are quiet: no build runs. 1-minute load 12.3 is other work: "
+            + "nate cargo-berth 130%, nate python3 99%, nate claude 60%, "
+            + "nate cargo-tile 30%, ci-runner agent 20%\n")
+
+    def test_process_that_ends_during_cpu_window_is_skipped(self) -> None:
+        process = build_hold.Process(41, "ci-runner", "python3")
+        stat = self.write_process_stat(process, 100, 50)
+        clock = iter((0.0, 1.0))
+
+        def sleep(seconds: float) -> None:
+            self.assertEqual(seconds, 1)
+            stat.unlink()
+
+        with mock.patch.object(os, "sysconf", return_value=100):
+            readings = build_hold.heaviest_processes(
+                [process], proc_root=self.scratch / "proc", clock=lambda: next(clock), sleep=sleep,
+            )
+        self.assertEqual(readings, ())
+
+    def test_reused_pid_is_skipped(self) -> None:
+        process = build_hold.Process(41, "ci-runner", "python3")
+        _ = self.write_process_stat(process, 100, 50, started=1)
+        clock = iter((0.0, 1.0))
+
+        def sleep(seconds: float) -> None:
+            self.assertEqual(seconds, 1)
+            _ = self.write_process_stat(process, 200, 150, started=2)
+
+        with mock.patch.object(os, "sysconf", return_value=100):
+            readings = build_hold.heaviest_processes(
+                [process], proc_root=self.scratch / "proc", clock=lambda: next(clock), sleep=sleep,
+            )
+        self.assertEqual(readings, ())
+
+    def test_success_line_when_no_processes_are_visible(self) -> None:
+        output = io.StringIO()
+        with mock.patch.object(build_hold, "wait_for_quiet", return_value=build_hold.Quiet(())), \
+             mock.patch.object(build_hold, "heaviest_processes", return_value=()), \
+             mock.patch.object(os, "getloadavg", return_value=(0.0, 0.0, 0.0)), redirect_stdout(output):
+            self.assertEqual(build_hold.main(["quiet", "--max-wait", "0"]), 0)
+        self.assertEqual(output.getvalue(),
+            "builds are quiet: no build runs. 1-minute load 0 is other work: none visible\n")
+
+    def test_wait_ends_when_builds_end(self) -> None:
+        readings = iter([
+            [build_hold.Process(41, "ci-runner", "rustc")],
+            [build_hold.Process(42, "nate", "python3")],
+        ])
+        sleeps: list[float] = []
+        verdict = build_hold.wait_for_quiet(
+            600, clock=lambda: 0.0, sleep=sleeps.append,
+            processes=lambda: next(readings), user="nate",
+        )
+        self.assertIsInstance(verdict, build_hold.Quiet)
+        self.assertEqual(sleeps, [10])
+
+    def test_builds_are_grouped_by_user_then_command_largest_first(self) -> None:
+        processes = [
+            *[build_hold.Process(pid, "nate", "rustc") for pid in range(34)],
+            *[build_hold.Process(pid, "nate", "cargo-nextest") for pid in range(34, 37)],
+            *[build_hold.Process(pid, "nate", "cargo") for pid in range(37, 43)],
+            build_hold.Process(43, "ci-runner", "rustc"),
+            build_hold.Process(44, "ci-runner", "rustc"),
+        ]
+        verdict = build_hold.quiet_verdict(processes, "nate")
+        self.assertEqual(verdict, build_hold.Busy((
+            "your builds still running: 34 rustc, 6 cargo, 3 cargo-nextest", "ci-runner: 2 rustc",
+        )))
+
+    def test_builds_for_entire_wait_name_ci_and_other_user_without_cpu_sample(self) -> None:
         elapsed = 0.0
         sleeps: list[float] = []
-        running = [
-            build_hold.Process(101, "ci", "rustc", 91.0),
-            build_hold.Process(102, "other", "cargo", 55.0),
-        ]
+        running = [build_hold.Process(101, "ci", "rustc"), build_hold.Process(102, "other", "cargo")]
 
         def clock() -> float:
             return elapsed
@@ -557,40 +644,17 @@ class QuietTests(IsolatedBuildHoldTest):
             elapsed += seconds
 
         verdict = build_hold.wait_for_quiet(
-            600,
-            clock=clock,
-            sleep=sleep,
-            load=lambda: 9.0,
-            cores=lambda: build_hold.KnownCores(32),
-            processes=lambda: running,
-            user="nate",
+            600, clock=clock, sleep=sleep, processes=lambda: running, user="nate",
         )
-        self.assertIsInstance(verdict, build_hold.Busy)
-        assert isinstance(verdict, build_hold.Busy)
+        self.assertEqual(verdict, build_hold.Busy(("ci: 1 rustc", "other: 1 cargo")))
         self.assertEqual(elapsed, 600)
         self.assertEqual(sleeps, [10] * 60)
-        reasons = "; ".join(verdict.reasons)
-        self.assertIn("ci rustc", reasons)
-        self.assertIn("other cargo", reasons)
         output = io.StringIO()
-        with mock.patch.object(build_hold, "wait_for_quiet", return_value=verdict), redirect_stdout(output):
+        with mock.patch.object(build_hold, "wait_for_quiet", return_value=verdict), \
+             mock.patch.object(build_hold, "heaviest_processes", side_effect=AssertionError("unexpected CPU sample")), \
+             mock.patch.object(os, "getloadavg", side_effect=AssertionError("unexpected load read")), redirect_stdout(output):
             self.assertEqual(build_hold.main(["quiet", "--max-wait", "600"]), 1)
-        self.assertIn("ci rustc", output.getvalue())
-        self.assertIn("other cargo", output.getvalue())
-
-    def test_own_cargo_remains_busy_even_after_load_falls(self) -> None:
-        verdict = build_hold.wait_for_quiet(
-            0,
-            clock=lambda: 0.0,
-            sleep=lambda seconds: self.fail(f"unexpected sleep: {seconds}"),
-            load=lambda: 1.0,
-            cores=lambda: build_hold.KnownCores(32),
-            processes=lambda: [build_hold.Process(77, "nate", "cargo", 2.0)],
-            user="nate",
-        )
-        self.assertIsInstance(verdict, build_hold.Busy)
-        assert isinstance(verdict, build_hold.Busy)
-        self.assertIn("cargo", "; ".join(verdict.reasons))
+        self.assertEqual(output.getvalue(), "ci: 1 rustc; other: 1 cargo\n")
 
 
 class TargetCommandTests(IsolatedBuildHoldTest):
@@ -1352,20 +1416,19 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
             self.assertTrue(complete)
             self.assertEqual(sent, ["first", "second"])
 
-    def test_memory_wait_ends_after_the_gate_limit_and_grace(self) -> None:
+    def test_memory_wait_counts_as_answered_after_its_turn(self) -> None:
         now = self.begin("first", "second")
         with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/tmp/socket")), \
-             mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()), \
-             mock.patch.dict(os.environ, {"BUILDLOG_MEM_WAIT_LIMIT_S": "900"}):
+             mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()):
             _ = self.advance(now)
             _ = build_hold.mark_gate("first", "WaitingForMemory")
             self.assertEqual(self.entries()[1]["state"], "ReleasedAwaitingAdmission")
             waiting = build_hold.aware_instant(self.entries()[0].get("wait_started_at", ""))
-            deadline = waiting + timedelta(seconds=900 + build_hold.MEMORY_GATE_GRACE_S)
+            deadline = waiting + timedelta(seconds=build_hold.MEMORY_WAIT_TURN_S)
             _ = self.advance(deadline - timedelta(seconds=1))
             self.assertEqual(self.entries()[0]["state"], "WaitingForMemory")
             _ = self.advance(deadline)
-            self.assertEqual(self.entries()[0]["state"], "NoAdmissionAck")
+            self.assertEqual(self.entries()[0]["state"], "MemoryGateReturned")
 
     def test_no_admission_ack_is_not_early(self) -> None:
         now = self.begin("first", "second")
@@ -1463,11 +1526,9 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
             self.assertEqual(send.call_count, 2)
             self.assertIn("WaitingForMemory", build_hold.mark_gate("first", "WaitingForMemory"))
             self.assertIn("MemoryGateReturned", build_hold.mark_gate("first", "MemoryGateReturned", "Granted"))
-            complete, detail = self.advance(now + timedelta(seconds=build_hold.NO_REGISTRATION_S))
-            self.assertFalse(complete)
-            self.assertEqual(detail, "late name [late]: ReleasedAwaitingAdmission")
+            complete, _ = self.advance(now)
+            self.assertTrue(complete)
             self.assertEqual(send.call_count, 2)
-            self.assertTrue((self.scratch / "holders" / "holder").exists())
 
     def test_delivery_clock_starts_on_delivery_and_queue_clock_on_attempt(self) -> None:
         now = self.begin("first")
@@ -1615,18 +1676,16 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
         self.assertTrue(complete)
         self.assertIn("NoRegistration", detail)
 
-    def test_recorded_recipient_without_wait_receives_release_immediately(self) -> None:
+    def test_recorded_recipient_without_wait_is_told_and_holds_nothing(self) -> None:
         now = self.begin(recipients=(("late name", "missing-session"),))
         with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/tmp/socket")), \
              mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()) as send:
             complete, detail = self.advance(now)
-            self.assertFalse(complete)
+            self.assertTrue(complete, detail)
             self.assertIn("late name", detail)
             self.assertEqual(self.entries()[0]["state"], "ReleasedAwaitingAdmission")
+            self.assertFalse(self.entries()[0]["session_pending"])
             send.assert_called_once()
-            complete, _ = self.advance(now + timedelta(seconds=build_hold.NO_REGISTRATION_S))
-            self.assertFalse(complete)
-            self.assertEqual(self.entries()[0]["state"], "ReleasedAwaitingAdmission")
 
     def test_registration_waits_for_release_lock(self) -> None:
         _ = self.begin()
@@ -1717,6 +1776,24 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
         notice = calls[1][calls[1].index("--text") + 1]
         self.assertTrue(notice.startswith("/build:hold: your hold has been released."), notice)
         self.assertIn("build_hold.py nothing-to-build", notice)
+
+    def test_a_session_only_told_gets_a_notice_that_asks_for_no_answer(self) -> None:
+        entry = build_hold.new_entry("session-a", "shared name")
+        notices: list[str] = []
+
+        def run(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            notices.append(arguments[-1])
+            return subprocess.CompletedProcess(arguments, 0, "", "")
+
+        with mock.patch.object(subprocess, "run", side_effect=run):
+            entry["session_pending"] = False
+            _ = build_hold.send_release(entry, "/test/socket")
+            entry["session_pending"] = True
+            _ = build_hold.send_release(entry, "/test/socket")
+        self.assertIn("may resume", notices[0])
+        self.assertIn("no answer is needed", notices[0])
+        self.assertNotIn("nothing-to-build", notices[0])
+        self.assertIn("build_hold.py nothing-to-build", notices[1])
 
     def test_send_exit_codes_have_named_delivery_results(self) -> None:
         entry = build_hold.new_entry("session-a", "shared name")
@@ -2357,6 +2434,9 @@ class ReleaseDriverTests(IsolatedBuildHoldTest):
         _ = build_hold.start_hold(folder, build_hold.HolderIdentity(name, name), "first hold", build_hold.NoReleaseEta(), self.now)
         build_hold.record_recipients([("first", "first"), ("second", "second"), ("third", "third")])
         _ = build_hold.register_wait("first", call_id="first-call")
+        # Waits keep second and third in the release; a session only told would hold nothing.
+        for key in ("second", "third"):
+            _ = build_hold.register_wait(key)
         return folder
 
     def finish_turn(self, _seconds: float) -> None:
@@ -3002,7 +3082,7 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
         keys = ("z-first", "a-second", "m-third")
         for ending in ("gate", "nothing", "timeout"):
             with self.subTest(ending=ending):
-                self.begin(*keys)
+                self.begin(*keys, registered=keys)
                 snapshots: list[list[tuple[str, str]]] = []
 
                 def lookup(_key: str) -> build_hold.RecipientLive:
@@ -3049,7 +3129,7 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
     def test_departed_session_ends_turn_on_next_poll_without_changing_delivery(self) -> None:
         for queued in (False, True):
             with self.subTest(queued=queued):
-                self.begin("first", "second")
+                self.begin("first", "second", registered=("first", "second"))
                 self.release_mocks["lookup"].side_effect = None
                 self.release_mocks["send"].return_value = (build_hold.ReleaseQueued() if queued
                                                            else build_hold.ReleaseDelivered())
@@ -3082,7 +3162,7 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
     def test_lookup_failure_preserves_silent_turn_until_its_deadline(self) -> None:
         for queued in (False, True):
             with self.subTest(queued=queued):
-                self.begin("owner")
+                self.begin("owner", registered=("owner",))
                 self.release_mocks["lookup"].return_value = build_hold.RecipientLive("/test/socket")
                 self.release_mocks["send"].return_value = (build_hold.ReleaseQueued() if queued
                                                            else build_hold.ReleaseDelivered())
@@ -3113,7 +3193,7 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
     def test_silent_delivered_and_queued_turns_end_together_at_the_deadline_without_lookup(self) -> None:
         for queued in (False, True):
             with self.subTest(queued=queued):
-                self.begin("first", "second")
+                self.begin("first", "second", registered=("first", "second"))
                 self.release_mocks["lookup"].side_effect = None
                 self.release_mocks["send"].return_value = (build_hold.ReleaseQueued() if queued
                                                            else build_hold.ReleaseDelivered())
@@ -3137,7 +3217,7 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
     def test_late_call_preserves_a_silent_turns_full_timeout(self) -> None:
         for queued in (False, True):
             with self.subTest(queued=queued):
-                self.begin("owner")
+                self.begin("owner", registered=("owner",))
                 self.release_mocks["send"].return_value = (build_hold.ReleaseQueued() if queued
                                                           else build_hold.ReleaseDelivered())
                 started = self.now
@@ -3206,7 +3286,7 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
 
     def test_late_calls_add_no_turn_while_told_sessions_are_released(self) -> None:
         keys = ("first", "second", "third")
-        self.begin(*keys)
+        self.begin(*keys, registered=keys)
         _ = self.advance()
         self.assertEqual(self.sent(), list(keys))
         for index in range(6):
@@ -3228,9 +3308,9 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
         _ = self.returned("second", "second-call")
         complete, detail = self.advance()
         self.assertFalse(complete)
-        self.assertEqual(detail, "name first [first]: ReleasedAwaitingAdmission; name third [third]: ReleasedAwaitingAdmission")
-        for key in ("first", "third"):
-            _ = build_hold.answer_nothing_to_build(key)
+        # third was only told: it holds nothing and owes no nothing-to-build.
+        self.assertEqual(detail, "name first [first]: ReleasedAwaitingAdmission")
+        _ = build_hold.answer_nothing_to_build("first")
         self.assertTrue(self.advance()[0])
         self.assertEqual(self.sent(), ["first", "second", "third"])
 
@@ -3261,7 +3341,7 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
     def test_call_registering_after_delivery_takes_open_turn_but_not_memory_wait(self) -> None:
         for turn in ("delivered", "queued", "memory"):
             with self.subTest(turn=turn):
-                self.begin("owner", "peer")
+                self.begin("owner", "peer", registered=("owner", "peer"))
                 self.release_mocks["send"].return_value = (build_hold.ReleaseQueued() if turn == "queued"
                                                            else build_hold.ReleaseDelivered())
                 _ = self.advance()
@@ -3440,7 +3520,7 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
                 self.assertEqual(self.sent(), ["owner"])
 
     def test_delivered_silent_sessions_are_reached_without_final_warning(self) -> None:
-        self.begin("first", "second")
+        self.begin("first", "second", registered=("first", "second"))
         started = self.now
         _ = self.advance()
         self.assertEqual(self.sent(), ["first", "second"])
@@ -3531,6 +3611,29 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
                     self.assertIn("name owner (session gone)" if outcome == "gone" else "name owner (send failed)", line)
                 else:
                     self.assertNotIn("Not reached", line)
+
+    def test_a_session_only_told_is_told_again_in_a_new_generation_and_holds_nothing(self) -> None:
+        self.begin("owner", "told", registered=("owner",))
+        self.assertFalse(self.advance()[0])
+        self.assertEqual(self.sent(), ["owner", "told"])
+        _ = build_hold.answer_nothing_to_build("owner")
+        self.assertTrue(self.advance()[0])
+        _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("second-holder", "second-holder"), "new hold", build_hold.NoReleaseEta(), self.now)
+        cycle = self.cycle()
+        cycle["release_started_at"] = self.now.isoformat()
+        build_hold.save_cycle(cycle)
+        complete, detail = self.advance()
+        self.assertTrue(complete, detail)
+        self.assertEqual(self.sent(), ["owner", "told", "owner", "told"])
+        self.assertFalse(self.entry("told")["session_pending"])
+
+    def test_a_queued_call_of_a_told_session_holds_the_release_until_its_gate(self) -> None:
+        self.begin("owner", "told", calls=(("owner", "call-a"),))
+        complete, detail = self.advance()
+        self.assertFalse(complete)
+        self.assertEqual(detail, "name owner [owner]: ReleasedAwaitingAdmission")
+        _ = self.returned("owner", "call-a")
+        self.assertTrue(self.advance()[0])
 
     def test_new_holder_generation_permits_one_new_notification(self) -> None:
         self.begin("owner", calls=(("owner", "call-a"),))

@@ -268,9 +268,12 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    Two kinds stay the user's, and no showrunner message is the user's approval
    for them: an action that cannot be undone, and a choice only the user knows
    the answer to (what the product should do, their priorities, what they
-   intend). End the turn on `— decision:` for these as before; the showrunner
-   shows it to the user, and the answer arrives beginning
-   `From the user (via the showrunner):`.
+   intend). File these with `/unit:question`: it puts the question on the
+   production's open-questions list, where the user finds it when they ask
+   for their next question. Do not send it to the showrunner, which does not
+   put it in front of the user (user, 2026-10-28). Go on with the work that
+   does not wait on it, then end the turn on `— decision:`. The answer arrives
+   beginning `From the user (via the showrunner):`.
 3. **Commit notices.** The checkpoint hash is mergeable at once. Also send a
    notice after each final-gate and as-built commit. Timing:
    `~/.claude/docs/direct/phase_end.md` → <PhaseEnd/>.

@@ -805,11 +805,11 @@ exec "$TEST_REAL_SLEEP" "$@"
         self.assertEqual(left, [], output.read_text(errors="replace"))
         self.assertIn("the call that started this step is gone", output.read_text(errors="replace"))
 
-    def test_a_token_wait_does_not_start_a_new_memory_wait_limit(self) -> None:
+    def test_a_token_wait_keeps_the_steps_place_and_never_starts_without_memory(self) -> None:
         # On 2026-10-21 a step waited 15 min for memory, 24 min for the token,
-        # then 15 min for memory again. The forced start counts the step's
-        # whole memory wait, so the pass after the token wait gets only what
-        # is left of the limit: here nothing, so it starts with no poll sleep.
+        # then 15 min for memory again. No pass starts a step without memory now:
+        # the first poll sleep frees memory, the step's token try fails, and the
+        # pass after the token wait admits at once, in the first pass's place.
         # The board wrapper makes the step's one try for the token fail, and
         # logs each other acquire next to the sleep calls.
         home = self.root / "busy-home"
@@ -831,6 +831,7 @@ exec "$TEST_REAL_SLEEP" "$@"
             self.fail("the memory wait test needs sleep on PATH")
         sleep = self.root / "stubs" / "sleep"
         _ = sleep.write_text('#!/bin/sh\nprintf "sleep %s\\n" "$*" >> "$TEST_SLEEP_LOG"\n'
+                             + 'printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO"\n'
                              + 'exec "$TEST_REAL_SLEEP" "$@"\n')
         sleep.chmod(0o755)
         _ = Path(self.environment["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 0 kB\n")
@@ -843,13 +844,14 @@ exec "$TEST_REAL_SLEEP" "$@"
         result = self.verify(environment)
         output = result.stdout + result.stderr
         self.assertEqual(result.returncode, 0, output)
-        self.assertEqual(output.count("memory wait limit reached"), 2, output)
+        self.assertNotIn("memory wait limit reached", output)
+        self.assertNotIn("starting anyway", output)
         lines = log.read_text().splitlines()
         self.assertIn("token", lines)
         # The step's acquire after its failed try is the last one in the log.
         last_token = len(lines) - 1 - lines[::-1].index("token")
-        self.assertIn("sleep 1", lines[:last_token], "the first memory wait polls until its limit")
-        self.assertNotIn("sleep 1", lines[last_token:], "the pass after the token wait started a new limit")
+        self.assertIn("sleep 1", lines[:last_token], "the first memory wait polls until memory is free")
+        self.assertNotIn("sleep 1", lines[last_token:], "the pass after the token wait waited again")
 
     def build_stub(self, targets: list[dict[str, object]]) -> dict[str, str]:
         """A cargo whose metadata lists `targets` for sample and whose build makes each bin and example."""
@@ -888,6 +890,22 @@ exec "$TEST_REAL_SLEEP" "$@"
         self.assertEqual((self.root / "cargo-calls").read_text(), "build --workspace --bin sample-app\n")
         self.assertIn("claim: token cargo acquired", (self.root / "board" / "board.log").read_text())
         self.assertFalse((self.root / "board" / "locks" / "cargo.d").exists())
+
+    def test_check_keep_going_reaches_cargo_in_either_order_with_features(self) -> None:
+        # A migration phase that fixes only some crates reads every crate's result (hana, 2026-10-26).
+        environment = self.build_stub([{"name": "sample", "kind": ["lib"]}])
+        for words, expected in ((("--keep-going",), "check --workspace --lib --bins --keep-going\n"),
+                                (("--features", "fast", "--keep-going"),
+                                 "check --workspace --lib --bins --keep-going --features sample/fast\n"),
+                                (("--keep-going", "--features", "fast"),
+                                 "check --workspace --lib --bins --keep-going --features sample/fast\n"),
+                                ((), "check --workspace --lib --bins\n")):
+            with self.subTest(words=words):
+                (self.root / "cargo-calls").unlink(missing_ok=True)
+                result = subprocess.run(["bash", str(VERIFY), "check", "sample", *words], cwd=self.root,
+                                        env=environment, capture_output=True, text=True, check=False, timeout=300)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual((self.root / "cargo-calls").read_text(), expected)
 
     def test_build_of_an_example_turns_on_its_required_features(self) -> None:
         environment = self.build_stub([{"name": "sample-app", "kind": ["bin"]},

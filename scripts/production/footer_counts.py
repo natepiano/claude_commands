@@ -1,9 +1,10 @@
 """The counts line: how much waits on the user, read at render time and never stored.
 
 The status line and the dailies report's own footer show it; no reply carries it (user,
-2026-10-18). Changes are the rows still to review on the list the doc's Change review line names,
-proposals the open proposal issues in its Proposals folder that are its own and that the user has
-not approved (see proposals_folder and proposal_issue.proposal_progress), efficiency proposals
+2026-10-18). Each count is the production's own: the showrunners above and below it count their
+own (user, 2026-10-27). Changes are the rows still to review that are the production's
+(change_review.scope_rows), proposals the open proposal issues in its Proposals folder that are its
+own and that the user has not approved (see proposals_folder and proposal_issue.proposal_progress), efficiency proposals
 the proposed or deferred lines in its Efficiency ledger, and projects the improvement-queue
 lines still to decide or hand out, for a doc with an Improvement queue line.
 """
@@ -41,8 +42,7 @@ def total(each: list[FooterCounts]) -> FooterCounts:
 
 def changes(doc: Path) -> int:
     try:
-        path = change_review.list_path(doc)
-        return 0 if path is None or not path.exists() else len(change_review.pending(path))
+        return len(change_review.scope_rows(change_review.scope_list(doc), doc))
     except (change_review.ChangeReviewError, OSError):
         return 0
 
@@ -122,7 +122,7 @@ def sources(doc: Path) -> list[Path]:
     changes.
     """
     try:
-        listed = change_review.list_path(doc)
+        listed: Path | None = change_review.scope_list(doc)
     except (change_review.ChangeReviewError, OSError):
         listed = None
     folder = proposals_folder.issues_folder(doc)
@@ -133,8 +133,6 @@ def sources(doc: Path) -> list[Path]:
         queue = None
         efficiency_queue = None
     found = [doc, *(path for path in (listed, folder, queue, efficiency_queue) if path is not None)]
-    # A unit added below changes which proposals are this production's.
-    found.extend(proposals_folder.owner_docs(doc)[1:])
     try:
         found.extend(issue.path for issue in proposals_folder.open_proposals(doc))
     except OSError:

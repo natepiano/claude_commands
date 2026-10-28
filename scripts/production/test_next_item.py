@@ -5,15 +5,18 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import re
 import tempfile
 import unittest
 from datetime import date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from typing import TYPE_CHECKING, cast, final, override
 from unittest import mock
 
 import change_review
 import next_item
+from add_unit import Production
 import proposals_folder
 import showrunners
 from change_review import Visible
@@ -29,6 +32,8 @@ else:
     import candidates
 
 PRODUCTION = Path.home() / "worktrees/demo-trunk/docs/plans/demo-production.md"
+# The production an item in the tree test belongs to: each item's text holds `<slug>-item`.
+ITEM = re.compile(r"\b(\w+)-item\b")
 LEDGER = """\
 - 2026-10-05 rust/nateroids: Build CI tests without debug info [gain/week: 2.5 h red CI] — deferred
 - 2026-10-12 rust/hana: Run the GPU tests 8 at a time [gain/week: 38 min waiting] — proposed
@@ -75,8 +80,8 @@ class NextItemTests(unittest.TestCase):
                                                 Entry("Q2", "demo: Newest question", since=at(5))]),
         }
 
-    def read(self, kind: str, production: Path | None) -> Queue:
-        del production
+    def read(self, kind: str, production: Path | None, below: bool = False) -> Queue:
+        del production, below
         if kind not in self.queues:
             raise NextError(f"{kind}: not readable")
         return self.queues[kind]
@@ -158,46 +163,76 @@ class NextItemTests(unittest.TestCase):
                 "change", "C1 Panels keep shields", "  How to check: Run `hana`. You see: Each panel has its shield",
                 "  Merged: 2026-10-15", "  Production: demo", ""]), ""))
 
-    def test_a_showrunner_sees_its_own_items_and_those_below_it_never_above_or_beside(self) -> None:
+    def test_each_kind_shows_its_own_production_and_with_all_below_each_lower_one_never_above(self) -> None:
         plans = self.root / "docs" / "plans"
         plans.mkdir(parents=True)
-        docs = {slug: plans / f"{slug}-production.md" for slug in ("top", "kid", "side")}
+        issues_folder = self.root / "issues"
+        issues_folder.mkdir()
+        outstanding = self.root / "showrunner" / "outstanding"
+        outstanding.mkdir(parents=True)
+        slugs = ("top", "kid", "grand", "side")
+        docs = {slug: plans / f"{slug}-production.md" for slug in slugs}
         for slug, doc in docs.items():
-            _ = (self.root / f"{slug}.md").write_text(f"- 2026-10-12 rust/{slug}: {slug} gain — proposed\n")
-            _ = doc.write_text(f"# {slug}\n\n- **Efficiency ledger:** {self.root / f'{slug}.md'}\n")
+            _ = (self.root / f"{slug}.md").write_text(f"- 2026-10-12 rust/{slug}: {slug}-item gain — proposed\n")
+            _ = doc.write_text(f"# {slug}\n\n- **Efficiency ledger:** {self.root / f'{slug}.md'}\n"
+                               + f"- **Proposals:** {issues_folder}\n")
+            _ = (issues_folder / f"{slug}-item.md").write_text(
+                f"---\nstatus: open\ntags: [issue, proposal]\nproposed_by: {slug}\ndate_created: 2026-10-01\n---\n")
+            _ = (outstanding / f"{slug}.json").write_text(f'[{{"since": "2026-10-06T09:00", "text": "{slug}-item"}}]')
         path = self.root / "change-review" / "change-review - natedev.md"
-        for slug in ("top", "kid", "side", "gone"):
-            _ = change_review.append_rows(path, [Visible(f"{slug} change", "Run it", "It works")], date(2026, 10, 15),
+        # The side production is a root of its own, with its own list.
+        side_list = path.with_name("change-review - side.md")
+        for slug in (*slugs, "gone"):
+            _ = change_review.append_rows(side_list if slug == "side" else path, [Visible(f"{slug}-item change", "Run it", "It works")], date(2026, 10, 15),
                                           "", plans / f"{slug}-production.md")
         # A row written before the Production column belongs to the list's root.
         _ = path.write_text(path.read_text(encoding="utf-8").replace(" gone |", "  |"), encoding="utf-8")
-        below = {"top": [docs["top"], docs["kid"]], "kid": [docs["kid"]], "side": [docs["side"]]}
+        tree = {"top": ["top", "kid", "grand"], "kid": ["kid", "grand"], "grand": ["grand"], "side": ["side"]}
 
         def owner_docs(doc: Path) -> list[Path]:
-            return below[doc.name.removesuffix("-production.md")]
-
-        def root_of(slug: str) -> str:
-            return "top" if slug == "kid" else slug
+            return [docs[slug] for slug in tree[proposals_folder.slug_of(doc)]]
 
         def the_list(production: str) -> Path:
-            del production
-            return path
+            # Only the root's doc has a Change review line; its children read its list.
+            if proposals_folder.slug_of(Path(production)) in ("kid", "grand"):
+                raise change_review.ChangeReviewError("no line")
+            return side_list if proposals_folder.slug_of(Path(production)) == "side" else path
+
+        def production(doc: Path) -> Production:
+            return Production(doc, proposals_folder.slug_of(doc), "", self.root, self.root / "log.md", ZoneInfo("UTC"))
+
+        def shown(kind: str, slug: str, below: bool = False) -> list[str]:
+            queue = next_item.read_queue(kind, docs[slug], below)
+            return sorted(found[1] for entry in queue.entries if (found := ITEM.search(entry.item)))
+
+        def root_of(slug: str) -> str:
+            return "top" if slug in tree["top"] else slug
+
+        def descendants_of(slug: str) -> list[str]:
+            return tree[slug][1:]
 
         with mock.patch.object(proposals_folder, "owner_docs", owner_docs), \
                 mock.patch.object(showrunners, "root_of", root_of), \
-                mock.patch.object(change_review, "production_list", the_list):
-            top = next_item.change_queue(docs["top"])
-            kid = next_item.change_queue(docs["kid"])
-            self.assertEqual([entry.item.splitlines()[0] for entry in top.entries],
-                             ["C1 top change", "C2 kid change", "C4 gone change"])
-            self.assertEqual([entry.item.splitlines()[0] for entry in kid.entries], ["C2 kid change"])
-            # Each showrunner pins its own item, so one /next never moves the other's.
-            self.assertNotEqual(top.name, kid.name)
-            self.assertEqual([entry.item for entry in next_item.efficiency_queue(docs["top"]).entries],
-                             ["- 2026-10-12 rust/top: top gain — proposed", "- 2026-10-12 rust/kid: kid gain — proposed"])
-            self.assertEqual([entry.item for entry in next_item.efficiency_queue(docs["kid"]).entries],
-                             ["- 2026-10-12 rust/kid: kid gain — proposed"])
-
+                mock.patch.object(showrunners, "descendants_of", descendants_of), \
+                mock.patch.object(showrunners, "timer_docs", return_value=docs), \
+                mock.patch.object(change_review, "production_list", the_list), \
+                mock.patch.object(next_item, "read_production", production), \
+                mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.root / "showrunner")}):
+            for kind in next_item.KINDS:
+                # Each showrunner shows its own production: never the one above, and not the ones below.
+                self.assertEqual(shown(kind, "top"), ["gone", "top"] if kind == "change" else ["top"], kind)
+                self.assertEqual(shown(kind, "kid"), ["kid"], kind)
+                self.assertEqual(shown(kind, "grand"), ["grand"], kind)
+                self.assertEqual(shown(kind, "side"), ["side"], kind)
+                # all-below adds every production below, at any depth, and keeps its own pin.
+                self.assertEqual(shown(kind, "top", below=True),
+                                 sorted(["grand", "kid", "top", *(["gone"] if kind == "change" else [])]), kind)
+                self.assertEqual(shown(kind, "kid", below=True), ["grand", "kid"], kind)
+                self.assertEqual(shown(kind, "grand", below=True), ["grand"], kind)
+                self.assertNotEqual(next_item.read_queue(kind, docs["kid"]).name,
+                                    next_item.read_queue(kind, docs["kid"], True).name, kind)
+            # Each showrunner pins its own change row, so one /next never moves the other's.
+            self.assertNotEqual(next_item.change_queue(docs["top"]).name, next_item.change_queue(docs["kid"]).name)
 
     def test_a_child_with_no_change_review_line_reads_its_roots_list(self) -> None:
         path = self.root / "change-review - top.md"

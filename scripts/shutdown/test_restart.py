@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import io
+from types import SimpleNamespace
 import json
 from datetime import datetime, timezone, tzinfo
 import os
@@ -33,6 +34,7 @@ import sessions
 import remote_control
 from user_action import ActionRequired
 from push_texts import RenderedPush
+from session_types import GitCheckout
 import restart
 import unit_lookup
 import launch_permission as restore_permission
@@ -46,7 +48,7 @@ import settle
 import showrunners as settle_showrunners
 import shutdown
 import account as account_reader
-from scripts.accounts import accounts, moves
+from scripts.accounts import accounts, moves, outage_alerts
 import quota_alert
 from scripts.production import showrunners
 from account import Account, UnknownAccountName, UnreadableAccount
@@ -426,11 +428,11 @@ class RestartTests(ShutdownTestCase):
                       patch.object(account_reader, "process_config_dir", return_value=account_reader.ConfiguredClaudeFolder(self.root / ".claude2")),
                       patch.object(settle, "_unit_showrunner", return_value="fixture-showrunner"),
                       patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as notice,
-                      patch.object(settle, "alert_user") as phone,
+                      patch.object(settle, "alert_user", return_value=True) as phone,
                       redirect_stdout(io.StringIO()) as output):
                     current = restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state)
                     if failure == "confirmation":
-                        restart.confirm_entry(current, RESTARTED, False)
+                        restart.confirm_entry(current, RESTARTED, False, observed_at=time.time())
                 self.assertEqual(launch.call_count, 2)
                 self.assertEqual(launch.call_args_list[0].kwargs, {"dry_run": False})
                 self.assertEqual(launch.call_args_list[1].kwargs, {"dry_run": False, "source_fallback": True})
@@ -532,8 +534,13 @@ class RestartTests(ShutdownTestCase):
                 assert current is not None
                 if attempt == 0:
                     self.assertNotIn("restore_alerted", current)
+                    claimed = outage_alerts.claim(saved["session"]["session_id"])
+                    self.assertIsInstance(claimed, outage_alerts.AlertClaim)
+                    assert isinstance(claimed, outage_alerts.AlertClaim)
+                    outage_alerts.release(claimed)
                 else:
                     self.assertIn("restore_alerted", current)
+                    self.assertIsInstance(outage_alerts.claim(saved["session"]["session_id"]), outage_alerts.AlertDelivered)
             self.assertEqual(launch.call_count, 6)
             self.assertEqual(phone.call_count, 2)
 
@@ -596,7 +603,7 @@ class RestartTests(ShutdownTestCase):
               patch.object(sessions, "live_sessions", return_value=[live]),
               redirect_stdout(io.StringIO())):
             claimed = restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state)
-            restart.confirm_entry(claimed, RESTARTED, True)
+            restart.confirm_entry(claimed, RESTARTED, True, observed_at=time.time())
         argv = cast(list[str], launch.call_args.args[0])
         self.assertEqual(argv[argv.index("--account") + 1], LABEL)
         self.assertIn("--source-fallback", argv)
@@ -626,7 +633,7 @@ class RestartTests(ShutdownTestCase):
               patch.object(sessions, "live_sessions", return_value=[live]),
               redirect_stdout(io.StringIO())):
             claimed = restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state)
-            restart.confirm_entry(claimed, RESTARTED, True)
+            restart.confirm_entry(claimed, RESTARTED, True, observed_at=time.time())
         argv = cast(list[str], launch.call_args.args[0])
         self.assertEqual(argv[argv.index("--account") + 1], LABEL)
         self.assertIn("--source-fallback", argv)
@@ -683,7 +690,7 @@ class RestartTests(ShutdownTestCase):
               patch.object(restart, "_live_session_ids", return_value=frozenset()),
               patch.object(restore_permission, "launch_permission", return_value=restore_permission.AllowedByShutdownState()),
               patch.object(restart, "_run", return_value=subprocess.CompletedProcess([], 1, "", "refused")) as launch,
-              patch.object(settle, "alert_user"), redirect_stdout(io.StringIO())):
+              patch.object(settle, "alert_user", return_value=True), redirect_stdout(io.StringIO())):
             _ = restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state)
             self.assertEqual(launch.call_count, 2)
             self.configure_groups(units=LABEL)
@@ -723,7 +730,7 @@ class RestartTests(ShutdownTestCase):
               patch.object(restart, "wait_for_confirmation", return_value=restart.RegistryConfirmation((live,))),
               patch.object(sessions, "live_sessions", return_value=[live]),
               patch.object(account_reader, "process_config_dir", return_value=account_reader.ConfiguredClaudeFolder(self.root / ".claude2")),
-              patch.object(settle, "alert_user") as phone,
+              patch.object(settle, "alert_user", return_value=True) as phone,
               redirect_stdout(io.StringIO())):
             _ = restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state)
         self.assertEqual([argv[argv.index("--account") + 1] for argv in commands], ["claude3", "claude2"])
@@ -746,7 +753,7 @@ class RestartTests(ShutdownTestCase):
               patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
               patch.object(restore_permission, "launch_permission", return_value=restore_permission.AllowedByShutdownState()),
               patch.object(restart, "_launch_session", side_effect=OSError("fixture refused")) as launch,
-              patch.object(settle, "alert_user") as phone,
+              patch.object(settle, "alert_user", return_value=True) as phone,
               redirect_stdout(io.StringIO())):
             _ = restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state)
         self.assertEqual(launch.call_count, 2)
@@ -804,7 +811,7 @@ class RestartTests(ShutdownTestCase):
                 with (patch.object(restart, "_run", run_commands),
                       patch.object(sessions, "live_sessions", return_value=[live]),
                       patch.object(account_reader, "process_config_dir", return_value=account_reader.ConfiguredClaudeFolder(self.root / ".claude3"))):
-                    restart.confirm_entry(saved, RESTARTED, True)
+                    restart.confirm_entry(saved, RESTARTED, True, observed_at=time.time())
                 sends = [argv for argv in run_commands.calls if "--key" in argv and "resume-workers-" + owner["session_id"] in argv]
                 self.assertEqual(len(sends), 1)
                 argv = sends[0]
@@ -849,7 +856,7 @@ class RestartTests(ShutdownTestCase):
         self.create([saved])
         commands = CommandRecorder()
         with patch.object(restart, "_run", commands):
-            restart.confirm_entry(saved, RESTARTED, True)
+            restart.confirm_entry(saved, RESTARTED, True, observed_at=time.time())
         sends = [argv for argv in commands.calls if "resume-workers-" + owner["session_id"] in argv]
         self.assertEqual(len(sends), 1)
         self.assertEqual(sends[0][sends[0].index("--to") + 1], "session:" + owner["session_id"])
@@ -869,7 +876,7 @@ class RestartTests(ShutdownTestCase):
         with (patch.object(restart, "_run", commands),
               patch.object(sessions, "live_sessions", return_value=[live]),
               patch.object(account_reader, "process_config_dir", return_value=account_reader.ConfiguredClaudeFolder(self.root / ".claude2"))):
-            restart.confirm_entry(saved, RESTARTED, True)
+            restart.confirm_entry(saved, RESTARTED, True, observed_at=time.time())
         self.assertEqual(commands.calls, [])
         self.assertEqual(self.stored_record()["progress"]["kind"], "restart failed")
 
@@ -882,7 +889,7 @@ class RestartTests(ShutdownTestCase):
                 self.create([saved])
                 commands = CommandRecorder()
                 with patch.object(restart, "_run", commands):
-                    restart.confirm_entry(saved, RESTARTED, live)
+                    restart.confirm_entry(saved, RESTARTED, live, observed_at=time.time())
                 self.assertFalse(any("--key" in argv and any(value.startswith("resume-workers-") for value in argv) for argv in commands.calls))
                 self.assertEqual(saved["progress"]["kind"], "restarted" if live else "restart failed")
 
@@ -902,7 +909,7 @@ class RestartTests(ShutdownTestCase):
               patch.object(syslog, "syslog") as logged,
               redirect_stderr(io.StringIO()) as errors,
               redirect_stdout(io.StringIO()) as output):
-            restart.confirm_entry(saved, RESTARTED, True)
+            restart.confirm_entry(saved, RESTARTED, True, observed_at=time.time())
         self.assertEqual(len(calls), 1)
         self.assertEqual(saved["progress"]["kind"], "restarted")
         self.assertEqual(self.stored_record()["progress"]["kind"], "restarted")
@@ -919,7 +926,7 @@ class RestartTests(ShutdownTestCase):
               patch.object(account_reader, "process_config_dir", return_value=account_reader.ConfiguredClaudeFolder(self.root / ".claude2")),
               patch.object(account_reader, "account_of", return_value=Account("claude", LOGIN, LABEL)),
               patch.object(settle, "run_notifier") as timers):
-            restart.confirm_entry(saved, RESTARTED, True)
+            restart.confirm_entry(saved, RESTARTED, True, observed_at=time.time())
         timers.assert_not_called()
         entries = moves.read_moves()
         self.assertEqual([item["kind"] for item in entries], ["failed"])
@@ -1008,7 +1015,7 @@ class RestartTests(ShutdownTestCase):
               patch.object(account_reader, "process_config_dir", return_value=account_reader.ConfiguredClaudeFolder(self.root / ".claude3")),
               patch.object(account_reader, "account_of", return_value=Account("claude", "target@example.com", "claude3")),
               patch.object(settle, "run_notifier", side_effect=RuntimeError("timer unavailable"))):
-            restart.confirm_entry(saved, RESTARTED, True)
+            restart.confirm_entry(saved, RESTARTED, True, observed_at=time.time())
         self.assertEqual(self.stored_record()["progress"]["kind"], "timers pending")
         confirmed = moves.read_moves()
         self.assertEqual([item["kind"] for item in confirmed], ["confirmed"])
@@ -1023,7 +1030,7 @@ class RestartTests(ShutdownTestCase):
               patch.object(restore_permission, "launch_permission", return_value=restore_permission.AllowedByShutdownState()),
               patch.object(restart, "_launch_session", side_effect=OSError("source failed")),
               patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent())):
-            restart.confirm_entry(saved, RESTARTED, False)
+            restart.confirm_entry(saved, RESTARTED, False, observed_at=time.time())
         entries = moves.read_moves()
         self.assertEqual([item["kind"] for item in entries], ["failed"])
         item = entries[0]
@@ -1038,7 +1045,7 @@ class RestartTests(ShutdownTestCase):
         with (patch.object(sessions, "live_sessions", return_value=live),
               patch.object(restart, "_send_worker_resume") as resume,
               patch.object(restart, "_restore_timers") as timers):
-            restart.confirm_entry(saved, RESTARTED, True)
+            restart.confirm_entry(saved, RESTARTED, True, observed_at=time.time())
         rows = moves.read_moves()
         self.assertEqual([row["kind"] for row in rows], ["failed"])
         self.assertEqual(rows[0].get("reason"), "restart prompt not submitted")
@@ -1187,7 +1194,7 @@ class RestartTests(ShutdownTestCase):
                       patch.object(restart, "_restore_timers") as timers,
                       patch.object(restart, "_launch_session") as launch):
                     if progress_kind == "timers pending":
-                        restart.confirm_entry(saved, RESTARTED, True)
+                        restart.confirm_entry(saved, RESTARTED, True, observed_at=time.time())
                     else:
                         result = restart.clear_running_on_target([saved])
                         self.assertEqual(result.finished, [])
@@ -1218,7 +1225,7 @@ class RestartTests(ShutdownTestCase):
               patch.object(restart, "wait_for_confirmation", return_value=restart.RegistryConfirmation((live,))),
               patch.object(sessions, "live_sessions", return_value=[live]),
               patch.object(account_reader, "process_config_dir", return_value=account_reader.ConfiguredClaudeFolder(self.root / ".claude2")),
-              patch.object(settle, "alert_user") as phone, redirect_stdout(io.StringIO()) as output):
+              patch.object(settle, "alert_user", return_value=True) as phone, redirect_stdout(io.StringIO()) as output):
             current = restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state)
         launches = [call for call in command.call_args_list
                     if any(part.endswith("/add_unit.py") for part in cast(list[str], call.args[0]))]
@@ -1249,7 +1256,7 @@ class RestartTests(ShutdownTestCase):
         live = self.running_on(saved, self.root / ".claude3")
         with (patch.object(sessions, "live_sessions", return_value=live),
               patch.object(settle, "run_remote", return_value=(0, "[]")),
-              patch.object(settle, "send_message") as sender, patch.object(settle, "alert_user") as alert):
+              patch.object(settle, "send_message") as sender, patch.object(settle, "alert_user", return_value=True) as alert):
             settle.report_stop([saved])
         alert.assert_not_called()
         sender.assert_not_called()
@@ -1296,17 +1303,17 @@ class RestartTests(ShutdownTestCase):
         saved = self.hand_restart_record()
         with (patch.object(sessions, "live_sessions", return_value=[]),
               patch.object(settle, "run_remote", return_value=(0, "[]")),
-              patch.object(settle, "send_message"), patch.object(settle, "alert_user") as alert):
+              patch.object(settle, "send_message"), patch.object(settle, "alert_user", return_value=True) as alert):
             settle.report_stop([saved])
             settle.report_stop([self.stored_record()])
             alert.assert_called_once()
             progress: SessionProgress = record.SessionRestartFailed(kind="restart failed", at=RESTARTED, reason="window failed to open")
             _ = record.update_session(LOGIN, saved["session"]["session_id"], lambda current: current.update(progress=progress))
             settle.report_stop([self.stored_record()])
-        self.assertEqual(alert.call_count, 2)
+        self.assertEqual(alert.call_count, 1)
         push = cast(RenderedPush, alert.call_args.args[0])
-        self.assertEqual(push.id, "shutdown.move_failed")
-        self.assertEqual((push.values["session"], push.values["target"]), ("moved-owner", "claude3"))
+        self.assertEqual(push.id, "shutdown.manual_restart")
+        self.assertEqual(push.values["session"], "moved-owner")
 
     def home_cutover_evidence(self) -> None:
         configuration = accounts.accounts_config_file()
@@ -1464,7 +1471,7 @@ class RestartTests(ShutdownTestCase):
             messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
         with (patch.object(sessions, "live_sessions", return_value=[live]),
               patch.object(account_reader, "process_config_dir", return_value=account_reader.ConfiguredClaudeFolder(self.root / ".claude2"))):
-            restart.confirm_entry(saved, RESTARTED, True)
+            restart.confirm_entry(saved, RESTARTED, True, observed_at=time.time())
         self.assertFalse(assumed.exists())
         entries = moves.read_moves()
         self.assertEqual([item["kind"] for item in entries], ["confirmed"])
@@ -1934,6 +1941,7 @@ class RestartTests(ShutdownTestCase):
                 self.assertIn("writing restart issue: pane restore left panes not resumed", output.getvalue())
 
     def test_ssh_mac_refusal_keeps_claude_records_restartable_and_reaches_peer_json(self) -> None:
+        _ = self.enterContext(patch.object(settle, "_deliver_message", return_value=settle.MessageSent(kind="sent")))
         owner, responses, log = self.herdr_restart_fixture()
         second = copy.deepcopy(owner)
         second["session_id"], second["name"] = "second-id", "second"
@@ -1964,6 +1972,7 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(restart.parse_peer_result(json.dumps(peer))["lines"], peer["lines"])
 
     def test_ssh_mac_failed_window_keeps_codex_snapshot_unacknowledged(self) -> None:
+        _ = self.enterContext(patch.object(settle, "_deliver_message", return_value=settle.MessageSent(kind="sent")))
         snapshot, _, responses, log = self.codex_recovery_fixture(attached=True)
         name = "writing"
         self.configure_mac_bootstrap(responses, name)
@@ -3100,8 +3109,12 @@ class RestartTests(ShutdownTestCase):
 
     def test_herdr_restart_starts_a_stopped_server_under_its_named_unit(self) -> None:
         owner, responses, log = self.herdr_restart_fixture()
-        transient = ["--user", "--unit=herdr-writing.service", "--collect", str(self.root / "fake-herdr"),
-                     "--session", "writing", "server"]
+        # An empty SHELL makes the pane shell /bin/sh; the wrapper goes under HOME.
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"SHELL": "", "XDG_STATE_HOME": ""})))
+        transient = ["--user", "--unit=herdr-writing.service", "--collect",
+                     "-p", "CPUWeight=1000", "-p", "MemoryLow=1G", "-p", "MemorySwapMax=0",
+                     f"--setenv=SHELL={self.root}/.local/state/herdr/pane-shell", "--setenv=HERDR_PANE_SHELL=/bin/sh",
+                     str(self.root / "fake-herdr"), "--session", "writing", "server"]
         for fragment, started in (("\n", transient),
                                   ("/home/u/.config/systemd/user/herdr-writing.service\n",
                                    ["--user", "start", "herdr-writing.service"])):
@@ -3367,6 +3380,32 @@ class RestartTests(ShutdownTestCase):
         assert progress["kind"] == "restart failed"
         self.assertEqual(progress.get("trust_command"), command)
         self.assertFalse(log.exists())
+
+    def test_a_checkout_move_that_fails_launches_in_whichever_folder_holds_the_checkout(self) -> None:
+        old, new = self.root / "demo-old-trunk", self.root / "demo-new-trunk"
+        for moved in (False, True):
+            with self.subTest(moved=moved), patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / f"move-{moved}")}):
+                old.mkdir(exist_ok=True)
+                saved = entry(top_level("mover", name="natedev", cwd=str(old)))
+                saved["checkout_move"] = {"old": str(old), "new": str(new)}
+                checkout: GitCheckout = {"kind": "git", "path": str(old), "head": {"kind": "branch", "name": "trunk"},
+                                         "upstream": {"kind": "no upstream"}, "dirty": []}
+                saved["session"]["checkout"] = checkout
+                self.create([saved])
+
+                def fail(_old: Path, _new: Path, moved: bool = moved) -> None:
+                    if moved:
+                        (new / ".git").mkdir(parents=True, exist_ok=True)
+                    raise RuntimeError("trust copy refused")
+
+                mover = SimpleNamespace(move=fail)
+                with patch.object(restart, "import_module", return_value=mover), redirect_stdout(io.StringIO()) as output:
+                    updated = restart.move_checkout(saved, dry_run=False)
+                self.assertEqual(updated["session"]["cwd"], str(new if moved else old))
+                self.assertEqual(updated["session"]["checkout"].get("path"), str(new if moved else old))
+                self.assertNotIn("checkout_move", updated)
+                self.assertEqual(record.session_records(LOGIN)[0]["session"]["cwd"], str(new if moved else old))
+                self.assertIn("checkout move", output.getvalue())
 
     def test_a_restore_whose_folder_is_gone_is_dropped_and_frees_the_account_hold(self) -> None:
         for dry_run in (True, False):
@@ -3703,6 +3742,7 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(record.session_records(LOGIN)[0]["progress"]["kind"], "manual restart")
 
     def test_live_restart_verb_reports_an_unknown_host_move_command_exactly_once(self) -> None:
+        _ = self.enterContext(patch.object(settle, "_deliver_message", return_value=settle.MessageSent(kind="sent")))
         saved = entry(top_level("manual-move", name="kept name"), where=record.WhereNotSaid(kind="not said"))
         saved["target"] = "claude3"
         self.create([saved])
@@ -4238,9 +4278,10 @@ class RestartTests(ShutdownTestCase):
         self.create([saved])
         pushes: list[str] = []
 
-        def alert(push: RenderedPush, *, machine: str = "") -> None:
+        def alert(push: RenderedPush, *, machine: str = "") -> bool:
             del machine
             pushes.append(push.id)
+            return True
         for reason, expected in (("name taken", []), ("not trusted", ["shutdown.restart_failed"])):
             with self.subTest(reason=reason):
                 pushes.clear()
@@ -4267,9 +4308,10 @@ class RestartTests(ShutdownTestCase):
         self.create([saved])
         pushes: list[RenderedPush] = []
 
-        def alert(push: RenderedPush, *, machine: str = "") -> None:
+        def alert(push: RenderedPush, *, machine: str = "") -> bool:
             del machine
             pushes.append(push)
+            return True
         result = restart.MachineRestartResult("natedev", LABEL, "partial", failed=1,
             failed_sessions=(restart.FailedSessionRestart("stuck", reason, command),))
         for attempt in ("first", "unchanged retry"):
@@ -4305,7 +4347,7 @@ class RestartTests(ShutdownTestCase):
         with (patch.object(restart, "named_claude_account", return_value=self.account),
               patch.object(restart, "_up", return_value=result),
               patch.object(settle, "local_machine", return_value="natedev"),
-              patch.object(settle, "alert_user") as alert,
+              patch.object(settle, "alert_user", return_value=True) as alert,
               redirect_stdout(io.StringIO())):
             _ = restart.restart(restart.AccountNamed(LABEL), dry_run=False,
                                 alerts=restart.AlertWhenNotBack(), only=["mover"], here=True)
@@ -4339,6 +4381,114 @@ class RestartTests(ShutdownTestCase):
         self.assertIn("to claude3", action)
         self.assertNotIn("claude1", action)
         self.assertNotIn("restart", action)
+
+    def test_cli_claims_each_push_only_when_it_is_ready_to_send(self) -> None:
+        records = [entry(top_level(f"slow-{index}", name=f"Owner {index}")) for index in range(6)]
+        for saved in records:
+            saved["target"] = "claude3"
+        self.create(records)
+        clock = [1000.0]
+        sent: list[str] = []
+        def send(_push: RenderedPush, **_kwargs: object) -> bool:
+            pending = records[len(sent) + 1:]
+            for saved in pending:
+                claim = outage_alerts.claim(saved["session"]["session_id"])
+                self.assertIsInstance(claim, outage_alerts.AlertClaim)
+                assert isinstance(claim, outage_alerts.AlertClaim)
+                outage_alerts.release(claim)
+            sent.append(_push.values["session"])
+            clock[0] += 190
+            return True
+        with (patch.object(restart, "named_claude_account", return_value=self.account),
+              patch.object(restart, "_retire"),
+              patch.object(restart, "_live_session_ids", return_value=frozenset()),
+              patch.object(restart, "_owner_liveness", return_value=restart.SessionNotLive()),
+              patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
+              patch.object(restart, "_launch_session", side_effect=OSError("fixture launch failed")),
+              patch.object(time, "time", side_effect=lambda: clock[0]),
+              patch.object(settle, "alert_user", side_effect=send), redirect_stdout(io.StringIO())):
+            self.assertEqual(restart.restart(restart.AccountNamed(LABEL), dry_run=False,
+                                            alerts=restart.AlertWhenNotBack(), here=True), 1)
+        self.assertEqual(len(sent), 6)
+
+    def test_peer_json_sends_local_failure_once_and_no_alert_suppresses_it(self) -> None:
+        self.create([entry(top_level("peer-owned", name="Peer owner"))])
+        with (patch.object(restart, "_retire"),
+              patch.object(restart, "_live_session_ids", return_value=frozenset()),
+              patch.object(restart, "_owner_liveness", return_value=restart.SessionNotLive()),
+              patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
+              patch.object(restart, "_launch_session", side_effect=OSError("fixture launch failed")),
+              patch.object(settle, "_deliver_message", return_value=settle.MessageSent(kind="sent")) as sender,
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["up", LOGIN, "--here", "--json", "--no-alert"]), 1)
+            sender.assert_not_called()
+            for _ in range(2):
+                self.assertEqual(shutdown.main(["up", LOGIN, "--here", "--json"]), 1)
+        sender.assert_called_once()
+        self.assertIsInstance(outage_alerts.claim("peer-owned"), outage_alerts.AlertDelivered)
+        for line in output.getvalue().splitlines():
+            self.assertEqual(restart.parse_peer_result(line)["outcome"], "partial")
+
+    def test_hand_restore_clears_alert_before_a_crash_without_a_watchdog_pass(self) -> None:
+        saved = self.hand_restart_record("hand-alert")
+        claim = outage_alerts.claim("hand-alert")
+        assert isinstance(claim, outage_alerts.AlertClaim)
+        outage_alerts.delivered(claim)
+        live = self.running_on(saved, self.root / ".claude3")
+        with patch.object(sessions, "live_sessions", return_value=live):
+            self.assertEqual(len(restart.clear_running_on_target([saved]).finished), 1)
+        self.assertIsNone(record.find_session(LOGIN, "hand-alert"))
+        self.create([entry(top_level("hand-alert", name="Hand owner"))])
+        with (patch.object(restart, "named_claude_account", return_value=self.account),
+              patch.object(restart, "_retire"),
+              patch.object(restart, "_live_session_ids", return_value=frozenset()),
+              patch.object(restart, "_owner_liveness", return_value=restart.SessionNotLive()),
+              patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
+              patch.object(restart, "_launch_session", side_effect=OSError("fixture launch failed")),
+              patch.object(settle, "alert_user", return_value=True) as sender, redirect_stdout(io.StringIO())):
+            self.assertEqual(restart.restart(restart.AccountNamed(LABEL), dry_run=False,
+                                            alerts=restart.AlertWhenNotBack(), here=True), 1)
+        sender.assert_called_once()
+
+    def test_real_cli_failure_push_names_only_sessions_it_claimed(self) -> None:
+        records = [entry(top_level(identity, name=name)) for identity, name in
+                   (("already-pushed", "Alpha"), ("not-pushed", "Beta"))]
+        self.create(records)
+        claimed = outage_alerts.claim("already-pushed")
+        assert isinstance(claimed, outage_alerts.AlertClaim)
+        outage_alerts.delivered(claimed)
+        with (patch.object(restart, "named_claude_account", return_value=self.account),
+              patch.object(restart, "_retire"),
+              patch.object(restart, "_live_session_ids", return_value=frozenset()),
+              patch.object(restart, "_owner_liveness", return_value=restart.SessionNotLive()),
+              patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
+              patch.object(restart, "_launch_session", side_effect=OSError("fixture launch failed")),
+              patch.object(settle, "_deliver_message", return_value=settle.MessageSent(kind="sent")) as sender,
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(restart.restart(restart.AccountNamed(LABEL), dry_run=False,
+                                            alerts=restart.AlertWhenNotBack(), here=True), 1)
+        sender.assert_called_once()
+        argv = cast(list[str], sender.call_args.args[0])
+        self.assertIn("stopped=One session (Beta)", argv)
+        self.assertFalse(any("Alpha" in argument for argument in argv))
+        self.assertIsInstance(outage_alerts.claim("not-pushed"), outage_alerts.AlertDelivered)
+
+    def test_real_cli_failure_push_releases_a_failed_delivery_for_retry(self) -> None:
+        self.create([entry(top_level("retry-alert", name="Beta"))])
+        with (patch.object(restart, "named_claude_account", return_value=self.account),
+              patch.object(restart, "_retire"),
+              patch.object(restart, "_live_session_ids", return_value=frozenset()),
+              patch.object(restart, "_owner_liveness", return_value=restart.SessionNotLive()),
+              patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
+              patch.object(restart, "_launch_session", side_effect=OSError("fixture launch failed")),
+              patch.object(settle, "_deliver_message", side_effect=[RuntimeError("fixture send failed"),
+                           settle.MessageSent(kind="sent")]) as sender,
+              redirect_stdout(io.StringIO())):
+            for _ in range(3):
+                self.assertEqual(restart.restart(restart.AccountNamed(LABEL), dry_run=False,
+                                                alerts=restart.AlertWhenNotBack(), here=True), 1)
+        self.assertEqual(sender.call_count, 2)
+        self.assertIsInstance(outage_alerts.claim("retry-alert"), outage_alerts.AlertDelivered)
 
     def test_restart_failure_push_names_the_failed_session_machine_and_cause(self) -> None:
         push, = restart.restart_push("claude2", [restart.FailedSessionRestart("Beta", "window failed to open")],
@@ -4375,13 +4525,15 @@ class RestartTests(ShutdownTestCase):
         batches.append(["Short owner", "Oversize-" + "x" * 201, "Another owner"])
         for names in batches:
             with self.subTest(names=names):
+                self.create([entry(top_level(f"split-{len(names[0])}-{index}", name=name))
+                             for index, name in enumerate(names)])
                 result = restart.MachineRestartResult("natedev", LABEL, "partial", failed=len(names),
                     failed_sessions=tuple(restart.FailedSessionRestart(name, "restart prompt not submitted")
                                           for name in names))
                 with (patch.object(restart, "named_claude_account", return_value=self.account),
                       patch.object(restart, "_up", return_value=result),
                       patch.object(restart, "_restart_alerts_enabled", return_value=True),
-                      patch.object(settle, "alert_user") as alert, redirect_stdout(io.StringIO())):
+                      patch.object(settle, "alert_user", return_value=True) as alert, redirect_stdout(io.StringIO())):
                     code = restart.restart(restart.AccountNamed(LABEL), dry_run=False,
                                            alerts=restart.AlertWhenNotBack(), here=True)
                 self.assertEqual(code, 1)
@@ -4413,12 +4565,13 @@ class RestartTests(ShutdownTestCase):
             timers_not_started=(restart.TimerNotStarted("Owner", "job", "unavailable"),))
         manual = restart.MachineRestartResult("natedev", LABEL, "partial", manual=1,
             manual_sessions=(restart.ManualSessionRestart("Owner", "private resume command"),))
+        self.create([entry(top_level("manual-owner", name="Owner"))])
         for result in (pending, manual):
             with (self.subTest(manual=result.manual),
                   patch.object(restart, "named_claude_account", return_value=self.account),
                   patch.object(restart, "_up", return_value=result),
                   patch.object(restart, "_restart_alerts_enabled", return_value=True),
-                  patch.object(settle, "alert_user") as alert, redirect_stdout(io.StringIO())):
+                  patch.object(settle, "alert_user", return_value=True) as alert, redirect_stdout(io.StringIO())):
                 self.assertEqual(restart.restart(restart.AccountNamed(LABEL), dry_run=False,
                     alerts=restart.AlertWhenNotBack(), here=True), 1)
             self.assertEqual(alert.call_count, result.manual)
@@ -4431,7 +4584,7 @@ class RestartTests(ShutdownTestCase):
         completed = restart.MachineRestartResult("natedev", LABEL, "done", restarted=1)
         with (patch.object(restart, "named_claude_account", return_value=self.account),
               patch.object(restart, "_up", return_value=completed),
-              patch.object(settle, "alert_user") as alert, redirect_stdout(io.StringIO())):
+              patch.object(settle, "alert_user", return_value=True) as alert, redirect_stdout(io.StringIO())):
             self.assertEqual(restart.restart(restart.AccountNamed(LABEL), dry_run=False,
                 alerts=restart.AlertWhenNotBack(), here=True), 0)
         alert.assert_not_called()
@@ -4482,7 +4635,7 @@ class RestartTests(ShutdownTestCase):
         self.assertNotIn('--no-alert', output.getvalue())
 
     def test_unknown_named_account_is_a_usage_error(self) -> None:
-        with patch.object(restart, 'named_claude_account', side_effect=UnknownAccountName('nobody')), patch.object(settle, 'alert_user') as alert_user, redirect_stderr(io.StringIO()):
+        with patch.object(restart, 'named_claude_account', side_effect=UnknownAccountName('nobody')), patch.object(settle, 'alert_user', return_value=True) as alert_user, redirect_stderr(io.StringIO()):
             self.assertEqual(restart.restart(restart.AccountNamed('nobody'), dry_run=False, alerts=restart.AlertWhenNotBack()), 2)
         alert_user.assert_not_called()
 
@@ -4626,7 +4779,7 @@ class RestartTests(ShutdownTestCase):
                   patch.object(restart, "_owner_liveness", return_value=liveness),
                   patch.object(restart, "named_claude_account", return_value=self.account),
                   patch.object(restart, "_up", return_value=result),
-                  patch.object(settle, "alert_user") as alert,
+                  patch.object(settle, "alert_user", return_value=True) as alert,
                   redirect_stdout(io.StringIO())):
                 self.assertEqual(restart.restart(restart.AccountNamed(LABEL), dry_run=False,
                     alerts=restart.AlertWhenNotBack(), only=["slow-resume"], here=True), 1)
@@ -5018,7 +5171,7 @@ class RestartTests(ShutdownTestCase):
               redirect_stdout(io.StringIO())):
             _ = restart._launch_session(saved, restart.restart_note(saved, RESTARTED),  # pyright: ignore[reportPrivateUsage]
                 self.desktop_state, dry_run=False)
-            restart.confirm_entry(saved, RESTARTED, True)
+            restart.confirm_entry(saved, RESTARTED, True, observed_at=time.time())
         launch.assert_called_once()
         sender.assert_not_called()
         timers.assert_called_once_with("start", "timer")
@@ -5281,7 +5434,7 @@ class RestartTests(ShutdownTestCase):
             current = restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state)
             wait.assert_not_called()
             self.assertEqual(current["progress"]["kind"], "restarting")
-            restart.confirm_entry(current, RESTARTED, True)
+            restart.confirm_entry(current, RESTARTED, True, observed_at=time.time())
         finished = record.find_session(LOGIN, "owner")
         assert finished is not None
         self.assertEqual(finished["progress"]["kind"], "restarted")
@@ -5366,7 +5519,7 @@ class RestartTests(ShutdownTestCase):
         launch_proof = proof_path.read_bytes()
         with (patch.object(sessions, "live_sessions", return_value=live),
               patch.object(settle, "run_notifier", side_effect=RuntimeError("timer unavailable"))):
-            restart.confirm_entry(saved, RESTARTED, True)
+            restart.confirm_entry(saved, RESTARTED, True, observed_at=time.time())
         pending = self.stored_record()
         self.assertEqual(pending["progress"]["kind"], "timers pending")
         self.assertEqual(READ_PROMPT_OUTCOME(pending), submitted)
@@ -5403,7 +5556,7 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(claimed["progress"]["at"], RESTARTED)
         self.assertIsInstance(READ_PROMPT_OUTCOME(claimed), herdr.PromptNotSubmitted)
         with patch.object(restart, "_restore_timers") as timers:
-            restart.confirm_entry(claimed, RESTARTED, True)
+            restart.confirm_entry(claimed, RESTARTED, True, observed_at=time.time())
         self.assertEqual(self.stored_record()["progress"]["kind"], "restart failed")
         self.assertEqual([row["kind"] for row in moves.read_moves()], ["failed"])
         timers.assert_not_called()
@@ -5474,7 +5627,7 @@ class RestartTests(ShutdownTestCase):
         saved["timers"] = [TimerRestore(instance="timer", was_enabled=True)]
         self.create([saved])
         with patch.object(restart, "_send_restart_note", return_value=settle.MessageQueued(kind="queued", reason="not ready")), patch.object(settle, "run_notifier") as timers:
-            restart.confirm_entry(saved, RESTARTED, True)
+            restart.confirm_entry(saved, RESTARTED, True, observed_at=time.time())
         timers.assert_not_called()
         self.assertEqual(self.stored_record()["progress"]["kind"], "restart failed")
 
@@ -5716,14 +5869,14 @@ class RestartTests(ShutdownTestCase):
         saved = entry(top_level("owner"), timers=[TimerRestore(instance="disabled", was_enabled=False)])
         self.create([saved])
         with patch.object(settle, "run_notifier") as timer:
-            restart.confirm_entry(saved, RESTARTED, True)
+            restart.confirm_entry(saved, RESTARTED, True, observed_at=time.time())
         timer.assert_not_called()
 
     def test_restart_with_alerts_disabled_does_not_send_a_phone_alert(self) -> None:
         saved = entry(top_level("owner"))
         saved["alerts"] = "none"
         self.create([saved])
-        with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "_up", return_value=restart.MachineRestartResult("natedev", LABEL, "partial")), patch.object(restart, "run_remote", return_value=(1, "failed")), patch.object(settle, "alert_user") as alert, redirect_stdout(io.StringIO()):
+        with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "_up", return_value=restart.MachineRestartResult("natedev", LABEL, "partial")), patch.object(restart, "run_remote", return_value=(1, "failed")), patch.object(settle, "alert_user", return_value=True) as alert, redirect_stdout(io.StringIO()):
             self.assertEqual(restart.restart(restart.AccountNamed(LABEL), dry_run=False, alerts=restart.AlertWhenNotBack()), 1)
         alert.assert_not_called()
 
@@ -5748,7 +5901,7 @@ class RestartTests(ShutdownTestCase):
                             patch.object(restart, "_up", return_value=restart.MachineRestartResult("natedev", LABEL, "nothing")),
                             patch.object(restart, "session_records", return_value=local_records),
                             patch.object(restart, "run_remote", remote),
-                            patch.object(settle, "alert_user") as alert,
+                            patch.object(settle, "alert_user", return_value=True) as alert,
                             redirect_stdout(io.StringIO()),
                         ):
                             self.assertEqual(restart.restart(restart.AccountNamed(LABEL), dry_run=False, alerts=restart.AlertWhenNotBack()), 0)
@@ -5773,7 +5926,7 @@ class RestartTests(ShutdownTestCase):
                 self.assertEqual(result.failed_sessions,
                     (restart.FailedSessionRestart("slow-resume", "restart prompt not submitted"),))
 
-    def test_peer_live_skipped_restart_sends_no_push_but_a_dead_failure_does(self) -> None:
+    def test_peer_failure_lines_are_printed_without_a_caller_push(self) -> None:
         saved = entry(top_level("peer"), state=record.SessionRestartFailed(
             kind="restart failed", at=RESTARTED, reason="restart prompt not submitted"))
         saved["machine"] = "Mac"
@@ -5781,8 +5934,9 @@ class RestartTests(ShutdownTestCase):
                  ("partial", "Peer: already running; skipped", ""),
                  ("partial", "Mac: Peer restart failed: restart prompt not submitted", "shutdown.restart_failed"),
                  ("partial", "Mac: Peer needs folder trust: cd /tmp/peer && claude", "shutdown.restart_untrusted"))
-        for outcome, line, pushed in cases:
+        for outcome, line, _pushed in cases:
             with self.subTest(outcome=outcome, line=line):
+                _ = outage_alerts.clear("peer", time.time())
                 def remote(args: list[str], **_kwargs: object) -> tuple[int, str]:
                     if args == ["records", "--json", "--here"]:
                         return 0, json.dumps([saved])
@@ -5794,25 +5948,15 @@ class RestartTests(ShutdownTestCase):
                       patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
                       patch.object(restart, "_owner_liveness", return_value=restart.SessionNotLive()),
                       patch.object(restart, "run_remote", side_effect=remote) as peer,
-                      patch.object(settle, "alert_user") as alert,
+                      patch.object(settle, "alert_user", return_value=True) as alert,
                       redirect_stdout(io.StringIO())):
                     code = restart.restart(restart.AccountNamed(LABEL), dry_run=False,
                                            alerts=restart.AlertWhenNotBack())
                 self.assertEqual(code, 1 if outcome == "partial" else 0)
                 self.assertTrue(peer.called)
-                if pushed:
-                    alert.assert_called_once()
-                    push = cast(RenderedPush, alert.call_args.args[0])
-                    self.assertEqual((push.id, push.values["machine"]), (pushed, "Mac"))
-                    self.assertIn("Peer", push.body)
-                    if pushed == "shutdown.restart_failed":
-                        self.assertEqual(push.values["cause"], "restart prompt not submitted")
-                    else:
-                        self.assertEqual(push.values["command"], "cd /tmp/peer && claude")
-                else:
-                    alert.assert_not_called()
+                alert.assert_not_called()
 
-    def test_restart_uses_the_peer_incomplete_records_alert_policy(self) -> None:
+    def test_restart_leaves_peer_alert_policy_to_the_peer(self) -> None:
         for policy in ("none", "user"):
             with self.subTest(policy=policy):
                 saved = entry(top_level("peer"), state=record.SessionRestartFailed(kind="restart failed", at=RESTARTED, reason="not live"))
@@ -5833,12 +5977,12 @@ class RestartTests(ShutdownTestCase):
                     patch.object(restart, "named_claude_account", return_value=self.account),
                     patch.object(restart, "_up", return_value=restart.MachineRestartResult("natedev", LABEL, "nothing")),
                     patch.object(restart, "run_remote", remote),
-                    patch.object(settle, "alert_user") as alert,
+                    patch.object(settle, "alert_user", return_value=True) as alert,
                     redirect_stdout(io.StringIO()),
                 ):
                     self.assertEqual(restart.restart(restart.AccountNamed(LABEL), dry_run=False, alerts=restart.AlertWhenNotBack()), 1)
-                self.assertEqual(alert.call_count, 0 if policy == "none" else 1)
-                self.assertEqual(calls, [["up", LOGIN, "--here", "--json"], ["records", "--json", "--here"]])
+                alert.assert_not_called()
+                self.assertEqual(calls, [["up", LOGIN, "--here", "--json"]])
 
     def test_unreached_restore_uses_local_waiting_policy_without_reading_peer_records(self) -> None:
         replies = [(0, "Mac: restarted"), (0, "{}"), (255, ""), (2, peer_json())]
@@ -5856,7 +6000,7 @@ class RestartTests(ShutdownTestCase):
                         patch.object(restart, "_up", return_value=restart.MachineRestartResult("natedev", LABEL, "nothing")),
                         patch.object(restart, "session_records", return_value=[saved]),
                         patch.object(restart, "run_remote", side_effect=remote),
-                        patch.object(settle, "alert_user") as alert,
+                        patch.object(settle, "alert_user", return_value=True) as alert,
                         redirect_stdout(io.StringIO()) as output,
                     ):
                         self.assertEqual(restart.restart(restart.AccountNamed(LOGIN), dry_run=False, alerts=restart.AlertWhenNotBack()), 0)
@@ -5873,7 +6017,7 @@ class RestartTests(ShutdownTestCase):
             patch.object(restart, "_up", return_value=restart.MachineRestartResult("natedev", LABEL, "nothing")),
             patch.object(restart, "session_records", return_value=[chosen, sibling]),
             patch.object(restart, "run_remote", return_value=(0, "Mac: restarted")) as peer,
-            patch.object(settle, "alert_user") as alert,
+            patch.object(settle, "alert_user", return_value=True) as alert,
             redirect_stdout(io.StringIO()),
         ):
             self.assertEqual(restart.restart(restart.AccountNamed(LOGIN), dry_run=False,
@@ -5898,7 +6042,7 @@ class RestartTests(ShutdownTestCase):
         with (
             patch.object(restart, "named_claude_account", return_value=self.account),
             patch.object(restart, "_up", up), patch.object(restart, "run_remote", remote),
-            patch.object(settle, "alert_user") as alert, redirect_stdout(io.StringIO()),
+            patch.object(settle, "alert_user", return_value=True) as alert, redirect_stdout(io.StringIO()),
         ):
             self.assertEqual(restart.restart(restart.AccountNamed(LABEL), dry_run=False, alerts=restart.AlertWhenNotBack()), 1)
         alert.assert_not_called()
@@ -5971,7 +6115,7 @@ class RestartTests(ShutdownTestCase):
         with (
             patch.object(settle, "run_remote", return_value=(0, "[]")),
             patch.object(restart, "_live_session_ids", return_value=frozenset()),
-            patch.object(settle, "alert_user"),
+            patch.object(settle, "alert_user", return_value=True),
             redirect_stdout(output),
         ):
             settle.report_stop([stored])
@@ -6121,7 +6265,7 @@ class RestartTests(ShutdownTestCase):
                     current["progress"] = replacement
                 _ = record.update_session(LOGIN, "owner", replace)
                 with patch.object(settle, "run_notifier") as timer:
-                    restart.confirm_entry(saved, STOPPED, live)
+                    restart.confirm_entry(saved, STOPPED, live, observed_at=time.time())
                 timer.assert_not_called()
                 self.assertEqual(self.stored_record()["progress"], replacement)
 
@@ -6141,7 +6285,7 @@ class RestartTests(ShutdownTestCase):
                 current["progress"] = replacement
             _ = record.update_session(LOGIN, "owner", replace)
         with patch.object(settle, "run_notifier", timer):
-            restart.confirm_entry(saved, STOPPED, True)
+            restart.confirm_entry(saved, STOPPED, True, observed_at=time.time())
         self.assertEqual(self.stored_record()["progress"], replacement)
 
     def test_launcher_does_not_return_a_replacement_claim_for_confirmation(self) -> None:
@@ -6184,7 +6328,7 @@ class RestartTests(ShutdownTestCase):
     def test_selected_restart_routes_only_peer_id_and_preserves_flags(self) -> None:
         waiting = entry(top_level("waiting"), state={"kind": "waiting"})
         self.create([waiting])
-        with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "run_remote", return_value=(0, peer_json(lines=["Mac: restored Remote"]))) as peer, patch.object(restart, "_launch_session") as launch, patch.object(settle, "alert_user") as alert, redirect_stdout(io.StringIO()):
+        with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "run_remote", return_value=(0, peer_json(lines=["Mac: restored Remote"]))) as peer, patch.object(restart, "_launch_session") as launch, patch.object(settle, "alert_user", return_value=True) as alert, redirect_stdout(io.StringIO()):
             self.assertEqual(restart.restart(restart.AccountNamed(LABEL), only=["remote-id"], dry_run=True, alerts=restart.NeverAlert()), 0)
         peer.assert_called_once_with(["up", LOGIN, "--here", "--json", "--no-alert", "--dry-run", "--only", "remote-id"], limit={"kind": "while link alive"})
         launch.assert_not_called()
@@ -6218,7 +6362,7 @@ class RestartTests(ShutdownTestCase):
     def test_selected_peer_restart_refusal_exits_one_without_phone_alert_or_summary(self) -> None:
         line = "Peer is waiting, not stopped; nothing to restart"
         output = io.StringIO()
-        with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(settle, "inventory", return_value=inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])), patch.object(restart, "run_remote", return_value=(1, peer_json(lines=[line], refused=[restart.RestartNotStopped(kind="not stopped", session_id="peer-id", name="Peer", progress="waiting")])) ) as peer, patch.object(settle, "alert_user") as alert, patch.object(restart, "_print_result") as summary, redirect_stdout(output):
+        with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(settle, "inventory", return_value=inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])), patch.object(restart, "run_remote", return_value=(1, peer_json(lines=[line], refused=[restart.RestartNotStopped(kind="not stopped", session_id="peer-id", name="Peer", progress="waiting")])) ) as peer, patch.object(settle, "alert_user", return_value=True) as alert, patch.object(restart, "_print_result") as summary, redirect_stdout(output):
             self.assertEqual(restart.restart(restart.AccountNamed(LABEL), only=["peer-id"], dry_run=False, alerts=restart.AlertWhenNotBack()), 1)
         self.assertEqual(output.getvalue(), line + "\n")
         peer.assert_called_once_with(["up", LOGIN, "--here", "--json", "--only", "peer-id"], limit={"kind": "while link alive"})
@@ -6246,7 +6390,7 @@ class RestartTests(ShutdownTestCase):
         response = peer_json(lines=[line], refused=[refusal])
         parsed = restart.parse_peer_result(response)
         self.assertEqual(parsed["refused"], [refusal])
-        with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(settle, "inventory", return_value=inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])), patch.object(restart, "run_remote", return_value=(1, response)), patch.object(settle, "alert_user") as alert, patch.object(restart, "_print_result") as summary, redirect_stdout(io.StringIO()) as output:
+        with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(settle, "inventory", return_value=inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])), patch.object(restart, "run_remote", return_value=(1, response)), patch.object(settle, "alert_user", return_value=True) as alert, patch.object(restart, "_print_result") as summary, redirect_stdout(io.StringIO()) as output:
             self.assertEqual(restart.restart(restart.AccountNamed(LABEL), only=["peer-id"], dry_run=False, alerts=restart.AlertWhenNotBack()), 1)
         self.assertEqual(output.getvalue(), line + "\n")
         alert.assert_not_called()
@@ -6276,7 +6420,7 @@ class RestartTests(ShutdownTestCase):
         line = "Peer is reaping, not stopped; nothing to restart"
         response = peer_json(outcome="nothing", lines=[line], refused=[refusal])
         self.assertEqual(restart.parse_peer_result(response)["refused"], [refusal])
-        with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "run_remote", return_value=(1, response)) as peer, patch.object(settle, "alert_user") as alert, patch.object(restart, "_print_result") as summary, redirect_stdout(io.StringIO()) as output:
+        with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "run_remote", return_value=(1, response)) as peer, patch.object(settle, "alert_user", return_value=True) as alert, patch.object(restart, "_print_result") as summary, redirect_stdout(io.StringIO()) as output:
             self.assertEqual(restart.restart(restart.AccountNamed(LABEL), only=["peer-id"], dry_run=False, alerts=restart.AlertWhenNotBack()), 1)
         self.assertEqual(output.getvalue(), line + "\n")
         peer.assert_called_once_with(["up", LOGIN, "--here", "--json", "--only", "peer-id"], limit={"kind": "while link alive"})
@@ -6290,7 +6434,7 @@ class RestartTests(ShutdownTestCase):
         chosen["machine"], chosen["alerts"] = "Mac", "none"
         def remote(arguments: list[str], **_keywords: object) -> tuple[int, str]:
             return (0, json.dumps([chosen])) if arguments[0] == "records" else (1, peer_json(outcome="partial", lines=["Mac: Peer restart failed: not live"]))
-        with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(settle, "inventory", return_value=inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])), patch.object(restart, "run_remote", side_effect=remote), patch.object(settle, "alert_user") as alert, redirect_stdout(io.StringIO()):
+        with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(settle, "inventory", return_value=inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])), patch.object(restart, "run_remote", side_effect=remote), patch.object(settle, "alert_user", return_value=True) as alert, redirect_stdout(io.StringIO()):
             self.assertEqual(restart.restart(restart.AccountNamed(LABEL), only=["peer"], dry_run=False, alerts=restart.AlertWhenNotBack()), 1)
         alert.assert_not_called()
         self.assertEqual(record.find_session(LOGIN, "sibling"), sibling)
@@ -6358,7 +6502,7 @@ class RestartTests(ShutdownTestCase):
                     saved["requested_at"] = "2026-10-09T21:49:" + str(10 + (2 if policy == "none" else 0) + int(isinstance(command_alerts, restart.NeverAlert))) + "+00:00"
                     self.create([saved])
                     output = io.StringIO()
-                    with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "_retire"), patch.object(restart, "_launch_session", return_value=restart.SessionLaunched(SUBMITTED_PROMPT)), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "wait_for_confirmation", return_value=restart.RegistryConfirmation((sessions.SessionRecord(pid=912, sessionId="owner", name="Owner", procStart="resumed-start", messagingSocketPath="", updatedAt=1, tmux="", formerNames=[]),))), patch.object(remote_control, "launch_fixer") as fixer, patch.object(restart, "wait_for_remote_control", return_value=frozenset()) as check, patch.object(restart, "_send_restart_note", return_value=settle.MessageSent(kind="sent")), patch.object(settle, "alert_user") as alert, redirect_stdout(output):
+                    with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "_retire"), patch.object(restart, "_launch_session", return_value=restart.SessionLaunched(SUBMITTED_PROMPT)), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "wait_for_confirmation", return_value=restart.RegistryConfirmation((sessions.SessionRecord(pid=912, sessionId="owner", name="Owner", procStart="resumed-start", messagingSocketPath="", updatedAt=1, tmux="", formerNames=[]),))), patch.object(remote_control, "launch_fixer") as fixer, patch.object(restart, "wait_for_remote_control", return_value=frozenset()) as check, patch.object(restart, "_send_restart_note", return_value=settle.MessageSent(kind="sent")), patch.object(settle, "alert_user", return_value=True) as alert, redirect_stdout(output):
                         self.assertEqual(restart.restart(restart.AccountNamed(LOGIN), dry_run=False, alerts=command_alerts, here=True), 0)
                     self.assertNotIn("Remote Control", output.getvalue())
                     check.assert_called_once()
@@ -6380,7 +6524,7 @@ class RestartTests(ShutdownTestCase):
                 saved["alerts"] = policy
                 with (patch.object(restart, "wait_for_remote_control", return_value=frozenset()),
                       patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as launch,
-                      patch.object(settle, "alert_user") as alert, redirect_stdout(io.StringIO())):
+                      patch.object(settle, "alert_user", return_value=True) as alert, redirect_stdout(io.StringIO())):
                     _ = restart.remote_control_missing([saved], confirmed)
                 launch.assert_called_once()
                 argv = cast(list[str], launch.call_args.args[0])
@@ -6404,7 +6548,7 @@ class RestartTests(ShutdownTestCase):
                 with (patch.object(restart, "wait_for_remote_control", return_value=frozenset()),
                       patch.object(remote_control, "launch_fixer", side_effect=OSError("service unavailable")) as launch,
                       patch.object(syslog, "syslog") as journal,
-                      patch.object(settle, "alert_user") as alert, redirect_stdout(output)):
+                      patch.object(settle, "alert_user", return_value=True) as alert, redirect_stdout(output)):
                     _ = restart.remote_control_missing([saved], confirmed)
                 launch.assert_called_once_with("owner", 912, "resumed-start", "owner unit", "Owner")
                 journal.assert_called_once()
@@ -6415,7 +6559,7 @@ class RestartTests(ShutdownTestCase):
     def test_remote_control_active_restart_sends_no_alert(self) -> None:
         saved = entry(top_level("owner", name="Owner", host=inventory.HerdrHost(kind="herdr", herdr_session="owner", pane_id="w1:p1", presentation="detached")))
         self.create([saved])
-        with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "_retire"), patch.object(restart, "_launch_session", return_value=restart.SessionLaunched(SUBMITTED_PROMPT)), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "wait_for_confirmation", side_effect=self.all_sessions_live), patch.object(restart, "_send_restart_note", return_value=settle.MessageSent(kind="sent")), patch.object(settle, "alert_user") as alert, redirect_stdout(io.StringIO()) as output:
+        with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "_retire"), patch.object(restart, "_launch_session", return_value=restart.SessionLaunched(SUBMITTED_PROMPT)), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "wait_for_confirmation", side_effect=self.all_sessions_live), patch.object(restart, "_send_restart_note", return_value=settle.MessageSent(kind="sent")), patch.object(settle, "alert_user", return_value=True) as alert, redirect_stdout(io.StringIO()) as output:
             self.assertEqual(restart.restart(restart.AccountNamed(LOGIN), dry_run=False, alerts=restart.AlertWhenNotBack(), here=True), 0)
         self.assertNotIn("no Remote Control", output.getvalue())
         self.assertIsNone(record.find_session(LOGIN, "owner"))
@@ -6425,7 +6569,7 @@ class RestartTests(ShutdownTestCase):
         for policy in ("user", "none"):
             with self.subTest(policy=policy):
                 missing = LegacyPeerRemoteControl(session_id="peer", name="Remote", alerts=policy)
-                with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "run_remote", return_value=(0, peer_json(missing=[missing]))), patch.object(settle, "alert_user") as alert, patch.object(remote_control, "launch_fixer") as fixer, redirect_stdout(io.StringIO()) as output:
+                with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "run_remote", return_value=(0, peer_json(missing=[missing]))), patch.object(settle, "alert_user", return_value=True) as alert, patch.object(remote_control, "launch_fixer") as fixer, redirect_stdout(io.StringIO()) as output:
                     self.assertEqual(restart.restart(restart.AccountNamed(LOGIN), dry_run=False, alerts=restart.AlertWhenNotBack()), 0)
                 self.assertNotIn("Remote Control", output.getvalue())
                 alert.assert_not_called()
@@ -6443,21 +6587,23 @@ class RestartTests(ShutdownTestCase):
 
     def test_peer_no_shutdown_refusal_keeps_line_without_alert(self) -> None:
         refusal = restart.RestartNoShutdown(kind="no shutdown", session_id="peer", name="Remote")
-        with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "run_remote", return_value=(1, peer_json(lines=[restart.refusal_line(refusal)], refused=[refusal]))), patch.object(settle, "alert_user") as alert, redirect_stdout(io.StringIO()) as output:
+        with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "run_remote", return_value=(1, peer_json(lines=[restart.refusal_line(refusal)], refused=[refusal]))), patch.object(settle, "alert_user", return_value=True) as alert, redirect_stdout(io.StringIO()) as output:
             self.assertEqual(restart.restart(restart.AccountNamed(LOGIN), dry_run=False, alerts=restart.AlertWhenNotBack(), only=["peer"]), 1)
         self.assertEqual(output.getvalue(), "Remote: no shutdown in progress\n")
         alert.assert_not_called()
 
-    def test_peer_refusal_beside_real_failure_alerts_only_the_failure(self) -> None:
+    def test_peer_refusal_and_failure_are_printed_without_a_caller_alert(self) -> None:
         refused = restart.RestartNotStopped(kind="not stopped", session_id="waiting", name="Waiting", progress="waiting")
         lines = [restart.refusal_line(refused), "Mac: Failed restart failed: not live"]
+        failed = entry(top_level("failed", name="Failed"))
+        failed["machine"] = "Mac"
         def remote(args: list[str], **_kwargs: object) -> tuple[int, str]:
-            return (0, "[]") if args[0] == "records" else (1, peer_json(outcome="partial", lines=lines, refused=[refused]))
-        with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "run_remote", side_effect=remote), patch.object(settle, "alert_user") as alert, redirect_stdout(io.StringIO()):
+            return (0, json.dumps([failed])) if args[0] == "records" else (1, peer_json(outcome="partial", lines=lines, refused=[refused]))
+        with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "run_remote", side_effect=remote), patch.object(settle, "alert_user", return_value=True) as alert, redirect_stdout(io.StringIO()) as output:
             self.assertEqual(restart.restart(restart.AccountNamed(LOGIN), dry_run=False, alerts=restart.AlertWhenNotBack()), 1)
-        alert.assert_called_once()
-        self.assertEqual(cast(RenderedPush, alert.call_args.args[0]).values["stopped"], "One session (Failed)")
-        self.assertNotIn("Waiting", cast(RenderedPush, alert.call_args.args[0]).body)
+        alert.assert_not_called()
+        self.assertIn(restart.refusal_line(refused), output.getvalue())
+        self.assertIn("Mac: Failed restart failed: not live", output.getvalue())
 
     def test_peer_result_refuses_old_output_and_invalid_nested_fields(self) -> None:
         valid = cast(dict[str, object], json.loads(peer_json()))

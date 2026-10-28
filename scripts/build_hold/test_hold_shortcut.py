@@ -190,6 +190,9 @@ for ((n=0; n<2000; n++)); do build_hold_nothing_held; done
         _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder", "holder"),
                                   "release test", build_hold.NoReleaseEta(), now)
         build_hold.record_recipients([("first", "first"), ("second", "second")])
+        # Waits keep both sessions in the release; a session only told would hold nothing.
+        for key in ("first", "second"):
+            _ = build_hold.register_wait(key)
         sleeps: list[float] = []
 
         def finish_turn(seconds: float) -> None:

@@ -273,6 +273,21 @@ class RuleTests(unittest.TestCase):
 
         self.assertEqual(str(raised.exception), f"{path}: tier D requires the modules family")
 
+    def test_approval_loads_always_with_the_rule_family_and_refuses_any_other_value(self) -> None:
+        _ = self.write_rule("asked", "tier: C\nfamily: names\n")
+        _ = self.write_rule("always", "tier: C\nfamily: types\napproval: always\n")
+        self.assertEqual({rule.name: rule.approval for rule in rules.load_rules(None)},
+                         {"asked": rules.UserApproves(), "always": rules.AlwaysApproved("types")})
+        for name, metadata, reason in (("typo", "tier: C\nfamily: names\napproval: alway\n", "approval must be always"),
+                                       ("blank", "tier: C\nfamily: names\napproval:\n", "approval must be a nonempty scalar"),
+                                       ("unclassified", "approval: always\n", "approval always requires a family")):
+            with self.subTest(name=name):
+                path = self.write_rule(name, metadata)
+                with self.assertRaises(rules.RuleValidationError) as raised:
+                    _ = rules.load_rules(None)
+                self.assertEqual(str(raised.exception), f"{path}: {reason}")
+                path.unlink()
+
     def test_local_tier_d_rule_rejects_the_types_family(self) -> None:
         repo = self.member_repo()
         local_dir = repo / "docs" / "style"

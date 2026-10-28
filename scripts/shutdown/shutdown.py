@@ -49,6 +49,7 @@ from launch_permission import (
     shutdown_state_root,
 )
 from record import (
+    CheckoutMove,
     InvalidRecord,
     SessionShutdown,
     ShutdownContinuation,
@@ -970,6 +971,8 @@ def main(arguments: list[str] | None = None) -> int:
     _ = origin.add_argument("--auto", action="store_true", help="move requested by an automatic account rule")
     _ = down.add_argument("--reset", action=AwareReset)
     _ = down.add_argument("--move-id", default="", help=argparse.SUPPRESS)
+    # rename.py checkout: the conductor moves the showrunner's checkout between its stop and its launch.
+    _ = down.add_argument("--checkout-move", nargs=2, metavar=("OLD", "NEW"), help=argparse.SUPPRESS)
     _ = down.add_argument("--why", default="", help="reason for the account move")
     _ = down.add_argument("--requested-by", help=argparse.SUPPRESS)
     _ = down.add_argument("--request-id", default="", help=argparse.SUPPRESS)
@@ -1028,7 +1031,7 @@ def main(arguments: list[str] | None = None) -> int:
     _ = up.add_argument("--only")
     _ = up.add_argument("--here", action="store_true")
     _ = up.add_argument("--json", action="store_true", dest="as_json")
-    # Read by nothing; an older peer still sends `up --no-alert`.
+    # The peer owns alert delivery for its local sessions.
     _ = up.add_argument("--no-alert", action="store_true", help=argparse.SUPPRESS)
     ownership = commands.add_parser("conductor-status")
     _ = ownership.add_argument("account")
@@ -1278,7 +1281,8 @@ def _dispatch(options: CommandLine) -> int:
 
     if options.command == "up":
         if options.as_json:
-            result = restart_work.up_result(options.account or "", options.dry_run, _only_ids(options.only))
+            result = restart_work.up_result(options.account or "", options.dry_run, _only_ids(options.only),
+                alerts=restart_work.NeverAlert() if options.no_alert else restart_work.AlertWhenNotBack())
             print(json.dumps(result, sort_keys=True))
             return 1 if result["outcome"] == "partial" or result["refused"] else 0
         return restart_work.up(options.account or "", options.dry_run, _only_ids(options.only))
@@ -1378,6 +1382,12 @@ def _dispatch(options: CommandLine) -> int:
                 print(f"shutdown: {error}", file=sys.stderr)
                 return 3
         if options.command == "down":
+            checkout_move: CheckoutMove | None = None
+            if moved := cast(list[str] | None, options.checkout_move):
+                if not (options.here and options.restart and len(ids) == 1 and not options.target):
+                    print("shutdown: --checkout-move needs --here, --restart and one --only session, without --to", file=sys.stderr)
+                    return 2
+                checkout_move = {"old": moved[0], "new": moved[1]}
             if isinstance(down_report, settle.InventoryNeeded):
                 down_report = inventory(selected.login)
             from scripts.accounts import accounts
@@ -1395,6 +1405,7 @@ def _dispatch(options: CommandLine) -> int:
                 requested_by=options.requested_by, request_id=options.request_id,
                 target=options.target, why=options.why, report=down_report,
                 origin=move_origin, move_id=options.move_id,
+                checkout_move=checkout_move,
             )
         if options.command == "now":
             return settle.now(selected, _stop_here(options, ids), ids)

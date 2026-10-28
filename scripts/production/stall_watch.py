@@ -613,7 +613,8 @@ def prompt_alert(slug: str, unit: str, pane: str, since: float, zone: ZoneInfo,
     rendered = push_texts.render(PROMPT_TEXT_ID, unit=unit.removesuffix("-unit"), machine=machine_name(),
                                  since=datetime.fromtimestamp(since, zone).strftime("%H:%M %Z"),
                                  request=prompt_request(pane, pending))
-    command = push_texts.user_send_argv(rendered, sender=SENDER, key=prompt_key(slug, unit))
+    # end_prompt() retires the alert when its prompt is gone.
+    command = push_texts.user_send_argv(rendered, sender=SENDER, key=prompt_key(slug, unit), self_clearing=True)
     # The send script is the one this watcher is set to use, so a test's stands in for it.
     return Delivery(prompt_path(slug, unit), "alert", [sys.executable, str(SEND), *command[2:]], report)
 
@@ -692,6 +693,11 @@ def tick(now: float) -> None:
     settings = showrunners.load_settings()
     rows = processes()
     pending: list[Delivery] = []
+    try:
+        runs = unit_lookup.read_run_states()
+    except (OSError, UnicodeError) as error:
+        print(f"stall-watch: units: their run state is unknown: {error}", file=sys.stderr)
+        return
     for configured in showrunners.registered_showrunners():
         # A showrunner that is not running has no one to tell: its units are not watched.
         showrunner_socket = configured["socket"]
@@ -714,11 +720,7 @@ def tick(now: float) -> None:
             continue
         for name, unit in marked.items():
             # A unit is watched while the newest /unit:direct run in its worktree is unfinished.
-            try:
-                running = name in live and unit_lookup.run_state(Path(live[name])) is unit_lookup.UnitState.RUNNING
-            except (OSError, UnicodeError) as error:
-                print(f"stall-watch: {name}: its run state is unknown: {error}", file=sys.stderr)
-                continue
+            running = name in live and runs.state(Path(live[name])) is unit_lookup.UnitState.RUNNING
             if not running:
                 if (retire := forget(slug, name)) is not None:
                     pending.append(retire)

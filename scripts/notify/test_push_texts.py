@@ -175,7 +175,7 @@ class PushTextTests(unittest.TestCase):
     def test_nate_adhoc_renders_without_a_header_line(self) -> None:
         push = push_texts.render("nate.adhoc", sender="natedev", title="the /nate skill is ready", description="It is ready now.")
         self.assertEqual(push.title, "natedev the /nate skill is ready")
-        self.assertEqual(push.message, "It is ready now.\n\nadhoc")
+        self.assertEqual(push.message, "It is ready now.")
 
     def test_auto_mode_refusal_keeps_the_user_approved_lines(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "auto_mode.refused")
@@ -363,3 +363,10 @@ class PushTextTests(unittest.TestCase):
                 continue
             findings.extend(f"{relative}:{line}: literal phone send; use push_texts.user_send_argv" for line in literal_delivery_calls(path.read_text()))
         self.assertEqual(findings, [])
+
+    def test_only_pushover_posts_to_pushover(self) -> None:
+        """pushover.post_message adds the "Sent by" and "Template" lines; no other script may post round it."""
+        found = [path.relative_to(ROOT).as_posix() for path in (ROOT / "scripts").rglob("*")
+                 if path.is_file() and "__pycache__" not in path.parts and not path.name.startswith("test_")
+                 and path.name != "pushover.py" and b"api.pushover.net" in path.read_bytes()]
+        self.assertEqual(found, [])

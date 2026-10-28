@@ -35,11 +35,12 @@ from target_config import ConfigError, read_targets
 
 
 BUILD_COMMANDS = frozenset({"cargo", "rustc", "cargo-nextest"})
+PROC_ROOT = Path("/proc")
 INSTANT = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})")
 SAFE = re.compile(r"[^A-Za-z0-9._-]")
-# The memory gate starts a step anyway at BUILDLOG_MEM_WAIT_LIMIT_S and then marks its return;
-# a memory wait ends as unanswered only this long after that limit.
-MEMORY_GATE_GRACE_S = 60
+# A memory wait holds the release this long, then counts as answered: the session's build is in the
+# memory gate, which never starts a build without memory and keeps it first in line.
+MEMORY_WAIT_TURN_S = 960
 NO_ADMISSION_ACK_S = 900
 # A release ends this long after it starts. Each session still unanswered then counts as released
 # and is named in the result: one silent session never holds every other build past it.
@@ -51,7 +52,7 @@ RELEASE_POLL_S = 15
 LOOKUP_TRIES = 3
 LOOKUP_RETRY_S = 1.0
 
-GateOutcome = Literal["Granted", "TimedOut", "MeminfoUnavailable"]
+GateOutcome = Literal["Granted", "TimedOut", "MeminfoUnavailable", "StillWaiting"]
 DeliveryOutcome = Literal["NotAttempted", "Delivered", "QueuedUnconfirmed", "RecipientGone", "DeliveryFailed"]
 
 
@@ -281,7 +282,7 @@ def read_release_state(entry: Mapping[str, object]) -> ReleaseState:
             return WaitingForMemory(instant("released_at"), instant("wait_started_at"))
         case "MemoryGateReturned":
             outcome = entry["outcome"]
-            if outcome not in {"Granted", "TimedOut", "MeminfoUnavailable"}:
+            if outcome not in {"Granted", "TimedOut", "MeminfoUnavailable", "StillWaiting"}:
                 raise ValueError(f"invalid gate outcome for {session_id}")
             return MemoryGateReturned(instant("wait_ended_at"), cast(GateOutcome, outcome))
         case "NothingToBuild":
@@ -325,19 +326,6 @@ class UnknownReleaseEta:
 
 
 ReleaseEta = KnownReleaseEta | UnknownReleaseEta
-
-
-@dataclass(frozen=True)
-class KnownCores:
-    count: int
-
-
-@dataclass(frozen=True)
-class UnknownCores:
-    pass
-
-
-Cores = KnownCores | UnknownCores
 
 
 @dataclass(frozen=True)
@@ -472,12 +460,23 @@ class Process:
     pid: int
     user: str
     command: str
+
+
+@dataclass(frozen=True)
+class ProcessCpuTime:
+    ticks: int
+    started_at_ticks: int
+
+
+@dataclass(frozen=True)
+class CurrentProcessCpu:
+    process: Process
     cpu_percent: float
 
 
 @dataclass(frozen=True)
 class Quiet:
-    pass
+    processes: tuple[Process, ...]
 
 
 @dataclass(frozen=True)
@@ -1315,10 +1314,16 @@ def socket_for(session_id: str) -> RecipientLive | RecipientGone | RecipientLook
 
 
 def send_release(entry: ReleaseEntry, socket: str) -> ReleaseDelivered | ReleaseQueued | ReleaseSendFailed:
+    """Send the release notice. A session that was only told of the hold, with no call or wait
+    pending, is told it may resume; nothing waits on its answer, so it is not asked for one."""
     script = Path(__file__).resolve().parent.parent / "message" / "send.py"
-    notice = ("/build:hold: your hold has been released. Start your next build or BRP launch now; its memory gate records admission. "
-              "With nothing to build, run python3 ~/.claude/scripts/build_hold/build_hold.py nothing-to-build now, so the release stops waiting for you. "
-              f"Session {entry['session_id']}.")
+    if not entry["active_call_id"] and not entry["session_pending"]:
+        notice = ("/build:hold: the build hold has been released; builds and BRP launches may resume. "
+                  f"The release does not wait for you, so no answer is needed. Session {entry['session_id']}.")
+    else:
+        notice = ("/build:hold: your hold has been released. Start your next build or BRP launch now; its memory gate records admission. "
+                  "With nothing to build, run python3 ~/.claude/scripts/build_hold/build_hold.py nothing-to-build now, so the release stops waiting for you. "
+                  f"Session {entry['session_id']}.")
     try:
         result = subprocess.run([sys.executable, str(script), "--to", f"uds:{socket}", "--text", notice], capture_output=True, text=True)
     except OSError as error:
@@ -1354,18 +1359,34 @@ def has_pending_call(entry: ReleaseEntry, generation: int) -> bool:
     return any(call["admitted_generation"] != generation for call in entry["calls"])
 
 
+def holds_release(entry: ReleaseEntry, generation: int) -> bool:
+    """Whether the release waits for this session: its turn is open and it has a build pending, from
+    a registered wait, a queued or active call, or a build in its memory gate. A session the hold
+    only told has none, so it never holds the release and owes no nothing-to-build."""
+    return in_progress(entry) and (bool(entry["active_call_id"]) or entry["session_pending"]
+                                   or has_pending_call(entry, generation)
+                                   or isinstance(read_release_state(entry), WaitingForMemory))
+
+
 def queue_told_sessions(cycle: HoldCycle) -> None:
-    """Every session the hold told gets its own release, registered or not, in the same pass as the rest."""
+    """Every session the hold told gets the release notice, registered or not, in the same pass as the rest.
+
+    Telling a session does not make it pending: only a registered wait (register_wait) or a queued
+    call does, so a session that never builds does not hold the release open (postmaster answered
+    40+ notices with nothing-to-build before 2026-10-27).
+    """
     entries = cycle["entries"]
     generation = cycle.get("holder_generation", 1)
     registered = {entry["session_id"] for entry in entries}
     for entry in entries:
         if (entry["session_id"] in cycle["recipients"] and not entry["session_id"].startswith("verify:")
-            and entry["delivery"]["generation"] != generation and not in_progress(entry)):
-            entry["session_pending"] = True
+            and entry["delivery"]["generation"] != generation and not holds_release(entry, generation)):
             store_release_state(entry, AwaitingRelease())
-    entries.extend(new_entry(session_id, name) for session_id, name in cycle["recipients"].items()
-                   if session_id not in registered and not session_id.startswith("verify:"))
+    for session_id, name in cycle["recipients"].items():
+        if session_id not in registered and not session_id.startswith("verify:"):
+            told = new_entry(session_id, name)
+            told["session_pending"] = False
+            entries.append(told)
 
 
 def not_reached_detail(cycle: HoldCycle) -> str:
@@ -1403,15 +1424,17 @@ def end_lapsed_turn(entry: ReleaseEntry, now: datetime, release_start: datetime,
                            else state.attempted_at if isinstance(state, DeliveryFailed) else release_start)
             deadline = released_at + timedelta(seconds=NO_ADMISSION_ACK_S)
         case WaitingForMemory(released_at=released_at, wait_started_at=wait_started_at):
-            limit_s = int(os.environ.get("BUILDLOG_MEM_WAIT_LIMIT_S", "900")) + MEMORY_GATE_GRACE_S
-            deadline = wait_started_at + timedelta(seconds=limit_s)
+            deadline = wait_started_at + timedelta(seconds=MEMORY_WAIT_TURN_S)
         case ReleasedAwaitingAdmission(released_at=released_at) | DeliveryQueued(attempted_at=released_at):
             deadline = released_at + timedelta(seconds=NO_ADMISSION_ACK_S)
         case _:
             return
     if now >= deadline:
         end_session_turn(entry, generation)
-        store_release_state(entry, NoAdmissionAck(released_at))
+        if isinstance(state, WaitingForMemory):
+            store_release_state(entry, MemoryGateReturned(now, "StillWaiting"))
+        else:
+            store_release_state(entry, NoAdmissionAck(released_at))
     elif (not entry["active_call_id"] and not isinstance(state, (RecipientGone, DeliveryFailed))
           and isinstance(socket_for(entry["session_id"]), RecipientGone)):
         entry["session_pending"] = False
@@ -1419,7 +1442,9 @@ def end_lapsed_turn(entry: ReleaseEntry, now: datetime, release_start: datetime,
 
 
 def release_entry(cycle: HoldCycle, entry: ReleaseEntry, clock: Callable[[], datetime]) -> None:
-    """Admit the session's next pending call, or its session wait, and send its release notice once per generation."""
+    """Admit the session's next pending call, or its session wait, and send its release notice once per
+    generation. A session with neither, that the hold told, gets the notice too; its open turn lets a
+    later call build at once, and it holds the release only once it has one (holds_release)."""
     generation = cycle.get("holder_generation", 1)
     pending_calls = sorted((call for call in entry["calls"] if call["admitted_generation"] != generation),
                            key=lambda call: not call["started"])
@@ -1432,7 +1457,6 @@ def release_entry(cycle: HoldCycle, entry: ReleaseEntry, clock: Callable[[], dat
         if entry["session_id"] not in cycle["recipients"] or entry["delivery"]["generation"] == generation:
             store_release_state(entry, NoPendingTurn())
             return
-        entry["session_pending"] = True
     entry["active_released_at"] = clock().isoformat()
     if entry["session_id"].startswith("verify:") or entry["delivery"]["generation"] == generation:
         store_release_state(entry, ReleasedAwaitingAdmission(clock()))
@@ -1510,7 +1534,7 @@ def advance_release(cycle: HoldCycle, now: datetime, *, clock: Callable[[], date
             save_cycle(cycle)
             release_entry(cycle, entry, clock)
     save_cycle(cycle)
-    waiting = [entry_text(entry) for entry in entries if in_progress(entry)]
+    waiting = [entry_text(entry) for entry in entries if holds_release(entry, generation)]
     if waiting:
         return False, "; ".join(waiting)
     if not cycle["recipients"] and (now - release_start).total_seconds() < NO_REGISTRATION_S:
@@ -1602,37 +1626,72 @@ def release_cycle(directory: Path, name: str, start: FirstRelease | ResumedRelea
         time.sleep(RELEASE_POLL_S)
 
 
-def quiet_verdict(load_1m: float, cores: Cores, processes: Sequence[Process], user: str) -> Quiet | Busy:
-    own = Counter(process.command for process in processes if process.user == user and process.command in BUILD_COMMANDS)
+def quiet_verdict(processes: Sequence[Process], user: str) -> Quiet | Busy:
+    builds = [process for process in processes if process.command in BUILD_COMMANDS]
     reasons: list[str] = []
-    if own:
-        reasons.append("your builds still running: " + ", ".join(f"{count} {command}" for command, count in sorted(own.items(), key=lambda item: (-item[1], item[0]))))
-    if isinstance(cores, UnknownCores):
-        reasons.append("core count unavailable, so the load limit cannot be judged")
-    elif load_1m >= cores.count / 4:
-        heaviest = sorted(processes, key=lambda process: process.cpu_percent, reverse=True)[:5]
-        running = ", ".join(f"{process.user} {process.command} {process.cpu_percent:g}%" for process in heaviest)
-        reasons.append(f"1-minute load {load_1m:g} is at or above {cores.count / 4:g}; heaviest: {running or 'none visible'}")
-    return Busy(tuple(reasons)) if reasons else Quiet()
+    for owner in sorted({process.user for process in builds}, key=lambda owner: (owner != user, owner)):
+        counts = Counter(process.command for process in builds if process.user == owner)
+        label = "your builds still running" if owner == user else owner
+        reasons.append(label + ": " + ", ".join(
+            f"{count} {command}" for command, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))))
+    if reasons:
+        return Busy(tuple(reasons))
+    return Quiet(tuple(processes))
 
 
 def read_processes() -> list[Process]:
-    output = subprocess.check_output(["ps", "-eo", "pid=,user:32=,pcpu=,comm="], text=True)
+    output = subprocess.check_output(["ps", "-eo", "pid=,user:32=,comm="], text=True)
     processes: list[Process] = []
     for line in output.splitlines():
-        parts = line.split(maxsplit=3)
-        if len(parts) == 4:
-            pid, user, cpu, command = parts
+        parts = line.split(maxsplit=2)
+        if len(parts) == 3:
+            pid, user, command = parts
             try:
-                processes.append(Process(int(pid), user, Path(command).name, float(cpu)))
+                processes.append(Process(int(pid), user, Path(command).name))
             except ValueError:
                 continue
     return processes
 
 
-def read_cores() -> Cores:
-    count = os.cpu_count()
-    return UnknownCores() if count is None else KnownCores(count)
+def read_process_cpu_times(processes: Sequence[Process], proc_root: Path) -> dict[int, ProcessCpuTime]:
+    readings: dict[int, ProcessCpuTime] = {}
+    for process in processes:
+        try:
+            # comm can contain spaces and closing parentheses; the remaining fields start at 3.
+            fields = (proc_root / str(process.pid) / "stat").read_text().rsplit(")", 1)[1].split()
+            readings[process.pid] = ProcessCpuTime(int(fields[11]) + int(fields[12]), int(fields[19]))
+        except (OSError, ValueError, IndexError):
+            continue
+    return readings
+
+
+def heaviest_processes(
+    processes: Sequence[Process],
+    *,
+    proc_root: Path = PROC_ROOT,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[CurrentProcessCpu, ...]:
+    if not processes:
+        return ()
+    ticks_per_second = os.sysconf("SC_CLK_TCK")
+    started = clock()
+    before = read_process_cpu_times(processes, proc_root)
+    sleep(1)
+    after = read_process_cpu_times(processes, proc_root)
+    elapsed = clock() - started
+    if elapsed <= 0:
+        return ()
+    usage: list[CurrentProcessCpu] = []
+    for process in processes:
+        if process.pid not in before or process.pid not in after:
+            continue
+        first, last = before[process.pid], after[process.pid]
+        if first.started_at_ticks != last.started_at_ticks or last.ticks <= first.ticks:
+            continue
+        percent = 100 * (last.ticks - first.ticks) / (elapsed * ticks_per_second)
+        usage.append(CurrentProcessCpu(process, percent))
+    return tuple(sorted(usage, key=lambda reading: reading.cpu_percent, reverse=True)[:5])
 
 
 def wait_for_quiet(
@@ -1640,8 +1699,6 @@ def wait_for_quiet(
     *,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
-    load: Callable[[], float] = lambda: os.getloadavg()[0],
-    cores: Callable[[], Cores] = read_cores,
     processes: Callable[[], Sequence[Process]] = read_processes,
     user: str | None = None,
 ) -> Quiet | Busy:
@@ -1650,7 +1707,7 @@ def wait_for_quiet(
     current_user = user or os.environ.get("USER", "")
     deadline = clock() + max_wait
     while True:
-        result = quiet_verdict(load(), cores(), processes(), current_user)
+        result = quiet_verdict(processes(), current_user)
         if isinstance(result, Quiet) or clock() >= deadline:
             return result
         sleep(min(10, max(0, deadline - clock())))
@@ -1723,7 +1780,9 @@ def main(arguments: list[str]) -> int:
             if isinstance(verdict, Busy):
                 print("; ".join(verdict.reasons))
                 return 1
-            print("builds are quiet; load is below the limit")
+            heaviest = heaviest_processes(verdict.processes)
+            running = ", ".join(f"{reading.process.user} {reading.process.command} {reading.cpu_percent:g}%" for reading in heaviest)
+            print(f"builds are quiet: no build runs. 1-minute load {os.getloadavg()[0]:g} is other work: {running or 'none visible'}")
         elif action == "release":
             given = cast(str | None, options.holder)
             resume_requested = cast(bool, options.resume)

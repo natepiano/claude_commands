@@ -882,6 +882,34 @@ STOPPED_RECORD = {"login": "owner@example.com", "then": "stop", "progress": {"ki
                               "host": {"kind": "unit", "production": SLUG, "unit": "alpha-unit"}}}
 
 
+class RunRecordLookupTests(unittest.TestCase):
+    def test_move_lookups_build_once_and_keep_exact_worktree_spelling(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        runs = root / "history/runs"
+        runs.mkdir(parents=True)
+        tree = root / "tree"
+        tree.mkdir()
+        alias = root / "alias"
+        alias.symlink_to(tree, target_is_directory=True)
+        for worktree, at in ((tree, 2), (alias, 1)):
+            events = [{"event_type": "run_started", "working_dir": str(worktree), "run_started_at": at}]
+            _ = (runs / f"{worktree.name}.jsonl").write_text(
+                "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+        with (mock.patch.dict(os.environ, {"UNIT_HISTORY_DIR": str(root / "history")}),
+              mock.patch.object(unit_lookup, "read_run_states", wraps=unit_lookup.read_run_states) as reads):
+            for lookup in (unit_move.newest_run, unit_move.open_run):
+                for worktree in (tree, alias, root / "absent"):
+                    with self.subTest(lookup=lookup.__name__, worktree=worktree):
+                        reads.reset_mock()
+                        expected = runs / f"{worktree.name}.jsonl" if worktree != root / "absent" else None
+                        self.assertEqual(lookup(worktree), expected)
+                        reads.assert_called_once_with()
+            with (runs / "alias.jsonl").open("a", encoding="utf-8") as handle:
+                _ = handle.write('{"event_type": "run_finished"}\n')
+            self.assertIsNone(unit_move.open_run(alias))
+            self.assertEqual(unit_move.newest_run(alias), runs / "alias.jsonl")
+
+
 class FakeProcess(NamedTuple):
     cwd: Path
     session: int

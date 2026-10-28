@@ -79,6 +79,19 @@ EFFORT_LEVELS = [
     "L: broad work with substantial coordination or integration, such as building the color picker widget or cable auto routing.",
     "XL: a multi-phase initiative or epic needing decomposition, such as a network-aware undo system or an AI graph builder with playback.",
 ]
+# Exact open vault filenames named in the rubric, excluded from evaluation.
+EFFORT_EXAMPLE_STEMS = frozenset({
+    "board prints pointer to its own json",
+    "0.20.0 - handle enum variant-index reflect path (bevy PR 23137)",
+    "NonZeroSize",
+    "anchor refresh wakes only for its panels",
+    "add gamepad camera modes to switcher",
+    "audit bevy migration impact",
+    "color picker widget",
+    "cable auto routing",
+    "implement network aware undo",
+    "ai graph builder with playback",
+})
 PRESSURE_LEVELS = [
     "The work can wait; delay has little material cost.",
     "Pressure is building; delay slowly raises cost or loses opportunity.",

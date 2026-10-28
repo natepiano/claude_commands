@@ -2446,37 +2446,68 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - Restarts launch in a pool: assert launched names with `assertCountEqual`.
 - Carried to Phase 88: F009 (a retried cleared-hold notice after a `QUEUED` result queues again; jobs have no name).
 
-### Phase 88 — A unit watchdog restarts any unit that is down, and a gate test rebuilds the 10-26 outage  · status: done
+### Phase 88 — A unit watchdog restarts any unit that is down, and a gate test rebuilds the 10-26 outage  · status: done (4b8cbb3e)
 
 **Depends on:** Phase 87
 
-#### Work Order
+#### As-built
 
-**Goal:** Whatever stops a unit (a move, a crash, a stale hold), it comes back with no user step. Showrunner, user go 10-26: a watchdog on a timer restarts a unit whose session is down without a stop the user asked for, on the group account, else the source; a phone alert goes only when both fail. A gate test rebuilds the 10-26 case and passes only when every unit runs again with no manual step. User: "Anything you have to use a memory for is not viable."
+- `scripts/accounts/unit_watchdog.py` runs from the two-minute notes timer on natedev. A unit that is down with no user or account stop and no work in progress gets one pass of grace, then a restart on its group account (`accounts.account_for_group_launch`), else its source account. Retired and finished units are skipped.
+- Restarts run detached (`systemd-run --user --no-block`, one 30 s deadline for all submissions per pass); the result is read on a later pass. A job is always consumed before a stale restart claim or a missing record can drop its outage. State: `~/.local/state/accounts/unit_watchdog.json`, results in `unit-watchdog-results`.
+- A crash in a live herdr host (registry not live, pane has no live agent: `restart.watchdog_crash_signal`) is saved as snapshot `crash: "agent exited"` (`record.mark_snapshot_agent_exited`); with an unreadable probe the watchdog keeps its own copy and restores it (`restore_snapshot_agent_exited`) once the exit is confirmed. The store entry always wins over the copy. Restart turns it into `AgentExitRecovery` with `last_seen` and names it in the prompt.
+- A queued restart checks its saved source under the restart claim (`RecoverySourceAuthorized` / `RecoverySourceChanged`); a newer stop or account hold stops the launch.
+- Alerts: the showrunner gets a line for each attempt. The phone gets one delivered alert per outage: `shutdown.move_failed` for a move record (shared `record.claim_restore_alert`; a failed push releases it, a live unit clears it), `shutdown.restart_failed` with a cause for a crash. A restore whose folder is gone (shutdown 61459ed7) ends the outage with one alert.
+- The gate test in `test_unit_watchdog.py` rebuilds 10-26: a stale stop hold on the target and the stopped units all come back.
 
-**Constraints:**
-- The notes timer (`agent-sessions-snapshot.timer`, every 2 min on natedev; the Mac has none) runs `whoami/agent_notes.py`, whose argument-free run calls `refusal_watch.run()` (~1176). The watchdog runs there, after the move passes, under the same lock. `production/stall_watch.py` belongs to other units: do not edit it.
-- Units that should run: each registered showrunner (`production/showrunners.py`) has a production doc; `production/live_units.py` (`production_units(doc)` → `LiveUnit(unit, session)`, states `live|stopped|unknown|gone`), `production_units.live_unit_table`, `unit_is_retired`, and `unit_lookup.run_state(worktree)` (`UnitState.RUNNING`) tell which units are in a run and whether their session is live. Read these; change them only if a defect blocks the watchdog.
-- Shutdown records (`shutdown/record.py`: `all_session_records`, `session_records(login)`, `lookup_account_hold`) and the recovery snapshot (`record.read_snapshot` / `all_snapshots`) say what stopped a unit. A user-asked stop is a record with `then: "stop"` whose `requested_by` is a session or a terminal; a stop the move system made has `then: "restart"`.
-- The restart path is `shutdown.py restart <login> --here --only <ids>` (Phase 87: skips the running, per-name errors), which covers both a record and a crash found in the recovery snapshot. A moved record already falls back to its source (Phase 87).
+#### Files
 
-**Spec:**
-1. `scripts/accounts/unit_watchdog.py` with one entry, `run(now, *, dry_run) -> list[str]`, called from `refusal_watch.run()` after the move passes. Natedev only (the role-map host); the Mac does nothing.
-2. Down unit: a non-retired unit in a running run (`RUNNING`) whose session is not live. Skip it when a shutdown record for its session is in progress (`waiting`, `ready`, `stopping`, `restarting`, `held by usage limit`, `reaping`), when a user-asked stop holds it (`then: "stop"` record, or an account hold with `then: "stop"` that `launch_permission` still reports in use), or when it was first seen down less than one pass ago. Keep first-seen times and alert state in `~/.local/state/accounts/unit_watchdog.json` (scratch in tests; atomic write).
-3. Restart: through `shutdown.py restart` on the group account (`accounts.group_accounts()["units"]`) for a unit with no move record, else the record's own login (the Phase 87 fallback then covers the source). If the group-account restart fails and the unit last ran on another account (record source or snapshot login), try that account once. Each pass tells the unit's showrunner one line per restart ("watchdog: <unit> was down since <time>; restarted on <account>"), through the existing showrunner message path, not a phone push.
-4. Both failing: one `shutdown.move_failed`-style user push per outage (reuse an existing push id from `notify/push_catalog.py`; add no new push text), sent once until the unit runs again; the showrunner gets a line every pass.
-5. F009 carried from Phase 87: the cleared-hold relay in `refusal_watch.py` builds its `quota_alert` jobs with an empty name, so a retry after a `QUEUED` result appends another copy. Name each job by the pending notice's stable identity and treat `QUEUED` as handed off (drop it from the pending file). Test with the real retry, delivery and enqueue functions and in-memory storage.
-6. Gate test `scripts/accounts/test_unit_watchdog.py`, scratch HOME and state dirs, fakes for every launch and send leaf:
-   - the 10-26 case: units on claude4 in a scratch production, a stale `then: "stop"` hold on claude2 whose requesting session is gone, then the auto group move claude4 → claude2 through `refusal_watch.run()`. With a fake launch that makes each started session live, every unit runs again on claude2 with no manual step, and the showrunner notice names the cleared hold;
-   - a hold still in use on claude2: the move stops nobody; then a unit's session dies (crash, no record), and the watchdog restarts it on claude4 after one pass of grace;
-   - a user-asked stop (`then: "stop"`, terminal origin) is never restarted; a retired unit and a finished run are never restarted;
-   - group account and source both refuse: one user push across three passes, a showrunner line each pass, and the push again only after the unit ran and went down again.
-7. Docs: `docs/accounts.md` (the watchdog: what it restarts, what it skips, where it alerts).
+`scripts/accounts/unit_watchdog.py` (new), `refusal_watch.py`, `scripts/shutdown/restart.py`, `record.py`, `session_types.py`; tests `test_unit_watchdog.py` (new), `test_refusal_watch.py`, `test_restart.py`, `test_record.py`; docs `docs/accounts.md`, `docs/as-built/shutdown-and-restart.md`.
 
-**Files:** `scripts/accounts/unit_watchdog.py` (new), `scripts/accounts/refusal_watch.py`, `scripts/accounts/test_unit_watchdog.py` (new), `scripts/accounts/test_refusal_watch.py`, `docs/accounts.md`.
+#### Gotchas
 
-**Workers:** 1 writer. impl owns all files.
+- Run the full merge gate after every origin merge: shutdown 61459ed7 (restore dropped when its folder is gone) turned five watchdog tests red only after the merge; give restored sessions a real scratch folder.
+- `test_launch_accounts` requires every Claude launcher to pick its account through `account_for_group_launch`, and `scripts/lib/test_user_zone` requires `astimezone(user_zone())`; neither is in the accounts suites, so run them.
+- Residual (fixed in Phase 89): a worker could deliver `move_failed` and a later missing-folder retry archived the record, so a second, different `restart_failed` push followed for that outage.
 
-**Verification:** `scripts.accounts.test_unit_watchdog scripts.accounts.test_refusal_watch scripts.accounts.test_accounts scripts.whoami.test_agent_notes scripts.whoami.test_quota_alert` with a scratch HOME; basedpyright 0/0 on changed Python files.
+### Phase 89 — One outage sends at most one phone push  · status: done (936445e3)
 
-**Acceptance gate:** the 10-26 gate test passes with no manual step; suites pass; basedpyright 0/0; merge gate passes.
+**Depends on:** Phase 88
+
+#### As-built
+
+- `scripts/accounts/outage_alerts.py` (new) is a per-session outage ledger in `~/.local/state/accounts/unit_outage_alerts.json`, under a file lock: `claim` → `delivered` or `release`, `reserve` for the sessions of one push, `clear` when the session is live. It survives the shutdown record's archive.
+- Every per-session outage push uses it: `settle.report_stop`, the `shutdown.py restart` CLI, the restart fallback and the watchdog's crash, move and missing-folder alerts (`restart.send_failure_pushes` is shared). A sender claims one push's sessions just before it sends, names only the sessions it holds, marks delivery only after a sent push and releases the claim otherwise.
+- A claim stores its owner pid and time; a dead owner or a claim older than 15 minutes is taken over with a new token, and the old token can no longer deliver or release.
+- The machine that owns a session sends its pushes: the peer's `up --here --json` run sends from its own ledger (unless `--no-alert`, which `shutdown.py` now forwards); the calling CLI only prints the peer's lines.
+- Every place that settles a record because its session is live clears the ledger: `clear_running_on_target`, `_record_timer_restore_progress`, `confirm_entry`, `_confirm_entries`, `settle._archive_finished`, the live skips in `launch_entry`/`relaunch_session`/`_up`, and the watchdog's live observation. `drop_restore_without_folder` keeps it. Phase 90 changed this: timer settlement and archives no longer clear, and each clear removes only alerts claimed before its observation.
+- Not per-session outage pushes, left outside the ledger: `restart_incomplete`, `shutdown.stop_failed`, the holdout notice.
+
+#### Files
+
+`scripts/accounts/outage_alerts.py` (new), `unit_watchdog.py`, `scripts/shutdown/restart.py`, `settle.py`, `shutdown.py`; tests `test_unit_watchdog.py`, `test_restart.py`, `test_settle.py`; docs `docs/accounts.md`, `docs/as-built/shutdown-and-restart.md`.
+
+#### Gotchas
+
+- Copying the record's `restore_alerted` mark into the watchdog outage fails both ways: an unfinished claim reads as delivered, and an archive before the next pass loses the mark. The ledger must be separate from the record.
+- Reserving all of a report's pushes up front lets a late claim pass its lease behind slow sends; claim per push.
+- Residual (fixed in Phase 90): a slow batch confirm could clear a newer outage's entry and allow a second push.
+
+### Phase 90 — A slow batch restart does not clear a newer outage's alert  · status: done (7e92e7b5)
+
+**Depends on:** Phase 89
+
+#### As-built
+
+- `outage_alerts.clear(session_id, observed_at)` removes only an alert claimed strictly before `observed_at`; an alert claimed at or after it belongs to a newer outage and stays. A delivered entry keeps its claim time. `clear` returns whether the outage ended, and the record mark `restore_alerted` is cleared only then.
+- Every live clear passes the time its liveness read started (`time.time()`): `_up`'s cached `live_ids`, the shared registry confirmation (`RegistryConfirmation.observed_at`, used by `confirm_entry`, `_confirm_entries` and `settle._confirm_relaunch_pass`), `clear_running_on_target`, the live skips in `launch_entry`/`relaunch_session`, the source fallback and the watchdog's probe.
+- Later timer settlement (`_record_timer_restore_progress`) and record archives (`_confirm_entries`, `settle._archive_finished`) no longer clear the ledger.
+
+#### Files
+
+`scripts/accounts/outage_alerts.py`, `unit_watchdog.py`, `scripts/shutdown/restart.py`, `settle.py`; tests `test_unit_watchdog.py`, `test_restart.py`, `test_settle.py`; docs `docs/accounts.md`, `docs/as-built/shutdown-and-restart.md`.
+
+#### Gotchas
+
+- A clear must use the time of the observation it acts on, never the time of the clear: a cached reading is old by the time a slow loop reaches it.
+- Known minor residual: an old alert claimed inside the one registry read that sees the unit live survives the clear; a new crash before the next watchdog live pass (about 2 minutes) then sends no push.
+- `scripts.agents.test_mesh_runs` `test_a_live_supervisor_is_not_ended` failed once under the full parallel gate and passed alone and on the rerun: a load flake outside this unit.

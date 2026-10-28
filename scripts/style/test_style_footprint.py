@@ -269,6 +269,11 @@ class StyleFootprintTests(unittest.TestCase):
         _ = self.commit()
         self.assertIn("check 6", self.assert_review(base))
 
+    def test_a_char_literal_with_a_unicode_or_byte_escape_is_one_literal(self) -> None:
+        tokens = style_footprint.tokens(r"const BAR: char = '\u{2580}'; const TAB: u8 = b'\x7f';")
+        self.assertEqual([token.value for token in tokens if token.kind == "literal"], [r"'\u{2580}'", r"b'\x7f'"])
+        self.assertNotIn("unknown", {token.kind for token in tokens})
+
     def test_erasing_a_parameter_captured_by_a_plain_or_raw_format_literal_requires_review(self) -> None:
         for literal in ('"{_input}"', '"{_input:04}"', 'r#"{_input}"#', 'r#"{_input:04}"#'):
             with self.subTest(literal=literal):

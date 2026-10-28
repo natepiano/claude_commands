@@ -3,14 +3,16 @@
 #
 # Work Orders list exact invocations of this script; the worker composes no
 # cargo flags and makes no scope choices. `check` pins lib and bin targets;
-# `test` selects the package's test targets, including examples with test = true.
+# `test` selects the package's test targets; examples are never test targets.
 # `build` builds one package's binaries, or one bin or example, so a smoke run
 # or live shot can launch it, and prints each binary's path.
 # `lint` runs clippy with --all-targets --all-features to match CI, and mend
 # also uses --all-targets. It checks TOML formatting with taplo at the workspace
 # root. `example` runs clippy on one named example while
 # iterating. `final` is the plan-final full gate, run by the unit director,
-# never by a phase worker.
+# never by a phase worker. It checks all targets, including examples, then
+# runs nextest with --tests so no example is linked. No tests are lost:
+# the scan first refuses examples that hold a test or set test = true.
 #
 # Package selection is always --workspace. Commands use default features unless
 # the Work Order supplies --features; `lint`'s clippy always uses all features.
@@ -27,22 +29,19 @@
 # with it. `test` builds the named package's test targets, plus workspace libs
 # when the package has a lib.
 #
-# rustdoc is the exception: `lint` documents only the members that differ from
-# HEAD, found here rather than named by the worker (CHANGED_MEMBERS_PY). A
-# workspace rustdoc starts one process per member at 1 to 5 GB each, and
-# overlapping runs ran natedev out of memory on 2026-09-30. Each distinct member
-# set pays its own dependency compile for that; the push gate still documents
-# the whole workspace.
+# `doc` documents the whole workspace with warnings denied, as the unit
+# director's last command before a Rust checkpoint. Workers may run it too.
+# Unlike lint stages, this phase check cannot be switched off in lint.conf.
+# A pass is stored in ~/.local/state/verify/doc_pass/<tree>.json, keyed by a
+# temporary index of all tracked and untracked, non-ignored working files.
+# The real index is unchanged. A tree changed during the run records nothing.
+# Records outlive worker sessions and are pruned after 14 days on each write.
 #
-# The lint stages — mend, fmt, clippy fix, fmt, clippy judgment, doc — use
-# config/lint.conf (edit it with /lint_config). One switch controls a check in
-# the lint CLI and every worker phase. `lint` also always runs taplo fmt --check at the
-# workspace root, using its taplo.toml. A phase runs all five; its unit director
-# runs the style review in the main review. A gated-off check
-# prints a SKIPPED line and the command still exits 0. Scope is never
-# configurable: the target pinning and the single package selection above are
-# correctness and cache constraints, not preferences. cargo check and cargo
-# nextest are never gated — a phase that compiles nothing has verified nothing.
+# The lint stages — mend, fmt, clippy fix, fmt, clippy judgment — use
+# config/lint.conf (edit it with /lint_config). Taplo fmt --check always runs
+# at the workspace root. A gated-off check prints a SKIPPED line and exits 0.
+# Scope is never configurable. cargo check, cargo nextest and the checkpoint
+# rustdoc check are correctness gates and cannot be switched off.
 #
 # A worker session remembers passes. With UNIT_RUN_DIR or
 # UNIT_SESSION_DIR set, a `test` or `lint` that exits 0 is recorded in
@@ -53,7 +52,9 @@
 # that differs from HEAD, so one lint record answers for each package. A
 # `test` key holds only the part of the tree its package is built from
 # (TREE_KEY_PY), so a second phase editing another member in the same worktree
-# neither drops the pass nor misses it. A `test --filter` key holds its names
+# neither drops the pass nor misses it. No key holds the files under the
+# session folder (--session-dir, UNIT_RUN_DIR) when it is inside the worktree:
+# the call writes its own log and board there while it runs. A `test --filter` key holds its names
 # sorted, each once, so one set of names finds one record whatever order a call
 # gives them in. The same call on the
 # same tree then prints that record and its log and exits 0 without the cargo
@@ -66,10 +67,10 @@
 # usage error, the sandbox or a kill. A lint failure is not recorded when the
 # third clippy fix and format pass still changed the tree. The judged tree is
 # the tree when the run starts, or for `lint` the tree invoke_clippy_fix and formatting leave
-# for clippy judgment and rustdoc. A run that ends on any other tree (for `test`,
+# for clippy judgment. A run that ends on any other tree (for `test`,
 # any other part of it the package is built from) records nothing: an edit
 # landed while it ran, and its verdict belongs to neither tree.
-# A run outside a worker session is never cached.
+# A test or lint run outside a worker session is never cached.
 # end_session.sh deletes the records when the run ends.
 #
 # Each record carries what a repeat would cost: the run's wall time minus
@@ -83,11 +84,14 @@
 # outlives the records; /verify_saved reports the time saved.
 #
 # Usage:
-#   verify.sh check <package>              fast compile feedback (workspace
-#                                          lib + bins)
+#   verify.sh check <package> [--keep-going]
+#                                          fast compile feedback (workspace
+#                                          lib + bins); --keep-going reads every
+#                                          crate's result past the first that fails
 #   verify.sh test <package>               the package's unit + integration tests
 #                                          (package targets; workspace libs if any);
 #                                          refuse examples that hold a test
+#                                          or set test = true
 #   verify.sh test <package> <int_test>    one named integration test target,
 #                                          for re-running it alone
 #   verify.sh test <package> --filter <name> [--filter <name> …]
@@ -106,19 +110,20 @@
 #                                          workspace taplo fmt --check,
 #                                          workspace clippy fix, fmt, then clippy
 #                                          judgment on all targets with all features
-#                                          (warnings denied), then
-#                                          rustdoc on the members that differ
+#                                          (warnings denied)
 #                                          — cargo stages gated by config/lint.conf;
 #                                          taplo always checks TOML formatting
 #   verify.sh lint --workspace [--check]   the same gate with fmt over all members;
 #                                          emits style-lint tool boundaries for records
 #                                          --check reports mend findings and checks
 #                                          formatting without applying fixes
-#   … [--features <list>]                  check, test, and lint accept one trailing
+#   verify.sh doc [--features <list>]      workspace rustdoc, warnings denied;
+#                                          mandatory before a Rust checkpoint,
+#                                          regardless of lint.conf; workspace
+#                                          feature names pass through unchanged
+#   … [--features <list>]                  check and test accept one trailing
 #                                          `--features a,b` when the Work Order names
-#                                          it. For lint, the list reaches mend and
-#                                          rustdoc; clippy always checks all features.
-#                                          Names without a `/` are qualified as
+#                                          it. Names without a `/` are qualified as
 #                                          <package>/<name>
 #   … --no-cache                           test and lint: run even when this
 #                                          exact call already passed (or lint
@@ -138,8 +143,11 @@
 #                                          binary's path (`binary: <path>`);
 #                                          an example's required features are
 #                                          turned on. Accepts --features <list>
-#   verify.sh final                        full workspace gate; refuse examples
-#                                          that hold a test (unit director only)
+#   verify.sh final                        full workspace gate (unit director only);
+#                                          check all targets; nextest uses --tests
+#                                          so no example is linked; refuse examples
+#                                          that hold a test or set test = true
+#                                          so no tests are lost
 #   verify.sh --session-dir <dir> …        any of the above inside a worker
 #                                          session; same as setting
 #                                          UNIT_SESSION_DIR=<dir>
@@ -337,7 +345,7 @@ while pending:
     if name in features and name not in enabled:
         enabled.add(name)
         pending += features[name]
-flags = {"bin": "--bin", "test": "--test", "example": "--example", "bench": "--bench"}
+flags = {"bin": "--bin", "test": "--test", "bench": "--bench"}
 shared = {
     (target["kind"][0], target["name"])
     for other in meta["packages"]
@@ -379,6 +387,9 @@ for package in packages:
     for target in package["targets"]:
         if "example" not in target["kind"]:
             continue
+        example_name = target["name"]
+        owner_package = package["name"]
+        manifest_path = package["manifest_path"]
         source = Path(target["src_path"])
         if source.name == "main.rs" and source.parent.parent.name == "examples":
             sources = sorted(source.parent.rglob("*.rs"))
@@ -387,20 +398,25 @@ for package in packages:
         for path in sources:
             for line_number, line in enumerate(path.read_text().splitlines(), 1):
                 if match := test_marker.match(line):
-                    offenders.append((target["name"], path, line_number, match.group(1), package["name"]))
+                    offenders.append((
+                        f"example {example_name} holds a test: {path}:{line_number} has {match.group(1)}, and examples carry no tests.",
+                        f"move it into {owner_package}\x27s src/ or tests/, or delete it.",
+                    ))
                     break
             else:
                 continue
             break
+        if target.get("test", False):
+            offenders.append((
+                f"example {example_name} sets test = true in {manifest_path}, and examples carry no tests.",
+                "remove test = true from its [[example]] entry.",
+            ))
 
-for index, (name, path, line_number, attribute, package_name) in enumerate(offenders):
+for index, (reason, fix) in enumerate(offenders):
     if index:
         print(file=sys.stderr)
-    print(
-        f"example {name} holds a test: {path}:{line_number} has {attribute}, and examples carry no tests.",
-        file=sys.stderr,
-    )
-    print(f"move it into {package_name}\x27s src/ or tests/, or delete it.", file=sys.stderr)
+    print(reason, file=sys.stderr)
+    print(fix, file=sys.stderr)
 if offenders:
     sys.exit(2)
 '
@@ -410,8 +426,7 @@ if offenders:
 # checkpoint, so HEAD is where the phase started and this is the whole phase's
 # work, not its last edit. A file belongs to the member whose folder holds it,
 # the deepest one when members nest; a file outside every member (the root
-# manifest, Cargo.lock, docs/) adds none. A non-empty argv[1] is always
-# included: --features names that package, so cargo needs it selected.
+# manifest, Cargo.lock, docs/) adds none. Used only for fmt scope.
 CHANGED_MEMBERS_PY='
 import json
 import os
@@ -441,7 +456,7 @@ roots = sorted(
 top = os.path.realpath(git("rev-parse", "--show-toplevel").strip())
 paths = git("-C", top, "diff", "--name-only", "--no-renames", "-z", "HEAD").split("\0")
 paths += git("-C", top, "ls-files", "--others", "--exclude-standard", "-z").split("\0")
-changed = {sys.argv[1]} if sys.argv[1] else set()
+changed = set()
 for path in filter(None, paths):
     full = os.path.join(top, path)
     for root, name in roots:
@@ -538,10 +553,18 @@ if package:
 # session working in it. Same paths: staged, unstaged, deleted, untracked.
 top = run("git", "--no-optional-locks", "rev-parse", "--show-toplevel").strip()
 status = run("git", "--no-optional-locks", "-C", top, "status", "--porcelain", "-z", "--untracked-files=all", "--no-renames")
-changed = sorted({entry[3:] for entry in status.split(b"\0") if len(entry) > 3})
+real_top = os.path.realpath(top)
+# The session folder of this run, when it is inside the worktree: verify.sh writes
+# its log and board there while the command runs, so they are not tree changes.
+own = tuple(
+    folder + b"/" for folder in (
+        os.path.relpath(os.path.realpath(os.fsencode(name)), real_top)
+        for name in {os.environ.get("UNIT_SESSION_DIR", ""), os.environ.get("UNIT_RUN_DIR", "")} if name
+    ) if not folder.startswith(b"..") and folder != b"."
+)
+changed = sorted({entry[3:] for entry in status.split(b"\0") if len(entry) > 3 and not entry[3:].startswith(own)})
 if package:
     built, members = package_roots(package)
-    real_top = os.path.realpath(top)
 
     def counts(path: bytes) -> bool:
         full = os.path.join(real_top, path)
@@ -633,7 +656,7 @@ qualify_features() {
     printf '%s' "$out"
 }
 
-# Optional trailing `--features <list>` on check, test, and lint. The Work Order
+# Optional trailing `--features <list>` on check and test. The Work Order
 # names the exact list; the worker still composes no flags of its own. Any
 # other leftover argument is a usage error rather than something to pass through.
 # The caller sets PKG before calling this.
@@ -788,6 +811,10 @@ VERIFY_ORIGINAL_ARGS=("$@")
 if [[ "${1:-}" == "--session-dir" ]]; then
     export UNIT_SESSION_DIR="${2:?verify.sh --session-dir <dir> <command> ...}"
     shift 2
+    # Test temp folders land in the run folder and end with it (tmp_sweep.py judges each entry).
+    if mkdir -p "${UNIT_SESSION_DIR}/tmp" 2>/dev/null; then
+        export TMPDIR="${UNIT_SESSION_DIR}/tmp"
+    fi
 fi
 
 # A Codex mesh worker's command dies with its turn, and a worker that waits on
@@ -977,6 +1004,79 @@ tree_key() {
     "$PY" -c "$TREE_KEY_PY" ${scope[@]+"${scope[@]}"} "${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh" \
         "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}" -- "${words[@]}" \
         <<< "${GATE_METADATA}" 2>/dev/null || true
+}
+
+# Git's own tree identity, including every non-ignored working file. Initialize
+# from the real index to retain tracked files even when they are now ignored.
+doc_tree() {
+    "$PY" - <<'PYDOC'
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import shutil
+
+with tempfile.TemporaryDirectory(prefix="verify-doc-", dir="/tmp") as temporary:
+    top = subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip()
+    original = Path(subprocess.check_output(["git", "rev-parse", "--git-path", "index"], text=True).strip())
+    private_index = Path(temporary) / "index"
+    if original.exists():
+        shutil.copyfile(original, private_index)
+    environment = {**os.environ, "GIT_INDEX_FILE": str(private_index)}
+    def git(*arguments: str) -> str:
+        return subprocess.check_output(["git", "-C", top, *arguments], env=environment, text=True).strip()
+    git("add", "-A", "--", ".")
+    print(git("write-tree"))
+PYDOC
+}
+
+doc_record() {
+    local current_tree
+    current_tree="$(doc_tree)" || return
+    if [[ "$current_tree" != "$DOC_TREE" ]]; then
+        echo 'verify.sh: the tree changed while doc ran; no doc pass record was written.'
+        return 0
+    fi
+    "$PY" - "$DOC_REPO_TOP" "$DOC_TREE" "$BUILDLOG_CALL_ID" <<'PYDOC'
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+
+records = Path.home() / ".local/state/verify/doc_pass"
+records.mkdir(parents=True, exist_ok=True)
+cutoff = time.time() - 14 * 24 * 60 * 60
+for old in records.glob("*.json"):
+    try:
+        if old.stat().st_mtime < cutoff:
+            old.unlink()
+    except FileNotFoundError:
+        pass
+record = dict(repo_top=str(Path(sys.argv[1]).resolve()), tree_id=sys.argv[2],
+              time=datetime.now(timezone.utc).isoformat(), call_id=sys.argv[3])
+with tempfile.NamedTemporaryFile(mode="w", dir=records, prefix=".doc-", delete=False) as output:
+    temporary = Path(output.name)
+    try:
+        json.dump(record, output)
+        output.flush()
+        os.fsync(output.fileno())
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+try:
+    temporary.replace(records / (sys.argv[2] + ".json"))
+    directory_fd = os.open(records, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+finally:
+    temporary.unlink(missing_ok=True)
+print("verify.sh: doc pass recorded for tree " + sys.argv[2])
+PYDOC
 }
 
 # note_event OUTCOME WAIT WALL BUILD SAVED STATUS: this call's one record in
@@ -1296,9 +1396,11 @@ route_test() {
 
 # Starts copy_watch.py beside the natedev step run() is about to start: while
 # the step compiles, it may run a copy of the same test on the Mac, and the
-# first result wins (see docs/as-built/mac-test-offload.md).
+# first result wins (see docs/as-built/mac-test-offload.md). Its folder sits in
+# the run's hold folder, so the EXIT trap removes both, and both names carry
+# the run's pid for tmp_sweep.py when a kill skips the trap.
 start_copy_watch() {
-    COPY_WATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-copy.XXXXXX")"
+    COPY_WATCH_DIR="$(mktemp -d "${HOLD_WAIT_DIR:-${TMPDIR:-/tmp}}/verify-copy.$$.XXXXXX")"
     VERIFY_STEP_INFO_FILE="$COPY_WATCH_DIR/step"
     local watch_args=(--info "$VERIFY_STEP_INFO_FILE" --result "$COPY_WATCH_DIR/result"
         --runner "$MAC_RUNNER" --settings "$MAC_LEAVE_SETTINGS"
@@ -1590,7 +1692,7 @@ if cache_lookup; then
     exit "${LOOKUP_STATUS}"
 fi
 
-HOLD_WAIT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-hold.XXXXXX")"
+HOLD_WAIT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-hold.$$.XXXXXX")"
 export BUILDLOG_HOLD_WAIT_FILE="$HOLD_WAIT_DIR/seconds"
 export BUILDLOG_HOLD_ADMISSION_FILE="$HOLD_WAIT_DIR/admission"
 export BUILDLOG_HOLD_STARTED_FILE="$HOLD_WAIT_DIR/started"
@@ -2037,12 +2139,8 @@ buildlog_wait_for_memory() {
         buildlog_release_memory 0
         acquire_token
         memory_wait=$BUILDLOG_MEM_WAIT_S
-        # The forced start counts the step's whole memory wait: a new full
-        # limit here made one step wait 15 min twice (2026-10-21).
-        limit="${BUILDLOG_MEM_WAIT_LIMIT_S:-900}"
-        [[ "$limit" =~ ^[0-9]+$ ]] || limit=900
-        BUILDLOG_MEM_WAIT_LIMIT_S=$(( limit > memory_wait ? limit - memory_wait : 0 )) \
-            buildlog_wait_for_memory_only "$@"
+        # The second pass keeps the step's place in the memory queue from its first wait.
+        BUILDLOG_MEM_WAIT_SINCE=$BUILDLOG_MEM_WAIT_FROM buildlog_wait_for_memory_only "$@"
         BUILDLOG_MEM_WAIT_S=$(( memory_wait + BUILDLOG_MEM_WAIT_S ))
         if [[ "$BUILDLOG_MEM_OUTCOME" == LeftQueue ]]; then
             if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then
@@ -2185,9 +2283,18 @@ case "$CMD" in
     check)
         PKG="${1:?verify.sh check <package>}"
         shift
-        take_features "$@"
+        KEEP_GOING=()
+        CHECK_ARGS=()
+        for word in "$@"; do
+            if [[ "$word" == --keep-going ]]; then
+                KEEP_GOING=(--keep-going)
+            else
+                CHECK_ARGS+=("$word")
+            fi
+        done
+        take_features "${CHECK_ARGS[@]}"
         require_member "$PKG"
-        run cargo check --workspace --lib --bins "${FEATURE_FLAGS[@]}"
+        run cargo check --workspace --lib --bins "${KEEP_GOING[@]}" "${FEATURE_FLAGS[@]}"
         ;;
     build)
         PKG="${1:?verify.sh build <package> [--bin <name> | --example <name>] [--release] [--features <list>]}"
@@ -2212,7 +2319,7 @@ case "$CMD" in
             CHECK_LINT=1
             shift
         fi
-        take_features "$@"
+        [[ $# -eq 0 ]] || { usage; exit 2; }
         if [[ "$PKG" != --workspace ]]; then
             require_member "$PKG"
         fi
@@ -2258,7 +2365,7 @@ case "$CMD" in
             fi
             exit "$lint_status"
         fi
-        # Order: mend, fmt, taplo, clippy fix, fmt, clippy judgment, rustdoc.
+        # Order: mend, fmt, taplo, clippy fix, fmt, clippy judgment.
         # Cargo stages are gated by lint.conf; the Taplo check always runs.
         # mend passes --all-targets because it needs the test and example
         # targets to see every import and visibility site. It covers the
@@ -2300,7 +2407,7 @@ case "$CMD" in
         else
             FMT_SCOPE=(-p "$PKG")
             FMT_MEMBERS="$(cargo metadata --no-deps --format-version 1 \
-            | "$PY" -c "$CHANGED_MEMBERS_PY" "")"
+            | "$PY" -c "$CHANGED_MEMBERS_PY")"
             while IFS= read -r member; do
                 if [[ -n "$member" && "$member" != "$PKG" ]]; then
                     FMT_SCOPE+=(-p "$member")
@@ -2360,24 +2467,22 @@ case "$CMD" in
         else
             invoke_clippy --workspace --all-targets --all-features
         fi
-        # Found after mend, so a member its --fix rewrote is documented too.
-        FEATURE_MEMBER=""
-        if [[ ${#FEATURE_FLAGS[@]} -gt 0 ]]; then
-            FEATURE_MEMBER="$PKG"
+        ;;
+    doc)
+        DOC_FEATURE_FLAGS=()
+        if [[ $# -eq 2 && "$1" == --features && -n "$2" ]]; then
+            DOC_FEATURE_FLAGS=(--features "$2")
+        elif [[ $# -ne 0 ]]; then
+            usage
+            exit 2
         fi
-        DOC_MEMBERS="$(cargo metadata --no-deps --format-version 1 \
-            | "$PY" -c "$CHANGED_MEMBERS_PY" "$FEATURE_MEMBER")"
-        DOC_SCOPE=()
-        while IFS= read -r member; do
-            if [[ -n "$member" ]]; then
-                DOC_SCOPE+=(-p "$member")
-            fi
-        done <<< "$DOC_MEMBERS"
-        if [[ ${#DOC_SCOPE[@]} -gt 0 ]]; then
-            invoke_doc "${DOC_SCOPE[@]}" "${FEATURE_FLAGS[@]}"
-        else
-            echo "verify.sh: no workspace member differs from HEAD; rustdoc skipped"
+        DOC_REPO_TOP="$(git rev-parse --show-toplevel)"
+        DOC_TREE="$(doc_tree)"
+        if ! lint_config_enabled doc; then
+            echo 'verify.sh: the phase rustdoc check cannot be switched off; ignoring doc=off.'
         fi
+        LINT_CONFIG_FORCE=1 invoke_doc --workspace "${DOC_FEATURE_FLAGS[@]}"
+        doc_record
         ;;
     example)
         PKG="${1:?verify.sh example <package> <name>}"
@@ -2398,7 +2503,7 @@ case "$CMD" in
         ;;
     final)
         run cargo check --workspace --all-targets
-        run_nextest --workspace
+        run_nextest --workspace --tests
         ;;
     *)
         usage

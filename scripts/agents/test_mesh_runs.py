@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import os
+import select
 import socket
 import subprocess
 import sys
@@ -138,10 +139,18 @@ class MeshRunsTests(unittest.TestCase):
         command line names mesh_runs.py supervise and the record, unless pid names another process."""
         path = self.record(command)
         if not pid:
-            stand_in = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "mesh_runs.py",
-                                         "supervise", str(path)], stdin=subprocess.DEVNULL)
+            stand_in = subprocess.Popen([sys.executable, "-c",
+                                         "import sys; print('ready', flush=True); sys.stdin.read()",
+                                         "mesh_runs.py", "supervise", str(path)],
+                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
             self.addCleanup(stand_in.wait)
             self.addCleanup(stand_in.kill)
+            assert stand_in.stdin is not None and stand_in.stdout is not None
+            self.addCleanup(stand_in.stdin.close)
+            self.addCleanup(stand_in.stdout.close)
+            # Wait for Python to start before the test reads the child's command line.
+            self.assertTrue(select.select([stand_in.stdout], [], [], 300)[0], "supervisor did not start")
+            self.assertEqual(stand_in.stdout.readline(), "ready\n")
             pid = stand_in.pid
         self.update_record(path, cwd=os.getcwd(), tree_key="key-1", pid=pid)
         return path

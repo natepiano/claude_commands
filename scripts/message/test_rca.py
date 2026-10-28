@@ -392,7 +392,7 @@ class RcaTests(unittest.TestCase):
             values = self.values(argv)
             rendered = push_texts.render(given["--text-id"], **values)
             return {"source": given["--from"], "priority": "0", "title": rendered.title, "message": rendered.body,
-                    "detail": "", "key": given.get("--key", "")}
+                    "detail": "", "key": given.get("--key", ""), "text_id": given["--text-id"]}
 
         def deliver(argv: list[str]) -> tuple[bool, str]:
             """send.py as rca.py runs it: a retire runs the real one; a push is kept, as pushover.py keeps it."""
