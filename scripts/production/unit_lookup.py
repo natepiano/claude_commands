@@ -87,17 +87,85 @@ def runs_dir() -> Path:
     return unit_runs.history_root() / "runs"
 
 
-def _events(path: Path) -> list[dict[str, object]]:
-    """A run record's events. A line caught half-written is left out; the next read has it."""
-    events: list[dict[str, object]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        try:
-            event = cast(object, json.loads(line))
-        except ValueError:
+class RunRecord(NamedTuple):
+    path: Path
+    state: UnitState
+
+
+class RunStates(NamedTuple):
+    # Keep the recorded spelling: unit_move matches working_dir exactly.
+    records: dict[str, RunRecord]
+
+    def state(self, worktree: Path) -> UnitState:
+        record = self.records.get(str(worktree.expanduser().resolve()))
+        return record.state if record is not None else UnitState.STANDING_BY
+
+
+class _StartedRun(NamedTuple):
+    at: float
+    path: Path
+
+
+def _event(line: str) -> dict[str, object] | None:
+    try:
+        event = cast(object, json.loads(line))
+    except ValueError:
+        return None
+    return cast(dict[str, object], event) if isinstance(event, dict) else None
+
+
+def _last_event(path: Path) -> dict[str, object] | None:
+    """Read backwards to the last JSON object, retaining lines across block boundaries."""
+    with path.open("rb") as handle:
+        position = handle.seek(0, os.SEEK_END)
+        pending = b""
+        block_size = 64 * 1024
+        while position:
+            size = min(position, block_size)
+            position -= size
+            _ = handle.seek(position)
+            lines = (handle.read(size) + pending).split(b"\n")
+            pending = lines.pop(0) if position else b""
+            for line in reversed(lines):
+                if not line.strip():
+                    continue
+                event = _event(line.decode("utf-8"))
+                if event is not None:
+                    return event
+            block_size *= 2
+    return None
+
+
+def read_run_states() -> RunStates:
+    """Snapshot newest runs once: each file's first line, then each newest file's last event.
+
+    Keys keep working_dir as recorded; state() looks up a resolved worktree path. Unreadable
+    records raise OSError, and invalid UTF-8 in the lines read raises UnicodeError.
+    """
+    directory = runs_dir()
+    if not directory.exists():
+        return RunStates({})
+    newest: dict[str, _StartedRun] = {}
+    for path in directory.iterdir():
+        if path.suffix != ".jsonl":
             continue
-        if isinstance(event, dict):
-            events.append(cast(dict[str, object], event))
-    return events
+        with path.open("rb") as handle:
+            first = _event(handle.readline().decode("utf-8"))
+        if first is None or first.get("event_type") != "run_started":
+            continue
+        worktree = first.get("working_dir")
+        if not isinstance(worktree, str) or not worktree:
+            continue
+        started = first.get("run_started_at")
+        at = float(started) if isinstance(started, (int, float)) and not isinstance(started, bool) else 0.0
+        if worktree not in newest or at > newest[worktree].at:
+            newest[worktree] = _StartedRun(at, path)
+    records: dict[str, RunRecord] = {}
+    for worktree, run in newest.items():
+        last = _last_event(run.path)
+        state = UnitState.RUN_FINISHED if last is not None and last.get("event_type") == "run_finished" else UnitState.RUNNING
+        records[worktree] = RunRecord(run.path, state)
+    return RunStates(records)
 
 
 def run_state(worktree: Path) -> UnitState:
@@ -106,25 +174,7 @@ def run_state(worktree: Path) -> UnitState:
     No record means the unit has started no run, so it is standing by. Raises OSError when the
     records cannot be read, which says nothing about the unit.
     """
-    directory = runs_dir()
-    if not directory.exists():
-        return UnitState.STANDING_BY
-    wanted = str(worktree.expanduser().resolve())
-    newest: tuple[float, list[dict[str, object]]] | None = None
-    for path in directory.iterdir():
-        if path.suffix != ".jsonl":
-            continue
-        events = _events(path)
-        first = events[0] if events else {}
-        if first.get("event_type") != "run_started" or first.get("working_dir") != wanted:
-            continue
-        started = first.get("run_started_at")
-        at = float(started) if isinstance(started, (int, float)) and not isinstance(started, bool) else 0.0
-        if newest is None or at > newest[0]:
-            newest = (at, events)
-    if newest is None:
-        return UnitState.STANDING_BY
-    return UnitState.RUN_FINISHED if newest[1][-1].get("event_type") == "run_finished" else UnitState.RUNNING
+    return read_run_states().state(worktree)
 
 
 def sessions_dir() -> Path:
