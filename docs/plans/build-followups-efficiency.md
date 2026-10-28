@@ -58,30 +58,23 @@ The two hana proposals in the same request went to hana's production (assembly-u
 **Ruled out:** a git commit-msg hook (it needs an install in each repo); rustdoc on changed members only (a change in one member can break the intra-doc links of another member).
 
 ### Phase 2 — `verify.sh final` stops linking examples  · status: done
-**Depends on:** Phase 1 (same file, `scripts/direct/verify.sh`)
 
-#### Work Order
+#### As-built
 
-**Goal:** `verify.sh final` no longer builds and links workspace examples, and every example is still compiled at the final gate.
+- `verify.sh final` runs `cargo check --workspace --all-targets`, then `run_nextest --workspace --tests`. The check type-checks every example once; the test build no longer builds and links them again. `--tests` selects every target with `test = true`: by default each lib, bin and integration test. `--lib` is not passed: cargo stops with "no library targets found" (exit 101) in a workspace with no library.
+- `UNTESTED_EXAMPLES_PY` runs before any build for `final` and `verify.sh test <package>`. It refuses (exit 2) an example that holds a test, and an example whose metadata `test` is true: `example <name> sets test = true in <manifest>, and examples carry no tests.` then `remove test = true from its [[example]] entry.` One example can get both refusals, the test one first. So no test is lost, and `--tests` selects no example.
+- `TEST_TARGETS_PY` no longer selects examples for the `test` verb.
+- `commands/unit/checkpoint.md` states the hook's rules: any `checkpoint(` text after quote removal makes every commit in the call a checkpoint, and `--git-dir`/`--work-tree`/`GIT_DIR=`-style overrides and unresolved `-C` directories are refused.
 
-**Spec:**
-- Showrunner and hana request, 2026-10-27: `final` runs `cargo check --workspace --all-targets` and `run_nextest --workspace`. nextest's default target selection follows `cargo test`, so it builds and links every example; hana has 3. Pass `--tests` to the nextest run in `final` (`run_nextest --workspace --tests`) so examples are not linked. `--tests` selects every target with `test = true`: by default each lib, bin and integration test. Do not add `--lib`: it fails with "no library targets found" in a workspace with no library (review round 1). No test is lost: `final` first runs `UNTESTED_EXAMPLES_PY` (near line 1660) and exits 2 when any example holds a test.
-- The same scan also refuses an example that sets `test = true` (its metadata `test` is true), exit 2 before any build: `example <name> sets test = true in <manifest>, and examples carry no tests.` then `remove test = true from its [[example]] entry.` Such an example holds no test, so `--tests` would link it for nothing. Hana has two, left from its phase 15 (review round 1; the hana owner removes them). `TEST_TARGETS_PY` stops selecting examples, and the header line for `test` stops naming them.
-- Examples stay compiled. `final`'s `cargo check --workspace --all-targets` type-checks every example at the final gate; leave it as it is. In a phase with Rust changes and clippy enabled, `verify.sh lint`'s `invoke_clippy --workspace --all-targets --all-features` also type-checks every example. Do not change the switch policy.
-- Update `final`'s header and usage text (near line 143) to say its nextest run skips example targets and why no test is lost.
-- Procedure text for the checkpoint hook: in `commands/unit/checkpoint.md`, say that the hook treats a call as a checkpoint when its text holds `checkpoint(` anywhere after quote removal (a body line or an example counts too), and that it refuses `--git-dir`/`--work-tree`/`GIT_DIR=`-style overrides and `-C` directories it cannot resolve (shell expansion, glob). Each refusal names the fix. Check the wording against `scripts/hooks/test_checkpoint_doc_gate.py`.
-- Measurement (unit director, after the phase lands): on `~/rust/hana`, same tree, compare `final` with the installed verifier (`~/.claude/scripts/direct/verify.sh`, links examples) against the worktree verifier. Before each run, touch the same workspace source file so both rebuild the same set. Take wall time and build time from the build log (`~/.local/state/buildlog/index.sqlite`, table `steps`); report memory-gate and build-lock waits separately from build time. Record before and after in this plan's as-built and in the efficiency line of `~/.local/state/nightly-review/ledger.md`. Memory-gate repairs are outside this phase (sent to the showrunner 2026-10-27).
+**Measured** (2026-10-28, hana init/catalyst 48dd8e2209, 84 examples in 27 packages, natedev, same file touched before each run): the test build fell from 1,051 build units to 942, and its log holds no example unit. Timing gave no valid result. Load average was 180–220, both test runs stopped early on different failing hana tests, and each step waited about 900 s on the memory gate. Under that load, the test-profile build took 22 min 21 s before and 26 min 51 s after, which is noise. A clean timing needs a quiet natedev under a build hold.
 
 **Files:**
-- `scripts/direct/verify.sh` — `final` nextest target selection, and its header and usage text
+- `scripts/direct/verify.sh` — `final`'s nextest selection, the example scan, `TEST_TARGETS_PY`, header and usage text
+- `scripts/direct/test_verify_final_targets.py` (new), `scripts/direct/test_verify_untested_examples.py` — target selection, the no-library workspace, and the `test = true` refusals
 - `commands/unit/checkpoint.md` — the hook's recognition and refusal rules
-- `scripts/direct/test_verify_final_targets.py` — new: `final` passes `--tests` to nextest; passes in a workspace with no library; still runs `cargo check --workspace --all-targets`; a failed check stops before nextest; an example with a test or with `test = true` exits 2 before any build
-- `scripts/direct/test_verify_untested_examples.py` — its exact `nextest run --workspace` assertion (near line 377) takes the new flags
 
-**Workers:** 1 writer + 1 tester.
-- `impl` — `scripts/direct/verify.sh`, `commands/unit/checkpoint.md`
-- `test` — `scripts/direct/test_verify_final_targets.py`, `scripts/direct/test_verify_untested_examples.py`
+**Gotchas:**
+- hana main and bevy_hana keep two `test = true` example lines (fairy_dust:21, hana_clerestory:22) until hana's next main promotion, so their `final` and `test` runs refuse until then. A search for `test = true` misses hana_clerestory's, which pads the `=`; search with `test *= *true`.
+- A hana build outside its checkout needs its flake shell (`direnv exec <hana checkout> …`), or mold fails with "library not found: gbm".
 
-**Constraints from prior phases:** Phase 1 owns the `doc` verb, `doc_tree`, `doc_record`, the `doc` usage lines and `lint`'s refusal of `--features` in the same file; keep them unchanged, and keep `scripts/direct/test_verify_doc.py`, `scripts/direct/test_verify_lint_scope.py` and `scripts/hooks/test_checkpoint_doc_gate.py` green. This repository has no `Cargo.toml`: its checkpoint needs the own-call rule but no doc record.
-
-**Acceptance gate:** the gate passes, basedpyright is clean on the touched files, and the measured before and after times are recorded in the plan and the efficiency ledger line.
+**Ruled out:** `--lib --bins --tests` (fails with no library); exact per-target selection from metadata (more code, and `--bins` still links `test = false` bins).
