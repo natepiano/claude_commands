@@ -57,7 +57,7 @@ The two hana proposals in the same request went to hana's production (assembly-u
 
 **Ruled out:** a git commit-msg hook (it needs an install in each repo); rustdoc on changed members only (a change in one member can break the intra-doc links of another member).
 
-### Phase 2 — `verify.sh final` stops linking examples  · status: todo
+### Phase 2 — `verify.sh final` stops linking examples  · status: done
 **Depends on:** Phase 1 (same file, `scripts/direct/verify.sh`)
 
 #### Work Order
@@ -65,7 +65,8 @@ The two hana proposals in the same request went to hana's production (assembly-u
 **Goal:** `verify.sh final` no longer builds and links workspace examples, and every example is still compiled at the final gate.
 
 **Spec:**
-- Showrunner and hana request, 2026-10-27: `final` runs `cargo check --workspace --all-targets` and `run_nextest --workspace`. nextest's default target selection follows `cargo test`, so it builds and links every example; hana has 3. Pass `--lib --bins --tests` to the nextest run in `final` (`run_nextest --workspace --lib --bins --tests`) so examples are not linked. No test is lost: `final` first runs `UNTESTED_EXAMPLES_PY` (near line 1660) and exits 2 when any example holds a test.
+- Showrunner and hana request, 2026-10-27: `final` runs `cargo check --workspace --all-targets` and `run_nextest --workspace`. nextest's default target selection follows `cargo test`, so it builds and links every example; hana has 3. Pass `--tests` to the nextest run in `final` (`run_nextest --workspace --tests`) so examples are not linked. `--tests` selects every target with `test = true`: by default each lib, bin and integration test. Do not add `--lib`: it fails with "no library targets found" in a workspace with no library (review round 1). No test is lost: `final` first runs `UNTESTED_EXAMPLES_PY` (near line 1660) and exits 2 when any example holds a test.
+- The same scan also refuses an example that sets `test = true` (its metadata `test` is true), exit 2 before any build: `example <name> sets test = true in <manifest>, and examples carry no tests.` then `remove test = true from its [[example]] entry.` Such an example holds no test, so `--tests` would link it for nothing. Hana has two, left from its phase 15 (review round 1; the hana owner removes them). `TEST_TARGETS_PY` stops selecting examples, and the header line for `test` stops naming them.
 - Examples stay compiled. `final`'s `cargo check --workspace --all-targets` type-checks every example at the final gate; leave it as it is. In a phase with Rust changes and clippy enabled, `verify.sh lint`'s `invoke_clippy --workspace --all-targets --all-features` also type-checks every example. Do not change the switch policy.
 - Update `final`'s header and usage text (near line 143) to say its nextest run skips example targets and why no test is lost.
 - Procedure text for the checkpoint hook: in `commands/unit/checkpoint.md`, say that the hook treats a call as a checkpoint when its text holds `checkpoint(` anywhere after quote removal (a body line or an example counts too), and that it refuses `--git-dir`/`--work-tree`/`GIT_DIR=`-style overrides and `-C` directories it cannot resolve (shell expansion, glob). Each refusal names the fix. Check the wording against `scripts/hooks/test_checkpoint_doc_gate.py`.
@@ -74,7 +75,7 @@ The two hana proposals in the same request went to hana's production (assembly-u
 **Files:**
 - `scripts/direct/verify.sh` — `final` nextest target selection, and its header and usage text
 - `commands/unit/checkpoint.md` — the hook's recognition and refusal rules
-- `scripts/direct/test_verify_final_targets.py` — new: `final` passes `--lib --bins --tests` to nextest; still runs `cargo check --workspace --all-targets`; a failed check stops before nextest; an example with a test still exits 2 before any build
+- `scripts/direct/test_verify_final_targets.py` — new: `final` passes `--tests` to nextest; passes in a workspace with no library; still runs `cargo check --workspace --all-targets`; a failed check stops before nextest; an example with a test or with `test = true` exits 2 before any build
 - `scripts/direct/test_verify_untested_examples.py` — its exact `nextest run --workspace` assertion (near line 377) takes the new flags
 
 **Workers:** 1 writer + 1 tester.
