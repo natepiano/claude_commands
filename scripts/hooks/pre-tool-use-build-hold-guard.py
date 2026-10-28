@@ -16,7 +16,7 @@ from tool_call_text import HookPayload, scan_text
 
 CANDIDATE = re.compile(r"\b(?:cargo|verify\.sh)\b")
 CARGO_BUILDS = frozenset({"build", "b", "check", "c", "clippy", "test", "t", "nextest", "run", "r",
-                          "bench", "doc", "d", "rustc", "rustdoc", "fix", "install"})
+                          "bench", "doc", "d", "rustc", "rustdoc", "fix", "install", "mend", "miri"})
 VERIFY_BUILDS = frozenset({"check", "lint", "build", "doc", "clippy"})
 PREFIXES = frozenset({"env", "sudo", "exec", "command", "nohup", "time", "timeout", "nice",
                       "!", "{", "then", "else", "do", "if", "while", "until"})
@@ -71,6 +71,8 @@ def builds(words: list[str]) -> bool:
         return any("c" in option and building_command(script)
                    for option, script in zip(arguments, arguments[1:]) if option.startswith("-"))
     if program == "verify.sh":
+        while arguments and arguments[0].startswith("-"):
+            arguments = arguments[2:] if arguments[0] == "--session-dir" else arguments[1:]
         return bool(arguments and arguments[0] in VERIFY_BUILDS)
     if program != "cargo":
         return False

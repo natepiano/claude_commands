@@ -17,11 +17,18 @@ from scripts.build_hold.test_hold_applies import REFUSAL, TemporaryHoldTest
 HOOK = Path(__file__).with_name("pre-tool-use-build-hold-guard.py")
 FRONT = HOOK.with_suffix(".sh")
 CARGO_BUILDS = ("build", "b", "check", "c", "clippy", "test", "t", "nextest", "run", "r",
-                "bench", "doc", "d", "rustc", "rustdoc", "fix", "install")
+                "bench", "doc", "d", "rustc", "rustdoc", "fix", "install", "mend", "miri")
 VERIFY_BUILDS = ("check", "lint", "build", "doc", "clippy")
 
 
-class BuildHoldGuardTest(TemporaryHoldTest):
+class TemporaryGuardTest(TemporaryHoldTest):
+    @override
+    def setUp(self) -> None:
+        with mock.patch("tempfile.tempdir", str(HOOK.resolve().parents[2])):
+            super().setUp()
+
+
+class BuildHoldGuardTest(TemporaryGuardTest):
     def run_hook(self, command: str, tool: str = "Bash", session: str = "caller") -> str:
         payload = {"session_id": session, "tool_name": tool, "tool_input": {"command": command}}
         done = subprocess.run(["bash", str(FRONT)], input=json.dumps(payload),
@@ -47,8 +54,9 @@ class BuildHoldGuardTest(TemporaryHoldTest):
         self.hold()
         for verb in VERIFY_BUILDS:
             for path in ("verify.sh", "~/.claude/scripts/direct/verify.sh"):
-                with self.subTest(verb=verb, path=path):
-                    self.assert_denied(f"{path} {verb}")
+                for options in ("", '--session-dir "check session" ', "--session-dir=run "):
+                    with self.subTest(verb=verb, path=path, options=options):
+                        self.assert_denied(f"{path} {options}{verb} x")
 
     def test_paths_prefixes_and_compound_commands(self) -> None:
         self.hold()
@@ -59,13 +67,17 @@ class BuildHoldGuardTest(TemporaryHoldTest):
                         "bash ~/.claude/scripts/direct/verify.sh lint", "bash -lc 'cargo test'",
                         "if true; then cargo build; fi", "(cargo build)", "cargo fmt | cargo test",
                         "cargo \\\nbuild", "timeout 600 cargo test", "sudo -u user cargo build",
-                        "nice -n 10 cargo check", "bash <<'EOF'\ncargo build\nEOF\n"):
+                        "nice -n 10 cargo check", "bash <<'EOF'\ncargo build\nEOF\n",
+                        "cargo miri test", "cargo +nightly miri test",
+                        "verify.sh --session-dir run check x", "bash verify.sh --session-dir run check x"):
             with self.subTest(command=command):
                 self.assert_denied(command)
 
     def test_non_building_calls_are_allowed(self) -> None:
         self.hold()
         for command in ("verify.sh test", "verify.sh test package", "verify.sh status", "verify.sh help",
+                        "verify.sh --session-dir run test x", 'verify.sh --session-dir "check" test x',
+                        "verify.sh --session-dir=check test x", "verify.sh --session-dir",
                         "verify.sh", "cargo metadata", "cargo +nightly metadata", "cargo fmt", "cargo tree",
                         "cargo clean", "cargo --version", "cargo help build", "echo 'cargo build'",
                         "printf '%s' 'verify.sh check'", "rg 'cargo build' .", "# cargo build\npwd",
@@ -151,7 +163,7 @@ class BuildHoldGuardTest(TemporaryHoldTest):
             self.assertEqual(done.stdout, "")
 
 
-class ShellFrontTest(TemporaryHoldTest):
+class ShellFrontTest(TemporaryGuardTest):
     front: Path = Path()
     calls: Path = Path()
     stdin_copy: Path = Path()
