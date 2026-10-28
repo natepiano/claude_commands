@@ -100,6 +100,18 @@ class RefusalTest(unittest.TestCase):
         _ = (self.repo / "base.py").write_text("changed", encoding="utf-8")
         self.assertIn("no Change-Review line", self.refused('git commit -am "checkpoint(u): grid"'))
 
+    def test_attached_directory_options_review_the_target_index(self) -> None:
+        target = self.repo / "target-repo"
+        target.mkdir()
+        _ = subprocess.run(["git", "-C", str(target), "init", "-q"], capture_output=True, check=True)
+        _ = (target / "notes.md").write_text("notes", encoding="utf-8")
+        _ = subprocess.run(["git", "-C", str(target), "add", "notes.md"], capture_output=True, check=True)
+        for option in (f'-C"{target}"', f"-C'{target}'", f"-C{target}"):
+            self.assertEqual(self.refused(f'git {option} commit -m "checkpoint(u): notes"'), "")
+        _ = (target / "code.py").write_text("changed", encoding="utf-8")
+        _ = subprocess.run(["git", "-C", str(target), "add", "code.py"], capture_output=True, check=True)
+        self.assertIn("no Change-Review line", self.refused(f'git -C"{target}" commit -m "checkpoint(u): code"'))
+
 
 class HookTest(unittest.TestCase):
     """Run as Claude Code runs it: a refusal is a deny, and a broken payload never blocks."""

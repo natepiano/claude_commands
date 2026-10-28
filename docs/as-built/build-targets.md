@@ -60,7 +60,7 @@ Every command decides "held" through `target_state` and reads admission through 
 
 ### Where a job runs: `scripts/direct/verify.sh`
 
-- `check`, `lint`, `example` and `final` run on natedev only. Only `test` routes.
+- `check`, `build`, `lint`, `doc`, `example` and `final` run on natedev only. Only `test` routes.
 - `route_test` runs after the per-call wait files and cleanup trap exist, and before the per-call `wait-local` and the cargo token. It reads the `eligible` table and records an excluded Mac at once (`BUILDLOG_MAC=declined`, and its reason in `BUILDLOG_MAC_REASON` and `BUILDLOG_LOCAL_REASON` unless `--local` was given), also when `offload.py` is never called. It then visits the eligible targets in config order:
   - natedev: `build_hold_check_admission`. Exit 0 sends the test to natedev with no further routing. Exit 10 or 12 goes on to the next target, so a filtered test can still pass on the Mac when natedev's hold state cannot be read.
   - an `ssh` target: `try_mac_test <settings>` runs `offload.py run --settings <path>`. A `busy` or `blocked` decline puts the target on the retry list. A pass ends the call: it prints `verify.sh: PASS on the Mac (macOS), so nothing ran on natedev.`, records `passed_full` or `passed_filter` with a `host=mac` pass record, and exits 0. A failure exits with the Mac's status. A lost run or any other decline ends the Mac tries and the test waits for natedev.
@@ -131,7 +131,7 @@ Each command shows its script's output unchanged; each script answers in about a
 
 ## Invariants
 
-- Linux stays the gate. A full `verify.sh test` that passed on the Mac still confirms on natedev, and that confirmation waits out a natedev hold. `check`, `lint`, `example` and `final` never leave natedev.
+- A Mac pass or failure ends a `verify.sh test` call (`passed_full`, `passed_filter`, `failed`; since 2026-10-16 natedev does not confirm it). CI's Linux jobs catch a Linux-only failure. `check`, `build`, `lint`, `doc`, `example` and `final` never leave natedev.
 - natedev's own limits are unchanged: the memory gate, the cargo token, build-folder turns.
 - A job never runs on a held target and never falls back to one. When every eligible target is held or full it waits and says what it is waiting on.
 - Code that picks a target counts `StateUnreadable` and `Held(end=AwaitingBlockRemoval)` as not free, and every reader of `TargetState` handles all five cases.
@@ -147,7 +147,7 @@ Each command shows its script's output unchanged; each script answers in about a
 
 ## Calibration / gotchas
 
-- Numbers: poll 15 s (`BUILD_TARGETS_POLL_S`, `RELEASE_POLL_S`; local waits wake earlier on a release, see [merge-gate-and-test-speed.md](merge-gate-and-test-speed.md)); escalation 2 h (`BUILD_TARGETS_ESCALATE_S`); silent turn 900 s; memory wait `BUILDLOG_MEM_WAIT_LIMIT_S` plus `MEMORY_GATE_GRACE_S` (60 s); session lookup `LOOKUP_TRIES` 3, `LOOKUP_RETRY_S` 1 s. A release lasts about 1,860 s (900 s to admission plus a 960 s memory wait) times the most calls one session had queued when it began.
+- Numbers: poll 15 s (`BUILD_TARGETS_POLL_S`, `RELEASE_POLL_S`; local waits wake earlier on a release, see [merge-gate-and-test-speed.md](merge-gate-and-test-speed.md)); escalation 2 h (`BUILD_TARGETS_ESCALATE_S`); silent turn 900 s; memory wait turn `MEMORY_WAIT_TURN_S` (960 s); session lookup `LOOKUP_TRIES` 3, `LOOKUP_RETRY_S` 1 s. A release lasts about 1,860 s (900 s to admission plus a 960 s memory wait) times the most calls one session had queued when it began.
 - Cost while a holder file exists: each compiling step of a local call starts Python twice (`wait-local`, then `check-admission`), about 70 ms each. With nothing held, the shell shortcut answers in under 1 ms (it was 210 to 250 ms per call). Importing `build_hold` adds about 9 ms per start, paid only while a holder file exists. The shell guard costs 0.03 ms per call, the Python guard 1.3 microseconds, with nothing set.
 - On a machine that never held, the holder directory is missing, so steps keep starting Python until the first hold creates it.
 - The launch hook always starts `check-local`; it has no shell shortcut.
