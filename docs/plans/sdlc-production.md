@@ -112,7 +112,7 @@ Model, in the user's words (2026-10-21): the goal of a guild is to help guild me
 | R3 | Q5 head names versus per-design role names | Settled by G7: heads are named designers, reviewers, showrunners, units; astra-designer and astra-reviewer stay for the per-design threads; goddess names on hold. |
 | R4 | Q2 "gate" | A "wait" is one unit waiting on another. A "gate" always means a check that must pass (verification). This replaces roles-unit's recommendation ("gate" for the wait, "verification gate" for the check). |
 | R5 | Q3 "reviewer" | Name by the job: design reviewer, code reviewer, UI reviewer, and designer. This replaces roles-unit's "Astra reviewer / pooled reviewer". |
-| R5b | Reviewer names across productions (the user, 2026-10-28) | |
+| R5b | Reviewer names across productions (the user, 2026-10-28) | Every shown name carries production · unit · job, for example "sdlc · roles · code reviewer 6", in reports, messages and thread names. The address stays as it is. |
 | R6 | Q4 "proposal", "add-on", "change" | Approved as roles-unit recommended (the user, directly with roles-unit, 2026-10-28 13:18 EDT: "yes to all"). |
 | R7 | Q6 "orchestrator" | Approved as roles-unit recommended (the user, directly with roles-unit, 2026-10-28 13:18 EDT: "yes to all"). |
 | R8 | Q7 "worker" and its other names | Approved as roles-unit recommended (the user, directly with roles-unit, 2026-10-28 13:18 EDT: "yes to all"). "Small-fix helper" does no code work (the 2026-10-28 rule). |
