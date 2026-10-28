@@ -2527,8 +2527,9 @@ case "$CMD" in
         export CARGO_TARGET_DIR
         DOC_CHECKOUT="$CARGO_TARGET_DIR/verify-doc/$("$PY" -c 'import hashlib, sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:24])' "$DOC_REPO_TOP")"
         mkdir -p "$DOC_CHECKOUT"
-        exec {DOC_CHECKOUT_LOCK}>"$DOC_CHECKOUT/lock"
-        flock "$DOC_CHECKOUT_LOCK"
+        # fd 8 holds the doc checkout lock; fd 9 belongs to nextest sharing.
+        exec 8>"$DOC_CHECKOUT/lock"
+        flock 8
         DOC_TREE="$(doc_tree)"
         doc_checkout
         if ! lint_config_enabled doc; then
