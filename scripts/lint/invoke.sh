@@ -567,18 +567,11 @@ invoke_mend() {
     run env RUSTC_WRAPPER= cargo mend --all-targets "$@"
 }
 
-# Scope comes from the caller, like mend and clippy. --workspace used to be
-# hardcoded here, which made every dev-time doc lint a full-workspace rustdoc
-# run no matter how little changed. Narrowing is safe: rustdoc resolves
-# intra-doc links per crate against that crate's own dependency metadata, so
-# which other members share the invocation never changes a given crate's
-# warnings. The workspace-wide sweep it used to provide incidentally now runs
-# once at the push gate (validate_ci.sh), where it belongs.
-#
-# Features come from the caller too. A hardcoded --all-features made every
-# dev-loop doc run resolve a feature set that no check, clippy or test run
-# shares, and so compile its own copy of the dependency tree. The push gate
-# passes --all-features itself, where full coverage is the point.
+# Scope and features come from the caller, like mend and clippy. Both used to
+# be fixed here. Standalone lint doc can select members and honors doc=off.
+# verify.sh doc checks the workspace before each Cargo checkpoint and ignores
+# that switch. The push gate (validate_ci.sh) also checks the workspace and
+# passes --all-features for full feature coverage.
 #
 # At most LINT_DOC_JOBS (default 8) processes at once, for every caller. cargo
 # defaults to one per core and starts one rustdoc per member at 1 to 5 GB each:

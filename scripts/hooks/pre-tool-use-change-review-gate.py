@@ -25,8 +25,9 @@ else:
     import change_review
 
 COMMIT = re.compile(r"\bgit\b(?P<options>[^\n;&|]*?)\bcommit\b")
-DIRECTORY = re.compile(r"-C\s+(?P<path>\"[^\"]+\"|'[^']+'|\S+)")
+DIRECTORY = re.compile(r"(?:^|\s)-C\s*(?P<path>\"[^\"]+\"|'[^']+'|\S+)")
 MESSAGE_FILE = re.compile(r"(?:-F|--file)[=\s]+(?P<path>\"[^\"]+\"|'[^']+'|\S+)")
+HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z_0-9]*)\1[^\n]*\n(.*?)\n\2(?:\n|$)", re.DOTALL)
 SUBJECT = re.compile(r"(?:^|(?:-[a-zA-Z]*m|--message)[=\s]*[\"']?)(?P<subject>checkpoint\([^)\s]*\):[^\n\"']*)", re.MULTILINE)
 ALL = re.compile(r"\s(?:-[a-zA-Z]*a[a-zA-Z]*|--all)\b")
 LINE = re.compile(r"Change-Review:[ \t]*(?P<value>[^\n]*)")
