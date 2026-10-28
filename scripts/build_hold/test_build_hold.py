@@ -961,7 +961,7 @@ class CommandTests(IsolatedBuildHoldTest):
     def test_resume_after_earlier_damage_does_not_release_holder(self) -> None:
         path, content = self.damage_record("cycle", self.scratch)
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "waiting-session"}):
-            waited = self.run_cli(self.scratch / "holders", "wait")
+            waited = self.run_cli(self.scratch / "holders", "record-recipient", "--session-id", "waiting-session", "--name", "waiting")
         self.assertEqual(waited.returncode, 0, waited.stderr)
         self.assert_record_set_aside(path, content, waited.stdout, self.scratch)
         resumed = self.run_cli(self.scratch / "holders", "release", "--resume")
@@ -1005,7 +1005,7 @@ class CommandTests(IsolatedBuildHoldTest):
                 self.assertEqual(final.stdout.strip(), "released, builds may resume. No hold cycle: broadcast this release to every session.")
                 self.assertFalse((scratch / "holders" / "second").exists())
 
-    def test_wait_and_recipient_set_aside_damaged_record(self) -> None:
+    def test_wait_refuses_damaged_record_and_recipient_can_set_it_aside(self) -> None:
         commands = (
             ("wait",),
             ("record-recipient", "--session-id", "first", "--name", "first session"),
@@ -1021,10 +1021,15 @@ class CommandTests(IsolatedBuildHoldTest):
                 }):
                     path, content = self.damage_record(kind, scratch)
                     result = self.run_cli(scratch / "holders", *command)
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assert_record_set_aside(path, content, result.stdout, scratch)
                     if command[0] == "wait":
-                        self.assertIn("no hold cycle: wait for the release broadcast", result.stdout)
+                        self.assertEqual(result.returncode, 12, result.stderr)
+                        self.assertIn("hold state cannot be read", result.stdout)
+                        self.assertEqual(path.read_bytes(), content)
+                        self.assertTrue((scratch / "holders" / "first").is_file())
+                        self.assertEqual(list(path.parent.glob(path.name + ".damaged-*")), [])
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assert_record_set_aside(path, content, result.stdout, scratch)
 
     def test_status_reports_recovery_without_changing_damaged_record(self) -> None:
         for kind in ("cycle", "current"):
@@ -1090,12 +1095,61 @@ class CommandTests(IsolatedBuildHoldTest):
             ["python3", str(SCRIPT), "wait"], capture_output=True, text=True, check=False,
             env={**os.environ, "CLAUDE_CODE_SESSION_ID": "received-session"},
         )
-        self.assertEqual(received.returncode, 0, received.stderr)
-        self.assertIn("registered received-session", received.stdout)
+        self.assertEqual(received.returncode, 10, received.stderr)
+        self.assertIn("natedev is held by holder", received.stdout)
         cycle = build_hold.read_cycle()
         assert cycle is not None
         self.assertEqual([entry["session_id"] for entry in cycle["entries"]], ["received-session"])
         self.assertEqual(cycle["entries"][0]["delivery"], "NotAttempted")
+
+    def test_wait_status_guards_shell_build_until_last_other_holder_releases(self) -> None:
+        folder = self.scratch / "holders"
+        events = self.scratch / "build-events"
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "owner"}):
+            def attempt(phase: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    ["bash", "-c", 'python3 "$1" wait && printf "%s\\n" "$2" >> "$3"',
+                     "wait-and-build", str(SCRIPT), phase, str(events)],
+                    capture_output=True, text=True, check=False,
+                )
+
+            free = attempt("no hold")
+            self.assertEqual(free.returncode, 0, free.stderr)
+            held = self.run_cli(folder, "hold", "--holder", "owner", "--for", "owner test")
+            self.assertEqual(held.returncode, 0, held.stderr)
+            own = attempt("sole holder")
+            self.assertEqual(own.returncode, 0, own.stderr)
+            cycle = build_hold.read_cycle()
+            assert cycle is not None
+            self.assertEqual(cycle["recipients"], {})
+            other = self.run_cli(folder, "hold", "--holder", "other", "--for", "other test")
+            self.assertEqual(other.returncode, 0, other.stderr)
+            shared = attempt("must not build with two holders")
+            self.assertEqual(shared.returncode, 10, shared.stderr)
+            self.assertTrue((folder / "other").is_file())
+            partial = self.run_cli(folder, "release", "--holder", "owner")
+            self.assertEqual(partial.returncode, 0, partial.stderr)
+            self.assertIn("still held by other", partial.stdout)
+            blocked = attempt("must not build before release")
+            self.assertEqual(blocked.returncode, 10, blocked.stderr)
+            self.assertEqual(events.read_text().splitlines(), ["no hold", "sole holder"])
+            released = self.run_cli(folder, "release", "--holder", "other")
+            self.assertEqual(released.returncode, 0, released.stderr)
+            self.assertFalse((folder / "other").exists())
+            after_release = attempt("released")
+            self.assertEqual(after_release.returncode, 0, after_release.stderr)
+            self.assertEqual(events.read_text().splitlines(), ["no hold", "sole holder", "released"])
+
+    def test_wait_without_session_id_refuses_other_holder_until_release(self) -> None:
+        folder = self.scratch / "holders"
+        held = self.run_cli(folder, "hold", "--holder", "other", "--for", "other test")
+        self.assertEqual(held.returncode, 0, held.stderr)
+        blocked = self.run_cli(folder, "wait")
+        self.assertEqual(blocked.returncode, 10, blocked.stderr)
+        self.assertTrue((folder / "other").is_file())
+        released = self.run_cli(folder, "release", "--holder", "other")
+        self.assertEqual(released.returncode, 0, released.stderr)
+        self.assertEqual(self.run_cli(folder, "wait").returncode, 0)
 
     def test_overlapping_holders_share_one_cycle_and_next_hold_starts_another(self) -> None:
         folder = self.scratch / "holders"

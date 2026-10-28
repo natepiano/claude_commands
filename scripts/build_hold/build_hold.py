@@ -1265,7 +1265,11 @@ def main(arguments: list[str]) -> int:
                 name = held_key(holder_directory(), given)
             print(release_cycle(holder_directory(), name, resume=resume_requested))
         elif action == "wait":
-            print(register_wait(os.environ.get("CLAUDE_CODE_SESSION_ID", "")))
+            # Use the local gate's hold and caller check; recording a notice recipient permits no build.
+            import importlib
+            check_local_hold = cast(Callable[[], int], getattr(
+                importlib.import_module("build_targets"), "command_check_local"))
+            return check_local_hold()
         elif action == "record-recipient":
             record_recipients([(cast(str, options.name), cast(str, options.session_id))])
         elif action == "audit":
