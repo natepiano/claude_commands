@@ -183,6 +183,13 @@ class UnitWatchdogTests(unittest.TestCase):
             self.complete_jobs()
         return unit_watchdog.run(NOW + timedelta(minutes=minute), dry_run=dry_run)
 
+    def test_several_units_read_run_records_once_per_pass(self) -> None:
+        for name in ("alpha", "beta", "gamma"):
+            _ = self.add_unit(name)
+        with patch.object(unit_lookup, "read_run_states", wraps=unit_lookup.read_run_states) as reads:
+            self.assertEqual(self.pass_at(0, dry_run=True), [])
+            reads.assert_called_once_with()
+
     def test_10_26_auto_move_clears_a_stale_hold_and_every_unit_recovers(self) -> None:
         _ = self.fixture.groups(units="claude4")
         for name in ("alpha", "beta", "gamma"):
