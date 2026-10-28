@@ -693,6 +693,11 @@ def tick(now: float) -> None:
     settings = showrunners.load_settings()
     rows = processes()
     pending: list[Delivery] = []
+    try:
+        runs = unit_lookup.read_run_states()
+    except (OSError, UnicodeError) as error:
+        print(f"stall-watch: units: their run state is unknown: {error}", file=sys.stderr)
+        return
     for configured in showrunners.registered_showrunners():
         # A showrunner that is not running has no one to tell: its units are not watched.
         showrunner_socket = configured["socket"]
@@ -715,11 +720,7 @@ def tick(now: float) -> None:
             continue
         for name, unit in marked.items():
             # A unit is watched while the newest /unit:direct run in its worktree is unfinished.
-            try:
-                running = name in live and unit_lookup.run_state(Path(live[name])) is unit_lookup.UnitState.RUNNING
-            except (OSError, UnicodeError) as error:
-                print(f"stall-watch: {name}: its run state is unknown: {error}", file=sys.stderr)
-                continue
+            running = name in live and runs.state(Path(live[name])) is unit_lookup.UnitState.RUNNING
             if not running:
                 if (retire := forget(slug, name)) is not None:
                     pending.append(retire)

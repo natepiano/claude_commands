@@ -23,6 +23,7 @@ from dailies_render import LENGTHS
 from dailies_input import (Activity, BevyUpgradeUnavailable, Block, ClaudeNotRunning, Decision, FormWaiting,
                            Running, SessionGone, StillWaiting, TicksFailing, UnitRow,
                            bevy_upgrade_watch, status_blocks)
+import unit_lookup
 from unit_lookup import UnitState
 
 
@@ -428,6 +429,17 @@ class DailiesInputTests(unittest.TestCase):
         units = cast(list[dict[str, object]], self.report()["units"])
         self.assertEqual([unit["unit"] for unit in units], [ALPHA])
         self.assertIn(f"left out, run finished and nothing waiting on the user: {BETA}", result.stdout)
+
+    def test_units_from_doc_reads_run_records_once_for_several_units(self) -> None:
+        self.production_doc(beta=True)
+        self.finished_run(self.root / "beta")
+        with (mock.patch.dict(os.environ, self.env),
+              mock.patch.object(unit_lookup, "marked_units", return_value={}),
+              mock.patch.object(unit_lookup, "read_run_states", wraps=unit_lookup.read_run_states) as reads):
+            units = dailies_input.units_from_doc(self.doc.read_text(encoding="utf-8").splitlines(), "fixture")
+            reads.assert_called_once_with()
+        self.assertEqual([(unit.name, unit.run) for unit in units],
+                         [(ALPHA, UnitState.STANDING_BY), (BETA, UnitState.RUN_FINISHED)])
 
     def test_a_finished_unit_that_shows_a_form_keeps_its_place_and_needs_its_entry(self) -> None:
         self.production_doc(beta=True)
