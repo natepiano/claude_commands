@@ -35,6 +35,17 @@ def phase_events() -> tuple[process.Event, ...]:
             event("phase_finished", 100), event("phase_started", 120, phase="next"))
 
 
+def parsed_phase_records(records: list[dict[str, object]]) -> tuple[process.Event, ...]:
+    events: list[process.Event] = []
+    for record in records:
+        raw: dict[str, object] = {"run_id": "run", "phase_id": "1", "phase_instance_id": "phase", **record}
+        parsed = process.parse_event(raw)
+        if isinstance(parsed, process.NotRecorded):
+            raise AssertionError(parsed.reason)
+        events.append(parsed)
+    return tuple(events)
+
+
 def commit_fixture_documents(root: Path, documents: dict[str, str], message: str) -> None:
     root.mkdir(parents=True, exist_ok=True)
     if not (root / ".git").is_dir():
@@ -73,6 +84,168 @@ class PhaseProcessTests(unittest.TestCase):
         self.assertEqual([(phase.instance, phase.start, phase.end) for phase in phases],
                          [("phase", 10, 100), ("other", 50, 150)])
         self.assertEqual(process.phase_boundaries(events, process.Window(151, 200)), ())
+
+    def test_rounds_parallel_repairs_are_worker_time_not_wall_share(self) -> None:
+        records: list[dict[str, object]] = [
+            {"event_type": "phase_started", "timestamp_epoch": 10},
+            {"event_type": "phase_finished", "timestamp_epoch": 100, "status": "completed"},
+        ]
+        for instance in ("fix-a", "fix-b"):
+            records.extend((
+                {"event_type": "pass_started", "timestamp_epoch": 20, "pass_started_at": 20,
+                 "pass_instance_id": instance, "pass_kind": "fix", "pass_activity": "merge conflict repair"},
+                {"event_type": "pass_finished", "timestamp_epoch": 80, "pass_started_at": 20,
+                 "pass_instance_id": instance, "pass_kind": "fix", "pass_activity": "merge conflict repair",
+                 "pass_elapsed_seconds": 60},
+            ))
+        records.extend((
+            {"event_type": "activity_started", "timestamp_epoch": 20,
+             "activity_instance_id": "merge", "activity_label": "merge"},
+            {"event_type": "activity_finished", "timestamp_epoch": 80,
+             "activity_instance_id": "merge", "activity_label": "merge"},
+        ))
+        events = parsed_phase_records(records)
+        phases = process.phase_boundaries(events, WINDOW)
+        self.assertEqual(process.fix_time(phases), (process.FixWorkerTime(120, 1),))
+        self.assertGreater(phases[0].repair.seconds, phases[0].end - phases[0].start)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            process.render_steps(events, WINDOW, False)
+        text = output.getvalue()
+        wall_table, worker_table = text.split("Fix costs", 1)
+        self.assertNotIn("fix worker time", wall_table)
+        self.assertNotIn("activity: merge", wall_table)
+        self.assertIn("120.0s", worker_table)
+        self.assertNotIn("not counted here", text)
+
+    def test_finish_only_fix_suppresses_only_its_merge_coverage(self) -> None:
+        for start_fields in ({"pass_started_at": 20}, {}):
+            with self.subTest(start_fields=start_fields):
+                events = parsed_phase_records([
+                    {"event_type": "phase_started", "timestamp_epoch": 10},
+                    {"event_type": "activity_started", "timestamp_epoch": 15,
+                     "activity_instance_id": "merge", "activity_label": "merge"},
+                    {"event_type": "pass_finished", "timestamp_epoch": 80,
+                     "pass_instance_id": "fix", "pass_kind": "fix",
+                     "pass_activity": "merge conflict repair", "pass_elapsed_seconds": 60,
+                     **start_fields},
+                    {"event_type": "activity_finished", "timestamp_epoch": 85,
+                     "activity_instance_id": "merge", "activity_label": "merge"},
+                    {"event_type": "phase_finished", "timestamp_epoch": 100, "status": "completed"},
+                ])
+                phases = process.phase_boundaries(events, WINDOW)
+                self.assertEqual(process.fix_time(phases), (process.FixWorkerTime(60, 1),))
+                costs = {cost.step: cost.total for cost in process.measure_phase_steps(events, phases).costs}
+                self.assertEqual(costs["activity: merge"], 10)
+                self.assertEqual(costs["director time"], 20)
+
+    def test_rounds_open_phase_has_named_state_and_no_epoch_finish(self) -> None:
+        events = parsed_phase_records([
+            {"event_type": "phase_started", "timestamp_epoch": 10},
+            {"event_type": "pass_started", "timestamp_epoch": 20,
+             "pass_kind": "fix", "pass_instance_id": "open"},
+        ])
+        states = process.phase_states(events)
+        self.assertEqual(states, (process.OpenPhase("run", "phase", 10),))
+        self.assertEqual(process.phase_boundaries(events, WINDOW), ())
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            process.render_steps(events, WINDOW, False)
+        self.assertIn("open unmixed n=1", output.getvalue())
+
+    def test_rounds_mixed_phase_is_excluded_from_costs_and_reported(self) -> None:
+        events = parsed_phase_records([
+            {"event_type": "phase_started", "timestamp_epoch": 10},
+            {"event_type": "pass_finished", "timestamp_epoch": 60, "pass_started_at": 20,
+             "pass_elapsed_seconds": 40, "pass_kind": "impl", "pass_instance_id": "impl",
+             "pass_activity": "Implement Phase 7"},
+            {"event_type": "phase_finished", "timestamp_epoch": 100, "status": "completed"},
+        ])
+        self.assertIsInstance(process.phase_states(events)[0], process.MixedPhase)
+        self.assertEqual(process.phase_boundaries(events, WINDOW), ())
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            process.render_steps(events, WINDOW, False)
+        self.assertIn("mixed n=1", output.getvalue())
+        self.assertEqual(process.measure_phase_steps(events, process.phase_boundaries(events, WINDOW)).wall, 0)
+
+    def test_ledger_only_round_counts_without_worker_time(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "run.jsonl"
+            records = [
+                {"event_type": "phase_started", "timestamp_epoch": 10, "run_id": "run", "phase_id": "1", "phase_instance_id": "phase"},
+                {"event_type": "finding_batch_dispatched", "timestamp_epoch": 30, "phase_instance_id": "phase", "round": 1, "covered": ["F1"]},
+                {"event_type": "phase_finished", "timestamp_epoch": 100, "run_id": "run", "phase_id": "1", "phase_instance_id": "phase", "status": "completed"},
+            ]
+            _ = path.write_text("\n".join(json.dumps(record) for record in records))
+            events, problems = process.read_events((path,))
+        self.assertEqual(problems, ())
+        self.assertEqual(process.fix_time(process.phase_boundaries(events, WINDOW)), (process.FixWorkerTime(0, 1),))
+
+    def test_closure_review_stays_in_review_wall_costs(self) -> None:
+        events = parsed_phase_records([
+            {"event_type": "phase_started", "timestamp_epoch": 10},
+            {"event_type": "pass_started", "timestamp_epoch": 20, "pass_started_at": 20,
+             "pass_instance_id": "closure", "pass_kind": "review", "pass_activity": "Closure review"},
+            {"event_type": "pass_finished", "timestamp_epoch": 60, "pass_started_at": 20,
+             "pass_instance_id": "closure", "pass_kind": "review", "pass_elapsed_seconds": 40},
+            {"event_type": "phase_finished", "timestamp_epoch": 100, "status": "completed"},
+        ])
+        phases = process.phase_boundaries(events, WINDOW)
+        costs = {cost.step: cost.total for cost in process.measure_phase_steps(events, phases).costs}
+        self.assertEqual(costs["pass: review"], 40)
+        self.assertEqual(process.fix_time(phases), (process.FixWorkerTime(0, 0),))
+
+    def test_document_after_dispatch_is_separate_from_lead_costs(self) -> None:
+        pipeline = (
+            process.DocMilestone("good", "good.md", process.DocCommit("a", 10, "", ""), 30, 50.0, "", ""),
+            process.DocMilestone("late", "late.md", process.DocCommit("b", 60, "", ""), 30, 50.0, "", ""),
+            process.DocMilestone("late", "proposal.md", process.DocCommit("c", 70, "", ""), 30, 50.0, "", ""),
+        )
+        leads = process.plan_lead_times(pipeline)
+        self.assertIsInstance(leads[1].doc_to_phase, process.DocAfterDispatch)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            process.render_pipeline(pipeline, WINDOW, False)
+        text = output.getvalue()
+        self.assertIn("doc after dispatch: n plans=1; n documents=2", text)
+        rows = {parts[0]: parts[1:] for line in text.splitlines() if len(parts := re.split(r"  +", line)) > 1}
+        self.assertEqual(rows["first doc to first phase"], ["1", "40.0s", "40.0s", "40.0s", "0"])
+        self.assertEqual(rows["run to first phase"], ["1", "20.0s", "20.0s", "20.0s", "0"])
+        self.assertNotIn("late", text.split("Doc pipeline: top 10", 1)[1].split("Earliest doc requires", 1)[0])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            process.render_pipeline(pipeline, WINDOW, True)
+        self.assertIn("doc after dispatch", output.getvalue())
+        self.assertIn("late.md", output.getvalue())
+
+    def test_late_documents_preserve_early_leads_and_missing_source_state(self) -> None:
+        absent = process.NotRecorded("git log", "source absent")
+        pipeline = (
+            process.DocMilestone("early", "plan.md", process.DocCommit("a", 60, "", ""), 30, 50.0, "", ""),
+            process.DocMilestone("early", "proposal.md", process.DocCommit("b", 10, "", ""), 30, 50.0, "", ""),
+            process.DocMilestone("unknown", "late.md", process.DocCommit("c", 70, "", ""), 30, 50.0, "", ""),
+            process.DocMilestone("unknown", "missing.md", absent, 30, 50.0, "", ""),
+        )
+        leads = process.plan_lead_times(pipeline)
+        self.assertEqual((leads[0].doc_to_run, leads[0].run_to_phase, leads[0].doc_to_phase), (20, 20, 40))
+        self.assertIsInstance(leads[1].doc_to_phase, process.NotRecorded)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            process.render_pipeline(pipeline, WINDOW, False)
+        text = output.getvalue()
+        self.assertIn("doc after dispatch: n plans=0; n documents=2", text)
+        rows = {parts[0]: parts[1:] for line in text.splitlines() if len(parts := re.split(r"  +", line)) > 1}
+        self.assertEqual(rows["first doc to first phase"], ["1", "40.0s", "40.0s", "40.0s", "1"])
+        self.assertEqual(rows["run to first phase"], ["2", "20.0s", "20.0s", "40.0s", "0"])
+        self.assertIn("early", text.split("Doc pipeline: top 10", 1)[1])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            process.render_pipeline(pipeline, WINDOW, True)
+        late_rows = [line for line in output.getvalue().splitlines() if line.startswith("doc after dispatch")]
+        self.assertEqual(len(late_rows), 2)
+        self.assertTrue(any("plan.md" in line for line in late_rows))
+        self.assertTrue(any("late.md" in line for line in late_rows))
 
     def test_history_label_normalization_and_bad_event_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

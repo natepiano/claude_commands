@@ -15,7 +15,7 @@ from bisect import bisect_left
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import cache
 from pathlib import Path
@@ -25,6 +25,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "history"))
 from scripts.direct import plan_history  # noqa: E402
+from scripts.history import rounds  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.usage import collect  # noqa: E402
 
@@ -38,7 +39,8 @@ class HistoryLabels(Protocol):
 
 history = cast(HistoryLabels, cast(object, importlib.import_module("history")))
 MEASURE_EVENTS = frozenset(("run_started", "phase_started", "phase_finished", "pass_started",
-                            "pass_finished", "activity_started", "activity_finished"))
+                            "pass_finished", "activity_started", "activity_finished",
+                            "finding_opened", "finding_batch_dispatched"))
 
 
 @dataclass(frozen=True)
@@ -79,15 +81,39 @@ class Event:
     directory: str
     plan: str
     branch: str
+    record: dict[str, object] = field(default_factory=dict, compare=False, repr=False)
+
+
+@dataclass(frozen=True)
+class FixWorkerTime:
+    seconds: float
+    rounds: int
 
 
 @dataclass(frozen=True)
 class PhaseBoundary:
+    """A completed, single-plan-phase interval, eligible for phase costs."""
     run: str
     instance: str
     identifier: str
     start: float
     end: float
+    repair: FixWorkerTime = FixWorkerTime(0.0, 0)
+
+
+@dataclass(frozen=True)
+class OpenPhase:
+    run: str
+    instance: str
+    start: float
+
+
+@dataclass(frozen=True)
+class MixedPhase:
+    run: str
+    instance: str
+    start: float
+    finish: float | OpenPhase
 
 
 @dataclass(frozen=True)
@@ -243,14 +269,14 @@ def parse_event(raw: dict[str, object]) -> Event | NotRecorded:
     is_pass = kind.startswith("pass_")
     label = text_field(raw, "pass_kind" if is_pass else "activity_label")
     step = history.PASS_STAGE.get(label, label or "unknown") if is_pass else history._clean_label(label)  # pyright: ignore[reportPrivateUsage]
-    # A fix activity and a fix pass have the same owner. Neither gets a duration here.
+    # Fix activities and passes share the same wall-coverage label.
     if not is_pass and history.ACTIVITY_STAGE.get(step) == "fix":
         step = "fix"
     return Event(text_field(raw, "run_id"), text_field(raw, "phase_instance_id"),
                  text_field(raw, "phase_id"), kind, float(epoch),
                  text_field(raw, "pass_instance_id" if is_pass else "activity_instance_id"),
                  step, text_field(raw, "status"), director, text_field(raw, "working_dir"),
-                 text_field(raw, "plan_doc"), text_field(raw, "branch"))
+                 text_field(raw, "plan_doc"), text_field(raw, "branch"), raw)
 
 
 def read_events(paths: Iterable[Path]) -> tuple[tuple[Event, ...], tuple[str, ...]]:
@@ -288,24 +314,58 @@ def read_events(paths: Iterable[Path]) -> tuple[tuple[Event, ...], tuple[str, ..
     return tuple(sorted(events, key=lambda event: event.at)), tuple(problems)
 
 
-def phase_boundaries(events: Sequence[Event], window: Window) -> tuple[PhaseBoundary, ...]:
-    """Boundary seam: use recorded phases until fix-rounds-unit supplies rounds.py."""
-    opened: dict[tuple[str, str], Event] = {}
-    phases: list[PhaseBoundary] = []
+def rounds_records(events: Sequence[Event]) -> list[dict[str, object]]:
+    """Keep source fields for the owning parser; support parsed fixture events."""
+    records: list[dict[str, object]] = []
+    starts: dict[tuple[str, str, str], float] = {}
     for event in sorted(events, key=lambda event: event.at):
-        key = (event.run, event.phase)
-        if event.kind == "phase_started":
-            opened[key] = event
-        elif event.kind == "phase_finished" and key in opened:
-            start = opened.pop(key)
-            if event.status == "completed" and window.contains(event.at) and event.at >= start.at:
-                phases.append(PhaseBoundary(event.run, event.phase, event.phase_id, start.at, event.at))
-    return tuple(phases)
+        if event.record:
+            records.append(event.record)
+            continue
+        raw: dict[str, object] = {
+            "run_id": event.run, "phase_instance_id": event.phase,
+            "phase_id": event.phase_id, "event_type": event.kind,
+            "timestamp_epoch": event.at, "status": event.status,
+        }
+        if event.kind.startswith("pass_"):
+            key = (event.run, event.phase, event.instance)
+            if event.kind == "pass_started":
+                starts[key] = event.at
+            start = starts.get(key, event.at)
+            raw.update(pass_instance_id=event.instance,
+                       pass_kind="impl" if event.step == "implementation" else event.step,
+                       pass_started_at=start, pass_elapsed_seconds=event.at - start)
+        records.append(raw)
+    return records
 
 
-def fix_time() -> NotRecorded:
-    """Fix seam: its owner supplies both phase meaning and fix costs."""
-    return NotRecorded("history.py rounds (fix-rounds-unit)", "not counted here")
+def phase_states(events: Sequence[Event]) -> tuple[PhaseBoundary | OpenPhase | MixedPhase, ...]:
+    """Convert rounds.py's open sentinel at the API boundary, never to epoch 0."""
+    result: list[PhaseBoundary | OpenPhase | MixedPhase] = []
+    for phase in rounds.load_phases(rounds_records(events)):
+        run, instance, start = phase["run_id"], phase["phase_instance_id"], phase["started_at"]
+        finish: float | OpenPhase = (OpenPhase(run, instance, start) if phase["finished_at"] == 0.0
+                                     else phase["finished_at"])
+        if phase["check"] == "mixed":
+            result.append(MixedPhase(run, instance, start, finish))
+        elif isinstance(finish, OpenPhase):
+            result.append(finish)
+        elif phase["status"] == "completed" and finish >= start:
+            result.append(PhaseBoundary(run, instance, phase["phase_id"], start, finish,
+                                        FixWorkerTime(phase["fix_seconds"], len(phase["rounds"]))))
+    return tuple(result)
+
+
+def phase_boundaries(events: Sequence[Event], window: Window) -> tuple[PhaseBoundary, ...]:
+    """Use only completed, unmixed rounds.py phases that finish in the window."""
+    return tuple(sorted((phase for phase in phase_states(events)
+                         if isinstance(phase, PhaseBoundary) and window.contains(phase.end)),
+                        key=lambda phase: (phase.end, phase.run, phase.instance)))
+
+
+def fix_time(phases: Sequence[PhaseBoundary]) -> tuple[FixWorkerTime, ...]:
+    """Fix worker time and round counts come only from rounds.py."""
+    return tuple(phase.repair for phase in phases)
 
 
 def step_intervals(events: Sequence[Event], phases: Sequence[PhaseBoundary]) -> tuple[StepInterval, ...]:
@@ -325,6 +385,19 @@ def step_intervals(events: Sequence[Event], phases: Sequence[PhaseBoundary]) -> 
                 if right > left:
                     label = "fix" if start.step == "fix" else ("pass: " if is_pass else "activity: ") + start.step
                     intervals.append(StepInterval(start.run, start.phase, label, left, right, is_pass))
+        elif event.kind == "pass_finished" and event.step == "fix":
+            # Finish records retain pass bounds even when the start event is absent.
+            # Use the same start/elapsed fallback as rounds.py's pass reader.
+            recorded_start = event.record.get("pass_started_at")
+            elapsed = event.record.get("pass_elapsed_seconds")
+            start_at = (float(recorded_start) if isinstance(recorded_start, int | float)
+                        and not isinstance(recorded_start, bool) else event.at -
+                        (float(elapsed) if isinstance(elapsed, int | float) and not isinstance(elapsed, bool) else 0.0))
+            phase = bounds.get((event.run, event.phase))
+            if phase is not None:
+                left, right = max(start_at, phase.start), min(event.at, phase.end)
+                if right > left:
+                    intervals.append(StepInterval(event.run, event.phase, "fix", left, right, True))
     # An unclosed window is unknown coverage, never assumed to last to phase end.
     return tuple(intervals)
 
@@ -347,6 +420,8 @@ def allocated_step_seconds(events: Sequence[Event], phases: Sequence[PhaseBounda
         totals: dict[str, float] = defaultdict(float)
         for left, right in zip(points, points[1:]):
             active = {span.step for span in spans if span.start <= left and span.end >= right}
+            if "fix" in active:
+                active.discard("activity: merge")
             if not active:
                 totals["director time"] += right - left
             else:
@@ -830,12 +905,21 @@ def render_steps(events: Sequence[Event], window: Window, detailed: bool) -> Non
     costs = steps.costs if detailed else compact_steps(events, phases, steps)
     rows = [(cost.step, str(cost.n), duration(cost.median), duration(cost.p90), duration(cost.total),
              f"{cost.wall_share:.1%}") for cost in costs]
-    stub = fix_time()
-    rows.append((f"fix — from {stub.source}, {stub.reason}", "0", "—", "—", "—", "—"))
     wall = summarize("phase wall", [phase.end - phase.start for phase in phases], steps.wall) if phases else NotRecorded("phase_finished", "no finished phases")
     rows.append(("phase wall", str(steps.phases), "—" if isinstance(wall, NotRecorded) else duration(wall.median),
                  "—" if isinstance(wall, NotRecorded) else duration(wall.p90), duration(steps.wall), "100%"))
     table("Phase steps — natedev only", ("step", "n phases", "median", "p90", "total", "wall share"), rows, window)
+    repairs = fix_time(phases)
+    table("Fix costs — worker time, natedev only; source: history.py rounds",
+          ("measure", "n phases", "median", "p90", "total", "not recorded"),
+          [distribution_row("fix worker time", [repair.seconds for repair in repairs], 0, duration),
+           distribution_row("repair rounds", [float(repair.rounds) for repair in repairs], 0, count)], window)
+    states = phase_states(events)
+    mixed = sum(isinstance(phase, MixedPhase) and
+                (window.contains(phase.finish) if isinstance(phase.finish, float) else phase.start < window.until)
+                for phase in states)
+    opened = sum(isinstance(phase, OpenPhase) and phase.start < window.until for phase in states)
+    print(f"Excluded from per-phase costs: mixed n={mixed} (finished in window or open); open unmixed n={opened} (started before window end).")
     table("Phase end through next Work Order — natedev only", ("step", "n phases", "median", "p90", "total"),
           [(cost.step, str(cost.n), duration(cost.median), duration(cost.p90), duration(cost.total)) for cost in steps.gaps], window)
 
@@ -895,11 +979,18 @@ def render_contract(contract: Sequence[ContractFile], window: Window, detailed: 
 
 
 @dataclass(frozen=True)
+class DocAfterDispatch:
+    document: str
+    committed_at: float
+    dispatched_at: float
+
+
+@dataclass(frozen=True)
 class PlanLeadTime:
     plan: str
-    doc_to_run: float | NotRecorded
-    run_to_phase: float | NotRecorded
-    doc_to_phase: float | NotRecorded
+    doc_to_run: float | NotRecorded | DocAfterDispatch
+    run_to_phase: float | NotRecorded | DocAfterDispatch
+    doc_to_phase: float | NotRecorded | DocAfterDispatch
 
 
 def plan_lead_times(pipeline: Sequence[DocMilestone]) -> tuple[PlanLeadTime, ...]:
@@ -908,13 +999,21 @@ def plan_lead_times(pipeline: Sequence[DocMilestone]) -> tuple[PlanLeadTime, ...
         groups[row.plan].append(row)
     results: list[PlanLeadTime] = []
     for plan, milestones in groups.items():
-        commits = [row.first_commit.at for row in milestones if isinstance(row.first_commit, DocCommit)]
+        commits = [(row.first_commit.at, row.document) for row in milestones if isinstance(row.first_commit, DocCommit)]
         first = milestones[0]
         absent = NotRecorded("git log + phase_started", "milestone absent")
-        complete_docs = len(commits) == len(milestones)
-        to_run = float(first.run_started - min(commits)) if complete_docs else absent
+        to_run: float | NotRecorded = absent
+        lead: float | NotRecorded = absent
+        if len(commits) == len(milestones):
+            committed_at, document = min(commits)
+            if not isinstance(first.phase_started, NotRecorded) and committed_at > first.phase_started:
+                late = DocAfterDispatch(document, committed_at, first.phase_started)
+                results.append(PlanLeadTime(plan, late, late, late))
+                continue
+            to_run = float(first.run_started - committed_at)
+            if not isinstance(first.phase_started, NotRecorded):
+                lead = float(first.phase_started - committed_at)
         to_phase = float(first.phase_started - first.run_started) if not isinstance(first.phase_started, NotRecorded) else absent
-        lead = float(first.phase_started - min(commits)) if complete_docs and not isinstance(first.phase_started, NotRecorded) else absent
         results.append(PlanLeadTime(plan, to_run, to_phase, lead))
     return tuple(results)
 
@@ -929,18 +1028,26 @@ def render_pipeline(pipeline: Sequence[DocMilestone], window: Window, detailed: 
             to_run = "not recorded" if isinstance(commit, NotRecorded) else duration(row.run_started - commit.at)
             to_phase = "not recorded" if isinstance(row.phase_started, NotRecorded) else duration(row.phase_started - row.run_started)
             lead = "not recorded" if isinstance(commit, NotRecorded) or isinstance(row.phase_started, NotRecorded) else duration(row.phase_started - commit.at)
-            rows.append((row.plan, row.document, "0" if isinstance(commit, NotRecorded) else "1", first,
+            state = ("doc after dispatch" if isinstance(commit, DocCommit)
+                     and isinstance(row.phase_started, float | int) and commit.at > row.phase_started
+                     else "not recorded" if isinstance(commit, NotRecorded) else "recorded")
+            rows.append((state, row.plan, row.document, "0" if isinstance(commit, NotRecorded) else "1", first,
                          stamp(row.run_started), phase, to_run, to_phase, lead, row.commands, row.problem))
-        table("Doc pipeline detail — natedev only", ("plan", "document", "n commits", "first commit", "first run", "first phase", "doc to run", "run to phase", "doc to phase", "commands named", "source limit"), rows, window)
+        table("Doc pipeline detail — natedev only", ("state", "plan", "document", "n commits", "first commit", "first run", "first phase", "doc to run", "run to phase", "doc to phase", "commands named", "source limit"), rows, window)
         return
     leads = plan_lead_times(pipeline)
+    late_count = sum(isinstance(row.doc_to_phase, DocAfterDispatch) for row in leads)
     for name, samples in (("first doc to run", [row.doc_to_run for row in leads]),
                           ("run to first phase", [row.run_to_phase for row in leads]),
                           ("first doc to first phase", [row.doc_to_phase for row in leads])):
         values = [value for value in samples if isinstance(value, float)]
-        rows.append(distribution_row(name, values, len(leads) - len(values), duration))
+        rows.append(distribution_row(name, values, len(leads) - len(values) - late_count, duration))
     table("Doc pipeline summary — natedev only", ("measure", "n plans", "median", "p90", "total", "not recorded"), rows, window)
-    items = [RankedItem(Path(row.plan).name, 1, (row.doc_to_phase, row.doc_to_run, row.run_to_phase)) for row in leads]
+    items = [RankedItem(Path(row.plan).name, 1, (row.doc_to_phase, row.doc_to_run, row.run_to_phase)) for row in leads
+             if not isinstance(row.doc_to_phase, DocAfterDispatch)
+             and not isinstance(row.doc_to_run, DocAfterDispatch)
+             and not isinstance(row.run_to_phase, DocAfterDispatch)]
+    print(f"doc after dispatch: n plans={late_count}; n documents={sum(isinstance(row.first_commit, DocCommit) and isinstance(row.phase_started, float | int) and row.first_commit.at > row.phase_started for row in pipeline)}; negative-lead plans excluded from all lead distributions, totals and ranking; see --detail doc-pipeline.")
     table("Doc pipeline: top 10 plans by lead time — natedev only", ("plan", "n plans", "doc to phase", "doc to run", "run to phase"),
           item_rows(top_items(items), (duration, duration, duration)), window)
     print(f"Earliest doc requires all named source commits. Document commits not recorded: n={sum(isinstance(row.first_commit, NotRecorded) for row in pipeline)}/{len(pipeline)} documents; source: git log. Commands and exact milestones: --detail doc-pipeline.")
@@ -981,9 +1088,9 @@ def render_baseline(events: Sequence[Event], window: Window, usage: tuple[UsageT
                     contract: Sequence[ContractFile], plans: Sequence[PlanHistory], problems: Sequence[str]) -> None:
     print("Phase process baseline — natedev only; no Mac records read. Use baseline --detail TABLE for full rows.")
     print("n counts phases, plans or files as labeled; p90 is nearest rank. Top lists show 10 plus summed other.")
-    print("Distinct overlapping steps share wall time equally; parallel workers of one kind count once. Fix costs are excluded.")
+    print("Distinct overlapping steps share wall time equally; parallel workers of one kind count once. Repair wall coverage is excluded from shares; fix costs are worker time, shown apart.")
     print("Director time includes uncovered waits; unmatched steps have unknown coverage. Activity tails below 0.1% are merged.")
-    print("Recorded phases can hold multiple plan phases; rounds.py will supply boundaries. Plans are selected by run start, phases by finish.")
+    print("rounds.py owns phase boundaries; mixed phases are excluded. Plans are selected by run start, completed phases by finish.")
     print("Token input includes caches; pass records bound before/after shares of input + output. Shared sessions can overlap; compose before phase start is not isolated.")
     phases = phase_boundaries(events, window)
     render_steps(events, window, False)
