@@ -147,7 +147,7 @@ Each command shows its script's output unchanged; each script answers in about a
 
 ## Calibration / gotchas
 
-- Numbers: poll 15 s (`BUILD_TARGETS_POLL_S`, `RELEASE_POLL_S`; local waits wake earlier on a release, see [merge-gate-and-test-speed.md](merge-gate-and-test-speed.md)); escalation 2 h (`BUILD_TARGETS_ESCALATE_S`); silent turn 900 s; memory wait `BUILDLOG_MEM_WAIT_LIMIT_S` plus `MEMORY_GATE_GRACE_S` (60 s); session lookup `LOOKUP_TRIES` 3, `LOOKUP_RETRY_S` 1 s. A release lasts about 1,860 s (900 s to admission plus a 960 s memory wait) times the most calls one session had queued when it began.
+- Numbers: poll 15 s (`BUILD_TARGETS_POLL_S`, `RELEASE_POLL_S`; local waits wake earlier on a release, see [merge-gate-and-test-speed.md](merge-gate-and-test-speed.md)); escalation 2 h (`BUILD_TARGETS_ESCALATE_S`); silent turn 900 s; memory wait turn `MEMORY_WAIT_TURN_S` (960 s); session lookup `LOOKUP_TRIES` 3, `LOOKUP_RETRY_S` 1 s. A release lasts about 1,860 s (900 s to admission plus a 960 s memory wait) times the most calls one session had queued when it began.
 - Cost while a holder file exists: each compiling step of a local call starts Python twice (`wait-local`, then `check-admission`), about 70 ms each. With nothing held, the shell shortcut answers in under 1 ms (it was 210 to 250 ms per call). Importing `build_hold` adds about 9 ms per start, paid only while a holder file exists. The shell guard costs 0.03 ms per call, the Python guard 1.3 microseconds, with nothing set.
 - On a machine that never held, the holder directory is missing, so steps keep starting Python until the first hold creates it.
 - The launch hook always starts `check-local`; it has no shell shortcut.

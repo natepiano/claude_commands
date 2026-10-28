@@ -139,7 +139,8 @@ class IsolatedBuildHoldTest(unittest.TestCase):
     def reap_recorders(self) -> None:
         for thread in threading.enumerate():
             if thread.name == "hold-event-recorder":
-                thread.join(timeout=5)
+                # A recorder runs a short subprocess; under load it can take far longer than its usual second.
+                thread.join(timeout=60)
                 self.assertFalse(thread.is_alive())
 
 
@@ -1352,20 +1353,19 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
             self.assertTrue(complete)
             self.assertEqual(sent, ["first", "second"])
 
-    def test_memory_wait_ends_after_the_gate_limit_and_grace(self) -> None:
+    def test_memory_wait_counts_as_answered_after_its_turn(self) -> None:
         now = self.begin("first", "second")
         with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/tmp/socket")), \
-             mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()), \
-             mock.patch.dict(os.environ, {"BUILDLOG_MEM_WAIT_LIMIT_S": "900"}):
+             mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()):
             _ = self.advance(now)
             _ = build_hold.mark_gate("first", "WaitingForMemory")
             self.assertEqual(self.entries()[1]["state"], "ReleasedAwaitingAdmission")
             waiting = build_hold.aware_instant(self.entries()[0].get("wait_started_at", ""))
-            deadline = waiting + timedelta(seconds=900 + build_hold.MEMORY_GATE_GRACE_S)
+            deadline = waiting + timedelta(seconds=build_hold.MEMORY_WAIT_TURN_S)
             _ = self.advance(deadline - timedelta(seconds=1))
             self.assertEqual(self.entries()[0]["state"], "WaitingForMemory")
             _ = self.advance(deadline)
-            self.assertEqual(self.entries()[0]["state"], "NoAdmissionAck")
+            self.assertEqual(self.entries()[0]["state"], "MemoryGateReturned")
 
     def test_no_admission_ack_is_not_early(self) -> None:
         now = self.begin("first", "second")

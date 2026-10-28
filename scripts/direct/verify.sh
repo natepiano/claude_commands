@@ -2125,12 +2125,8 @@ buildlog_wait_for_memory() {
         buildlog_release_memory 0
         acquire_token
         memory_wait=$BUILDLOG_MEM_WAIT_S
-        # The forced start counts the step's whole memory wait: a new full
-        # limit here made one step wait 15 min twice (2026-10-21).
-        limit="${BUILDLOG_MEM_WAIT_LIMIT_S:-900}"
-        [[ "$limit" =~ ^[0-9]+$ ]] || limit=900
-        BUILDLOG_MEM_WAIT_LIMIT_S=$(( limit > memory_wait ? limit - memory_wait : 0 )) \
-            buildlog_wait_for_memory_only "$@"
+        # The second pass keeps the step's place in the memory queue from its first wait.
+        BUILDLOG_MEM_WAIT_SINCE=$BUILDLOG_MEM_WAIT_FROM buildlog_wait_for_memory_only "$@"
         BUILDLOG_MEM_WAIT_S=$(( memory_wait + BUILDLOG_MEM_WAIT_S ))
         if [[ "$BUILDLOG_MEM_OUTCOME" == LeftQueue ]]; then
             if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then

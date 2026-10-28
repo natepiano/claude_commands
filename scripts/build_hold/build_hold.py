@@ -37,9 +37,9 @@ from target_config import ConfigError, read_targets
 BUILD_COMMANDS = frozenset({"cargo", "rustc", "cargo-nextest"})
 INSTANT = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})")
 SAFE = re.compile(r"[^A-Za-z0-9._-]")
-# The memory gate starts a step anyway at BUILDLOG_MEM_WAIT_LIMIT_S and then marks its return;
-# a memory wait ends as unanswered only this long after that limit.
-MEMORY_GATE_GRACE_S = 60
+# A memory wait holds the release this long, then counts as answered: the session's build is in the
+# memory gate, which never starts a build without memory and keeps it first in line.
+MEMORY_WAIT_TURN_S = 960
 NO_ADMISSION_ACK_S = 900
 # A release ends this long after it starts. Each session still unanswered then counts as released
 # and is named in the result: one silent session never holds every other build past it.
@@ -51,7 +51,7 @@ RELEASE_POLL_S = 15
 LOOKUP_TRIES = 3
 LOOKUP_RETRY_S = 1.0
 
-GateOutcome = Literal["Granted", "TimedOut", "MeminfoUnavailable"]
+GateOutcome = Literal["Granted", "TimedOut", "MeminfoUnavailable", "StillWaiting"]
 DeliveryOutcome = Literal["NotAttempted", "Delivered", "QueuedUnconfirmed", "RecipientGone", "DeliveryFailed"]
 
 
@@ -281,7 +281,7 @@ def read_release_state(entry: Mapping[str, object]) -> ReleaseState:
             return WaitingForMemory(instant("released_at"), instant("wait_started_at"))
         case "MemoryGateReturned":
             outcome = entry["outcome"]
-            if outcome not in {"Granted", "TimedOut", "MeminfoUnavailable"}:
+            if outcome not in {"Granted", "TimedOut", "MeminfoUnavailable", "StillWaiting"}:
                 raise ValueError(f"invalid gate outcome for {session_id}")
             return MemoryGateReturned(instant("wait_ended_at"), cast(GateOutcome, outcome))
         case "NothingToBuild":
@@ -1425,15 +1425,17 @@ def end_lapsed_turn(entry: ReleaseEntry, now: datetime, release_start: datetime,
                            else state.attempted_at if isinstance(state, DeliveryFailed) else release_start)
             deadline = released_at + timedelta(seconds=NO_ADMISSION_ACK_S)
         case WaitingForMemory(released_at=released_at, wait_started_at=wait_started_at):
-            limit_s = int(os.environ.get("BUILDLOG_MEM_WAIT_LIMIT_S", "900")) + MEMORY_GATE_GRACE_S
-            deadline = wait_started_at + timedelta(seconds=limit_s)
+            deadline = wait_started_at + timedelta(seconds=MEMORY_WAIT_TURN_S)
         case ReleasedAwaitingAdmission(released_at=released_at) | DeliveryQueued(attempted_at=released_at):
             deadline = released_at + timedelta(seconds=NO_ADMISSION_ACK_S)
         case _:
             return
     if now >= deadline:
         end_session_turn(entry, generation)
-        store_release_state(entry, NoAdmissionAck(released_at))
+        if isinstance(state, WaitingForMemory):
+            store_release_state(entry, MemoryGateReturned(now, "StillWaiting"))
+        else:
+            store_release_state(entry, NoAdmissionAck(released_at))
     elif (not entry["active_call_id"] and not isinstance(state, (RecipientGone, DeliveryFailed))
           and isinstance(socket_for(entry["session_id"]), RecipientGone)):
         entry["session_pending"] = False
