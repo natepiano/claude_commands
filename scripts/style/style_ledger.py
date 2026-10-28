@@ -43,6 +43,8 @@ CellState = Literal["current", "stale", "open", "awaiting merge"]
 # `removed` closes a ticket cell whose file the ticket's own commits deleted; it is not a verdict on code.
 Verdict = Literal["clean", "fixed", "exception", "held", "waived", "removed"]
 LintTool = Literal["clippy", "mend", "rustfmt"]
+# Why a sync finished a tip: it ran the lint, or the tip holds the style branch's own tree, so no lint ran.
+ProcessedTipReason = Literal["linted", "own hand-off"]
 # How long every ledger connection waits for another writer's lock before it fails.
 BUSY_TIMEOUT_SECONDS = 30
 
@@ -1530,6 +1532,11 @@ class Judgment:
 
 
 @dataclass(frozen=True)
+class UnseenTip:
+    """No sync finished the tip."""
+
+
+@dataclass(frozen=True)
 class LintCoverage:
     has_runs: bool
     passed: bool
@@ -1924,7 +1931,11 @@ MIGRATIONS = {
         ALTER TABLE tickets ADD COLUMN reservation_session_dir TEXT NOT NULL DEFAULT '';
         ALTER TABLE tickets ADD COLUMN reservation_phase TEXT NOT NULL DEFAULT '';
     """,
-    # Migration 23 belongs to phase 83's processed_tips.reason change on the integration branch.
+    # Distinguish linted tips from the style branch's own hand-offs (style_sync.py own-handoff).
+    23: """
+        ALTER TABLE processed_tips ADD COLUMN reason TEXT NOT NULL DEFAULT 'linted';
+    """,
+    # Findings a bulk rename batch released to ordinary tickets, with the refusal reason (bulk_rename.py).
     24: """
         CREATE TABLE IF NOT EXISTS bulk_refusals (
             finding_id TEXT NOT NULL, ticket TEXT NOT NULL, reason TEXT NOT NULL, at TEXT NOT NULL,
@@ -3110,14 +3121,17 @@ class Ledger:
         ).fetchall())
         return tuple(dict(zip(("checkpoint", "state", "merge_commit", "sent_to", "created_at", "updated_at"), row)) for row in rows)
 
-    def tip_seen(self, tip: str) -> bool:
+    def tip_seen(self, tip: str) -> ProcessedTipReason | UnseenTip:
         tip = _git(self.repo, "rev-parse", "--verify", f"{tip}^{{commit}}")
-        return self._connection.execute("SELECT tip FROM processed_tips WHERE tip=?", (tip,)).fetchone() is not None
+        rows = cast(list[tuple[ProcessedTipReason]], self._connection.execute(
+            "SELECT reason FROM processed_tips WHERE tip=?", (tip,)).fetchall())
+        return rows[0][0] if rows else UnseenTip()
 
-    def tip_done(self, tip: str) -> None:
+    def tip_done(self, tip: str, reason: ProcessedTipReason = "linted") -> None:
         tip = _git(self.repo, "rev-parse", "--verify", f"{tip}^{{commit}}")
         with self._connection:
-            _ = self._connection.execute("INSERT INTO processed_tips VALUES (?,?) ON CONFLICT(tip) DO NOTHING", (tip, _now()))
+            _ = self._connection.execute("INSERT INTO processed_tips(tip,processed_at,reason) VALUES (?,?,?) ON CONFLICT(tip) DO NOTHING",
+                                         (tip, _now(), reason))
 
     def hold(
         self, rule: str, path: str, line: int, text: str, kind: FindingKind, before: str,
@@ -6053,7 +6067,9 @@ def main() -> None:
                         print(json.dumps(handoff, sort_keys=True))
             elif args.command == "tip":
                 if args.action == "seen":
-                    print("seen" if ledger.tip_seen(args.tip) else "new")
+                    seen = ledger.tip_seen(args.tip)
+                    print("new" if isinstance(seen, UnseenTip) else "seen" if seen == "linted"
+                          else f"seen ({seen}: synced with no lint run)")
                 else:
                     ledger.tip_done(args.tip)
             elif args.command == "held":
