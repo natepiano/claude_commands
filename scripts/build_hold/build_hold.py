@@ -35,6 +35,7 @@ from target_config import ConfigError, read_targets
 
 
 BUILD_COMMANDS = frozenset({"cargo", "rustc", "cargo-nextest"})
+PROC_ROOT = Path("/proc")
 INSTANT = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})")
 SAFE = re.compile(r"[^A-Za-z0-9._-]")
 # A memory wait holds the release this long, then counts as answered: the session's build is in the
@@ -328,19 +329,6 @@ ReleaseEta = KnownReleaseEta | UnknownReleaseEta
 
 
 @dataclass(frozen=True)
-class KnownCores:
-    count: int
-
-
-@dataclass(frozen=True)
-class UnknownCores:
-    pass
-
-
-Cores = KnownCores | UnknownCores
-
-
-@dataclass(frozen=True)
 class NoReleaseEta:
     pass
 
@@ -472,12 +460,23 @@ class Process:
     pid: int
     user: str
     command: str
+
+
+@dataclass(frozen=True)
+class ProcessCpuTime:
+    ticks: int
+    started_at_ticks: int
+
+
+@dataclass(frozen=True)
+class CurrentProcessCpu:
+    process: Process
     cpu_percent: float
 
 
 @dataclass(frozen=True)
 class Quiet:
-    pass
+    processes: tuple[Process, ...]
 
 
 @dataclass(frozen=True)
@@ -1627,37 +1626,72 @@ def release_cycle(directory: Path, name: str, start: FirstRelease | ResumedRelea
         time.sleep(RELEASE_POLL_S)
 
 
-def quiet_verdict(load_1m: float, cores: Cores, processes: Sequence[Process], user: str) -> Quiet | Busy:
-    own = Counter(process.command for process in processes if process.user == user and process.command in BUILD_COMMANDS)
+def quiet_verdict(processes: Sequence[Process], user: str) -> Quiet | Busy:
+    builds = [process for process in processes if process.command in BUILD_COMMANDS]
     reasons: list[str] = []
-    if own:
-        reasons.append("your builds still running: " + ", ".join(f"{count} {command}" for command, count in sorted(own.items(), key=lambda item: (-item[1], item[0]))))
-    if isinstance(cores, UnknownCores):
-        reasons.append("core count unavailable, so the load limit cannot be judged")
-    elif load_1m >= cores.count / 4:
-        heaviest = sorted(processes, key=lambda process: process.cpu_percent, reverse=True)[:5]
-        running = ", ".join(f"{process.user} {process.command} {process.cpu_percent:g}%" for process in heaviest)
-        reasons.append(f"1-minute load {load_1m:g} is at or above {cores.count / 4:g}; heaviest: {running or 'none visible'}")
-    return Busy(tuple(reasons)) if reasons else Quiet()
+    for owner in sorted({process.user for process in builds}, key=lambda owner: (owner != user, owner)):
+        counts = Counter(process.command for process in builds if process.user == owner)
+        label = "your builds still running" if owner == user else owner
+        reasons.append(label + ": " + ", ".join(
+            f"{count} {command}" for command, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))))
+    if reasons:
+        return Busy(tuple(reasons))
+    return Quiet(tuple(processes))
 
 
 def read_processes() -> list[Process]:
-    output = subprocess.check_output(["ps", "-eo", "pid=,user:32=,pcpu=,comm="], text=True)
+    output = subprocess.check_output(["ps", "-eo", "pid=,user:32=,comm="], text=True)
     processes: list[Process] = []
     for line in output.splitlines():
-        parts = line.split(maxsplit=3)
-        if len(parts) == 4:
-            pid, user, cpu, command = parts
+        parts = line.split(maxsplit=2)
+        if len(parts) == 3:
+            pid, user, command = parts
             try:
-                processes.append(Process(int(pid), user, Path(command).name, float(cpu)))
+                processes.append(Process(int(pid), user, Path(command).name))
             except ValueError:
                 continue
     return processes
 
 
-def read_cores() -> Cores:
-    count = os.cpu_count()
-    return UnknownCores() if count is None else KnownCores(count)
+def read_process_cpu_times(processes: Sequence[Process], proc_root: Path) -> dict[int, ProcessCpuTime]:
+    readings: dict[int, ProcessCpuTime] = {}
+    for process in processes:
+        try:
+            # comm can contain spaces and closing parentheses; the remaining fields start at 3.
+            fields = (proc_root / str(process.pid) / "stat").read_text().rsplit(")", 1)[1].split()
+            readings[process.pid] = ProcessCpuTime(int(fields[11]) + int(fields[12]), int(fields[19]))
+        except (OSError, ValueError, IndexError):
+            continue
+    return readings
+
+
+def heaviest_processes(
+    processes: Sequence[Process],
+    *,
+    proc_root: Path = PROC_ROOT,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[CurrentProcessCpu, ...]:
+    if not processes:
+        return ()
+    ticks_per_second = os.sysconf("SC_CLK_TCK")
+    started = clock()
+    before = read_process_cpu_times(processes, proc_root)
+    sleep(1)
+    after = read_process_cpu_times(processes, proc_root)
+    elapsed = clock() - started
+    if elapsed <= 0:
+        return ()
+    usage: list[CurrentProcessCpu] = []
+    for process in processes:
+        if process.pid not in before or process.pid not in after:
+            continue
+        first, last = before[process.pid], after[process.pid]
+        if first.started_at_ticks != last.started_at_ticks or last.ticks <= first.ticks:
+            continue
+        percent = 100 * (last.ticks - first.ticks) / (elapsed * ticks_per_second)
+        usage.append(CurrentProcessCpu(process, percent))
+    return tuple(sorted(usage, key=lambda reading: reading.cpu_percent, reverse=True)[:5])
 
 
 def wait_for_quiet(
@@ -1665,8 +1699,6 @@ def wait_for_quiet(
     *,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
-    load: Callable[[], float] = lambda: os.getloadavg()[0],
-    cores: Callable[[], Cores] = read_cores,
     processes: Callable[[], Sequence[Process]] = read_processes,
     user: str | None = None,
 ) -> Quiet | Busy:
@@ -1675,7 +1707,7 @@ def wait_for_quiet(
     current_user = user or os.environ.get("USER", "")
     deadline = clock() + max_wait
     while True:
-        result = quiet_verdict(load(), cores(), processes(), current_user)
+        result = quiet_verdict(processes(), current_user)
         if isinstance(result, Quiet) or clock() >= deadline:
             return result
         sleep(min(10, max(0, deadline - clock())))
@@ -1748,7 +1780,9 @@ def main(arguments: list[str]) -> int:
             if isinstance(verdict, Busy):
                 print("; ".join(verdict.reasons))
                 return 1
-            print("builds are quiet; load is below the limit")
+            heaviest = heaviest_processes(verdict.processes)
+            running = ", ".join(f"{reading.process.user} {reading.process.command} {reading.cpu_percent:g}%" for reading in heaviest)
+            print(f"builds are quiet: no build runs. 1-minute load {os.getloadavg()[0]:g} is other work: {running or 'none visible'}")
         elif action == "release":
             given = cast(str | None, options.holder)
             resume_requested = cast(bool, options.resume)
