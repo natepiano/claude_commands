@@ -227,26 +227,15 @@ def _events(path: Path) -> list[dict[str, object]]:
 
 
 def newest_run(worktree: Path) -> Path | None:
-    """The worktree's newest run record, finished or not: the one unit_lookup.run_state reads."""
-    directory = unit_lookup.runs_dir()
-    found: tuple[float, Path] | None = None
-    for path in directory.glob("*.jsonl") if directory.is_dir() else ():
-        events = _events(path)
-        first = events[0] if events else {}
-        if first.get("event_type") != "run_started" or first.get("working_dir") != str(worktree):
-            continue
-        started = first.get("run_started_at")
-        at = float(started) if isinstance(started, (int, float)) and not isinstance(started, bool) else 0.0
-        if found is None or at > found[0]:
-            found = (at, path)
-    return found[1] if found else None
+    """The newest run record matching the worktree's exact recorded spelling, finished or not."""
+    run = unit_lookup.read_run_states().records.get(str(worktree))
+    return run.path if run is not None else None
 
 
 def open_run(worktree: Path) -> Path | None:
     """The record of the worktree's newest /unit:direct run when that run has not finished."""
-    run = newest_run(worktree)
-    events = _events(run) if run else []
-    return run if events and events[-1].get("event_type") != "run_finished" else None
+    run = unit_lookup.read_run_states().records.get(str(worktree))
+    return run.path if run is not None and run.state is unit_lookup.UnitState.RUNNING else None
 
 
 def open_phase(path: Path) -> str:
