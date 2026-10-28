@@ -105,7 +105,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 - Claims of fewer wrong-party asks: message records have no sender or recipient roles.
 - D16 as a duplicate duty: it has one owner.
 
-### Phase 3 — Build the first approved step  · status: todo
+### Phase 3 — Build the first approved step  · status: done
 **Depends on:** Phase 2, and the user's approval of Step 1
 
 #### Work Order
@@ -118,11 +118,87 @@ For active process redesigns, as we are currently undergoing with promotions and
 - An edit to `commands/unit/direct.md` goes to phases-unit as a change request through the showrunner; this phase does not edit it. Edits to `docs/production_format.md` and `commands/showrunner/produce.md` merge with any pending edits from guilds-unit or fix-rounds-unit that touch the same tags; the Work Order names each.
 - A rename changes every live file the measure names in one phase, and adds the old name to `role_terms.toml` as `retired`.
 
-**Files:**
-- `docs/plans/sdlc-roles-design.md` — Step log
-- `scripts/production/role_terms.toml` — when the step changes a name
+- **Approved step** (the user, 2026-10-28 13:18 EDT, "yes to all"; Step 1 copied verbatim from the design doc at 5ebb4dc2, `### 1. Retire singular and plural worker-seat prose with its check`):
 
-**Workers:** filled from the approved step.
+> **Needs the user and dependencies:** Q7, R-seat and G-A approval. Keep worker duties and any-time rename behavior. The question carries the measured source-only scan time (Comparison). The build phase first replays a plural-aware prototype over the commits after the retirement (`4ddd7b52..HEAD`, n=21 commits that add the word) and counts real flags against false failures and run time; if that reverses the case for G-A, the phase stops before any rename and asks again. The implementation estimate covers matcher, context data, fixtures and gate test.
+>
+> **Change files — live prose:** `commands/showrunner/rename_unit.md`; `commands/showrunner/retire_unit.md`; `commands/unit/direct.md`; `docs/production_format.md`; `docs/as-built/agent-registry.md`; `docs/as-built/long-lived-workers.md`; `docs/as-built/shutdown-and-restart.md`; `docs/as-built/unit-rename.md`; `docs/delegate/dual_review.md`. Phases-unit supplies the director edit; hub edits use the owning unit's normal flow. Change worker-role labels, not runtime behavior. Treat `Codex seats` and `Codex seat` before the shorter words.
+>
+> **Change files — scripts:** `scripts/agents/codex_mesh.py`; `scripts/agents/mesh_runs.py`; `scripts/direct/implement.sh`; `scripts/direct/phase_reservation.py`; `scripts/production/rename_unit.py`; `scripts/production/retire_unit.py`; `scripts/shutdown/restart.py`; `scripts/direct/board.sh`; `scripts/direct/review.sh`; `scripts/hooks/pre-tool-use-berth.py`. Change worker-role comments, docstrings, help, printed labels and messages, including `restart.py:1975`, `mesh_runs.py:272–275` and the rename/retire descriptions. The last three files contain role prose missed by string extraction; their edits earn no extra count credit. Keep identifiers, API fields, flags, transport addresses, filenames, placeholders documenting those contracts and historical identities.
+>
+> **Change files — measure and gate:** `scripts/production/role_terms.toml`; `scripts/production/roles_audit.py`; `scripts/production/test_roles_audit.py`. Add explicit inflected forms for the worker aliases to the data and use those forms in both Names and `check`; do not apply an English plural rule to every command or term. Add per-file kept contexts with reasons, instead of extending today's global masking. In `test_roles_audit.py`, add fixture tests for singular/plural matches, overlap, protocol/history contexts, a context copied into another file, changed kept text and a returning retired use. Add a source-only repository check test in this same discovered test file, so existing `merge_gate --tests-only` runs it in the unit and at merge. No new merge-gate dispatch code is needed. It reads repository sources, not home-state records. Tests that prove behavior must still fail on an eligible re-add.
+>
+> **Change files — assertions of changed output:** `scripts/shutdown/test_restart.py:435`, `scripts/production/test_rename_unit.py:553`, `scripts/agents/test_mesh_runs.py:183`, and `scripts/production/test_retire_unit.py:214`. Update their role-label expectations with the source output. Keep checks for thread identity, launcher arguments, worker names, refusal behavior and dry-run side effects. The expanded search found the retire dry-run assertion in addition to the first review's pinned tests. Checked `scripts/agents/test_codex_mesh.py` reopen assertions and `scripts/direct/test_implement_launcher.py` claim refusal assertions retain their existing expectations: those strings do not change. Test files stay outside the Names denominator because `read_live_files` skips `test_` scripts.
+>
+> **Reviewed and kept live files:** `docs/as-built/message-clarity.md:269` is a retirement record preserved at commit `291e1da55`, dated 2026-10-16 by blame; keep its old word as history, not an allowed role label. `docs/as-built/usage-ledger.md:46` and `scripts/usage/collect.py:532–534` document or implement the old `seats` data value migration; keep those exact values. These files belong to the measured source set and are reviewed in this phase, not deferred to a later rename. Raw source matches in `scripts/accounts/worker_names.py`, `scripts/agents/agent_bg.sh`, `scripts/buildlog/index.py`, `scripts/direct/worker_state.py`, `scripts/feature_log/inventory.py`, `scripts/shutdown/inventory.py`, `scripts/shutdown/record.py` and `scripts/shutdown/stop.py` are identifiers, stored keys or migration values, not worker-role prose. Keep them. This classification covers every worker-role singular/plural use found by the read-only search over the audit's scanned folders, plus uncounted source prose above; it makes no claim about files the scanner excludes.
+>
+> **Director-owned memory cleanup:** review agent-read prose under `~/.claude/projects/*/memory/` with the approved names. Correct current role explanations as director-owned cleanup, outside this worker's repository Work Order. Keep dated history, identities and quoted command output as recorded. Memory folders are not in the audit's Names set and earn no count credit. Do not send a question to the user for routine memory maintenance under an already approved naming policy.
+>
+> **Read-only classification, 2026-10-20:** the following table uses the current audit file filters, extraction and global kept-path masking, then applies `(?<![\w-])seats?(?![\w-])` case-insensitively. It adds only the explicit plural form to today's singular matcher. Each cell is eligible / kept. Every occurrence not listed in the kept contexts below is eligible role prose. Script and combined counts remain lower bounds. Source-only comments/docstrings excluded by the extractor receive no numeric credit.
+>
+> | Measured live file | Singular eligible / kept (n) | Plural eligible / kept (n) |
+> | --- | --- | --- |
+> | `commands/showrunner/rename_unit.md` | 5 / 0 | 2 / 0 |
+> | `commands/showrunner/retire_unit.md` | 0 / 0 | 2 / 0 |
+> | `commands/unit/direct.md` | 8 / 0 | 0 / 0 |
+> | `docs/as-built/agent-registry.md` | 1 / 0 | 1 / 0 |
+> | `docs/as-built/long-lived-workers.md` | 5 / 0 | 0 / 0 |
+> | `docs/as-built/message-clarity.md` | 0 / 0 | 0 / 1 |
+> | `docs/as-built/shutdown-and-restart.md` | 20 / 11 | 7 / 3 |
+> | `docs/as-built/unit-rename.md` | 1 / 0 | 1 / 0 |
+> | `docs/as-built/usage-ledger.md` | 0 / 0 | 0 / 1 |
+> | `docs/delegate/dual_review.md` | 1 / 0 | 0 / 0 |
+> | `docs/production_format.md` | 0 / 0 | 1 / 0 |
+> | Prose subtotal, n=11 files | 41 / 11 | 14 / 5 |
+> | `scripts/agents/codex_mesh.py` | 2 / 0 | 0 / 0 |
+> | `scripts/agents/mesh_runs.py` | 1 / 0 | 0 / 0 |
+> | `scripts/direct/implement.sh` | 1 / 0 | 0 / 0 |
+> | `scripts/direct/phase_reservation.py` | 0 / 0 | 1 / 0 |
+> | `scripts/production/rename_unit.py` | 1 / 0 | 2 / 0 |
+> | `scripts/production/retire_unit.py` | 0 / 0 | 2 / 0 |
+> | `scripts/shutdown/restart.py` | 1 / 0 | 0 / 0 |
+> | `scripts/usage/collect.py` | 0 / 0 | 0 / 2 |
+> | Script subtotal, n=8 files | 6 / 0 | 5 / 2 |
+> | Total, n=19 measured live files | 47 / 11 | 19 / 7 |
+>
+> **Kept contexts:**
+>
+> - Stored field: `docs/as-built/shutdown-and-restart.md:116`, literal `seat` (n=1 singular).
+> - Command/output placeholders: that file `:120`, `--to <seat>`, `reopened <seat>`, printed `--to <seat>` and `codex_mesh: <seat>: <reason>` (n=4 singular); `:143`, `<seat> (<role>, was working|idle): <command>` (n=1 singular). These document protocol arguments; ordinary role prose and the newly changed live message quotation change together.
+> - Filename placeholders: that file `:116`, `<run_dir>/<seat>.resume-prompt.md`, and `:122`, `<seat>.account-move.json` (n=2 singular). Today's masking leaves those placeholders partly visible; keep that fact in the lexical report.
+> - Dated probe history: that file `:290`, the 2026-10-16 run narrative (n=3 singular, n=3 plural). Keep its recorded wording and worker identity. Unlike the prior classification, this classification retains the full dated record, not just its identity.
+> - Retirement history: `docs/as-built/message-clarity.md:269` at `291e1da55`, dated 2026-10-16 (n=1 plural).
+> - Legacy data value: `docs/as-built/usage-ledger.md:46` (n=1 plural) and `scripts/usage/collect.py:532–534` SQL migration values (n=2 plural). They remain inputs the migration must recognize, not names for current workers.
+>
+> **Before and target:** singular n=58 reconciles with the checker's n=58 exactly; plural adds n=26, giving n=84 in n=19 live files. Eligible n=66 comprises prose n=55 and script n=11; kept n=18 comprises prose n=16 and script n=2. Singular eligible is n=47 and plural eligible n=19. With the same extraction the lexical result should become singular n=11 plus plural n=7, total n=18, while scoped eligible uses become zero. Phase 4's half-size test uses n=66 as the expected reduction. Re-run this classification before the build Work Order; source drift requires a new frozen classification. Do not claim adding plural detection or retaining more history as a rename saving. Keep the singular-only before/after report as well as the expanded report. `Codex seat` and `Codex seats` overlap these matches and earn no extra credit. Definitions, production names and sent contacts have no target here.
+>
+> **Why first:** this narrow role meaning has a classified plural-aware pool and a documented drift event after retirement. G-A adds matcher, context data, fixture and integration work, but later approved retirements reuse it. The judge supports drift prevention, not a measured work rate. The ranking remains conditional on the false-failure replay at the start of the build phase; a prose count alone does not rank implementation effort. This keeps the first phase measurable without pretending the other broad aliases are classified defects.
+>
+> **Undo:** revert role prose and pinned expectations with the inflection/retirement entries and check test. Preserve identities and migration inputs. Keep the before records. No live session, transport key, file path or thread moves during this rename or its undo.
+
+- **Amendments since the step was written** (unit director, 2026-10-28; showrunner points of 2026-10-28):
+  - **Re-classify first.** The merge of `origin/sdlc` (307 commits) moved the source: a raw count over the audit's 563 live files now finds singular n=69 and plural n=29 (was 58 and 26). New files with uses: `commands/showrunner/transfer_unit.md`, `scripts/production/transfer_unit.py`, `docs/as-built/build-memory-admission.md`, `docs/as-built/guilds.md`; `docs/as-built/shutdown-and-restart.md` grew. The first task, before any rename, freezes a new classification with the step's method (eligible / kept per file, kept contexts with reasons) and writes it with the `roles_audit.py baseline` before measure into the design doc's **Step log**. The new files join the change set by the same rules. The 2026-10-20 replay stands (sent to the showrunner); it is not run again.
+  - **`commands/unit/direct.md` is not edited here.** phases-unit owns it. `impl` writes the exact replacement text for each eligible use in it into the Step log; the unit director sends that to phases-unit as a change request through the showrunner. Its uses stay counted as eligible until phases-unit lands them; the check's kept list names them with that reason until then.
+  - **Hub files.** Read the `<Guild>` sections guild-process added to `commands/showrunner/produce.md` and `docs/production_format.md` before editing either file; change only worker-role words there.
+  - **Fix in this phase:** `role_terms.toml` lines 185 and 191 name a plan file in another worktree (`sdlc-guilds.md`) and `docs/plans/sdlc-production.md`; point each `defined_in` at the live defining file (`docs/as-built/guilds.md` where it defines the role). Its kept path `docs/delegate/` is stale: those files moved to `docs/direct/`; keep both until no live file is under `docs/delegate/`.
+  - **Approved names that touch this step** (the user, sdlc review): "worker" replaces "seat" for a Codex thread a unit director sends work to; "small-fix helper" is a showrunner's helper that does no code work. Q2 and Q3 answers (a "wait" is one unit waiting on another; a "gate" is a check that must pass; reviewers are named design reviewer, code reviewer, UI reviewer and designer) go into the design doc's Questions and term table as answered, with no source rename in this phase.
+  - **Read before relying on the duty map:** hierarchies' Map changed in `d14a7368`.
+
+**Files:**
+- `docs/plans/sdlc-roles-design.md` — Step log (before measure, frozen classification, the direct.md change request text), Questions and term table answers
+- `commands/showrunner/rename_unit.md`, `commands/showrunner/retire_unit.md`, `commands/showrunner/transfer_unit.md`, `docs/production_format.md`, `docs/as-built/agent-registry.md`, `docs/as-built/build-memory-admission.md`, `docs/as-built/guilds.md`, `docs/as-built/long-lived-workers.md`, `docs/as-built/shutdown-and-restart.md`, `docs/as-built/unit-rename.md`, `docs/direct/dual_review.md` — live prose
+- `scripts/agents/codex_mesh.py`, `scripts/agents/mesh_runs.py`, `scripts/direct/implement.sh`, `scripts/direct/phase_reservation.py`, `scripts/production/rename_unit.py`, `scripts/production/retire_unit.py`, `scripts/production/transfer_unit.py`, `scripts/shutdown/restart.py`, `scripts/direct/board.sh`, `scripts/direct/review.sh`, `scripts/hooks/pre-tool-use-berth.py` — scripts
+- `scripts/production/role_terms.toml`, `scripts/production/roles_audit.py`, `scripts/production/test_roles_audit.py` — measure and gate
+- `scripts/shutdown/test_restart.py`, `scripts/production/test_rename_unit.py`, `scripts/agents/test_mesh_runs.py`, `scripts/production/test_retire_unit.py`, `scripts/production/test_transfer_unit.py` — assertions of changed output
+- `docs/as-built/rustdoc-once-and-final-targets.md`, `scripts/berth/install/README.md`, `scripts/shutdown/inventory.py` — worker-role prose the `origin/sdlc` merge brought; the unit director's doc-only fix (F006)
+- `commands/unit/direct.md` — the 9 worker-role word changes from the Step log, applied by the unit director (showrunner's call, 2026-10-28: phases-unit is paused); phases-unit owns the file and gets an also-touches line
+- `docs/as-built/message-clarity.md`, `docs/as-built/usage-ledger.md`, `scripts/usage/collect.py` — read only; kept history and migration values
+- `commands/showrunner/produce.md` — read only unless the re-classification finds an eligible use
+
+
+**Workers:** `1 writer + 1 tester`, split by file set.
+- `impl` — the design doc, every live prose file and every script above; it freezes the classification first and writes the Step log
+- `test` — `role_terms.toml`, `roles_audit.py`, `test_roles_audit.py` and the assertion test files; it builds the plural-aware forms, per-file kept contexts and the source-only check test, and updates pinned expectations after `impl` posts each changed label on the board
 
 **Constraints from prior phases:** the Steps section and the user's answer, plus these facts from Phase 2:
 - Step 1 (as committed in e02e6370) covers 19 measured files plus 4 test files that assert the changed text (`scripts/shutdown/test_restart.py`, `scripts/production/test_rename_unit.py`, `scripts/agents/test_mesh_runs.py`, `scripts/production/test_retire_unit.py`). The expected reduction is n=66 (singular and plural), with n=18 kept uses; re-run the classification before dispatch.
@@ -133,8 +209,28 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Acceptance gate:** the gates in Delegation Context green; the change is live on main per the production's rule for `~/.claude`; the Step log has the before measure, the command and its file set or window.
 
-### Phase 4 — Measure the first step and propose the next  · status: todo
+### Phase 4 — Each session records its role apart from its name  · status: todo
 **Depends on:** Phase 3
+
+#### Work Order
+
+**Goal:** every session records its role apart from its name, so many sessions can hold one role and no session needs a role in its name.
+
+**Spec:**
+- Decided by the user (R1b, 2026-10-21; production doc Decisions): a session's name and its role are separate. Every session records its role apart from its name. roles-unit defines the role record; the unit board's owner and cargo-liner add the name and role columns (the showrunner asks them).
+- Packaging: the showrunner's call, 2026-10-28 — this phase follows Step 1. Bring the user only a choice R1b leaves open.
+- The unit director writes the Work Order from the current session records at phase start (roster, `showrunners.py`, `units_table.py`), with the role values from the approved names (Q3: design reviewer, code reviewer, UI reviewer, designer; Q6: showrunner, unit director; Q7: worker, small-fix helper).
+
+**Files:** set at phase start from the records the role field joins.
+
+**Workers:** set at phase start.
+
+**Constraints from prior phases:** the approved names; Step 1's worker words.
+
+**Acceptance gate:** the gates in Delegation Context green; each role-holding record type has a role field apart from its name; the record definition is in the design doc and sent to the showrunner for the column owners.
+
+### Phase 5 — Measure the first step and propose the next  · status: todo
+**Depends on:** Phase 4
 
 #### Work Order
 

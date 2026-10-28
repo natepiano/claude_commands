@@ -35,7 +35,7 @@ worker is busy, and keep it for reuse.
 
 The worker is the address and the lens is the judgment. Pass both to `review.sh`;
 findings remain keyed by lens even when a different slot takes it, and each
-seat's agent log carries its slot (`review_agent_<pass>_<lens>-<slot>.log`).
+worker's agent log carries its slot (`review_agent_<pass>_<lens>-<slot>.log`).
 
 The adversary's brief is to break the change, not to check it. It reports the
 concrete failing case it built, or reports plainly that it could not build one:

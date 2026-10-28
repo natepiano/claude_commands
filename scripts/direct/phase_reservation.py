@@ -11,7 +11,7 @@ reservation; a path a sibling phase already holds answers `left_unmapped` with t
 reservation, which is never recorded here (`commands/unit/direct.md` →
 <PhaseReservationContract/>). With one open phase there is no sibling: a `left_unmapped`
 reservation that cargo-berth's session map names for the director's bare session id, from an edit
-the director made itself, is that phase's own. Codex seats edit through `apply_patch`, so the Codex
+the director made itself, is that phase's own. Codex workers edit through `apply_patch`, so the Codex
 pre-edit hook (`scripts/hooks/pre-tool-use-berth.py`) runs that check and writes `Active`
 here. `record-active` is the checkpoint-time backstop for a first touch the hook did not see:
 it checks every path of the phase changed since its baseline and writes `Active` from the answer.
@@ -717,9 +717,9 @@ def _record_active_command(args: argparse.Namespace) -> int:
 
 
 def _claim_command(args: argparse.Namespace) -> int:
-    """Acquire a phase's reservation over its whole files list before any of its seats edits.
+    """Acquire a phase's reservation over its whole files list before any worker edits.
 
-    A seat's first edit is claimed only when the seat runs the berth check itself: a Codex seat
+    A worker's first edit is claimed only when the worker runs the berth check itself: a Codex worker
     whose hook never fires, on either machine, edits with no reservation, and drift charges those
     paths to whichever reservation is held. Claiming at launch leaves no window. A directory entry
     (trailing `/`) is claimed at its first touch.
@@ -761,7 +761,7 @@ def main(argv: list[str]) -> int:
     _ = record.add_argument("--session-dir", required=True)
     _ = record.add_argument("--phase", required=True)
     _ = record.add_argument("--repo", default=".")
-    claim = commands.add_parser("claim", help="acquire a phase's reservation over its files before its seats open")
+    claim = commands.add_parser("claim", help="acquire a phase's reservation over its files before its workers open")
     _ = claim.add_argument("--session-dir", required=True)
     _ = claim.add_argument("--phase", required=True)
     _ = claim.add_argument("--repo", default=".")
