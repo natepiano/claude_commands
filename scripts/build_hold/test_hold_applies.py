@@ -36,6 +36,7 @@ class TemporaryHoldTest(unittest.TestCase):
         targets = self.root / "targets.conf"
         _ = targets.write_text("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
         self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.root),
             "BUILD_HOLD_DIR": str(self.holders),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
