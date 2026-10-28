@@ -284,8 +284,12 @@ def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", call
             if isinstance(state, StateUnreadable):
                 print(wait_diagnostic(state.reason, caller), file=sys.stderr, flush=True)
                 return 12
-            if not isinstance(state, Held) or caller_holds_only_own():
+            holds = build_hold.natedev_holds(build_hold.holder_directory()).in_force
+            if not holds or caller_holds_only_own():
                 return 0
+            if not isinstance(state, Held):
+                print(wait_diagnostic("holder file exists; target state disagrees", caller), file=sys.stderr, flush=True)
+                return 12
             if not announced:
                 announced = True
                 print(f"{name}: natedev is held by {display_field(state.holder)} for "
@@ -355,8 +359,12 @@ def command_check_local(caller: str = "") -> int:
         if isinstance(state, StateUnreadable):
             print(wait_diagnostic(state.reason, "" if caller == "verify" else caller), file=output)
             return 12
-        if not isinstance(state, Held) or caller_holds_only_own():
+        holds = build_hold.natedev_holds(build_hold.holder_directory()).in_force
+        if not holds or caller_holds_only_own():
             return 0
+        if not isinstance(state, Held):
+            print(wait_diagnostic("holder file exists; target state disagrees", caller), file=output)
+            return 12
         if caller:
             label = speaker("" if caller == "verify" else caller)
             print(f"{label}: natedev is held by {display_field(state.holder)} for {display_field(state.reason)}.", file=output)

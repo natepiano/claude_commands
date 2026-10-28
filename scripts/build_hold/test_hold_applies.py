@@ -38,6 +38,7 @@ class TemporaryHoldTest(unittest.TestCase):
         self.enterContext(mock.patch.dict(os.environ, {
             "BUILD_HOLD_DIR": str(self.holders),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
+            "BUILDLOG_DIR": str(self.root / "buildlog"),
             "MAC_TEST_STATE_DIR": str(self.root / "mac"),
             "BUILD_TARGETS_CONFIG": str(targets),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
@@ -74,6 +75,24 @@ class TemporaryHoldTest(unittest.TestCase):
         _ = (release / "current").write_text(cycle_id + "\n")
 
 
+class CargoVerbTests(unittest.TestCase):
+    def test_build_verbs_match_the_wrapper_and_lookup_verbs_pass(self) -> None:
+        wrapper = SCRIPT.with_name("cargo").read_text()
+        branch = wrapper.split('case "$subcommand" in', 1)[1].split(') ;;', 1)[0].strip()
+        self.assertEqual(hold_applies.BUILDING_CARGO_VERBS, frozenset(branch.split("|")))
+        for verb in hold_applies.BUILDING_CARGO_VERBS | {"metadata", "locate-project", "tree", "version", "search"}:
+            with self.subTest(verb=verb):
+                self.assertEqual(hold_applies.cargo_verb(("+nightly", "--config=term.color=never", verb)), verb)
+        self.assertEqual(hold_applies.cargo_verb(("+stable", "-v")), "")
+
+    def test_option_values_cannot_turn_a_lookup_into_a_build(self) -> None:
+        for option in hold_applies.CARGO_OPTIONS_WITH_VALUES:
+            with self.subTest(option=option):
+                self.assertEqual(hold_applies.cargo_verb((option, "build", "metadata")), "metadata")
+                self.assertEqual(hold_applies.cargo_verb((option, "metadata", "check")), "check")
+        self.assertEqual(hold_applies.cargo_verb(("--config",)), "")
+
+
 class HoldAppliesTest(TemporaryHoldTest):
     def assert_cli(self, status: int, refusal: str = "") -> None:
         done = subprocess.run([sys.executable, str(SCRIPT)], capture_output=True, text=True, check=False)
@@ -108,26 +127,29 @@ class HoldAppliesTest(TemporaryHoldTest):
         self.assertIn("builder (for app test, release eta unknown)", refusal)
         self.assert_cli(0, refusal)
 
-    def test_releasing_hold_allows_builds_with_holder_file_present(self) -> None:
+    def test_release_record_never_admits_while_holder_file_exists(self) -> None:
         self.hold()
         self.releasing("other")
         self.assertTrue((self.holders / "other").is_file())
-        self.assertEqual(hold_applies.hold_applies(), "")
-        self.assert_cli(1)
-
-    def test_refusal_names_only_in_force_holders(self) -> None:
-        self.hold()
-        self.hold("released", "released builder")
-        self.releasing("released")
         self.assertEqual(hold_applies.hold_applies(), REFUSAL)
         self.assert_cli(0, REFUSAL)
 
-    def test_caller_is_only_in_force_holder_next_to_releasing_hold(self) -> None:
+    def test_refusal_names_every_present_holder_despite_release_record(self) -> None:
+        self.hold()
+        self.hold("released", "released builder")
+        self.releasing("released")
+        refusal = hold_applies.hold_applies()
+        self.assertIn("released builder", refusal)
+        self.assertIn("builder (for app test", refusal)
+        self.assert_cli(0, refusal)
+
+    def test_another_present_holder_blocks_the_caller_despite_release_record(self) -> None:
         self.hold("caller")
         self.hold("released", "released builder")
         self.releasing("released")
-        self.assertEqual(hold_applies.hold_applies(), "")
-        self.assert_cli(1)
+        refusal = hold_applies.hold_applies()
+        self.assertIn("released builder", refusal)
+        self.assert_cli(0, refusal)
 
     def test_unreadable_state(self) -> None:
         self.unreadable()
@@ -135,12 +157,12 @@ class HoldAppliesTest(TemporaryHoldTest):
             _ = hold_applies.hold_applies()
         self.assert_cli(2)
 
-    def test_unreadable_release_state(self) -> None:
+    def test_unreadable_release_state_does_not_change_sole_holder_admission(self) -> None:
         self.hold("caller")
         release = self.root / "release"
         release.mkdir()
         _ = (release / "current").write_text("missing-cycle\n")
-        self.assert_cli(2)
+        self.assert_cli(1)
 
     def test_uses_wait_local_decision(self) -> None:
         self.hold()

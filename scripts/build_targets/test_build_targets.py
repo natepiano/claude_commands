@@ -12,7 +12,7 @@ from collections.abc import Generator
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 import unittest
 
@@ -21,11 +21,18 @@ import build_hold
 import offload
 import mac_test
 import targets
+if TYPE_CHECKING:
+    from ..buildlog import record, store
+else:
+    import record
+    import store
 from test_targets import END, NOW, SHIPPED_CONFIG, SINCE, IsolatedTargetTest
 
 REAL_SUBPROCESS_RUN = subprocess.run
 REAL_SUBPROCESS_POPEN = subprocess.Popen
 REAL_PROCESS_START_TIME = build_hold.process_start_time
+REAL_RECORD_HOLD_EVENT = build_hold.record_hold_event
+REAL_BUILDLOG_ROOT = Path.home() / ".local/state/buildlog"
 
 
 @contextmanager
@@ -38,7 +45,16 @@ def pacific_zone() -> Generator[None, None, None]:
         time.tzset()
 
 
-class StatusTests(IsolatedTargetTest):
+class IsolatedBuildTargetTest(IsolatedTargetTest):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "BUILDLOG_DIR": str(self.root / "buildlog"),
+        })))
+
+
+class StatusTests(IsolatedBuildTargetTest):
     @override
     def setUp(self) -> None:
         super().setUp()
@@ -317,7 +333,7 @@ class StatusTests(IsolatedTargetTest):
         self.assertEqual(block.read_bytes(), before)
 
 
-class EligibleCommandTests(IsolatedTargetTest):
+class EligibleCommandTests(IsolatedBuildTargetTest):
     def test_cli_prints_every_target_in_config_order_with_resolved_settings(self) -> None:
         config = self.write_config(
             "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
@@ -339,7 +355,7 @@ class EligibleCommandTests(IsolatedTargetTest):
                 self.assertEqual(output.getvalue(), f"natedev\teligible\t-\t-\nmac\t{disposition}\t{reason}\t{self.settings}\n")
 
 
-class WaitLocalTests(IsolatedTargetTest):
+class WaitLocalTests(IsolatedBuildTargetTest):
     sleeps: int = 0
 
     @override
@@ -374,24 +390,49 @@ class WaitLocalTests(IsolatedTargetTest):
             code = build_targets.command_wait_local("call-a", pid=12345)
         return code, output.getvalue(), errors.getvalue()
 
-    def test_wait_local_with_holder_file_does_not_read_an_invalid_user_zone(self) -> None:
-        self.write_holder()
+    def test_damaged_cycle_pointer_waits_for_unlink_without_reading_user_zone(self) -> None:
         release = self.root / "release"
         release.mkdir()
         _ = (release / "current").write_text("damaged")
         for zone in ("America/New_York", "NoSuchZone"):
-            environment = {**os.environ, "TZ": "UTC", "USER_ZONE": zone}
-            with self.subTest(zone=zone), \
-                 mock.patch.object(subprocess, "run", wraps=REAL_SUBPROCESS_RUN), \
-                 mock.patch.object(subprocess, "Popen", wraps=REAL_SUBPROCESS_POPEN):
-                result = subprocess.run([sys.executable, build_targets.__file__, "wait-local", "--call-id", "call-a",
-                                         "--pid", str(os.getpid())], env=environment,
-                                        capture_output=True, text=True, timeout=5)
-            self.assertEqual(result.returncode, 12, result.stdout + result.stderr)
-            self.assertNotIn("Traceback", result.stderr)
-            self.assertIn("release record could not be read", result.stderr)
+            with self.subTest(zone=zone), mock.patch.dict(os.environ, {"TZ": "UTC", "USER_ZONE": zone}):
+                self.write_holder()
+                events: list[str] = []
+
+                def remove_holder(_seconds: float) -> None:
+                    self.assertTrue((self.holders / "hana").exists())
+                    events.append("wait")
+                    (self.holders / "hana").unlink()
+                    events.append("unlink")
+
+                with mock.patch.object(build_targets, "wait_sleep", side_effect=remove_holder):
+                    code, output, errors = self.wait()
+                events.append("return")
+                self.assertEqual(code, 0, output + errors)
+                self.assertEqual(events, ["wait", "unlink", "return"])
+                with mock.patch.object(build_targets, "wait_sleep", side_effect=AssertionError("No holder may delay")):
+                    self.assertEqual(self.wait(), (0, "", ""))
+                self.assertEqual((release / "current").read_text(), "damaged")
 
 
+
+    def test_hold_and_release_write_temp_log_without_writing_real_log(self) -> None:
+        def record_now(command: list[str]) -> None:
+            self.assertEqual(command[2], "hold-event")
+            record.hold_event(command[3:])
+
+        with mock.patch.object(build_hold, "record_hold_event", wraps=REAL_RECORD_HOLD_EVENT), \
+             mock.patch.object(build_hold, "start_recorder", side_effect=record_now), \
+             mock.patch.object(store, "append_line", wraps=store.append_line) as append:
+            self.begin_hold()
+            self.release_hold(0)
+        destinations = [cast(Path, call.args[0]) for call in append.call_args_list]
+        self.assertEqual(len(destinations), 2)
+        self.assertTrue(all(path.is_relative_to(self.root / "buildlog") for path in destinations))
+        self.assertFalse(any(path.is_relative_to(REAL_BUILDLOG_ROOT) for path in destinations))
+        rows = [cast(dict[str, object], json.loads(line))
+                for path in set(destinations) for line in path.read_text().splitlines()]
+        self.assertEqual([row["event"] for row in rows], ["began", "ended"])
 
     def test_unheld_call_returns_without_polling_or_creating_cycle(self) -> None:
         with mock.patch.object(build_targets, "wait_sleep", side_effect=AssertionError("No hold needs no poll")):
@@ -518,18 +559,28 @@ class WaitLocalTests(IsolatedTargetTest):
         self.assertEqual(self.sleeps, 2)
         self.assertFalse((self.holders / "hana").exists())
 
-    def test_unreadable_cycle_exits_twelve_without_polling(self) -> None:
+    def test_damaged_cycle_waits_for_unlink_then_passes_without_a_holder(self) -> None:
         self.begin_hold()
         cycle = build_hold.read_cycle()
         assert cycle is not None
         path = self.root / "release" / cycle["id"] / "cycle.json"
         _ = path.write_text("{broken")
-        with mock.patch.object(build_targets, "wait_sleep", side_effect=AssertionError("Invalid record cannot admit")):
+
+        events: list[str] = []
+
+        def release_holder(_seconds: float) -> None:
+            self.assertTrue((self.holders / "hana").exists())
+            events.append("wait")
+            (self.holders / "hana").unlink()
+            events.append("unlink")
+
+        with mock.patch.object(build_targets, "wait_sleep", side_effect=release_holder):
             code, output, errors = self.wait()
-        self.assertEqual(code, 12)
-        self.assertIn("hold state cannot be read (", output + errors)
-        self.assertIn("Expecting property name", output + errors)
-        self.assertIn("); not starting.", output + errors)
+        events.append("return")
+        self.assertEqual(code, 0, output + errors)
+        self.assertEqual(events, ["wait", "unlink", "return"])
+        with mock.patch.object(build_targets, "wait_sleep", side_effect=AssertionError("No holder may delay")):
+            self.assertEqual(self.wait(), (0, "", ""))
         self.assertEqual(path.read_text(), "{broken")
 
     def test_unreadable_holder_state_exits_twelve_without_waiting(self) -> None:

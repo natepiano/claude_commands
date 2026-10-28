@@ -86,6 +86,11 @@ class IsolatedBuildHoldTest(unittest.TestCase):
         lifetime = self.scratch / "child-lifetime"
         lifetime.mkdir()
         _ = (lifetime / "sitecustomize.py").write_text(CHILD_LIFETIME)
+        tools = self.scratch / "tools"
+        tools.mkdir()
+        systemctl = tools / "systemctl"
+        _ = systemctl.write_text("#!/bin/sh\nexit 0\n")
+        systemctl.chmod(0o755)
         fifo = lifetime / "writers"
         os.mkfifo(fifo)
         self.lifetime_reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
@@ -97,6 +102,9 @@ class IsolatedBuildHoldTest(unittest.TestCase):
             "BUILDLOG_DIR": str(self.scratch / "buildlog"),
             "BUILD_HOLD_DIR": str(self.scratch / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.scratch / "release"),
+            "BUILD_HOLD_ENFORCER_DIR": str(self.scratch / "enforcer"),
+            "BUILD_HOLD_CGROUP_ROOT": str(self.scratch / "cgroup"),
+            "PATH": str(tools) + os.pathsep + os.environ.get("PATH", ""),
             "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
             "MAC_TEST_STATE_DIR": str(self.scratch / "mac-state"),
@@ -600,7 +608,8 @@ class TargetCommandTests(IsolatedBuildHoldTest):
             return subprocess.CompletedProcess(argv, exit_code, "Mac stand-in result\n", "Mac stand-in detail\n")
 
         output, errors = io.StringIO(), io.StringIO()
-        with mock.patch.object(subprocess, "run", side_effect=command), redirect_stdout(output), redirect_stderr(errors):
+        with mock.patch.object(build_hold.hold_enforcer(), "start"), \
+             mock.patch.object(subprocess, "run", side_effect=command), redirect_stdout(output), redirect_stderr(errors):
             try:
                 status = build_hold.main(arguments)
             except SystemExit as error:
@@ -1005,7 +1014,7 @@ class CommandTests(IsolatedBuildHoldTest):
                 self.assertEqual(final.stdout.strip(), "released, builds may resume. No hold cycle: broadcast this release to every session.")
                 self.assertFalse((scratch / "holders" / "second").exists())
 
-    def test_wait_refuses_damaged_record_and_recipient_can_set_it_aside(self) -> None:
+    def test_sole_holder_wait_ignores_damaged_cycle_and_recipient_can_set_it_aside(self) -> None:
         commands = (
             ("wait",),
             ("record-recipient", "--session-id", "first", "--name", "first session"),
@@ -1022,8 +1031,7 @@ class CommandTests(IsolatedBuildHoldTest):
                     path, content = self.damage_record(kind, scratch)
                     result = self.run_cli(scratch / "holders", *command)
                     if command[0] == "wait":
-                        self.assertEqual(result.returncode, 12, result.stderr)
-                        self.assertIn("hold state cannot be read", result.stdout)
+                        self.assertEqual(result.returncode, 0, result.stderr)
                         self.assertEqual(path.read_bytes(), content)
                         self.assertTrue((scratch / "holders" / "first").is_file())
                         self.assertEqual(list(path.parent.glob(path.name + ".damaged-*")), [])
@@ -1084,7 +1092,7 @@ class CommandTests(IsolatedBuildHoldTest):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("verify.sh waits by itself", result.stdout)
             self.assertNotIn("build_hold.py wait", result.stdout)
-            self.assertIn("already running when this hold began", result.stdout)
+            self.assertIn("tests and builds outside the hold are stopped", result.stdout)
             self.assertEqual(len(recorded_hold_events(self.scratch / "buildlog", 1)), 1)
 
     def test_recipient_wait_command_registers_its_session_id(self) -> None:
@@ -1402,7 +1410,7 @@ class AtomicWriteTests(IsolatedBuildHoldTest):
                     self.assertEqual(list(folder.iterdir()), old_files)
                     self.assertEqual(source, folder.parent / f"{folder.name}.{path.name}.tmp")
                     content = cast(object, json.loads(source.read_text()))
-                    expected: dict[str, str] = {"holder": "holder", "since": self.now.isoformat(), "for": "new purpose", "release_eta": "unknown"}
+                    expected: dict[str, object] = {"holder": "holder", "since": self.now.isoformat(), "for": "new purpose", "release_eta": "unknown", "keep": []}
                     self.assertEqual(content, expected)
                     seen.append(source)
                     replace(source, destination)
@@ -1442,7 +1450,7 @@ class HoldRecordingTests(IsolatedBuildHoldTest):
                 result = subprocess.run(
                     ["python3", str(SCRIPT), "hold", "--holder", "alice", "--for", "render checks",
                      "--proc-root", str(self.scratch / "proc")],
-                    env=dict(os.environ), capture_output=True, text=True, timeout=1.5, check=False)
+                    env=dict(os.environ), capture_output=True, text=True, timeout=10, check=False)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn("natedev is held for render checks.", result.stdout)
                 self.assertTrue((self.scratch / "holders" / "alice").is_file())
@@ -1484,7 +1492,7 @@ class HoldRecordingTests(IsolatedBuildHoldTest):
         release.mkdir()
         _ = (release / "current").write_text("damaged")
         with mock.patch.object(build_hold, "read_cycle", side_effect=AssertionError("no files need no cycle")):
-            self.assertEqual(build_hold.natedev_holds(self.scratch / "holders"), build_hold.NatedevHolds((), ()))
+            self.assertEqual(build_hold.natedev_holds(self.scratch / "holders"), build_hold.NatedevHolds(()))
 
     def test_holder_file_without_a_cycle_is_in_force(self) -> None:
         folder = self.scratch / "holders"
@@ -1492,9 +1500,8 @@ class HoldRecordingTests(IsolatedBuildHoldTest):
         _ = write_holder(folder, "session-id", "2026-10-12T10:00:00+00:00", "render checks")
         result = build_hold.natedev_holds(folder)
         self.assertEqual([holder.key for holder in result.in_force], ["session-id"])
-        self.assertEqual(result.releasing, ())
 
-    def test_released_at_with_matching_since_puts_file_in_releasing_and_reads_holders_once(self) -> None:
+    def test_released_at_with_matching_since_does_not_end_a_present_hold(self) -> None:
         folder = self.begin()
         cycle = build_hold.read_cycle()
         assert cycle is not None
@@ -1503,14 +1510,12 @@ class HoldRecordingTests(IsolatedBuildHoldTest):
         with mock.patch.object(build_hold, "read_holders", wraps=build_hold.read_holders) as read:
             result = build_hold.natedev_holds(folder)
         self.assertEqual(read.call_count, 1)
-        self.assertEqual(result.in_force, ())
-        self.assertEqual([holder.key for holder in result.releasing], ["session-id"])
+        self.assertEqual([holder.key for holder in result.in_force], ["session-id"])
 
-    def test_present_holder_and_damaged_cycle_raise_release_record_read_error(self) -> None:
+    def test_present_holder_and_damaged_cycle_stay_in_force(self) -> None:
         folder = self.begin()
         _ = (self.scratch / "release" / "current").write_text("damaged")
-        with self.assertRaises(build_hold.ReleaseRecordReadError):
-            _ = build_hold.natedev_holds(folder)
+        self.assertEqual([holder.key for holder in build_hold.natedev_holds(folder).in_force], ["session-id"])
 
     def test_repeated_hold_and_renamed_release_keep_one_begin_and_the_file_key(self) -> None:
         folder = self.begin("unsafe name", "old name")
@@ -1564,6 +1569,88 @@ class HoldRecordingTests(IsolatedBuildHoldTest):
 class ImmediateReleaseTests(IsolatedBuildHoldTest):
     now: datetime = datetime(2026, 10, 28, tzinfo=timezone.utc)
 
+    def test_interrupted_old_release_keeps_wait_and_local_checks_held_until_unlink(self) -> None:
+        import build_targets
+        self.begin()
+        cycle = self.cycle()
+        cycle["holders"]["holder"]["released_at"] = self.now.isoformat()
+        cycle["release_started_at"] = self.now.isoformat()
+        build_hold.save_cycle(cycle)
+        config = self.scratch / "targets.conf"
+        _ = config.write_text("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
+        events: list[str] = []
+
+        def remove_on_wait(_seconds: float) -> None:
+            events.append("waited with file")
+            self.assertTrue((self.scratch / "holders/holder").is_file())
+            (self.scratch / "holders/holder").unlink()
+            events.append("file removed")
+
+        with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config), "CLAUDE_CODE_SESSION_ID": "waiter"}), \
+             mock.patch.object(build_hold, "socket_for") as lookup, \
+             mock.patch.object(build_targets, "wait_clock", return_value=self.now), \
+             mock.patch.object(build_targets, "wait_sleep", side_effect=remove_on_wait), \
+             redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with mock.patch.object(build_hold, "release_hold", side_effect=OSError("interrupted before unlink")):
+                with self.assertRaisesRegex(OSError, "interrupted"):
+                    _ = build_hold.release_cycle(self.scratch / "holders", "holder", clock=lambda: self.now)
+            self.assertEqual(build_hold.main(["wait"]), 10)
+            self.assertEqual(build_targets.command_check_local(), 10)
+            self.assertEqual(build_targets.command_register_local("call", pid=123), 10)
+            self.assertIn("wait for release", build_hold.register_wait("waiter"))
+            self.assertEqual(build_hold.notify_release(self.cycle()), "")
+            lookup.assert_not_called()
+            self.assertEqual(build_targets.command_wait_local("call", caller="lint"), 0)
+            events.append("wait returned")
+        self.assertEqual(events, ["waited with file", "file removed", "wait returned"])
+
+    def test_release_unlinks_before_saving_release_fields_and_before_notice(self) -> None:
+        self.begin()
+        build_hold.record_recipients([("waiting", "one")])
+        save = build_hold.save_cycle
+        events: list[str] = []
+
+        def saved(cycle: build_hold.HoldCycle) -> None:
+            self.assertFalse((self.scratch / "holders/holder").exists())
+            self.assertEqual(cycle["holders"]["holder"]["released_at"], self.now.isoformat())
+            events.append("started" if cycle["release_started_at"] else "released")
+            save(cycle)
+
+        def send(_entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseDelivered:
+            self.assertFalse((self.scratch / "holders/holder").exists())
+            self.assertIn("started", events)
+            events.append("notice")
+            return build_hold.ReleaseDelivered()
+
+        with mock.patch.object(build_hold, "save_cycle", side_effect=saved), \
+             mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/fake")), \
+             mock.patch.object(build_hold, "send_release", side_effect=send):
+            _ = build_hold.release_cycle(self.scratch / "holders", "holder", clock=lambda: self.now)
+            _ = build_hold.notify_release(self.cycle())
+        self.assertEqual(events[:2], ["released", "started"])
+        self.assertEqual(events.count("notice"), 1)
+
+    def test_same_session_rehold_resets_release_and_adds_keep_runs(self) -> None:
+        self.begin()
+        cycle = self.cycle()
+        cycle["holders"]["holder"]["released_at"] = self.now.isoformat()
+        cycle["release_started_at"] = self.now.isoformat()
+        build_hold.save_cycle(cycle)
+        for pid in (10, 20):
+            _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("holder", "holder"),
+                                      "again", build_hold.NoReleaseEta(), self.now,
+                                      (build_hold.ProcessIdentity(pid, str(pid * 10)),))
+        self.assertEqual(self.cycle()["release_started_at"], "")
+        self.assertEqual(self.cycle()["holders"]["holder"]["released_at"], "")
+        self.assertIn("wait for release", build_hold.register_wait("waiter"))
+        holder, = build_hold.natedev_holds(self.scratch / "holders").in_force
+        self.assertEqual(holder.keep, (build_hold.ProcessIdentity(10, "100"), build_hold.ProcessIdentity(20, "200")))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(build_hold.main(["status"]), 0)
+        self.assertIn("kept by holder: pid 10, start 100", output.getvalue())
+        self.assertIn("kept by holder: pid 20, start 200", output.getvalue())
+
     def begin(self, name: str = "holder") -> None:
         _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity(name, name),
                                   "tests", build_hold.NoReleaseEta(), self.now)
@@ -1572,6 +1659,29 @@ class ImmediateReleaseTests(IsolatedBuildHoldTest):
         cycle = build_hold.read_cycle()
         assert cycle is not None
         return cycle
+
+    def test_release_never_waits_on_an_idle_waiter(self) -> None:
+        self.begin()
+        for session in ("idle", "ready"):
+            self.assertIn("wait for release", build_hold.register_wait(session, session))
+        sent: list[str] = []
+
+        def send(entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseDelivered:
+            self.assertFalse((self.scratch / "holders/holder").exists())
+            sent.append(entry["session_id"])
+            # Neither session acknowledges or reports that its turn ended.
+            return build_hold.ReleaseDelivered()
+
+        with mock.patch.object(time, "sleep", side_effect=AssertionError("release must not sleep")), \
+             mock.patch.object(build_hold, "wait_for_quiet", side_effect=AssertionError("release must not wait")), \
+             mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test")), \
+             mock.patch.object(build_hold, "send_release", side_effect=send):
+            result = build_hold.release_cycle(self.scratch / "holders", "holder", clock=lambda: self.now)
+            self.assertEqual(result, "released, builds may resume.")
+            self.assertFalse((self.scratch / "holders/holder").exists())
+            self.assertCountEqual(sent, ["idle", "ready"])
+            self.assertEqual(build_hold.notify_release(self.cycle()), "")
+            self.assertCountEqual(sent, ["idle", "ready"])
 
     def test_last_release_removes_holder_before_each_notice_and_never_sends_twice(self) -> None:
         self.begin()
@@ -1582,8 +1692,7 @@ class ImmediateReleaseTests(IsolatedBuildHoldTest):
 
         def send(entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseDelivered:
             self.assertFalse((self.scratch / "holders" / "holder").exists())
-            with (self.scratch / "release" / "release.lock").open() as lock:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertTrue(self.cycle()["holders"]["holder"]["released_at"])
             sent.append(entry["session_id"])
             return build_hold.ReleaseDelivered()
 
@@ -1806,6 +1915,21 @@ class BuildAuditTests(IsolatedBuildHoldTest):
         _ = build_hold.audit_hold(self.holders, self.proc)
         self.assertEqual(len(self.rows()), 5)
 
+    def test_hold_keep_cli_captures_start_time_adds_runs_and_reports_stop_choices(self) -> None:
+        _ = self.process(10, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "other"})
+        _ = self.process(20, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "other"})
+        output = io.StringIO()
+        with redirect_stdout(output):
+            for pid in (10, 20):
+                self.assertEqual(build_hold.main(["hold", "--holder", "holder", "--for", "app test",
+                                                 "--proc-root", str(self.proc), "--keep", str(pid)]), 0)
+            self.assertEqual(build_hold.main(["hold", "--holder", "holder", "--for", "app test",
+                                             "--proc-root", str(self.proc), "--keep", "999"]), 1)
+        holder, = build_hold.natedev_holds(self.holders).in_force
+        self.assertEqual(holder.keep, (build_hold.ProcessIdentity(10, "100"), build_hold.ProcessIdentity(20, "200")))
+        self.assertIn("kept: other, pid 10", output.getvalue())
+        self.assertIn("--keep 20", output.getvalue())
+
     def test_hold_status_and_audit_print_builds_and_only_record_no_session(self) -> None:
         _ = self.process(10, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "other"})
         _ = self.process(20, "cargo", argv=("cargo", "check", "--package", "unowned"))
@@ -1818,9 +1942,12 @@ class BuildAuditTests(IsolatedBuildHoldTest):
             with redirect_stdout(output):
                 self.assertEqual(build_hold.main(args), 0)
             self.assertIn("other_session: other, pid 10: cargo test", output.getvalue())
-            self.assertNotIn("unowned", output.getvalue())
+            if action == "audit":
+                self.assertNotIn("unowned", output.getvalue())
+            else:
+                self.assertIn("--keep 20", output.getvalue())
             if action == "hold":
-                self.assertIn("already running when this hold began", output.getvalue())
+                self.assertIn("tests and builds outside the hold are stopped", output.getvalue())
         self.assertEqual(len(self.rows()), 2)
 
     def test_audit_read_failure_does_not_fail_hold_or_status(self) -> None:

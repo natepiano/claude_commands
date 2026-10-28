@@ -12,12 +12,36 @@ import build_hold
 from targets import Held, StateUnreadable, target_state
 
 
+BUILDING_CARGO_VERBS = frozenset({
+    "build", "b", "check", "c", "clippy", "test", "t", "nextest", "run", "r", "bench", "doc", "d",
+    "rustc", "rustdoc", "fix", "install", "miri", "mend",
+})
+CARGO_OPTIONS_WITH_VALUES = frozenset({
+    "-C", "--config", "-Z", "--color", "--manifest-path", "--lockfile-path", "--target-dir", "--target",
+    "-j", "--jobs", "-p", "--package", "--exclude", "-F", "--features", "--profile", "--message-format",
+    "--artifact-dir", "--out-dir",
+})
+
+
+def cargo_verb(arguments: tuple[str, ...]) -> str:
+    """Match the cargo wrapper's first-verb and option-value rules."""
+    skip_value = False
+    for argument in arguments:
+        if skip_value:
+            skip_value = False
+        elif argument in CARGO_OPTIONS_WITH_VALUES:
+            skip_value = True
+        elif not argument.startswith(("+", "-")):
+            return argument
+    return ""
+
+
 class HoldStateReadError(ValueError):
     """The hold decision could not be read; callers may run their command."""
 
 
 def hold_applies() -> str:
-    """Return the refusal while a hold is in force; allow its release.
+    """Return the refusal while another session's holder file exists.
 
     Raise HoldStateReadError when the hold state cannot be read.
     """
@@ -25,13 +49,11 @@ def hold_applies() -> str:
         state = target_state(build_targets.local_target())
         if isinstance(state, StateUnreadable):
             raise HoldStateReadError(state.reason)
-        if not isinstance(state, Held):
-            return ""
-        # The ownership helper treats a damaged cycle as not owned. Read it here
-        # as well so a read failure lets the caller run its command.
         holds = build_hold.natedev_holds(build_hold.holder_directory())
         if not holds.in_force or build_targets.caller_holds_only_own():
             return ""
+        if not isinstance(state, Held):
+            raise HoldStateReadError("holder file exists; target state disagrees")
         names = "; ".join(build_hold.holder_text(holder) for holder in holds.in_force)
         return (f"natedev builds are held by {names}. Keep working, writes included. "
                 "Run tests with verify.sh test: they go to the Mac. "

@@ -21,7 +21,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, time as ClockTime, timezone
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import Literal, Protocol, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
@@ -232,12 +232,12 @@ class Holder:
     release: ReleaseEta
     # The hold file's name: the holder's Claude session id, or its name when it is no Claude session.
     key: str
+    keep: tuple[ProcessIdentity, ...] = ()
 
 
 @dataclass(frozen=True)
 class NatedevHolds:
     in_force: tuple[Holder, ...]
-    releasing: tuple[Holder, ...]
 
 
 @dataclass(frozen=True)
@@ -339,6 +339,24 @@ class AuditProcess:
     cwd: str
     environment: Mapping[str, str]
     in_build_scope: bool
+    uid: int = -1
+    tty_nr: int = 0
+    executable: str = ""
+    desktop_app: bool = False
+
+
+@dataclass(frozen=True)
+class FullBuildAudit:
+    pass
+
+
+@dataclass(frozen=True)
+class HoldBuildCandidates:
+    uid: int
+
+
+FULL_BUILD_AUDIT = FullBuildAudit()
+SYSTEM_CGROUP_ROOT = Path("/sys/fs/cgroup")
 
 
 BuildClass = Literal["holder", "admitted", "other_session", "no_session"]
@@ -354,23 +372,61 @@ class AuditedBuild:
     children: tuple[ProcessIdentity, ...]
 
 
-def read_audit_processes(proc_root: Path) -> dict[int, AuditProcess]:
+def read_audit_processes(
+    proc_root: Path, selection: FullBuildAudit | HoldBuildCandidates = FULL_BUILD_AUDIT,
+    cgroup_root: Path = SYSTEM_CGROUP_ROOT,
+) -> dict[int, AuditProcess]:
+    """Read the table once; an enforcer reads details only for candidates and ancestors."""
     processes: dict[int, AuditProcess] = {}
+    desktop_pids: set[int] = set()
+    if isinstance(selection, HoldBuildCandidates):
+        cgroup_root = Path(os.environ.get("BUILD_HOLD_CGROUP_ROOT", str(cgroup_root)))
+        apps = cgroup_root / f"user.slice/user-{selection.uid}.slice/user@{selection.uid}.service/app.slice"
+        for unit in apps.glob("app-*"):
+            if not (unit.name.endswith(".scope") or "@" in unit.name and unit.name.endswith(".service")):
+                continue
+            for file in unit.rglob("cgroup.procs"):
+                try:
+                    desktop_pids.update(int(pid) for pid in file.read_text().split() if pid.isdecimal())
+                except OSError:
+                    continue
     for directory in proc_root.iterdir():
         if not directory.name.isdecimal():
             continue
         pid = int(directory.name)
-        start = process_start_time(pid, proc_root)
-        if not start.isdecimal():
-            continue
         try:
             stat = (directory / "stat").read_text(errors="replace").rsplit(")", 1)[1].split()
+            start = stat[19]
+            if stat[0] == "Z" or not start.isdecimal():
+                continue
             parent_pid = int(stat[1])
             command = (directory / "comm").read_text(errors="replace").strip()
-            argv = tuple(part.decode("utf-8", "replace") for part in
-                         (directory / "cmdline").read_bytes().split(b"\0") if part)
+            uid, tty_nr = directory.stat().st_uid, int(stat[4])
         except (OSError, ValueError, IndexError):
             continue
+        try:
+            executable = (directory / "exe").readlink().name.removesuffix(" (deleted)")
+        except OSError:
+            executable = command
+        processes[pid] = AuditProcess(ProcessIdentity(pid, start), parent_pid, command, (), "", {}, False,
+                                      uid, tty_nr, executable, pid in desktop_pids)
+    details: set[int] = set()
+    for pid, process in processes.items():
+        if (isinstance(selection, FullBuildAudit) or process.uid == selection.uid and
+                any(name in AUDIT_COMMANDS | {"pytest", "py.test", "sccache", "bash", "sh", "dash", "zsh",
+                                             "verify.sh", "merge_gate.py", "clippy-driver", "rust-analyzer",
+                                             "basedpyright", "node", "nodejs"}
+                    or name.startswith("python") for name in (process.command, process.executable))):
+            details.add(pid)
+            details.update(parent.identity.pid for parent in audit_ancestors(process, processes))
+    for pid in details:
+        process = processes[pid]
+        directory = proc_root / str(pid)
+        try:
+            argv = tuple(part.decode("utf-8", "replace") for part in
+                         (directory / "cmdline").read_bytes().split(b"\0") if part)
+        except OSError:
+            argv = ()
         try:
             environment = dict(part.decode("utf-8", "replace").split("=", 1) for part in
                                (directory / "environ").read_bytes().split(b"\0") if b"=" in part)
@@ -380,14 +436,19 @@ def read_audit_processes(proc_root: Path) -> dict[int, AuditProcess]:
             cwd = str((directory / "cwd").readlink())
         except OSError:
             cwd = ""
-        try:
-            in_build_scope = any("/builds.slice/" in line
-                                 for line in (directory / "cgroup").read_text(errors="replace").splitlines())
-        except OSError:
-            in_build_scope = False
-        if process_start_time(pid, proc_root) == start:
-            processes[pid] = AuditProcess(ProcessIdentity(pid, start), parent_pid, command, argv, cwd,
-                                          environment, in_build_scope)
+        in_build_scope = False
+        if isinstance(selection, FullBuildAudit):
+            try:
+                in_build_scope = any("/builds.slice/" in line
+                                     for line in (directory / "cgroup").read_text(errors="replace").splitlines())
+            except OSError:
+                pass
+        if process_start_time(pid, proc_root) != process.identity.start_time:
+            del processes[pid]
+            continue
+        processes[pid] = AuditProcess(process.identity, process.parent_pid, process.command, argv, cwd,
+                                      environment, in_build_scope, process.uid, process.tty_nr,
+                                      process.executable, process.desktop_app)
     return processes
 
 
@@ -411,12 +472,15 @@ def audit_command(process: AuditProcess) -> str:
 
 
 def audit_owner(process: AuditProcess, ancestors: Sequence[AuditProcess]) -> OwningSession | NoOwningSession:
-    session_id = process.environment.get("CLAUDE_CODE_SESSION_ID", "")
-    if session_id:
-        return OwningSession(session_id)
-    owner = owning_session(process.environment)
-    if isinstance(owner, OwningSession):
-        return owner
+    for item in (process, *ancestors):
+        session_id = item.environment.get("CLAUDE_CODE_SESSION_ID", "")
+        if session_id:
+            return OwningSession(session_id)
+        owner = owning_session(item.environment)
+        if isinstance(owner, OwningSession):
+            return owner
+        if item.environment.get("CODEX_THREAD_ID"):
+            return OwningSession(item.environment["CODEX_THREAD_ID"])
     for parent in ancestors:
         if audit_command(parent) in {"claude", "codex"}:
             owner = owning_session(parent.environment)
@@ -444,6 +508,24 @@ def admitted_processes(buildlog_root: Path) -> frozenset[ProcessIdentity]:
     return frozenset(admitted)
 
 
+def owner_is_sole_holder(owner: OwningSession | NoOwningSession, holders: Sequence[Holder]) -> bool:
+    return (isinstance(owner, OwningSession) and bool(holders)
+            and all(holder.key == holder_path(Path(), owner.session_id).name for holder in holders))
+
+
+class HoldEnforcer(Protocol):
+    def start(self) -> None: ...
+    def record_build(self, build: AuditedBuild, holder: Holder, proc_root: Path,
+                     action: Literal["audit", "stopped"]) -> None: ...
+    def report(self, proc_root: Path, directory: Path) -> list[str]: ...
+
+
+def hold_enforcer() -> HoldEnforcer:
+    # The enforcer uses these audit types; load it after this module is ready.
+    import importlib
+    return cast(HoldEnforcer, cast(object, importlib.import_module("hold_enforcer")))
+
+
 def audit_builds(proc_root: Path, holders: Sequence[Holder], buildlog_root: Path) -> tuple[AuditedBuild, ...]:
     processes = read_audit_processes(proc_root)
     admitted = admitted_processes(buildlog_root)
@@ -466,8 +548,7 @@ def audit_builds(proc_root: Path, holders: Sequence[Holder], buildlog_root: Path
             continue
         owner = audit_owner(process, ancestors)
         classification: BuildClass
-        if (isinstance(owner, OwningSession) and holders
-                and all(holder.key == holder_path(Path(), owner.session_id).name for holder in holders)):
+        if owner_is_sole_holder(owner, holders):
             classification = "holder"
         elif process.in_build_scope or any(item.identity in admitted for item in (process, *ancestors)):
             classification = "admitted"
@@ -483,7 +564,7 @@ def audit_builds(proc_root: Path, holders: Sequence[Holder], buildlog_root: Path
 
 
 def audit_lines(builds: Sequence[AuditedBuild], *, beginning: bool = False) -> list[str]:
-    lines = ["Build audit: already running when this hold began; gates cannot stop these builds."
+    lines = ["Build audit: tests and builds outside the hold are stopped; use --keep <pid> to keep a run."
              if beginning else "Build audit:"]
     for build in builds:
         if build.classification == "no_session":
@@ -505,20 +586,11 @@ def audit_hold(directory: Path, proc_root: Path) -> tuple[AuditedBuild, ...]:
         holders = state.holders if isinstance(state, ActiveHolders) else ()
     buildlog_root = Path(os.environ.get("BUILDLOG_DIR") or Path.home() / ".local/state/buildlog")
     builds = audit_builds(proc_root, holders, buildlog_root)
-    try:
-        boot_id = (proc_root / "sys/kernel/random/boot_id").read_text().strip()
-    except OSError:
-        boot_id = ""
     for build in builds:
         if build.classification in {"holder", "admitted"}:
             continue
         for holder in holders:
-            command = [sys.executable, str(Path(__file__).resolve().parent.parent / "buildlog" / "record.py"),
-                       "hold-build", holder.key, holder.since.isoformat(), boot_id,
-                       str(build.process.identity.pid), build.process.identity.start_time, build.classification,
-                       build.owner.session_id if isinstance(build.owner, OwningSession) else "",
-                       shlex.join(build.process.argv) or build.process.command, build.process.cwd]
-            start_recorder(command)
+            hold_enforcer().record_build(build, holder, proc_root, "audit")
     return builds
 
 
@@ -529,6 +601,11 @@ def print_hold_audit(directory: Path, proc_root: Path, *, beginning: bool = Fals
         print(f"Build audit unavailable: {error}")
         return
     print("\n".join(audit_lines(builds, beginning=beginning)))
+    try:
+        for line in hold_enforcer().report(proc_root, directory):
+            print(line)
+    except (OSError, ValueError) as error:
+        print(f"Hold enforcer report unavailable: {error}")
 
 
 def holder_directory() -> Path:
@@ -601,7 +678,16 @@ def read_holder(path: Path) -> Holder:
             if isinstance(name, str) and isinstance(since, str) and isinstance(purpose, str) and isinstance(release, str):
                 eta: ReleaseEta = UnknownReleaseEta() if release == "unknown" else KnownReleaseEta(aware_instant(release))
                 now = next((record["name"] for record in live_sessions() if record["sessionId"] == path.name), name)
-                return Holder(now, aware_instant(since), purpose, eta, path.name)
+                keep: list[ProcessIdentity] = []
+                values = fields.get("keep", [])
+                if isinstance(values, list):
+                    for value in cast(list[object], values):
+                        if isinstance(value, dict):
+                            entry = cast(dict[str, object], value)
+                            pid, start = entry.get("pid"), entry.get("start_time")
+                            if isinstance(pid, int) and pid > 0 and isinstance(start, str) and start.isdecimal():
+                                keep.append(ProcessIdentity(pid, start))
+                return Holder(now, aware_instant(since), purpose, eta, path.name, tuple(keep))
     except (ValueError, TypeError):
         pass
     match = INSTANT.search(content)
@@ -644,24 +730,16 @@ def live_holds(cycle: HoldCycle, directory: Path) -> tuple[Holder, ...]:
 
 
 def holders_in_force(cycle: HoldCycle, directory: Path, holders: tuple[Holder, ...]) -> tuple[Holder, ...]:
-    return tuple(holder for holder in holders if not any(
-        holder_path(directory, key).name == holder.key
-        and aware_instant(instants["since"]) == holder.since
-        and instants["released_at"]
-        for key, instants in cycle["holders"].items()
-    ))
+    # Cycle fields record history. Only removal of a holder file ends a hold.
+    _ = cycle
+    return tuple(holder for holder in holders if holder_path(directory, holder.key).is_file())
 
 
 def natedev_holds(directory: Path) -> NatedevHolds:
     holders = read_holders(directory)
     if isinstance(holders, NoHolders):
-        return NatedevHolds((), ())
-    cycle = read_cycle()
-    if cycle is None:
-        return NatedevHolds(holders.holders, ())
-    in_force = holders_in_force(cycle, directory, holders.holders)
-    releasing = tuple(holder for holder in holders.holders if holder not in in_force)
-    return NatedevHolds(in_force, releasing)
+        return NatedevHolds(())
+    return NatedevHolds(holders.holders)
 
 
 def release_eta_text(release: ReleaseEta) -> str:
@@ -696,10 +774,18 @@ def release_request(release_time: str | None, zone_name: str | None) -> ReleaseR
     return ClockReleaseEta(ClockTime(hour, minute), zone)
 
 
-HoldFileRecord = TypedDict("HoldFileRecord", {"holder": str, "since": str, "for": str, "release_eta": str})
+class KeptRunRecord(TypedDict):
+    pid: int
+    start_time: str
 
 
-def write_hold(directory: Path, identity: HolderIdentity, purpose: str, request: ReleaseRequest, now: datetime) -> str:
+HoldFileRecord = TypedDict("HoldFileRecord", {
+    "holder": str, "since": str, "for": str, "release_eta": str, "keep": list[KeptRunRecord],
+})
+
+
+def write_hold(directory: Path, identity: HolderIdentity, purpose: str, request: ReleaseRequest, now: datetime,
+               keep: Sequence[ProcessIdentity] = ()) -> str:
     """Keep a hold under its resolved key and display name."""
     if not purpose.strip() or "\n" in purpose:
         raise ValueError("hold purpose must be one line of text")
@@ -711,14 +797,20 @@ def write_hold(directory: Path, identity: HolderIdentity, purpose: str, request:
             raise ValueError("release ETA has already passed today")
         release_eta = release.isoformat()
     directory.mkdir(parents=True, exist_ok=True)
-    record: HoldFileRecord = {"holder": identity.name, "since": now.isoformat(), "for": purpose.strip(), "release_eta": release_eta}
     path = holder_path(directory, identity.key)
+    previous = read_holder(path).keep if path.is_file() else ()
+    record: HoldFileRecord = {
+        "holder": identity.name, "since": now.isoformat(), "for": purpose.strip(), "release_eta": release_eta,
+        "keep": [{"pid": item.pid, "start_time": item.start_time} for item in dict.fromkeys((*previous, *keep))],
+    }
     temporary = directory.parent / f"{directory.name}.{path.name}.tmp"
     _ = temporary.write_text(json.dumps(record, ensure_ascii=False) + "\n")
     os.replace(temporary, path)
     return (f"natedev is held for {purpose.strip()}. verify.sh waits by itself; an app launch is refused until the release, "
             "so launch again after it. Tests that can run on the Mac keep running there. "
-            "Stop only cargo you started outside verify.sh. No release after 2 h: ask me.")
+            "Every other test and build is stopped with the reason, including runs already started. "
+            "Use --keep <pid> to keep a run and its children. Stopped sessions get a release notice; run again then. "
+            "No release after 2 h: ask me.")
 
 
 @dataclass(frozen=True)
@@ -914,7 +1006,8 @@ def open_cycle(now: datetime) -> HoldCycle:
     return cycle
 
 
-def start_hold(directory: Path, identity: HolderIdentity, purpose: str, request: ReleaseRequest, now: datetime) -> str:
+def start_hold(directory: Path, identity: HolderIdentity, purpose: str, request: ReleaseRequest, now: datetime,
+               keep: Sequence[ProcessIdentity] = ()) -> str:
     with release_lock():
         at = datetime.now(timezone.utc)
         new_hold = not holder_path(directory, identity.key).is_file()
@@ -922,7 +1015,7 @@ def start_hold(directory: Path, identity: HolderIdentity, purpose: str, request:
             cycle = open_cycle(now)
         else:
             cycle = read_cycle_for_change()
-        notice = write_hold(directory, identity, purpose, request, now)
+        notice = write_hold(directory, identity, purpose, request, now, keep)
         if new_hold:
             record_hold_event("began", read_holder(holder_path(directory, identity.key)), at)
         if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
@@ -943,8 +1036,6 @@ def record_recipients(recipients: Sequence[tuple[str, str]]) -> None:
             return
         cycle = read_cycle_for_change()
         if isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
-            return
-        if cycle["release_started_at"]:
             return
         for name, session_id in recipients:
             if session_id:
@@ -1029,7 +1120,22 @@ def not_reached_detail(cycle: HoldCycle) -> str:
 
 
 def notify_release(cycle: HoldCycle) -> str:
+    with release_lock():
+        current = read_cycle()
+        if (current is None or current["id"] != cycle["id"]
+                or not current["release_started_at"]
+                or current["release_started_at"] != cycle["release_started_at"]):
+            return ""
+        return notify_released_cycle(current)
+
+
+def notify_released_cycle(cycle: HoldCycle) -> str:
+    # The release lock prevents a same-session re-hold between this check and a send.
+    if has_holder_file(holder_directory()):
+        return ""
     for session_id, name in cycle["recipients"].items():
+        if has_holder_file(holder_directory()):
+            break
         entry = next((entry for entry in cycle["entries"] if entry["session_id"] == session_id), None)
         if entry is None:
             entry = new_entry(session_id, name)
@@ -1052,7 +1158,8 @@ def notify_release(cycle: HoldCycle) -> str:
     return not_reached_detail(cycle)
 
 
-def release_cycle(directory: Path, name: str, *, resume: bool = False) -> str:
+def release_cycle(directory: Path, name: str, *, resume: bool = False,
+                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> str:
     with release_lock():
         path = holder_path(directory, name)
         if not path.is_file():
@@ -1063,12 +1170,12 @@ def release_cycle(directory: Path, name: str, *, resume: bool = False) -> str:
             if holds:
                 raise ValueError(resume_refusal(holds))
         holder = read_holder(path)
+        result = release_hold(directory, holder)
         if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
             for key, instants in cycle["holders"].items():
                 if holder_path(directory, key).name == holder.key and aware_instant(instants["since"]) == holder.since:
-                    instants["released_at"] = datetime.now(timezone.utc).isoformat()
+                    instants["released_at"] = clock().isoformat()
             save_cycle(cycle)
-        result = release_hold(directory, holder)
         if isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
             if result != "released, builds may resume.":
                 return result
@@ -1076,14 +1183,8 @@ def release_cycle(directory: Path, name: str, *, resume: bool = False) -> str:
         remaining = live_holds(cycle, directory)
         if remaining:
             return "released; still held by " + "; ".join(holder_text(other) for other in remaining)
-        # An old release can leave files whose recorded holds have already ended.
-        # Clear them too, so the next hold starts a new cycle.
-        old_files = read_holders(directory)
-        if isinstance(old_files, ActiveHolders):
-            for old_holder in old_files.holders:
-                _ = release_hold(directory, old_holder)
         result = "released, builds may resume."
-        cycle["release_started_at"] = datetime.now(timezone.utc).isoformat()
+        cycle["release_started_at"] = clock().isoformat()
         save_cycle(cycle)
     return result + notify_release(cycle)
 
@@ -1186,6 +1287,7 @@ def main(arguments: list[str]) -> int:
     _ = hold.add_argument("--zone")
     _ = hold.add_argument("--target", type=parse_hold_target, default="natedev")
     _ = hold.add_argument("--proc-root", type=Path, default=PROC_ROOT)
+    _ = hold.add_argument("--keep", type=int, action="append", default=[])
     quiet = commands.add_parser("quiet")
     _ = quiet.add_argument("--max-wait", type=float, default=600)
     release = commands.add_parser("release")
@@ -1213,6 +1315,8 @@ def main(arguments: list[str]) -> int:
             if isinstance(target, MacHoldTarget):
                 refused: list[str] = []
                 if action == "hold":
+                    if cast(list[int], options.keep):
+                        refused.append("--keep")
                     if cast(object, options.release_eta) is not None:
                         refused.append("--release-eta")
                     if cast(object, options.zone) is not None:
@@ -1230,7 +1334,16 @@ def main(arguments: list[str]) -> int:
         if action == "hold":
             request = release_request(cast(str | None, options.release_eta), cast(str | None, options.zone))
             identity = holder_of(cast(str | None, options.holder))
-            print(start_hold(holder_directory(), identity, cast(str, options.purpose), request, datetime.now(timezone.utc)))
+            keep: list[ProcessIdentity] = []
+            proc_root = cast(Path, options.proc_root)
+            for pid in cast(list[int], options.keep):
+                start = process_start_time(pid, proc_root)
+                if not start:
+                    raise ValueError(f"--keep {pid}: no live process with a start time")
+                keep.append(ProcessIdentity(pid, start))
+            print(start_hold(holder_directory(), identity, cast(str, options.purpose), request,
+                             datetime.now(timezone.utc), keep))
+            hold_enforcer().start()
             print_hold_audit(holder_directory(), cast(Path, options.proc_root), beginning=True)
         elif action == "quiet":
             verdict = wait_for_quiet(cast(float, options.max_wait))
@@ -1281,6 +1394,8 @@ def main(arguments: list[str]) -> int:
             else:
                 for holder in state.holders:
                     print(f"{holder.name} since {holder.since.astimezone(user_zone()):%H:%M %Z}, for {holder.purpose} - release eta: {release_eta_text(holder.release)}")
+                    for run in holder.keep:
+                        print(f"  kept by {holder.name}: pid {run.pid}, start {run.start_time}")
                 try:
                     cycle = read_cycle()
                 except ReleaseRecordReadError as error:
@@ -1297,4 +1412,6 @@ def main(arguments: list[str]) -> int:
 
 
 if __name__ == "__main__":
+    # The enforcer must use this CLI's domain types, not a second module instance.
+    _ = sys.modules.setdefault("build_hold", sys.modules[__name__])
     sys.exit(main(sys.argv[1:]))
