@@ -2,7 +2,7 @@
 
 > **Status: IMPLEMENTATION PLAN — phased, direct-ready; approved by the user 2026-10-28 (relayed by the showrunner).** One launcher, `assign.sh`, opens and resumes long-lived worker seats that belong to the unit. Tools refuse worker work that a unit director does any other way.
 
-> **As-built disposition: create** — `docs/as-built/worker-seats.md`; it replaces `docs/as-built/long-lived-workers.md` and `docs/as-built/review-pool.md` (Phase 14).
+> **As-built disposition: create** — `docs/as-built/worker-seats.md`; it replaces `docs/as-built/long-lived-workers.md` and `docs/as-built/review-pool.md` (Phase 15).
 
 > **Production: build-followups** — unit `models-unit`; production doc `docs/plans/build-followups-production.md`
 
@@ -43,7 +43,7 @@
   - `commands/unit/direct.md` — `<TagReferenceContract>` at 141–177, `<LongLivedWorkers>` at 179–216, `<WorkerLaunchFailure/>`
   - `docs/direct/launch_implementation.md` (step 5), `docs/direct/dual_review.md` (step 3), `docs/direct/phase_end.md`, `commands/plan/phase_review.md`, `docs/production_format.md`, `commands/showrunner/produce.md`
   - `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/mod.rs` — `HierarchyRole` at 191, `text` at 206–218, `RoleFallback` at 299
-- **Test lanes:** `scripts/direct/test_*.py` (suite `direct`); `scripts/agents/test_*.py` plus `test_agents_config.sh`, `test_sync_codex_catalog.sh`, `test_launcher_tasks.sh`; `scripts/hooks/test_*.py`; `scripts/production/test_*.py`; `scripts/whoami/test_quota_alert.py`; `scripts/guilds/test_roles.py`; cargo handler: its crate tests. Docs and commands have no lane until Phase 11 adds the tag-reference test.
+- **Test lanes:** `scripts/direct/test_*.py` (suite `direct`); `scripts/agents/test_*.py` plus `test_agents_config.sh`, `test_sync_codex_catalog.sh`, `test_launcher_tasks.sh`; `scripts/hooks/test_*.py`; `scripts/production/test_*.py`; `scripts/whoami/test_quota_alert.py`; `scripts/guilds/test_roles.py`; cargo handler: its crate tests. Docs and commands have no lane until Phase 12 adds the tag-reference test.
 - **Build:** none
 - **Test:** `env HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only` from the repository root; shell tests run directly (`bash scripts/agents/test_agents_config.sh`, `bash scripts/agents/test_sync_codex_catalog.sh`, `bash scripts/agents/test_launcher_tasks.sh`); cargo handler: `bash ~/.claude/scripts/direct/verify.sh test cargo-handler`
 - **Lint:** `basedpyright scripts/direct scripts/agents scripts/hooks scripts/production scripts/whoami` — pass is its `0 errors, 0 warnings` line; cargo handler: `bash ~/.claude/scripts/direct/verify.sh lint cargo-handler`
@@ -62,70 +62,71 @@
 
 ### Phase 1 — Compaction hook path (WS P0)  · status: done
 
-**Depends on:** none
-**Progress:** done — 76fda104, merged as 356e99a6 and promoted (change review C371). The user typed the go in the models session on 2026-10-28.
+#### As-built
 
-#### Work Order
-
-**Goal:** a compacted director gets the direct-resume context again, and a test fails when a hook command in `settings.json` names a file that does not exist.
-
-**Spec:**
-- settings.json change: hook path session-start-delegate-resume.py -> session-start-direct-resume.py; the checkpoint body names this change so the showrunner gates it with the new blob.
-- The SessionStart `compact` entry (line 344) is the only `settings.json` line this phase changes. Commit 866d1b27 (2026-10-23) renamed the file and left this path behind.
-- New test: read `settings.json`, take each hook `command`, expand `$HOME` to the repository's `~/.claude` root, and assert that every `scripts/...` path in it exists in the checkout. It fails on today's committed file and passes after the fix.
-- A second case: a compacted fake director session that runs the configured compact command gets the direct-resume context.
+- The SessionStart `compact` hook in `settings.json` runs `scripts/hooks/session-start-direct-resume.py`.
+- Before the fix, the hook named `scripts/hooks/session-start-delegate-resume.py`. The delegate -> direct rename of 2026-10-23 removed that file, so a compacted director got no resume context.
+- A compacted director session gets the direct-resume context again.
+- No hook-path test shipped. `settings.json` is the only changed file.
 
 **Files:**
-- `settings.json` — the one path
-- `scripts/hooks/test_settings_hook_paths.py` — new path test and the compact-session case
+- `settings.json` — the SessionStart `compact` hook command names `session-start-direct-resume.py`
 
-**Workers:** `1 writer` — one line and one test file; nothing splits.
-- `impl` — `settings.json`, `scripts/hooks/test_settings_hook_paths.py`
-
-**Constraints from prior phases:**
-
-**Acceptance gate:** the merge gate is green; basedpyright on `scripts/hooks` is 0/0; the new test fails on `git show HEAD:settings.json` and passes on the fixed file.
+**Gotchas:** no test checks that a hook `command` in `settings.json` names a file that exists. A rename under `scripts/hooks/` must update `settings.json` in the same commit.
 
 ### Phase 2 — Short model names (WT P0)  · status: done
 
-**Progress:** done — one repair round closed five review findings (family pick needs a known effort row, status shows unresolved words, unsourced terra/luna weights left out, regression tests, version tie by slug). Usage weights for terra and luna wait as an add-on until a worker runs on them.
+#### As-built
+
+- An `agents.conf` row can name a model family word (`sol`, `astra`, `opus`, …) or a full slug. A full slug resolves and is checked as before.
+- `sync_codex_catalog.sh` generates `[codex.families]` beside `[codex.agents]`. A Codex word maps to the newest visible (`visibility: list`) slug in `~/.codex/models_cache.json` that has a `[codex.agents]` effort row. The highest version wins; equal versions break by slug. The sync compares sorted catalog rows of both generated sections, not file bytes.
+- `[claude.families]` is hand-kept: `fable`, `opus`, `sonnet`, `haiku`, each the alias the Claude CLI resolves itself. `[claude.agents]` has `haiku` with five efforts.
+- `_agents_model_slug` in `agents_config.sh` resolves a word. `_agents_validate_pair` checks the effort against the resolved slug's row. `agents_resolve` returns the slug.
+- `agent_admin.sh` and the status output print `word=<family>`. An unresolved word prints `<word> (unresolved: <reason>)`, and the listing continues.
+
+**Files:**
+- `scripts/agents/agents_config.sh` — `_agents_model_slug`, family lookup, failure line, word field in resolved and status lines
+- `scripts/agents/sync_codex_catalog.sh` — `[codex.families]` generation, catalog-row compare
+- `scripts/agents/agent_admin.sh`, `commands/agent.md` — family words in usage and docs
+- `config/agents.conf` — `[codex.families]`, `[claude.families]`, `haiku`, `[direct.codex]` rows naming `sol`
+- `scripts/agents/test_agents_config.sh`, `scripts/agents/test_sync_codex_catalog.sh` — family resolution and regression tests
+
+**Binds later work:** `[direct.codex]` rows are family words. `agents_resolve` returns the slug, or exits 1 with `no Codex model for '<word>' in ~/.codex/models_cache.json; run codex once to refresh the cache, or name the full slug`. A resolved line ends with ` word=<family word>`. `astra` resolves through `[codex.families]`. `gpt-6.1-terra` and `gpt-6-luna` have no `weights.py` row, so no row may name `terra` or `luna`.
+
+**Gotchas:** a newest release without reasoning levels never becomes a family target. A turn on terra or luna raises `UnweightedModel` in usage accounting.
+
+**Ruled out:** copying sol/astra weights for terra/luna (unsourced numbers feed accounting).
+
+### Phase 3 — `follow` CPU: event waits, no idle wake-ups (WS P2, part 1, CPU half)  · status: todo
 
 **Depends on:** none
 
 #### Work Order
 
-**Goal:** `agents.conf` rows name a model family (`sol`, `astra`, `opus`, …) that resolves to the newest model at each launch, and the committed `[codex.agents]` matches the live models, so `bash scripts/agents/sync_codex_catalog.sh --check` passes.
+**Goal:** an idle `codex_mesh.py follow` uses under 1% of a core and a streaming one under 10%, so followers stop taking CPU from builds.
 
 **Spec:**
-- `sync_codex_catalog.sh` writes a generated section `[codex.families]` beside `[codex.agents]`. It maps each family word to the newest visible slug in `~/.codex/models_cache.json`: `sol=gpt-6.1-sol`, `astra=gpt-6-astra`, `luna=gpt-6-luna`, `terra=gpt-6.1-terra`. "Newest" is the highest version number in the slug (`gpt-<version>-<family>`), among models with `visibility: list`. The incomplete-cache rule (`sync_codex_catalog.sh:261-279`) stays.
-- `[claude.families]` is hand-kept: `fable`, `opus`, `sonnet`, `haiku`. Each is the alias the Claude CLI resolves to the latest model itself (`claude --help`, `--model`). Add `haiku` to `[claude.agents]` with the five efforts.
-- `[direct.codex]` rows keep their keys and use the family word: `impl=sol:xhigh`, `test`, `fix` likewise, `review=sol:max`.
-- `_agents_validate_pair` accepts a family word when `[<family>.families]` has it, then checks the effort against the resolved slug's row. `agents_resolve` returns the resolved slug.
-- Failure: the cache is missing or unreadable, or no visible slug matches the family. `agents_resolve` exits 1 with `no Codex model for 'sol' in ~/.codex/models_cache.json; run codex once to refresh the cache, or name the full slug`. A full slug in a row still works and is checked as today.
-- `/agent` (`agent_admin.sh`) prints the word and the slug it resolves to today.
-- Run the sync so the committed `[codex.agents]` lists the live models. `scripts/usage/weights.py` has a row for each slug that `[codex.families]` names; add a missing one.
+- **`follow` waits on events, not a poll loop** (showrunner, 2026-10-28: builds-unit measured 26 `codex_mesh.py follow` processes using 1.5 cores on a quiet natedev, two at about 27% each, which takes CPU from builds). Each wait in `follow` (and any helper it runs) blocks on a socket read, a pipe, or inotify on the files it watches, with a long timeout only as a safety net. Measure before and after with the same method: CPU per `follow` process over 60 s on an idle turn (`ps -o pid,pcpu,cputime` deltas or `/proc/<pid>/stat`), and report both numbers in the summary. Goal: an idle `follow` uses under 1% of a core. Message delivery and turn-end detection stay as fast as today.
+- **The high-CPU `follow` (showrunner, 2026-10-28: one process at 0.92 cores).** Reading /proc showed this (pid 2428570, a cargo-liner seat running merge tests, 2 h 30 min old, 24% average CPU): about 5,500 read calls and 3.3 MB per second (about 600 bytes a read). The one-second `mesh_runs` scans below fit those numbers best (a file opened and closed inside one poll does not show in a sampled fd list); the notification stream is a second possible source. The implementer measures which, before the fix. Fix: `follow` asks the server only for the events it needs (turn and item completion, messages for its own thread), or skips output-delta events without a JSON parse, and reads in large buffers. Test it with a fake app-server that sends 10,000 output-delta lines: `follow` uses under 10% of a core and still reports the turn end. Report the CPU before and after for both cases (idle wait, and a seat streaming output).
+- **One-second wake-ups (builds-unit via the showrunner, 2026-10-28).** The follow loops wake every 1 s (`codex_mesh.py` about line 277 for the interval, the loop at about 3496, `_on_quiet_poll` at about 3590): 0.52 cores across 33 loops. Block on the socket plus inotify on the marker files instead. A follow whose worker has finished (terminal roster status, turn ended, or its run finished) ends its loop and exits. Test: a quiet follow makes no wake-up while nothing changes for 30 s; touching a marker file wakes it within 1 s; a finished worker's follow exits.
+- **`mesh_runs` scans (builds-unit via the showrunner, 2026-10-28).** Each 1 s poll globs `mesh_runs/*.json` twice (`_end_dead_runs` about line 1644, `_detached_run_live` about 1622; the second scan came from builds' 556e44d1) and parses every record. Records are never pruned (3,536 in one session), so one follower does 7,182 reads per second. Run the dead-run and unseen-end checks every 60 s, in one scan. A finished record never changes, so the follower remembers its name and does not read it again. Records stay in `mesh_runs/`: `mesh_runs.py`, `verify.sh`, `review.sh`, `unit_lookup.py`, `rename_unit.py` and `retire_unit.py` find a record by its path. Test: 3,000 finished records cost no reads on a quiet poll; a run that ends is still reported within 60 s.
+- **Short sleeps (efficiency-unit via the showrunner, 2026-10-28 12:05 EDT).** 32 follows at once used 1.8 cores over their lifetimes; the cargo-liner tile follower used 2,334 s CPU in 10,721 s (22%), several more 4-10%. Candidate loops: the 0.05 s sleep (about line 6823) while a turn is in flight, `REAP_POLL_SECS` 0.2 and `RESIDENT_POLL_SECS` 1.0. Measure first, then fix the loop the numbers name. `kernel.yama.ptrace_scope` is 1, so a running follower cannot be traced from outside: start a follower under `strace -c -f` (py-spy is not installed) against the fake app-server with a turn in flight, and report the syscall and sleep counts per loop before and after.
 
 **Files:**
-- `scripts/agents/sync_codex_catalog.sh` — `[codex.families]`
-- `scripts/agents/agents_config.sh` — family lookup in `_agents_validate_pair` and `agents_resolve`, the failure line
-- `scripts/agents/agent_admin.sh` — word and slug display
-- `commands/agent.md` — word and slug display
-- `config/agents.conf` — `[codex.agents]` refreshed, `[codex.families]`, `[claude.families]`, `haiku`, family words in `[direct.codex]`
-- `scripts/usage/weights.py` — rows for new slugs, if missing
-- `scripts/agents/test_sync_codex_catalog.sh` — tests
-- `scripts/agents/test_agents_config.sh` — tests
+- `scripts/agents/codex_mesh.py` — event-driven `follow` waits, the 60 s run scan that skips finished records, follow exit on a finished worker
+- `scripts/agents/test_codex_mesh.py` — new cases
 
-**Workers:** `1 writer + 1 tester` — `impl` owns the scripts, `agents.conf`, `weights.py` and `commands/agent.md`; hub: `config/agents.conf`.
-- `impl` — `sync_codex_catalog.sh`, `agents_config.sh`, `agent_admin.sh`, `commands/agent.md`, `weights.py`; hub: `config/agents.conf` (every row change)
-- `test` — `test_sync_codex_catalog.sh`, `test_agents_config.sh`: `sol` resolves to the highest version; a cache with no `sol` fails with the named line; a full slug still resolves; a family word with a bad effort is refused; `--check` is clean after a new release appears in the cache
+**Workers:** `1 writer + 1 tester` — one file holds every loop, so one writer.
+- `impl` — `codex_mesh.py`; also takes the before/after CPU and `strace -c -f` measurements
+- `test` — `test_codex_mesh.py` (fake app-server): 10,000 output-delta lines under 10% of a core with the turn end still reported; a quiet follow makes no wake-up for 30 s; a touched marker wakes it within 1 s; a finished worker's follow exits; 3,000 finished records cost no reads on a quiet poll; an ended run is reported within 60 s
 
 **Constraints from prior phases:**
 
-**Acceptance gate:** the merge gate is green; both shell tests pass; basedpyright on `scripts/usage` is 0/0; `bash scripts/agents/sync_codex_catalog.sh --check` exits 0.
+**Acceptance gate:** the merge gate is green; basedpyright on `scripts/agents` is 0/0; the summary reports CPU per `follow` before and after for an idle wait and a streaming seat, and the syscall and sleep counts per loop.
 
-### Phase 3 — Unit seat ledger, `seats.py resolve`, the finished-run gap (WS P2, part 1)  · status: todo
+### Phase 4 — Unit seat ledger, `seats.py resolve`, the finished-run gap (WS P2, part 1)  · status: todo
 
-**Depends on:** none
+**Depends on:** Phase 3
 
 #### Work Order
 
@@ -137,11 +138,6 @@
 - **`scripts/direct/seats.py resolve --session-dir <run> --role <impl|test|fix|review>`** prints the seat name. Order: an open seat with this role in this run; the unit's seat from the ledger (adopted into the run); reopen; a new seat. When every seat of the role is busy, it opens `<role>2` (`impl2`, `test2`, `fix2`, `review2`). Two runs that race for one seat: one wins, the other gets the `2` seat.
 - **Finished run.** `progress_history.py start-phase` on a finished run makes it active again: it writes a `reopened` event and restores the run marker. `codex_mesh.py reopen` on a finished run exits 2 and names `seats.py resolve`; it no longer exits 0.
 - A thread carried across a workers account move resumes on the new Codex home (`AccountMoveMarker`).
-- **`follow` waits on events, not a poll loop** (showrunner, 2026-10-28: builds-unit measured 26 `codex_mesh.py follow` processes using 1.5 cores on a quiet natedev, two at about 27% each, which takes CPU from builds). Each wait in `follow` (and any helper it runs) blocks on a socket read, a pipe, or inotify on the files it watches, with a long timeout only as a safety net. Measure before and after with the same method: CPU per `follow` process over 60 s on an idle turn (`ps -o pid,pcpu,cputime` deltas or `/proc/<pid>/stat`), and report both numbers in the summary. Goal: an idle `follow` uses under 1% of a core. Message delivery and turn-end detection stay as fast as today.
-- **The high-CPU `follow` (showrunner, 2026-10-28: one process at 0.92 cores).** Reading /proc showed this (pid 2428570, a cargo-liner seat running merge tests, 2 h 30 min old, 24% average CPU): about 5,500 read calls and 3.3 MB per second (about 600 bytes a read). The one-second `mesh_runs` scans below fit those numbers best (a file opened and closed inside one poll does not show in a sampled fd list); the notification stream is a second possible source. The implementer measures which, before the fix. Fix: `follow` asks the server only for the events it needs (turn and item completion, messages for its own thread), or skips output-delta events without a JSON parse, and reads in large buffers. Test it with a fake app-server that sends 10,000 output-delta lines: `follow` uses under 10% of a core and still reports the turn end. Report the CPU before and after for both cases (idle wait, and a seat streaming output).
-- **One-second wake-ups (builds-unit via the showrunner, 2026-10-28).** The follow loops wake every 1 s (`codex_mesh.py` about line 277 for the interval, the loop at about 3496, `_on_quiet_poll` at about 3590): 0.52 cores across 33 loops. Block on the socket plus inotify on the marker files instead. A follow whose worker has finished (terminal roster status, turn ended, or its run finished) ends its loop and exits. Test: a quiet follow makes no wake-up while nothing changes for 30 s; touching a marker file wakes it within 1 s; a finished worker's follow exits.
-- **`mesh_runs` scans (builds-unit via the showrunner, 2026-10-28).** Each 1 s poll globs `mesh_runs/*.json` twice (`_end_dead_runs` about line 1644, `_detached_run_live` about 1622; the second scan came from builds' 556e44d1) and parses every record. Records are never pruned (3,536 in one session), so one follower does 7,182 reads per second. Run the dead-run and unseen-end checks every 60 s, in one scan, and move each finished record to `mesh_runs/done/`. Test: 3,000 finished records cost no reads on a quiet poll; a run that ends is still reported within 60 s; its record moves to `done/`.
-- **Short sleeps (efficiency-unit via the showrunner, 2026-10-28 12:05 EDT).** 32 follows at once used 1.8 cores over their lifetimes; the cargo-liner tile follower used 2,334 s CPU in 10,721 s (22%), several more 4-10%. Candidate loops: the 0.05 s sleep (about line 6823) while a turn is in flight, `REAP_POLL_SECS` 0.2 and `RESIDENT_POLL_SECS` 1.0. Measure first, then fix the loop the numbers name. `kernel.yama.ptrace_scope` is 1, so a running follower cannot be traced from outside: start a follower under `strace -c -f` or `py-spy record` against the fake app-server with a turn in flight, and report the syscall and sleep counts per loop before and after.
 
 **Files:**
 - `scripts/direct/seats.py` — new: ledger I/O, `resolve`
@@ -159,9 +155,9 @@
 
 **Acceptance gate:** the merge gate is green; basedpyright on `scripts/direct scripts/agents` is 0/0.
 
-### Phase 4 — Seat lifecycle: run end, phase end, retire, transfer, rename (WS P2, part 2)  · status: todo
+### Phase 5 — Seat lifecycle: run end, phase end, retire, transfer, rename (WS P2, part 2)  · status: todo
 
-**Depends on:** Phase 3
+**Depends on:** Phase 4
 
 #### Work Order
 
@@ -191,11 +187,11 @@
 - `test` — the five test files: run end leaves seats paused and present; phase end keeps a ledger Claude seat; retire ends seats and removes the file; transfer moves it; rename renames file and seat names
 
 **Constraints from prior phases:**
-- Phase 3: the ledger path, entry fields and `flock` rule; `seats.py` holds all ledger I/O; `codex_mesh.py stop --pause` exists.
+- Phase 4: the ledger path, entry fields and `flock` rule; `seats.py` holds all ledger I/O; `codex_mesh.py stop --pause` exists.
 
 **Acceptance gate:** the merge gate is green; basedpyright on `scripts/direct scripts/production` is 0/0.
 
-### Phase 5 — Role words `research` and `propose` (WT P2)  · status: todo
+### Phase 6 — Role words `research` and `propose` (WT P2)  · status: todo
 
 **Depends on:** Phase 2
 
@@ -220,13 +216,13 @@
 - `test` (opens as impl) — `census/mod.rs` and its crate tests
 
 **Constraints from prior phases:**
-- Phase 2: `[direct.codex]` rows take family words; `astra` resolves through `[codex.families]`.
+- Phase 2: `[direct.codex]` rows take family words; `astra` resolves through `[codex.families]` to the newest cached release that has a `[codex.agents]` effort row (today `gpt-6-astra`, which has a `weights.py` row). `gpt-6.1-terra` and `gpt-6-luna` have no `weights.py` row: usage accounting raises `UnweightedModel` for them, so no row may name `terra` or `luna`.
 
 **Acceptance gate:** the merge gate is green; `verify.sh test cargo-handler` and `verify.sh lint cargo-handler` pass; the handler shows `research` and `propose`, and an unknown word takes `RoleFallback`.
 
-### Phase 6 — `assign.sh` core (WT P1, with WS P2's `--role`, run start and rules block)  · status: todo
+### Phase 7 — `assign.sh` core (WT P1, with WS P2's `--role`, run start and rules block)  · status: todo
 
-**Depends on:** Phase 2, Phase 3, Phase 5
+**Depends on:** Phase 2, Phase 4, Phase 6
 
 #### Work Order
 
@@ -250,7 +246,7 @@
 - Every launch: claim under the seat lock (port `implement.sh` `worker_record` and `review.sh` `claim_follow` into one path); compact above `UNIT_COMPACT_ABOVE_TOKENS`; append the rules block to every prompt (no poll; long commands through `mesh_runs.py start`, then end the turn; the Three Gods sentence); board register, heartbeat header, pass record keyed by role and phase (`progress_history.py start-pass` / `finish-pass`); summary settle; release.
 - Artifacts: `${PHASE_DIR}/<role>_status`, `<role>_summary.txt`, `<role>_agent.log`, with `_<lens>` and `_<pass>` suffixes for reviews.
 - Exit codes: 0 done; 1 the seat ran and failed; 2 a refused argument or claim; 3 blocked (no seat could start).
-- Review in this phase: `--role review` takes an open writer for the lens, as today without a pool. Pooled review seats come in Phase 7.
+- Review in this phase: `--role review` takes an open writer for the lens, as today without a pool. Pooled review seats come in Phase 8.
 
 **Files:**
 - `scripts/direct/assign.sh` — new
@@ -261,15 +257,15 @@
 - `test` — `test_assign_launcher.py` (fake app-server): each role opens with its sandbox; `--to` resumes a thread; `--model` runs the override and keeps the identity slug; `propose` writes the file and the launcher adds the ledger line once; a missing `--role` exits 2; every seat prompt carries the rules block; no run starts one
 
 **Constraints from prior phases:**
-- Phase 2: rows are family words; `agents_resolve` returns the slug or exits 1 with the named line.
-- Phase 3: `seats.py resolve --session-dir <run> --role <r>` prints the seat; `<role>2` when all are busy.
-- Phase 5: `WORKER_ROLES` holds `research` and `propose`; their rows are `astra:xhigh`.
+- Phase 2: rows are family words; `agents_resolve` returns the slug or exits 1 with `no Codex model for '<word>' in ~/.codex/models_cache.json; run codex once to refresh the cache, or name the full slug`. A resolved line ends with ` word=<family word>` when the row names a family (`agents_config.sh` `_agents_print_resolved`); the slug is in `agent=`.
+- Phase 4: `seats.py resolve --session-dir <run> --role <r>` prints the seat; `<role>2` when all are busy.
+- Phase 6: `WORKER_ROLES` holds `research` and `propose`; their rows are `astra:xhigh`.
 
 **Acceptance gate:** the merge gate is green; basedpyright on `scripts/direct` is 0/0.
 
-### Phase 7 — Review seats in the ledger (WT P3)  · status: todo
+### Phase 8 — Review seats in the ledger (WT P3)  · status: todo
 
-**Depends on:** Phase 6
+**Depends on:** Phase 7
 
 #### Work Order
 
@@ -280,8 +276,8 @@
 - A review seat is a ledger entry with `role: review`, `access: read-only`, `instructions_file`, `prime_hash`, `reviews`, and the mesh dir that holds its thread. `review_pool.py` `prime`, `allocate` (`_prime`, `_choose`, `_repoint`), `release`, `retire` become `seats.py` functions; `migrate` and `stop` stay as `seats.py` verbs for the showrunner. The production template thread and its mesh dir live in `~/.local/state/unit-seats/<slug>/`.
 - One app-server per production for reviewers stays; `seats.py` passes the entry's mesh dir to `follow --cwd <worktree> --read-only`.
 - No `--pool` flag and no `--lease`. `assign.sh --role review` reads the production doc's `**Review pool:** code|ui` line. With it, the seat is the owner's read-only reviewer. Without it, an open writer takes the lens. The unit and phase come from the run and `--phase`.
-- `seats.py import-pool --unit <unit>` copies that unit's entries from `~/.local/state/review-pool/<slug>/pool.json` into its ledger with their thread ids, so the primed threads are kept (1,435 against 12,982 weighted tokens a turn). Phase 11's `switched` calls it. `review.sh` keeps `pool.json` for units not yet switched.
-- `review_pool_report.py` reads review seats from the ledger and from `pool.json` until Phase 14.
+- `seats.py import-pool --unit <unit>` copies that unit's entries from `~/.local/state/review-pool/<slug>/pool.json` into its ledger with their thread ids, so the primed threads are kept (1,435 against 12,982 weighted tokens a turn). Phase 12's `switched` calls it. `review.sh` keeps `pool.json` for units not yet switched.
+- `review_pool_report.py` reads review seats from the ledger and from `pool.json` until Phase 15.
 
 **Files:**
 - `scripts/direct/seats.py` — review functions, `import-pool`
@@ -296,14 +292,14 @@
 - `test` — `test_seats_review.py`, review cases in `test_assign_launcher.py` and `test_review_pool_report.py`: the existing `test_review_pool.py` cases pass against `seats.py`; a second concurrent review forks the owner's reviewer; a prompt change re-points an idle reviewer; the turn record keeps every field; `import-pool` keeps thread ids
 
 **Constraints from prior phases:**
-- Phase 3: ledger shape and `flock`; Phase 4: `end_unit` and `rename_unit` cover review seats too.
-- Phase 6: `assign.sh` options, artifacts and exit codes; `--lens` and `--pass` suffixes.
+- Phase 4: ledger shape and `flock`; Phase 5: `end_unit` and `rename_unit` cover review seats too.
+- Phase 7: `assign.sh` options, artifacts and exit codes; `--lens` and `--pass` suffixes.
 
 **Acceptance gate:** the merge gate is green; basedpyright on `scripts/direct` is 0/0.
 
-### Phase 8 — Self-heal (WS P3)  · status: todo
+### Phase 9 — Self-heal (WS P3)  · status: todo
 
-**Depends on:** Phase 6
+**Depends on:** Phase 7
 
 #### Work Order
 
@@ -331,13 +327,13 @@
 - `test` — fake-server cases: lost thread gives a replacement with the brief in its prompt; live turn gives interrupt then replacement; second overflow gives compaction and one retry; outage gives a route with a 30-minute hold and a route back; quota route opens a Claude seat and returns to the Codex thread; no case starts an Agent-tool subagent
 
 **Constraints from prior phases:**
-- Phase 3: ledger `replaced` event; Phase 6: exit code 3 means blocked.
+- Phase 4: ledger `replaced` event; Phase 7: exit code 3 means blocked.
 
 **Acceptance gate:** the merge gate is green; basedpyright on `scripts/direct scripts/whoami` is 0/0.
 
-### Phase 9 — Seat provenance E4–E7 (WS P4, with WT's E4 line and E7 in `assign.sh`)  · status: todo
+### Phase 10 — Seat provenance E4–E7 (WS P4, with WT's E4 line and E7 in `assign.sh`)  · status: todo
 
-**Depends on:** Phase 6
+**Depends on:** Phase 7
 
 #### Work Order
 
@@ -369,13 +365,13 @@
 - `test` — test files: a seat-only commit passes; a director edit after the seat's turn is refused with its path; a merge-branch merge passes; Markdown passes; a Claude turn with no route is refused and one with a route passes; a checkpoint with no trailer is held; 50 files under 200 ms
 
 **Constraints from prior phases:**
-- Phase 6: `assign.sh` turn end and `${PHASE_DIR}`; Phase 8: Claude seats open only under a `routed to claude` entry.
+- Phase 7: `assign.sh` turn end and `${PHASE_DIR}`; Phase 9: Claude seats open only under a `routed to claude` entry.
 
 **Acceptance gate:** the merge gate is green; basedpyright on `scripts/direct scripts/hooks scripts/production scripts/whoami` is 0/0.
 
-### Phase 10 — `/unit:assign` and `/showrunner:assign` (WT P4)  · status: todo
+### Phase 11 — `/unit:assign` and `/showrunner:assign` (WT P4)  · status: todo
 
-**Depends on:** Phase 6, Phase 7
+**Depends on:** Phase 7, Phase 8
 
 #### Work Order
 
@@ -384,7 +380,7 @@
 **Spec:**
 - `/unit:assign <role> [--to <seat>] [--model m[:e]] <prompt file> [...]` composes the call: `--session-dir` is the run, `--cwd` the worktree, `--phase` the open phase.
 - `/showrunner:assign`: same skill, showrunner defaults: `--session-dir ~/.local/state/unit-seats/<slug>/showrunner/`, `--cwd` the showrunner checkout. It allows `research`, `propose` and `review` of a document. `implement`, `test` and `fix` are refused with one line: a showrunner never writes code; its units do.
-- The showrunner's ledger file gets `code` reviewers by the Phase 7 rule, for document and plan reviews. `/astra_review` keeps its held-role path. Showrunner seats end at production wrap, with the production's reviewers (user, 2026-10-28).
+- The showrunner's ledger file gets `code` reviewers by the Phase 8 rule, for document and plan reviews. `/astra_review` keeps its held-role path. Showrunner seats end at production wrap, with the production's reviewers (user, 2026-10-28).
 - Both skills print the seat name, the model and effort used, and the summary path. They read no transcripts and hold no state.
 
 **Files:**
@@ -398,13 +394,13 @@
 - `test` — the showrunner form refuses `implement`; both print seat, model and summary path
 
 **Constraints from prior phases:**
-- Phase 6: call form; Phase 7: review seats and the owner rule.
+- Phase 7: call form; Phase 8: review seats and the owner rule.
 
 **Acceptance gate:** the merge gate is green; basedpyright on `scripts/direct` is 0/0.
 
-### Phase 11 — The rule and the cutover (WS P1 + WT P5, merged: both change the same docs)  · status: todo
+### Phase 12 — The rule and the cutover (WS P1 + WT P5, merged: both change the same docs)  · status: todo
 
-**Depends on:** Phase 4, Phase 7, Phase 8, Phase 9, Phase 10
+**Depends on:** Phase 5, Phase 8, Phase 9, Phase 10, Phase 11
 
 #### Work Order
 
@@ -444,13 +440,13 @@
 - `test` (opens as impl) — every doc and command file, `test_tag_reference.py`; hub: `commands/unit/direct.md`
 
 **Constraints from prior phases:**
-- Phase 7: `seats.py import-pool --unit`; Phase 8: `blocked:` exit 3; Phase 9: E4 lines from all three launchers; Phase 10: `/unit:assign`.
+- Phase 8: `seats.py import-pool --unit`; Phase 9: `blocked:` exit 3; Phase 10: E4 lines from all three launchers; Phase 11: `/unit:assign`.
 
 **Acceptance gate:** the merge gate is green; basedpyright on `scripts/direct scripts/hooks` is 0/0; the tag-reference test resolves `<WorkerSeats/>`; a grep test finds no "spawn a fresh Claude Agent helper" and no `implement.sh --to` in `docs/direct/`; a switched unit's `implement.sh --to` call exits 2 with the refusal line; a unit not yet switched runs as before.
 
-### Phase 12 — Seat gate E1–E3 (WS P5)  · status: todo
+### Phase 13 — Seat gate E1–E3 (WS P5)  · status: todo
 
-**Depends on:** Phase 8, Phase 11
+**Depends on:** Phase 9, Phase 12
 **Approved:** the user typed the go for the `settings.json` registration in the models session (2026-10-28, reported by the models director).
 
 #### Work Order
@@ -471,22 +467,23 @@
 - `scripts/hooks/pre-tool-use-seat-gate.py` — new
 - `scripts/hooks/user-prompt-subagent-grant.py` — new
 - `scripts/hooks/test_seat_gate.py` — new
+- `scripts/hooks/test_settings_hook_paths.py` — new: every hook `command` in `settings.json` that names a `scripts/hooks/` file names one that exists
 - `settings.json` — the registration
 
 **Workers:** `1 writer + 1 tester`
 - `impl` — `pre-tool-use-seat-gate.py`, the replay, `settings.json`
-- `test` — `test_seat_gate.py`: each matcher; seat exemption by ledger and by `UNIT_SEAT`; subagent edit refusal; a typed grant opens one named task and `end subagent:` closes it; a grant line inside a cross-session, agent-message or task-notification frame opens nothing; a director write to the grant file is refused; fail-open with a log line; the off switch
+- `test` — `test_settings_hook_paths.py` (fails on a hook path that names a missing file, for example the old `session-start-delegate-resume.py`); `test_seat_gate.py`: each matcher; seat exemption by ledger and by `UNIT_SEAT`; subagent edit refusal; a typed grant opens one named task and `end subagent:` closes it; a grant line inside a cross-session, agent-message or task-notification frame opens nothing; a director write to the grant file is refused; fail-open with a log line; the off switch
 
 **Constraints from prior phases:**
-- Phase 1: `scripts/hooks/test_settings_hook_paths.py` checks the new hook path.
-- Phase 8: self-heal exists, so a refused director always has a seat it can start.
-- Phase 11: the rule doc is `docs/direct/worker_seats.md`.
+- Phase 1: the `compact` hook names `scripts/hooks/session-start-direct-resume.py`. No test checks that a `settings.json` hook command names a file that exists; this phase adds `test_settings_hook_paths.py`.
+- Phase 9: self-heal exists, so a refused director always has a seat it can start.
+- Phase 12: the rule doc is `docs/direct/worker_seats.md`.
 
 **Acceptance gate:** the merge gate is green; basedpyright on `scripts/hooks` is 0/0; the replay shows 0 refusals of `Explore`, `assign.sh`, `implement.sh` or `review.sh` calls.
 
-### Phase 13 — Gate announce and the three-day audit (WS P6, without the as-built)  · status: todo
+### Phase 14 — Gate announce and the three-day audit (WS P6, without the as-built)  · status: todo
 
-**Depends on:** Phase 12
+**Depends on:** Phase 13
 **Blocked by:** three days after the gate goes on, for the audit report.
 
 #### Work Order
@@ -506,13 +503,13 @@
 - `test` — the audit lists every live unit, counts writer subagents and names each refusal
 
 **Constraints from prior phases:**
-- Phase 3: ledger; Phase 8: `replaced` events; Phase 9 and Phase 12: refusal texts.
+- Phase 4: ledger; Phase 9: `replaced` events; Phase 10 and Phase 13: refusal texts.
 
 **Acceptance gate:** the merge gate is green; the three-day audit lists every live unit with writer subagents = 0.
 
-### Phase 14 — Remove the old launchers; write the as-built (WT P6 + WS P6 as-built)  · status: todo
+### Phase 15 — Remove the old launchers; write the as-built (WT P6 + WS P6 as-built)  · status: todo
 
-**Depends on:** Phase 11, Phase 13
+**Depends on:** Phase 12, Phase 14
 **Blocked by:** every unit of every running production is in `switched.json`.
 
 #### Work Order
@@ -544,6 +541,6 @@
 - `test` — `test_seat_gate.py` and `test_review_pool_report.py` updates; a grep test that no file names `implement.sh`
 
 **Constraints from prior phases:**
-- Phase 11: `switched.json` path and the refusal; Phase 12: the allow list.
+- Phase 12: `switched.json` path and the refusal; Phase 13: the allow list.
 
 **Acceptance gate:** the merge gate is green (the lib suite included); basedpyright on `scripts/direct scripts/hooks` is 0/0; the tag-reference test resolves every tag; no file names `implement.sh`.
