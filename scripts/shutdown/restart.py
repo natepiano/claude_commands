@@ -2189,7 +2189,7 @@ def launch_entry(
 
 
 def _resume_worker_command(seat: PausedSeat, cwd: str) -> str:
-    """Build a complete launcher invocation that continues this seat's thread."""
+    """Build a complete launcher invocation that continues this worker's thread."""
     launcher = "review.sh" if seat["role"] == "review" else "implement.sh"
     prompt = str(Path(seat["run_dir"]) / f"{seat['seat']}.resume-prompt.md")
     resumed = _resumed_launcher_command(seat["launcher_command"], seat["seat"], prompt) if seat["turn_live"] else None
@@ -2208,7 +2208,7 @@ def _resume_worker_command(seat: PausedSeat, cwd: str) -> str:
 
 
 def _resumed_launcher_command(command: list[str], seat: str, prompt: str) -> str | None:
-    """Keep the recorded task arguments, following the seat with its resume prompt; None when incomplete."""
+    """Keep the recorded task arguments, following the worker with its resume prompt; None when incomplete."""
     index = next((i for i, arg in enumerate(command) if Path(arg).name in {"implement.sh", "review.sh"}), -1)
     if index < 0:
         return None
@@ -2237,13 +2237,13 @@ def _send_worker_resume(record: SessionShutdown) -> None:
     lines = ["Resume your Codex workers; do not open new ones."]
     cwd = record["session"]["cwd"]
     for seat in seats:
-        # An idle seat stays paused on its thread until the next dispatch; a command now would need an open phase.
+        # An idle worker stays paused on its thread until the next dispatch; a command now would need an open phase.
         if seat["turn_live"]:
             lines.append(f"{seat['seat']} ({seat['role']}, was working): {_resume_worker_command(seat, cwd)}")
         else:
             lines.append(f"{seat['seat']} ({seat['role']}, idle): paused on its thread; nothing to run now. "
                          + f"Your next dispatch with --to {seat['seat']} resumes it.")
-    lines.append("Each seat continues its own thread; after resuming, send later work with --to as usual.")
+    lines.append("Each worker continues its own thread; after resuming, send later work with --to as usual.")
     identity = record["session"]["session_id"]
     try:
         result = _run([*_send_command(), "--to", f"session:{identity}", "--from", "shutdown",
