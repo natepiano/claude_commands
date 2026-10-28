@@ -6,9 +6,10 @@
 moves each unit between its runs. `/showrunner:rename` documents the order:
 `plan <old> <new>`, `apply <old> <new>`, `unit <new> <unit>` for each
 non-retired row, then `finish <new>`. Old names keep resolving through a
-`**Formerly:**` line in the production doc. Apply keeps the old merge branch
-until finish; each unit keeps its old branch until its replacement has been
-pushed.
+`**Formerly:**` line in the production doc. A merge branch named for the
+production (`<old>`) takes the name `<new>`, and apply keeps the old one until
+finish. A merge branch with another name (`main`, `init/catalyst`) keeps its
+name. Each unit keeps its old branch until its replacement has been pushed.
 
 ## Files and readers
 
@@ -16,7 +17,8 @@ pushed.
 | --- | --- |
 | `scripts/production/rename.py` | Plans changes, applies them, moves units and retires old branches. |
 | `scripts/production/rename_state.py` | Supplies `RenameRefused`, `_read_json` and the atomic `_write_json` / `_write_lines` writers. |
-| `scripts/production/tidy_wrapped.py` | Supplies `SLUG`, the reserved `SHARED` names and `owned_paths(slug)`, the four owned state paths. |
+| `scripts/production/tidy_wrapped.py` | Supplies `SLUG`, the reserved `SHARED` names and `owned_paths(slug)`, the six owned state paths (the state folder last). |
+| `scripts/production/rename_outside.py` | Step 4's state outside the showrunner state folder: /next pins, change-review Production cells, children's Parent production line, the bevy upgrade watch, the derived unit board, a slug-named log. |
 | `scripts/production/add_unit.py` | Reads the production doc, Units table and cell values; `plan_cell_is_retired`. |
 | `scripts/production/showrunners.py` | Reads timer CHECK paths and resolves Formerly names. |
 | `scripts/production/unit_lookup.py` | Groups marked sessions by current slug and reports Claude state. |
@@ -45,7 +47,8 @@ class RenamePlan:
     state: tuple[PathMove, ...]    # owned_paths(old) -> owned_paths(new)
     stall: tuple[PathMove, ...]    # one per unit
     review_pool: PathMove
-    # properties: journal = state[-1].destination / "rename.json"; message = commit subject
+    # properties: journal = state[-1].destination / "rename.json"; message = commit subject;
+    # renames_branch = merge_branch == old; branch = new if renames_branch else merge_branch
 ```
 
 ## Names
@@ -78,14 +81,14 @@ the same resolver.
 
 `plan` writes nothing and prints numbered items in apply order; once a journal
 exists it prints the recorded plan. New slugs match `[A-Za-z0-9][A-Za-z0-9_-]*`,
-exclude `footers-off`, `review-paused` and `outstanding`, must be valid git
+exclude `footers-off`, `review-paused`, `outstanding`, `counts` and `reports`, must be valid git
 branch names, and cannot already be current or former timer names or have a
 `showrunner-<new>` directory. The source needs a readable update timer whose
 CHECK names `<old>-production.md`; the doc needs Production Context and a
 Merge branch line; the doc must be tracked in git. Apply also
 requires a clean showrunner checkout on the declared merge branch, free
-destinations, no existing `<new>` branch locally or on origin, and no
-unfinished prior rename journal for the old slug.
+destinations, no existing `<new>` branch locally or on origin when the merge
+branch is renamed, and no unfinished prior rename journal for the old slug.
 
 | Completed step | Change |
 | --- | --- |
@@ -93,10 +96,10 @@ unfinished prior rename journal for the old slug.
 | 1 | Add or extend Formerly as the first bullet of Production Context, write the new doc, point CHECK at it, and `git mv` the doc. |
 | 2 | Rewrite unit-plan Production headers (both header forms) and their production-doc references; add a header where a plan has none. |
 | 3 | Rename `showrunner-<old>` to `showrunner-<new>` and keep the updated CHECK. |
-| 4 | Move `footers-off/<slug>`, `review-paused/<slug>.json`, `outstanding/<slug>.json`, then each entry of `<slug>/` into the new directory; rewrite matching `*/parent` contents; each guild design the showrunner holds takes `ShowrunnerHolder(<new>)` (`roles.move_holder`). |
+| 4 | Move `footers-off/<slug>`, `review-paused/<slug>.json`, `outstanding/<slug>.json`, `counts/<slug>`, `reports/<slug>.json`, then each entry of `<slug>/` into the new directory; rewrite matching `*/parent` contents; each guild design the showrunner holds takes `ShowrunnerHolder(<new>)` (`roles.move_holder`). Then `rename_outside.apply`: move the `next-`, `proposal-` and `question-<slug>` pins (and their `-all-below` forms) and rename their `<old>: ` item keys; rewrite Production cells naming `<old>` on the change-review list; point each child doc's Parent production line at the new doc; move the bevy upgrade record and notifier job (`RUN` names the new doc, `FROM` the new instance) and drop its lock; remove the derived `unit-board/<old>.json`; a Log line naming `<old>-log.md` takes `<new>-log.md`, the log and its `-recovered` copy move, and an info/exclude line naming an old one gains one for the new. The production's own log and its `-recovered` copy, by either name, may stand untracked: every clean-checkout check (`_dirty`, `_check_edits`) skips them, since a log is never committed. Every part repeats safely. |
 | 5 | Move each Units row's stall-watch file from `sha256(old\0unit).json` to `sha256(new\0unit).json`. |
 | 6 | Move the production's review-pool directory, including leases. |
-| 7 | Create and switch to the new merge branch at the saved tip, update Merge branch, commit documents and push with upstream. |
+| 7 | Renamed merge branch: create and switch to `<new>` at the saved tip and update Merge branch. Kept merge branch: stay on it. Then commit documents and push with upstream. |
 
 The journal sits in `<new>/` from step 0, so step 4 merges the old directory's
 entries into it: a prior journal goes to `rename-history/<old>.json`, the old
@@ -110,8 +113,9 @@ A plan path that is missing or not tracked in git is skipped, not refused.
 During apply, a merge branch that moved from the saved tip, a checkout switched
 to another branch, a CHECK that no longer names this production, or changes
 outside the doc and plans refuse. The document and plan changes form one
-commit on the new merge branch: `chore(<new>): rename production from <old>`.
-The old merge branch stays at its saved tip locally and on origin. Apply leaves
+commit on the merge branch after the rename (`RenamePlan.branch`):
+`chore(<new>): rename production from <old>`. A renamed old merge branch stays
+at its saved tip locally and on origin. Apply leaves
 unit branches, worktrees and their Units-row cells for the separate unit
 operation.
 
@@ -120,7 +124,7 @@ operation.
 A unit must have one non-retired Units row with Worktree and Branch columns,
 a branch starting `<old>-`, a linked worktree on that branch, no existing
 `<new>-<stem>` branch locally or on origin, a free destination, and a clean
-showrunner checkout on the new merge branch. An unfinished move must be
+showrunner checkout on the merge branch after the rename. An unfinished move must be
 completed before another unit starts, and a finished rename refuses new moves.
 
 Herdr observation failures refuse the move. The old local branch, while it
@@ -169,9 +173,9 @@ so once the timer has moved they also accept the old or a former name. Leave
 archived completed journals and do not replace the current journal.
 
 Finish requires apply step 7, no unfinished unit moves, no non-retired row
-with an `<old>-` branch, and the showrunner checkout on the new merge branch.
-It deletes the journal's recorded `merge_branch`, which may differ from the
-old slug. `finish_step: 1` records remote deletion; `finish_step: 2` and
+with an `<old>-` branch, and the showrunner checkout on the merge branch after
+the rename. When the merge branch was renamed, it deletes the old one; a kept
+merge branch is not deleted, and finish prints `kept merge branch <name>`. `finish_step: 1` records remote deletion; `finish_step: 2` and
 `done: true` record local deletion and completion. Missing already-deleted
 branches permit recovery; repeating a completed finish is a no-op. A changed
 local tip, or an origin tip that is not an ancestor of the saved tip, refuses
@@ -233,8 +237,12 @@ and 2 for invalid arguments.
   discovery is strict: one failing host could hide a live unit.
 
 - **The old merge branch stays until finish.** Apply leaves units on their
-  old branches; finish deletes the old merge branch only once every
+  old branches; finish deletes a renamed old merge branch only once every
   non-retired row has moved, and only at the saved tip, so no commit is lost.
+
+- **Only a merge branch named for the production is renamed.** A merge branch
+  such as `main` is shared history, not the production's name; renaming it
+  would move every checkout that tracks it.
 
 - **Merge history survives the rename.** `merge_checkpoint.py` derives the
   last merge per unit from subjects `Merge <unit> phase <N> (<hash>)`, which

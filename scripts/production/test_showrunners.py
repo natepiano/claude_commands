@@ -145,8 +145,8 @@ raise SystemExit(1)
         self.assertEqual(result.stdout, "")
         return result.stderr
 
-    def showrunner(self, slug: str, *, running: bool = True, formerly: tuple[str, ...] = ()) -> None:
-        """One production with an update timer, its showrunner named `<slug>-name` when it runs."""
+    def showrunner(self, slug: str, *, running: bool = True, formerly: tuple[str, ...] = (), name: str = "") -> None:
+        """One production with an update timer, its showrunner named `name`, else its slug, when it runs."""
         doc = self.root / f"{slug}-production.md"
         self.instance(f"showrunner-{slug}", target=f"session:{slug}-id", doc=doc)
         if formerly:
@@ -154,7 +154,7 @@ raise SystemExit(1)
             _ = doc.write_text(f"# Production\n\n## Production Context\n\n- **Formerly:** {names}\n",
                                encoding="utf-8")
         if running:
-            _ = self.record(f"{slug}-name", f"{slug}-id")
+            _ = self.record(name or slug, f"{slug}-id")
 
     def messages(self) -> list[tuple[str, str]]:
         """Each message sent, as the socket it went to and its text."""
@@ -223,7 +223,7 @@ raise SystemExit(1)
         self.assertIn("show\ton-demand\t", self.successful("list"))
 
     def test_former_slug_reaches_the_current_showrunner_by_name_and_address(self) -> None:
-        self.showrunner("new", formerly=("old",))
+        self.showrunner("new", formerly=("old",), name="new-name")
         address = f"uds:{self.root / 'new-id.sock'}"
         self.assertEqual(self.successful("address", "old"), f"{address}\n")
         self.assertEqual(self.successful("name", "old"), "new-name\n")
@@ -234,8 +234,15 @@ raise SystemExit(1)
             self.assertEqual(showrunners.current_address("old"), address)
             self.assertEqual(showrunners.current_name("old"), "new-name")
 
+    def test_attach_refuses_a_running_showrunner_not_named_for_its_production(self) -> None:
+        self.showrunner("top")
+        self.showrunner("mid", name="mid-name")
+        stderr = self.refused("attach", "mid", "top")
+        self.assertIn("production mid has showrunner mid-name", stderr)
+        self.assertFalse((self.state / "mid/parent").exists())
+
     def test_named_accepts_a_live_session_name_and_a_former_production_slug(self) -> None:
-        self.showrunner("new", formerly=("old",))
+        self.showrunner("new", formerly=("old",), name="new-name")
         with (mock.patch.dict(os.environ, self.environment()),
               mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
               mock.patch.object(showrunners, "SESSIONS_DIR", self.sessions),
@@ -391,7 +398,7 @@ raise SystemExit(1)
         self.assertEqual(self.successful("children", "leaf"), "")
         self.assertEqual([self.successful("root", slug) for slug in ("top", "mid", "leaf")], ["top\n"] * 3)
         self.assertEqual(self.successful("tree").splitlines(),
-                         ["top\ttop-name", "  mid\tmid-name", "    leaf\t<not running>"])
+                         ["top\ttop", "  mid\tmid", "    leaf\t<not running>"])
         sockets = [socket for socket, _ in self.messages()]
         self.assertEqual(sockets, [f"uds:{self.root / f'{slug}-id.sock'}" for slug in ("mid", "top", "mid")])
         to_child, to_parent, to_leafs_parent = (text for _, text in self.messages())
@@ -472,7 +479,7 @@ raise SystemExit(1)
         self.stored_parent("mid", "wrapped")
         self.assertEqual(self.successful("parent", "mid"), "")
         self.assertEqual(self.successful("root", "mid"), "mid\n")
-        self.assertEqual(self.successful("tree").splitlines(), ["mid\tmid-name", "top\ttop-name"])
+        self.assertEqual(self.successful("tree").splitlines(), ["mid\tmid", "top\ttop"])
         # The dead edge does not hold the child: it attaches again without a detach.
         _ = self.successful("attach", "mid", "top")
         self.assertEqual(self.successful("parent", "mid"), "top\n")

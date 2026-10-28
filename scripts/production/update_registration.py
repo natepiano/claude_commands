@@ -215,6 +215,8 @@ def register(production: Production) -> None:
     session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     if not session_id:
         raise RegistrationFailure("register", "CLAUDE_CODE_SESSION_ID is required")
+    if why := showrunners.name_refusal(production.slug, showrunners.session_name(session_id)):
+        raise RegistrationFailure("register", why)
     try:
         agents_log.append(session_id, "showrunner", None, datetime.now(timezone.utc))
     except Exception as exc:

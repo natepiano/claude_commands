@@ -22,6 +22,7 @@ import tidy_wrapped  # noqa: E402
 import unit_lookup  # noqa: E402
 import unit_move  # noqa: E402
 from unit_move import PathMove  # noqa: E402
+import rename_outside  # noqa: E402
 import rename_state  # noqa: E402
 from rename_state import RenameRefused, read_json, write_json, write_text  # noqa: E402
 
@@ -55,6 +56,19 @@ class RenamePlan:
     def message(self) -> str:
         return f"chore({self.new}): rename production from {self.old}"
 
+    @property
+    def renames_branch(self) -> bool:
+        """Whether the merge branch is named for the production and so takes the new name.
+
+        A merge branch such as `main` or `init/catalyst` is not the production's name and is kept.
+        """
+        return self.merge_branch == self.old
+
+    @property
+    def branch(self) -> str:
+        """The merge branch after the rename."""
+        return self.new if self.renames_branch else self.merge_branch
+
 
 def _check_unit_tip(plan: RenamePlan, record: dict[str, object]) -> None:
     unit_move.check_tip(plan.checkout, _string(record, "old_branch"), _string(record, "tip"))
@@ -62,7 +76,7 @@ def _check_unit_tip(plan: RenamePlan, record: dict[str, object]) -> None:
 
 def _push_unit_branch(plan: RenamePlan, record: dict[str, object]) -> None:
     unit_move.push_branch(plan.checkout, _string(record, "old_branch"), _string(record, "new_branch"),
-                          _string(record, "tip"), (plan.merge_branch, plan.new))
+                          _string(record, "tip"), (plan.merge_branch, plan.branch))
 
 
 def _move_unit_worktree(plan: RenamePlan, record: dict[str, object]) -> None:
@@ -258,7 +272,7 @@ def _load(path: Path, old: str, new: str) -> tuple[RenamePlan, int]:
         raise RenameRefused(f"{path}: rename is from {recorded_old}, not {old}")
     state = _read_moves(fields.get("state"))
     step = fields.get("step")
-    if len(state) != 4 or type(step) is not int or not 0 <= step <= 7 or not isinstance(fields.get("done"), bool):
+    if len(state) != len(tidy_wrapped.owned_paths(new)) or type(step) is not int or not 0 <= step <= 7 or not isinstance(fields.get("done"), bool):
         raise RenameRefused(f"{path}: invalid rename progress")
     result = RenamePlan(recorded_old, new, Path(_string(fields, "old_doc")), Path(_string(fields, "new_doc")),
                         Path(_string(fields, "checkout")), _string(fields, "merge_branch"), _string(fields, "base"),
@@ -295,25 +309,40 @@ def _describe(plan: RenamePlan) -> list[str]:
             f"4. parent files {plan.state[-1].source.parent}/*/parent: {plan.old} -> {plan.new}",
             *(f"4. parent {path}: {plan.old} -> {plan.new}" for path in parents),
             f"4. held guild roles: holder {plan.old} showrunner -> {plan.new} showrunner",
+            *rename_outside.describe(plan.old, plan.new, plan.old_doc, plan.new_doc),
             *(stretches or ["5. stall-watch: no Units rows"]),
             f"6. review pool {moves(plan.review_pool)}",
-            f"7. merge branch {plan.merge_branch} -> {plan.new}; commit {plan.message!r}; push origin {plan.new}; "
-            + f"keep {plan.merge_branch} until finish"]
+            (f"7. merge branch {plan.merge_branch} -> {plan.new}; commit {plan.message!r}; push origin {plan.new}; "
+             + f"keep {plan.merge_branch} until finish" if plan.renames_branch else
+             f"7. merge branch {plan.merge_branch} kept (not named for the production); commit {plan.message!r}; "
+             + f"push origin {plan.merge_branch}")]
+
+
+def _dirty(plan: RenamePlan) -> list[str]:
+    """The checkout's changes and untracked files, less the production's own log, which is never committed."""
+    doc = plan.new_doc if plan.new_doc.exists() else plan.old_doc
+    logs = rename_outside.log_paths(plan.old, plan.new, doc)
+    tracked = unit_move.git(plan.checkout, "status", "--porcelain", "--untracked-files=no").splitlines()
+    untracked = unit_move.git(plan.checkout, "ls-files", "--others", "--exclude-standard").splitlines()
+    return [*tracked, *(path for path in untracked if path not in logs)]
 
 
 def _preflight(plan: RenamePlan) -> None:
     branch = unit_move.git(plan.checkout, "branch", "--show-current")
     if branch != plan.merge_branch:
         raise RenameRefused(f"showrunner checkout is on {branch or 'detached HEAD'}, not {plan.merge_branch}")
-    if unit_move.git(plan.checkout, "status", "--porcelain"):
+    if _dirty(plan):
         raise RenameRefused(f"{plan.checkout}: checkout must be clean before rename")
-    if unit_move.git(plan.checkout, "for-each-ref", "--format=%(refname)", f"refs/heads/{plan.new}"):
+    if plan.renames_branch and unit_move.git(plan.checkout, "for-each-ref", "--format=%(refname)", f"refs/heads/{plan.new}"):
         raise RenameRefused(f"branch {plan.new} already exists")
-    if unit_move.git(plan.checkout, "ls-remote", "--heads", "origin", f"refs/heads/{plan.new}"):
+    if plan.renames_branch and unit_move.git(plan.checkout, "ls-remote", "--heads", "origin", f"refs/heads/{plan.new}"):
         raise RenameRefused(f"origin branch {plan.new} already exists")
     for move in (PathMove(plan.old_doc, plan.new_doc), plan.timer, *plan.state[:-1], *plan.stall, plan.review_pool):
         if unit_move.exists(move.destination):
             raise RenameRefused(f"destination already exists: {move.destination}")
+    for path in rename_outside.destinations(plan.old, plan.new, plan.old_doc):
+        if unit_move.exists(path):
+            raise RenameRefused(f"destination already exists: {path}")
     destination = plan.state[-1].destination
     if unit_move.exists(destination) and (destination.is_symlink() or not destination.is_dir()
                                  or any(path.name != "rename.lock" for path in destination.iterdir())):
@@ -399,6 +428,7 @@ def _rename_showrunner_state(plan: RenamePlan) -> None:
         if path.read_text(encoding="utf-8").strip() == plan.old:
             write_text(path, plan.new + "\n")
     _move_held_roles(roles.ShowrunnerHolder(plan.old), roles.ShowrunnerHolder(plan.new))
+    rename_outside.apply(plan.old, plan.new, plan.old_doc, plan.new_doc)
 
 
 def _move_held_roles(old: roles.Holder, new: roles.Holder, old_checkout: str = "", new_checkout: str = "") -> None:
@@ -421,7 +451,8 @@ def _rename_review_pool(plan: RenamePlan) -> None:
 def _check_edits(plan: RenamePlan) -> None:
     allowed = {_relative(plan, path) for path in (plan.old_doc, plan.new_doc, *plan.plans)}
     changed = set(unit_move.git(plan.checkout, "diff", "--name-only", "-z", "HEAD").split("\0")) - {""}
-    changed.update(set(unit_move.git(plan.checkout, "ls-files", "--others", "--exclude-standard", "-z").split("\0")) - {""})
+    changed.update(set(unit_move.git(plan.checkout, "ls-files", "--others", "--exclude-standard", "-z").split("\0"))
+                   - {""} - rename_outside.log_paths(plan.old, plan.new, plan.new_doc))
     if changed - allowed:
         raise RenameRefused("unrelated checkout changes: " + ", ".join(sorted(changed - allowed)))
 
@@ -430,29 +461,30 @@ def _rename_branch(plan: RenamePlan) -> None:
     if unit_move.git(plan.checkout, "rev-parse", f"refs/heads/{plan.merge_branch}") != plan.base:
         raise RenameRefused(f"{plan.merge_branch} moved during the rename")
     branch = unit_move.git(plan.checkout, "branch", "--show-current")
-    if branch not in (plan.merge_branch, plan.new):
+    if branch not in (plan.merge_branch, plan.branch):
         raise RenameRefused(f"showrunner checkout switched to {branch}")
     _check_edits(plan)
-    if not unit_move.git(plan.checkout, "for-each-ref", "--format=%(refname)", f"refs/heads/{plan.new}"):
-        _ = unit_move.git(plan.checkout, "branch", plan.new, plan.base)
-    tip = unit_move.git(plan.checkout, "rev-parse", f"refs/heads/{plan.new}")
+    if not unit_move.git(plan.checkout, "for-each-ref", "--format=%(refname)", f"refs/heads/{plan.branch}"):
+        _ = unit_move.git(plan.checkout, "branch", plan.branch, plan.base)
+    tip = unit_move.git(plan.checkout, "rev-parse", f"refs/heads/{plan.branch}")
     committed = (tip != plan.base and unit_move.git(plan.checkout, "show", "-s", "--format=%s", tip) == plan.message
                  and unit_move.git(plan.checkout, "rev-parse", f"{tip}^") == plan.base)
     if tip != plan.base and not committed:
-        raise RenameRefused(f"branch {plan.new} moved during the rename")
-    if branch != plan.new:
-        _ = unit_move.git(plan.checkout, "switch", plan.new)
+        raise RenameRefused(f"branch {plan.branch} moved during the rename")
+    if branch != plan.branch:
+        _ = unit_move.git(plan.checkout, "switch", plan.branch)
     if not committed:
-        write_text(plan.new_doc, _merge_line(plan.new_doc.read_text(encoding="utf-8"), plan.new))
+        if plan.renames_branch:
+            write_text(plan.new_doc, _merge_line(plan.new_doc.read_text(encoding="utf-8"), plan.new))
         paths = list(dict.fromkeys(_relative(plan, path) for path in (plan.old_doc, plan.new_doc, *plan.plans)))
         old_path = _relative(plan, plan.old_doc)
         if not unit_move.exists(plan.old_doc) and unit_move.git(plan.checkout, "ls-files", "-z", "--", old_path):
             _ = unit_move.git(plan.checkout, "rm", "--cached", "--quiet", "--", old_path)
         _ = unit_move.git(plan.checkout, "add", "--", *[path for path in paths if (plan.checkout / path).exists()])
         _ = unit_move.git(plan.checkout, "commit", "-m", plan.message)
-    elif unit_move.git(plan.checkout, "status", "--porcelain"):
+    elif _dirty(plan):
         raise RenameRefused("checkout changed after the rename commit")
-    _ = unit_move.git(plan.checkout, "push", "--set-upstream", "origin", f"{plan.new}:refs/heads/{plan.new}")
+    _ = unit_move.git(plan.checkout, "push", "--set-upstream", "origin", f"{plan.branch}:refs/heads/{plan.branch}")
 
 
 def apply(old: str, new: str) -> RenamePlan:
@@ -539,8 +571,8 @@ def _prepare_unit(plan: RenamePlan, name: str, row: dict[str, str]) -> dict[str,
         raise RenameRefused(f"destination already exists: {destination}")
     if unit_move.git(worktree, "branch", "--show-current") != branch:
         raise RenameRefused(f"{worktree} is not on {branch}")
-    if unit_move.git(plan.checkout, "branch", "--show-current") != plan.new or unit_move.git(plan.checkout, "status", "--porcelain"):
-        raise RenameRefused("showrunner checkout must be clean and on the new merge branch")
+    if unit_move.git(plan.checkout, "branch", "--show-current") != plan.branch or _dirty(plan):
+        raise RenameRefused(f"showrunner checkout must be clean and on the merge branch {plan.branch}")
     return {"old_branch": branch, "new_branch": new_branch, "old_worktree": str(worktree),
             "new_worktree": str(destination), "tip": unit_move.git(worktree, "rev-parse", "HEAD"),
             "base": unit_move.git(plan.checkout, "rev-parse", "HEAD"), "step": 0}
@@ -573,8 +605,8 @@ def _unit_doc(plan: RenamePlan, name: str, record: dict[str, object]) -> None:
 def _commit_unit(plan: RenamePlan, name: str, record: dict[str, object]) -> None:
     _check_unit_tip(plan, record)
     message = f"chore({plan.new}): rename unit {name} from {plan.old}"
-    if unit_move.git(plan.checkout, "branch", "--show-current") != plan.new:
-        raise RenameRefused("showrunner checkout switched away from the new merge branch")
+    if unit_move.git(plan.checkout, "branch", "--show-current") != plan.branch:
+        raise RenameRefused(f"showrunner checkout switched away from the merge branch {plan.branch}")
     path = _relative(plan, plan.new_doc)
     rows = production_units.unit_table(unit_move.git(plan.checkout, "show", f"HEAD:{path}").splitlines())
     matching = [row for row in rows if production_units.cell_value(row.get("Unit", "")) == name]
@@ -583,7 +615,8 @@ def _commit_unit(plan: RenamePlan, name: str, record: dict[str, object]) -> None
                  and production_units.cell_value(matching[0].get("Branch", "")) == _string(record, "new_branch"))
     changed = set(unit_move.git(plan.checkout, "diff", "--name-only", "-z", "HEAD").split("\0")) - {""}
     changed.update(set(unit_move.git(plan.checkout, "diff", "--cached", "--name-only", "-z", "HEAD").split("\0")) - {""})
-    untracked = unit_move.git(plan.checkout, "ls-files", "--others", "--exclude-standard")
+    untracked = [path for path in unit_move.git(plan.checkout, "ls-files", "--others", "--exclude-standard").splitlines()
+                 if path not in rename_outside.log_paths(plan.old, plan.new, plan.new_doc)]
     if changed - {path} or untracked or (committed and changed):
         raise RenameRefused("unrelated checkout changes during unit rename")
     if not committed:
@@ -591,7 +624,7 @@ def _commit_unit(plan: RenamePlan, name: str, record: dict[str, object]) -> None
         _ = unit_move.git(plan.checkout, "add", "--", path)
         _ = unit_move.git(plan.checkout, "commit", "-m", message)
     _check_unit_tip(plan, record)
-    _ = unit_move.git(plan.checkout, "push", "origin", f"{plan.new}:refs/heads/{plan.new}")
+    _ = unit_move.git(plan.checkout, "push", "origin", f"{plan.branch}:refs/heads/{plan.branch}")
 
 
 def unit(new: str, name: str) -> None:
@@ -647,7 +680,7 @@ def unit(new: str, name: str) -> None:
 
 
 def finish(new: str) -> None:
-    """Retire the recorded merge branch once all non-retired unit rows have moved."""
+    """Finish once all non-retired unit rows have moved: retire the old merge branch when it took the new name."""
     with _rename_journal(new) as (result, journal):
         if journal["done"]:
             return
@@ -660,16 +693,18 @@ def finish(new: str) -> None:
         records = _object(journal.get("unit_moves", {}))
         if any(_object(value).get("step") != 5 for value in records.values()):
             raise RenameRefused("complete interrupted unit moves before finish")
-        if unit_move.git(result.checkout, "branch", "--show-current") != result.new:
-            raise RenameRefused("showrunner checkout must be on the new merge branch before finish")
-        unit_move.delete_remote_branch(result.checkout, result.merge_branch, result.base)
-        journal["finish_step"] = 1
-        write_json(result.journal, journal)
-        unit_move.delete_local_branch(result.checkout, result.merge_branch, result.base)
+        if unit_move.git(result.checkout, "branch", "--show-current") != result.branch:
+            raise RenameRefused(f"showrunner checkout must be on the merge branch {result.branch} before finish")
+        if result.renames_branch:
+            unit_move.delete_remote_branch(result.checkout, result.merge_branch, result.base)
+            journal["finish_step"] = 1
+            write_json(result.journal, journal)
+            unit_move.delete_local_branch(result.checkout, result.merge_branch, result.base)
         journal["finish_step"] = 2
         journal["done"] = True
         write_json(result.journal, journal)
-        print(f"{result.new} rename finished; retired {result.merge_branch}")
+        print(f"{result.new} rename finished; " + (f"retired {result.merge_branch}" if result.renames_branch
+                                                   else f"kept merge branch {result.merge_branch}"))
 
 
 def main(argv: list[str]) -> int:
@@ -697,7 +732,7 @@ def main(argv: list[str]) -> int:
             for line in _describe(result):
                 print(line)
             if action == "apply":
-                print(f"{result.old} is now {result.new}; keep {result.merge_branch} until finish")
+                print(f"{result.old} is now {result.new}; " + (f"keep {result.merge_branch} until finish" if result.renames_branch else f"merge branch {result.merge_branch} kept"))
     except (RenameRefused, production_units.Refusal, tidy_wrapped.TidyRefused, OSError, UnicodeError) as error:
         print(f"rename: {error}", file=sys.stderr)
         return 1
