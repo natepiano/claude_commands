@@ -66,6 +66,7 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import signal
 import socket
 import struct
@@ -225,6 +226,9 @@ def _serving_request(
         raise ServingRequestFailure(detail, serving, proven) from error
 
 SERVER_FILE = "mesh_server.json"
+DEV_SHELL_FILE = "mesh_dev_shell.json"
+FAILED_DEV_SHELL_FILE = "mesh_failed_dev_shell.json"
+SERVER_START_FILE = "mesh_server_start.json"
 SERVER_LOG = "mesh_server.log"
 ROSTER_FILE = "mesh_roster.json"
 # Runs a worker detached with mesh_runs.py: one `<run id>.json` record and `<run id>.log` each.
@@ -254,6 +258,8 @@ COMPACT_IDLE_POLL_SECS = 1
 # `compact` exits with this when the thread still has a live turn, so no follow-up can be sent.
 COMPACT_TURN_STILL_LIVE = 3
 SERVER_START_TIMEOUT_SECS = 30
+# Cold direnv/Nix evaluation happens before the app-server can listen.
+DEV_SHELL_START_TIMEOUT_SECS = 300
 # Codex compacts a thread on its own once its context passes this many tokens. Every request
 # re-reads the whole context, and threads left to Codex's default grew to 460K; a 200K cap cut a
 # replayed day of worker usage by 19% (user, 2026-10-15). A server started with another value is
@@ -323,6 +329,49 @@ class ServerRecord(TypedDict):
     codex_home: NotRequired[str]
     auto_compact_tokens: NotRequired[int]
     guild_context: NotRequired[dict[str, object]]
+    dev_shell_worktree: NotRequired[str]
+
+
+@dataclass(frozen=True)
+class InheritedServerEnvironment:
+    """No allowed unit worktree dev-shell applies to this launch."""
+
+
+@dataclass(frozen=True)
+class AllowedDevShell:
+    """Direnv has authorized the nearest .envrc for this unit's cwd."""
+
+    worktree: Path
+    direnv: str
+    input_revision: str
+
+
+ServerDevShell = InheritedServerEnvironment | AllowedDevShell
+_INHERITED_SERVER_ENVIRONMENT = InheritedServerEnvironment()
+
+
+@dataclass(frozen=True)
+class DevShellProbeUnavailable:
+    """The probe cannot decide whether the server's dev-shell should change."""
+
+    reason: str
+
+
+@dataclass(frozen=True)
+class RememberedDevShellFailure:
+    """Suppress this failed shell's unchanged inputs until its retry deadline."""
+
+    worktree: Path
+    input_revision: str
+    retry_at: float
+
+    def suppresses(self, dev_shell: AllowedDevShell) -> bool:
+        return (self.worktree == dev_shell.worktree
+                and self.input_revision == dev_shell.input_revision
+                and time.time() < self.retry_at)
+
+
+DevShellProbe = ServerDevShell | DevShellProbeUnavailable | RememberedDevShellFailure
 
 
 @dataclass(frozen=True)
@@ -2046,7 +2095,76 @@ def held_thread_end_confirmed(session_dir: str, thread_id: str) -> bool:
     return True
 
 
-def ensure_server(session_dir: str, home: Path | None = None) -> tuple[int, bool]:
+def _server_dev_shell(session_dir: str, cwd: str | None) -> DevShellProbe:
+    """Ask direnv for permission without evaluating a worktree's environment."""
+    if not cwd or Path(session_dir).resolve().parent not in {root.resolve() for root in RUN_ROOTS}:
+        return InheritedServerEnvironment()
+    try:
+        directory = Path(cwd).resolve()
+        candidates = (directory, *directory.parents)
+        rc_folders = [folder for folder in candidates if (folder / ".envrc").is_file()]
+        if not rc_folders:
+            return InheritedServerEnvironment()
+        direnv = shutil.which("direnv")
+        if direnv is None:
+            return DevShellProbeUnavailable("direnv is not on PATH")
+        status = subprocess.run(
+            [direnv, "status", "--json"], cwd=directory,
+            capture_output=True, text=True, check=True, timeout=5,
+        )
+        state = _as_dict(_as_dict(_loads(status.stdout)).get("state"))
+        if "foundRC" in state and state["foundRC"] is None:
+            return InheritedServerEnvironment()
+        found = _as_dict(state.get("foundRC"))
+        allowed = found.get("allowed")
+        # Direnv's AllowStatus is an integer enum: 0 allowed, 1 unapproved, 2 denied.
+        rc_path = Path(_as_str(found.get("path")))
+        if rc_path != rc_folders[0] / ".envrc":
+            return DevShellProbeUnavailable("direnv did not identify the nearest .envrc")
+        if type(allowed) is int:
+            if allowed == 0:
+                revisions: dict[str, str] = {}
+                for name in (".envrc", "flake.nix", "flake.lock", "shell.nix", "default.nix", "devenv.nix"):
+                    try:
+                        info = (rc_path.parent / name).stat()
+                        revisions[name] = f"{info.st_mtime_ns}:{info.st_ctime_ns}:{info.st_size}"
+                    except FileNotFoundError:
+                        revisions[name] = "absent"
+                dev_shell = AllowedDevShell(rc_path.parent, direnv, json.dumps(revisions, sort_keys=True))
+                failed = _read_json_object(_session_path(session_dir, FAILED_DEV_SHELL_FILE))
+                failure = RememberedDevShellFailure(
+                    Path(_as_str(failed.get("worktree"))), _as_str(failed.get("input_revision")),
+                    _as_float(failed.get("retry_at"), 0),
+                )
+                if failure.suppresses(dev_shell):
+                    return failure
+                return dev_shell
+            if allowed in (1, 2):
+                return InheritedServerEnvironment()
+        return DevShellProbeUnavailable("direnv returned an unknown allowance")
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        return DevShellProbeUnavailable(str(error))
+
+
+def _remember_server_dev_shell(session_dir: str, dev_shell: ServerDevShell) -> None:
+    """Keep the last successful shell across idle-stop, separately from the live record."""
+    path = _session_path(session_dir, DEV_SHELL_FILE)
+    if isinstance(dev_shell, AllowedDevShell):
+        _ = path.write_text(json.dumps({"worktree": str(dev_shell.worktree)}), encoding="utf-8")
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _remember_failed_dev_shell(session_dir: str, dev_shell: AllowedDevShell) -> None:
+    """Retry failed evaluations after an input change or a thirty-minute cooldown."""
+    failure = RememberedDevShellFailure(dev_shell.worktree, dev_shell.input_revision, time.time() + 30 * 60)
+    _ = _session_path(session_dir, FAILED_DEV_SHELL_FILE).write_text(json.dumps({
+        "worktree": str(failure.worktree), "input_revision": failure.input_revision,
+        "retry_at": failure.retry_at,
+    }), encoding="utf-8")
+
+
+def ensure_server(session_dir: str, home: Path | None = None, cwd: str | None = None) -> tuple[int, bool]:
     """This session's app-server port, and whether this call is what started it.
 
     A caller that started the server just proved the provider was reachable
@@ -2065,6 +2183,10 @@ def ensure_server(session_dir: str, home: Path | None = None) -> tuple[int, bool
                 or (_pid_alive(pid) and _holds_old_sign_in(pid, previous_home))):
             _release_held_server(session_dir)
     with _server_lock(session_dir):
+        # Read failures under the same lock as launch: another caller may have
+        # just fallen back for this revision while this caller was acquiring it.
+        dev_shell = _server_dev_shell(session_dir, cwd)
+        dev_shell_worktree = str(dev_shell.worktree) if isinstance(dev_shell, AllowedDevShell) else ""
         path = _session_path(session_dir, SERVER_FILE)
         record = _read_json_object(path)
         port = record.get("port")
@@ -2074,19 +2196,37 @@ def ensure_server(session_dir: str, home: Path | None = None) -> tuple[int, bool
             matching_home = recorded_home == selected_home
             old_sign_in = matching_home and _holds_old_sign_in(pid, recorded_home)
             old_limit = record.get("auto_compact_tokens") != AUTO_COMPACT_TOKENS
-            if matching_home and not old_sign_in and not old_limit:
+            old_dev_shell = (cwd is not None and not isinstance(dev_shell, DevShellProbeUnavailable)
+                             and _as_str(record.get("dev_shell_worktree")) != dev_shell_worktree)
+            if matching_home and not old_sign_in and not old_limit and not old_dev_shell:
                 # The record's change time is when the server was last used; its watcher reads it.
                 os.utime(path)
+                if isinstance(dev_shell, AllowedDevShell):
+                    _remember_server_dev_shell(session_dir, dev_shell)
+                elif cwd is not None and isinstance(dev_shell, InheritedServerEnvironment):
+                    _remember_server_dev_shell(session_dir, dev_shell)
                 return port, False
             # A sign-in change `signin-changed` did not catch. The workers still on this server keep
             # it until they let go; its watcher then stops it.
             _retire_record(session_dir, record)
             cause = (f"no longer serves the workers home {codex_home_display(selected_home)}" if not matching_home
                      else f"holds the old sign-in at {codex_home_display(selected_home)}" if old_sign_in
+                     else f"serves another dev-shell than {dev_shell_worktree or 'the caller environment'}" if old_dev_shell
                      else f"compacts at another limit than {AUTO_COMPACT_TOKENS} tokens")
             _log_server(session_dir, f"app-server {pid} {cause}; retired, starting a new one")
             if not _stop_unused_with_lock_held(None, pid, port):
                 _ = _start_watcher(session_dir, pid, port)
+        if cwd is None:
+            remembered = _as_str(_read_json_object(_session_path(session_dir, DEV_SHELL_FILE)).get("worktree"))
+            # Also migrate a shell recorded before the persistent preference existed.
+            remembered = remembered or _as_str(record.get("dev_shell_worktree"))
+            dev_shell = _server_dev_shell(session_dir, remembered or None)
+        if isinstance(dev_shell, DevShellProbeUnavailable):
+            _log_server(session_dir, f"dev-shell probe unavailable: {dev_shell.reason}; starting with caller environment")
+        if isinstance(dev_shell, AllowedDevShell):
+            return _start_server(session_dir, selected_home, dev_shell), True
+        if isinstance(dev_shell, InheritedServerEnvironment):
+            _remember_server_dev_shell(session_dir, dev_shell)
         return _start_server(session_dir, selected_home), True
 
 
@@ -2129,68 +2269,112 @@ def _set_run(environment: dict[str, str], run: str) -> None:
     environment["TMPDIR"] = str(temp)
 
 
-def _start_server(session_dir: str, workers_home: Path) -> int:
+def _start_server(
+    session_dir: str, workers_home: Path, dev_shell: ServerDevShell = _INHERITED_SERVER_ENVIRONMENT,
+) -> int:
     """Start this session's app-server and record it. The caller holds the server lock."""
-    chosen = _free_port()
-    log_path = _session_path(session_dir, SERVER_LOG)
-    with log_path.open("ab") as log_handle:
-        process = subprocess.Popen(
-            ["codex", "-c", "thread_unload_delay_secs=0", "-c", f"model_auto_compact_token_limit={AUTO_COMPACT_TOKENS}",
-             "-c", f"background_terminal_max_timeout={BACKGROUND_TERMINAL_MAX_TIMEOUT_MS}",
-             "app-server", "--listen", f"ws://127.0.0.1:{chosen}"],
-            stdout=subprocess.DEVNULL,
-            stderr=log_handle,
-            start_new_session=True,
-            env=_server_environment(session_dir, workers_home),
-        )
-    served: ServerRecord = {"port": chosen, "pid": process.pid, "codex_home": str(workers_home),
-                            "auto_compact_tokens": AUTO_COMPACT_TOKENS}
-    context = _guild_context(session_dir)
-    if context:
-        served["guild_context"] = context
-    try:
-        deadline = time.time() + SERVER_START_TIMEOUT_SECS
-        while time.time() < deadline:
-            if process.poll() is not None:
-                raise SystemExit(
-                    f"codex_mesh: app-server exited immediately; see {log_path}"
+    while True:
+        chosen = _free_port()
+        log_path = _session_path(session_dir, SERVER_LOG)
+        environment = _server_environment(session_dir, workers_home)
+        command = ["codex", "-c", "thread_unload_delay_secs=0", "-c", f"model_auto_compact_token_limit={AUTO_COMPACT_TOKENS}",
+                   "-c", f"background_terminal_max_timeout={BACKGROUND_TERMINAL_MAX_TIMEOUT_MS}",
+                   "app-server", "--listen", f"ws://127.0.0.1:{chosen}"]
+        if isinstance(dev_shell, AllowedDevShell):
+            # Apply these AFTER direnv: its .envrc and environment reversion must not choose
+            # the workers home, run, temporary folder, or held-design identity. Both direnv
+            # (syscall.Exec in cmd_exec.go) and env exec their command, retaining process.pid.
+            protected = ("CODEX_HOME", "UNIT_RUN_DIR", "TMPDIR", "CLAUDE_CODE_SESSION_ID",
+                         "GUILD_DESIGN_ID", "GUILD_BINDING_GENERATION")
+            command = [dev_shell.direnv, "exec", str(dev_shell.worktree), shutil.which("env") or "/usr/bin/env",
+                       *(f"{key}={environment[key]}" for key in protected if key in environment), *command]
+        try:
+            with log_path.open("ab") as log_handle:
+                process = subprocess.Popen(
+                    command,
+                    stdout=subprocess.DEVNULL,
+                    stderr=log_handle,
+                    start_new_session=True,
+                    env=environment,
                 )
-            try:
-                probe = WebSocket(chosen)
-            except (OSError, ConnectionError):
-                time.sleep(0.4)
-                continue
-            probe.close()
-            _record_started_server(session_dir, served)
-            if context:
-                from scripts.guilds import roles
-                roles.refresh_census(_as_str(context.get("design_id")))
-            _STARTED_SERVERS.add((chosen, process.pid))
-            _ = _start_watcher(session_dir, process.pid, chosen)
-            return chosen
-        raise SystemExit(f"codex_mesh: app-server did not accept connections on {chosen}")
-    except BaseException:
-        _discard_failed_server_start(session_dir, served, process)
-        raise
+        except OSError as error:
+            if not isinstance(dev_shell, AllowedDevShell):
+                raise
+            _remember_failed_dev_shell(session_dir, dev_shell)
+            _log_server(session_dir, f"direnv exec {dev_shell.worktree} failed: {error}; falling back to caller environment")
+            dev_shell = _INHERITED_SERVER_ENVIRONMENT
+            continue
+        served: ServerRecord = {"port": chosen, "pid": process.pid, "codex_home": str(workers_home),
+                                "auto_compact_tokens": AUTO_COMPACT_TOKENS}
+        if isinstance(dev_shell, AllowedDevShell):
+            served["dev_shell_worktree"] = str(dev_shell.worktree)
+        context = _guild_context(session_dir)
+        if context:
+            served["guild_context"] = context
+        try:
+            if isinstance(dev_shell, AllowedDevShell):
+                _ = _session_path(session_dir, SERVER_START_FILE).write_text(json.dumps({
+                    "pid": process.pid, "port": chosen, "started_at": time.time(),
+                    "dev_shell_worktree": str(dev_shell.worktree),
+                }), encoding="utf-8")
+            timeout = DEV_SHELL_START_TIMEOUT_SECS if isinstance(dev_shell, AllowedDevShell) else SERVER_START_TIMEOUT_SECS
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                if process.poll() is not None:
+                    raise SystemExit(
+                        f"codex_mesh: app-server exited immediately; see {log_path}"
+                    )
+                try:
+                    probe = WebSocket(chosen)
+                except (OSError, ConnectionError):
+                    time.sleep(0.4)
+                    continue
+                probe.close()
+                _record_started_server(session_dir, served)
+                if isinstance(dev_shell, AllowedDevShell):
+                    _remember_server_dev_shell(session_dir, dev_shell)
+                    _session_path(session_dir, FAILED_DEV_SHELL_FILE).unlink(missing_ok=True)
+                if context:
+                    from scripts.guilds import roles
+                    roles.refresh_census(_as_str(context.get("design_id")))
+                _STARTED_SERVERS.add((chosen, process.pid))
+                _ = _start_watcher(session_dir, process.pid, chosen)
+                return chosen
+            raise SystemExit(f"codex_mesh: app-server did not accept connections on {chosen}")
+        except BaseException as error:
+            _discard_failed_server_start(session_dir, served, process)
+            if not isinstance(error, SystemExit) or not isinstance(dev_shell, AllowedDevShell):
+                raise
+            _remember_failed_dev_shell(session_dir, dev_shell)
+            _log_server(session_dir, f"direnv exec {dev_shell.worktree} failed: {error}; falling back to caller environment")
+            dev_shell = _INHERITED_SERVER_ENVIRONMENT
+        finally:
+            pending = _session_path(session_dir, SERVER_START_FILE)
+            if _record_names_server(_read_json_object(pending), process.pid, chosen):
+                pending.unlink(missing_ok=True)
 
 
 def _discard_failed_server_start(
     session_dir: str, served: ServerRecord, process: subprocess.Popen[bytes]
 ) -> None:
     """Leave neither a process nor a current record after a failed start."""
+    # Popen starts a new session: its pid is also the group id. Signal even when
+    # the leader already exited, since a failed Nix evaluation can leave children.
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except OSError:
+        if process.poll() is None:
+            with contextlib.suppress(OSError):
+                process.terminate()
+    with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+        _ = process.wait(timeout=5)
+    with contextlib.suppress(OSError):
+        os.killpg(process.pid, signal.SIGKILL)
     if process.poll() is None:
         with contextlib.suppress(OSError):
-            process.terminate()
-        try:
-            _ = process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            with contextlib.suppress(OSError):
-                process.kill()
-            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
-                _ = process.wait(timeout=5)
-    else:
+            process.kill()
         with contextlib.suppress(OSError, subprocess.TimeoutExpired):
-            _ = process.wait(timeout=0)
+            _ = process.wait(timeout=5)
     path = _session_path(session_dir, SERVER_FILE)
     if _record_names_server(_read_json_object(path), served["pid"], served["port"]):
         path.unlink(missing_ok=True)
@@ -2627,12 +2811,12 @@ def command_start(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 2
-    port, fresh_server = ensure_server(session_dir)
+    port, fresh_server = ensure_server(session_dir, cwd=_as_str(_attr(args, "cwd")) or None)
     outcome = _run_worker(args, port, started_here=fresh_server)
     tested = fresh_server
     if _retry_warranted(outcome, fresh_server, resident):
         _ = _retire_server(session_dir, port)
-        port, _fresh = ensure_server(session_dir)
+        port, _fresh = ensure_server(session_dir, cwd=_as_str(_attr(args, "cwd")) or None)
         assert isinstance(outcome, (FailedBeforeThread, FailedWithThread))
         if isinstance(outcome, FailedWithThread):
             note = "the inherited app-server holds a Codex sign-in that has since changed"
@@ -2703,7 +2887,7 @@ def command_follow(args: argparse.Namespace) -> int:
     live_turn = ""
     try:
         home = workers_home()
-        port, _fresh = ensure_server(session_dir, home)
+        port, _fresh = ensure_server(session_dir, home, cwd=_as_str(_attr(args, "turn_cwd")) or None)
         _note_worker_port(session_dir, name, owner_pid, port)
         released = _release_other_worker_writers(session_dir, name, thread_id, port)
         if isinstance(released, WorkerThreadStateUnknown):
@@ -4265,7 +4449,10 @@ def _move_idle_worker(
             if not isinstance(state, ThreadIdle):
                 return WorkerWaitingOnLiveTurn()
         # Refresh may park every role's queue, so it must run without a pending lock.
-        port, _fresh = ensure_server(session_dir, worker_home_for_turn)
+        port, _fresh = ensure_server(
+            session_dir, worker_home_for_turn,
+            cwd=_as_str(_attr(args, "turn_cwd")) or _as_str(_attr(args, "cwd")) or None,
+        )
         with _pending_file(session_dir, name) as handle:
             if _end_marker_path(session_dir, name).exists() or not _roster_still_on_thread(session_dir, name, thread_id):
                 return WorkerThreadStateUnknown("worker ended or was replaced before the new turn")
@@ -5033,6 +5220,14 @@ class UnownedServerWithLog:
 
 
 @dataclass(frozen=True)
+class StartingDevShellServer:
+    """A pending dev-shell launch names this pid before its listening record is installed."""
+
+    session_dir: Path
+    started_at: float
+
+
+@dataclass(frozen=True)
 class UnownedServerWithoutLog:
     """No record or mesh log handle identifies this server's run."""
 
@@ -5046,6 +5241,7 @@ KnownServerOwnership = (
     CurrentRunServer
     | HeldDesignServer
     | RetiredRunServer
+    | StartingDevShellServer
     | UnownedServerWithLog
     | UnownedServerWithoutLog
 )
@@ -5113,7 +5309,10 @@ def _sweep_verdict(facts: ServerFacts, busy_threads: Callable[[], tuple[str, ...
         if busy := busy_threads():
             return ServerInUse("a conversation is not idle: " + "; ".join(busy))
         return ServerUnused("retired by its run; no client and no conversation mid-turn")
-    if isinstance(facts.ownership, (UnownedServerWithLog, UnownedServerWithoutLog)):
+    if isinstance(facts.ownership, StartingDevShellServer):
+        if 0 <= time.time() - facts.ownership.started_at < DEV_SHELL_START_TIMEOUT_SECS:
+            return ServerInUse(f"dev-shell launch is within its {DEV_SHELL_START_TIMEOUT_SECS:.0f} s record-start window")
+    if isinstance(facts.ownership, (StartingDevShellServer, UnownedServerWithLog, UnownedServerWithoutLog)):
         # A server may begin listening just before _start_server records it. Its run-folder lock
         # closes that race on the second look when the log names one; the age guard closes it on
         # platforms that cannot recover the log handle.
@@ -5944,7 +6143,8 @@ def _server_ownership(
     else:
         current_folders = {path.parent for root in roots for path in root.glob(f"*/{SERVER_FILE}")}
         retired_folders = {path.parent for root in roots for path in root.glob(f"*/{RETIRED_FILE}")}
-        folders = tuple(sorted(current_folders | retired_folders, key=str))
+        starting_folders = {path.parent for root in roots for path in root.glob(f"*/{SERVER_START_FILE}")}
+        folders = tuple(sorted(current_folders | retired_folders | starting_folders, key=str))
     current_owners = tuple(
         folder
         for folder in folders
@@ -5972,6 +6172,10 @@ def _server_ownership(
             return RetiredRunServer(folder)
     if current_owners:
         return CurrentRunServer(current_owners[0])
+    for folder in folders:
+        pending = _read_json_object(folder / SERVER_START_FILE)
+        if _record_names_server(pending, pid, port) and _as_str(pending.get("dev_shell_worktree")):
+            return StartingDevShellServer(folder, _as_float(pending.get("started_at"), 0.0))
     if isinstance(stderr, MeshServerLog):
         return UnownedServerWithLog(stderr.folder)
     return UnownedServerWithoutLog()
@@ -6112,7 +6316,8 @@ def _stop_unused(
     launcher to wait and is not created again for the lock."""
     if isinstance(ownership, UnownedServerWithoutLog):
         return _stop_unused_with_lock_held(roots, pid, port)
-    if not isinstance(ownership, (CurrentRunServer, HeldDesignServer, RetiredRunServer, UnownedServerWithLog)):
+    if not isinstance(ownership, (CurrentRunServer, HeldDesignServer, RetiredRunServer,
+                                  StartingDevShellServer, UnownedServerWithLog)):
         return False
     folder = ownership.session_dir
     if not folder.is_dir():
@@ -6139,7 +6344,8 @@ def _stop_unused_with_lock_held(roots: tuple[Path, ...] | None, pid: int, port: 
     if isinstance(judgment.ownership, UnownedServerWithoutLog):
         return True
     ownership = judgment.ownership
-    if not isinstance(ownership, (CurrentRunServer, HeldDesignServer, RetiredRunServer, UnownedServerWithLog)):
+    if not isinstance(ownership, (CurrentRunServer, HeldDesignServer, RetiredRunServer,
+                                  StartingDevShellServer, UnownedServerWithLog)):
         return False
     folder = ownership.session_dir
     if folder.is_dir():
@@ -6147,6 +6353,9 @@ def _stop_unused_with_lock_held(roots: tuple[Path, ...] | None, pid: int, port: 
         record = folder / SERVER_FILE
         if _record_names_server(_read_json_object(record), pid, port):
             record.unlink(missing_ok=True)
+        pending = folder / SERVER_START_FILE
+        if _record_names_server(_read_json_object(pending), pid, port):
+            pending.unlink(missing_ok=True)
     return True
 
 
@@ -6882,7 +7091,7 @@ def command_prime(args: argparse.Namespace) -> int:
         service_tier = _as_str(_attr(args, "service_tier"))
         if service_tier:
             params["serviceTier"] = service_tier
-        port, _fresh = ensure_server(session_dir)
+        port, _fresh = ensure_server(session_dir, cwd=_as_str(_attr(args, "cwd")) or None)
         client = Client(port, name)
         _ = _bind_serving_server(client, session_dir, started_here=_fresh)
         result = _serving_request(client, "thread/start", params)
