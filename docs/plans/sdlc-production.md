@@ -124,7 +124,7 @@ Model, in the user's words (2026-10-21): the goal of a guild is to help guild me
 | # | Item | Decision |
 | --- | --- | --- |
 | F1 | Goal and plan: a true count of repair rounds, a study of the phases with the most, changes that cut rounds and keep the work; done 1-4; next 5 (apply approved changes), 6 (measure them) | OK. The user: the fixes could be far-ranging, so the lasting result is a process that finds them and improves the work. |
-| F2 | P1 the director runs unchanged lint and test commands itself | |
+| F2 | P1 the director runs unchanged lint and test commands itself | Approved (the user, 2026-10-28). |
 | F3 | P2 from round 4, a missing acceptance item becomes a follow-up | |
 | F4 | P3 from round 4, an open finding outside the kept kinds becomes a follow-up | |
 | F5 | P4 each launch checks the active phase and records planned work apart from repairs | |
