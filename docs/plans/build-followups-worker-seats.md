@@ -120,7 +120,7 @@
 
 **Ruled out:** moving finished run records out of `mesh_runs/` (`mesh_runs.py`, `verify.sh`, `review.sh`, `unit_lookup.py`, `rename_unit.py` and `retire_unit.py` find a record by its path).
 
-### Phase 4 — Unit worker ledger, `workers.py resolve`, the finished-run gap (WS P2, part 1)  · status: todo
+### Phase 4 — Unit worker ledger, `workers.py resolve`, the finished-run gap (WS P2, part 1)  · status: done
 
 **Depends on:** Phase 3
 
@@ -171,6 +171,7 @@
 - **Transfer keeps threads.** Today `transfer_unit._move_state()` runs `review_pool.py retire` for the giving production. A switched unit (Phase 12) skips that retire: it keeps each worker's thread identity, and transfer rebinds the entry's mesh dir and instruction paths to the new production. Each transfer step can run again after a fault and gives the same result.
 - **Rename changes the shown name only.** A rename changes the shown context (`<production> · <unit> · <job>`). The worker address never changes. Today `codex_mesh._post_board_status()` takes the board slot from the name suffix, and `worker_state.worker_record_path()` takes `fix` from the name suffix. Both read the stored role instead (naming rule 4).
 - `workers.py` gains the functions these callers use: `pause_unit`, `end_unit`, `move_unit`, `rename_unit`.
+- **A reservation outlives the resolve call (from Phase 4 review).** The `resolve` command records `os.getppid()` as the reservation owner. Under Claude Code's Bash tool that parent is the one-call shell, so the reservation is dead when the call returns, and a second `resolve` by hand returns `impl` again instead of `impl2`. The owner is a process that outlives the call: the run's director pid, or an explicit `--owner-pid`. A script caller (`name=$(… resolve …)`) keeps working as it does now.
 
 **Files:**
 - `scripts/direct/workers.py` — the four functions
@@ -178,6 +179,7 @@
 - `scripts/direct/worker_state.py` — `worker_record_path()` reads the stored role
 - `scripts/agents/test_codex_mesh.py` — pause and board-slot cases
 - `scripts/direct/test_worker_state.py` — arbitrary-address cases
+- `scripts/direct/test_workers.py` — a `resolve` run through `bash -c '…; true'` keeps its reservation, and a second `resolve` gets `<role>2`
 - `scripts/direct/end_session.sh`
 - `scripts/direct/remove_workers.py`
 - `scripts/production/retire_unit.py`

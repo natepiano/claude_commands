@@ -1339,6 +1339,24 @@ def _start_phase(args: argparse.Namespace) -> None:
             + f"`### Phase {phase_id} — <title>  · status: todo` under ## Phases, then start it."
         )
     started_at = _optional_epoch(args, "started_at", "--started-at", now)
+    if _string(state.get("status")) != "active" and "finished_at" in state:
+        previous_status = _string(state.get("status"))
+        state["status"] = "active"
+        _ = state.pop("finished_at", None)
+        reopened = _event(state, "reopened", now)
+        reopened.update({"previous_status": previous_status, "cause": "start-phase", "phase_id": phase_id})
+        _append_event(state, reopened)
+        _write_state(session_dir, state)
+        director = unit_runs.director(session_dir) or _string(
+            (_object_dict(state.get("main_agent")) or {}).get("session_id"))
+        if director:
+            active_root = os.environ.get("UNIT_ACTIVE_DIR")
+            # A temporary run stays within its temporary root unless explicitly configured.
+            marker = unit_runs.marker(director, Path(active_root) if active_root else session_dir.parent / "active")
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            temporary = marker.with_name(f".{marker.name}.{os.getpid()}")
+            _ = temporary.write_text(f"{session_dir}\n", encoding="utf-8")
+            os.replace(temporary, marker)
     _close_active_activity(session_dir, state, "interrupted", "", now)
     state = _read_state(session_dir)
     active = _object_dict(state.get("phase"))
