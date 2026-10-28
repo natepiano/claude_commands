@@ -528,7 +528,9 @@ def append_rows(path: Path, changes: list[Visible], day: date, merged: str, prod
         if rank:
             _add_column(path, lines, SECTION, URGENCY)
         _add_column(path, lines, SECTION, PRODUCTION)
-        columns, _, end = _table(path, lines, SECTION)
+        columns, first, end = _table(path, lines, SECTION)
+        if merged and (held := _held(columns, lines[first:end], changes, merged)):
+            raise ChangeReviewError(f"{held} already holds that change from merge {merged}; no row added")
         number = next_number("".join(lines))
         when = f"{day.isoformat()} · {_cell(merged)}" if merged else day.isoformat()
         rows = [_row(path, columns, {"#": f"C{number + offset}", "Change": _cell(item.change), "Merged": when,
@@ -546,6 +548,20 @@ def append_rows(path: Path, changes: list[Visible], day: date, merged: str, prod
         return f"{'row' if len(ids) == 1 else 'rows'} {named} from {merged}"
 
     return _edit(path, production, day, write, what)
+
+
+def _held(columns: list[str], rows: list[str], changes: list[Visible], merged: str) -> str:
+    """The To review row that already holds one of `changes` from the merge `merged`, or empty. A short
+    hash and a longer one of the same merge match: on 2026-10-22 rows written with 8-character hashes
+    repeated rows written with 7 (C94-C99 of C74-C79)."""
+    wanted = {item.change for item in changes}
+    for line in rows:
+        row = dict(zip(columns, (_plain(cell) for cell in _cells(line))))
+        found = _HASH.search(row.get("Merged", ""))
+        if (found is not None and row.get("Change") in wanted
+                and (found[0].startswith(merged) or merged.startswith(found[0]))):
+            return row["#"]
+    return ""
 
 
 def pending(path: Path) -> list[dict[str, str]]:
@@ -584,8 +600,28 @@ def scope_rows(path: Path, doc: Path, below: bool = False) -> list[dict[str, str
 
 
 def row_production(production: Path) -> str:
-    """The Production cell for a change of the production doc `production`: its slug."""
-    return slug_of(production)
+    """The Production cell for a change of the production doc `production`: the slug of the production
+    it is credited to (`credited`)."""
+    return slug_of(credited(production))
+
+
+def credited(production: Path) -> Path:
+    """The production a change of `production` belongs to. A style production's work lands on its parent's
+    merge branch through a hand-off, so its changes are its parent's, and its showrunner does not show them
+    (user, 2026-10-27). Any other production is its own."""
+    seen = {production}
+    while True:
+        try:
+            lines = production.read_text(encoding="utf-8").splitlines()
+            if production_field(lines, "Kind") != "style":
+                return production
+            parent = Path(production_field(lines, "Parent production")).expanduser()
+        except (OSError, UnicodeError, Refusal):
+            return production
+        if parent in seen:
+            return production
+        seen.add(parent)
+        production = parent
 
 
 def unit_branches(docs: Iterable[Path]) -> dict[str, Path]:
