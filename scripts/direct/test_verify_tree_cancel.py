@@ -119,6 +119,7 @@ class VerifyTreeCancelFixture(VerifyTokenWaitFixture):
         self.write_tool(stubs / "cargo", CARGO)
         self.write_tool(stubs / "taplo", "pass\n")
         self.write_tool(stubs / "rustc", 'print("rustc fixture")\n')
+        self.write_tool(stubs / "assertion-guard", "raise SystemExit(0)\n")
         # Do not inherit the token fixture's zero-duration polling sleep.
         sleep = shutil.which("sleep")
         assert sleep is not None
@@ -127,6 +128,7 @@ class VerifyTreeCancelFixture(VerifyTokenWaitFixture):
         self.environment.update({
             "PACKAGE_ROOT": str(self.workspace), "TEST_METADATA": json.dumps(metadata),
             "TEST_CONTROL": str(self.control), "VERIFY_TREE_WATCH_S": "0.2",
+            "VERIFY_ASSERTION_GUARD_SCRIPT": str(stubs / "assertion-guard"),
             "UNIT_RUN_DIR": str(self.board), "UNIT_SESSION_DIR": str(self.board),
             "UNIT_TEAM_ROLE": "test", "CLAUDE_PYTHON": sys.executable,
             "PYTHONPATH": str(VERIFY.resolve().parents[2]), "BUILDLOG_SYNC": "1",

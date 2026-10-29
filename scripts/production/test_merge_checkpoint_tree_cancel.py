@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 import merge_checkpoint
 import test_merge_checkpoint as checkpoint_fixture
-from add_unit import Production
+from production_units import Production
 
 
 class CheckpointTreeCancelTests(unittest.TestCase):
