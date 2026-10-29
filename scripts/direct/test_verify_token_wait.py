@@ -142,6 +142,7 @@ esac
             "XDG_RUNTIME_DIR": str(self.root / "runtime"),
             "XDG_STATE_HOME": str(self.root / "state"),
             "XDG_CACHE_HOME": str(self.root / "cache"),
+            "VERIFY_STEPS_DIR": str(self.root / "verify-steps"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILDLOG_BUILDS_CGROUP": str(self.root / "cgroup"),
             "BUILDLOG_MEMINFO": str(meminfo),
@@ -992,6 +993,9 @@ exec "$TEST_REAL_SLEEP" "$@"
         _ = stub.write_text(r"""import os, sys, time
 from pathlib import Path
 root = Path(os.environ["TEST_HOLD_ROOT"])
+if sys.argv[1] == "eligible":
+    print("natedev_only test target")
+    print("natedev\teligible\t-\t-")
 if sys.argv[1] == "wait-local":
     calls = root / "wait-local-calls"
     count = len(calls.read_text().splitlines()) if calls.exists() else 0

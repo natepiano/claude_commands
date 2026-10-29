@@ -310,6 +310,19 @@ class AddUnitTests(ShutdownTestCase):
         self.assertIn(f"Claude is not trusted in {prior}", result.stderr)
         self.assert_no_launch_change(document, head)
 
+    def test_missing_production_doc_refuses_with_a_nonzero_exit_before_any_launch(self) -> None:
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+        errors = io.StringIO()
+        missing = self.checkout / "missing-production.md"
+        with patch.dict(os.environ, self.env), redirect_stderr(errors):
+            code = add_unit.main(["--production", str(missing), "alpha", "--permanent",
+                                  "--resume", "session-123", "--cwd", str(self.root)])
+        self.assertEqual(code, 2, errors.getvalue())
+        self.assertIn("cannot read production doc:", errors.getvalue())
+        self.assertIn(str(missing), errors.getvalue())
+        self.assert_no_launch_change(document, head)
+
     def prepare_unit_account(self, label: str) -> Path:
         directory = self.select_unit_account(label)
         parsed = parse_account_label(label)
@@ -1529,6 +1542,122 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(result.stderr,
                          f"add_unit: unit trunk-unit resumes in {elsewhere.resolve()}; its Units row names {recorded}\n")
         self.assert_no_launch_change(document, head)
+
+    def test_retired_plan_resumes_in_its_start_folder_without_recreating_the_worktree(self) -> None:
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        self.commit_prepared_row(self.unit_row(
+            plan=f"(retired 2026-10-28, worktree removed, session session-123, folder {prior}) "
+                 + "`docs/plans/given.md` (run done)"))
+        before = self.repository_state()
+        head = self.git("rev-parse", "HEAD")
+
+        with patch.object(add_unit, "ensure_worktree") as worktree_step:
+            _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123",
+                                "--cwd", str(prior))
+
+        worktree_step.assert_not_called()
+        starts = [row for row in self.herdr_calls() if row[2:4] == ["agent", "start"]]
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0][starts[0].index("--resume") + 1], "session-123")
+        self.assertEqual(self.opened()[self.opened().index("--cwd") + 1], str(prior))
+        self.assertEqual(self.repository_state(), before)
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        self.assertFalse((self.root / "project-alpha").exists())
+
+    def test_retired_permanent_resume_ignores_an_existing_branch_without_a_worktree(self) -> None:
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        self.commit_prepared_row(self.unit_row(
+            plan="(retired 2026-10-28, worktree removed, session session-123) permanent"))
+        _ = self.git("branch", "build-followups-alpha")
+        before = self.repository_state()
+
+        _ = self.successful("alpha", "--permanent", "--resume", "session-123", "--cwd", str(prior))
+
+        self.assertEqual(self.opened()[self.opened().index("--cwd") + 1], str(prior))
+        self.assertEqual(self.repository_state(), before)
+        self.assertFalse((self.root / "project-alpha").exists())
+
+    def test_retired_as_built_plan_resumes_without_a_production_header(self) -> None:
+        plan = "docs/as-built/alpha.md"
+        path = self.checkout / plan
+        path.parent.mkdir(parents=True)
+        _ = path.write_text("# Alpha as built\n\nThe plan is complete.\n", encoding="utf-8")
+        _ = self.git("add", plan)
+        self.commit_prepared_row(self.unit_row(
+            plan=f"(retired 2026-10-28, worktree removed, session session-123) `{plan}` (run done)"))
+        worktree = self.root / "project-alpha"
+        _ = self.git("worktree", "add", str(worktree), "-b", "build-followups-alpha")
+        document = self.doc.read_bytes()
+
+        _ = self.successful("alpha", "--plan", plan, "--resume", "session-123", "--cwd", str(worktree))
+
+        starts = [row for row in self.herdr_calls() if row[2:4] == ["agent", "start"]]
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0][starts[0].index("--resume") + 1], "session-123")
+        self.assertEqual(self.opened()[self.opened().index("--cwd") + 1], str(worktree))
+        self.assertEqual(self.doc.read_bytes(), document)
+
+    def test_active_as_built_plan_resume_check_accepts_its_recorded_plan_without_a_header(self) -> None:
+        plan = "docs/as-built/alpha.md"
+        path = self.checkout / plan
+        path.parent.mkdir(parents=True)
+        _ = path.write_text("# Alpha as built\n", encoding="utf-8")
+        _ = self.git("add", plan)
+        self.commit_prepared_row(self.unit_row(plan=plan))
+        worktree = self.root / "project-alpha"
+        _ = self.git("worktree", "add", str(worktree), "-b", "build-followups-alpha")
+        before = self.repository_state()
+
+        _ = self.successful("alpha", "--plan", plan, "--resume", "session-123",
+                            "--cwd", str(worktree), "--check")
+
+        self.assertEqual(self.repository_state(), before)
+        self.assertEqual([call for call in self.herdr_calls()
+                          if call != ["--session", "default", "session", "list", "--json"]], [])
+
+        changed_plan = "docs/as-built/other.md"
+        result = self.cli("alpha", "--plan", changed_plan, "--resume", "session-123",
+                          "--cwd", str(worktree), "--check")
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertIn(f"unit alpha-unit Plan is {plan!r}; expected {changed_plan!r}", result.stderr)
+        self.assertEqual(self.repository_state(), before)
+        self.assertEqual([call for call in self.herdr_calls()
+                          if call != ["--session", "default", "session", "list", "--json"]], [])
+
+    def test_new_unit_as_built_plan_still_requires_a_production_header(self) -> None:
+        plan = "docs/as-built/alpha.md"
+        path = self.checkout / plan
+        path.parent.mkdir(parents=True)
+        _ = path.write_text("# Alpha as built\n", encoding="utf-8")
+        _ = self.git("add", plan)
+        _ = self.git("commit", "-m", "record completed plan")
+        before = self.repository_state()
+
+        result = self.cli("alpha", "--plan", plan, "--check")
+
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertEqual(result.stderr,
+                         f"add_unit: plan {plan} is missing on build-followups or lacks the Production header\n")
+        self.assertEqual(self.repository_state(), before)
+        self.assertEqual(self.herdr_calls(), [])
+
+    def test_retired_plan_resume_reuses_its_worktree_after_a_failed_launch(self) -> None:
+        self.commit_prepared_row(self.unit_row(
+            plan="(retired 2026-10-28, worktree removed, session session-123) docs/plans/given.md"))
+        worktree = self.root / "project-alpha"
+        _ = self.git("worktree", "add", str(worktree), "-b", "build-followups-alpha")
+        before = self.repository_state()
+
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123",
+                            "--cwd", str(worktree))
+
+        self.assertEqual(self.repository_state(), before)
+        starts = [row for row in self.herdr_calls() if row[2:4] == ["agent", "start"]]
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0][starts[0].index("--resume") + 1], "session-123")
+        self.assertEqual(self.opened()[self.opened().index("--cwd") + 1], str(worktree))
 
     def test_restore_in_a_cwd_other_than_the_row_worktree_launches_there(self) -> None:
         self.commit_prepared_row(self.unit_row())

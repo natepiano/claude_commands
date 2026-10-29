@@ -163,12 +163,12 @@ def codex_steps(account: NewAccount) -> list[Step]:
             return [Step(False, "\n    ".join(problems))]
         return [Step(True, f"set up ~/.{account.name}"),
                 Step(False, f"in a terminal, sign in as {account.label} (keep CODEX_HOME on it):\n"
-                     + f"    CODEX_HOME=~/{home.name} codex login")]
+                     + f"    CODEX_HOME=~/{home.name} codex login"), alias_step(account)]
     problems = accounts.check(account.label)
     if problems:
         return [Step(False, "\n    ".join(problems))]
     return [Step(True, f"~/.{account.name} is set up and signed in; it is a spare until "
-                 + f"/showrunner:accounts swap workers {account.label}")]
+                 + f"/showrunner:accounts swap workers {account.label}"), alias_step(account)]
 
 
 def settings_entries(account: NewAccount) -> list[tuple[str, str]]:
@@ -284,23 +284,28 @@ def settings_step(account: NewAccount) -> Step:
     return Step(False, f"add to ~/.claude/settings.json (agents may not edit it):\n{lines}")
 
 
+def _shell_module_path() -> Path:
+    machine = "darwin" if sys.platform == "darwin" else "linux"
+    return Path("modules") / machine / "shell.nix"
+
+
 def nixos_shell_module() -> Path | None:
+    relative = _shell_module_path()
     for repository in (Path("/etc/nixos"), accounts.accounts_home() / "nixos"):
-        module = repository / "modules" / "linux" / "shell.nix"
+        module = repository / relative
         if module.is_file():
             return module
     return None
 
 
-def alias_step(account: NewAccount) -> Step | None:
-    """The `claudeN` shell alias; None on a machine whose shell has no account aliases."""
-    if sys.platform == "darwin":
-        return None
+def alias_step(account: NewAccount) -> Step:
+    """The `claudeN` or `codexN` alias in this machine's shell module."""
     module = nixos_shell_module()
     if module is None:
-        return Step(False, f"no nixos shell module found to define the {account.name} alias")
+        return Step(False, f"no nixos shell module found to define the {account.name} alias "
+                    + f"(looked for {_shell_module_path()})")
     text = module.read_text(encoding="utf-8")
-    if ALIAS_LOOP_MARKER in text:
+    if account.tool == "claude" and ALIAS_LOOP_MARKER in text:
         return Step(True, f"{account.name} alias: comes from the account note; open a new terminal")
     if re.search(rf"^\s*{account.name}\s*=", text, re.MULTILINE):
         return Step(True, f"{account.name} alias in {module} (live after a rebuild)")
@@ -322,8 +327,7 @@ def new_account(account: NewAccount, identity: HomeLogin | NoHomeLogin) -> list[
     steps.append(settings_step(account))
     steps.append(nightly_review_step(account))
     steps.append(statusline_color_step(account))
-    if (alias := alias_step(account)) is not None:
-        steps.append(alias)
+    steps.append(alias_step(account))
     return steps
 
 
