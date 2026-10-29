@@ -1078,9 +1078,12 @@ phase_wait_start() {
     [[ ! -s "$file" ]] || return 0
     local args=(start-wait --session-dir "$PHASE_WAIT_SESSION"
         --kind WaitingForMemoryOrSlot --reason "$reason")
-    args+=(--slot "${UNIT_TEAM_ROLE:-}")
-    local owner="${CODEX_THREAD_ID:-${CLAUDE_CODE_SESSION_ID:-}}"
-    [[ -z "$owner" ]] || args+=(--owner-session "$owner")
+    local owner="${CODEX_THREAD_ID:-}"
+    if [[ -n "$owner" ]]; then
+        args+=(--worker-thread-id "$owner" --owner-session "$owner")
+    else
+        args+=(--director --owner-session "${CLAUDE_CODE_SESSION_ID:-}")
+    fi
     if id="$("$PY" "$PHASE_WAIT_RECORDER" "${args[@]}")" && [[ -n "$id" ]]; then
         printf '%s\n' "$id" > "$file"
     else
@@ -1110,13 +1113,12 @@ phase_wait_finish_all() {
 
 # The memory gate announces only blocked admission. A granted first check
 # emits no line and therefore creates no zero-length wait.
-eval "$(declare -f buildlog_memory_line | sed '1s/buildlog_memory_line/buildlog_memory_line_without_phase_wait/')"
 buildlog_memory_line() {
     case "$1" in
         first) phase_wait_start memory "memory admission" ;;
         done|left) phase_wait_finish memory ;;
     esac
-    buildlog_memory_line_without_phase_wait "$@"
+    buildlog_memory_line_inner "$@"
 }
 
 collect_routing_wait() {

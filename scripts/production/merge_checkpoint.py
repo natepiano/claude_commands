@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import fcntl
-import json
 import os
 import re
 import shlex
@@ -35,7 +34,6 @@ from production_units import Refusal, cell_value, production_field, unit_table
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.direct import progress_history  # noqa: E402
 from scripts.production import production_doc  # noqa: E402
-from scripts.lib import unit_runs  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 
 # /zone queues a change for the Mac while it is offline; a promotion's Mac pull sends it.
@@ -416,9 +414,6 @@ def on_origin(request: MergeRequest) -> bool:
 
 def ancestry(request: MergeRequest) -> bool:
     checkout = request.production.checkout
-    if git(checkout, "cat-file", "-e", f"{request.commit}^{{commit}}").returncode:
-        raise Stop("ancestry", "failed", f"commit {request.commit} is absent",
-                   "push the checkpoint and send its hash again")
     history = merge_history(request)
     if isinstance(history, LastMerged) and git(checkout, "merge-base", "--is-ancestor", history.hash,
                                                request.commit).returncode:
@@ -997,82 +992,15 @@ def notify_style(checkout: Path, branch: str, tip: str) -> None:
         print("style sync: " + str(error).replace("\n", "; "), flush=True)
 
 
-class PhaseWaitTarget(NamedTuple):
-    session_dir: Path
-    phase_id: str
-    phase_instance_id: str
-
-
-class WaitHistoryUnavailable(NamedTuple):
-    reason: str
-    runs: tuple[Path, ...] = ()
-
-
-def merge_wait_target(worktree: Path, phase_id: str) -> PhaseWaitTarget | WaitHistoryUnavailable:
-    """Find the checkpoint's phase instance, including a finished phase."""
-    explicit = unit_runs.environ("RUN_DIR") or os.environ.get("UNIT_SESSION_DIR", "")
-    candidates: set[Path] = {Path(explicit)} if explicit else set()
-    for root in unit_runs.run_roots(os.environ.get("MERGE_CHECKPOINT_RUN_ROOT")):
-        candidates.update(path.parent for path in root.glob("*/progress_history_state.json"))
-    targets: list[PhaseWaitTarget] = []
-    matching_runs: list[Path] = []
-    for directory in sorted(candidates):
-        try:
-            value = cast(object, json.loads((directory / "progress_history_state.json").read_text(encoding="utf-8")))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(value, dict):
-            continue
-        state = cast(dict[str, object], value)
-        working_dir = state.get("working_dir")
-        if not isinstance(working_dir, str) or Path(working_dir).resolve() != worktree.resolve():
-            continue
-        matching_runs.append(directory)
-        history = state.get("history_file")
-        if not isinstance(history, str):
-            continue
-        try:
-            records = [cast(object, json.loads(line)) for line in Path(history).read_text(encoding="utf-8").splitlines()]
-        except (OSError, ValueError):
-            continue
-        for record in records:
-            if not isinstance(record, dict):
-                continue
-            phase = cast(dict[str, object], record)
-            identifier, instance = phase.get("phase_id"), phase.get("phase_instance_id")
-            if (phase.get("event_type") == "phase_started" and isinstance(identifier, str)
-                    and isinstance(instance, str) and instance and (not phase_id or phase_id == identifier)):
-                targets.append(PhaseWaitTarget(directory, identifier, instance))
-    return targets[0] if len(targets) == 1 else WaitHistoryUnavailable(
-        f"{len(targets)} matching checkpoint phase instances", tuple(matching_runs))
-
-
 @contextmanager
-def merge_gate_wait(worktree: Path, phase_id: str, unit: str) -> Generator[None, None, None]:
+def _external_merge_wait(arguments: list[str]) -> Generator[None, None, None]:
     if os.environ.get(PROBE_ENV) == "1":
         yield
         return
-    target = merge_wait_target(worktree, phase_id)
-    if isinstance(target, WaitHistoryUnavailable):
-        report("wait", "HistoryNotRecorded", target.reason)
-        for directory in target.runs:
-            try:
-                missing = subprocess.run([sys.executable, str(Path(progress_history.__file__)), "start-wait",
-                    "--session-dir", str(directory), "--phase-id", phase_id,
-                    "--kind", "WaitingForMergeGate", "--unit", unit, "--missing-reason", target.reason],
-                    capture_output=True, text=True, check=False)
-                if missing.returncode:
-                    report("wait", "NotRecorded", missing.stderr.strip() or "cannot record missing merge wait")
-            except OSError as error:
-                report("wait", "NotRecorded", str(error))
-        yield
-        return
-    command = [sys.executable, str(Path(progress_history.__file__)), "start-wait",
-               "--session-dir", str(target.session_dir), "--phase-instance-id", target.phase_instance_id,
-               "--unit", unit, "--kind", "WaitingForMergeGate", "--reason", "checkpoint merge tests"]
+    recorder = [sys.executable, str(Path(progress_history.__file__))]
     wait_id = ""
     try:
-        started = subprocess.run(command, capture_output=True, text=True, check=False)
+        started = subprocess.run([*recorder, *arguments], capture_output=True, text=True, check=False)
         wait_id = started.stdout.strip() if started.returncode == 0 else ""
         if not wait_id:
             report("wait", "NotRecorded", started.stderr.strip() or "recorder returned no wait id")
@@ -1083,13 +1011,30 @@ def merge_gate_wait(worktree: Path, phase_id: str, unit: str) -> Generator[None,
     finally:
         if wait_id:
             try:
-                finished = subprocess.run([sys.executable, str(Path(progress_history.__file__)), "finish-wait",
-                                           "--session-dir", str(target.session_dir), "--wait-id", wait_id],
+                finished = subprocess.run([*recorder, "finish-external-wait", "--wait-id", wait_id],
                                           capture_output=True, text=True, check=False)
                 if finished.returncode:
                     report("wait", "NotRecorded", finished.stderr.strip() or "cannot close merge gate wait")
             except OSError as error:
                 report("wait", "NotRecorded", str(error))
+
+
+@contextmanager
+def merge_gate_wait(worktree: Path, phase_id: str, unit: str, checkpoint: str) -> Generator[None, None, None]:
+    """Resolve the full checkpoint in durable history, including finished runs."""
+    with _external_merge_wait(["start-checkpoint-wait", "--commit", checkpoint,
+        "--working-dir", str(worktree), "--phase-id", phase_id, "--unit", unit,
+        "--reason", "checkpoint merge tests"]):
+        yield
+
+
+@contextmanager
+def child_handoff_wait(production: str, checkpoint: str) -> Generator[None, None, None]:
+    """A child branch checkpoint belongs to its production, with no phase."""
+    owner = os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID", "")
+    with _external_merge_wait(["start-handoff-wait", "--production", production,
+        "--commit", checkpoint, "--owner-session", owner, "--reason", "child production merge tests"]):
+        yield
 
 
 def record_pushed_merges(production: Production, merge_head: str, source_checkpoint: str,
@@ -1115,6 +1060,11 @@ def record_pushed_merges(production: Production, merge_head: str, source_checkpo
 
 def run(request: MergeRequest) -> int:
     try:
+        checkpoint = git(request.unit.worktree, "rev-parse", "--verify", f"{request.commit}^{{commit}}")
+        if checkpoint.returncode:
+            raise Stop("ancestry", "failed", f"commit {request.commit} is absent",
+                       "push the checkpoint and send its hash again")
+        request = request._replace(commit=checkpoint.stdout.strip())
         already = ancestry(request)
         tests_green = "merge tests" if isinstance(request.kind, CodeCheckpoint) else "no tests"
         pushed = pushed_state(request.production, request.commit) if already else NotYetPushed()
@@ -1137,7 +1087,7 @@ def run(request: MergeRequest) -> int:
         if isinstance(pushed, NotYetPushed):
             try:
                 if isinstance(request.kind, CodeCheckpoint):
-                    with merge_gate_wait(request.unit.worktree, request.phase, request.unit.name):
+                    with merge_gate_wait(request.unit.worktree, request.phase, request.unit.name, request.commit):
                         tests_green = tests(request, paths, merge_head)
                 else:
                     tests_green = tests(request, paths, merge_head)
@@ -1355,7 +1305,7 @@ def run_handoff(request: ChildHandoffRequest) -> int:
         _ = good(git(checkout, "merge", "--no-ff", "-m", subject, checkpoint), "merge")
         merge_head = good(git(checkout, "rev-parse", "HEAD"), "merge")
         try:
-            with merge_gate_wait(request.child.checkout, "", request.child.slug):
+            with child_handoff_wait(request.child.slug, checkpoint):
                 _ = checkpoint_tests(request.production, paths, checkpoint, request.merge_tests,
                                      request.flakes, request.scratch, merge_head, request.flaky_tests)
         except (OSError, ValueError) as error:

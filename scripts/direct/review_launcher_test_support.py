@@ -338,6 +338,9 @@ class ReviewLauncherFixture(unittest.TestCase):
         direct_dir.mkdir(parents=True)
         agents.mkdir(parents=True)
         lib.mkdir(parents=True)
+        production = self.root / "scripts" / "production"
+        production.mkdir(parents=True)
+        _ = shutil.copy2(DIRECT_DIR.parent / "production" / "showrunners.py", production / "showrunners.py")
         # The wrapper reaches python3 through ../lib/py, resolved from its own
         # directory.
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "py", lib / "py")

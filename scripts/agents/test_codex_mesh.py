@@ -3987,6 +3987,60 @@ class MeshCommandTests(MeshCommandFixture):
             self.assertEqual(result.returncode, 0, result.stderr)
         return history / "runs" / f"{self.session_dir.name}.jsonl"
 
+    def test_controller_wait_uses_explicit_context_with_absent_or_wrong_environment_thread(self) -> None:
+        history = self.record_worker_phase()
+        for arguments in (
+            ["start-phase", "--session-dir", str(self.session_dir), "--phase-id", "8", "--phase-title", "Other"],
+            ["start-pass", "--session-dir", str(self.session_dir), "--phase-id", "8", "--pass-kind", "impl",
+             "--activity", "other", "--called-task", "direct.impl", "--called-family", "codex",
+             "--called-model", "fixture", "--worker-name", "other-worker"],
+        ):
+            result = invoke_recorder(arguments, {**dict(os.environ), "UNIT_TEAM_ROLE": "other"}, self.session_dir)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID}, "other-worker": {"thread_id": "other-thread"}})
+        for environment_thread in (None, "other-thread"):
+            with self.subTest(environment_thread=environment_thread), patch.dict(os.environ):
+                if environment_thread is None:
+                    _ = os.environ.pop("CODEX_THREAD_ID", None)
+                else:
+                    os.environ["CODEX_THREAD_ID"] = environment_thread
+                # The controller's run environment also points elsewhere.
+                os.environ["UNIT_RUN_DIR"] = str(self.session_dir / "wrong-run")
+                codex_mesh._mesh_phase_wait(str(self.session_dir), "worker", THREAD_ID, "ReadyWithoutCapacity", "room")  # pyright: ignore[reportPrivateUsage]
+                codex_mesh._mesh_phase_wait(str(self.session_dir), "worker", THREAD_ID, "ReadyWithoutCapacity", finished=True)  # pyright: ignore[reportPrivateUsage]
+        rows = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
+        worker_pass, = [row for row in rows if row["event_type"] == "pass_started" and row["worker_name"] == "worker"]
+        waits = [row for row in rows if row["event_type"] in ("wait_started", "wait_finished")]
+        self.assertEqual(len(waits), 4)
+        for wait in waits:
+            self.assertEqual((wait["phase_id"], wait["pass_instance_id"], wait["worker_name"], wait["owner_session"]),
+                             ("7", worker_pass["pass_instance_id"], "worker", THREAD_ID))
+
+    def test_two_controller_workers_keep_distinct_passes_in_one_phase(self) -> None:
+        history = self.record_worker_phase()
+        result = invoke_recorder([
+            "start-pass", "--session-dir", str(self.session_dir), "--phase-id", "7", "--pass-kind", "test",
+            "--activity", "test", "--called-task", "direct.test", "--called-family", "codex",
+            "--called-model", "fixture", "--worker-name", "worker-fix",
+        ], {**dict(os.environ), "UNIT_TEAM_ROLE": "test"}, self.session_dir)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID}, "worker-fix": {"thread_id": "test-thread"}})
+        for name, thread in (("worker", THREAD_ID), ("worker-fix", "test-thread")):
+            codex_mesh._mesh_phase_wait(str(self.session_dir), name, thread, "ReadyWithoutCapacity", "room")  # pyright: ignore[reportPrivateUsage]
+        for name, thread in (("worker", THREAD_ID), ("worker-fix", "test-thread")):
+            codex_mesh._mesh_phase_wait(str(self.session_dir), name, thread, "ReadyWithoutCapacity", finished=True)  # pyright: ignore[reportPrivateUsage]
+        rows = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
+        passes = {row["worker_name"]: row for row in rows if row["event_type"] == "pass_started"}
+        starts = [row for row in rows if row["event_type"] == "wait_started"]
+        ends = {row["wait_id"]: row for row in rows if row["event_type"] == "wait_finished"}
+        self.assertEqual(len(starts), 2)
+        self.assertEqual(len({row["pass_instance_id"] for row in starts}), 2)
+        for start in starts:
+            worker_pass = passes[start["worker_name"]]
+            for wait in (start, ends[start["wait_id"]]):
+                self.assertEqual((wait["phase_instance_id"], wait["pass_instance_id"], wait["worker_name"]),
+                                 (worker_pass["phase_instance_id"], worker_pass["pass_instance_id"], worker_pass["worker_name"]))
+
     def test_provider_refusal_wait_ends_when_the_worker_runs_again(self) -> None:
         _ = self.prepare_refusing_account()
         history = self.record_worker_phase()
@@ -5448,7 +5502,10 @@ class MeshCommandTests(MeshCommandFixture):
             }))
             return server.port
         def move_on_refusal(_name: str, serving: codex_mesh.CodexServingState, _detail: str, *,
+                            session_dir: str, thread_id: str,
                             stopped: codex_mesh.RefusalCommandContext = codex_mesh.REFUSAL_WITHOUT_COMMAND_EXIT) -> None:
+            self.assertEqual(session_dir, str(self.session_dir))
+            self.assertTrue(thread_id)
             self.assertIsInstance(stopped, codex_mesh.RefusalWithoutCommandExit)
             next_label = "codex1" if serving.home != target else "codex2"
             self.request_workers_move(agent_accounts.codex_home_role_label(serving.home), next_label,
@@ -10158,7 +10215,7 @@ class QuotaRefusalTests(unittest.TestCase):
                                (USAGE_LIMIT, "unknown")):
             with self.subTest(window=window), patch.object(subprocess, "run",
                     return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
-                codex_mesh._report_quota_refusal("worker", serving, detail)  # pyright: ignore[reportPrivateUsage]
+                codex_mesh._report_quota_refusal("worker", serving, detail, session_dir="/fixture/run", thread_id=THREAD_ID)  # pyright: ignore[reportPrivateUsage]
                 run.assert_called_once()
                 self.assertNotIn("env", run.call_args.kwargs)
                 command = cast(list[str], run.call_args.args[0])
@@ -10184,7 +10241,7 @@ class QuotaRefusalTests(unittest.TestCase):
                           patch.object(codex_mesh, "_launcher_sessions", return_value=launched) as launcher,
                           patch.object(sys, "argv", argv), patch.object(subprocess, "run",
                             return_value=subprocess.CompletedProcess([], 0, "", "")) as run):
-                        codex_mesh._report_quota_refusal("worker", serving, USAGE_LIMIT, stopped=codex_mesh.CommandStoppedOnThread(str(folder), THREAD_ID))  # pyright: ignore[reportPrivateUsage]
+                        codex_mesh._report_quota_refusal("worker", serving, USAGE_LIMIT, session_dir=str(folder), thread_id=THREAD_ID, stopped=codex_mesh.CommandStoppedOnThread(str(folder), THREAD_ID))  # pyright: ignore[reportPrivateUsage]
                     marker.assert_called_once_with(codex_mesh.SWEEP_ROOTS, folder)
                     if marked:
                         launcher.assert_not_called()
@@ -10210,7 +10267,7 @@ class QuotaRefusalTests(unittest.TestCase):
                   patch.object(codex_mesh, "_update_roster_if_expected") as update,
                   patch.object(subprocess, "run",
                       return_value=subprocess.CompletedProcess([], 0, "", "")) as run):
-                codex_mesh._report_quota_refusal("worker", serving, USAGE_LIMIT,  # pyright: ignore[reportPrivateUsage]
+                codex_mesh._report_quota_refusal("worker", serving, USAGE_LIMIT, session_dir="/fixture/run", thread_id="",  # pyright: ignore[reportPrivateUsage]
                     stopped=codex_mesh.CommandStoppedBeforeThread("/fixture/run", director))
                 marker.assert_not_called()
                 launcher.assert_not_called()
@@ -10229,7 +10286,7 @@ class QuotaRefusalTests(unittest.TestCase):
               patch.object(codex_mesh, "_launcher_sessions") as launcher,
               patch.object(codex_mesh, "_update_roster_if_expected") as update,
               patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run):
-            codex_mesh._report_quota_refusal("worker", serving, USAGE_LIMIT)  # pyright: ignore[reportPrivateUsage]
+            codex_mesh._report_quota_refusal("worker", serving, USAGE_LIMIT, session_dir="/fixture/run", thread_id=THREAD_ID)  # pyright: ignore[reportPrivateUsage]
         marker.assert_not_called()
         launcher.assert_not_called()
         update.assert_not_called()
@@ -10241,14 +10298,14 @@ class QuotaRefusalTests(unittest.TestCase):
         done = subprocess.CompletedProcess([], 0, "switched to claude for codex1: worker\n", "")
         with patch.object(subprocess, "run", return_value=done) as run, \
                 contextlib.redirect_stderr(io.StringIO()) as errors:
-            codex_mesh._report_quota_refusal("worker", serving)  # pyright: ignore[reportPrivateUsage]
+            codex_mesh._report_quota_refusal("worker", serving, session_dir="/fixture/run", thread_id=THREAD_ID)  # pyright: ignore[reportPrivateUsage]
         command = cast("list[str]", run.call_args.args[0])
         self.assertEqual(command[1:6], [str(codex_mesh.QUOTA_REPORT), "blocked", str(identity.home), identity.login, identity.label])
         self.assertTrue(codex_mesh.QUOTA_REPORT.is_file())
         self.assertIn("codex_mesh: worker: quota: switched to claude for codex1: worker", errors.getvalue())
         with patch.object(subprocess, "run", side_effect=OSError("no interpreter")), \
                 contextlib.redirect_stderr(io.StringIO()) as errors:
-            codex_mesh._report_quota_refusal("worker", serving)  # pyright: ignore[reportPrivateUsage]
+            codex_mesh._report_quota_refusal("worker", serving, session_dir="/fixture/run", thread_id=THREAD_ID)  # pyright: ignore[reportPrivateUsage]
         self.assertIn("quota refusal not reported: no interpreter", errors.getvalue())
 
 

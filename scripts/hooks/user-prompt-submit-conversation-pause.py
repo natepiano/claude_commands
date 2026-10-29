@@ -83,9 +83,16 @@ def main() -> None:
     _ = signal.signal(signal.SIGALRM, budget_spent)
     _ = signal.alarm(budget)
     try:
-        # Peer and user prompts both finish a declared turn wait, even when
-        # conversation-pause itself ignores the sender. Read the marker directly
-        # so a long user wait is not lost to active_run's liveness timeout.
+        import conversation_pause
+
+        source = conversation_pause.prompt_source(
+            prompt,
+            conversation_pause.scheduled_senders,
+            lambda: conversation_pause.read_scheduled_prompts(session_id),
+        )
+        # Classify before matching the declared wait. A timer or unrelated
+        # message does not supply the answer. Read the marker directly so long
+        # waits survive active_run's liveness timeout.
         from direct_run import marker_path
 
         try:
@@ -96,14 +103,7 @@ def main() -> None:
             sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
             from scripts.direct.progress_history import finish_turn_wait
 
-            finish_turn_wait(Path(run_text), session_id)
-        import conversation_pause
-
-        source = conversation_pause.prompt_source(
-            prompt,
-            conversation_pause.scheduled_senders,
-            lambda: conversation_pause.read_scheduled_prompts(session_id),
-        )
+            finish_turn_wait(Path(run_text), session_id, source=source.name, prompt=prompt)
         if source is conversation_pause.PromptSource.TYPED:
             _record_typed_prompt()
             _record_activity(session_id)

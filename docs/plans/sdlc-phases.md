@@ -223,7 +223,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Ruled out:** the slot taken from the shared app-server's start environment as a pass selector (it is fixed for every thread); choosing the newest phase instance for an ambiguous merge (it can name the wrong instance).
 
-### Phase 7 — Each wait names the worker, checkpoint and sender that own it  · status: todo
+### Phase 7 — Each wait names the worker, checkpoint and sender that own it  · status: done
 **Depends on:** Phase 6
 
 Phase 6's repair round 4 left three wait-attribution findings open. The landing rule moved them here: each is a wrong result in behavior Phase 6 added, not a regression and not a red gate. Astra's review (`/tmp/claude/astra/20261029T084546Z-3976557/review.md`) gives the approach for each. One rule covers all three: record explicit identity where the wait is seen, keep it through completion, and name the wait unresolved when identity cannot be resolved. Phase 4 waits for this phase as well, so both trial samples run with the same recorder.
@@ -281,3 +281,24 @@ Phase 6's repair round 4 left three wait-attribution findings open. The landing 
 **Constraints from prior phases:** keep Phase 6's event shape and wait ids, and reuse the recorder; new fields are additive. Old run files stay readable. Probe sessions write nothing. The checkpoint notice and the merge request format do not change. Fixture copies: a new import in a shared script must update the copy lists in `scripts/direct/test_review_launcher.py` and `scripts/production/test_update_registration.py`, or their fixtures fail; `emit` names each new import it adds on the board, and `fix2` updates both lists. The checkpoint notice names models-unit for `codex_mesh.py`, each build-followups owner of a touched file (`memory_gate.sh` included), trial-merged against its tip, and the `waits` schema handoff for hierarchies-unit.
 
 **Acceptance gate:** the gates in Delegation Context green, `basedpyright` on each slot's files; the lint and verification test lanes green; each regression test above fails on the Phase 6 tree and passes here; the `waits` JSON shows each state with its reason and candidate identities; a live scratch run with two slots on one server records each worker's wait on its own pass; the checkpoint notice holds the schema handoff for hierarchies-unit.
+
+### Phase 8 — A supplier reply that the postmaster forwards ends its wait  · status: todo
+**Depends on:** Phase 7; postmaster-unit's reply record (main abc8344f)
+
+Phase 7's closure review found F007: the recorder checked a postmaster-forwarded reply against the postmaster's `replies/*.json` log, but `mods/postmaster/hooks/replies.ts` writes that log only after it forwards, so the recipient's hook ran before the evidence existed. Phase 7 removed that check as containment: a forwarded reply leaves the wait open. The showrunner sent the postmaster half to postmaster-unit (2026-10-29): it writes the reply record before it forwards, with a pending-forward test. This phase is the recorder half. It starts when the showrunner sends the postmaster main hash and the record fields; keep Phase 7's containment until then.
+
+#### Work Order
+
+**Goal:** a supplier reply forwarded by the postmaster ends the declared wait, and only when the postmaster's pre-forward record proves the original sender.
+
+**Spec:**
+- `progress_history.py` `_supplier_message` checks a postmaster-forwarded message against postmaster-unit's pre-forward reply record: the original socket equals the supplier's current address, the body and record time match, and this session is an intended target. Intended targets stay distinct from confirmed forwarded targets.
+- A forwarded message with no unique matching record stays unverified, and the wait stays open.
+- The record (showrunner, 2026-10-29; on main abc8344f, postmaster 82f47a15): `replies/<at_ms>-<n>.json`, written before the forward, with fields `at_ms`, `socket`, `name`, `session_id`, `senders`, `body`, `targets`, `forward`, `forwarded`. `targets` holds the intended session ids and is present at the first write. `forward` is `"pending"`, then `"done"` after the last forward. `forwarded` holds the confirmed ids and stays empty while pending; `"done"` with an empty `forwarded` means none confirmed. A failed first write sends no forward.
+- Match: `socket` equals the supplier's current address, `body` equals the forwarded body, and this session is in `targets`. Merge origin/main first. Runs after Phase 7, because the files overlap.
+
+**Tests:** verification runs while the forward is still pending and ends the wait; a missing, duplicate or mismatched record leaves it open; a direct reply still ends it.
+
+**Files:** `scripts/direct/progress_history.py`, `scripts/direct/test_progress_history.py`, `scripts/hooks/test_direct_turn_wait_hooks.py`.
+
+**Acceptance gate:** the gates in Delegation Context green; `basedpyright` on the changed files; each new test fails on the Phase 7 tree and passes after.

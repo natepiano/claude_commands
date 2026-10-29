@@ -968,8 +968,15 @@ class PhaseProcessTests(unittest.TestCase):
                 self.assertRegex(text, r"fix worker time\s+0\s+—\s+—\s+—\s+0")
 
     def test_duration_switches_to_minutes_only_above_one_thousand_seconds(self) -> None:
-        for seconds, expected in ((999.9, "999.9s"), (1000, "1000.0s"), (1000.1, "16.7 min"),
-                                  (1404, "23.4 min"), (3600, "60.0 min"), (-1000.1, "-16.7 min")):
+        for seconds, expected in ((0, "0.0s"), (999.9, "999.9s"), (1000, "1000.0s"), (1000.1, "16.7 min"),
+                                  (1404, "23.4 min"), (3600, "60.0 min"), (-1000, "-1000.0s"), (-1000.1, "-16.7 min")):
+            with self.subTest(seconds=seconds):
+                self.assertEqual(process.duration(seconds), expected)
+
+    def test_duration_switches_to_hours_at_two_hours(self) -> None:
+        for seconds, expected in ((7199.9, "120.0 min"), (7200, "2.0 h"), (7200.1, "2.0 h"),
+                                  (9000, "2.5 h"), (5943036, "1650.8 h"),
+                                  (-7199.9, "-120.0 min"), (-7200, "-2.0 h"), (-9000, "-2.5 h")):
             with self.subTest(seconds=seconds):
                 self.assertEqual(process.duration(seconds), expected)
 

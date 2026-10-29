@@ -253,7 +253,8 @@ def _serving_request(
             serving.started_here or time.time() - opened > RETRY_FAST_FAILURE_SECS)
         if proven:
             _owe_quota_continuation(client, _as_str(params.get("threadId")))
-            _report_quota_refusal(client.name, serving, detail, stopped=stopped)
+            _report_quota_refusal(client.name, serving, detail, session_dir=client.session_dir,
+                                  thread_id=_as_str(params.get("threadId")), stopped=stopped)
         raise ServingRequestFailure(detail, serving, proven) from error
 
 SERVER_FILE = "mesh_server.json"
@@ -3239,12 +3240,12 @@ def _worker_director(folder: Path) -> KnownWorkerDirector | UnknownWorkerDirecto
     return KnownWorkerDirector(holders[0]) if len(holders) == 1 else UnknownWorkerDirector()
 
 
-def _mesh_phase_wait(name: str, kind: str, reason: str = "", *, finished: bool = False) -> None:
+def _mesh_phase_wait(session_dir: str, name: str, thread_id: str, kind: str, reason: str = "", *,
+                     finished: bool = False) -> None:
     """Keep a wait across launcher exits until this worker starts a turn again."""
-    run = unit_runs.environ("RUN_DIR")
-    if not run or os.environ.get(PROBE_ENV) == "1":
+    if not session_dir or os.environ.get(PROBE_ENV) == "1":
         return
-    directory = Path(run)
+    directory = Path(session_dir)
     if not (directory / "progress_history_state.json").is_file():
         return
     marker = directory / f"mesh-wait.{name}.{kind}"
@@ -3253,17 +3254,12 @@ def _mesh_phase_wait(name: str, kind: str, reason: str = "", *, finished: bool =
         if finished:
             if not marker.is_file():
                 return
-            command += ["finish-wait", "--session-dir", run, "--wait-id", marker.read_text().strip()]
+            command += ["finish-wait", "--session-dir", session_dir, "--wait-id", marker.read_text().strip()]
         else:
             if marker.is_file():
                 return
-            command += ["start-wait", "--session-dir", run, "--kind", kind, "--reason", reason]
-            slot = unit_runs.environ("TEAM_ROLE")
-            command += ["--slot", slot]
-            worker = _as_dict(_read_json_object(directory / ROSTER_FILE).get(name))
-            owner = _as_str(worker.get("thread_id"))
-            if owner:
-                command += ["--owner-session", owner]
+            command += ["start-wait", "--session-dir", session_dir, "--kind", kind, "--reason", reason]
+            command += ["--worker-thread-id", thread_id, "--owner-session", thread_id]
         result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=30)
         if result.returncode:
             print(f"codex_mesh: {name}: wait NotRecorded: {result.stderr.strip()}", file=sys.stderr)
@@ -3276,9 +3272,10 @@ def _mesh_phase_wait(name: str, kind: str, reason: str = "", *, finished: bool =
 
 
 def _report_quota_refusal(name: str, serving: CodexServingState, detail: str = "", *,
+                         session_dir: str, thread_id: str,
                          stopped: RefusalCommandContext = REFUSAL_WITHOUT_COMMAND_EXIT) -> None:
     """Hand the serving identity, named limit and refusal time to the account mover."""
-    _mesh_phase_wait(name, "WaitingForQuotaRefusal", detail)
+    _mesh_phase_wait(session_dir, name, thread_id, "WaitingForQuotaRefusal", detail)
     try:
         account = serving.account
         identity = ([str(account.home), account.login, account.label]
@@ -3384,15 +3381,18 @@ def command_start(args: argparse.Namespace) -> int:
             and isinstance(outcome.pending_refusal, PendingQuotaRefusal)):
         refusal = outcome.pending_refusal
         _report_quota_refusal(name, refusal.serving, refusal.detail,
+                             session_dir=session_dir, thread_id=outcome.thread_id,
                              stopped=CommandStoppedOnThread(session_dir, outcome.thread_id, outcome.director))
     if isinstance(outcome, (FailedBeforeThread, FailedWithThread)):
         print(f"codex_mesh: {name}: {outcome.failure}", file=sys.stderr)
         if not outcome.refusal_reported and not (isinstance(outcome, FailedWithThread) and outcome.refusal_checked) and _quota_refused(outcome, tested, resident):
             if isinstance(outcome, FailedWithThread):
                 _report_quota_refusal(name, outcome.serving, outcome.failure,
+                                     session_dir=session_dir, thread_id=outcome.thread_id,
                                      stopped=CommandStoppedOnThread(session_dir, outcome.thread_id, outcome.director))
             else:
                 _report_quota_refusal(name, outcome.serving, outcome.failure,
+                                     session_dir=session_dir, thread_id="",
                                      stopped=CommandStoppedBeforeThread(session_dir))
         return 1
     if isinstance(outcome, CapacityRetriesExhausted):
@@ -4202,8 +4202,8 @@ def _adopt_moved_worker(stream: TurnStream, moved: MovedWorker) -> bool:
     if not (moved.turn_id or _continuation_is_owed(stream.session_dir, stream.name)):
         return False
     if moved.turn_id:
-        _mesh_phase_wait(stream.name, "WaitingForQuotaRefusal", finished=True)
-        _mesh_phase_wait(stream.name, "ReadyWithoutCapacity", finished=True)
+        _mesh_phase_wait(stream.session_dir, stream.name, stream.thread_id, "WaitingForQuotaRefusal", finished=True)
+        _mesh_phase_wait(stream.session_dir, stream.name, stream.thread_id, "ReadyWithoutCapacity", finished=True)
         stream.turn_id, stream.turn_start_seen = moved.turn_id, False
     if stream.follow:
         stream.followed_turn = stream.turn_id
@@ -4250,7 +4250,7 @@ def _hold_messages_for_next_launch(stream: TurnStream, log: TextIO, reason: str)
 
 def _wait_for_room(stream: TurnStream, log: TextIO, waiting: WorkerWaitingForRoom) -> StreamStep:
     """Keep the task owed without watching an idle thread as a live turn."""
-    _mesh_phase_wait(stream.name, "ReadyWithoutCapacity", waiting.reason)
+    _mesh_phase_wait(stream.session_dir, stream.name, waiting.thread_id, "ReadyWithoutCapacity", waiting.reason)
     if stream.client is not waiting.client or stream.thread_id != waiting.thread_id:
         stream.room_wait_logged = False
     stream.client, stream.port, stream.thread_id = waiting.client, waiting.port, waiting.thread_id
@@ -4521,7 +4521,8 @@ def _record_turn_failure(stream: TurnStream, notice_turn: str, turn_outcome: Tur
         stream.reported_turns.add(identity)
         if _quota_refused(failed, serving.started_here, False):
             _owe_quota_continuation(stream.client, stream.thread_id)
-            _report_quota_refusal(stream.name, serving, turn_outcome.detail)
+            _report_quota_refusal(stream.name, serving, turn_outcome.detail,
+                                  session_dir=stream.session_dir, thread_id=stream.thread_id)
             stream.pending_refusal = PendingQuotaRefusal(serving, turn_outcome.detail)
     if not stream.followed_failure:
         stream.failure_serving = serving
@@ -5343,8 +5344,8 @@ def _start_workers_turn(
                     raise WorkerMoveUncertain(thread_id, result)
                 if isinstance(result, MovedWorker) and not isinstance(result, WorkerAwaitingQuotaRecovery):
                     if result.turn_id:
-                        _mesh_phase_wait(name, "WaitingForQuotaRefusal", finished=True)
-                        _mesh_phase_wait(name, "ReadyWithoutCapacity", finished=True)
+                        _mesh_phase_wait(session_dir, name, result.thread_id, "WaitingForQuotaRefusal", finished=True)
+                        _mesh_phase_wait(session_dir, name, result.thread_id, "ReadyWithoutCapacity", finished=True)
                     if isinstance(submission, QuotaContinuationTurn):
                         result = replace(result, submission=submission)
                     if isinstance(quota_recovery, WorkerAwaitingQuotaRecovery):

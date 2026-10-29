@@ -1260,6 +1260,9 @@ def measure_plan_churn(plans: Sequence[PlanHistory], events: Sequence[Event], wi
 
 
 def duration(seconds: float) -> str:
+    """Use seconds through 1,000 s, minutes below 2 h, then hours."""
+    if abs(seconds) >= 7200:
+        return f"{seconds / 3600:.1f} h"
     return f"{seconds / 60:.1f} min" if abs(seconds) > 1000 else f"{seconds:.1f}s"
 
 

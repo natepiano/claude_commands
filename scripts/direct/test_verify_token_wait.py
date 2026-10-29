@@ -17,7 +17,7 @@ class VerifyTokenWaitTests(VerifyTokenWaitFixture):
     def record_phase(self, session: Path) -> None:
         self.environment.update({"UNIT_HISTORY_DIR": str(self.root / "history"),
                                  "UNIT_PHASE_ID": "6", "UNIT_SYNC_WRITES": "0",
-                                 "UNIT_PASS_OWNER": "launcher",
+                                 "UNIT_PASS_OWNER": "launcher", "CODEX_THREAD_ID": "thread-impl",
                                  "CLAUDE_PROBE_SESSION": ""})
         for arguments in (
             ["start-run", "--session-dir", str(session), "--working-dir", str(self.root),
@@ -30,9 +30,12 @@ class VerifyTokenWaitTests(VerifyTokenWaitFixture):
         for slot in ("impl", "first", "second"):
             arguments = ["start-pass", "--session-dir", str(session), "--phase-id", "6", "--pass-kind", "impl",
                          "--activity", "verify", "--called-task", "direct.impl", "--called-family", "codex",
-                         "--called-model", "fixture"]
+                         "--called-model", "fixture", "--worker-name", f"fixture-{slot}"]
             result = invoke_recorder(arguments, {**self.environment, "UNIT_TEAM_ROLE": slot}, self.root)
             self.assertEqual(result.returncode, 0, result.stderr)
+
+        _ = (session / "mesh_roster.json").write_text(json.dumps({
+            f"fixture-{slot}": {"thread_id": f"thread-{slot}"} for slot in ("impl", "first", "second")}))
 
     def phase_waits(self, session: Path) -> list[dict[str, object]]:
         return [row for row in (cast(dict[str, object], json.loads(line)) for line in
@@ -185,10 +188,10 @@ exit 0
 ''')
         sleep.chmod(0o755)
         first_environment = {**self.environment, "UNIT_RUN_DIR": str(board),
-                             "UNIT_TEAM_ROLE": "first", "TEST_BLOCK": "1",
+                             "UNIT_TEAM_ROLE": "first", "CODEX_THREAD_ID": "thread-first", "TEST_BLOCK": "1",
                              "UNIT_TOKEN_CLOCK_FILE": str(first_clock)}
         second_environment = {**self.environment, "UNIT_RUN_DIR": str(board),
-                              "UNIT_TEAM_ROLE": "second", "TEST_WAITING": str(waiting),
+                              "UNIT_TEAM_ROLE": "second", "CODEX_THREAD_ID": "thread-second", "TEST_WAITING": str(waiting),
                               "TEST_WAIT_GATE": str(resume),
                               "UNIT_TOKEN_CLOCK_FILE": str(second_clock)}
         first = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,

@@ -143,7 +143,7 @@ class VerifyHoldWaitTests(unittest.TestCase):
             "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
             "UNIT_ACTIVE_DIR": str(root / "active"),
             "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
-            "UNIT_TEAM_ROLE": "", "CLAUDE_CODE_SESSION_ID": "",
+            "UNIT_TEAM_ROLE": "", "CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": "",
             "NOTIFIER_SESSIONS_DIR": str(root / "sessions"),
             "MAC_TEST_STATE_DIR": str(root / "mac-state"),
             "BUILD_TARGETS_POLL_S": "0.01", "BUILD_TARGETS_NOW": "",
@@ -237,7 +237,7 @@ else:
     def record_phase(self) -> Path:
         session = self.fixture.root / "unit-run"
         self.fixture.environment.update({"UNIT_RUN_DIR": str(session), "UNIT_PHASE_ID": "closed-server-phase",
-                                         "UNIT_TEAM_ROLE": "impl",
+                                         "UNIT_TEAM_ROLE": "impl", "CODEX_THREAD_ID": "thread-impl",
                                          "UNIT_PASS_OWNER": "launcher",
                                          "UNIT_HISTORY_DIR": str(self.fixture.root / "history"),
                                          "UNIT_SYNC_WRITES": "0", "CLAUDE_PROBE_SESSION": ""})
@@ -248,10 +248,12 @@ else:
             ["start-phase", "--session-dir", str(session), "--phase-id", "6", "--phase-title", "Hold"],
             ["start-pass", "--session-dir", str(session), "--phase-id", "6", "--pass-kind", "impl",
              "--activity", "verify", "--called-task", "direct.impl", "--called-family", "codex",
-             "--called-model", "fixture"],
+             "--called-model", "fixture", "--worker-name", "fixture-impl"],
         ):
             result = invoke_recorder(arguments, self.fixture.environment, self.fixture.root)
             self.assertEqual(result.returncode, 0, result.stderr)
+        _ = (session / "mesh_roster.json").write_text(json.dumps({
+            "fixture-impl": {"thread_id": "thread-impl"}}))
         return self.fixture.root / "history" / "runs" / f"{session.name}.jsonl"
 
     def test_reused_server_wait_uses_the_slots_open_phase_after_its_old_phase_closed(self) -> None:
@@ -264,7 +266,7 @@ else:
             ["start-phase", "--session-dir", str(session), "--phase-id", "7", "--phase-title", "Next"],
             ["start-pass", "--session-dir", str(session), "--phase-id", "7", "--pass-kind", "impl",
              "--activity", "verify", "--called-task", "direct.impl", "--called-family", "codex",
-             "--called-model", "fixture"],
+             "--called-model", "fixture", "--worker-name", "fixture-impl"],
         ):
             result = invoke_recorder(arguments, self.fixture.environment, self.fixture.root)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -283,12 +285,14 @@ else:
     def test_review_with_an_empty_slot_records_its_active_pass_wait(self) -> None:
         self.set_hold_routing("natedev_only")
         history = self.record_phase()
-        self.fixture.environment["UNIT_TEAM_ROLE"] = ""
+        self.fixture.environment.update({"UNIT_TEAM_ROLE": "", "CODEX_THREAD_ID": "thread-review"})
+        _ = (Path(self.fixture.environment["UNIT_RUN_DIR"]) / "mesh_roster.json").write_text(json.dumps({
+            "fixture-impl": {"thread_id": "thread-impl"}, "fixture-review": {"thread_id": "thread-review"}}))
         session = self.fixture.environment["UNIT_RUN_DIR"]
         result = invoke_recorder([
             "start-pass", "--session-dir", session, "--phase-id", "6", "--pass-kind", "review",
             "--activity", "verify", "--called-task", "direct.review", "--called-family", "codex",
-            "--called-model", "fixture",
+            "--called-model", "fixture", "--worker-name", "fixture-review",
         ], self.fixture.environment, self.fixture.root)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.hold()
@@ -301,6 +305,83 @@ else:
         phase, = [row for row in rows if row["event_type"] == "phase_started"]
         wait, = [row for row in rows if row["event_type"] == "wait_started"]
         self.assertEqual(wait["phase_instance_id"], phase["phase_instance_id"])
+
+    def assert_wait_follows_worker_thread(self, worker_name: str) -> None:
+        history = self.record_phase()
+        session = Path(self.fixture.environment["UNIT_RUN_DIR"])
+        _ = (session / "mesh_roster.json").write_text(json.dumps({
+            "fixture-impl": {"thread_id": "thread-impl"}, worker_name: {"thread_id": "thread-test"}}))
+        for arguments in (
+            ["start-phase", "--session-dir", str(session), "--phase-id", "7", "--phase-title", "Test"],
+            ["start-pass", "--session-dir", str(session), "--phase-id", "7", "--pass-kind", "test",
+             "--activity", "verify", "--called-task", "direct.test", "--called-family", "codex",
+             "--called-model", "fixture", "--worker-name", worker_name],
+        ):
+            result = invoke_recorder(arguments, {**self.fixture.environment, "UNIT_TEAM_ROLE": "test"}, self.fixture.root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.fixture.environment["CODEX_THREAD_ID"] = "thread-test"
+        self.hold()
+        process = self.start("test", "sample", "--local", "worker attribution", "--filter", "smoke")
+        self.wait_for_call(process)
+        grant_call(self.cycle_file)
+        code, output = self.finish(process)
+        self.assertEqual(code, 0, output)
+        rows = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
+        worker_pass, = [row for row in rows if row["event_type"] == "pass_started" and row["worker_name"] == worker_name]
+        started, = [row for row in rows if row["event_type"] == "wait_started"]
+        finished, = [row for row in rows if row["event_type"] == "wait_finished"]
+        for wait in (started, finished):
+            self.assertEqual((wait["phase_id"], wait["phase_instance_id"], wait["pass_instance_id"],
+                              wait["worker_name"], wait["owner_session"]),
+                             ("7", worker_pass["phase_instance_id"], worker_pass["pass_instance_id"], worker_name, "thread-test"))
+
+    def test_verification_thread_overrides_the_servers_impl_slot(self) -> None:
+        self.assert_wait_follows_worker_thread("fixture-test")
+
+    def test_fix_named_worker_uses_its_recorded_test_slot(self) -> None:
+        self.assert_wait_follows_worker_thread("fixture-fix")
+
+    def test_director_verification_uses_its_claude_owner_and_single_active_phase(self) -> None:
+        self.set_hold_routing("natedev_only")
+        history = self.record_phase()
+        self.fixture.environment.update({"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "claude-director"})
+        self.hold()
+        process = self.start("check", "sample")
+        self.wait_for_call(process)
+        grant_call(self.cycle_file)
+        code, output = self.finish(process)
+        self.assertEqual(code, 0, output)
+        rows = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
+        wait, = [row for row in rows if row["event_type"] == "wait_started"]
+        self.assertEqual((wait["owner_session"], wait["phase_id"]), ("claude-director", "6"))
+        self.assertNotIn("pass_instance_id", wait)
+
+    def test_director_verification_with_two_active_phases_records_one_miss_for_both(self) -> None:
+        self.set_hold_routing("natedev_only")
+        history = self.record_phase()
+        session = self.fixture.environment["UNIT_RUN_DIR"]
+        result = invoke_recorder(["start-phase", "--session-dir", session, "--phase-id", "7", "--phase-title", "Concurrent"],
+                                 self.fixture.environment, self.fixture.root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.fixture.environment.update({"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "claude-director"})
+        self.hold()
+        process = self.start("check", "sample")
+        self.wait_for_call(process)
+        grant_call(self.cycle_file)
+        code, output = self.finish(process)
+        self.assertEqual(code, 0, output)
+        rows = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
+        miss, = [row for row in rows if row["event_type"] == "wait_not_recorded"]
+        self.assertEqual(miss["owner_session"], "claude-director")
+        attribution = cast(dict[str, object], miss["wait_attribution"])
+        candidates = cast(list[dict[str, object]], attribution["candidates"])
+        self.assertEqual({candidate["phase_id"] for candidate in candidates}, {"6", "7"})
+        self.assertFalse(any(row["event_type"] == "wait_started" for row in rows))
+        report = invoke_recorder(["waits", "--session-dir", session], self.fixture.environment, self.fixture.root)
+        self.assertEqual(report.returncode, 0, report.stderr)
+        phases = cast(list[dict[str, object]], json.loads(report.stdout)["phases"])
+        self.assertEqual([phase["state"] for phase in phases], ["UncertainCoverage", "UncertainCoverage"])
+        self.assertTrue(all("wait_n" not in phase for phase in phases))
 
     def test_probe_verification_waits_without_phase_wait_events(self) -> None:
         self.set_hold_routing("natedev_only")
@@ -414,7 +495,7 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
         started, = [row for row in rows if row["event_type"] == "wait_started"]
         finished, = [row for row in rows if row["event_type"] == "wait_finished"]
         self.assertEqual((started["wait_kind"], started["wait_reason"], started["owner_session"]),
-                         ("WaitingForMemoryOrSlot", "build hold", "fixture-director"))
+                         ("WaitingForMemoryOrSlot", "build hold", "thread-impl"))
         self.assertEqual(started["wait_id"], finished["wait_id"])
         self.assertEqual(cast(dict[str, object], finished["wait_end"])["state"], "Finished")
 

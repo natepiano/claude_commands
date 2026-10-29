@@ -18,6 +18,7 @@ from unittest import mock
 from pathlib import Path
 from typing import NamedTuple, cast, final, override
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import merge_checkpoint
 from scripts.production import production_doc
 from merge_checkpoint import (ChildHandoffEntry, CodeCheckpoint, LastMerged, MergeEntry, NoMerge, ShrinkCommit,
@@ -199,6 +200,7 @@ class MergeCheckpointTests(unittest.TestCase):
                     "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
                     "SHOWRUNNER_STATE_DIR": str(self.root / "showrunners"),
                     "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "", "PLAN_DELEGATE_BOARD_DIR": "",
+                    "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "",
                     "MERGE_CHECKPOINT_RUN_ROOT": str(self.root / "unit-runs"),
                     "UNIT_HISTORY_DIR": str(self.root / "history"), "UNIT_SYNC_WRITES": "0",
                     "CLAUDE_PROBE_SESSION": ""}
@@ -343,10 +345,35 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertEqual(self.git("rev-parse", "HEAD"), failed.before)
         self.assertEqual(self.receipts(), [])
 
+    def test_abbreviated_checkpoint_keeps_full_hash_wait_attribution_and_receipt(self) -> None:
+        checkpoint = self.checkpoint()
+        short = self.git("rev-parse", "--short", checkpoint, cwd=self.unit)
+        session = self.start_history_run("abbreviated-checkpoint", self.unit)
+        _ = self.record_history("start-phase", "--session-dir", str(session), "--phase-id", "2", "--phase-title", "Gate")
+        _ = self.record_history("checkpoint", "--session-dir", str(session), "--phase", "2", "--commit", checkpoint)
+        _ = self.record_history("finish-phase", "--session-dir", str(session), "--phase-id", "2", "--status", "completed")
+
+        merged = self.run_checkpoint(short)
+        self.assertEqual(merged.process.returncode, 0, merged.process.stdout + merged.process.stderr)
+        report = self.record_history("waits")
+        self.assertEqual(report["attribution_miss_n"], 0)
+        wait, = cast(list[dict[str, object]], report["waits"])
+        attribution = cast(dict[str, object], wait["wait_attribution"])
+        self.assertEqual(attribution["state"], "CheckpointPhase")
+        self.assertEqual(wait["checkpoint_commit"], checkpoint)
+        phase, = cast(list[dict[str, object]], report["phases"])
+        self.assertEqual(wait["phase_instance_id"], phase["phase_instance_id"])
+        receipt, = self.receipts()
+        self.assertEqual(receipt["source_checkpoint"], checkpoint)
+
+        retried = self.run_checkpoint(checkpoint)
+        self.assertEqual(retried.process.returncode, 0, retried.process.stdout + retried.process.stderr)
+        self.assertEqual(self.receipts(), [receipt])
+
     def test_child_receipt_survives_retry_and_rebuilds_a_missed_write(self) -> None:
         _ = self.child_production()
         checkpoint = self.checkpoint()
-        first = self.run_handoff(checkpoint)
+        first = self.run_handoff(self.git("rev-parse", "--short", checkpoint, cwd=self.unit))
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         merge = self.git("rev-parse", "HEAD")
         receipt, = self.receipts()
@@ -381,6 +408,7 @@ class MergeCheckpointTests(unittest.TestCase):
              "--main-family", "codex", "--main-model", "fixture", "--main-effort", "high",
              "--main-session-id", "unit-director"],
             ["start-phase", "--session-dir", str(session), "--phase-id", "2", "--phase-title", "Gate"],
+            ["checkpoint", "--session-dir", str(session), "--phase", "2", "--commit", checkpoint],
             ["start-phase", "--session-dir", str(session), "--phase-id", "3", "--phase-title", "Parallel"],
         ):
             result = subprocess.run([sys.executable, str(recorder), *arguments], cwd=self.unit, env=self.env,
@@ -391,6 +419,8 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertNotEqual(failed.process.returncode, 0)
         rows = [cast(dict[str, object], json.loads(line)) for line in
                 (self.root / "history" / "runs" / "alpha-run.jsonl").read_text().splitlines()]
+        rows.extend(cast(dict[str, object], json.loads(line)) for line in
+                    (self.root / "history" / "wait_attribution.jsonl").read_text().splitlines())
         started, = [row for row in rows if row["event_type"] == "wait_started"]
         finished, = [row for row in rows if row["event_type"] == "wait_finished"]
         phase, = [row for row in rows if row["event_type"] == "phase_started" and row["phase_id"] == "2"]
@@ -407,6 +437,7 @@ class MergeCheckpointTests(unittest.TestCase):
             ["start-run", "--session-dir", str(session), "--working-dir", str(self.unit),
              "--main-family", "codex", "--main-model", "fixture", "--main-session-id", "unit-director"],
             ["start-phase", "--session-dir", str(session), "--phase-id", "2", "--phase-title", "Finished"],
+            ["checkpoint", "--session-dir", str(session), "--phase", "2", "--commit", checkpoint],
             ["finish-phase", "--session-dir", str(session), "--phase-id", "2", "--status", "completed"],
         ):
             recorded = subprocess.run([sys.executable, str(recorder), *arguments], env=self.env, cwd=self.unit,
@@ -423,6 +454,98 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertEqual((wait["wait_kind"], wait["phase_instance_id"], phase["wait_n"]),
                          ("WaitingForMergeGate", phase["phase_instance_id"], 1))
         self.assertEqual(cast(dict[str, object], wait["wait_end"])["state"], "Finished")
+
+    def record_history(self, *arguments: str) -> dict[str, object]:
+        recorder = SCRIPT.parent.parent / "direct" / "progress_history.py"
+        result = subprocess.run([sys.executable, str(recorder), *arguments], cwd=self.unit, env=self.env,
+                                capture_output=True, text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return cast(dict[str, object], json.loads(result.stdout)) if arguments[0] == "waits" else {}
+
+    def start_history_run(self, name: str, worktree: Path) -> Path:
+        session = self.root / "unit-runs" / name
+        _ = self.record_history("start-run", "--session-dir", str(session), "--working-dir", str(worktree),
+                                "--main-family", "codex", "--main-model", "fixture", "--main-session-id", "director")
+        return session
+
+    def assert_checkpoint_provenance(self, *, across_runs: bool, second_active: bool, checkpoint_events: int) -> None:
+        checkpoint = self.checkpoint()
+        first = self.start_history_run("first", self.unit)
+        _ = self.record_history("start-phase", "--session-dir", str(first), "--phase-id", "2", "--phase-title", "First")
+        if checkpoint_events:
+            _ = self.record_history("checkpoint", "--session-dir", str(first), "--phase", "2", "--commit", checkpoint)
+        _ = self.record_history("finish-phase", "--session-dir", str(first), "--phase-id", "2", "--status", "completed")
+        if across_runs:
+            _ = self.record_history("finish-run", "--session-dir", str(first), "--status", "completed")
+        second = self.start_history_run("second", self.unit) if across_runs else first
+        _ = self.record_history("start-phase", "--session-dir", str(second), "--phase-id", "2", "--phase-title", "Second")
+        if checkpoint_events == 2:
+            _ = self.record_history("checkpoint", "--session-dir", str(second), "--phase", "2", "--commit", checkpoint)
+        if not second_active:
+            _ = self.record_history("finish-phase", "--session-dir", str(second), "--phase-id", "2", "--status", "completed")
+        merged = self.run_checkpoint(checkpoint)
+        self.assertEqual(merged.process.returncode, 0, merged.process.stdout + merged.process.stderr)
+        report = self.record_history("waits")
+        phases = cast(list[dict[str, object]], report["phases"])
+        waits = cast(list[dict[str, object]], report["waits"])
+        self.assertEqual(len(phases), 2)
+        if checkpoint_events == 1:
+            self.assertEqual(len(waits), 1)
+            self.assertEqual((waits[0]["run_id"], waits[0]["phase_instance_id"]),
+                             (phases[0]["run_id"], phases[0]["phase_instance_id"]))
+            self.assertEqual([phase["wait_n"] for phase in phases], [1, 0])
+        else:
+            self.assertEqual(waits, [])
+            self.assertEqual(report["missing_record_n"], 1)
+            for phase in phases:
+                self.assertEqual(phase["state"], "UncertainCoverage")
+                self.assertNotIn("wait_n", phase)
+                self.assertTrue(phase["reason"])
+                self.assertTrue(phase["candidates"])
+
+    def test_checkpoint_event_selects_the_first_repeated_phase_instance(self) -> None:
+        for across_runs in (False, True):
+            for second_active in (False, True):
+                with self.subTest(across_runs=across_runs, second_active=second_active):
+                    # Each matrix cell owns a disposable repository and history root.
+                    fixture = MergeCheckpointTests("runTest")
+                    fixture.setUp()
+                    try:
+                        fixture.assert_checkpoint_provenance(across_runs=across_runs, second_active=second_active,
+                                                             checkpoint_events=1)
+                    finally:
+                        self.assertTrue(fixture.doCleanups())
+
+    def test_missing_or_duplicate_checkpoint_events_make_every_candidate_uncertain(self) -> None:
+        for across_runs in (False, True):
+            for second_active in (False, True):
+                for checkpoint_events in (0, 2):
+                    with self.subTest(across_runs=across_runs, second_active=second_active, checkpoint_events=checkpoint_events):
+                        fixture = MergeCheckpointTests("runTest")
+                        fixture.setUp()
+                        try:
+                            fixture.assert_checkpoint_provenance(across_runs=across_runs, second_active=second_active,
+                                                                 checkpoint_events=checkpoint_events)
+                        finally:
+                            self.assertTrue(fixture.doCleanups())
+
+    def test_child_handoff_wait_has_production_ownership_without_phase_coverage(self) -> None:
+        _ = self.child_production()
+        # A real child run may have phases; its branch checkpoint still belongs to the production.
+        session = self.start_history_run("child", self.unit)
+        _ = self.record_history("start-phase", "--session-dir", str(session), "--phase-id", "2", "--phase-title", "Child unit")
+        checkpoint = self.checkpoint()
+        merged = self.run_handoff(checkpoint)
+        self.assertEqual(merged.returncode, 0, merged.stdout + merged.stderr)
+        report = self.record_history("waits")
+        wait, = cast(list[dict[str, object]], report["waits"])
+        attribution = cast(dict[str, object], wait["wait_attribution"])
+        self.assertEqual(attribution["state"], "ProductionHandoff")
+        self.assertTrue(attribution["reason"])
+        self.assertNotIn("phase_instance_id", wait)
+        self.assertEqual(report["missing_record_n"], 0)
+        phase, = cast(list[dict[str, object]], report["phases"])
+        self.assertEqual((phase["state"], phase["wait_n"]), ("Covered", 0))
 
     def test_missing_hash_and_unpushed_checkpoint_stop_at_ancestry(self) -> None:
         missing = self.run_checkpoint("0" * 40)
