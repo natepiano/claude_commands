@@ -61,11 +61,11 @@ class QueueTests(unittest.TestCase):
         self.assertTrue(lines[0].endswith("needs 10.9 GiB; 23.1 free; ready for the next admission check"))
         self.assertNotIn("promised", lines[1])
 
-    def test_memory_reason_names_growth_headroom_and_earlyoom_reserve(self) -> None:
+    def test_memory_reason_names_free_memory_and_earlyoom_reserve(self) -> None:
         pending = int(23.5 * GIB)
         waiting = memory_admit.WaitingStep(
             10, "waiting-id", "unit", "check", "/tmp/tree", NOW - 2400,
-            int(11.6 * GIB), memory_admit.NeedsMemory(int(11.6 * GIB), int(23.1 * GIB), 2, pending),
+            int(11.6 * GIB), memory_admit.NeedsMemory(int(11.6 * GIB), int(23.1 * GIB)),
         )
         running = (
             memory_admit.RunningStep("one", "", "test", "/one", 12 * GIB, memory_admit.PromisedMemory(12 * GIB)),
@@ -75,7 +75,16 @@ class QueueTests(unittest.TestCase):
         view = memory_admit.QueueView((waiting,), running, int(23.1 * GIB), pending, 3 * GIB, NOW)
         line = build_queue.render_queue(view, ZoneInfo("UTC"))[0]
         self.assertTrue(line.endswith(
-            "needs 11.6 GiB; 23.1 free; 3.0 kept for earlyoom; 23.5 growth headroom for 2 running steps"))
+            "needs 11.6 GiB; 23.1 free; 3.0 kept for earlyoom"))
+
+    def test_budget_reason_names_charged_builds_and_the_limit(self) -> None:
+        waiting = memory_admit.WaitingStep(
+            10, "waiting-id", "unit", "check", "/tmp/tree", NOW - 300,
+            int(10.8 * GIB), memory_admit.NeedsBuildBudget(int(10.8 * GIB), int(17.6 * GIB), 20 * GIB),
+        )
+        view = memory_admit.QueueView((waiting,), (), 30 * GIB, 0, 3 * GIB, NOW)
+        line = build_queue.render_queue(view, ZoneInfo("UTC"))[0]
+        self.assertTrue(line.endswith("needs 10.8 GiB; builds 17.6 of 20.0 GiB budget"))
 
     def test_live_queue_pressure_reason_reaches_the_cli(self) -> None:
         process = self.root / "proc/100"
@@ -153,7 +162,7 @@ class QueueTests(unittest.TestCase):
     def test_ten_thousand_waiting_and_running_rows_render_in_under_one_second(self) -> None:
         waiting = tuple(memory_admit.WaitingStep(
             pid, f"session-{pid}", "", "check", f"/tmp/tree-{pid}", NOW - pid,
-            12 * GIB, memory_admit.NeedsMemory(12 * GIB, 20 * GIB, 2, 10 * GIB),
+            12 * GIB, memory_admit.NeedsMemory(12 * GIB, 20 * GIB),
         ) for pid in range(10000))
         running = tuple(memory_admit.RunningStep(
             f"session-{pid}", "", "test", f"/tmp/tree-{pid}", 8 * GIB, memory_admit.MeasuredMemory(GIB),
