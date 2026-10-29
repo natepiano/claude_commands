@@ -68,15 +68,16 @@ class DecisionTests(unittest.TestCase):
         result = gate.decide(5 * GIB, None, 5 * GIB, [])
         self.assertEqual((result.reserve, result.threshold, result.state), (0, 5 * GIB, "admit"))
 
-    def test_positive_budget_override_changes_admission_and_invalid_values_use_20(self) -> None:
-        for setting, state in (("24", "admit"), ("20", "hold"), ("0", "hold"), ("-1", "hold"),
-                               ("bad", "hold"), ("nan", "hold"), ("inf", "hold"), ("", "hold")):
+    def test_positive_budget_override_changes_admission_and_invalid_values_use_21(self) -> None:
+        for setting, state in (("24", "admit"), ("20", "hold"), ("0", "admit"), ("-1", "admit"),
+                               ("bad", "admit"), ("nan", "admit"), ("inf", "admit"), ("", "admit")):
             with self.subTest(setting=setting), patch.dict(os.environ, {"BUILDLOG_BUILD_BUDGET_GIB": setting}):
-                decision = gate.decide(40 * GIB, 60 * GIB, 10 * GIB, [gate.MeasuredMemory(12 * GIB)])
+                decision = gate.decide(40 * GIB, 60 * GIB, 10 * GIB, [gate.MeasuredMemory(11 * GIB)])
                 self.assertEqual(decision.state, state)
         with patch.dict(os.environ):
             del os.environ["BUILDLOG_BUILD_BUDGET_GIB"]
-            self.assertEqual(gate.decide(40 * GIB, 60 * GIB, 10 * GIB, [gate.MeasuredMemory(12 * GIB)]).state, "hold")
+            self.assertEqual(gate.decide(40 * GIB, 60 * GIB, 10 * GIB, [gate.MeasuredMemory(11 * GIB)]).state, "admit")
+            self.assertEqual(gate.decide(40 * GIB, 60 * GIB, 10 * GIB + 1, [gate.MeasuredMemory(11 * GIB)]).state, "hold")
 
     def test_psi_11_holds_a_step_that_fits_memory_and_budget(self) -> None:
         decision = gate.decide(40 * GIB, 60 * GIB, GIB, [], pressure=gate.MemoryPressure(11))
@@ -676,14 +677,18 @@ class QueueApiTests(MemoryQueueFixture):
         self.assertIsInstance(view.waiting[0].reason, gate.ReadyForAdmission)
         self.assertTrue(all(isinstance(row.reason, gate.BehindHead) for row in view.waiting[1:]))
 
-    def test_queue_view_names_running_steps_that_hold_the_head(self) -> None:
+    def test_queue_view_names_budget_before_free_memory_when_both_hold_the_head(self) -> None:
         _ = self.running(100, 12, age=0)
         _ = self.running(200, 11.5, age=0)
         _ = self.queue()
         view = gate.queue_view()
         self.assertEqual(view.promised, int(20.5 * GIB))
         reason = view.waiting[0].reason
-        self.assertEqual(reason, gate.HeadWaitingForDrain(2))
+        self.assertIsInstance(reason, gate.HeadAdmissionHold)
+        if isinstance(reason, gate.HeadAdmissionHold):
+            self.assertEqual(gate.head_wait_text(reason),
+                             "head: needs 10.9 GiB; builds use 23.5 of the 20.0 GiB budget "
+                             + "(starts when build use falls to 9.1 GiB); needs 34.4 GiB free; 23.1 free")
         self.assertCountEqual([row.measured for row in view.running],
                               [gate.MeasuredMemory(GIB, 12 * GIB), gate.MeasuredMemory(2 * GIB, int(11.5 * GIB))])
 
@@ -698,8 +703,52 @@ class QueueApiTests(MemoryQueueFixture):
         second = self.check(need=1, free=21.9)
         self.assertEqual(second.decision.state, "hold")
         view = gate.queue_view()
-        self.assertEqual(view.waiting[0].reason, gate.HeadWaitingForDrain(1))
+        reason = view.waiting[0].reason
+        self.assertIsInstance(reason, gate.HeadAdmissionHold)
+        if isinstance(reason, gate.HeadAdmissionHold):
+            self.assertEqual(gate.head_wait_text(reason), "head: needs 22.3 GiB free; 21.9 free")
         self.assertIsInstance(view.waiting[1].reason, gate.BehindHead)
+
+    def test_mature_builds_hold_head_on_13_point_2_used_not_72_point_3_promised(self) -> None:
+        for pid in range(500, 510):
+            self.processes[pid] = str(pid)
+            self.readings[pid] = gate.MeasuredMemory(int(1.32 * GIB))
+            _ = self.running(pid, 7.23)
+        _ = self.enterContext(patch.object(gate, "process_table", return_value={
+            pid: gate.ProcessIdentity(1, start) for pid, start in self.processes.items()
+        }))
+        _ = self.head(15.1)
+        result = self.check(pid=300, need=15.1, free=19.5)
+        self.assertEqual(result.decision.state, "hold")
+        self.assertAlmostEqual(sum(row["need"] for row in result.live) / GIB, 72.3)
+        self.assertAlmostEqual(result.decision.charged / GIB, 13.2)
+        self.assertGreater(result.available, result.decision.threshold)
+        view = gate.queue_view()
+        self.assertEqual(view.waiting[0].reason, result.head_reason)
+        self.assertIsInstance(result.head_reason, gate.HeadAdmissionHold)
+        if isinstance(result.head_reason, gate.HeadAdmissionHold):
+            text = gate.head_wait_text(result.head_reason)
+            self.assertEqual(text, "head: needs 15.1 GiB; builds use 13.2 of the 20.0 GiB budget "
+                             + "(starts when build use falls to 4.9 GiB)")
+            arguments = ["memory_admit.py", "check", str(self.meminfo), "300", "", "0",
+                         "test", "nextest", "test", str(int(15.1 * GIB)), "measured", "5", "cargo", "nextest"]
+            for detail in ("", "1"):
+                output = io.StringIO()
+                with patch.object(gate, "check", return_value=result), patch.object(sys, "argv", arguments), \
+                     patch.dict(os.environ, {"BUILDLOG_MEM_DETAIL": detail}), redirect_stdout(output):
+                    gate.main()
+                self.assertIn(text, output.getvalue().split("|")[8])
+
+    def test_head_names_only_free_memory_when_budget_fits(self) -> None:
+        _ = self.running(100, 1)
+        _ = self.head(15.1)
+        result = self.check(pid=300, need=15.1, free=18)
+        self.assertEqual(result.decision.state, "hold")
+        self.assertLess(result.decision.charged + result.peak.bytes, result.decision.budget)
+        self.assertEqual(gate.queue_view().waiting[0].reason, result.head_reason)
+        self.assertIsInstance(result.head_reason, gate.HeadAdmissionHold)
+        if isinstance(result.head_reason, gate.HeadAdmissionHold):
+            self.assertEqual(gate.head_wait_text(result.head_reason), "head: needs 18.1 GiB free; 18.0 free")
 
     def test_drained_head_starts_below_memory_floor_and_a_younger_check_cannot_take_its_place(self) -> None:
         running = self.running(100, 12)

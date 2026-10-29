@@ -56,8 +56,8 @@ def reason_text(step: memory_admit.WaitingStep, view: memory_admit.QueueView) ->
         case memory_admit.BehindHead():
             return (f"{capacity}; behind {field(reason.head_name)} "
                     + f"(waiting {age(reason.head_since, view.now)} min)")
-        case memory_admit.HeadWaitingForDrain():
-            return f"head: waits for {reason.running_count} running steps to end"
+        case memory_admit.HeadAdmissionHold():
+            return memory_admit.head_wait_text(reason)
         case memory_admit.ReadyForAdmission():
             return f"{capacity}; ready for the next admission check"
         case _:
