@@ -4,9 +4,10 @@
 Usage: rename_unit.py plan|apply|verify <slug> <old> <new> [--scratch <showrunner state directory>]
 
 `<old>` is the unit's Units id, or its stem; `<new>` takes an id or a stem and becomes
-`<stem>-unit`, as add_unit names a unit. apply saves the request before it changes anything, stops
-the unit and its Codex workers at once through the shutdown path (`down`, then `now`), sends SIGTERM to
-what its runs leave in its worktree (an app-server and its workers, a detached run's supervisor, an app-server's watcher), merges the merge branch into the unit, moves the branch and
+`<stem>-unit`, as add_unit names a unit. apply saves the request before it changes anything, pauses
+the unit and its Codex workers through the shutdown path (`down`, then `now`), stops its runs'
+app-servers and keeps each paused worker's detached runs (it refuses while one works inside the
+worktree), merges the merge branch into the unit, moves the branch and
 worktree (unit_move), commits `chore(<slug>): rename unit <old> to <new>` on the merge branch, which
 merge_branch_history follows, merges that commit into the unit, moves the unit's state, retires the
 old branch, points the unit's shutdown record at the new names (each paused Codex worker's launcher
@@ -284,6 +285,7 @@ def _check_stopped(rename: UnitRename) -> None:
 def check_stoppable(rename: StopTarget) -> None:
     """What the stop step cannot settle: the new id running, a Claude it cannot read, or processes
     in the worktree of a unit with no Claude to stop. A live old unit is the stop step's to stop."""
+    _refuse_detached_worktree(rename)
     try:
         marked = unit_lookup.marked_units(rename.slug)
     except OSError as error:
@@ -297,7 +299,17 @@ def check_stoppable(rename: StopTarget) -> None:
         return
     inside = unit_move.processes_inside(rename.worktree())
     runs = retire_unit.run_processes(rename.worktree(), inside) if inside else {}
-    pids = [pid for pid in inside if pid not in runs]
+    retained = _retained_command_sessions(rename.worktree())
+    pids: list[int] = []
+    for pid in inside:
+        if pid in runs:
+            continue
+        try:
+            if os.getsid(pid) in retained:
+                continue
+        except ProcessLookupError:
+            continue
+        pids.append(pid)
     if pids:
         raise RenameRefused(f"processes {', '.join(map(str, pids))} work inside {rename.worktree()}; stop them first")
 
@@ -502,6 +514,10 @@ def _merge_rename(rename: UnitRename, save: Callable[[], None]) -> None:
 
 def _move_state(rename: UnitRename, _save: Callable[[], None]) -> None:
     from scripts.guilds import roles
+    from scripts.direct import workers
+    workers.rename_unit(rename.slug, rename.old, rename.new,
+                        runs=tuple(set((*retire_unit.runs_of(Path(rename.old_worktree)),
+                                        *retire_unit.runs_of(Path(rename.new_worktree))))))
     try:
         roles.rename_holder(rename.slug, rename.old, rename.new, rename.old_worktree, rename.new_worktree)
     except (OSError, ValueError, SystemExit) as error:
@@ -619,24 +635,63 @@ def stop_unit(rename: StopTarget, _save: Callable[[], None]) -> None:
     _stop_runs(rename)
 
 
+def _refuse_detached_worktree(rename: StopTarget) -> None:
+    if not isinstance(rename, UnitRename):
+        return
+    from scripts.direct import workers
+    worktree = rename.worktree().resolve()
+    for folder in retire_unit.runs_of(rename.worktree()):
+        for path, record in workers.retained_detached_runs(folder):
+            cwd = Path(str(record.get("cwd", ""))).resolve()
+            if cwd == worktree or worktree in cwd.parents:
+                raise RenameRefused(f"detached run {path.stem} of {record.get('worker', '')} works inside "
+                                    + f"{worktree}; rerun apply once it ends")
+
+
+def _retained_command_sessions(worktree: Path) -> set[int]:
+    from scripts.direct import workers
+    protected: set[int] = set()
+    for folder in retire_unit.runs_of(worktree):
+        for _, record in workers.retained_detached_runs(folder):
+            pid = record.get("pid")
+            if isinstance(pid, int):
+                try:
+                    protected.add(os.getsid(pid))
+                except ProcessLookupError:
+                    pass
+    return protected
+
+
 def _stop_runs(rename: StopTarget) -> None:
-    """End what the unit's runs leave in its worktree once the unit has stopped: each run's
-    app-server with its workers (`codex_mesh.py stop`, as retire_unit does), then by SIGTERM a
-    detached run's supervisor with its command, an app-server's idle-stop watcher, and an
-    app-server that did not stop. Each leads its own session, so the shutdown path does not end
-    it, and nothing starts it again."""
+    """Pause unit workers and clean up processes outside their retained work."""
+    from scripts.direct import workers
     worktree = rename.worktree()
-    for item in retire_unit.mesh_runs(retire_unit.runs_of(worktree)):
-        result = retire_unit.run([sys.executable, str(retire_unit.MESH), "stop", "--session-dir", str(item.run)])
+    folders = retire_unit.runs_of(worktree)
+    _refuse_detached_worktree(rename)
+    servers = {item.run: item for item in retire_unit.mesh_runs(folders)}
+    for folder in folders:
+        if folder not in servers and not (folder / "mesh_roster.json").exists():
+            continue
+        result = retire_unit.run([sys.executable, str(retire_unit.MESH), "stop", "--pause", "--session-dir", str(folder)])
         if result.returncode:
-            print(f"{retire_unit.describe_run(item)}: {retire_unit.failure(result)}; SIGTERM instead")
-        else:
-            print(f"stopped: {retire_unit.describe_run(item)}")
+            if workers.ledger_for_run(folder).path.exists():
+                raise RenameRefused(f"cannot pause run {folder}: {retire_unit.failure(result)}")
+            print(f"{retire_unit.failure(result)}; SIGTERM instead")
+        elif folder in servers:
+            print(f"stopped: app-server pid {servers[folder].pid} of run {folder.name}")
+    workers.pause_unit(rename.slug, rename.old)
+    protected = _retained_command_sessions(worktree)
     inside = unit_move.processes_inside(worktree) if unit_move.exists(worktree) else []
     runs = retire_unit.run_processes(worktree, inside) if inside else {}
+    for pid in list(runs):
+        try:
+            if os.getsid(pid) in protected:
+                del runs[pid]
+        except ProcessLookupError:
+            del runs[pid]
     left = retire_unit.terminate(sorted(runs), runs, RUN_STOP_WAIT_SECONDS)
     if left:
-        raise RenameRefused("; ".join(left) + "; rerun apply once they stop")
+        raise RenameRefused("; ".join(left))
 
 
 def _await_stopped(rename: StopTarget) -> SessionShutdown:
@@ -949,8 +1004,8 @@ class Step(NamedTuple):
 
 
 def _describe_stop(r: UnitRename) -> str:
-    return (f"stop {r.old} and its Codex workers at once through the shutdown path; its record carries the relaunch; "
-            + "then stop its runs' app-servers and SIGTERM their supervisors and app-server watchers left in the worktree")
+    return (f"pause {r.old} and its Codex workers through the shutdown path; its record carries the relaunch; "
+            + "then stop its runs' app-servers and keep detached commands")
 
 
 def _describe_merge(r: UnitRename) -> str:
@@ -1144,6 +1199,7 @@ def verify(slug: str, old: str, new: str) -> UnitRename:
 
 
 def main(argv: list[str]) -> int:
+    from scripts.direct.workers import WorkerUnavailable
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0] if __doc__ else None)
     _ = parser.add_argument("action", choices=("plan", "apply", "verify"))
     _ = parser.add_argument("slug")
@@ -1161,7 +1217,7 @@ def main(argv: list[str]) -> int:
     except RenameWaiting as error:
         print(f"rename_unit: {error}", file=sys.stderr)
         return 2
-    except (RenameRefused, production_units.Refusal, unit_names.BadName, OSError, UnicodeError) as error:
+    except (RenameRefused, production_units.Refusal, unit_names.BadName, WorkerUnavailable, OSError, UnicodeError) as error:
         print(f"rename_unit: {error}", file=sys.stderr)
         return 1
     for line in describe(rename):

@@ -18,7 +18,8 @@ from typing import TYPE_CHECKING, Literal, cast, final, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from scripts.guilds import roles  # noqa: E402
+from scripts.guilds import roles
+from scripts.direct import workers  # noqa: E402
 
 import retire_unit
 import unit_lookup
@@ -138,6 +139,7 @@ class RetireUnitTests(unittest.TestCase):
             return sessions.SessionProcesses(tuple(item["pid"] for item in self.claude if item["sessionId"] == session_id))
 
         self.enterContext(mock.patch.dict(os.environ, {"RETIRE_UNIT_RUN_ROOT": str(runs),
+                                                       "UNIT_WORKERS_STATE": str(self.root / "unit-workers"),
                                                        "BUILD_HOLD_DIR": str(holds),
                                                        "GUILD_ROLES_STATE": str(self.root / "guild-roles"),
                                                        "GUILD_OWNERSHIP_STATE": str(self.root / "guild-ownership")}))
@@ -257,6 +259,30 @@ class RetireUnitTests(unittest.TestCase):
         self.assertEqual(code, 0, output)
         self.assertIn(f"would stop: Claude session alpha ({DIRECTOR}, pid 4101), through shutdown down", output.splitlines())
         self.assertNotIn("elsewhere", output)
+
+    def test_worker_cancellation_conflict_prints_a_refusal_without_a_traceback(self) -> None:
+        with mock.patch.object(workers, "end_unit", side_effect=workers.WorkerUnavailable(
+                "worker ownership changed; rerun apply")):
+            code, output = self.retire()
+        self.assertEqual(code, 1)
+        self.assertIn("refused:", output)
+        self.assertIn("worker ownership changed; rerun apply", output)
+        self.assertNotIn("Traceback", output)
+        self.assertTrue(self.worktree.exists())
+
+    def test_retirement_ends_the_unit_workers_and_reports_quarantine_removal(self) -> None:
+        store = workers.UnitWorkerLedger(workers.ledger_path("alpha", "alpha-unit"))
+        with store.locked() as ledger:
+            ledger.workers["w7"] = workers.UnitWorker("w7", "impl", "codex", "sol", "high", {},
+                workers.CodexThread("retiring-thread", str(self.root / "codex")), workers.Paused(), [])
+            ledger.quarantined_workers["damaged"] = {"reason": "invalid backend", "record": {}}
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertFalse(store.path.exists())
+        self.assertIn("w7", output)
+        self.assertIn("damaged", output)
+        self.assertIn("invalid backend", output)
+        self.assertIn(str(store.path), output)
 
     def test_retires_a_unit_with_a_seat_a_worker_and_a_reviewer(self) -> None:
         code, output = self.retire()

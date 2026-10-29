@@ -620,7 +620,9 @@ def terminate(pids: list[int], what: dict[int, str], wait: float | None = None) 
 
 def stop_rest(unit: Unit, found: Found) -> list[str]:
     """Stop the workers, reviewers, holds, reservations, claims and processes; what still runs comes back."""
+    from scripts.direct import workers
     left: list[str] = []
+    workers.end_unit(unit.production.slug, unit.name)
     for item in found.runs:
         result = run([sys.executable, str(MESH), "stop", "--session-dir", str(item.run)])
         if result.returncode:
@@ -762,6 +764,7 @@ def retire(unit: Unit, wait_minutes: float) -> int:
 
 
 def main(argv: list[str]) -> int:
+    from scripts.direct.workers import WorkerUnavailable
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     _ = parser.add_argument("slug")
     _ = parser.add_argument("unit")
@@ -773,7 +776,7 @@ def main(argv: list[str]) -> int:
         if cast(bool, options.dry_run):
             return dry_run(unit)
         return retire(unit, cast(float, options.wait_minutes))
-    except (Refused, production_units.Refusal, unit_names.BadName, shutdown_record.InvalidRecord, OSError) as error:
+    except (Refused, production_units.Refusal, unit_names.BadName, WorkerUnavailable, shutdown_record.InvalidRecord, OSError) as error:
         print(f"refused: {error}")
         return 1
 

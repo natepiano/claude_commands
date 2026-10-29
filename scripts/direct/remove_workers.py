@@ -24,6 +24,9 @@ Every launch appends `<id>\\t<name>` to its run's `workers` ledger. This removes
     roots -- the sweep that catches a run whose unit director died before its
     own cleanup ran.
 
+Claude sessions held by a unit worker ledger remain available until that unit
+is retired, regardless of the run's phase or active marker.
+
 A run is live while a run-active marker names its session directory and the
 unit director that wrote the marker is still listed, or while its heartbeat
 log moved in the last `unit_runs.LIVE_HEARTBEAT_SECS`. The heartbeat test covers
@@ -31,10 +34,8 @@ a run with no marker, which prepare_session.sh skips outside a Claude session: a
 worker still working beats every minute.
 
 Only background sessions are ever removed, and never the session running this.
-After a successful Claude session listing, phase cleanup also asks codex_mesh to
-sweep unused app-servers under the real run roots. That destructive sweep is
-best-effort and never runs when the listing failed and cleanup cannot account for
-its other effects.
+Server reclamation belongs to codex_mesh's idle and retired-server cleanup;
+run-end worker cleanup never launches it.
 """
 
 from __future__ import annotations
@@ -65,8 +66,6 @@ LEDGER = "workers"
 CLAUDE_TIMEOUT_SECS = 30
 SHUTDOWN_TIMEOUT_SECS = 30
 SHUTDOWN = Path(__file__).resolve().parents[1] / "shutdown" / "shutdown.py"
-CODEX_MESH = Path(__file__).resolve().parents[1] / "agents" / "codex_mesh.py"
-SWEEP_TIMEOUT_SECS = 120
 
 # Workers launched before the ledger were named `<session dir basename>-<slot>`,
 # and the basename was a uuid, so the name alone says which run owns them.
@@ -160,24 +159,6 @@ def shutdown_command() -> list[str]:
     return [sys.executable, str(SHUTDOWN)]
 
 
-def sweep_app_servers(root: Path) -> None:
-    """Best-effort orphan cleanup after a phase releases its Claude workers."""
-    try:
-        result = subprocess.run(
-            [sys.executable, str(CODEX_MESH), "sweep", "--root", str(root), "--stop"],
-            timeout=SWEEP_TIMEOUT_SECS,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        print(f"remove_workers: app-server sweep could not run: {error}", file=sys.stderr)
-        return
-    if result.returncode:
-        print(
-            f"remove_workers: app-server sweep exited {result.returncode}; worker cleanup continues.",
-            file=sys.stderr,
-        )
-
-
 def live_runs(roots: tuple[Path, ...], listed_sessions: set[str]) -> set[Path]:
     live: set[Path] = set()
     shutdown_state = shutdown_held_sessions()
@@ -243,6 +224,23 @@ def removal_targets(
             _ = targets.setdefault(row.get("id", ""), "this run's phase is over")
         elif not runs & live:
             _ = targets.setdefault(row.get("id", ""), f"run {match.group(1)} is not live")
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.direct import workers
+    try:
+        held = workers.held_claude_sessions()
+        # A run-end or broad sweep must also keep workers predating the unit
+        # ledger while their director is still available to dispatch them.
+        for run in {*(directory for root in roots for directory in root.glob("*")), *own_runs}:
+            if run.is_dir() and workers.run_has_live_director(run):
+                held.update(ledger_ids(run))
+    except (workers.WorkerUnavailable, OSError, ValueError) as error:
+        print(f"remove_workers: keeping workers until unit ledger can be read: {error}", file=sys.stderr)
+        return {}
+    for row in rows:
+        if row.get("sessionId", "") in held or row.get("id", "") in held:
+            _ = targets.pop(row.get("id", ""), None)
+    for identity in held:
+        _ = targets.pop(identity, None)
     return targets
 
 
@@ -263,13 +261,6 @@ def main() -> int:
     if rows is None:
         print("remove_workers: could not list sessions with `claude agents --json`; nothing removed.", file=sys.stderr)
         return 1
-
-    # --session-dir identifies phase cleanup. Restrict the automatic destructive
-    # sweep to the real run roots; tests and callers inspecting another root
-    # must invoke codex_mesh.py themselves. List Claude sessions first so an
-    # early failure can truthfully promise that cleanup changed nothing.
-    if own_runs and any(root.resolve() in {default.resolve() for default in DEFAULT_ROOTS} for root in roots):
-        sweep_app_servers(roots[0])
 
     listed_sessions = {row.get("sessionId", "") for row in rows}
     targets = removal_targets(roots, own_runs, rows, live_runs(roots, listed_sessions))
