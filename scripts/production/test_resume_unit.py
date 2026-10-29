@@ -124,6 +124,23 @@ class ResumeUnitTests(unittest.TestCase):
     def test_resumes_the_recorded_session_in_a_worktree_made_from_the_merge_branch(self) -> None:
         self.assert_resumed(*self.resume())
 
+    def test_retired_as_built_without_a_header_is_passed_to_the_resume_launch(self) -> None:
+        plan = "docs/as-built/alpha.md"
+        path = self.checkout / plan
+        path.parent.mkdir(parents=True)
+        _ = path.write_text("# Alpha as built\n\nThe plan is complete.\n", encoding="utf-8")
+        self.write_row(f"(retired 2026-10-28, worktree removed, session {DIRECTOR}) `{plan}` (run done)")
+        _ = git(self.checkout, "add", "-A")
+        _ = git(self.checkout, "commit", "-q", "-m", "condensed plan")
+
+        code, output = self.resume()
+
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self.calls, [["add_unit.py", "--production", str(self.doc), "alpha-unit",
+                                      "--resume", DIRECTOR, "--cwd", str(self.worktree), "--plan", plan]])
+        self.assertIn(f"| `{plan}` (run done) |", self.row())
+        self.assertNotIn("(retired", self.row())
+
     def test_a_transcript_under_another_account_resumes(self) -> None:
         # The units account moved since the retire: the transcript is under the other config dir.
         self.configs.reverse()
