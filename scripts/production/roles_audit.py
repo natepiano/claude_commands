@@ -99,11 +99,27 @@ class DefinitionFinding:
 
 
 @dataclass(frozen=True)
+class CurrentName:
+    """The live name that replaces a retired one."""
+    name: str
+
+
+@dataclass(frozen=True)
+class NoCurrentName:
+    """The term itself is retired: the thing it named is gone."""
+
+
+@dataclass(frozen=True)
 class RetiredUse:
     path: str
     line: int
     name: str
-    replacement: str
+    replacement: CurrentName | NoCurrentName
+
+    def hint(self) -> str:
+        if isinstance(self.replacement, NoCurrentName):
+            return f"{self.path}:{self.line}: retired {self.name!r}; no current name replaces it"
+        return f"{self.path}:{self.line}: retired {self.name!r}; use {self.replacement.name!r}"
 
 
 @dataclass(frozen=True)
@@ -288,6 +304,7 @@ def check_retired(terms: tuple[Term, ...], files: tuple[LiveFile, ...]) -> tuple
         if not term.retired:
             continue
         retired = {name.casefold() for name in term.retired}
+        replacement = NoCurrentName() if term.name.casefold() in retired else CurrentName(term.name)
         pattern = forms_pattern(tuple(name for _, name in term_forms(term)))
         for file in files:
             text = file.text
@@ -301,7 +318,7 @@ def check_retired(terms: tuple[Term, ...], files: tuple[LiveFile, ...]) -> tuple
                 for match in pattern.finditer(without_paths(line, term.kept)):
                     if match.group().casefold() in retired:
                         source_line = file.source_lines[offset + match.start()] if file.source_lines else number
-                        findings.append(RetiredUse(file.path, source_line, match.group(), term.name))
+                        findings.append(RetiredUse(file.path, source_line, match.group(), replacement))
                 offset += len(line) + 1
     return tuple(findings)
 
@@ -397,7 +414,7 @@ def check_live_sources(terms: tuple[Term, ...], loaded: display_names.Names, sou
     classified = check_fixed_display(loaded, files)
     return SourceCheck(
         (*(source.warning() for source in sources.unread_sources),
-         *(f"{use.path}:{use.line}: retired {use.name!r}; use {use.replacement!r}" for use in uses),
+         *(use.hint() for use in uses),
          *(f"{use.path}:{use.line}: fixed display name {use.name!r}; read config/names.toml"
            for use in classified if isinstance(use, DisplayLabel))),
         tuple(use for use in classified if isinstance(use, SentenceRoleWord)),

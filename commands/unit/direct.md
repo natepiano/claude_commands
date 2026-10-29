@@ -302,10 +302,30 @@ an empty `write_stdin` poll. A longer command, a `verify.sh` run or any other
 started with `mesh_runs.py start`, detaches and pushes its own result to the
 worker, per <WritePromptContract/> item 3. A live run keeps the worker's
 launcher attached, so the dispatch finishes only when the worker is done.
-Records are in `${SESSION_DIR}/mesh_runs/`, each log beside its record; cancel
-a run with `kill -TERM -- -<pid>`. A message from a worker's run saying no
+Records are in `${SESSION_DIR}/mesh_runs/`, each log beside its record.
+A message from a worker's run saying no
 launcher is attached carries the result to you: dispatch that worker
 (`implement.sh --to <full worker name>`) when it should act on it.
+
+When a decision makes a running or queued test, lint or build run useless,
+cancel it in the same turn to free its memory and its place in the queue.
+This applies when a phase is parked, a round fails, a newer tree replaces the
+run's tree, or a result already in hand answers the question. No run finishes
+only to complete a report.
+
+- For a `mesh_runs.py` run, read `pid` from its record in
+  `${SESSION_DIR}/mesh_runs/` (the `.json` beside its log). Signal only while
+  its `status` is `running` and `ps -p <pid> -o args=` shows
+  `mesh_runs.py supervise` with that record's path, so a reused pid is never
+  hit; then run `kill -TERM -- -<pid>`. A start that found the same run live
+  prints no pid: read it from that run's record.
+- A detached `verify.sh` run uses the same record and command: `verify.sh`
+  detaches through `mesh_runs.py` and handles TERM to stop its step.
+- For a run in the memory queue, cancel its owning run as above. The queue
+  drops dead callers on its next read. It has no separate cancel command;
+  `memory_admit.py release` only releases a reservation. A clean queue cancel
+  and one command for all run kinds are not built yet
+  (`docs/plans/sdlc-run-cancel-design.md`); report any run you cannot cancel.
 </WorkerRuns>
 
 <WorkerLaunchFailure>
@@ -626,6 +646,7 @@ closes each at its own end. Name the phase on every launch,
 `implement.sh --phase <id>` and `review.sh --phase <id>`: the pass is stamped
 with it, and the launcher writes its files to that phase's `${PHASE_DIR}`.
 A launch without a phase is refused (the user, 2026-10-28).
+When a park makes a run useless, apply <WorkerRuns/>.
 
 Before each launch, check the prompt's phase against its active instance and title. Run start-phase and finish-phase at the real boundaries and keep parallel phases separately identified. Do not launch against a stale or absent instance. Classify planned implementation/deployment as implementation and command-only verification as an activity. A fix launch names its defect, failed gate or ledger batch. Correct active state only through supported recorder operations, preserving old evidence; never fabricate starts/finishes or rewrite historic records. Missing historic boundaries stay uncertain in analysis. (the user, 2026-10-28)
 
@@ -1142,6 +1163,7 @@ reports `No active phase to report`, continue without the progress report.
 
 <FixDispatch>
 Apply <LongLivedWorkers/>.
+When a repair round fails or its next edit replaces a run's tree, apply <WorkerRuns/>.
 
 Find a failing test's cause before you scope its repair: read the failure text
 and the fixture it runs in. A repair aimed at a cause no one has checked costs

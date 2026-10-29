@@ -58,6 +58,11 @@ opening in <ReviewPromptContract/>; one to a Codex reviewer also carries item
    (pass or fail, exit code, log path, last lines) arrives as your next
    message, also after an account move or a stop. Never poll, sleep, call
    `wait`, loop on a status file, or post a waiting status.
+   When a later edit or result makes a run of yours useless, cancel it in
+   the same turn: take `pid` from the run's record (the `.json` beside its
+   log), check that `ps -p <pid> -o args=` still shows
+   `mesh_runs.py supervise` with that record's path, then run
+   `kill -TERM -- -<pid>`.
    ```
 
    Every model call resends the worker's whole context, and on 2026-10-15

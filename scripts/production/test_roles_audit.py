@@ -60,8 +60,17 @@ class NameTests(unittest.TestCase):
         ])
         uses = audit.check_retired(terms, files)
         self.assertEqual([(use.name, use.replacement) for use in uses],
-                         [("seat", "worker"), ("seats", "worker"),
-                          ("CODEX SEAT", "worker"), ("Codex seats", "worker")])
+                         [("seat", audit.CurrentName("worker")), ("seats", audit.CurrentName("worker")),
+                          ("CODEX SEAT", audit.CurrentName("worker")), ("Codex seats", audit.CurrentName("worker"))])
+
+    def test_a_term_that_retires_itself_names_no_replacement(self) -> None:
+        gone = term("review pool", retired=("review pool",))
+        renamed = term("worker", "seat", retired=("seat",))
+        files = (audit.LiveFile("docs/a.md", "The review pool and one seat."),)
+        self.assertEqual([use.hint() for use in audit.check_retired((gone, renamed), files)], [
+            "docs/a.md:1: retired 'review pool'; no current name replaces it",
+            "docs/a.md:1: retired 'seat'; use 'worker'",
+        ])
 
     def test_scoped_protocol_history_and_legacy_contexts_keep_lexical_counts(self) -> None:
         data = WORKER_TERMS + '''
