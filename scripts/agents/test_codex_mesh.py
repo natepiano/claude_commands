@@ -1221,6 +1221,45 @@ class MeshCommandFixture(unittest.TestCase):
         return agent_accounts.KnownCodexAccount(selected, login, "codex2")
 
 
+    def configure_context(self) -> None:
+        self.patches.enter_context(patch.dict(os.environ, {
+            "UNIT_WORKERS_STATE": str(self.session_dir / "unit-workers"),
+        }))
+        _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps({
+            "production": "natedev", "unit": "models-unit", "working_dir": str(self.session_dir),
+        }))
+
+
+@final
+class WorkerShownNameTests(MeshCommandFixture):
+    def test_replacement_thread_and_its_followup_notice_use_the_current_unit_context(self) -> None:
+        self.configure_context()
+        self.write_pool_roster({"worker": {"thread_id": "old-follow-thread", "status": "done",
+                                          "role": "review", "port": self.server.port}})
+        self.failing_method = "thread/resume"
+
+        code, errors = self.run_follow(role="review")
+
+        self.assertEqual(code, 0, errors)
+        names = [_as_test_dict(request["params"])["name"] for request in self.methods("thread/name/set")]
+        self.assertTrue(names)
+        for name in names:
+            self.assertTrue(str(name).startswith("natedev · models-unit · "), name)
+            self.assertNotIn("(worker)", str(name))
+        notice = (self.session_dir / "board.log").read_text()
+        self.assertIn(str(names[-1]), notice)
+        self.assertIn(f"continues as new thread {THREAD_ID}", notice)
+        self.assertEqual(len(self.methods("turn/start")), 1)
+
+    def test_help_for_addressable_commands_uses_the_worker_vocabulary(self) -> None:
+        for command in ([], ["start"], ["follow"], ["prime"], ["fork"], ["reopen"], ["adopt"]):
+            with self.subTest(command=command), contextlib.redirect_stdout(io.StringIO()) as output:
+                with self.assertRaises(SystemExit) as ended:
+                    _ = codex_mesh.main([*command, "--help"])
+                self.assertEqual(ended.exception.code, 0)
+                self.assertNotRegex(output.getvalue().lower(), r"\bseats?\b")
+
+
 class FixtureHomeSafetyTests(unittest.TestCase):
     def test_worker_selection_refuses_real_home_descendants_and_symlinks(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/tmp")))
@@ -1909,6 +1948,7 @@ class MeshCommandTests(MeshCommandFixture):
                          + '{"message": "invented release refusal"}\n')
 
     def test_prime_creates_and_names_a_read_only_review_template_without_a_turn(self) -> None:
+        self.configure_context()
         arguments = self.prime_cli("--model", "gpt-test", "--service-tier", "fast", "--task", "delegate.review")
         instructions = (self.session_dir / "review-instructions.txt").read_text(encoding="utf-8")
         self.write_pool_roster({"other": {"thread_id": "other-thread", "status": "done"}})
@@ -1927,7 +1967,8 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(params.get("cwd"), str(self.session_dir))
         self.assertEqual(params.get("model"), "gpt-test")
         self.assertEqual(params.get("serviceTier"), "fast")
-        self.assertEqual(requests[1]["params"], {"threadId": THREAD_ID, "name": "template"})
+        self.assertEqual(requests[1]["params"], {
+            "threadId": THREAD_ID, "name": "natedev · models-unit · code reviewer"})
         self.assert_review_record("template", THREAD_ID)
         self.assertEqual(self.roster()["other"], {"thread_id": "other-thread", "status": "done"})
         self.assertEqual(_as_test_dict(self.roster()["template"]).get("context_tokens"), 0)
@@ -1962,6 +2003,7 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(self.methods("thread/start"), [])
 
     def test_fork_resumes_the_source_before_creating_and_naming_a_read_only_review_thread(self) -> None:
+        self.configure_context()
         source = {"thread_id": THREAD_ID, "status": "done", "role": "review"}
         self.write_pool_roster({"template": source})
 
@@ -1975,7 +2017,8 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(requests[1]["params"], {
             "threadId": THREAD_ID, "sandbox": "read-only", "approvalPolicy": "never",
         })
-        self.assertEqual(requests[2]["params"], {"threadId": self.fork_thread_id, "name": "reviewer"})
+        self.assertEqual(requests[2]["params"], {
+            "threadId": self.fork_thread_id, "name": "natedev · models-unit · code reviewer 2"})
         self.assert_review_record("reviewer", self.fork_thread_id)
         self.assertEqual(self.roster()["template"], source)
         self.assertEqual(self.methods("turn/start"), [])
@@ -2358,6 +2401,7 @@ class MeshCommandTests(MeshCommandFixture):
                     self.assertEqual(request["params"], {"threadId": THREAD_ID})
 
     def test_unreadable_standing_instructions_fail_before_any_turn(self) -> None:
+        self.configure_context()
         path = self.session_dir / "missing-standing-instructions.txt"
         cases = [(self.follow_cli(), "worker"), (["compact", "--to", "worker"], "worker"),
                  (["reset", "--to", "worker"], "worker"),
@@ -2371,7 +2415,8 @@ class MeshCommandTests(MeshCommandFixture):
 
                 self.assertEqual(code, 1, errors)
                 self.assertEqual(output, "")
-                self.assertTrue(errors.startswith(f"codex_mesh: {name}: "), errors)
+                label = "natedev · models-unit · code reviewer" if arguments[0] == "follow" else name
+                self.assertTrue(errors.startswith(f"codex_mesh: {label}: "), errors)
                 self.assertIn(path.name, errors)
                 self.assertEqual(self.methods("turn/start"), [])
                 self.assertEqual(self.methods("thread/compact/start"), [])
@@ -2921,7 +2966,7 @@ class MeshCommandTests(MeshCommandFixture):
         roster_path = self.session_dir / codex_mesh.ROSTER_FILE
         before = roster_path.read_bytes()
         with self.assertRaisesRegex(SystemExit, r"roles\.py recover"):
-            _ = codex_mesh._seat_sandbox(  # pyright: ignore[reportPrivateUsage]
+            _ = codex_mesh._worker_sandbox(  # pyright: ignore[reportPrivateUsage]
                 self.start_args(), str(self.session_dir), "worker")
         with self.assertRaisesRegex(SystemExit, r"roles\.py recover"):
             _ = codex_mesh._resume_params(  # pyright: ignore[reportPrivateUsage]
@@ -3219,19 +3264,22 @@ class MeshCommandTests(MeshCommandFixture):
         return result
 
     def test_follow_name_taken_during_resume_releases_fallback_without_touching_new_owner(self) -> None:
+        self.configure_context()
         code, errors = self.follow_with_name_taken("thread/resume")
-        self.assertEqual((code, errors), (1, "codex_mesh: worker: name was taken while the follow-up ran; "
+        self.assertEqual((code, errors), (1, "codex_mesh: natedev · models-unit · implementer: name was taken while the follow-up ran; "
                                          + "follow-up did not start\n"))
 
     def test_follow_name_taken_after_fallback_is_named_releases_it_without_starting_a_turn(self) -> None:
+        self.configure_context()
         code, errors = self.follow_with_name_taken("thread/name/set")
-        self.assertEqual((code, errors), (1, "codex_mesh: worker: name was taken while the follow-up ran; "
+        self.assertEqual((code, errors), (1, "codex_mesh: natedev · models-unit · implementer: name was taken while the follow-up ran; "
                                          + "follow-up did not start\n"))
 
     def test_follow_name_taken_reports_unconfirmed_fallback_release_and_keeps_new_owner(self) -> None:
+        self.configure_context()
         code, errors = self.follow_with_name_taken("thread/resume", release_unknown=True)
         self.assertEqual(code, 1)
-        self.assertEqual(errors, "codex_mesh: worker: name was taken while the follow-up ran; "
+        self.assertEqual(errors, "codex_mesh: natedev · models-unit · implementer: name was taken while the follow-up ran; "
                          + f"replacement thread {THREAD_ID} not released: "
                          + "old thread release could not be confirmed: codex_mesh: thread/unsubscribe failed: "
                          + '{"message": "invented release refusal"}\n')
@@ -3420,6 +3468,27 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertTrue(errors.startswith("agents_log: "), errors)
         self.assertEqual(self.worker_record()["status"], "done")
         self.assertEqual(len(self.methods("turn/start")), 2)
+
+    def test_a_preclaimed_follow_reports_handoff_if_ownership_moves_before_the_child_check(self) -> None:
+        self.assertEqual(self.run_start(), (0, ""))
+        args = self.start_args()
+        args.to = "worker"
+        args.role = "review"
+        args.claim_pid = os.getpid()
+        self.assertEqual(codex_mesh.command_can_follow(args), 0)
+        record = self.worker_record()
+        destination = str(self.session_dir.parent / "taking-run")
+        record["adopted_to"] = destination
+        codex_mesh.advance_worker_roster_revision(record)
+        self.write_pool_roster({"worker": record})
+        args.message_file = str(self.session_dir / "follow-up.txt")
+        _ = Path(args.message_file).write_text("Do not send work after losing ownership")
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            code = codex_mesh.command_follow(args)
+        self.assertEqual(code, 2, errors.getvalue())
+        self.assertIn(f"worker handed off to {destination}", errors.getvalue())
+        self.assertEqual(len(self.methods("turn/start")), 1)
+        self.assertEqual(self.worker_record()["adopted_to"], destination)
 
     def test_preclaimed_follow_survives_a_deeply_nested_usage_line(self) -> None:
         self.assertEqual(self.run_start(), (0, ""))
@@ -7437,7 +7506,7 @@ class MeshCommandTests(MeshCommandFixture):
 
         # Finish the original turn before selecting the new account: startup
         # file wakes do not establish an idle resident or a retry tick.
-        # Advance the duration seam after real quiet reads, independently of load.
+        # Advance the simulated clock after real quiet reads, independently of load.
         with (patch.object(codex_mesh.Client, "call", rpc),
               patch.object(codex_mesh.Client, "next_frame", poll),
               patch.object(codex_mesh, "_deliver_reply", reply),
@@ -9142,8 +9211,7 @@ raise SystemExit(codex_mesh.main(['end', '--session-dir', sys.argv[1], '--to', '
                     try:
                         _ = update.result(timeout=2)
                     finally:
-                        # Only our child may be stopped; this also frees the
-                        # inversion's roster lock on the unrepaired code.
+                        # Only our child may be stopped; this also frees its roster lock when the lock order is inverted.
                         if not update.done():
                             child.kill()
                             _ = child.wait(timeout=3)
@@ -9449,11 +9517,12 @@ class WorkerPauseTests(MeshCommandFixture):
         self.assertEqual(other_server.read_bytes(), before)
 
     def test_board_slot_comes_from_stored_role_for_an_arbitrary_address(self) -> None:
+        self.configure_context()
         self.write_pool_roster({"w7": {"thread_id": THREAD_ID, "status": "done", "role": "fix"}})
-        with patch.object(subprocess, "run") as run:
-            codex_mesh._post_board_status(str(self.session_dir), "w7", "Waiting for assignment")  # pyright: ignore[reportPrivateUsage]
-        command = cast(list[str], run.call_args.args[0])
-        self.assertEqual(command[3:6], [str(self.session_dir), "fix", "status"])
+        codex_mesh._post_board_status(str(self.session_dir), "w7", "Waiting for assignment")  # pyright: ignore[reportPrivateUsage]
+        line = (self.session_dir / "board.log").read_text()
+        self.assertEqual(len(line.splitlines()), 1)
+        self.assertIn("[fix] status: natedev · models-unit · repair worker: Waiting for assignment", line)
 
 
 @final

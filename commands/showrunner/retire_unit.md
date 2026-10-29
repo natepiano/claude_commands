@@ -26,7 +26,7 @@ the reason:
 1. Each Claude session that works in the worktree, the unit director and its Claude workers, and the director of each of the worktree's runs wherever it works, stops
    through `shutdown.py down`: it pauses and stops at its ready mark. Its restore is then forgotten,
    so no restart brings it back.
-2. Each run of the worktree with an app-server stops it and ends its Codex workers.
+2. Each run of the worktree with an app-server stops it and ends its Codex workers. `workers.end_unit` then prints one line for each pending message, owed continuation, detached run and reservation it cancels, and for each quarantined entry it removes, and deletes the unit's worker ledger. A worker that cannot end refuses the retire; run it again.
 3. The unit's review-pool reviewers retire. A reviewer still reviewing stays.
 4. The build holds of the unit's sessions release, its berth reservations release, and the process
    of each Mac claim on the worktree stops.

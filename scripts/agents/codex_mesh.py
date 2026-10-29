@@ -117,6 +117,7 @@ class UnitWorkerRegistry(Protocol):
     def run_has_live_director(self, run: Path) -> bool: ...
     def note_backend(self, run: Path, name: str, thread_id: str, home: Path) -> None: ...
     def ledger_for_run(self, run: Path) -> UnitWorkerLedgerLocation: ...
+    def shown_name(self, run: Path, address: str, *, role: str = "") -> str: ...
     def adopt(self, source: Path, destination: Path, name: str) -> str: ...
     def allocation_is_live(self, record: Mapping[str, object]) -> bool: ...
     def clear_allocation(self, record: dict[str, object]) -> None: ...
@@ -268,7 +269,6 @@ DETACHED_RUN_START_GRACE_SECS = 60.0
 # mesh_runs.py ends a run whose supervisor is gone; its delivery may wait on send.py.
 MESH_RUNS_SCRIPT = Path(__file__).with_name("mesh_runs.py")
 DEAD_RUN_END_TIMEOUT_SECS = 300
-BOARD_HELPER = Path(__file__).resolve().parent.parent / "direct" / "board.sh"
 # The folders that hold unit run folders. An app-server whose session directory is one of their
 # children serves that run alone, so its workers get the run as UNIT_RUN_DIR.
 RUN_ROOTS: tuple[Path, ...] = unit_runs.run_roots()
@@ -1298,14 +1298,10 @@ def _post_board_status(session_dir: str, name: str, message: str) -> None:
     slot = _as_str(record.get("role"))
     if not slot:
         return
-    with contextlib.suppress(OSError, subprocess.TimeoutExpired):
-        _ = subprocess.run(
-            ["bash", str(BOARD_HELPER), "post", session_dir, slot, "status", message],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
+    message = f"{unit_workers.shown_name(Path(session_dir), name)}: {message}"
+    with contextlib.suppress(OSError):
+        _ = subprocess.run(["bash", str(Path(__file__).resolve().parents[1] / "direct/board.sh"),
+                            "post", session_dir, slot, "status", message], capture_output=True, text=True)
 
 
 @dataclass(frozen=True)
@@ -1493,6 +1489,8 @@ def _set_roster_assignment(session_dir: str, name: str, role: WorkerRole, task: 
         entry = _as_dict(roster.get(name))
         if entry and not entry.get("adopted_to"):
             entry["role"] = role
+            if entry.get("unit_ledger") and not entry.get("held_design_id") and not entry.get("instructions_file"):
+                entry["access_policy"] = {"kind": "ReadOnlyReviewer" if role == "review" else "WorkerLaunchPolicy"}
             if task:
                 entry["task"] = task
             _advance_roster_revision(entry)
@@ -1536,7 +1534,7 @@ def _lookup_state(session_dir: str, name: str) -> RosterThread:
     return _roster_thread(_lookup(session_dir, name))
 
 
-def _seat_sandbox(args: argparse.Namespace, session_dir: str, name: str) -> str:
+def _worker_sandbox(args: argparse.Namespace, session_dir: str, name: str) -> str:
     """Select the sandbox from the worker's resolved access policy."""
     record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
     policy = roster_access_policy(record)
@@ -3436,6 +3434,7 @@ def _follow_worker(args: argparse.Namespace) -> int:
             _read_account_move(session_dir, name, _as_str(record.get("thread_id"))), AccountMoveMarker)
         if not moving:
             raise SystemExit("codex_mesh: held role assignment must come from roles.py")
+    display_name = unit_workers.shown_name(Path(session_dir), name)
     role = _worker_role(args)
     claim_pid = _as_int(_attr(args, "claim_pid"))
     try:
@@ -3444,22 +3443,27 @@ def _follow_worker(args: argparse.Namespace) -> int:
         print(exc, file=sys.stderr)
         return 1 if claim_pid else 2
     if claim_pid:
+        if isinstance(state, AdoptedThread):
+            print(f"codex_mesh: {display_name}: worker handed off to {state.to_run}; assignment completion unknown",
+                  file=sys.stderr)
+            return 2
         if not isinstance(state, StartingThread) or state.launcher_pid != claim_pid:
-            print(f"codex_mesh: {name}: follow claim changed after dispatch", file=sys.stderr)
+            print(f"codex_mesh: {display_name}: follow claim changed after dispatch", file=sys.stderr)
             return 1
     else:
         reason = _follow_refusal(session_dir, state, name=name)
         if reason:
-            print(f"codex_mesh: {name}: {reason}; follow refused", file=sys.stderr)
+            print(f"codex_mesh: {display_name}: {reason}; follow refused", file=sys.stderr)
             return 2
     assert not isinstance(state, InvalidThread)
     thread_id = state.thread_id
     if not claim_pid and not _claim_follow(
         session_dir, name, thread_id, os.getpid(), role, _dispatch_lens(args)
     ):
-        print(f"codex_mesh: {name} was already claimed", file=sys.stderr)
+        print(f"codex_mesh: {display_name} was already claimed", file=sys.stderr)
         return 2
     _set_roster_assignment(session_dir, name, role, _as_str(_attr(args, "task")))
+    display_name = unit_workers.shown_name(Path(session_dir), name)
     if claim_pid:
         _record_assignment(thread_id, role, _dispatch_lens(args), only_if_changed=True)
     owner_pid = claim_pid or os.getpid()
@@ -3491,10 +3495,9 @@ def _follow_worker(args: argparse.Namespace) -> int:
                                    accepting_messages=not _messages_closed(handle, thread_id))
         if record.get("unit_ledger"):
             unit_workers.note_backend(Path(session_dir), name, resumed.thread_id, home)
-            context = unit_workers.ledger_for_run(Path(session_dir)).path
             _ = _require(client.call("thread/name/set", {
                 "threadId": resumed.thread_id,
-                "name": f"{context.parent.name} · {context.stem} · {role} ({name})",
+                "name": unit_workers.shown_name(Path(session_dir), name, role=role),
             }), "thread/name/set")
         if resumed.thread_replaced:
             thread_id = resumed.thread_id
@@ -3514,13 +3517,13 @@ def _follow_worker(args: argparse.Namespace) -> int:
         outcome = _stream_turn(args, client, port, session_dir, name, thread_id, prompt, timeout, opened, follow=True)
         client = None
         if isinstance(outcome, (FailedBeforeThread, FailedWithThread)):
-            print(f"codex_mesh: {name}: {outcome.failure}", file=sys.stderr)
+            print(f"codex_mesh: {display_name}: {outcome.failure}", file=sys.stderr)
             return 1
         if isinstance(outcome, CapacityRetriesExhausted):
-            print(f"codex_mesh: {name}: {outcome.message(name)}", file=sys.stderr)
+            print(f"codex_mesh: {display_name}: {outcome.message(name)}", file=sys.stderr)
             return 1
         if isinstance(outcome, WorkerHandedOff):
-            print(f"codex_mesh: {name}: worker handed off to {outcome.to_run}; assignment completion unknown", file=sys.stderr)
+            print(f"codex_mesh: {display_name}: worker handed off to {outcome.to_run}; assignment completion unknown", file=sys.stderr)
             return 2
         return 0
     except (ConnectionError, OSError, SystemExit, unit_workers.WorkerUnavailable, ValueError) as exc:
@@ -3532,7 +3535,7 @@ def _follow_worker(args: argparse.Namespace) -> int:
                     _restore_follow_claim(session_dir, name, owner_pid, finished=True)
             except (ConnectionError, OSError, SystemExit):
                 pass
-        print(f"codex_mesh: {name}: {exc}", file=sys.stderr)
+        print(f"codex_mesh: {display_name}: {exc}", file=sys.stderr)
         return 1
     finally:
         if client is not None:
@@ -4102,7 +4105,8 @@ def _start_streamed_turn(stream: TurnStream, prompt: str, log: TextIO) -> Stream
     # The roster is written before this call: a disconnect after thread
     # creation must still leave its id reachable.
     if not stream.follow:
-        _ = stream.client.call("thread/name/set", {"threadId": stream.thread_id, "name": stream.name})
+        _ = stream.client.call("thread/name/set", {"threadId": stream.thread_id,
+            "name": unit_workers.shown_name(Path(stream.session_dir), stream.name)})
     initial_move = (_read_account_move(stream.session_dir, stream.name, stream.thread_id)
                     if _attr(stream.args, "account_move") is True else NoAccountMove())
     started = _start_workers_turn(
@@ -4734,7 +4738,8 @@ def _after_turn_end(stream: TurnStream, log: TextIO, turn_outcome: TurnOutcome) 
     stream.failure = stream.followed_failure or (turn_outcome.detail if isinstance(turn_outcome, TurnFailed) else "")
     if stream.resident:
         stream.replies += 1
-        _deliver_reply(stream.name, stream.replies, stream.final_answer, stream.failure,
+        _deliver_reply(unit_workers.shown_name(Path(stream.session_dir), stream.name),
+                       stream.replies, stream.final_answer, stream.failure,
                        stream.summary_path, stream.reply_path, log)
         stream.final_answer = ""
         stream.failure = ""
@@ -4813,7 +4818,8 @@ def _finish_stream(stream: TurnStream) -> RunOutcome:
     if not stream.resident or stream.failure or stream.end_marker.exists():
         _ = _end_unwatched_turn(stream.port, stream.thread_id, stream.log_path)
     if not stream.resident or stream.replies == 0:
-        _finish_summary(stream.summary_path, stream.reply_path, stream.name, stream.replies + 1,
+        _finish_summary(stream.summary_path, stream.reply_path,
+                        unit_workers.shown_name(Path(stream.session_dir), stream.name), stream.replies + 1,
                         stream.final_answer or stream.failure or f"The worker {stream.name} produced no summary.")
     if isinstance(stream.run_outcome, CapacityRetriesExhausted):
         return replace(stream.run_outcome, pending_refusal=stream.pending_refusal, director=stream.director)
@@ -5010,7 +5016,7 @@ def _resume_worker_thread(
     previous_record = _lookup(session_dir, name)
     instructions_file = _as_str(previous_record.get("instructions_file"))
     held = bool(previous_record.get("held_design_id"))
-    sandbox = _seat_sandbox(args, session_dir, name)
+    sandbox = _worker_sandbox(args, session_dir, name)
     resumed = client.call("thread/resume", params)
     if not resumed.get("error"):
         result = _require(resumed, "thread/resume")
@@ -5034,11 +5040,15 @@ def _resume_worker_thread(
     if not replacement:
         raise SystemExit("thread/start returned no replacement thread id")
     record: StartingRecord = {"thread_id": replacement, "status": "starting", "port": client.port}
+    if "access_policy" in previous_record:
+        # Assignment policy is durable for unit workers, even on a new thread.
+        # Ordinary workers without one still take each launch's sandbox.
+        record["access_policy"] = dict(previous_record["access_policy"])
     if instructions_file:
         record["instructions_file"] = instructions_file
     if not _update_roster_if_expected(session_dir, name, record, RosterOnThread(thread_id)):
         _refuse_taken_follow_up(client, replacement, session_dir)
-    _ = client.call("thread/name/set", {"threadId": replacement, "name": name})
+    _ = client.call("thread/name/set", {"threadId": replacement, "name": unit_workers.shown_name(Path(session_dir), name)})
     _post_board_status(
         session_dir, name,
         f"{codex_home_display(workers_home)} refused to resume {thread_id}; worker continues as new thread {replacement}",
@@ -5285,7 +5295,7 @@ def _move_idle_worker(
                     inputs = (["Continue where you stopped.", *([message] if message else []), *messages] if owes_continuation
                               else [message, *messages] if message else messages)
                 cleanup = WorkerTurnCleanup(port, thread_id)
-                turn_id = _start_turn(moved, args, thread_id, _seat_sandbox(args, session_dir, name),
+                turn_id = _start_turn(moved, args, thread_id, _worker_sandbox(args, session_dir, name),
                                       inputs[0], tuple(inputs[1:]))
                 if owes_continuation and not turn_id:
                     raise SystemExit("quota continuation was not confirmed by turn/start; task is still owed")
@@ -5398,7 +5408,7 @@ def _turn_service_tier(client: Client, args: argparse.Namespace) -> str:
 
 
 def _start_turn(
-    client: Client, args: argparse.Namespace, thread_id: str, seat_sandbox: str, message: str,
+    client: Client, args: argparse.Namespace, thread_id: str, worker_sandbox: str, message: str,
     pending: tuple[str, ...] = (),
 ) -> str:
     inputs: list[dict[str, str]] = [{"type": "text", "text": message}]
@@ -5416,7 +5426,7 @@ def _start_turn(
     # Every turn names its policy: the app-server keeps a thread's last turn policy, so a
     # turn that leaves it out would inherit a previous `--read-only` turn's sandbox.
     params["sandboxPolicy"] = _turn_sandbox_policy(
-        READ_ONLY_SANDBOX if _attr(args, "read_only") is True else seat_sandbox)
+        READ_ONLY_SANDBOX if _attr(args, "read_only") is True else worker_sandbox)
     model = _as_str(_attr(args, "model"))
     if model:
         params["model"] = model
@@ -5427,7 +5437,13 @@ def _start_turn(
     params["serviceTier"] = service_tier
     client.turn_submitted_at = time.time()
     result = _serving_request(client, "turn/start", params, submits_work=True)
-    return _as_str(_as_dict(result.get("turn")).get("id"))
+    turn_id = _as_str(_as_dict(result.get("turn")).get("id"))
+    receipt_file = _as_str(_attr(args, "submission_receipt_file"))
+    if turn_id and receipt_file:
+        with Path(receipt_file).open("a", encoding="utf-8") as receipt:
+            _ = receipt.write(json.dumps({"thread_id": thread_id, "turn_id": turn_id,
+                                          "messages": [message, *pending]}) + "\n")
+    return turn_id
 
 
 def _log_uninterrupted_thread(log_path: Path, thread_id: str, reason: str) -> None:
@@ -5997,7 +6013,8 @@ class UnrecordedWorkerThread:
     thread_id: str
 
 
-def open_unit_worker(session_dir: str, name: str, role: str) -> dict[str, object]:
+def open_unit_worker(session_dir: str, name: str, role: str, *, model: str = "",
+                     effort: str = "") -> dict[str, object]:
     """Open an idle thread; assignment starts its first turn later through follow."""
     command = ['bash', '-c',
                'source "$1"; agents_resolve "direct.$2" || exit; printf "%s\\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" "${AGENT_SERVICE_TIER:-default}"', 'workers',
@@ -6006,7 +6023,9 @@ def open_unit_worker(session_dir: str, name: str, role: str) -> dict[str, object
     fields = resolved.stdout.strip().split()
     if resolved.returncode or len(fields) != 4:
         raise unit_workers.WorkerUnavailable(resolved.stderr.strip() or "cannot resolve worker model")
-    family, model, effort, service_tier = fields
+    family, configured_model, configured_effort, service_tier = fields
+    model = model or configured_model
+    effort = effort or configured_effort
     if family != "codex":
         raise unit_workers.WorkerUnavailable("new persistent worker requires a Codex assignment")
     state = _read_json_object(_session_path(session_dir, plan_history.STATE_FILENAME))
@@ -6026,8 +6045,7 @@ def open_unit_worker(session_dir: str, name: str, role: str) -> dict[str, object
         if not thread_id:
             raise unit_workers.WorkerUnavailable("thread/start returned no thread id")
         allocation = UnrecordedWorkerThread(thread_id)
-        ledger_path = unit_workers.ledger_for_run(Path(session_dir)).path
-        display_name = f"{ledger_path.parent.name} · {ledger_path.stem} · {role} ({name})"
+        display_name = unit_workers.shown_name(Path(session_dir), name, role=role)
         _ = _require(client.call("thread/name/set", {"threadId": thread_id, "name": display_name}), "thread/name/set")
         record: FollowableRecord = {"thread_id": thread_id, "status": "paused", "role": cast(WorkerRole, role),
                                     "model": model, "effort": effort, "access_policy": policy}
@@ -8144,7 +8162,7 @@ def command_prime(args: argparse.Namespace) -> int:
         thread_id = _as_str(_as_dict(result.get("thread")).get("id"))
         if not thread_id:
             raise SystemExit("thread/start returned no thread id")
-        _ = _require(client.call("thread/name/set", {"threadId": thread_id, "name": name}), "thread/name/set")
+        _ = _require(client.call("thread/name/set", {"threadId": thread_id, "name": unit_workers.shown_name(Path(session_dir), name, role="review")}), "thread/name/set")
         record: FollowableRecord = {
             "thread_id": thread_id, "status": "done", "role": "review",
             "context_tokens": 0, "instructions_file": str(instructions_path),
@@ -8210,7 +8228,7 @@ def command_fork(args: argparse.Namespace) -> int:
         thread_id = _as_str(_as_dict(result.get("thread")).get("id"))
         if not thread_id:
             raise SystemExit("thread/fork returned no thread id")
-        _ = _require(client.call("thread/name/set", {"threadId": thread_id, "name": name}), "thread/name/set")
+        _ = _require(client.call("thread/name/set", {"threadId": thread_id, "name": unit_workers.shown_name(Path(session_dir), name, role="review")}), "thread/name/set")
         record: FollowableRecord = {
             "thread_id": thread_id, "status": "done", "role": "review", "context_tokens": 0,
             "access_policy": {"kind": "ReadOnlyReviewer"},
@@ -8426,6 +8444,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = follow.add_argument("--summary-file", required=True)
     _ = follow.add_argument("--reply-file", default="")
     _ = follow.add_argument("--log-file", required=True)
+    _ = follow.add_argument("--submission-receipt-file", default="", help=argparse.SUPPRESS)
     _ = follow.add_argument("--model", default="")
     _ = follow.add_argument("--effort", default="")
     _ = follow.add_argument("--service-tier", default="")

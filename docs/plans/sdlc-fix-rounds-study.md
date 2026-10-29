@@ -1,6 +1,6 @@
 # Repair rounds: evidence study
 
-The study covers **15 phases, 260 repair rounds and 271 hours of fix time**. Failed fixes account for **36% of rounds and 49% of time**; specification gaps account for **17% and 19%**; mechanical work accounts for **15% and 11%**. These rounded figures come from [Totals](#totals); the three mixed records are excluded. Medians and phase/time shares in the round report use reviewed phases only; unreviewed phases remain in its rows and totals.
+The study covers the **15 phases with the most repair rounds** among the 1,867 phases started in the 60 days to 2026-10-20 (mixed records removed): **260 repair rounds and 271 hours of fix time**. These figures describe those 15 phases, not all phases. In them, failed fixes account for **36% of rounds and 49% of time**; specification gaps account for **17% and 19%**; mechanical work accounts for **15% and 11%**. These rounded figures come from [Totals](#totals); the three mixed records are excluded. Medians and phase/time shares in the round report use reviewed phases only; unreviewed phases remain in its rows and totals.
 
 ## Method and selection
 
