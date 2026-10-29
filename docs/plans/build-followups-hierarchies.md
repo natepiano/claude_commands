@@ -202,3 +202,28 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - `test` — `test_measure.py`: `compare` on fixtures with known before and after values
 
 **Acceptance gate:** unit tests green; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; Results holds real numbers for each step, judged on the measure and review point each of Phases 3–5 names. **Measure and review point:** this phase is the review point for Steps 1, 2 and 4. At phase end the unit director sends the showrunner the Results and the keep-or-drop list as one question for the user.
+
+### Phase 7 — The baseline measure and the push audit count failed checks by one rule, and session names come from config  · status: done
+**Depends on:** Phases 3 and 5 (showrunner ruling 2026-10-28: runs now, while Phase 4 waits on sdlc gate G1).
+
+#### Work Order
+
+**Goal:** the baseline measure and the push audit give the same count of pushes sent after a failed text check, and the audit takes the names of bare sessions from config, not from code.
+
+**Hana link:** indirect. Two reports that disagree on user attention mislead the Phase 6 review.
+
+**Spec:**
+- `measure.py` counts a push after a failed text check with `push_audit.after_failed_check`, the reference rule; it keeps no second rule. The Baseline window then reads 17 in both reports (n=64), and the last 7 days agree too.
+- The names of top-level sessions that send bare sources (today `hana`) live in one config file as a key and a display name, per the user's names-through-config rule (2026-10-28). `push_audit.owner()` reads that config; no session name is written in code. A test fails when a session name is written in `push_audit.py`.
+- A `nate.adhoc` push that fails its check is held (messaging-unit c73a2d02): it has no delivered push row, so the audit leaves it out. A test pins this with the real record shapes.
+
+**Files:**
+- `scripts/hierarchies/measure.py`, `scripts/hierarchies/test_measure.py` — the shared rule
+- `scripts/hierarchies/push_audit.py`, `scripts/hierarchies/test_push_audit.py` — config read, tests
+- `scripts/hierarchies/log_records.py` — the log-record helpers both reports read (new). `push_audit.py` imports `measure.py` today, so `measure.py` cannot import the rule back without a cycle; the shared helpers move here and both import them, one way
+- `config/hierarchies/sessions.toml` — session keys and display names (new)
+
+**Workers:** `1 writer`
+- `impl` — all files
+
+**Acceptance gate:** unit tests green; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; `measure.py baseline --since 2026-10-13T17:24 --until 2026-10-20T17:24` and `push_audit.py report` over the same window both print 17. **Measure:** the two counts agree in both windows. **Review point (C53):** the Phase 3 two-week re-run.
