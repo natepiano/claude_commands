@@ -226,61 +226,32 @@ For active process redesigns, as we are currently undergoing with promotions and
 ### Phase 7 — Each wait names the worker, checkpoint and sender that own it  · status: done
 **Depends on:** Phase 6
 
-Phase 6's repair round 4 left three wait-attribution findings open. The landing rule moved them here: each is a wrong result in behavior Phase 6 added, not a regression and not a red gate. Astra's review (`/tmp/claude/astra/20261029T084546Z-3976557/review.md`) gives the approach for each. One rule covers all three: record explicit identity where the wait is seen, keep it through completion, and name the wait unresolved when identity cannot be resolved. Phase 4 waits for this phase as well, so both trial samples run with the same recorder.
+#### As-built
 
-#### Work Order
-
-**Goal:** every wait record names the worker pass, checkpoint phase instance or message sender that owns it, or it is a named unresolved state. Wait counts are never certain when identity is unknown.
-
-**Spec:**
-- Worker waits (Phase 6 F001): two boundaries, one resolver. One server serves every slot of a run, so no variable fixed at app-server start (`UNIT_TEAM_ROLE` or another) selects the pass.
-  - `verify.sh` runs inside a worker thread. It reads `CODEX_THREAD_ID` and gives it to the resolver.
-  - `_mesh_phase_wait()` in `codex_mesh.py` runs in the mesh controller, where `CODEX_THREAD_ID` names no worker. It reads no environment identity. Its callers already hold the worker name, the run directory and the thread id, and they pass all three to it as explicit context.
-  - Both boundaries call the recorder's one worker-to-pass resolver. It resolves the thread id to exactly one `mesh_roster.json` entry, then matches that entry's full worker name to exactly one active pass (`worker_name` and `team_slot` in the pass record). Do not decode the slot from the name: a `…-fix` worker can hold `impl`. A missing or ambiguous match records a named attribution miss, with no fallback to a slot.
-- Pass identity in the event (Phase 6 review, finding 5): the resolver returns a semantic type, never optional fields or empty strings whose meaning a caller must infer. A resolved pass carries the pass instance id, the worker name and the phase instance. An unresolved attribution carries its reason and its candidate identities. Supplier resolution has its own explicit states: a named supplier, and no named supplier. The wait start event gets additive `pass_instance_id` and `worker_name` fields from a resolved pass; `finish-wait` and the unclosed close at `finish-phase` keep them. Old events without them stay readable.
-- Merge-gate waits (Phase 6 F002): checkpoint provenance.
-  - Writer: `<CheckpointCommit/>` in `commands/unit/checkpoint.md` gets one line: after a successful commit, in every repository, enrolled or not, run `progress_history.py checkpoint --session-dir <S> --phase <id> --commit <full hash>`. (`phase_reservation.py committed` does not run in a repository that is not enrolled, so it cannot be the writer.) The new verb records a `checkpoint` event in the run file. The event is keyed by the full checkpoint commit and names its run and phase instance. The notice and merge request text do not change.
-  - Reader: `merge_checkpoint.py` finds that event by the full commit across the run files under the history root. The checkpoint notice and the merge request format do not change.
-  - Validation: exactly one match attributes the wait to that phase instance. Zero or several matches read as uncertain coverage for every candidate instance, never covered zero. The miss is counted once, and no candidate gets an invented wait. Choosing the newest instance hides the defect, so it is not allowed.
-  - One worker owns both sides: `emit` owns the writer call and the merge lookup. `fix2` adds the event and the verb to `progress_history.py`, its only owner, and names them in its claim.
-- Child handoffs (`ChildHandoffRequest`): a child production's merge-branch checkpoint has no owning phase instance, and a child showrunner is never a unit. Its merge-gate wait records as a production-level handoff wait with no phase attribution, a named state that is never covered zero and never uncertain coverage of a phase. No phase association is invented for a child production.
-- User and supplier waits (Phase 6 F004): the UserPromptSubmit hook classifies the prompt before it ends a wait.
-  - `WaitingForUser` ends on typed user input. It also ends on a user-decision relay: a message that begins `From the user (via the showrunner):` from the expected showrunner address (`docs/production_format.md`). The same text from any other sender does not end it.
-  - `WaitingForSupplier` stores the expected supplier when it starts and ends only on a message from that sender. A supplier wait with no named supplier is its explicit unresolved state.
-  - Timers, task notifications, scheduled notices and unrelated peers leave both waits open.
-  - The duplicate-wait check in `record_turn_wait` compares the supplier as well as the owner and kind.
-- Memory wrapper (Phase 6 F007, nit): `buildlog_memory_line` is defined in `scripts/lint/memory_gate.sh`, and `verify.sh` copies it. Move its body to a shared inner function in `memory_gate.sh`; `buildlog_memory_line` becomes a plain wrapper that calls it, and `verify.sh` wraps the same inner function, not an `eval` of an edited `declare -f`. Direct lint callers keep their output, and verification keeps its memory-wait start and finish.
-- Read output (`waits` JSON): this phase owns the acceptance of the read verb's `waits` JSON for started, finished and unclosed waits, `HistoryNotRecorded`, covered zero, attribution misses, uncertain coverage and the child handoff state. Each miss and each uncertain state shows its reason and its candidate identities, so the showrunner can tell missing evidence from no wait. The receipts surface and `ReceiptMissing` keep their current checks in `test_merge_checkpoint.py`. `turn_wait.json` stays an implementation file: it links hook lifecycle events, and the hook tests cover it.
-- Schema handoff: no script in this tree reads wait events yet (`phase_process.py` and `scripts/hierarchies/measure.py` do not). The checkpoint notice gives hierarchies-unit the `waits` JSON schema (fields, states, reasons) and the commit, as a handoff for its readers. Phases 4 and 5 do not read waits.
-- Regression tests, each failing on the Phase 6 tree:
-  - `UNIT_TEAM_ROLE=impl` held constant, impl and test passes open in different phase instances, and verification run with the test worker's thread id: the wait belongs to the test phase and keeps that thread as owner. The same check for a `…-fix` worker.
-  - The mesh controller path with `CODEX_THREAD_ID` absent, and again set to another worker's thread: the wait follows the explicit context, never the environment.
-  - Two workers in the same phase instance, each with a wait: each start event carries its own `pass_instance_id` and `worker_name`, and its completion keeps them.
-  - Two finished instances with one display id, merging the first one's checkpoint: with one checkpoint event for the commit, exactly the first gets the wait; with no event, and with two events for one commit, neither reads covered zero. The same check across two runs, and with the second instance still active.
-  - A child handoff merge records the production-level handoff wait with no phase attribution, and no phase instance reads covered zero or uncertain because of it. This test is separate from the checkpoint-path tests.
-  - A user wait survives a timer, a task notification and a peer message. It ends on typed input. In a second case it ends on a `From the user (via the showrunner):` relay from the expected showrunner address, and the same relay text from another peer leaves it open. A showrunner wait survives an unrelated peer and ends once, at the showrunner's message. The Phase 6 supplier test that closes on a generic peer is corrected.
-  - The `waits` JSON cases above, each with its reason and candidate identities.
-  - A direct lint caller's memory line is the same as on the Phase 6 tree, and a verification run still starts and finishes its memory wait.
+- Worker waits: `verify.sh` gives `CODEX_THREAD_ID` to the recorder, and `codex_mesh.py`'s controller passes the worker name, run directory and thread id explicitly (it reads no environment identity). Both call one resolver, `resolve_worker_pass`, which maps the thread to exactly one `mesh_roster.json` worker and that worker to exactly one active pass. It returns `ResolvedWorkerPass` or `UnresolvedWaitAttribution` with its reason and candidates. Start and finish events carry `pass_instance_id` and `worker_name`. A director-run `verify.sh` wait is owned by the director (`--director` plus `CLAUDE_CODE_SESSION_ID`).
+- Merge-gate waits: `<CheckpointCommit/>` runs `progress_history.py checkpoint --session-dir <S> --phase <id> --commit <hash>` after each commit, in every repository. `merge_checkpoint.py` turns the notice's hash into the full id (`git rev-parse --verify <commit>^{commit}`) and finds that event across the run files under the history root, this worktree's phases included. One match attributes the wait. Zero or several matches read as uncertain coverage for each candidate, never covered zero. A child handoff records a production-level handoff wait with no phase.
+- User and supplier waits: the UserPromptSubmit hook ends `WaitingForUser` on typed input, or on a `From the user (via the showrunner):` relay from the expected showrunner address. It ends `WaitingForSupplier` only on a message from the supplier's current address. The production comes from the plan header through `resolve_production_unit`, which reads metadata only and accepts both header forms. Timers, task notices and other peers leave both open. The duplicate check compares the supplier too. Waits a phase leaves open close as `Unclosed` at phase completion, external waits included, under a shared lock.
+- `waits` JSON reports `covered_n`, `attribution_miss_n`, `uncertain_phase_n`, `missing_n`, `production_handoff_n` and the handoffs, each miss with its reason and candidates.
+- `memory_gate.sh` holds the memory-line body in one inner function; `buildlog_memory_line` and `verify.sh` call it.
+- `phase_process.py baseline` prints durations of 2 h or more in hours.
+- `workers.py` reads the production through `resolve_production_unit` and keeps `showrunners.canonical_slug` for the ledger path.
 
 **Files:**
-- `scripts/direct/progress_history.py`, `scripts/direct/test_progress_history.py` — the worker-to-pass resolver, the resolved-pass and unresolved-attribution types, pass identity fields, supplier identity, the checkpoint event and verb, uncertain coverage, the child handoff state, `waits` JSON
-- `scripts/hooks/user-prompt-submit-conversation-pause.py`, `scripts/hooks/stop-direct-continue.py`, `scripts/hooks/test_direct_turn_wait_hooks.py` — sender-matched completion and the showrunner relay
-- `scripts/direct/verify.sh`, `scripts/direct/test_verify_hold_wait.py`, `scripts/direct/test_verify_token_wait.py` — thread-based attribution and the wrapper
-- `scripts/lint/memory_gate.sh` — the shared inner memory-line function
-- `scripts/agents/codex_mesh.py`, `scripts/agents/test_codex_mesh.py` — explicit controller context (models-unit also owns these)
-- `commands/unit/checkpoint.md` — the one `<CheckpointCommit/>` line that calls the checkpoint verb (outside path; the showrunner approved it 2026-10-29; name it in the checkpoint notice)
-- `scripts/production/merge_checkpoint.py`, `scripts/production/test_merge_checkpoint.py` — the checkpoint lookup and the child handoff wait
-- `scripts/direct/test_review_launcher.py`, `scripts/production/test_update_registration.py` — fixture copy lists, only when a new import needs them
+- `scripts/direct/progress_history.py` — resolver, attribution types, checkpoint verb, supplier identity, uncertain coverage, `waits` JSON
+- `scripts/hooks/user-prompt-submit-conversation-pause.py` — sender-matched completion and the showrunner relay
+- `scripts/direct/verify.sh`, `scripts/lint/memory_gate.sh` — thread attribution and the shared memory line
+- `scripts/agents/codex_mesh.py` — explicit controller context
+- `scripts/production/merge_checkpoint.py` — full-hash checkpoint lookup and the child handoff wait
+- `commands/unit/checkpoint.md` — the checkpoint verb line
+- `scripts/direct/workers.py`, `scripts/direct/phase_process.py`
 
-**Workers:** `2 writers`
-- `fix2` — the recorder, the attribution types and read output, the hooks, and their tests: `scripts/direct/progress_history.py`, `scripts/direct/test_progress_history.py`, the three hook files, `scripts/direct/test_review_launcher.py`, `scripts/production/test_update_registration.py`
-- `emit` — opens as impl — verification and the shared memory wrapper, the mesh emitter, the checkpoint provenance writer and the merge integration, and their tests: `scripts/direct/verify.sh`, `scripts/lint/memory_gate.sh`, `scripts/agents/codex_mesh.py`, `commands/unit/checkpoint.md`, `scripts/production/merge_checkpoint.py`, and their test files above
+**Binds later work:** the `waits` JSON schema went to hierarchies-unit at 820357a2. A reply that the postmaster forwards does not end a supplier wait yet; Phase 8 fixes it.
 
-`progress_history.py` has one owner, `fix2`. Before `emit` writes an emit point, `fix2` posts its resolver and event interface on the board as a `claim`: the resolver call, the resolved-pass and unresolved-attribution types, the start-event fields, the checkpoint verb and event, the lookup by full commit, and the child handoff state. `emit` builds on that claim, and a change to it is a new claim.
+**Gotchas:**
+- A launcher that never exits keeps its subscription to the worker thread and records the next compaction turn as work, so the worker reads busy and refuses follow-ups. End only the stale launcher pids.
+- A merge in a `git clone --shared` scratch copy must fetch from the GitHub URL: the copy's `origin` is the worktree, so its `origin/sdlc` is the local ref.
 
-**Constraints from prior phases:** keep Phase 6's event shape and wait ids, and reuse the recorder; new fields are additive. Old run files stay readable. Probe sessions write nothing. The checkpoint notice and the merge request format do not change. Fixture copies: a new import in a shared script must update the copy lists in `scripts/direct/test_review_launcher.py` and `scripts/production/test_update_registration.py`, or their fixtures fail; `emit` names each new import it adds on the board, and `fix2` updates both lists. The checkpoint notice names models-unit for `codex_mesh.py`, each build-followups owner of a touched file (`memory_gate.sh` included), trial-merged against its tip, and the `waits` schema handoff for hierarchies-unit.
-
-**Acceptance gate:** the gates in Delegation Context green, `basedpyright` on each slot's files; the lint and verification test lanes green; each regression test above fails on the Phase 6 tree and passes here; the `waits` JSON shows each state with its reason and candidate identities; a live scratch run with two slots on one server records each worker's wait on its own pass; the checkpoint notice holds the schema handoff for hierarchies-unit.
+**Ruled out:** the slot taken from a variable fixed at app-server start; the newest phase instance for an ambiguous checkpoint; checking a postmaster-forwarded reply against its log before the log exists (removed as containment).
 
 ### Phase 8 — A supplier reply that the postmaster forwards ends its wait  · status: todo
 **Depends on:** Phase 7; postmaster-unit's reply record (main abc8344f)
