@@ -2646,32 +2646,38 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Depends on:** Phase 95 (order only)
 
-#### Work Order
+**Also touches:** herdr-unit (`scripts/herdr`).
 
-**Goal:** One live timer pass of `scripts/whoami/agent_notes.py` uses less CPU. Phase 94 cut 0.587 s to 0.212 s at a live-sized fixture, but live runs still use 9.4–11.7 s of CPU (6.0 s in-process, 2.9 s in child processes). The live cost is in work the fixture does not reach.
+#### As-built
 
-**Spec:**
-- A profile script, `scripts/whoami/profile_notes_pass.py`, runs the timer's exact command (the `ExecStart` of `agent-sessions-snapshot.service`, the same environment) in-process under `cProfile`, writing the stats to a file the caller names. It reads live data as it is. It patches every call that writes or acts to a no-op: note writes, the timer usage file, phone and showrunner alerts, the pacer tier and plan files, refusal moves, and unit watchdog actions. The state files those calls read are scratch copies. Its output names each patched call, so the cost the profile skips is not missed. A second run beside the timer's own run changes nothing.
-- The director runs the profile on natedev, names the top live costs by cumulative CPU, and gives them to the writer. The writer cuts the largest one and keeps each result of the pass the same (Phase 94's list).
-- Before and after numbers come from the same method: the profile script, then the timer runs (`notes_cpu` sampler and the service `Consumed` lines).
+- One notes timer pass does one herdr process scan. `herdr.process_snapshot()` is a scope that `agent_notes` main opens; in it, every `herdr_processes` reader gets the same cached scan. `herdr.process_action()` reads fresh and retires the snapshot for the rest of the pass. A copied context obeys a retired ancestor scope.
+- `refusal_watch.session_observation` records the registry identities (sessionId, pid, procStart) before the report snapshot opens. Committed-group completion enters `process_action` only when the identities changed, no observation exists, or the cached members pass the completion filters. Inside that scope it builds the membership again and applies the same filters before holds, account preparation or session moves. Refusal placement and ready queued moves keep their fresh reads. An unchanged idle pass, the watchdog report included, does one scan.
+- `unit_watchdog._live_account` has the `@herdr.process_action()` decorator, so each call scans fresh. The outage check proves a reported outage fresh before recovery. For an observed-live unit with a pending job, `_live_account` confirms the unit before the recovery-result delete, the outage-alert clear and the `restarted on` line. An absent fresh result goes to the not-running branch; an unreadable one keeps the outage and result evidence through the `watchdog: <production>: <error>` line.
+- `scripts/whoami/profile_notes_pass.py` (`--stats`, `--scratch`, `--peer-python HOST=/nix/store/<python-package>/bin/python3`) runs `agent_notes.main` in-process under `cProfile`. Each write and act is a no-op patch, and state files are copies in a private scratch folder. Child reads go through one `TrustedChildRead` table: a pinned canonical executable, an exact argv grammar and a fixed environment per row; all other children are refused and counted as suppressed. Local Python reads run `sys.executable -B -I -S` directly, with no `py` wrapper. The output gives CPU, `incomplete components`, the top 25 cumulative entries, child counts and each patched call.
+- Live A/B on natedev at load 134–142: 9.18/8.37 s → 5.61/5.24 s CPU per pass (−38%); herdr scans 3 (4.62 s cumulative) → 1 (1.45 s).
 
 **Files:**
-- `scripts/whoami/profile_notes_pass.py` — new: the profile script.
-- `scripts/whoami/test_profile_notes_pass.py` — new: the patch list covers each side-effect call; a pass under the script writes nothing outside the scratch folder.
-- `scripts/whoami/`, `scripts/accounts/` — the module that holds the top live cost, and the test module beside it. The profile names the module; it can be in another directory.
+- `scripts/herdr/herdr.py` — `process_snapshot`, `process_action`, the scan cache.
+- `scripts/accounts/refusal_watch.py` — `session_observation`, the completion precheck, `_action_group_members`.
+- `scripts/accounts/unit_watchdog.py` — the fresh outage proof, the `_live_account` decorator, the observed-live order.
+- `scripts/whoami/agent_notes.py` — opens the snapshot and observation scopes.
+- `scripts/whoami/profile_notes_pass.py` — the profile script.
+- Tests: `scripts/herdr/test_herdr.py` (scopes, copied context), `scripts/accounts/test_refusal_watch.py` (one scan on an idle pass, a unit started after the snapshot, a changed pid or process start), `scripts/accounts/test_unit_watchdog.py` (`test_live_report_without_fresh_confirmation_keeps_recovery_evidence`, `test_unreadable_fresh_confirmation_preserves_recovery_result_and_job`), `scripts/whoami/test_agent_notes.py`, `scripts/whoami/test_profile_notes_pass.py` (child table, pinned Python, patch list).
 
-**Workers:** 1 writer, no split.
-- `impl` — the profile script, then the cut.
-
-**Constraints from prior phases:** Phase 91's reuse rules and Phase 94's cuts stay. Tests use a scratch `HOME` and `AGENT_NOTES_DIR`; they never touch live dirs, `~/.local/state`, usage stores, ssh or real sessions. Only the director runs the profile on live data.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/<dir> -p 'test_*.py'` passes for `scripts/whoami`, `scripts/accounts` and each other touched dir; `basedpyright <changed files>` reads `0 errors, 0 warnings, 0 notes`. Live check (the director): the profile's total and the timer runs' CPU per run both drop after the cut, at a similar load.
-
-Assertion-Change: `scripts/accounts/test_refusal_watch.py` `test_idle_completion_and_later_watchdog_report_share_one_scan` (was `test_idle_completion_keeps_report_sharing_and_checks_members_fresh`): `self.assertEqual(scans.call_count, 2)` → `self.assertEqual(scans.call_count, 1)`; an idle pass does one scan (repair round 3, Astra review).
+**Binds later work:**
+- `_live_account` is wrapped in `herdr.process_action()`, and its unreadable path keeps the `watchdog: <production>: <error>` line. The recovery-result branch still clears before it confirms, and the held or blocked branch relies on `_recovery_result` deleting the file ("The watchdog keeps recovery evidence until a fresh check confirms the unit").
+- `scripts/whoami/profile_notes_pass.py` imports `usage_store`, `run_out` and `agent_accounts` by bare name, in code and in `import_module("<name>")` strings. If a second module object exists, its no-op patches miss it and a profile run can write live state ("All consumers import shared whoami modules by one name").
 
 **Gotchas:**
-- The machine load on natedev is often 100 or more, which makes CPU time read high. Compare runs at a similar load.
+- Put "an act reads fresh" around the act, not at the read boundary of a function that decides and acts; else every idle decision scans again.
+- A remote read in the profile needs `--peer-python`. With no pin it is refused and shows only in the suppressed-child count, not in `incomplete components`.
+- The profile's git rows do not stop a repository-local clean filter under `git status --porcelain`. The ~/.claude worktrees have `filter.claude-settings.clean` (jq, stdin to stdout); it is read-only in practice.
+- natedev load is often 100 or more, which makes CPU time read high. Compare runs at a similar load.
 - Never run `agent_notes.py` by hand without the profile script: it sends alerts and can move sessions.
+
+**Ruled out:**
+- A `py` wrapper row in the child table: the wrapper writes its interpreter cache.
+- `ssh -F /dev/null`: it drops the configured `mac` host mapping.
 
 ### Phase 94c — Each account problem says what is wrong, why, and what to do  · status: todo
 
@@ -2684,7 +2690,7 @@ Assertion-Change: `scripts/accounts/test_refusal_watch.py` `test_idle_completion
 **Spec:**
 - One typed problem in `scripts/accounts/accounts.py`: the subject (the home or account), what is wrong, the cause, and the step to fix it. One render function writes every problem line in that order, in Simplified Technical English. The terminal status and `status --json` `problems` (which the unit board shows as is, `mods/unit-board/hooks/data.ts`) use the same lines. `problems` stays `list[str]`.
 - One line per cause. When one cause makes several symptoms for the same subject, the status shows the cause's line only. Example: a login in `~/.codex` that has no account note makes the read failure, the cutover hint and the no-note hint: those become one line.
-- A test login is its own cause: a login whose address domain is reserved for tests (`.invalid`, `.test`, `.example`, `.localhost`, `example.com`, `example.net`, `example.org`; RFC 2606 and 6761). Its line says that a test wrote it, names the file and its creation time, and gives the step `delete <file>`. It never suggests cutover-home or an account note.
+- A test login is its own cause: a login whose address domain is reserved for tests (`.invalid`, `.test`, `.example`, `.localhost`, `example.com`, `example.net`, `example.org`; RFC 2606 and 6761). Its line says that a test wrote it, names the file and the time it was written (`st_mtime`), and gives the step `delete <file>`. It never suggests cutover-home or an account note.
 - Apply the form to every problem that `accounts.py status` emits (read failures, role problems, home logins, unnoted homes, Codex problems, account state notes). Keep each problem's facts, times and commands; change only the words, the order and the merging.
 - The fixture leak itself (`select_fixture_workers(Path.home())` in `scripts/agents/test_codex_mesh.py`) is out of scope: the showrunner gave it to shutdown-unit, which owns that file now.
 - The fake file in the live `~/.codex` is removed only with the user's yes; it is not part of the code change.
@@ -2694,17 +2700,24 @@ Assertion-Change: `scripts/accounts/test_refusal_watch.py` `test_idle_completion
 **Files:**
 - `scripts/accounts/accounts.py` — the problem type, the render function, the merging and the test-login cause.
 - `scripts/accounts/test_accounts.py`, `scripts/accounts/test_cutover_home.py` — each problem's line; the merged `~/.codex` case; the test-login case for each reserved domain; a real login keeps its cutover and note steps.
-- `docs/accounts.md` — the problem lines.
+- `docs/accounts.md` — the problem lines (lines 40, 42, 166, 202 and 264 show problem texts today).
 
 **Workers:** 1 writer, no split.
 - `impl` — all files.
 
 **Constraints from prior phases:** Phase 40's role map and Phase 54's Codex note texts keep their facts. Tests use a scratch `HOME`, `AGENT_NOTES_DIR` and Codex homes; they never touch a live home, `~/.local/state`, usage stores, ssh or real sessions. Never run `accounts.py status` against the live home.
+- Where the lines come from: `_read_status` in `scripts/accounts/accounts.py` builds `notes` in this order: `_read_failure_note(row, zone)` per row, `role_problems` (`AccountsError` texts), the `~/.claude holds a login` and `~/.codex holds a login` lines (`account.claude_account(main_config_dir())`, `_codex_home_login(accounts_home() / ".codex")`), `_status_notes` per Claude status (`status.problems`, `_account_state_notes`, unclassified, mcpServers), Codex `status.problems`, Codex `_account_state_notes`, Codex unclassified. `AccountStatus.problems` and `CodexStatus.problems` are `tuple[str, ...]`, filled in `_status_for` (`check(label)`, `unnoted_home_line`) and `codex_statuses` (`_check_codex_home`, `_check_default_codex_home`, `unnoted_home_line`, `accounts: sign in as …`).
+- The three `~/.codex` lines of the Goal come from `_read_failure_note` (row label `~/.codex`, `UsageReadOutcome.ERROR`), the `~/.codex holds a login` line, and `unnoted_home_line` through `codex_statuses`.
+- Phase 75: a read-failure note and an account-state note start with `* `, the footnote of the starred Read cell. The terminal keeps it; `render_status_json` strips it for `problems`.
+- Texts outside status keep their words ("No other behavior changes"): `unnoted_home_line` also builds `AccountsError` messages (`raise AccountsError("accounts: " + unnoted_home_line(…))`, two sites) and `refuse_default` labels; `AccountDirectory*.problems` also show in `new_account.claude_login_step` (`scripts/accounts/new_account.py`); role problems are `AccountsError` texts that launches raise too. Apply the new form where status assembles its notes, and update the `docs/accounts.md:264` sentence that says status prints "the same problem".
+- Type Design Contract: the typed problem holds no bare `Optional` or empty string for "no separate cause" or "no step"; use named variants.
+- Linux Python 3.13 `os.stat` has no creation time (`st_birthtime` is absent on natedev); the test-login line uses `st_mtime`.
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/accounts -p 'test_*.py'` passes with a scratch HOME set before import; `basedpyright` on the changed Python files reads `0 errors, 0 warnings, 0 notes`. Text check (the director): each new line names the subject, what is wrong, the cause and the step, and a reader who knows nothing else can act on it.
 
 **Gotchas:**
 - Problem texts have had long review loops before (`attempts-*-text` memories). Pin the form in one render function and test the parts, not each word.
+- `_account_state_notes` drops its line when a `status.problems` string starts with `accounts: <path> is missing` (also `is not a directory`, `is a link`, `is not logged in`, `accounts: could not read|inspect <path>:`). New words break this match with no error. The same-cause merge reads the typed cause, never the text.
 
 ### Phase 94d — The watchdog keeps recovery evidence until a fresh check confirms the unit  · status: todo
 
@@ -2715,19 +2728,26 @@ Assertion-Change: `scripts/accounts/test_refusal_watch.py` `test_idle_completion
 **Goal:** A unit watchdog pass never loses a finished recovery's result before it knows whether the unit is live. The Phase 94b closure review found: on the recovery-result path (`scripts/accounts/unit_watchdog.py`, the `job = outage.get("job")` branch), `_recovery_result` deletes the result file and the job is removed before `_live_account` reads; when that read is unreadable and raises, the result and the job are gone and the next pass cannot report the restart. The order is the same at `ed98b7dc` (before Phase 94b). Phase 94b fixed the same order on the observed-live branch.
 
 **Spec:**
-- On the recovery-result path, read the result without deleting it, confirm liveness fresh with `_live_account`, then delete the result and remove the job. A confirmed live unit: success cleanup and the `restarted on` line. An absent unit: the existing retry line and recovery handling. An unreadable read: keep the result file, the job and the outage; no line.
-- `scripts/whoami/test_profile_notes_pass.py` `test_child_launch_options_cannot_substitute_executable_or_run_hooks`: use argv forms the policy permits, so the test fails only when the launch-option check is missing (today argument rejection alone makes it pass).
+- On the recovery-result path, read the result without deleting it, confirm liveness fresh with `_live_account`, then delete the result and remove the job. A confirmed live unit: success cleanup and the `restarted on` line. An absent unit: delete the result and remove the job, then the existing retry line and recovery handling. An unreadable read: keep the result file, the job and the outage; no `restarted on` or retry line. The existing error path still writes its `watchdog: <production>: <error>` line.
+- The held or blocked branch between the result read and `_live_account` (`(source.blocked and not owns_claim) or _held(source, dry_run=False)`, which drops the outage with `del retained[key]`) relies today on `_recovery_result` having deleted the file. After the reorder it deletes the result file itself, so no file stays in `unit-watchdog-results`.
+- `scripts/whoami/test_profile_notes_pass.py` `test_child_launch_options_cannot_substitute_executable_or_run_hooks`: use an argv form the policy permits, for example `("ps", "-eo", "pid=,ppid=,comm=,args=")`, and add a positive control: the same argv with no launch option starts once. Then the test fails only when the launch-option check is missing (today `ps -c 'touch …'` fails `ps_read`, so argument rejection alone makes it pass).
 - No other behavior changes.
 
 **Files:**
-- `scripts/accounts/unit_watchdog.py` — the recovery-result order.
-- `scripts/accounts/test_unit_watchdog.py` — live, absent and unreadable after a finished result; the file and job stay for unreadable.
+- `scripts/accounts/unit_watchdog.py` — the recovery-result order; the held or blocked branch deletes the result.
+- `scripts/accounts/test_unit_watchdog.py` — live, absent and unreadable after a finished result; the file and job stay for unreadable; the held or blocked branch leaves no result file.
 - `scripts/whoami/test_profile_notes_pass.py` — the launch-options test.
 
 **Workers:** 1 writer, no split.
 - `impl` — all files.
 
 **Constraints from prior phases:** Phase 94b's one-scan idle pass and fresh reads before acts stay. Tests use a scratch `HOME` and state dirs; they never touch live dirs, `~/.local/state`, ssh or real sessions.
+- `_live_account(doc, unit) -> str` is wrapped in `@herdr.process_action()`: each call scans processes fresh and retires the pass's shared snapshot. It returns the account name, `""` for an absent unit, and raises `OSError` when liveness or the account is unreadable.
+- Phase 94b already reordered the observed-live branch (`if outage is not None and "job" in outage and not dry_run: restored = _live_account(doc, unit)`, before `outage_alerts.clear` and the result delete). When that read finds the unit absent, `claude` becomes `ClaudeNotRunning()` and the pass falls through to the recovery-result branch, which reads `_live_account` a second time.
+- The failing sequence the tests must cover: the report sees the unit live, the observed-live branch's fresh read finds it absent, a finished result file exists, and the recovery-result branch's fresh read raises. Do not patch `_recovery_result` in these tests; 94b's `test_live_report_without_fresh_confirmation_keeps_recovery_evidence` patches it to `RecoveryStillRunning` and so never reaches this path.
+- Fixture helpers in `test_unit_watchdog.py`: `add_unit`, `die`, `revive`, `marked`, `pass_at`, `finish_jobs` (set `False` to keep a job unfinished), `notices` and `pending`. 94b's `test_unreadable_fresh_confirmation_preserves_recovery_result_and_job` shows the pattern (write the result, revive, patch `_live_account` with `OSError`).
+- The profile test's setUp puts fake `ps`, `git`, `herdr`, `lsof`, `ssh` and `security` scripts on `PATH` (`self.bin`); `child_policy` pins only programs that `shutil.which` finds. `readonly_launch_options` refuses more than two positional arguments.
+- Type Design Contract: a finished result that is read but not yet deleted needs a name that says so (for example, `RecoveryFinished` carrying its result path), not a flag.
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/accounts -p 'test_*.py'` and the same for `scripts/whoami` pass; `basedpyright` on the changed files reads `0 errors, 0 warnings, 0 notes`.
 
@@ -2744,7 +2764,7 @@ Assertion-Change: `scripts/accounts/test_refusal_watch.py` `test_idle_completion
 **Spec:**
 - The package name is the one name: it works from every directory with only the repository root on `sys.path`, and the agents, herdr, usage and nix_env consumers already use it.
 - Change every bare import of the six modules (`import <module>`, `from <module> import …`, also inside functions) to the package form. Bare-import consumers found at planning:
-  - `scripts/whoami`: `five_hour.py`, `quota_alert.py`, `codex_pacer.py`, `agent_notes.py`, `run_out.py`, `session_table.py`, `whoami.py`.
+  - `scripts/whoami`: `five_hour.py`, `quota_alert.py`, `codex_pacer.py`, `agent_notes.py`, `run_out.py`, `session_table.py`, `whoami.py`, `profile_notes_pass.py` (added by Phase 94b; also string imports `import_module("<module>")` of three of the six).
   - `scripts/accounts`: `accounts.py`, `new_account.py`, `refusal_watch.py`, `refusals.py`, `unit_watchdog.py`.
   - `scripts/shutdown`: `inventory.py`, `pane_record.py`, `pane_restore.py`, `record.py`, `restart.py`, `settle.py`, `shutdown.py`.
   - `scripts/production`: `cli_fixture.py`, `dailies_render.py`, `showrunner_move.py`.
@@ -2766,7 +2786,8 @@ Assertion-Change: `scripts/accounts/test_refusal_watch.py` `test_idle_completion
 - `scripts/whoami/test_agent_notes.py`, `scripts/whoami/test_codex_alert_accounts.py`, `scripts/whoami/test_codex_homes.py`, `scripts/whoami/test_codex_pacer.py`, `scripts/whoami/test_five_hour.py`, `scripts/whoami/test_note_file.py`, `scripts/whoami/test_quota_alert.py`, `scripts/whoami/test_run_out.py`, `scripts/whoami/test_session_table.py`, `scripts/whoami/test_usage_store.py` — tests.
 - `scripts/accounts/test_accounts.py`, `scripts/accounts/test_cutover_home.py`, `scripts/accounts/test_new_account.py`, `scripts/accounts/test_refusals.py`, `scripts/accounts/test_refusal_watch.py`, `scripts/accounts/test_unit_watchdog.py` — tests.
 - `scripts/shutdown/test_account_move.py`, `scripts/shutdown/test_inventory.py`, `scripts/shutdown/test_pane_record.py`, `scripts/shutdown/test_restart.py`, `scripts/shutdown/test_settle.py`, `scripts/shutdown/test_shutdown_cli.py`, `scripts/shutdown/test_shutdown_status.py`, `scripts/shutdown/test_stop.py` — tests.
-- `scripts/production/test_add_showrunner.py`, `scripts/production/test_add_unit.py`, `scripts/nightly_review/test_nightly_review.py` — tests.
+- `scripts/production/test_add_showrunner.py`, `scripts/production/add_unit_test_support.py`, `scripts/nightly_review/test_nightly_review.py` — tests; the support file has `import usage_store` at line 39.
+- `scripts/whoami/profile_notes_pass.py` — consumer: `import usage_store` and `from agent_accounts import …` inside a function, and `import_module("usage_store")`, `import_module("run_out")`, `import_module("agent_accounts")` in `load_pass` and `patch_list`.
 - `scripts/agents/agent_exec.sh` — the inline Python import.
 - `scripts/agents/codex_mesh.py`, `scripts/herdr/herdr_sessions.py` — already package form; read to confirm, change only a bare import found.
 
@@ -2776,9 +2797,10 @@ Assertion-Change: `scripts/accounts/test_refusal_watch.py` `test_idle_completion
 
 **Constraints from prior phases:** Tests sit beside the code (Delegation Context); after this phase they import the six modules by the package name, the same object the code uses. Tests never touch live dirs: `HOME`, `AGENT_NOTES_DIR` and the patched `note_file.AGENTS_DIR` point at scratch folders. No `Any`, no file-level ignores.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/<dir> -p 'test_*.py'` passes for `whoami`, `accounts`, `shutdown`, `production`, `message`, `nightly_review`, `agents`, `herdr`, `usage`, `nix_env` and `lib`; `basedpyright` on every changed file and each caller module reads `0 errors, 0 warnings, 0 notes`; `grep -rnE '^\s*(import|from) (agent_accounts|account|note_file|session_table|run_out|usage_store)\b' scripts` finds nothing (it covers the `.sh` inline Python too); no `sys.modules.setdefault` remains in `scripts/whoami`; with `/tmp` as the working directory and only the file's own directory on `sys.path` (as a script run has it), `python3 -c 'import sys; sys.path.insert(0, "<dir>"); import <module>'` imports each changed non-test consumer without `ModuleNotFoundError` (import only; never call its `main`).
+**Acceptance gate:** `python3 -m unittest discover -s scripts/<dir> -p 'test_*.py'` passes for `whoami`, `accounts`, `shutdown`, `production`, `message`, `nightly_review`, `agents`, `herdr`, `usage`, `nix_env` and `lib`; `basedpyright` on every changed file and each caller module reads `0 errors, 0 warnings, 0 notes`; `grep -rnE '^\s*(import|from) (agent_accounts|account|note_file|session_table|run_out|usage_store)\b' scripts` finds nothing (it covers the `.sh` inline Python too); `grep -rnE 'import_module\("(agent_accounts|account|note_file|session_table|run_out|usage_store)"\)' scripts` finds nothing; no `sys.modules.setdefault` remains in `scripts/whoami`; with `/tmp` as the working directory and only the file's own directory on `sys.path` (as a script run has it), `python3 -c 'import sys; sys.path.insert(0, "<dir>"); import <module>'` imports each changed non-test consumer without `ModuleNotFoundError` (import only; never call its `main`).
 
 **Gotchas:**
 - A test that imports a module by the other name gets a second module object. Its `patch.object(note_file, "AGENTS_DIR", …)` then misses the object the code uses, and the code can write to the live notes dir. Change each test's import in the same commit as its module's consumers.
 - Type identity: a `KnownCodexAccount` or `Report` made from one module object fails `isinstance` against the other. A remaining bare import shows as a failing `isinstance` test, not an import error.
 - The unit suites run from the repository root, so the working directory puts the root on `sys.path` and hides a missing root insert. Only the import check from `/tmp` in the acceptance gate finds one.
+- `scripts/whoami/profile_notes_pass.py` patches the pass's write and act calls to no-ops on the module objects it loads. If it keeps a bare name after the registration blocks go, its patches attach to a second module object, and a director's profile run can write the live usage store and run_out log or start a live Codex read. `test_profile_notes_pass.py` `test_argument_free_pass_keeps_all_input_files_unchanged` (zero `usage_store.save_timer_usage` calls, read through the package import) is the guard.
