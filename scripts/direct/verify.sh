@@ -164,6 +164,30 @@
 
 set -euo pipefail
 if [[ -n "${TMPDIR:-}" && ! -d "$TMPDIR" ]]; then mkdir -p -- "$TMPDIR"; fi
+# Ask the shared helper which envrc applies, before tool setup or record access.
+# With no envrc, ensure returns the unchanged env without invoking direnv.
+if [[ -z "${IN_NIX_SHELL:-}" ]]; then
+    if [[ -n "${VERIFY_NIX_ENV_REEXEC:-}" ]]; then
+        printf '%s\n' 'verify.sh: nix_env.py re-exec still has no nix shell (IN_NIX_SHELL unset)' >&2
+        exit 1
+    fi
+    VERIFY_NIX_SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
+    [[ "$VERIFY_NIX_SCRIPT_DIR" != "${BASH_SOURCE[0]}" ]] || VERIFY_NIX_SCRIPT_DIR=.
+    VERIFY_NIX_SCRIPT_DIR="$(cd -- "$VERIFY_NIX_SCRIPT_DIR" && pwd -P)"
+    VERIFY_NIX_ENV_JSON="$("$VERIFY_NIX_SCRIPT_DIR/../lib/py" \
+        "$VERIFY_NIX_SCRIPT_DIR/../lib/nix_env.py" ensure "$PWD")"
+    if "$VERIFY_NIX_SCRIPT_DIR/../lib/py" -c \
+        'import json, sys; sys.exit(0 if json.load(sys.stdin).get("IN_NIX_SHELL") else 1)' \
+        <<< "$VERIFY_NIX_ENV_JSON"; then
+        printf '%s\n' 'verify.sh: not in the nix shell; re-running under nix_env.py exec' >&2
+        export VERIFY_NIX_ENV_REEXEC=1
+        exec "$VERIFY_NIX_SCRIPT_DIR/../lib/py" "$VERIFY_NIX_SCRIPT_DIR/../lib/nix_env.py" \
+            exec "$VERIFY_NIX_SCRIPT_DIR/${BASH_SOURCE[0]##*/}" "$@"
+    fi
+    unset VERIFY_NIX_ENV_JSON VERIFY_NIX_SCRIPT_DIR
+fi
+unset VERIFY_NIX_ENV_REEXEC
+
 BUILD_OVERRIDE_GUARD_DIR="${BASH_SOURCE[0]%/*}"
 [[ "$BUILD_OVERRIDE_GUARD_DIR" != "${BASH_SOURCE[0]}" ]] || BUILD_OVERRIDE_GUARD_DIR=.
 source "$BUILD_OVERRIDE_GUARD_DIR/../build_hold/override_guard.sh" || exit 2

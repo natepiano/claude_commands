@@ -2511,3 +2511,25 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - A clear must use the time of the observation it acts on, never the time of the clear: a cached reading is old by the time a slow loop reaches it.
 - Known minor residual: an old alert claimed inside the one registry read that sees the unit live survives the clear; a new crash before the next watchdog live pass (about 2 minutes) then sends no push.
 - `scripts.agents.test_mesh_runs` `test_a_live_supervisor_is_not_ended` failed once under the full parallel gate and passed alone and on the rerun: a load flake outside this unit.
+
+### Phase 91 — The account notes cost less CPU  · status: done (b0c06054)
+
+**Depends on:** Phase 90
+
+#### As-built
+
+- The 2-minute timer pass of `agent_notes.py` reuses a usage reading younger than 10 minutes (`usage_store.recent_timer_usage`/`save_timer_usage`, file `timer-usage.json`, keyed by `timer_usage_signature` over logins, homes and the account selection). A reused pass keeps the original reading times and skips the quota note apply, the usage store save and the readings log.
+- A pass reads live when it is `agent_notes.py refresh`, a next-moves queue waits on the role-map host, an in-use account (Claude in use, or the selected Codex workers account) is at or below `LIVE_USAGE_REMAINING_THRESHOLD` (10%) weekly or 5-hour remaining, a Codex fallback is active, a reset passed, or a login or selection changed.
+- The refusal watch, the unit watchdog, the session table and the note sessions sections run on every pass. `refusal_watch.run(refresh_usage=…)` reads usage before it places a new refusal on a reused pass. Refusals already open, cancelled, continued or group-selected do not cause a read. A failed read is reported and never stops placement or the watchdog. The refresh saves with the same login labels as the main pass.
+- `live_reports` passes `use_disk_identity=True`: `claude_live` takes the login and `subscriptionType` from the stored credentials and starts no `claude auth status`. Without a stored plan it keeps the CLI read, so `/whoami` and the notes show the same plan as before.
+- Measured before: one timer run of `agent_notes.py` used 43.4 s CPU in 39.5 s wall, and the service used 42–64 s per run. The figures after promotion come from the real timer runs.
+
+#### Files
+
+`scripts/whoami/agent_notes.py`, `agent_accounts.py`, `usage_store.py`, `scripts/accounts/refusal_watch.py`; tests `test_agent_notes.py`, `test_agent_accounts.py`, `test_usage_store.py`, `test_session_table.py`, `test_codex_homes.py`, `test_quota_alert.py`, `scripts/accounts/test_refusal_watch.py`; `docs/accounts.md`.
+
+#### Gotchas
+
+- Weekly and 5-hour usage alerts can come up to 10 minutes later. The showrunner accepted this, because those alerts only give information.
+- An in-use account that runs out from above 10% inside the 10 minutes is not moved from the reading. It moves on its first refusal: Codex at once through `codex_mesh`'s `blocked` path, Claude on the next 2-minute refusal pass. The worst case is one refused request before the move.
+- Measure a timer cut on the real timer runs (`journalctl --user -u agent-sessions-snapshot.service`, "Consumed … CPU time"). A by-hand `refresh` always reads live, so it shows no reuse.
