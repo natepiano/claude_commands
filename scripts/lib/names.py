@@ -9,7 +9,8 @@ import sys
 import tomllib
 from typing import Literal, cast, get_args
 
-JobKey = Literal["showrunner", "unit_director", "worker", "code_reviewer", "ui_reviewer", "designer", "design_reviewer"]
+JobKey = Literal["showrunner", "unit_director", "worker", "implementer", "tester", "repair_worker", "code_reviewer",
+                 "ui_reviewer", "designer", "design_reviewer"]
 AudienceKey = Literal["showrunners", "unit_directors", "agents", "workers", "top_level", "all_roles"]
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "config/names.toml"
 

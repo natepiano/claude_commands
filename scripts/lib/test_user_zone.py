@@ -11,6 +11,8 @@ import unittest
 from pathlib import Path
 from typing import override
 
+from scripts.lib.code_kind import is_test_code
+
 SCRIPT = Path(__file__).with_name("user_zone.py")
 PROBE = ("import sys; sys.path.insert(0, sys.argv[1]); import user_zone; from datetime import datetime, timezone; "
          "print(user_zone.user_zone().key, user_zone.zone_label(datetime(2026, 7, 1, 12, tzinfo=timezone.utc)), "
@@ -90,7 +92,7 @@ class UserZoneTests(unittest.TestCase):
         found: set[str] = set()
         for path in scripts.rglob("*"):
             relative = path.relative_to(scripts)
-            if (path.suffix not in (".py", ".sh") or path.name.startswith("test_")
+            if (path.suffix not in (".py", ".sh") or is_test_code(path)
                     or SKIPPED_DIRS.intersection(relative.parts) or not path.is_file()):
                 continue
             if HARDCODED.search(path.read_text(encoding="utf-8", errors="replace")):
@@ -103,7 +105,7 @@ class UserZoneTests(unittest.TestCase):
         found: set[str] = set()
         for path in scripts.rglob("*.py"):
             relative = path.relative_to(scripts)
-            if path.name.startswith("test_") or SKIPPED_DIRS.intersection(relative.parts) or not path.is_file():
+            if is_test_code(path) or SKIPPED_DIRS.intersection(relative.parts) or not path.is_file():
                 continue
             if MACHINE_ZONE.search(path.read_text(encoding="utf-8", errors="replace")):
                 found.add(relative.as_posix())

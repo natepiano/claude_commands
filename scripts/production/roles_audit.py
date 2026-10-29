@@ -29,6 +29,7 @@ import production_units
 import showrunners
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from code_kind import is_test_code  # noqa: E402
 from user_zone import user_zone, user_zone_name  # noqa: E402
 from scripts.lib import names as display_names  # noqa: E402
 
@@ -888,7 +889,7 @@ def read_live_sources(root: Path, *, retired_forms: tuple[str, ...] = (), fixed_
         if relative.parts[:2] == ("docs", "plans"):
             continue
         script = relative.parts[0] == "scripts"
-        if script and (path.name.startswith("test_") or path.suffix not in (".py", ".sh", "")):
+        if script and (is_test_code(path) or path.suffix not in (".py", ".sh", "")):
             continue
         if not script and path.suffix not in (".md", ".txt"):
             continue

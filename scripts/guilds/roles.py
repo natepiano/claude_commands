@@ -26,7 +26,7 @@ from typing import Literal, Protocol, TextIO, cast
 from uuid import UUID, uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.guilds import astra_work, tips
+from scripts.guilds import astra_work
 
 ROOT = Path(__file__).resolve().parents[2]
 Role = Literal['designer', 'reviewer']
@@ -604,7 +604,7 @@ def _prompt(design: HeldDesign, role: Role, text: str) -> tuple[Path, Path]:
     reply = directory / 'replies' / f'{role}-{token}.md'
     prompt = directory / 'prompts' / f'{role}-{token}.md'
     if role == 'designer':
-        instructions = (ROOT / 'config/guilds/designer.md').read_text(encoding='utf-8') + '\n' + tips.load('designers')
+        instructions = (ROOT / 'config/guilds/designer.md').read_text(encoding='utf-8')
         instructions += '\nUse apply_patch for all repository edits. Edit only the bound output paths.\n'
     else:
         review_prompt = cast(Callable[[Path, str], str],

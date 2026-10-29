@@ -1098,6 +1098,16 @@ def _held_location(holder: roles.Holder) -> tuple[ShowrunnerRelationship, Direct
             UnderDirector(holder.unit_name, "", "") if isinstance(holder, roles.UnitHolder) else NoDirector())
 
 
+def unit_worker_title(production: str, unit: str, job: JobKey, ordinal: int, address: str) -> str:
+    """Render a unit worker's title from its ledger placement; a second holder of a job gets a number."""
+    qualifier: JobQualifier = JobNumber(ordinal) if ordinal > 1 else Unqualified()
+    return ShownName(ProductionPart(production), UnitPart(unit), ShownJob(job, qualifier), address).render()
+
+
+def mesh_title(session_dir: str, name: str, record: Mapping[str, object]) -> str:
+    return mesh_shown_name(session_dir, name, record).render()
+
+
 def mesh_shown_name(session_dir: str, name: str, record: Mapping[str, object]) -> ShownName:
     """Build a thread title with the same production and unit lookup as the roster."""
     run = Path(session_dir)

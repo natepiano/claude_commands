@@ -7,7 +7,7 @@ import os
 import re
 import shlex
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
@@ -242,14 +242,18 @@ def _move_record(move: PathMove) -> dict[str, str]:
 
 
 def _save(plan: RenamePlan, completed: tuple[str, ...]) -> None:
-    write_json(plan.journal, {
+    fields = _object(read_json(plan.journal)) if plan.journal.exists() else {}
+    fields.update({
         "version": 1, "old": plan.old, "new": plan.new, "old_doc": str(plan.old_doc),
         "new_doc": str(plan.new_doc), "checkout": str(plan.checkout), "merge_branch": plan.merge_branch,
         "base": plan.base, "units": list(plan.units), "plans": [str(path) for path in plan.plans],
         "timer": _move_record(plan.timer), "state": [_move_record(move) for move in plan.state],
         "stall": [_move_record(move) for move in plan.stall], "review_pool": _move_record(plan.review_pool),
-        "completed": list(completed), "done": False,
+        "completed": list(completed),
     })
+    if "done" not in fields:
+        fields["done"] = False
+    write_json(plan.journal, fields)
 
 
 def _object(value: object) -> dict[str, object]:
@@ -290,7 +294,7 @@ def _completed_steps(fields: dict[str, object]) -> tuple[str, ...] | None:
     """Return the completed apply step names, or None when the record is not valid."""
     if "completed" in fields:
         names = fields["completed"]
-        if not isinstance(names, list) or not all(isinstance(name, str) and name in APPLY_STEP_NAMES for name in cast(list[object], names)):
+        if not isinstance(names, list) or not all(isinstance(name, str) and name for name in cast(list[object], names)):
             return None
         return tuple(cast(list[str], names))
     # A journal written before apply recorded step names holds a count of the 7-step list.
@@ -738,6 +742,86 @@ def _commit_unit(plan: RenamePlan, name: str, record: dict[str, object]) -> None
     _ = unit_move.git(plan.checkout, "push", "origin", f"{plan.branch}:refs/heads/{plan.branch}")
 
 
+def _repoint_unit_workers(plan: RenamePlan, name: str, record: dict[str, object], *, dry_run: bool = False) -> None:
+    from scripts.direct import workers
+    changes = workers.repoint_unit_worktree(
+        plan.new, name, Path(_string(record, "old_worktree")), Path(_string(record, "new_worktree")),
+        _string(record, "new_branch"), from_production=plan.old, dry_run=dry_run)
+    for change in changes:
+        print(f"{name}: {'would change' if dry_run else 'changed'} {change}")
+    if not changes:
+        print(f"{name}: workers have nothing to change")
+
+
+def repair_workers(new: str, *, dry_run: bool = False) -> None:
+    """Repair saved worker paths from journaled moves or current Units rows."""
+    from scripts.direct import workers
+    new = showrunners.canonical_slug(new)
+    _validate_slug(new)
+    path = rename_state.production_journal(new)
+    with nullcontext() if dry_run else unit_move.production_lock():
+        journal = _object(read_json(path)) if path.exists() else {}
+        if journal:
+            doc = Path(_string(journal, "new_doc"))
+        else:
+            checked = showrunners.checked_doc(showrunners.NOTIFIER_STATE_DIR / f"showrunner-{new}")
+            if isinstance(checked, showrunners.NoCheckedDoc):
+                raise RenameRefused(f"{new}: no production doc: {checked.reason}")
+            doc = checked.path
+        production = add_unit.read_production(doc)
+        text = doc.read_text(encoding="utf-8")
+        former_names = [_string(journal, "old")] if journal else []
+        for line in text.splitlines():
+            if line.startswith("- **Formerly:**"):
+                former_names.extend(cast(list[str], re.findall(r"`([^`]+)`", line)))
+        former = tuple(dict.fromkeys(former_names))
+        units = tuple(workers.UnitWorktree(new, production_units.cell_value(row.get("Unit", "")),
+            production.checkout / Path(production_units.cell_value(row.get("Worktree", ""))).expanduser(),
+            production_units.cell_value(row.get("Branch", "")))
+            for row in production_units.unit_table(text.splitlines())
+            if not production_units.plan_cell_is_retired(row.get("Plan", ""))
+            and production_units.cell_value(row.get("Worktree", "")) not in ("", "—", "-"))
+        found = workers.find_moved_unit_runs(units, former)
+        for skipped in found.skipped:
+            print(skipped)
+        records = _object(journal.get("unit_moves", {}))
+        journaled: set[tuple[str, Path]] = set()
+        reported: set[str] = set()
+        for name, raw in sorted(records.items()):
+            record = _object(raw)
+            completed = record.get("step")
+            if type(completed) is not int or completed < 2:
+                continue
+            old = Path(_string(record, "old_worktree"))
+            changes = workers.repoint_unit_worktree(new, name, old, Path(_string(record, "new_worktree")),
+                _string(record, "new_branch"), from_production=former[0] if former else new, dry_run=dry_run)
+            for change in changes:
+                print(f"{name}: {'would change' if dry_run else 'changed'} {change}")
+            if not changes:
+                print(f"{name}: workers have nothing to change")
+            reported.add(name)
+            journaled.add((name, old))
+            if not dry_run and not record.get("workers_repointed", False):
+                record["workers_repointed"] = True
+                write_json(path, journal)
+        for move in found.moves:
+            name = move.current.unit
+            if (name, move.old) in journaled:
+                continue
+            changes = workers.repoint_moved_unit_runs(move, from_production=former[0] if former else new, dry_run=dry_run)
+            for change in changes:
+                print(f"{name}: {'would change' if dry_run else 'changed'} {change}")
+            if not changes and name not in reported:
+                print(f"{name}: workers have nothing to change")
+            reported.add(name)
+        if not reported:
+            print(f"{new}: no moved unit was found: no unit run names an old worktree"
+                  + (" with one matching Units row" if found.skipped else ""))
+        for current in units:
+            if current.unit not in reported:
+                print(f"{current.unit}: workers have nothing to change")
+
+
 def unit(new: str, name: str) -> None:
     """Move one stopped unit, resuming recorded branch, worktree and configuration steps."""
     with _rename_journal(new) as (result, journal):
@@ -780,6 +864,10 @@ def unit(new: str, name: str) -> None:
             _stopped_unit(result, name)
             _move_unit_worktree(result, record)
             record["step"] = 2
+            write_json(result.journal, journal)
+        if not record.get("workers_repointed", False):
+            _repoint_unit_workers(result, name, record)
+            record["workers_repointed"] = True
             write_json(result.journal, journal)
         if not record.get("restore_repointed", False):
             if restore["kind"] == "stopped":
@@ -864,6 +952,9 @@ def main(argv: list[str]) -> int:
     _ = command.add_argument("unit")
     command = actions.add_parser("finish")
     _ = command.add_argument("new")
+    command = actions.add_parser("repair-workers", help="repair worker paths for units moved before this fix")
+    _ = command.add_argument("new", metavar="production")
+    _ = command.add_argument("--dry-run", action="store_true")
     command = actions.add_parser("checkout", help="move the showrunner checkout through a shutdown restart")
     _ = command.add_argument("new", metavar="slug")
     _ = command.add_argument("path", nargs="?", default="")
@@ -878,6 +969,8 @@ def main(argv: list[str]) -> int:
                 print("no phase notes to repair")
         elif action == "unit":
             unit(new, cast(str, args.unit))
+        elif action == "repair-workers":
+            repair_workers(new, dry_run=cast(bool, args.dry_run))
         elif action == "finish":
             finish(new)
         elif action == "checkout":

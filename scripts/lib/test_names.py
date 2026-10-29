@@ -16,6 +16,9 @@ NAMES_TOML = '''[jobs]
 showrunner = ["showrunner"]
 unit_director = ["unit director"]
 worker = ["worker"]
+implementer = ["implementer"]
+tester = ["tester"]
+repair_worker = ["repair worker"]
 code_reviewer = ["code reviewer"]
 ui_reviewer = ["UI reviewer"]
 designer = ["designer"]
@@ -34,6 +37,7 @@ def fixture_names(*, worker: str = "worker", director: str = "unit director") ->
     """Complete fixture configuration; render tests never need the live file."""
     return names.Names(
         {"showrunner": ("showrunner",), "unit_director": (director,), "worker": (worker,),
+         "implementer": ("implementer",), "tester": ("tester",), "repair_worker": ("repair worker",),
          "code_reviewer": ("code reviewer",), "ui_reviewer": ("UI reviewer",),
          "designer": ("designer",), "design_reviewer": ("design reviewer",)},
         {"showrunners": ("showrunners",), "unit_directors": ("unit directors",),

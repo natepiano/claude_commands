@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_roles  # noqa: E402
-from scripts.guilds import astra_work, tips, roles  # noqa: E402
+from scripts.guilds import astra_work, roles  # noqa: E402
 
 MODEL = "gpt-6-astra"
 REASONING = "xhigh"
@@ -63,17 +63,7 @@ Only read. Do not build, run tests, or change, create or delete any file.
 
 Your final message is the review. Start with a short verdict paragraph. Then list findings, most
 important first. Each finding names where it is (the section heading, or a file path with a line
-number), what is wrong or missing, why it matters, and the change you would make.
-
-## Guild
-
-{tips.guild_block("reviewers")}
-
-Load tips: ~/.claude/scripts/lib/py ~/.claude/scripts/guilds/tips.py load --guild reviewers
-
-Use Events in ~/.claude/docs/as-built/guilds.md for report detection and form.
-
-{tips.load("reviewers")}"""
+number), what is wrong or missing, why it matters, and the change you would make."""
 
 
 def workers_label() -> str | subprocess.CompletedProcess[str]:
@@ -201,9 +191,6 @@ def held_review(design: roles.HeldDesign, focus: str, work: astra_work.PhaseWork
         print(reply.read_text(encoding="utf-8").strip())
         print(f"\nSaved: {reply}")
         return 0
-    except tips.BaselineMissing as error:
-        print(f"astra_review: {error}", file=sys.stderr)
-        return 2
     except (OSError, ValueError) as error:
         print(f"astra_review: held reviewer busy or unavailable: {str(error).replace(chr(10), ' ')}", file=sys.stderr)
         return 1
@@ -253,14 +240,7 @@ def main(arguments: list[str]) -> int:
     review = folder / "review.md"
     assignment = astra_work.AstraWork("astra-reviewer", str(folder), str(document),
                                      datetime.now(timezone.utc).isoformat(), str(review), work)
-    try:
-        prompt = astra_work.header_line(assignment) + "\n" + review_prompt(document, focus)
-    except tips.BaselineMissing as error:
-        print(f"astra_review: {error}", file=sys.stderr)
-        return 2
-    except (OSError, ValueError) as error:
-        print(f"astra_review: {str(error).replace(chr(10), ' ')}", file=sys.stderr)
-        return 1
+    prompt = astra_work.header_line(assignment) + "\n" + review_prompt(document, focus)
     _ = (folder / "prompt.md").write_text(prompt, encoding="utf-8")
     log = folder / "codex.log"
     returncode = run_review(label, review, prompt, log)

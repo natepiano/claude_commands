@@ -463,13 +463,13 @@ kept = ["docs/delegate/", "docs/direct/", "scripts/direct/", "scripts/delegate/"
 [[terms]]
 name = "astra-designer"
 kind = "role"
-defined_in = "docs/as-built/guilds.md#Lasting roles"
+defined_in = "docs/as-built/long-lived-workers.md#Lasting roles"
 other_names = ["chief designer"]
 
 [[terms]]
 name = "astra-reviewer"
 kind = "role"
-defined_in = "docs/as-built/guilds.md#Lasting roles"
+defined_in = "docs/as-built/long-lived-workers.md#Lasting roles"
 other_names = ["chief reviewer"]
 
 [[terms]]
