@@ -768,7 +768,7 @@ def repair_workers(new: str, *, dry_run: bool = False) -> None:
             if isinstance(checked, showrunners.NoCheckedDoc):
                 raise RenameRefused(f"{new}: no production doc: {checked.reason}")
             doc = checked.path
-        production = add_unit.read_production(doc)
+        production = read_production(doc)
         text = doc.read_text(encoding="utf-8")
         former_names = [_string(journal, "old")] if journal else []
         for line in text.splitlines():
