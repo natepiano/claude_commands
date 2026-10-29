@@ -117,6 +117,13 @@ This is the meat — do not paraphrase a resolved design down to a summary.>
      reads `opens as impl`. Writers hold disjoint files; every hub file has
      exactly one owner. Rule 7. -->
 
+**State:** <optional: lasting state this phase writes, or `none` — records,
+marks, locks, claims, state files, file moves or deletes, or a list of steps
+where one step can fail>
+<!-- Accepted with or without this field. Naming lasting state arms the rerun
+     review lens. `none` and an absent field do not arm it; /unit:direct always
+     checks the phase diff too, so neither can suppress a detected write. -->
+
 **Constraints from prior phases:** <concrete facts a worker would otherwise
 re-derive — what earlier phases built, decisions that bind this phase. Empty for
 Phase 1. Maintained by /plan:phase_review.>
