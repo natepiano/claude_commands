@@ -640,7 +640,7 @@ class BulkRefusal:
 def rule_changed_since_judged(finding: HeldFinding, definitions: Mapping[str, Rule]) -> bool:
     """Whether the catalog has no rule for the finding, or the rule's text is not the text the finding was judged under."""
     definition = definitions.get(finding.rule.removesuffix("#uncovered"))
-    return definition is None or definition.blob != finding.rule_blob
+    return definition is None or not rule_catalog.judged_text_unchanged(finding.rule_blob, definition)
 
 
 @dataclass(frozen=True)
@@ -2359,8 +2359,11 @@ class Ledger:
             if rule not in pins:
                 raise LedgerError(f"{ticket}: rule {rule} is outside the ticket")
             if rule_blob and rule_blob != pins[rule]:
-                raise LedgerError(f"{ticket}: rule blob for {rule} differs from ticket pin {pins[rule]}")
-            return pins[rule]
+                definition = next(item for item in rule_catalog.load_rules(self.repo)
+                                  if item.rule_id == rule.removesuffix("#uncovered"))
+                if not rule_catalog.judged_text_unchanged(rule_blob, definition, compared_blob=pins[rule]):
+                    raise LedgerError(f"{ticket}: rule blob for {rule} differs from ticket pin {pins[rule]}")
+            return rule_blob or pins[rule]
         if not rule_blob:
             raise LedgerError(f"{rule}: --rule-blob is required without a ledger ticket")
         return rule_blob
@@ -3231,7 +3234,7 @@ class Ledger:
                                   else self._scope_inputs(tip, scope, path))
                     other_old = {name: entry for name, entry in old_inputs.items() if name != path}
                     other_new = {name: entry for name, entry in new_inputs.items() if name != path}
-                    if (judgment.verdict == "removed" or judgment.rule_blob != definition.blob
+                    if (judgment.verdict == "removed" or not rule_catalog.judged_text_unchanged(judgment.rule_blob, definition)
                             or judged.blobs.get(path) != base.blobs[path] or other_old != other_new
                             or not self._judgment_inputs_match(judgment, judged, scope, path, "types")):
                         blocked.add(rule)
@@ -3910,8 +3913,8 @@ class Ledger:
             raise
         except LedgerError:
             unchanged = False
-        if (held.cell_newest_id != held.judgment_id or held.inputs.rule_blob != definition.blob
-                or any(finding.rule_blob != definition.blob for finding in members) or not unchanged):
+        if (held.cell_newest_id != held.judgment_id or not rule_catalog.judged_text_unchanged(held.inputs.rule_blob, definition)
+                or any(not rule_catalog.judged_text_unchanged(finding.rule_blob, definition) for finding in members) or not unchanged):
             return InputChangedSinceJudged()
         if held_by_others:
             return CellStillHeld(held.judgment)
@@ -3940,7 +3943,7 @@ class Ledger:
             if finding.finding_id in waiting:
                 continue
             definition = definitions.get(finding.rule.removesuffix("#uncovered"))
-            if definition is not None and (isinstance(finding.state, Unfiled) or definition.blob != finding.rule_blob):
+            if definition is not None and (isinstance(finding.state, Unfiled) or not rule_catalog.judged_text_unchanged(finding.rule_blob, definition)):
                 changed.append((finding, definition))
         return tuple(changed)
 
@@ -3953,15 +3956,17 @@ class Ledger:
         # A removed row closes a cell whose file is gone; it is no verdict on code.
         rows = cast(list[tuple[int, Verdict, str, str, str, str, str]], self._connection.execute(
             "SELECT j.id,j.verdict,j.rule_blob,j.recorded_at,h.created_at,h.followed_at,h.updated_at FROM judgments j "
-            + "JOIN held_findings h ON h.finding_id=? WHERE j.rule=? AND j.path=? AND j.rule_blob IN (?,?) AND j.verdict!='removed' "
-            + "ORDER BY j.recorded_at DESC,j.id DESC LIMIT 1",
-            (finding.finding_id, finding.rule, _finding_cell(definition, finding.path, tip), definition.blob, finding.rule_blob),
+            + "JOIN held_findings h ON h.finding_id=? WHERE j.rule=? AND j.path=? AND j.verdict!='removed' "
+            + "ORDER BY j.recorded_at DESC,j.id DESC",
+            (finding.finding_id, finding.rule, _finding_cell(definition, finding.path, tip)),
         ).fetchall())
-        withdraws = (rows and rows[0][2] == definition.blob
+        rows = [row for row in rows if rule_catalog.judged_text_unchanged(row[2], definition)
+                or rule_catalog.judged_text_unchanged(row[2], definition, compared_blob=finding.rule_blob)][:1]
+        withdraws = (rows and rule_catalog.judged_text_unchanged(rows[0][2], definition)
                      and (isinstance(finding.state, Unfiled) or rows[0][1] == "exception")
                      and rows[0][4] < rows[0][3]
                      and (not rows[0][5] or rows[0][6] < rows[0][3]))
-        return SupersedingJudgment(rows[0][0], rows[0][1], definition.blob) if withdraws else NotJudgedAgain()
+        return SupersedingJudgment(rows[0][0], rows[0][1], rows[0][2]) if withdraws else NotJudgedAgain()
 
     def _judged_again_without(self, finding: HeldFinding, definition: Rule, tip: RepositoryTip) -> SupersedingJudgment | NotJudgedAgain:
         """The newest judgment at the cell under the finding's rule text, when another ticket recorded it after the
@@ -3972,24 +3977,26 @@ class Ledger:
         cell = _finding_cell(definition, finding.path, tip)
         created, followed, updated = cast(tuple[str, str, str], self._connection.execute(
             "SELECT created_at,followed_at,updated_at FROM held_findings WHERE finding_id=?", (finding.finding_id,)).fetchone())
-        rows = cast(list[tuple[int, Verdict, str, str, str, str, str, str]], self._connection.execute(
-            'SELECT id,verdict,ticket,input_fingerprint,"commit",input_scope,declared_scope,read_files FROM judgments '
-            + "WHERE rule=? AND path=? AND rule_blob=? AND verdict!='removed' AND recorded_at>? ORDER BY recorded_at DESC,id DESC LIMIT 1",
-            (finding.rule, cell, finding.rule_blob, updated if followed else created),
+        candidates = cast(list[tuple[int, Verdict, str, str, str, str, str, str, str]], self._connection.execute(
+            'SELECT id,verdict,ticket,input_fingerprint,"commit",input_scope,declared_scope,read_files,rule_blob FROM judgments '
+            + "WHERE rule=? AND path=? AND verdict!='removed' AND recorded_at>? ORDER BY recorded_at DESC,id DESC",
+            (finding.rule, cell, updated if followed else created),
         ).fetchall())
-        holder = {row[0] for row in cast(list[tuple[str]], self._connection.execute(
-            "SELECT input_fingerprint FROM judgments WHERE rule=? AND path=? AND rule_blob=? AND ticket=?",
-            (finding.rule, cell, finding.rule_blob, finding.ticket),
-        ).fetchall())}
+        rows = [row for row in candidates if rule_catalog.judged_text_unchanged(
+            row[8], definition, compared_blob=finding.rule_blob)][:1]
+        holder = {fingerprint for fingerprint, blob in cast(list[tuple[str, str]], self._connection.execute(
+            "SELECT input_fingerprint,rule_blob FROM judgments WHERE rule=? AND path=? AND ticket=?",
+            (finding.rule, cell, finding.ticket),
+        ).fetchall()) if rule_catalog.judged_text_unchanged(blob, definition, compared_blob=finding.rule_blob)}
         if not rows or rows[0][2] == finding.ticket:
             return NotJudgedAgain()
-        judgment_id, verdict, _, fingerprint, commit, scope, declared, reads = rows[0]
+        judgment_id, verdict, _, fingerprint, commit, scope, declared, reads, blob = rows[0]
         # A followed finding's holding ticket judged its old file, so a judgment of its new file after the follow read
         # that file again.
         if not ((fingerprint not in holder) if holder else bool(followed)):
             return NotJudgedAgain()
         # A judgment of an older file at the cell did not read the file the finding is at now.
-        judgment = Judgment(finding.rule_blob, fingerprint, commit, verdict, CellInputScope(scope), DeclaredInputScope(declared), _read_files(reads))
+        judgment = Judgment(blob, fingerprint, commit, verdict, CellInputScope(scope), DeclaredInputScope(declared), _read_files(reads))
         try:
             current = (self._is_ancestor(commit, tip.commit)
                        and self._judgment_inputs_match(judgment, tip, _cell_scope(definition, cell, tip), cell, definition.family))
@@ -3997,13 +4004,13 @@ class Ledger:
             raise
         except LedgerError:
             current = False
-        return SupersedingJudgment(judgment_id, verdict, finding.rule_blob) if current else NotJudgedAgain()
+        return SupersedingJudgment(judgment_id, verdict, blob) if current else NotJudgedAgain()
 
     def _superseded(self, definitions: Mapping[str, Rule], tip: RepositoryTip) -> Withdrawal:
         withdrawn: list[WithdrawnFinding] = []
         kept: list[KeptForBuild] = []
         for finding, definition in self._withdrawal_candidates(definitions):
-            verdict = (self._judged_again_without(finding, definition, tip) if definition.blob == finding.rule_blob
+            verdict = (self._judged_again_without(finding, definition, tip) if rule_catalog.judged_text_unchanged(finding.rule_blob, definition)
                        else self._judged_under_changed_text(finding, definition, tip))
             if isinstance(verdict, NotJudgedAgain):
                 continue
@@ -4842,7 +4849,8 @@ class Ledger:
             return line_local and not contextual
         longest = max(len(path) for path, _ in candidates)
         path, row = next((path, row) for path, row in candidates if len(path) == longest)
-        if (row.rule_blob != finding.rule_blob or not self._is_ancestor(row.commit, tip.commit)
+        if (not rule_catalog.judged_text_unchanged(row.rule_blob, self._component_rule(finding.rule),
+                                                           compared_blob=finding.rule_blob) or not self._is_ancestor(row.commit, tip.commit)
                 or row not in self._rows_after_removals(self._site_rows[(finding.rule, path)], tip.commit)):
             return False
         scope = _comparison_scope(row.declared_scope, row.input_scope)
@@ -4913,7 +4921,7 @@ class Ledger:
         definition = next((rule for rule in self._catalog
                            if rule.rule_id == finding.rule.removesuffix("#uncovered")), None)
         family = self._site_rule_families.get(finding.rule_blob, "")
-        if not family and definition is not None and definition.blob == finding.rule_blob:
+        if not family and definition is not None and rule_catalog.judged_text_unchanged(finding.rule_blob, definition):
             family = definition.family or ""
         for tree in (before, tip):
             entry = tree.entries.get(finding.path)
@@ -6177,7 +6185,7 @@ class Ledger:
                     pass
                 continue
             judged = True
-            if row.declared_scope != declared or row.rule_blob != rule.blob:
+            if row.declared_scope != declared or not rule_catalog.judged_text_unchanged(row.rule_blob, rule):
                 continue
             try:
                 ancestor = self._is_ancestor(row.commit, tip.commit)
@@ -6244,7 +6252,7 @@ class Ledger:
             for row in rows:
                 if row.verdict == "removed":
                     break
-                if row.declared_scope != rows[0].declared_scope or row.rule_blob != rule.blob:
+                if row.declared_scope != rows[0].declared_scope or not rule_catalog.judged_text_unchanged(row.rule_blob, rule):
                     continue
                 try:
                     repeats = (self._is_ancestor(row.commit, tip.commit) and self._is_ancestor(row.commit, merged)
@@ -6333,7 +6341,7 @@ class Ledger:
                         state: CellState = "open"
                         if lint_coverage.has_runs:
                             state = "current" if (lint_coverage.passed and lint_coverage.diagnostics.get(path, 0) == 0
-                                                  and lint_coverage.rule_blobs.get(component.rule_id) == component.blob) else "stale"
+                                                  and rule_catalog.judged_text_unchanged(lint_coverage.rule_blobs.get(component.rule_id, ""), component)) else "stale"
                         verdict = ""
                     else:
                         state, verdict = self._judgment_state(_judgment_rule(component, path), path, tip)

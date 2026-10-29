@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from typing import TypedDict, cast, override
+from typing import ClassVar, TypedDict, cast, override
 import unittest
 
 
@@ -145,6 +145,24 @@ exit 0
 
 
 class VerifyLintScopeFixture(unittest.TestCase):
+    fixture_root: ClassVar[Path]
+    fixture_seed: ClassVar[Path]
+    fixture_environment: ClassVar[dict[str, str]]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        directory = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="lint-scope-test-")))
+        builder = cls()
+        builder.root = directory / "case"
+        builder.root.mkdir()
+        builder.build_fixture()
+        cls.fixture_root = builder.root
+        cls.fixture_seed = directory / "seed"
+        cls.fixture_environment = builder.environment.copy()
+        _ = shutil.copytree(builder.root, cls.fixture_seed, symlinks=True)
+        shutil.rmtree(builder.root)
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root: Path = Path()
@@ -155,7 +173,20 @@ class VerifyLintScopeFixture(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        # A few feature tests use this fixture directly, without a class lifecycle.
+        if "fixture_seed" not in type(self).__dict__ or not self.fixture_seed.is_dir():
+            self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+            self.build_fixture()
+            return
+        self.root = self.fixture_root
+        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
+        self.addCleanup(shutil.rmtree, self.root)
+        self.config = self.root / "lint.conf"
+        self.events = self.root / "cargo-events.jsonl"
+        self.taplo_events = self.root / "taplo-events.jsonl"
+        self.environment = self.fixture_environment.copy()
+
+    def build_fixture(self) -> None:
         home = self.root / "home"
         claude = home / ".claude"
         claude.mkdir(parents=True)
@@ -221,6 +252,9 @@ class VerifyLintScopeFixture(unittest.TestCase):
                                     "CARGO_", "RUST", "NEXTEST_", "CLAUDE_CODE_", "CODEX_"))
         }
         self.environment.update({
+            # The fixture supplies its complete toolchain; Nix discovery is unrelated
+            # to lint scope, formatting, fix convergence or cache assertions.
+            "IN_NIX_SHELL": "pure",
             "HOME": str(home),
             "PATH": f"{bin_directory}{os.pathsep}{os.environ['PATH']}",
             "CLAUDE_PYTHON": "",

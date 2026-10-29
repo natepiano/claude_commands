@@ -107,6 +107,10 @@ class StyleLedgerSitesTests(LedgerTestCase):
 
     def test_site_follow_preserves_line_evidence_and_pinned_fields_without_restamping_cells(self) -> None:
         ledger, rule, finding = self.site_fixture()
+        # Keep the historical rule readable when both original pins are validated.
+        _ = subprocess.run(["git", "init", "-q", str(self.rule_dir.parent)], check=True)
+        _ = subprocess.run(["git", "-C", str(self.rule_dir.parent), "hash-object", "-w",
+                            str(self.rule_dir / "site-rule.md")], check=True, capture_output=True)
         # A substantive rule edit must remain separate coverage work after the follow.
         _ = (self.rule_dir / "site-rule.md").write_text((self.rule_dir / "site-rule.md").read_text() + "New requirement\n")
         tip = self.commit_tip(ledger, {PARENT_FILE: "// inserted\nfn work() {\n    let old = 791;\n}\nfn sibling() {}\n"})
