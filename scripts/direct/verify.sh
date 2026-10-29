@@ -1531,14 +1531,13 @@ finish_mac_pass() {
 # when the holder, reason or escalation message changes during this wait.
 check_routing_hold() {
     local admission=0
-    if build_hold_nothing_held; then phase_wait_finish hold; return 0; fi
+    if build_hold_nothing_held; then return 0; fi
     python3 "$BUILD_TARGETS_SCRIPT" register-local --call-id "$BUILDLOG_CALL_ID" --pid $$ \
         2>"$HOLD_WAIT_DIR/routing-diagnostic" || admission=$?
     if ! cmp -s "$HOLD_WAIT_DIR/routing-diagnostic" "$HOLD_WAIT_DIR/last-routing-diagnostic"; then
         cat "$HOLD_WAIT_DIR/routing-diagnostic" >&2
         cp "$HOLD_WAIT_DIR/routing-diagnostic" "$HOLD_WAIT_DIR/last-routing-diagnostic"
     fi
-    if [[ "$admission" == 10 ]]; then phase_wait_start hold "build hold"; fi
     build_hold_check_result "$admission" register-local
 }
 
@@ -1785,6 +1784,7 @@ route_test() {
             echo "verify.sh: waiting for the Mac ($BUILDLOG_MAC_REASON) or natedev's release." >&2
             announced_reason="$BUILDLOG_MAC_REASON"
         fi
+        phase_wait_start hold "build hold"
         if [[ -z "$ROUTING_WAIT_STARTED" ]]; then
             ROUTING_WAIT_STARTED="$("$PY" -c 'import time; print(time.monotonic())')"
         fi
@@ -2208,6 +2208,8 @@ fi
 # token is given back for each memory wait, so the two differ between steps.
 TOKEN_USED=0
 TOKEN_HELD=0
+# A step routed to the Mac skips its first token acquisition.
+TOKEN_WAITED=0
 TOKEN_WAITER_PID=""
 token_wait_clock() {
     # Tests can advance a disposable clock while acquisition still blocks on

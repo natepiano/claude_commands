@@ -17,6 +17,7 @@ import unittest
 from pathlib import Path
 from typing import cast, override
 
+from scripts.direct import test_verify_step_routes as routes
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.direct.test_verify_mac_offload import RUSTC_STUB, stub_build_tool_path
@@ -298,6 +299,29 @@ esac
             if child.poll() is None:
                 child.kill()
             _ = child.wait(timeout=300)
+
+    def test_mac_routing_under_hold_skips_initial_token_acquisition(self) -> None:
+        holders = Path(self.environment["BUILD_HOLD_DIR"])
+        holders.mkdir()
+        _ = (holders / "other").write_text("fixture hold")
+        targets = self.root / "targets.py"
+        runner = self.root / "mac-runner.py"
+        _ = targets.write_text(routes.TARGETS)
+        _ = runner.write_text(routes.RUNNER)
+        self.environment.update({
+            "BUILD_TARGETS_SCRIPT": str(targets), "VERIFY_MAC_RUNNER": str(runner),
+            "TEST_ROUTE_EVENTS": str(self.root / "route-events"),
+            "TEST_MAC_EVENTS": str(self.root / "mac-events"),
+            "MAC_TEST_CONFIG": str(self.root / "mac-settings"), "TEST_MAC_ALLOWED": "1",
+        })
+        result = self.verify(self.environment)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rows = [cast(Record, json.loads(line)) for line in (self.root / "mac-events").read_text().splitlines()]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(cast(Record, rows[0]["record"])["state"], "on_mac")
+        self.assertFalse((self.root / "cargo-calls").exists())
+        self.assertFalse((self.root / "session" / "locks" / "cargo.d").exists())
+        self.assertEqual(self.records()[-1]["token_wait_s"], 0)
 
     def test_no_token_records_zero(self) -> None:
         # A session dir alone makes this a director's run, which takes the token.

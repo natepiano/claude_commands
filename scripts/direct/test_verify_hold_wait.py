@@ -17,7 +17,7 @@ from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TypedDict, cast, override
+from typing import Literal, TypedDict, cast, override
 from unittest import mock
 
 from scripts.build_hold import build_hold
@@ -214,6 +214,23 @@ class VerifyHoldWaitTests(unittest.TestCase):
         output, errors = process.communicate(timeout=HANG_GUARD_S)
         return process.returncode, self.wait_output.pop(process.pid, "") + output + self.wait_diagnostics.pop(process.pid, "") + errors
 
+    def set_hold_routing(self, runs_on: Literal["natedev_only", "mac_allowed"]) -> None:
+        targets = self.fixture.root / "hold-targets.py"
+        _ = targets.write_text(f'''import os
+import runpy
+import sys
+
+if sys.argv[1] == "eligible":
+    print({runs_on!r} + (" fixture local wait" if {runs_on!r} == "natedev_only" else ""))
+    print("natedev\\teligible\\t-\\t-")
+    if {runs_on!r} == "mac_allowed":
+        print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"])
+else:
+    sys.path.insert(0, {str(TARGETS.parent)!r})
+    runpy.run_path({str(TARGETS)!r}, run_name="__main__")
+''')
+        self.fixture.environment["BUILD_TARGETS_SCRIPT"] = str(targets)
+
     def record_phase(self) -> Path:
         session = self.fixture.root / "unit-run"
         self.fixture.environment.update({"UNIT_RUN_DIR": str(session), "UNIT_PHASE_ID": "closed-server-phase",
@@ -235,6 +252,7 @@ class VerifyHoldWaitTests(unittest.TestCase):
         return self.fixture.root / "history" / "runs" / f"{session.name}.jsonl"
 
     def test_reused_server_wait_uses_the_slots_open_phase_after_its_old_phase_closed(self) -> None:
+        self.set_hold_routing("natedev_only")
         history = self.record_phase()
         session = Path(self.fixture.environment["UNIT_RUN_DIR"])
         for arguments in (
@@ -260,6 +278,7 @@ class VerifyHoldWaitTests(unittest.TestCase):
         self.assertEqual((wait["phase_id"], wait["phase_instance_id"]), ("7", phase["phase_instance_id"]))
 
     def test_review_with_an_empty_slot_records_its_active_pass_wait(self) -> None:
+        self.set_hold_routing("natedev_only")
         history = self.record_phase()
         self.fixture.environment["UNIT_TEAM_ROLE"] = ""
         session = self.fixture.environment["UNIT_RUN_DIR"]
@@ -281,6 +300,7 @@ class VerifyHoldWaitTests(unittest.TestCase):
         self.assertEqual(wait["phase_instance_id"], phase["phase_instance_id"])
 
     def test_probe_verification_waits_without_phase_wait_events(self) -> None:
+        self.set_hold_routing("natedev_only")
         history = self.record_phase()
         self.fixture.environment["CLAUDE_PROBE_SESSION"] = "1"
         self.hold()
@@ -289,6 +309,20 @@ class VerifyHoldWaitTests(unittest.TestCase):
         grant_call(self.cycle_file)
         code, output = self.finish(process)
         self.assertEqual(code, 0, output)
+        rows = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
+        self.assertEqual([row for row in rows if str(row["event_type"]).startswith("wait_")], [])
+
+    def test_mac_allowed_check_during_hold_starts_no_phase_hold_wait(self) -> None:
+        history = self.record_phase()
+        self.set_hold_routing("mac_allowed")
+        self.hold()
+        before = self.cycle_file.read_bytes()
+        self.fixture.environment.update({"TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
+        result = self.fixture.verify("check", "sample")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(self.fixture.runner_events()), 1)
+        self.assertEqual(self.fixture.local_runs(), [])
+        self.assertEqual(self.cycle_file.read_bytes(), before)
         rows = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
         self.assertEqual([row for row in rows if str(row["event_type"]).startswith("wait_")], [])
 
