@@ -1827,6 +1827,12 @@ def _config_hash(repo: Path, tip: RepositoryTip, tool: LintTool) -> str:
     return hashlib.sha256(json.dumps(inputs, separators=(",", ":")).encode()).hexdigest()
 
 
+def legacy_built_at_sql(finding: str = "held_findings") -> str:
+    """The build time of a built finding before schema 25, using its SQL table name or alias."""
+    return (f"COALESCE((SELECT updated_at FROM tickets WHERE id={finding}.build_ticket "
+            + f"AND state='merged'), {finding}.updated_at)")
+
+
 MIGRATIONS = {
     1: """
         CREATE TABLE judgments (
@@ -1959,7 +1965,7 @@ MIGRATIONS = {
             PRIMARY KEY(finding_id, ticket)
         );
     """,
-    25: """
+    25: f"""
         CREATE TABLE refill_results (
             unit TEXT PRIMARY KEY, at TEXT NOT NULL, outcome TEXT NOT NULL,
             split_at TEXT NOT NULL DEFAULT '', ready INTEGER NOT NULL DEFAULT 0,
@@ -1967,9 +1973,7 @@ MIGRATIONS = {
             other INTEGER NOT NULL DEFAULT 0
         );
         ALTER TABLE held_findings ADD COLUMN built_at TEXT NOT NULL DEFAULT '';
-        UPDATE held_findings SET built_at=COALESCE(
-            (SELECT updated_at FROM tickets WHERE id=held_findings.build_ticket AND state='merged'), updated_at
-        ) WHERE state='built';
+        UPDATE held_findings SET built_at={legacy_built_at_sql()} WHERE state='built';
     """,
 }
 
