@@ -19,7 +19,7 @@
 
 | Unit | Plan | Worktree | Branch | Port | Owns |
 | --- | --- | --- | --- | --- | --- |
-| designers | `docs/plans/guilds-designers.md` | `/home/natepiano/worktrees/claude-guilds-designers` | `guilds-designers` | — | `~/rust/nate_style/guilds/designers/`; `~/rust/nate_style/guilds/designers_base/`; common tips tagged only `head/designers` |
+| designers | (retired 2026-10-28, worktree removed, session 78d3a48b-b86d-4952-b150-401507c8dbe1) `docs/plans/guilds-designers.md` | `/home/natepiano/worktrees/claude-guilds-designers` | `guilds-designers` | — | `~/rust/nate_style/guilds/designers/`; `~/rust/nate_style/guilds/designers_base/`; common tips tagged only `head/designers` |
 | reviewers | `docs/plans/guilds-reviewers.md` | `/home/natepiano/worktrees/claude-guilds-reviewers` | `guilds-reviewers` | — | `~/rust/nate_style/guilds/reviewers/`; `~/rust/nate_style/guilds/reviewers_base/`; common tips tagged only `head/reviewers` |
 | showrunners | `docs/plans/guilds-showrunners.md` | `/home/natepiano/worktrees/claude-guilds-showrunners` | `guilds-showrunners` | — | `~/rust/nate_style/guilds/showrunners/`; `~/rust/nate_style/guilds/showrunners_base/`; common tips tagged only `head/showrunners` |
 | units | `docs/plans/guilds-units.md` | `/home/natepiano/worktrees/claude-guilds-units` | `guilds-units` | — | `~/rust/nate_style/guilds/units/`; `~/rust/nate_style/guilds/units_base/`; common tips tagged only `head/units` |
