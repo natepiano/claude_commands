@@ -13,10 +13,10 @@ import sys
 import tempfile
 import unittest
 import urllib.request
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
-from typing import Self, cast, override
+from typing import TYPE_CHECKING, Self, cast, override
 from unittest.mock import MagicMock, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -85,6 +85,7 @@ class AgentNotesTests(unittest.TestCase):
         _ = self.enterContext(patch.object(agent_notes, "READINGS_LOG", self.root / "readings.jsonl", create=True))
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         self.rows = cast(MagicMock, self.enterContext(patch.object(session_table, "live_sessions", return_value=session_table.ReadSessions({}, frozenset()))))
+        _ = self.enterContext(patch("sessions.live_sessions", return_value=[]))
 
     def snapshot(self, reports: list[Report]) -> agent_notes.UpdatedAgentNotes:
         selection = agent_accounts.ClaudeAccountsInUse(agent_accounts.UnreadableIdentity(Path.home() / ".claude", "fixture identity unavailable"), False, (), frozenset())
@@ -563,6 +564,69 @@ class AgentNotesTests(unittest.TestCase):
         self.assertEqual(former_after.get("tier"), "null")
         self.assertEqual(selected_after.get("tier"), "regular")
         self.assertEqual([event.args[1] for event in replace.call_args_list], [former.path, selected.path])
+
+    def test_notes_pass_shares_process_scan_without_changing_outputs_or_decisions(self) -> None:
+        from scripts.accounts import unit_watchdog
+        if TYPE_CHECKING:
+            from scripts.herdr import herdr
+        else:
+            import herdr
+        proc = self.root / "proc"
+        proc.mkdir()
+        home = self.root / ".codex"
+        self.codex_login(home, "timer@example.invalid")
+        note = self.note("codex1.md", "timer@example.invalid")
+        report = Report("Codex", email="timer@example.invalid", source=CodexHomeSource(home),
+                        quotas=[Quota("Weekly", 20, self.future)], credit_balance="0")
+        events: list[str] = []
+        rows = session_table.ReadSessions({}, frozenset())
+        def sessions(*_args: object, **_kwargs: object) -> session_table.ReadSessions:
+            self.assertEqual(herdr.herdr_processes(), [])
+            events.append("sessions")
+            return rows
+        def alerted(*_args: object, **_kwargs: object) -> list[str]:
+            self.assertEqual(herdr.herdr_processes(), [])
+            events.append("alert")
+            return ["fixture alert decision"]
+        def watched(*_args: object, **_kwargs: object) -> list[str]:
+            self.assertEqual(herdr.herdr_processes(), [])
+            events.append("refusal")
+            return ["fixture refusal decision", *unit_watchdog.run(self.now, dry_run=False)]
+        with (patch.object(sys, "argv", ["agent_notes.py"]),
+              patch.object(herdr, "_proc_root", return_value=proc),
+              patch.object(herdr, "_process_sessions", wraps=herdr._process_sessions) as scans,  # pyright: ignore[reportPrivateUsage]
+              patch.object(agent_notes, "live_reports", return_value=[report]) as reports,
+              patch.object(agent_notes, "resolve_workers_home", return_value=home),
+              patch.object(five_hour, "watch", return_value=[]),
+              patch.object(session_table, "live_sessions", side_effect=sessions),
+              patch.object(agent_notes, "alert", side_effect=alerted),
+              patch.object(codex_pacer, "tick", return_value={"tier": "default"}) as paced,
+              patch.object(agent_notes, "mark_tier") as marked,
+              patch.object(refusal_watch, "run", side_effect=watched),
+              patch.object(unit_watchdog, "run", return_value=["fixture watchdog decision"]) as watchdog):
+            # Seed the stored reading, then compare the same reused pass with and without a scope.
+            _ = agent_notes.update_alert_pass(accounts.claude_account_selection(), home)
+            scans.reset_mock()
+            events.clear()
+            with patch.object(herdr, "process_snapshot", return_value=nullcontext()), redirect_stdout(io.StringIO()) as baseline:
+                agent_notes.main()
+            self.assertEqual(scans.call_count, 3)
+            before_note = note.path.read_bytes()
+            before_readings = (self.root / "readings.jsonl").read_bytes()
+            before_events = list(events)
+            events.clear()
+            scans.reset_mock()
+            with redirect_stdout(io.StringIO()) as scoped:
+                agent_notes.main()
+            self.assertEqual(scans.call_count, 1)
+        self.assertEqual(scoped.getvalue(), baseline.getvalue())
+        self.assertEqual(events, before_events)
+        self.assertEqual(note.path.read_bytes(), before_note)
+        self.assertEqual((self.root / "readings.jsonl").read_bytes(), before_readings)
+        self.assertEqual(reports.call_count, 1)
+        self.assertEqual(paced.call_count, 2)
+        self.assertEqual(marked.call_args_list, [call({"tier": "default"})] * 2)
+        self.assertEqual(watchdog.call_count, 2)
 
     def test_argument_free_notes_update_runs_watcher_after_notes_alert_and_pacer(self) -> None:
         events: list[str] = []

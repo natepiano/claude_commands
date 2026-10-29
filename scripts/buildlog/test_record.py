@@ -20,6 +20,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 
+if TYPE_CHECKING:
+    from ..lib.socket_test_support import short_socket_directory
+else:
+    from scripts.lib.socket_test_support import short_socket_directory
+
 import record as recorder
 import sample
 import store
@@ -232,7 +237,7 @@ class RecordTests(unittest.TestCase):
     def test_piped_run_records_memory_wait_outside_step_duration(self) -> None:
         meminfo = self.base / "meminfo"
         _ = meminfo.write_text("MemAvailable: 11534336 kB\n")
-        runtime = self.base / "runtime" / "systemd"
+        runtime = Path(self.enterContext(short_socket_directory())) / "systemd"
         runtime.mkdir(parents=True)
         with socket.socket(socket.AF_UNIX) as manager:
             manager.bind(str(runtime / "private"))

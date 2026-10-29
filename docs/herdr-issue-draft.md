@@ -14,7 +14,7 @@ A Claude Code pane sits at a permission dialog ("Do you want to proceed?"), but 
 
 ## Cause
 
-`live_prompt_box` uses region `prompt_box_body`: the text between the last two horizontal lines on the screen (full-width rows of the box-drawing character `─`, U+2500, which Claude Code draws above and below its input box and at the top of a dialog). It matches when a line in that text starts with `❯`.
+`live_prompt_box` uses region `prompt_box_body`: the text between the last two horizontal lines on the screen (rows of the box-drawing character `─`, U+2500, which Claude Code draws above and below its input box and at the top of a dialog). A row does not have to be full width to count: in our test, an indented line of 140 `─` in a 158-column pane counted. It matches when a line in that text starts with `❯`.
 
 While a permission dialog is open, the last horizontal line on the screen is the top border of the dialog, not the input box. If the transcript above the dialog holds one more horizontal line (for example, a separator in tool output or in a rendered message), the text between that stray line and the dialog's top border is taken as the input box. When that text holds a line that starts with `❯` (an echoed earlier prompt, or a `❯` in tool output), `live_prompt_box` matches.
 
@@ -22,12 +22,26 @@ The rule's `not` clauses (`esc to cancel`, `enter to select`, …) do not help, 
 
 ## How to reproduce
 
-1. Start Claude Code in a herdr pane in default permission mode.
-2. Make the transcript show a horizontal line of `─` characters and, below it, a line that starts with `❯`. For example, ask Claude to print a line of `─` characters, then send a second prompt so that the echoed `❯ <prompt>` line is below that line.
-3. Ask Claude to run a Bash command that needs approval, so that the permission dialog opens at the bottom of the screen.
-4. Run `herdr pane get <pane>` and `herdr agent explain <pane>`.
+We ran these steps on 2026-10-29 in a 158-column herdr pane, with Claude Code in default permission mode:
 
-We have not run these exact steps. We found the cause from a saved copy of the pane's screen. You can check a saved screen without a live session: `herdr agent explain --file <screen> --agent claude`.
+1. Send this prompt: `Reply with only this, as plain text and no code block: the word ok, then on the next line 140 copies of the box-drawing character U+2500 and nothing else. Do not use any tool.` Claude replies `ok` and a line of `─`.
+2. Send this prompt: `Run this exact Bash command and nothing else: uptime`. The command runs with no dialog. Its echoed prompt line, `❯ Run this exact Bash command …`, is now below the line of `─`.
+3. Send this prompt: `Run this exact Bash command and nothing else: curl -sI https://example.com`. The permission dialog opens ("Do you want to proceed?").
+4. Save the screen with `herdr pane read <pane> --source detection > screen.txt`, and run `herdr agent explain --file screen.txt --agent claude`.
+
+Result with the downloaded rules (`version = "2026.10.11.1"`):
+
+```
+state: idle
+rule: live_prompt_box (region=prompt_box_body priority=950)
+evidence: "\n✻ Cooked for 4s · done 11:09\n\n❯ Run this exact Bash command and nothing else: uptime\n…"
+```
+
+`agent explain -v` shows that `bash_permission_prompt` (blocked, priority 850) also matches, but `live_prompt_box` outranks it.
+
+To check the cause, we removed only the line of `─` from the same saved screen and ran `agent explain` again. The result is `state: blocked`, rule `bash_permission_prompt`.
+
+The saved screen is attached (`herdr-issue-screen.txt`).
 
 ## Expected
 
