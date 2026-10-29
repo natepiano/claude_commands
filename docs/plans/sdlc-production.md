@@ -58,8 +58,9 @@ These three files are also hub files in build-followups. An edit to one of them 
 
 | Gate | Waiting | Waits on | Clears when |
 | --- | --- | --- | --- |
+| G1 | hierarchies-unit Phase 4 (measure.py reads wait records and merge receipts) | phases-unit Phase 6 (HI7 wait records and merge receipts; depends on its phase 3) | That checkpoint is on origin/sdlc and ~/.claude main, its notice names the record file and commit, and the file holds at least one wait record and one receipt from a real phase. |
 
-No gates yet. The plans are not written. When a plan needs another unit's checkpoint, the gate goes here.
+When a plan needs another unit's checkpoint, the gate goes here.
 
 ## Close-out
 
