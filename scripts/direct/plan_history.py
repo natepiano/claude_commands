@@ -38,6 +38,12 @@ PHASE_STATUS_PATTERN = re.compile(r"·[ \t]*status:[ \t]*(?P<status>todo|done)\b
 # em-dash separator.
 PHASE_TITLE_PATTERN = re.compile(r"^[ \t]*[—–-][ \t]*\S")
 DEPENDS_ON_PATTERN = re.compile(r"^\*\*Depends on:\*\*[ \t]*(?P<list>[^\n]*)$", re.MULTILINE)
+PHASE_REFERENCE_PATTERN = re.compile(
+    r"\bPhase[ \t]+(?P<single>\d+[a-z]?(?!\w|[-:./]\d))"
+    + r"|\bPhases[ \t]+(?P<list>\d+[a-z]?(?!\w|[-:./]\d)"
+    + r"(?:[ \t]*(?:,[ \t]*(?:and[ \t]+)?|and[ \t]+|&[ \t]*)"
+    + r"\d+[a-z]?(?!\w|[-:./]\d))*)"
+)
 BLOCKED_BY_PATTERN = re.compile(r"^\*\*Blocked by:\*\*[ \t]*(?P<gate>G\d+)", re.MULTILINE)
 
 
@@ -111,11 +117,14 @@ def plan_phase_details(plan_path: Path) -> tuple[list[PlanPhase], list[str]]:
         end = headings[position + 1].start() if position + 1 < len(headings) else len(text)
         body = text[match.end() : end]
         depends_match = DEPENDS_ON_PATTERN.search(body)
-        depends_on = (
-            None
-            if depends_match is None
-            else re.findall(r"\b\d+[a-z]?\b", depends_match.group("list"))
-        )
+        depends_on: list[str] | None = None
+        if depends_match is not None:
+            depends_on = []
+            for reference in PHASE_REFERENCE_PATTERN.finditer(depends_match.group("list")):
+                phase_ids = reference.group("single") or reference.group("list")
+                for dependency in phase_ids.replace(",", " ").replace("&", " ").split():
+                    if dependency != "and" and dependency not in depends_on:
+                        depends_on.append(dependency)
         blocked_match = BLOCKED_BY_PATTERN.search(body)
         phases.append(
             PlanPhase(

@@ -56,6 +56,7 @@
 | typesafe-unit | docs/plans/build-followups-typesafe.md | `/home/natepiano/worktrees/claude-natedev-typesafe` | `natedev-typesafe` | — | — |
 | postmaster-unit | permanent | `/home/natepiano/worktrees/claude-natedev-postmaster` | `natedev-postmaster` | — | — |
 | ups-unit | permanent | `/home/natepiano/worktrees/claude-natedev-ups` | `natedev-ups` | — | — |
+| security-unit | standby | /home/natepiano/worktrees/claude-natedev-security | natedev-security | — | — |
 
 ## Hub files
 
