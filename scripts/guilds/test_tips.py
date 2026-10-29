@@ -9,12 +9,15 @@ import shlex
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
+from types import SimpleNamespace
 from typing import override
 from unittest import mock
+
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.guilds import tips  # noqa: E402
@@ -26,7 +29,17 @@ LOCK_PUBLISH_DRIVER = """
 import sys
 sys.path.insert(0, sys.argv[1])
 from scripts.guilds import tips
-tips.GIT_TIMEOUT = float(sys.argv[2])
+from types import SimpleNamespace
+tips.GIT_TIMEOUT = 2 if sys.argv[2] == "expire" else float(sys.argv[2])
+if sys.argv[2] == "expire":
+    elapsed = 0.0
+    def monotonic() -> float:
+        return elapsed
+    def retry_sleep(_delay: float) -> None:
+        global elapsed
+        elapsed += 1.0
+        print("lock retry", flush=True)
+    tips.time = SimpleNamespace(monotonic=monotonic, sleep=retry_sleep)
 real_flock = tips.fcntl.flock
 def observed_flock(fd: int, operation: int) -> None:
     try:
@@ -76,7 +89,7 @@ class TipsTests(unittest.TestCase):
 
     def git(self, directory: Path, *arguments: str) -> str:
         result = subprocess.run(["git", "-C", str(directory), *arguments], env=self.environment,
-                                capture_output=True, text=True, timeout=15, check=False)
+                                capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout.strip()
 
@@ -94,7 +107,7 @@ class TipsTests(unittest.TestCase):
     def invoke(self, *arguments: str, checkout: Path | None = None) -> subprocess.CompletedProcess[str]:
         environment = {**self.environment, "GUILD_TIPS_REPO": str(checkout or self.checkout)}
         return subprocess.run([sys.executable, str(SCRIPT), *arguments], env=environment,
-                              capture_output=True, text=True, timeout=25, check=False)
+                              capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
 
     def publish(self, head: str, folder: Path, checkout: Path | None = None) -> subprocess.CompletedProcess[str]:
         return self.invoke("publish", "--head", head, "--from", str(folder), checkout=checkout)
@@ -246,7 +259,7 @@ class TipsTests(unittest.TestCase):
 
     def test_publish_waits_for_a_busy_lock_and_refuses_when_the_wait_expires(self) -> None:
         folder = self.prepared("units/after-lock.md", tip("units", "Published after contention."))
-        command = [sys.executable, "-c", LOCK_PUBLISH_DRIVER, str(SCRIPT.resolve().parents[2]), "3",
+        command = [sys.executable, "-c", LOCK_PUBLISH_DRIVER, str(SCRIPT.resolve().parents[2]), str(TEST_HANG_GUARD_SECS),
                    "publish", "--head", "units", "--from", str(folder)]
         lock_path = self.checkout / ".git/guild-tips.lock"
         with lock_path.open("a") as holder:
@@ -257,24 +270,23 @@ class TipsTests(unittest.TestCase):
                     self.fail("The publisher has no output pipe")
                 self.assertEqual(publisher.stdout.readline(), "lock blocked\n")
                 fcntl.flock(holder, fcntl.LOCK_UN)
-                output, errors = publisher.communicate(timeout=10)
+                output, errors = publisher.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(publisher.returncode, 0, errors)
                 self.assertIn(self.git(self.origin, "rev-parse", "main"), output)
         self.assertIn("Published after contention.", self.git(self.origin, "show", "main:guilds/units/after-lock.md"))
         blocked_folder = self.root / "blocked-prepared"
         _ = self.write(blocked_folder, "units/blocked.md", tip("units", "Must not be written."))
         before = self.git(self.checkout, "rev-parse", "HEAD")
-        command[4] = "0.4"
+        command[4] = "expire"
         command[-1] = str(blocked_folder)
         with lock_path.open("a") as holder:
             fcntl.flock(holder, fcntl.LOCK_EX)
-            started = time.monotonic()
             result = subprocess.run(command, env=self.environment, capture_output=True, text=True,
-                                    check=False, timeout=10)
-            elapsed = time.monotonic() - started
+                                    check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 1)
         self.assertIn("lock", result.stderr.lower())
-        self.assertGreaterEqual(elapsed, 0.35)
+        self.assertEqual(result.stdout.splitlines().count("lock retry"), 2)
+        self.assertEqual(result.stdout.splitlines().count("lock blocked"), 3)
         self.assertFalse((self.checkout / "guilds/units/blocked.md").exists())
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), before)
         self.assertEqual(self.git(self.checkout, "diff", "--cached", "--name-only"), "")
@@ -285,7 +297,7 @@ class TipsTests(unittest.TestCase):
         lock_path = self.checkout / ".git/guild-tips.lock"
         real_flock = fcntl.flock
         with (lock_path.open("a") as holder, mock.patch.dict(os.environ, self.environment),
-              mock.patch.object(tips, "LOAD_LOCK_TIMEOUT", 0.4)):
+              mock.patch.object(tips, "LOAD_LOCK_TIMEOUT", TEST_HANG_GUARD_SECS)):
             real_flock(holder, fcntl.LOCK_EX)
 
             def release_after_contention(fd: int, operation: int) -> None:
@@ -306,11 +318,15 @@ class TipsTests(unittest.TestCase):
             # Keep the real holder locked for the entire second call.
             real_flock(holder, fcntl.LOCK_EX)
             warnings = io.StringIO()
-            started = time.monotonic()
-            with redirect_stderr(warnings):
+            readings = iter((0.0, 0.0, float(TEST_HANG_GUARD_SECS)))
+            delays: list[float] = []
+            lock_clock = SimpleNamespace(monotonic=lambda: next(readings), sleep=delays.append)
+            with (redirect_stderr(warnings),
+                  mock.patch("scripts.guilds.tips.time", lock_clock),
+                  mock.patch.object(fcntl, "flock", wraps=real_flock) as attempts):
                 fallback = tips.load("units")
-            elapsed = time.monotonic() - started
-            self.assertGreaterEqual(elapsed, 0.35)
+            self.assertEqual(delays, [0.05])
+            self.assertEqual(attempts.call_count, 2)
             self.assertEqual(fallback, loaded)
             self.assertEqual(len(warnings.getvalue().strip().splitlines()), 1)
             self.assertIn("lock", warnings.getvalue().lower())

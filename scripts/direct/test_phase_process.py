@@ -3,19 +3,25 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
 import re
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import unittest
+from dataclasses import replace
+from contextlib import closing
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 from unittest.mock import patch
 
-from scripts.direct import phase_process as process
+from scripts.direct import phase_process as process, plan_history
+from scripts.usage import collect
 
 
 DIRECTOR = process.DirectorSession("claude", "director")
@@ -33,6 +39,21 @@ def phase_events() -> tuple[process.Event, ...]:
             event("pass_started", 20, instance="impl", step="implementation"),
             event("pass_finished", 60, instance="impl", step="implementation"),
             event("phase_finished", 100), event("phase_started", 120, phase="next"))
+
+
+def repair_report_events() -> tuple[process.Event, ...]:
+    events: list[process.Event] = [event("run_started", 1)]
+    for index, implementation in enumerate((60, 60, 60, 20, 10)):
+        start = 10 + index * 100
+        phase = str(index)
+        events.extend((event("phase_started", start, phase=phase),
+                       event("pass_started", start + 10, phase=phase, instance="impl", step="implementation"),
+                       event("pass_finished", start + 10 + implementation, phase=phase, instance="impl", step="implementation"),
+                       event("phase_finished", start + 90, phase=phase)))
+    for phase, start, end in (("3", 340, 380), ("4", 430, 450), ("4", 460, 500)):
+        events.extend((event("pass_started", start, phase=phase, instance=str(start), step="fix"),
+                       event("pass_finished", end, phase=phase, instance=str(start), step="fix")))
+    return tuple(events)
 
 
 def parsed_phase_records(records: list[dict[str, object]]) -> tuple[process.Event, ...]:
@@ -60,6 +81,413 @@ def commit_fixture_documents(root: Path, documents: dict[str, str], message: str
                         "commit", "-qm", message], check=True, capture_output=True)
 
 
+OLD_HASH = hashlib.sha256(b"old contract\n").hexdigest()
+NEW_HASH = hashlib.sha256(b"short route\n").hexdigest()
+ROUTE = process.RouteHashes(frozenset((OLD_HASH,)), frozenset((NEW_HASH,)))
+
+
+def contract_event(kind: str, at: float, *, phase: str = "phase", run: str = "run",
+                   direct_hash: str = OLD_HASH, director: process.DirectorSession = DIRECTOR) -> process.Event:
+    parsed = process.parse_event({
+        "run_id": run, "phase_instance_id": phase, "phase_id": phase,
+        "event_type": kind, "timestamp_epoch": at, "status": "completed",
+        "main_agent": {"family": director.family, "session_id": director.session},
+        "worktree": run, "branch": run, "working_dir": f"/fixture/{run}",
+        "contract_revision": {"main_head": {"state": "Recorded", "commit": "fixture-head"},
+                              "direct_md": {"state": "Recorded", "sha256": direct_hash},
+                              "files": {"docs/direct/phase_checks.md": {"state": "Recorded", "sha256": OLD_HASH}}},
+    })
+    if isinstance(parsed, process.NotRecorded):
+        raise AssertionError(parsed)
+    return parsed
+
+
+def trial_events(direct_hash: str = OLD_HASH) -> tuple[process.Event, ...]:
+    return (contract_event("run_started", 1), contract_event("phase_started", 10, direct_hash=direct_hash),
+            contract_event("phase_finished", 100, direct_hash=direct_hash),
+            contract_event("phase_started", 120, phase="next", direct_hash=direct_hash))
+
+
+def transcript_record(kind: str, at: float, **fields: object) -> dict[str, object]:
+    return {"type": kind, "timestamp": datetime.fromtimestamp(at, UTC).isoformat(), **fields}
+
+
+def request_record(at: float, key: str, raw_input: int, blocks: list[dict[str, object]]) -> dict[str, object]:
+    return transcript_record("assistant", at, requestId=key,
+                             message={"id": key, "content": blocks,
+                                      "usage": {"input_tokens": raw_input, "cache_read_input_tokens": 20,
+                                                "cache_creation_input_tokens": 30, "output_tokens": 1}})
+
+
+class TrialProcessTests(unittest.TestCase):
+    def test_start_and_finish_hashes_select_the_named_route_side(self) -> None:
+        for direct_hash, expected in ((OLD_HASH, process.BeforeChange), (NEW_HASH, process.AfterChange)):
+            with self.subTest(side=expected.__name__):
+                events = trial_events(direct_hash)
+                trial = process.select_trial_phases(events, WINDOW, ROUTE)[0]
+                self.assertIsInstance(trial.exposure, expected)
+                self.assertEqual(trial.interval, process.PhaseWithGap(120))
+
+    def test_absent_changed_missing_invalid_and_unclassified_exposure_stay_unknown(self) -> None:
+        events = trial_events()
+        start, finish = events[1:3]
+        missing = replace(start, record={**start.record, "contract_revision": {"direct_md": {"state": "Missing", "reason": "file gone"}}})
+        invalid = contract_event("phase_started", 10, direct_hash="bad")
+        cases = (
+            (replace(start, record={}), finish, ROUTE, "phase_started: direct.md not recorded"),
+            (start, replace(finish, record={}), ROUTE, "phase_finished: direct.md not recorded"),
+            (missing, finish, ROUTE, "Missing: file gone"),
+            (invalid, finish, ROUTE, "invalid direct.md sha256"),
+            (start, contract_event("phase_finished", 100, direct_hash=NEW_HASH), ROUTE, "hash changed"),
+            (start, finish, process.RouteHashes(frozenset(), frozenset()), "neither side"),
+            (start, finish, process.RouteHashes(frozenset((OLD_HASH,)), frozenset((OLD_HASH,))), "both sides"),
+            (start, finish, process.NotRecorded("route", "revision absent"), "revision absent"),
+        )
+        for first, last, route, reason in cases:
+            with self.subTest(reason=reason):
+                exposure = process.trial_exposure(first, last, route)
+                self.assertIsInstance(exposure, process.ExposureNotRecorded)
+                self.assertIn(reason, cast(process.ExposureNotRecorded, exposure).reason)
+
+    def test_route_revision_uses_git_bytes_and_does_not_label_dirty_bytes(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+            root = Path(folder)
+            direct = "commands/unit/direct.md"
+            commit_fixture_documents(root, {direct: "old contract\n"}, "Old route")
+            commit_fixture_documents(root, {direct: "short route\n"}, "Install route")
+            revision = process.git_output(root, ["rev-parse", "HEAD"]).strip()
+            _ = (root / direct).write_text("dirty route\n")
+            route = process.read_route_hashes(root, revision)
+            self.assertEqual(route, ROUTE)
+            self.assertEqual((root / direct).read_text(), "dirty route\n")
+            dirty_hash = hashlib.sha256((root / direct).read_bytes()).hexdigest()
+            events = trial_events(dirty_hash)
+            self.assertIsInstance(process.trial_exposure(events[1], events[2], route), process.ExposureNotRecorded)
+            self.assertIsInstance(process.read_route_hashes(root, "no-such-revision"), process.NotRecorded)
+
+    def test_before_anchor_classifies_recorded_hashes_without_a_route_commit(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+            root = Path(folder)
+            direct = "commands/unit/direct.md"
+            commit_fixture_documents(root, {direct: "earlier contract\n"}, "Earlier before")
+            commit_fixture_documents(root, {direct: "old contract\n"}, "Before anchor")
+            anchor = process.git_output(root, ["rev-parse", "HEAD"]).strip()
+            route = process.read_exposure_hashes(root, "", anchor)
+            earlier_hash = hashlib.sha256(b"earlier contract\n").hexdigest()
+            for direct_hash in (OLD_HASH, earlier_hash):
+                with self.subTest(direct_hash=direct_hash):
+                    trial = process.select_trial_phases(trial_events(direct_hash), WINDOW, route)[0]
+                    self.assertEqual(trial.exposure, process.BeforeChange(direct_hash))
+                    self.assertEqual(trial.interval, process.PhaseWithGap(120))
+
+    def test_before_anchor_does_not_include_contract_changes_after_it(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+            root = Path(folder)
+            direct = "commands/unit/direct.md"
+            commit_fixture_documents(root, {direct: "old contract\n"}, "Before anchor")
+            anchor = process.git_output(root, ["rev-parse", "HEAD"]).strip()
+            commit_fixture_documents(root, {direct: "short route\n"}, "Later contract")
+            route = process.read_exposure_hashes(root, "", anchor)
+            trial = process.select_trial_phases(trial_events(NEW_HASH), WINDOW, route)[0]
+            self.assertIsInstance(trial.exposure, process.ExposureNotRecorded)
+            self.assertIn("neither side", cast(process.ExposureNotRecorded, trial.exposure).reason)
+            self.assertIsInstance(process.select_trial_phases(trial_events(), WINDOW, route)[0].exposure,
+                                  process.BeforeChange)
+
+    def test_explicit_before_anchor_can_make_route_side_ambiguous(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+            root = Path(folder)
+            direct = "commands/unit/direct.md"
+            commit_fixture_documents(root, {direct: "old contract\n"}, "Before")
+            commit_fixture_documents(root, {direct: "short route\n"}, "Route")
+            revision = process.git_output(root, ["rev-parse", "HEAD"]).strip()
+            route = process.read_exposure_hashes(root, revision, revision)
+            trial = process.select_trial_phases(trial_events(NEW_HASH), WINDOW, route)[0]
+            self.assertIsInstance(trial.exposure, process.ExposureNotRecorded)
+            self.assertIn("both sides", cast(process.ExposureNotRecorded, trial.exposure).reason)
+            route_only = process.read_exposure_hashes(root, revision, "")
+            self.assertIsInstance(process.select_trial_phases(trial_events(NEW_HASH), WINDOW, route_only)[0].exposure,
+                                  process.AfterChange)
+
+    def test_absent_options_and_invalid_before_anchor_keep_exposure_unknown(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+            root = Path(folder)
+            commit_fixture_documents(root, {"commands/unit/direct.md": "old contract\n"}, "Before")
+            blob = process.git_output(root, ["rev-parse", "HEAD:commands/unit/direct.md"]).strip()
+            for revision, anchor, reason in (("", "", "neither --before-at nor --route-revision supplied"),
+                                             ("", "absent", "before anchor is not a commit"),
+                                             ("", blob, "before anchor is not a commit"),
+                                             ("absent", "HEAD", "route revision or its parent is absent")):
+                with self.subTest(revision=revision, anchor=anchor):
+                    route = process.read_exposure_hashes(root, revision, anchor)
+                    self.assertIsInstance(route, process.NotRecorded)
+                    trial = process.select_trial_phases(trial_events(), WINDOW, route)[0]
+                    self.assertIsInstance(trial.exposure, process.ExposureNotRecorded)
+                    self.assertIn(reason, cast(process.ExposureNotRecorded, trial.exposure).reason)
+
+    def test_start_window_includes_full_phase_and_gap_beyond_window(self) -> None:
+        events = trial_events()
+        trials = process.select_trial_phases(events, process.Window(10, 11), ROUTE)
+        self.assertEqual([(trial.phase.start, trial.phase.end, trial.interval) for trial in trials],
+                         [(10, 100, process.PhaseWithGap(120))])
+        self.assertEqual(process.select_trial_phases(events, process.Window(0, 10), ROUTE), ())
+
+    def test_no_following_phase_is_counted_separately(self) -> None:
+        trials = process.select_trial_phases(trial_events()[:-1], WINDOW, ROUTE)
+        self.assertIsInstance(trials[0].interval, process.NoFollowingPhase)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            process.render_trial(trials, (), WINDOW, "before")
+        self.assertIn("NoFollowingPhase n=1", output.getvalue())
+        self.assertRegex(output.getvalue(), r"weighted director tokens, phase plus gap\s+0\s+—")
+
+    def test_next_phase_must_start_with_the_same_hash(self) -> None:
+        for next_start in (contract_event("phase_started", 120, phase="next", direct_hash=NEW_HASH),
+                           event("phase_started", 120, phase="next")):
+            with self.subTest(next_start=next_start.record):
+                trial = process.select_trial_phases((*trial_events()[:-1], next_start), WINDOW, ROUTE)[0]
+                self.assertIsInstance(trial.exposure, process.BeforeChange)
+                self.assertIsInstance(trial.interval, process.ExposureNotRecorded)
+
+    def test_open_or_finished_overlap_with_one_director_is_shared(self) -> None:
+        for finish in ((), (contract_event("phase_finished", 150, run="other"),)):
+            with self.subTest(finished=bool(finish)):
+                events = (*trial_events(), contract_event("run_started", 2, run="other"),
+                          contract_event("phase_started", 90, run="other"), *finish)
+                trial = process.select_trial_phases(events, process.Window(10, 11), ROUTE)[0]
+                self.assertIsInstance(trial.interval, process.SharedDirector)
+
+    def test_gap_overlap_is_shared_but_other_directors_do_not_exclude(self) -> None:
+        for director, expected in ((DIRECTOR, process.SharedDirector),
+                                   (process.DirectorSession("claude", "other"), process.PhaseWithGap)):
+            with self.subTest(director=director):
+                events = (*trial_events(), contract_event("run_started", 2, run="other", director=director),
+                          contract_event("phase_started", 105, run="other", director=director))
+                self.assertIsInstance(process.select_trial_phases(events, process.Window(10, 11), ROUTE)[0].interval, expected)
+
+    def test_overlapping_phases_in_the_same_run_are_shared(self) -> None:
+        events = (*trial_events()[:-1], contract_event("phase_started", 50, phase="next"))
+        self.assertIsInstance(process.select_trial_phases(events, WINDOW, ROUTE)[0].interval, process.SharedDirector)
+
+    def test_weighted_tokens_include_gap_and_keep_raw_classes_apart(self) -> None:
+        trial = process.select_trial_phases(trial_events(), WINDOW, ROUTE)[0]
+        turns = (process.UsageTurn(DIRECTOR, 10, 10, 2, "claude-sonnet-4-6", 4, 3, 20),
+                 process.UsageTurn(DIRECTOR, 100, 7, 1, "claude-opus-4-6", 0, 0, 10),
+                 process.UsageTurn(DIRECTOR, 120, 999, 999, "unknown"),
+                 process.UsageTurn(DIRECTOR, 9, 999, 999, "unknown"),
+                 process.UsageTurn(process.DirectorSession("claude", "worker"), 50, 999, 999, "unknown"))
+        result = process.trial_tokens(trial, DIRECTOR, turns)
+        # 10 + 4*1.25 + 3*2 + 20*.1 + 2*5; then 7 + 10*.1 + 1*5.
+        self.assertEqual(result, process.TrialTokens(46.0, 54, 3, 2))
+
+    def test_turn_time_selects_dated_weights_and_unknown_never_becomes_zero(self) -> None:
+        at = datetime(2026, 10, 10, 21, 35, tzinfo=UTC).timestamp()
+        phase = process.PhaseBoundary("run", "phase", "1", at - 10, at + 10)
+        trial = process.TrialPhase(phase, process.BeforeChange(OLD_HASH), process.PhaseWithGap(at + 20))
+        known = process.UsageTurn(DIRECTOR, at, 10, 2, "gpt-6.1-sol", 0, 0, 20)
+        self.assertEqual(process.trial_tokens(trial, DIRECTOR, (known,)), process.TrialTokens(21.0, 30, 2, 1))
+        for unknown in (replace(known, at=at - 1), replace(known, model="not-weighted")):
+            result = process.trial_tokens(trial, DIRECTOR, (known, unknown))
+            self.assertIsInstance(result, process.TrialTokens)
+            self.assertIsInstance(cast(process.TrialTokens, result).weighted, process.Unweighted)
+            self.assertEqual(cast(process.TrialTokens, result).raw_input, 60)
+        self.assertIsInstance(process.trial_tokens(trial, DIRECTOR, ()), process.NotRecorded)
+
+    def test_reload_context_uses_first_request_after_matching_result_and_counts_once(self) -> None:
+        records = [
+            transcript_record("system", 5, subtype="compact_boundary"),
+            transcript_record("system", 20, subtype="compact_boundary"),
+            request_record(21, "read", 2, [{"type": "tool_use", "id": "wrong", "name": "Read", "input": {"file_path": "/fixture/other.md"}}]),
+            request_record(22, "contract", 3, [{"type": "tool_use", "id": "contract-read", "name": "Read", "input": {"file_path": "/home/fixture/.claude/commands/unit/direct.md"}}]),
+            request_record(23, "too-early", 999, []),
+            transcript_record("user", 24, message={"content": [{"type": "tool_result", "tool_use_id": "wrong"}]}),
+            transcript_record("user", 25, message={"content": [{"type": "tool_result", "tool_use_id": "contract-read"}]}),
+            request_record(26, "after", 400, []), request_record(27, "after", 400, []),
+            request_record(28, "later", 900, []),
+            transcript_record("system", 100, subtype="compact_boundary"),
+        ]
+        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+            path = Path(folder) / "director.jsonl"
+            _ = path.write_text("\n".join(json.dumps(record) for record in records))
+            before = path.read_bytes()
+            transcript = process.read_transcript(path)
+            self.assertEqual(path.read_bytes(), before)
+        phase = process.PhaseBoundary("run", "phase", "1", 10, 100)
+        self.assertEqual(process.measure_reloads(phase, transcript, frozenset(("commands/unit/direct.md",))),
+                         process.PhaseReloads(1, (450,)))
+
+    def test_step_read_after_route_is_a_reload_and_second_compaction_has_no_reload(self) -> None:
+        phase = process.phase_boundaries(trial_events(NEW_HASH), WINDOW)[0]
+        entries = (process.CompactionBoundary(20), process.ContractRead(21, "step", "docs/direct/phase_checks.md", "read"),
+                   process.ReadResult(22, "step", False), process.ContextRequest(23, "next", 150),
+                   process.CompactionBoundary(40), process.ContextRequest(41, "no-read", 900))
+        result = process.measure_reloads(phase, process.DirectorTranscript(entries),
+                                         process.reload_paths(trial_events(NEW_HASH), phase, process.AfterChange(NEW_HASH)))
+        self.assertEqual(result, process.PhaseReloads(2, (150, process.NoReload("no contract Read after compact_boundary"))))
+        before = process.measure_reloads(phase, process.DirectorTranscript(entries),
+                                          process.reload_paths(trial_events(), phase, process.BeforeChange(OLD_HASH)))
+        self.assertIsInstance(cast(tuple[object, ...], cast(process.PhaseReloads, before).contexts)[0], process.NoReload)
+
+    def test_no_compaction_no_reload_failed_read_and_absent_transcript_are_distinct(self) -> None:
+        phase = process.PhaseBoundary("run", "phase", "1", 10, 100)
+        paths = frozenset(("commands/unit/direct.md",))
+        self.assertEqual(process.measure_reloads(phase, process.DirectorTranscript(()), paths), process.PhaseReloads(0, process.NoCompaction()))
+        for failed in (True, False):
+            with self.subTest(failed=failed):
+                entries: tuple[process.TranscriptEntry, ...] = (process.CompactionBoundary(20), process.ContractRead(21, "read", "commands/unit/direct.md", "a"))
+                if failed:
+                    entries += (process.ReadResult(22, "read", True),)
+                result = process.measure_reloads(phase, process.DirectorTranscript(entries), paths)
+                self.assertIsInstance(result, process.PhaseReloads)
+                self.assertIsInstance(cast(tuple[object, ...], cast(process.PhaseReloads, result).contexts)[0], process.NoReload)
+        absent = process.NotRecorded("fixture", "transcript absent")
+        self.assertEqual(process.measure_reloads(phase, absent, paths), absent)
+        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+            mapping = process.read_director_transcripts(Path(folder), (DIRECTOR,))
+            self.assertIsInstance(mapping[DIRECTOR], process.NotRecorded)
+
+    def test_new_boundary_stops_the_previous_reload_search(self) -> None:
+        phase = process.PhaseBoundary("run", "phase", "1", 10, 100)
+        entries = (process.CompactionBoundary(20), process.ContractRead(21, "read", "commands/unit/direct.md", "a"),
+                   process.CompactionBoundary(22), process.ReadResult(23, "read", False), process.ContextRequest(24, "b", 999))
+        result = process.measure_reloads(phase, process.DirectorTranscript(entries), frozenset(("commands/unit/direct.md",)))
+        self.assertIsInstance(result, process.PhaseReloads)
+        contexts = cast(process.PhaseReloads, result).contexts
+        self.assertTrue(isinstance(contexts, tuple) and all(isinstance(item, process.NoReload) for item in contexts))
+
+    def test_missing_request_after_result_is_not_a_zero_context(self) -> None:
+        phase = process.PhaseBoundary("run", "phase", "1", 10, 100)
+        entries = (process.CompactionBoundary(20), process.ContractRead(21, "read", "commands/unit/direct.md", "a"),
+                   process.ReadResult(22, "read", False), process.ContextRequest(100, "outside", 700))
+        result = process.measure_reloads(phase, process.DirectorTranscript(entries), frozenset(("commands/unit/direct.md",)))
+        contexts = cast(process.PhaseReloads, result).contexts
+        self.assertIsInstance(cast(tuple[object, ...], contexts)[0], process.NotRecorded)
+
+    def test_units_filter_uses_recorded_labels_and_keeps_complete_runs(self) -> None:
+        events = (*trial_events(), *(replace(entry, run="other", branch="other", directory="/fixture/other",
+                                             record={**entry.record, "run_id": "other", "worktree": "other"}) for entry in trial_events()))
+        self.assertEqual(process.filter_units(events, frozenset(("run",))), trial_events())
+        self.assertEqual(process.filter_units(events, frozenset(("absent",))), ())
+
+    def test_report_exposure_filter_counts_unknowns_without_including_their_cost(self) -> None:
+        before = process.select_trial_phases(trial_events(), WINDOW, ROUTE)[0]
+        after = replace(before, exposure=process.AfterChange(NEW_HASH))
+        unknown = replace(before, exposure=process.ExposureNotRecorded("old event"), interval=process.NoFollowingPhase())
+        measures = (process.TrialMeasures(before, process.TrialTokens(40.0, 50, 2, 1), process.PhaseReloads(0, process.NoCompaction())),
+                    process.TrialMeasures(after, process.TrialTokens(999.0, 999, 999, 1), process.PhaseReloads(1, (900,))))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            process.render_trial((before, after, unknown), measures, WINDOW, "before")
+        text = output.getvalue()
+        self.assertIn("ExposureNotRecorded n=1", text)
+        self.assertIn("ExposureNotRecorded: old event n=1", text)
+        self.assertIn("NoFollowingPhase n=1", text)
+        self.assertIn("NoCompaction n=1 phases", text)
+        self.assertRegex(text, r"weighted director tokens, phase plus gap\s+1\s+40\s+40\s+40\s+0")
+        self.assertNotIn("999", text)
+
+    def test_cli_filters_fixture_units_and_exposure_and_reads_usage_through_gap(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+            root = Path(folder)
+            contract = root / ".claude"
+            commit_fixture_documents(contract, {"commands/unit/direct.md": "old contract\n"}, "Before")
+            commit_fixture_documents(contract, {"commands/unit/direct.md": "short route\n"}, "After")
+            revision = process.git_output(contract, ["rev-parse", "HEAD"]).strip()
+            runs = root / "history/runs"
+            runs.mkdir(parents=True)
+            records = [entry.record for entry in trial_events()]
+            other = process.DirectorSession("claude", "other-director")
+            records.extend(contract_event(kind, at, run="other", director=other).record for kind, at in
+                           (("run_started", 1), ("phase_started", 10), ("phase_finished", 100)))
+            short = process.DirectorSession("claude", "short-director")
+            records.extend(contract_event(kind, at, run="short", director=short).record for kind, at in
+                           (("run_started", 1), ("phase_started", 10.25), ("phase_finished", 10.75)))
+            _ = (runs / "fixture.jsonl").write_text("\n".join(json.dumps(record) for record in records))
+            path = root / "usage.db"
+            with closing(sqlite3.connect(path)) as db, db:
+                _ = db.execute("CREATE TABLE turns (machine, family, agent_id, parent_id, at, input, cache_write_5m, cache_write_1h, cache_read, output, model)")
+                _ = db.executemany("INSERT INTO turns VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
+                    ("natedev", "claude", "director", "", "1970-01-01T00:00:10+00:00", 10, 0, 0, 0, 2, "claude-opus-4-6"),
+                    ("natedev", "claude", "director", "", "1970-01-01T00:01:50+00:00", 20, 0, 0, 0, 1, "claude-opus-4-6"),
+                    ("natedev", "claude", "director", "", "1970-01-01T00:02:00+00:00", 999, 0, 0, 0, 999, "claude-opus-4-6"),
+                ])
+            transcript = contract / "projects/project/director.jsonl"
+            transcript.parent.mkdir(parents=True)
+            _ = transcript.write_text("\n".join(json.dumps(record) for record in (
+                transcript_record("system", 20, subtype="compact_boundary"),
+                request_record(21, "read", 1, [{"type": "tool_use", "id": "read", "name": "Read", "input": {"file_path": "commands/unit/direct.md"}}]),
+                transcript_record("user", 22, message={"content": [{"type": "tool_result", "tool_use_id": "read"}]}),
+                request_record(23, "reloaded", 100, []),
+            )))
+            args = ["phase_process.py", "baseline", "--units", "run,short", "--exposure", "before", "--route-revision", revision,
+                    "--since", "1970-01-01T00:00:10+00:00", "--until", "1970-01-01T00:00:11+00:00", "--detail", "trial"]
+            output = io.StringIO()
+            with patch.object(Path, "home", return_value=root), \
+                    patch.object(plan_history, "history_root", return_value=root / "history"), \
+                    patch.object(collect, "store_path", return_value=path), \
+                    patch.object(process, "__file__", str(root / "scripts/direct/phase_process.py")), \
+                    patch.object(sys, "argv", args), contextlib.redirect_stdout(output):
+                self.assertEqual(process.main(), 0)
+            text = output.getvalue()
+            self.assertIn("BeforeChange n=2", text)
+            self.assertIn("NoFollowingPhase n=1", text)
+            self.assertIn("run/phase", text)
+            self.assertNotIn("other/phase", text)
+            self.assertRegex(text, r"weighted director tokens, phase plus gap\s+1\s+45\s+45\s+45\s+0")
+            self.assertRegex(text, r"first request after contract Read result\s+1\s+150\s+150\s+150\s+0")
+
+    def test_local_date_window_uses_the_user_zone(self) -> None:
+        with patch.dict(os.environ, {"USER_ZONE": "America/New_York", "USER_ZONE_CONF": "/nonexistent"}):
+            self.assertEqual(process.date_epoch("2026-10-28T09:00:00"), process.date_epoch("2026-10-28T13:00:00+00:00"))
+
+    def test_cli_before_anchor_keeps_mixed_open_and_other_exclusion_counts(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+            root = Path(folder)
+            commit_fixture_documents(root / ".claude", {"commands/unit/direct.md": "old contract\n"}, "Before anchor")
+            records: list[dict[str, object]] = []
+            for run in ("before", "unknown", "last", "shared-a", "shared-b", "mixed", "open", "outside"):
+                director = process.DirectorSession("claude", "shared" if run.startswith("shared-") else run)
+                for kind, at, phase in (("run_started", 1, "phase"), ("phase_started", 10, "phase"),
+                                        ("phase_finished", 100, "phase"), ("phase_started", 120, "next")):
+                    if run in ("open", "outside") and kind == "phase_finished":
+                        continue
+                    if run in ("last", "mixed", "open", "outside") and phase == "next":
+                        continue
+                    record = {**contract_event(kind, at, run=run, phase=phase, director=director).record,
+                              "phase_id": "1"}
+                    if run == "unknown":
+                        _ = record.pop("contract_revision")
+                    records.append(record)
+            records.append({"run_id": "mixed", "phase_instance_id": "phase", "phase_id": "1",
+                            "event_type": "pass_finished", "timestamp_epoch": 60, "pass_started_at": 20,
+                            "pass_elapsed_seconds": 40, "pass_kind": "impl", "pass_instance_id": "impl",
+                            "pass_activity": "Implement Phase 7"})
+            runs = root / "history/runs"
+            runs.mkdir(parents=True)
+            _ = (runs / "fixture.jsonl").write_text("\n".join(json.dumps(record) for record in records))
+            args = ["phase_process.py", "baseline", "--units", "before,unknown,last,shared-a,shared-b,mixed,open",
+                    "--exposure", "before", "--before-at", "HEAD",
+                    "--since", "1970-01-01T00:00:10+00:00", "--until", "1970-01-01T00:01:41+00:00"]
+            for detail in ((), ("--detail", "trial")):
+                with self.subTest(detail=detail):
+                    output = io.StringIO()
+                    with patch.object(Path, "home", return_value=root), \
+                            patch.object(plan_history, "history_root", return_value=root / "history"), \
+                            patch.object(collect, "store_path", return_value=root / "absent-usage.db"), \
+                            patch.object(process, "__file__", str(root / "scripts/direct/phase_process.py")), \
+                            patch.object(sys, "argv", [*args, *detail]), contextlib.redirect_stdout(output):
+                        self.assertEqual(process.main(), 0)
+                    text = output.getvalue()
+                    self.assertRegex(text, r"Trial exclusions before exposure filter[^\n]*mixed n=1; open unmixed n=1")
+                    self.assertIn("ExposureNotRecorded n=1", text)
+                    self.assertIn("NoFollowingPhase n=1", text)
+                    self.assertIn("SharedDirector n=2", text)
+                    self.assertRegex(text, r"weighted director tokens, phase plus gap\s+0\s+—\s+—\s+—\s+1")
+                    if not detail:
+                        self.assertIn("Excluded from per-phase costs: mixed n=1", text)
+                        self.assertIn("open unmixed n=1", text)
+
+
 class PhaseProcessTests(unittest.TestCase):
     def test_wall_steps_share_overlap_and_preserve_director_gaps(self) -> None:
         events = (*phase_events(), event("activity_started", 40, instance="gate", step="verification"),
@@ -75,7 +503,7 @@ class PhaseProcessTests(unittest.TestCase):
         self.assertAlmostEqual(costs["director time"].wall_share, 1 / 3)
         self.assertEqual(result.gaps[0].median, 20)
 
-    def test_boundary_seam_selects_completed_finish_and_keeps_overlapping_phases(self) -> None:
+    def test_window_edges_select_completed_finish_and_keep_overlapping_phases(self) -> None:
         events = (*phase_events(), event("phase_started", 50, phase="other"),
                   event("phase_finished", 150, phase="other"),
                   event("phase_started", 170, phase="canceled"),
@@ -84,6 +512,18 @@ class PhaseProcessTests(unittest.TestCase):
         self.assertEqual([(phase.instance, phase.start, phase.end) for phase in phases],
                          [("phase", 10, 100), ("other", 50, 150)])
         self.assertEqual(process.phase_boundaries(events, process.Window(151, 200)), ())
+        self.assertEqual(process.phase_boundaries(events, process.Window(0, 100)), ())
+
+    def test_finished_phase_keeps_pass_coverage_when_it_starts_before_the_window(self) -> None:
+        events = (event("run_started", 80), event("phase_started", 90),
+                  event("pass_started", 100, instance="impl", step="implementation"),
+                  event("pass_finished", 140, instance="impl", step="implementation"),
+                  event("phase_finished", 150))
+        phases = process.phase_boundaries(events, process.Window(100, 200))
+        self.assertEqual([(phase.start, phase.end) for phase in phases], [(90, 150)])
+        allocations = process.allocated_step_seconds(events, phases)
+        self.assertEqual(allocations[0]["pass: implementation"], 40)
+        self.assertNotIn("unmatched step", allocations[0])
 
     def test_rounds_parallel_repairs_are_worker_time_not_wall_share(self) -> None:
         records: list[dict[str, object]] = [
@@ -168,6 +608,21 @@ class PhaseProcessTests(unittest.TestCase):
             process.render_steps(events, WINDOW, False)
         self.assertIn("mixed n=1", output.getvalue())
         self.assertEqual(process.measure_phase_steps(events, process.phase_boundaries(events, WINDOW)).wall, 0)
+
+    def test_step_exclusion_counts_keep_finished_and_open_phases_from_before_the_window(self) -> None:
+        events = parsed_phase_records([
+            {"event_type": "phase_started", "timestamp_epoch": 90},
+            {"event_type": "pass_finished", "timestamp_epoch": 140, "pass_started_at": 100,
+             "pass_elapsed_seconds": 40, "pass_kind": "impl", "pass_instance_id": "impl",
+             "pass_activity": "Implement Phase 7"},
+            {"event_type": "phase_finished", "timestamp_epoch": 150, "status": "completed"},
+            {"event_type": "phase_started", "timestamp_epoch": 50, "phase_instance_id": "open"},
+        ])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            process.render_steps(events, process.Window(100, 200), False)
+        self.assertIn("mixed n=1 (finished in window or open)", output.getvalue())
+        self.assertIn("open unmixed n=1 (started before window end)", output.getvalue())
 
     def test_ledger_only_round_counts_without_worker_time(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -306,19 +761,22 @@ class PhaseProcessTests(unittest.TestCase):
     def test_readonly_usage_filters_machine_workers_and_window(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "usage.db"
-            with sqlite3.connect(path) as db:
-                _ = db.execute("CREATE TABLE turns (machine, family, agent_id, parent_id, at, input, cache_write_5m, cache_write_1h, cache_read, output)")
+            with closing(sqlite3.connect(path)) as db, db:
+                _ = db.execute("CREATE TABLE turns (machine, family, agent_id, parent_id, at, input, cache_write_5m, cache_write_1h, cache_read, output, model)")
                 rows = [("natedev", "claude", "director", "", "1970-01-01T00:00:30+00:00", 1, 2, 3, 4, 5),
                         ("mac", "claude", "director", "", "1970-01-01T00:00:30+00:00", 9, 0, 0, 0, 9),
                         ("natedev", "claude", "worker", "director", "1970-01-01T00:00:30+00:00", 9, 0, 0, 0, 9),
                         ("natedev", "claude", "director", "", "1970-01-01T00:03:20+00:00", 9, 0, 0, 0, 9)]
-                _ = db.executemany("INSERT INTO turns VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+                _ = db.executemany("INSERT INTO turns VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                   [(*row, "claude-opus-4-6") for row in rows])
             before = path.read_bytes()
             turns = process.read_usage(path, WINDOW)
             self.assertEqual(process.read_usage(path, WINDOW, [DIRECTOR]), turns)
             self.assertEqual(process.read_usage(path, WINDOW, [process.DirectorSession("claude", "absent")]), ())
             self.assertEqual(path.read_bytes(), before)
-        self.assertEqual(turns, (process.UsageTurn(DIRECTOR, 30, 10, 5),))
+        self.assertEqual(turns, (process.UsageTurn(DIRECTOR, 30, 1, 5, "claude-opus-4-6", 2, 3, 4),))
+        if isinstance(turns, tuple):
+            self.assertEqual(turns[0].raw_input, 10)
 
     def test_contract_sums_full_reads_and_separates_final_gate(self) -> None:
         direct = b"Read `~/.claude/docs/direct/work.md` in full each phase.\nRead `~/.claude/docs/direct/final_gate_commit.md` in full once.\n"
@@ -428,6 +886,66 @@ class PhaseProcessTests(unittest.TestCase):
         self.assertIn("1969-12-31 19:00:00 EST", text)
         self.assertIn("n phases", text)
 
+    def test_baseline_starts_with_window_largest_step_and_repaired_phase_median(self) -> None:
+        window = process.Window(0, 501)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            process.render_baseline(repair_report_events(), window, process.NotRecorded("fixture usage", "absent"), (), (), ())
+        lines = output.getvalue().splitlines()
+        self.assertEqual(lines[:3], [
+            f"The window {window.label()} has 5 completed phases.",
+            "The largest step is pass: implementation, at 210.0s across 5 phases.",
+            "Median repair time is 50.0s across 2 repaired phases.",
+        ])
+        self.assertTrue(lines[3].startswith("Phase process baseline"))
+
+    def test_fix_distributions_exclude_phases_without_a_repair(self) -> None:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            process.render_steps(repair_report_events(), process.Window(0, 501), False)
+        text = output.getvalue()
+        rows = {cells[0]: cells[1:] for line in text.splitlines()
+                if (cells := re.split(r"  +", line)) and cells[0] in ("fix worker time", "repair rounds")}
+        self.assertEqual(rows["fix worker time"], ["2", "50.0s", "60.0s", "100.0s", "0"])
+        self.assertEqual(rows["repair rounds"], ["2", "1.5", "2", "3", "0"])
+        self.assertIn("3 of 5 phases had no repair.", text)
+
+    def test_baseline_without_repairs_keeps_the_median_unrecorded(self) -> None:
+        for events in ((), phase_events()):
+            with self.subTest(events=bool(events)):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    process.render_baseline(events, WINDOW, process.NotRecorded("fixture usage", "absent"), (), (), ())
+                text = output.getvalue()
+                self.assertEqual(text.splitlines()[2], "No phases had a repair; median repair time is not recorded.")
+                self.assertRegex(text, r"fix worker time\s+0\s+—\s+—\s+—\s+0")
+
+    def test_duration_switches_to_minutes_only_above_one_thousand_seconds(self) -> None:
+        for seconds, expected in ((999.9, "999.9s"), (1000, "1000.0s"), (1000.1, "16.7 min"),
+                                  (1404, "23.4 min"), (3600, "60.0 min"), (-1000.1, "-16.7 min")):
+            with self.subTest(seconds=seconds):
+                self.assertEqual(process.duration(seconds), expected)
+
+    def test_baseline_formats_long_phase_gap_and_document_times_in_minutes(self) -> None:
+        events = (event("run_started", 1), event("phase_started", 10),
+                  event("pass_started", 20, instance="impl", step="implementation"),
+                  event("pass_finished", 1424, instance="impl", step="implementation"),
+                  event("pass_started", 2000, instance="fix", step="fix"),
+                  event("pass_finished", 3200, instance="fix", step="fix"),
+                  event("phase_finished", 4010), event("phase_started", 5510, phase="next"))
+        plan = process.PlanHistory("fixture", ("run",), 2000, 2100,
+                                   (process.DocCommit("fixture", 500, "Initial plan", "# Plan"),), (), "")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            process.render_baseline(events, process.Window(0, 6000), process.NotRecorded("fixture usage", "absent"), (), (plan,), ())
+        text = output.getvalue()
+        self.assertRegex(text, r"pass: implementation\s+1\s+23\.4 min")
+        self.assertRegex(text, r"fix worker time\s+1\s+20\.0 min")
+        self.assertRegex(text, r"phase end to next phase start\s+1\s+25\.0 min")
+        self.assertRegex(text, r"first doc to run\s+1\s+25\.0 min")
+        self.assertNotRegex(text, r"\d+(?:\.\d+)?h\b")
+        self.assertTrue(all(float(match.group(1)) <= 1000 for match in re.finditer(r"\b(\d+(?:\.\d+)?)s\b", text)))
+
     def test_default_report_is_bounded_and_detail_selects_all_rows_of_one_table(self) -> None:
         events: list[process.Event] = []
         turns: list[process.UsageTurn] = []
@@ -450,15 +968,15 @@ class PhaseProcessTests(unittest.TestCase):
         with contextlib.redirect_stdout(output):
             process.render_baseline(events, window, tuple(turns), contract, plans, ())
         text = output.getvalue()
-        self.assertLessEqual(len(text.splitlines()), 120)
+        self.assertLessEqual(len(text.splitlines()), 124)
         self.assertLess(len(text.encode()), 25000)
         pipeline_top = text.split("Doc pipeline: top 10", 1)[1].split("Earliest doc requires", 1)[0]
         self.assertNotIn("plan-001.md", pipeline_top)
         self.assertIn("plan-030.md", pipeline_top)
         self.assertIn("other (n=20)", text)
         self.assertIn("other (n=10)", text)
-        # A window appears only in a table title, never padded into each item row.
-        self.assertTrue(all(" | " in line for line in text.splitlines() if window.label() in line))
+        # After the summary, windows appear in table titles, never in each item row.
+        self.assertTrue(all(" | " in line for line in text.splitlines()[1:] if window.label() in line))
         detail = io.StringIO()
         with contextlib.redirect_stdout(detail):
             process.render_detail("doc-pipeline", events, window, tuple(turns), contract, plans)
@@ -596,6 +1114,82 @@ class PhaseProcessTests(unittest.TestCase):
         self.assertEqual(len(commits), 2)
         self.assertNotIn("More detail.", commits[0].text)
         self.assertIn("More detail.", commits[1].text)
+
+
+class DesignRecommendationTests(unittest.TestCase):
+    @property
+    def document(self) -> str:
+        return (Path(__file__).resolve().parents[2] / "docs/plans/sdlc-phases-design.md").read_text()
+
+    @property
+    def recommendation(self) -> str:
+        return self.document.split("## Recommendation\n", 1)[1].split("## Steps\n", 1)[0]
+
+    @property
+    def steps(self) -> str:
+        return self.document.split("## Steps\n", 1)[1]
+
+    def required_match(self, pattern: str, text: str) -> str:
+        match = re.search(pattern, text)
+        if match is None:
+            self.fail(f"Missing design commitment matching {pattern!r}")
+        return match.group(1)
+
+    def test_full_route_estimates_and_targets_agree_with_the_recommendation(self) -> None:
+        row = next(line for line in self.recommendation.splitlines() if line.startswith("| Full A |"))
+        cells = [cell.strip() for cell in row.strip("|").split("|")]
+        tokens = self.required_match(r"(\d+–\d+%)", cells[1])
+        gap = cells[2]
+        hours = self.required_match(r"(\d+–\d+)", cells[3])
+        candidate = self.document.split("**Full A.", 1)[1].split("**B.", 1)[0]
+        full_step = self.steps.split("3. **Full A", 1)[1].split("4. **G", 1)[0]
+        evidence_row = next(line for line in self.steps.splitlines() if line.startswith("| Full A |"))
+        self.assertEqual(self.required_match(r"Total:\s*(\d+–\d+) work hours", candidate), hours)
+        self.assertEqual(self.required_match(r"Total:\s*(\d+–\d+) h", full_step), hours)
+        self.assertEqual(self.required_match(r"\| (\d+–\d+) with recording", evidence_row), hours)
+        for section in (candidate, full_step):
+            with self.subTest(section=section[:30]):
+                self.assertIn(tokens, section)
+                self.assertIn(gap, section)
+        comparison = next(line for line in self.document.splitlines() if line.startswith("| Full A:"))
+        self.assertIn(tokens, comparison)
+        self.assertIn(gap, comparison)
+        for match in re.finditer(r"Full A: (\d[^|\n]+)", self.document):
+            rank = match.group(1)
+            self.assertIn(tokens, rank)
+            self.assertIn(gap, rank)
+        rationale = self.document.split("## Recommendation", 1)[0].strip().rsplit("\n\n", 1)[1]
+        self.assertEqual(self.required_match(r"full A's target is\s*\d+–\d+% over (\d+–\d+) h", rationale), hours)
+
+    def test_every_step_one_statement_agrees_with_the_first_approved_step(self) -> None:
+        first_step = self.required_match(r"\n1\. \*\*([^—]+) —", self.steps).strip()
+        mentions = [paragraph for paragraph in self.document.split("\n\n") if "Step 1" in paragraph]
+        self.assertGreater(len(mentions), 1)
+        for paragraph in mentions:
+            with self.subTest(paragraph=paragraph[:60]):
+                self.assertIn(first_step.casefold(), paragraph.casefold())
+        recommended = self.required_match(r"Step 1 is ([^:]+):", self.recommendation)
+        self.assertEqual(first_step.casefold(), recommended.casefold())
+
+    def test_review_wait_figures_agree_with_the_recommendation(self) -> None:
+        row = next(line for line in self.recommendation.splitlines() if line.startswith("| C |"))
+        cells = [cell.strip() for cell in row.strip("|").split("|")]
+        tokens = cells[1]
+        gap = self.required_match(r"(\d+–\d+ s)", cells[2])
+        hours = cells[3]
+        comparison = next(line for line in self.document.splitlines() if line.startswith("| C:"))
+        self.assertIn(tokens, comparison)
+        self.assertIn(gap, comparison)
+        for match in re.finditer(r"C: (0[^|\n]+)", self.document):
+            rank = match.group(1)
+            self.assertIn(tokens, rank)
+            self.assertIn(gap, rank)
+        evidence = next(line for line in self.steps.splitlines() if line.startswith("| C |"))
+        self.assertEqual(self.required_match(r"\| (\d+–\d+) with recording", evidence), hours)
+        alternative = self.steps.split("6. **C then D", 1)[1].split("7. **E", 1)[0]
+        self.assertEqual(self.required_match(r"Total C: (\d+–\d+) h", alternative), hours)
+        self.assertIn(tokens, alternative)
+        self.assertIn(gap, alternative)
 
 
 if __name__ == "__main__":

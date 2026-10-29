@@ -127,6 +127,19 @@ a branch starting `<old>-`, a linked worktree on that branch, no existing
 showrunner checkout on the merge branch after the rename. An unfinished move must be
 completed before another unit starts, and a finished rename refuses new moves.
 
+A shutdown record that is not stopped refuses before any branch or worktree
+change. After the worktree moves, `unit` updates the stopped record through
+`rename_unit.repoint_shutdown_worktree`: the session and worker folders, plan
+paths under the worktree, paused Codex worker launchers and resume notes, and
+a herdr name made from the old branch. The unit id and Claude session name
+stay the same. The record also takes the new production slug and doc path.
+`restore_repointed` journals this update separately from the numbered steps;
+a retry skips it once saved. An interrupted update repeats safely.
+
+The command prints `shutdown.py restart --only <session-id>` from the record.
+Use that command after the move succeeds. With no record, the move continues
+and reports that the unit has no shutdown record to relaunch from.
+
 Herdr observation failures refuse the move. The old local branch, while it
 exists, must stay at the recorded tip before each later change.
 
@@ -138,6 +151,28 @@ exists, must stay at the recorded tip before each later change.
 | 3 | Moved account project directories and copied trust entries; each guild design the unit holds took `UnitHolder(<new>, <unit>)` and the new worktree paths (`roles.move_holder`). |
 | 4 | Committed the Units row's Worktree and Branch cells and pushed the merge branch. |
 | 5 | Verified the new remote tip and deleted the old remote and local unit branch. |
+
+After step 2, `workers.repoint_unit_worktree` sets each run's production and
+unit, moves its `working_dir`, `plan_doc` and `project_plan_doc` paths, and
+updates roster worker `cwd` paths under the old worktree. It uses the unit
+ledger's run history and the run roots to find callers. A former-production
+or older adhoc ledger moves through the existing ledger migration code.
+Threads, Codex homes and paused state stay the same. The journal records
+`workers_repointed` after these writes; a retry repeats partial writes safely
+and skips a completed worker step.
+
+`rename.py repair-workers <production> [--dry-run]` reads journaled moves
+at step 2 or later and the current production doc's Units rows. It also works
+without a rename journal, using the doc named by the update timer. Missing
+old worktrees in run state or worker roster paths are matched by saved unit
+identity, a plan header, then the old folder name. Former production names
+come from the journal and the doc's Formerly line. A run that matches two
+units is named and skipped. Each change and each unit with nothing to change
+gets one line; no matches prints the reason. Dry run writes no file or lock.
+A second repair changes nothing.
+
+Apply updates its own journal fields and retains all other keys, including
+`unit_moves`, later step names and the completed `done` value on a rerun.
 
 The destination is a sibling named `<repository>-<new>-<stem>`. The repository
 prefix comes from the conventional old basename, or the showrunner checkout's

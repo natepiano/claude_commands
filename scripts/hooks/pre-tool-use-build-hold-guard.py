@@ -14,10 +14,9 @@ from typing import TYPE_CHECKING, TypedDict, cast
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tool_call_text import scan_text
 
-CANDIDATE = re.compile(r"\b(?:cargo|verify\.sh|merge_gate\.py)\b")
+CANDIDATE = re.compile(r"\b(?:cargo|merge_gate\.py)\b")
 CARGO_BUILDS = frozenset({"build", "b", "check", "c", "clippy", "test", "t", "nextest", "run", "r",
                           "bench", "doc", "d", "rustc", "rustdoc", "fix", "install", "mend", "miri"})
-VERIFY_BUILDS = frozenset({"check", "lint", "build", "doc", "clippy"})
 PREFIXES = frozenset({"env", "sudo", "exec", "command", "nohup", "time", "timeout", "nice",
                       "!", "{", "then", "else", "do", "if", "while", "until"})
 PREFIX_ARGUMENTS = frozenset({"-u", "--unset", "--user", "-g", "--group", "-n", "--adjustment",
@@ -73,8 +72,6 @@ def builds(words: list[str], *, merge_gate_only: bool = False) -> bool:
     program = Path(words[0]).name
     arguments = words[1:]
     if program in {"bash", "sh", "zsh"}:
-        if arguments and Path(arguments[0]).name == "verify.sh":
-            return builds(arguments, merge_gate_only=merge_gate_only)
         return any("c" in option and building_command(script, merge_gate_only=merge_gate_only)
                    for option, script in zip(arguments, arguments[1:]) if option.startswith("-"))
     if program == "merge_gate.py":
@@ -91,10 +88,6 @@ def builds(words: list[str], *, merge_gate_only: bool = False) -> bool:
         return bool(arguments and Path(arguments[0]).name == "merge_gate.py")
     if merge_gate_only:
         return False
-    if program == "verify.sh":
-        while arguments and arguments[0].startswith("-"):
-            arguments = arguments[2:] if arguments[0] == "--session-dir" else arguments[1:]
-        return bool(arguments and arguments[0] in VERIFY_BUILDS)
     if program != "cargo":
         return False
     if arguments and arguments[0].startswith("+"):

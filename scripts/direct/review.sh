@@ -201,7 +201,7 @@ fi
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
-# repo needs >= 3.10.
+# repo needs >= 3.11.
 PY="${SCRIPT_DIR}/../lib/py"
 POOL_HELPER="${SCRIPT_DIR}/review_pool.py"
 MESH_SESSION_DIR="${SESSION_DIR}"
@@ -410,7 +410,7 @@ with worker_claim_lock(root):
         "model": model,
         "worker_id": worker_id,
     }
-    worker_record_path(root, name, slot).write_text(json.dumps(identity))
+    worker_record_path(root, name, slot, role="review").write_text(json.dumps(identity))
 PY
 }
 

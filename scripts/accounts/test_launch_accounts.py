@@ -15,6 +15,7 @@ from typing import cast, final, override
 from unittest.mock import patch
 
 from scripts.accounts import accounts, nix_env_fake as fixtures
+from scripts.lib.code_kind import is_test_code
 from scripts.shutdown import launch_permission
 
 
@@ -447,7 +448,7 @@ def _resume_parts(session: Session, prompt: str):
     def test_all_python_claude_launchers_use_the_shared_account_resolver(self) -> None:
         violations: list[str] = []
         for path in sorted(ROOT.rglob("*.py")):
-            if path.name.startswith(("test_", "fake_")):
+            if is_test_code(path):
                 continue
             violations.extend(launch_account_violations(path.read_text(encoding="utf-8"), str(path.relative_to(ROOT))))
         self.assertEqual(violations, [], "\n".join(violations))
@@ -481,7 +482,7 @@ subprocess.run([claude, "agents", "--json"], capture_output=True, text=True)
                     self.assertEqual(shell_launch_account_violations(rendering, "fixture.sh"), [])
         violations: list[str] = []
         for path in sorted(ROOT.rglob("*.sh")):
-            if path.name.startswith(("test_", "fake_")):
+            if is_test_code(path):
                 continue
             violations.extend(shell_launch_account_violations(path.read_text(encoding="utf-8"), str(path.relative_to(ROOT))))
         self.assertEqual(violations, [], "\n".join(violations))

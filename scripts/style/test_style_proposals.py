@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -77,6 +78,31 @@ class StyleProposalsTests(unittest.TestCase):
     propose: str = "global:rust/propose.md"
     calls: list[tuple[str, ...]] = []
 
+    template_repo: Path = Path()
+    template_tip: str = ""
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.template_repo = Path(cls.enterClassContext(tempfile.TemporaryDirectory())) / "sample"
+        cls.template_repo.mkdir()
+        fixture = cls(methodName="runTest")
+        fixture.repo = cls.template_repo
+        # Match setUp's isolated Git configuration while building the class template.
+        with mock.patch.dict(os.environ, {"HOME": str(cls.template_repo.parent)}):
+            _ = fixture.git("init", "-q", "--initial-branch=main")
+            _ = fixture.git("config", "user.name", "Proposal tests")
+            _ = fixture.git("config", "user.email", "proposals@example.invalid")
+            fixture.write("Cargo.toml", '[workspace]\nmembers = ["alpha", "beta"]\n')
+            for crate in ("alpha", "beta"):
+                fixture.write(f"{crate}/Cargo.toml", f'[package]\nname = "{crate}"\nversion = "0.1.0"\n')
+                fixture.write(f"{crate}/src/lib.rs", APPLIED + "fn value() -> u32 { 1 }\n")
+            _ = fixture.git("add", "--all")
+            _ = fixture.git("commit", "-qm", "Workspace")
+            cls.template_tip = fixture.git("rev-parse", "HEAD")
+
+
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -85,7 +111,7 @@ class StyleProposalsTests(unittest.TestCase):
         self.catalog = self.root / "nate_style/rust"
         self.proposals = self.root / "vault/issues"
         self.template = self.root / "issue.yaml"
-        self.repo.mkdir()
+        _ = shutil.copytree(self.template_repo, self.repo, symlinks=True)
         self.catalog.mkdir(parents=True)
         _ = self.template.write_text(TEMPLATE)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
@@ -94,16 +120,7 @@ class StyleProposalsTests(unittest.TestCase):
             "STYLE_HISTORY_NATE_STYLE_DIR": str(self.catalog.parent),
         })))
         _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", self.catalog.parent))
-        _ = self.git("init", "-q", "--initial-branch=main")
-        _ = self.git("config", "user.name", "Proposal tests")
-        _ = self.git("config", "user.email", "proposals@example.invalid")
-        self.write("Cargo.toml", '[workspace]\nmembers = ["alpha", "beta"]\n')
-        for crate in ("alpha", "beta"):
-            self.write(f"{crate}/Cargo.toml", f'[package]\nname = "{crate}"\nversion = "0.1.0"\n')
-            self.write(f"{crate}/src/lib.rs", APPLIED + "fn value() -> u32 { 1 }\n")
-        _ = self.git("add", "--all")
-        _ = self.git("commit", "-qm", "Workspace")
-        self.tip = self.git("rev-parse", "HEAD")
+        self.tip = self.template_tip
         _ = self.git("branch", "style/main")
         for name, metadata in (("names", "tier: C\nfamily: names\ninput_scope: file\n"),
                                ("modules", "tier: D\nfamily: modules\ninput_scope: crate\n"),

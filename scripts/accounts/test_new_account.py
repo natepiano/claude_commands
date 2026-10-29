@@ -4,6 +4,7 @@ import io
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -70,6 +71,8 @@ class NewAccountTests(unittest.TestCase):
         _ = self.enterContext(patch.object(sys, "platform", "linux"))
         _ = self.enterContext(patch.object(agent_accounts, "prepare_codex_home",
                                            return_value=agent_accounts.CodexHomePrepared()))
+        _ = self.enterContext(patch.object(subprocess, "run", side_effect=AssertionError("no real process")))
+        _ = self.enterContext(patch.object(subprocess, "Popen", side_effect=AssertionError("no real process")))
         self.write_settings([])
         nightly = self.home / ".claude/scripts/nightly_review/settings.json"
         nightly.parent.mkdir(parents=True)
@@ -360,11 +363,121 @@ class NewAccountTests(unittest.TestCase):
         self.assertNotIn("stays uncolored", stdout)
         self.assertEqual(self.colors.read_bytes(), colors_before)
 
-    def test_mac_has_no_alias_step(self) -> None:
+    def test_mac_existing_alias_is_done_and_names_the_darwin_module(self) -> None:
+        module = self.nixos.parent / "modules/darwin/shell.nix"
+        module.parent.mkdir(parents=True)
+        _ = module.write_text('  claude5 = "existing command";\n')
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(new_account, "nixos_shell_module", return_value=module)):
+            _, stdout, stderr = self.run_cli("claude", "claude5")
+        self.assertEqual(stderr, "")
+        self.assertIn(f"done: claude5 alias in {module} (live after a rebuild)", stdout)
+        self.assertNotIn("add to shellAliases", stdout)
+
+    def test_mac_missing_alias_prints_the_add_line_in_the_darwin_module(self) -> None:
+        module = self.nixos.parent / "modules/darwin/shell.nix"
+        module.parent.mkdir(parents=True)
+        _ = module.write_text('  claude1 = "existing command";\n')
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(new_account, "nixos_shell_module", return_value=module)):
+            _, stdout, stderr = self.run_cli("claude", "claude5")
+        self.assertEqual(stderr, "")
+        self.assertIn(f"for you: add to shellAliases in {module}, then rebuild:", stdout)
+        self.assertIn('claude5 = "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec claude5";', stdout)
+        self.assertEqual(module.read_text(), '  claude1 = "existing command";\n')
+
+    def test_missing_shell_module_names_the_account_and_platform_path(self) -> None:
+        for platform, folder in (("darwin", "darwin"), ("linux", "linux")):
+            with (self.subTest(platform=platform), patch.object(sys, "platform", platform),
+                  patch.object(new_account, "nixos_shell_module", return_value=None)):
+                _, stdout, stderr = self.run_cli("claude", "claude5")
+                self.assertEqual(stderr, "")
+                self.assertIn("for you: no nixos shell module", stdout)
+                self.assertIn("claude5 alias", stdout)
+                self.assertIn(f"modules/{folder}/shell.nix", stdout)
+
+    def test_mac_alias_loop_still_comes_from_the_account_note(self) -> None:
+        _ = self.nixos.write_text(new_account.ALIAS_LOOP_MARKER)
         with patch.object(sys, "platform", "darwin"):
-            _, stdout, _ = self.run_cli("claude", "claude4")
-        self.assertNotIn("alias", stdout)
-        self.assertEqual([line for line in stdout.splitlines() if "shellAliases" in line], [])
+            _, stdout, stderr = self.run_cli("claude", "claude5")
+        self.assertEqual(stderr, "")
+        self.assertIn("done: claude5 alias: comes from the account note; open a new terminal", stdout)
+
+    def test_claude_alias_loop_does_not_define_a_new_codex_alias(self) -> None:
+        _ = self.nixos.write_text(new_account.ALIAS_LOOP_MARKER
+            + '\n  codex1 = "existing command";\n  codex2 = "existing command";\n')
+        account = new_account.parse_account("codex", "codex3")
+        for platform in ("linux", "darwin"):
+            with self.subTest(platform=platform), patch.object(sys, "platform", platform):
+                step = new_account.alias_step(account)
+                self.assertEqual(step, new_account.Step(False,
+                    f'add to shellAliases in {self.nixos}, then rebuild:\n'
+                    + '    codex3 = "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec codex3";'))
+
+    def test_codex_setup_appends_alias_on_both_platforms_only_after_success(self) -> None:
+        account = new_account.parse_account("codex", "codex3")
+        for platform in ("linux", "darwin"):
+            with (self.subTest(platform=platform), patch.object(sys, "platform", platform),
+                  patch.object(new_account, "home_login", return_value=new_account.NoHomeLogin()),
+                  patch.object(accounts, "setup", return_value=["fixture setup failed"]) as setup,
+                  patch.object(new_account, "alias_step", wraps=new_account.alias_step) as alias):
+                self.assertEqual(new_account.codex_steps(account), [new_account.Step(False, "fixture setup failed")])
+                alias.assert_not_called()
+                setup.return_value = []
+                steps = new_account.codex_steps(account)
+                alias.assert_called_once_with(account)
+                self.assertIn("set up ~/.codex3", steps[0].text)
+                self.assertIn("codex login", steps[1].text)
+                self.assertEqual(steps[-1], new_account.Step(False,
+                    f'add to shellAliases in {self.nixos}, then rebuild:\n'
+                    + '    codex3 = "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec codex3";'))
+
+    def test_codex_signed_in_check_appends_alias_on_both_platforms_only_after_success(self) -> None:
+        account = new_account.parse_account("codex", "codex3")
+        for platform in ("linux", "darwin"):
+            with (self.subTest(platform=platform), patch.object(sys, "platform", platform),
+                  patch.object(new_account, "home_login", return_value=new_account.HomeLogin("three@example.invalid")),
+                  patch.object(accounts, "check", return_value=["fixture check failed"]) as check,
+                  patch.object(new_account, "alias_step", wraps=new_account.alias_step) as alias):
+                self.assertEqual(new_account.codex_steps(account), [new_account.Step(False, "fixture check failed")])
+                alias.assert_not_called()
+                check.return_value = []
+                steps = new_account.codex_steps(account)
+                alias.assert_called_once_with(account)
+                self.assertIn("set up and signed in", steps[0].text)
+                self.assertIn('codex3 = "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec codex3";', steps[-1].text)
+                self.assertFalse(steps[-1].done)
+
+
+class ShellModuleTests(unittest.TestCase):
+    def test_platform_module_lookup_prefers_etc_then_home_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            system_repository, home = root / "system-repository", root / "home"
+
+            def repository_path(value: str) -> Path:
+                return system_repository if value == "/etc/nixos" else Path(value)
+
+            for platform in ("darwin", "linux"):
+                for repository in (system_repository, home / "nixos"):
+                    module = repository / f"modules/{platform}/shell.nix"
+                    module.parent.mkdir(parents=True)
+                    _ = module.write_text("# fixture\n")
+            for platform, folder in (("darwin", "darwin"), ("linux", "linux"), ("freebsd", "linux")):
+                with (self.subTest(platform=platform), patch.object(sys, "platform", platform),
+                      patch.object(accounts, "accounts_home", return_value=home),
+                      patch.object(new_account, "Path", side_effect=repository_path)):
+                    expected = system_repository / f"modules/{folder}/shell.nix"
+                    if not expected.exists():
+                        _ = expected.write_text("# fixture\n")
+                    self.assertEqual(new_account.nixos_shell_module(), expected)
+                    expected.unlink()
+                    fallback = home / f"nixos/modules/{folder}/shell.nix"
+                    if not fallback.exists():
+                        _ = fallback.write_text("# fixture\n")
+                    self.assertEqual(new_account.nixos_shell_module(), fallback)
+                    fallback.unlink()
+                    self.assertIsNone(new_account.nixos_shell_module())
 
 
 if __name__ == "__main__":

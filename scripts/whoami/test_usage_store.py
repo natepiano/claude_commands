@@ -21,6 +21,9 @@ import usage_store
 import agent_accounts
 from agent_accounts import NoWeeklyReadSkip, Quota, Report, StaleTokenSkip, UsageReadOutcome
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 READ = datetime(2026, 10, 12, 14, 30, tzinfo=timezone.utc)
 RESETS = datetime(2026, 10, 15, 16, 0, tzinfo=timezone.utc)
 
@@ -350,15 +353,15 @@ class UsageStoreTests(unittest.TestCase):
         start = Barrier(2)
 
         def save(login: str) -> None:
-            _ = start.wait(timeout=2)
+            _ = start.wait(timeout=TEST_HANG_GUARD_SECS)
             usage_store.save([Report("Claude", email=login,
                 quotas=[Quota("Weekly", 10, RESETS)])], READ)
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             first = pool.submit(save, "first@example.invalid")
             second = pool.submit(save, "second@example.invalid")
-            first.result(timeout=3)
-            second.result(timeout=3)
+            first.result(timeout=TEST_HANG_GUARD_SECS)
+            second.result(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(set(usage_store.load()), {"first@example.invalid", "second@example.invalid"})
 
     def test_load_drops_what_it_cannot_read(self) -> None:

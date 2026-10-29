@@ -124,6 +124,7 @@ class WaitingForMerge:
 @dataclass(frozen=True)
 class WaitingForSync:
     unclassified: int
+    reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -133,10 +134,108 @@ class WaitingForStructure:
 
 
 @dataclass(frozen=True)
-class WaitingForBranchPointSync:
-    branch_point: str
-    branch_tip: str
-    synced_tip: str
+class SyncNeeded:
+    reason: str
+
+
+@dataclass(frozen=True)
+class SyncNotNeeded:
+    pass
+
+
+@dataclass(frozen=True)
+class MainChanges:
+    pushed_tip: str
+    paths: frozenset[str] = frozenset()
+    crates: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class UnknownMainChanges:
+    reason: str
+
+
+def main_changes(ledger: style_ledger.Ledger, branch_point: str, tip: str) -> MainChanges | UnknownMainChanges:
+    """Read every commit's touched paths once; endpoint diffs would miss edits later reverted on main."""
+    repo = ledger.repo
+    try:
+        main = style_ledger.pushed_branch_point_tip(repo, branch_point)
+        # A synced style tip can already contain main, without main containing that style tip.
+        for older, newer in ((main, tip), (tip, main)):
+            ancestry = subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", older, newer],
+                                      capture_output=True, text=True, check=False)
+            if ancestry.returncode == 0:
+                if older == main:
+                    return MainChanges(main)
+                break
+            if ancestry.returncode != 1:
+                return UnknownMainChanges(ancestry.stderr.strip() or "git ancestry check failed")
+        else:
+            return UnknownMainChanges("synced tip is not an ancestor of main")
+        changes = subprocess.run(
+            ["git", "-C", str(repo), "-c", "diff.renameLimit=0", "log", "--format=", "--name-status", "-z",
+             "--no-ext-diff", "--no-textconv", "--no-relative", "-M", "-C", "--find-copies-harder",
+             "--diff-merges=first-parent", f"{tip}..{main}", "--"],
+            capture_output=True, check=False,
+        )
+        if changes.returncode or changes.stderr:
+            return UnknownMainChanges(os.fsdecode(changes.stderr).strip() or "git touched-path read failed")
+        fields = changes.stdout.split(b"\0")
+        paths: set[str] = set()
+        index = 0
+        while index < len(fields) - 1:
+            status = fields[index].lstrip(b"\n")
+            if status.startswith((b"R", b"C")):
+                return UnknownMainChanges("rename or copy in main range")
+            if status not in (b"A", b"M", b"D", b"T") or index + 1 >= len(fields) - 1 or not fields[index + 1]:
+                return UnknownMainChanges("unrecognized git name-status output")
+            raw_path = fields[index + 1]
+            path = os.fsdecode(raw_path)
+            if os.fsencode(path) != raw_path:
+                return UnknownMainChanges("unrepresentable git path")
+            # Ledger paths cross a UTF-8 text boundary; refuse surrogate escapes there.
+            _ = path.encode("utf-8")
+            paths.add(path)
+            index += 2
+        if fields[-1]:
+            return UnknownMainChanges("unterminated git name-status output")
+        crates = tuple(member.directory for member in coverage_report.workspace(ledger, tip)) if paths else ()
+        return MainChanges(main, frozenset(paths), tuple(sorted(crates, key=len, reverse=True)))
+    except (OSError, ValueError, style_ledger.LedgerError, subprocess.CalledProcessError) as error:
+        return UnknownMainChanges(str(error))
+
+
+def ticket_sync_check(changes: MainChanges | UnknownMainChanges, files: tuple[str, ...]) -> SyncNeeded | SyncNotNeeded:
+    if isinstance(changes, UnknownMainChanges):
+        return SyncNeeded(f"touched set unknown: {changes.reason}")
+    if not changes.paths:
+        return SyncNotNeeded()
+    protected = {"Cargo.toml", "Cargo.lock", *files}
+    for path in files:
+        crate = next((crate for crate in changes.crates
+                      if crate == "." or path == crate or path.startswith(crate + "/")), "")
+        if not crate:
+            return SyncNeeded(f"touched set unknown: unknown crate for {path}")
+        protected.update(str(PurePosixPath(crate) / name) for name in ("Cargo.toml", "build.rs"))
+    touched = sorted(protected & changes.paths)
+    return SyncNeeded(f"main touched {touched[0]}") if touched else SyncNotNeeded()
+
+
+def ticket_sync_wait(ledger: style_ledger.Ledger, changes: MainChanges | UnknownMainChanges,
+                     kind: str, crate: str, rule: str, files: tuple[str, ...],
+                     findings: tuple[style_ledger.HeldFinding, ...] = ()) -> WaitingForSync | SyncNotNeeded:
+    # Only the selected proposal needs a footprint at main, where new callers may have appeared.
+    if isinstance(changes, MainChanges) and changes.paths and findings:
+        try:
+            main_edits = EditedFiles(ledger.repo, ledger, UnitBranchTip(changes.pushed_tip))
+            files = tuple(dict.fromkeys((*files, *(path for finding in findings for path in main_edits.of(finding)))))
+        except (OSError, ValueError, style_ledger.LedgerError, subprocess.CalledProcessError) as error:
+            changes = UnknownMainChanges(f"cannot read selected footprint at main: {error}")
+    check = ticket_sync_check(changes, files)
+    if isinstance(check, SyncNeeded):
+        label = " ".join(filter(None, (kind, crate, rule)))
+        return WaitingForSync(0, f"{label}: {check.reason}")
+    return check
 
 
 @dataclass(frozen=True)
@@ -231,7 +330,7 @@ class BusyFiles:
 
 
 NextPhase = (PhaseWritten | Resumed | RepairFirst | WaitingForMerge | WaitingForSync | WaitingForStructure
-             | WaitingForBranchPointSync | MergeStyleBranchFirst | berth_board.BoardUnavailable)
+             | MergeStyleBranchFirst | berth_board.BoardUnavailable)
 
 
 def style_document(repo: Path) -> Path:
@@ -1960,7 +2059,8 @@ def _select_phase(
     ledger: style_ledger.Ledger, unit: str, branch: str, plan: Path, repo: Path,
     doc: Path, text: str, scope: PilotScope, busy: BusyFiles, first_files: frozenset[str],
     definitions: Mapping[str, rules.Rule],
-) -> PhaseWritten | NoAvailableWork | WaitingForStructure | MergeStyleBranchFirst:
+    changes: MainChanges | UnknownMainChanges,
+) -> PhaseWritten | NoAvailableWork | WaitingForStructure | MergeStyleBranchFirst | WaitingForSync:
     queued: list[style_ledger.TicketRecord] = []
     for ticket in ledger.queued_tickets(unit):
         if ticket["kind"] == "proposal" and not ticket["finding_ids"]:
@@ -2014,11 +2114,16 @@ def _select_phase(
                   _rank_waits(ledger, ticket, family, waits, scopes, tip)) if index == 0 and in_scope and not uncertain else ()
         if (index == 0 and in_scope and not uncertain and not ranked
                 and not any(busy.contains(path) for path in edits.of_ticket(ticket))):
+            origin = ledger.ticket_origin(ticket["id"])
+            findings = edits.ticket_findings(origin) if isinstance(origin, style_ledger.ApprovedProposal) else ()
+            sync = ticket_sync_wait(ledger, changes, ticket["kind"], ticket["crate"], ticket["rule"],
+                                    edits.of_ticket(ticket), findings)
+            if isinstance(sync, WaitingForSync):
+                return sync
             ledger.ticket_assign(ticket["id"], branch)
             for extra in queued[1:]:
                 ledger.ticket_drop(extra["id"])
                 print(f"dropped {extra['id']}: files busy")
-            origin = ledger.ticket_origin(ticket["id"])
             if isinstance(origin, style_ledger.ApprovedProposal):
                 style_proposals.proposal_command("start", str(origin.issue))
             write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
@@ -2148,6 +2253,13 @@ def _select_phase(
         files = ((available[0],) if PurePosixPath(rule.partition(":")[2]).stem == "no-magic-values"
                  else read_slices(repo, tip, available, limits)[0])
         selected_findings = tuple(finding for path in files for finding in by_file[path])
+        sync = ticket_sync_wait(ledger, changes, "proposal", style_proposals.crate_for(directories, files[0]), rule,
+                                tuple(dict.fromkeys(path for finding in selected_findings for path in edits.of(finding))),
+                                selected_findings)
+        if isinstance(sync, WaitingForSync):
+            if closed:
+                style_proposals.renumber()
+            return sync
         ticket_id = ledger.next_ticket_id(unit)
         ledger.ticket_add(ticket_id, unit, "proposal", family, style_proposals.crate_for(directories, files[0]),
                           list(files), sorted({finding.rule for finding in selected_findings}),
@@ -2187,6 +2299,9 @@ def _select_phase(
             print(f"waiting for sync: {' '.join(filter(None, (selected.kind, selected.crate, selected.rule)))}: "
                   + changed[0].line(tip))
             continue
+        sync = ticket_sync_wait(ledger, changes, selected.kind, selected.crate, selected.rule, selected.files)
+        if isinstance(sync, WaitingForSync):
+            return sync
         ticket_id = ledger.next_ticket_id(unit)
         ledger.ticket_add(ticket_id, unit, selected.kind, selected.family, selected.crate, list(selected.files),
                           list(selected.rules), selected.rule, [dict(rule=site.rule, path=site.path, line=site.line, text=site.text) for site in selected.sites],
@@ -2229,20 +2344,18 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
             write_phase(ledger, ticket, plan, text)
             ledger.clear_sync_wait(unit)
             return Resumed(ticket["id"])
-        tip = synced_tip(ledger)
+        try:
+            tip = synced_tip(ledger)
+        except style_ledger.LedgerError as error:
+            ledger.wait_for_sync(unit)
+            return WaitingForSync(0, f"touched set unknown: {error}")
         standing = standing_style_production(repo)
         if not isinstance(standing, StandingStyleProduction):
             raise style_ledger.LedgerError(f"no standing style production: {standing.slug}")
-        branch_tip = style_ledger.pushed_branch_point_tip(repo, standing.branch_point)
-        ancestry = subprocess.run(
-            ["git", "-C", str(repo), "merge-base", "--is-ancestor", branch_tip, tip],
-            capture_output=True, text=True, check=False,
-        )
-        if ancestry.returncode == 1:
+        changes_on_main = main_changes(ledger, standing.branch_point, tip)
+        if isinstance(changes_on_main, UnknownMainChanges):
             ledger.wait_for_sync(unit)
-            return WaitingForBranchPointSync(standing.branch_point, branch_tip, tip)
-        if ancestry.returncode:
-            raise style_ledger.LedgerError(ancestry.stderr.strip() or "git merge-base --is-ancestor failed")
+            return WaitingForSync(0, f"touched set unknown: {changes_on_main.reason}")
         # One catalog read serves both refill passes; it reads no shared state, so it runs before the lock.
         definitions = {rule.rule_id: rule for rule in rules.load_rules(repo)}
         with style_ledger.refill_lock(repo):
@@ -2251,10 +2364,13 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
                 return board
             busy = busy_files(repo, doc, ledger, unit, board)
             selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files,
-                                     definitions)
+                                     definitions, changes_on_main)
             # A unit told to merge the style branch acts at once, so it records no sync wait.
             if isinstance(selected, PhaseWritten | MergeStyleBranchFirst):
                 ledger.clear_sync_wait(unit)
+                return selected
+            if isinstance(selected, WaitingForSync):
+                ledger.wait_for_sync(unit)
                 return selected
         ledger.wait_for_sync(unit)
         with style_ledger.refill_lock(repo):
@@ -2263,11 +2379,11 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
                 return board
             busy = busy_files(repo, doc, ledger, unit, board)
             selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files,
-                                     definitions)
+                                     definitions, changes_on_main)
             if isinstance(selected, PhaseWritten | MergeStyleBranchFirst):
                 ledger.clear_sync_wait(unit)
                 return selected
-            if isinstance(selected, WaitingForStructure):
+            if isinstance(selected, WaitingForStructure | WaitingForSync):
                 return selected
             return WaitingForSync(len(ledger.unclassified_rules()))
 
@@ -2567,8 +2683,6 @@ def refill_outcome(result: NextPhase) -> str:
             return "waiting for sync"
         case WaitingForStructure(crates):
             return f"waiting for structure: {', '.join(crates)}"
-        case WaitingForBranchPointSync():
-            return "waiting for branch-point sync"
         case MergeStyleBranchFirst():
             return "merge the style branch first"
         case berth_board.BoardUnavailable():
@@ -2660,8 +2774,8 @@ def main(argv: list[str]) -> int:
             case berth_board.BoardUnavailable(reason):
                 print(f"board unavailable: {reason}")
                 return 4
-            case WaitingForSync(unclassified):
-                print("waiting for sync")
+            case WaitingForSync(unclassified, reason):
+                print("waiting for sync" + (f": {reason}" if reason else ""))
                 if unclassified:
                     print(f"unclassified: {unclassified} rules — pull nate_style", file=sys.stderr)
                 return 3
@@ -2669,9 +2783,6 @@ def main(argv: list[str]) -> int:
                 print(f"waiting for structure: {', '.join(crates)}")
                 if unclassified:
                     print(f"unclassified: {unclassified} rules — pull nate_style", file=sys.stderr)
-                return 3
-            case WaitingForBranchPointSync(branch_point, branch_tip, tip):
-                print(f"waiting for sync: {branch_point} {branch_tip[:7]} is not in the synced tip {tip[:7]}")
                 return 3
             case MergeStyleBranchFirst(cell_count, unit_tip, style_branch):
                 print(f"merge the style branch first: {cell_count} cell{'' if cell_count == 1 else 's'} judged at {unit_tip[:7]} "

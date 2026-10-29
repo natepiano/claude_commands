@@ -1,14 +1,23 @@
-"""Tests for heartbeat.sh's bound on the shared heartbeat log."""
+"""Tests for heartbeat log bounds and watcher shutdown."""
 
 from __future__ import annotations
 
+import os
 import re
+import select
+import signal
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import cast
+
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
 
 HEARTBEAT = Path(__file__).resolve().parent / "heartbeat.sh"
+WATCHER = HEARTBEAT.with_name("heartbeat_watch.sh")
 MAX_BYTES = 256 * 1024
 KEEP_BYTES = 128 * 1024
 BEAT = re.compile(r"^\d{4}-\d{2}-\d{2}T\S+ \[wrapper\] ")
@@ -47,6 +56,54 @@ class HeartbeatCapTests(unittest.TestCase):
         self.assertTrue(all(BEAT.match(line) for line in rest), "no partial line survives the cut")
         self.assertEqual(rest[-1].split("] ", 1)[1], "newest\n")
         self.assertEqual(rest[:-1], beats[-len(rest) + 1:], "the kept beats are the newest, in order")
+
+
+class HeartbeatWatcherTests(unittest.TestCase):
+    def test_stop_signals_close_the_output_pipes_and_reap_the_sleep(self) -> None:
+        for stop_signal in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            with self.subTest(signal=stop_signal), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                # The interval cannot finish naturally: its stand-in blocks on
+                # a pipe the parent keeps open but never releases. EOF therefore
+                # proves signal cleanup, independently of elapsed wall time.
+                interval_read, interval_write = os.pipe()
+                self.addCleanup(os.close, interval_read)
+                self.addCleanup(os.close, interval_write)
+                sleep_probe = root / "sleep"
+                _ = sleep_probe.write_text(
+                    f"#!{sys.executable}\nimport os\n"
+                    + "print(os.getpid(), flush=True)\n"
+                    + f"os.read({interval_read}, 1)\n",
+                    encoding="utf-8",
+                )
+                sleep_probe.chmod(0o755)
+                environment = dict(os.environ)
+                environment["PATH"] = str(root) + os.pathsep + environment["PATH"]
+                watcher: subprocess.Popen[str] = subprocess.Popen(
+                    ["bash", str(WATCHER), str(root / "heartbeat.log"), "fixture",
+                     str(os.getpid()), str(root / "agent.log"), "30"],
+                    env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, start_new_session=True, pass_fds=(interval_read,),
+                )
+                try:
+                    assert watcher.stdout is not None
+                    self.assertTrue(select.select([watcher.stdout], [], [], TEST_HANG_GUARD_SECS)[0],
+                                    "the watcher's sleep child never started")
+                    sleep_pid = int(cast(str, watcher.stdout.readline()))
+                    watcher.send_signal(stop_signal)
+                    output, errors = watcher.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    self.assertEqual(watcher.returncode, 0, output + errors)
+                    with self.assertRaises(ProcessLookupError,
+                                           msg="the watcher's sleep child survived shutdown"):
+                        os.kill(sleep_pid, 0)
+                finally:
+                    # On a regression, kill only this disposable process group,
+                    # including a child that still owns the output pipes.
+                    try:
+                        os.killpg(watcher.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    _ = watcher.communicate(timeout=TEST_HANG_GUARD_SECS)
 
 
 if __name__ == "__main__":

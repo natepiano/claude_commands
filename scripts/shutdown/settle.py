@@ -613,6 +613,18 @@ def running_restart_line(saved: SessionShutdown, *, for_showrunner: bool = False
     return f"{subject} — check it, then close its record in a terminal on {saved['machine']}: {command}"
 
 
+def failed_prompt_screen_lines(saved: SessionShutdown) -> list[str]:
+    """Render a local failed restart's saved submit screen, when it was read."""
+    if saved["progress"]["kind"] != "restart failed":
+        return []
+    import restart as restart_work
+    screen = restart_work.saved_prompt_screen(saved)
+    if isinstance(screen, herdr.PromptScreenNotRead):
+        return []
+    return ["  last screen of the failed prompt submit:",
+            *("    " + line for line in screen.splitlines())]
+
+
 def _warm() -> bool:
     try:
         result = subprocess.run(
@@ -639,6 +651,9 @@ def pause_confirmation_line(record: SessionShutdown) -> str:
         f"This request comes from the shutdown the user started ({reference}), not from another session's own choice. "
         f"To confirm it, run in this terminal: {command}. It lists this session under the {'move' if moving else 'stop'}."
     )
+
+
+RETIRE_REASON = "retired; /showrunner:resume_unit brings it back."
 
 
 def _settle_text(record: SessionShutdown, session: Session) -> str:
@@ -795,6 +810,8 @@ def begin(
             saved["move_id"] = move_id
         if checkout_move is not None:
             saved["checkout_move"] = checkout_move
+        if why:
+            saved["why"] = why
         if target:
             saved["target"] = target
             saved["source_label"] = report["label"]
@@ -1451,6 +1468,8 @@ def report_stop(records: list[SessionShutdown]) -> None:
             lines.append(f"  {saved['session']['name']}: {progress['reason']}")
         elif progress["kind"] == "manual restart":
             lines.append(f"  {saved['session']['name']}: in a terminal on {saved['machine']}: {progress['command']}")
+        if saved["machine"].casefold() == local_machine().casefold():
+            lines.extend(failed_prompt_screen_lines(saved))
     failed = [saved for saved in records if saved["session"]["session_id"] not in running and store.stop_incomplete(saved)]
     restore_failed = [saved for saved in records
                       if saved["progress"]["kind"] in {"restart failed", "manual restart", "timers pending"}
@@ -1566,7 +1585,9 @@ def tell_showrunner_stopping(saved: SessionShutdown) -> None:
     back = (("it comes back on " + target if target else "it comes back") + " within minutes"
             if saved["then"] == "restart" else "it stays stopped until the user restarts it")
     summary = f"{name} is stopping: {why}"
-    _ = send_message(showrunner, summary, f"{summary}; {back}. One more line follows when it is back or has not come back.",
+    text = (summary if why == RETIRE_REASON and saved["then"] == "stop" else
+            f"{summary}; {back}. One more line follows when it is back or has not come back.")
+    _ = send_message(showrunner, summary, text,
                      key=f"shutdown-unit-{saved['session']['session_id']}")
 
 
@@ -1705,6 +1726,8 @@ def holdout_line(saved: SessionShutdown) -> str:
     command = shutdown_command("now", saved["login"], "--here", "--only", saved["session"]["session_id"])
     request = "restart" if saved["then"] == "restart" else "shutdown"
     after_stop = "the restart brings it back." if saved["then"] == "restart" else "it stays stopped until restarted."
+    if saved.get("why") == RETIRE_REASON and saved["then"] == "stop":
+        after_stop = RETIRE_REASON
     return (f"{saved['session']['name']} has not answered the pause for {minutes} minutes "
             f"in {_holdout_host(saved)}. A {saved['label']} {request} asked it to pause at a safe point and say ready. "
             f"Do nothing: the {request} keeps waiting. Stop now (recommended): ends Claude mid-step so the {request} goes on. "

@@ -1,8 +1,8 @@
 # efficiency
 
-> **Status: IMPLEMENTATION PLAN — phased, delegate-ready.** Phase 4: one Python dispatcher per hook event runs the event's Python hooks in one interpreter, so a Bash call starts 2 Python processes instead of 8, and a Stop starts 1 instead of 4. Phase 5: the checkpoint doc gate judges the staged tree and real git command words. Phase 6: every Claude and Codex session starts inside its worktree's nix shell.
+> **Status: IMPLEMENTATION PLAN — phased, delegate-ready.** Phase 4: one Python dispatcher per hook event runs the event's Python hooks in one interpreter, so a Bash call starts 2 Python processes instead of 8, and a Stop starts 1 instead of 4. Phase 5: the checkpoint doc gate judges the staged tree and real git command words. Phase 6: every Claude and Codex session starts inside its worktree's nix shell. Phase 7: the launch scan sees accounts.py's guard with no exemption, and the unused SessionStart nix-shell hook is removed.
 
-> **Production: build-followups** — unit `efficiency-unit`; production doc `docs/plans/build-followups-production.md`
+> **Production: natedev** — unit `efficiency-unit`; production doc `docs/plans/natedev-production.md`
 
 ## Source
 
@@ -31,7 +31,7 @@ Showrunner of build-followups, 2026-10-28 (measured by builds-unit):
 - `scripts/hooks/hook_dispatch.py` runs the Python hooks of PreToolUse, PostToolUse and Stop in one interpreter each, in the old `settings.json` order, with the same decisions, text and exit codes. The combination rules are in its docstring. `settings.json` has one dispatcher entry per event; the shell hooks (with origin's `pre-tool-use-build-hold-guard.sh`), push-gate and the other events stay as their own entries. The random-ack entry is removed; its script header says how to turn it on again.
 - Bench (N=20, same window, natedev under load): child CPU per Bash call 576.5 -> 350.7 ms (-39%), per Stop 317.4 -> 168.3 ms (-47%).
 - Gate: the full merge gate added no failure; the one red (`direct/test_progress_history`, AF_UNIX path too long) fails the same way on origin dab6cf38.
-- Open: the live check in a new session (refused heredoc, allowed Bash, Stop with a banned word) runs after promotion to main.
+- Live check on main d76569ca (2026-10-28 23:00 EDT): scratch-guard refused a Write with its usual text, PostToolUse blocked forbidden words in a tool output, the Stop dispatcher blocked a turn, and a new probe session's prose word reached the prose log (that hook logs and never blocks).
 
 ### Phase 5 — Checkpoint doc gate judges the staged tree and real git command words  · status: done
 
@@ -61,6 +61,45 @@ Showrunner of build-followups, 2026-10-28 (measured by builds-unit):
 - `verify.sh` re-runs itself under `nix_env.py exec` when it starts outside the shell, with one line.
 - `scripts/nix_env/heal.py sweep` restarts a session outside its shell, after the build-hold check, on its own account; when the restart cannot fix it, it pushes `nix_heal.failed` (texts reviewed and approved).
 - Live check: `ensure` in `~/rust/bevy_brp` loaded the shell in 0.4 s; `exec` ran a program inside it.
-- Open: the SessionStart hook `scripts/hooks/session-start-nix-shell.py` is in the tree, but its `settings.json` registration waits for the user's typed go. The `nix-heal` notifier timer (every 5 minutes) is registered after the merge.
+- The `nix-heal` notifier timer (every 5 minutes) is registered on main. A SessionStart hook was built and then dropped in phase 7 (showrunner ruling): the timer and the PATH wrappers cover the case.
 
 **After the merge:** the showrunner adds PATH wrappers for bare `claude`, `claude1`-`claude4`, `codex`, `codex1` and `codex2` in /etc/nixos on both machines; accounts-unit wires `accounts.py exec`. Both get the merge commit.
+
+### Phase 7 — Launch scan sees accounts.py's nix shell guard  · status: done
+
+**Goal:** `scripts/lib/test_claude_launch_scan.py` has no exemption, and the unused SessionStart nix-shell hook is gone.
+
+#### As-built
+
+- Checkpoint 4c174618. The full record is `docs/as-built/nix-shell-launch.md` (Launch scan, Timer registration).
+- The scan counts a same-module guard function as a guard: a top-level function that calls `ensure` on `nix_env` or on a value from `import_module("...nix_env")`, or that calls another guard by bare name (fixed point). Nested functions, methods and other-module attribute calls do not count. The `accounts/accounts.py` exemption is removed; its `launch_shell_environment` is seen as a guard.
+- The unregistered SessionStart hook `scripts/hooks/session-start-nix-shell.py`, its test, and the `heal.py --wait-idle` path only it used are removed (showrunner ruling, 2026-10-28: the five-minute nix-heal timer and the PATH wrappers cover the case; revisit only if a failed build from such a session is seen). `heal.py sweep --only <id> --check` stays for the `nix_heal.failed` push.
+- Checks: 41 tests pass, basedpyright clean. The full merge gate was stopped by a natedev build hold; the showrunner gates at merge.
+
+### Phase 8 — Checkpoint doc gate acts only on a real git commit or merge  · status: done
+
+**Source:** showrunner of natedev, 2026-10-29 (defect report from cargo-liner's showrunner).
+
+**Goal:** `scripts/hooks/pre-tool-use-checkpoint-doc-gate.py` acts only when a parsed command runs git commit or git merge (or a wrapper that runs one). Any other command passes, whatever its arguments hold.
+
+**Defects:**
+- It refused `cd ... && S=...; $HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/merge_checkpoint.py ... --started "$(git log -1 --format=%cI 719c9b28)"` with "the command word is expanded or eval-generated; use a literal git invocation" (line ~401). That command runs no git commit.
+- It refuses Bash text that holds the words checkpoint and commit, for example an `echo` of a message.
+
+**Fix:** treat a command word that is a variable or `$(...)` as unreadable only when it could be git: its literal text names git, or it holds no readable text at all and the same segment has a `commit` or `merge` word. A variable in an argument, a `$(...)` in an argument (a command inside `$(...)` is still parsed on its own), a path such as `$HOME/.../py`, and the words checkpoint, commit or merge in arguments, strings or script names never trigger the gate.
+
+**Tests** (`scripts/hooks/test_checkpoint_doc_gate.py`): the cargo-liner command above passes; `echo "checkpoint(x): commit message"` passes; a `$HOME/...py` command word with checkpoint text in its arguments passes; a real `git commit -F msg` with a checkpoint subject and no doc record is still refused; `$GIT commit` and `eval "git commit ..."` with checkpoint text are still refused.
+
+**Acceptance:** `python3 -m unittest scripts.hooks.test_checkpoint_doc_gate` passes from the repo root; basedpyright clean on both files.
+
+### Phase 9 — nix_env loads a trusted repo's linked worktree outside the trusted roots  · status: done
+
+**Source:** showrunner of natedev, 2026-10-29 (top priority: it blocks every style sync and merge in cargo-liner-style).
+
+**Defect:** `style_sync.py lint` makes its checkout with `git worktree add --detach` under `/tmp/claude/session/<id>/style-sync-lint-*/checkout`. verify.sh there runs under `nix_env.py exec`; `trusted_envrc` approves only files below `~/rust`, `~/worktrees` and `~/.claude*`, so direnv refuses: `.envrc is blocked. Run direnv allow`. The cause is phase 6 (187c88b9).
+
+**Fix:** in `scripts/lib/nix_env.py`, an `.envrc` is also trusted when its folder is the top of a linked worktree that a trusted repository registered. Prove it by reading files only, never by running git in the untrusted tree: the folder's `.git` is a file `gitdir: <path>`; that path resolves to `<common>/worktrees/<name>`; `<common>` (from that folder's `commondir` file, relative to it or absolute) resolves below a trusted root; and that folder's `gitdir` file resolves back to this folder's `.git`. Any other tree, a plain clone included, keeps direnv's explicit approval. No blanket `direnv allow`.
+
+**Tests** (`scripts/lib/test_nix_env.py`, real `git`): a `git worktree add` of a repo below the fake `~/rust`, made outside the trusted roots, is approved and loads; a plain `git clone` outside the roots is not approved; a hand-written `.git` file that points at a trusted repo's real worktree entry, from another folder, is not approved; a worktree of a repo outside the roots is not approved.
+
+**Acceptance:** `python3 -m unittest scripts.lib.test_nix_env scripts.lib.test_nix_env_launches scripts.lib.test_nix_env_integration` passes from the repo root; basedpyright clean on the changed files; `docs/as-built/nix-shell-launch.md` states the rule.

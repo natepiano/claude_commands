@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import runpy
+from collections.abc import Callable
 from datetime import datetime, timezone
 import os
 from pathlib import Path
@@ -12,15 +14,41 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from typing import cast, override
+from typing import ClassVar, cast, override
 import unittest
+from unittest import mock
 
 HOOK = Path(__file__).with_name("pre-tool-use-checkpoint-doc-gate.py")
 CHECKPOINT = 'git commit -m "checkpoint(efficiency): phase 1"'
 DOC_COMMAND = "~/.claude/scripts/direct/verify.sh doc"
+# load 136 on natedev, 2026-10-29
+TEST_HANG_GUARD_SECS = 300
+DECIDE = cast(Callable[[str], str], runpy.run_path(str(HOOK))["decide"])
 
 
 class CheckpointDocGateTests(unittest.TestCase):
+    seed: ClassVar[Path]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.seed = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="checkpoint-doc-seed-"))) / "repo"
+        cls.seed.mkdir()
+        _ = (cls.seed / "Cargo.toml").write_text('[package]\nname = "sample"\nversion = "0.1.0"\n')
+        _ = (cls.seed / "lib.rs").write_text("pub fn base() {}\n")
+        environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+        environment.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+        commands = (["init", "-q", "-b", "test"], ["add", "-A"],
+                    ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
+                     "commit", "-q", "-m", "base"])
+        for arguments in commands:
+            _ = subprocess.run(["git", "-C", str(cls.seed), *arguments], env=environment,
+                               capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS)
+        _ = (cls.seed / "lib.rs").write_text("pub fn staged() {}\n")
+        _ = subprocess.run(["git", "-C", str(cls.seed), "add", "lib.rs"], env=environment,
+                           capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS)
+
     root: Path = Path()
     repo: Path = Path()
     records: Path = Path()
@@ -30,7 +58,7 @@ class CheckpointDocGateTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.repo = self.root / "cargo repo"
-        self.repo.mkdir()
+        _ = shutil.copytree(self.seed, self.repo)
         home = self.root / "home"
         home.mkdir()
         self.records = home / ".local/state/verify/doc_pass"
@@ -42,20 +70,10 @@ class CheckpointDocGateTests(unittest.TestCase):
         self.environment.update({"HOME": str(home), "PYTHONDONTWRITEBYTECODE": "1",
                                  "XDG_STATE_HOME": str(self.root / "xdg-state"),
                                  "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
-        _ = (self.repo / "Cargo.toml").write_text(
-            '[package]\nname = "sample"\nversion = "0.1.0"\n', encoding="utf-8",
-        )
-        _ = (self.repo / "lib.rs").write_text("pub fn base() {}\n", encoding="utf-8")
-        _ = self.git("init", "-q", "-b", "test")
-        _ = self.git("add", "-A")
-        _ = self.git("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
-                     "commit", "-q", "-m", "base")
-        _ = (self.repo / "lib.rs").write_text("pub fn staged() {}\n", encoding="utf-8")
-        _ = self.git("add", "lib.rs")
 
     def git(self, *arguments: str) -> str:
         return subprocess.run(["git", "-C", str(self.repo), *arguments], env=self.environment,
-                              capture_output=True, text=True, check=True, timeout=10).stdout.strip()
+                              capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
 
     def record(self, *, repo: str = "", tree: str = "") -> Path:
         judged_tree = tree or self.git("write-tree")
@@ -66,24 +84,29 @@ class CheckpointDocGateTests(unittest.TestCase):
                             encoding="utf-8")
         return path
 
-    def decision(self, command: str, *, cwd: Path | None = None) -> dict[str, str]:
+    def decision(self, command: str, *, cwd: Path | None = None, subprocess_cli: bool = False) -> dict[str, str]:
         payload = {"tool_name": "Bash", "cwd": str(cwd or self.repo),
                    "tool_input": {"command": command}}
+        if not subprocess_cli:
+            with mock.patch.dict(os.environ, self.environment, clear=True):
+                reason = DECIDE(json.dumps(payload))
+            return ({"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}
+                    if reason else {})
         result = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(payload),
                                 env=self.environment, capture_output=True, text=True, check=False,
-                                timeout=20)
+                                timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         if not result.stdout.strip():
             return {}
         response = cast(dict[str, dict[str, str]], json.loads(result.stdout))
         return response.get("hookSpecificOutput", {})
 
-    def assert_allowed(self, command: str, *, cwd: Path | None = None) -> None:
-        decision = self.decision(command, cwd=cwd)
+    def assert_allowed(self, command: str, *, cwd: Path | None = None, subprocess_cli: bool = False) -> None:
+        decision = self.decision(command, cwd=cwd, subprocess_cli=subprocess_cli)
         self.assertNotEqual(decision.get("permissionDecision"), "deny", decision)
 
-    def assert_denied(self, command: str, *, cwd: Path | None = None) -> str:
-        decision = self.decision(command, cwd=cwd)
+    def assert_denied(self, command: str, *, cwd: Path | None = None, subprocess_cli: bool = False) -> str:
+        decision = self.decision(command, cwd=cwd, subprocess_cli=subprocess_cli)
         self.assertEqual(decision.get("permissionDecision"), "deny", decision)
         self.assertEqual(decision.get("hookEventName"), "PreToolUse")
         reason = decision.get("permissionDecisionReason", "")
@@ -135,7 +158,7 @@ class CheckpointDocGateTests(unittest.TestCase):
     def test_checkpoint_with_a_pass_for_the_index_tree_is_allowed(self) -> None:
         _ = self.record()
         before = (self.repo / ".git/index").read_bytes()
-        self.assert_allowed(CHECKPOINT)
+        self.assert_allowed(CHECKPOINT, subprocess_cli=True)
         self.assertEqual((self.repo / ".git/index").read_bytes(), before)
 
     def test_staged_subset_requires_its_tree_instead_of_the_whole_working_tree(self) -> None:
@@ -204,6 +227,73 @@ class CheckpointDocGateTests(unittest.TestCase):
         ):
             with self.subTest(command=command):
                 self.assertEqual(self.decision(command), {})
+
+    def test_merge_checkpoint_script_with_git_log_substitution_passes(self) -> None:
+        command = (
+            'cd /home/natepiano/worktrees/cargo-liner && S=/tmp/checkpoint-session; '
+            '$HOME/.claude/scripts/lib/py '
+            '$HOME/.claude/scripts/production/merge_checkpoint.py '
+            '--session-dir "$S" --phase 8 --commit 719c9b28 '
+            '--started "$(git log -1 --format=%cI 719c9b28)"'
+        )
+        self.assertEqual(self.decision(command), {})
+
+    def test_expanded_non_git_paths_and_argument_text_do_not_trigger_the_gate(self) -> None:
+        checkpoint = shlex.quote(CHECKPOINT)
+        commands = (
+            'echo "checkpoint(x): commit message"',
+            'echo "checkpoint(x): git commit message"',
+            '$HOME/.claude/scripts/lib/py send.py --text ' + checkpoint,
+            '"$HOME/.claude/scripts/lib/py" merge_checkpoint.py --text ' + checkpoint,
+            '${HOME}/.claude/scripts/lib/py commit.py --text ' + checkpoint,
+            '"${TOOLS}/py" merge.py --text ' + checkpoint,
+            '$(which python3)/py --text ' + checkpoint,
+            '$HOME/tools/git/helper.py --text ' + checkpoint,
+            '$HOME/tools/git-status.py --text ' + checkpoint,
+            '$PY script.py --text ' + checkpoint,
+            'send.py --text "$MESSAGE" --title ' + checkpoint,
+            'send.py --text "$(git log -1 --format=%s)" --title ' + checkpoint,
+            '$HOME/.claude/scripts/lib/py send.py --text "$(git status)" --title ' + checkpoint,
+        )
+        for cwd in (self.repo, self.root):
+            for command in commands:
+                with self.subTest(cwd=cwd, command=command):
+                    self.assertEqual(self.decision(command, cwd=cwd), {})
+
+    def test_possible_expanded_git_words_and_eval_still_refuse_checkpoints(self) -> None:
+        commands = (
+            '$GIT commit -m "checkpoint(x): p"',
+            '${GIT} commit -m "checkpoint(x): p"',
+            '$PROGRAM commit -m "checkpoint(x): p"',
+            '"$(command -v git)" commit -m "checkpoint(x): p"',
+            '`command -v git` merge topic -m "checkpoint(x): p"',
+            '$HOME/bin/git commit -m "checkpoint(x): p"',
+            'git${SUFFIX} commit -m "checkpoint(x): p"',
+            'eval "git commit -m \\"checkpoint(x): p\\""',
+        )
+        for cwd in (self.repo, self.root):
+            for command in commands:
+                with self.subTest(cwd=cwd, command=command):
+                    reason = self.assert_denied(command, cwd=cwd)
+                    self.assertIn("command word is expanded or eval-generated", reason)
+
+    def test_expanded_non_git_command_keeps_real_git_substitutions_checked(self) -> None:
+        for command in (
+            '$HOME/.claude/scripts/lib/py send.py --text "$(' + CHECKPOINT + ')"',
+            '$HOME/.claude/scripts/lib/py send.py --text `' + CHECKPOINT + '`',
+            '$HOME/.claude/scripts/lib/py send.py --text ready; ' + CHECKPOINT,
+        ):
+            with self.subTest(command=command):
+                reason = self.assert_denied(command)
+                self.assertIn("first command of its own Bash call", reason)
+
+    def test_literal_git_file_message_still_requires_the_doc_record(self) -> None:
+        message = self.repo / "msg"
+        _ = message.write_text("checkpoint(x): commit message\n", encoding="utf-8")
+        reason = self.assert_denied("git commit -F msg")
+        self.assertIn("no doc pass record", reason)
+        _ = self.record()
+        self.assertEqual(self.decision("git commit -F msg"), {})
 
     def test_real_git_command_words_are_checked_through_shell_prefixes(self) -> None:
         target = shlex.quote(str(self.repo))
@@ -846,7 +936,7 @@ class CheckpointDocGateTests(unittest.TestCase):
         for command in ("ls", "echo commit", CHECKPOINT):
             payload = {"tool_name": "Bash", "cwd": str(self.root / "commit-cache"), "tool_input": {"command": command}}
             result = subprocess.run([sys.executable, str(isolated)], input=json.dumps(payload),
-                                    env=self.environment, capture_output=True, text=True, check=True, timeout=20)
+                                    env=self.environment, capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS)
             if command != CHECKPOINT:
                 self.assertEqual(result.stdout, "")
             else:
@@ -862,7 +952,7 @@ class CheckpointDocGateTests(unittest.TestCase):
     def test_invalid_or_unreadable_matching_record_fails_closed(self) -> None:
         path = self.record()
         _ = path.write_text("not json", encoding="utf-8")
-        reason = self.assert_denied(CHECKPOINT)
+        reason = self.assert_denied(CHECKPOINT, subprocess_cli=True)
         self.assertTrue("record" in reason.lower() or "json" in reason.lower(), reason)
         path.unlink()
         path.mkdir()
@@ -874,14 +964,12 @@ class CheckpointDocGateTests(unittest.TestCase):
         tools.mkdir()
         git = tools / "git"
         real_git = subprocess.run(["which", "git"], capture_output=True, text=True,
-                                  check=True, timeout=10).stdout.strip()
+                                  check=True, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
         _ = git.write_text(
-            f"#!{sys.executable}\nimport os, sys\n"
-            + "if 'write-tree' in sys.argv:\n"
-            + "    print('fixture index read failed', file=sys.stderr)\n"
-            + "    raise SystemExit(42)\n"
-            + f"os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])\n", encoding="utf-8",
-        )
+            "#!/bin/sh\nfor argument do\n"
+            + "  if [ \"$argument\" = write-tree ]; then\n"
+            + "    echo 'fixture index read failed' >&2\n    exit 42\n  fi\ndone\n"
+            + "exec " + shlex.quote(real_git) + ' "$@"\n', encoding="utf-8")
         git.chmod(0o755)
         self.environment["PATH"] = f"{tools}{os.pathsep}{os.environ['PATH']}"
         reason = self.assert_denied(CHECKPOINT)

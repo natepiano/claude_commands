@@ -14,6 +14,9 @@ from pathlib import Path
 from scripts.usage import rollouts
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 def record(record_type: str, at: str, payload: dict[str, object]) -> str:
     return json.dumps({"timestamp": at, "type": record_type, "payload": payload})
 
@@ -133,7 +136,7 @@ assert hasattr(module, 'KnownThreadOpening')
         with tempfile.TemporaryDirectory() as directory:
             result = subprocess.run([sys.executable, "-I", "-S", "-c", script, str(Path(rollouts.__file__))],
                                     env=environment, cwd=directory, capture_output=True,
-                                    text=True, check=False, timeout=10)
+                                    text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout + result.stderr, "")
 

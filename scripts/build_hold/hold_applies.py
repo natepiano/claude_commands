@@ -37,7 +37,7 @@ def cargo_verb(arguments: tuple[str, ...]) -> str:
 
 
 class HoldStateReadError(ValueError):
-    """The hold decision could not be read; callers may run their command."""
+    """The hold decision could not be read; admission must stop."""
 
 
 def hold_applies() -> str:
@@ -56,8 +56,8 @@ def hold_applies() -> str:
             raise HoldStateReadError("holder file exists; target state disagrees")
         names = "; ".join(build_hold.holder_text(holder) for holder in holds.in_force)
         return (f"natedev builds are held by {names}. Keep working, writes included. "
-                "Run tests with verify.sh test: they go to the Mac. "
-                "Run check, lint and builds after the hold ends.")
+                "Use verify.sh: eligible steps go to the Mac; other steps wait. "
+                "Raw cargo and merge gates must wait for the hold to end.")
     except (OSError, UnicodeError, ValueError) as error:
         raise HoldStateReadError(str(error)) from error
 
