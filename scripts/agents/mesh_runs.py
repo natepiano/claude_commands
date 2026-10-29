@@ -48,7 +48,7 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -136,13 +136,15 @@ def _pool_state() -> Path:
     return Path(os.environ.get("REVIEW_POOL_STATE") or Path.home() / ".local/state/review-pool").expanduser()
 
 
-def _roster_folders() -> list[Path]:
-    """Every run's mesh folder: unit run folders, then review pool meshes."""
-    folders = [path.parent for root in RUN_ROOTS for path in sorted(root.glob(f"*/{codex_mesh.ROSTER_FILE}"))]
-    folders.extend(path.parent for path in sorted(_pool_state().glob(f"*/mesh/*/{codex_mesh.ROSTER_FILE}")))
+def _roster_folders() -> Iterator[Path]:
+    """Read unit runs first, before inspecting retained external meshes."""
+    for root in RUN_ROOTS:
+        for path in sorted(root.glob(f"*/{codex_mesh.ROSTER_FILE}")):
+            yield path.parent
+    for path in sorted(_pool_state().glob(f"*/mesh/*/{codex_mesh.ROSTER_FILE}")):
+        yield path.parent
     from scripts.guilds import roles
-    folders.extend(roles.durable_meshes())
-    return folders
+    yield from roles.durable_meshes()
 
 
 def caller_from_environment(environment: dict[str, str]) -> Caller:
@@ -156,10 +158,14 @@ def caller_from_environment(environment: dict[str, str]) -> Caller:
         roster = codex_mesh._read_json_object(folder / codex_mesh.ROSTER_FILE)  # pyright: ignore[reportPrivateUsage]
         for name, value in roster.items():
             entry = codex_mesh._as_dict(value)  # pyright: ignore[reportPrivateUsage]
-            if entry.get("thread_id") != thread_id or entry.get("status") == "ended" or entry.get("transferring_role") or entry.get("role_redirect"):
+            if (entry.get("thread_id") != thread_id or entry.get("status") in ("ended", "adopted")
+                    or entry.get("adopted_to") or entry.get("transferring_role") or entry.get("role_redirect")):
                 continue
             launcher = codex_mesh._pid_alive(codex_mesh._as_int(entry.get("launcher_pid")))  # pyright: ignore[reportPrivateUsage]
-            found.append((launcher, MeshCaller(str(folder), name, thread_id)))
+            caller = MeshCaller(str(folder), name, thread_id)
+            if entry.get("unit_ledger") or entry.get("unit_worker_ledger"):
+                return caller
+            found.append((launcher, caller))
     if not found:
         return NotMeshWorker()
     found.sort(key=lambda item: not item[0])

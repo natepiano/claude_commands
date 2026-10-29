@@ -46,6 +46,7 @@ import showrunners  # noqa: E402
 import unit_lookup  # noqa: E402
 import unit_runs  # noqa: E402
 from sessions import running_sessions  # noqa: E402
+import roster  # noqa: E402
 
 Role = Literal["showrunner", "unit", "impl", "test", "review", "fix", "astra-designer", "astra-reviewer"]
 WORKER_ROLES: tuple[Role, ...] = ("impl", "test", "review", "fix")
@@ -147,20 +148,20 @@ def _server_running(run: Path) -> bool:
     return True
 
 
-def _worker_role(name: str, entry: dict[str, object]) -> Role | None:
-    """The roster's role, else the role its name ends with, as older rosters name workers."""
-    role = entry.get("role")
-    suffix = name.rpartition("-")[2]
-    return next((known for known in WORKER_ROLES if known in (role, suffix)), None)
+def _worker_role(entry: dict[str, object]) -> roster.WorkerRoleState:
+    """The stored assignment; a name supplies no assignment."""
+    return roster.worker_role(entry)
 
 
 def _codex_edges(director: str, run: Path) -> list[Edge]:
     edges: list[Edge] = []
-    for name, value in sorted(_json_object(run / ROSTER_FILE).items()):
+    records = _json_object(run / ROSTER_FILE)
+    for name in sorted(records):
+        value = records[name]
         entry = cast(dict[str, object], value) if isinstance(value, dict) else {}
         thread = entry.get("thread_id")
-        role = _worker_role(name, entry)
-        if isinstance(thread, str) and thread and role and entry.get("status") not in ENDED_STATUSES:
+        role = _worker_role(entry)
+        if isinstance(thread, str) and thread and isinstance(role, str) and entry.get("status") not in ENDED_STATUSES:
             edges.append(Edge(manager=director, member=thread, role=role))
     return edges
 
