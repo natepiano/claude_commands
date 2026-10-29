@@ -373,6 +373,56 @@ class BerthHookTests(unittest.TestCase):
             phase_reservation.phase_session_id(DIRECTOR, phase): {"reservation_id": RESERVATION,
                                                                    "coordination_run_id": RUN}}}))
 
+    def hold_phase(self) -> None:
+        """Phase 15's own session maps to a reservation the board shows active, with the phase baseline written."""
+        self.map_phase_session("15")
+        self.board("active")
+        _ = (phase_reservation.phase_directory(self.session_dir, "15") / phase_reservation.BASELINE_FILE).write_text(
+            HEAD + "\n")
+
+    def assert_held_without_a_check(self) -> None:
+        self.assertEqual([call["argv"] for call in self.berth_calls()],
+                         [["board", "--reservation", RESERVATION, "--json"]])
+        self.assertEqual(self.state()["active_phase_reservation"], {
+            "reservation_id": RESERVATION, "coordination_run_id": RUN, "phase": "15", "phase_start_head": HEAD})
+
+    def test_an_edit_in_a_phase_that_holds_its_reservation_runs_no_berth_check(self) -> None:
+        # The check took 77 s on 2026-10-29; Codex stops this hook at 30 s and refused the edit.
+        self.hold_phase()
+        self.answer(envelope("timed_out", "cargo-berth check did not answer"))
+        result = self.hook(patch_text("*** Update File: src/lib.rs"))
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assert_held_without_a_check()
+
+    def test_a_claim_for_a_phase_that_holds_its_reservation_runs_no_berth_check(self) -> None:
+        self.hold_phase()
+        _ = (phase_reservation.phase_directory(self.session_dir, "15") / phase_reservation.FILES_FILE).write_text(
+            "src/lib.rs\n")
+        self.answer(envelope("timed_out", "cargo-berth check did not answer"))
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, self.environment, clear=True), contextlib.redirect_stdout(output):
+            code = phase_reservation.main(["claim", "--session-dir", str(self.session_dir), "--phase", "15",
+                                           "--repo", str(self.repo)])
+        self.assertEqual(code, 0)
+        self.assertIn(f"Active, reservation {RESERVATION}", output.getvalue())
+        self.assert_held_without_a_check()
+
+    def test_a_check_waits_ninety_seconds_for_berth(self) -> None:
+        self.recorder_phases("15")
+        phase = phase_reservation.open_phases(self.session_dir)[0]
+        timeouts: list[object] = []
+        run = subprocess.run
+
+        def stop_berth(argv: list[str], **options: object) -> object:
+            if argv[0] != "cargo-berth":
+                return run(argv, **options)  # pyright: ignore[reportCallIssue, reportArgumentType, reportUnknownVariableType]
+            timeouts.append(options["timeout"])
+            raise subprocess.TimeoutExpired(argv, 90)
+
+        with mock.patch.object(subprocess, "run", side_effect=stop_berth):
+            answer = phase_reservation.phase_check(self.repo, ["src/lib.rs"], DIRECTOR, phase)
+        self.assertEqual((answer.status, timeouts), ("timed_out", [90]))
+
     def test_a_recorder_phase_never_enrolled_checks_under_the_bare_session(self) -> None:
         # FinalGate's `final` phase starts with no reservation: no state file and no berth mapping.
         self.recorder_phases("final")
