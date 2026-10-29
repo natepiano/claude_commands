@@ -107,7 +107,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Ruled out:** candidate B, a shared rank order with a Hana-cost test (HI10); candidate C, capacity-led with natedev allocating workers (HI11); a fixed Hana share or measured Hana cost (HI2); a daily review budget (HI3); a size threshold for the four-week review's proposal (HI10).
 
-### Phase 3 — Each user push after a failed text check names its approved exception, and unapproved paths are fixed  · status: todo
+### Phase 3 — Each user push after a failed text check names its approved exception, and unapproved paths are fixed  · status: done
 **Depends on:** Phase 2
 
 #### Work Order
