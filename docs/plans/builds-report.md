@@ -92,56 +92,29 @@ verify-unit's Work Order for the copy folder name (roster.py join `<showrunner>-
 
 ### Phase 2 — Samples record CPU and disk pressure  · status: done
 
-**Depends on:** Phase 1
+#### As-built
 
-#### Work Order
-
-**Goal:** each 60 s machine sample records CPU and IO stall totals and the CPU idle and iowait counters, and `/build:report` shows them as share of time beside Memory pressure, so the build history says whether natedev was CPU bound, disk bound or neither.
-
-**Spec:**
-
-1. **New readings in `buildlog sample`** (`scripts/buildlog/sample.py`, `sample()` line ~150). Add module paths beside `PRESSURE`: `CPU_PRESSURE = Path("/proc/pressure/cpu")`, `IO_PRESSURE = Path("/proc/pressure/io")`, `STAT = Path("/proc/stat")`. Read each once per sample:
-   - CPU and IO PSI: `parse_pressure(text, require_both=False)`. `some` and `full` totals in microseconds. The kernel may omit the `full` line for CPU; that value is `None`.
-   - `/proc/stat`: the first line that starts with `cpu ` (all CPUs). Record field 4 `idle` and field 5 `iowait` (USER_HZ ticks since boot), and the sum of fields 1–8 (user, nice, system, idle, iowait, irq, softirq, steal) as the total. Guest time is already inside user and nice, so it is not added. Add a parser `parse_cpu_ticks(text) -> CpuTicks` (NamedTuple: `idle`, `iowait`, `total`) beside `parse_meminfo`; it raises `ValueError` on a missing or short `cpu ` line.
-   - A missing file or a parse error makes only that reading `None`. The memory readings stay required (the Linux-only check at line ~150 does not change): a sample with no CPU or IO reading is still written.
-   - Record fields: `cpu_stall_some_us`, `cpu_stall_full_us`, `io_stall_some_us`, `io_stall_full_us`, `cpu_idle_ticks`, `cpu_iowait_ticks`, `cpu_total_ticks`.
-
-   **Director's call:** the total ticks are recorded too. A share of time needs a denominator; wall time times CPU count goes wrong when CPUs go offline, the tick total does not. One field; a one-line revert if not wanted.
-
-2. **Samples table** (`scripts/buildlog/index.py` `SAMPLE_COLUMNS`, line ~245). Add the seven columns as `INTEGER`, NULL when not recorded, each with a one-line description in the existing style (`"machine CPU some stall counter since boot, microseconds; NULL when not recorded"`, `"CPU idle ticks since boot from /proc/stat, USER_HZ"`, and so on). Raise `SCHEMA_VERSION` (22 → 23) so the index rebuilds from the JSONL files, the way earlier sample columns were added. Older sample rows load with NULL in the new columns.
-
-3. **Shared counter deltas** (`scripts/buildlog/report.py`). `memory_pressure_section` sums counter deltas between samples inside its loop (line ~846): same host, gap at most `MAX_SAMPLE_GAP_S`, same boot id (a new boot counts the counter from zero). Move that rule into one function that the memory stall and the new section both use, so the boot and gap rules live in one place. A pair where either value is NULL adds nothing to that counter, and adds nothing to its time denominator. The memory stall line keeps its current text and numbers.
-
-4. **New report section** `### CPU and disk pressure`, right after `### Memory pressure` (line ~1796), from the same day's samples. Per host that has at least one counted pair, one line:
-
-   `natedev: CPU some 41.2%, full —; IO some 3.1%, full 1.0%; CPU idle 52.0%, iowait 0.4% (of 14 h 20 min sampled)`
-
-   - PSI share = summed stall delta in microseconds / summed wall-time delta of the same counted pairs in microseconds.
-   - Idle and iowait share = summed tick delta / summed total-tick delta of the same pairs.
-   - A value with no counted pair shows `—`. A host with no counted pair for any of the seven is left out. When no host has one, the section says `CPU and IO samples: none.`
-   - One decimal place, like the report's other percentages. The `(of …)` part is the sampled wall time counted for the PSI shares, written the way the report writes other durations.
-   - The section's Source line: `Source: 60 s machine samples (/proc/pressure/cpu, /proc/pressure/io, /proc/stat).`
-
-5. **Docs.** `commands/build/report.md`: name the new section in one sentence. `docs/as-built/buildlog-memory-stalls.md`: the sample record's new fields and the new section.
+- `buildlog sample` reads `/proc/pressure/cpu`, `/proc/pressure/io` and `/proc/stat` once per 60 s sample and records seven fields: `cpu_stall_some_us`, `cpu_stall_full_us`, `io_stall_some_us`, `io_stall_full_us` (PSI totals, microseconds) and `cpu_idle_ticks`, `cpu_iowait_ticks`, `cpu_total_ticks` (USER_HZ). A missing file or a parse error makes only that reading `null`; the memory readings stay required, and the sample is still written.
+- `sample.py` holds the paths `CPU_PRESSURE`, `IO_PRESSURE`, `STAT`; `CpuTicks(idle, iowait, total)` from `parse_cpu_ticks(text)`, which sums the first eight fields of the `cpu ` line (guest time is already inside user and nice) and raises `ValueError` on a missing or short line; `read_cpu_ticks(path) -> CpuTicks | Unmeasured`; and `read_pressure(path) -> PartialStallTotals`. The PSI result types are `StallTotals` and `PartialStallTotals`, shared by memory, CPU and IO.
+- The `samples` table has the seven fields as `INTEGER` columns at `SCHEMA_VERSION` 23; older rows read NULL.
+- `report.py` `sample_counter_deltas(connection, day, columns) -> list[SampleCounterInterval]` holds the one pairing rule for memory, CPU and IO counters: same host, gap at most `MAX_SAMPLE_GAP_S`, the host's latest earlier sample as the day's baseline, and a new `boot_id` counts the later counter from zero. `SampleCounterInterval.deltas` is keyed by counter name; a NULL at either end gives `CounterNotRecorded.VALUE`, which adds nothing to that counter or its denominator. `memory_pressure_section` uses it, with unchanged text and numbers.
+- `cpu_disk_pressure_section(connection, day)` prints `### CPU and disk pressure` after Memory pressure, with `Source: 60 s machine samples (/proc/pressure/cpu, /proc/pressure/io, /proc/stat).` Each host with a counted pair gets `<host>: CPU some X%, full Y%; IO some X%, full Y%; CPU idle X%, iowait Y% (of <duration> sampled)`. A PSI share divides by the wall time of that counter's counted pairs; idle and iowait divide by the `cpu_total_ticks` delta of the same pairs. A share with no denominator is `—`; with no counted host the section says `CPU and IO samples: none.`
+- One sample costs about 0.11 ms more (20-run median 0.234 ms → 0.347 ms).
 
 **Files:**
-- `scripts/buildlog/sample.py` — paths, `parse_cpu_ticks`, the seven record fields
-- `scripts/buildlog/index.py` — seven `SAMPLE_COLUMNS`, `SCHEMA_VERSION` 23
-- `scripts/buildlog/report.py` — shared counter delta function, the new section
-- `scripts/buildlog/test_sample.py`, `scripts/buildlog/test_report.py`, `scripts/buildlog/test_index.py`
-- `commands/build/report.md`, `docs/as-built/buildlog-memory-stalls.md`
+- `scripts/buildlog/sample.py` — the three paths, `CpuTicks`, `parse_cpu_ticks`, `read_cpu_ticks`, `read_pressure`, `StallTotals`, `PartialStallTotals`, the seven record fields
+- `scripts/buildlog/index.py` — seven sample columns, schema 23
+- `scripts/buildlog/report.py` — `sample_counter_deltas`, `SampleCounterInterval`, `CounterNotRecorded`, `cpu_disk_pressure_section`
+- `scripts/buildlog/test_sample.py`, `scripts/buildlog/test_index.py`, `scripts/buildlog/test_report.py` — faked readings, schema rebuild, section cases
+- `scripts/buildlog/test_memory_records.py` — its subprocess fixture points the three new paths at scratch files
+- `commands/build/report.md`, `docs/as-built/buildlog-memory-stalls.md` — the new section and fields
 
-**Workers:** `2 writers` — the open phase 1 workers, `test` still opened as impl.
-- `impl` — `sample.py`, `index.py`, `report.py`, `commands/build/report.md`, `docs/as-built/buildlog-memory-stalls.md`
-- `test` — `test_sample.py`, `test_report.py`, `test_index.py`. Fake every reading with `patch.object(sample, …)` on the module paths, as `test_sample.py` fakes `MEMINFO` and `PRESSURE` now; never read live `/proc`. Cases: all readings present; CPU without a `full` line; a missing CPU, IO or stat file (sample still written, that field `None`); a malformed `/proc/stat`; the report shares for two hosts with known deltas; a reboot between samples; a gap over `MAX_SAMPLE_GAP_S`; old rows with NULL columns next to new rows; no samples; the memory stall line unchanged.
+**Gotchas:**
+- A test that runs `sample()` in a subprocess must point `CPU_PRESSURE`, `IO_PRESSURE` and `STAT` at scratch paths, as `test_memory_records.py` does, or it reads live `/proc`.
+- The `(of …)` duration is the union of pairs where any PSI counter counted, so a host with only tick readings shows `0.0 s` sampled beside valid idle and iowait shares.
+- A `SCHEMA_VERSION` raise changes `test_index.py`'s schema expectation, which needs its own `Assertion-Change:` line.
 
-**Constraints from prior phases:** Phase 1 changed only `/build:queue` (`scripts/build_queue/`, `memory_admit.py`); no file here overlaps it. The checkpoint's assertion guard refuses `::*` wildcards: every changed or removed test expectation needs its own `Assertion-Change: <path>::<test> — <why>` line, which the test worker lists in its summary.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` green, and the production Merge tests (`env HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only`) green.
-- `basedpyright scripts/buildlog`: `0 errors, 0 warnings`.
-- Live check on natedev from the worktree: run the sampler once with `BUILDLOG_DIR` set to a scratch folder and read the JSONL line: all seven fields hold integers (`cpu_stall_full_us` may be `null` if the kernel omits it). Then build a report from a scratch log with two such samples a minute apart and see the new section with shares between 0% and 100%.
-- Speed: one sample reads three more small `/proc` files. Time 20 runs of `sample()` before and after with live readings: the median grows by at most 2 ms.
+**Ruled out:** wall time times CPU count as the tick denominator — it goes wrong when CPUs go offline; picking counters by tuple position in `report.py` — they are keyed by name.
 
 ### Phase 3 — Build views name the showrunner and unit by short name  · status: todo
 
