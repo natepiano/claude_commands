@@ -253,7 +253,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Ruled out:** the slot taken from a variable fixed at app-server start; the newest phase instance for an ambiguous checkpoint; checking a postmaster-forwarded reply against its log before the log exists (removed as containment).
 
-### Phase 8 — A supplier reply that the postmaster forwards ends its wait  · status: todo
+### Phase 8 — A supplier reply that the postmaster forwards ends its wait  · status: done
 **Depends on:** Phase 7; postmaster-unit's reply record (main abc8344f)
 
 Phase 7's closure review found F007: the recorder checked a postmaster-forwarded reply against the postmaster's `replies/*.json` log, but `mods/postmaster/hooks/replies.ts` writes that log only after it forwards, so the recipient's hook ran before the evidence existed. Phase 7 removed that check as containment: a forwarded reply leaves the wait open. The showrunner sent the postmaster half to postmaster-unit (2026-10-29): it writes the reply record before it forwards, with a pending-forward test. This phase is the recorder half. It starts when the showrunner sends the postmaster main hash and the record fields; keep Phase 7's containment until then.

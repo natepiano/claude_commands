@@ -13,12 +13,14 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from collections import defaultdict
 from collections.abc import Callable, Generator, Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import Enum
 from functools import cache
 from pathlib import Path
 from typing import Literal, NoReturn, TypedDict, cast
@@ -5194,40 +5196,169 @@ def _supplier_address(identity: str) -> NamedSupplier | NoNamedSupplier:
     return NamedSupplier("uds:" + matches[0]["messagingSocketPath"])
 
 
+class SupplierMessageRoute(Enum):
+    DIRECT_REPLY = "direct supplier reply"
+    POSTMASTER_REPLY = "verified postmaster reply"
+
+
+class SupplierMessageRejection(Enum):
+    INVALID_ORIGIN = "invalid message origin"
+    SUPPLIER_UNAVAILABLE = "supplier address unavailable"
+    OUTER_SENDER_NOT_POSTMASTER = "outer sender is not the postmaster"
+    INVALID_FORWARD = "invalid postmaster forward"
+    NO_RECORD = "no valid reply record at the forward time"
+    SEVERAL_RECORDS = "several matching reply records"
+    SOCKET_MISMATCH = "reply socket is not the supplier current address"
+    BODY_MISMATCH = "reply body does not match the forward"
+    NOT_A_TARGET = "receiving session is not an intended target"
+
+
 @dataclass(frozen=True)
 class VerifiedSupplierMessage:
     body: str
+    route: SupplierMessageRoute = SupplierMessageRoute.DIRECT_REPLY
 
 
 @dataclass(frozen=True)
 class UnverifiedSupplierMessage:
-    reason: str
+    rejection: SupplierMessageRejection
+
+    @property
+    def reason(self) -> str:
+        return self.rejection.value
 
 
-def _supplier_message(identity: str, prompt: str) -> VerifiedSupplierMessage | UnverifiedSupplierMessage:
-    """Trust wrapper `from`, never `from-name` or a claimed sender in text.
+@dataclass(frozen=True)
+class PostmasterReplyRecord:
+    at_ms: int
+    socket: str
+    name: str
+    session_id: str
+    senders: tuple[str, ...]
+    body: str
+    targets: tuple[str, ...]
+    forward: Literal["pending", "done"]
+    forwarded: tuple[str, ...]
 
-    send.py's separate relay inherits the supplied name, not its origin socket;
-    that alone proves nothing. Postmaster forwarding is not yet verifiable:
-    its replies log is written after delivery, so the recipient's hook can run
-    before the evidence exists. Forwarded messages leave the wait open, with or
-    without that log. Direct delivery resolves supplier aliases anew.
-    """
+    @classmethod
+    def from_fields(cls, fields: dict[str, object]) -> PostmasterReplyRecord:
+        """Validate the postmaster schema at the JSON boundary."""
+        def session_names(value: object) -> tuple[str, ...]:
+            if not isinstance(value, list):
+                raise ValueError("reply session names must be a list")
+            names: list[str] = []
+            for item in cast(list[object], value):
+                if not isinstance(item, str) or not item:
+                    raise ValueError("reply session names must be nonempty strings")
+                names.append(item)
+            return tuple(names)
+
+        at_ms = fields.get("at_ms")
+        socket = fields.get("socket")
+        name = fields.get("name")
+        session_id = fields.get("session_id")
+        body = fields.get("body")
+        forward = fields.get("forward")
+        if (type(at_ms) is not int or not 0 <= at_ms <= 9007199254740991
+                or not isinstance(socket, str) or not socket.startswith("uds:/")
+                or not isinstance(name, str) or not name
+                or not isinstance(session_id, str) or not session_id
+                or not isinstance(body, str) or forward not in ("pending", "done")):
+            raise ValueError("invalid postmaster reply fields")
+        senders = session_names(fields.get("senders"))
+        if not senders:
+            raise ValueError("reply must name a sender")
+        return cls(at_ms, socket, name, session_id, senders, body,
+                   session_names(fields.get("targets")),
+                   "pending" if forward == "pending" else "done",
+                   session_names(fields.get("forwarded")))
+
+
+def _read_postmaster_reply_record(path: Path) -> PostmasterReplyRecord:
+    # The postmaster rewrites pending records in place after forwarding. Retry
+    # unreadable or torn JSON up to five times, with at most 80 ms of pauses.
+    retries = 4
+    while True:
+        try:
+            fields = _json_object(path.read_text(encoding="utf-8"))
+            if fields is None:
+                raise ValueError("reply record is not a JSON object")
+        except (OSError, ValueError):
+            if retries == 0:
+                raise
+            retries -= 1
+            time.sleep(0.02)
+            continue
+        # A complete object with invalid fields is not a torn read.
+        return PostmasterReplyRecord.from_fields(fields)
+
+
+def _supplier_message(identity: str, prompt: str, owner_session: str) -> VerifiedSupplierMessage | UnverifiedSupplierMessage:
+    """Verify direct origin, or the postmaster's pre-forward origin and target record."""
     wrapper = re.fullmatch(r'\s*<cross-session-message\b([^>]*)>(.*)</cross-session-message>\s*', prompt, re.DOTALL)
     if wrapper is None:
-        return UnverifiedSupplierMessage("message has no cross-session origin")
+        return UnverifiedSupplierMessage(SupplierMessageRejection.INVALID_ORIGIN)
     pairs = cast(list[tuple[str, str]], re.findall(r'([\w-]+)="([^"]*)"', wrapper[1]))
     attributes = dict(pairs)
     if len(pairs) != len(attributes):
-        return UnverifiedSupplierMessage("message has duplicate origin attributes")
+        return UnverifiedSupplierMessage(SupplierMessageRejection.INVALID_ORIGIN)
     address = _supplier_address(identity)
     if isinstance(address, NoNamedSupplier):
-        return UnverifiedSupplierMessage(address.reason)
-    body = wrapper[2].strip()
+        return UnverifiedSupplierMessage(SupplierMessageRejection.SUPPLIER_UNAVAILABLE)
+    body = wrapper[2]
     origin = attributes.get("from", "")
     if origin == address.address:
-        return VerifiedSupplierMessage(body)
-    return UnverifiedSupplierMessage("message origin is not the supplier current address")
+        return VerifiedSupplierMessage(body.strip())
+
+    # Remove only the transport's enclosing line breaks. The supplier body,
+    # including its leading/trailing whitespace, must match the record exactly.
+    if body.startswith("\r\n"):
+        body = body.removeprefix("\r\n").removesuffix("\r\n")
+    elif body.startswith("\n"):
+        body = body.removeprefix("\n").removesuffix("\n")
+    forward = re.fullmatch(
+        r'Message from [^\r\n]+ \(their answer to [^\r\n]+, passed on by postmaster\) '
+        + r'\[([0-9]+)-[0-9]+\]:\n\n(.*)', body, re.DOTALL)
+    if forward is None:
+        return UnverifiedSupplierMessage(SupplierMessageRejection.INVALID_FORWARD)
+
+    # Resolve the outer sender before reading reply records. A name in the
+    # message, or a reply record alone, cannot establish the forward's origin.
+    postmaster = _supplier_address("postmaster")
+    outer = _supplier_address(origin) if origin.startswith("session:") else NamedSupplier(origin)
+    if (not isinstance(postmaster, NamedSupplier) or not isinstance(outer, NamedSupplier)
+            or outer.address != postmaster.address):
+        return UnverifiedSupplierMessage(SupplierMessageRejection.OUTER_SENDER_NOT_POSTMASTER)
+
+    root = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+    records: list[PostmasterReplyRecord] = []
+    if root.is_absolute():
+        # replyCount names files; forwardCount names deliveries. They need not agree.
+        for path in (root / "message/postmaster/replies").glob(f"{forward[1]}-*.json"):
+            if path.is_symlink() or re.fullmatch(r'[0-9]+-[0-9]+\.json', path.name) is None:
+                continue
+            try:
+                record = _read_postmaster_reply_record(path)
+            except (OSError, ValueError):
+                continue
+            if str(record.at_ms) == forward[1]:
+                records.append(record)
+    if not records:
+        return UnverifiedSupplierMessage(SupplierMessageRejection.NO_RECORD)
+    records = [record for record in records if record.socket == address.address]
+    if not records:
+        return UnverifiedSupplierMessage(SupplierMessageRejection.SOCKET_MISMATCH)
+    records = [record for record in records if record.body == forward[2]]
+    if not records:
+        return UnverifiedSupplierMessage(SupplierMessageRejection.BODY_MISMATCH)
+    records = [record for record in records if owner_session in record.targets]
+    if not records:
+        return UnverifiedSupplierMessage(SupplierMessageRejection.NOT_A_TARGET)
+    if len(records) != 1:
+        return UnverifiedSupplierMessage(SupplierMessageRejection.SEVERAL_RECORDS)
+    # targets proves intent even while pending. forwarded records confirmations
+    # and is deliberately not used to decide whether this session is a target.
+    return VerifiedSupplierMessage(forward[2], SupplierMessageRoute.POSTMASTER_REPLY)
 
 
 def record_turn_wait(session_dir: Path, owner_session: str, final_message: str) -> bool:
@@ -5291,9 +5422,9 @@ def finish_turn_wait(session_dir: Path, owner_session: str, *, source: str, prom
         if wait is None or wait.get("event_type") != "wait_started":
             return
         supplier = _object_dict(wait.get("expected_supplier")) or {}
-        message = (_supplier_message(_string(supplier.get("address")), prompt)
+        message = (_supplier_message(_string(supplier.get("address")), prompt, owner_session)
                    if source == "PEER" and supplier.get("state") == "NamedSupplier"
-                   else UnverifiedSupplierMessage("input is not a named supplier message"))
+                   else UnverifiedSupplierMessage(SupplierMessageRejection.INVALID_ORIGIN))
         from_supplier = isinstance(message, VerifiedSupplierMessage)
         user_wait = wait.get("wait_kind") == "WaitingForUser"
         body = message.body if isinstance(message, VerifiedSupplierMessage) else ""
