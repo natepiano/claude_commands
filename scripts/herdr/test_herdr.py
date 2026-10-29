@@ -3504,13 +3504,13 @@ class SavedLayoutTests(unittest.TestCase):
 
     def test_the_snapshot_pass_saves_a_tab_renamed_in_herdr_only_for_a_running_shared_session(self) -> None:
         client = self.running()
-        next(tab for tab in client.tabs if tab["label"] == "roles")["label"] = "guilds"
+        next(tab for tab in client.tabs if tab["label"] == "roles")["label"] = "design"
         with patch.object(herdr, "shared_session", return_value="fixture"), patch.object(herdr, "Herdr", return_value=client):
             herdr.save_shared_layout({"other"})
-            self.assertNotIn("guilds", [tab["name"] for space in herdr.saved_layout("fixture")["workspaces"] for tab in space["tabs"]])
+            self.assertNotIn("design", [tab["name"] for space in herdr.saved_layout("fixture")["workspaces"] for tab in space["tabs"]])
             herdr.save_shared_layout({"fixture", "other"})
         saved = {space["name"]: [tab["name"] for tab in space["tabs"]] for space in herdr.saved_layout("fixture")["workspaces"]}
-        self.assertEqual(saved["sdlc"], ["sdlc", "roles", "guilds"])
+        self.assertEqual(saved["sdlc"], ["sdlc", "roles", "design"])
 
     def test_without_a_saved_layout_the_showrunner_comes_first_then_a_to_z(self) -> None:
         self.assertEqual(herdr.tab_order("boss", ["delta", "boss", "alpha"], [], set()), [1, 2, 0])

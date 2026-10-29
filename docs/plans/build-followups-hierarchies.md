@@ -107,7 +107,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Ruled out:** candidate B, a shared rank order with a Hana-cost test (HI10); candidate C, capacity-led with natedev allocating workers (HI11); a fixed Hana share or measured Hana cost (HI2); a daily review budget (HI3); a size threshold for the four-week review's proposal (HI10).
 
-### Phase 3 — Each user push after a failed text check names its approved exception, and unapproved paths are fixed  · status: todo
+### Phase 3 — Each user push after a failed text check names its approved exception, and unapproved paths are fixed  · status: done
 **Depends on:** Phase 2
 
 #### Work Order
@@ -136,8 +136,8 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 **Acceptance gate:** unit tests green; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; the report on the Baseline window and on the last 7 days shows each send's class; zero `Unapproved` sends after the fixes, or each one left names its open question. **Measure:** unapproved sends per week, from 16 after-failed-review pushes in the Baseline (n=64). **Review point (C53):** re-run the report 2 weeks after the merge; Phase 6 keeps or drops the duty on it.
 
 ### Phase 4 — The measure reads wait records and merge receipts, and the 4-week experiment starts  · status: todo
-**Depends on:** Phase 2; and a wait on sdlc phases-unit (approved by the sdlc showrunner 2026-10-28; the row for the sdlc production doc's Gates table goes to the sdlc showrunner with the Phase 2 notice):
-- **Supplier:** phases-unit's HI7 phase, the phase it plans right after its phase 3 (phases-unit, 2026-10-28).
+**Depends on:** Phase 2; and phases-unit Phase 6 (sdlc gate G1):
+- **Supplier:** phases-unit's HI7 phase, its Phase 6 (sdlc gate G1, 2026-10-28).
 - **Record contract:** the shape sent to phases-unit on 2026-10-28, given under Spec below. phases-unit picks the file and the writer and sends both, with the commit, when its phase lands.
 - **Clears when:** that phase's checkpoint is merged to `origin/sdlc` and on `~/.claude` main, its message names the record file and commit, and the file holds at least one wait record and one merge receipt written by a real phase. Until then this phase does not start.
 
@@ -165,7 +165,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Acceptance gate:** unit tests green; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; `measure.py baseline` over the first records prints real wait and receipt rows. **Measure:** share of Hana phase time with a recorded wait kind, and share of merges with a receipt. **Review point (C53):** four weeks after the first records land; Phase 6 keeps or drops the step on it.
 
-### Phase 5 — A run end ends only workers whose unit director is gone or whose owner cannot be found  · status: todo
+### Phase 5 — A run end ends only workers whose unit director is gone or whose owner cannot be found  · status: done
 **Depends on:** Phase 2
 
 #### Work Order

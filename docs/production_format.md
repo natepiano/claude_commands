@@ -20,23 +20,6 @@ must not drift from it:
 
 ## Words
 
-<GuildHeads>
-For Words and <ProductionUnit/> below, production `guilds` has four unit
-directors with the exact IDs `designers`, `reviewers`, `showrunners`, `units`,
-without `-unit`. The guilds showrunner runs on natedev under sdlc; these heads
-are its units, not showrunners, and belong to the units guild. Other unit
-names and worker IDs keep their current rules.
-
-A plan headed `> **Standing:** guild-head` runs its report/evidence/tip/reply
-loop and daily read instead of a phased build. It dispatches no worker, runs
-no phase or gate, and makes no checkpoint or shrink. It may write and publish
-its owned guild tips directly. The production row still gives its identity,
-plan, worktree and ownership. It owns no assignments, acceptance, model
-choices or gates; process proposals go through guilds to sdlc for
-guild-process-unit. Ordinary phased and standing style contracts retain their
-current behavior.
-</GuildHeads>
-
 - **Production** — the whole effort: its units, its merge branch, and its
   production doc.
 - **Executive producer** — the user. Every product, scope and irreversible
@@ -497,4 +480,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
     `Change-Review:` line in its checkpoint (`/unit:checkpoint`). A change
     outside a checkpoint goes on the list through `/change_review add`. Never
     ask the user to check something directly.
+19. **Builds for the user.** Before a build goes to the user's machine, run
+    `assertion_guard.py --base main` in that repository (`/unit:direct`
+    <UserBuildGuard/>). Exit 1 or 2 stops the hand-off.
 </ProductionUnit>

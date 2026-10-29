@@ -7,14 +7,14 @@ import os
 import re
 import shlex
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import add_unit  # noqa: E402
+from production_units import read_production  # noqa: E402
 import production_units  # noqa: E402
 import showrunners  # noqa: E402
 import stall_watch  # noqa: E402
@@ -203,7 +203,7 @@ def _build(old: str, new: str) -> RenamePlan:
     checked = showrunners.checked_doc(instance)
     if isinstance(checked, showrunners.NoCheckedDoc):
         raise RenameRefused(f"{old} has no readable update timer: {checked.reason}")
-    production = add_unit.read_production(checked.path)
+    production = read_production(checked.path)
     _ = unit_move.git(production.checkout, "check-ref-format", "--branch", new)
     if showrunners.production_slug(str(production.doc)) != old:
         raise RenameRefused(f"{old}'s timer names a different production doc: {production.doc}")
@@ -242,14 +242,18 @@ def _move_record(move: PathMove) -> dict[str, str]:
 
 
 def _save(plan: RenamePlan, completed: tuple[str, ...]) -> None:
-    write_json(plan.journal, {
+    fields = _object(read_json(plan.journal)) if plan.journal.exists() else {}
+    fields.update({
         "version": 1, "old": plan.old, "new": plan.new, "old_doc": str(plan.old_doc),
         "new_doc": str(plan.new_doc), "checkout": str(plan.checkout), "merge_branch": plan.merge_branch,
         "base": plan.base, "units": list(plan.units), "plans": [str(path) for path in plan.plans],
         "timer": _move_record(plan.timer), "state": [_move_record(move) for move in plan.state],
         "stall": [_move_record(move) for move in plan.stall], "review_pool": _move_record(plan.review_pool),
-        "completed": list(completed), "done": False,
+        "completed": list(completed),
     })
+    if "done" not in fields:
+        fields["done"] = False
+    write_json(plan.journal, fields)
 
 
 def _object(value: object) -> dict[str, object]:
@@ -290,7 +294,7 @@ def _completed_steps(fields: dict[str, object]) -> tuple[str, ...] | None:
     """Return the completed apply step names, or None when the record is not valid."""
     if "completed" in fields:
         names = fields["completed"]
-        if not isinstance(names, list) or not all(isinstance(name, str) and name in APPLY_STEP_NAMES for name in cast(list[object], names)):
+        if not isinstance(names, list) or not all(isinstance(name, str) and name for name in cast(list[object], names)):
             return None
         return tuple(cast(list[str], names))
     # A journal written before apply recorded step names holds a count of the 7-step list.
@@ -750,17 +754,72 @@ def _repoint_unit_workers(plan: RenamePlan, name: str, record: dict[str, object]
 
 
 def repair_workers(new: str, *, dry_run: bool = False) -> None:
-    """Use completed worktree moves to repair worker ownership without moving git state."""
-    with _rename_journal(new) as (result, journal):
-        for name, raw in sorted(_object(journal.get("unit_moves", {})).items()):
+    """Repair saved worker paths from journaled moves or current Units rows."""
+    from scripts.direct import workers
+    new = showrunners.canonical_slug(new)
+    _validate_slug(new)
+    path = rename_state.production_journal(new)
+    with nullcontext() if dry_run else unit_move.production_lock():
+        journal = _object(read_json(path)) if path.exists() else {}
+        if journal:
+            doc = Path(_string(journal, "new_doc"))
+        else:
+            checked = showrunners.checked_doc(showrunners.NOTIFIER_STATE_DIR / f"showrunner-{new}")
+            if isinstance(checked, showrunners.NoCheckedDoc):
+                raise RenameRefused(f"{new}: no production doc: {checked.reason}")
+            doc = checked.path
+        production = add_unit.read_production(doc)
+        text = doc.read_text(encoding="utf-8")
+        former_names = [_string(journal, "old")] if journal else []
+        for line in text.splitlines():
+            if line.startswith("- **Formerly:**"):
+                former_names.extend(cast(list[str], re.findall(r"`([^`]+)`", line)))
+        former = tuple(dict.fromkeys(former_names))
+        units = tuple(workers.UnitWorktree(new, production_units.cell_value(row.get("Unit", "")),
+            production.checkout / Path(production_units.cell_value(row.get("Worktree", ""))).expanduser(),
+            production_units.cell_value(row.get("Branch", "")))
+            for row in production_units.unit_table(text.splitlines())
+            if not production_units.plan_cell_is_retired(row.get("Plan", ""))
+            and production_units.cell_value(row.get("Worktree", "")) not in ("", "—", "-"))
+        found = workers.find_moved_unit_runs(units, former)
+        for skipped in found.skipped:
+            print(skipped)
+        records = _object(journal.get("unit_moves", {}))
+        journaled: set[tuple[str, Path]] = set()
+        reported: set[str] = set()
+        for name, raw in sorted(records.items()):
             record = _object(raw)
             completed = record.get("step")
             if type(completed) is not int or completed < 2:
                 continue
-            _repoint_unit_workers(result, name, record, dry_run=dry_run)
+            old = Path(_string(record, "old_worktree"))
+            changes = workers.repoint_unit_worktree(new, name, old, Path(_string(record, "new_worktree")),
+                _string(record, "new_branch"), from_production=former[0] if former else new, dry_run=dry_run)
+            for change in changes:
+                print(f"{name}: {'would change' if dry_run else 'changed'} {change}")
+            if not changes:
+                print(f"{name}: workers have nothing to change")
+            reported.add(name)
+            journaled.add((name, old))
             if not dry_run and not record.get("workers_repointed", False):
                 record["workers_repointed"] = True
-                write_json(result.journal, journal)
+                write_json(path, journal)
+        for move in found.moves:
+            name = move.current.unit
+            if (name, move.old) in journaled:
+                continue
+            changes = workers.repoint_moved_unit_runs(move, from_production=former[0] if former else new, dry_run=dry_run)
+            for change in changes:
+                print(f"{name}: {'would change' if dry_run else 'changed'} {change}")
+            if not changes and name not in reported:
+                print(f"{name}: workers have nothing to change")
+            reported.add(name)
+        if not reported:
+            print(f"{new}: no moved unit was found: no unit run names an old worktree"
+                  + (" with one matching Units row" if found.skipped else ""))
+        for current in units:
+            if current.unit not in reported:
+                print(f"{current.unit}: workers have nothing to change")
 
 
 def unit(new: str, name: str) -> None:
