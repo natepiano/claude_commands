@@ -9,6 +9,11 @@ its last run started RUN_INTERVAL_SECONDS or more ago, and before the floor
 takes any build cache. On the Mac, disk-floor does not run, and the tmp-sweep job
 in nixos modules/darwin/tmp-sweep.nix runs `tmp_sweep.py` every hour.
 `tmp_sweep.py [--dry-run]` runs it at once.
+For hand cleanup use `tmp_sweep.py --plan <new-plan.json>` first; it lists every
+candidate with keep/remove and a reason, writes the plan, and removes nothing.
+Then use `tmp_sweep.py --apply <plan.json>` to recheck and remove only planned
+paths. Hand cleanup also requires end evidence: all recorded workers ended, a
+scratch task ended, or a recorded verify.sh run stopped. Age alone keeps a path.
 
 An entry is one top-level file, folder or link under a root: /tmp/claude,
 /tmp/claude/delegate, /tmp/claude/unit, or a /tmp/claude-<uid>/-<project>/
@@ -38,8 +43,8 @@ both are true:
   * no process has its working folder, an open file or a mapped file inside it
     (one /proc scan per run; where no /proc exists, one lsof scan).
 
-These stay too: runs named by active markers, runs with any worker seat not ended (including
-paused seats), and runs using a live or paused session worktree. Unreadable ownership records
+These stay too: runs named by active markers, runs with any worker not ended (including
+paused workers), and runs using a live or paused session worktree. Unreadable ownership records
 keep runs too, including their temp entries. The roots and their active/ run-marker folders stay; a unit run
 folder whose own record names a running session: that session's marker in an
 active/ folder, else the folder's `director` file, else the `run_started` event
@@ -549,7 +554,7 @@ def delete_tree(path: str) -> None:
 
 class RunKeepReason(Enum):
     ACTIVE_MARKER = "an active-run marker names it"
-    UNENDED_SEAT = "a worker has not ended"
+    UNENDED_WORKER = "a worker has not ended"
     SESSION_WORKTREE = "a live or paused session uses its worktree"
     UNREADABLE_RECORD = "a run ownership record cannot be read"
 
@@ -680,11 +685,11 @@ def run_folder_guards(roots: Roots, live: frozenset[str] | None,
         try:
             roster = record_object(Path(folder) / "mesh_roster.json")
             if not isinstance(roster, MissingRecord):
-                for seat in roster.values():
-                    if not isinstance(seat, dict) or not isinstance(cast(dict[str, object], seat).get("status"), str):
+                for worker in roster.values():
+                    if not isinstance(worker, dict) or not isinstance(cast(dict[str, object], worker).get("status"), str):
                         raise ValueError("worker roster entry unreadable")
-                    if cast(dict[str, object], seat)["status"] != "ended":
-                        kept[folder] = RunKeepReason.UNENDED_SEAT
+                    if cast(dict[str, object], worker)["status"] != "ended":
+                        kept[folder] = RunKeepReason.UNENDED_WORKER
             # Read even when another reason keeps the folder, so errors are visible.
             state = record_object(Path(folder) / unit_runs.STATE_FILE)
             if not isinstance(state, MissingRecord):
@@ -763,9 +768,24 @@ def temp_parents(roots: Roots, live: frozenset[str] | None) -> tuple[str, ...]:
     return sessions + runs
 
 
-def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR) -> Sweep:
-    """Delete every idle entry no process uses, and record why each other entry stays."""
-    result = Sweep()
+@dataclass(frozen=True)
+class KeptEntry:
+    path: str
+    reason: str
+    use: str = ""
+
+
+@dataclass(frozen=True)
+class RemovableEntry:
+    path: str
+    root: str
+    newest: float
+    size: int
+
+
+def judge_entries(roots: Roots, now: float, proc: str) -> list[KeptEntry | RemovableEntry]:
+    """Apply the ownership, use and idle checks shared by timed and hand cleanup."""
+    result: list[KeptEntry | RemovableEntry] = []
     if not roots.all():
         return result
     # The scan keeps only paths under the roots' common folder (/tmp), which entry_uses then sorts.
@@ -776,7 +796,7 @@ def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR) -> Swee
     if paths is None:
         for root in roots.all():
             for entry in roots.entries(root):
-                result.keep(entry.path, NO_PROC)
+                result.append(KeptEntry(entry.path, NO_PROC))
         return result
     live = running_session_ids()
     inner = session_folders(roots, live)
@@ -790,7 +810,6 @@ def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR) -> Swee
     judged = roots.all() + inner + temp_parents(roots, live)
     uses = entry_uses(paths, judged)
     for root in judged:
-        emptied = False
         for entry in roots.entries(root):
             reason = owner_reason(entry, root, roots, live, marked)
             # Apply to every deletion path, including entries inside a protected run's tmp/.
@@ -802,34 +821,167 @@ def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR) -> Swee
                         reason = NO_SESSIONS if live is None else guard.value
                         break
             if reason is None and entry.path in uses:
-                result.keep(f"{entry.path}: {uses[entry.path]}", IN_USE)
+                result.append(KeptEntry(entry.path, IN_USE, uses[entry.path]))
                 continue
             change = last_change(entry.path, roots.limit(root, entry, now, proc)) if reason is None else reason
             if isinstance(change, str):
-                result.keep(entry.path, change)
+                result.append(KeptEntry(entry.path, change))
                 continue
             newest, size = change
             if root in inner and size < SESSION_ENTRY_MIN_BYTES:
-                result.keep(entry.path, SMALL_IN_LIVE_SESSION)
+                result.append(KeptEntry(entry.path, SMALL_IN_LIVE_SESSION))
                 continue
-            if not dry_run:
-                try:
-                    delete_tree(entry.path)
-                except OSError as error:
-                    # Another sweep can delete the same entry first.
-                    if os.path.lexists(entry.path):
-                        result.failed.append(FailedEntry(path=entry.path, error=str(error)))
-                    continue
-                emptied = True
-            result.freed += size
-            result.deleted.append(DeletedEntry(path=entry.path, gib=round(size / GIB, 3),
-                                               last_change=when(newest)))
-        if emptied and root in roots.projects:
-            try:
-                os.rmdir(root)
-            except OSError:
-                pass
+            result.append(RemovableEntry(entry.path, root, newest, size))
     return result
+
+
+def remove_entry(entry: RemovableEntry, result: Sweep, dry_run: bool) -> bool:
+    if not dry_run:
+        try:
+            delete_tree(entry.path)
+        except OSError as error:
+            if os.path.lexists(entry.path):
+                result.failed.append(FailedEntry(path=entry.path, error=str(error)))
+            return False
+    result.freed += entry.size
+    result.deleted.append(DeletedEntry(path=entry.path, gib=round(entry.size / GIB, 3),
+                                       last_change=when(entry.newest)))
+    return True
+
+
+def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR) -> Sweep:
+    """Delete every idle entry no process uses, and record why each other entry stays."""
+    result = Sweep()
+    emptied: set[str] = set()
+    for entry in judge_entries(roots, now, proc):
+        if isinstance(entry, KeptEntry):
+            path = f"{entry.path}: {entry.use}" if entry.use else entry.path
+            result.keep(path, entry.reason)
+        elif remove_entry(entry, result, dry_run) and not dry_run:
+            emptied.add(entry.root)
+    for root in emptied.intersection(roots.projects):
+        try:
+            os.rmdir(root)
+        except OSError:
+            pass
+    return result
+
+
+class CleanupEndReason(Enum):
+    WORKERS_ENDED = "all recorded workers ended; idle and unused"
+    TASK_ENDED = "its scratch task ended; idle and unused"
+    VERIFY_STOPPED = "its recorded verify.sh run stopped; idle and unused"
+
+
+class CleanupKeepReason(Enum):
+    NO_END = "no recorded end permits hand cleanup"
+    UNREADABLE = "its end record cannot be read"
+
+
+def cleanup_end_reason(entry: RemovableEntry, roots: Roots, now: float, proc: str) -> CleanupEndReason | CleanupKeepReason:
+    """Require end evidence as well as the timed sweep's checks."""
+    try:
+        for root in roots.runs:
+            relative = Path(entry.path).relative_to(root) if Path(entry.path).is_relative_to(root) else Path()
+            if relative.parts:
+                roster = record_object(Path(root) / relative.parts[0] / "mesh_roster.json")
+                if isinstance(roster, dict) and roster and all(
+                        isinstance(worker, dict) and cast(dict[str, object], worker).get("status") == "ended"
+                        for worker in roster.values()):
+                    return CleanupEndReason.WORKERS_ENDED
+        if entry.root in roots.scratch:
+            task = scratch.task_of(Path(entry.path))
+            if task is not None and scratch.ended(task, now):
+                return CleanupEndReason.TASK_ENDED
+        verify = VERIFY_TEMP_NAME.fullmatch(Path(entry.path).name) if entry.root in roots.temp else None
+        if verify is not None and verify.group(1):
+            made = os.stat(entry.path, follow_symlinks=False).st_mtime
+            if not verify_running(int(verify.group(1)), made, now, proc):
+                return CleanupEndReason.VERIFY_STOPPED
+    except (OSError, UnicodeError, ValueError):
+        return CleanupKeepReason.UNREADABLE
+    return CleanupKeepReason.NO_END
+
+
+class PlanEntry(TypedDict):
+    path: str
+    action: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class CleanupRemoval:
+    entry: RemovableEntry
+    reason: CleanupEndReason
+
+
+def cleanup_entries(roots: Roots, now: float, proc: str) -> list[KeptEntry | CleanupRemoval]:
+    result: list[KeptEntry | CleanupRemoval] = []
+    for entry in judge_entries(roots, now, proc):
+        if isinstance(entry, KeptEntry):
+            result.append(entry)
+            continue
+        reason = cleanup_end_reason(entry, roots, now, proc)
+        if isinstance(reason, CleanupKeepReason):
+            result.append(KeptEntry(entry.path, reason.value))
+        else:
+            result.append(CleanupRemoval(entry, reason))
+    return result
+
+
+def write_cleanup_plan(plan: Path, roots: Roots, now: float, proc: str) -> int:
+    rows: list[PlanEntry] = []
+    for entry in cleanup_entries(roots, now, proc):
+        action = "keep" if isinstance(entry, KeptEntry) else "remove"
+        reason = entry.reason if isinstance(entry, KeptEntry) else entry.reason.value
+        path = entry.path if isinstance(entry, KeptEntry) else entry.entry.path
+        rows.append(PlanEntry(path=path, action=action, reason=reason))
+    # An existing plan is never replaced; apply uses exactly the reviewed remove list.
+    with plan.open("x", encoding="utf-8") as handle:
+        _ = handle.write(json.dumps({"version": 1, "entries": rows}, indent=2) + "\n")
+    for row in rows:
+        print(f"{row['action']} {row['path']}: {row['reason']}")
+    print(f"tmp sweep: plan {plan}")
+    return 0
+
+
+def planned_removals(plan: Path) -> list[str]:
+    record = record_object(plan)
+    if not isinstance(record, dict) or record.get("version") != 1 or not isinstance(record.get("entries"), list):
+        raise ValueError("invalid cleanup plan")
+    paths: list[str] = []
+    for value in cast(list[object], record["entries"]):
+        if not isinstance(value, dict):
+            raise ValueError("invalid cleanup plan entry")
+        row = cast(dict[str, object], value)
+        path, action = row.get("path"), row.get("action")
+        if not isinstance(path, str) or not os.path.isabs(path) or action not in ("keep", "remove"):
+            raise ValueError("invalid cleanup plan path or action")
+        if action == "remove" and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def apply_cleanup_plan(plan: Path, roots: Roots, now: float, proc: str) -> int:
+    result = Sweep()
+    removals = planned_removals(plan)
+    # Judge every candidate again once, after the plan; the timed sweep has the same window.
+    current = {entry.path if isinstance(entry, KeptEntry) else entry.entry.path: entry
+               for entry in cleanup_entries(roots, now, proc)}
+    for path in removals:
+        entry = current.get(path)
+        if not isinstance(entry, CleanupRemoval):
+            reason = entry.reason if isinstance(entry, KeptEntry) else "no current sweep candidate"
+            print(f"keep {path}: {reason}")
+            result.keep(path, reason)
+            continue
+        if remove_entry(entry.entry, result, False):
+            removed = result.deleted[-1]
+            print(f"tmp sweep: deleted {path} ({removed['gib']:.1f} GiB), last changed {removed['last_change']}")
+    for failure in result.failed:
+        print(f"tmp sweep: could not delete {failure['path']}: {failure['error']}", file=sys.stderr)
+    append_log(state_dir() / LOG_NAME, record(result, False, now), now)
+    return 1 if result.failed else 0
 
 
 def state_dir() -> Path:
@@ -917,8 +1069,15 @@ def run_if_due(dry_run: bool, now: float | None = None) -> int:
 
 
 def main(argv: list[str]) -> int:
+    if len(argv) == 2 and argv[0] in ("--plan", "--apply"):
+        operation = write_cleanup_plan if argv[0] == "--plan" else apply_cleanup_plan
+        try:
+            return operation(Path(argv[1]), default_roots(), time.time(), PROC_DIR)
+        except (OSError, UnicodeError, ValueError) as error:
+            print(f"tmp sweep: {error}", file=sys.stderr)
+            return 1
     if any(arg != DRY_RUN_FLAG for arg in argv):
-        print(f"usage: tmp_sweep.py [{DRY_RUN_FLAG}]", file=sys.stderr)
+        print(f"usage: tmp_sweep.py [{DRY_RUN_FLAG}] | --plan <new-plan.json> | --apply <plan.json>", file=sys.stderr)
         return 2
     return run(DRY_RUN_FLAG in argv)
 

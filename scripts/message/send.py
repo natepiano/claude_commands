@@ -1624,11 +1624,12 @@ def wrong_template(options: Options, shown: str) -> str | None:
     """The hold detail when a user push tells in free text what a registered template carries, else None."""
     if options.to != USER:
         return None
+    registered_text = bool(options.text_id) and not push_texts.agent_written(options.text_id)
     if options.text_id != AUTO_MODE_TEXT and options.text_id not in RCA_TEXTS and reports_auto_mode_refusal(shown):
         return AUTO_MODE_HELD
-    if not options.text_id and PAID_CREDITS_REPORT.search(shown) is not None:
+    if not registered_text and PAID_CREDITS_REPORT.search(shown) is not None:
         return PAID_CREDITS_HELD
-    if not options.text_id and NEEDS_GO_REPORT.search(shown) is not None:
+    if not registered_text and NEEDS_GO_REPORT.search(shown) is not None:
         return NEEDS_GO_HELD
     return None
 

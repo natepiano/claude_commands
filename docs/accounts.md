@@ -45,6 +45,32 @@ Each Claude group with no account has a note: `accounts: units has no account; r
 
 Without `--stored`, a role map that cannot be fetched or read from cache refuses status with an error on stderr and exit 1, for both the table and JSON.
 
+The two-minute account-note timer reuses its last usage reports for less than ten minutes.
+It keeps the original reading times. Session tables, note session sections, the refusal
+watch and the unit watchdog still run on every timer pass. Weekly and five-hour warnings
+can follow the next usage read. The timer stores reports without credentials in
+`~/.local/state/agent-notes/timer-usage.json`.
+
+An explicit refresh reads at once. A queued account move on the role-map host, a
+weekly or five-hour window at or below 10% remaining on an account in use, an active Claude fallback,
+a passed window reset, or a changed login or account selection also requires a live read.
+A new Claude refusal refreshes usage
+before placement if the timer reused reports; it does not repeat session collection.
+An unchanged refusal already requested, cancelled, continued or assigned to a group
+does not refresh usage. A failed refusal refresh reports one line and keeps placement
+and the watchdog running with stored readings.
+The Codex blocked-command path keeps its own immediate live read. These exceptions
+keep moves and restarts on their existing cadence. A missing or damaged timer cache
+requires a live read.
+
+For a readable Claude directory with a stored subscription type, the live usage pass
+uses its on-disk login and plan and sends the stored OAuth token to the usage endpoint.
+It skips `claude auth status`. A missing identity or subscription type keeps the CLI
+check, so plan labels stay the same in `/whoami` and the notes. Standalone account status reads keep their
+auth-status check. Each Codex home keeps one app-server for its
+initialize, account and usage requests during a live pass; no server starts on a
+reused pass.
+
 ## Starting a session
 
 Run these in a terminal:

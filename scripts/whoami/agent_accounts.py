@@ -403,6 +403,7 @@ class ClaudeAuthStatus(TypedDict, total=False):
 
 class ClaudeOauth(TypedDict, total=False):
     accessToken: str
+    subscriptionType: str
     # Epoch milliseconds.
     expiresAt: int
 
@@ -731,14 +732,26 @@ def claude_five_hour(usage: dict[str, object]) -> Quota | None:
     return Quota("5-hour", window.get("utilization"), parse_reset(window.get("resets_at")))
 
 
-def claude_live(config_dir: Path | None = None) -> Report:
+def claude_live(config_dir: Path | None = None, *, use_disk_identity: bool = False) -> Report:
     store = cast(UsageReadStore, cast(object, import_module("scripts.whoami.usage_store")))
 
     report = Report("Claude", source=ClaudeDirectorySource(
         claude_config_dir() if config_dir is None else config_dir,
     ))
+    stored_credentials: ClaudeCredentials = {}
     try:
-        if config_dir is None:
+        disk = claude_on_disk(config_dir) if use_disk_identity and config_dir is not None else Report("Claude")
+        if disk.email:
+            try:
+                stored_credentials = claude_credentials(config_dir)
+            except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
+                pass
+        subscription = stored_credentials.get("claudeAiOauth", {}).get("subscriptionType")
+        if disk.email and isinstance(subscription, str) and subscription:
+            # The usage endpoint checks the stored token. Do not start a CLI to read this login again.
+            status: object = {"loggedIn": True, "email": disk.email, "authMethod": "claude.ai",
+                              "subscriptionType": subscription}
+        elif config_dir is None:
             status = command_json("claude", "auth", "status")
         else:
             environment = {key: value for key, value in os.environ.items() if not key.startswith("CLAUDE_")}
@@ -761,7 +774,9 @@ def claude_live(config_dir: Path | None = None) -> Report:
     try:
         token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") if config_dir is None else None
         if not token:
-            oauth = (claude_credentials() if config_dir is None else claude_credentials(config_dir)).get("claudeAiOauth", {})
+            if not stored_credentials:
+                stored_credentials = claude_credentials() if config_dir is None else claude_credentials(config_dir)
+            oauth = stored_credentials.get("claudeAiOauth", {})
             token = oauth.get("accessToken")
             expires = oauth.get("expiresAt")
             # Only a Claude session refreshes a stored token, so an idle account's goes stale.
@@ -1136,7 +1151,7 @@ async def live_reports(selection: ClaudeAccountsInUse, workers_home: Path | NoWo
     if home_login and Path.home() / ".claude" not in directories:
         directories.append(Path.home() / ".claude")
     reports = list(await asyncio.gather(
-        *(asyncio.to_thread(claude_live, directory) for directory in directories),
+        *(asyncio.to_thread(claude_live, directory, use_disk_identity=True) for directory in directories),
         *(codex_live(home) for home in homes),
     ))
     known = {named.directory: named.identity.login for named in selection.named_accounts}

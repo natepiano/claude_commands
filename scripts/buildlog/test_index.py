@@ -186,8 +186,10 @@ class LogIsolationTests(unittest.TestCase):
                     [
                         sys.executable,
                         "-c",
-                        "import importlib, store, sys; importlib.import_module(sys.argv[1]); print(store.root())",
+                        "import importlib, store, sys; sys.path.insert(0, sys.argv[2]); "
+                        + "importlib.import_module(sys.argv[1]); print(store.root())",
                         module.stem,
+                        str(Path(__file__).resolve().parents[2]),
                     ],
                     cwd=module.parent,
                     env=environment,
@@ -594,7 +596,7 @@ class IndexTests(unittest.TestCase):
                 ("old", None, None, None, None),
             ],
         )
-        self.assertEqual(index.SCHEMA_VERSION, 21)
+        self.assertEqual(index.SCHEMA_VERSION, 22)
 
     def test_copy_call_fields_reach_index_and_old_records_read_as_null(self) -> None:
         self.write(
@@ -666,6 +668,22 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(self.rows("PRAGMA index_info(steps_call)"), [(0, 23, "call_id")])
         self.assertIn("steps_call", str(self.rows("EXPLAIN QUERY PLAN SELECT id FROM steps WHERE call_id = ?", "call")))
 
+    def test_queue_bump_reaches_query_rebuild_and_schema(self) -> None:
+        event: Record = {"kind": "queue_bump", "v": 1, "id": "move-1", "host": "natedev", "at": STAMP,
+                         "actor": "user", "session": "session-id", "step": "nextest", "folder": "/tmp/tree", "old_position": 3}
+        self.write(self.host_file, event)
+        _ = index.update()
+        self.assertEqual(self.rows("SELECT actor, session, step, folder, old_position FROM queue_bumps"),
+                         [("user", "session-id", "nextest", "/tmp/tree", 3)])
+        _ = index.update()
+        self.assertEqual(self.rows("SELECT count(*) FROM queue_bumps"), [(1,)])
+        schema = subprocess.run([sys.executable, str(CLI), "schema"], capture_output=True, text=True, check=False)
+        self.assertIn("TABLE queue_bumps", schema.stdout)
+        with closing(sqlite3.connect(self.root / "index.sqlite")) as connection:
+            _ = connection.execute("PRAGMA user_version = 1")
+        _ = index.update()
+        self.assertEqual(self.rows("SELECT old_position FROM queue_bumps"), [(3,)])
+
     def test_mac_holder_and_hold_event_schema_keep_source_and_identity_indexes(self) -> None:
         self.write(self.host_file, call("busy", mac="declined", mac_reason="busy", mac_holder="hana nextest"), call("old"))
         _ = index.update()
@@ -716,7 +734,7 @@ class IndexTests(unittest.TestCase):
             connection.commit()
         self.assertEqual(index.update(), 2)
         self.assertEqual(self.rows("SELECT action FROM hold_builds ORDER BY id"), [("audit",), ("stopped",)])
-        self.assertEqual(self.rows("PRAGMA user_version"), [(21,)])
+        self.assertEqual(self.rows("PRAGMA user_version"), [(index.SCHEMA_VERSION,)])
         self.assertEqual(index.reindex(), 2)
         self.assertEqual(self.rows("SELECT DISTINCT src FROM hold_builds"), [("natedev/hold-builds-test.jsonl",)])
         result = subprocess.run([sys.executable, str(CLI), "schema"], capture_output=True, text=True, check=False)

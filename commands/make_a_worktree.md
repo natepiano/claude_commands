@@ -79,16 +79,8 @@ Mark third todo as completed when finished.
 </CopySettingsLocal>
 
 <AllowDirenv>
-**Approve the worktree's `.envrc` so direnv-gated tooling works there.**
-
-A fresh worktree carries the repo's `.envrc` but not direnv's approval, so the
-environment stays blocked. Anything that shells through `direnv exec` then fails
-without ever touching the code — cargo-port, for one, reports the lint column as
-environment-unavailable (yellow) rather than pass/fail.
-
-- Run `bash ~/.claude/scripts/make_a_worktree/direnv_allow.sh ../[worktree-name]`
-- If the output says there is no `.envrc`, SKIP silently — nothing to report.
-- Otherwise report the result in one line: allowed, plus whether the environment
-  probe passed. If the probe still fails, surface the script's warning so the
-  user knows lints in that worktree will not run yet.
+Run `bash ~/.claude/scripts/make_a_worktree/direnv_allow.sh ../[worktree-name]`.
+It calls `nix_env.py ensure`: no `.envrc` succeeds silently; otherwise the loaded
+environment must contain `IN_NIX_SHELL`. On failure, report its one stderr line
+and stop. Automatic approval is limited to `~/rust`, `~/worktrees`, and `~/.claude*`.
 </AllowDirenv>

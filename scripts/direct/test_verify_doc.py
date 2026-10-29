@@ -28,12 +28,17 @@ class CargoDocCall(TypedDict):
     args: list[str]
     rustdocflags: str
     call_id: str
+    cwd: str
+    sources: dict[str, str]
+    notes_present: bool
+    target: str
 
 
 CARGO_STUB = r'''
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 
 arguments = sys.argv[1:]
@@ -42,10 +47,20 @@ if arguments[:1] == ["metadata"]:
 elif arguments[:1] == ["doc"]:
     with Path(os.environ["TEST_CARGO_EVENTS"]).open("a", encoding="utf-8") as output:
         output.write(json.dumps({"args": arguments, "rustdocflags": os.environ.get("RUSTDOCFLAGS", ""),
-                                 "call_id": os.environ.get("BUILDLOG_CALL_ID", "")}) + "\n")
+                                 "call_id": os.environ.get("BUILDLOG_CALL_ID", ""),
+                                 "cwd": str(Path.cwd()),
+                                 "target": os.environ.get("CARGO_TARGET_DIR", ""),
+                                 "sources": {name: Path(name).read_text(encoding="utf-8")
+                                             for name in ("alpha/src/lib.rs", "beta/src/lib.rs")},
+                                 "notes_present": Path("notes.md").exists()}) + "\n")
     if os.environ.get("TEST_EDIT_DURING_DOC"):
         with Path(os.environ["TEST_EDIT_DURING_DOC"]).open("a", encoding="utf-8") as source:
             source.write("// edited during rustdoc\n")
+        if os.environ.get("TEST_STAGE_DURING_DOC"):
+            stage_environment = {name: value for name, value in os.environ.items()
+                                 if name not in {"GIT_INDEX_FILE", "GIT_WORK_TREE", "GIT_DIR"}}
+            subprocess.run(["git", "-C", os.environ["TEST_ORIGINAL_REPO"], "add", "--",
+                            os.environ["TEST_EDIT_DURING_DOC"]], check=True, env=stage_environment)
     raise SystemExit(int(os.environ.get("TEST_DOC_STATUS", "0")))
 else:
     raise SystemExit("unexpected cargo invocation: " + repr(arguments))
@@ -82,6 +97,8 @@ class VerifyDocTests(unittest.TestCase):
             self.executable(tools / name, "raise SystemExit(99)\n")
         for name in ("tmp", "state", "cache", "runtime", "target", "session"):
             (self.root / name).mkdir()
+        meminfo = self.root / "meminfo"
+        _ = meminfo.write_text("MemAvailable: 67108864 kB\n", encoding="utf-8")
         _ = (self.repo / "Cargo.toml").write_text(
             '[workspace]\nmembers = ["alpha", "beta"]\nresolver = "2"\n', encoding="utf-8",
         )
@@ -108,13 +125,15 @@ class VerifyDocTests(unittest.TestCase):
             "HOME": str(home), "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}",
             "CLAUDE_PYTHON": sys.executable, "PYTHONDONTWRITEBYTECODE": "1",
             "TEST_CARGO_EVENTS": str(self.events),
+            "TEST_ORIGINAL_REPO": str(self.repo),
             "TEST_METADATA": json.dumps({"workspace_root": str(self.repo),
+                                         "target_directory": str(self.root / "target"),
                                          "workspace_members": ["alpha", "beta"], "packages": packages}),
             "TMPDIR": str(self.root / "tmp"), "XDG_STATE_HOME": str(self.root / "state"),
             "XDG_CACHE_HOME": str(self.root / "cache"), "XDG_RUNTIME_DIR": str(self.root / "runtime"),
             "CARGO_HOME": str(self.root / "cargo-home"), "CARGO_TARGET_DIR": str(self.root / "target"),
             "BUILDLOG_DIR": str(self.root / "buildlog"), "BUILDLOG_OFF": "1", "BUILDLOG_SCOPE": "0",
-            "BUILDLOG_MEMINFO": str(self.root / "missing-meminfo"),
+            "BUILDLOG_MEMINFO": str(meminfo),
             "BUILD_HOLD_DIR": str(self.root / "build-hold"), "BUILD_TARGETS_SCRIPT": str(targets),
             "LINT_CONFIG_READER": str(SCRIPTS / "lint/lint_config.sh"),
             "LINT_CONFIG_FILE": str(self.config),
@@ -149,7 +168,10 @@ class VerifyDocTests(unittest.TestCase):
         source = self.repo / "alpha/src/lib.rs"
         _ = source.write_text("pub fn staged() {}\n", encoding="utf-8")
         _ = self.git("add", "alpha/src/lib.rs")
+        expected_tree = self.git("write-tree")
         _ = source.write_text("pub fn unstaged() {}\n", encoding="utf-8")
+        other = self.repo / "beta/src/lib.rs"
+        _ = other.write_text("pub fn unrelated_unstaged() {}\n", encoding="utf-8")
         _ = (self.repo / "notes.md").write_text("untracked plan edit\n", encoding="utf-8")
         _ = (self.repo / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
         _ = (self.repo / "ignored.txt").write_text("ignored\n", encoding="utf-8")
@@ -157,8 +179,8 @@ class VerifyDocTests(unittest.TestCase):
         result = self.verify()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((self.repo / ".git/index").read_bytes(), index_before)
-        _ = self.git("add", "-A")
-        expected_tree = self.git("write-tree")
+        self.assertEqual(source.read_text(encoding="utf-8"), "pub fn unstaged() {}\n")
+        self.assertEqual(other.read_text(encoding="utf-8"), "pub fn unrelated_unstaged() {}\n")
         records = self.pass_records()
         self.assertEqual(len(records), 1, result.stdout + result.stderr)
         record = cast(DocPassRecord, json.loads(records[0].read_text(encoding="utf-8")))
@@ -168,6 +190,11 @@ class VerifyDocTests(unittest.TestCase):
         self.assertTrue(record["time"])
         calls = self.cargo_calls()
         self.assertEqual(len(calls), 1)
+        self.assertNotEqual(Path(calls[0]["cwd"]).resolve(), self.repo.resolve())
+        self.assertEqual(calls[0]["sources"], {
+            "alpha/src/lib.rs": "pub fn staged() {}\n", "beta/src/lib.rs": "pub fn value() {}\n",
+        })
+        self.assertFalse(calls[0]["notes_present"])
         self.assertEqual(record["call_id"], calls[0]["call_id"])
         self.assertTrue(record["call_id"])
         self.assertIn("--workspace", calls[0]["args"])
@@ -181,13 +208,84 @@ class VerifyDocTests(unittest.TestCase):
         self.assertEqual(result.returncode, 41, result.stdout + result.stderr)
         self.assertEqual(self.pass_records(), [])
 
+    def test_doc_reuses_checkout_and_target_preserving_unchanged_mtimes(self) -> None:
+        removed = self.repo / "deleted.txt"
+        _ = removed.write_text("remove in second tree\n", encoding="utf-8")
+        _ = self.git("add", "deleted.txt")
+        first = self.verify()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        initial = self.cargo_calls()[0]
+        checkout = Path(initial["cwd"])
+        self.assertTrue(checkout.is_relative_to(self.root / "target/verify-doc"))
+        self.assertEqual(initial["target"], str(self.root / "target"))
+        self.assertTrue((checkout / "deleted.txt").is_file())
+        # Set a distinct old mtime: this proves preservation without a sleep or
+        # dependence on the filesystem's clock resolution between doc runs.
+        unchanged = checkout / "beta/src/lib.rs"
+        stamp = 1_000_000_000_000_000_000
+        os.utime(unchanged, ns=(stamp, stamp))
+        _ = (self.repo / "alpha/src/lib.rs").write_text("pub fn next_tree() {}\n", encoding="utf-8")
+        _ = self.git("add", "alpha/src/lib.rs")
+        removed.unlink()
+        _ = self.git("add", "-u", "--", "deleted.txt")
+        second = self.verify()
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        current = self.cargo_calls()[1]
+        self.assertEqual(current["cwd"], initial["cwd"])
+        self.assertEqual(current["target"], initial["target"])
+        self.assertEqual(unchanged.stat().st_mtime_ns, stamp, second.stdout + second.stderr)
+        self.assertEqual(current["sources"]["alpha/src/lib.rs"], "pub fn next_tree() {}\n")
+        self.assertFalse((checkout / "deleted.txt").exists())
+
+    def test_doc_target_defaults_to_repo_metadata_and_reuses_checkout(self) -> None:
+        del self.environment["CARGO_TARGET_DIR"]
+        for run in range(2):
+            with self.subTest(run=run):
+                result = self.verify()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        first, second = self.cargo_calls()
+        self.assertEqual(first["target"], str(self.root / "target"))
+        self.assertEqual(second["target"], first["target"])
+        self.assertEqual(second["cwd"], first["cwd"])
+
+    def test_doc_recovers_a_missing_or_damaged_private_index(self) -> None:
+        for damage in ("missing", "corrupt"):
+            with self.subTest(damage=damage):
+                before = self.verify()
+                self.assertEqual(before.returncode, 0, before.stdout + before.stderr)
+                checkout = Path(self.cargo_calls()[-1]["cwd"])
+                index = checkout.parent / "index"
+                self.assertTrue(index.is_file())
+                if damage == "missing":
+                    index.unlink()
+                else:
+                    _ = index.write_text("damaged index\n", encoding="utf-8")
+                _ = (checkout / "beta/src/lib.rs").write_text("damaged checkout\n", encoding="utf-8")
+                result = self.verify()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                call = self.cargo_calls()[-1]
+                self.assertEqual(call["cwd"], str(checkout))
+                self.assertEqual(call["sources"]["beta/src/lib.rs"], "pub fn value() {}\n")
+
     def test_edits_during_doc_leave_no_pass_even_without_a_worker_session(self) -> None:
+        self.environment["TEST_STAGE_DURING_DOC"] = "1"
         for name in ("alpha/src/lib.rs", "new-plan.md"):
             with self.subTest(path=name):
                 self.environment["TEST_EDIT_DURING_DOC"] = str(self.repo / name)
                 result = self.verify()
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(self.pass_records(), [], result.stdout + result.stderr)
+
+    def test_unstaged_edits_during_doc_do_not_invalidate_the_staged_verdict(self) -> None:
+        staged_tree = self.git("write-tree")
+        self.environment["TEST_EDIT_DURING_DOC"] = str(self.repo / "alpha/src/lib.rs")
+        result = self.verify()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        records = self.pass_records()
+        self.assertEqual(len(records), 1, result.stdout + result.stderr)
+        record = cast(DocPassRecord, json.loads(records[0].read_text(encoding="utf-8")))
+        self.assertEqual(record["tree_id"], staged_tree)
+        self.assertIn("edited during rustdoc", (self.repo / "alpha/src/lib.rs").read_text(encoding="utf-8"))
 
     def test_doc_off_still_runs_the_workspace_check_and_explains_once(self) -> None:
         _ = self.config.write_text("doc=off\nsweep=off\n", encoding="utf-8")

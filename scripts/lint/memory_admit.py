@@ -8,13 +8,14 @@ import importlib
 import json
 import math
 import os
+import signal
 import sqlite3
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal, Protocol, TypedDict, cast
+from typing import Literal, NoReturn, NotRequired, Protocol, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
 
@@ -33,6 +34,8 @@ class StepParser(Protocol):
 class GitIdentityReader(Protocol):
     def git_directory(self, argv: list[str], cwd: str) -> str: ...
     def git_facts(self, directory: str) -> GitFacts: ...
+    def queue_bump(self, actor: str, session: str, step: str, folder: str,
+                   old_position: int, at: float) -> None: ...
 
 
 class BuildLogStore(Protocol):
@@ -42,6 +45,7 @@ class BuildLogStore(Protocol):
     def host_name(self) -> str: ...
     def utc_iso(self, epoch: float) -> str: ...
     def append_line(self, path: Path, record: object) -> None: ...
+    def host_file(self, host: str, epoch: float) -> Path: ...
 
 
 parse: StepParser = cast(StepParser, cast(object, importlib.import_module("parse")))
@@ -54,15 +58,13 @@ FALLBACK = 12 * GIB
 # clippy had 65%, so 0.65 covers the measured p90 process-memory share.
 ANON_SHARE = 0.65
 HISTORY_DAYS = 14
-# A step starts its scope, and writes the sidecar, within seconds of its admission. A reservation
-# whose sidecar is still missing after this is not building: on 2026-10-21 verify.sh runs on code
-# older than 208631b3 held 94.5 GiB that way while they waited for the cargo token, and every
-# waiting step reached the 15-minute limit.
-SCOPE_GRACE_SECONDS = 120
-# Builds admitted within this many seconds of each other grow together: their gaps add up.
-GROUP_SECONDS = 60
-# A step held this long is first in line: every other step must leave room for its need too.
+# Build anon at 16–20 GiB averaged 10.4% full PSI; at 20–24 GiB it averaged 16.4%.
+BUILD_BUDGET_BYTES = 20 * GIB
+RAMP_SECONDS = 120
+PROC = Path("/proc")
+# A step held this long gets room first when it can start.
 HEAD_SECONDS = 900
+QUEUE_LOCK_TIMEOUT_SECONDS = 10.0
 
 
 class Reservation(TypedDict):
@@ -86,10 +88,37 @@ class ExpectedPeak:
 
 
 @dataclass(frozen=True)
-class RunningMemory:
-    need: int
-    anon: int
-    admitted_at: float = 0.0
+class PromisedMemory:
+    bytes: int
+
+
+@dataclass(frozen=True)
+class MeasuredMemory:
+    bytes: int
+    # Only a step inside its ramp window reserves growth.
+    ramp_promise: int = 0
+
+
+@dataclass(frozen=True)
+class GoneMemory:
+    pass
+
+
+StepMemory = PromisedMemory | MeasuredMemory | GoneMemory
+
+
+@dataclass(frozen=True)
+class NoPressureHold:
+    pass
+
+
+@dataclass(frozen=True)
+class MemoryPressure:
+    full_avg10: float
+
+
+Pressure = NoPressureHold | MemoryPressure
+NO_PRESSURE_HOLD = NoPressureHold()
 
 
 class Waiter(TypedDict):
@@ -97,6 +126,12 @@ class Waiter(TypedDict):
     start_time: str
     need: int
     since: float
+    label: NotRequired[str]
+    session_id: NotRequired[str]
+    session_name: NotRequired[str]
+    step: NotRequired[str]
+    folder: NotRequired[str]
+    bump_order: NotRequired[int]
 
 
 @dataclass(frozen=True)
@@ -105,6 +140,80 @@ class AdmissionDecision:
     threshold: int
     promised: int
     reserve: int
+    measured: int
+    pressure: Pressure = NO_PRESSURE_HOLD
+    charged: int = 0
+    budget: int = BUILD_BUDGET_BYTES
+
+
+@dataclass(frozen=True)
+class NeedsBuildBudget:
+    need: int
+    charged: int
+    budget: int
+
+
+@dataclass(frozen=True)
+class NeedsMemory:
+    need: int = 0
+    free: int = 0
+
+
+@dataclass(frozen=True)
+class BehindHead:
+    head_name: str
+    head_since: float
+
+
+@dataclass(frozen=True)
+class ReadyForAdmission:
+    pass
+
+
+@dataclass(frozen=True)
+class ReadingUnavailable:
+    pass
+
+
+WaitReason = NeedsBuildBudget | NeedsMemory | BehindHead | ReadyForAdmission | ReadingUnavailable | MemoryPressure
+
+
+@dataclass(frozen=True)
+class WaitingStep:
+    pid: int
+    session_id: str
+    session_name: str
+    step: str
+    folder: str
+    since: float
+    need: int
+    reason: WaitReason
+
+
+@dataclass(frozen=True)
+class RunningStep:
+    session_id: str
+    session_name: str
+    step: str
+    folder: str
+    promise: int
+    measured: StepMemory
+
+
+@dataclass(frozen=True)
+class QueueView:
+    waiting: tuple[WaitingStep, ...]
+    running: tuple[RunningStep, ...]
+    available: int
+    promised: int
+    reserve: int
+    now: float
+
+
+@dataclass(frozen=True)
+class ProcessIdentity:
+    parent: int
+    start: str
 
 
 @dataclass(frozen=True)
@@ -135,34 +244,57 @@ class CheckResult:
     step: str
     available: int
     profile: StepProfile
+    head_need: int = 0
+    head_label: str = ""
 
 
-def joint_promise(running: list[RunningMemory]) -> int:
-    """The growth still to come in the running builds, as one figure.
-
-    Builds admitted within GROUP_SECONDS of each other grow together, so their gaps (need - anon) add up.
-    Separate groups do not peak at once, so the groups combine as a root sum of squares. The sum of every
-    gap held over 90% of wait ticks (2026-10-28 replay: 240 waits, 1863 min, 25 short starts, all at the
-    old 15 min forced start); this rule waits 1221 min with 0 short.
-    """
-    groups: list[int] = []
-    previous: float | None = None
-    for row in sorted(running, key=lambda item: item.admitted_at):
-        if previous is None or row.admitted_at - previous > GROUP_SECONDS:
-            groups.append(0)
-        groups[-1] += max(0, row.need - row.anon)
-        previous = row.admitted_at
-    return math.isqrt(sum(gap * gap for gap in groups))
+def build_budget_bytes() -> int:
+    try:
+        value = float(os.environ["BUILDLOG_BUILD_BUDGET_GIB"]) * GIB
+        if math.isfinite(value) and value > 0:
+            return max(1, int(value))
+    except (KeyError, ValueError):
+        pass
+    return BUILD_BUDGET_BYTES
 
 
-def decide(available: int, total: int | None, need: int, running: list[RunningMemory],
-           head_need: int = 0) -> AdmissionDecision:
-    """All inputs are bytes; anon already in use remains in MemAvailable. `head_need` is the need of a step
-    held HEAD_SECONDS or more ahead of this one: this step leaves room for it."""
-    promised = joint_promise(running)
+def decide(available: int, total: int | None, need: int, running: list[StepMemory],
+           head_need: int = 0, pressure: Pressure = NO_PRESSURE_HOLD) -> AdmissionDecision:
+    """Apply the build budget, free-memory floor and pressure limit together."""
+    promised = sum(growth_headroom(row) for row in running)
+    measured = sum(row.bytes for row in running if isinstance(row, MeasuredMemory))
+    charged = sum(build_charge(row) for row in running)
+    budget = build_budget_bytes()
     reserve = total * 5 // 100 if total is not None else 0
-    threshold = (need + promised + reserve if running else min(need + reserve, FALLBACK)) + head_need
-    return AdmissionDecision("admit" if available >= threshold else "hold", threshold, promised, reserve)
+    threshold = need + promised + reserve + head_need
+    fits_budget = charged + need + head_need <= budget or all(isinstance(row, GoneMemory) for row in running)
+    admit = fits_budget and available >= threshold and isinstance(pressure, NoPressureHold)
+    return AdmissionDecision("admit" if admit else "hold", threshold, promised, reserve, measured,
+                             pressure, charged, budget)
+
+
+def build_charge(memory: StepMemory) -> int:
+    if isinstance(memory, PromisedMemory):
+        return memory.bytes
+    if isinstance(memory, MeasuredMemory):
+        return max(memory.ramp_promise, memory.bytes)
+    return 0
+
+
+def growth_headroom(memory: StepMemory) -> int:
+    if isinstance(memory, PromisedMemory):
+        return memory.bytes
+    if isinstance(memory, MeasuredMemory):
+        return max(0, memory.ramp_promise - memory.bytes)
+    return 0
+
+
+def _head_holds_later(available: int, total: int | None, need: int,
+                      running: list[StepMemory]) -> bool:
+    decision = decide(available, total, need, running)
+    # Leave room if the head fits now or after measured running steps end.
+    # Pending starts have no measured use to return.
+    return decision.state == "admit" or available + decision.measured >= need + decision.reserve
 
 
 def percentile(values: list[int]) -> int:
@@ -248,20 +380,63 @@ def expected_peak(repo: str, step: str, host: str, now: datetime, root: Path,
 def process_start_time(pid: int) -> str | None:
     try:
         stat = (Path("/proc") / str(pid) / "stat").read_text()
-        return stat.rsplit(") ", 1)[1].split()[19]
+        fields = stat.rsplit(") ", 1)[1].split()
+        return fields[19] if fields[0] not in ("Z", "X") else None
     except (OSError, IndexError):
         return None
 
 
-def cgroup_anon(sidecar: str) -> int:
-    try:
-        scope = Path(sidecar).read_text().strip()
-        for line in (Path(scope) / "memory.stat").read_text().splitlines():
-            if line.startswith("anon "):
-                return int(line.split()[1])
-    except (OSError, ValueError, IndexError):
-        pass
-    return 0
+def process_table(proc: Path = PROC) -> dict[int, ProcessIdentity]:
+    processes: dict[int, ProcessIdentity] = {}
+    for entry in proc.iterdir():
+        if not entry.name.isdecimal():
+            continue
+        try:
+            fields = (entry / "stat").read_text().rsplit(") ", 1)[1].split()
+            if fields[0] not in ("Z", "X"):
+                processes[int(entry.name)] = ProcessIdentity(int(fields[1]), fields[19])
+        except (OSError, ValueError, IndexError):
+            continue
+    return processes
+
+
+def tree_memory(pid: int, start: str, processes: dict[int, ProcessIdentity],
+                proc: Path = PROC) -> MeasuredMemory | GoneMemory:
+    """Sum resident and swapped bytes from one process table reading."""
+    identity = processes.get(pid)
+    if identity is None or identity.start != start:
+        return GoneMemory()
+    children: dict[int, list[int]] = {}
+    for child, identity in processes.items():
+        children.setdefault(identity.parent, []).append(child)
+    pending, seen, used = [pid], set[int](), 0
+    while pending:
+        child = pending.pop()
+        if child in seen:
+            continue
+        seen.add(child)
+        pending.extend(children.get(child, []))
+        try:
+            for line in (proc / str(child) / "status").read_text().splitlines():
+                parts = line.split()
+                if parts and parts[0] in ("VmRSS:", "VmSwap:"):
+                    used += int(parts[1]) * 1024
+        except (OSError, ValueError, IndexError):
+            continue
+    return MeasuredMemory(used)
+
+
+def step_memory(row: Reservation, now: datetime, processes: dict[int, ProcessIdentity],
+                proc: Path = PROC) -> StepMemory:
+    identity = processes.get(row["pid"])
+    if identity is None or identity.start != row["start_time"]:
+        return GoneMemory()
+    reading = tree_memory(row["pid"], row["start_time"], processes, proc)
+    if isinstance(reading, MeasuredMemory) and now.timestamp() - _epoch(row["admitted_at"]) < RAMP_SECONDS:
+        if reading.bytes == 0:
+            return PromisedMemory(row["need"])
+        return replace(reading, ramp_promise=row["need"])
+    return reading
 
 
 def read_meminfo(path: Path) -> tuple[int, int | None]:
@@ -279,16 +454,22 @@ def read_meminfo(path: Path) -> tuple[int, int | None]:
     return available, total
 
 
-def building(row: Reservation, now: datetime) -> bool:
-    """False for a reservation that expects a scope and has none after SCOPE_GRACE_SECONDS. A step
-    with no scope at all (sidecar "") cannot show it is building, so it always counts."""
-    if not row["sidecar"] or os.path.exists(row["sidecar"]):
-        return True
+def read_pressure() -> Pressure:
+    """An unreadable pressure file does not block; the memory rule still applies."""
+    full = 0.0
     try:
-        admitted = datetime.fromisoformat(row["admitted_at"])
-    except ValueError:
-        return True
-    return (now - admitted).total_seconds() < SCOPE_GRACE_SECONDS
+        path = Path(os.environ.get("BUILDLOG_MEMORY_PRESSURE", "/proc/pressure/memory"))
+        for line in path.read_text().splitlines():
+            parts = line.split()
+            if parts and parts[0] == "full":
+                full = next(float(part.removeprefix("avg10=")) for part in parts[1:] if part.startswith("avg10="))
+    except (OSError, ValueError, StopIteration):
+        pass
+    return MemoryPressure(full) if full > 10.0 else NO_PRESSURE_HOLD
+
+
+def pressure_text(pressure: MemoryPressure) -> str:
+    return f"memory pressure: full avg10 {pressure.full_avg10:.1f}"
 
 
 def admission_dir(root: Path) -> Path:
@@ -326,6 +507,25 @@ def live_waiters(directory: Path) -> list[tuple[Path, Waiter]]:
     return live
 
 
+def waiter_label(row: Waiter) -> str:
+    label = row.get("label", "")
+    if label:
+        return label
+    # Old callers wrote only a pid. Read their label without changing the record.
+    process = Path("/proc") / str(row["pid"])
+    try:
+        folder = (process / "cwd").readlink().name
+        argv = (process / "cmdline").read_bytes().decode(errors="replace").split("\0")
+        caller = "verify" if any(item.endswith("/verify.sh") for item in argv) else Path(argv[0]).name
+        return f"{folder} ({caller} pid {row['pid']})"
+    except (OSError, IndexError):
+        return f"caller pid {row['pid']}"
+
+
+def waiter_order(row: Waiter) -> tuple[int, float, int]:
+    return row.get("bump_order", 0), row["since"], row["pid"]
+
+
 def git_identity(argv: list[str], cwd: str) -> tuple[str, str]:
     if not argv:
         return "", ""
@@ -351,25 +551,54 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
     repo, step, worktree, peak = profile.repo, profile.step, profile.worktree, profile.peak
     if not argv and not (root / "admission").exists():
         available, total = read_meminfo(meminfo)
-        return CheckResult(decide(available, total, peak.bytes, []), peak, [], NotReserved("launch"), repo, step, available, profile)
+        pressure = read_pressure()
+        return CheckResult(decide(available, total, peak.bytes, [], pressure=pressure), peak, [], NotReserved("launch"), repo, step, available, profile)
     directory = admission_dir(root)
     with (directory / "lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        live = live_reservations(directory)
-        running = [RunningMemory(row["need"], cgroup_anon(row["sidecar"]), _epoch(row["admitted_at"]))
-                   for _, row in live if building(row, now)]
+        proc = Path(os.environ.get("BUILDLOG_PROC", "/proc"))
+        processes = process_table(proc)
+        live: list[tuple[Path, Reservation]] = []
+        running: list[StepMemory] = []
+        for path, row in live_reservations(directory):
+            memory = step_memory(row, now, processes, proc)
+            if isinstance(memory, GoneMemory):
+                path.unlink(missing_ok=True)
+                path.with_suffix(".max").unlink(missing_ok=True)
+                continue
+            live.append((path, row))
+            running.append(memory)
         start = process_start_time(pid)
         mine = directory / f"{pid}-{start}.waiting"
-        waiters = [row for path, row in live_waiters(directory) if path != mine]
-        heads = sorted((row for row in waiters if now.timestamp() - row["since"] >= HEAD_SECONDS),
-                       key=lambda row: row["since"])
+        waiting = live_waiters(directory)
+        previous = next((row for path, row in waiting if path == mine), None)
+        waiters = [row for path, row in waiting if path != mine]
+        heads = sorted((row for row in waiters
+                        if row.get("bump_order", 0) < 0 or now.timestamp() - row["since"] >= HEAD_SECONDS),
+                       key=waiter_order)
         waited_from = since or now.timestamp()
-        head_need = heads[0]["need"] if heads and heads[0]["since"] < waited_from else 0
+        if previous is not None:
+            waited_from = min(waited_from, previous["since"])
+        own_order = (previous.get("bump_order", 0) if previous is not None else 0, waited_from, pid)
         available, total = read_meminfo(meminfo)
-        decision = decide(available, total, peak.bytes, running, head_need)
+        pressure = read_pressure()
+        head_need, head_label = 0, ""
+        if heads and waiter_order(heads[0]) < own_order:
+            head = heads[0]
+            if _head_holds_later(available, total, head["need"], running):
+                head_need, head_label = head["need"], waiter_label(head)
+        decision = decide(available, total, peak.bytes, running, head_need, pressure)
+        if head_need and heads[0].get("bump_order", 0) < 0:
+            decision = replace(decision, state="hold")
         reservation: Reserved | NotReserved = NotReserved("held" if argv else "launch")
         if argv and decision.state == "hold" and start is not None:
-            waiter: Waiter = {"pid": pid, "start_time": start, "need": peak.bytes, "since": waited_from}
+            waiter: Waiter = {"pid": pid, "start_time": start, "need": peak.bytes, "since": waited_from,
+                              "label": f"{worktree or repo} {step} ({os.environ.get('BUILDLOG_CALLER') or 'caller'} pid {pid})"}
+            if previous is not None and "bump_order" in previous:
+                waiter["bump_order"] = previous["bump_order"]
+            identity = waiter_identity(repo, step, worktree)
+            waiter["session_id"], waiter["session_name"] = identity["session_id"], identity["session_name"]
+            waiter["step"], waiter["folder"] = identity["step"], identity["folder"]
             _ = mine.write_text(json.dumps(waiter, separators=(",", ":")))
         if argv and decision.state == "admit":
             mine.unlink(missing_ok=True)
@@ -384,7 +613,181 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                 reservation = Reserved(path)
             else:
                 reservation = NotReserved("untracked")
-        return CheckResult(decision, peak, [row for _, row in live], reservation, repo, step, available, profile)
+        return CheckResult(decision, peak, [row for _, row in live], reservation, repo, step, available, profile, head_need, head_label)
+
+
+def waiter_identity(repo: str, step: str, worktree: str) -> WaiterIdentity:
+    session = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    return {"session_id": session, "session_name": os.environ.get("CLAUDE_SESSION_NAME", ""),
+            "step": f"{repo} {step}".strip(), "folder": os.getcwd() if worktree else ""}
+
+
+class WaiterIdentity(TypedDict):
+    session_id: str
+    session_name: str
+    step: str
+    folder: str
+
+
+class QueueIdentityReader:
+    def __init__(self, processes: dict[int, ProcessIdentity], proc: Path = PROC) -> None:
+        self.processes: dict[int, ProcessIdentity] = processes
+        self.proc: Path = proc
+        self.environments: dict[int, dict[str, str]] = {}
+        self.names: dict[str, str] = {}
+        directory = Path(os.environ.get("NOTIFIER_SESSIONS_DIR", str(Path.home() / ".claude/sessions")))
+        for path in directory.glob("*.json"):
+            try:
+                row = cast(dict[str, object], json.loads(path.read_text()))
+                session, name = row.get("sessionId"), row.get("name")
+                if isinstance(session, str) and isinstance(name, str):
+                    self.names[session] = name
+            except (OSError, ValueError, TypeError, AttributeError):
+                continue
+
+    def identity(self, pid: int, row: dict[str, object]) -> WaiterIdentity:
+        session = str(row.get("session_id", ""))
+        name = str(row.get("session_name", ""))
+        folder = str(row.get("folder") or row.get("worktree") or "")
+        step = str(row.get("step", ""))
+        try:
+            folder = str((self.proc / str(pid) / "cwd").readlink())
+        except OSError:
+            pass
+        current, seen = pid, set[int]()
+        while not session and current in self.processes and current not in seen:
+            seen.add(current)
+            if current not in self.environments:
+                try:
+                    raw = (self.proc / str(current) / "environ").read_bytes().decode(errors="replace")
+                    self.environments[current] = dict(part.split("=", 1) for part in raw.split("\0") if "=" in part)
+                except OSError:
+                    self.environments[current] = {}
+            env = self.environments[current]
+            session = env.get("CODEX_THREAD_ID") or env.get("CLAUDE_CODE_SESSION_ID", "")
+            name = name or env.get("CLAUDE_SESSION_NAME", "")
+            current = self.processes[current].parent
+        if not step:
+            try:
+                argv = (self.proc / str(pid) / "cmdline").read_bytes().decode(errors="replace").split("\0")
+                verb = next((item for item in argv if item in ("test", "lint", "check", "build", "doc", "clippy")), "build")
+                step = verb
+            except OSError:
+                step = "build"
+        return {"session_id": session, "session_name": name or self.names.get(session, ""), "step": step, "folder": folder}
+
+
+def queue_rows(directory: Path, suffix: str, processes: dict[int, ProcessIdentity]) -> list[tuple[Path, dict[str, object]]]:
+    rows: list[tuple[Path, dict[str, object]]] = []
+    for path in directory.glob(f"*.{suffix}"):
+        try:
+            row = cast(dict[str, object], json.loads(path.read_text()))
+            pid = row["pid"]
+            identity = processes.get(pid) if isinstance(pid, int) else None
+            if identity is not None and identity.start == row["start_time"]:
+                rows.append((path, row))
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return rows
+
+
+def read_queue(directory: Path, processes: dict[int, ProcessIdentity], now: float) -> tuple[QueueView, list[tuple[Path, Waiter]]]:
+    proc = Path(os.environ.get("BUILDLOG_PROC", "/proc"))
+    identities = QueueIdentityReader(processes, proc)
+    running: list[RunningStep] = []
+    memory: list[StepMemory] = []
+    for _, row in queue_rows(directory, "reservation", processes):
+        reservation = cast(Reservation, cast(object, row))
+        pid = reservation["pid"]
+        reading = step_memory(reservation, datetime.fromtimestamp(now, UTC), processes, proc)
+        if isinstance(reading, GoneMemory):
+            continue
+        identity = identities.identity(pid, row)
+        running.append(RunningStep(identity["session_id"], identity["session_name"], identity["step"],
+                                   identity["folder"], reservation["need"], reading))
+        memory.append(reading)
+    available, total = 0, 0
+    unavailable = False
+    try:
+        available, total = read_meminfo(Path(os.environ.get("BUILDLOG_MEMINFO", "/proc/meminfo")))
+    except (OSError, ValueError):
+        unavailable = True
+    pressure = read_pressure()
+    ordered = sorted(((path, cast(Waiter, cast(object, row))) for path, row in queue_rows(directory, "waiting", processes)),
+                     key=lambda item: waiter_order(item[1]))
+    head = next((row for _, row in ordered if row.get("bump_order", 0) < 0 or now - row["since"] >= HEAD_SECONDS), None)
+    pending = sum(growth_headroom(item) for item in memory)
+    waiting: list[WaitingStep] = []
+    for _, row in ordered:
+        identity = identities.identity(row["pid"], cast(dict[str, object], cast(object, row)))
+        own = decide(available, total, row["need"], memory, pressure=pressure)
+        reason: WaitReason = ReadyForAdmission()
+        if unavailable:
+            reason = ReadingUnavailable()
+        elif isinstance(own.pressure, MemoryPressure):
+            reason = own.pressure
+        elif own.state == "hold":
+            reason = (NeedsMemory(row["need"], available) if available < own.threshold
+                      else NeedsBuildBudget(row["need"], own.charged, own.budget))
+        elif head is not None and waiter_order(head) < waiter_order(row) and _head_holds_later(available, total, head["need"], memory):
+            if head.get("bump_order", 0) < 0 or decide(available, total, row["need"], memory, head["need"]).state == "hold":
+                head_identity = identities.identity(head["pid"], cast(dict[str, object], cast(object, head)))
+                reason = BehindHead(head_identity["session_name"] or Path(head_identity["folder"]).name or str(head["pid"]), head["since"])
+        waiting.append(WaitingStep(row["pid"], identity["session_id"], identity["session_name"], identity["step"],
+                                   identity["folder"], row["since"], row["need"], reason))
+    return QueueView(tuple(waiting), tuple(running), available, pending, total * 5 // 100 if total else 0, now), ordered
+
+
+def _queue_lock_timeout(_signum: int, _frame: object) -> NoReturn:
+    raise TimeoutError(f"admission lock busy for {QUEUE_LOCK_TIMEOUT_SECONDS:g} s; try again")
+
+
+def queue_view() -> QueueView:
+    directory = store.root() / "admission"
+    try:
+        lock = (directory / "lock").open("r")
+    except FileNotFoundError:
+        return read_queue(directory, process_table(Path(os.environ.get("BUILDLOG_PROC", "/proc"))), time.time())[0]
+    with lock:
+        previous = signal.signal(signal.SIGALRM, _queue_lock_timeout)
+        try:
+            _ = signal.setitimer(signal.ITIMER_REAL, QUEUE_LOCK_TIMEOUT_SECONDS)
+            fcntl.flock(lock, fcntl.LOCK_SH)
+        finally:
+            _ = signal.setitimer(signal.ITIMER_REAL, 0)
+            _ = signal.signal(signal.SIGALRM, previous)
+        return read_queue(directory, process_table(Path(os.environ.get("BUILDLOG_PROC", "/proc"))), time.time())[0]
+
+
+def bump_waiter(selector: str, actor: str) -> WaitingStep:
+    directory = admission_dir(store.root())
+    with (directory / "lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        view, ordered = read_queue(directory, process_table(Path(os.environ.get("BUILDLOG_PROC", "/proc"))), time.time())
+        matches: list[int] = []
+        if selector.isdecimal():
+            position = int(selector) - 1
+            if 0 <= position < len(view.waiting):
+                matches = [position]
+        else:
+            matches = [position for position, item in enumerate(view.waiting)
+                       if selector in (item.session_id, item.session_name, item.folder, Path(item.folder).name)]
+        if len(matches) != 1:
+            labels = ", ".join(f"{position + 1}: {item.session_name or item.session_id or item.pid} {item.folder}"
+                               for position, item in enumerate(view.waiting) if not matches or position in matches)
+            raise ValueError(f"{selector!r}: {'unknown' if not matches else 'ambiguous'} waiter; matches: {labels or 'none'}")
+        position = matches[0]
+        moved = view.waiting[position]
+        path, row = ordered[position]
+        # Each move gets an order before all current waiters. Keep the wait time.
+        row["bump_order"] = min(0, *(item.get("bump_order", 0) for _, item in ordered)) - 1
+        temporary = path.with_suffix(".bump")
+        _ = temporary.write_text(json.dumps(row, separators=(",", ":")))
+        os.replace(temporary, path)
+        record.queue_bump(actor, moved.session_id or moved.session_name, moved.step, moved.folder, position + 1, view.now)
+        reason = moved.reason if isinstance(moved.reason, (NeedsBuildBudget, NeedsMemory, ReadingUnavailable, MemoryPressure)) else ReadyForAdmission()
+        return WaitingStep(moved.pid, moved.session_id, moved.session_name, moved.step, moved.folder,
+                           row["since"], moved.need, reason)
 
 
 def release(path: Path, status: int, root: Path | None = None) -> None:
@@ -454,12 +857,22 @@ def main() -> None:
     result = check(Path(meminfo), int(pid), sidecar, argv, float(since or 0), profile=profile)
     decision, peak, live = result.decision, result.peak, result.live
     summary = ", ".join(f"{row['repo']} {row['step']} in {row['worktree']}" for row in live)
+    if isinstance(decision.pressure, MemoryPressure):
+        summary = f"{pressure_text(decision.pressure)}; {summary}".rstrip("; ")
     reservation = result.reservation
     path = str(reservation.path) if isinstance(reservation, Reserved) else ""
     reason = "reserved" if isinstance(reservation, Reserved) else reservation.reason
     fields: list[str | int] = [decision.state, decision.threshold, peak.bytes, peak.source, peak.count,
                                decision.promised, len(live), decision.reserve, summary, path, result.repo, result.step,
                                result.available, reason, result.profile.worktree]
+    # Running shells may still read the old field count.
+    if os.environ.get("BUILDLOG_MEM_DETAIL") == "1":
+        fields.extend([decision.measured, result.head_need, result.head_label])
+    else:
+        details = f"{decision.measured / GIB:.1f} GiB measured"
+        if result.head_need:
+            details += f"; head {result.head_label} needs {result.head_need / GIB:.1f} GiB"
+        fields[8] = f"{summary}; {details}" if summary else details
     print("|".join(clean_field(str(field)) for field in fields))
 
 
