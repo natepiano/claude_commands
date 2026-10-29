@@ -3678,7 +3678,7 @@ class StylePlanTests(unittest.TestCase):
         left = split.ready + split.changed + split.structure + split.other
         output = style_units.table([live_units.LiveUnit("names-unit", None)], {}, now=datetime(2026, 10, 28, 12, tzinfo=UTC),
                                    zone=UTC, ledger_paths={"names-unit": ledger.database})
-        self.assertIn(f"| 1 (0 in 24 h) | {left} |", output)
+        self.assertIn(f"| 1 (0) | {left} approved of 14 filed |", output)
 
     def test_a_merged_ticket_keeps_its_filed_type_finding_in_other_until_a_person_marks_it_built(self) -> None:
         rule = self.rule("split-merged-type")
@@ -3733,7 +3733,7 @@ class StylePlanTests(unittest.TestCase):
             table = style_units.table([live_units.LiveUnit("names-unit", None)], {},
                                       ledger_paths={"names-unit": ledger.database})
         self.assertEqual(result, style_ledger.RecordedSplit(1, 0, 0, 1, measured_at))
-        self.assertIn("| 0 (0 in 24 h) | 2 |", table)
+        self.assertIn("| 0 (0) | 2 |", table)
         self.assertEqual(result.ready + result.changed + result.structure + result.other, 2)
 
     def test_refill_and_split_readers_agree_on_rank_waits_and_changed_judgments(self) -> None:
@@ -3819,7 +3819,7 @@ class StylePlanTests(unittest.TestCase):
         self.assertEqual((self.plan.read_bytes(), issue.read_bytes()), (before_plan, before_issue))
         rendered = style_units.table([live_units.LiveUnit("names-unit", None)], {}, now=measured_at, zone=UTC,
                                      ledger_paths={"names-unit": ledger.database})
-        self.assertIn("| gone | idle | — | 0 (0 in 24 h) | 1: ready 1 · changed 0 · structure 0 · other 0 (0 min) |", rendered)
+        self.assertIn("| gone | idle | idle | — | 0 (0) | 1: ready 1 · changed 0 · structure 0 · other 0 (0 min) |", rendered)
 
     def test_a_scan_error_or_time_limit_keeps_the_last_split_and_reports_the_cause(self) -> None:
         _ = self.rule("failed-split")
@@ -3856,23 +3856,39 @@ class StylePlanTests(unittest.TestCase):
         output, errors = io.StringIO(), io.StringIO()
 
         limit_seconds = 0.25
+        deadline = style_plan.SplitDeadline(limit_seconds, limit_seconds / 60)
+        write_durations: list[float] = []
+        record_split = style_ledger.record_split
+
+        def timed_write(repo: Path, unit: str, split: style_ledger.RecordedSplit, *, busy_timeout_seconds: float) -> None:
+            began = time.monotonic()
+            try:
+                record_split(repo, unit, split, busy_timeout_seconds=busy_timeout_seconds)
+            finally:
+                write_durations.append(time.monotonic() - began)
+
+        # Scan setup cannot spend the write budget. Without SIGALRM, SQLite itself
+        # must bound the real lock wait using the remaining deadline passed by split.
         with (closing(sqlite3.connect(ledger.database)) as writer,
+              mock.patch.object(style_plan, "split_time_limit", return_value=nullcontext(deadline)),
+              mock.patch.object(style_plan, "time", wraps=time, monotonic=mock.Mock(return_value=0.0)),
               mock.patch.object(style_plan, "style_document", return_value=self.doc),
               mock.patch.object(style_plan, "busy_files", return_value=style_plan.BusyFiles(self.board(), frozenset())),
               mock.patch.object(style_plan, "classify_split", return_value=style_ledger.RecordedSplit(
                   1, 2, 3, 4, "2026-10-28T12:00:00+00:00")),
-              mock.patch.object(style_ledger, "record_split", wraps=style_ledger.record_split) as record,
+              mock.patch.object(style_ledger, "record_split", side_effect=timed_write) as record,
               redirect_stdout(output), redirect_stderr(errors)):
             _ = writer.execute("BEGIN IMMEDIATE")
-            began = time.monotonic()
             code = style_plan.main(["split", "--unit", "names-unit", "--repo", str(self.unit),
                                     "--timeout-minutes", str(limit_seconds / 60)])
-            elapsed = time.monotonic() - began
             writer.rollback()
         self.assertEqual((code, output.getvalue()), (1, ""))
         self.assertRegex(errors.getvalue(), r"^split names-unit: (time limit.*|database is locked)\n$")
-        self.assertLess(elapsed, limit_seconds + 1)
         record.assert_called_once()
+        self.assertEqual(record.call_args.kwargs["busy_timeout_seconds"], limit_seconds)
+        elapsed, = write_durations
+        self.assertGreaterEqual(elapsed, limit_seconds * 0.9)
+        self.assertLess(elapsed, limit_seconds + 1)
         with closing(sqlite3.connect(ledger.database)) as connection:
             self.assertEqual(tuple(connection.iterdump()), before)
 

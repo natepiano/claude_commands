@@ -75,7 +75,7 @@ class StyleUnitsTests(unittest.TestCase):
 
     def decision(self, name: str, unit: str, answer: str = "approved") -> Path:
         path = self.root / (name + ".md")
-        fields = {"approved": f"unit: {unit}\nplan: approved\n", "unanswered": "",
+        fields = {"approved": f"unit: {unit}\nplan: approved\n", "unanswered": f"unit: {unit}\n",
                   "declined": f"unit: {unit}\nplan: approved\nstyle_answer: declined\n"}
         _ = path.write_text("---\nstatus: open\n" + fields[answer] + "---\n", encoding="utf-8")
         return path
@@ -109,7 +109,6 @@ class StyleUnitsTests(unittest.TestCase):
                     _ = self.ticket(kind=kind, count=count)
                     expected = f"#42 · comments-name-code-constructs · cargo-liner · {count} {noun}{'' if count == 1 else 's'}"
                     self.assertIn(f"| names | {expected} |", self.render())
-        self.assertTrue(self.render().startswith("| Unit | Ticket | Step | Built | Left |\n"))
 
     def test_ticket_count_comes_from_the_payload_for_its_kind(self) -> None:
         for kind, noun, expected in (("proposal", "findings", 3), ("listed", "sites", 2), ("read", "file", 1),
@@ -139,53 +138,115 @@ class StyleUnitsTests(unittest.TestCase):
         _ = self.ticket(number="6", created_at="2026-10-28")
         _ = self.ticket(number="5", state="checkpointed", created_at="2026-10-27")
         self.assertIn("| names | #5 ·", self.render())
-        self.assertIn("| checkpoint sent |", self.render())
+        self.assertIn("| waiting for the showrunner to merge |", self.render())
 
-    def test_idle_with_and_without_a_refill_record_uses_the_production_zone(self) -> None:
-        self.assertIn("| names | idle | — | 0 (0 in 24 h) | 0 |", self.render())
+    def render_open_step(self, kind: str, text: str = "", *, eta: str = "") -> str:
+        run = self.root / "open.jsonl"
+        events = [{"event_type": "phase_started"},
+                  {"event_type": "pass_started", "pass_instance_id": "p", "pass_kind": kind,
+                   "pass_activity": text}]
+        _ = run.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+        record: dict[str, object] = {"plan": str(self.root / "plan.md"), "current": {"eta": {"time": eta}}}
+        with patch.object(plan_history, "plan_runs", return_value=[run]):
+            return self.render(records={"names-unit": record})
+
+    def test_headers_name_the_eta_and_finding_counts(self) -> None:
+        self.assertEqual(self.render().splitlines()[:2], [
+            "| Unit | Ticket | Step | ETA | Findings built (24 h) | Findings left |",
+            "| --- | --- | --- | --- | --- | --- |",
+        ])
+
+    def test_idle_step_names_the_refill_outcome_and_ticket_keeps_its_time(self) -> None:
+        self.assertIn("| names | idle | idle | — | 0 (0) | 0 |", self.render())
         self.refill()
-        self.assertIn("| names | idle — waiting for structure: cargo-liner (09:45) |", self.render())
+        self.assertIn("| names | idle — waiting for structure: cargo-liner (09:45) | "
+                      + "idle — waiting for structure: cargo-liner | — |", self.render())
 
-    def test_step_is_the_label_of_the_newest_open_step_with_eta_in_the_production_zone(self) -> None:
+    def test_writing_step_uses_the_ticket_count_and_noun(self) -> None:
+        for kind, noun in (("proposal", "finding"), ("listed", "site"), ("read", "file"), ("structure", "file")):
+            for count in (1, 17):
+                with self.subTest(kind=kind, count=count):
+                    with closing(sqlite3.connect(self.database)) as connection, connection:
+                        _ = connection.execute("DELETE FROM tickets")
+                    _ = self.ticket(kind=kind, count=count)
+                    self.assertIn(f"| writing {count} {noun}{'' if count == 1 else 's'} | — |",
+                                  self.render_open_step("impl"))
+
+    def test_writing_step_without_a_ticket_says_writing(self) -> None:
+        self.assertIn("| idle | writing | — |", self.render_open_step("impl", "impl"))
+
+    def test_assigned_ticket_without_an_open_step_starts_its_count_and_noun(self) -> None:
+        for kind, noun in (("proposal", "findings"), ("listed", "sites"), ("read", "files")):
+            with self.subTest(kind=kind):
+                with closing(sqlite3.connect(self.database)) as connection, connection:
+                    _ = connection.execute("DELETE FROM tickets")
+                _ = self.ticket(kind=kind, count=17)
+                self.assertIn(f"| starting 17 {noun} | — |", self.render())
+
+    def test_testing_step_says_testing(self) -> None:
+        self.assertIn("| testing | — |", self.render_open_step("test"))
+
+    def test_reviewing_step_says_reviewing(self) -> None:
+        self.assertIn("| reviewing | — |", self.render_open_step("review"))
+
+    def test_fixing_step_says_fixing_review_findings(self) -> None:
+        self.assertIn("| fixing review findings | — |", self.render_open_step("fix"))
+
+    def test_specific_step_activity_names_the_host_or_action(self) -> None:
+        for kind, activity in (("test", "testing on the Mac"), ("fix", "repairing a merge conflict")):
+            with self.subTest(kind=kind):
+                self.assertIn(f"| {activity} | — |", self.render_open_step(kind, activity))
+
+    def test_step_uses_the_newest_open_activity_then_returns_to_the_open_pass(self) -> None:
         old = self.root / "old.jsonl"
         newest = self.root / "new.jsonl"
         _ = old.write_text(json.dumps({"event_type": "activity_started", "activity_label": "Old"}) + "\n")
         events: list[dict[str, str]] = [
             {"event_type": "phase_started"},
-            {"event_type": "pass_started", "pass_instance_id": "p", "pass_kind": "impl", "pass_activity": "long text"},
+            {"event_type": "pass_started", "pass_instance_id": "p", "pass_kind": "impl"},
             {"event_type": "activity_started", "activity_instance_id": "a", "activity_label": "Verification",
-             "activity_text": "a long command that does not belong in the step"},
+             "activity_text": "checking the table on the Mac"},
         ]
         _ = newest.write_text("\n".join(json.dumps(event) for event in events) + "\n")
-        record: dict[str, object] = {"plan": str(self.root / "plan.md"),
-                                     "current": {"eta": {"time": "2026-10-28T16:15:00+02:00"}}}
+        record: dict[str, object] = {"plan": str(self.root / "plan.md")}
         with patch.object(plan_history, "plan_runs", return_value=[old, newest]):
-            output = self.render(records={"names-unit": record})
-            self.assertIn("| Verification · ETA 10:15 |", output)
-            self.assertNotIn("long command", output)
+            self.assertIn("| checking the table on the Mac | — |", self.render(records={"names-unit": record}))
             events.append({"event_type": "activity_finished", "activity_instance_id": "a"})
             _ = newest.write_text("\n".join(json.dumps(event) for event in events) + "\n")
-            self.assertIn("| impl · ETA 10:15 |", self.render(records={"names-unit": record}))
+            self.assertIn("| writing | — |", self.render(records={"names-unit": record}))
 
-    def test_closed_steps_show_checkpoint_sent_or_a_dash(self) -> None:
+    def test_checkpointed_ticket_without_an_open_step_waits_for_the_showrunner_to_merge(self) -> None:
+        _ = self.ticket(state="checkpointed")
         run = self.root / "closed.jsonl"
-        _ = run.write_text('\n'.join((json.dumps({"event_type": "phase_started"}),
-                                      json.dumps({"event_type": "pass_started", "pass_instance_id": "p", "pass_kind": "impl"}),
-                                      json.dumps({"event_type": "phase_finished"}))) + '\n')
+        events = [{"event_type": "phase_started"},
+                  {"event_type": "pass_started", "pass_instance_id": "p", "pass_kind": "impl"},
+                  {"event_type": "phase_finished"}]
+        _ = run.write_text("\n".join(json.dumps(event) for event in events) + "\n")
         record: dict[str, object] = {"plan": str(self.root / "plan.md"), "current": None}
-        with patch.object(plan_history, "plan_runs", return_value=[run]):
-            self.assertEqual(style_units.step_cell(record, True, ZONE), "checkpoint sent")
-            self.assertEqual(style_units.step_cell(record, False, ZONE), "—")
-        with patch.object(plan_history, "plan_runs", return_value=[]):
-            self.assertEqual(style_units.step_cell(record, True, ZONE), "checkpoint sent")
-            self.assertEqual(style_units.step_cell(record, False, ZONE), "—")
+        for runs in ([run], []):
+            with self.subTest(runs=runs), patch.object(plan_history, "plan_runs", return_value=runs):
+                self.assertIn("| waiting for the showrunner to merge | — |",
+                              self.render(records={"names-unit": record}))
 
-    def test_no_open_step_or_checkpoint_shows_the_current_eta_alone(self) -> None:
+    def test_checkpointed_ticket_with_an_open_step_describes_the_activity(self) -> None:
+        _ = self.ticket(state="checkpointed")
+        self.assertIn("| testing on the Mac | — |", self.render_open_step("test", "testing on the Mac"))
+
+    def test_eta_has_its_own_column_in_the_production_zone(self) -> None:
+        output = self.render_open_step("test", eta="2026-10-28T16:15:00+02:00")
+        self.assertIn("| testing | 10:15 | 0 (0) |", output)
+        self.assertNotIn(" · ETA", output)
+
+    def test_eta_column_shows_a_dash_without_a_valid_recorded_eta(self) -> None:
+        for eta in ("", "invalid", "2026-10-28T16:15:00"):
+            with self.subTest(eta=eta):
+                self.assertIn("| testing | — | 0 (0) |", self.render_open_step("test", eta=eta))
+
+    def test_eta_without_an_open_step_keeps_the_idle_step_and_its_own_column(self) -> None:
         record: dict[str, object] = {"plan": str(self.root / "plan.md"),
                                      "current": {"eta": {"time": "2026-10-28T16:15:00+02:00"}}}
         with patch.object(plan_history, "plan_runs", return_value=[]):
-            self.assertEqual(style_units.step_cell(record, False, ZONE), "ETA 10:15")
-            self.assertIn("| idle | ETA 10:15 |", self.render(records={"names-unit": record}))
+            self.assertIn("| idle | idle | 10:15 |", self.render(records={"names-unit": record}))
 
     def test_built_counts_use_the_decision_family_and_built_at_instead_of_updated_at(self) -> None:
         decision = self.decision("names", "project-style-names-unit")
@@ -194,10 +255,10 @@ class StyleUnitsTests(unittest.TestCase):
         self.findings(decision, "built", built_at="2026-10-27T11:59:59+00:00")
         self.findings(decision, "built")
         self.findings(self.decision("types", "types-unit"), "built", built_at="2026-10-28T11:00:00+00:00")
-        self.assertIn("| 4 (2 in 24 h) |", self.render())
-        self.assertIn("All families: 5 built", self.render())
+        self.assertIn("| 4 (2) |", self.render())
+        self.assertIn("All families: 5 findings built", self.render())
 
-    def test_left_shows_the_approved_total_and_recorded_counts_with_their_age(self) -> None:
+    def test_left_names_approved_and_all_filed_counts_before_the_split_and_age(self) -> None:
         approved = self.decision("approved", "names-unit")
         self.findings(approved, "filed", 1300)
         for state in ("unfiled", "waived", "withdrawn"):
@@ -208,10 +269,17 @@ class StyleUnitsTests(unittest.TestCase):
         self.findings(self.root / "missing.md", "filed", 13)
         self.refill()
         output = self.render()
-        self.assertIn("| 1,300: ready 1,234 · changed 20 · structure 30 · other 16 (30 min) |", output)
-        self.assertIn("All families: 0 built · 1,311 left", output)
+        self.assertIn("| 1,300 approved of 1,316 filed: ready 1,234 · changed 20 · structure 30 · other 16 (30 min) |", output)
+        self.assertEqual(output.splitlines()[-1],
+                         "All families: 0 findings built · 1,311 approved findings left of 1,340 filed · "
+                         + "0 built in the last 24 h · no ETA: nothing built in 24 h")
 
-    def test_left_with_default_reserved_columns_uses_only_the_approved_total(self) -> None:
+    def test_left_without_a_split_names_approved_and_all_filed_counts(self) -> None:
+        self.findings(self.decision("approved", "names-unit"), "filed", 40)
+        self.findings(self.decision("unanswered", "names-unit", "unanswered"), "filed", 15)
+        self.assertIn("| 40 approved of 55 filed |", self.render())
+
+    def test_left_with_equal_approved_and_filed_counts_shows_only_the_count(self) -> None:
         self.findings(self.decision("approved", "names-unit"), "filed", 1234)
         self.refill(split_at="")
         self.assertIn("| 1,234 |", self.render())
@@ -225,14 +293,14 @@ class StyleUnitsTests(unittest.TestCase):
                                  ("2026-10-25T11:59:00+00:00", "3 d")):
             with self.subTest(measured_at=measured_at):
                 split = style_ledger.RecordedSplit(1000, 2000, 3000, 4000, measured_at)
-                self.assertEqual(style_units.left_cell(10000, split, NOW),
+                self.assertEqual(style_units.left_cell(10000, 10000, split, NOW),
                                  f"10,000: ready 1,000 · changed 2,000 · structure 3,000 · other 4,000 ({age})")
 
     def test_a_first_zero_split_is_recorded_and_still_shows_idle_without_a_refill(self) -> None:
         with closing(sqlite3.connect(self.database)) as connection, connection:
             _ = connection.execute("INSERT INTO refill_results(unit,at,outcome,split_at) VALUES (?,'','',?)",
                                    ("names-unit", "2026-10-28T10:00:00+00:00"))
-        self.assertIn("| names | idle | — | 0 (0 in 24 h) | "
+        self.assertIn("| names | idle | idle | — | 0 (0) | "
                       + "0: ready 0 · changed 0 · structure 0 · other 0 (2 h) |", self.render())
 
     def test_a_built_finding_without_a_decision_uses_its_build_ticket_family(self) -> None:
@@ -240,7 +308,7 @@ class StyleUnitsTests(unittest.TestCase):
         self.findings(self.root / "missing.md", "built", 5, ticket=ticket, built_at="2026-10-28T11:00:00+00:00")
         self.findings(self.root / "missing.md", "filed", 7, ticket=ticket)
         self.findings(self.root / "missing.md", "built", 3, ticket="missing-ticket")
-        self.assertIn("| 5 (5 in 24 h) | 0 |", self.render())
+        self.assertIn("| 5 (5) | 0 |", self.render())
 
     def test_total_with_a_rate_counts_all_families_once_and_uses_thousands_commas(self) -> None:
         names = self.decision("names", "names-unit")
@@ -252,9 +320,41 @@ class StyleUnitsTests(unittest.TestCase):
         self.findings(types, "filed", 1300)
         units = [live_unit("names-unit", "names"), live_unit("types-unit", "types")]
         output = self.render(units)
-        self.assertEqual(output.splitlines()[-1], "All families: 1,334 built · 3,900 left · 1,300 built in the last 24 h · "
+        self.assertEqual(output.splitlines()[-1], "All families: 1,334 findings built · 3,900 approved findings left · 1,300 built in the last 24 h · "
                          + "ETA at that rate 2026-10-31")
-        self.assertIn("| 1,234 (1,200 in 24 h) | 2,600 |", output)
+        self.assertIn("| 1,234 (1,200) | 2,600 |", output)
+
+    def test_total_names_all_filed_findings_and_uses_only_approved_findings_for_eta(self) -> None:
+        names = self.decision("names", "names-unit")
+        self.findings(names, "built", 10, built_at="2026-10-28T11:00:00+00:00")
+        self.findings(names, "filed", 20)
+        self.findings(self.decision("unanswered", "names-unit", "unanswered"), "filed", 30)
+        self.assertEqual(self.render().splitlines()[-1],
+                         "All families: 10 findings built · 20 approved findings left of 50 filed · "
+                         + "10 built in the last 24 h · ETA at that rate 2026-10-30")
+
+    def test_total_counts_unanswered_findings_without_a_unit_once_for_a_shared_ledger(self) -> None:
+        self.findings(self.decision("approved", "names-unit"), "filed")
+        unanswered = self.root / "unanswered.md"
+        _ = unanswered.write_text("---\nstatus: open\n---\n", encoding="utf-8")
+        self.findings(unanswered, "filed")
+        output = self.render([live_unit("names-unit", "names"), live_unit("types-unit", "types")])
+        self.assertIn("| names | idle | idle | — | 0 (0) | 1 |", output)
+        self.assertIn("| types | idle | idle | — | 0 (0) | 0 |", output)
+        self.assertEqual(output.splitlines()[-1],
+                         "All families: 0 findings built · 1 approved findings left of 2 filed · "
+                         + "0 built in the last 24 h · no ETA: nothing built in 24 h")
+
+    def test_total_counts_filed_findings_with_missing_or_unreadable_decisions(self) -> None:
+        self.findings(self.root / "missing.md", "filed")
+        unreadable = self.root / "unreadable.md"
+        _ = unreadable.write_bytes(b"\xff")
+        self.findings(unreadable, "filed")
+        output = self.render()
+        self.assertIn("| names | idle | idle | — | 0 (0) | 0 |", output)
+        self.assertEqual(output.splitlines()[-1],
+                         "All families: 0 findings built · 0 approved findings left of 2 filed · "
+                         + "0 built in the last 24 h · no ETA: nothing built in 24 h")
 
     def test_schema_24_uses_merged_ticket_or_finding_time_without_writing(self) -> None:
         decision = self.decision("names", "names-unit")
@@ -278,8 +378,8 @@ class StyleUnitsTests(unittest.TestCase):
         with patch.object(style_ledger, "Ledger", side_effect=AssertionError("no migration")):
             output = self.render()
         self.assertEqual(output.splitlines()[-1],
-                         "All families: 11 built · 16 left · 8 built in the last 24 h · ETA at that rate 2026-10-30")
-        self.assertIn("| 11 (8 in 24 h) | 16 |", output)
+                         "All families: 11 findings built · 16 approved findings left · 8 built in the last 24 h · ETA at that rate 2026-10-30")
+        self.assertIn("| 11 (8) | 16 |", output)
         self.assertEqual(self.database.read_bytes(), before)
 
     def test_legacy_ledgers_without_ticket_metadata_use_finding_time_read_only(self) -> None:
@@ -302,9 +402,9 @@ class StyleUnitsTests(unittest.TestCase):
                 before = database.read_bytes()
                 output = style_units.table([live_unit("names-unit")], {}, now=NOW, zone=ZONE,
                                            ledger_paths={"names-unit": database})
-                self.assertIn("| 3 (2 in 24 h) | 4 |", output)
+                self.assertIn("| 3 (2) | 4 |", output)
                 self.assertEqual(output.splitlines()[-1],
-                                 "All families: 3 built · 4 left · 2 built in the last 24 h · ETA at that rate 2026-10-30")
+                                 "All families: 3 findings built · 4 approved findings left · 2 built in the last 24 h · ETA at that rate 2026-10-30")
                 self.assertEqual(database.read_bytes(), before)
 
     def test_schema_25_uses_built_at_even_when_updated_at_disagrees(self) -> None:
@@ -315,7 +415,7 @@ class StyleUnitsTests(unittest.TestCase):
         self.findings(decision, "filed", 4)
         before = self.database.read_bytes()
         self.assertEqual(self.render().splitlines()[-1],
-                         "All families: 5 built · 4 left · 2 built in the last 24 h · ETA at that rate 2026-10-30")
+                         "All families: 5 findings built · 4 approved findings left · 2 built in the last 24 h · ETA at that rate 2026-10-30")
         self.assertEqual(self.database.read_bytes(), before)
 
     def test_total_without_a_recent_build_has_no_eta(self) -> None:
@@ -323,7 +423,7 @@ class StyleUnitsTests(unittest.TestCase):
         self.findings(decision, "built", 1234, built_at="2026-10-01T12:00:00+00:00")
         self.findings(decision, "filed", 2345)
         self.assertEqual(self.render().splitlines()[-1],
-                         "All families: 1,234 built · 2,345 left · 0 built in the last 24 h · no ETA: nothing built in 24 h")
+                         "All families: 1,234 findings built · 2,345 approved findings left · 0 built in the last 24 h · no ETA: nothing built in 24 h")
 
     def test_each_decision_is_read_once_across_groups_and_shared_database_units(self) -> None:
         decision = self.decision("names", "names-unit")
@@ -346,12 +446,12 @@ class StyleUnitsTests(unittest.TestCase):
                 before = database.read_bytes()
                 output = style_units.table([live_unit("names-unit")], {}, now=NOW, zone=ZONE,
                                            ledger_paths={"names-unit": database})
-                self.assertIn("| gone | idle | — | 0 (0 in 24 h) | 0 |", output)
+                self.assertIn("| gone | idle | idle | — | 0 (0) | 0 |", output)
                 self.assertEqual(database.read_bytes(), before)
         database = self.root / "absent" / "ledger.sqlite"
         output = style_units.table([live_unit("names-unit")], {}, now=NOW, zone=ZONE,
                                    ledger_paths={"names-unit": database})
-        self.assertIn("All families: 0 built · 0 left", output)
+        self.assertIn("All families: 0 findings built · 0 approved findings left", output)
         self.assertFalse(database.parent.exists())
 
     def test_the_ledger_is_opened_once_read_only_and_a_write_through_that_connection_fails(self) -> None:
@@ -387,7 +487,7 @@ class StyleUnitsTests(unittest.TestCase):
         records: dict[str, object] = {"names-unit": {"unavailable": "plan cannot be read"}}
         with patch.object(style_ledger, "ledger_location", side_effect=AssertionError("the caller resolved the path")):
             output = self.render(records=records)
-        self.assertIn("| names | #42 · comments-name-code-constructs · cargo-liner · 3 findings | — | 0 (0 in 24 h) | 7 |", output)
+        self.assertIn("| names | #42 · comments-name-code-constructs · cargo-liner · 3 findings | starting 3 findings | — | 0 (0) | 7 |", output)
 
     def test_session_cells_and_pipes_keep_the_phase_table_meaning(self) -> None:
         units = [live_unit("names-unit", "names|worker"), live_unit("types-unit")]
