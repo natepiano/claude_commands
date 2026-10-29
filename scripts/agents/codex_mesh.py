@@ -1641,9 +1641,7 @@ def _claim_follow(
         if not _validate_held_claim(name, entry, thread_id):
             return False
         current = _roster_thread(entry)
-        stale = isinstance(current, (ActiveThread, StartingThread)) and (
-            current.launcher_pid > 0 and not _pid_alive(current.launcher_pid)
-        )
+        stale = _launcher_died(current)
         if isinstance(current, InvalidThread) or not (
             isinstance(current, FollowableThread) or stale
         ) or current.thread_id != thread_id:
@@ -2869,13 +2867,15 @@ def _recent_turns(client: Client, thread_id: str, timeout: float = CALL_TIMEOUT_
     return [_as_dict(turn) for turn in cast("list[object]", turns)]
 
 
-def _ended_unseen(client: Client, thread_id: str, turn_id: str = "") -> bool:
+def _ended_unseen(client: Client, thread_id: str, turn_id: str = "", *, start_seen: bool = True) -> bool:
     """True when no turn is active and nothing is queued, so no turn is left to end.
 
     A launcher that reads this while it waits for a completion notice has missed
-    the notice. Given the watched turn, the thread must also list that turn as
-    ended: the server can read a thread idle just after its turn starts. With
-    no turn the read asks for none, so it stays small on a long thread.
+    the notice. Given the watched turn, the thread must also list that turn,
+    either after a later turn or, once its start was seen, as ended: the server
+    can read a thread idle, and list a turn as ended, just after the turn starts.
+    A turn not yet listed has not ended. With no turn the read asks for none, so
+    it stays small on a long thread.
     A call that is refused or times out says nothing, and the launcher keeps waiting.
     """
     try:
@@ -2893,9 +2893,11 @@ def _ended_unseen(client: Client, thread_id: str, turn_id: str = "") -> bool:
         turns = _recent_turns(client, thread_id, UNSEEN_END_CALL_SECS)
     except SystemExit:
         return False
-    return any(
-        turn.get("id") == turn_id and turn.get("status") in ("completed", "failed", "interrupted")
-        for turn in turns)
+    # Newest first: a later turn proves the watched one is over.
+    for index, turn in enumerate(turns):
+        if turn.get("id") == turn_id:
+            return index > 0 or (start_seen and turn.get("status") in ("completed", "failed", "interrupted"))
+    return False
 
 
 def _more_work_coming(client: Client, thread_id: str, deadline: float) -> bool:
@@ -3644,14 +3646,18 @@ def command_compact(args: argparse.Namespace) -> int:
             client.close()
 
 
+def _launcher_died(state: RosterThread) -> bool:
+    """True when a live status names a launcher that is gone, which leaves the worker followable."""
+    return isinstance(state, (ActiveThread, StartingThread, WaitingCapacityThread)) and (
+        state.launcher_pid > 0 and not _pid_alive(state.launcher_pid))
+
+
 def _follow_refusal(session_dir: str, state: RosterThread, *, name: str) -> str:
     if isinstance(state, InvalidThread):
         return state.reason
     if isinstance(state, AdoptedThread):
         return f"worker adopted to {state.to_run}"
-    stale_launcher = isinstance(state, (ActiveThread, StartingThread)) and (
-        state.launcher_pid > 0 and not _pid_alive(state.launcher_pid)
-    )
+    stale_launcher = _launcher_died(state)
     if not isinstance(state, FollowableThread) and not stale_launcher:
         return "worker is busy or not followable"
     record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
@@ -3854,6 +3860,8 @@ class TurnStream:
     failure_serving: CodexServingState
     runs: DetachedRunWatch
     turn_id: str = ""
+    # Whether a notice for `turn_id` arrived; a turn this launcher just submitted has none yet.
+    turn_start_seen: bool = False
     # The turn a follow watches; empty between its turns.
     followed_turn: str = ""
     final_answer: str = ""
@@ -4070,6 +4078,7 @@ def _adopt_started_turn(stream: TurnStream, started: MovedWorker) -> None:
     stream.client, stream.port = started.client, started.port
     stream.room_wait_logged = False
     stream.thread_id, stream.turn_id = started.thread_id, started.turn_id
+    stream.turn_start_seen = False
     stream.pending_refusal = _pending_after_worker_start(stream.pending_refusal, started)
     if stream.follow:
         stream.followed_turn = stream.turn_id
@@ -4082,7 +4091,8 @@ def _adopt_moved_worker(stream: TurnStream, moved: MovedWorker) -> bool:
     stream.pending_refusal = _pending_after_worker_start(stream.pending_refusal, moved)
     if not (moved.turn_id or _continuation_is_owed(stream.session_dir, stream.name)):
         return False
-    stream.turn_id = moved.turn_id or stream.turn_id
+    if moved.turn_id:
+        stream.turn_id, stream.turn_start_seen = moved.turn_id, False
     if stream.follow:
         stream.followed_turn = stream.turn_id
     return True
@@ -4168,7 +4178,9 @@ def _on_quiet_poll(stream: TurnStream, log: TextIO) -> StreamStep | FailedWithTh
         return _resume_marked_account_move(stream, log, account_move)
     if stream.resume_owed:
         return _resume_owed_turn(stream, log, refused_for_capacity=stream.capacity_backoff_owed)
-    if not stream.resident and time.time() < stream.deadline:
+    # The frame loop bounds the run; a wall-clock jump past the deadline must
+    # not leave a one-turn launcher holding results it never checks again.
+    if not stream.resident:
         return _finish_if_ended_unseen(stream, log)
     if stream.end_marker.exists():
         return StreamStep.FINISH
@@ -4193,7 +4205,7 @@ def _finish_if_ended_unseen(stream: TurnStream, log: TextIO) -> StreamStep:
     quota_owed = _continuation_is_owed(stream.session_dir, stream.name)
     if stream.resume_owed:
         return StreamStep.NEXT_FRAME
-    if not _ended_unseen(stream.client, stream.thread_id, stream.turn_id):
+    if not _ended_unseen(stream.client, stream.thread_id, stream.turn_id, start_seen=stream.turn_start_seen):
         return StreamStep.NEXT_FRAME
     # The read-back RPC may have received the completion or answer ahead of
     # its reply. Process those frames before inferring a missing notice.
@@ -4259,7 +4271,8 @@ def _keep_resident_on_selected_server(stream: TurnStream, log: TextIO) -> None:
         changed = moved.port != stream.port or moved.thread_id != stream.thread_id
         stream.client, stream.port, stream.thread_id = moved.client, moved.port, moved.thread_id
         stream.pending_refusal = _pending_after_worker_start(stream.pending_refusal, moved)
-        stream.turn_id = moved.turn_id or stream.turn_id
+        if moved.turn_id:
+            stream.turn_id, stream.turn_start_seen = moved.turn_id, False
         if changed:
             _ = log.write(f"[{_now_stamp()}] mesh: {stream.name} moved to the workers app-server on port {stream.port}\n")
             log.flush()
@@ -4271,6 +4284,9 @@ def _on_frame(stream: TurnStream, log: TextIO, frame: RpcMessage) -> StreamStep 
     params = _as_dict(frame.get("params"))
     if _as_str(params.get("threadId")) not in ("", stream.thread_id):
         return StreamStep.NEXT_FRAME
+    if stream.turn_id and stream.turn_id in (
+            _as_str(params.get("turnId")), _as_str(_as_dict(params.get("turn")).get("id"))):
+        stream.turn_start_seen = True
     if method == "turn/started":
         _on_turn_started(stream, params)
     elif method == "thread/tokenUsage/updated":
@@ -4285,7 +4301,7 @@ def _on_frame(stream: TurnStream, log: TextIO, frame: RpcMessage) -> StreamStep 
 def _on_turn_started(stream: TurnStream, params: dict[str, object]) -> None:
     live = _as_str(_as_dict(params.get("turn")).get("id"))
     if live and (not stream.follow or not stream.followed_turn or live == stream.followed_turn):
-        stream.turn_id = live
+        stream.turn_id, stream.turn_start_seen = live, True
         if stream.resume_owed:
             stream.capacity_backoff_owed = False
         if stream.follow:
