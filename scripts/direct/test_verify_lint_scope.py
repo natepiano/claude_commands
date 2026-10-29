@@ -180,6 +180,8 @@ class VerifyLintScopeTests(unittest.TestCase):
         self.write_executable(bin_directory / "rustc", 'print("rustc fixture")\n')
         targets = self.root / "build-targets.py"
         self.write_executable(targets, "raise SystemExit(0)\n")
+        assertion_guard = self.root / "assertion-guard.py"
+        self.write_executable(assertion_guard, "raise SystemExit(0)\n")
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.write_executable(bin_directory / name, "raise SystemExit(99)\n")
         for directory in ("tmp", "state", "cache", "runtime", "target", "cargo-home", ".git"):
@@ -243,6 +245,7 @@ class VerifyLintScopeTests(unittest.TestCase):
             "BUILDLOG_MEMINFO": str(meminfo),
             "BUILD_HOLD_DIR": str(self.root / "build-hold"),
             "BUILD_TARGETS_SCRIPT": str(targets),
+            "VERIFY_ASSERTION_GUARD_SCRIPT": str(assertion_guard),
             "LINT_CONFIG_READER": str(SCRIPTS / "lint" / "lint_config.sh"),
             "LINT_CONFIG_FILE": str(self.config),
         })

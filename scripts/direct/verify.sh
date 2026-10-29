@@ -209,6 +209,7 @@ source "$HOME/.claude/scripts/lint/invoke.sh" || {
 }
 BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_targets" && pwd)/build_targets.py}"
 LOCAL_RELEASE_WAIT_SCRIPT="${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/local_release_wait.py}"
+ASSERTION_GUARD_SCRIPT="${VERIFY_ASSERTION_GUARD_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/assertion_guard.py}"
 
 # A failed step may be a process killed by earlyoom or the kernel. Keep the
 # journal query here so tests can put a journalctl stub first on PATH.
@@ -2462,6 +2463,14 @@ case "$CMD" in
             shift
         fi
         [[ $# -eq 0 ]] || { usage; exit 2; }
+        ASSERTION_REPO="${WORKSPACE_ROOT:-$(git rev-parse --show-toplevel)}"
+        ASSERTION_ARGS=(--repo "$ASSERTION_REPO")
+        if [[ -n "${UNIT_SESSION_DIR:-}" ]]; then
+            ASSERTION_ARGS+=(--rulings "$UNIT_SESSION_DIR")
+        fi
+        [[ "$PKG" != --workspace ]] || echo 'style-lint: assertion guard start'
+        "$PY" "$ASSERTION_GUARD_SCRIPT" "${ASSERTION_ARGS[@]}"
+        [[ "$PKG" != --workspace ]] || echo 'style-lint: assertion guard passed'
         if [[ "$PKG" != --workspace ]]; then
             require_member "$PKG"
         fi
