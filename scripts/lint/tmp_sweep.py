@@ -45,7 +45,14 @@ both are true:
 
 These stay too: runs named by active markers, runs with any worker not ended (including
 paused workers), and runs using a live or paused session worktree. Unreadable ownership records
-keep runs too, including their temp entries. The roots and their active/ run-marker folders stay; a unit run
+keep runs too, including their temp entries. These runs also keep folders named by cwd in their
+mesh_runs/*.json records. Empty mesh_runs files are not records. Pending files are not read.
+A worker thread not ended keeps its session temp parent, but its old temp entries can go.
+An unreadable worker record keeps scratch entries and top-level /tmp/claude entries, and names
+the record in the log. Before an idle entry can go, a git check searches
+three folder levels without following links. Uncommitted work, a stash, commits absent from remote
+and clone-source refs, or a failed git check keep it. Git commands have a timeout and never fetch.
+Timed and hand cleanup use the same checks. The roots and their active/ run-marker folders stay; a unit run
 folder whose own record names a running session: that session's marker in an
 active/ folder, else the folder's `director` file, else the `run_started` event
 that opens its history (unit_runs.director), so an idle run that no worker has
@@ -82,6 +89,7 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast
+from urllib.parse import unquote, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import scratch  # noqa: E402
@@ -168,6 +176,10 @@ TASK_OPEN = "its task is open and it changed in the last 7 days"
 SMALL_IN_LIVE_SESSION = "under 1 GiB in a running session's folder"
 UNLISTED_REASONS = (RECENT, RECENT_WIDE, SMALL_IN_LIVE_SESSION, TASK_OPEN)
 UNREADABLE = "it cannot be read"
+WORKER_USES = "a live worker uses it"
+UNSAVED_WORK = "it holds unsaved git work"
+GIT_DEPTH = 3
+GIT_TIMEOUT_SECONDS = 10
 NO_PROC = "no /proc or lsof to show which processes use it"
 
 
@@ -557,6 +569,7 @@ class RunKeepReason(Enum):
     UNENDED_WORKER = "a worker has not ended"
     SESSION_WORKTREE = "a live or paused session uses its worktree"
     UNREADABLE_RECORD = "a run ownership record cannot be read"
+    DIRECTOR = DIRECTOR_RUNS
 
 
 class MissingRecord(Enum):
@@ -706,6 +719,8 @@ def run_folder_guards(roots: Roots, live: frozenset[str] | None,
             director = Path(folder) / unit_runs.DIRECTOR_FILE
             if os.path.lexists(director) and not director.read_text(encoding="utf-8").strip():
                 raise ValueError("run director unreadable")
+            if folder not in kept and unit_runs.director(Path(folder)) in live:
+                kept[folder] = RunKeepReason.DIRECTOR
             if not isinstance(state, MissingRecord) and state.get("history_file"):
                 history = state["history_file"]
                 if not isinstance(history, str):
@@ -717,6 +732,130 @@ def run_folder_guards(roots: Roots, live: frozenset[str] | None,
         except (OSError, UnicodeError, ValueError):
             kept[folder] = RunKeepReason.UNREADABLE_RECORD
     return kept
+
+
+@dataclass(frozen=True)
+class WorkerUse:
+    folders: frozenset[str]
+    threads: frozenset[str]
+    unreadable_records: tuple[str, ...]
+
+
+def worker_use(guarded: dict[str, RunKeepReason]) -> WorkerUse:
+    """Read working folders and live thread ids only from runs that must stay."""
+    folders: set[str] = set()
+    threads: set[str] = set()
+    unreadable: list[str] = []
+
+    for folder in guarded:
+        roster_path = Path(folder) / "mesh_roster.json"
+        try:
+            roster = record_object(roster_path)
+            if not isinstance(roster, MissingRecord):
+                for value in roster.values():
+                    if not isinstance(value, dict):
+                        raise ValueError("worker roster unreadable")
+                    worker = cast(dict[str, object], value)
+                    if worker.get("status") != "ended":
+                        thread = worker.get("thread_id", "")
+                        if not isinstance(thread, str):
+                            raise ValueError("worker thread id unreadable")
+                        if thread:
+                            threads.add(thread)
+        except (OSError, UnicodeError, ValueError):
+            unreadable.append(str(roster_path))
+        runs_path = Path(folder) / "mesh_runs"
+        try:
+            for path in record_entries(runs_path):
+                if path.suffix != ".json":
+                    continue
+                try:
+                    text = path.read_text(encoding="utf-8")
+                    if not text:
+                        continue
+                    record = cast(object, json.loads(text))
+                    if not isinstance(record, dict):
+                        continue
+                    cwd = cast(dict[str, object], record).get("cwd", "")
+                    if not isinstance(cwd, str) or (cwd and not os.path.isabs(cwd)):
+                        raise ValueError("worker working folder unreadable")
+                    if cwd:
+                        folders.add(os.path.realpath(cwd))
+                except (OSError, UnicodeError, ValueError):
+                    unreadable.append(str(path))
+        except (OSError, UnicodeError, ValueError):
+            unreadable.append(str(runs_path))
+    return WorkerUse(frozenset(folders), frozenset(threads), tuple(unreadable))
+
+
+class GitWork(Enum):
+    SAVED = "all git work is saved"
+    UNSAVED = UNSAVED_WORK
+    UNREADABLE = UNREADABLE
+
+
+def checked_git(repo: Path, *arguments: str) -> str:
+    """Read git state without optional locks or a network request."""
+    result = subprocess.run(["git", "-C", str(repo), *arguments], capture_output=True, text=True,
+                            check=False, timeout=GIT_TIMEOUT_SECONDS,
+                            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+    if result.returncode:
+        raise ValueError(f"{repo}: git {arguments[0]} failed")
+    return result.stdout
+
+
+def repo_git_work(repo: Path) -> GitWork:
+    if checked_git(repo, "status", "--porcelain", "--untracked-files=all").strip():
+        return GitWork.UNSAVED
+    refs = checked_git(repo, "for-each-ref", "--format=%(refname)")
+    linked = (repo / ".git").is_file()
+    if not linked and "refs/stash" in refs.splitlines():
+        return GitWork.UNSAVED
+    # An empty repository has no commit to lose. A broken HEAD fails closed below.
+    head = checked_git(repo, "rev-parse", "--git-path", "HEAD").strip()
+    head_path = Path(head) if os.path.isabs(head) else repo / head
+    head_text = head_path.read_text(encoding="utf-8").strip()
+    if not refs.strip() and head_text.startswith("ref: "):
+        return GitWork.SAVED
+    sources: list[str] = []
+    for remote in checked_git(repo, "remote").splitlines():
+        url = checked_git(repo, "remote", "get-url", remote).strip()
+        if url.startswith("file://"):
+            parsed = urlparse(url)
+            if parsed.netloc not in ("", "localhost"):
+                continue
+            url = unquote(parsed.path)
+        elif ":" in url and not os.path.isabs(url):
+            continue
+        source = Path(url) if os.path.isabs(url) else repo / url
+        sources.extend(checked_git(source, "for-each-ref", "--format=%(objectname)", "refs/heads/").splitlines())
+    tips = ["HEAD"] if linked else ["HEAD", "--branches", "--tags"]
+    remaining = checked_git(repo, "-c", "core.alternateRefsPrefixes=refs/heads/", "rev-list", "-n1",
+                            *tips, "--not", "--remotes", "--alternate-refs", *sources)
+    return GitWork.UNSAVED if remaining.strip() else GitWork.SAVED
+
+
+def git_work(path: Path, depth: int = GIT_DEPTH) -> GitWork:
+    """Check all worktrees down to a fixed depth. Never follow links."""
+    try:
+        if path.is_symlink() or not path.is_dir():
+            return GitWork.SAVED
+        if (path / ".git").is_symlink():
+            return GitWork.UNREADABLE
+        if os.path.lexists(path / ".git"):
+            result = repo_git_work(path)
+            if result is not GitWork.SAVED:
+                return result
+        if depth:
+            for entry in path.iterdir():
+                if entry.name == ".git":
+                    continue
+                result = git_work(entry, depth - 1)
+                if result is not GitWork.SAVED:
+                    return result
+        return GitWork.SAVED
+    except (OSError, UnicodeError, ValueError, subprocess.TimeoutExpired):
+        return GitWork.UNREADABLE
 
 
 def when(timestamp: float) -> str:
@@ -807,11 +946,15 @@ def judge_entries(roots: Roots, now: float, proc: str) -> list[KeptEntry | Remov
         marked = {}
         guarded = {entry.path: RunKeepReason.UNREADABLE_RECORD for root in roots.runs
                    for entry in listing(root) if entry.name != RUN_MARKERS}
-    judged = roots.all() + inner + temp_parents(roots, live)
+    workers = worker_use(guarded)
+    for path in workers.unreadable_records:
+        print(f"tmp sweep: {path}: {UNREADABLE}; keeping scratch and top-level /tmp/claude entries", file=sys.stderr)
+    temp_live = None if live is None else live | workers.threads
+    judged = roots.all() + inner + temp_parents(roots, temp_live)
     uses = entry_uses(paths, judged)
     for root in judged:
         for entry in roots.entries(root):
-            reason = owner_reason(entry, root, roots, live, marked)
+            reason = owner_reason(entry, root, roots, temp_live, marked)
             # Apply to every deletion path, including entries inside a protected run's tmp/.
             if reason != ROOT:
                 # Resolve only the parents: a link inside a protected run is judged where it lies.
@@ -820,6 +963,10 @@ def judge_entries(roots: Roots, now: float, proc: str) -> list[KeptEntry | Remov
                     if path == folder or path.startswith(folder + os.sep) or folder.startswith(path + os.sep):
                         reason = NO_SESSIONS if live is None else guard.value
                         break
+                if any(path == folder or folder.startswith(path + os.sep) for folder in workers.folders):
+                    reason = WORKER_USES
+                elif workers.unreadable_records and root in roots.scratch + roots.plain and reason is None:
+                    reason = UNREADABLE
             if reason is None and entry.path in uses:
                 result.append(KeptEntry(entry.path, IN_USE, uses[entry.path]))
                 continue
@@ -830,6 +977,10 @@ def judge_entries(roots: Roots, now: float, proc: str) -> list[KeptEntry | Remov
             newest, size = change
             if root in inner and size < SESSION_ENTRY_MIN_BYTES:
                 result.append(KeptEntry(entry.path, SMALL_IN_LIVE_SESSION))
+                continue
+            git = git_work(Path(entry.path))
+            if git is not GitWork.SAVED:
+                result.append(KeptEntry(entry.path, git.value))
                 continue
             result.append(RemovableEntry(entry.path, root, newest, size))
     return result
