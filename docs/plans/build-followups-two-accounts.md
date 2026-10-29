@@ -2562,3 +2562,30 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 #### Ruled out
 
 - Patching `sys.modules` in test fixtures: it changed other modules' tests.
+
+### Phase 93 — /new_account gives the alias step on the Mac  · status: done
+
+**Depends on:** Phase 92
+
+#### Work Order
+
+**Goal:** `/new_account` (scripts/accounts/new_account.py) prints the shell alias step for a new Claude or Codex account on the Mac as well as on natedev, from the machine's own nixos shell module.
+
+**Spec:**
+- `nixos_shell_module()` (new_account.py ~286) takes the machine into account: on `sys.platform == "darwin"` it looks for `modules/darwin/shell.nix`, otherwise `modules/linux/shell.nix`. It keeps the repository order `/etc/nixos`, then `accounts.accounts_home() / "nixos"` (the Mac's repository is `~/nixos`).
+- `alias_step(account)` (~295) no longer returns None on darwin. It returns a `Step` on both machines, so its return type becomes `Step` and `new_account` appends it with no None check. Fix the docstring: it names the `claudeN` or `codexN` alias in this machine's shell module.
+- Keep the three outcomes: the `ALIAS_LOOP_MARKER` text means the alias comes from the account note; an existing `<name> =` line means the alias is there (live after a rebuild); otherwise the step is not done and prints the line to add to `shellAliases` in that module, then rebuild. The added line is `<name> = "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec <label>";`, the same form both modules use today (linux shell.nix:54-61, darwin shell.nix:41-47).
+- Codex accounts get the same alias step: `codex_steps` appends `alias_step(account)` after a successful setup and after the signed-in check (both modules carry `codex1`/`codex2` aliases). A failed setup or check returns as today, with no alias step.
+- A missing module keeps its not-done step naming the account. Its text names the module path it looked for (`modules/darwin/shell.nix` or `modules/linux/shell.nix`).
+- No other behavior changes.
+
+**Files:**
+- `scripts/accounts/new_account.py` — `nixos_shell_module`, `alias_step`, `new_account`, `codex_steps`.
+- `scripts/accounts/test_new_account.py` — replace `test_mac_has_no_alias_step` with Mac tests: a darwin module with the alias line (done), without it (not done, prints the add line and names the darwin module), and a missing darwin module; a Codex account gets the alias step on both platforms after setup; `nixos_shell_module` picks the darwin path on darwin and the linux path otherwise (scratch repository folders only).
+
+**Workers:** 1 writer, no split (one module and its test file).
+- `impl` — both files.
+
+**Constraints from prior phases:** Tests never touch live dirs, `/etc/nixos`, `~/nixos`, ssh, real credentials or `~/.local/state/accounts`; they patch `nixos_shell_module` or the repository roots to scratch folders. `ALIAS_LOOP_MARKER` (new_account.py:34) stays. `accounts.py exec` already loads the folder's nix shell (Phase 92); the alias lines need nothing extra for that.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/accounts -p test_new_account.py` passes; `basedpyright scripts/accounts/new_account.py scripts/accounts/test_new_account.py` reads `0 errors, 0 warnings, 0 notes`; on the Mac tree, `new_account.py claude claude5` style output shows the alias step (covered by the darwin tests).
