@@ -63,6 +63,47 @@ Each copy is known to cleanup at birth. The helper does not add a cleaner.
 - **Mac:** see Mac mirrors.
 - **Git:** the copy's own `clone --shared` git dir borrows objects from the source; a copy outliving a `git gc` of the source can lose objects. Copies are short-lived; the 7-day idle rule bounds it.
 
+## Survey changes
+
+Survey of every unit director, sent 14:05 EDT 2026-10-29, closes 23:00 EDT; 42 units answered by 19:20 EDT (each answer, with its unit, in `.claude/handoff/copies-survey-answers.md` of this worktree). Most said the format suits them. These changes go into Phase 3; the unit that asked is in brackets.
+
+**Name.**
+- The phase part is a slug, `[a-z0-9-]`: `54b`, `94b`, `adhoc` for ad hoc work. A slash is refused. Where no phase exists, a free label takes its place: `sync-test`, `demo27-fastest4`, `adhoc-stallcpu-gate` [unit-board, merge-gate, messaging, fix-rounds, models].
+- A purpose can carry one suffix word, for copies that differ on purpose: `34-before-beeece8b`, `42-work-port` [tile-unit, berth]. `-2`, `-3` stay for a second copy made at the same time, picked with an atomic `mkdir` [style-unit, models].
+- New purpose `work`: a writable clone with its own branch; edits, commits, merges and pushes are allowed; it lives until its branch lands [style-unit, lfo, inspectors, organon, trunk, cables, herdr].
+- `--unit <unit>`: a showrunner makes a copy for another unit [unit-board].
+- Names come from roster labels only, never from a session id [models].
+
+**Source.**
+- Any git repository: hana, `~/.claude`, cargo-liner, `/etc/nixos`, `~/rust/bevy_brp`; not only unit worktrees [bevy-upgrade, herdr, roles, report].
+- `--with-diff`: copy HEAD plus the working-tree diff (tracked changes and untracked files, less ignored ones). The record says "HEAD + diff" with the diff's hash [fix-rounds, models].
+- Unpushed local commits come with the copy: clone from the source path, then set origin to the source's origin URL [messaging, shutdown].
+- The copy gets the source's tracking ref for its merge target (`origin/<merge branch>` and `origin/HEAD`). A stale `origin/HEAD` made the assertion guard count 116 changes that were not the phase's [trunk].
+- A `~/.claude` copy without `b8ef1b37` is refused: an older tree's test deletes every session folder [models].
+- The helper never writes into the source worktree (`review.sh` fails on a worktree change) [models].
+
+**Target.**
+- Mode `none` when the source has no `Cargo.toml`: no seed, no shared build-dir, no cargo lock [roles, hierarchies, fix-rounds, screenshot, report, style-unit, models].
+- A seed comes only from a target built with the same `Cargo.lock` and toolchain [hana-migration]. The newest landed gate copy of the repository is the first seed choice [merge-gate].
+- A before/after pair gets the same fill from the same base build [fastest].
+
+**Lifetime and cleanup** (resources-unit, `scratch.py`; Phase 2 request).
+- Task `landed:<unit>/<branch>`: ended when the branch lands, not at the first checkpoint [widget, lfo, startup, style-unit].
+- A queued or running `verify.sh` run marks its copy busy; no idle rule or phase end removes a busy copy. A memory wait of 4 h 34 min passed the 4 h idle rule [widget, fix-rounds].
+- A `phase:` copy is not idle while its phase is open [organon, frame-cost].
+- A copy whose origin is a sibling copy is removed before that sibling [startup].
+- Removing a `before` copy never removes its `after` copy [shutdown].
+- `copies.py hand-over --to <unit>` renames the pair and moves the cleanup owner when a phase moves [demo].
+- A same-name copy at another source commit is replaced or refused, never built in [screenshot]; a same-name copy at the same commit is reused across review passes [style-unit].
+- A copy whose borrowed objects were pruned by `git gc` is refused loudly; the record names the borrowed object dir [models].
+
+**Out of scope.**
+- hana's product frozen builds (`scripts/perf/build.py`, `hana-measure-*`) stay outside the helper. The floor sweep should honour a busy lock file in a target that hana can set without `~/.claude` (resources-unit request) [benchmark].
+- Codex work clones under `~/.cache` and delegate folders may move to `work` copies; each owner decides in Phase 4 [cables, trunk].
+- A Windows VM copy place: not in this plan [research].
+- Before/after profile trees that need `config` linked to `~/.claude/config` make the link themselves after make [accounts].
+- Mac exact-tree gate copies for clippy and nextest go to Phase 5 [port].
+
 ## Disk cost
 
 Per copy, hana, natedev:
@@ -124,7 +165,7 @@ Hold length: 3 h. Count: about 17 hana builds — A 2, B 4, C 4, D 5 (one pair a
 
 **Goal:** names and cleanup support exist where they live.
 
-**Spec:** report-unit lands `unit_labels` / `unit_labels_for` (its Phase 3) plus the join function and dropped-part rule (Naming). resources-unit adds the copies root to `scratch.py` (two-level name, provenance fields), `tmp_sweep.py` and the scratch guard; its Phase 3 in-use marking covers `/tmp/claude/copies`. If Phase 1 picks the shared build-dir, resources-unit owns its budget and hold. efficiency-unit changes `scripts/lib/nix_env.py` to trust a copy's `.envrc` only when the copy's copies.py/scratch.py record names a source repo under `~/rust`, `~/worktrees` or `~/.claude*`, and the copy's `.envrc` equals the source's `.envrc` blob at the copy commit (approved by builds). Today it refuses (`direnv: .envrc is blocked`), so verify.sh and style_sync lint fail in a copy. verify-unit sends efficiency the record's path and fields (source path, source commit, copy commit) when Phase 3 fixes them. Due before Phase 4.
+**Spec:** report-unit lands `unit_labels` / `unit_labels_for` (its Phase 3) plus the join function and dropped-part rule (Naming). resources-unit adds the copies root to `scratch.py` (two-level name, provenance fields), `tmp_sweep.py` and the scratch guard; its Phase 3 in-use marking covers `/tmp/claude/copies`. If Phase 1 picks the shared build-dir, resources-unit owns its budget and hold. efficiency-unit changes `scripts/lib/nix_env.py` to trust a copy's `.envrc` only when the copy's copies.py/scratch.py record names a source repo under `~/rust`, `~/worktrees` or `~/.claude*`, and the copy's `.envrc` equals the source's `.envrc` blob at the copy commit (approved by builds). Today it refuses (`direnv: .envrc is blocked`), so verify.sh and style_sync lint fail in a copy. verify-unit sends efficiency the record's path and fields (source path, source commit, copy commit) when Phase 3 fixes them. Due before Phase 4. resources-unit also gets the Lifetime and cleanup items of Survey changes (task `landed:`, busy copy during a queued or running run, open-phase copies not idle, child before parent, a target busy lock file hana can set); report-unit's `UnitLabels.folder_name()` (its Phase 4, hana + lfo gives `hana-lfo`) is the join function.
 
 **Files:** owned by report-unit, resources-unit and efficiency-unit; verify-unit sends the requests.
 
@@ -138,7 +179,7 @@ Rough duration: half a day each, in parallel with Phase 1.
 
 **Goal:** `copies.py make|list|remove` makes a named, registered copy with the chosen target mode.
 
-**Spec:** `copies.py make --source <worktree> --commit <sha> --phase <id> --purpose <word> [--task <task>]` prints the path. Steps: name from roster via `owning_session`; folder through `scratch.py`; own git (`clone --shared --no-checkout`, origin = source's origin URL, check `git rev-parse --absolute-git-dir` names the copy); target per Phase 1 verdict (seed: `cp -a` under the three source locks, skip `incremental/` unless the rule kept it; shared: set `CARGO_BUILD_BUILD_DIR` in the copy's `.cargo/config.toml`; neither: empty). `list` shows copies, task, source, size. `remove` ends one copy through scratch.py. Python API `make_copy(...)` for callers.
+**Spec:** `copies.py make --source <worktree> --commit <sha> --phase <id> --purpose <word> [--task <task>]` prints the path. Steps: name from roster via `owning_session`; folder through `scratch.py`; own git (`clone --shared --no-checkout`, origin = source's origin URL, check `git rev-parse --absolute-git-dir` names the copy); target per Phase 1 verdict (seed: `cp -a` under the three source locks, skip `incremental/` unless the rule kept it; shared: set `CARGO_BUILD_BUILD_DIR` in the copy's `.cargo/config.toml`; neither: empty). `list` shows copies, task, source, size. `remove` ends one copy through scratch.py. Python API `make_copy(...)` for callers. Every item of Survey changes under Name, Source and Target, and `hand-over`.
 
 **Files:** `scripts/copies/copies.py`, `scripts/copies/test_copies.py`, `docs/as-built/frozen-copies.md`.
 
@@ -168,7 +209,7 @@ Rough duration: half a day for verify-unit; owners' changes about an hour each.
 
 **Goal:** Mac mirrors use the copies naming and an APFS-clone seed.
 
-**Spec:** as in Mac mirrors above. Path from the helper's name function; first run of a new mirror clones the newest same-repo mirror's target with `cp -c -R`; cleanup least recently used first, then retired units; move every path match. Check APFS first; on another file system, seed nothing.
+**Spec:** as in Mac mirrors above. Path from the helper's name function; first run of a new mirror clones the newest same-repo mirror's target with `cp -c -R`; cleanup least recently used first, then retired units; move every path match. Check APFS first; on another file system, seed nothing. A Mac gate copy of an exact tree (`<phase>-gate`), reusing the unit mirror's target, for offload clippy and nextest [port].
 
 **Files:** `scripts/mac_test/offload.py`, `scripts/mac_test/mac_test.py`, `scripts/mac_test/copy_watch.py`, `scripts/buildlog/mac_idle.py`, tests, `docs/as-built/mac-test-offload.md`.
 
