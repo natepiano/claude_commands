@@ -241,14 +241,14 @@ def _move_record(move: PathMove) -> dict[str, str]:
     return {"source": str(move.source), "destination": str(move.destination)}
 
 
-def _save(plan: RenamePlan, step: int) -> None:
+def _save(plan: RenamePlan, completed: tuple[str, ...]) -> None:
     write_json(plan.journal, {
         "version": 1, "old": plan.old, "new": plan.new, "old_doc": str(plan.old_doc),
         "new_doc": str(plan.new_doc), "checkout": str(plan.checkout), "merge_branch": plan.merge_branch,
         "base": plan.base, "units": list(plan.units), "plans": [str(path) for path in plan.plans],
         "timer": _move_record(plan.timer), "state": [_move_record(move) for move in plan.state],
         "stall": [_move_record(move) for move in plan.stall], "review_pool": _move_record(plan.review_pool),
-        "step": step, "done": False,
+        "completed": list(completed), "done": False,
     })
 
 
@@ -286,7 +286,21 @@ def _read_moves(value: object) -> tuple[PathMove, ...]:
     return tuple(_read_move(item) for item in cast(list[object], value))
 
 
-def _load(path: Path, old: str, new: str) -> tuple[RenamePlan, int]:
+def _completed_steps(fields: dict[str, object]) -> tuple[str, ...] | None:
+    """Return the completed apply step names, or None when the record is not valid."""
+    if "completed" in fields:
+        names = fields["completed"]
+        if not isinstance(names, list) or not all(isinstance(name, str) and name in APPLY_STEP_NAMES for name in cast(list[object], names)):
+            return None
+        return tuple(cast(list[str], names))
+    # A journal written before apply recorded step names holds a count of the 7-step list.
+    step = fields.get("step")
+    if type(step) is not int or not 0 <= step <= len(COUNTED_APPLY_STEP_NAMES):
+        return None
+    return COUNTED_APPLY_STEP_NAMES[:step]
+
+
+def _load(path: Path, old: str, new: str) -> tuple[RenamePlan, tuple[str, ...]]:
     fields = _object(read_json(path))
     if fields.get("version") != 1 or fields.get("new") != new:
         raise RenameRefused(f"{path}: incompatible rename journal")
@@ -294,8 +308,8 @@ def _load(path: Path, old: str, new: str) -> tuple[RenamePlan, int]:
     if old not in (recorded_old, new) and showrunners.canonical_slug(old) not in (recorded_old, new):
         raise RenameRefused(f"{path}: rename is from {recorded_old}, not {old}")
     state = _read_moves(fields.get("state"))
-    step = fields.get("step")
-    if len(state) != len(tidy_wrapped.owned_paths(new)) or type(step) is not int or not 0 <= step <= 7 or not isinstance(fields.get("done"), bool):
+    completed = _completed_steps(fields)
+    if len(state) != len(tidy_wrapped.owned_paths(new)) or completed is None or not isinstance(fields.get("done"), bool):
         raise RenameRefused(f"{path}: invalid rename progress")
     result = RenamePlan(recorded_old, new, Path(_string(fields, "old_doc")), Path(_string(fields, "new_doc")),
                         Path(_string(fields, "checkout")), _string(fields, "merge_branch"), _string(fields, "base"),
@@ -304,7 +318,7 @@ def _load(path: Path, old: str, new: str) -> tuple[RenamePlan, int]:
                         _read_move(fields.get("review_pool")))
     if result.journal != path:
         raise RenameRefused(f"{path}: journal state directory changed")
-    return result, step
+    return result, completed
 
 
 def plan(old: str, new: str) -> RenamePlan:
@@ -471,6 +485,15 @@ def _rename_review_pool(plan: RenamePlan) -> None:
     unit_move.move(plan.review_pool)
 
 
+def _rename_unit_workers(plan: RenamePlan) -> None:
+    from scripts.direct import workers
+    root = workers.ledger_path(plan.old, "unused").parent
+    units = {path.name.removesuffix(".move.json") if path.name.endswith(".move.json") else path.stem
+             for path in root.glob("*.json")}
+    for unit in sorted(units):
+        workers.move_unit(plan.old, plan.new, unit)
+
+
 def _check_edits(plan: RenamePlan) -> None:
     allowed = {_relative(plan, path) for path in (plan.old_doc, plan.new_doc, *plan.plans)}
     changed = set(unit_move.git(plan.checkout, "diff", "--name-only", "-z", "HEAD").split("\0")) - {""}
@@ -510,6 +533,14 @@ def _rename_branch(plan: RenamePlan) -> None:
     _ = unit_move.git(plan.checkout, "push", "--set-upstream", "origin", f"{plan.branch}:refs/heads/{plan.branch}")
 
 
+APPLY_STEPS = (_rename_doc, _rewrite_plans, _rename_timer, _rename_showrunner_state,
+               _rename_stall_watch, _rename_review_pool, _rename_unit_workers, _rename_branch)
+APPLY_STEP_NAMES = tuple(step.__name__ for step in APPLY_STEPS)
+# The step list of journals that recorded a count; its order maps a count to step names.
+COUNTED_APPLY_STEP_NAMES = ("_rename_doc", "_rewrite_plans", "_rename_timer", "_rename_showrunner_state",
+                            "_rename_stall_watch", "_rename_review_pool", "_rename_branch")
+
+
 def apply(old: str, new: str) -> RenamePlan:
     """Perform each atomic move and record completed steps so a refusal can be resumed."""
     result = plan(old, new)
@@ -524,15 +555,14 @@ def apply(old: str, new: str) -> RenamePlan:
             result, completed = _load(result.journal, old, new)
         else:
             _preflight(result)
-            _save(result, 0)
-            completed = 0
-        steps = (_rename_doc, _rewrite_plans, _rename_timer, _rename_showrunner_state,
-                 _rename_stall_watch, _rename_review_pool, _rename_branch)
-        for number, run in enumerate(steps, start=1):
-            if number <= completed:
+            completed = ()
+            _save(result, completed)
+        for run in APPLY_STEPS:
+            if run.__name__ in completed:
                 continue
             run(result)
-            _save(result, number)
+            completed = (*completed, run.__name__)
+            _save(result, completed)
     return result
 
 
@@ -545,8 +575,9 @@ def _rename_journal(new: str) -> Generator[tuple[RenamePlan, dict[str, object]]]
         raise RenameRefused(f"{new} has no rename journal")
     with unit_move.production_lock():
         result, completed = _load(path, new, new)
-        if completed != 7:
-            raise RenameRefused(f"{new}: apply must complete step 7 first")
+        missing = [name for name in APPLY_STEP_NAMES if name not in completed]
+        if missing:
+            raise RenameRefused(f"{new}: apply must complete {', '.join(missing)} first")
         yield result, _object(read_json(path))
 
 
@@ -799,6 +830,7 @@ def finish(new: str) -> None:
 
 
 def main(argv: list[str]) -> int:
+    from scripts.direct.workers import WorkerUnavailable
     parser = argparse.ArgumentParser(description=__doc__)
     actions = parser.add_subparsers(dest="action", required=True)
     for name in ("plan", "apply"):
@@ -829,7 +861,7 @@ def main(argv: list[str]) -> int:
                 print(line)
             if action == "apply":
                 print(f"{result.old} is now {result.new}; " + (f"keep {result.merge_branch} until finish" if result.renames_branch else f"merge branch {result.merge_branch} kept"))
-    except (RenameRefused, production_units.Refusal, tidy_wrapped.TidyRefused, OSError, UnicodeError) as error:
+    except (RenameRefused, production_units.Refusal, tidy_wrapped.TidyRefused, WorkerUnavailable, OSError, UnicodeError) as error:
         print(f"rename: {error}", file=sys.stderr)
         return 1
     return 0

@@ -337,20 +337,22 @@ candidate search.
 | Before the first pass: `Director tokens summary → before first pass share` | A, E, F, G, H |
 
 The build costs below are author estimates, not measured results. They cover
-base implementation and fixture checks. Steps adds recording and measurement
-work to each total. Observation wait time is outside those costs. The estimates
+base implementation and fixture checks, except full A and C, whose totals
+include recording as Recommendation states. Steps adds recording and measurement
+work to the other totals. Observation wait time is outside those costs. The estimates
 assume one writer and one checker. No trial has run (n=0). Hours describe work,
 not a promise about elapsed delivery time. A larger build cost does not excuse
 a worse result under the three gods.
 
-**A. Read each contract at its step.** Keep `commands/unit/direct.md` as a short
+**Full A. Read each contract at its step.** Keep `commands/unit/direct.md` as a short
 route through the phase. Move the full rules to one named file per step under
 `docs/delegate/`. Remove repeated full reads of the same rules from
 `commands/unit/checkpoint.md`, `commands/plan/phase_review.md`, and
 `commands/plan/shrink.md`; each route still names every required rule. The
 director reads the full step file before that step and reads it again when its
-content changes. This affects director context, not decision authority. Build:
-8–12 work hours; risk: a moved rule or link can be lost. A tag inventory must
+content changes. This affects director context, not decision authority. Total:
+10–16 work hours with recording and merges. Target: director tokens 4–8% lower;
+gap 0–3 s. Risk: a moved rule or link can be lost. A tag inventory must
 prove that every old rule has exactly one authoritative home.
 
 The proposed new files for A are `docs/delegate/run_contract.md` (core rules,
@@ -506,7 +508,8 @@ an approved edit with its tag; it must not settle the request by accident.
 All cuts and build hours below are planning estimates, n=0 trials, for future
 before/after windows defined in Steps. They are not Baseline results. A zero
 means no direct saving is proposed. It can still regress. Token targets apply
-to median input and output separately. Input includes caches; it is not a cash
+to median input and output separately unless the row names counted and weighted
+tokens. Input includes caches; it is not a cash
 estimate. Before/after share targets use percentage points (pp). A share cut
 alone never passes a token test. Missing evidence is not zero saving.
 
@@ -529,9 +532,9 @@ remains read-only. No model downgrade or responsibility change is proposed.
 
 | Candidate and cause | Phase measures: expected median cut | Finish-to-start gap cut | Director input / output cut | Before / after share cut | Static full-read size; scheduled read load | Doc→run / run→phase / doc→phase cut | Churn: Work Order edits / opened / closed / inserted / splits | Quality check | Rules U; S/F/B; E; O; Q; M; T; L |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| A: read unchanged rules once per route | W 3%, D 10%; I/T/R/activities/fix 0 | 10 s: fewer compose reads | 10% / 10% | 2 / 2 pp | No static line/byte cut; six extra files and bounded route text. Scheduled byte cut at least 19.8% on the route below; no line-cut target | 0 / 0 / 0 | 0 / 0 / 0 / 0 / 0 | Every tag and every mode gate retained | K; C/K/K; K; C; K; K; K; K |
+| Full A: read unchanged rules once per route | W 3%, D 10%; I/T/R/activities/fix 0 | 0–3 s: fewer compose reads | 4–8% counted and weighted | 2 / 2 pp | No static line/byte cut; six extra files and bounded route text. Scheduled byte cut at least 19.8% on the route below; no line-cut target | 0 / 0 / 0 | 0 / 0 / 0 / 0 / 0 | Every tag and every mode gate retained | K; C/K/K; K; C; K; K; K; K |
 | B: reuse closeout facts | W 5%, D 15%; I/T/R/fix 0; shrink elapsed 20%, other activities 0 | 0 s: checkpoint/review precede finish; loop shrink follows next launch | 15% / 15% | 0 / 6 pp | No static line/byte or scheduled-read cut claimed | 0 / 0 / 0 | 0 / 0 / 0 / 0 / 0 | Content/ledger/check invalidation; independent review and both commits retained | K; K/K/K; K; C; K; K; K; K |
-| C: compose during review wait | W/D/I/T/R/activities/fix 0 | 60 s: draft precedes gap | 0% / 0%; invalidated drafts can add tokens | 0 / 0 pp | No static line/byte or scheduled-read cut claimed; draft guard adds text | 0 / 0 / 0 | 0 / 0 / 0 / 0 / 0 | Main review focus; no tree writes; stale draft rejected | K; C/K/K; K; C; C; K; K; K |
+| C: compose during review wait | W/D/I/T/R/activities/fix 0 | 15–50 s per eligible gap; 20–50% eligible | 0 to −2%; invalidated drafts can add tokens | 0 / 0 pp | No static line/byte or scheduled-read cut claimed; draft guard adds text | 0 / 0 / 0 | 0 / 0 / 0 / 0 / 0 | Main review focus; no tree writes; stale draft rejected | K; C/K/K; K; C; C; K; K; K |
 | D: assemble validated envelope | W/D/I/T/R/activities/fix 0 | 45 s: less compose writing | 0% / 0%; savings before phase start are not phase tokens | 0 / 0 pp | No static line/byte or scheduled-read cut claimed; adds script/schema | 0 / 0 / 0 | 0 / 0 / 0 / 0 / 0 | Director reads output; missing fields block dispatch | K; K/K/K; K; C; K; K; K; K |
 | E: resolved design format | W/D/I/T/R/activities/fix 0 | 0 s on later gaps | 4% / 4% on first phases only | 2 / 0 pp | No static line/byte or scheduled-read cut claimed; adds design format/command | 20% / 0 / 20% | 20% / 0 / 0 / 10% / 10% | Retain states, decisions, sources and required review | K; C/K/K; K; C; C; K; K; K |
 | F: complete small issue compiles directly | W/D/I/T/R/activities/fix 0 | 0 s on later gaps | 2% / 2% on first phases only | 1 / 0 pp | No static line/byte or scheduled-read cut claimed; eligibility adds text | 30% / 0 / 30% | 0 / 0 / 0 / 0 / 0 | Incomplete source takes normal design path | K; C/K/K; K; C; C; K; K; K |
@@ -611,15 +614,15 @@ finish-to-start gap cuts. Ties favor lower total build cost.
 
 | Existing-phase rank | Director tokens first: token cut; gap cut | Dispatch time first: token cut; gap cut |
 | --- | --- | --- |
-| 1 | B: 15%; 0 s | C: 0%; 60 s |
-| 2 | A: 10%; 10 s | D: 0% inside phases; 45 s |
+| 1 | B: 15%; 0 s | C: 0 to −2%; 15–50 s per eligible gap |
+| 2 | Full A: 4–8%; 0–3 s | D: 0% inside phases; 45 s |
 | 3 | K: 6%; 0 s; alternative to B | G: 5%; 15 s |
-| 4 | G: 5%; 15 s | A: 10%; 10 s |
+| 4 | G: 5%; 15 s | Full A: 4–8%; 0–3 s |
 | 5 | H: 3%; 5 s | H: 3%; 5 s |
 | 6 | I: 1%; 5 s | I: 1%; 5 s |
 | 7 | J: 1%; 0 s; check span 15% | B: 15%; 0 s |
 | 8 | D: 0% inside phases; 45 s | K: 6%; 0 s; alternative to B |
-| 9 | C: 0%; 60 s | J: 1%; 0 s; check span 15% |
+| 9 | C: 0 to −2%; 15–50 s per eligible gap | J: 1%; 0 s; check span 15% |
 
 | New-plan rank | Director tokens first: first-phase token cut; first-doc-to-dispatch cut | Dispatch time first: first-phase token cut; first-doc-to-dispatch cut |
 | --- | --- | --- |
@@ -631,15 +634,14 @@ content rules. Otherwise select by eligibility, not by this rank. Do not apply
 the percentages to Baseline's multi-day tail. B and K are alternatives. All
 other effects can overlap; there is no summed forecast for a candidate set.
 
-Including the recording work below changes the proposed first step. B has the
-largest central token target per work hour among existing-phase proposals:
-15% over 28–40 h, versus A's 10% over 24–36 h. These are estimates, n=0 trials;
-the cost ranges overlap and eligible populations are not yet recorded. The
-claim is a planning choice, not a proved benefit ratio. B keeps the route layout
-and reduces repeated closeout collection; A must first build revision-aware
-read accounting. E/F remain separate because their first-phase population
-has no measured weight against later phases. Recommend B as Step 1, with a
-prospective old-route sample before deploying its fact reuse.
+Cheap A is Step 1, as the user chose. Its token target is 3–7% over 2–4 work
+hours. B remains a later candidate at 15% over 28–40 h; full A's target is
+4–8% over 10–16 h with merges, with a gap cut of 0–3 s. These are estimates,
+n=0 trials, not a proved benefit ratio. B keeps the route layout and reduces
+repeated closeout collection; full A adds revision-aware read accounting.
+E/F remain separate because their first-phase population has no measured
+weight against later phases. Collect the prospective old-route sample for
+cheap A before changing its route.
 
 ## Recommendation
 
@@ -649,7 +651,7 @@ and each step reads only its own rule file. After a compaction the director
 reads the always-read rules and the current step's file, found by tag name.
 
 The adversarial review (for, against and a judge, all evidence scripts re-run)
-changed the A and C numbers in Comparison. These values replace them:
+sets the A and C numbers used in Comparison and Steps:
 
 | Option | Director token cut | Gap cut | Work hours |
 | --- | --- | --- | --- |
@@ -666,7 +668,7 @@ stays complete, and no `/unit:delegate` alias copies the text.
 
 The settling test is a 20-phase trial of cheap A. It measures context size
 just after the reload, compactions per phase, and weighted tokens over each
-phase plus its following gap. Phase 4 runs it. B, full A, G and I stay
+phase plus its following gap. Phase 5 runs it. B, full A, G and I stay
 candidates for later answers; C waits until dispatch time comes first.
 Astra review `/tmp/claude/astra/20261020T222712Z-2504835/review.md` and the
 adversarial verdict are folded into this document.
@@ -679,6 +681,8 @@ steps propose process and recorder changes; none is applied by this document.
 The adversarial result is in Recommendation. Guilds destinations above stay
 pending until the showrunner supplies their decisions.
 
+Cheap A uses only its approved phase-boundary recording and three trial measures.
+The common recording below applies to full A and the later candidates.
 Common trial work is part of each total estimate below, not free filtering.
 Add exposure evidence to scripts/direct/progress_history.py and fixture tests
 in scripts/direct/test_progress_history.py. Wire the capture calls into
@@ -705,8 +709,11 @@ For already cached text, retain the read event that served that exact revision;
 compaction forces a new served read. This records delivered text, not proof
 that a model understood it; required review and gates still check behavior.
 Common work costs 8–12 estimated work hours per standalone candidate, n=0
-trials; reuse it in later steps only after its evidence fits that step. Totals
-below conservatively include it each time and exclude observation wait time.
+trials; reuse it in later steps only after its evidence fits that step.
+Full A and C use Recommendation's total estimates, which include recording.
+Other totals below conservatively include common work each time. All totals
+exclude observation wait time. Cheap A uses only its approved phase-boundary
+recording and three trial measures, within its separate 2–4 hour estimate.
 
 The current run_started event retains working_dir, worktree, branch, plan_doc
 and main_agent. Phase and pass events retain ids and observed time bounds.
@@ -761,10 +768,10 @@ Allocated shares remain diagnostics with no acceptance threshold.
 | Candidate | Evidence for its eligibility beyond common ids/mode/model | Required prospective record before old-route collection | Total estimated work hours, n=0 trials |
 | --- | --- | --- | --- |
 | B | Code/shrink commit hashes from git; closeout input hashes and route are absent | phase_end/checkpoint/run_phase_review/shrink calls record source phase, containing phase, route and evidence hash at each use; only then collect old closeout route | 28–40 |
-| A | Prompt count from retained prompts/pass events; consumed read revisions are absent | Actual file read/step and revision events from direct and all A callers; expand both read schedules from selected revision, including exceptions | 24–36: base 8–12, common 8–12, schedule/accounting 8–12 |
+| Full A | Prompt count from retained prompts/pass events; consumed read revisions are absent | Actual file read/step and revision events from direct and all A callers; expand both read schedules from selected revision, including exceptions | 10–16 with recording and merges |
 | G | Work Order/source commit and file targets from retained prompt/git; compiler version is absent | to_phased_plan records source blobs, compiler/format revision and output hash in the plan header and existing run event; retain mismatch disposition | 24–40: base 12–20, common 8–12, elapsed 4–8 |
 | I | Exact commands in prompt and finished logs where retained; checklist version and complete timings can be absent | Compiler and phase_checks record checklist hash, input tree and check boundaries; preserve gate identity | 20–32: base 8–12, common 8–12, elapsed 4–8 |
-| C | Adjacent phase/review bounds exist; review opportunity, blocks and draft inputs are absent | dual_review/compose record next-order eligibility, user/dependency blocks and current source hash in both samples; after also record draft hash/invalidation and cost | 16–24 |
+| C | Adjacent phase/review bounds exist; review opportunity, blocks and draft inputs are absent | dual_review/compose record next-order eligibility, user/dependency blocks and current source hash in both samples; after also record draft hash/invalidation and cost | 8–12 with recording |
 | D | Validated Work Order artifact exists where retained; assembly version is absent | compose/write_prompt record manual old-envelope version and inputs, then assembly revision and same inputs after | 24–36 |
 | E | Named git source commits and first phase bounds exist; format/review route version is absent | Existing compiler records old input/source/output hashes and review links; new design command also records its format after deployment; both retain source content class in plan headers/events | 24–36 |
 | F | Issue content/approval links can be retained; issue eligibility and compile route are absent | proposal/compiler record complete-source eligibility verdict and review/approval evidence before old-route collection; same rule after | 16–24 |
@@ -786,7 +793,12 @@ Contract route decisions remain with the current owners.
    core rules and the current step's file by tag name. Keep the tag inventory
    complete; add no `/unit:delegate` copy. Start after fix-rounds-unit's
    `<FixDispatch/>` edits merge. Target: director tokens 3–7% lower per phase;
-   gap 0–3 s. Phase 4 runs the 20-phase trial named in Recommendation.
+   gap 0–3 s. Phase 5 runs the 20-phase trial named in Recommendation.
+   The before sample is prospective, from the deploy of Phase 3 recording
+   with the old route. Phase 4 freezes that sample with `--exposure before
+   --before-at <main HEAD at the freeze>` and then builds the route.
+   The before anchor names the committed `direct.md` history; no route commit
+   is needed to classify that sample.
    Total: 2–4 work hours plus the trial's recording. Undo: restore the single
    `direct.md` from git; retain the trial records.
 
@@ -813,7 +825,7 @@ Contract route decisions remain with the current owners.
    phases with exactly the named prompt/checkpoint route, unchanged gates and
    consumed read revisions. Extra dispatch/compaction/mode routes have separate
    samples and schedules. Test every tag, reachable gate, missing blob and
-   reread rule. Total: 24–36 h. Undo: restore old routing/read rules and callers;
+   reread rule. Total: 10–16 h with merges. Undo: restore old routing/read rules and callers;
    retain measurement support, selected revisions and both samples.
 
 4. **G — Compile verified context. Needs a separate answer.** Change G's
@@ -843,13 +855,13 @@ Contract route decisions remain with the current owners.
 6. **C then D — Dispatch-first alternative. Each needs its own answer.**
    C is not built now (user, 2026-10-28). C changes its three files and
    common/opportunity capture calls. Target gap median: 15–50 s lower on
-   eligible gaps; phase token/wall targets 0. Select adjacent completed
+   eligible gaps; director token target 0 to −2%, phase wall target 0. Select adjacent completed
    unmixed loop phases with a review-wait draft opportunity and no user or
    dependency block, established from recorded current inputs before either
    route runs. Include invalidated drafts, cost and changed orders; do not
    select only successful drafts. Minimum sample is the common phase threshold
    applied to eligible gaps. Pin no writes during review and stale rejection.
-   Total C: 16–24 h. Undo: stop drafts; compose after plan review.
+   Total C: 8–12 h with recording. Undo: stop drafts; compose after plan review.
    D then needs a separate C-only prospective before sample and envelope input
    capture, with the same adjacent-phase filter and confirmed assembly revision.
    Target gap: 45 s; phase tokens 0%. Pin missing/changed fields and director

@@ -4,8 +4,8 @@
 A run folder under /tmp/claude/unit/ (or /tmp/claude/delegate/) collects the
 copies its phases make: gate copies under phases/, exports under scratch/, and
 before and after builds such as p62_bin and p26_before. Each is a git checkout,
-a cargo target, or both. Nothing reads them after the run ends, and before this
-they stayed in /tmp until the disk filled. end_session.sh passes every run
+a cargo target, or both. Every non-retired worker's live detached command keeps its
+working directory and containing checkout. end_session.sh passes every run
 folder the ending director holds. In each one this removes:
 
   * verify_cache/, the verify.sh pass records; the time they saved is already
@@ -13,6 +13,9 @@ folder the ending director holds. In each one this removes:
   * every folder, at any depth, that holds .git (a folder or a file): a checkout;
   * every folder, at any depth, that holds .rustc_info.json or CACHEDIR.TAG: a
     cargo target.
+
+With --tracked it also ends tracked scratch for these runs, preserving live
+command directories and the scratch registry's existing unsaved-work holds.
 
 A checkout whose .git is a file is a linked worktree. It goes through its
 source repo (git worktree remove), so the source keeps no stale entry; a stale
@@ -35,6 +38,10 @@ import sys
 from pathlib import Path
 from typing import cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.direct import workers
+from scripts.lib import scratch
+
 VERIFY_CACHE = "verify_cache"
 # A folder holding any of these is a checkout or a cargo target.
 COPY_MARKERS = (".git", ".rustc_info.json", "CACHEDIR.TAG")
@@ -48,6 +55,7 @@ def scratch_folders(run: Path) -> list[Path]:
     """verify_cache/ and each outermost checkout or cargo target under run, never run itself."""
     if run.is_symlink() or not run.is_dir():
         return []
+    protected = workers.protected_working_directories(run)
     found: list[Path] = []
     frontier = [str(run)]
     while frontier:
@@ -58,8 +66,12 @@ def scratch_folders(run: Path) -> list[Path]:
         except OSError:
             continue
         for folder in sorted(folders):
+            candidate = Path(folder).resolve()
+            if candidate in protected:
+                continue
             if (current == str(run) and os.path.basename(folder) == VERIFY_CACHE) or is_copy(folder):
-                found.append(Path(folder))
+                if not any(candidate in cwd.parents for cwd in protected):
+                    found.append(Path(folder))
             else:
                 frontier.append(folder)
     return found
@@ -108,10 +120,24 @@ def remove(folder: Path) -> None:
         _ = git(source, "prune")
 
 
+def end_tracked_scratch(run: Path) -> int:
+    """End the run's tracked scratch except folders still hosting its commands."""
+    task = f"run:{run.name}"
+    protected = workers.protected_working_directories(run)
+
+    def retained(path: Path) -> bool:
+        resolved = path.resolve()
+        return any(cwd == resolved or resolved in cwd.parents for cwd in protected)
+
+    return len(scratch.end(task, keep=retained))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0] if __doc__ else None)
     _ = parser.add_argument("runs", nargs="*", help="run folders whose scratch copies go")
-    runs = [Path(run) for run in cast("list[str]", parser.parse_args().runs)]
+    _ = parser.add_argument("--tracked", action="store_true", help="also end tracked scratch for these runs")
+    args = parser.parse_args()
+    runs = [Path(run) for run in cast("list[str]", args.runs)]
     failed = 0
     for run in runs:
         removed = 0
@@ -123,6 +149,8 @@ def main() -> int:
                 print(f"remove_run_scratch: could not remove {folder}: {error}", file=sys.stderr)
                 continue
             removed += 1
+        if cast(bool, args.tracked):
+            removed += end_tracked_scratch(run)
         if removed:
             print(f"remove_run_scratch: removed {removed} scratch folders from {run}")
     return 1 if failed else 0
