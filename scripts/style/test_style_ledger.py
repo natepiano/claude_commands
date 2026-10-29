@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+import fcntl
 import io
 import json
 import re
@@ -10,19 +11,22 @@ import sqlite3
 import subprocess
 import sys
 import threading
-import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from contextlib import closing, redirect_stdout
 from datetime import datetime, timezone
-from typing import cast, final
+from typing import IO, cast, final
 from unittest import mock
 import rules
 import style_ledger
 
 
 from ledger_test_support import (LedgerTestCase, LedgerStatus, PARENT_FILE)
+
+
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
 
 
 @final
@@ -33,20 +37,29 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         lock_path = self.root / "state" / self.repo.name / "refill.lock"
         self.assertEqual(lock_path.parent, style_ledger.ledger_location(self.repo).database.parent)
         self.assertFalse(lock_path.parent.exists())
-        attempting, acquired = threading.Event(), threading.Event()
+        blocked, acquired = threading.Event(), threading.Event()
+        flock = fcntl.flock
+
+        def observe_lock(file: IO[str], operation: int) -> None:
+            self.assertEqual(operation, fcntl.LOCK_EX)
+            try:
+                flock(file, operation | fcntl.LOCK_NB)
+            except BlockingIOError:
+                blocked.set()
+                flock(file, operation)
 
         def take_lock() -> None:
-            attempting.set()
             with style_ledger.refill_lock(worktree):
                 acquired.set()
 
         with ThreadPoolExecutor(max_workers=1) as pool:
             with style_ledger.refill_lock(self.repo):
                 self.assertTrue(lock_path.is_file())
-                contender = pool.submit(take_lock)
-                self.assertTrue(attempting.wait(5), "second worktree did not attempt refill")
-                self.assertFalse(acquired.wait(0.2), "second worktree entered a held refill lock")
-            contender.result(timeout=5)
+                with mock.patch.object(fcntl, "flock", side_effect=observe_lock):
+                    contender = pool.submit(take_lock)
+                    self.assertTrue(blocked.wait(TEST_HANG_GUARD_SECS), "second worktree did not contend for refill")
+                    self.assertFalse(acquired.is_set(), "second worktree entered a held refill lock")
+            contender.result(timeout=TEST_HANG_GUARD_SECS)
         self.assertTrue(acquired.is_set(), "refill lock was not released on context exit")
 
     def test_migration_25_backfills_from_merged_build_ticket_else_the_finding(self) -> None:
@@ -202,14 +215,21 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         before = self.refill_result(ledger.database)
         with closing(sqlite3.connect(ledger.database)) as writer:
             _ = writer.execute("BEGIN IMMEDIATE")
-            began = time.monotonic()
-            with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
+            connect = sqlite3.connect
+            busy_budgets: list[tuple[int]] = []
+
+            def observe_connect(database: str, *, uri: bool, timeout: float) -> sqlite3.Connection:
+                connection = connect(database, uri=uri, timeout=timeout)
+                busy_budgets.append(cast(tuple[int], connection.execute("PRAGMA busy_timeout").fetchone()))
+                return connection
+
+            with (mock.patch.object(sqlite3, "connect", side_effect=observe_connect),
+                  self.assertRaisesRegex(sqlite3.OperationalError, "database is locked")):
                 style_ledger.record_split(self.repo, "names-unit",
                                           style_ledger.RecordedSplit(1, 2, 3, 4, "2026-10-28T12:00:00+00:00"),
                                           busy_timeout_seconds=0.05)
-            elapsed = time.monotonic() - began
             writer.rollback()
-        self.assertLess(elapsed, 0.75)
+        self.assertEqual(busy_budgets, [(50,)])
         self.assertEqual(self.refill_result(ledger.database), before)
 
     def test_a_later_split_preserves_the_refill_and_a_refill_preserves_the_split(self) -> None:
