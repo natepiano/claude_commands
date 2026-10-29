@@ -152,6 +152,22 @@ exists, must stay at the recorded tip before each later change.
 | 4 | Committed the Units row's Worktree and Branch cells and pushed the merge branch. |
 | 5 | Verified the new remote tip and deleted the old remote and local unit branch. |
 
+After step 2, `workers.repoint_unit_worktree` sets each run's production and
+unit, moves its `working_dir`, `plan_doc` and `project_plan_doc` paths, and
+updates roster worker `cwd` paths under the old worktree. It uses the unit
+ledger's run history and the run roots to find callers. A former-production
+or older adhoc ledger moves through the existing ledger migration code.
+Threads, Codex homes and paused state stay the same. The journal records
+`workers_repointed` after these writes; a retry repeats partial writes safely
+and skips a completed worker step.
+
+`rename.py repair-workers <production> [--dry-run]` applies the same repair
+to each journaled unit that reached step 2, including completed moves made
+before this repair existed. It prints one line per change and one line for
+each unit with nothing to change. Dry run writes nothing. A second repair
+changes nothing. Units without a journaled worktree move are outside this
+command's scope.
+
 The destination is a sibling named `<repository>-<new>-<stem>`. The repository
 prefix comes from the conventional old basename, or the showrunner checkout's
 name when that suffix is absent. The unit commit is
