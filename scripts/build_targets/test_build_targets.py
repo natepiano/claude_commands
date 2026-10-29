@@ -518,6 +518,15 @@ class WaitLocalTests(IsolatedBuildTargetTest):
         self.assertNotIn("the Mac is free", errors)
         self.assertFalse((self.holders / "hana").exists())
 
+    def test_held_call_uses_its_marker_hook_when_no_hook_argument_was_given(self) -> None:
+        self.begin_hold()
+        with mock.patch.dict(os.environ, {"BUILDLOG_MAC_IDLE_HOOK": "exit 0"}), \
+             mock.patch.object(build_targets, "wait_sleep", side_effect=self.count_sleep):
+            code, errors = self.leave_wait("")
+        self.assertEqual(code, build_targets.LEFT_QUEUE_STATUS, errors)
+        self.assertEqual(self.sleeps, 1)
+        self.assertTrue((self.holders / "hana").exists())
+
     def test_unheld_call_never_runs_the_leave_hook(self) -> None:
         marker = self.root / "hook-ran"
         self.assertEqual(self.leave_wait(f"touch {marker}"), (0, ""))

@@ -184,6 +184,8 @@ class VerifyLintScopeTests(unittest.TestCase):
             self.write_executable(bin_directory / name, "raise SystemExit(99)\n")
         for directory in ("tmp", "state", "cache", "runtime", "target", "cargo-home", ".git"):
             (self.root / directory).mkdir()
+        meminfo = self.root / "meminfo"
+        _ = meminfo.write_text("MemAvailable: 67108864 kB\n", encoding="utf-8")
         _ = (self.root / "Cargo.toml").write_text(
             '[package]\nname = "sample"\nversion = "0.1.0"\nedition = "2021"\n',
             encoding="utf-8",
@@ -238,7 +240,7 @@ class VerifyLintScopeTests(unittest.TestCase):
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILDLOG_OFF": "1",
             "BUILDLOG_SCOPE": "0",
-            "BUILDLOG_MEMINFO": str(self.root / "missing-meminfo"),
+            "BUILDLOG_MEMINFO": str(meminfo),
             "BUILD_HOLD_DIR": str(self.root / "build-hold"),
             "BUILD_TARGETS_SCRIPT": str(targets),
             "LINT_CONFIG_READER": str(SCRIPTS / "lint" / "lint_config.sh"),

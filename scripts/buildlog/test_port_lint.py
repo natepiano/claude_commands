@@ -6,19 +6,22 @@ from __future__ import annotations
 import gzip
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
 import port_lint
 import store
 import treekey
 from port_lint import Process, ProbeRow
+if TYPE_CHECKING:
+    from ..direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
+else:
+    from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
 from test_index import Record, encode, point_root_at, step
 from test_treekey import GIT_ENVIRONMENT
 
@@ -26,7 +29,7 @@ SCRIPT = Path(__file__).with_name("port_lint.py")
 CLIPPY = ["cargo", "clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
 MEND = ["env", "RUSTC_WRAPPER=", "cargo", "mend", "--all-targets", "--workspace"]
 KEY = "k" * 64
-RUSTC = "rustc 1.90.0 (1159e78c4 2025-09-14)"
+RUSTC = FIXED_RUSTC
 WORKTREE = "/r/feature"
 
 
@@ -196,9 +199,17 @@ class CommandTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        if shutil.which("rustc") is None:
-            self.skipTest("no rustc on PATH")
         self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        tools = rust_tool_path(self.base / "tools")
+        self.enterContext(mock.patch.dict(os.environ, {"PATH": tools}))
+        lint = self.base / ".claude/scripts/lint/lint"
+        lint.parent.mkdir(parents=True)
+        _ = lint.write_text(
+            '#!/bin/sh\n'
+            + 'printf "%s\\n" "$*" >> "$TEST_LINT_CALLS"\n'
+            + 'echo "test lint fallback" >&2\nexit 86\n'
+        )
+        lint.chmod(0o755)
         self.root = self.base / "buildlog"
         self.repo = self.base / "repo"
         self.repo.mkdir()
@@ -207,7 +218,8 @@ class CommandTests(unittest.TestCase):
             _ = subprocess.run(["git", *args], cwd=self.repo, env=self.environment(), check=True, capture_output=True)
 
     def environment(self) -> dict[str, str]:
-        return {**os.environ, **GIT_ENVIRONMENT, "BUILDLOG_DIR": str(self.root)}
+        return {**os.environ, **GIT_ENVIRONMENT, "BUILDLOG_DIR": str(self.root),
+                "HOME": str(self.base), "TEST_LINT_CALLS": str(self.base / "lint-calls")}
 
     def port_lint(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -221,7 +233,8 @@ class CommandTests(unittest.TestCase):
         )
 
     def record(self, **fields: object) -> None:
-        rustc = subprocess.run(["rustc", "-V"], cwd=self.repo, capture_output=True, text=True, check=True).stdout.strip()
+        rustc = subprocess.run(["rustc", "-V"], cwd=self.repo, env=self.environment(),
+                               capture_output=True, text=True, check=True).stdout.strip()
         key = treekey.tree_key(str(self.repo))
         path = self.root / store.host_name() / "2026-10.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -272,6 +285,15 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(result.returncode, 101, result.stderr)
         self.assertIn("tree unchanged (failed)\nerror: unused import\n", result.stdout)
         self.assertEqual([(call["outcome"], call["status"]) for call in self.calls()], [("replayed", 101)])
+
+    def test_reuse_miss_runs_only_the_private_lint(self) -> None:
+        self.record()
+        _ = (self.repo / "lib.rs").write_text("// changed after the recorded lint\n")
+        result = self.port_lint("clippy")
+        self.assertEqual(result.returncode, 86, result.stdout + result.stderr)
+        self.assertIn("test lint fallback", result.stderr)
+        self.assertEqual((self.base / "lint-calls").read_text(), "clippy\n")
+        self.assertEqual(self.calls(), [])
 
     def test_usage(self) -> None:
         for args in ((), ("doc",)):

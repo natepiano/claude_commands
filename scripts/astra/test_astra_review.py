@@ -53,7 +53,7 @@ if review:
 """
 
 REVIEWER_GUILD_BLOCK = (
-    "Your guild is `reviewers`. Your head is the `reviewers` unit director in the top-level `guilds` "
+    "Your guild is `reviewers`. Your head is the `reviewers` unit director in the `guilds` "
     "production on natedev. At skill start, use the Tips lock/pull rule for `~/rust/nate_style` and load "
     "`guilds/common/` and `guilds/reviewers/`; a Codex holder does this for its worker. Report to your "
     "head when the user corrects you, a phase needs repair round 4, a finding meets the Events repeat "
