@@ -119,6 +119,7 @@ class RepairFirst:
 class WaitingForMerge:
     ticket_id: str
     checkpoint: str
+    reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -1067,6 +1068,7 @@ def gate(repo: Path, ticket_id: str) -> int:
     """Exit 0 when the change may commit, 1 for a review result, 2 when the gate could not run."""
     try:
         with style_ledger.open_ledger(repo) as ledger:
+            ledger.check_ticket_pipeline(ticket_id)
             origin = ledger.ticket_origin(ticket_id)
             if isinstance(origin, style_ledger.SelectedByCoverage):
                 # The worktree is what the checkpoint commits: a removed cell's path is looked for there, its removal in HEAD.
@@ -1273,11 +1275,7 @@ def mechanical_files(repo: Path, ticket_rules: frozenset[str],
 
 
 def synced_tip(ledger: style_ledger.Ledger) -> str:
-    with closing(sqlite3.connect(ledger.database, timeout=style_ledger.BUSY_TIMEOUT_SECONDS)) as connection:
-        rows = cast(list[tuple[str]], connection.execute("SELECT tip FROM sync WHERE id=1").fetchall())
-    if not rows:
-        raise style_ledger.LedgerError("no synced tip; run set-tip first")
-    return rows[0][0]
+    return ledger.synced_commit()
 
 
 def synced_style_branch(ledger: style_ledger.Ledger) -> str:
@@ -2055,12 +2053,81 @@ def _rank_waits(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord, 
                         if not style_proposals.judged_at_current_file(ledger, finding, tip))
 
 
+@dataclass(frozen=True)
+class NoCheckpointBlock:
+    """No waiting checkpoint blocks this selection."""
+
+
+_NO_CHECKPOINT_BLOCK = NoCheckpointBlock()
+
+
+@dataclass(frozen=True)
+class WaitingCheckpoint:
+    ticket_id: str
+    commit: str
+    files: frozenset[str]
+    crates: tuple[str, ...]
+
+    def protected(self, files: frozenset[str]) -> frozenset[str]:
+        return style_ledger.protected_ticket_files(files, self.crates)
+
+    def check(self, files: tuple[str, ...]) -> WaitingForMerge | NoCheckpointBlock:
+        if not files:
+            raise style_ledger.LedgerError("empty selected footprint")
+        selected = frozenset(files)
+        # Build inputs protect source work, but two source tickets do not edit their shared Cargo.lock.
+        overlap = (self.files & self.protected(selected)) | (selected & self.protected(self.files))
+        if overlap:
+            return WaitingForMerge(self.ticket_id, self.commit, "overlap: " + ", ".join(sorted(overlap)))
+        return NoCheckpointBlock()
+
+
+def waiting_checkpoint(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord,
+                       branch: str) -> WaitingCheckpoint:
+    checkpoint = git(ledger.repo, "rev-parse", "--verify", f"{ticket['checkpoint']}^{{commit}}").strip()
+    base = unit_base(ledger.repo, branch)
+    if not isinstance(base, UnitBranchTip) or base.commit != checkpoint:
+        raise style_ledger.LedgerError("unit branch is not at the waiting checkpoint")
+    edits = EditedFiles(ledger.repo, ledger, UnitBranchTip(checkpoint))
+    origin = ledger.ticket_origin(ticket["id"])
+    if isinstance(origin, style_ledger.ApprovedProposal):
+        if not origin.finding_ids or len(edits.ticket_findings(origin)) != len(origin.finding_ids):
+            raise style_ledger.LedgerError("waiting findings cannot be read")
+    if edits.uncertain_of_ticket(ticket):
+        raise style_ledger.LedgerError("waiting footprint has an uncertain module route")
+    original = EditedFiles(ledger.repo, ledger, UnitBranchTip(ticket["base"]))
+    if not ticket["base"] or original.uncertain_of_ticket(ticket):
+        raise style_ledger.LedgerError("waiting base footprint cannot be proved")
+    files = frozenset((*edits.of_ticket(ticket), *original.of_ticket(ticket)))
+    if not files:
+        raise style_ledger.LedgerError("empty waiting footprint")
+    crates = tuple(sorted({member.directory for commit in edits.commits()
+                           for member in coverage_report.workspace(ledger, commit)}, key=len, reverse=True))
+    work = WaitingCheckpoint(ticket["id"], checkpoint, files, crates)
+    _ = work.protected(files)
+    return work
+
+
+def checkpoint_selection(work: WaitingCheckpoint | NoCheckpointBlock, ledger: style_ledger.Ledger,
+                         changes: MainChanges | UnknownMainChanges, files: tuple[str, ...],
+                         findings: tuple[style_ledger.HeldFinding, ...] = ()) -> WaitingForMerge | NoCheckpointBlock:
+    if isinstance(work, NoCheckpointBlock):
+        return work
+    if isinstance(changes, MainChanges) and changes.paths and findings:
+        edits = EditedFiles(ledger.repo, ledger, UnitBranchTip(changes.pushed_tip))
+        if any(edits.uncertain(finding) for finding in findings):
+            raise style_ledger.LedgerError("selected footprint at main is uncertain")
+        files = (*files, *(path for finding in findings for path in edits.of(finding)))
+    return work.check(files)
+
+
 def _select_phase(
     ledger: style_ledger.Ledger, unit: str, branch: str, plan: Path, repo: Path,
     doc: Path, text: str, scope: PilotScope, busy: BusyFiles, first_files: frozenset[str],
     definitions: Mapping[str, rules.Rule],
     changes: MainChanges | UnknownMainChanges,
-) -> PhaseWritten | NoAvailableWork | WaitingForStructure | MergeStyleBranchFirst | WaitingForSync:
+    predecessor: WaitingCheckpoint | NoCheckpointBlock = _NO_CHECKPOINT_BLOCK,
+) -> PhaseWritten | NoAvailableWork | WaitingForStructure | MergeStyleBranchFirst | WaitingForSync | WaitingForMerge:
     queued: list[style_ledger.TicketRecord] = []
     for ticket in ledger.queued_tickets(unit):
         if ticket["kind"] == "proposal" and not ticket["finding_ids"]:
@@ -2112,10 +2179,21 @@ def _select_phase(
         skipped = ticket["proposal"] and Path(ticket["proposal"]) in follow.skipped
         ranked = (("skipped by the declaration step",) if skipped else
                   _rank_waits(ledger, ticket, family, waits, scopes, tip)) if index == 0 and in_scope and not uncertain else ()
+        if index == 0 and in_scope and isinstance(predecessor, WaitingCheckpoint):
+            if uncertain:
+                raise style_ledger.LedgerError("selected footprint is uncertain")
+            origin = ledger.ticket_origin(ticket["id"])
+            findings = edits.ticket_findings(origin) if isinstance(origin, style_ledger.ApprovedProposal) else ()
+            checkpoint = checkpoint_selection(predecessor, ledger, changes, edits.of_ticket(ticket), findings)
+            if isinstance(checkpoint, WaitingForMerge):
+                return checkpoint
         if (index == 0 and in_scope and not uncertain and not ranked
                 and not any(busy.contains(path) for path in edits.of_ticket(ticket))):
             origin = ledger.ticket_origin(ticket["id"])
             findings = edits.ticket_findings(origin) if isinstance(origin, style_ledger.ApprovedProposal) else ()
+            checkpoint = checkpoint_selection(predecessor, ledger, changes, edits.of_ticket(ticket), findings)
+            if isinstance(checkpoint, WaitingForMerge):
+                return checkpoint
             sync = ticket_sync_wait(ledger, changes, ticket["kind"], ticket["crate"], ticket["rule"],
                                     edits.of_ticket(ticket), findings)
             if isinstance(sync, WaitingForSync):
@@ -2126,7 +2204,7 @@ def _select_phase(
                 print(f"dropped {extra['id']}: files busy")
             if isinstance(origin, style_ledger.ApprovedProposal):
                 style_proposals.proposal_command("start", str(origin.issue))
-            write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
+            write_phase(ledger, next(ticket for ticket in ledger.ticket_open(unit) if ticket["state"] == "assigned"), plan, text)
             return PhaseWritten(ticket["id"])
         ledger.ticket_drop(ticket["id"])
         reason = ((f"{uncertain[0]} has a path attribute the rename gate cannot read" if uncertain
@@ -2253,6 +2331,11 @@ def _select_phase(
         files = ((available[0],) if PurePosixPath(rule.partition(":")[2]).stem == "no-magic-values"
                  else read_slices(repo, tip, available, limits)[0])
         selected_findings = tuple(finding for path in files for finding in by_file[path])
+        checkpoint = checkpoint_selection(predecessor, ledger, changes,
+                                          tuple(path for finding in selected_findings for path in edits.of(finding)),
+                                          selected_findings)
+        if isinstance(checkpoint, WaitingForMerge):
+            return checkpoint
         sync = ticket_sync_wait(ledger, changes, "proposal", style_proposals.crate_for(directories, files[0]), rule,
                                 tuple(dict.fromkeys(path for finding in selected_findings for path in edits.of(finding))),
                                 selected_findings)
@@ -2266,7 +2349,7 @@ def _select_phase(
                           proposal=str(issue.path), finding_ids=tuple(finding.finding_id for finding in selected_findings))
         ledger.ticket_assign(ticket_id, branch)
         style_proposals.proposal_command("start", str(issue.path))
-        write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
+        write_phase(ledger, next(ticket for ticket in ledger.ticket_open(unit) if ticket["state"] == "assigned"), plan, text)
         decision_phase = PhaseWritten(ticket_id)
         break
     # As complete does, one renumber follows every decision this refill closed.
@@ -2292,7 +2375,12 @@ def _select_phase(
             if blocked:
                 return WaitingForStructure(blocked, len(ledger.unclassified_rules()))
         return NoAvailableWork()
+    overlap_wait: WaitingForMerge | NoCheckpointBlock = NoCheckpointBlock()
     for selected in candidates:
+        checkpoint = checkpoint_selection(predecessor, ledger, changes, selected.files)
+        if isinstance(checkpoint, WaitingForMerge):
+            overlap_wait = checkpoint
+            continue
         # The ticket's sites and cells were read at the synced tip, so a file a commit on the unit base changed waits.
         changed = [unsynced[path] for path in selected.files if path in unsynced]
         if changed:
@@ -2307,9 +2395,9 @@ def _select_phase(
                           list(selected.rules), selected.rule, [dict(rule=site.rule, path=site.path, line=site.line, text=site.text) for site in selected.sites],
                           cells=selected.cells)
         ledger.ticket_assign(ticket_id, branch)
-        write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
+        write_phase(ledger, next(ticket for ticket in ledger.ticket_open(unit) if ticket["state"] == "assigned"), plan, text)
         return PhaseWritten(ticket_id)
-    return NoAvailableWork()
+    return overlap_wait if isinstance(overlap_wait, WaitingForMerge) else NoAvailableWork()
 
 
 def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
@@ -2334,10 +2422,23 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
         for change in changes:
             print(change)
         opened = ledger.ticket_open(unit)
-        if opened:
+        predecessor: WaitingCheckpoint | NoCheckpointBlock = NoCheckpointBlock()
+        assigned = tuple(ticket for ticket in opened if ticket["state"] == "assigned")
+        if opened and not assigned:
             ticket = opened[0]
-            if ticket["state"] == "checkpointed":
-                return WaitingForMerge(ticket["id"], ticket["checkpoint"])
+            if len(opened) >= 2:
+                return WaitingForMerge(ticket["id"], ticket["checkpoint"], "two open tickets")
+            try:
+                predecessor = waiting_checkpoint(ledger, ticket, row.branch)
+            except (OSError, ValueError, style_ledger.LedgerError, subprocess.CalledProcessError) as error:
+                return WaitingForMerge(ticket["id"], ticket["checkpoint"], f"footprint unknown: {error}")
+        if assigned:
+            ticket = assigned[0]
+            try:
+                ledger.check_ticket_pipeline(ticket["id"])
+            except (OSError, ValueError, subprocess.CalledProcessError) as error:
+                waiting = next((item for item in opened if item["state"] == "checkpointed"), ticket)
+                return WaitingForMerge(waiting["id"], waiting["checkpoint"], f"footprint unknown: {error}")
             origin = ledger.ticket_origin(ticket["id"])
             if isinstance(origin, style_ledger.ApprovedProposal):
                 style_proposals.proposal_command("start", str(origin.issue))
@@ -2347,6 +2448,8 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
         try:
             tip = synced_tip(ledger)
         except style_ledger.LedgerError as error:
+            if isinstance(predecessor, WaitingCheckpoint):
+                return WaitingForMerge(predecessor.ticket_id, predecessor.commit, f"footprint unknown: {error}")
             ledger.wait_for_sync(unit)
             return WaitingForSync(0, f"touched set unknown: {error}")
         standing = standing_style_production(repo)
@@ -2354,17 +2457,31 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
             raise style_ledger.LedgerError(f"no standing style production: {standing.slug}")
         changes_on_main = main_changes(ledger, standing.branch_point, tip)
         if isinstance(changes_on_main, UnknownMainChanges):
+            if isinstance(predecessor, WaitingCheckpoint):
+                return WaitingForMerge(predecessor.ticket_id, predecessor.commit, f"footprint unknown: {changes_on_main.reason}")
             ledger.wait_for_sync(unit)
             return WaitingForSync(0, f"touched set unknown: {changes_on_main.reason}")
         # One catalog read serves both refill passes; it reads no shared state, so it runs before the lock.
         definitions = {rule.rule_id: rule for rule in rules.load_rules(repo)}
+        def select(busy: BusyFiles) -> PhaseWritten | NoAvailableWork | WaitingForStructure | MergeStyleBranchFirst | WaitingForSync | WaitingForMerge:
+            try:
+                return _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files,
+                                     definitions, changes_on_main, predecessor)
+            except (OSError, ValueError, style_ledger.LedgerError, subprocess.CalledProcessError) as error:
+                if isinstance(predecessor, WaitingCheckpoint):
+                    return WaitingForMerge(predecessor.ticket_id, predecessor.commit, f"footprint unknown: {error}")
+                raise
+
         with style_ledger.refill_lock(repo):
             board = berth_board.read_board(repo)
             if isinstance(board, berth_board.BoardUnavailable):
                 return board
             busy = busy_files(repo, doc, ledger, unit, board)
-            selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files,
-                                     definitions, changes_on_main)
+            selected = select(busy)
+            if isinstance(selected, WaitingForMerge):
+                return selected
+            if isinstance(predecessor, WaitingCheckpoint) and not isinstance(selected, PhaseWritten):
+                return WaitingForMerge(predecessor.ticket_id, predecessor.commit, "no disjoint ticket available")
             # A unit told to merge the style branch acts at once, so it records no sync wait.
             if isinstance(selected, PhaseWritten | MergeStyleBranchFirst):
                 ledger.clear_sync_wait(unit)
@@ -2378,8 +2495,11 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
             if isinstance(board, berth_board.BoardUnavailable):
                 return board
             busy = busy_files(repo, doc, ledger, unit, board)
-            selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files,
-                                     definitions, changes_on_main)
+            selected = select(busy)
+            if isinstance(selected, WaitingForMerge):
+                return selected
+            if isinstance(predecessor, WaitingCheckpoint) and not isinstance(selected, PhaseWritten):
+                return WaitingForMerge(predecessor.ticket_id, predecessor.commit, "no disjoint ticket available")
             if isinstance(selected, PhaseWritten | MergeStyleBranchFirst):
                 ledger.clear_sync_wait(unit)
                 return selected
@@ -2768,8 +2888,8 @@ def main(argv: list[str]) -> int:
                 print(f"resume {ticket_id}")
             case RepairFirst():
                 print("repair first")
-            case WaitingForMerge(ticket_id, checkpoint):
-                print(f"waiting for merge: {ticket_id} checkpointed at {checkpoint[:7]}")
+            case WaitingForMerge(ticket_id, checkpoint, reason):
+                print(f"waiting for merge: {ticket_id} checkpointed at {checkpoint[:7]}" + (f"; {reason}" if reason else ""))
                 return 5
             case berth_board.BoardUnavailable(reason):
                 print(f"board unavailable: {reason}")

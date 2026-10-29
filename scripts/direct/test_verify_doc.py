@@ -12,6 +12,8 @@ import time
 from typing import TypedDict, cast, override
 import unittest
 
+from scripts.lint.memory_test_support import fake_memory_readings
+
 VERIFY = Path(__file__).with_name("verify.sh")
 SCRIPTS = VERIFY.parent.parent
 HANG_SECONDS = 300
@@ -97,8 +99,7 @@ class VerifyDocTests(unittest.TestCase):
             self.executable(tools / name, "raise SystemExit(99)\n")
         for name in ("tmp", "state", "cache", "runtime", "target", "session"):
             (self.root / name).mkdir()
-        meminfo = self.root / "meminfo"
-        _ = meminfo.write_text("MemAvailable: 67108864 kB\n", encoding="utf-8")
+        memory_environment = fake_memory_readings(self.root)
         _ = (self.repo / "Cargo.toml").write_text(
             '[workspace]\nmembers = ["alpha", "beta"]\nresolver = "2"\n', encoding="utf-8",
         )
@@ -134,7 +135,7 @@ class VerifyDocTests(unittest.TestCase):
             "CARGO_HOME": str(self.root / "cargo-home"), "CARGO_TARGET_DIR": str(self.root / "target"),
             "VERIFY_STEPS_DIR": str(self.root / "verify-steps"),
             "BUILDLOG_DIR": str(self.root / "buildlog"), "BUILDLOG_OFF": "1", "BUILDLOG_SCOPE": "0",
-            "BUILDLOG_MEMINFO": str(meminfo),
+            **memory_environment,
             "BUILD_HOLD_DIR": str(self.root / "build-hold"), "BUILD_TARGETS_SCRIPT": str(targets),
             "LINT_CONFIG_READER": str(SCRIPTS / "lint/lint_config.sh"),
             "LINT_CONFIG_FILE": str(self.config),

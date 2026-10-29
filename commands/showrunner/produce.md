@@ -283,6 +283,8 @@ State:
   2026-10-06 rule that restated the user's items in every reply.
 - **Long commands** run in the background. The task notification is the wait;
   never poll.
+- A ruling that parks, stops or replaces work names the runs to cancel in
+  the same turn under <WorkerRuns/> in `/unit:direct`.
 - **Helpers.** Stop each named helper agent once its report is read.
 - **An auto-mode denial** is never retried or worked around. Tell the user what
   was denied and let them add a permission rule.
