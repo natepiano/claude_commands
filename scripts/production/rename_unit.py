@@ -934,8 +934,10 @@ def _session_failures(rename: UnitRename) -> list[str]:
     if found is None or not isinstance(found.claude, unit_lookup.LiveClaude):
         failures.append(f"{rename.new} is not running; relaunch it with shutdown.py restart --here --only {rename.session_id}")
     # When the id already matched, the mark is the new id too; only the session name changed.
-    if rename.old in marked and not rename.id_matches:
-        failures.append(f"a session still carries the mark {rename.old}")
+    old = marked.get(rename.old)
+    if old is not None and not rename.id_matches and isinstance(old.claude, (unit_lookup.LiveClaude, unit_lookup.ClaudeUnknown)):
+        failures.append(f"a session still carries the mark {rename.old}: "
+                        + unit_lookup.holder_text(old))
     new_stem = unit_names.stem(rename.new)
     if found is not None and isinstance(found.claude, unit_lookup.LiveClaude):
         if found.claude.name != new_stem:
