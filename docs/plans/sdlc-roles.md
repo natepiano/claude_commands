@@ -178,48 +178,30 @@ For active process redesigns, as we are currently undergoing with promotions and
 **Ruled out:** a second lexical baseline run — the file set is not the same after the role and names changes.
 
 ### Phase 6 — Names that can change live in one config file  · status: done
-**Depends on:** Phase 5
 
-#### Work Order
+#### As-built
 
-**Goal:** a name the user may change later (a shown job, a broadcast audience label) is one line in one config file, so a rename never spreads through scripts and docs again, as `seat` and `delegate` did.
-
-**Spec:**
-- Decided by the user (2026-10-28, via the showrunner): names go through config indirection. One config file holds each changeable name as a stable key and a display name. Scripts use the key; printed text reads the display name. A rename is a one-line config edit.
-- The file: `config/names.toml` (unit director's call: one file for every changeable name, beside the other `config/` files; `config/guilds.conf` keeps the guild ownership settings).
-- Guild heads are retired (the user, through the showrunner, 2026-10-28): no head names in the config, the loader or the check. Role labels stay.
-- Shown jobs (phase 5's `Job` values: showrunner, unit director, worker, code reviewer, UI reviewer, designer, design reviewer): each gets a key and a display name; `roster.ShownName.render()` reads the display name. The key stays the value in records and code.
-- The herdr session name keeps the key (it works as an address). The herdr tab label shows the display name, set at `add_unit` and at restart; there is no live retitle (agreed with the guilds showrunner).
-- Tab title and identity are two things. Today `add_unit.launch_session` and `restart._herdr_launch` pass the session name as the tab title, and `herdr.Herdr.lookup(label)` (`scripts/herdr/herdr.py`) finds panes by label; restart also restores the tab layout and order from labels. Only the shown tab title takes the display name. Every lookup, restored layout, tab order and attach hint keeps using the key. Files at phase start name each callee that sets or reads a tab title or pane label. Tests: after a display rename in a fixture config, restart finds each pane, restores the old layout and tab order, and prints attach hints that work; a label assertion at `add_unit` and restart alone does not count.
-- Inventory first: before dispatch, the unit director lists each printed literal that is a changeable display name, with its file. Phase 5's `Job` values equal their first display names, so a stored key and its display text look the same today. Organizational roles, worker assignments, legacy JSON values and old snapshots stay compatibility contracts and keep their keys. Fixtures prove that retiring a display name flags printed text and leaves stored keys, comparisons and old snapshots alone.
-- The history format: each key holds one ordered list of display names, current name first, earlier names after it. A rename is one edit: put the new name first and keep the rest. Test two successive renames in a fixture: both earlier names reach the retired-name list, and the current one does not.
-- Shown senders captured by phase 5 stay as captured. `send.py` resolves the shown sender on the sending machine, stores it in the queued message (`Shown sender:` line) and forwards it to remote delivery; replay keeps that text. Test in `test_send.py`: after a config rename, a new message carries the new display name, a message queued before it keeps its original text, and a receiver never puts in its own config or roster value.
-- What the fixed-display check fails on (the showrunner, 2026-10-28, option 1): only labels — a printed literal whose whole text is a display name, or the job part of a shown name or a status column. Role words inside sentences (help, errors, report prose) stay plain text; the check prints one count line for them and lists them only with `--prose`. Stored keys (for example the account group key in `accounts.py`) are never hits. Prose is covered by the retired-name check: a changed display name joins the retired list by itself, so a rename is two steps — change the config, then fix the lines the retired-name check lists; the design doc says so.
-- The stderr heredoc gap closes in this phase (next item amended, phase 5 review): `roles_audit.py`'s shell output extraction skips `cat >&2 <<EOF` bodies, so a script could print a fixed display name there and pass the check. Fixtures prove stderr `cat` heredocs count in Names and report retired or fixed display names at their physical source lines, while non-output heredocs stay excluded. Record the extraction change apart from the frozen Phase 3 lexical measure.
-- Phase 5 follow-up, done first in this phase (phase 5 review found two gaps in what shipped):
-  - The roster's human output shows why a job is missing. `ShownName.render()` drops `JobUnassigned.reason`, and the human table shows the legacy `slot_role` instead. Show the reason (assignment not recorded, or record not readable, with the record named), so the responsible director can fix the board or mesh record. Never derive a job from the name. Test in `test_roster.py`.
-  - `roster.py --json` carries the job as its own field. Today it adds only the composite `shown_name`, and `slot_role` is neither the shown job nor a reliable assignment state. Add one structured field that holds the job key, its display name, or the explicit unassigned state with its reason; keep every existing field. The design doc's Role record section names this field for the unit board's owner and cargo-liner, with each one's landing evidence and acceptance test. Sending them the definition does not count as their change landing.
-- The retired-name check (`roles_audit.py check`) fails when a script holds a display name from `config/names.toml` as fixed printed text outside that file. Docs prose is out of scope: a rename still updates docs through the normal retired-name flow.
-- A rename stays one edit (the showrunner, 2026-10-28): each name in `config/names.toml` keeps a history of its earlier display names, and the loader adds each one to the retired-name list on its own. The fast retired-name check then finds every doc and script that still uses the old display name. Test: change a display name in a fixture config, and the check reports a fixture doc that still uses the old one.
-- Types: a key type per name group and one loader that refuses an unknown key, a missing display name and a duplicate display name, each with its own explicit error; no bare string lookups with a default.
-- Tests: rename one display name in a fixture config and every renderer (shown name, Codex thread title, broadcast line, tab label) shows the new name while addresses, session names and records keep the key; the check fails on a planted fixed display name in a fixture script and passes on the live tree.
-- Files at phase start name every place a job or audience display text is printed or set as a tab label.
+- `config/names.toml` has `[jobs]` and `[audiences]` tables. Each stable key holds an ordered list of display names: the current name first, retired names after it. A rename is one edit: put the new name first and keep the rest.
+- `scripts/lib/names.py` has key types `JobKey` and `AudienceKey`, and `load_names(path) -> Names | NamesError`. `NamesError` is `UnknownKey | MissingKey | MissingDisplayName | DuplicateDisplayName | UnreadableNames | InvalidNames`. `Names` gives `job(key)`, `audience(key)`, `current()` and `retired()`. `error_text(error)` names the file, table and key; `report_error` prints it once per process; `runtime_names()` loads once per process and caches the result.
+- Roster shown names, broadcast lines, Codex thread titles, `add_unit` and restart show display names. Record keys, addresses, session names and pane labels keep the key. A shown sender that `send.py` captured keeps its text on replay and remote delivery.
+- `roster.py` human output shows a missing job's reason. `roster.py --json` adds a `job` field: `{"state": "assigned", "key", "display", "qualifier"}` or `{"state": "unassigned", "reason"}`; all earlier fields stay.
+- herdr: `session_title(name, production, unit)` renders the tab title, and `Herdr.retitle(pane, title, *, label)` sets the title apart from the pane label. The Stop hook `scripts/hooks/herdr_tab_title.py` keeps both.
+- `roles_audit.py check` fails on a printed display label: a whole literal, the job part of a shown name, each branch of a printed conditional, and `cat >&2 <<EOF` heredoc bodies at their physical source lines. It counts role words in sentences in one line and lists them only with `--prose`. Each retired name joins the retired-name check by itself.
 
 **Files:**
 - `config/names.toml` — keys and ordered display-name lists
-- `scripts/lib/names.py` — the one loader: key types per name group and its explicit errors
-- `scripts/message/roster.py` — shown job reads the display name; human output shows a missing job's reason; `--json` job field
-- `scripts/message/send.py` — keeps the captured shown sender (read only unless a test shows a gap)
-- `scripts/production/roles_audit.py`, `scripts/production/role_terms.toml` — fixed display-name check; stderr heredoc extraction
-- `scripts/production/add_unit.py`, `scripts/shutdown/restart.py`, `scripts/herdr/herdr.py` — tab title writers and label readers; the unit director adds each further callee found at phase start
-- `docs/plans/sdlc-roles-design.md` — the name config section; the Role record job field
-- `scripts/lib/test_names.py`, `scripts/message/test_roster.py`, `scripts/message/test_send.py`, `scripts/production/test_roles_audit.py`, `scripts/production/test_add_unit.py`, `scripts/shutdown/test_restart.py`, `scripts/herdr/test_herdr.py` — tests
+- `scripts/lib/names.py` — the one loader, key types, error states
+- `scripts/message/roster.py` — display-name render, missing-job reason, `--json` `job` field
+- `scripts/herdr/herdr.py`, `scripts/hooks/herdr_tab_title.py` — tab title apart from pane label
+- `scripts/production/add_unit.py`, `scripts/shutdown/restart.py` — tab title writers
+- `scripts/production/roles_audit.py` — fixed-display label check, sentence count, heredoc and `conditional_fragments` extraction
+- `docs/plans/sdlc-roles-design.md` — "Name config" section and the Role record `job` field
 
-**Workers:** `1 writer + 1 tester`. `impl` holds the loader, the config, the scripts and the design doc section; `test` holds the test files listed above. Use semantic key types and distinct config-error states, never optional values or fallback strings.
+**Binds later work:** a names-config error prints `names.error_text` once per process, and renderers fall back to the address. `runtime_names()` caches once per process; read shown jobs (the code reviewer too) through it. The tab title (shown display title) is not the pane label (session and record identity); restart and layout restore find panes by the label key. `roles_audit.py` keeps label failures apart from the sentence count (211 sentence uses on the live tree).
 
-**Constraints from prior phases:** R5b shown names; the stored fields `seat` and `codex_seats` stay as they are. Phase 5's role record: `Job`, `OrganizationalRole` and `WorkerAssignment` stay distinct; `JobUnassigned` carries `AssignmentUnrecorded` or `AssignmentUnreadable`. `send.py` carries the shown sender, resolved once on the sending machine, as a `Shown sender:` line. The broadcast report line reads `<shown name> [<address>] - <outcome>[: <detail>]`, with the bracket only when the address differs; `zone.py` counts ` - sent\b` on it.
+**Gotchas:** a config edit does not retitle a live tab; launch, restart or a session rename sets the next title. Fixtures pass a config path or patch `runtime_names`; they never read the live config. A pane-restore stub must take the `label` keyword.
 
-**Acceptance gate:** the gates in Delegation Context green, with `python3 -m unittest discover -s scripts/message -p 'test_*.py'` and the tests of each tab title writer; a one-line display-name edit in a fixture config changes every printed place and nothing else; two successive renames retire both earlier names; the check fails on a planted fixed display name, in a stderr heredoc too; after a rename, restart finds each pane by its key and keeps the tab order; `roster.py` on the live tree shows a missing job's reason, and `roster.py --json` carries the job field (smoke: `python3 ~/.claude/scripts/message/roster.py` and `--json` on natedev).
+**Ruled out:** live retitle of open tabs after a config edit — the old title stays until restart or session rename; guild head names in the config — guild heads are retired and `config/guilds.conf` keeps guild ownership.
 
 ### Phase 7 — Each unit director owns its reviewers  · status: todo
 **Depends on:** Phase 6, and models-unit's worker-seats Phase 7 (`assign.sh`) on main; the showrunner says when. Start no code before that message.
@@ -229,6 +211,8 @@ For active process redesigns, as we are currently undergoing with promotions and
 **Goal:** a unit director owns its code reviewers as it owns its writers, testers and fixers. It resumes the same reviewers across phases and plans, so their context builds up. The review pool is gone.
 
 **Spec:**
+- Move each pool reviewer to its unit with one explicit, recoverable transfer whose states are migrated, deferred and conflict, with no nullable fields (showrunner, 2026-10-29). A busy reviewer stays reachable until its move ends. The pool readers go, and unused pool servers stop, only after every move ends. Delete the transfer code in this same phase once every pool reviewer is migrated or ended, so no migration layer stays.
+- Remove `scripts/direct/review_pool.py`, `scripts/direct/test_review_pool.py`, their callers and the review-pool as-built (moved here from worker-seats Phase 15 by models' plan change d8873d42).
 - Decided by the user (2026-10-28, through the showrunner): "unit directors own their own reviews just as they have their own implementers and testers and fixers and they should restart sessions rather than start new ones so context builds up"; the pool "feels unnecessarily complex"; the roles unit director owns the retirement.
 - Reviewers are ordinary unit workers in the unit worker ledger (worker-seats Phase 4), role `review`: addresses `<worktree>-review` and `<worktree>-review2`. `assign.sh --role review` resumes `review`; when `review` is busy (the two lenses of one review run at once), `workers.py resolve` gives `review2`. They are read-only and persist, pause, move and end exactly as writers do (`docs/as-built/long-lived-workers.md`). Never a fresh reviewer while its thread exists.
 - Context carries over (unit director's call): a one-time step makes each unit's leased pool code reviewer (`~/.local/state/review-pool/<slug>/pool.json`) its `review` worker on the same thread. A unit with no leased reviewer opens `review` at its next review. A reviewer still reviewing is not moved; a rerun moves it. A rerun after the move changes nothing.
@@ -241,6 +225,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 - Docs match: `docs/as-built/review-pool.md` and `review-pool-probes.md` are removed; `long-lived-workers.md` gains the reviewer rows; every other as-built that names the pool (Files at phase start list each) says what is true now.
 
 **Files:**
+- `scripts/production/production_tree.py`, `scripts/production/test_production_tree.py`, `scripts/agents/mesh_runs.py`, `scripts/agents/test_mesh_runs.py`, `scripts/production/test_rename.py`, `scripts/production/test_rename_unit.py`
 - `scripts/direct/review.sh` — pool paths removed; `--pool`/`--lease` accepted and ignored
 - `scripts/direct/assign.sh`, `scripts/direct/workers.py` — the `review`/`review2` resolve and the one-time reviewer step (models-unit dropped worker-seats Phase 8, its Phase 12 import-pool call and its Phase 15 `review_pool.py` removal, 2026-10-29: all reviewer work is in this phase)
 - `scripts/direct/review_pool.py`, `scripts/direct/test_review_pool.py`, `scripts/direct/review_pool_report.py`, `scripts/direct/test_review_pool_report.py` — removed
@@ -254,9 +239,9 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Workers:** `1 writer + 1 tester`. `impl` holds the scripts, config and docs above; `test` holds the test files. Files owned by build-followups units (`review.sh`, `assign.sh`, `workers.py`, `codex_mesh.py`, `docs/production_format.md`, the commands) go on the checkpoint notice's also-touches lines, trial-merged against each owner's tip.
 
-**Constraints from prior phases:** phase 5 role record: `Job` keeps `code reviewer`; a reviewer's shown name is `<production> · <unit> · code reviewer[ N]`. Phase 6 names config: the reviewer's shown job reads `config/names.toml`. Worker-seats Phase 7: `assign.sh` options, exit codes, the address and shown name kept apart.
+**Constraints from prior phases:** phase 5 role record: `Job` keeps `code reviewer`; a reviewer's shown name is `<production> · <unit> · code reviewer[ N]`. Phase 6 names config: the reviewer's shown job reads `config/names.toml`. Worker-seats Phase 7: `assign.sh` options, exit codes, the address and shown name kept apart. Reuse `workers.resolve` (it reuses idle workers, adopts prior-run workers, reopens threads and numbers new ones) and `open_unit_worker` (it makes `review` read-only); do not write a second allocator. The job key is `code_reviewer`; ordinary reviewer qualifiers are `JobSlot("review")` and `JobSlot("review2")`, not the pool's numbers. Take reviewer addresses from the worker-seats address contract; do not invent a second form. Two pool readers still read the archive: `production_tree.py` builds reviewer edges from `pool.json` (line 231) and `mesh_runs.py` `_roster_folders` scans pool meshes; the pool part of the design doc's Role record section changes with them.
 
-**Acceptance gate:** the gates in Delegation Context green, with the direct, production and message suites; `rg -n 'review_pool|review-pool|--pool code|Review pool' scripts commands docs config` lists only the retirement note, the archive path and `feature_log --pool`; the retired-name check exit 0. Live check: this unit's next review runs on its own `review` and `review2` workers, and the review after it resumes the same threads (same thread ids in the roster).
+**Acceptance gate:** the gates in Delegation Context green, with the direct, production and message suites; a fixture-backed check finds no operational pool reader or caller, with named exceptions for the migration decoder, compatibility flags and kept history (the retired-name check stays the separate prose gate). Live check: this unit's next review runs on its own `review` and `review2` workers, and the review after it resumes the same threads (same thread ids in the roster).
 
 ### Phase 8 — The retired-name baseline reads at a glance  · status: todo
 **Depends on:** Phase 6
@@ -273,6 +258,10 @@ For active process redesigns, as we are currently undergoing with promotions and
 - Rename the report-facing `WrongPartyCounts` to `SentContactCoverage`: phase 5 records no historical request intent, so the counts show sent contacts, not wrong-party asks.
 - The change comes back to the user as a new change review row.
 - Tests pin the summary lines on a fixture and that the flag prints the full tables; also an unreadable source (its warning shows), an unknown coverage (shown as unknown, not 0) and a window (named in the summary).
+- The summary shows fixed-display label failures (a person must fix them) apart from the count of role words in sentences (information only). `source_check` already returns both, as issues and typed sentence uses; `baseline()` shows neither today. Fixtures cover a tree with a label failure and a tree with sentence uses only. `check` keeps its exit codes and `--prose` keeps its listing.
+- A names-config error keeps its Phase 6 behavior in the baseline: `names.error_text` names the file, table and key, and the baseline fails with it. It never reads as zero findings.
+
+**Constraints from prior phases:** Phase 6 names config: `scripts/lib/names.py` `runtime_names()` loads `config/names.toml` once per process; `load_names(path)` is uncached for fixtures. `roles_audit.py` classifies printed text with `conditional_fragments` (each branch of a printed conditional, in its context) and keeps labels and sentence uses as separate types. A herdr tab title is display text; the pane label is the lookup identity.
 
 **Files:**
 - `scripts/production/roles_audit.py`, `scripts/production/test_roles_audit.py`
@@ -293,9 +282,10 @@ For active process redesigns, as we are currently undergoing with promotions and
 - The windowed measure names the merge timestamp of f8f5b962 into sdlc and a complete observation interval of at least 3 days after it. Sent-contact counts are descriptive and have no Step 1 reduction target. Keep unknown roles unknown: a current role record gives no historical roles or request intent, so never infer a role from a shown name.
 - Add the merge-gate cost of the retired-name check (Phase 4 budget) as measured in real gates over the window.
 - Do not run the lexical baseline again: the recorded 104-to-22 reduction (n=82) is the lexical result, and a new run on the current tree has no same file set, because Phases 5–8 change sources, config and output. The lexical half-size decision is closed by that result.
+- Measure contacts alone, without the combined `baseline` command (it reads lexical sources first): call `parse_messages` over one fixed `AuditWindow` and the contact-count function in `roles_audit.py`. Keep unknown coverage and historical intent as unknown. Report gate timings for each implementation checkpoint, because Phase 6 changed extraction and classification after the Phase 4 timings.
 - For the windowed measure (sent contacts per recipient), the after window is at least 3 days from the merge. Wrong-party asks are not measurable until message records carry roles; do not report them. Add each number to the Step log with its n or window and its source.
 - Update Steps with what the measure taught, and propose the next step; that proposal is the question.
-- At phase end, the unit director sends the showrunner the result and the next step as one question for the user. The next approved step becomes a new phase after this one, with the Work Order of Phase 3 and the step's own Spec.
+- At phase end, the unit director sends the showrunner the result and the next step as one question for the user. The next approved step becomes a new phase after this one, with its own self-contained Work Order: the step's files, owners, compatibility constraints, measures and gates. Phase 3 is now an As-built and holds no Work Order to copy.
 
 **Files:**
 - `docs/plans/sdlc-roles-design.md` — Step log, Steps
