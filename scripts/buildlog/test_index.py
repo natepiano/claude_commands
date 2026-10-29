@@ -596,7 +596,7 @@ class IndexTests(unittest.TestCase):
                 ("old", None, None, None, None),
             ],
         )
-        self.assertEqual(index.SCHEMA_VERSION, 22)
+        self.assertEqual(index.SCHEMA_VERSION, 23)
 
     def test_copy_call_fields_reach_index_and_old_records_read_as_null(self) -> None:
         self.write(

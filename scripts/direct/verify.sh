@@ -655,7 +655,9 @@ def blob(path: bytes) -> bytes | None:
 # The member folders the tests of `name` are built from, and every member
 # folder, deepest first.
 def package_roots(name: str) -> tuple[set[bytes], list[bytes]]:
+    global test_target_directory
     meta = json.load(sys.stdin)
+    test_target_directory = meta.get("target_directory", "")
     members = {
         os.path.realpath(os.path.dirname(package["manifest_path"])).encode(): package
         for package in meta["packages"]
@@ -677,7 +679,15 @@ def package_roots(name: str) -> tuple[set[bytes], list[bytes]]:
 
 
 split = sys.argv.index("--")
+test_target_directory = ""
 files = sys.argv[1:split]
+guard_files = files[1:2] if files[:1] == ["--assertion-guard"] else []
+rulings_folders = []
+if guard_files:
+    files = files[2:]
+    while files[:1] == ["--rulings"]:
+        rulings_folders.append(files[1])
+        files = files[2:]
 package = files[1] if files[:1] == ["--package"] else ""
 if package:
     files = files[2:]
@@ -722,14 +732,61 @@ else:
     key = hashlib.sha256(top + b"\0" + run("git", "--no-optional-locks", "-C", top, "rev-parse", "HEAD^{tree}"))
     for path in changed:
         key.update(path + b"\0" + content(os.path.join(top, path)))
+if guard_files:
+    # Resolve exactly as the guard does, including completed merge parents.
+    # An unresolved base produces no cache key, so the guard runs and refuses.
+    import runpy
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    # Load the same guard the lint stage runs, including any configured
+    # replacement. Its own base and rulings readers define the cache inputs.
+    assertion_guard = SimpleNamespace(**runpy.run_path(guard_files[0]))
+
+    repo = Path(os.fsdecode(top))
+    explicit = os.environ.get("VERIFY_ASSERTION_BASE", "")
+    try:
+        bases = [assertion_guard.default_base(repo, explicit)]
+        if not explicit:
+            bases.extend(assertion_guard.git(repo, "rev-list", "--parents", "-n", "1", "HEAD").split()[2:])
+        for base in dict.fromkeys(bases):
+            key.update(b"\0guard-base=" + base.encode())
+            key.update(assertion_guard.git(repo, "log", "--format=%B", base + "..HEAD", "--").encode())
+        key.update(assertion_guard.git(repo, "rev-parse", "HEAD").encode())
+        rulings = assertion_guard.read_rulings(rulings_folders, "")
+    except assertion_guard.GuardError:
+        sys.exit(1)
+    for name in guard_files:
+        key.update(content(os.fsencode(name)))
+    key.update(json.dumps(sorted(rulings.items()), separators=(",", ":")).encode())
 key.update(run("rustc", "-vV"))
 for name in files:
     key.update(content(name.encode()))
+build_key = key.copy()
+build_words = []
+words = iter(sys.argv[split + 1 :])
+for word in words:
+    if word == "--filter":
+        next(words, None)
+    else:
+        build_words.append(word)
+for word in build_words:
+    build_key.update(b"\0" + word.encode())
 for word in sys.argv[split + 1 :]:
     key.update(b"\0" + word.encode())
 for name, value in sorted(os.environ.items()):
     if name.startswith(("RUST", "CARGO_", "NEXTEST_")) and name != "CARGO_MAKEFLAGS":
         key.update(("\0" + name + "=" + value).encode())
+        if not name.startswith("NEXTEST_") or name == "NEXTEST_CARGO_PROFILE":
+            build_key.update(("\0" + name + "=" + value).encode())
+if package and os.environ.get("VERIFY_COMPUTE_TEST_BUILD") == "1":
+    # Cargo metadata resolves build.target-dir, CARGO_TARGET_DIR and the
+    # workspace root for us. An unknown destination proves no fresh build.
+    output = os.environ.get("VERIFY_TEST_BUILD_INPUTS_FILE", "")
+    if output and os.path.isabs(test_target_directory):
+        build_key.update(b"\0target=" + os.fsencode(test_target_directory))
+        with open(output, "w") as handle:
+            handle.write(build_key.hexdigest() + "\n" + test_target_directory + "\n")
 print(key.hexdigest())
 '
 
@@ -974,6 +1031,21 @@ if [[ "${1:-}" == "--session-dir" ]]; then
     fi
 fi
 
+# One list feeds both the guard invocation and its cache inputs. The identity
+# check also deduplicates two spellings of the same existing folder.
+assertion_rulings_args() {
+    ASSERTION_RULINGS_ARGS=()
+    local folder previous=""
+    for folder in "${UNIT_SESSION_DIR:-}" "${UNIT_RUN_DIR:-}"; do
+        [[ -n "$folder" ]] || continue
+        if [[ "$folder" != "$previous" && ( -z "$previous" || ! "$folder" -ef "$previous" ) ]]; then
+            ASSERTION_RULINGS_ARGS+=(--rulings "$folder")
+            previous="$folder"
+        fi
+    done
+}
+assertion_rulings_args
+
 # A Codex mesh worker's command dies with its turn, and a worker that waits on
 # one spends a model call per wait. So a worker's call detaches: mesh_runs.py
 # runs this same call under a supervisor outside the worker's process group,
@@ -1143,8 +1215,9 @@ fi
 
 tree_key() {
     local words=("$CMD" "${ARGS[@]}") names=() name scope=()
-    if [[ "$CMD" == lint && ${#ARGS[@]} -eq 1 ]]; then
-        words=(lint)
+    if [[ "$CMD" == lint ]]; then
+        scope=(--assertion-guard "$ASSERTION_GUARD_SCRIPT" ${ASSERTION_RULINGS_ARGS[@]+"${ASSERTION_RULINGS_ARGS[@]}"})
+        if [[ ${#ARGS[@]} -eq 1 ]]; then words=(lint); fi
     elif [[ "${FILTER_RUN}" -eq 1 ]]; then
         # The filter names go last, sorted, each once (see the header).
         words=("$CMD")
@@ -1166,6 +1239,7 @@ tree_key() {
         # Keyed on the package's own build, read from the call's metadata.
         scope=(--package "${ARGS[0]}")
     fi
+    VERIFY_TEST_BUILD_INPUTS_FILE="${HOLD_WAIT_DIR:+$HOLD_WAIT_DIR/test-build-inputs}" \
     "$PY" -c "$TREE_KEY_PY" ${scope[@]+"${scope[@]}"} "${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh" \
         "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}" -- "${words[@]}" \
         <<< "${GATE_METADATA}" 2>/dev/null || true
@@ -2080,7 +2154,7 @@ if [[ "$CMD" == final || ( "$CMD" == test && ( ${#ARGS[@]} -eq 1 \
     fi
 fi
 # A test record's key reads the package's dependencies from it (tree_key).
-if [[ "$CMD" == test && -n "${CACHE_DIR}" && -z "${GATE_METADATA}" ]]; then
+if [[ "$CMD" == test && -z "${GATE_METADATA}" ]]; then
     GATE_METADATA="$(cargo metadata --no-deps --format-version 1 2>/dev/null)" || GATE_METADATA=""
 fi
 
@@ -2601,6 +2675,24 @@ buildlog_wait_for_memory() {
 # leaves the hold wait for the Mac (status LINT_LEFT_QUEUE_STATUS) does not. The
 # hold time stays in the hold wait record; only the time to take the token
 # again counts as token wait. With no hold present, nothing is given back.
+refresh_test_build_inputs() {
+    # Admission and the recorder must see the inputs after a hold, just as
+    # buildlog_begin takes its source key after that wait.
+    rm -f "$HOLD_WAIT_DIR/test-build-inputs"
+    VERDICT_KEY="$(VERIFY_COMPUTE_TEST_BUILD=1 tree_key)"
+    export BUILDLOG_TEST_BUILD_KEY="" BUILDLOG_TEST_TARGET_DIR=""
+    if [[ -f "$HOLD_WAIT_DIR/test-build-inputs" ]]; then
+        { IFS= read -r BUILDLOG_TEST_BUILD_KEY; IFS= read -r BUILDLOG_TEST_TARGET_DIR; } \
+            < "$HOLD_WAIT_DIR/test-build-inputs"
+    fi
+    # A hold can also arrive during memory admission, after buildlog_begin.
+    if [[ -n "${BUILDLOG_START:-}" ]]; then
+        BUILDLOG_TREE="$("$PY" "$BUILDLOG_RECORD" key 2>/dev/null)" || BUILDLOG_TREE=""
+    fi
+    TEST_BUILD_INPUTS_READY=1
+}
+TEST_BUILD_INPUTS_READY=0
+
 eval "$(declare -f build_hold_wait_local | sed '1s/build_hold_wait_local/build_hold_wait_local_only/')"
 build_hold_wait_local() {
     local status=0
@@ -2610,8 +2702,9 @@ build_hold_wait_local() {
     step_state waiting_hold
     # A step without the token (before the first take, or after a Mac trip) only waits.
     if [[ "${TOKEN_HELD:-0}" -ne 1 ]]; then
-        build_hold_wait_local_only "$@"
-        return
+        build_hold_wait_local_only "$@" || return $?
+        if [[ "$TEST_BUILD_INPUTS_READY" == 1 ]]; then refresh_test_build_inputs; fi
+        return 0
     fi
     if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then
         : > "${TOKEN_WAIT_FILE}.given_back"
@@ -2623,6 +2716,7 @@ build_hold_wait_local() {
     if (( TOKEN_WAITED > 0 )) && [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
         printf '%s\n' "$TOKEN_WAITED" >> "$TOKEN_WAIT_FILE"
     fi
+    if [[ "$TEST_BUILD_INPUTS_READY" == 1 ]]; then refresh_test_build_inputs; fi
     return "$status"
 }
 
@@ -2637,10 +2731,14 @@ fi
 RUN_STARTED=${SECONDS}
 MEM_KILL_FILE="$(mktemp)"
 TOKEN_WAIT_FILE="$(mktemp)"
+if [[ "$CMD" == test ]]; then
+    # The common path calculates once; a later hold refreshes after its wait.
+    refresh_test_build_inputs
+fi
 if [[ -n "${CACHE_DIR}" ]] && mkdir -p "${CACHE_DIR}"; then
     # Taken now, after the token and hold waits: an edit made while this call
     # waited is part of the tree it runs on.
-    VERDICT_KEY="$(tree_key)"
+    if [[ "$CMD" != test ]]; then VERDICT_KEY="$(tree_key)"; fi
     RUN_LOG="${CACHE_DIR}/run.$$.log"
     : > "${RUN_LOG}"
     exec > >(tee -a "${RUN_LOG}") 2> >(tee -a "${RUN_LOG}" >&2)
@@ -2768,10 +2866,7 @@ case "$CMD" in
         fi
         [[ $# -eq 0 ]] || { usage; exit 2; }
         ASSERTION_REPO="${WORKSPACE_ROOT:-$(git rev-parse --show-toplevel)}"
-        ASSERTION_ARGS=(--repo "$ASSERTION_REPO")
-        if [[ -n "${UNIT_SESSION_DIR:-}" ]]; then
-            ASSERTION_ARGS+=(--rulings "$UNIT_SESSION_DIR")
-        fi
+        ASSERTION_ARGS=(--repo "$ASSERTION_REPO" ${ASSERTION_RULINGS_ARGS[@]+"${ASSERTION_RULINGS_ARGS[@]}"})
         if [[ -n "${VERIFY_ASSERTION_BASE:-}" ]]; then
             ASSERTION_ARGS+=(--base "$VERIFY_ASSERTION_BASE")
         fi

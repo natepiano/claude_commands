@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, redirect_stdout
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast, override
+from typing import Protocol, cast, override
 from unittest import mock
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -29,9 +29,25 @@ import memory_admit as gate
 import nextest_budget as budget
 store = gate.store
 
+
+class SourceTreeKeyReader(Protocol):
+    def tree_key(self, directory: str) -> str | None: ...
+
+
+class BuildStepRecorder(Protocol):
+    store: gate.BuildLogStore
+    treekey: SourceTreeKeyReader
+
+    def step(self, arguments: list[str]) -> None: ...
+
+
+buildlog_record = cast(BuildStepRecorder, cast(object, gate.record))
+
 GIB = gate.GIB
 NOW = datetime(2026, 10, 6, 22, 0, tzinfo=UTC)
 HISTORY_AT = NOW - timedelta(seconds=1)
+FRESH_HISTORY_AT = NOW - timedelta(minutes=5)
+LAST_TEST_BUILD_AT = NOW - timedelta(minutes=1)
 INVOKE = Path(__file__).with_name("invoke.sh")
 MEMORY_GATE = Path(__file__).with_name("memory_gate.sh")
 HANA = gate.RepositoryIdentity("https://example.org/nate/hana", "hana", "hana")
@@ -471,6 +487,381 @@ class FilteredPromiseTests(unittest.TestCase):
                                scope="filtered", package="hana", filters=("native_rate",)),
             gate.ExpectedPeak(6 * GIB, "measured", 1),
         )
+
+
+class FreshTestPromiseTests(unittest.TestCase):
+    root: Path = Path()
+    worktree: Path = Path()
+    state: Path = Path()
+    sample_id: int = 0
+    host: str = "test-host"
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.worktree = self.root / "checkout"
+        (self.worktree / "target").mkdir(parents=True)
+        self.state = self.root / "sweep-state"
+        self.state.mkdir()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"LINT_SWEEP_STATE_DIR": str(self.state)})))
+        (self.root / "admission").mkdir()
+        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+            _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
+                           + "ended_at TEXT, peak_mem_bytes INTEGER, argv TEXT, call_id TEXT, "
+                           + "worktree TEXT, tree_key TEXT, status INTEGER, tests_run INTEGER, "
+                           + "crates_compiled INTEGER, sweep_freed_bytes INTEGER)")
+        self.sample_id = 0
+        self.samples([12 * GIB] * 10, scope="full", crates=1)
+        self.samples([10 * GIB] * 10, crates=1)
+
+    def samples(self, peaks: list[int], *, package: str = "hana", scope: gate.TestScope = "filtered",
+                filters: tuple[str, ...] = ("native_rate",), crates: int | None = 0,
+                host: str = "test-host", at: datetime = FRESH_HISTORY_AT,
+                status: int = 0, tests_run: int = 1, measured: bool = True) -> None:
+        expression = f"package({package})"
+        if scope == "filtered":
+            selection = " | ".join(f"test({name})" for name in filters)
+            expression += " & " + (selection if len(filters) == 1 else f"({selection})")
+        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db, \
+                (self.root / "admission/anon_peaks.jsonl").open("a") as output:
+            for peak in peaks:
+                self.sample_id += 1
+                call = f"call-{self.sample_id}"
+                timestamp = store.utc_iso(at.timestamp())
+                _ = db.execute("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                               (host, "hana", "nextest", timestamp, timestamp, 20 * GIB,
+                                json.dumps(["cargo", "nextest", "run", "-E", expression]), call,
+                                "/another/history-worktree", "historical-key", status, tests_run, crates, 0))
+                if measured:
+                    _ = output.write(json.dumps({
+                        "host": host, "repo": "hana", "repo_identity": HANA.key, "step": "nextest",
+                        "package": package, "test_scope": scope, "filters": list(filters),
+                        "ended_at": timestamp, "anon_peak_bytes": peak, "call_id": call,
+                    }) + "\n")
+
+    def previous_build(self, *, key: str = "current-key", worktree: str = "", package: str = "hana",
+                       scope: gate.TestScope = "filtered", status: int = 0, tests_run: int = 1,
+                       at: datetime = LAST_TEST_BUILD_AT, finished: bool = True,
+                       indexed: bool = True, recorded_build_key: bool = True) -> None:
+        expression = f"package({package})" + (" & test(other_filter)" if scope == "filtered" else "")
+        timestamp = store.utc_iso(at.timestamp())
+        arguments = ["cargo", "nextest", "run", "-E", expression]
+        if indexed:
+            with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+                _ = db.execute("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                               (self.host, "hana", "nextest", timestamp, timestamp if finished else None, None,
+                                json.dumps(arguments), "last-build", worktree or str(self.worktree),
+                                key, status, tests_run, 3, 0))
+        record: dict[str, object] = {
+            "kind": "step", "host": self.host, "repo": "hana", "step": "nextest",
+            "started_at": timestamp, "ended_at": timestamp if finished else None,
+            "argv": arguments, "worktree": worktree or str(self.worktree), "tree_key": key,
+            "status": status, "tests_run": tests_run, "crates_compiled": 3,
+        }
+        if recorded_build_key:
+            record["test_build_key"] = key
+        self.append_step(record, at)
+
+    def append_step(self, record: dict[str, object], at: datetime) -> None:
+        store.append_line(self.root / self.host / f"{at:%Y-%m}.jsonl", record)
+
+    def index_current_prefix(self) -> Path:
+        path = self.root / self.host / f"{NOW:%Y-%m}.jsonl"
+        offset = path.stat().st_size
+        with path.open("rb") as handle:
+            marks = gate.file_marks.marks(handle, offset)
+        source = path.relative_to(self.root).as_posix()
+        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+            _ = db.execute("ALTER TABLE steps ADD COLUMN test_build_key TEXT")
+            _ = db.execute("ALTER TABLE steps ADD COLUMN src TEXT")
+            _ = db.execute("UPDATE steps SET test_build_key = tree_key, src = ? WHERE worktree = ?",
+                           (source, str(self.worktree)))
+            _ = db.execute("CREATE TABLE files(path TEXT PRIMARY KEY, offset INTEGER, marks TEXT)")
+            _ = db.execute("INSERT INTO files VALUES (?, ?, ?)", (source, offset, marks))
+        return path
+
+    def fresh(self, *, key: str = "current-key", scope: gate.TestScope = "filtered",
+              target_dir: str = "target") -> bool:
+        return gate.is_fresh_test(self.root, self.host, str(self.worktree), "hana", scope, key, NOW,
+                                  target_dir=target_dir)
+
+    def promise(self, *, key: str = "current-key", scope: gate.TestScope = "filtered",
+                filters: tuple[str, ...] = ("native_rate",)) -> gate.ExpectedPeak:
+        return gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, scope=scope,
+                                  package="hana", filters=filters, fresh=self.fresh(key=key, scope=scope))
+
+    def test_same_tree_native_rate_run_uses_zero_compile_anon_p90_joined_by_call(self) -> None:
+        self.samples([number * GIB // 4 for number in range(1, 11)])
+        self.samples([11 * GIB] * 10, crates=2)
+        self.previous_build()
+        self.assertTrue(self.fresh())
+        self.assertEqual(self.promise(), gate.ExpectedPeak(9 * GIB // 4, "measured", 10))
+
+    def test_fresh_exact_filter_set_is_sorted_and_precedes_broader_package_history(self) -> None:
+        self.samples([2 * GIB], filters=("render", "native_rate"))
+        self.samples([8 * GIB] * 10, filters=("other",))
+        self.previous_build()
+        self.assertEqual(self.promise(filters=("native_rate", "render")),
+                         gate.ExpectedPeak(2 * GIB, "measured", 1))
+
+    def test_fresh_unseen_filters_use_only_fresh_same_package_and_scope(self) -> None:
+        self.samples([2 * GIB], filters=("render",))
+        self.samples([8 * GIB] * 10, package="hana-ui")
+        self.samples([9 * GIB] * 10, scope="full")
+        self.previous_build()
+        self.assertEqual(self.promise(), gate.ExpectedPeak(2 * GIB, "measured", 1))
+
+    def test_fresh_promise_has_the_fixed_floor(self) -> None:
+        self.samples([GIB // 4])
+        self.previous_build()
+        self.assertEqual(self.promise().bytes, gate.FILTERED_FLOOR)
+
+    def test_fresh_full_suite_uses_its_own_zero_compile_history(self) -> None:
+        self.samples([3 * GIB], scope="full")
+        self.samples([GIB], scope="filtered")
+        self.previous_build(scope="full")
+        self.assertEqual(self.promise(scope="full"), gate.ExpectedPeak(3 * GIB, "measured", 1))
+
+    def test_fresh_without_zero_compile_history_keeps_compile_promise(self) -> None:
+        self.previous_build()
+        self.assertTrue(self.fresh())
+        self.assertEqual(self.promise(), gate.ExpectedPeak(10 * GIB, "measured", 10))
+
+    def test_fresh_index_peak_is_scaled_when_no_joined_anon_measurement_exists(self) -> None:
+        self.samples([GIB], measured=False)
+        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+            _ = db.execute("UPDATE steps SET peak_mem_bytes = ? WHERE crates_compiled = 0", (4 * GIB,))
+        self.previous_build()
+        self.assertEqual(self.promise(), gate.ExpectedPeak(int(4 * GIB * gate.ANON_SHARE), "buildlog", 1))
+
+    def test_missing_prior_step_cannot_use_fresh_history(self) -> None:
+        self.samples([2 * GIB])
+        self.assertFalse(self.fresh())
+        self.assertEqual(self.promise().bytes, 10 * GIB)
+
+    def test_other_worktree_cannot_prove_this_target_is_built(self) -> None:
+        self.samples([2 * GIB])
+        self.previous_build(worktree=str(self.root / "other-checkout"))
+        self.assertFalse(self.fresh())
+        self.assertEqual(self.promise().bytes, 10 * GIB)
+
+    def test_other_package_or_scope_cannot_prove_this_test_build_is_fresh(self) -> None:
+        self.samples([2 * GIB])
+        self.previous_build(package="hana-ui")
+        self.previous_build(scope="full")
+        self.assertFalse(self.fresh())
+        self.assertEqual(self.promise().bytes, 10 * GIB)
+
+    def test_changed_or_missing_current_tree_key_keeps_compile_promise(self) -> None:
+        self.samples([2 * GIB])
+        self.previous_build()
+        for key in ("different-key", ""):
+            with self.subTest(key=key):
+                self.assertFalse(self.fresh(key=key))
+                self.assertEqual(self.promise(key=key).bytes, 10 * GIB)
+
+    def test_latest_finished_build_overrides_older_matching_tree_key(self) -> None:
+        self.samples([2 * GIB])
+        self.previous_build(at=NOW - timedelta(minutes=2))
+        self.previous_build(key="newer-different-key")
+        self.assertFalse(self.fresh())
+        self.assertEqual(self.promise().bytes, 10 * GIB)
+
+    def test_compile_failure_without_tests_cannot_prove_freshness(self) -> None:
+        self.samples([2 * GIB])
+        self.previous_build(status=101, tests_run=0)
+        self.assertFalse(self.fresh())
+        self.assertEqual(self.promise().bytes, 10 * GIB)
+
+    def test_failed_tests_still_prove_the_test_targets_were_built(self) -> None:
+        self.samples([2 * GIB])
+        self.previous_build(status=100, tests_run=1)
+        self.assertTrue(self.fresh())
+        self.assertEqual(self.promise().bytes, 2 * GIB)
+
+    def test_successful_empty_selection_still_proves_the_test_targets_were_built(self) -> None:
+        self.samples([2 * GIB])
+        self.previous_build(status=0, tests_run=0)
+        self.assertTrue(self.fresh())
+        self.assertEqual(self.promise().bytes, 2 * GIB)
+
+    def test_unfinished_step_does_not_replace_the_last_finished_build(self) -> None:
+        self.previous_build()
+        self.previous_build(key="unfinished-other-key", at=NOW - timedelta(seconds=30), finished=False)
+        self.assertTrue(self.fresh())
+
+    def test_source_only_legacy_step_cannot_prove_the_build_inputs_are_fresh(self) -> None:
+        self.samples([2 * GIB])
+        self.previous_build(recorded_build_key=False)
+        self.assertFalse(self.fresh())
+        self.assertEqual(self.promise().bytes, 10 * GIB)
+
+    def test_recorder_preserves_build_input_key_only_when_source_stays_unchanged(self) -> None:
+        path = self.root / self.host / f"{NOW:%Y-%m}.jsonl"
+        for seconds, ending_source, expected_fresh in ((30, "same-source", True), (20, "edited-source", False)):
+            with self.subTest(source=ending_source), patch.dict(os.environ, {
+                    "BUILDLOG_TREE_START": "same-source", "BUILDLOG_TEST_BUILD_KEY": "current-key"}), \
+                    patch.object(buildlog_record, "git_directory", return_value=str(self.worktree)), \
+                    patch.object(buildlog_record, "git_facts", return_value={"worktree": str(self.worktree)}), \
+                    patch.object(buildlog_record.treekey, "tree_key", return_value=ending_source), \
+                    patch.object(buildlog_record, "rustc_version", return_value="rustc fixture"), \
+                    patch.object(buildlog_record.store, "host_name", return_value=self.host), \
+                    patch.object(buildlog_record.store, "host_file", return_value=path):
+                ended = NOW.timestamp() - seconds
+                buildlog_record.step(["0", str(ended - 5), str(ended), "1", "", "",
+                                      "cargo", "nextest", "run", "-E", "package(hana) & test(native_rate)"])
+                row = cast(dict[str, object], json.loads(path.read_text().splitlines()[-1]))
+                self.assertEqual(row.get("test_build_key"), "current-key" if expected_fresh else None)
+                self.assertEqual(self.fresh(), expected_fresh)
+
+    def test_newer_unindexed_step_overrides_the_indexed_matching_build(self) -> None:
+        self.samples([2 * GIB])
+        self.previous_build(at=NOW - timedelta(minutes=2))
+        self.assertTrue(self.fresh())
+        self.previous_build(key="different-build-inputs", indexed=False)
+        self.assertFalse(self.fresh())
+        self.assertEqual(self.promise().bytes, 10 * GIB)
+
+    def test_validated_index_prefix_still_reads_newer_finished_build_in_jsonl_tail(self) -> None:
+        self.samples([2 * GIB])
+        self.previous_build(at=NOW - timedelta(minutes=2))
+        _ = self.index_current_prefix()
+        self.assertTrue(self.fresh())
+        self.previous_build(key="different-build-inputs", indexed=False)
+        self.assertFalse(self.fresh())
+        self.assertEqual(self.promise().bytes, 10 * GIB)
+
+    def test_replaced_log_invalidates_previously_matching_index_prefix(self) -> None:
+        self.previous_build()
+        path = self.index_current_prefix()
+        self.assertTrue(self.fresh())
+        original = path.read_text()
+        replaced = original.replace('"test_build_key":"current-key"',
+                                    '"test_build_key":"altered-key"')
+        self.assertNotEqual(replaced, original)
+        self.assertEqual(len(replaced), len(original))
+        _ = path.write_text(replaced)
+        self.assertFalse(self.fresh())
+
+    def test_incomplete_tail_after_validated_index_prefix_refuses_freshness(self) -> None:
+        self.previous_build()
+        path = self.index_current_prefix()
+        self.assertTrue(self.fresh())
+        with path.open("a") as log:
+            _ = log.write('{"kind": "step"')
+        self.assertFalse(self.fresh())
+
+    def test_unreadable_current_history_cannot_trust_the_matching_index(self) -> None:
+        self.previous_build()
+        self.assertTrue(self.fresh())
+        with (self.root / self.host / f"{NOW:%Y-%m}.jsonl").open("a") as log:
+            _ = log.write("{incomplete record\n")
+        self.assertFalse(self.fresh())
+
+    def test_unknown_resolved_target_directory_cannot_prove_freshness(self) -> None:
+        self.previous_build()
+        self.assertTrue(self.fresh())
+        self.assertFalse(self.fresh(target_dir=""))
+
+    def test_sweep_of_cargo_configured_target_invalidates_the_build(self) -> None:
+        configured = self.worktree / "configured-target"
+        configured.mkdir()
+        cargo = self.worktree / ".cargo"
+        cargo.mkdir()
+        _ = (cargo / "config.toml").write_text('[build]\ntarget-dir = "configured-target"\n')
+        self.previous_build()
+        self.assertTrue(self.fresh(target_dir=str(configured)))
+        _ = (self.state / "target-deletes.json").write_text(json.dumps({
+            str(configured): (NOW - timedelta(seconds=30)).timestamp(),
+        }))
+        self.assertFalse(self.fresh(target_dir=str(configured)))
+
+    def test_admission_uses_the_resolved_target_and_build_key_passed_by_verify(self) -> None:
+        configured = self.worktree / "cargo-config-target"
+        configured.mkdir()
+        self.samples([2 * GIB])
+        self.previous_build()
+        meminfo = self.root / "meminfo"
+        _ = meminfo.write_text("MemAvailable: 67108864 kB\n")
+        arguments = ["cargo", "nextest", "run", "-E", "package(hana) & test(native_rate)"]
+        with patch.dict(os.environ, {
+                "BUILDLOG_TEST_BUILD_KEY": "current-key", "BUILDLOG_TREE": "source-only-key",
+                "BUILDLOG_TEST_TARGET_DIR": str(configured),
+                "CARGO_TARGET_DIR": str(self.worktree / "target")}), \
+                patch.object(gate, "git_identity", return_value=(HANA, "checkout")), \
+                patch.object(gate.store, "host_name", return_value=self.host), \
+                patch.object(gate.record, "git_directory", return_value=str(self.worktree)), \
+                patch.object(gate.record, "git_facts", return_value={"worktree": str(self.worktree)}), \
+                patch.object(gate, "process_start_time", return_value=None):
+            fresh = gate.check(meminfo, 400, "", arguments, root=self.root, now=NOW)
+            self.assertEqual(fresh.peak.bytes, 2 * GIB)
+            _ = (self.state / "target-deletes.json").write_text(json.dumps({
+                str(configured): (NOW - timedelta(seconds=30)).timestamp(),
+            }))
+            swept = gate.check(meminfo, 400, "", arguments, root=self.root, now=NOW)
+            self.assertEqual(swept.peak.bytes, 10 * GIB)
+
+    def test_custom_target_deletion_invalidates_its_build(self) -> None:
+        custom = self.worktree / "custom-target"
+        custom.mkdir()
+        self.previous_build()
+        self.assertTrue(self.fresh(target_dir="custom-target"))
+        _ = (self.state / "target-deletes.json").write_text(json.dumps({
+            str(custom): (NOW - timedelta(seconds=30)).timestamp(),
+        }))
+        self.assertFalse(self.fresh(target_dir="custom-target"))
+
+    def test_corrupt_sweep_state_keeps_compile_promise(self) -> None:
+        self.samples([2 * GIB])
+        self.previous_build()
+        _ = (self.state / "target-deletes.json").write_text("not json")
+        self.assertFalse(self.fresh())
+        self.assertEqual(self.promise().bytes, 10 * GIB)
+
+    def test_unknown_compile_count_and_compile_failures_are_not_fresh_history(self) -> None:
+        self.samples([GIB], crates=None)
+        self.samples([GIB], status=101, tests_run=0)
+        self.previous_build()
+        self.assertEqual(self.promise().bytes, 10 * GIB)
+
+    def test_target_deletion_since_build_forces_compile_promise(self) -> None:
+        self.samples([2 * GIB])
+        self.previous_build()
+        _ = (self.state / "target-deletes.json").write_text(json.dumps({
+            str(self.worktree / "target"): (NOW - timedelta(seconds=30)).timestamp(),
+        }))
+        self.assertFalse(self.fresh())
+        self.assertEqual(self.promise().bytes, 10 * GIB)
+
+    def test_deletion_before_build_or_in_other_target_does_not_invalidate_it(self) -> None:
+        self.samples([2 * GIB])
+        self.previous_build()
+        _ = (self.state / "target-deletes.json").write_text(json.dumps({
+            str(self.worktree / "target"): (NOW - timedelta(minutes=2)).timestamp(),
+            str(self.root / "other-target"): NOW.timestamp(),
+        }))
+        self.assertTrue(self.fresh())
+        self.assertEqual(self.promise().bytes, 2 * GIB)
+
+    def test_logged_disk_sweep_since_build_forces_compile_promise(self) -> None:
+        self.samples([2 * GIB])
+        self.previous_build()
+        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+            _ = db.execute("INSERT INTO steps(host, worktree, step, started_at, sweep_freed_bytes) "
+                           + "VALUES (?, ?, 'sweep', ?, ?)",
+                           (self.host, str(self.worktree), store.utc_iso((NOW - timedelta(seconds=30)).timestamp()), GIB))
+        self.append_step({"kind": "step", "host": self.host, "worktree": str(self.worktree),
+                          "step": "sweep", "started_at": store.utc_iso((NOW - timedelta(seconds=30)).timestamp()),
+                          "sweep_freed_bytes": GIB}, NOW)
+        self.assertFalse(self.fresh())
+        self.assertEqual(self.promise().bytes, 10 * GIB)
+
+    def test_missing_target_and_expired_sweep_evidence_force_compile_promise(self) -> None:
+        self.previous_build(at=NOW - timedelta(days=2))
+        self.assertFalse(self.fresh())
+        self.previous_build()
+        (self.worktree / "target").rmdir()
+        self.assertFalse(self.fresh())
 
 
 class RepositoryHistoryTests(unittest.TestCase):

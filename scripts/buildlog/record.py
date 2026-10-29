@@ -295,6 +295,10 @@ def step(args: list[str]) -> None:
             "cwd": cwd,
             **git_facts(directory),
             **tree,
+            # A reusable test build needs verify's Cargo inputs as well as
+            # unchanged sources. Older callers leave this unknown.
+            "test_build_key": (os.environ.get("BUILDLOG_TEST_BUILD_KEY") or None)
+            if name == "nextest" and tree["tree_changed"] is False else None,
             "caller": step_caller,
             **who(),
             "call_id": os.environ.get("BUILDLOG_CALL_ID") or None,

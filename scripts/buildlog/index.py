@@ -30,7 +30,7 @@ from urllib.parse import quote
 
 import store
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 # Step and call fields under a former name, renamed in the file on its next read.
 FORMER_FIELDS = (("seat", "worker"), ("delegate_session", "unit_session"))
 LOCK_NAME = "index.lock"
@@ -104,6 +104,7 @@ STEP_COLUMNS: list[Column] = [
     ("mend_s", "REAL", "mend's own analysis time"),
     ("sweep_freed_bytes", "INTEGER", "bytes lint sweep removed"),
     ("log", "TEXT", "gzipped output of a failed step, relative to the root"),
+    ("test_build_key", "TEXT", "verify test Cargo build-input key, excluding nextest run-only selection; NULL for older or changed builds"),
 ]
 
 TEST_COLUMNS: list[Column] = [
