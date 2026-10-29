@@ -8,6 +8,6 @@
 
 **Rule (strict):** trust a copy's `.envrc` only when its copies.py record names a source repo under a trusted root, and the copy's `.envrc` equals the source's `.envrc` blob at the copy's commit. Anything else stays blocked.
 
-**Start when both hold:** (1) the user approves verify-copies; (2) verify sends its Phase 3 record format (path and fields).
+**Start when both hold:** (1) the user approves verify-copies (done 2026-10-29, plan header); (2) verify sends its Phase 3 record format (path and fields). The plan's Cleanup section names the provenance fields (source path, source commit, copy commit, target mode, seed source) in a `scratch.py` record; the exact path and format are not fixed yet.
 
 **Due:** before verify's Phase 4 moves the first caller.
