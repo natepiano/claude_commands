@@ -56,7 +56,7 @@ Loop/verbose only:
    Exit `1` means the check was refused: answer the overlap it names under
    `/unit:direct` <BerthDecisions/>, then run it again. An exit `1` that names a
    released reservation with no live one blocks the checkpoint: apply
-   <RetainDelegatedPhaseReservation/> and report the line. Then read and validate
+   <RetainPhaseReservation/> and report the line. Then read and validate
    `${PHASE_DIR}/delegated_phase_reservation_state.json`; never use a value
    remembered from conversation or the harness-session mapping.
 

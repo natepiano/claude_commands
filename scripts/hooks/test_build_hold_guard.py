@@ -23,7 +23,6 @@ HOOK = Path(__file__).with_name("pre-tool-use-build-hold-guard.py")
 FRONT = HOOK.with_suffix(".sh")
 CARGO_BUILDS = ("build", "b", "check", "c", "clippy", "test", "t", "nextest", "run", "r",
                 "bench", "doc", "d", "rustc", "rustdoc", "fix", "install", "mend", "miri")
-VERIFY_BUILDS = ("check", "lint", "build", "doc", "clippy")
 MERGE_GATE_COMMANDS = (
     "python3 merge_gate.py --tests-only",
     "/usr/bin/python3 scripts/production/merge_gate.py --promote-only",
@@ -92,7 +91,6 @@ class BuildHoldGuardTest(TemporaryGuardTest):
         # The marker must take priority even when the worker inherits the holder's id.
         self.codex_unit("another-director", "other")
         for command, reason in ((["cargo", "check"], REFUSAL),
-                                (["/bin/bash", "-lc", "verify.sh check"], REFUSAL),
                                 (["python3", "scripts/production/merge_gate.py", "--tests-only"], MERGE_GATE_REFUSAL)):
             with self.subTest(command=command):
                 response = cast(dict[str, dict[str, str]], json.loads(self.run_hook(command, session="codex-thread")))
@@ -142,13 +140,34 @@ class BuildHoldGuardTest(TemporaryGuardTest):
                 with self.subTest(verb=verb, toolchain=toolchain):
                     self.assert_denied(f"cargo {toolchain}{verb}")
 
-    def test_each_verify_build(self) -> None:
+    def test_verify_routes_itself_without_a_record_or_in_any_record_state(self) -> None:
         self.hold()
-        for verb in VERIFY_BUILDS:
-            for path in ("verify.sh", "~/.claude/scripts/direct/verify.sh"):
-                for options in ("", '--session-dir "check session" ', "--session-dir=run "):
-                    with self.subTest(verb=verb, path=path, options=options):
-                        self.assert_denied(f"{path} {options}{verb} x")
+        directory = Path(os.environ["VERIFY_STEPS_DIR"])
+        directory.mkdir()
+        os.environ["BUILDLOG_CALL_ID"] = "verify-call"
+        proc = self.root / "proc" / "10"
+        proc.mkdir(parents=True)
+        fields = ["0"] * 20
+        fields[0], fields[19] = "S", "11000"
+        _ = (proc / "stat").write_text("10 (verify.sh) " + " ".join(fields))
+        os.environ["VERIFY_PROC_ROOT"] = str(proc.parent)
+        for state in ("missing", "waiting_hold", "waiting_mac", "on_mac", "on_natedev", "unreadable"):
+            record = directory / "verify-call.json"
+            if state == "unreadable":
+                _ = record.write_text("{broken")
+            elif state != "missing":
+                _ = record.write_text(json.dumps({
+                    "v": 1, "call_id": "verify-call", "pid": 10, "proc_start": "11000",
+                    "repo": str(self.root), "kind": "check", "package": None,
+                    "runs_on": {"kind": "mac_allowed"}, "state": state,
+                    "updated": "2026-10-28T12:00:00+00:00",
+                }))
+            for verb in ("check", "lint", "build", "doc", "clippy", "test", "example", "final"):
+                for command in (f"verify.sh {verb}", f"bash verify.sh --session-dir run {verb} x"):
+                    with self.subTest(state=state, command=command):
+                        self.assertEqual(self.run_hook(command), "")
+            # A record does not grant permission to start raw cargo.
+            self.assert_denied("cargo check")
 
     def test_paths_prefixes_and_compound_commands(self) -> None:
         self.hold()
@@ -156,12 +175,12 @@ class BuildHoldGuardTest(TemporaryGuardTest):
                         "env RUST_LOG=debug cargo +stable run", "RUST_LOG=debug cargo test",
                         "command cargo clippy", "/home/user/.cargo/bin/cargo build",
                         "cargo --offline check", "cargo --config config.toml build",
-                        "bash ~/.claude/scripts/direct/verify.sh lint", "bash -lc 'cargo test'",
+                        "bash -lc 'cargo test'",
                         "if true; then cargo build; fi", "(cargo build)", "cargo fmt | cargo test",
                         "cargo \\\nbuild", "timeout 600 cargo test", "sudo -u user cargo build",
                         "nice -n 10 cargo check", "bash <<'EOF'\ncargo build\nEOF\n",
                         "cargo miri test", "cargo +nightly miri test",
-                        "verify.sh --session-dir run check x", "bash verify.sh --session-dir run check x"):
+                        "verify.sh check; cargo check"):
             with self.subTest(command=command):
                 self.assert_denied(command)
 
@@ -216,7 +235,7 @@ class BuildHoldGuardTest(TemporaryGuardTest):
         self.hold("released", "released builder")
         self.releasing("released")
         self.assert_denied("cargo build")
-        self.assert_denied("verify.sh lint")
+        self.assertEqual(self.run_hook("verify.sh lint"), "")
 
     def test_caller_is_only_in_force_holder_next_to_releasing_hold(self) -> None:
         self.hold("caller")
@@ -273,7 +292,8 @@ with mock.patch.object(hold_applies, "hold_applies", side_effect=error(sys.argv[
         self.assertEqual(self.run_hook("cargo build", tool="Write"), "")
 
     def test_fast_paths_do_not_import_hold_code(self) -> None:
-        for has_hold, command in ((False, "cargo build"), (True, "cargo metadata"), (True, "pwd")):
+        for has_hold, command in ((False, "cargo build"), (True, "cargo metadata"), (True, "pwd"),
+                                  (True, "verify.sh check")):
             if has_hold:
                 self.hold()
             payload = {"tool_name": "Bash", "tool_input": {"command": command}}
@@ -338,19 +358,20 @@ exit "$GUARD_STATUS"
 
     def test_no_build_text_starts_no_python_during_hold(self) -> None:
         self.hold()
-        self.assert_no_python(json.dumps({"tool_name": "Bash", "tool_input": {"command": "pwd"}}))
+        for command in ("pwd", "verify.sh check", "bash verify.sh --session-dir run lint"):
+            self.assert_no_python(json.dumps({"tool_name": "Bash", "tool_input": {"command": command}}))
 
     def test_same_stdin_output_and_status_are_relayed(self) -> None:
         self.hold()
         os.environ["GUARD_OUTPUT"] = 'deny output\n'
         os.environ["GUARD_STATUS"] = "7"
-        for command in ("cargo build", "verify.sh check", "python3 merge_gate.py --tests-only"):
+        for command in ("cargo build", "python3 merge_gate.py --tests-only"):
             for ending in ("", "\n\n"):
                 raw = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}}) + ending
                 done = self.run_front(raw)
                 self.assertEqual((done.returncode, done.stdout, done.stderr), (7, 'deny output\n', ""))
                 self.assertEqual(self.stdin_copy.read_text(), raw)
-        self.assertEqual(self.calls.read_text().splitlines(), ["called"] * 6)
+        self.assertEqual(self.calls.read_text().splitlines(), ["called"] * 4)
 
     def test_hidden_hold_entry_starts_python(self) -> None:
         self.hold(".holder")

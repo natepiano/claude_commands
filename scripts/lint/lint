@@ -12,6 +12,8 @@ source "$HOME/.claude/scripts/lint/invoke.sh"
 usage() {
   cat <<EOF
 Usage:
+  lint check [args...]            cargo check
+  lint mend-check [args...]       cargo mend --fail-on-warn
   lint mend [args...]             cargo mend --all-targets
   lint clippy [args] [-- lints]   clippy --all-targets, -D warnings
   lint clippy-tests [args] [-- lints]
@@ -25,7 +27,7 @@ Usage:
                                   (cargo-port's last lint command)
 
 Scope is resolved per run: in a workspace with more than one member, mend,
-clippy, clippy-tests, doc, and nextest cover --workspace; a single-crate
+check, clippy, clippy-tests, doc, and nextest cover --workspace; a single-crate
 project gets no scope flags. Features are the default set unless the caller
 passes its own (the push gate passes --all-features). One package selection
 and one feature set for every run is what lets them all share one compiled
@@ -90,6 +92,10 @@ CMD="${1:-}"
 [[ $# -gt 0 ]] && shift
 
 case "$CMD" in
+  check)        resolve_scope "$@"
+                run cargo check ${SCOPE[@]+"${SCOPE[@]}"} "$@" ;;
+  mend-check)   resolve_scope "$@"
+                invoke_mend --fail-on-warn ${SCOPE[@]+"${SCOPE[@]}"} "$@" ;;
   mend)         resolve_scope "$@"
                 invoke_mend ${SCOPE[@]+"${SCOPE[@]}"} "$@" ;;
   clippy)       resolve_scope "$@"
