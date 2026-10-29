@@ -91,8 +91,12 @@ def is_waiting_gate(process: build_hold.AuditProcess) -> bool:
     if not process.argv:
         return False
     executable = Path(process.argv[0]).name
-    if executable == "verify.sh":
+    if executable in {"verify.sh", "merge_gate.py"}:
         return True
+    if executable.startswith("python"):
+        target = python_target(process.argv[1:])
+        return (target[:2] == ("-m", "scripts.production.merge_gate")
+                or bool(target) and Path(target[0]).name == "merge_gate.py")
     if executable not in {"bash", "sh", "dash", "zsh"}:
         return False
     for argument in process.argv[1:]:
@@ -107,19 +111,25 @@ def is_build(process: build_hold.AuditProcess) -> bool:
     names = {process.executable, Path(process.argv[0]).name if process.argv else process.command}
     if "cargo" in names:
         return cargo_verb(process.argv[1:]) in BUILDING_CARGO_VERBS
+    if "rustc" in names:
+        arguments = process.argv[1:]
+        if arguments and arguments[0].startswith("+"):
+            arguments = arguments[1:]
+        if arguments in {("-vV",), ("-V",), ("--version",)}:
+            return False
     if names & ((build_hold.AUDIT_COMMANDS - {"cargo"}) | {"clippy-driver", "pytest", "py.test", "basedpyright", "merge_gate.py"}):
         return True
     if "rust-analyzer" in names:
         # Ownership needs ancestors, so it is checked by decide_builds.
         return True
     if any(name.startswith("python") for name in names):
-        if any(Path(name).match("test_*.py") or Path(name).match("*_test.py") for name in names):
+        if any(Path(name).match("test_*.py") for name in names):
             return True
         target = python_target(process.argv[1:])
         return (target[:2] in {("-m", "unittest"), ("-m", "pytest")}
                 or target[:2] == ("-m", "scripts.production.merge_gate")
                 or bool(target) and (Path(target[0]).name in {"pytest", "py.test", "merge_gate.py", "basedpyright"}
-                                     or Path(target[0]).match("test_*.py") or Path(target[0]).match("*_test.py")))
+                                     or Path(target[0]).match("test_*.py")))
     if names & {"node", "nodejs"}:
         return any(Path(argument).name in {"basedpyright", "basedpyright.js"} for argument in process.argv[1:])
     if names & {"bash", "sh", "dash", "zsh"}:
@@ -153,7 +163,7 @@ def protected_reason(
     if process.identity in enforcer_ancestors:
         return "enforcer or its ancestor"
     if is_waiting_gate(process):
-        return "verify.sh sends tests to the Mac and waits at its own gate"
+        return "verify.sh or merge_gate.py waits at its own hold gate"
     if any(is_sccache_server(item) for item in (process, *ancestors)):
         return "sccache server compiles for the holder too"
     if build_hold.owner_is_sole_holder(owner, holders):

@@ -9,12 +9,12 @@ import re
 import shlex
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from tool_call_text import HookPayload, scan_text
+from tool_call_text import scan_text
 
-CANDIDATE = re.compile(r"\b(?:cargo|verify\.sh)\b")
+CANDIDATE = re.compile(r"\b(?:cargo|verify\.sh|merge_gate\.py)\b")
 CARGO_BUILDS = frozenset({"build", "b", "check", "c", "clippy", "test", "t", "nextest", "run", "r",
                           "bench", "doc", "d", "rustc", "rustdoc", "fix", "install", "mend", "miri"})
 VERIFY_BUILDS = frozenset({"check", "lint", "build", "doc", "clippy"})
@@ -27,8 +27,15 @@ HEREDOC = re.compile(r"<<(-?)[ \t]*(['\"]?)([A-Za-z_][A-Za-z_0-9]*)\2[^\n]*\n")
 SHELL_HEREDOC = re.compile(r"\b(?:bash|sh|zsh)(?:[ \t]+[^<\n]*)?[ \t]*$")
 
 
-class BuildHoldHookPayload(HookPayload, total=False):
+class BuildHoldCommandInput(TypedDict, total=False):
+    command: str | list[str]
+    cmd: str | list[str]
+
+
+class BuildHoldHookPayload(TypedDict, total=False):
     session_id: str
+    tool_name: str
+    tool_input: BuildHoldCommandInput
 
 
 def without_literal_heredocs(command: str) -> str:
@@ -47,7 +54,7 @@ def without_literal_heredocs(command: str) -> str:
     return command
 
 
-def builds(words: list[str]) -> bool:
+def builds(words: list[str], *, merge_gate_only: bool = False) -> bool:
     """Test one shell command after its environment and command prefixes."""
     while words:
         if ASSIGNMENT.match(words[0]):
@@ -67,9 +74,23 @@ def builds(words: list[str]) -> bool:
     arguments = words[1:]
     if program in {"bash", "sh", "zsh"}:
         if arguments and Path(arguments[0]).name == "verify.sh":
-            return builds(arguments)
-        return any("c" in option and building_command(script)
+            return builds(arguments, merge_gate_only=merge_gate_only)
+        return any("c" in option and building_command(script, merge_gate_only=merge_gate_only)
                    for option, script in zip(arguments, arguments[1:]) if option.startswith("-"))
+    if program == "merge_gate.py":
+        return True
+    if re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", program) or (program == "py" and Path(words[0]).parent.name == "lib"):
+        while arguments and arguments[0].startswith("-"):
+            option = arguments[0]
+            if option == "--":
+                arguments = arguments[1:]
+                break
+            if option.startswith(("-c", "-m")):
+                return False
+            arguments = arguments[2:] if option in {"-W", "-X", "--check-hash-based-pycs"} else arguments[1:]
+        return bool(arguments and Path(arguments[0]).name == "merge_gate.py")
+    if merge_gate_only:
+        return False
     if program == "verify.sh":
         while arguments and arguments[0].startswith("-"):
             arguments = arguments[2:] if arguments[0] == "--session-dir" else arguments[1:]
@@ -84,7 +105,7 @@ def builds(words: list[str]) -> bool:
     return bool(arguments and arguments[0] in CARGO_BUILDS)
 
 
-def building_command(command: str) -> bool:
+def building_command(command: str, *, merge_gate_only: bool = False) -> bool:
     if not CANDIDATE.search(command):
         return False
     command = scan_text("Bash", {"command": command}, {}).replace("\\\n", "")
@@ -94,19 +115,22 @@ def building_command(command: str) -> bool:
     words: list[str] = []
     for word in lexer:
         if word and all(char in ";&|()\n" for char in word):
-            if builds(words):
+            if builds(words, merge_gate_only=merge_gate_only):
                 return True
             words = []
         else:
             words.append(word)
-    return builds(words)
+    return builds(words, merge_gate_only=merge_gate_only)
 
 
 def decide(raw: str) -> str:
     payload = cast(BuildHoldHookPayload, json.loads(raw))
     if payload.get("tool_name") != "Bash":
         return ""
-    command = payload.get("tool_input", {}).get("command", "")
+    tool_input = payload.get("tool_input", {})
+    command = tool_input.get("command") or tool_input.get("cmd") or ""
+    if isinstance(command, list):
+        command = shlex.join(command)
     if not building_command(command):
         return ""
     directory = Path(os.environ.get("BUILD_HOLD_DIR", str(Path.home() / ".local/state/build-hold")))
@@ -125,17 +149,19 @@ def decide(raw: str) -> str:
     if not os.environ.get("CLAUDE_CODE_SESSION_ID"):
         os.environ["CLAUDE_CODE_SESSION_ID"] = payload.get("session_id", "")
     try:
-        return hold_applies()
-    except HoldStateReadError:
-        return ""
+        reason = hold_applies()
+    except HoldStateReadError as error:
+        return f"natedev hold state cannot be read: {' '.join(str(error).split())}"
+    if reason and building_command(command, merge_gate_only=True):
+        return reason + " The merge gate waits for the hold to end. Run it after the release."
+    return reason
 
 
 def main() -> None:
     try:
         reason = decide(sys.stdin.read())
     except Exception as error:
-        print(f"build hold guard: {type(error).__name__}: {error}", file=sys.stderr)
-        return
+        reason = f"natedev build hold decision cannot be read: {type(error).__name__}: {' '.join(str(error).split())}"
     if reason:
         print(json.dumps({"hookSpecificOutput": {
             "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}}))
