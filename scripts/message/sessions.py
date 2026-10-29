@@ -36,6 +36,25 @@ class SessionRecord(TypedDict):
     entrypoint: NotRequired[str]
 
 
+@dataclass(frozen=True)
+class LiveSessionProcess:
+    """The registry or saved process identity positively identifies a live session."""
+
+    pid: int
+
+
+@dataclass(frozen=True)
+class SessionNotLive:
+    """The available registry or process identity establishes no live session."""
+
+
+@dataclass(frozen=True)
+class SessionLivenessUnknown:
+    """Unreadable evidence prevents establishing whether the session is live."""
+
+    reason: str
+
+
 class UnreadableSessionRecord(Enum):
     FOUND = "unreadable session record"
 
@@ -193,6 +212,74 @@ def running_session(record: SessionRecord) -> bool:
     if recorded_start:
         return recorded_start == process_start(record["pid"])
     return messaging_socket_exists(record)
+
+
+def process_liveness(pid: int, recorded_start: str) -> LiveSessionProcess | SessionNotLive | SessionLivenessUnknown:
+    """Check the saved process identity without treating unreadable evidence as absence."""
+    if not recorded_start:
+        return SessionNotLive()
+    current = process_start(pid)
+    if current is not None and current != recorded_start:
+        return SessionNotLive()
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return SessionNotLive()
+    except PermissionError:
+        if current == recorded_start:
+            return LiveSessionProcess(pid)
+    except (OSError, OverflowError) as error:
+        return SessionLivenessUnknown(f"process identity unreadable: {error}")
+    if current is None:
+        return SessionLivenessUnknown(f"process identity unreadable for pid {pid}")
+    return LiveSessionProcess(pid)
+
+
+@dataclass(frozen=True)
+class SessionProcesses:
+    """Every live registry record's pid for a session, from a complete registry read."""
+
+    pids: tuple[int, ...]
+
+
+def _session_observations(session_id: str) -> Iterator[LiveSessionProcess | SessionLivenessUnknown]:
+    try:
+        paths = [path for path in sessions_dir().iterdir() if path.suffix == ".json"]
+    except OSError as error:
+        reason = str(error).splitlines()
+        yield SessionLivenessUnknown(f"session registry unreadable: {reason[0] if reason else type(error).__name__}")
+        return
+    unreadable_records: list[str] = []
+    for path in paths:
+        registered = read_session(path)
+        if isinstance(registered, UnreadableSessionRecord):
+            unreadable_records.append(path.name)
+            continue
+        if registered["sessionId"] != session_id:
+            continue
+        if running_session(registered):
+            yield LiveSessionProcess(registered["pid"])
+        else:
+            observed = process_liveness(registered["pid"], registered.get("procStart", ""))
+            if not isinstance(observed, SessionNotLive):
+                yield observed
+    if unreadable_records:
+        yield SessionLivenessUnknown("unreadable session registry record: " + unreadable_records[0])
+
+
+def session_liveness(session_id: str) -> LiveSessionProcess | SessionNotLive | SessionLivenessUnknown:
+    """Find a running session and its pid, preserving unknown registry or process identity."""
+    return next(_session_observations(session_id), SessionNotLive())
+
+
+def session_processes(session_id: str) -> SessionProcesses | SessionLivenessUnknown:
+    """Count all registered processes; incomplete evidence cannot prove a unique process."""
+    pids: list[int] = []
+    for observed in _session_observations(session_id):
+        if isinstance(observed, SessionLivenessUnknown):
+            return observed
+        pids.append(observed.pid)
+    return SessionProcesses(tuple(sorted(pids)))
 
 
 def messaging_socket_exists(record: SessionRecord) -> bool:
