@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import NamedTuple, cast, final, override
 
 import merge_checkpoint
+from scripts.production import production_doc
 from merge_checkpoint import (ChildHandoffEntry, CodeCheckpoint, LastMerged, MergeEntry, NoMerge, ShrinkCommit,
                               check_parallel, merge_branch_history, merge_history, promote, request_from)
 
@@ -1838,9 +1839,9 @@ class TestPassedTests(unittest.TestCase):
 @final
 class MacPromotionPathTests(unittest.TestCase):
     def remote_command(self, promote_line: str) -> str:
-        promotion = merge_checkpoint.promotion_from_doc([f"- **Promote:** {promote_line}"])
-        assert isinstance(promotion, merge_checkpoint.PromoteTo)
-        assert isinstance(promotion.mac, merge_checkpoint.MacCheckout)
+        promotion = production_doc.promotion_from_doc([f"- **Promote:** {promote_line}"])
+        assert isinstance(promotion, production_doc.PromoteTo)
+        assert isinstance(promotion.mac, production_doc.MacCheckout)
         done = subprocess.CompletedProcess(["ssh"], 0, "rc=0\n", "")
         with mock.patch("merge_checkpoint.subprocess.run", return_value=done) as run:
             merge_checkpoint.pull_mac_checkout(promotion.mac.path, Path("/home/natepiano/.claude"))

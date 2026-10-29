@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import add_unit
 import dailies_render
 import merge_checkpoint
+from scripts.production import production_doc
 import update_registration
 import waiting
 from cli_fixture import invoke_cli
@@ -340,7 +341,7 @@ class WaitingTests(unittest.TestCase):
         request = merge_checkpoint.MergeRequest(
             production._replace(log=producer_log), unit, phase, unit_tip, (),
             merge_checkpoint.ShrinkCommit(), merge_checkpoint.ValidateAndPush(),
-            merge_checkpoint.NoPromotion(), (), frozenset(), frozenset(), (unit,), (), self.root,
+            production_doc.NoPromotion(), (), frozenset(), frozenset(), (unit,), (), self.root,
             (), merge_checkpoint.NoReviewTrial(), "", False, "", "", 0, 0, "",
         )
         with redirect_stdout(io.StringIO()):
