@@ -108,13 +108,13 @@ Busy day: in-scope clones run about 78 a week (12 gate/merge + 31 phase + 22 oth
 
 **Goal:** the numbers the Decision rule needs, and the rule applied.
 
-**Spec:** One session under `/build:hold` (natedev quiet), hana at one commit C, then C+1 with one workspace-crate edit. Cases: A cold fresh copy; B seed with `incremental/`; C seed without it; each of B and C twice, sources fresh-checked-out vs copied with `cp -a` then own git (`clone --shared --no-checkout`, move `.git`, `git reset -q`, `git checkout --detach C`); D shared `CARGO_BUILD_BUILD_DIR`: clone 1 then clone 2 in sequence, then both at once, then clone 1 again. Hold the source's `.cargo-lock`, `.cargo-build-lock`, `.cargo-artifact-lock` during each seed copy. Record per case: copy wall s, GiB added (`du`), build wall s, crates compiled, lock wait s. Run with sccache as today. resources-unit's Phase 4 lock trial runs as case D, in this session (builds, 2026-10-29). builds sets the build-hold time.
+**Spec:** One session under `/build:hold` (natedev quiet), hana at one commit C, then C+1 with one workspace-crate edit. Cases: A cold fresh copy; B seed with `incremental/`; C seed without it; each of B and C twice, sources fresh-checked-out vs copied with `cp -a` then own git (`clone --shared --no-checkout`, move `.git`, `git reset -q`, `git checkout --detach C`); D shared `CARGO_BUILD_BUILD_DIR`: clone 1 then clone 2 in sequence, then both at once, then clone 1 again. Hold the source's `.cargo-lock`, `.cargo-build-lock`, `.cargo-artifact-lock` during each seed copy. Record per case: copy wall s, GiB added (`du`), build wall s, crates compiled, lock wait s. Run with sccache as today. resources-unit's Phase 4 lock trial runs as case D, in this session (builds, 2026-10-29). builds sets the build-hold time. E: resources-unit's Phase 5 compile-cache trial, two hana clone builds one after the other, on the same commit C, run last so cases A-D see today's cache (builds, 2026-10-29). resources-unit has its setup ready before 23:00 EDT and agrees it with verify-unit, including what cache state E needs at its start.
 
 **Files:** none changed; results to the builds LOG and this plan's Decision section.
 
-**Acceptance gate:** a table of cases A-D with every metric; the rule's verdict written into the Decision section; cargo version named.
+**Acceptance gate:** a table of cases A-E with every metric; the rule's verdict written into the Decision section; cargo version named.
 
-Rough duration: half a day (about 8 hana builds; cold build time unverified).
+Hold length: 3 h, from 00:00 EDT (builds sets the start). Count: about 17 hana builds — A 2, B 4, C 4, D 5 (one pair at once), E 2 — plus 4 seed copies. Basis: a 603-crate hana build took 928 s on a busy natedev today (build log, 10:35 EDT); a quiet machine is assumed at about 12 min cold and 2 min for C+1. If every seed compiles fully it is about 2 h 40 min; if the seeds work it is about 1 h 45 min. The Bevy dylib change (13:50 EDT) is in C, so it is in every case. If the hold ends before E, E moves to the next hold; A-D never split.
 
 ### Phase 2 — Prerequisites from other units  · status: todo
 
