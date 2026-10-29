@@ -32,6 +32,11 @@ import build_hold
 import unit_runs
 from sessions import SessionRecord
 
+if TYPE_CHECKING:
+    from ..lint.memory_test_support import fake_memory_readings
+else:
+    from scripts.lint.memory_test_support import fake_memory_readings
+
 
 # Hang guards allow for load 136 on natedev (2026-10-29).
 TEST_HANG_GUARD_SECS = 300
@@ -91,8 +96,6 @@ class IsolatedBuildHoldTest(unittest.TestCase):
         proc = self.scratch / "proc"
         proc.mkdir()
         _ = self.enterContext(mock.patch.object(build_hold, "PROC_ROOT", proc))
-        meminfo = self.scratch / "meminfo"
-        _ = meminfo.write_text("MemAvailable: 67108864 kB\n")
         lifetime = self.scratch / "child-lifetime"
         lifetime.mkdir()
         _ = (lifetime / "sitecustomize.py").write_text(CHILD_LIFETIME)
@@ -118,7 +121,7 @@ class IsolatedBuildHoldTest(unittest.TestCase):
             "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
             "MAC_TEST_STATE_DIR": str(self.scratch / "mac-state"),
-            "BUILDLOG_MEMINFO": str(meminfo),
+            **fake_memory_readings(self.scratch),
             # No test reads the machine's own session records, or passes for the session that runs it.
             "NOTIFIER_SESSIONS_DIR": str(self.scratch / "sessions"),
             "CLAUDE_CODE_SESSION_ID": "",

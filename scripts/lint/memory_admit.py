@@ -220,12 +220,17 @@ class NeedsBuildBudget:
 class NeedsMemory:
     need: int = 0
     free: int = 0
+    threshold: int = 0
+    growth: int = 0
+    reserve: int = 0
+    head_need: int = 0
 
 
 @dataclass(frozen=True)
 class BehindHead:
     head_name: str
     head_since: float
+    head_session_id: str
 
 
 @dataclass(frozen=True)
@@ -695,7 +700,32 @@ def step_memory(row: Reservation, now: datetime, processes: dict[int, ProcessIde
     return reading
 
 
+class LiveMemoryReading(RuntimeError):
+    """A test tried to read the host's memory state."""
+
+
+def check_memory_reading(path: Path) -> None:
+    record_path = os.environ.get("BUILDLOG_LIVE_MEMORY_TRIPWIRE", "")
+    if not record_path:
+        return
+    live_path = os.path.realpath(path)
+    if live_path not in ("/proc/meminfo", "/proc/pressure/memory"):
+        return
+    try:
+        with Path(record_path).open("a") as output:
+            fcntl.flock(output, fcntl.LOCK_EX)
+            _ = output.write(json.dumps({"reading": live_path, "argv": sys.argv, "pid": os.getpid()}) + "\n")
+            output.flush()
+    except OSError:
+        pass  # The refusal below still stops the read; callers swallow OSError.
+    raise LiveMemoryReading(
+        f"live memory reading {live_path} in a test; fake BUILDLOG_MEMINFO and "
+        + "BUILDLOG_MEMORY_PRESSURE (scripts/lint/memory_test_support.py)"
+    )
+
+
 def read_meminfo(path: Path) -> tuple[int, int | None]:
+    check_memory_reading(path)
     available: int | None = None
     total: int | None = None
     for line in path.read_text().splitlines():
@@ -713,8 +743,9 @@ def read_meminfo(path: Path) -> tuple[int, int | None]:
 def read_pressure() -> Pressure:
     """An unreadable pressure file does not block; the memory rule still applies."""
     full = 0.0
+    path = Path(os.environ.get("BUILDLOG_MEMORY_PRESSURE", "/proc/pressure/memory"))
+    check_memory_reading(path)
     try:
-        path = Path(os.environ.get("BUILDLOG_MEMORY_PRESSURE", "/proc/pressure/memory"))
         for line in path.read_text().splitlines():
             parts = line.split()
             if parts and parts[0] == "full":
@@ -1032,7 +1063,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
         decision = queue_decision(available, total, waiter, running, head, pressure)
         reservation: Reserved | NotReserved = NotReserved("held" if argv else "launch")
         if argv and decision.state == "hold" and start is not None:
-            identity = waiter_identity(repo, step, worktree)
+            identity = waiter_identity(step, worktree)
             waiter["session_id"], waiter["session_name"] = identity["session_id"], identity["session_name"]
             waiter["step"], waiter["folder"] = identity["step"], identity["folder"]
             _ = mine.write_text(json.dumps(waiter, separators=(",", ":")))
@@ -1060,10 +1091,10 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                            head_need, head_label, head_reason)
 
 
-def waiter_identity(repo: str, step: str, worktree: str) -> WaiterIdentity:
+def waiter_identity(step: str, worktree: str) -> WaiterIdentity:
     session = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     return {"session_id": session, "session_name": os.environ.get("CLAUDE_SESSION_NAME", ""),
-            "step": f"{repo} {step}".strip(), "folder": os.getcwd() if worktree else ""}
+            "step": step, "folder": os.getcwd() if worktree else ""}
 
 
 class WaiterIdentity(TypedDict):
@@ -1171,13 +1202,16 @@ def read_queue(directory: Path, processes: dict[int, ProcessIdentity], now: floa
         elif (isinstance(head, HeadPriority) and isinstance(head.window, StrictUntil)
               and waiter_order(head.waiter) < waiter_order(row)):
             head_identity = identities.identity(head.waiter["pid"], cast(dict[str, object], cast(object, head.waiter)))
-            reason = BehindHead(head_identity["session_name"] or Path(head_identity["folder"]).name or str(head.waiter["pid"]), head.waiter["since"])
+            reason = BehindHead(head_identity["session_name"] or Path(head_identity["folder"]).name or str(head.waiter["pid"]),
+                                head.waiter["since"], head_identity["session_id"])
         elif row is ordered[0][1]:
             reason = head_wait_reason(own, row["need"], available, row, now)
         elif isinstance(own.pressure, MemoryPressure):
             reason = own.pressure
         elif own.state == "hold":
-            reason = (NeedsMemory(row["need"], available) if available < own.threshold
+            reason = (NeedsMemory(row["need"], available, own.threshold, own.promised, own.reserve,
+                                  own.threshold - row["need"] - own.promised - own.reserve)
+                      if available < own.threshold
                       else NeedsBuildBudget(row["need"], own.charged, own.budget))
         waiting.append(WaitingStep(row["pid"], identity["session_id"], identity["session_name"], identity["step"],
                                    identity["folder"], row["since"], row["need"], reason))
@@ -1291,8 +1325,11 @@ def clean_field(value: str) -> str:
     return value.replace("|", " ").replace("\n", " ")
 
 
-def main() -> None:
+def run_action() -> None:
     action = sys.argv[1]
+    if action == "tripwire":
+        check_memory_reading(Path(sys.argv[2]))
+        return
     if action == "release":
         release(Path(sys.argv[2]), int(sys.argv[3]))
         return
@@ -1341,6 +1378,14 @@ def main() -> None:
             details += f"; head {result.head_label} needs {result.head_need / GIB:.1f} GiB"
         fields[8] = f"{summary}; {details}" if summary else details
     print("|".join(clean_field(str(field)) for field in fields))
+
+
+def main() -> None:
+    try:
+        run_action()
+    except LiveMemoryReading as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(2)
 
 
 if __name__ == "__main__":
