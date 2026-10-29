@@ -488,8 +488,9 @@ class MeshRunsTests(unittest.TestCase):
                 del timeout
                 calls.append((method, params))
                 if method == "thread/read":
-                    return {"result": {"thread": {"status": {"type": "active"},
-                                                  "turns": [{"id": "turn-9", "status": "inProgress"}]}}}
+                    return {"result": {"thread": {"status": {"type": "active"}, "turns": []}}}
+                if method == "thread/turns/list":
+                    return {"result": {"data": [{"id": "turn-9", "status": "inProgress"}]}}
                 return {"result": {}}
 
             def close(self) -> None:

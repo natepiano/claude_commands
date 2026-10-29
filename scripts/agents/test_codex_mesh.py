@@ -609,7 +609,7 @@ class MeshCommandFixture(unittest.TestCase):
         if method == "thread/fork":
             return [_reply(request, {"thread": {"id": self.fork_thread_id}})]
         if method == "thread/turns/list":
-            turns = self.history_turns.copy()
+            turns = [*self.history_turns, *self.listed_turns()]
             if params.get("sortDirection") != "asc":
                 turns.reverse()
             limit = params.get("limit")
@@ -912,11 +912,7 @@ class MeshCommandFixture(unittest.TestCase):
                     }))
                     self.stale_read_turn = self.live_turn = ""
                 return frames
-            turns: list[dict[str, object]] = [
-                *({"id": turn, "status": status} for turn, status in self.started_turns.items()
-                  if turn not in (self.live_turn, self.unlisted_turn)),
-                *self.silent_ended,
-            ] if params.get("includeTurns") else []
+            turns = self.listed_turns() if params.get("includeTurns") else []
             unlisted_ends: list[dict[str, object]] = []
             if self.unlisted_turn:
                 self.unlisted_reads += 1
@@ -929,9 +925,10 @@ class MeshCommandFixture(unittest.TestCase):
                         _notice("turn/completed", {"threadId": THREAD_ID, "turn": {"id": self.unlisted_turn}}),
                     ]
                     self.unlisted_turn = ""
-            if self.live_turn and not self.hide_live_turn_id:
-                turns.append({"id": self.live_turn, "status": "inProgress"})
-            frames = [_reply(request, {"thread": {
+            # Codex 0.163 queues this notice ahead of every full-history read.
+            frames = [_notice("deprecationNotice", {
+                "summary": "Full-history hydration is deprecated"})] if params.get("includeTurns") else []
+            frames += [_reply(request, {"thread": {
                 "id": thread_id,
                 "status": {"type": self.thread_statuses.get(thread_id) or (
                     "active" if self.live_turn else
@@ -996,6 +993,19 @@ class MeshCommandFixture(unittest.TestCase):
             return []
         return [cast("dict[str, object]", json.loads(line))
                 for line in self.usage_path().read_text(encoding="utf-8").splitlines()]
+
+    def listed_turns(self) -> list[dict[str, object]]:
+        """Turns the server lists, oldest first: ended ones, then any in progress."""
+        turns: list[dict[str, object]] = [
+            *({"id": turn, "status": status} for turn, status in self.started_turns.items()
+              if turn not in (self.live_turn, self.unlisted_turn, self.stale_read_turn)),
+            *self.silent_ended,
+        ]
+        if self.stale_read_turn:
+            turns.append({"id": self.stale_read_turn, "status": "inProgress"})
+        elif self.live_turn and not self.hide_live_turn_id:
+            turns.append({"id": self.live_turn, "status": "inProgress"})
+        return turns
 
     def methods(self, method: str) -> list[dict[str, object]]:
         return [request for request in self.server.requests if request.get("method") == method]
@@ -1959,8 +1969,9 @@ class MeshCommandTests(MeshCommandFixture):
             if request.get("method") == "thread/loaded/list":
                 return [_reply(request, {"data": [THREAD_ID], "nextCursor": None})]
             if request.get("method") == "thread/read":
-                return [_reply(request, {"thread": {"status": {"type": "active"},
-                    "turns": [{"id": "outgoing-turn", "status": "inProgress"}]}})]
+                return [_reply(request, {"thread": {"status": {"type": "active"}, "turns": []}})]
+            if request.get("method") == "thread/turns/list":
+                return [_reply(request, {"data": [{"id": "outgoing-turn", "status": "inProgress"}], "nextCursor": None})]
             return respond(request)
         self.server.respond = held_thread
         for arguments in (["reset", "--to", "worker"], ["fork", "--from", "worker", "--name", "reviewer"]):
@@ -3887,7 +3898,8 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(self.worker_record()["status"], "failed")
         self.assertIs(self.worker_record().get("continuation_owed"), False)
         if continuation_completed:
-            self.assertTrue(any(read.get("includeTurns") is True for read in recovery_reads))
+            self.assertFalse(any(read.get("includeTurns") is True for read in recovery_reads))
+            self.assertTrue(self.methods("thread/turns/list"))
             self.assertIn("recovered task finished without notification",
                           (self.session_dir / "worker.log").read_text())
         else:
@@ -4780,8 +4792,9 @@ class MeshCommandTests(MeshCommandFixture):
             params = _as_test_dict(request.get("params"))
             thread_id = str(params.get("threadId", ""))
             if request.get("method") == "thread/read":
-                return [_reply(request, {"thread": {"id": thread_id, "status": {"type": "active"},
-                    "turns": [{"id": "live-turn", "status": "inProgress"}]}})]
+                return [_reply(request, {"thread": {"id": thread_id, "status": {"type": "active"}, "turns": []}})]
+            if request.get("method") == "thread/turns/list":
+                return [_reply(request, {"data": [{"id": "live-turn", "status": "inProgress"}], "nextCursor": None})]
             if request.get("method") == "turn/interrupt":
                 folder, name = locations[thread_id]
                 marker = _as_test_dict(cast(object, json.loads((folder / f"{name}.account-move.json").read_text())))
@@ -5888,7 +5901,7 @@ class MeshCommandTests(MeshCommandFixture):
                 if quiet_polls == 2:
                     # The first quiet poll must keep the launcher for the live run.
                     self.assertEqual(self.methods("thread/read")[-1]["params"], {
-                        "threadId": THREAD_ID, "includeTurns": True,
+                        "threadId": THREAD_ID, "includeTurns": False,
                     })
                     _ = run.write_text(json.dumps({"worker": "worker", "status": "finished", "pid": os.getpid()}))
                     if room_wait:
@@ -8027,6 +8040,10 @@ class FollowEventRegressionTests(MeshCommandFixture):
                             to="worker", message="detached run result", message_file=""))
             code, errors = future.result(timeout=3)
         self.assertEqual((code, errors), (0, ""))
+        # A full-history read queues a notice that kept the idle check from
+        # ever reaching delivery.
+        self.assertFalse([read for read in self.methods("thread/read")
+                          if _as_test_dict(read["params"]).get("includeTurns")])
         if not resident:
             self.assertEqual(self.turn_inputs[-1], "detached run result")
         self.assertTrue(run.exists(), "run discovery removed a lookup record")
@@ -10515,11 +10532,13 @@ class SweepTests(unittest.TestCase):
                 pass
 
             @bounded_fixture
-            def call(self, method: str, params: dict[str, object]) -> dict[str, object]:
+            def call(self, method: str, params: dict[str, object], _timeout: float = 0.0) -> dict[str, object]:
                 if method == "thread/loaded/list":
                     return loaded
+                if method == "thread/turns/list":
+                    return {"result": {"data": [{"id": "u", "status": "inProgress"}]}}
                 status = statuses[cast("str", params["threadId"])]
-                return {"result": {"thread": {"status": {"type": status}, "turns": [{"id": "u", "status": "inProgress"}]}}}
+                return {"result": {"thread": {"status": {"type": status}, "turns": []}}}
 
             def close(self) -> None:
                 pass
@@ -11225,8 +11244,10 @@ class SignInChangeTests(unittest.TestCase):
     def test_a_resident_worker_mid_turn_stays_until_its_turn_ends(self) -> None:
         class BusyClient:
             @bounded_fixture
-            def call(self, _method: str, _params: dict[str, object]) -> dict[str, object]:
-                return {"result": {"thread": {"status": {"type": "active"}, "turns": [{"id": "t", "status": "inProgress"}]}}}
+            def call(self, method: str, _params: dict[str, object], _timeout: float = 0.0) -> dict[str, object]:
+                if method == "thread/turns/list":
+                    return {"result": {"data": [{"id": "t", "status": "inProgress"}]}}
+                return {"result": {"thread": {"status": {"type": "active"}, "turns": []}}}
 
             def close(self) -> None:
                 raise AssertionError("a worker mid-turn keeps its connection")
@@ -11742,7 +11763,9 @@ class WorkersHomeTests(unittest.TestCase):
                 if method == "thread/loaded/list":
                     return {"result": {"data": ["thread-1"]}}
                 if method == "thread/read":
-                    return {"result": {"thread": {"status": {"type": "active"}, "turns": [{"id": "turn-1", "status": "inProgress"}]}}}
+                    return {"result": {"thread": {"status": {"type": "active"}, "turns": []}}}
+                if method == "thread/turns/list":
+                    return {"result": {"data": [{"id": "turn-1", "status": "inProgress"}]}}
                 raise AssertionError(f"Live writer must not receive {method}")
             def close(self) -> None:
                 pass

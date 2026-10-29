@@ -316,6 +316,8 @@ PAUSE_INTERRUPT_SECS = 15.0
 UNSEEN_END_CHECK_SECS = 60.0
 DETACHED_RUN_CHECK_SECS = 60.0
 UNSEEN_END_CALL_SECS = 10.0
+# How many of the newest turns a read lists to find the watched or live turn.
+RECENT_TURNS = 8
 # How fast a failure has to arrive to be read as this machine's fault rather
 # than the provider's. An app-server that has wedged answers from what it
 # cached, without a round trip, so it fails in seconds; a refusal that travelled
@@ -2852,6 +2854,21 @@ def _thread_has_no_active_turn(status: str) -> bool:
     return status in ("idle", "notLoaded", "systemError")
 
 
+def _recent_turns(client: Client, thread_id: str, timeout: float = CALL_TIMEOUT_SECS) -> list[dict[str, object]]:
+    """The thread's newest turns, newest first.
+
+    A full-history `thread/read` queues a deprecation notice ahead of its reply,
+    which a following launcher takes as a frame still to handle, so turns come
+    from the paged list. A refused call lists none.
+    """
+    reply = client.call("thread/turns/list", {
+        "threadId": thread_id, "limit": RECENT_TURNS, "sortDirection": "desc"}, timeout)
+    turns = _as_dict(reply.get("result")).get("data")
+    if not isinstance(turns, list):
+        return []
+    return [_as_dict(turn) for turn in cast("list[object]", turns)]
+
+
 def _ended_unseen(client: Client, thread_id: str, turn_id: str = "") -> bool:
     """True when no turn is active and nothing is queued, so no turn is left to end.
 
@@ -2867,19 +2884,18 @@ def _ended_unseen(client: Client, thread_id: str, turn_id: str = "") -> bool:
         if isinstance(items, list) and items:
             return False
         reply = client.call(
-            "thread/read", {"threadId": thread_id, "includeTurns": bool(turn_id)}, UNSEEN_END_CALL_SECS)
+            "thread/read", {"threadId": thread_id, "includeTurns": False}, UNSEEN_END_CALL_SECS)
+        thread = _as_dict(_as_dict(reply.get("result")).get("thread"))
+        if not _thread_has_no_active_turn(_as_str(_as_dict(thread.get("status")).get("type"))):
+            return False
+        if not turn_id:
+            return True
+        turns = _recent_turns(client, thread_id, UNSEEN_END_CALL_SECS)
     except SystemExit:
         return False
-    thread = _as_dict(_as_dict(reply.get("result")).get("thread"))
-    if not _thread_has_no_active_turn(_as_str(_as_dict(thread.get("status")).get("type"))):
-        return False
-    if not turn_id:
-        return True
-    turns = thread.get("turns")
-    return isinstance(turns, list) and any(
-        (record := _as_dict(turn)).get("id") == turn_id
-        and record.get("status") in ("completed", "failed", "interrupted")
-        for turn in cast("list[object]", turns))
+    return any(
+        turn.get("id") == turn_id and turn.get("status") in ("completed", "failed", "interrupted")
+        for turn in turns)
 
 
 def _more_work_coming(client: Client, thread_id: str, deadline: float) -> bool:
@@ -3891,18 +3907,16 @@ def _pending_after_worker_start(
 def _quota_continuation_finished(client: Client, thread_id: str, turn_id: str) -> bool:
     """An idle read-back must confirm this continuation completed successfully."""
     try:
-        reply = client.call("thread/read", {"threadId": thread_id, "includeTurns": True}, UNSEEN_END_CALL_SECS)
+        reply = client.call("thread/read", {"threadId": thread_id, "includeTurns": False}, UNSEEN_END_CALL_SECS)
+        if reply.get("error"):
+            return False
+        thread = _as_dict(_as_dict(reply.get("result")).get("thread"))
+        if _as_str(_as_dict(thread.get("status")).get("type")) != "idle":
+            return False
+        turns = _recent_turns(client, thread_id, UNSEEN_END_CALL_SECS)
     except (ConnectionError, OSError, SystemExit):
         return False
-    if reply.get("error"):
-        return False
-    thread = _as_dict(_as_dict(reply.get("result")).get("thread"))
-    if _as_str(_as_dict(thread.get("status")).get("type")) != "idle":
-        return False
-    turns = thread.get("turns")
-    return isinstance(turns, list) and any(
-        (record := _as_dict(turn)).get("id") == turn_id and record.get("status") == "completed"
-        for turn in cast("list[object]", turns))
+    return any(turn.get("id") == turn_id and turn.get("status") == "completed" for turn in turns)
 
 
 def _pending_after_completion_readback(
@@ -5559,7 +5573,7 @@ def _drop_queued_messages(client: Client, thread_id: str) -> int:
 
 def _read_live_turn(client: Client, thread_id: str) -> ThreadState:
     """Read the active turn without sending text into the thread."""
-    reply = client.call("thread/read", {"threadId": thread_id, "includeTurns": True})
+    reply = client.call("thread/read", {"threadId": thread_id, "includeTurns": False})
     error = reply.get("error")
     if error:
         return ThreadStateUnknown(_as_str(_as_dict(error).get("message")) or "thread/read failed")
@@ -5572,14 +5586,11 @@ def _read_live_turn(client: Client, thread_id: str) -> ThreadState:
         return ThreadIdle()
     if status != "active":
         return ThreadStateUnknown(f"unrecognized status {status or '(missing)'}")
-    turns = thread.get("turns")
-    if isinstance(turns, list):
-        for turn in reversed(cast("list[object]", turns)):
-            record = _as_dict(turn)
-            if record.get("status") == "inProgress":
-                turn_id = _as_str(record.get("id"))
-                if turn_id:
-                    return ThreadLive(turn_id)
+    for turn in _recent_turns(client, thread_id):
+        if turn.get("status") == "inProgress":
+            turn_id = _as_str(turn.get("id"))
+            if turn_id:
+                return ThreadLive(turn_id)
     # Active is enough to refuse a relaunch, even if the server has not yet
     # persisted the new turn in the read response.
     return ThreadActiveWithoutTurn()
