@@ -454,18 +454,9 @@ class OpenLists(NamedTuple):
     unreadable: list[str]
 
 
-# The /next word that adds every production below the showrunner's own.
-ALL_BELOW = "all-below"
-
-
-def scope_queue(name: str, below: bool) -> str:
-    """The pin name of a list: an all-below show keeps its own pin, so it never moves the default's."""
-    return f"{name}-{ALL_BELOW}" if below else name
-
-
 def question_queue(production: Production, below: bool = False) -> str:
     """The name urgency.py pins the question /next showed under."""
-    return scope_queue(f"question-{production.slug}", below)
+    return urgency.scope_queue(f"question-{production.slug}", below)
 
 
 def item_key(slug: str, text: str) -> str:
