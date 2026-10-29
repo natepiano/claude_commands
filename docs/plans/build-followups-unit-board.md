@@ -24,37 +24,21 @@ The showrunner reported a defect from cargo-liner-style: the units report shows 
 
 ### Phase 24 — the units report counts recent builds on every ledger, and the nightly split is one command  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** The units report shows the real number of findings built in the last 24 h on a ledger at schema 24 or 25, and `style_plan.py split-all --all` runs the split for every running style production as one fixed command.
-
-**Depends on:** none
-
-**Spec:**
-1. The report's recent-built count reads `held_findings.built_at` when the column exists. On a ledger without the column (schema below 25), it uses the same rule migration 25 uses to fill it: for `state='built'` rows, the merged build ticket's `updated_at`, else the row's `updated_at`. One function owns this rule for both the report and migration 25's fill, so the two cannot drift. The report stays read-only: no migration, no write.
-2. The ETA in the same totals line uses the same recent-built count, so a ledger with recent builds no longer reads `no ETA: nothing built in 24 h`.
-3. `style_plan.py split-all --all` finds every running production whose doc carries `**Kind:** style`, from `showrunners.py list` and each production doc, and runs `split-all` for each. A production that fails is skipped with one log line naming it and the error; the others still run. With no style production, it prints one line and exits 0. While a natedev build hold is in force (`build_hold.py status`), it prints one line and exits 0 without running any split. Exit status is 0 unless the command itself cannot run.
-4. `docs/as-built/style-showrunner.md` and `docs/as-built/unit-board.md` describe the fallback and the `--all` form, with the exact nightly command line.
+- `style_ledger.legacy_built_at_sql(finding="held_findings") -> str` returns the SQL for the build time of a built finding before schema 25: the `updated_at` of its merged build ticket, else the `updated_at` of the finding. Migration 25 fills `held_findings.built_at` with it, so the report and the migration use one rule.
+- `style_units.read_snapshot` reads `h.built_at` when the column exists. Without the column, it uses `legacy_built_at_sql("h")` when the `tickets` table and the `build_ticket` column exist, else `h.updated_at`. The report stays read-only: no migration, no write. The recent-built count and the ETA in the totals line use this value.
+- `style_plan.split_all_running()` runs behind `split-all --all`, which is mutually exclusive with `--production`. It checks the natedev build hold (`build_hold.natedev_holds(build_hold.holder_directory()).in_force`) before discovery and again before each production. It reads `showrunners.registered_showrunners()`, keeps the entries with a session, reads the Kind of each doc with `production_field`, and runs `split_all` for each `style` production.
+- Output of `split-all --all`: a failed production prints `split-all: <slug>: failed: <cause>` and the others still run; no style production prints `no running style productions`; a hold prints `split-all: natedev build hold in force; skipped`. The exit status is 0 in all these cases. A discovery error exits 1.
+- The nightly command is `~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py split-all --all`.
 
 **Files:**
-- `scripts/production/style_units.py`
-- `scripts/production/test_style_units.py`
-- `scripts/style/style_ledger.py`
-- `scripts/style/test_style_ledger.py`
-- `scripts/style/style_plan.py`
-- `scripts/style/test_style_plan.py`
-- `docs/as-built/style-showrunner.md`
-- `docs/as-built/unit-board.md`
+- `scripts/style/style_ledger.py` — `legacy_built_at_sql`; migration 25 fill uses it.
+- `scripts/production/style_units.py` — `read_snapshot` built-time fallback.
+- `scripts/style/style_plan.py` — `split_all_running`; `split-all --all`.
+- `scripts/production/test_style_units.py` — schema-24 fallback with unchanged ledger bytes; schema-25 `built_at` precedence; legacy ledgers without ticket metadata.
+- `scripts/style/test_style_ledger.py` — the fallback matches the migration 25 fill.
+- `scripts/style/test_style_plan.py` — `AllStyleProductionsTests`: a failure continues, no production, hold before discovery, hold that starts between productions, discovery failure.
+- `docs/as-built/style-showrunner.md`, `docs/as-built/unit-board.md` — the fallback, the `--all` form and the nightly command.
 
-**Workers:** 1 writer
-- impl: every file above.
-
-**Acceptance gate:**
-- A test builds a schema-24 ledger with no `built_at` column and built rows updated in the last 24 h; the report's totals line counts them and gives an ETA, and the ledger file's bytes are unchanged.
-- A test on a schema-25 ledger reads `built_at`.
-- Tests for `split-all --all`: two style productions where one fails (the other still runs, exit 0); no style production (one line, exit 0); a build hold in force (one line, exit 0, no split runs). Tests patch the production list, the hold status and the split call; no test touches live data.
-- basedpyright on every touched Python file: `0 errors, 0 warnings, 0 notes`.
-- `cd scripts/production && python3 -m unittest test_style_units` and `cd scripts/style && python3 -m unittest test_style_plan test_style_ledger` pass.
-
-**Constraints from prior phases:**
-- `style_plan.split` keeps its `SplitDeadline` and bounded `record_split` write; `split-all` keeps its existing per-unit output lines.
+**Gotchas:** The legacy SQL reads the `tickets` table and `held_findings.build_ticket`. On a ledger without one of them that SQL fails, so the report uses `h.updated_at` there. A build hold can start while a production splits, so the hold check runs before each production, not only once.
