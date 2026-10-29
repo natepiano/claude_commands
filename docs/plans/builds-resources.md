@@ -315,7 +315,7 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 - `test_sweep.py` passes; `basedpyright` over both files reports `0 errors, 0 warnings, 0 notes`.
 - Change-Review line: the floor sweep stops only after it frees the shortfall | run the sweep tests: `python3 -m unittest discover -s scripts/lint -p test_sweep.py` | the outside-link test passes, and the pass takes the next candidate.
 
-### Phase 10 — Memory admission names the reservation a waiting step waits on  · status: todo
+### Phase 10 — Memory admission names the reservation a waiting step waits on  · status: done
 **Depends on:** none
 
 **Approved:** showrunner 2026-10-29, one writer, ready by 17:00 EDT for verify-unit's Phase 8 (it names the holder of a wait for hierarchies' wait experiment; starts about 18:30 EDT). Form agreed with verify-unit.
