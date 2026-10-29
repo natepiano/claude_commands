@@ -65,7 +65,7 @@ Each copy is known to cleanup at birth. The helper does not add a cleaner.
 
 ## Survey changes
 
-Survey of every unit director, sent 14:05 EDT 2026-10-29, closes 23:00 EDT; 42 units answered by 19:20 EDT (each answer, with its unit, in `.claude/handoff/copies-survey-answers.md` of this worktree). Most said the format suits them. These changes go into Phase 3; the unit that asked is in brackets.
+Survey of every unit director, sent 14:05 EDT 2026-10-29, closes 23:00 EDT; 42 units answered by 19:05 EDT (each answer, with its unit, in `.claude/handoff/copies-survey-answers.md` of this worktree). Most said the format suits them. These changes go into Phase 3; the unit that asked is in brackets.
 
 **Name.**
 - The phase part is a slug, `[a-z0-9-]`: `54b`, `94b`, `adhoc` for ad hoc work. A slash is refused. Where no phase exists, a free label takes its place: `sync-test`, `demo27-fastest4`, `adhoc-stallcpu-gate` [unit-board, merge-gate, messaging, fix-rounds, models].
