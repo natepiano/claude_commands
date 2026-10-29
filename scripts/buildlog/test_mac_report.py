@@ -20,6 +20,9 @@ import launches
 import mac_report
 import mac_outcome
 import store
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 if TYPE_CHECKING:
     from ..direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
 else:
@@ -536,7 +539,7 @@ class MacReportTests(unittest.TestCase):
         for args in (["mac-report", "--hours", "2"], ["schema"]):
             result = subprocess.run(
                 [sys.executable, str(CLI), *args], env={**os.environ, "BUILDLOG_DIR": str(self.root)},
-                capture_output=True, text=True, check=False, timeout=30,
+                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             if args[0] == "mac-report":
