@@ -15,6 +15,9 @@ from contextlib import closing
 from pathlib import Path
 from typing import BinaryIO, Literal, TypedDict, cast
 
+# load 136 on natedev, 2026-10-29
+TEST_HANG_GUARD_SECS = 300
+
 
 class SshConfiguration(TypedDict):
     home: str
@@ -73,7 +76,7 @@ def stream_kind(value: object) -> StreamKind:
 
 
 def observe_role_snapshot(configuration: SshConfiguration) -> CommittedRoleSnapshot:
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + TEST_HANG_GUARD_SECS
     while time.monotonic() < deadline:
         with closing(sqlite3.connect(f"file:{configuration['database']}?mode=ro", uri=True)) as database:
             rows = cast(list[tuple[int, str, str]], database.execute(
@@ -118,7 +121,7 @@ def main() -> int:
         if behavior == "wait_for_release":
             marker = Path(configuration["report"])
             _ = marker.with_suffix(".waiting").write_bytes(b"")
-            deadline = time.monotonic() + 15
+            deadline = time.monotonic() + TEST_HANG_GUARD_SECS
             while not marker.with_suffix(".release").exists():
                 if time.monotonic() >= deadline:
                     raise RuntimeError("fixture pass was never released")
