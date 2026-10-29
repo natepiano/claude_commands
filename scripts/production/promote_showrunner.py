@@ -36,8 +36,8 @@ import unit_lookup
 import unit_runs
 import herdr
 from session_pane import HerdrFailure, read_place, type_place, where_place
-from add_unit import Production, commit_paths, read_production
-from production_units import Refusal, cell_value, plan_cell_is_retired, unit_headings, unit_rows, unit_table
+from add_unit import commit_paths
+from production_units import Production, Refusal, cell_value, plan_cell_is_retired, read_production, unit_headings, unit_rows, unit_table
 
 STOP_WAIT_S = float(os.environ.get("PROMOTE_STOP_WAIT_S") or 60)
 POLL_S = 0.5

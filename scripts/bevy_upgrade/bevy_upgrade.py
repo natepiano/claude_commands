@@ -12,7 +12,7 @@ from typing import TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 
-import add_unit
+from production_units import Production, read_production
 import production_units
 import pins
 import showrunners
@@ -54,13 +54,13 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _production(args: argparse.Namespace) -> add_unit.Production:
+def _production(args: argparse.Namespace) -> Production:
     doc = cast(Path | None, args.production)
     if doc is None:
         doc = showrunners.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
     if doc is None:
         raise production_units.Refusal("this session runs no production; pass --production <doc>")
-    return add_unit.read_production(doc)
+    return read_production(doc)
 
 
 def _baseline(record: upgrade_record.Record) -> None:
@@ -68,7 +68,7 @@ def _baseline(record: upgrade_record.Record) -> None:
                            for name, entry in record["dependencies"].items()}
 
 
-def _line(production: add_unit.Production, now: datetime, as_json: bool) -> int:
+def _line(production: Production, now: datetime, as_json: bool) -> int:
     current = upgrade_record.load(production.slug)
     if current is None or current["closed"] is not None:
         return 0
@@ -89,7 +89,7 @@ def _line(production: add_unit.Production, now: datetime, as_json: bool) -> int:
     return 0
 
 
-def _scheduled(record: upgrade_record.Record, production: add_unit.Production,
+def _scheduled(record: upgrade_record.Record, production: Production,
                now: datetime, differences: list[str], complete: bool) -> bool:
     """Return whether successful delivery closes the watch."""
     if complete:
@@ -120,7 +120,7 @@ def _closed_sentence(record: upgrade_record.Record) -> str:
             "The watch is closed.")
 
 
-def _run(args: argparse.Namespace, production: add_unit.Production, now: datetime) -> int:
+def _run(args: argparse.Namespace, production: Production, now: datetime) -> int:
     verb = cast(str | None, args.verb) or "status"
     if verb == "line":
         return _line(production, now, cast(bool, args.json))

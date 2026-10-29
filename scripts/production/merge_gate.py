@@ -1208,7 +1208,8 @@ def nightly(args: GateArguments) -> int:
         _ = nightly_git(clone, "checkout", "--detach", commit)
         tree = checked_git(clone, "rev-parse", "HEAD^{tree}")
         try:
-            run = run_suites(clone, args.memory_cap_mib, module_time_limit_s=args.module_time_limit_s, full=True)
+            run = run_suites(clone, args.memory_cap_mib, args.type_dirs,
+                             module_time_limit_s=args.module_time_limit_s, full=True)
         except (GateRefused, OSError, subprocess.SubprocessError) as error:
             print(f"Nightly suite runner failed: {error}", flush=True)
             run = GateRun((GateJobResult("runner", "suite-run", 1, 0, str(error)),), 0, 0)
@@ -1274,6 +1275,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return nightly(args)
             if args.tests_only:
                 return 0 if run_suites(Path(str(args.repo)).resolve(), int(args.memory_cap_mib),
+                                       args.type_dirs,
                                        module_time_limit_s=float(args.module_time_limit_s), full=args.full).passed else 1
             if args.promote_only:
                 promote(args)
