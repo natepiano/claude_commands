@@ -157,11 +157,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone  # noqa: E402
 if TYPE_CHECKING:
     from . import tmp_sweep
+    from .config_values import config_values as config_values
     from ..notify.push_texts import RenderedPush
     from ..notify import review
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import tmp_sweep
+    from config_values import config_values as config_values
 
 GIB = 1 << 30
 MIB = 1 << 20
@@ -1440,6 +1442,66 @@ def send_floor_alert(message: str, channels: FloorAlertChannels, *,
     return delivered
 
 
+if TYPE_CHECKING:
+    from ..build_hold import build_hold
+    from ..message import sessions
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_hold"))
+    import build_hold
+    import sessions
+
+
+@dataclass(frozen=True)
+class BuildHoldTarget:
+    """A target reserved for a named build hold holder, including between steps."""
+
+    holder: str
+
+
+def build_hold_targets(targets: Sequence[str], known_trees: dict[str, list[str]]) -> dict[str, BuildHoldTarget]:
+    """Protect session workspaces and recently written build trees without reading build output."""
+    state = build_hold.read_holders(build_hold.holder_directory())
+    if isinstance(state, build_hold.NoHolders):
+        return {}
+    records = sessions.live_sessions()
+    protected: dict[str, BuildHoldTarget] = {}
+    for holder in state.holders:
+        folders: list[Path] = []
+        for record in records:
+            if record["sessionId"] != holder.key:
+                continue
+            try:
+                folder = Path(os.readlink(Path(PROC_DIR) / str(record["pid"]) / "cwd")).resolve(strict=True)
+            except OSError:
+                continue
+            if folder.is_dir():
+                folders.append(folder)
+        if not folders:
+            print(f"lint sweep: {holder.name} holds natedev builds; its working folder was not found")
+        # Allow three minutes for clock differences and filesystem timestamp granularity.
+        changed_since = holder.since.timestamp() - 3 * 60
+        for root in targets:
+            if root in protected:
+                continue
+            if any(Path(root).resolve().is_relative_to(folder) for folder in folders):
+                protected[root] = BuildHoldTarget(holder.name)
+                continue
+            if root not in known_trees:
+                known_trees[root] = build_trees(root)
+            paths = [os.path.join(root, USE_STAMP)]
+            for tree in known_trees[root]:
+                paths.extend([tree, *(os.path.join(tree, name) for name in (*HASHED_DIRS, INCREMENTAL_DIR))])
+            for path in paths:
+                try:
+                    changed = os.stat(path).st_mtime
+                except OSError:
+                    continue
+                if changed >= changed_since:
+                    protected[root] = BuildHoldTarget(holder.name)
+                    break
+    return protected
+
+
 def hold_floor(
     floor: int,
     dry_run: bool,
@@ -1465,15 +1527,22 @@ def hold_floor(
         idle: list[str] = []
         trees: list[str] = []
         tree_targets: dict[str, str] = {}
-        busy: dict[str, TargetUse | LockHeld] = {}
+        busy: dict[str, TargetUse | LockHeld | BuildHoldTarget] = {}
         targets = target_dirs(roots)
+        known_trees: dict[str, list[str]] = {}
+        hold_targets = build_hold_targets(targets, known_trees)
         uses = process_uses(targets)
         for root in targets:
+            if root in hold_targets:
+                reason = hold_targets[root]
+                print(f"lint sweep: {reason.holder} holds natedev builds; {root} left alone")
+                busy[root] = reason
+                continue
             if root in uses:
                 print(f"lint sweep: pid {uses[root].pid} {uses[root].how}; {root} left alone")
                 busy[root] = uses[root]
                 continue
-            root_trees = build_trees(root)
+            root_trees = known_trees[root] if root in known_trees else build_trees(root)
             root_held, blocked = lock_trees(root_trees)
             if blocked is not None:
                 busy[root] = LockHeld(blocked)
@@ -1489,7 +1558,9 @@ def hold_floor(
         target_uses = {root: target_last_use(root, groups) for root, groups in target_groups.items()}
         scratch_targets = {root: is_scratch_target(root, scratch_roots) for root in idle}
         total = sum(scan.blocks.values())
-        busy_bytes = {path: directory_blocks(path) for path in busy}
+        # A held target is not walked even for accounting; its bytes stay unmeasured this pass.
+        busy_bytes = {path: 0 if isinstance(use, BuildHoldTarget) else directory_blocks(path)
+                      for path, use in busy.items()}
         held_bytes = sum(busy_bytes.values())
         ci_bytes = sum(directory_blocks(path) for path in CI_TARGETS)
         unchanged_caches = held_bytes + ci_bytes
@@ -1549,7 +1620,10 @@ def hold_floor(
             # holds a busy target is told; the user gets a page, with exact paths, only when no
             # session could be told.
             if left > budget and after_free < floor and push_due:
-                holders = floor_holders(busy, busy_bytes)
+                holders = floor_holders({root: use for root, use in busy.items()
+                                         if not isinstance(use, BuildHoldTarget)}, busy_bytes)
+                holders.extend(FloorHolder(root, 0, None, f"{use.holder} holds natedev builds", None)
+                               for root, use in busy.items() if isinstance(use, BuildHoldTarget))
                 told = frozenset(holder.path for holder in holders if holder.session is not None
                                  and send_holder_message(holder.session, holder_message_text(holder, after_free, floor)))
                 measurement = read_disk_measurement()
@@ -1592,25 +1666,6 @@ def size_bytes(raw: str, unit: int) -> int | None:
     except ValueError:
         return None
     return int(value * unit) if math.isfinite(value) and value >= 0 else None
-
-
-def config_values(path: str) -> dict[str, str]:
-    """lint.conf's key=value pairs, read as lint_config.sh's _lint_config_raw
-    reads them: '#' starts a comment, [section] lines are skipped, the first
-    value of a key wins."""
-    try:
-        with open(path, encoding="utf-8") as handle:
-            lines = handle.readlines()
-    except OSError:
-        return {}
-    values: dict[str, str] = {}
-    for raw in lines:
-        line = raw.split("#", 1)[0].strip()
-        if not line or (line.startswith("[") and line.endswith("]")) or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        _ = values.setdefault(key.strip(), value.strip())
-    return values
 
 
 def repo_name(directory: str) -> str | None:

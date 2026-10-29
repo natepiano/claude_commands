@@ -29,6 +29,7 @@ from collections import deque
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from enum import Enum, auto
 import fcntl
 import json
 import os
@@ -46,9 +47,12 @@ from typing import TextIO, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import change_review  # noqa: E402
+from scripts.direct.local_release_wait import local_release_waiter  # noqa: E402
+from scripts.build_targets import build_targets  # noqa: E402
+from scripts.build_hold import build_hold  # noqa: E402
 
 TEST_SUITES = (
-    "lib", "hooks", "message", "accounts", "whoami", "agents", "build_hold",
+    "lib", "hooks", "message", "accounts", "whoami", "agents", "build_hold", "build_queue",
     "mac_test", "usage", "bevy_upgrade", "bevy_migration_plan", "production", "direct", "buildlog",
     "lint", "nightly_review", "build_targets", "shutdown", "feature_log",
     "model_study", "herdr", "notify", "statusline", "astra", "style", "history", "guilds", "issue_score",
@@ -61,6 +65,7 @@ MODULE_MEMORY_MIB = 48
 # 2026-10-18); the limit is about 4.6 times that.
 DEFAULT_MODULE_TIME_LIMIT_S = 1800
 RERUN_LIMIT = 8
+RELEASE_LOCK_WAIT_S = 60
 # basedpyright resolves bpy (Blender's interpreter only) and PIL (a PEP 723 dependency) from this
 # type-check-only venv, so the full tree reports 0/0. The stub date matches the 2026-08-23 sweep;
 # later dates report new diagnostics in bake_textures.py.
@@ -123,6 +128,7 @@ class GateJobResult:
     seconds: float
     output: str
     killed_for: str = ""
+    build_tool_started: bool = False
 
 
 @dataclass(frozen=True)
@@ -198,6 +204,43 @@ class GateRefused(Exception):
     """A gate precondition or operation failed; no later step may run."""
 
 
+@dataclass
+class BuildHoldWait:
+    """Track admission and time spent waiting for another session's natedev hold."""
+    seconds: float = field(default=0.0, init=False)
+    waiting: bool = field(default=False, init=False)
+    started: float = field(default=0.0, init=False)
+
+    def admits(self) -> bool:
+        try:
+            directory = build_hold.holder_directory()
+            holds = build_hold.natedev_holds(directory)
+            held = bool(holds.in_force) and not build_targets.caller_holds_only_own()
+        except (OSError, ValueError) as error:
+            raise GateRefused(f"natedev hold state cannot be read: {error}") from error
+        if held and not self.waiting:
+            self.started = time.monotonic()
+            self.waiting = True
+            names = "; ".join(" ".join(holder.name.split()) for holder in holds.in_force)
+            print(f"Gate hold: natedev is held by {names}; waiting for release", flush=True)
+        elif not held and self.waiting:
+            waited = time.monotonic() - self.started
+            self.seconds += waited
+            self.waiting = False
+            print(f"Gate hold: released after {waited:.2f}s", flush=True)
+        return not held
+
+    def wait_until_free(self) -> None:
+        if self.admits():
+            return
+        with local_release_waiter(build_hold.holder_directory(), build_hold.release_directory()) as events:
+            while True:
+                events.arm()
+                if self.admits():
+                    return
+                events.wait(15.0)
+
+
 def interrupted(signum: int, _frame: object) -> None:
     raise GateRefused(f"interrupted by {signal.Signals(signum).name}")
 
@@ -243,15 +286,34 @@ def checked_git(repo: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
-def release_running() -> bool:
-    result = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True, text=True, check=False)
-    if result.returncode:
-        raise GateRefused("cannot determine whether build-hold release is running")
-    for line in result.stdout.splitlines():
-        fields = line.strip().split(maxsplit=1)
-        if len(fields) == 2 and fields[0] != str(os.getpid()) and re.search(r"build_hold\.py\s+release(?:\s|$)", fields[1]):
-            return True
-    return False
+class ReleaseLockState(Enum):
+    ABSENT = auto()
+    FREE = auto()
+    HELD = auto()
+
+
+def release_lock_state() -> ReleaseLockState:
+    try:
+        with (build_hold.release_directory() / "release.lock").open("r") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return ReleaseLockState.HELD
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            return ReleaseLockState.FREE
+    except FileNotFoundError:
+        return ReleaseLockState.ABSENT
+    except OSError as error:
+        raise GateRefused(f"build-hold release lock cannot be read: {error}") from error
+
+
+def wait_for_release_lock(wait_s: float = RELEASE_LOCK_WAIT_S, poll_interval_s: float = 0.2) -> None:
+    deadline = time.monotonic() + wait_s
+    while release_lock_state() is ReleaseLockState.HELD:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise GateRefused(f"build-hold state stayed locked for {wait_s:g} s; main promotion refused")
+        time.sleep(min(poll_interval_s, remaining))
 
 
 def swapped_kib(pid: int) -> int:
@@ -433,12 +495,38 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
     return RunningGateJob(suite, path, process, started, output, log)
 
 
+def test_module_environment(root: Path, environment: dict[str, str]) -> dict[str, str]:
+    """Give a module a private build log and commands that record toolchain calls."""
+    buildlog = root / "buildlog"
+    buildlog.mkdir()
+    tools = root / "build-tool-tripwires"
+    tools.mkdir()
+    marker = root / "build-tool-calls.jsonl"
+    script = f"""#!{sys.executable}
+import fcntl, json, sys
+with open({str(marker)!r}, "a") as output:
+    fcntl.flock(output, fcntl.LOCK_EX)
+    output.write(json.dumps(sys.argv) + "\\n")
+raise SystemExit(99)
+"""
+    for name in ("cargo", "rustc", "rustdoc", "rustup", "cargo-nextest"):
+        executable = tools / name
+        _ = executable.write_text(script)
+        executable.chmod(0o755)
+    return {**environment, "TMPDIR": str(root), "BUILDLOG_DIR": str(buildlog),
+            "PATH": str(tools) + os.pathsep + environment.get("PATH", os.defpath)}
+
+
 def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
     seconds = time.monotonic() - job.started
     kill_job_group(job)
     job.output.close()
     captured = job.log.read_text(errors="replace")
-    job.log.unlink()
+    marker = job.log.parent / "build-tool-calls.jsonl"
+    calls = [cast(list[str], json.loads(line)) for line in marker.read_text().splitlines()] if marker.exists() else []
+    for call in calls:
+        captured += f"\n{job.path.name}: a test started real {Path(call[0]).name}: {shlex.join(call[1:])}\n"
+    shutil.rmtree(job.log.parent)
     if job.killed_for:
         captured = f"{job.killed_for}\n{captured}"
     # Python 3.13 returns 5 for empty helper modules; import errors still return 1.
@@ -446,7 +534,9 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
         status = 0
     if job.suite == "types":
         status = 0 if status in (0, 3) and re.search(r"^0 errors, 0 warnings, 0 notes\s*$", captured, re.MULTILINE) else 1
-    return GateJobResult(job.suite, job.path.name, status, seconds, captured, job.killed_for)
+    if calls:
+        status = 1
+    return GateJobResult(job.suite, job.path.name, status, seconds, captured, job.killed_for, bool(calls))
 
 
 def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_dirs: Sequence[str] = (),
@@ -471,6 +561,9 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     tmpfs = Path("/dev/shm")
     if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
         raise GateRefused("the test runner requires writable tmpfs at /dev/shm")
+    hold = BuildHoldWait()
+    hold.wait_until_free()
+    initial_hold_seconds = hold.seconds
     print(f"Runner: {len(modules)} modules, sampled memory cap {memory_cap_mib} MiB", flush=True)
     scope_prefix = suite_scope_prefix()
     timings_path = gate_state_dir() / "module_seconds.json"
@@ -527,13 +620,20 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                             kill_job_group(job)
                 while (pending and len(running) < max_running_jobs
                        and admission.admits(bool(running)) and (not rerunning or not running)):
+                    if not hold.admits():
+                        if not running:
+                            hold.wait_until_free()
+                        break
                     suite, path = pending.popleft()
-                    log = Path(temporary) / f"{suite}-{path.stem}.log"
+                    root = Path(tempfile.mkdtemp(prefix=f"{suite}-{path.stem}-", dir=temporary))
+                    log = root / "output.log"
+                    job_environment = ({**environment, "TMPDIR": str(root)} if suite == "types"
+                                       else test_module_environment(root, environment))
                     argv = ([os.environ.get("MERGE_GATE_BASEDPYRIGHT", "basedpyright"), "--pythonpath", str(types_python),
                              *type_dirs]
                             if suite == "types" else
                             [*scope_prefix, python, "-c", SUITE_BOOTSTRAP, "-m", "unittest", "discover", "-s", str(path.parent), "-p", path.name])
-                    job = start_gate_job(suite, path, argv, repo, environment, log)
+                    job = start_gate_job(suite, path, argv, repo, job_environment, log)
                     running.append(job)
                     _ = suite_started.setdefault(suite, job.started)
                     admission.reserve(job.process.pid, (types_peaks[types_key] * TYPES_PEAK_MARGIN
@@ -549,6 +649,12 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     if status is None:
                         continue
                     result = finish_gate_job(job, status)
+                    running.remove(job)
+                    admission.release(job.process.pid)
+                    if status < 0 and not job.killed_for and not hold.admits():
+                        pending.appendleft((job.suite, job.path))
+                        print(f"{job.suite}/{job.path.name}: stopped during a natedev hold; queued again", flush=True)
+                        continue
                     if job.suite == "types":
                         if not job.killed_for and types_peak_mib:
                             types_peaks[types_key] = types_peak_mib
@@ -569,11 +675,10 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     else:
                         results.append(result)
                     suite_finished[job.suite] = job.started + result.seconds
-                    running.remove(job)
-                    admission.release(job.process.pid)
                 if not pending and not running and not rerunning:
                     failed = [result for result in results
-                              if result.suite != "types" and result.returncode and not result.killed_for]
+                              if result.suite != "types" and result.returncode and not result.killed_for
+                              and not result.build_tool_started]
                     rerunning = True
                     if len(failed) > RERUN_LIMIT:
                         print(f"{len(failed)} modules failed; this is a real breakage, not load; no reruns", flush=True)
@@ -590,7 +695,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
             save_measures(timings_path, timings)
             save_measures(types_peaks_path, types_peaks)
             save_measures(history_path, history)
-    elapsed = time.monotonic() - began
+    elapsed = time.monotonic() - began - (hold.seconds - initial_hold_seconds)
     ending_load = one_minute_load()
     maximum_load = max(maximum_load, ending_load)
     for suite in TEST_SUITES:
@@ -610,6 +715,8 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
             print(f"basedpyright: {'RED' if result.returncode else 'OK'}\n{result.output}", flush=True)
     for slow in slow_modules:
         print(f"Slow module: {slow} ({SLOW_MODULE_FACTOR:g}x or more)", flush=True)
+    if hold.seconds > 0:
+        print(f"Gate hold wait: {hold.seconds:.2f}s (excluded from Gate tests)", flush=True)
     print(f"Gate tests: {elapsed:.2f}s; at most {max_running_jobs} modules at once; "
           + f"peak memory: {admission.peak_mib / 1024:.3f} GiB (sampled memory); cap: {memory_cap_mib / 1024:.3f} GiB", flush=True)
     print(f"Largest module peak: {largest_module_peak_mib / 1024:.3f} GiB (sampled memory); module: {largest_module or '(not sampled)'}", flush=True)
@@ -627,10 +734,12 @@ def check_settings(repo: Path, revision: str, approved: str) -> None:
         raise GateRefused(f"settings.json differs from approved blob {approved}: {actual}")
 
 
-def promote(args: GateArguments) -> None:
+def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WAIT_S,
+            release_lock_poll_s: float = 0.2) -> None:
+    hold = BuildHoldWait()
+    hold.wait_until_free()
     main_repo = Path(str(args.main_repo)).expanduser().resolve()
-    if release_running():
-        raise GateRefused("build-hold release is running; main promotion refused")
+    wait_for_release_lock(release_lock_wait_s, release_lock_poll_s)
     if checked_git(main_repo, "branch", "--show-current") != "main":
         raise GateRefused("promotion checkout must be on main")
     fetch_branches(main_repo, "main", args.merge_branch)
@@ -639,6 +748,7 @@ def promote(args: GateArguments) -> None:
     if git(main_repo, "merge-base", "--is-ancestor", "origin/main", f"origin/{args.merge_branch}").returncode:
         raise GateRefused("main is not an ancestor of the merge branch")
     check_settings(main_repo, f"origin/{args.merge_branch}", str(args.settings_blob))
+    hold.wait_until_free()
     _ = checked_git(main_repo, "merge", "--ff-only", f"origin/{args.merge_branch}")
     _ = checked_git(main_repo, "push", "origin", "main")
     promoted = checked_git(main_repo, "rev-parse", "HEAD")
@@ -714,6 +824,8 @@ def check_local_doc_commits(repo: Path, origin: str) -> None:
 
 
 def merge_checkpoint(args: GateArguments) -> int:
+    hold = BuildHoldWait()
+    hold.wait_until_free()
     repo = Path(str(args.repo)).resolve()
     # Untracked files (each showrunner's LOG) never block; a merge that would
     # overwrite one fails on its own and is aborted.
@@ -739,6 +851,7 @@ def merge_checkpoint(args: GateArguments) -> int:
         raise GateRefused("checkpoint commits without a Change-Review line: " + "; ".join(refused))
     subject = f"Merge {args.unit} {args.phase} ({args.checkpoint}) into {args.merge_branch}"
     try:
+        hold.wait_until_free()
         result = git(repo, "merge", "--no-ff", "-m", f"{subject}\n\n{args.body}", checkpoint)
         if result.returncode:
             conflicts = git(repo, "diff", "--name-only", "--diff-filter=U").stdout.strip()
@@ -752,6 +865,7 @@ def merge_checkpoint(args: GateArguments) -> int:
         fetch_branches(repo, "main")
         if git(repo, "merge-base", "--is-ancestor", "origin/main", "HEAD").returncode:
             raise GateRefused("origin/main is not an ancestor of the merge branch")
+        hold.wait_until_free()
     except BaseException as error:
         rollback_merge(repo, baseline)
         raise GateRefused(f"{error or type(error).__name__}; merge undone, not pushed") from error
