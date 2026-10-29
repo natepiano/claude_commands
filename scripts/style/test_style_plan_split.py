@@ -107,7 +107,7 @@ class StylePlanTests(StylePlanFixture):
         left = split.ready + split.changed + split.structure + split.other
         output = style_units.table([live_units.LiveUnit("names-unit", None)], {}, now=datetime(2026, 10, 28, 12, tzinfo=UTC),
                                    zone=UTC, ledger_paths={"names-unit": ledger.database})
-        self.assertIn(f"| 1 (0) | {left} approved of 14 filed |", output)
+        self.assertIn(f"| 1 | 0 | {left} approved of 14 filed |", output)
 
     def test_a_merged_ticket_keeps_its_filed_type_finding_in_other_until_a_person_marks_it_built(self) -> None:
         rule = self.rule("split-merged-type")
@@ -162,7 +162,7 @@ class StylePlanTests(StylePlanFixture):
             table = style_units.table([live_units.LiveUnit("names-unit", None)], {},
                                       ledger_paths={"names-unit": ledger.database})
         self.assertEqual(result, style_ledger.RecordedSplit(1, 0, 0, 1, measured_at))
-        self.assertIn("| 0 (0) | 2 |", table)
+        self.assertIn("| 0 | 0 | 2 |", table)
         self.assertEqual(result.ready + result.changed + result.structure + result.other, 2)
 
     def test_refill_and_split_readers_agree_on_rank_waits_and_changed_judgments(self) -> None:
@@ -252,7 +252,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual((self.plan.read_bytes(), issue.read_bytes()), (before_plan, before_issue))
         rendered = style_units.table([live_units.LiveUnit("names-unit", None)], {}, now=measured_at, zone=UTC,
                                      ledger_paths={"names-unit": ledger.database})
-        self.assertIn("| gone | idle | idle | — | 0 (0) | 1: ready 1 · changed 0 · structure 0 · other 0 (0 min) |", rendered)
+        self.assertIn("| gone | idle | idle | — | 0 | 0 | 1: ready 1 · changed 0 · structure 0 · other 0 (0 min) |", rendered)
 
     def test_a_scan_error_or_time_limit_keeps_the_last_split_and_reports_the_cause(self) -> None:
         _ = self.rule("failed-split")
