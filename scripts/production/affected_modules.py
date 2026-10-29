@@ -15,24 +15,6 @@ import subprocess
 import sys
 
 
-# Shared fixture providers, including test modules imported by other modules.
-# Changing their setup/patch boundaries requires a full isolation check.
-SHARED_TEST_HELPERS = frozenset({
-    "scripts/shutdown/test_support.py", "scripts/shutdown/test_account_move.py",
-    "scripts/shutdown/test_inventory.py", "scripts/production/cli_fixture.py",
-    "scripts/production/add_unit_test_support.py",
-    "scripts/usage/fixtures/collect/mac/fake_ssh.py",
-    "scripts/direct/recorder_fixture.py", "scripts/direct/wait_for_test_state.py",
-    "scripts/direct/test_verify_mac_offload.py", "scripts/direct/test_verify_doc.py",
-    "scripts/direct/test_verify_lint_scope.py", "scripts/direct/test_verify_token_wait.py",
-    "scripts/direct/test_verify_untested_examples.py", "scripts/accounts/nix_env_fake.py",
-    "scripts/accounts/test_refusal_watch.py", "scripts/agents/test_codex_mesh.py",
-    "scripts/build_hold/test_build_hold.py", "scripts/build_hold/test_hold_applies.py",
-    "scripts/buildlog/test_index.py", "scripts/model_study/test_report.py",
-    "scripts/lib/nix_env_test_support.py", "scripts/lib/test_claude_launch_scan.py",
-})
-
-
 @dataclass(frozen=True)
 class CertifiedBase:
     commit: str
@@ -119,7 +101,7 @@ def git_output(repo: Path, *arguments: str) -> str:
 
 def full_suite_trigger(path: str) -> bool:
     name = Path(path).name
-    return (path.startswith("scripts/lib/") or path in SHARED_TEST_HELPERS
+    return (path.startswith("scripts/lib/")
             or name in {"conftest.py", "settings.json", "merge_gate.py", "affected_modules.py", "agents_config.sh"}
             or (Path(path).parent == Path("config") and name.endswith(".conf")))
 
@@ -203,7 +185,10 @@ def dependency_graph(repo: Path, tracked: set[str], changed_files: Sequence[str]
                     elif root and root not in external:
                         dependencies.update(bare_modules.get(root, set()))
             text = "\0".join(strings)
-        dependencies.update(mentions.in_text(text))
+        # These full-suite triggers hold selection data, not runtime file uses.
+        # Their imports still contribute dependencies above.
+        if path not in {"scripts/production/affected_modules.py", "scripts/production/merge_gate.py"}:
+            dependencies.update(mentions.in_text(text))
         dependencies.discard(path)
         graph[path] = dependencies
     return graph, scanners

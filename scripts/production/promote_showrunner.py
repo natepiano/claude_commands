@@ -132,9 +132,9 @@ def checked(name: str, child_doc: Path) -> Promotion:
     _settled(unit, claude, worktree)
     child = read_production(child_doc)
     _committed(child.doc)
-    # Only the unit's herdr session will end before the same-named destination starts.
+    # Only the unit's herdr tab will end before the same-named destination starts.
     directory = showrunner_account_directory()
-    ending = marked.place.session
+    ending = add_showrunner.EndingUnitTab(marked.place.pane)
     _ = add_showrunner.checked(child, parent.slug, ending=ending, start_in=worktree, config_dir=directory)
     return Promotion(unit, parent, child, marked, claude, worktree, cell_value(cells.get("Plan", "")))
 

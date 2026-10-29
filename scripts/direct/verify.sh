@@ -119,6 +119,7 @@
 #                                          emits style-lint tool boundaries for records
 #                                          --check reports mend findings and checks
 #                                          formatting without applying fixes
+#   verify.sh final-pass [<tree>]          read a matching machine-wide final pass
 #   verify.sh doc [--features <list>]      workspace rustdoc, warnings denied;
 #                                          mandatory before a Rust checkpoint,
 #                                          regardless of lint.conf; workspace
@@ -157,6 +158,12 @@
 #                                          session; same as setting
 #                                          UNIT_SESSION_DIR=<dir>
 #
+# `final` always runs the full gate. A clean, unchanged tree that passes gets
+# ~/.local/state/verify/final_pass/<tree>.json (VERIFY_STATE_DIR sets its parent).
+# `final-pass [<tree>]` reads that proof without Cargo or build admission. It
+# requires the current rustc -vV and verify.sh hash. No tree argument means
+# the current clean HEAD tree. Writes prune records older than 14 days.
+#
 # Invocation policy — canonical flags, lint.conf gating, sandbox-failure
 # detection — lives in scripts/lint/invoke.sh, the
 # single bottom layer, sourced below. This file adds only worker scope rules
@@ -167,6 +174,14 @@
 # the same command unsandboxed; anything else is the underlying tool status.
 
 set -euo pipefail
+# Read-only queries run before environment setup and build admission.
+if [[ "${1:-}" == final-pass || ( "${1:-}" == --session-dir && "${3:-}" == final-pass ) ]]; then
+    if [[ "$1" == --session-dir ]]; then shift 2; fi
+    shift
+    VERIFY_QUERY_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+    export CLAUDE_PYTHON="${CLAUDE_PYTHON:-python3}"
+    exec "$VERIFY_QUERY_DIR/../lib/py" "$VERIFY_QUERY_DIR/final_pass.py" query "$VERIFY_QUERY_DIR/verify.sh" "$@"
+fi
 if [[ -n "${TMPDIR:-}" && ! -d "$TMPDIR" ]]; then mkdir -p -- "$TMPDIR"; fi
 # Ask the shared helper which envrc applies, before tool setup or record access.
 # With no envrc, ensure returns the unchanged env without invoking direnv.
@@ -215,6 +230,13 @@ BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}
 LOCAL_RELEASE_WAIT_SCRIPT="${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/local_release_wait.py}"
 ASSERTION_GUARD_SCRIPT="${VERIFY_ASSERTION_GUARD_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/assertion_guard.py}"
 STEP_RECORD_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/step_record.py"
+FINAL_PASS_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/final_pass.py"
+FINAL_PASS_START=""
+final_pass_finish() {
+    [[ -n "$FINAL_PASS_START" ]] || return 0
+    env -u BUILDLOG_CALL_ID "$PY" "$FINAL_PASS_SCRIPT" finish "${BASH_SOURCE[0]}" "$FINAL_PASS_START" "$1" "${FINAL_FEATURES:-}" || true
+    FINAL_PASS_START=""
+}
 STEP_RECORD_ACTIVE=0
 STEP_RUNS_ON=natedev_only
 STEP_TARGET_TABLE=""
@@ -977,6 +999,10 @@ if [[ -z "$CMD" ]]; then
     exit 2
 fi
 shift
+if [[ "$CMD" == final ]]; then
+    FINAL_PASS_START="$("$PY" "$FINAL_PASS_SCRIPT" start "${BASH_SOURCE[0]}")"
+    trap 'final_status=$?; final_pass_finish "$final_status"; exit "$final_status"' EXIT
+fi
 
 if [[ "$CMD" == example-test ]]; then
     echo 'verify.sh: example-test is removed: examples carry no tests (user, 2026-10-04).' >&2
@@ -2118,7 +2144,7 @@ HOLD_WAIT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-hold.$$.XXXXXX")"
 export BUILDLOG_HOLD_WAIT_FILE="$HOLD_WAIT_DIR/seconds"
 export BUILDLOG_HOLD_WAITER_FILE="$HOLD_WAIT_DIR/waiter"
 export BUILDLOG_CHECK_FAILED_FILE="$HOLD_WAIT_DIR/check-failed"
-trap 'hold_status=$?; interrupt_hold_wait; finish_hold_wait; remove_step_record; exit "$hold_status"' EXIT
+trap 'hold_status=$?; interrupt_hold_wait; finish_hold_wait; remove_step_record; final_pass_finish "$hold_status"; exit "$hold_status"' EXIT
 hold_interrupted() {
     local signal_name=$1 code=$2
     trap - INT TERM HUP
@@ -2747,7 +2773,7 @@ verify_cleanup() {
 }
 # EXIT alone would report success for a failed cargo run, so branch on the
 # status the trap receives; a lint failure record keeps it.
-trap 'EXIT_STATUS=$?; [[ ${EXIT_STATUS} -eq 0 ]] && verify_cleanup completed || verify_cleanup error; exit "${EXIT_STATUS}"' EXIT
+trap 'EXIT_STATUS=$?; [[ ${EXIT_STATUS} -eq 0 ]] && verify_cleanup completed || verify_cleanup error; final_pass_finish "$EXIT_STATUS"; exit "${EXIT_STATUS}"' EXIT
 verify_interrupted() {
     trap - EXIT INT TERM HUP
     EXIT_STATUS=$((128 + $1))
@@ -2759,6 +2785,7 @@ verify_interrupted() {
         RUN_STEP_PID=""
     fi
     verify_cleanup interrupted
+    final_pass_finish "$EXIT_STATUS"
     exit "$EXIT_STATUS"
 }
 trap 'verify_interrupted 2' INT

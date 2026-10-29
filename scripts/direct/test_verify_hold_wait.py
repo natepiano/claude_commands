@@ -133,10 +133,13 @@ class VerifyHoldWaitTests(unittest.TestCase):
         self.fixture.setUp()
         self.addCleanup(self.fixture_cleanups)
         root = self.fixture.root
+        pressure = root / "memory-pressure"
+        _ = pressure.write_text("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
         self.cycle_file = root / "release" / CYCLE_ID / "cycle.json"
         self.fixture.environment.update({
             "CLAUDE_PYTHON": sys.executable,
             "BUILDLOG_DIR": str(root / "buildlog"),
+            "BUILDLOG_MEMORY_PRESSURE": str(pressure),
             "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
             "UNIT_ACTIVE_DIR": str(root / "active"),
             "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",

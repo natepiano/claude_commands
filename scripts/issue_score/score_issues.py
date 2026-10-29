@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack
 from dataclasses import asdict
@@ -45,10 +45,12 @@ class CommandArguments(argparse.Namespace):
     sheet: str = ""
 
 
-def content_hash(issue: vault.Issue, areas: Sequence[str] = ()) -> str:
+def content_hash(issue: vault.Issue, areas: Sequence[str], definitions: Mapping[str, str]) -> str:
     """Hash content plus area context, excluding all current field labels."""
     text = json.dumps({"title": issue.title, "project": issue.project,
-                       "body": issue.body, "areas": areas}, sort_keys=True, ensure_ascii=False)
+                       "body": issue.body, "areas": areas,
+                       "area_definitions": {area: definitions[area] for area in areas if area in definitions}},
+                      sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
@@ -81,16 +83,17 @@ def _decided_fields(main: client.Response, area: client.Response) -> dict[str, o
 
 
 def _score_issue(issue: vault.Issue, areas: list[str], model: str, state_dir: Path,
-                 budget_exhausted: Event) -> ScoredIssue:
-    return _issue_judgments(issue, areas, model, state_dir, budget_exhausted, {}, "")["production"]
+                 budget_exhausted: Event, definitions: Mapping[str, str]) -> ScoredIssue:
+    return _issue_judgments(issue, areas, model, state_dir, budget_exhausted, {}, "", definitions)["production"]
 
 
 def _issue_judgments(issue: vault.Issue, areas: list[str], model: str, state_dir: Path,
-                     budget_exhausted: Event, variants: wording.VariantSets, experiment_id: str) -> dict[str, ScoredIssue]:
+                     budget_exhausted: Event, variants: wording.VariantSets, experiment_id: str,
+                     definitions: Mapping[str, str]) -> dict[str, ScoredIssue]:
     state = vault.build_state(issue)
     area_state: questions.AreaState = {"issue": state["issue"], "areas": list(areas)}
     main_payload: RequestPayload = {"model": model, "state": state, "questions": wording.build_questions(questions.main_questions(), variants)}
-    area_payload: RequestPayload = {"model": model, "state": area_state, "questions": wording.build_questions(questions.area_questions(areas), variants)}
+    area_payload: RequestPayload = {"model": model, "state": area_state, "questions": wording.build_questions(questions.area_questions(areas, definitions), variants)}
 
     def request(payload: RequestPayload) -> client.Response:
         if budget_exhausted.is_set():
@@ -111,7 +114,7 @@ def _issue_judgments(issue: vault.Issue, areas: list[str], model: str, state_dir
         selected_main = wording.project_response(main, variant, variants)
         selected_area = wording.project_response(area, variant, variants)
         record: ScoredIssue = {
-            "issue_path": str(issue.path), "content_hash": content_hash(issue, areas),
+            "issue_path": str(issue.path), "content_hash": content_hash(issue, areas, definitions),
             "question_set_version": questions.QUESTION_SET_VERSION, "model": main["model"],
             "payloads": {"main": main_payload, "area": area_payload},
             "answers": {"main": selected_main, "area": selected_area},
@@ -128,7 +131,8 @@ def _issue_judgments(issue: vault.Issue, areas: list[str], model: str, state_dir
 
 def experiment(variants: wording.VariantSets, only: str = "*", limit: int = 0, *,
                issues_dir: Path = vault.ISSUES_DIR, state_dir: Path = STATE_DIR,
-               model: str = questions.MODEL) -> dict[str, ScoreRun]:
+               model: str = questions.MODEL,
+               area_definitions_path: Path = vault.AREA_DEFINITIONS_PATH) -> dict[str, ScoreRun]:
     """Ask production and variants together, freshly, on tuning issues only."""
     if limit < 0 or not variants:
         raise ValueError("Experiments require variants and a nonnegative limit")
@@ -137,7 +141,8 @@ def experiment(variants: wording.VariantSets, only: str = "*", limit: int = 0, *
         raise ValueError("Result files must be outside the issue vault")
     issues = vault.load_open_issues(issues_dir)
     areas = vault.area_vocabulary(issues)
-    known = questions.main_questions() | questions.area_questions(areas)
+    definitions = vault.load_area_definitions(area_definitions_path)
+    known = questions.main_questions() | questions.area_questions(areas, definitions)
     if any(name not in known for replacements in variants.values() for name in replacements):
         raise ValueError("Variant references an unknown production question")
     # Validate every replacement before incurring a request or opening result files.
@@ -161,7 +166,7 @@ def experiment(variants: wording.VariantSets, only: str = "*", limit: int = 0, *
                 if budget_exhausted.is_set():
                     break
                 pending = {executor.submit(_issue_judgments, issue, areas, model, state_dir,
-                                           budget_exhausted, variants, identifier): issue for issue in selected[start:start + WORKERS]}
+                                           budget_exhausted, variants, identifier, definitions): issue for issue in selected[start:start + WORKERS]}
                 for future in as_completed(pending):
                     try:
                         results = future.result()
@@ -179,7 +184,8 @@ def experiment(variants: wording.VariantSets, only: str = "*", limit: int = 0, *
 
 def score(only: str = "*", limit: int = 0, *, issues_dir: Path = vault.ISSUES_DIR,
           state_dir: Path = STATE_DIR, model: str = questions.MODEL,
-          split: Split = "all", fresh: bool = False) -> ScoreRun:
+          split: Split = "all", fresh: bool = False,
+          area_definitions_path: Path = vault.AREA_DEFINITIONS_PATH) -> ScoreRun:
     if limit < 0:
         raise ValueError("--limit must be nonnegative")
     state_dir = state_dir.expanduser().resolve()
@@ -187,6 +193,7 @@ def score(only: str = "*", limit: int = 0, *, issues_dir: Path = vault.ISSUES_DI
         raise ValueError("Result files must be outside the issue vault")
     issues = vault.load_open_issues(issues_dir)
     areas = vault.area_vocabulary(issues)
+    definitions = vault.load_area_definitions(area_definitions_path)
     selected = [issue for issue in issues if in_split(issue.path, split) and (fnmatch.fnmatch(issue.path.name, only)
                 or fnmatch.fnmatch(issue.path.stem, only) or fnmatch.fnmatch(str(issue.path), only))]
     if limit:
@@ -200,12 +207,12 @@ def score(only: str = "*", limit: int = 0, *, issues_dir: Path = vault.ISSUES_DI
     failure_count = 0
 
     def result(issue: vault.Issue) -> ScoredIssue:
-        key = (str(issue.path), content_hash(issue, areas))
+        key = (str(issue.path), content_hash(issue, areas, definitions))
         if key in cache:
             record = cache[key].copy()
             record["decided_fields"] = _decided_fields(record["answers"]["main"], record["answers"]["area"])
             return record
-        return _score_issue(issue, areas, model, state_dir, budget_exhausted)
+        return _score_issue(issue, areas, model, state_dir, budget_exhausted, definitions)
 
     with result_path.open("x", encoding="utf-8") as output:
         with ThreadPoolExecutor(max_workers=WORKERS) as executor:
