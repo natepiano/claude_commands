@@ -31,8 +31,10 @@ no lost record: its edits check under the bare session id. The hook reads the re
 state in process. `progress_history.py finish-phase` clears an inactive state when the
 phase completes, and `start-phase` on a finished phase id restores its enrolled state from the
 kept board answer and removes the release marker (rca 261023-3). With one
-open phase every edited path is that phase's. With several, a path is the phase's whose `files`
+open phase in the edit's worktree every edited path is that phase's. With several, a path is the phase's whose `files`
 list covers it: one repository-relative path per line, a trailing `/` covering the tree below.
+Before workers open, `claim --repo` writes the repository root in the phase directory's `worktree` file.
+A legacy phase with no file still matches every worktree.
 
 `enrolled_awaiting_first_touch` turns `Active`, and an `Active` record follows a new
 reservation of its own phase: once cargo-berth releases the recorded one, as a shrink's
@@ -52,7 +54,7 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import NamedTuple, cast
+from typing import NamedTuple, cast, overload
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -65,6 +67,7 @@ STATE_FILE = "delegated_phase_reservation_state.json"
 BASELINE_FILE = "phase_baseline"
 BASELINE_STATUS_FILE = "progress_baseline_status"
 FILES_FILE = "files"
+WORKTREE_FILE = "worktree"
 AWAITING_FIRST_TOUCH = "enrolled_awaiting_first_touch"
 ACTIVE = "active"
 NOT_ENROLLED = "repository_not_enrolled"
@@ -117,11 +120,29 @@ class CheckAnswer(NamedTuple):
     session_mapping: str = ""
 
 
+class KnownPhaseWorktree(NamedTuple):
+    """The repository root recorded when this phase claimed its files."""
+
+    root: Path
+
+
+class LegacyPhaseWorktree(NamedTuple):
+    """No worktree was recorded; this phase still matches every root."""
+
+
+class AllPhaseWorktrees(NamedTuple):
+    """A caller without an edit root keeps the original attribution across all phases."""
+
+
+ALL_PHASE_WORKTREES = AllPhaseWorktrees()
+
+
 class OpenPhase(NamedTuple):
     """A phase open in the recorder, or a legacy run's still-held reservation state."""
 
     phase: str
     directory: Path
+    worktree: KnownPhaseWorktree | LegacyPhaseWorktree = LegacyPhaseWorktree()
 
 
 class PhaseMissingRecord(NamedTuple):
@@ -129,6 +150,10 @@ class PhaseMissingRecord(NamedTuple):
 
     phase: str
     directory: Path
+
+
+class NoOpenPhaseHere(NamedTuple):
+    """No open phase runs in this edit root; check under the bare session id."""
 
 
 class Attribution(NamedTuple):
@@ -310,6 +335,36 @@ def _adopt_session_level_files(session_dir: Path) -> None:
             os.replace(session_dir / name, target / name)
 
 
+def _phase_worktree(directory: Path) -> KnownPhaseWorktree | LegacyPhaseWorktree:
+    """Read the repository root kept by claim, or keep legacy global matching."""
+    try:
+        root = (directory / WORKTREE_FILE).read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return LegacyPhaseWorktree()
+    if not root:
+        raise ValueError(f"Empty phase worktree record: {directory / WORKTREE_FILE}")
+    return KnownPhaseWorktree(Path(root))
+
+
+def _record_worktree(directory: Path, root: Path) -> None:
+    """Keep one live worktree per phase, before claim checks its reservation state."""
+    previous = _phase_worktree(directory)
+    if isinstance(previous, KnownPhaseWorktree):
+        if previous.root.resolve() == root:
+            return
+        if previous.root.is_dir():
+            raise StateRefused(f"phase worktree is {previous.root}; cannot claim it in {root}")
+    directory.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=".worktree-", dir=directory)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            _ = output.write(str(root) + "\n")
+        os.replace(temporary, directory / WORKTREE_FILE)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 def open_phases(session_dir: Path) -> list[OpenPhase]:
     """Recorder-open phases still awaiting a checkpoint release, including lost records.
 
@@ -319,15 +374,16 @@ def open_phases(session_dir: Path) -> list[OpenPhase]:
     if not (session_dir / recorder_state.STATE_FILENAME).is_file():
         return held_phases(session_dir)
     names = {phase_directory_name(phase) for phase in recorder_state.read_open_phase_ids(session_dir)}
-    return [OpenPhase(name, session_dir / PHASES_DIR / name) for name in sorted(names - {""})
-            if not (session_dir / PHASES_DIR / name / RELEASED_FILE).is_file()]
+    return [OpenPhase(name, session_dir / PHASES_DIR / name,
+                      _phase_worktree(session_dir / PHASES_DIR / name))
+            for name in sorted(names - {""}) if not (session_dir / PHASES_DIR / name / RELEASED_FILE).is_file()]
 
 
 def held_phases(session_dir: Path) -> list[OpenPhase]:
     """Every phase whose directory still holds a state file, in phase-name order: a run with no recorder list."""
     phases = session_dir / PHASES_DIR
     found = sorted(phases.iterdir()) if phases.is_dir() else []
-    return [OpenPhase(path.name, path) for path in found if (path / STATE_FILE).is_file()]
+    return [OpenPhase(path.name, path, _phase_worktree(path)) for path in found if (path / STATE_FILE).is_file()]
 
 
 def enrolled_phases(phases: list[OpenPhase], root: Path, session_id: str) -> list[OpenPhase]:
@@ -352,8 +408,23 @@ def _covers(entry: str, scope: str) -> bool:
     return scope.startswith(entry) if entry.endswith("/") else scope == entry
 
 
-def attribute(phases: list[OpenPhase], scopes: list[str]) -> Attribution:
-    """Group the scopes by owning phase: the only open phase, else the one whose files cover each."""
+@overload
+def attribute(phases: list[OpenPhase], scopes: list[str],
+              root: AllPhaseWorktrees = ALL_PHASE_WORKTREES) -> Attribution: ...
+
+
+@overload
+def attribute(phases: list[OpenPhase], scopes: list[str], root: Path) -> Attribution | NoOpenPhaseHere: ...
+
+
+def attribute(phases: list[OpenPhase], scopes: list[str],
+              root: Path | AllPhaseWorktrees = ALL_PHASE_WORKTREES) -> Attribution | NoOpenPhaseHere:
+    """Group scopes in the edit root; callers without one keep the original attribution."""
+    if isinstance(root, Path):
+        phases = [phase for phase in phases if isinstance(phase.worktree, LegacyPhaseWorktree)
+                  or (phase.worktree.root.is_dir() and phase.worktree.root.resolve() == root.resolve())]
+        if not phases:
+            return NoOpenPhaseHere()
     if len(phases) == 1:
         return Attribution({phases[0]: list(scopes)}, [])
     by_phase: dict[OpenPhase, list[str]] = {}
@@ -599,9 +670,12 @@ def repair_command(session_dir: Path, phase: str, root: Path) -> str:
                        "--phase", phase, "--repo", str(root)])
 
 
-def missing_record_phases(phases: list[OpenPhase], scopes: list[str]) -> list[PhaseMissingRecord]:
+def missing_record_phases(phases: list[OpenPhase], scopes: list[str], root: Path) -> list[PhaseMissingRecord]:
     """Open phases owning edited paths whose reservation records have been lost."""
-    owners = attribute(phases, scopes).by_phase
+    attribution = attribute(phases, scopes, root)
+    if isinstance(attribution, NoOpenPhaseHere):
+        return []
+    owners = attribution.by_phase
     return [PhaseMissingRecord(phase.phase, phase.directory) for phase in owners
             if not (phase.directory / STATE_FILE).is_file()]
 
@@ -704,6 +778,9 @@ def _record_active_command(args: argparse.Namespace) -> int:
         print(f"phase reservation: {_string(state.get('kind')) or 'no state'}; nothing to record")
         return 0
     root = repository_root(Path(cast(str, args.repo)))
+    if root is not None and isinstance(attribute([phase], [], root), NoOpenPhaseHere):
+        print("phase reservation: no open phase in this worktree; nothing to record")
+        return 0
     status = lifecycle(root, recorded) if recorded and root is not None else ""
     if recorded and status in ("active", ""):
         # A board that cannot be read leaves the record to drift, which names the failure.
@@ -714,7 +791,11 @@ def _record_active_command(args: argparse.Namespace) -> int:
     if root is None or not baseline:
         raise SystemExit("phase reservation: no repository or no phase baseline to compare against")
     # Paths a sibling phase owns, or no phase owns, are that phase's or the director's to answer.
-    scopes = attribute(phases, changed_since_baseline(root, baseline)).by_phase.get(phase, [])
+    attribution = attribute(phases, changed_since_baseline(root, baseline), root)
+    if isinstance(attribution, NoOpenPhaseHere):
+        print("phase reservation: no open phase in this worktree; nothing to record")
+        return 0
+    scopes = attribution.by_phase.get(phase, [])
     stale = f"reservation {recorded} is {status} on the board"
     if not scopes:
         if recorded:
@@ -750,16 +831,25 @@ def _claim_command(args: argparse.Namespace) -> int:
     (trailing `/`) is claimed at its first touch.
     """
     session_dir = Path(cast(str, args.session_dir))
-    phases = open_phases(session_dir)
     directory = phase_directory(session_dir, cast(str, args.phase))
+    root = repository_root(Path(cast(str, args.repo)))
+    if root is None:
+        print("phase reservation: no repository or no files to claim; still awaiting first touch")
+        return 0
+    root = root.resolve()
+    try:
+        _record_worktree(directory, root)
+    except StateRefused as refused:
+        print(f"phase_reservation: {refused}", file=sys.stderr)
+        return 2
+    phases = open_phases(session_dir)
     phase = next((open_phase for open_phase in phases if open_phase.directory == directory), None)
     state = read_state(phase.directory) if phase is not None else {}
     if phase is None or _string(state.get("kind")) != AWAITING_FIRST_TOUCH:
         print(f"phase reservation: {_string(state.get('kind')) or 'no state'}; nothing to claim")
         return 0
-    root = repository_root(Path(cast(str, args.repo)))
     scopes = [entry for entry in _phase_files(phase) if not entry.endswith("/")]
-    if root is None or not scopes:
+    if not scopes:
         print("phase reservation: no repository or no files to claim; still awaiting first touch")
         return 0
     session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
