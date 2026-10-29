@@ -218,7 +218,7 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 **Ruled out:**
 - Effort-example exclusion by title text: substring matches select the wrong issues; exact filename stems replace it.
 
-### Phase 3 — tune wordings and thresholds; the user's review  · status: todo
+### Phase 3 — tune wordings and thresholds; the user's review  · status: done
 
 **Depends on:** Phase 2
 
