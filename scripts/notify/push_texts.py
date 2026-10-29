@@ -57,6 +57,8 @@ class PushText:
     # False: the phone shows the title and body exactly as rendered, with no
     # "No action needed." line. Only an entry with no action and no session can opt out.
     header: bool = True
+    # An agent writes the text at send time; no person approved it, so check it like free text.
+    agent_written: bool = False
 
 
 @dataclass(frozen=True)
@@ -192,6 +194,10 @@ class FingerprintRecord(TypedDict):
     action: dict[str, str | bool]
     body: str
     examples: list[FilledExampleRecord]
+
+
+def agent_written(text_id: str) -> bool:
+    return any(entry.id == text_id and entry.agent_written for entry in catalog())
 
 
 def user_specified(text_id: str) -> bool:

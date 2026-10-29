@@ -262,6 +262,14 @@ class TokenSpan:
     end: int
 
 
+class MoveRefused(Exception):
+    """The change is not a proven item move; the message says why."""
+
+
+class UnreadableTokenSpans(MoveRefused):
+    """Code tokens could not be located; an empty, readable source is a different result."""
+
+
 def token_spans(text: str) -> tuple[TokenSpan, ...]:
     """Locate code tokens without treating comments as replacement sites."""
     result: list[TokenSpan] = []
@@ -288,7 +296,7 @@ def token_spans(text: str) -> tuple[TokenSpan, ...]:
             else:
                 break
         if token.kind == "unknown" or not text.startswith(token.value, cursor):
-            return ()
+            raise UnreadableTokenSpans("source token offsets are unavailable")
         end = cursor + len(token.value)
         result.append(TokenSpan(token, cursor, end))
         cursor = end
@@ -1960,7 +1968,10 @@ def erase_proven_parameters(change: FileChange) -> FileChange:
     erasures = prove_parameter_erasures(tokens(change.before), tokens(change.after))
     if not erasures:
         return change
-    spans = token_spans(change.before)
+    try:
+        spans = token_spans(change.before)
+    except UnreadableTokenSpans:
+        return change
     if not spans:
         return change
     before = change.before
@@ -2278,10 +2289,6 @@ class NoItemMoves:
     reason: str
 
 
-class MoveRefused(Exception):
-    """The change is not a proven item move; the message says why."""
-
-
 @dataclass(frozen=True)
 class SourceItem:
     """A module-level item: its first word (attributes included), its keyword and the word after its end."""
@@ -2364,6 +2371,40 @@ def item_end(words: tuple[str, ...], ends: dict[int, int], cursor: int, body: bo
     return cursor + 1 if words[cursor] == ";" else ends[cursor] + 1 if cursor in ends else None
 
 
+# These words may precede an item keyword. Const and extern can also start their own items.
+ITEM_QUALIFIERS = frozenset({"pub", "default", "const", "async", "unsafe", "safe", "extern", "auto"})
+
+
+def item_prefix(words: tuple[str, ...], ends: dict[int, int], start: int) -> tuple[int, str]:
+    """The keyword offset and visibility after any sequence of item qualifiers.
+
+    Attributes are consumed by the caller. An incomplete visibility ends at len(words), so
+    the item parser refuses it. Const items and extern blocks/crate declarations retain their keyword.
+    """
+    cursor, visibility = start, ""
+    while cursor < len(words):
+        word = words[cursor]
+        following = words[cursor + 1:cursor + 2]
+        if word == "pub":
+            close = ends.get(cursor + 1, len(words)) if following == ("(",) else cursor
+            visibility = visibility_of(words[cursor:close + 1]) if not visibility else "other"
+            cursor = close + 1
+        elif word in {"default", "async", "unsafe", "safe", "auto"}:
+            cursor += 1
+        elif word == "const" and following and following[0] in ITEM_QUALIFIERS | {"fn"}:
+            cursor += 1
+        elif word == "extern":
+            next_word = cursor + 1
+            if following and following[0].startswith('"'):
+                next_word += 1
+            if words[next_word:next_word + 1] in (("{",), ("crate",)):
+                break
+            cursor = next_word
+        else:
+            break
+    return cursor, visibility
+
+
 def source_items(words: tuple[str, ...]) -> tuple[SourceItem, ...] | None:
     """Each module-level item of a file, or None when a word does not start a known item."""
     ends = delimiter_ends(words)
@@ -2378,20 +2419,7 @@ def source_items(words: tuple[str, ...]) -> tuple[SourceItem, ...] | None:
         start = cursor
         while cursor in attributes:
             cursor = attributes[cursor]
-        visibility = ""
-        if words[cursor:cursor + 1] == ("pub",):
-            close = ends.get(cursor + 1, cursor) if words[cursor + 1:cursor + 2] == ("(",) else cursor
-            visibility = visibility_of(words[cursor:close + 1])
-            cursor = close + 1
-        while cursor + 1 < len(words):
-            word, following = words[cursor], words[cursor + 1]
-            if word in {"unsafe", "async", "auto", "default"} or (
-                    word == "const" and following in {"fn", "unsafe", "async", "extern"}):
-                cursor += 1
-            elif word == "extern" and following.startswith('"') and words[cursor + 2:cursor + 3] != ("{",):
-                cursor += 2
-            else:
-                break
+        cursor, visibility = item_prefix(words, ends, cursor)
         if cursor >= len(words):
             return None
         keyword, word = cursor, words[cursor]
@@ -3802,7 +3830,10 @@ def stale_lint_removal(change: FileChange, before: RevisionTree) -> bool:
     if not removes_only_lint_names(change, proof) or OTHER_LINE_BREAKS & set(change.before):
         return False
     allows = {(allow.line, allow.column): allow for allow in boilerplate_allows(mask_source(change.before))}
-    spans = token_spans(change.before)
+    try:
+        spans = token_spans(change.before)
+    except UnreadableTokenSpans:
+        return False
     old, new = tokens(change.before), tokens(change.after)
     words = tuple(token.value.removeprefix("r#") for token in old)
     tests = cfg_test_items(words)

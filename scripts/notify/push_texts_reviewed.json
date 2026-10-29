@@ -110,6 +110,18 @@
       "time": "2026-10-27T11:40:34.667654-04:00"
     }
   },
+  "nix_heal.failed": {
+    "refused": {
+      "reviewer": "opus",
+      "sha256": "0758297ee1eaf4aa6b3c3562e8a2835649ebfa740fdbe906ffaf8c69c72321c4",
+      "time": "2026-10-28T20:10:49.552518-04:00"
+    },
+    "still_broken": {
+      "reviewer": "opus",
+      "sha256": "0758297ee1eaf4aa6b3c3562e8a2835649ebfa740fdbe906ffaf8c69c72321c4",
+      "time": "2026-10-28T20:10:59.787920-04:00"
+    }
+  },
   "nixos.disk_low": {
     "no_free_space": {
       "reviewer": "opus",

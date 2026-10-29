@@ -28,6 +28,7 @@ import reply_asks
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone, user_zone_name, zone_label  # noqa: E402
+import nix_env
 
 from user_action import (ActionRequired, NoActionRequired, UserAction, action_conflicts, first_line, parse_user_action,
                          NotificationSession, NO_SESSION_LINE, SessionLine, split_session)
@@ -740,6 +741,10 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
                    "--tools", "", "--no-session-persistence", "--setting-sources", "", draft_prompt]
         if time.monotonic() - started >= timeout:
             return Unreviewed("timeout", details())
+        loaded = nix_env.ensure(Path.cwd(), environment)
+        if isinstance(loaded, nix_env.Refused):
+            return Unreviewed(loaded.reason, details())
+        environment = loaded.env
         result = runner(command, timeout=remaining(), env=environment)
         if result.returncode != 0:
             return Unreviewed(f"reviewer exit {result.returncode}", details())
