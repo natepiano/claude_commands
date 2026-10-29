@@ -17,8 +17,9 @@ items of that production only: never of the production above it, and not of the 
 it, whose showrunners show their own (user, 2026-10-27). `--all-below` adds every production below
 it, at any depth, and pins under its own names, so it never moves the item the default shows. A
 change row belongs to the production its Production cell names, and a row without one to its
-list's root. Efficiency reads the Efficiency ledger line of each of those docs; a production with
-none has no efficiency items. A list that cannot be read is left out of a show with no kind, with
+list's production. Earlier lists stay in the queue after attachment. Current-list rows keep their
+IDs and pins; other rows name their list in their IDs. Efficiency reads the Efficiency ledger line of each of those
+docs; a production with none has no efficiency items. A list that cannot be read is left out, with
 one line on stderr.
 """
 from __future__ import annotations
@@ -82,13 +83,13 @@ def _doc(production: Path | None) -> Path:
 
 
 def change_queue(doc: Path, below: bool = False) -> Queue:
-    """The change rows of the production, and with `below` of each production below it, from its list."""
+    """The production's current and earlier change rows, and with `below` each lower one's."""
     path = change_review.scope_list(doc)
-    rows = change_review.scope_rows(path, doc, below)
+    entries = change_review.scope_entries(path, doc, below)
     # The root keeps the list's own pin; a lower showrunner pins its own row.
     slug = proposals_folder.slug_of(doc)
     name = change_review.queue(path) if slug == showrunners.root_of(slug) else f"{change_review.queue(path)}-{slug}"
-    return Queue(scope_queue(name, below), _as_text(change_review.row_entries(rows),
+    return Queue(scope_queue(name, below), _as_text(entries,
                                                 lambda entry: change_review.describe(entry.item)))
 
 

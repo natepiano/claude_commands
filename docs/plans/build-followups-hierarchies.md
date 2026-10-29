@@ -238,7 +238,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Binds later work:** reports print a short summary by default and their tables under `--full`; a new report or compare follows the same form. `push_audit.py` never imports `measure.py`; shared log helpers live in `scripts/hierarchies/log_records.py`.
 
-### Phase 9 — An attached production's earlier change rows reach /next and the count, under their own names  · status: todo
+### Phase 9 — An attached production's earlier change rows reach /next and the count, under their own names  · status: done
 **Depends on:** Phase 8 (showrunner request 2026-10-29: a defect in nested showrunners, fixed at its cause).
 
 #### Work Order
@@ -249,8 +249,9 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Spec:**
 - Cause: `change_review.list_path` names the list for the top-level showrunner while it runs, so `scope_list`/`scope_rows` read only natedev's list after sdlc attached. sdlc's own list (`~/rust/hanadocs/change-review/change-review - sdlc.md`) still holds open rows that passed the vet (C9, C16, C17, C22, C23, C25, C26, C29, C32, C37, C41) that no command shows.
-- An attached production's queue reads its own earlier list as well as its root's list. A row from its own list with no Production cell belongs to that production. Each row keeps its list's name and number (`sdlc/C9`, `natedev/C434`); nothing is renumbered or copied between lists.
-- `next_item.py show --kind change` with `--order oldest|newest|urgent`, `move-to-end`, `--all-below` and `footer_counts.py`'s For-you count all read the same merged queue. A list that cannot be read stays one stderr line, not a stop.
+- An attached production's queue reads its own earlier list as well as its root's list. A row from its own list with no Production cell belongs to that production. Each row keeps its list's number; a row from a list other than the current one is named with its list (`sdlc/C9`), and a current-list row keeps its plain name (`C434`), so stored pins and moved rows stay valid. Nothing is renumbered or copied between lists. A list that is a scoped production's own list is that production's list, also when it is the current list because the root showrunner is stopped.
+- `change_review.py edit|verdict|mark-important --row` takes the ID exactly as `/next` shows it: `sdlc/C9` acts on sdlc's list, `C434` on the current list as today; a list-named ID that contradicts `--list` is refused. `/next` and `/change_review` say to pass the ID as shown.
+- `next_item.py show --kind change` with `--order oldest|newest|urgent`, `move-to-end`, `--all-below` and `footer_counts.py`'s For-you count all read the same merged queue. A list that cannot be read, or holds a row whose Urgency cell cannot be read, stays one stderr line, not a stop.
 - A production that never had its own list behaves as today.
 
 **Files:**
@@ -258,6 +259,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - `scripts/production/next_item.py` — the change queue and its pin names
 - `scripts/production/footer_counts.py` — the For-you count
 - `scripts/production/test_change_review.py`, `scripts/production/test_next_item.py` — tests
+- `commands/next.md`, `commands/change_review.md` — pass the row ID as shown
 
 **Workers:** `1 writer`
 - `impl` — all files

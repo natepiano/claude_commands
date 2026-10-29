@@ -24,6 +24,7 @@ from change_review import Invisible, Malformed, Visible
 
 # Importable once change_review has put scripts/lib on the path.
 import scratch
+import urgency
 
 # Hang guards allow for load 136 on natedev (2026-10-29).
 TEST_HANG_GUARD_SECS = 300
@@ -159,6 +160,74 @@ class ListTest(unittest.TestCase):
             names.clear()
             self.assertRaises(change_review.ChangeReviewError, change_review.showrunner_of,
                               Path("/p/child-production.md"))
+
+
+class AttachedListTest(unittest.TestCase):
+    root: Path = Path()
+    doc: Path = Path()
+    current: Path = Path()
+    earlier: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        import showrunners
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.doc = self.root / "child-production.md"
+        _ = self.doc.write_text("# Child\n")
+        self.current = self.root / "change-review - parent.md"
+        self.earlier = self.root / "change-review - child.md"
+        _ = self.current.write_text("## To review\n\n| # | Change | Production | How to check | Merged |\n" +
+            "| --- | --- | --- | --- | --- |\n" +
+            "| C9 | Current child | child | Check current | 2026-10-20 |\n" +
+            "| C10 | Parent-only legacy row | | Check parent | 2026-10-01 |\n")
+        _ = self.earlier.write_text("## To review\n\n| # | Change | How to check | Merged | Urgency |\n" +
+            "| --- | --- | --- | --- | --- |\n" +
+            "| C9 | Earlier child | Check earlier | 2026-10-02 | |\n" +
+            "| C11 | Dependent child | Check dependent | 2026-10-03 | blocks, after C9 |\n")
+        _ = self.enterContext(mock.patch.object(change_review, "LISTS", self.root))
+        _ = self.enterContext(mock.patch.object(showrunners, "root_of", return_value="parent"))
+
+    def test_columnless_earlier_rows_belong_to_the_attached_production_without_list_edits(self) -> None:
+        before = {path: path.read_bytes() for path in (self.current, self.earlier)}
+        rows = change_review.scope_rows(self.current, self.doc)
+        self.assertEqual([(row["#"], row["Change"]) for row in rows],
+                         [("C9", "Current child"), ("C9", "Earlier child"), ("C11", "Dependent child")])
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+    def test_merged_prerequisite_names_its_own_list_despite_a_repeated_row_number(self) -> None:
+        entries = change_review.scope_entries(self.current, self.doc)
+        self.assertEqual({entry.key: entry.after for entry in entries},
+                         {"C9": "", "child/C9": "", "child/C11": "child/C9"})
+        ordered = [entry.key for entry in urgency.queue_order(entries, "attached-list-prerequisites")]
+        self.assertLess(ordered.index("child/C9"), ordered.index("child/C11"))
+
+    def test_broken_current_list_keeps_earlier_rows_and_reports_one_problem(self) -> None:
+        _ = self.current.write_text("# Missing table\n")
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            rows = change_review.scope_rows(self.current, self.doc)
+        self.assertEqual([row["Change"] for row in rows], ["Earlier child", "Dependent child"])
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn(str(self.current), errors.getvalue())
+
+    def test_absent_earlier_list_preserves_current_row_keys_and_filter(self) -> None:
+        self.earlier.unlink()
+        entries = change_review.scope_entries(self.current, self.doc)
+        self.assertEqual([(entry.key, entry.item["Change"]) for entry in entries], [("C9", "Current child")])
+
+    def test_current_list_prerequisites_keep_their_local_row_ids_after_attachment(self) -> None:
+        _ = self.current.write_text("## To review\n\n| # | Change | Production | How to check | Merged | Urgency |\n" +
+            "| --- | --- | --- | --- | --- | --- |\n" +
+            "| C9 | Current child | child | Check current | 2026-10-20 | after C12 |\n" +
+            "| C12 | Current prerequisite | child | Check prerequisite | 2026-10-21 | |\n")
+        entries = change_review.scope_entries(self.current, self.doc)
+        self.assertEqual({entry.key: entry.after for entry in entries},
+                         {"C9": "C12", "C12": "", "child/C9": "", "child/C11": "child/C9"})
+        ordered = [entry.key for entry in urgency.queue_order(entries, "attached-current-prerequisites")]
+        self.assertLess(ordered.index("C12"), ordered.index("C9"))
 
 
 class StampTest(unittest.TestCase):
@@ -432,6 +501,65 @@ class ActionTest(unittest.TestCase):
             self.assertEqual((code, output), (1, ""), row)
             self.assertEqual(len(error.splitlines()), 1, row)
         self.assertEqual(self.path.read_text(encoding="utf-8"), LIST)
+
+    def attached_lists(self) -> Path:
+        earlier = self.path.with_name("change-review - child.md")
+        _ = self.path.write_text(LIST.replace("C76", "C9"), encoding="utf-8")
+        _ = earlier.write_text(LIST.replace("C76", "C9").replace("Panels keep shields", "Earlier change"),
+                               encoding="utf-8")
+        _ = self.enterContext(mock.patch.object(change_review, "LISTS", self.path.parent))
+        _ = self.enterContext(mock.patch.object(change_review, "production_list", return_value=self.path))
+        return earlier
+
+    def test_list_named_verdict_changes_only_that_list_and_ends_its_scratch(self) -> None:
+        earlier = self.attached_lists()
+        before = self.path.read_bytes()
+        scratch_folder = scratch.new("row:child-C9", "earlier")
+        current_scratch = scratch.new("row:current-C9", "current")
+        self.assertEqual(run("verdict", "--production", DOC, "--row", "child/C9", "--verdict", "works"),
+                         (0, f"child/C9 landed\nremoved {scratch_folder}\n", ""))
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertNotIn("C9", {row["#"] for row in change_review.pending(earlier)})
+        self.assertIn("| C9 | Earlier change | works |", earlier.read_text())
+        self.assertNotIn("child/C9", earlier.read_text())
+        self.assertFalse(scratch_folder.exists())
+        self.assertTrue(current_scratch.exists())
+
+    def test_list_named_important_mark_changes_only_that_lists_local_row(self) -> None:
+        earlier = self.attached_lists()
+        before = self.path.read_bytes()
+        code, output, error = run("mark-important", "--production", DOC, "--row", "child/C9")
+        self.assertEqual((code, error), (0, ""))
+        self.assertTrue(output.startswith("| C9 | Earlier change |"))
+        self.assertEqual(self.path.read_bytes(), before)
+        entry = next(entry for entry in change_review.row_entries(change_review.pending(earlier)) if entry.key == "C9")
+        self.assertEqual(entry.urgency.level, urgency.USER)
+        self.assertNotIn("child/C9", earlier.read_text())
+
+    def test_list_named_edit_accepts_a_matching_list_and_keeps_local_row_text(self) -> None:
+        earlier = self.attached_lists()
+        before = self.path.read_bytes()
+        code, output, error = run("edit", "--production", DOC, "--list", str(earlier), "--row", "child/C9",
+                                  "--change", "Revised change", "--check", "Run it", "--see", "Revised result")
+        self.assertEqual((code, error), (0, ""))
+        self.assertTrue(output.startswith("| C9 | Revised change |"))
+        self.assertEqual(self.path.read_bytes(), before)
+        row = next(row for row in change_review.pending(earlier) if row["#"] == "C9")
+        self.assertEqual((row["Change"], row[change_review.CHECK]), ("Revised change", "Run it. You see: Revised result"))
+        self.assertNotIn("child/C9", earlier.read_text())
+
+    def test_list_named_row_refuses_a_different_explicit_list_without_writes(self) -> None:
+        earlier = self.attached_lists()
+        before = {path: path.read_bytes() for path in (self.path, earlier)}
+        for action, arguments in (("verdict", ("--verdict", "works")), ("mark-important", ()),
+                                  ("edit", ("--change", "Changed", "--check", "Run it", "--see", "A result"))):
+            with self.subTest(action=action):
+                code, output, error = run(action, "--production", DOC, "--list", str(self.path),
+                                          "--row", "child/C9", *arguments)
+                self.assertEqual((code, output), (1, ""))
+                self.assertEqual(len(error.splitlines()), 1)
+                self.assertIn("differs from --list", error)
+                self.assertEqual({path: path.read_bytes() for path in before}, before)
 
     def test_a_write_waits_for_the_lock_and_concurrent_writes_keep_every_row(self) -> None:
         held = os.open(self.path.parent, os.O_RDONLY)
