@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shlex
+import socket
 import subprocess
 import sys
 import tempfile
@@ -21,7 +22,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import fake_unit_host
 import showrunners
+from sessions import SessionRecord
 from fake_unit_host import HostedUnit
+from scripts.lib.socket_test_support import short_socket_directory
 
 
 SCRIPT = Path(__file__).with_name("showrunners.py")
@@ -184,6 +187,32 @@ raise SystemExit(1)
         check = shlex.join(["zsh", "/opt/tools/production_check.sh", str(doc), "extra"])
         _ = (directory / "conf").write_text(f"TARGET=session:abc\nCHECK={check}\n", encoding="utf-8")
         self.assertEqual(showrunners.checked_doc(directory), showrunners.CheckedDoc(doc))
+
+    def test_registered_showrunners_uses_supplied_records_without_session_discovery(self) -> None:
+        self.instance("showrunner-builds", target="session:builds-id", doc=self.doc)
+        self.instance("showrunner-stopped", target="session:stopped-id", doc=self.root / "stopped.md")
+        socket_path = Path(self.enterContext(short_socket_directory())) / "builds.sock"
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(str(socket_path))
+        self.addCleanup(listener.close)
+        record: SessionRecord = {
+            "pid": os.getpid(), "sessionId": "builds-id", "name": "builds", "updatedAt": 1,
+            "messagingSocketPath": str(socket_path), "tmux": "", "formerNames": [],
+        }
+        with mock.patch.object(showrunners, "socket_for", side_effect=AssertionError("no sessions subprocess")) as sockets, \
+             mock.patch.object(showrunners, "_session_name", side_effect=AssertionError("no session reread")) as names:
+            found = showrunners.registered_showrunners(self.notifier, known_sessions={"builds-id": record})
+            record["name"] = "renamed-builds"
+            renamed = showrunners.registered_showrunners(self.notifier, known_sessions={"builds-id": record})
+            absent = showrunners.registered_showrunners(self.notifier, known_sessions={})
+        self.assertEqual([(runner["slug"], runner["session"], runner["socket"], runner["doc"]) for runner in found], [
+            ("builds", "builds", str(socket_path), str(self.doc)),
+            ("stopped", "", "", str(self.root / "stopped.md")),
+        ])
+        self.assertEqual(renamed[0]["session"], "renamed-builds")
+        self.assertEqual([(runner["session"], runner["socket"]) for runner in absent], [("", ""), ("", "")])
+        sockets.assert_not_called()
+        names.assert_not_called()
 
     def test_checked_doc_refuses_missing_check_line(self) -> None:
         directory = self.notifier / "showrunner-check"

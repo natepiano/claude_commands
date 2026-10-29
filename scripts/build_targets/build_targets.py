@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import ExitStack
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -18,7 +18,7 @@ import subprocess
 import sys
 import time
 from types import FrameType
-from typing import Literal, Protocol, TypedDict, cast, final
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast, final
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -31,6 +31,7 @@ from targets import (
     ExpiresAt,
     Free,
     Held,
+    HolderSession,
     IdleSince,
     LocalTarget,
     LocalRequired,
@@ -50,6 +51,10 @@ import offload
 import build_hold
 import override_guard
 from user_zone import user_zone
+if TYPE_CHECKING:
+    from ..message import roster
+else:
+    from scripts.message import roster
 
 
 
@@ -85,24 +90,38 @@ def display_field(value: str) -> str:
     return " ".join(value.split())
 
 
-def running_job_text(job: RunningJob) -> str:
+def unit_label_suffix(state: RunningJob | Held, labels: Mapping[RunningJob | Held, roster.UnitLabels]) -> str:
+    identity = labels.get(state)
+    if identity is None:
+        return ""
+    return f" (showrunner {display_field(identity.showrunner)}, unit {display_field(identity.unit)})"
+
+
+_NO_UNIT_LABELS: Mapping[RunningJob | Held, roster.UnitLabels] = {}
+
+
+def running_job_text(job: RunningJob,
+                     labels: Mapping[RunningJob | Held, roster.UnitLabels] = _NO_UNIT_LABELS) -> str:
     text = f"running {display_field(job.what)} since {local_time(job.since)}"
+    text += unit_label_suffix(job, labels)
     if isinstance(job.idle, IdleSince):
         text += f", idle since {job.idle.when.astimezone(user_zone()).strftime('%H:%M')}"
     return text
 
 
-def format_state(name: str, state: TargetState) -> str:
+def format_state(name: str, state: TargetState,
+                 labels: Mapping[RunningJob | Held, roster.UnitLabels] = _NO_UNIT_LABELS) -> str:
     name = display_field(name)
     if isinstance(state, Free):
         return f"{name}: free"
     if isinstance(state, Running):
-        return f"{name}: " + "; ".join(running_job_text(job) for job in state.jobs)
+        return f"{name}: " + "; ".join(running_job_text(job, labels) for job in state.jobs)
     if isinstance(state, Unreachable):
         return f"{name}: unreachable — {display_field(state.reason)}"
     if isinstance(state, StateUnreadable):
         return f"{name}: state unreadable — {display_field(state.reason)}"
     line = f"{name}: held by {display_field(state.holder)} since {local_time(state.since)}"
+    line += unit_label_suffix(state, labels)
     if isinstance(state.end, ExpiresAt):
         line += f" until {local_time(state.end.when)}"
     elif isinstance(state.end, ReleaseEstimated):
@@ -125,13 +144,26 @@ def command_status(probe: bool = False) -> int:
     except ConfigError as error:
         print(f"build targets: {error}", file=sys.stderr)
         return 2
+    states: list[tuple[str, TargetState]] = []
+    holders: dict[RunningJob | Held, str] = {}
     for target in targets:
         state = (
             probe_target(target)
             if probe and isinstance(target, SshTarget)
             else target_state(target)
         )
-        print(format_state(target.name, state))
+        states.append((target.name, state))
+        jobs = state.jobs if isinstance(state, Running) else (state,) if isinstance(state, Held) else ()
+        for job in jobs:
+            if isinstance(job.holder_session, HolderSession):
+                holders[job] = job.holder_session.session_id
+    try:
+        identities = roster.unit_labels_for(holders.values(), os.environ) if holders else {}
+    except Exception:
+        identities = {}
+    labels = {state: identities[session_id] for state, session_id in holders.items() if session_id in identities}
+    for name, state in states:
+        print(format_state(name, state, labels))
     return 0
 
 

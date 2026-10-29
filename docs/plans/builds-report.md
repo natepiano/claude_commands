@@ -116,7 +116,7 @@ verify-unit's Work Order for the copy folder name (roster.py join `<showrunner>-
 
 **Ruled out:** wall time times CPU count as the tick denominator — it goes wrong when CPUs go offline; picking counters by tuple position in `report.py` — they are keyed by name.
 
-### Phase 3 — Build views name the showrunner and unit by short name  · status: todo
+### Phase 3 — Build views name the showrunner and unit by short name  · status: done
 
 **Depends on:** Phase 1
 
