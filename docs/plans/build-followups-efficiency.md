@@ -65,12 +65,13 @@ Showrunner of build-followups, 2026-10-28 (measured by builds-unit):
 
 **Goal:** every start path for a Claude or Codex session loads the worktree's `.envrc` nix shell first, or refuses with one line; a session that started outside it is healed.
 
-**Scope:**
-- One launch helper `scripts/lib/nix_env.py` (`ensure(directory, base_env) -> Loaded | NoEnvrc | Refused`; auto-allow only under `~/rust`, `~/worktrees` and `~/.claude*`; the proof is `IN_NIX_SHELL`; 600 s budget; CLI `ensure` and `exec`). Every start path goes through it: herdr's `launch_agent` choke point, restart and pane restore, add_unit, add_showrunner, berth_fix, agent_bg, agent_exec, cli_agent, codex_mesh, review, make_a_worktree. A scan test fails on any start site outside the helper.
-- A SessionStart self-heal hook `scripts/hooks/session-start-nix-shell.py` (its `settings.json` registration waits for the user's typed go).
-- `scripts/nix_env/heal.py sweep`, run every 5 minutes by a notifier timer registered after the merge: it finds a session outside its shell and restarts it in place, after the build-hold check, with the session's own account, and keeps the pending record until a healthy replacement runs.
-- `verify.sh` re-runs itself under `nix_env.py exec` and prints one line; it refuses only when `ensure` refuses.
-- Regression tests per launch path, including an `.envrc` allowed after the launch.
-- The as-built `docs/as-built/nix-shell-launch.md`.
+#### As-built
+
+- Checkpoint 187c88b9. The full record is `docs/as-built/nix-shell-launch.md`.
+- `scripts/lib/nix_env.py` (`ensure`, `exec`) is the one way a session starts: herdr's `launch_agent`, restart and pane restore, add_unit, add_showrunner, berth_fix, agent_bg, agent_exec, cli_agent, codex_mesh, review and make_a_worktree all go through it, and `scripts/lib/test_claude_launch_scan.py` fails on a start site outside it. herdr gives a new session a clean base environment (launcher variables and the parent's nix shell removed).
+- `verify.sh` re-runs itself under `nix_env.py exec` when it starts outside the shell, with one line.
+- `scripts/nix_env/heal.py sweep` restarts a session outside its shell, after the build-hold check, on its own account; when the restart cannot fix it, it pushes `nix_heal.failed` (texts reviewed and approved).
+- Live check: `ensure` in `~/rust/bevy_brp` loaded the shell in 0.4 s; `exec` ran a program inside it.
+- Open: the SessionStart hook `scripts/hooks/session-start-nix-shell.py` is in the tree, but its `settings.json` registration waits for the user's typed go. The `nix-heal` notifier timer (every 5 minutes) is registered after the merge.
 
 **After the merge:** the showrunner adds PATH wrappers for bare `claude`, `claude1`-`claude4`, `codex`, `codex1` and `codex2` in /etc/nixos on both machines; accounts-unit wires `accounts.py exec`. Both get the merge commit.
