@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import TypedDict, cast, override
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 HOOK = Path(__file__).with_name("stop-assistant-prose-banned-words.py")
 SESSION = "session-1234"
 # Made-up stems, so this file does not hold a word the real guide bans.
@@ -50,7 +53,7 @@ class StopBannedWordsHookTests(unittest.TestCase):
         payload = {"session_id": SESSION, "last_assistant_message": message, **fields}
         return subprocess.run([sys.executable, str(HOOK)], input=json.dumps(payload),
                               capture_output=True, text=True, check=False,
-                              env=self.environment, timeout=15)
+                              env=self.environment, timeout=TEST_HANG_GUARD_SECS)
 
     def log_rows(self) -> list[list[str]]:
         return [line.split("\t") for line in self.log.read_text(encoding="utf-8").splitlines()]

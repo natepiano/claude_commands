@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the Mac test state command through its process interface."""
+"""Exercise Mac test commands and their real process coordination boundaries."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import json
 import fcntl
 import socket
 import os
+import runpy
 import select
 import subprocess
 import sys
@@ -18,19 +19,26 @@ import time
 import threading
 import unittest
 from pathlib import Path
-from typing import NotRequired, TypedDict, cast, final, override
+from types import ModuleType
+from typing import TYPE_CHECKING, NotRequired, TypedDict, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
 import mac_test
+
+if TYPE_CHECKING:
+    from ..production.cli_fixture import invoke_cli
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
+    from cli_fixture import invoke_cli
 
 
 SCRIPT = Path(__file__).with_name("mac_test.py")
 LOCAL_ZONE = ZoneInfo("America/New_York")
 CI_JOB = "macOS: Compile and Test"
 SKIPPED_REPORT_RUNS = 200
-# Guard hung fixture commands without timing their Python starts under load.
-COMMAND_TIMEOUT_S = 5 * 60
+# load 136 on natedev, 2026-10-29
+TEST_HANG_GUARD_SECS = 300
 
 
 class RunState(TypedDict):
@@ -214,6 +222,22 @@ class FixtureChild(original_popen):
         super().__init__(*args, **kwargs)
 
 subprocess.Popen = FixtureChild
+
+# Publish the contender's real flock request before it blocks behind GH.
+import fcntl
+from pathlib import Path
+original_flock = fcntl.flock
+
+def fixture_flock(fd, operation):
+    marker = os.environ.get('MAC_TEST_LOCK_ATTEMPT')
+    target = Path(os.environ['MAC_TEST_STATE_DIR']) / 'control.lock'
+    if marker and operation == fcntl.LOCK_EX and target.exists():
+        opened, expected = os.fstat(fd), target.stat()
+        if (opened.st_dev, opened.st_ino) == (expected.st_dev, expected.st_ino):
+            Path(marker).write_text('attempted\n')
+    return original_flock(fd, operation)
+
+fcntl.flock = fixture_flock
 '''
 
 
@@ -232,7 +256,7 @@ with (root / "send.jsonl").open("a", encoding="utf-8") as output:
 (root / "send-started").write_text("started\n", encoding="utf-8")
 hold_file = root / "send-hold"
 if hold_file.exists():
-    deadline = time.monotonic() + 20
+    deadline = time.monotonic() + TEST_HANG_GUARD_SECS0
     while not (root / "send-continue").exists() and time.monotonic() < deadline:
         time.sleep(0.01)
 delay_file = root / "send-delay"
@@ -341,6 +365,7 @@ class MacTestCommandTests(unittest.TestCase):
             "MAC_TEST_SEND": str(send_stub),
             "MAC_TEST_SESSIONS": str(sessions_stub),
             "MAC_TEST_STUB_DIR": str(self.stub_directory),
+            "MAC_TEST_HANG_GUARD_SECS": str(TEST_HANG_GUARD_SECS),
             "MAC_TEST_WATCH_INTERVAL_S": "0.05",
             "TZ": "America/New_York",
             "USER_ZONE": "America/New_York",
@@ -373,7 +398,7 @@ class MacTestCommandTests(unittest.TestCase):
         os.close(self.writer_write_fd)
         self.writer_write_fd = -1
         try:
-            readable, _, _ = select.select([self.writer_read_fd], [], [], COMMAND_TIMEOUT_S)
+            readable, _, _ = select.select([self.writer_read_fd], [], [], TEST_HANG_GUARD_SECS)
             self.assertTrue(readable, "Fixture descendants did not finish before directory cleanup")
             self.assertEqual(os.read(self.writer_read_fd, 1), b"")
         finally:
@@ -392,7 +417,7 @@ class MacTestCommandTests(unittest.TestCase):
             "ci_job": CI_JOB,
             # Long enough for the Python gh stand-in under load; a test about
             # the limit sets its own.
-            "gh_timeout_s": str(COMMAND_TIMEOUT_S),
+            "gh_timeout_s": str(TEST_HANG_GUARD_SECS),
             "block_hours": "4",
             "block_max_hours": "48",
             "block_warn_minutes": "15",
@@ -416,19 +441,61 @@ class MacTestCommandTests(unittest.TestCase):
         self,
         *arguments: str,
         environment: dict[str, str] | None = None,
-        timeout: float = COMMAND_TIMEOUT_S,
+        timeout: float = TEST_HANG_GUARD_SECS,
+        subprocess_cli: bool = False,
     ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [sys.executable, str(SCRIPT), *arguments],
-            cwd=self.root,
-            env=self.environment if environment is None else environment,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=timeout,
-            pass_fds=(self.writer_write_fd,),
-        )
+        selected_environment = self.environment if environment is None else environment
+        if subprocess_cli:
+            return subprocess.run(
+                [sys.executable, str(SCRIPT), *arguments], cwd=self.root,
+                env=selected_environment, stdin=subprocess.DEVNULL, capture_output=True,
+                text=True, check=False, timeout=timeout, pass_fds=(self.writer_write_fd,))
+        real_run = subprocess.run
+        real_record = mac_test.start_hold_recorder
+        real_popen = subprocess.Popen
+
+        def launch(command: list[str], *, stdin: int, stdout: int, stderr: int,
+                   start_new_session: bool, close_fds: bool) -> subprocess.Popen[bytes]:
+            return real_popen(command, stdin=stdin, stdout=stdout, stderr=stderr,
+                              start_new_session=start_new_session, close_fds=close_fds,
+                              pass_fds=(self.writer_write_fd,))
+
+        def record(event: mac_test.MacBlockEvent) -> None:
+            # Keep the production detached recorder and reap thread. The pipe
+            # still proves every fixture writer has exited before cleanup.
+            with mock.patch.object(subprocess, "Popen", side_effect=launch):
+                real_record(event)
+
+        def run(command: list[str], *, capture_output: bool = False, text: bool = False,
+                check: bool, timeout: float | None = None,
+                stdin: int | None = None, stdout: int | None = None,
+                stderr: int | None = None) -> subprocess.CompletedProcess[str]:
+            script = self.bin_directory / command[0]
+            stub_arguments = command[1:]
+            for name in ("sessions.py", "send.py"):
+                if command[:2] == [sys.executable, str(self.stub_directory / name)]:
+                    # Tests of blocked/timed-out delivery keep the actual child.
+                    if name == "send.py" and any((self.stub_directory / flag).exists()
+                                                for flag in ("send-hold", "send-delay")):
+                        break
+                    script = self.stub_directory / name
+                    stub_arguments = command[2:]
+            if script in (self.bin_directory / "gh", self.bin_directory / "systemd-run",
+                          self.stub_directory / "sessions.py", self.stub_directory / "send.py") and script.exists():
+                module = ModuleType("mac_test_fixture_tool")
+                module.__file__ = str(script)
+
+                def main() -> int:
+                    _ = runpy.run_path(str(script), run_name="__main__")
+                    return 0
+
+                return invoke_cli(module, main, stub_arguments, dict(os.environ), self.root)
+            return real_run(command, capture_output=capture_output, text=text, check=check,
+                            timeout=timeout, stdin=stdin, stdout=stdout, stderr=stderr)
+
+        with (mock.patch.object(subprocess, "run", side_effect=run),
+              mock.patch.object(mac_test, "start_hold_recorder", side_effect=record)):
+            return invoke_cli(mac_test, mac_test.main, list(arguments), selected_environment, self.root)
 
     def start_command(
         self, *arguments: str, environment: dict[str, str] | None = None
@@ -454,7 +521,7 @@ class MacTestCommandTests(unittest.TestCase):
                 (
                     "import ctypes, time; "
                     + f"ctypes.CDLL(None).prctl(15, {name!r}); "
-                    + "time.sleep(30)"
+                    + f"time.sleep({TEST_HANG_GUARD_SECS})"
                 ),
             ],
             cwd=self.root,
@@ -463,7 +530,7 @@ class MacTestCommandTests(unittest.TestCase):
             text=True,
         )
         self.children.append(child)
-        deadline = time.monotonic() + 2
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
         process_name = b""
         while time.monotonic() < deadline:
             stat = Path(f"/proc/{child.pid}/stat").read_bytes()
@@ -478,10 +545,10 @@ class MacTestCommandTests(unittest.TestCase):
         if child.poll() is None:
             child.terminate()
             try:
-                _ = child.wait(timeout=3)
+                _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
             except subprocess.TimeoutExpired:
                 child.kill()
-                _ = child.wait(timeout=3)
+                _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
         if child.stdout is not None:
             child.stdout.close()
         if child.stderr is not None:
@@ -559,7 +626,7 @@ class MacTestCommandTests(unittest.TestCase):
     def clear_log(self, name: str) -> None:
         (self.stub_directory / f"{name}.jsonl").unlink(missing_ok=True)
 
-    def wait_for_path(self, path: Path, timeout: float = 60) -> None:
+    def wait_for_path(self, path: Path, timeout: float = TEST_HANG_GUARD_SECS) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if path.exists():
@@ -567,7 +634,7 @@ class MacTestCommandTests(unittest.TestCase):
             time.sleep(0.01)
         self.fail(f"timed out waiting for {path}")
 
-    def wait_for_log_count(self, name: str, count: int, timeout: float = 60) -> None:
+    def wait_for_log_count(self, name: str, count: int, timeout: float = TEST_HANG_GUARD_SECS) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if len(self.logged_arguments(name)) >= count:
@@ -576,7 +643,7 @@ class MacTestCommandTests(unittest.TestCase):
         self.fail(f"timed out waiting for {count} {name} calls")
 
     def wait_for_free_message(
-        self, expected: FreeMessageState, timeout: float = 60
+        self, expected: FreeMessageState, timeout: float = TEST_HANG_GUARD_SECS
     ) -> dict[str, object]:
         deadline = time.monotonic() + timeout
         block = self.block_state()
@@ -627,7 +694,7 @@ class MacTestCommandTests(unittest.TestCase):
         return cast(str, values["variable"])
 
     def test_status_without_block_reports_all_switch_results(self) -> None:
-        on = self.command("status")
+        on = self.command("status", subprocess_cli=True)
         self.assert_command(on, 0, "free\nno block\nCI's Mac switch: on\n")
 
         self.gh["variable"] = "false"
@@ -1117,7 +1184,7 @@ class MacTestCommandTests(unittest.TestCase):
     def start_script_child(self, code: str) -> subprocess.Popen[str]:
         ready = self.root / f"ready-{len(self.children)}"
         child = subprocess.Popen([sys.executable, "-c", code + f"\nopen({str(ready)!r}, 'w').close()\n"
-                                  + "import time\ntime.sleep(60)"], text=True)
+                                  + f"import time\ntime.sleep({TEST_HANG_GUARD_SECS})"], text=True)
         self.children.append(child)
         self.wait_for_path(ready)
         return child
@@ -1161,16 +1228,19 @@ class MacTestCommandTests(unittest.TestCase):
     def test_copy_that_does_not_stop_leaves_the_new_test_busy(self) -> None:
         hana = self.repository("hana")
         copy = self.start_script_child("import signal\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)")
-        self.assert_command(self.copy_claim(copy.pid, hana), 0, "claimed\n")
-        held = self.repository_claim("hana")
-        taker = self.start_child()
-        started = time.monotonic()
-        result = self.command("claim", "--pid", str(taker.pid), "--what", "hana tests", "--worktree", str(hana),
-                              environment={**self.environment, "MAC_TEST_COPY_YIELD_S": "0.5"})
-        self.assert_command(result, 11, self.busy_line(held))
-        self.assertGreaterEqual(time.monotonic() - started, 0.5)
-        self.assertIsNone(copy.poll())
-        self.assertEqual(self.repository_claim("hana"), held)
+        try:
+            self.assert_command(self.copy_claim(copy.pid, hana), 0, "claimed\n")
+            held = self.repository_claim("hana")
+            taker = self.start_child()
+            started = time.monotonic()
+            result = self.command("claim", "--pid", str(taker.pid), "--what", "hana tests", "--worktree", str(hana),
+                                  environment={**self.environment, "MAC_TEST_COPY_YIELD_S": "0.5"})
+            self.assert_command(result, 11, self.busy_line(held))
+            self.assertGreaterEqual(time.monotonic() - started, 0.5)
+            self.assertIsNone(copy.poll())
+            self.assertEqual(self.repository_claim("hana"), held)
+        finally:
+            copy.kill()
 
     def test_a_copy_never_replaces_a_copy_and_a_mac_only_run_never_gives_way(self) -> None:
         hana = self.repository("hana")
@@ -1252,7 +1322,7 @@ class MacTestCommandTests(unittest.TestCase):
         self.assert_command(self.claim_in(owner.pid, "hana tests", hana), 12, f"state unreadable: {damaged}\n")
 
     def hold_events(self, expected: int = 1) -> list[HoldEventRecord]:
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
         while True:
             rows = [cast(HoldEventRecord, json.loads(line))
                     for path in (self.root / "buildlog").rglob("*.jsonl")
@@ -1290,7 +1360,6 @@ class MacTestCommandTests(unittest.TestCase):
         errors: list[BaseException] = []
 
         def wait_for_writer() -> None:
-            waiting.set()
             try:
                 self.wait_for_fixture_writers()
             except BaseException as error:
@@ -1298,19 +1367,28 @@ class MacTestCommandTests(unittest.TestCase):
             finally:
                 finished.set()
 
-        with log.open("a+") as held_log:
+        real_select = select.select
+
+        def observe_wait(readers: list[int], writers: list[int], exceptions: list[int],
+                         timeout: float) -> tuple[list[int], list[int], list[int]]:
+            # The writer pipe is still open while its recorder is held by flock.
+            self.assertEqual(real_select(readers, writers, exceptions, 0)[0], [])
+            waiting.set()
+            return real_select(readers, writers, exceptions, timeout)
+
+        with log.open("a+") as held_log, mock.patch.object(select, "select", side_effect=observe_wait):
             fcntl.flock(held_log, fcntl.LOCK_EX)
             result = self.command("block", "--holder", "alice", "--for", "rendering")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             waiter = threading.Thread(target=wait_for_writer)
             waiter.start()
             try:
-                self.assertTrue(waiting.wait(3))
-                self.assertFalse(finished.wait(0.05))
+                self.assertTrue(waiting.wait(TEST_HANG_GUARD_SECS))
+                self.assertFalse(finished.is_set())
                 self.assertEqual(log.read_text(), "")
             finally:
                 fcntl.flock(held_log, fcntl.LOCK_UN)
-                waiter.join(timeout=60)
+                waiter.join(timeout=TEST_HANG_GUARD_SECS)
         self.assertFalse(waiter.is_alive())
         self.assertEqual(errors, [])
         self.assertTrue(finished.is_set())
@@ -1346,7 +1424,7 @@ class MacTestCommandTests(unittest.TestCase):
                 self.assertEqual(launched, [])
             for thread in threading.enumerate():
                 if thread.name == "hold-event-recorder":
-                    thread.join(timeout=60)
+                    thread.join(timeout=TEST_HANG_GUARD_SECS)
                     self.assertFalse(thread.is_alive())
         self.assertEqual(len(launched), 1)
         self.assertEqual(launched[0].returncode, 0)
@@ -1390,7 +1468,6 @@ for arguments in (
         self.assertEqual(rows[2]["hold_key"], self.block_state()["since"])
         self.assertLess(rows[1]["at"], rows[2]["at"])
         self.assertEqual(rows[0]["at"][:19], rows[2]["at"][:19])
-
 
     def test_repeated_block_records_one_begin_and_unblock_records_one_end_with_since_key(self) -> None:
         first = self.command("block", "--holder", "alice", "--for", "rendering")
@@ -1637,7 +1714,7 @@ for arguments in (
 
         unblocked = self.command("unblock", "--holder", "alice")
         self.assertEqual(unblocked.returncode, 0, unblocked.stdout + unblocked.stderr)
-        stdout, stderr = watcher.communicate(timeout=60)
+        stdout, stderr = watcher.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(watcher.returncode, 0, stdout + stderr)
         self.assertEqual(len(self.logged_arguments("send-delivered")), 1)
 
@@ -2034,7 +2111,6 @@ for arguments in (
         )
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         original = self.block_state()
-        time.sleep(0.02)
         environment["CLAUDE_CODE_SESSION_ID"] = "second-session"
         renewed = self.command(
             "block",
@@ -2245,7 +2321,7 @@ subprocess.run = expire_after_set
         blocked = self.start_command(
             "block", "--holder", "alice", "--for", "rendering"
         )
-        stdout, stderr = blocked.communicate(timeout=300)
+        stdout, stderr = blocked.communicate(timeout=TEST_HANG_GUARD_SECS)
         _ = lifetime.write_text(FIXTURE_CHILD_LIFETIME)
         self.assertEqual(blocked.returncode, 2, stdout + stderr)
         self.assertIn("CI can still use the Mac:", stdout)
@@ -2336,8 +2412,8 @@ subprocess.run = expire_gh
             "block", "--holder", "alice", "--for", "rendering"
         )
         limits_path = self.stub_directory / "gh-timeout-limits"
-        self.wait_for_path(limits_path, timeout=300)
-        stdout, stderr = process.communicate(timeout=300)
+        self.wait_for_path(limits_path, timeout=TEST_HANG_GUARD_SECS)
+        stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         limits = [float(line) for line in limits_path.read_text().splitlines()]
         self.assertTrue(limits)
         self.assertEqual(limits, [0.2] * len(limits))
@@ -2364,7 +2440,7 @@ subprocess.run = expire_gh
         _ = (self.stub_directory / "continue-gh").write_text(
             "continue\n", encoding="utf-8"
         )
-        stdout, stderr = blocker.communicate(timeout=60)
+        stdout, stderr = blocker.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(blocker.returncode, 0, stdout + stderr)
 
     def test_release_starts_watcher_without_gh_or_send(self) -> None:
@@ -2421,12 +2497,14 @@ subprocess.run = expire_gh
         )
         self.gh["variable"] = "false"
         self.gh["delays"] = [
-            {"match": "run list", "seconds": 0.5, "marker": "watch-gh-started"}
+            {"match": "run list", "seconds": TEST_HANG_GUARD_SECS, "marker": "watch-gh-started",
+             "release": "continue-renewal-gh"}
         ]
         self.sync_gh()
         watcher = self.start_command("watch")
         self.wait_for_path(self.stub_directory / "watch-gh-started")
-        environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": "new-session"}
+        environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": "new-session",
+                       "MAC_TEST_LOCK_ATTEMPT": str(self.stub_directory / "renewal-lock-attempt")}
         renewal = self.start_command(
             "block",
             "--holder",
@@ -2437,14 +2515,16 @@ subprocess.run = expire_gh
             "3",
             environment=environment,
         )
-        stdout, stderr = renewal.communicate(timeout=60)
+        self.wait_for_path(self.stub_directory / "renewal-lock-attempt")
+        _ = (self.stub_directory / "continue-renewal-gh").write_text("continue\n")
+        stdout, stderr = renewal.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(renewal.returncode, 0, stdout + stderr)
         block = self.block_state()
         self.assertEqual(block["for"], "renewed work")
         self.assertEqual(block["session"], "new-session")
         self.assertEqual(block["since"], original["since"])
         watcher.terminate()
-        _ = watcher.wait(timeout=60)
+        _ = watcher.wait(timeout=TEST_HANG_GUARD_SECS)
 
     def test_unblock_and_expiry_restore_switch_once(self) -> None:
         now = datetime.now(timezone.utc)
@@ -2455,14 +2535,18 @@ subprocess.run = expire_gh
         )
         self.gh["variable"] = "false"
         self.gh["delays"] = [
-            {"match": "variable set", "seconds": 0.4, "marker": "restore-started"}
+            {"match": "variable set", "seconds": TEST_HANG_GUARD_SECS, "marker": "restore-started",
+             "release": "continue-restore-gh"}
         ]
         self.sync_gh()
         expiry = self.start_command("status")
         self.wait_for_path(self.stub_directory / "restore-started")
-        unblock = self.start_command("unblock", "--holder", "alice")
-        expiry_output = expiry.communicate(timeout=60)
-        unblock_output = unblock.communicate(timeout=60)
+        unblock = self.start_command("unblock", "--holder", "alice", environment={
+            **self.environment, "MAC_TEST_LOCK_ATTEMPT": str(self.stub_directory / "unblock-lock-attempt")})
+        self.wait_for_path(self.stub_directory / "unblock-lock-attempt")
+        _ = (self.stub_directory / "continue-restore-gh").write_text("continue\n")
+        expiry_output = expiry.communicate(timeout=TEST_HANG_GUARD_SECS)
+        unblock_output = unblock.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(expiry.returncode, 0, "".join(expiry_output))
         self.assertEqual(unblock.returncode, 0, "".join(unblock_output))
         self.assertEqual(self.gh_calls("variable set"), 1)
@@ -2497,7 +2581,7 @@ subprocess.run = expire_gh
         )
         unblocked = self.command("unblock", "--holder", "alice")
         self.assertEqual(unblocked.returncode, 0, unblocked.stdout + unblocked.stderr)
-        stdout, stderr = first.communicate(timeout=60)
+        stdout, stderr = first.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(first.returncode, 0, stdout + stderr)
 
     def test_failed_free_message_stays_owed_and_status_reports_it(self) -> None:
@@ -2715,7 +2799,7 @@ subprocess.run = expire_gh
         _ = (self.stub_directory / "send-continue").write_text(
             "continue\n", encoding="utf-8"
         )
-        stdout, stderr = status.communicate(timeout=60)
+        stdout, stderr = status.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(status.returncode, 0, stdout + stderr)
 
 

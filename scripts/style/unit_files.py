@@ -11,7 +11,7 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS / "production"))
 
 import style_ledger
-from add_unit import read_production
+from production_units import read_production
 from production_units import cell_value, plan_cell_is_retired, production_field, unit_table
 
 

@@ -23,12 +23,13 @@ import re
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
 import showrunners
-from add_unit import Production, read_production
+from production_units import Production, read_production
 from production_units import Refusal
 import herdr
 
@@ -39,6 +40,22 @@ WAIT_S = float(os.environ.get("ADD_SHOWRUNNER_WAIT_S") or 180)
 # The session registry has no notification interface; callers may choose its retry interval.
 POLL_S = float(os.environ.get("ADD_SHOWRUNNER_POLL_S") or 2.0)
 SESSION_NOT_READY = 3
+
+
+@dataclass(frozen=True)
+class EndingUnitTab:
+    """The unit's tab that closes before the child's showrunner starts."""
+
+    pane_id: str
+
+
+@dataclass(frozen=True)
+class NoEndingTab:
+    """Every open tab remains in place when the child's showrunner starts."""
+
+
+EndingTab = EndingUnitTab | NoEndingTab
+NO_ENDING_TAB = NoEndingTab()
 
 
 def running(slug: str) -> bool:
@@ -55,10 +72,10 @@ def claude_json(config_dir: Path) -> Path:
     return Path(os.environ.get("ADD_SHOWRUNNER_CLAUDE_JSON") or config_dir / ".claude.json")
 
 
-def checked(child: Production, caller: str, ending: str = "", start_in: Path | None = None, *, config_dir: Path) -> None:
+def checked(child: Production, caller: str, ending: EndingTab = NO_ENDING_TAB, start_in: Path | None = None, *, config_dir: Path) -> None:
     """Check whether `child` can start; raise Refusal naming what is in the way.
 
-    `ending` names a session the caller ends before the start, so it is not in the way.
+    `ending` identifies the unit's tab that closes before launch, or says no tab ends.
     `start_in` is the folder the session starts in, the child's checkout unless given.
     """
     from scripts.accounts.accounts import NamedAccount, account_dir, trust_command
@@ -89,18 +106,20 @@ def checked(child: Production, caller: str, ending: str = "", start_in: Path | N
         raise Refusal(f"{child.slug}: Claude is not trusted in {folder} on {label}. "
                       + f"Run: {trust_command(folder, selected)}")
     try:
-        if child.slug != ending and herdr_tab_open(child.slug):
+        if herdr_tab_open(child.slug, ending):
             raise Refusal(f"a tab named {child.slug} is already open in herdr session {herdr.shared_session()}")
     except herdr.HerdrFailure as error:
         raise Refusal(str(error)) from error
 
 
-def herdr_tab_open(name: str) -> bool:
-    """Whether the shared herdr session already holds a tab named `name`."""
+def herdr_tab_open(name: str, ending: EndingTab) -> bool:
+    """Whether a tab named `name` remains in the shared herdr session after `ending`."""
     shared = herdr.shared_session()
     if not any(session["name"] == shared for session in herdr.live_sessions()):
         return False
-    return any(pane.get("label") == name for pane in herdr.Herdr(shared).panes())
+    return any(pane.get("label") == name
+               and (not isinstance(ending, EndingUnitTab) or pane["pane_id"] != ending.pane_id)
+               for pane in herdr.Herdr(shared).panes())
 
 
 def account_directory(selected: ClaudeLaunchAccount) -> Path:

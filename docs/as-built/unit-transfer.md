@@ -19,7 +19,7 @@ script is `scripts/production/transfer_unit.py`, with three actions: `plan`, `ap
 - The stall-watch stretch and its prompt file move to the receiving slug. This pool's reviewers of
   the unit retire (`review_pool.py retire`), so the receiving pool leases its own. The old pane
   entry is forgotten, because the relaunch records a new pane.
-- Each guild design the unit holds (`scripts/guilds/roles.py`) takes the receiving production as
+- Each held design the unit holds (`scripts/guilds/roles.py`) takes the receiving production as
   holder (`roles.move_holder`), so resume, rebind and end accept the relaunched unit. The role
   threads, role names, checkout paths and saved prompts stay.
 - The shutdown record's host takes the receiving `production` and `doc`. A herdr session name of
@@ -29,7 +29,7 @@ script is `scripts/production/transfer_unit.py`, with three actions: `plan`, `ap
 - The relaunch runs `add_unit.py` with the record's doc, so the unit's marks
   (`SHOWRUNNER_UNIT`, `SHOWRUNNER_UNIT_ID`) name the receiving production. Status, dailies, panes and
   merges find the unit there.
-- A held design role (`docs/as-built/guilds.md`) does not move: `transfer_unit.py` calls no
+- A held design role (`docs/as-built/long-lived-workers.md#lasting-roles`) does not move: `transfer_unit.py` calls no
   `roles.py` verb, so its `UnitHolder` keeps the giving slug. After the relaunch `resolve_holder`
   reports `unit holder is not recorded`, and every `roles.py` verb that authorizes the holder
   (`resume`, `rebind`, `end`) refuses.
@@ -66,5 +66,5 @@ row commit does (user, 2026-10-08). The unit takes the receiving merge branch at
 verify fails when the receiving doc has no row, the giving doc still has one, a plan header does
 not name the receiving production, the stretch is still under the giving slug, the shutdown record
 does not name the receiving production, the unit is not live under the receiving slug, a session
-still carries the giving marks, a giving reviewer is still leased to the unit, or a guild design
+still carries the giving marks, a giving reviewer is still leased to the unit, or a held design
 still names the giving production as the unit's holder (`roles.holder_failures`).

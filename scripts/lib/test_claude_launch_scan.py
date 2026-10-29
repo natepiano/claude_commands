@@ -15,6 +15,8 @@ import re
 import tempfile
 import unittest
 
+from scripts.lib.code_kind import is_test_code
+
 
 @dataclass(frozen=True)
 class UnguardedLaunch:
@@ -142,7 +144,7 @@ def shell_launches(source: str, relative: str) -> list[UnguardedLaunch]:
 def unguarded_launches(scripts: Path) -> list[UnguardedLaunch]:
     found: list[UnguardedLaunch] = []
     for path in sorted(scripts.rglob("*")):
-        if not path.is_file() or path.suffix not in {".py", ".sh"} or path.name.startswith(("test_", "fake_")):
+        if not path.is_file() or path.suffix not in {".py", ".sh"} or is_test_code(path):
             continue
         relative = path.relative_to(scripts).as_posix()
         source = path.read_text(encoding="utf-8")
@@ -178,6 +180,8 @@ class ClaudeLaunchScanTests(unittest.TestCase):
                      "herdr.py": 'import subprocess\nsubprocess.run(["herdr", "agent", "start", "worker", "--kind", "claude"])\n'}
             for name, source in cases.items():
                 _ = (root / name).write_text(source)
+            for name in ("test_launch.py", "fake_launch.py", "launch_test_support.py"):
+                _ = (root / name).write_text(cases["print.py"])
             self.assertEqual({item.path for item in unguarded_launches(root)}, set(cases))
 
     def test_same_module_ensure_guard_covers_its_caller(self) -> None:

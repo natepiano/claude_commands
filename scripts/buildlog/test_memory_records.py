@@ -13,6 +13,9 @@ from unittest import mock
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 if TYPE_CHECKING:
     from ..direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
 else:
@@ -53,7 +56,7 @@ class MemoryRecordTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
-            timeout=30,
+            timeout=TEST_HANG_GUARD_SECS,
         )
 
     def records(self) -> list[Record]:
@@ -90,7 +93,7 @@ class MemoryRecordTests(unittest.TestCase):
         def take_sample() -> None:
             result = subprocess.run(
                 [sys.executable, "-c", command, str(HERE), str(proc)],
-                env=env, capture_output=True, text=True, check=False, timeout=30,
+                env=env, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
 

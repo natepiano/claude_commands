@@ -24,6 +24,9 @@ import herdr
 import sessions
 import top_level
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 NO_SHOWRUNNER = roster.NoShowrunner()
 NO_DIRECTOR = roster.NoDirector()
 
@@ -298,7 +301,7 @@ class TopLevelRunningRecordTests(unittest.TestCase):
         ))
         self.child_pid = child.pid
         self.process_starts = {}
-        self.addCleanup(child.communicate, timeout=5)
+        self.addCleanup(child.communicate, timeout=TEST_HANG_GUARD_SECS)
         environment = cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             "HOME": str(self.folder), "NOTIFIER_SESSIONS_DIR": str(self.directory),
             "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}", "SSH_RECORD": str(self.folder / "ssh.log"),

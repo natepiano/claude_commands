@@ -99,7 +99,28 @@ describe("reply routes", () => {
     expect(firstLine(forward)).toEqual(expect.stringMatching(/^Message from Recipient \(their answer to Original sender, passed on by postmaster\) \[1000-\d+\]:$/));
     expect(forward.text.slice(forward.text.indexOf("\n") + 1)).toBe("\n" + body);
     expect(onlyLog(fake.logs())).toEqual({ at_ms: 1000, socket, name: "Recipient", session_id: "recipient",
-      senders: ["Original sender"], body, forwarded: ["original-session"] });
+      senders: ["Original sender"], body, targets: ["original-session"], forward: "done", forwarded: ["original-session"] });
+  });
+
+  test("the reply record names its origin and targets while the forward is still pending", async () => {
+    const fake = fakeCalls();
+    const replies = await startReplies(fake.calls);
+    await replies.sending(entry(), fake.calls.now());
+    let began: () => void = () => {};
+    const forwarding = new Promise<void>(resolve => { began = resolve; });
+    let finish: () => void = () => { throw new Error("Forward not started"); };
+    fake.answerSend(() => new Promise<SessionSendResult>(resolve => {
+      finish = () => { resolve({ isDelivered: true }); };
+      began();
+    }));
+    const receiving = replies.receive(reply());
+    await forwarding;
+    expect(onlyLog(fake.logs())).toEqual({ at_ms: 1000, socket, name: "Recipient", session_id: "recipient",
+      senders: ["Original sender"], body: "My answer", targets: ["original-session"], forward: "pending", forwarded: [] });
+    finish();
+    expect(await receiving).toEqual(consumed);
+    expect(onlyLog(fake.logs())).toEqual({ at_ms: 1000, socket, name: "Recipient", session_id: "recipient",
+      senders: ["Original sender"], body: "My answer", targets: ["original-session"], forward: "done", forwarded: ["original-session"] });
   });
 
   test("a reply arriving before the original send returns already has a route", async () => {
@@ -181,7 +202,7 @@ describe("reply routes", () => {
     await replies.sending(entry("quota_alert", ""), fake.calls.now());
     expect(await replies.receive(reply())).toEqual(consumed);
     expect(onlyLog(fake.logs())).toEqual({ at_ms: 1000, socket, name: "Recipient", session_id: "recipient",
-      senders: ["quota_alert"], body: "My answer", forwarded: [] });
+      senders: ["quota_alert"], body: "My answer", targets: [], forward: "done", forwarded: [] });
     expect(fake.sent).toEqual([]);
   });
 
@@ -192,7 +213,8 @@ describe("reply routes", () => {
     fake.answerSend(async () => ({ isDelivered: false, reason: "session is gone" }));
     expect(await replies.receive(reply())).toEqual(consumed);
     expect(fake.sent.length).toBe(1);
-    expect(onlyLog(fake.logs()).forwarded).toEqual([]);
+    const { targets, forward, forwarded } = onlyLog(fake.logs());
+    expect({ targets, forward, forwarded }).toEqual({ targets: ["original-session"], forward: "done", forwarded: [] });
   });
 
   test("a throwing forward still consumes the reply and logs an empty forwarded list", async () => {
@@ -201,7 +223,8 @@ describe("reply routes", () => {
     await replies.sending(entry(), fake.calls.now());
     fake.answerSend(async () => { throw new Error("forward cannot be confirmed"); });
     expect(await replies.receive(reply())).toEqual(consumed);
-    expect(onlyLog(fake.logs()).forwarded).toEqual([]);
+    const { targets, forward, forwarded } = onlyLog(fake.logs());
+    expect({ targets, forward, forwarded }).toEqual({ targets: ["original-session"], forward: "done", forwarded: [] });
   });
 
   test("equal answers at the same time have distinct first lines and log files", async () => {

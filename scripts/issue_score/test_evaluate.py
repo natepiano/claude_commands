@@ -132,11 +132,11 @@ class CompareTests(unittest.TestCase):
         issue = next(issue for issue in vault.load_rated_issues(self.issues).issues if issue.path == path)
         state = vault.build_state(issue)
         area_state: questions.AreaState = {"issue": state["issue"], "areas": ["rendering", "tooling"]}
-        main_questions, area_questions = questions.main_questions(), questions.area_questions(area_state["areas"])
+        main_questions, area_questions = questions.main_questions(), questions.area_questions(area_state["areas"], {})
         main = client.parse_response(cast(object, json.loads((FIXTURES / "main_response.json").read_text())), main_questions)
         area = client.parse_response(cast(object, json.loads((FIXTURES / "area_response.json").read_text())), area_questions)
         return {
-            "issue_path": str(path), "content_hash": score_issues.content_hash(issue, area_state["areas"]),
+            "issue_path": str(path), "content_hash": score_issues.content_hash(issue, area_state["areas"], {}),
             "question_set_version": questions.QUESTION_SET_VERSION, "model": questions.MODEL,
             "payloads": {"main": {"model": questions.MODEL, "state": state, "questions": main_questions},
                          "area": {"model": questions.MODEL, "state": area_state, "questions": area_questions}},
@@ -149,10 +149,10 @@ class CompareTests(unittest.TestCase):
         _ = path.write_text("".join(json.dumps(record) + "\n" for record in entries), encoding="utf-8")
         return path
 
-    def compare(self, run_id: str, *, repeat_run_id: str = "",
+    def compare(self, run_id: str, *, repeat_run_id: str = "", baseline_run_id: str = "",
                 split: Literal["tune", "holdout", "all"] = "all") -> str:
         path = evaluate.compare(run_id, split=split, issues_dir=self.issues, state_dir=self.state,
-                                goals_path=self.goals, repeat_run_id=repeat_run_id)
+                                goals_path=self.goals, repeat_run_id=repeat_run_id, baseline_run_id=baseline_run_id)
         self.assertEqual(path, self.state / "reports" / f"{run_id}-{split}.md")
         return path.read_text(encoding="utf-8")
 
@@ -167,6 +167,211 @@ class CompareTests(unittest.TestCase):
         answer["score"] = sum(int(level) * probability for level, probability in probabilities.items())
         answer["confidence"] = max(probabilities.values())
         self.refresh_decisions(record)
+
+    def test_alignment_risk_sweeps_only_its_threshold_and_matches_production(self) -> None:
+        path = self.issue("Target A")
+        record = self.record(path)
+        answers = record["answers"]["main"]["answers"]
+        for name in ("goal", "goal_reverse"):
+            answers[name] = {"type": "choice", "choice": "ship_hana", "confidence": .65,
+                             "probabilities": {"ship_hana": .65, "find_collaborators": .35}}
+        self.score_answer(record, "alignment_ship_hana", {"0": 0., "1": 0., "2": .2, "3": .8, "4": 0.})
+        _ = self.run_file("unequal-thresholds", [record])
+        decision = decide.decide_answers(answers, record["answers"]["area"]["answers"])["backlog_alignment"]
+        for goal_threshold in (.4, .6, .7):
+            with self.subTest(goal_threshold=goal_threshold), mock.patch.dict(questions.THRESHOLDS, backlog_goal=decide.Supported(goal_threshold)):
+                report = self.compare("unequal-thresholds", split="tune")
+                rows = table(section(section(report, "## Risk-coverage"), "### backlog_alignment"), "Threshold")
+                for row in rows:
+                    thresholds = dict(questions.THRESHOLDS)
+                    thresholds["backlog_alignment"] = decide.Supported(float(row["Threshold"]))
+                    expected = int(decide.is_sure("backlog_alignment", decision, thresholds))
+                    self.assertEqual(int(row["Sure N"]), expected, row)
+                by_threshold = {row["Threshold"]: row["Sure N"] for row in rows}
+                self.assertEqual(by_threshold["0.75"], "1" if goal_threshold <= .65 else "0")
+
+    def test_baseline_and_candidate_use_intersection_and_read_current_labels_once(self) -> None:
+        common = self.issue("Target A", impact=1)
+        candidate_only = self.issue("Target B", impact=5)
+        baseline_only = self.issue("Target C", impact=5)
+        example = self.issue(sorted(questions.HISTORICAL_EFFORT_EXAMPLE_STEMS)[0], impact=5)
+        baseline = self.record(common)
+        candidate = copy.deepcopy(baseline)
+        self.score_answer(candidate, "impact", {"0": 0., "1": 0., "2": 0., "3": 0., "4": 1.})
+        _ = self.run_file("cohort-baseline", [baseline, self.record(baseline_only), self.record(example)])
+        _ = self.run_file("cohort-candidate", [candidate, self.record(candidate_only), self.record(example)])
+        _ = common.write_text(common.read_text().replace("backlog_impact: ⭐\n", "backlog_impact: ⭐⭐⭐⭐⭐\n"))
+        with mock.patch.object(vault, "load_rated_issues", wraps=vault.load_rated_issues) as loader:
+            report = self.compare("cohort-candidate", baseline_run_id="cohort-baseline")
+        loader.assert_called_once()
+        candidate_section = report.split("## Baseline: cohort-baseline")[0]
+        baseline_section = report.split("## Baseline: cohort-baseline", 1)[1]
+        for part, heading, exact, mae in ((candidate_section, "## Group: all (N=1)", "1.0000", "0.0000"),
+                                          (baseline_section, "## Baseline group: all (N=1)", "0.0000", "2.0000")):
+            group = section(part, heading)
+            metrics = table(section(group, "#### backlog_impact"), "N")[0]
+            self.assertEqual((metrics["N"], metrics["Exact"], metrics["MAE"]), ("1", exact, mae))
+        self.assertNotIn("## Group: all (N=2)", report)
+        self.assertIn("Excluded effort examples: 1", report)
+
+    def test_threshold_outcomes_require_complete_tuning_runs_and_keep_effort_and_urgency_report_only(self) -> None:
+        path = self.issue("Target A")
+        _ = self.run_file("threshold-complete", [self.record(path)])
+        cases: tuple[tuple[Literal["tune", "holdout", "all"], str], ...] = (
+            ("tune", "supported("), ("all", "unsupported"))
+        for split, outcome in cases:
+            with self.subTest(split=split):
+                risk = section(self.compare("threshold-complete", split=split), "## Risk-coverage")
+                for field in ("backlog_goal", "backlog_alignment", "backlog_impact", "category", "area"):
+                    self.assertIn("Threshold outcome: " + outcome, section(risk, "### " + field))
+                for field in ("backlog_urgency", "backlog_effort"):
+                    self.assertIn("Threshold outcome: report-only", section(risk, "### " + field))
+        missing_title = next(f"Missing tune {number}" for number in range(50)
+                             if evaluate.split_for(f"Missing tune {number}.md") == "tune")
+        _ = self.issue(missing_title)
+        partial = self.compare("threshold-complete", split="tune")
+        self.assertIn("partial", partial.splitlines()[0])
+        self.assertIn("Threshold outcome: unsupported", section(section(partial, "## Risk-coverage"), "### backlog_impact"))
+
+    def test_heldout_validates_the_configured_threshold_without_selecting_and_marks_incomplete_results_partial(self) -> None:
+        paths: list[Path] = []
+        for number in range(100):
+            title = f"Heldout validation {number:03}"
+            if evaluate.split_for(title + ".md") == "holdout":
+                paths.append(self.issue(title))
+                if len(paths) == 11:
+                    break
+        entries = [self.record(path) for path in paths]
+        for index, record in enumerate(entries):
+            confidence = .72 if index == 10 else .74
+            for name in ("goal", "goal_reverse"):
+                record["answers"]["main"]["answers"][name] = {
+                    "type": "choice", "choice": "ship_hana", "confidence": confidence,
+                    "probabilities": {"ship_hana": confidence, "find_collaborators": 1 - confidence},
+                }
+            self.refresh_decisions(record)
+        for index in (0, 10):
+            _ = paths[index].write_text(paths[index].read_text().replace(
+                'backlog_goal: "1 - Ship Hana"', 'backlog_goal: "2 - Find Collaborators"'))
+        _ = self.run_file("heldout-validation", entries)
+        # .73 is between sweep points. Ten answers qualify; the eleventh,
+        # wrong answer is below this configured threshold and must be excluded.
+        with mock.patch.dict(questions.THRESHOLDS, backlog_goal=decide.Supported(.73)), \
+                mock.patch.object(decide, "select_threshold", side_effect=AssertionError("Held-out data must not select thresholds")):
+            passed = self.compare("heldout-validation", split="holdout")
+            goal = section(section(passed, "## Risk-coverage"), "### backlog_goal")
+            self.assertIn("Held-out validation: pass at configured threshold 0.73", goal)
+            self.assertIn("Sure N: 10", goal)
+            self.assertIn("coverage: 0.9091", goal)
+            self.assertIn("exact error: 0.1000", goal)
+            self.assertNotIn("Threshold outcome:", passed)
+            recommendations = table(section(passed, "## Per-field recommendations and score ≥ 20 results"), "Field")
+            self.assertIn("Jev proposes", next(row["Recommendation"] for row in recommendations if row["Field"] == "backlog_goal"))
+            for field in ("backlog_urgency", "backlog_effort"):
+                self.assertIn("Held-out validation: report-only", section(section(passed, "## Risk-coverage"), "### " + field))
+
+            _ = paths[1].write_text(paths[1].read_text().replace(
+                'backlog_goal: "1 - Ship Hana"', 'backlog_goal: "2 - Find Collaborators"'))
+            failed = self.compare("heldout-validation", split="holdout")
+            goal = section(section(failed, "## Risk-coverage"), "### backlog_goal")
+            self.assertIn("Held-out validation: fail at configured threshold 0.73", goal)
+            self.assertIn("exact error: 0.2000", goal)
+            self.assertIn("agent-only", goal)
+
+            with mock.patch.dict(questions.THRESHOLDS, backlog_goal=decide.Supported(.9)):
+                uncovered = self.compare("heldout-validation", split="holdout")
+            goal = section(section(uncovered, "## Risk-coverage"), "### backlog_goal")
+            self.assertIn("Held-out validation: fail at configured threshold 0.90", goal)
+            self.assertIn("Sure N: 0", goal)
+
+            _ = paths[1].write_text(paths[1].read_text().replace(
+                'backlog_goal: "2 - Find Collaborators"', 'backlog_goal: "1 - Ship Hana"'))
+            missing_titles = [f"Missing heldout validation {number}" for number in range(30)
+                              if evaluate.split_for(f"Missing heldout validation {number}.md") == "holdout"][:2]
+            missing, request_failed = [self.issue(title) for title in missing_titles]
+            _ = self.run_file("heldout-validation", [*entries, {"issue_path": str(request_failed), "error": "fixture failure"}])
+            partial = self.compare("heldout-validation", split="holdout")
+            self.assertIn("partial", partial.splitlines()[0])
+            self.assertIn(missing.stem, section(section(partial, "## Exclusions and incomplete coverage"), "### Unscored issues"))
+            self.assertIn(request_failed.stem, section(section(partial, "## Exclusions and incomplete coverage"), "### Failed issues"))
+            goal = section(section(partial, "## Risk-coverage"), "### backlog_goal")
+            self.assertIn("Held-out validation: partial at configured threshold 0.73", goal)
+            self.assertNotIn("Held-out validation: pass", goal)
+            self.assertNotIn("Threshold outcome:", partial)
+
+    def test_heldout_checks_the_tuned_supported_policy_and_keeps_other_fields_agent_only(self) -> None:
+        titles = [f"Tuned heldout {number}" for number in range(100)
+                  if evaluate.split_for(f"Tuned heldout {number}.md") == "holdout"][:2]
+        entries = [self.record(self.issue(title)) for title in titles]
+        for record, confidence in zip(entries, (.89, .9)):
+            for name in ("category", "category_reverse"):
+                record["answers"]["main"]["answers"][name] = {
+                    "type": "choice", "choice": "feature", "confidence": confidence,
+                    "probabilities": {"feature": confidence, "refactor": 1 - confidence},
+                }
+            # Preserve the historical Unsupported behavior independently of adoption.
+            for name in ("area", "area_reverse"):
+                record["answers"]["area"]["answers"][name] = {
+                    "type": "choice", "choice": "rendering", "confidence": 1.,
+                    "probabilities": {"rendering": 1., "tooling": 0.},
+                }
+            record["answers"]["area"]["answers"]["area_fits"] = {"type": "noul", "noul": 1.}
+            self.refresh_decisions(record)
+        _ = self.run_file("tuned-heldout", entries)
+        with mock.patch.dict(questions.THRESHOLDS, area=decide.Unsupported()), \
+                mock.patch.object(decide, "select_threshold", side_effect=AssertionError("Held-out data must not select thresholds")):
+            report = self.compare("tuned-heldout", split="holdout")
+        risk = section(report, "## Risk-coverage")
+        for field, threshold, count in (("backlog_goal", "0.40", 2), ("category", "0.90", 1),
+                                        ("backlog_impact", "0.40", 2), ("backlog_alignment", "0.40", 2)):
+            with self.subTest(field=field):
+                judgment = section(risk, "### " + field)
+                self.assertIn("Held-out validation: pass at configured threshold " + threshold, judgment)
+                self.assertIn(f"Sure N: {count};", judgment)
+        area = section(risk, "### area")
+        self.assertIn("Held-out validation: unsupported", area)
+        self.assertIn("agent-only", area)
+        # Diagnostic sweeps evaluate a candidate threshold for this field;
+        # the configured Unsupported outcome still controls production.
+        self.assertEqual([row["Sure N"] for row in table(area, "Threshold")], ["2"] * 12)
+        for field in ("backlog_urgency", "backlog_effort"):
+            self.assertIn("Held-out validation: report-only", section(risk, "### " + field))
+        self.assertNotIn("Threshold outcome:", report)
+        recommendations = table(section(report, "## Per-field recommendations and score ≥ 20 results"), "Field")
+        area_recommendation = next(row["Recommendation"] for row in recommendations if row["Field"] == "area")
+        self.assertIn("agent-only", area_recommendation)
+
+    def test_routing_reports_taken_and_user_shares_at_the_configured_area_threshold(self) -> None:
+        entries = [self.record(self.issue(f"Routing {number}")) for number in range(4)]
+        for record, confidence, fits, agrees in zip(
+                entries, (.9, .89, .99, .99), (.95, .95, .5, .95), (True, True, True, False)):
+            answers = record["answers"]["area"]["answers"]
+            answers["area"] = {
+                "type": "choice", "choice": "rendering", "confidence": confidence,
+                "probabilities": {"rendering": confidence, "tooling": 1 - confidence},
+            }
+            answers["area_reverse"] = copy.deepcopy(answers["area"]) if agrees else {
+                "type": "choice", "choice": "tooling", "confidence": .51,
+                "probabilities": {"rendering": .49, "tooling": .51},
+            }
+            answers["area_fits"] = {"type": "noul", "noul": fits}
+            self.refresh_decisions(record)
+        _ = self.run_file("routing", entries)
+        risk = section(self.compare("routing"), "## Risk-coverage")
+        area = section(risk, "### area")
+        self.assertIn("Routing at configured threshold 0.90: taken (sure): 0.2500; "
+                      + "routed to the user (unsure): 0.7500", area)
+        rows = table(area, "Threshold")
+        by_threshold = {row["Threshold"]: row for row in rows}
+        self.assertEqual(by_threshold["0.90"]["Coverage"], "0.2500")
+        self.assertEqual(by_threshold["0.90"]["Routed to user"], "0.7500")
+        self.assertEqual(by_threshold["0.85"]["Coverage"], "0.5000")
+        self.assertEqual(by_threshold["0.85"]["Routed to user"], "0.5000")
+        self.assertEqual(by_threshold["0.95"]["Routed to user"], "1.0000")
+        for field in ("backlog_urgency", "backlog_effort"):
+            with self.subTest(field=field):
+                self.assertIn("taken (sure): 0.0000; routed to the user (unsure): 1.0000",
+                              section(risk, "### " + field))
 
     def test_partial_report_counts_success_failure_and_unattempted_rated_issues(self) -> None:
         scored = self.issue("Target A")
@@ -259,7 +464,7 @@ class CompareTests(unittest.TestCase):
         target = self.issue("Target A")
         _ = self.run_file("baseline", [self.record(target)])
         baseline = self.compare("baseline")
-        example_titles = sorted(questions.EFFORT_EXAMPLE_STEMS)
+        example_titles = sorted(questions.HISTORICAL_EFFORT_EXAMPLE_STEMS)
         excluded = [self.issue(title, impact=5) for title in example_titles]
         style = self.issue("Style proposal for review", impact=5, extra='style_rule: "global:rust/names.md"\n')
         self.assertIn(style, [issue.path for issue in vault.load_rated_issues(self.issues).issues])
@@ -297,7 +502,7 @@ class CompareTests(unittest.TestCase):
         _ = path.write_text(path.read_text().replace('area: "[[rendering]]"', 'area: unfiled'))
         record["payloads"]["area"]["state"] = {"issue": record["payloads"]["main"]["state"]["issue"],
                                                 "areas": ["rendering", "unfiled"]}
-        record["payloads"]["area"]["questions"] = questions.area_questions(["rendering", "unfiled"])
+        record["payloads"]["area"]["questions"] = questions.area_questions(["rendering", "unfiled"], {})
         area_answers = record["answers"]["area"]["answers"]
         area_answers["area"] = {"type": "choice", "choice": "unfiled", "confidence": .99,
                                 "probabilities": {"unfiled": .99, "rendering": .01}}
@@ -323,7 +528,7 @@ class CompareTests(unittest.TestCase):
         _ = path.write_text(path.read_text().replace('area: "[[rendering]]"', 'area: unfiled'))
         record["payloads"]["area"]["state"] = {"issue": record["payloads"]["main"]["state"]["issue"],
                                                 "areas": ["rendering", "unfiled"]}
-        record["payloads"]["area"]["questions"] = questions.area_questions(["rendering", "unfiled"])
+        record["payloads"]["area"]["questions"] = questions.area_questions(["rendering", "unfiled"], {})
         area_answers = record["answers"]["area"]["answers"]
         for name in ("area", "area_reverse"):
             area_answers[name] = {"type": "choice", "choice": "unfiled", "confidence": .8,
@@ -422,6 +627,52 @@ class CompareTests(unittest.TestCase):
                          ("1", "1", "1.0000"))
         self.assertEqual(rows["backlog_effort"]["Change rate"], "0.0000")
 
+    def test_repeat_pairs_require_the_same_variant_name_and_question_definitions(self) -> None:
+        path = self.issue("Target A")
+        production = self.record(path)
+        explicit_production = copy.deepcopy(production)
+        explicit_production["variant_set"] = "production"
+        explicit_production["variant_definitions"] = {}
+        variant = copy.deepcopy(production)
+        variant["variant_set"] = "benefit_scope"
+        replacement = copy.deepcopy(questions.main_questions()["impact"])
+        replacement["instructions"] = "How large is the benefit once `issue` is complete?"
+        variant["variant_definitions"] = {"impact": replacement}
+        other_name = copy.deepcopy(variant)
+        other_name["variant_set"] = "another_scope"
+        other_wording = copy.deepcopy(variant)
+        other_wording["variant_definitions"]["impact"]["instructions"] = "How much does completing `issue` benefit its users?"
+        repeated_variant = copy.deepcopy(variant)
+        self.score_answer(repeated_variant, "impact", {"0": 0., "1": 0., "2": 0., "3": 0., "4": 1.})
+        choice_variant = copy.deepcopy(production)
+        choice_variant["variant_set"] = "category_scope"
+        category = copy.deepcopy(questions.main_questions()["category"])
+        assert category["type"] == "choice"
+        choice_variant["variant_definitions"] = {"category": category}
+        repeated_choice = copy.deepcopy(choice_variant)
+        reversed_choice = copy.deepcopy(choice_variant)
+        reversed_category = copy.deepcopy(category)
+        reversed_category["criteria"] = dict(reversed(list(category["criteria"].items())))
+        reversed_choice["variant_definitions"] = {"category": reversed_category}
+        cases = ((production, variant, 0, 0), (variant, other_name, 0, 0),
+                 (variant, other_wording, 0, 0), (variant, repeated_variant, 1, 1),
+                 (production, explicit_production, 1, 0),
+                 (choice_variant, reversed_choice, 0, 0), (choice_variant, repeated_choice, 1, 0))
+        for first, second, comparable, changes in cases:
+            with self.subTest(first=first.get("variant_set"), second=second.get("variant_set"), comparable=comparable, changes=changes):
+                _ = self.run_file("wording-first", [first])
+                _ = self.run_file("wording-second", [second])
+                report = section(self.compare("wording-first", repeat_run_id="wording-second"), "## Repeat check")
+                self.assertIn(f"Comparable issues: {comparable};", report)
+                self.assertIn(f"changed question definitions: {1 - comparable};", report)
+                self.assertIn(f"not comparable: {1 - comparable}.", report)
+                impact = next(row for row in table(report, "Field") if row["Field"] == "backlog_impact")
+                self.assertEqual((impact["N"], impact["Changed"]), (str(comparable), str(changes)))
+                if comparable:
+                    self.assertEqual(impact["Change rate"], "1.0000" if changes else "0.0000")
+                else:
+                    self.assertTrue(impact["Change rate"].startswith("N/A"))
+
     def test_ordering_uses_imported_goal_parser_and_score_formula_with_current_backlog_scores(self) -> None:
         paths = [self.issue("Target A", score=30), self.issue("Target B", score=10), self.issue("Target C", score=20)]
         records = [self.record(path) for path in paths]
@@ -460,19 +711,20 @@ class CompareTests(unittest.TestCase):
         original_compare = evaluate.compare
 
         def isolated_compare(run_id: str, *, split: Literal["tune", "holdout", "all"] = "all",
-                             repeat_run_id: str = "") -> Path:
+                             repeat_run_id: str = "", baseline_run_id: str = "") -> Path:
             return original_compare(run_id, split=split, repeat_run_id=repeat_run_id,
-                                    issues_dir=self.issues, state_dir=self.state, goals_path=self.goals)
+                                    issues_dir=self.issues, state_dir=self.state, goals_path=self.goals, baseline_run_id=baseline_run_id)
 
         stdout = io.StringIO()
         with mock.patch.object(score_issues, "compare", side_effect=isolated_compare), contextlib.redirect_stdout(stdout):
-            code = score_issues.main(["compare", "cli-first", "--split", "tune", "--repeat", "cli-repeat"])
+            code = score_issues.main(["compare", "cli-first", "--split", "tune", "--repeat", "cli-repeat", "--baseline", "cli-repeat"])
         self.assertEqual(code, 0)
         report_path = Path(stdout.getvalue().strip())
         self.assertEqual(report_path, self.state / "reports" / "cli-first-tune.md")
         report = report_path.read_text()
         self.assertIn("Scored: 1; failed: 0; unscored: 0", report)
         self.assertIn("Comparable issues: 1", section(report, "## Repeat check"))
+        self.assertIn("Shared cohort with baseline cli-repeat: 1 issues", report)
 
 
 if __name__ == "__main__":
