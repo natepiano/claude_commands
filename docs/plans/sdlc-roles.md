@@ -204,7 +204,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 **Ruled out:** live retitle of open tabs after a config edit — the old title stays until restart or session rename; guild head names in the config — guild heads are retired and `config/guilds.conf` keeps guild ownership.
 
 ### Phase 7 — Each unit director owns its reviewers  · status: todo
-**Depends on:** Phase 6, and models-unit's worker-seats Phase 7 (`assign.sh`) on main; the showrunner says when. Start no code before that message.
+**Depends on:** Phase 6, and `assign.sh` from models-unit's worker-seats plan on main; the showrunner says when. Start no code before that message.
 
 #### Work Order
 
@@ -244,31 +244,25 @@ For active process redesigns, as we are currently undergoing with promotions and
 **Acceptance gate:** the gates in Delegation Context green, with the direct, production and message suites; a fixture-backed check finds no operational pool reader or caller, with named exceptions for the migration decoder, compatibility flags and kept history (the retired-name check stays the separate prose gate). Live check: this unit's next review runs on its own `review` and `review2` workers, and the review after it resumes the same threads (same thread ids in the roster).
 
 ### Phase 8 — The retired-name baseline reads at a glance  · status: done
-**Depends on:** Phase 6
 
-#### Work Order
+#### As-built
 
-**Goal:** a person reads `roles_audit.py baseline` in a few lines (user verdict on change review row C1, 2026-10-28: "pretty much something you can read but not me really").
-
-**Spec:**
-- The output starts with a short summary: the share of other names, the worst names with their counts, and each finding in plain words.
-- The full tables print only behind a flag.
-- Drop wrong-party rows that are all zero or "not recorded".
-- Keep what the numbers mean: the short output keeps each file-set count (n), each message window, each warning for a source it could not read, and the difference between unknown coverage and zero findings. Hiding a row with no information never hides missing evidence.
-- Rename the report-facing `WrongPartyCounts` to `SentContactCoverage`: phase 5 records no historical request intent, so the counts show sent contacts, not wrong-party asks.
-- The change comes back to the user as a new change review row.
-- Tests pin the summary lines on a fixture and that the flag prints the full tables; also an unreadable source (its warning shows), an unknown coverage (shown as unknown, not 0) and a window (named in the summary).
-- The summary shows fixed-display label failures (a person must fix them) apart from the count of role words in sentences (information only). `source_check` already returns both, as issues and typed sentence uses; `baseline()` shows neither today. Fixtures cover a tree with a label failure and a tree with sentence uses only. `check` keeps its exit codes and `--prose` keeps its listing.
-- A names-config error keeps its Phase 6 behavior in the baseline: `names.error_text` names the file, table and key, and the baseline fails with it. It never reads as zero findings.
-
-**Constraints from prior phases:** Phase 6 names config: `scripts/lib/names.py` `runtime_names()` loads `config/names.toml` once per process; `load_names(path)` is uncached for fixtures. `roles_audit.py` classifies printed text with `conditional_fragments` (each branch of a printed conditional, in its context) and keeps labels and sentence uses as separate types. A herdr tab title is display text; the pane label is the lookup identity.
+- `roles_audit.py baseline` prints a short summary by default: the other-name share, the top other names with counts, definition and unit-name findings, the file set (n), the message window, and sent-contact and director-contact coverage. `--tables` adds the full tables.
+- The summary shows fixed-display label failures (a person must fix them) apart from the count of role words in sentences (information only). `check` keeps its exit codes and `--prose` keeps its listing.
+- `SentContactCoverage` and `measure_sent_contacts` replace `WrongPartyCounts` and `measure_wrong_party`. The counts show sent contacts, not wrong-party asks. Unknown coverage prints as unknown, never 0. The full table drops rows that are all zero or all unknown.
+- `report(..., *, tables, source_result, unread_production_docs)` takes the source result as a required argument, so a missing source check cannot print as zero labels.
+- Typed `UnreadSource(path, reason)` and `LiveSources(files, unread_sources)`: `baseline()` reads the tree once and passes it to `check_live_sources`. Each unreadable file prints as a warning with its path and reason.
+- A names-config error fails the baseline with `names.error_text` (file, table and key). It never reads as zero findings.
 
 **Files:**
-- `scripts/production/roles_audit.py`, `scripts/production/test_roles_audit.py`
+- `scripts/production/roles_audit.py` — baseline summary, `--tables` flag, single tree read, unread-source warnings
+- `scripts/production/test_roles_audit.py` — summary lines, `--tables`, dropped rows, unread-source warning, unknown coverage, window, sentence-only fixture, required source result, single-read regression
 
-**Workers:** `1 writer + 1 tester`. `impl` holds `scripts/production/roles_audit.py`; `test` holds `scripts/production/test_roles_audit.py`. Phase 6 also edits `roles_audit.py`, so this phase starts after Phase 6's checkpoint.
+**Binds later work:** contact measures use `measure_sent_contacts` and `SentContactCoverage`. The baseline prints the summary by default and the tables only with `--tables`. Unknown coverage stays unknown, never 0. Unread sources show as warnings.
 
-**Acceptance gate:** the gates in Delegation Context green; the baseline on the live tree prints the summary first, in plain words.
+**Gotchas:** `check` and `check_sources` still call `source_check(root)`, which reads the tree itself. Only `baseline` shares one read.
+
+**Ruled out:** a second tree read in `baseline` (about 3.6 s of a 25.6 s run, and its result can disagree with the first read).
 
 ### Phase 9 — Measure the first step and propose the next  · status: todo
 **Depends on:** Phase 5 (it needs only the Phase 3 merge window, so it may run beside Phases 6, 7 and 8)
@@ -282,7 +276,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 - The windowed measure names the merge timestamp of f8f5b962 into sdlc and a complete observation interval of at least 3 days after it. Sent-contact counts are descriptive and have no Step 1 reduction target. Keep unknown roles unknown: a current role record gives no historical roles or request intent, so never infer a role from a shown name.
 - Add the merge-gate cost of the retired-name check (Phase 4 budget) as measured in real gates over the window.
 - Do not run the lexical baseline again: the recorded 104-to-22 reduction (n=82) is the lexical result, and a new run on the current tree has no same file set, because Phases 5–8 change sources, config and output. The lexical half-size decision is closed by that result.
-- Measure contacts alone, without the combined `baseline` command (it reads lexical sources first): call `parse_messages` over one fixed `AuditWindow` and the contact-count function in `roles_audit.py`. Keep unknown coverage and historical intent as unknown. Report gate timings for each implementation checkpoint, because Phase 6 changed extraction and classification after the Phase 4 timings.
+- Measure contacts alone, without the combined `baseline` command (it reads lexical sources first): call `parse_messages` over one fixed `AuditWindow` and `measure_sent_contacts` in `roles_audit.py`, which returns a `SentContactCoverage`. Keep unknown coverage and historical intent as unknown. Report gate timings for each implementation checkpoint, because Phase 6 changed extraction and classification after the Phase 4 timings.
 - For the windowed measure (sent contacts per recipient), the after window is at least 3 days from the merge. Wrong-party asks are not measurable until message records carry roles; do not report them. Add each number to the Step log with its n or window and its source.
 - Update Steps with what the measure taught, and propose the next step; that proposal is the question.
 - At phase end, the unit director sends the showrunner the result and the next step as one question for the user. The next approved step becomes a new phase after this one, with its own self-contained Work Order: the step's files, owners, compatibility constraints, measures and gates. Phase 3 is now an As-built and holds no Work Order to copy.
@@ -294,6 +288,6 @@ For active process redesigns, as we are currently undergoing with promotions and
 - `impl` — `docs/plans/sdlc-roles-design.md`
 - `test` — checks each number in the Step log against its recorded evidence (window, contact counts, gate cost); it edits nothing
 
-**Constraints from prior phases:** the Step log before measure and the change Phase 3 shipped.
+**Constraints from prior phases:** the Step log before measure and the change Phase 3 shipped. Phase 8: `baseline` prints a short summary by default and the full tables only with `--tables`; a sent-contact count it cannot attribute prints as unknown, never zero, and an unreadable source prints as a named warning.
 
 **Acceptance gate:** the Step log has before and after numbers with n and file set or window; the question is sent.
