@@ -344,3 +344,59 @@ The same showrunner request (2026-10-29), Ask 2: research and a design, no build
 **Constraints from prior phases:** Phase 6 and Phase 7 wait records name the worker pass, checkpoint and sender that own each wait (`progress_history.py`); the stop record should reuse those identities. `mesh_runs.py` records live in `${SESSION_DIR}/mesh_runs/`, each log beside its record. Reservation states are in `phase_reservation.py`.
 
 **Acceptance gate:** each criterion has its source, reliability and gap with a file reference; the command design names its links, records, exit codes and callers; builds' part is marked and sent; the reviewer's findings are answered; the design is sent to the showrunner.
+
+### Phase 10b — The run-stop design carries its owners' answers  · status: done
+**Depends on:** Phase 10
+
+Phase 10 sent builds' part of the design. The builds showrunner answered at 13:58 EDT, and verify-unit and resources-unit answer their items by 15:30 EDT.
+
+#### Work Order
+
+**Goal:** `docs/plans/sdlc-run-cancel-design.md` carries each owner's answer, and the design goes to the sdlc showrunner.
+
+**Spec:**
+- Copy paths follow the user's rule of 2026-10-29 (`/tmp/claude/copies/<showrunner>-<unit>/<phase>-<purpose>`, names from `roster.py unit_labels`, owned by verify-unit's `docs/plans/verify-copies.md`). The design points to that rule and defines no second path; the run-stop provenance goes in a file inside that folder.
+- `board.sh` is natedev's file. The TERM and release order builds on verify-unit's token fix (no reclaim from a live holder, token renewed with `--pid`).
+- Fold in verify-unit's and resources-unit's answers on items 1-4, 6 and the grace numbers. An answer that changes a decision is stated as theirs; an item still open stays under Open questions.
+- No code changes.
+
+**Files:**
+- `docs/plans/sdlc-run-cancel-design.md`
+
+**Workers:** none — the unit director makes these doc edits.
+
+**Constraints from prior phases:** Phase 10's design and its round 1 review answers (F001-F008) stay as accepted.
+
+**Acceptance gate:** each owner's answer is in the doc or named as open; no second copy path rule is in the doc; the design is sent to the showrunner.
+
+### Phase 11 — Each quota, memory and slot wait names who holds what it waits on  · status: todo
+**Depends on:** Phase 8
+
+The sdlc showrunner's add-on for hierarchies-unit (2026-10-29). Wait records (Phase 6 and 7) carry `owner_session`, `wait_attribution` and `expected_supplier`, but not who holds the account, slot or memory being waited on. hierarchies counts a Hana wait as caused from outside only when a record names that holder; its four-week experiment (its Phase 4, HI7) waits on this field. It ships its typed reader now and infers no outside cause until the field exists.
+
+#### Work Order
+
+**Goal:** the recorder takes and reports, for each `WaitingForQuotaRefusal`, `ReadyWithoutCapacity` and `WaitingForMemoryOrSlot` wait, the named holder of the resource waited on, and the producers that own the data get an exact hand-off for passing it.
+
+**Spec:**
+- Recorder (`scripts/direct/progress_history.py`):
+  - A tagged holder value: `NamedHolder(resource_kind, resource, holder)` with `resource_kind` one of `account`, `slot`, `memory`, `resource` the account label, slot name or memory pool, and `holder` tagged `SessionHolder(session_id)` or `UnitHolder(unit)`; or `HolderNotNamed(reason)`. No empty strings or nulls carry state.
+  - `start-wait` takes `--holder-resource-kind`, `--holder-resource` and one of `--holder-session` or `--holder-unit`, all or none. None records `HolderNotNamed("producer named no holder")`. A partial set is refused with exit 2.
+  - A holder can change during one wait (the queue moves). A new verb `wait-holder --session-dir D --wait-id ID <holder flags>` appends a `wait_holder_seen` event for an open wait; it refuses a closed or unknown wait id.
+  - `waits` output gives each wait `holders`: every holder seen, in order, each with its time, or one `HolderNotNamed`. Old records with no holder events read as `HolderNotNamed("recorded before holders")`.
+  - Holders apply only to the three wait kinds above; a holder flag on another kind is refused.
+- Producers are other units' files. Write a hand-off for each, with the exact flags, and send it through the sdlc showrunner:
+  - builds (verify-unit, resources-unit): `verify.sh`'s `phase_wait_start` passes the board token owner for a slot wait, the memory reservation owner for a memory wait, and the build hold's holder for a hold wait, and calls `wait-holder` when the holder changes. Agree it with builds [a703f3].
+  - natedev models-unit: `codex_mesh.py`'s `_mesh_phase_wait` passes the account label it waits on for quota and capacity waits.
+- Tell hierarchies-unit the field shape once the checkpoint lands.
+
+**Files:**
+- `scripts/direct/progress_history.py`
+- `scripts/direct/test_progress_history.py`
+
+**Workers:** `1 impl` — writes the recorder change and its tests.
+- `impl` — both files above.
+
+**Constraints from prior phases:** Phase 6 and 7 wait identities (`owner_session`, `wait_attribution`, `expected_supplier`) stay as they are. Phase 8's typed record pattern (frozen dataclass from fields, `ValueError` on bad fields) is the model for the holder type. Type check: `basedpyright scripts/direct/progress_history.py scripts/direct/test_progress_history.py` reads 0 errors, 0 warnings, 0 notes. Tests: `python3 -m unittest scripts.direct.test_progress_history`.
+
+**Acceptance gate:** a test opens each of the three wait kinds with a named session holder and a named unit holder, changes the holder once with `wait-holder`, and reads both holders back in order from `waits`; a wait opened with no holder flags reads `HolderNotNamed`; a partial flag set, a holder on `WaitingForUser`, and `wait-holder` on a closed wait each exit 2; an old history file with no holder events reads `HolderNotNamed("recorded before holders")`. The two hand-offs are sent.

@@ -220,8 +220,9 @@ run_stop.py round --session-dir /tmp/claude/unit/U --phase-instance P --round 3 
 | Records | Control files above; existing mesh JSON, verify live/buildlog records, board wait/ownership records and memory `.waiting`/`.reservation` files gain the common command id and tagged ownership. |
 | Completion | All owned execution confirmed empty, queued places removed, admitted charges and execution slots released, exact waits closed and projections saved. Preserve raw termination status and resource-release times as evidence. |
 
-Use one overall deadline per attempt, proposed as ten seconds including locks,
-local cleanup and host calls. No per-host reset. After committing the stop:
+Use one overall deadline per attempt, 15 seconds (verify-unit), including locks,
+local cleanup and host calls; ssh uses `ConnectTimeout=3`. An attempt ends as soon
+as every target is confirmed empty. No per-host reset. After committing the stop:
 
 1. Block admissions and retries. Remove matching queued entries under their
    queue locks; an already granted entry becomes a cleanup target. Never let a
@@ -229,7 +230,7 @@ local cleanup and host calls. No per-host reset. After committing the stop:
 2. Send **all local TERM requests before any remote call**. Use registered
    handles, deduplicate mesh-wrapped verify, and signal outside resource locks.
    Cover child groups, hold waiters, watchers and registered remote work.
-3. Request remote cleanup within the remaining deadline. Allow a proposed five
+3. Request remote cleanup within the remaining deadline. Allow five
    seconds from each TERM before force. Do not let a remote request consume time
    reserved for local force/recheck. Recheck identity before force. If the overall
    deadline is too close, carry that target and its grace start into the next attempt.
@@ -251,7 +252,9 @@ Stop CLI: **0** means complete, **1** means committed but pending, **2** means
 invalid scope or no confirmed durable commit. Persistence uncertainty includes
 the record path and must be retried before claiming cancellation succeeded.
 
-Run status **77 always means cancelled**, never failed. The receipt names
+Run status **77 always means cancelled**, never failed, and only when verify's
+own cancel path sets it (verify-unit). A child's raw 77 (a test binary or tool)
+records as a failure. The receipt names
 `Command`, `Round` or `Phase`; 77 alone does not mean the phase stopped. Tree-change
 cancellation planned at `docs/plans/natedev-verify.md:101` and explicit replacement
 both call the command form. Neither reruns work or closes its phase. A raw 77
@@ -290,8 +293,10 @@ move preserves ownership. No caller infers stop authority from session absence.
 
 ## builds' part
 
-**Owner: builds production, verify-unit. Every change below needs builds'
-agreement. This is a self-contained hand-off, not permission for sdlc to edit it.**
+**Owners: builds production — verify-unit (verify.sh, its wrappers, mesh and
+final-pass results) and resources-unit (item 2: `memory_admit.py` and hold
+waits); `board.sh` is natedev's. Every change below needs its owner's agreement.
+This is a self-contained hand-off, not permission for sdlc to edit it.**
 
 The proposed `scripts/direct/run_stop.py` stops a command, exact phase instance
 or dispatch ordinal. It atomically replaces one authoritative
@@ -307,24 +312,70 @@ projection. Managed CONTROL is `<session>/run_control`; standalone CONTROL is
    execution. Adapter requests carry stop scope, first cancel id, command id,
    ownership, handles and one attempt deadline; responses are `Pending(targets)`
    or `Complete(evidence)`. Store them in existing verify, board and memory records.
+   **verify-unit agrees**, with two changes. (a) Landing order: the launchers
+   (`implement.sh`, `review.sh`, `mesh_runs.py start`) first export the full
+   Managed link (unit run, session dir, phase instance, dispatch ordinal, origin)
+   in env; verify.sh refuses a unit call with no link only after that lands, so no
+   worker's verify call fails on the day the refusal lands. (b) One id: the
+   outermost entry makes the command id once and passes it down in one env
+   variable. `BUILDLOG_CALL_ID`, the mesh run id, the board wait key and the memory
+   `.waiting`/`.reservation` ids stay as adapter handles. The Mac boot id is
+   `kern.boottime`, because macOS has no `/proc` boot_id.
 2. **Admission and memory.** Add idempotent cancel-by-command to memory admission,
    board and hold waits. Remove queued places promptly and block recreation.
-   Change **normal** cleanup at `scripts/lint/memory_admit.py:737`, not just the
+   Change **normal** cleanup at `scripts/lint/memory_admit.py:763`, not just the
    cancel path: bind each admitted charge to its owned execution group or
    containment, retain it after wrapper death, and release only on confirmed
    emptiness. Unknown or unreachable groups retain charges. Admission returns
    unused grants when the control barrier rejects a start.
-3. **TERM and release order.** `scripts/direct/verify.sh:2785` currently calls
-   `release_token` immediately on TERM. `scripts/direct/board.sh:285` sends SIGKILL;
-   release invokes it under its guard (`scripts/direct/board.sh:453`). Replace
-   these routes with: commit stop, deny new execution, request TERM outside locks,
+   **resources-unit agrees**, with these changes. (a) Bind each charge to the
+   step's systemd scope cgroup, not a process group: `invoke.sh` never calls
+   setsid and nextest moves tests into groups of their own, so a group check
+   can call a live group empty or a reused pgid alive. The scope exists
+   (`invoke.sh:88`, `:138`) and its cgroup path is already the reservation's
+   sidecar field. Empty means `populated 0` in `<cgroup>/cgroup.events`, or the
+   scope folder is gone. Store the cgroup inode and boot id at admission so
+   reuse cannot match. (b) A kept charge whose wrapper is dead counts the
+   cgroup's measured memory, not `need`, because a kept charge blocks the
+   alone-always-fits rule in `decide()` (`memory_admit.py:395`). (c) A step with
+   no scope (`BUILDLOG_SCOPE=0`, a sandbox, no user systemd) keeps today's rule:
+   the charge goes when the wrapper pid dies, so admission never starves.
+   (d) Hold waits keep no queue place (`build_targets.py:322-399`); cancel them
+   with the existing interrupt-local (`:402`). Cancel and grant take the same
+   admission lock (`memory_admit.py:1003`). Re-entry is blocked by a durable
+   tombstone `admission/<command-id>.stopped`, which a second cancel rewrites
+   unchanged and which is pruned when no row names that command. Today's
+   cleanup is `live_reservations` at `memory_admit.py:763` (it moved from `:737`
+   in resources-unit's Phase 1). `run_stop.py` calls the installed
+   `~/.claude/scripts/lint/memory_admit.py` through a new `cancel` verb, never a
+   checkout's copy. If `run_stop.py` deletes a clone's target, it takes the
+   cargo locks as `sweep.py` `lock_trees` does and writes a removal record.
+3. **TERM and release order.** Build this on verify-unit's token fix (board.sh
+   never reclaims from a live holder; the token is renewed with `--pid`), not on
+   today's `scripts/direct/verify.sh:2785`, which calls `release_token` at once on
+   TERM. `scripts/direct/board.sh` is natedev's file: today line 285 sends SIGKILL
+   and release invokes it under its guard (line 453). On that fix, the order is: commit stop, deny new execution, request TERM outside locks,
    allow grace, force only verified targets, confirm emptiness, then reacquire the
    resource guard and release the exact owner's slot/charge. Normal release and
    stale-owner reclaim must follow the same rule when execution remains. No
-   signals or waits under the resource guard. One ten-second attempt deadline
+   signals or waits under the resource guard. One 15-second attempt deadline
    includes every host; send all local TERM requests before remote calls, reserve
-   time for local rechecks, and persist unfinished targets. Proposed grace is five
-   seconds; an unfinished grace continues on retry.
+   time for local rechecks, and persist unfinished targets. Grace is five seconds;
+   an unfinished grace continues on retry.
+   **verify-unit agrees.** Its token fix (its Phase 7, branch
+   `natedev-verify-token`, landing about 15:30 EDT 2026-10-29) already moves
+   `board.sh` to this rule: an expired hold is never reclaimed while `holder_pid`
+   is alive and the owned group matches. Build on that branch. Additions: (a) the
+   token-renew loop runs inside verify's owned group, so TERM stops it, and it
+   never takes or renews a token after the stop commits; (b) the Mac claim
+   (`mac_test.py` `state.lock`) is a resource like the token: release it only
+   after the remote side is confirmed empty, and an unreachable Mac keeps the
+   claim and the memory charge pending; (c) `verify.sh:2785` release on TERM and
+   `board.sh:285` SIGKILL under the guard both go. Five seconds of grace suits
+   local and Mac targets because TERM reaches the whole owned group; nextest's
+   own grace is about ten seconds, and the force at five wins for verified
+   targets. Ten seconds was too short with a Mac target (ssh connect up to about
+   three seconds, five seconds of grace, a second ssh to check and force).
 4. **Cancellation result.** Agree command-only cancellation for explicit replacement
    and `docs/plans/natedev-verify.md:101` tree changes. Both use the same stop and
    receipt protocol; 77 always means cancelled. Receipts identify command, round
@@ -332,27 +383,36 @@ projection. Managed CONTROL is `<session>/run_control`; standalone CONTROL is
    cancellation as a verdict or trigger repair. Keep 76 compatible. A command keeps
    its first cancel id even when a later phase stop takes over pending round cleanup;
    publish one command result. Mesh and final-pass consumers must honor this too.
-5. **Copy path: please confirm.** The external copy plan is unavailable here.
-   Request this shape, or an equivalent with the same identity components:
-
-   ```text
-   /tmp/claude/unit/<unit-run-id>/phases/<phase-id>/instances/<phase-instance-id>/
-     build-copies/<command-id>/<copy-id>/tree/
-     build-copies/<command-id>/<copy-id>/provenance.json
-   ```
-
-   Existing delegate runs may retain `/tmp/claude/delegate/`. Publish provenance
-   before execution: command id, tagged phase/round ownership, copy id, host and
-   source repo plus `CommitTree(commit,tree)` or `WorkingTreeDigest(algorithm,digest)`.
-   Never reuse copy ids. This proves ownership, not obsolescence. Retain provenance
-   through cleanup; remove bulky copies only after execution is confirmed empty.
+   **verify-unit agrees.** Its Phase 2 (cancel on tree change) already exits 77
+   for its own command only, with no rerun, records buildlog outcome
+   `cancelled`, writes no pass record, and `merge_checkpoint` does not retry 77.
+   It writes no receipt yet, so it reads as `PendingReceipt` until
+   `run_stop.py` exists; then its watcher calls `run_stop.py command`.
+   `lint_failure_is_the_tree` excludes 77 as its Phase 7 excludes 125.
+5. **Copy path: the user's rule.** This design defines no copy path. Copies
+   follow the user's rule of 2026-10-29: `/tmp/claude/copies/<showrunner>-<unit>/<phase>-<purpose>`
+   (example `/tmp/claude/copies/hana-lfo/54b-gate`), with names only from
+   `roster.py unit_labels`, never run or session ids. verify-unit's plan
+   `docs/plans/verify-copies.md` owns it, and each copy is a `scratch.py` record
+   made at birth with its task and provenance. The run-stop fields go in a
+   provenance file inside that folder, written before execution: command id,
+   tagged phase/round ownership, copy id, host and source repo plus
+   `CommitTree(commit,tree)` or `WorkingTreeDigest(algorithm,digest)`. Never reuse
+   copy ids. This proves ownership, not obsolescence. Retain provenance through
+   cleanup; remove bulky copies only after execution is confirmed empty.
 6. **Future acceptance cases.** Cover registration/admission/stop races; wrapper
    death with a live child during normal reservation cleanup; local TERM before
    an unreachable host; deadline expiry and retry; pid reuse; command-only tree
    change; standalone calls; late round-N landed/abandon after N+1; partial writes
    and scratch sweep; completed-result races; two callers; **round stop pending,
-   then phase stop**; and sibling phases. These are implementation checks, not
-   checks run for this document.
+   then phase stop**; and sibling phases. verify-unit adds: after a stop, the
+   renew loop does not extend the token; the Mac claim and memory charge are
+   kept while the Mac is unreachable and released after it is confirmed empty;
+   a child's raw 77 records as a failure; a cancelled lint is never replayed
+   from cache; an expired hold with a live holder is not reclaimed during a
+   stop's grace; a stop between the Mac claim and the remote start leaves no
+   remote process. These are implementation checks, not checks run for this
+   document.
 
 sdlc owns the command, authoritative record, findings/history projections, callers
 and the pending-record protection in `scripts/lint/tmp_sweep.py`. Mesh must adopt
@@ -369,8 +429,8 @@ shared ownership and cancellation receipts. Unsupported adapters remain pending.
 
 ## Open questions
 
-Builds must confirm the copy path, adapter contract, remote containment and proposed
-five-second grace/ten-second attempt. No cross-host completeness was established.
+verify-unit agreed items 1, 3, 4 and 6, and resources-unit agreed item 2, each
+with the changes above. No cross-host completeness was established.
 L1–L4 do not verify the exact child start or park time, retained memory, or affected
 peers. Legacy records lack complete joins. Automatic stops from owner absence,
 reservation release or tree obsolescence need a separate process ruling.
