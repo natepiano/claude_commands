@@ -369,7 +369,7 @@ Phase 10 sent builds' part of the design. The builds showrunner answered at 13:5
 
 **Acceptance gate:** each owner's answer is in the doc or named as open; no second copy path rule is in the doc; the design is sent to the showrunner.
 
-### Phase 11 — Each quota, memory and slot wait names who holds what it waits on  · status: todo
+### Phase 11 — Each quota, memory and slot wait names who holds what it waits on  · status: done
 **Depends on:** Phase 8
 
 The sdlc showrunner's add-on for hierarchies-unit (2026-10-29). Wait records (Phase 6 and 7) carry `owner_session`, `wait_attribution` and `expected_supplier`, but not who holds the account, slot or memory being waited on. hierarchies counts a Hana wait as caused from outside only when a record names that holder; its four-week experiment (its Phase 4, HI7) waits on this field. It ships its typed reader now and infers no outside cause until the field exists.
