@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
+import fcntl
 import io
 import json
 import os
@@ -113,6 +114,20 @@ class QueueTests(unittest.TestCase):
             self.assertEqual(build_queue.main(), 0)
         read.assert_called_once_with()
         self.assertEqual(output.getvalue(), "memory queue: empty\n")
+
+    def test_cli_reports_admission_lock_timeout_with_status_two(self) -> None:
+        directory = self.root / "buildlog/admission"
+        directory.mkdir(parents=True)
+        errors = io.StringIO()
+        output = io.StringIO()
+        with (directory / "lock").open("a+") as lock, \
+             mock.patch.object(memory_admit, "QUEUE_LOCK_TIMEOUT_SECONDS", 0.03), \
+             mock.patch("sys.argv", ["build_queue.py"]), \
+             redirect_stderr(errors), redirect_stdout(output):
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.assertEqual(build_queue.main(), 2)
+        self.assertEqual(errors.getvalue(), "build queue: admission lock busy for 0.03 s; try again\n")
+        self.assertEqual(output.getvalue(), "")
 
     def test_ten_thousand_waiting_and_running_rows_render_in_under_one_second(self) -> None:
         waiting = tuple(memory_admit.WaitingStep(

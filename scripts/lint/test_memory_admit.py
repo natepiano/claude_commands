@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -435,11 +436,28 @@ class MeasuredAdmissionTests(MemoryQueueFixture):
         self.assertEqual((result.decision.state, result.head_need), ("admit", 0))
         self.assertFalse(head.exists())
 
-    def test_head_that_cannot_fit_reserves_nothing_from_smaller_steps(self) -> None:
+    def test_head_beyond_memory_released_by_running_steps_does_not_hold_smaller_steps(self) -> None:
         _ = self.running(100, 12)
         _ = self.head(20)
         result = self.check(need=2, free=8)
         self.assertEqual((result.decision.state, result.head_need), ("admit", 0))
+
+    def test_head_that_fits_after_measured_steps_end_holds_smaller_steps(self) -> None:
+        _ = self.running(100, 30)
+        self.readings[100] = gate.MeasuredMemory(int(21.5 * GIB))
+        _ = self.head(19.3)
+        result = self.check(need=2, free=13)
+        self.assertEqual(result.decision.state, "hold")
+        self.assertEqual((result.head_need, result.head_label),
+                         (int(19.3 * GIB), "clone88ci nextest (verify pid 300)"))
+        self.assertIsInstance(result.reservation, gate.NotReserved)
+
+    def test_pending_start_promise_cannot_make_a_head_fit_after_drain(self) -> None:
+        _ = self.running(100, 12, age=0)
+        _ = self.head(20)
+        result = self.check(need=2, free=18)
+        self.assertEqual((result.decision.state, result.head_need, result.decision.promised),
+                         ("admit", 0, 12 * GIB))
 
     def test_dead_head_is_removed_without_charging_its_need(self) -> None:
         head = self.head()
@@ -577,18 +595,72 @@ class QueueApiTests(MemoryQueueFixture):
                          {"kind": "queue_bump", "actor": "actor-id", "session": "session-400", "step": "nextest",
                           "folder": "/tmp/warmup-tree", "old_position": 2, "at": store.utc_iso(NOW.timestamp())})
 
-    def test_queue_view_does_not_prune_dead_records_or_wait_for_the_lock(self) -> None:
+    def test_queue_view_and_check_agree_on_heads_that_can_and_cannot_fit_after_drain(self) -> None:
+        _ = self.running(100, 30)
+        self.readings[100] = gate.MeasuredMemory(int(21.5 * GIB))
+        for need, held in ((19.3, True), (38, False)):
+            with self.subTest(head_need=need):
+                path = self.head(need)
+                row = cast(gate.Waiter, json.loads(path.read_text()))
+                row["session_name"] = "clone88ci"
+                _ = path.write_text(json.dumps(row))
+                result = self.check(need=2, free=13)
+                if not held:
+                    assert isinstance(result.reservation, gate.Reserved)
+                    result.reservation.path.unlink()
+                    _ = self.waiter(400, NOW.timestamp(), "/tmp/warmup-tree", "warmup")
+                    waiter_path = self.root / "admission/400-warmup.waiting"
+                    follower = cast(gate.Waiter, json.loads(waiter_path.read_text()))
+                    follower["need"] = 2 * GIB
+                    _ = waiter_path.write_text(json.dumps(follower))
+                view = gate.queue_view()
+                reason = next(step.reason for step in view.waiting if step.pid == 400)
+                if held:
+                    self.assertEqual(result.decision.state, "hold")
+                    self.assertEqual(reason, gate.BehindHead("clone88ci", NOW.timestamp() - 2400))
+                else:
+                    self.assertEqual(result.decision.state, "admit")
+                    self.assertIsInstance(reason, gate.ReadyForAdmission)
+
+    def test_queue_view_waits_for_lock_and_keeps_real_reasons_without_pruning(self) -> None:
         paths = self.queue()
         del self.processes[300]
         _ = self.enterContext(patch.object(gate, "process_table", return_value={
             pid: gate.ProcessIdentity(1, start) for pid, start in self.processes.items()}))
         lock_path = self.root / "admission/lock"
+        released = threading.Event()
+        previous = signal.getsignal(signal.SIGALRM)
         with lock_path.open("a+") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            view = gate.queue_view()
+            def release() -> None:
+                released.set()
+                fcntl.flock(lock, fcntl.LOCK_UN)
+            timer = threading.Timer(0.05, release)
+            timer.start()
+            try:
+                view = gate.queue_view()
+                self.assertTrue(released.is_set())
+            finally:
+                timer.cancel()
+                timer.join()
         self.assertEqual([row.pid for row in view.waiting], [400, 500])
         self.assertTrue(paths[0].exists())
-        self.assertTrue(all(isinstance(row.reason, gate.ReadingUnavailable) for row in view.waiting))
+        self.assertTrue(all(isinstance(row.reason, gate.ReadyForAdmission) for row in view.waiting))
+        self.assertEqual(view.available, int(23.1 * GIB) // 1024 * 1024)
+        self.assertEqual(signal.getsignal(signal.SIGALRM), previous)
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL)[0], 0)
+
+    def test_queue_view_times_out_on_held_lock_and_restores_alarm(self) -> None:
+        _ = self.queue()
+        previous = signal.getsignal(signal.SIGALRM)
+        with (self.root / "admission/lock").open("a+") as lock, \
+             patch.object(gate, "QUEUE_LOCK_TIMEOUT_SECONDS", 0.03):
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with self.assertRaisesRegex(TimeoutError, "admission lock busy for 0.03 s; try again"):
+                _ = gate.queue_view()
+        self.assertEqual(signal.getsignal(signal.SIGALRM), previous)
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL)[0], 0)
+        self.assertEqual(len(gate.queue_view().waiting), 3)
 
     def test_missing_meminfo_is_a_reading_unavailable_reason(self) -> None:
         _ = self.queue()
