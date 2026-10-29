@@ -206,7 +206,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - `impl` — `measure.py`, `push_audit.py` and the doc
 - `test` — `test_measure.py` and `test_push_audit.py`: `compare` on fixtures with known before and after values, and the fixtures above
 
-**Constraints from prior phases:** shared log helpers live in `scripts/hierarchies/log_records.py`; `measure.py` imports `push_audit.py`, never the reverse; session names come only from `config/hierarchies/sessions.toml`. The wait records come from `progress_history.py waits` (phases-unit 820357a2) through the Phase 4 loader and types. From Phase 8: `measure.py baseline` and `push_audit.py report` print a short summary by default and their tables under `--full`; `compare` prints the same way.
+**Constraints from prior phases:** shared log helpers live in `scripts/hierarchies/log_records.py`; `measure.py` imports `push_audit.py`, never the reverse; session names come only from `config/hierarchies/sessions.toml`. The wait records come from `progress_history.py waits` (phases-unit 820357a2; holder and origin fields from 49fd1b0f) through the Phase 4 loader and types. Phase 11's repair reads origin fields into `RecordedOrigin` / `OriginNotRecorded`; Phase 10 adds the unresolved-origin row and the holder history, and this review keeps that uncertainty visible. From Phase 8: `measure.py baseline` and `push_audit.py report` print a short summary by default and their tables under `--full`; `compare` prints the same way.
 
 **Acceptance gate:** unit tests green; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; Results holds real numbers for each step, judged on the measure and review point each of Phases 3–5 names. **Measure and review point:** this phase is the review point for Steps 1, 2 and 4. At phase end the unit director sends the showrunner the Results and the keep-or-drop list as one question for the user.
 
@@ -285,46 +285,42 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - A wait row with no `wait_id` that the supplier now counts in `ignored_n` / `wait_without_id_n` is still a source problem, not a zero.
 - Rename `WaitCauseNotRecorded` to `WaitKindNotRecorded`: it is built when `wait_kind` is absent and says nothing about cause.
 - The reader's checkpoint does not start the experiment. The experiment starts on the first day on which each holder producer (builds' `verify.sh` for slot, memory and hold waits; models-unit's `codex_mesh.py` for quota and capacity waits) has recorded a `NamedHolder`, read live from `waits`. Design doc Step 2 records the start and the review date (four weeks later) as UTC bounds. While a producer has not emitted, Step 2 says `start not set: waiting on <producer>`, and the unit director tells the sdlc showrunner which producer. On 2026-10-29, `verify.sh` (~1073) and `codex_mesh.py` (~3243) still call `start-wait` without holder flags; builds and models-unit own those calls, and sdlc has told them. One wait plus one receipt never sets the start (sdlc, G1): it needs a `NamedHolder` from each producer.
+- A phase whose origin fields are all `NotRecorded` and that no worktree or plan path identifies is not dropped: it becomes a typed unresolved-origin outcome, and `baseline --full` prints a row with its run, phase instance and reason (architect review after Phase 11 found it silently dropped, 0.0 min). Mixed-record test: such a phase beside valid Hana rows.
+- Row-level recovery: a malformed holder or origin value beside valid Hana rows leaves the valid counts in the final report and names the rejected row; the whole report never falls back to missing history. Test it with mixed fixtures.
+- `baseline --full` shows, per wait with a holder history, the wait id, the resource, the session or unit, the observation times and the unnamed intervals; a wait with no recorded end keeps its duration unknown, never zero.
 - HI7 acceptance case: one test reads, through the real `progress_history.py waits` and on to the final `baseline --full` report, a producer's named holder, a holder change during one wait, and an unnamed holder. Unknown evidence shows as recorded or not recorded with its reason, never as zero delay.
 
 **Files:**
-- `scripts/hierarchies/measure.py`, `scripts/hierarchies/test_measure.py` — holder history type, origin conversion, the holder rows, the rename
+- `scripts/hierarchies/measure.py`, `scripts/hierarchies/test_measure.py` — holder history type, the unresolved-origin row, the holder rows, the rename (origin conversion shipped in Phase 11)
 - `docs/plans/build-followups-hierarchies-design.md` — Step 2 experiment dates
 
 **Workers:** `1 writer + 1 tester`
 - `impl` — `measure.py` and the design doc
 - `test` — `test_measure.py`: holder named for the whole wait, a holder change during one wait, a wait with a holder for part of its time, `HolderNotNamed` and `HolderNotNamed("recorded before holders")`, not-recorded origin fields, the retired-phase fixture, the missing-id count, and one test that runs the real `progress_history.py waits` on a fixture history file
 
-**Constraints from prior phases:** the supplier schema is sdlc's `docs/plans/sdlc-phases.md` Phase 11, merged as 49fd1b0f: producer flags `--holder-resource-kind`, `--holder-resource` and `--holder-session` or `--holder-unit` on `start-wait`, and `progress_history.py wait-holder --session-dir D --wait-id ID` when the holder changes; `NamedHolder(resource_kind, resource, holder)`, `SessionHolder(session_id)`, `UnitHolder(unit)`, `HolderNotNamed(reason)`, `wait_holder_seen` events, `wait_without_id_n`, and the phase row fields `plan_doc`, `production`, `repository`. Wait kinds, `HistoryNotRecorded`, `UncertainWaitCoverage`, `WaitCauseNotRecorded`, `NamedSupplier`/`NoNamedSupplier` and `RecordedWaitReason`/`WaitReasonNotRecorded` exist in `measure.py`; the summary keeps its five lines and new rows print under `--full`; `push_audit.py` never imports `measure.py`; shared log helpers live in `scripts/hierarchies/log_records.py`. Phase 12 also edits `measure.py`; the two phases never run at the same time.
+**Constraints from prior phases:** the supplier schema is sdlc's `docs/plans/sdlc-phases.md` Phase 11, merged as 49fd1b0f: producer flags `--holder-resource-kind`, `--holder-resource` and `--holder-session` or `--holder-unit` on `start-wait`, and `progress_history.py wait-holder --session-dir D --wait-id ID` when the holder changes; `NamedHolder(resource_kind, resource, holder)`, `SessionHolder(session_id)`, `UnitHolder(unit)`, `HolderNotNamed(reason)`, `wait_holder_seen` events, `wait_without_id_n`, and the phase row fields `plan_doc`, `production`, `repository`. Wait kinds, `HistoryNotRecorded`, `UncertainWaitCoverage`, `WaitCauseNotRecorded`, `NamedSupplier`/`NoNamedSupplier` and `RecordedWaitReason`/`WaitReasonNotRecorded` exist in `measure.py`; the summary keeps its five lines and new rows print under `--full`; `push_audit.py` never imports `measure.py`; shared log helpers live in `scripts/hierarchies/log_records.py`. Phase 12 also edits `measure.py`; the two phases never run at the same time. From Phase 11: `PhaseOrigin` fields are `RecordedOrigin | OriginNotRecorded`, read by `origin_field`; `scope_queue` lives in `scripts/lib/urgency.py`. When imports move, the type check also covers the gate's cycle files (`scripts/accounts/accounts.py`, `scripts/hooks/showrunner_footer.py`), or run the merge gate's basedpyright.
 
 **Acceptance gate:** unit tests green, with the fixtures above; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; live on natedev, `measure.py baseline --full` over a window after the supplier merge prints the holder rows per wait kind. **Change-Review row:** one, with the full command.
 
 ### Phase 11 — /change_review shows the same first row as /next, also from an attached production's earlier list  · status: done
-**Depends on:** Phase 9. Runs next (a gap in what Phase 9 shipped).
 
-#### Work Order
+#### As-built
 
-**Goal:** `change_review.py show <production>` reads the same queue as `/next`: the current list and the attached production's earlier list, in the same order, with the same pinned first row, named as `/next` names it (`C434`, `sdlc/C9`).
-
-**Hana link:** indirect. `/change_review` says it keeps the order of `/next`; when the two disagree, the user reviews a different change from the one `/next` offered, and an earlier-list change never comes up there.
-
-**Spec:**
-- Cause: the `show` action in `change_review._run` reads only the current list (`pending(path)`, `row_entries`, `queue(path)`), while `next_item.change_queue` reads `scope_entries(path, doc, below)` and pins under `<queue>-<slug>` for a lower showrunner. So `show` omits `sdlc/C9` and can pin a different row.
-- Move the change queue (its entries and its pin name) into one function in `change_review.py`; `next_item.change_queue` and `show` both call it. `next_item.py` imports `change_review.py`, never the reverse.
-- `show` prints the row ID as `/next` shows it. Its `N more to review` count is the queue's length and equals the For-you count for the same production.
-- A list that cannot be read stays one stderr line, as in `/next`.
+- `change_review.change_queue(path: Path, scope: Path | WholeReviewList, below: bool = False) -> ChangeQueue` is the one change queue. `ChangeQueue` holds `name` (the pin name) and `entries`. For a production doc it reads `scope_entries(path, doc, below)` and pins under `queue(path)` for the root, or `<queue>-<slug>` for a lower showrunner. `WholeReviewList.ALL_ROWS` reads every row of an explicit list.
+- `next_item.change_queue` and `change_review.py show` both call it. With a production, `show` reads the current and earlier lists, prints the row ID as `/next` does (`C434`, `sdlc/C9`), keeps the same pin, and its `N more to review` count is the queue length. `show --list` with no production reads every row of that list.
+- `measure.py` reads origin fields into typed values. A field that is not recorded never marks a phase as Hana.
 
 **Files:**
-- `scripts/production/change_review.py` — the shared change queue, `show`
-- `scripts/production/next_item.py` — `change_queue` calls the shared function
-- `scripts/production/test_change_review.py`, `scripts/production/test_next_item.py` — tests
+- `scripts/production/change_review.py` — `ChangeQueue`, `WholeReviewList`, `change_queue`, `show`
+- `scripts/production/next_item.py` — `change_queue` wraps the shared queue
+- `scripts/lib/urgency.py` — `scope_queue`, `ALL_BELOW`
+- `scripts/production/update_registration.py`, `scripts/production/rename_outside.py` — call `urgency.scope_queue`
+- `scripts/hierarchies/measure.py` — `RecordedOrigin`, `OriginNotRecorded`, `origin_field`
+- `scripts/production/test_change_review.py`, `scripts/production/test_next_item.py`, `scripts/hierarchies/test_measure.py` — tests
 
-**Workers:** `1 writer`
-- `impl` — all files
+**Binds later work:** `PhaseOrigin` fields `plan`, `production` and `repository` are `RecordedOrigin | OriginNotRecorded`. `origin_field(record, key)` reads them for the wait report and phase completion readers. It accepts the supplier's tagged shape (`state` `Recorded` with `value`, or `NotRecorded` with `reason`) and earlier plain text, and raises `ValueError` on any other shape. `scope_queue(name, below)` and `ALL_BELOW` live in `scripts/lib/urgency.py`. `next_item.py` imports `change_review.py`, never the reverse. A pin set by `/next` is the row `/change_review show` shows, and the reverse.
 
-**Constraints from prior phases:** from Phase 9: current-list rows keep plain IDs and their saved pins and moved state; rows from other lists carry the list name; a scoped production's own list belongs to it also when it is the current list; `--row` takes the ID as shown and a contradicting `--list` is refused. Tests: `python3 -m unittest scripts.production.test_change_review scripts.production.test_next_item`.
-
-**Acceptance gate:** unit tests green, with a test that `change_review.py show` and `next_item.py show --kind change` print the same first row for an attached production (`child/C9`) and exclude parent-only rows, and that a pin set by one is the row the other shows; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; live on natedev, `change_review.py show` for sdlc prints the same first row as `next_item.py show --kind change --production <sdlc doc>`. **Change-Review row:** one, with the full command. **Also touches:** `scripts/production/` (owner: builds unit; enh-showrunner unit retired); name them in the checkpoint notice.
+**Gotchas:** the merge gate's basedpyright reports import cycles through function-local imports, and a per-file type check does not. A change that moves an import must type-check the cycle files (`accounts.py`, `showrunner_footer.py`) or run the gate's basedpyright.
 
 ### Phase 12 — The push audit judges each push by the exception in force when it went out, and the wait share counts one set of phases  · status: todo
 **Depends on:** Phase 4. Merge before the 2026-11-12 re-runs. Not at the same time as Phase 10 (both edit `measure.py`).
@@ -347,6 +343,10 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - `impl` — `push_audit.py` and `measure.py`
 - `test` — `test_push_audit.py` and `test_measure.py`: the fixtures above
 
-**Constraints from prior phases:** `measure.py` imports `push_audit.py`, never the reverse; shared log helpers live in `scripts/hierarchies/log_records.py`; session names come only from `config/hierarchies/sessions.toml`; `measure.py baseline` and `push_audit.py report` print a short summary and their tables under `--full`. Tests: `python3 -m unittest scripts.hierarchies.test_push_audit scripts.hierarchies.test_measure`.
+**Constraints from prior phases:** `measure.py` imports `push_audit.py`, never the reverse; shared log helpers live in `scripts/hierarchies/log_records.py`; session names come only from `config/hierarchies/sessions.toml`; `measure.py baseline` and `push_audit.py report` print a short summary and their tables under `--full`. From Phase 11: `PhaseOrigin` fields are `RecordedOrigin | OriginNotRecorded`; from Phase 10: the unresolved-origin row stays visible in the wait share. The policy boundary is the merge of c73a2d02, `dde7ec2e` at 2026-10-29T03:05:59Z. Tests: `python3 -m unittest scripts.hierarchies.test_push_audit scripts.hierarchies.test_measure`.
 
-**Acceptance gate:** unit tests green, with the fixtures above; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; live on natedev, `push_audit.py report` and `measure.py baseline --full` over the Baseline window print the corrected rows. **Change-Review row:** one per command, with the full command.
+**Spec additions (architect review after Phase 11):**
+- `PhaseCompletion` keeps the run id and phase instance id, so waits match their phase; load the earlier history a phase in the window needs, since the supplier filters waits by start time; join each phase's origin from its `phase_started` record (the supplier does not copy origin fields to `phase_finished`). The boundary test runs through the real supplier reader, with a retired worktree.
+- Test a delivery exactly at the boundary, and a review before it whose delivery follows it.
+
+**Acceptance gate:** unit tests green, with the fixtures above; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; live on natedev, `push_audit.py report` and `measure.py baseline --full` over the Baseline window print the corrected rows, and both commands over a window after the boundary (2026-10-29T03:05:59Z) show the revoked exception applied. **Change-Review row:** one per command, with the full command.
