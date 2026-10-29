@@ -49,7 +49,7 @@
 | herdr-trust-unit | (retired 2026-10-18, worktree removed) `docs/as-built/herdr-adoption.md` (run done; as-built) | /home/natepiano/worktrees/claude-build-followups-herdr-trust | build-followups-herdr-trust | — | — |
 | herdr-unit | docs/as-built/herdr-adoption.md | `/home/natepiano/worktrees/claude-natedev-herdr` | `natedev-herdr` | — | — |
 | nightly-review-unit | (retired 2026-10-19, worktree removed) permanent | /home/natepiano/worktrees/claude-build-followups-nightly-review | build-followups-nightly-review | — | — |
-| style-unit | `docs/as-built/style-showrunner.md` (run done; as-built) | /home/natepiano/worktrees/claude-build-followups-style | build-followups-style | — | — |
+| style-unit | `docs/as-built/style-showrunner.md` (run done; as-built) | `/home/natepiano/worktrees/claude-natedev-style` | `natedev-style` | — | — |
 | unit-board-unit | docs/as-built/unit-board.md | `/home/natepiano/worktrees/claude-natedev-unit-board` | `natedev-unit-board` | — | — |
 | hanadocs-unit | (retired 2026-10-28, worktree removed, session 6eaf058b-3fef-41bc-98d3-3c54e63a242a) standby | /home/natepiano/worktrees/claude-build-followups-hanadocs | build-followups-hanadocs | — | the hanadocs vault (~/rust/hanadocs); commits to its main |
 | review-unit | (retired 2026-10-18, worktree removed) docs/plans/build-followups-review.md | /home/natepiano/worktrees/claude-build-followups-review | build-followups-review | — | — |
