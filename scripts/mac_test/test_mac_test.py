@@ -29,11 +29,8 @@ SCRIPT = Path(__file__).with_name("mac_test.py")
 LOCAL_ZONE = ZoneInfo("America/New_York")
 CI_JOB = "macOS: Compile and Test"
 SKIPPED_REPORT_RUNS = 200
-# An unblock that reports this many runs starts the stand-in gh once for the
-# switch, once for the list and once for each run, one after another. A start
-# costs about 20 ms of processor time, so the whole report needs about 4 s on
-# an idle machine; 0.3 s for each start leaves room for cores shared with builds.
-SKIPPED_REPORT_TIMEOUT_S = (SKIPPED_REPORT_RUNS + 2) * 0.3
+# Guard hung fixture commands without timing their Python starts under load.
+COMMAND_TIMEOUT_S = 5 * 60
 
 
 class RunState(TypedDict):
@@ -347,7 +344,7 @@ class MacTestCommandTests(unittest.TestCase):
         os.close(self.writer_write_fd)
         self.writer_write_fd = -1
         try:
-            readable, _, _ = select.select([self.writer_read_fd], [], [], 30)
+            readable, _, _ = select.select([self.writer_read_fd], [], [], COMMAND_TIMEOUT_S)
             self.assertTrue(readable, "Fixture descendants did not finish before directory cleanup")
             self.assertEqual(os.read(self.writer_read_fd, 1), b"")
         finally:
@@ -366,7 +363,7 @@ class MacTestCommandTests(unittest.TestCase):
             "ci_job": CI_JOB,
             # Long enough for the Python gh stand-in under load; a test about
             # the limit sets its own.
-            "gh_timeout_s": "60",
+            "gh_timeout_s": str(COMMAND_TIMEOUT_S),
             "block_hours": "4",
             "block_max_hours": "48",
             "block_warn_minutes": "15",
@@ -390,12 +387,13 @@ class MacTestCommandTests(unittest.TestCase):
         self,
         *arguments: str,
         environment: dict[str, str] | None = None,
-        timeout: float = 60,
+        timeout: float = COMMAND_TIMEOUT_S,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [sys.executable, str(SCRIPT), *arguments],
             cwd=self.root,
             env=self.environment if environment is None else environment,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             check=False,
@@ -410,6 +408,7 @@ class MacTestCommandTests(unittest.TestCase):
             [sys.executable, str(SCRIPT), *arguments],
             cwd=self.root,
             env=self.environment if environment is None else environment,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -1154,7 +1153,7 @@ class MacTestCommandTests(unittest.TestCase):
         with log.open("a+") as held_log:
             fcntl.flock(held_log, fcntl.LOCK_EX)
             try:
-                result = self.command("block", "--holder", "alice", "--for", "rendering", timeout=60)
+                result = self.command("block", "--holder", "alice", "--for", "rendering")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 block = self.block_state()
                 for name in ("state.lock", "control.lock"):
@@ -1944,9 +1943,7 @@ for arguments in (
         }
         self.sync_gh()
         self.clear_log("gh")
-        capped = self.command(
-            "unblock", "--holder", "alice", timeout=SKIPPED_REPORT_TIMEOUT_S
-        )
+        capped = self.command("unblock", "--holder", "alice")
         self.assertEqual(capped.returncode, 0, capped.stdout + capped.stderr)
         self.assertEqual(self.gh_calls("run view"), SKIPPED_REPORT_RUNS)
         self.assertIn("No CI run skipped the macOS job under this block.\n", capped.stdout)
@@ -2241,7 +2238,7 @@ subprocess.run = expire_gh
         self.sync_gh()
         first = self.start_command("watch")
         self.wait_for_path(self.stub_directory / "watch-gh-started")
-        second = self.command("watch", timeout=60)
+        second = self.command("watch")
         self.assert_command(second, 0, "")
         self.assertIsNone(first.poll())
         _ = (self.stub_directory / "continue-watch-gh").write_text(
@@ -2308,7 +2305,7 @@ subprocess.run = expire_gh
             **self.environment,
             "MAC_TEST_MESSAGE_TIMEOUT_S": "0.05",
         }
-        status = self.command("status", environment=environment, timeout=60)
+        status = self.command("status", environment=environment)
         self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
         self.assertIn(
             'The "Mac is free" message has not reached dana yet.\n',

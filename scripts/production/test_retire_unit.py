@@ -10,10 +10,11 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
-from typing import TYPE_CHECKING, final, override
+from typing import TYPE_CHECKING, Literal, cast, final, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -69,6 +70,7 @@ class RetireUnitTests(unittest.TestCase):
     pool_lines: str = ""
     marked: unit_lookup.MarkedUnit | None = None
     config: Path = Path()
+    records: list[SessionShutdown] = []
 
     @override
     def setUp(self) -> None:
@@ -113,6 +115,7 @@ class RetireUnitTests(unittest.TestCase):
         _ = (holds / DIRECTOR).write_text("{}", encoding="utf-8")
 
         self.calls = []
+        self.records = []
         self.claude = [session(DIRECTOR, "alpha", 4101), session(SEAT, "alpha-seat", 4102)]
         self.pool_lines = "code-1\tcode\talpha-unit:1\tidle\t3\ncode-2\tcode\tbeta-unit:1\tidle\t1\n"
         production = read_production(self.doc)
@@ -130,7 +133,10 @@ class RetireUnitTests(unittest.TestCase):
             return ()
 
         def no_records() -> list[SessionShutdown]:
-            return []
+            return self.records
+
+        def session_processes(session_id: str) -> sessions.SessionProcesses:
+            return sessions.SessionProcesses(tuple(item["pid"] for item in self.claude if item["sessionId"] == session_id))
 
         self.enterContext(mock.patch.dict(os.environ, {"RETIRE_UNIT_RUN_ROOT": str(runs),
                                                        "UNIT_WORKERS_STATE": str(self.root / "unit-workers"),
@@ -144,6 +150,7 @@ class RetireUnitTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(unit_move, "processes_inside", nothing_inside))
         _ = self.enterContext(mock.patch.object(retire_unit, "reservations", no_reservations))
         _ = self.enterContext(mock.patch.object(shutdown_record, "all_session_records", no_records))
+        _ = self.enterContext(mock.patch.object(sessions, "session_processes", session_processes))
         self.marked = unit_lookup.MarkedUnit(
             "alpha-unit", unit_lookup.LiveClaude("alpha", DIRECTOR, "/nonexistent.sock", 4101), HerdrPlace("alpha", "w1:p1"))
 
@@ -153,6 +160,19 @@ class RetireUnitTests(unittest.TestCase):
         self.config = self.root / "config"
         _ = self.enterContext(mock.patch.object(unit_lookup, "marked_unit", marked_unit))
         _ = self.enterContext(mock.patch.object(unit_move, "config_dirs", lambda: [self.config]))
+        self.transcript(self.worktree)
+
+    def transcript(self, cwd: Path) -> None:
+        folder = self.config / "projects" / unit_move.project_folder(str(cwd))
+        folder.mkdir(parents=True, exist_ok=True)
+        _ = (folder / f"{DIRECTOR}.jsonl").write_text(json.dumps({"entrypoint": "cli", "cwd": str(cwd)}) + "\n")
+
+    def shutdown_state(self, kind: Literal["stopping", "stopped"]) -> SessionShutdown:
+        # Only the record fields read by the stop/finished checks at this patched boundary.
+        return cast("SessionShutdown", cast(object, {"session": {"session_id": DIRECTOR, "pid": 4101,
+                    "name": "alpha", "kind": "unit", "host": {"production": "alpha", "unit": "alpha-unit"}},
+                    "requested_at": "2026-10-28T23:00:00+00:00",
+                    "progress": {"kind": kind}, "force": "wait for ready", "then": "stop", "stop_issues": []}))
 
     def fake_run(self, argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
         """Git runs for real; every other command is recorded and answered."""
@@ -168,6 +188,7 @@ class RetireUnitTests(unittest.TestCase):
                              if "\talpha-unit:" in line and "\tidle\t" in line)
         elif call[:2] == ["shutdown.py", "down"]:
             self.claude = []
+            self.marked = None
         return subprocess.CompletedProcess(argv, 0, stdout, "")
 
     def retire(self, *arguments: str) -> tuple[int, str]:
@@ -268,7 +289,8 @@ class RetireUnitTests(unittest.TestCase):
 
         self.assertEqual(code, 0, output)
         self.assertEqual(self.stops(), [
-            ["shutdown.py", "down", "--here", "--only", f"{DIRECTOR},{SEAT}"],
+            ["shutdown.py", "down", "--here", "--only", f"{DIRECTOR},{SEAT}",
+             "--why", "retired; /showrunner:resume_unit brings it back."],
             ["shutdown.py", "forget", DIRECTOR],
             ["shutdown.py", "forget", SEAT],
             ["codex_mesh.py", "stop", "--session-dir", str(self.run_folder)],
@@ -300,10 +322,10 @@ class RetireUnitTests(unittest.TestCase):
     def test_a_stopped_director_is_found_by_its_newest_interactive_transcript(self) -> None:
         self.marked = None
         folder = self.config / "projects" / unit_move.project_folder(str(self.worktree))
-        folder.mkdir(parents=True)
+        folder.mkdir(parents=True, exist_ok=True)
         for name, entrypoint, mtime in (("older", "cli", 100), (DIRECTOR, "cli", 200), (SEAT, "sdk-cli", 300)):
             transcript = folder / f"{name}.jsonl"
-            _ = transcript.write_text('{"type": "summary"}\n' + json.dumps({"entrypoint": entrypoint}) + "\n",
+            _ = transcript.write_text('{"type": "summary"}\n' + json.dumps({"entrypoint": entrypoint, "cwd": str(self.worktree)}) + "\n",
                                       encoding="utf-8")
             os.utime(transcript, (mtime, mtime))
 
@@ -322,6 +344,195 @@ class RetireUnitTests(unittest.TestCase):
         self.assertIn("alpha-unit is not retired: rerun once these stop", output)
         self.assertTrue(self.worktree.is_dir())
         self.assertNotIn("(retired", self.doc.read_text(encoding="utf-8"))
+
+    def outside_director(self) -> Path:
+        (self.run_folder / "director").unlink()
+        self.claude = []
+        old = self.config / "projects" / unit_move.project_folder(str(self.worktree)) / f"{DIRECTOR}.jsonl"
+        old.unlink()
+        folder = self.root / "original-checkout"
+        self.transcript(folder)
+        return folder
+
+    def test_dry_run_finds_a_marked_director_outside_the_worktree_without_run_history(self) -> None:
+        folder = self.outside_director()
+        code, output = self.retire("--dry-run")
+        self.assertEqual(code, 0, output)
+        self.assertIn(f"would stop: Claude session alpha ({DIRECTOR}, pid 4101)", output)
+        self.assertNotIn("nothing to stop", output)
+        self.assertIn(f"session {DIRECTOR}, folder {folder})", output)
+        self.assertEqual(self.stops(), [])
+
+    def test_retires_the_marked_director_outside_the_worktree_and_records_its_start_folder(self) -> None:
+        folder = self.outside_director()
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertIn(["shutdown.py", "down", "--here", "--only", DIRECTOR,
+                       "--why", "retired; /showrunner:resume_unit brings it back."], self.calls)
+        self.assertIn(["shutdown.py", "forget", DIRECTOR], self.calls)
+        self.assertIn(f"session {DIRECTOR}, folder {folder})", self.doc.read_text())
+        self.assertFalse(self.worktree.exists())
+
+    def test_retired_note_uses_the_folder_holding_a_renamed_directors_transcript(self) -> None:
+        folder = self.outside_director()
+        transcript = self.config / "projects" / unit_move.project_folder(str(folder)) / f"{DIRECTOR}.jsonl"
+        old = self.root / "old-checkout"
+        _ = transcript.write_text("\n".join(json.dumps({"cwd": str(cwd)})
+                                            for cwd in (old, old, folder, folder)) + "\n")
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertIn(f"session {DIRECTOR}, folder {folder})", self.doc.read_text())
+        self.assertNotIn(str(old), self.doc.read_text())
+        self.assertFalse(self.worktree.exists())
+
+    def test_transcript_without_a_matching_cwd_refuses_retire_before_stopping(self) -> None:
+        transcript = self.config / "projects" / unit_move.project_folder(str(self.worktree)) / f"{DIRECTOR}.jsonl"
+        _ = transcript.write_text(json.dumps({"cwd": str(self.root / "old-checkout")}) + "\n")
+        before = self.doc.read_bytes()
+        code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertIn(f"no cwd matching its project folder {transcript.parent.name}", output)
+        self.assertEqual(self.stops(), [])
+        self.assertEqual(self.doc.read_bytes(), before)
+        self.assertTrue(self.worktree.exists())
+
+    def test_final_live_mark_prevents_marking_and_removal_including_an_already_retired_row(self) -> None:
+        for retired in (False, True):
+            with self.subTest(already_retired=retired):
+                if retired:
+                    _ = self.doc.write_text(self.doc.read_text().replace("| docs/plans/alpha.md |",
+                        f"| (retired 2026-10-28, worktree removed, session {DIRECTOR}) docs/plans/alpha.md |"))
+                before = self.doc.read_bytes()
+                def return_director(_slug: str, _unit: str) -> None:
+                    self.marked = unit_lookup.MarkedUnit("alpha-unit",
+                        unit_lookup.LiveClaude("alpha", DIRECTOR, "/nonexistent.sock", 5101), HerdrPlace("alpha", "w1:p1"))
+                with mock.patch.object(roles, "end_holder", side_effect=return_director):
+                    code, output = self.retire()
+                self.assertEqual(code, 1, output)
+                self.assertIn(f"left running: marked session {DIRECTOR}, pid 5101", output)
+                self.assertEqual(output.splitlines()[-1], "alpha-unit is not retired: rerun once these stop")
+                self.assertEqual(self.doc.read_bytes(), before)
+                self.assertTrue(self.worktree.exists())
+                self.assertEqual(git(self.checkout, "branch", "--list", "--format=%(refname:short)", "alpha-branch"), "alpha-branch")
+                self.marked = None
+
+    def test_unreadable_mark_refuses_without_stopping_or_removing(self) -> None:
+        before = self.doc.read_bytes()
+        with mock.patch.object(unit_lookup, "marked_unit", side_effect=OSError("herdr mark unreadable")):
+            code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertIn("cannot read unit mark: herdr mark unreadable", output)
+        self.assertEqual(self.stops(), [])
+        self.assertEqual(self.doc.read_bytes(), before)
+        self.assertTrue(self.worktree.exists())
+
+    def test_forget_waits_for_the_shutdown_record_after_the_process_exits(self) -> None:
+        events: list[str] = []
+        def command(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+            result = self.fake_run(argv, cwd)
+            if argv[1:3] == [str(retire_unit.SHUTDOWN), "down"]:
+                self.records = [self.shutdown_state("stopping")]
+                events.append("process exits")
+            elif argv[1:3] == [str(retire_unit.SHUTDOWN), "forget"]:
+                self.assertEqual(self.records[0]["progress"]["kind"], "stopped")
+                events.append("forget")
+            return result
+        def finish_stop(_seconds: float) -> None:
+            events.append("stop finishes")
+            self.records = [self.shutdown_state("stopped")]
+        with (mock.patch.object(retire_unit, "run", command),
+              mock.patch.object(time, "sleep", finish_stop)):
+            code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(events, ["process exits", "stop finishes", "forget", "forget"])
+
+    def test_failed_forget_keeps_the_unit_and_reports_failure(self) -> None:
+        before = self.doc.read_bytes()
+        def command(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+            if argv[1:3] == [str(retire_unit.SHUTDOWN), "forget"]:
+                return subprocess.CompletedProcess(argv, 1, "", "cannot forget shutdown in progress (stopping)")
+            return self.fake_run(argv, cwd)
+        with mock.patch.object(retire_unit, "run", command):
+            code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertIn("left running:", output)
+        self.assertIn("cannot forget shutdown in progress (stopping)", output)
+        self.assertEqual(self.doc.read_bytes(), before)
+        self.assertTrue(self.worktree.exists())
+
+    def test_final_check_refuses_a_shutdown_record_that_is_still_in_progress(self) -> None:
+        before = self.doc.read_bytes()
+        def pending_stop(_slug: str, _unit: str) -> None:
+            self.records = [self.shutdown_state("stopping")]
+        with mock.patch.object(roles, "end_holder", side_effect=pending_stop):
+            code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertIn(f"session {DIRECTOR}, pid 4101: shutdown stopping", output)
+        self.assertEqual(self.doc.read_bytes(), before)
+        self.assertTrue(self.worktree.exists())
+
+    def test_final_check_refuses_an_unmarked_session_id_that_reappears(self) -> None:
+        before = self.doc.read_bytes()
+        def relaunch(_slug: str, _unit: str) -> None:
+            self.claude = [session(SEAT, "returned-worker", 5202)]
+        with mock.patch.object(roles, "end_holder", side_effect=relaunch):
+            code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertIn(f"session {SEAT}, pid 5202", output)
+        self.assertEqual(self.doc.read_bytes(), before)
+        self.assertTrue(self.worktree.exists())
+
+    def test_final_check_refuses_unreadable_process_evidence(self) -> None:
+        before = self.doc.read_bytes()
+        with mock.patch.object(sessions, "session_processes",
+                               return_value=sessions.SessionLivenessUnknown("process identity unreadable")):
+            code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertIn(f"session {DIRECTOR}: process identity unreadable", output)
+        self.assertEqual(self.doc.read_bytes(), before)
+        self.assertTrue(self.worktree.exists())
+
+    def test_unfinished_stop_exhausts_the_same_deadline_without_forgetting(self) -> None:
+        before = self.doc.read_bytes()
+        def command(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+            result = self.fake_run(argv, cwd)
+            if argv[1:3] == [str(retire_unit.SHUTDOWN), "down"]:
+                self.records = [self.shutdown_state("stopping")]
+            return result
+        with mock.patch.object(retire_unit, "run", command):
+            code, output = self.retire("--wait-minutes", "0")
+        self.assertEqual(code, 1, output)
+        self.assertIn(f"{DIRECTOR}, pid 4101): still stopping after 0 minutes", output)
+        self.assertNotIn(["shutdown.py", "forget", DIRECTOR], self.calls)
+        self.assertEqual(self.doc.read_bytes(), before)
+        self.assertTrue(self.worktree.exists())
+
+    def test_rerun_forgets_the_exited_directors_retained_restore_before_marking(self) -> None:
+        folder = self.outside_director()
+        reject_forget = True
+        def command(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+            if argv[1:3] == [str(retire_unit.SHUTDOWN), "forget"] and reject_forget:
+                return subprocess.CompletedProcess(argv, 1, "", "forget storage failed")
+            result = self.fake_run(argv, cwd)
+            if argv[1:3] == [str(retire_unit.SHUTDOWN), "down"]:
+                self.records = [self.shutdown_state("stopped")]
+            elif argv[1:3] == [str(retire_unit.SHUTDOWN), "forget"]:
+                self.records = []
+            return result
+        with mock.patch.object(retire_unit, "run", command):
+            code, output = self.retire()
+            self.assertEqual(code, 1, output)
+            self.assertIn("forget storage failed", output)
+            self.assertNotIn("(retired", self.doc.read_text())
+            self.assertTrue(self.worktree.exists())
+            self.assertIsNone(self.marked)
+            reject_forget = False
+            code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertIn(f"session {DIRECTOR}, folder {folder})", self.doc.read_text())
+        self.assertFalse(self.worktree.exists())
+        self.assertEqual(len([call for call in self.calls if call[:2] == ["shutdown.py", "down"]]), 1)
+        self.assertEqual(self.records, [])
 
 
 if __name__ == "__main__":
