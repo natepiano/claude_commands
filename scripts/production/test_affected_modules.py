@@ -79,6 +79,32 @@ class AffectedModulesTests(unittest.TestCase):
         self.assertCountEqual([path.name for path in self.selection().modules],
                               ["test_bare.py", "test_mention.py"])
 
+    def test_imported_test_module_selects_its_importer_without_requesting_full_suite(self) -> None:
+        self.add_test("agents/test_codex_mesh.py", "VALUE = 1\n")
+        self.add_test("direct/test_workers.py", "from scripts.agents.test_codex_mesh import VALUE\n")
+        self.certify()
+        self.write("scripts/agents/test_codex_mesh.py", "VALUE = 2\n")
+        _ = self.commit()
+        self.assertCountEqual([path.name for path in self.selection().modules],
+                              ["test_codex_mesh.py", "test_workers.py"])
+
+    def test_selection_file_strings_do_not_connect_dependents_but_imports_do(self) -> None:
+        self.write("scripts/component/subject.py", "VALUE = 1\n")
+        self.write("scripts/component/imported.py", "VALUE = 1\n")
+        for name in ("affected_modules", "merge_gate"):
+            self.write(f"scripts/production/{name}.py",
+                       'FILES = ["subject.py"]\nimport scripts.component.imported\n')
+            self.add_test(f"checks/test_{name}.py", f"import scripts.production.{name}\n")
+        self.certify()
+        self.write("scripts/component/subject.py", "VALUE = 2\n")
+        _ = self.commit()
+        self.assertEqual(self.selection().modules, ())
+        self.certify()
+        self.write("scripts/component/imported.py", "VALUE = 2\n")
+        _ = self.commit()
+        self.assertCountEqual([path.name for path in self.selection().modules],
+                              ["test_affected_modules.py", "test_merge_gate.py"])
+
     def test_package_initializers_and_relative_imports_are_dependencies(self) -> None:
         self.write("scripts/component/__init__.py", "VALUE = 1\n")
         self.write("scripts/component/subject.py", "VALUE = 1\n")
@@ -114,8 +140,7 @@ class AffectedModulesTests(unittest.TestCase):
     def test_every_shared_input_trigger_requests_full_validation(self) -> None:
         paths = ["scripts/lib/new.py", "scripts/other/conftest.py", "settings.json",
                  "scripts/production/merge_gate.py", "scripts/production/affected_modules.py",
-                 "config/agents.conf", "scripts/agents/agents_config.sh",
-                 *sorted(affected.SHARED_TEST_HELPERS)]
+                 "config/agents.conf", "scripts/agents/agents_config.sh"]
         for path in paths:
             with self.subTest(path=path):
                 self.write(path, "# changed\n")
