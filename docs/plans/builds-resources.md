@@ -316,33 +316,22 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 - Change-Review line: the floor sweep stops only after it frees the shortfall | run the sweep tests: `python3 -m unittest discover -s scripts/lint -p test_sweep.py` | the outside-link test passes, and the pass takes the next candidate.
 
 ### Phase 10 — Memory admission names the reservation a waiting step waits on  · status: done
-**Depends on:** none
 
-**Approved:** showrunner 2026-10-29, one writer, ready by 17:00 EDT for verify-unit's Phase 8 (it names the holder of a wait for hierarchies' wait experiment; starts about 18:30 EDT). Form agreed with verify-unit.
+#### As-built
 
-#### Work Order
-
-**Goal:** a waiting build step can ask memory admission which reservation blocks it now, with no extra Python start per wait poll.
-
-**Spec:**
-
-1. `scripts/lint/memory_admit.py` gets `current_blocker(waiter_path)`, read only: it takes the admission lock in shared mode (or reads one snapshot) and writes nothing. It returns one of three typed results: one reservation blocks the step (its owner `session_id`, `session_name`, and `pool: "memory"`); only the unit is known (`unit`); or no single reservation blocks it. Build it from the existing queue view, `decide`, `live_reservations` and `live_waiters`; do not add a second admission rule.
-2. A verb `memory_admit.py blocker --waiter <waiter file>` prints that result as one JSON line: `{"session_id": …, "session_name": …, "pool": "memory"}`, `{"unit": …}`, or `{}`. Exit 0 in all three cases; exit 2 only when the waiter file is gone.
-3. The result `memory_admit.py check` already prints on each wait poll (read by `memory_gate.sh` at :192 and :218) carries the same blocker object, so the wait loop sees a holder change on the poll it already makes. Existing fields and callers of that output stay as they are.
-4. Tests in `scripts/lint/test_memory_admit.py` for each result shape, the exit codes, the `check` field, and that the verb writes nothing (state folder bytes and mtimes unchanged). Tests fake both memory readings (`memory_test_support.py`).
-5. Docs: `docs/as-built/build-memory-admission.md` names the verb, the field and the three shapes.
+- `memory_admit.py` has `current_blocker(waiter_path)`. It reads the admission ledger under a shared lock. It does not create the lock, prune stale records or change state files. It uses the same queue view and `decide` rule as `check`; there is no second admission rule.
+- The lookup names a reservation only when removing it alone admits the waiter and no other single reservation does. It removes that reservation's full build charge and growth promise, then applies the admission rule. It never assigns a pressure hold to a reservation.
+- The verb `memory_admit.py blocker --waiter <waiter file>` prints one JSON line and exits 0: `{"session_id":…,"session_name":…,"pool":"memory"}` when the session is known; `{"unit":…}` when only the cgroup sidecar names a systemd scope or service; `{}` for a ready step, a pressure hold, queue priority, several possible blockers or unknown ownership. A gone waiter file gives exit 2. A stale waiter still on disk gives `{}` and exit 0.
+- `CheckResult.blocker` carries the same typed result from the snapshot that admission uses. With `BUILDLOG_MEM_BLOCKER=1`, `check` appends one JSON blocker field to its pipe-separated output: field 16, or field 19 with `BUILDLOG_MEM_DETAIL=1`. JSON escapes a pipe in a name as `\u007c`. Without the opt-in, the 15-field and 18-field forms do not change.
 
 **Files:**
-- `scripts/lint/memory_admit.py` — items 1-3.
-- `scripts/lint/test_memory_admit.py` — item 4.
-- `docs/as-built/build-memory-admission.md` — item 5 (Phase 2 also edits it; this phase adds a section only).
+- `scripts/lint/memory_admit.py` — `current_blocker`, the `blocker` verb and the `check` blocker field.
+- `scripts/lint/test_memory_admit.py` — tests for each result shape, the exit codes, the `check` field, and that the verb writes nothing.
+- `docs/as-built/build-memory-admission.md` — the "Name the reservation that blocks a waiter" section.
 
-**Workers:** `1 writer`
+**Binds later work:** A change to the admission charge or holds flows into the blocker lookup, because the lookup reuses `decide`; the lookup must follow each new charge and hold. The verify memory wait reads the blocker as `check` field 16 (19 with detail) under `BUILDLOG_MEM_BLOCKER=1`, so it sees a holder change on the poll it already makes, with no separate Python start.
 
-**Acceptance gate:**
-- The memory admission tests pass; `basedpyright` over both Python files reports `0 errors, 0 warnings, 0 notes`; the merge gate is green.
-- The commit is messaged to verify-unit.
-- Change-Review line: a waiting build step can name what it waits on | in a Claude session on natedev while a build waits for memory, run `python3 ~/.claude/scripts/lint/memory_admit.py blocker --waiter <its waiter file in ~/.local/state/buildlog/admission>` | it prints one JSON line naming the session that holds the blocking reservation, or `{}`.
+**Gotchas:** Releasing a measured reservation frees only its resident bytes. Its swap bytes stay part of the build charge but do not count as freed RAM.
 
 ### Phase 11 — Memory admission promises what each repository's steps really use  · status: todo
 **Depends on:** Phase 10 and Phase 12 (same file, `memory_admit.py`)
