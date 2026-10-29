@@ -47,11 +47,20 @@ from scripts.usage import collect, usage_report
 JsonObject = dict[str, object]
 
 
-class Unrecorded(Enum):
-    TIME = "time not recorded"
-    DURATION = "duration not recorded"
-    SCORE = "score not recorded"
-    MERGES = "merge history not recorded"
+class TimeNotRecorded(Enum):
+    MISSING = "time not recorded"
+
+
+class DurationNotRecorded(Enum):
+    MISSING = "duration not recorded"
+
+
+class ScoreNotRecorded(Enum):
+    MISSING = "score not recorded"
+
+
+class MergeHistoryNotRecorded(Enum):
+    MISSING = "merge history not recorded"
 
 
 class UnitActivity(Enum):
@@ -60,7 +69,7 @@ class UnitActivity(Enum):
     UNKNOWN = "unit activity not recorded"
 
 
-RecordedTime = datetime | Unrecorded
+RecordedTime = datetime | TimeNotRecorded
 
 
 @dataclass(frozen=True)
@@ -147,7 +156,7 @@ class PhaseCompletion:
     identity: str
     at: datetime
     hana: bool
-    seconds: float | Unrecorded
+    seconds: float | DurationNotRecorded
 
 
 @dataclass(frozen=True)
@@ -181,7 +190,7 @@ class AgentMessage:
 class IssueRank:
     name: str
     rank: float
-    score: float | Unrecorded = Unrecorded.SCORE
+    score: float | ScoreNotRecorded = ScoreNotRecorded.MISSING
 
 
 @dataclass(frozen=True)
@@ -204,7 +213,7 @@ class BaselineSources:
     rankings: list[IssueRank]
     waiting: list[WaitingItem]
     problems: list[SourceProblem]
-    merges: list[HanaMerge] | Unrecorded = Unrecorded.MERGES
+    merges: list[HanaMerge] | MergeHistoryNotRecorded = MergeHistoryNotRecorded.MISSING
 
 
 def field_text(record: JsonObject, key: str) -> str:
@@ -239,7 +248,7 @@ def moment(value: object) -> RecordedTime:
             return at.replace(tzinfo=user_zone()) if at.tzinfo is None else at
     except (ValueError, OverflowError, OSError):
         pass
-    return Unrecorded.TIME
+    return TimeNotRecorded.MISSING
 
 
 def required_time(value: object) -> datetime:
@@ -284,7 +293,7 @@ def parse_push(record: JsonObject) -> PhonePush:
 
 
 def parse_rank(record: JsonObject) -> IssueRank:
-    score = field_number(record, "score") if "score" in record else Unrecorded.SCORE
+    score = field_number(record, "score") if "score" in record else ScoreNotRecorded.MISSING
     return IssueRank(field_text(record, "name"), field_number(record, "rank"), score)
 
 
@@ -435,7 +444,7 @@ def distribution(name: str, values: Sequence[float], window: Window, source: str
 
 def phase_flow(events: Sequence[PhaseCompletion], window: Window) -> list[MeasureRow]:
     unique = {event.identity: event for event in events if event.hana and window.contains(event.at)}
-    times = [event.seconds / 60 for event in unique.values() if not isinstance(event.seconds, Unrecorded)]
+    times = [event.seconds / 60 for event in unique.values() if not isinstance(event.seconds, DurationNotRecorded)]
     source = "progress_history run records; elapsed wall time; no merge-to-main receipt; natedev only"
     rows = [
         MeasureRow("Hana phases done", str(len(unique)), len(unique), window.label, source),
@@ -459,14 +468,19 @@ def closure_names_merge(issue: issues.Issue) -> bool:
     return re.search(r"\bmerg(?:e|ed)\b[^\n]*\b[0-9a-fA-F]{7,40}\b", issue.value("reason"), re.IGNORECASE) is not None
 
 
+def is_declined(issue: issues.Issue) -> bool:
+    words = issue.value("reason").split()
+    return bool(words) and words[0].casefold().removesuffix(":") == "declined"
+
+
 def issue_flow(found: Sequence[issues.Issue], window: Window) -> list[MeasureRow]:
     goal = [issue for issue in found if issue.value("backlog_goal") == "1 - Ship Hana"]
     activated = [issue for issue in goal if window.contains(moment(issue.value("date_active")))]
     candidates = [issue for issue in goal if issue.value("status") == "closed" and window.contains(moment(issue.value("date_closed")))]
-    declined = [issue for issue in candidates if issue.value("reason").strip().casefold() == "declined"]
+    declined = [issue for issue in candidates if is_declined(issue)]
     closed = [issue for issue in candidates if issue not in declined]
     undated = [issue for issue in goal if issue.value("status") == "closed"
-               and issue.value("reason").strip().casefold() != "declined"
+               and not is_declined(issue)
                and not isinstance(moment(issue.value("date_closed")), datetime)]
     durations: list[float] = []
     for issue in closed:
@@ -524,9 +538,9 @@ def hana_repository(units: Sequence[Unit]) -> Path:
     raise FileNotFoundError("Hana repository not found through local Git common directories")
 
 
-def merge_flow(merges: Sequence[HanaMerge] | Unrecorded, window: Window) -> list[MeasureRow]:
+def merge_flow(merges: Sequence[HanaMerge] | MergeHistoryNotRecorded, window: Window) -> list[MeasureRow]:
     source = "git log --first-parent --merges origin/init/catalyst; local ref; commit time; no fetch"
-    if isinstance(merges, Unrecorded):
+    if isinstance(merges, MergeHistoryNotRecorded):
         return [MeasureRow("Hana merges / origin/init/catalyst", "not recorded", 0, window.label, source)]
     selected = {merge.commit: merge for merge in merges if window.contains(merge.at)}
     rows = [MeasureRow("Hana merges / origin/init/catalyst", str(len(selected)), len(selected), window.label, source)]
@@ -729,13 +743,19 @@ def running_phase_worktrees(folder: Path, problems: list[SourceProblem]) -> set[
         phases: set[str] = set()
         for record in records:
             kind = field_text(record, "event_type")
-            phase = str(record.get("phase", ""))
+            if kind == "run_finished":
+                phases.clear()
+                continue
+            if kind not in ("phase_started", "phase_finished"):
+                continue
+            phase = field_text(record, "phase_instance_id") or field_text(record, "phase_id")
+            if not phase:
+                problems.append(SourceProblem(str(path), "unreadable: phase identity not recorded"))
+                continue
             if kind == "phase_started":
                 phases.add(phase)
-            elif kind == "phase_finished":
+            else:
                 phases.discard(phase)
-            elif kind == "run_finished":
-                phases.clear()
         if tree not in newest or started > newest[tree][0]:
             newest[tree] = (started, bool(phases))
     return {tree for tree, (_, running) in newest.items() if running}
@@ -817,7 +837,7 @@ def parse_phase(record: JsonObject, prefixes: Sequence[str]) -> tuple[PhaseCompl
     identity = field_text(record, "event_id")
     if not identity:
         identity = f"{field_text(record, 'run_id')}:{field_text(record, 'phase_instance_id')}:{at}"
-    seconds = field_number(record, "phase_elapsed_seconds") if "phase_elapsed_seconds" in record else Unrecorded.DURATION
+    seconds = field_number(record, "phase_elapsed_seconds") if "phase_elapsed_seconds" in record else DurationNotRecorded.MISSING
     return (PhaseCompletion(identity, at, hana_origin(origin, prefixes), seconds),)
 
 
@@ -931,10 +951,10 @@ def load_sources(window: Window) -> BaselineSources:
     problems.extend(worker_problems)
     problems.extend(SourceProblem("session roster", problem) for problem in roster_problems)
     problems.extend(token_problems)
-    def load_merges() -> list[HanaMerge] | Unrecorded:
+    def load_merges() -> list[HanaMerge] | MergeHistoryNotRecorded:
         return read_hana_merges(hana_repository(units))
 
-    merges = read_source("Hana origin/init/catalyst merge log", load_merges, Unrecorded.MERGES, problems)
+    merges = read_source("Hana origin/init/catalyst merge log", load_merges, MergeHistoryNotRecorded.MISSING, problems)
     return BaselineSources(units, workers, builds, tokens, phases, pushes, reviews, messages, found, rankings, waiting, problems, merges)
 
 
