@@ -4,7 +4,7 @@
 
 > **As-built disposition: create** — `docs/as-built/workers.md`; it replaces `docs/as-built/long-lived-workers.md` (Phase 15). roles-unit (sdlc) removes `docs/as-built/review-pool.md` with `review_pool.py` (showrunner, 2026-10-29).
 
-> **Production: build-followups** — unit `models-unit`; production doc `docs/plans/build-followups-production.md`
+> **Production: natedev** — unit `models-unit`; production doc `docs/plans/natedev-production.md`
 
 > **Sources:** `~/.local/state/plan-backlog/2026-10-28-worker-tool.md` (WT) and `~/.local/state/plan-backlog/2026-10-27-long-lived-worker-seats.md` (WS). Each phase title names the source phases it builds.
 
@@ -23,20 +23,20 @@
   - `commands/unit/`, `commands/showrunner/`, `commands/agent.md`, `commands/plan/phase_review.md`, `docs/direct/`, `docs/production_format.md`, `docs/as-built/`
   - `scripts/delegate/` holds only a stale `__pycache__`; the real scripts are in `scripts/direct/`.
 - **Key files:**
-  - `settings.json` — SessionStart `compact` hook at line 344 (line 353 on `main`)
+  - `settings.json` — SessionStart `compact` hook at line 294
   - `scripts/hooks/session-start-direct-resume.py` — the resume hook the compact entry must name
-  - `scripts/direct/implement.sh` — writer launcher; claim code `worker_record` at ~217–396; `agents_resolve` at 203–204; positionals at 85–90
-  - `scripts/direct/review.sh` — review launcher; `claim_follow` at ~284–349; turn record at ~454–489; tree guard at ~805–820
+  - `scripts/direct/implement.sh` — writer launcher; claim code `worker_record` at 219–400; `agents_resolve` at 206; positionals at 85–93; `--fix-cause` at 65
+  - `scripts/direct/review.sh` — review launcher; `claim_follow` at 297–363; `check-launch` at 251; turn record at ~454–489; tree guard at ~805–820
   - `scripts/direct/review_pool.py` — pool: `_prime`, `_choose`, `_repoint`, `allocate` (~536–599), `release`, `retire`, `migrate`, `stop`, `rename_unit`; `main` at 788
   - `scripts/direct/review_tree.py`, `scripts/direct/review_pool_report.py`
-  - `scripts/agents/codex_mesh.py` — `WORKER_ROLES` at 382 (used at 636, 996, 7323, 7355, 7411); `command_reopen`, `_finished_run`, `prime`, `fork`, `set-instructions`, `follow`, `stop --pause`
-  - `scripts/agents/agents_config.sh` — `_agents_validate_pair` at 260, `agents_resolve` at 291, `agents_resolve_print` at 452
+  - `scripts/agents/codex_mesh.py` — `WORKER_ROLES` at 422 (used by `_roster_role()` 694, `_write_roster_record()` 1412, and the `start` 8346, `follow` 8378 and `can-follow` 8434 parsers); `command_reopen`, `_finished_run`, `prime`, `fork`, `set-instructions`, `follow`, `stop --pause`
+  - `scripts/agents/agents_config.sh` — `_agents_validate_pair` at 297, `agents_resolve` at 330, `agents_resolve_print` at 494
   - `scripts/agents/sync_codex_catalog.sh` — writes `[codex.agents]`; incomplete-cache rule at ~261–279
   - `scripts/agents/agent_admin.sh` — backend of `/agent`; `commands/agent.md`
   - `config/agents.conf` — `[codex.agents]`, `[claude.agents]`, `[direct.codex]`; the overlay `config/agents.local.conf` is gitignored and exists only in `~/.claude`
   - `scripts/agents/agent_bg.sh` — named background Claude sessions
   - `scripts/direct/progress_history.py`, `end_session.sh`, `remove_workers.py`, `prepare_session.sh`, `phase_reservation.py`
-  - `scripts/production/retire_unit.py`, `transfer_unit.py`, `rename_unit.py`, `merge_checkpoint.py`, `merge_gate.py` (`TEST_SUITES` at 47)
+  - `scripts/production/retire_unit.py`, `transfer_unit.py`, `rename_unit.py`, `merge_checkpoint.py`, `merge_gate.py` (`TEST_SUITES` at 63)
   - `scripts/hooks/pre-tool-use-change-review-gate.py`, `scripts/production/change_review.py` — the checkpoint commit hook
   - `scripts/whoami/quota_alert.py` — `routed to claude` routing; `moves.RoutedToClaude`
   - `scripts/guilds/roles.py`, `scripts/astra/astra_review.py`, `scripts/agents/mesh_runs.py`, `scripts/message/send.py`
@@ -146,80 +146,45 @@
 
 ### Phase 5 — Worker lifecycle: run end, phase end, retire, transfer, rename (WS P2, part 2)  · status: done
 
-**Depends on:** Phase 4
+#### As-built
 
-#### Work Order
-
-**Goal:** workers live until the unit is retired; run end, transfer and rename only pause them and keep their work, and retire alone ends them.
-
-**Spec:**
-- **Scope.** This phase covers writer workers (`impl`, `test`, `fix`) and the generic lifecycle that every ledger entry shares. Reviewer workers belong to roles-unit (sdlc); Phase 8 and its `import-pool` are dropped (showrunner, 2026-10-29). The switched-unit integration (`switched.json`) belongs to Phase 12. A unit's pool reviewers keep today's `review_pool.py` path in this phase (planner's split, from the Phase 4 review).
-- **Pause keeps work.** Today `codex_mesh._pause_roster()` truncates each `<name>.pending.json`, calls `_drop_queued_messages()` on the server, and `command_stop()` reaps every server the run folder records. Pause now keeps the pending file. Before it stops a server, it moves each server-queued message of a paused thread into that worker's pending file, so the message outlives the server. Pause keeps `continuation_owed`, the detached run records and their supervisors, and the reservation fields (`allocation_pending`, `allocation_id`, `allocation_owner_pid`, `allocation_expires_at`). Pause reaps only the servers that this run folder records (`mesh_server.json`, `mesh_retired.json`). It never reaps a server that another run or a production records.
-- **Retire cancels work.** `workers.end_unit` cancels pending messages, owed continuations and detached runs (it ends each supervisor by its record's `pid`), clears the reservation fields, ends each worker, prints one line for each thing it cancelled, prints one line for each quarantined entry it removes (name, reason, ledger path), and removes the ledger file.
-- **A paused worker's work moves with it on adopt.** Phase 4's `codex_mesh.worker_idle_reason()` refuses adoption when messages, an owed continuation or a detached run remain. The idle rule now depends on ledger ownership:
-  - `HeldBy(run)`: adoption is refused only for live activity: a live turn, an attached launcher (`worker_launcher_attached()`), or a live detached run.
-  - `Paused`: pending messages, `continuation_owed` and detached runs do not refuse adoption. They move with the worker. Adopt copies the pending entries into the taking run's inbox under the same transaction (the inbox lock is last in the lock order). `continuation_owed` stays in the taken roster record. Detached run records stay in the giving run's `mesh_runs/` (Phase 3 ruled out moving them); the taking run's `DetachedRunWatch` reads the worker's giving runs through `worker_run_history()`.
-  - The taking run's first `follow` drains the preserved queue before its new work: it delivers each detached run result and pending message, and runs the owed continuation, in that order. It never sends a prompt again.
-- **No destructive step on pause, transfer or rename.**
-  - `end_session.sh` runs `codex_mesh.py stop --pause` for each run (today it runs `stop`, which ends every worker). It leaves the workers in the ledger.
-  - **A live director keeps its workers running.** Run end pauses only the workers of a unit whose director is gone. While the unit's director is live — the same session, or a restarted director of the same unit on any account (shutdown history links the old session to the unit) — run end clears the run-active marker and changes nothing else: each worker keeps its thread, status, pending and server-queued messages, mesh routing records and server; it writes no end marker; the next run reuses the worker by name. An absent active marker or a deleted run folder alone does not prove the director is gone. No broad sweep (`cleanup`, idle-stop) undoes this. Showrunner requirement, 2026-10-28 (user rule HI9: workers live as long as their unit director), relayed by hierarchies-unit; its read-only owner report is `scripts/hierarchies/worker_owners.py` on build-followups-hierarchies.
-  - `remove_run_scratch.py` keeps each checkout that is, or holds, the `cwd` of a live detached run of a paused worker. It removes the rest as today.
-  - `rename_unit._stop_runs()` (used by rename, and by transfer through `rename_unit.stop_unit()`) runs `codex_mesh.py stop --pause`, not `stop`. It does not terminate the supervisor of a paused worker's detached run, nor that supervisor's command. When such a run works inside the worktree that a rename moves, the rename refuses with `RenameRefused` (`detached run <id> of <worker> works inside <worktree>; rerun apply once it ends`) and kills nothing. A transfer keeps the worktree, so it never refuses for this.
-  - `retire_unit.stop_rest()` keeps `codex_mesh.py stop` (it ends workers) and calls `workers.end_unit`.
-- `remove_workers.py` (phase end) does not remove a Claude worker that the ledger holds.
-- **A ledger move is a migration.** `workers.move_unit` (transfer: new production folder) and `workers.rename_unit` (rename: new unit file name) are one journalled migration that can run again after a fault and gives the same result:
-  - It first finishes or rolls back each pending adoption on the source ledger (Phase 4's `_recover`).
-  - It writes a move journal next to the source ledger before its first write. Any `resolve`, `adopt` or `follow` that finds the journal finishes the move before it acts, as with the adoption journal.
-  - It takes both ledger locks in a fixed order, the lower path (string order) first, and only then any roster lock. This keeps Phase 4's order (ledger, then giving roster, then taking roster, then inbox); two moves can never deadlock.
-  - It rewrites every reference: `unit_ledger` in the roster of each unit run (`retire_unit.runs_of(worktree)`), the `production` and `unit` keys of each run's `progress_history_state.json` when present, and the paths in each pending adoption journal entry.
-  - It moves `quarantined_workers`, `quarantined_adoptions` and each worker's reservation fields unchanged.
-  - It refuses a destination ledger that exists and names other owners. A destination that holds this move's own partial write continues.
-- `progress_history.py set-unit --session-dir <run> --production <slug> --unit <unit>` writes the `production` and `unit` keys that `workers.ledger_for_run()` reads first. `move_unit` and `rename_unit` call its function. Phase 11 uses it for the showrunner run.
-- A production rename (`scripts/production/rename.py`) moves every ledger of the production: a new step `_rename_unit_workers`, next to `_rename_review_pool`, calls `workers.move_unit` for each `<unit>.json` under `unit-workers/<old slug>/` (planner's addition: without it a production rename strands the ledgers).
-- `retire_unit.py` calls `workers.end_unit`. `transfer_unit._move_state()` calls `workers.move_unit`; its `review_pool.py retire` for the giving production stays. `rename_unit._move_state()` calls `workers.rename_unit`; its `review_pool.rename_unit()` stays.
-- **Transfer keeps threads.** Transfer keeps each writer worker's thread id, backend and ownership; only the ledger path and the references above change. Each transfer step can run again after a fault and gives the same result.
-- **Rename changes the shown name only.** A rename changes the shown context (`<production> · <unit> · <job>`). The worker address never changes. Today `codex_mesh._post_board_status()` takes the board slot from the name suffix (`name.rsplit("-", 1)[-1]`), and `worker_state.worker_record_path()` takes `fix` from the name suffix (`name.endswith("-fix")`). Both read the stored role instead (naming rule 4).
-- `workers.py` gains the functions these callers use: `pause_unit`, `end_unit`, `move_unit`, `rename_unit`.
-- **A reservation outlives the resolve call (Phase 4 review, F017).** The `resolve` CLI (`workers.main()`) records `os.getppid()` as `allocation_owner_pid`. Under Claude Code's Bash tool that parent is the one-call shell, so the reservation is dead when the call returns, and a second `resolve` by hand returns `impl` again instead of `impl2`. `resolve` gains `--owner-pid <pid>`. Without it, the owner is the run's director pid. A script caller (`name=$(… resolve …)`) keeps working. The allocation id, the 120 s window (`ALLOCATION_CLAIM_WINDOW_SECS`) and the identity-fenced release (`release_allocation()` clears only its own `allocation_id`) do not change.
+- Workers live until their unit is retired. Run end, transfer and rename pause workers; retire alone ends them. The scope is writer workers (`impl`, `test`, `fix`) and the lifecycle every ledger entry shares; pool reviewers keep the `review_pool.py` path (transfer still calls `review_pool.py retire`, rename `review_pool.rename_unit()`).
+- `workers.live_unit_director()` reads `unit_runs.director`, live sessions and shutdown history, so a director restarted on another account counts as live. While the director lives, `codex_mesh.py stop --pause` prints `kept workers and app-servers: unit director is live` and writes nothing. A run marker or a run folder alone does not prove the director is alive.
+- Pause (`workers.pause_run`, `pause_unit`) keeps pending messages (it moves each server-queued message into `<name>.pending.json` before it reaps), `continuation_owed`, detached runs and the reservation fields. It reaps only the servers this run folder records. Ownership stays `Paused` until adopt or retire.
+- Adopt carries a paused worker's queue (`AdoptionQueuePolicy`; old journals keep the legacy refuse). The taking run's first `follow` delivers detached results, then pending messages, then the owed continuation, before new work, and sends no prompt twice.
+- `workers.end_unit(production, unit)` cancels and names each pending message, detached run (signalled only through `mesh_runs.supervises`), owed continuation and reservation; ends each worker (Codex through `command_end`, Claude through `claude rm`); prints each removed quarantined entry; deletes the ledger. A worker it cannot end prints `cannot end worker <w> in <run>; retry retirement`. `retire_unit.py` `main()` refuses on `WorkerUnavailable` and `shutdown_record.InvalidRecord`.
+- `workers.move_unit` (transfer) and `workers.rename_unit` (rename) are one journalled migration (`<unit>.move.json`, error `worker ledger moved to <dest>; retry using current unit identity`). It finishes pending adoptions first, takes both ledger locks in path order, rewrites every roster `unit_ledger`, progress-state `production`/`unit` and adoption path, moves quarantine and reservation fields unchanged, and refuses a destination with other owners. `rename._rename_unit_workers` moves each ledger of a production.
+- Rename and transfer run `stop --pause` and `workers.pause_unit`. Rename refuses with `detached run <id> of <w> works inside <worktree>; rerun apply once it ends` and kills nothing; transfer keeps the worktree and never refuses for this.
+- `codex_mesh.py end --expected-thread-id <id> --idle-only` takes the inbox lock, then the roster lock, under one 5 s budget; a refusal exits nonzero and changes nothing. A retry on an ended worker drains and interrupts again.
+- Run end runs no server sweep. Server reclaim is codex_mesh idle-stop and retired-server cleanup; `_busy_threads` keeps a server that has queued work.
+- The board slot (`_post_board_status`) and the identity path (`worker_state.worker_record_path`) come from the stored role and the address. Identity records carry no `role`; the roster `role` is the current assignment, and a worker opened as `review` can be followed as `impl`.
+- `workers.py resolve --owner-pid <pid>`; the default owner is the live director's pid. With no live director and no `--owner-pid`, it exits 2: `run director pid is unknown; pass --owner-pid <pid>`. `progress_history.py set-unit --session-dir <run> --production <slug> --unit <unit>` writes the keys `ledger_for_run()` reads first.
 
 **Files:**
-- `scripts/direct/workers.py` — `pause_unit`, `end_unit`, `move_unit`, `rename_unit`, the move journal, the idle rule by ownership, `--owner-pid`
-- `scripts/agents/codex_mesh.py` — pause keeps pending and server-queued messages and reaps only this run's servers; adopt carries a paused worker's queue; `DetachedRunWatch` reads giving runs; the first follow drains the queue; `_post_board_status()` reads the stored role
-- `scripts/direct/worker_state.py` — `worker_record_path()` reads the stored role
+- `scripts/direct/workers.py` — ledger lifecycle: pause, end, move, rename, live director, retained detached runs, held Claude sessions; CLI `resolve` only
+- `scripts/agents/codex_mesh.py` — pause keeps work, adopt queue, first-follow drain, guarded `end`, live-director keep in `stop --pause`, `_busy_threads`
+- `scripts/agents/mesh_runs.py` — public `supervises()` on resolved paths
+- `scripts/direct/worker_state.py` — `worker_record_path()` by address
+- `scripts/direct/implement.sh`, `scripts/direct/review.sh` — identity without `role`
 - `scripts/direct/progress_history.py` — `set-unit`
-- `scripts/direct/end_session.sh` — `stop --pause`
-- `scripts/direct/remove_run_scratch.py` — keeps a paused worker's detached-run checkout
-- `scripts/direct/remove_workers.py` — keeps a ledger Claude worker
-- `scripts/production/retire_unit.py` — `end_unit`
-- `scripts/production/transfer_unit.py` — `move_unit`
-- `scripts/production/rename_unit.py` — `_stop_runs()` pauses; `rename_unit`; the detached-run refusal
-- `scripts/production/rename.py` — `_rename_unit_workers`
-- `scripts/agents/test_codex_mesh.py` — pause, adopt-queue and board-slot cases
-- `scripts/direct/test_worker_state.py` — arbitrary-address cases
-- `scripts/direct/test_workers.py` — move, retire, idle-rule and owner cases
-- `scripts/direct/test_progress_history.py` — `set-unit` cases
-- `scripts/direct/test_end_session.py`
-- `scripts/direct/test_remove_run_scratch.py`
-- `scripts/direct/test_remove_workers.py`
-- `scripts/production/test_retire_unit.py`
-- `scripts/production/test_transfer_unit.py`
-- `scripts/production/test_rename_unit.py`
-- `scripts/production/test_rename.py` — production rename moves each ledger
+- `scripts/direct/end_session.sh` — `stop --pause` per run, no sweep
+- `scripts/direct/remove_run_scratch.py`, `scripts/lib/scratch.py` — keep a retained detached command's cwd (`end(keep=)`)
+- `scripts/direct/remove_workers.py` — keeps ledger Claude workers and workers of live-director runs; no sweep
+- `scripts/production/retire_unit.py` — `end_unit`; refuses on `WorkerUnavailable`
+- `scripts/production/transfer_unit.py`, `rename_unit.py`, `rename.py` — `move_unit`, `rename_unit`, `pause_unit`, the detached-run refusal
+- `docs/as-built/agent-registry.md`, `docs/as-built/long-lived-workers.md` — run end without sweeps
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — the eleven script files; hub: `scripts/direct/workers.py` (every caller uses its four functions)
-- `test` — the eleven test files (fake app-server; bounded real waits): run end leaves workers paused and in the ledger; pause keeps pending messages, server-queued messages, owed continuations, detached runs and the reservation fields; pause leaves a server that another run records running; a paused detached command keeps its `cwd` through run end and through transfer and finishes; rename refuses, and kills nothing, while a paused worker's detached run works inside the worktree; a paused worker with pending messages, an owed continuation and a detached run is adopted and its queue moves; the taking run's first follow delivers the preserved queue before new work and sends no prompt twice; a `HeldBy` worker with a live turn, an attached launcher or a live detached run is not adopted; retire cancels and names each item, clears the reservation and reports each removed quarantined entry; phase end keeps a ledger Claude worker; a move stopped after each durable write finishes when run again and leaves exactly one owner; a move refuses a destination with other owners; a production rename moves each unit ledger; after a move, `ledger_for_run()` for each unit run resolves the new ledger, and every roster `unit_ledger` names it; a move with a pending adoption finishes the adoption first; `set-unit` writes the keys; `resolve` through `bash -c '…; true'` keeps its reservation and a second `resolve` gets `<role>2`; `--owner-pid` sets the owner; board slot and record path come from the stored role for an arbitrary address (for example `w7`)
+**Binds later work:** the `workers.py` CLI has only `resolve` (no `stop`); `end_unit()` is a library call. `assign.sh` passes `--owner-pid $$` to `resolve`, `--fix-cause` with `--role fix`, and a prompt whose phase line matches the phase. Self-heal extends `end_unit` and `held_claude_sessions` for a routed worker, and a replacement end passes `--expected-thread-id`. No non-ledger file (for example `switched.json`) goes under `unit-workers/<slug>/`; the worker gate and audit read ledgers without `locked()`.
 
-**Constraints from prior phases:**
-- Phase 4 (ledger): `~/.local/state/unit-workers/<production slug>/<unit>.json` (root `UNIT_WORKERS_STATE` in tests); a run outside a production uses `adhoc/<repository>-<hash of worktree path>`. `workers.ledger_for_run()` reads the `production` and `unit` keys of `progress_history_state.json` first, then the plan's `> **Production: …** — unit \`…\`;` header, else the adhoc key. `workers.py` holds all ledger I/O (`UnitWorkerLedger.locked()`, `save()`).
-- Phase 4 (types): `UnitWorker(name, role, family, model, effort, access_policy, backend, ownership, events)`; backend `CodexThread(thread_id, codex_home) | ClaudeSession(session_id)`; ownership `HeldBy(run) | Paused | Adopted(to_run) | Retired`; events `opened`, `replaced`, `adopted`. Roster records carry `unit_ledger` (the ledger path), `adopted_from`, `adoption_id`, `adopted_to`.
-- Phase 4 (lock order): the ledger lock, then the giving roster, then the taking roster, then the pending inbox. No caller enters `workers.py` while it holds a run lock. Each roster write advances the revision fence (`codex_mesh.advance_worker_roster_revision()`).
-- Phase 4 (quarantine): `locked()` moves an undecodable worker into `quarantined_workers` and an undecodable adoption into `quarantined_adoptions`, with the original record, saves, and raises `WorkerUnavailable` once; later calls proceed. Keep quarantined entries; only retire removes them.
-- Phase 4 (reservation): `resolve` writes `allocation_pending`, `allocation_id` (uuid), `allocation_owner_pid` and `allocation_expires_at` (120 s). `allocation_is_live()` needs all four and a live owner. `command_follow()` captures the reservation (`allocation_for_follow()`) and releases only its own `allocation_id` (`release_allocation()`); an adopted owner (`adopted_to`) is never released.
-- Phase 4 (finished run): `resolve` and `codex_mesh.py reopen` exit 2 on a finished run and name `progress_history.py start-phase` (it writes a `reopened` event and restores the run marker) or a new run. `follow` exits 2 with `worker handed off to <run>; assignment completion unknown` on `WorkerHandedOff`.
-- Phase 3: a lifecycle decision runs only after buffered notices drain (`state_change_owed`, `capacity_backoff_owed`). A new state file a follower must react to goes into the `FollowEvents` watch set and its fields into `_roster_state()`. A test fixture blocks until its deadline and keeps the 2,000-call guard (`FixtureLoopBudget`).
+**Gotchas:**
+- `UnitWorkerLedger.locked()` saves on exit and finishes move journals. Code that globs `unit-workers/<slug>/*.json` and opens each file through `locked()` rewrites it as a ledger (`held_claude_sessions()` and `rename._rename_unit_workers` do this).
+- Inside one run, launchers and `end` take the inbox lock, then the roster lock. Adoption holds the roster and only tries the inbox without blocking.
+- `progress_history.py start-pass`/`check-launch` refuse a `fix` launch with no findings round and no `--fix-cause`, and a prompt whose `Phase <id> — <title>` line names another phase.
+- Test fixtures that copy scripts go stale when an import appears. Symlink the real script, or put the repo root on the shim path. Timing and CPU-share tests use counted ticks, not wall clock.
 
-**Acceptance gate:** the merge gate is green; basedpyright on `scripts/direct scripts/production scripts/agents` is 0/0.
+**Ruled out:** a live-director veto inside server reclaim (`_judge`) — an empty server is reclaimed while the director lives; run-end server sweeps (`sweep --stop`, `sweep_app_servers`); a fixture-only `director_pid` state key; role in durable identity.
+
+**Deferred:** held run results reach the director when an account move fails; a next item after the `/unit:assign` and `/showrunner:assign` work, in no Work Order.
 
 ### Phase 6 — Role words `research` and `propose` (WT P2)  · status: todo
 
@@ -234,16 +199,18 @@
   - `codex_mesh.WorkerRole = Literal["impl", "test", "fix", "review", "research", "propose"]`
   - `codex_mesh.WORKER_ROLES = ("impl", "test", "fix", "review", "research", "propose")`
   - `workers.ROLES = ("impl", "test", "fix", "review", "research", "propose")`; today `workers.py resolve --role` and `workers._resolve()` refuse any other word before allocation.
-- Check every use of `WORKER_ROLES` by symbol: `_roster_role()`, `_write_roster_record()`, and the `start` and `follow` parsers in `main()`. Check every `WorkerRole` annotation (the roster `TypedDict`s, `_worker_role()`, `_set_roster_assignment()`).
+- Check every use of `WORKER_ROLES` by symbol: `_roster_role()`, `_write_roster_record()`, and the `start`, `follow` and `can-follow` parsers in `main()`. Check every `WorkerRole` annotation (the roster `TypedDict`s, `_worker_role()`, `_set_roster_assignment()`).
 - **Access policy.** `codex_mesh.open_unit_worker()` today makes only `review` read-only (`{"kind": "ReadOnlyReviewer"}` and `READ_ONLY_SANDBOX`). `research` and `propose` open the same way: `ReadOnlyReviewer` policy and `READ_ONLY_SANDBOX`. The extra writable root for `propose` (`~/.local/state/plan-backlog`) comes with `assign.sh`.
 - **`assign.sh` takes the two roles (showrunner, 2026-10-29).** Phase 7 built four roles. This phase adds `--role research` and `--role propose` as Phase 7's spec describes them: the `--summary` report, the one proposal file, the launcher's `ledger.md` line, the read-only sandbox and the `propose` writable root. `/showrunner:assign` (Phase 11) then allows both.
 - The hierarchy edge JSON `{"manager","member","role"}` carries the word.
+- `scripts/direct/board.sh` lists roles in two places: the handoff check `role_lead='^role=(impl|test|fix|review)( |$)'` (:124) and the `case` in `cmd_role` (:505–507). Add `research` and `propose` to both. The board slot is the stored role, so these workers post under slots `research` and `propose`.
 - `config/agents.conf [direct.codex]`: `research=astra:xhigh`, `propose=astra:xhigh` (user, 2026-10-28; the model `/astra_review` uses for documents).
 - Cargo handler: `HierarchyRole` gains `Research` and `Propose` (serde lowercase) with their `text`; an unknown word still takes `RoleFallback`. This is a separate repository; its commit lands there, and the checkpoint body names it.
 
 **Files:**
 - `scripts/agents/codex_mesh.py` — `WorkerRole`, `WORKER_ROLES`, `open_unit_worker()` access policy
 - `scripts/direct/workers.py` — `ROLES`
+- `scripts/direct/board.sh` — the two role lists
 - `scripts/direct/assign.sh` — `--role research|propose`
 - `scripts/direct/test_assign_launcher.py` — `research` and `propose` cases
 - `config/agents.conf` — two rows
@@ -259,8 +226,9 @@
 - Phase 2: `[direct.codex]` rows take family words; `astra` resolves through `[codex.families]` to the newest cached release that has a `[codex.agents]` effort row (today `gpt-6-astra`, which has a `weights.py` row). `gpt-6.1-terra` and `gpt-6-luna` have no `weights.py` row: usage accounting raises `UnweightedModel` for them, so no row may name `terra` or `luna`.
 - Phase 4: `codex_mesh.open_unit_worker(session_dir, name, role)` resolves `agents_resolve direct.<role>` and refuses a non-Codex family (`WorkerUnavailable("new persistent worker requires a Codex assignment")`); it records `access_policy` in the roster, and `workers._worker_from_record()` copies it to the ledger entry. Ledger lock order: ledger, giving roster, taking roster, inbox. Fixtures block until their deadline and keep `FixtureLoopBudget`.
 - Phase 7: `assign.sh` takes `implement`, `test`, `fix` and `review`; its call form, artifacts and exit codes.
+- Phase 5: `_post_board_status()` takes the board slot from the roster `role`. `worker_state.worker_record_path()` keys the identity file by address (a `fix` role uses `impl_worker_fix.json`; other roles use the slot). Role is not durable identity.
 
-**Acceptance gate:** the merge gate is green; `verify.sh test cargo-handler` and `verify.sh lint cargo-handler` pass; basedpyright on `scripts/direct scripts/agents` is 0/0; the handler shows `research` and `propose`, and an unknown word takes `RoleFallback`.
+**Acceptance gate:** the merge gate is green; `verify.sh test cargo-handler` and `verify.sh lint cargo-handler` pass; basedpyright on `scripts/direct scripts/agents scripts/production scripts/guilds` is 0/0; the handler shows `research` and `propose`, and an unknown word takes `RoleFallback`.
 
 ### Phase 7 — `assign.sh` core (WT P1, with WS P2's `--role`, run start and rules block)  · status: todo
 
@@ -278,6 +246,7 @@
             [--to <worker> | --new-worker <name>]
             [--model <short[:effort]>] [--effort <e>]
             --prompt <file> [--summary <file>]
+            [--fix-cause <text>]
             [--paths <file>]
             [--phase <id>] [--lens <adversary|contract|craft|ux>] [--pass <n>]
             [--image <path>]... [--early-ready <file>]
@@ -290,9 +259,10 @@
 - **Worker choice.** With `--to`, the named worker. Otherwise `workers.py resolve --role <role> --owner-pid $$` (the launcher's own pid: `assign.sh` lives for the whole turn, so the reservation stays live until its follow claims it). `--new-worker <name>` opens a new named worker (today's `review.sh --slot`). The launcher keeps the reservation's `allocation_id`, its 120 s window and the identity-fenced release: a refused follow releases only its own reservation, and an adopted owner (`adopted_to`) is never released.
 - **Model and effort.** `agents_resolve direct.<role>` gives family, model and effort. A live worker keeps its model and effort (live-worker identity invariant): `codex_mesh._follow_worker()` replaces a supplied model and effort with the roster identity when the record holds `unit_ledger`. So `--model sol:medium` or `--effort max` selects a worker with that identity: `workers.py resolve` gains `--model <slug> --effort <e>` and returns an idle worker of the role with exactly that identity, or opens `<role>N` with it. An override never changes an existing worker's model. `--to <worker>` with a `--model` or `--effort` that differs from that worker's identity exits 2 and names both. The identity check of `implement.sh` (`worker_record` `claim`, which keeps the stored model) stays the rule.
 - Every launch: claim under the worker lock (port `implement.sh` `worker_record` and `review.sh` `claim_follow` into one path); compact above `UNIT_COMPACT_ABOVE_TOKENS`; append the rules block to every prompt (no poll; long commands through `mesh_runs.py start`, then end the turn; the Three Gods sentence); board register, heartbeat header, pass record keyed by role and phase (`progress_history.py start-pass` / `finish-pass`); summary settle; release.
-- **Address and shown name (naming rule 6).** A worker has two separate values. The address is its full name (for example `impl2`, `claude-build-followups-sdlc-roles-impl`); it never changes, and `resolve` output, `--to`, roster keys, messages' routing and every file name use it. The shown name is `<production> · <unit> · <job>` (for example `build-followups · models · code reviewer 2`). New renderer `workers.shown_name(run, address) -> str` builds it at each call from the ledger path's production and unit (`ledger_for_run()`) and the stored role, never from the address. It is never stored, so it follows a rename or a transfer. CLI: `workers.py shown-name --session-dir <run> --name <address>`.
+- **Launch check (natedev 56b8f93b).** Before the claim, run `progress_history.py check-launch`, as `review.sh` does. `start-pass` and `check-launch` refuse a `fix` launch that has no findings round in flight or awaiting closure and no `--fix-cause`. They also refuse a prompt whose `Phase <id> — <title>` line names another phase. `assign.sh --role fix` passes `--fix-cause` through; a refusal exits 2 with the helper's line.
+- **Address and shown name (naming rule 6).** A worker has two separate values. The address is its full name (for example `impl2`, `claude-build-followups-sdlc-roles-impl`); it never changes, and `resolve` output, `--to`, roster keys, messages' routing and every file name use it. The shown name is `<production> · <unit> · <job>` (for example `natedev · models-unit · code reviewer 2`; production and unit come from the ledger path, which this plan's header sets). New renderer `workers.shown_name(run, address) -> str` builds it at each call from the ledger path's production and unit (`ledger_for_run()`) and the stored role, never from the address. It is never stored, so it follows a rename or a transfer. CLI: `workers.py shown-name --session-dir <run> --name <address>`.
 - `assign.sh` sets each Codex thread name and every board, heartbeat and summary label to the shown name. Messages and reports use it.
-- `codex_mesh.py` uses the shown name too: every `thread/name/set` (in `open_unit_worker()`, which today builds `<production> · <unit> · <role> (<name>)` by hand, and on a replacement thread) and every follow-up message it prints. Help and diagnostics drop "seat" (for example the `reopen` help and the `command_stop()` docstring). A stored key or field that existing data still reads keeps its name, with a note next to it (naming rule 5). The tests-only gate check for "seat" belongs to Phase 12.
+- `codex_mesh.py` uses the shown name too: every `thread/name/set` (in `open_unit_worker()`, which today builds `<production> · <unit> · <role> (<name>)` by hand, and on a replacement thread) and every follow-up message it prints. Help, docstrings and diagnostics in `codex_mesh.py` already say "worker". Rename the private `_seat_sandbox()` (codex_mesh.py:1538) and its `seat_sandbox` parameter (:5357) to `_worker_sandbox()` and `worker_sandbox`. A stored key or field that existing data still reads keeps its name, with a note next to it (naming rule 5). The tests-only gate check for "seat" belongs to Phase 12.
 - Artifacts: `${PHASE_DIR}/<role>_status`, `<role>_summary.txt`, `<role>_agent.log`, with `_<lens>` and `_<pass>` suffixes for reviews.
 - **Exit codes and outcomes.** 0 done; 1 the worker ran and failed; 2 a refused argument or claim; 3 blocked (no worker could start); 4 handed off. `follow` exits 2 for both a refusal and a `WorkerHandedOff`; after a `follow` exit 2, `assign.sh` reads the worker's roster record, and an `adopted_to` value means handed off. On handed off, `assign.sh` writes `handed_off` to `<role>_status`, records the destination run in `<role>_summary.txt`, prints `handed off: <worker> to <run>; completion unknown`, does not record the pass as done, and never sends the prompt again.
 - Review in this phase: `--role review` takes an open writer for the lens, as today without a pool. Reviewers become ordinary unit workers (`<worktree>-review`, `-review2`), opened and resumed by `assign.sh --role review`; roles-unit (sdlc) builds that after this phase, and Phase 8 is dropped (showrunner, 2026-10-29).
@@ -307,15 +277,15 @@
 
 **Workers:** `1 writer + 1 tester`
 - `impl` — `assign.sh`, `workers.py`, `codex_mesh.py`; hub: `scripts/direct/workers.py`
-- `test` — `test_assign_launcher.py` (fake app-server; bounded real waits): each role opens with its sandbox; `--to` resumes a thread; `--model` on a roster that holds `unit_ledger` selects or opens a worker with that identity and leaves the existing worker's model unchanged; `--to` with a different `--model` exits 2; `--role research` and `--role propose` exit 2; a missing `--role` exits 2; a writer role without `--paths` exits 2, a reviewer with `--paths` exits 2, a `..` path exits 2; each dispatch writes its `dispatch_<n>_paths.json`; every worker prompt carries the rules block; the thread name and board label read `<production> · <unit> · <job>` while `--to` takes the full address; no run starts one; a named finished run is reactivated with `start-phase` and keeps its worker's thread; the reservation owner is the launcher pid and stays live through the claim; a handoff during the turn gives exit 4, status `handed_off`, the destination run, no finished pass and no second prompt. `test_workers.py`: `resolve --model --effort` picks only an exact identity; `shown_name` follows a `move_unit` and a `rename_unit` while `resolve` prints the same address. `test_codex_mesh.py`: a replacement thread name and a follow-up message use the shown name; `--help` output has no "seat"
+- `test` — `test_assign_launcher.py` (fake app-server; bounded real waits): each role opens with its sandbox; `--to` resumes a thread; `--model` on a roster that holds `unit_ledger` selects or opens a worker with that identity and leaves the existing worker's model unchanged; `--to` with a different `--model` exits 2; `--role research` and `--role propose` exit 2; a missing `--role` exits 2; a writer role without `--paths` exits 2, a reviewer with `--paths` exits 2, a `..` path exits 2; each dispatch writes its `dispatch_<n>_paths.json`; every worker prompt carries the rules block; the thread name and board label read `<production> · <unit> · <job>` while `--to` takes the full address; no run starts one; a named finished run is reactivated with `start-phase` and keeps its worker's thread; the reservation owner is the launcher pid and stays live through the claim; a handoff during the turn gives exit 4, status `handed_off`, the destination run, no finished pass and no second prompt. `test_workers.py`: `resolve --model --effort` picks only an exact identity; `shown_name` follows a `move_unit` and a `rename_unit` while `resolve` prints the same address. `test_codex_mesh.py`: a replacement thread name and a follow-up message use the shown name; `--help` output has no "seat"; `--role fix` with no findings round and no `--fix-cause` exits 2, and with `--fix-cause` records the pass; a prompt with another phase's `Phase <id> — <title>` line exits 2; a worker opened as `review` and dispatched as `implement` keeps one identity record
 
 **Constraints from prior phases:**
 - Phase 2: rows are family words; `agents_resolve` returns the slug or exits 1 with `no Codex model for '<word>' in ~/.codex/models_cache.json; run codex once to refresh the cache, or name the full slug`. A resolved line ends with ` word=<family word>` when the row names a family (`agents_config.sh` `_agents_print_resolved`); the slug is in `agent=`.
 - Phase 4: `workers.py resolve --session-dir <run> --role <r>` prints the worker address; `<role>2` when all are busy. Its reservation is `allocation_pending`, `allocation_id`, `allocation_owner_pid` and `allocation_expires_at` (120 s, `ALLOCATION_CLAIM_WINDOW_SECS`); `command_follow()` releases only its own `allocation_id`. `resolve` and `reopen` exit 2 on a finished run and name `progress_history.py start-phase`. `follow` exits 2 on `WorkerHandedOff` (`worker handed off to <run>; assignment completion unknown`). A quarantined ledger entry makes the first `follow` or `reopen` exit 2 naming the quarantine; later calls proceed. Ledger lock order: ledger, giving roster, taking roster, inbox.
-- Phase 5: `resolve --owner-pid <pid>`; pause keeps pending messages, owed continuations and detached runs, and adopt carries them; the taking run's first follow drains them before new work. `workers.move_unit` and `workers.rename_unit` move the ledger and rewrite each roster's `unit_ledger`; `progress_history.py set-unit` writes the run's `production` and `unit`.
+- Phase 5: `resolve --owner-pid <pid>`. Without it, the owner is the live director's pid (`workers.director_pid()`); with no live director, `resolve` exits 2 `run director pid is unknown; pass --owner-pid <pid>`. Run end pauses workers only when the unit director is gone; while it lives, `codex_mesh.py stop --pause` keeps workers and servers, and the next run resolves the same worker by name. Pause keeps pending messages, owed continuations and detached runs, and adopt carries them; the taking run's first follow drains them before new work. Role is not durable identity: identity records (`impl_worker_*.json`, keyed by address through `worker_state.worker_record_path()`) hold `name`, `slot`, `family`, `model`, `worker_id` and no `role`; the roster `role` is the current assignment, and the board slot comes from it. Inside one run, launchers and `codex_mesh.py end` take the inbox lock, then the roster lock. `codex_mesh.py end --expected-thread-id <id> --idle-only` ends only that thread, and only when idle. `workers.move_unit` and `workers.rename_unit` move the ledger and rewrite each roster's `unit_ledger`; `progress_history.py set-unit` writes the run's `production` and `unit`.
 - Phase 3: a lifecycle decision runs only after buffered notices drain; keep the `FixtureLoopBudget` guard in new fixtures.
 
-**Acceptance gate:** the merge gate is green; basedpyright on `scripts/direct scripts/agents` is 0/0.
+**Acceptance gate:** the merge gate is green; basedpyright on `scripts/direct scripts/agents scripts/production scripts/guilds` is 0/0.
 
 ### Phase 8 — Reviewers in the worker ledger (WT P3)  · status: dropped
 
@@ -334,9 +304,9 @@ Dropped (showrunner, 2026-10-29). Reviewers become ordinary unit workers (`<work
 - Thread gone or cannot resume: `workers.py resolve` opens a replacement under the same name. Its opening prompt has a catch-up brief: the Work Order, the worker's last two summaries and `git diff --stat` since the phase baseline. It posts one board line and records `replaced` with the cause in the ledger.
 - **One replacement authority.** `workers.py` alone opens a replacement. Today `codex_mesh._resume_worker_thread()` calls `thread/start` and continues as a new thread when resume fails. It stops doing that and returns a named outcome (`ThreadMissing`). Each caller (the live follow and the resolve path) passes `ThreadMissing` up, and `workers.py` replaces the thread.
 - **No duplicate submission.** "Send the same phase prompt again" applies only when no submitted turn may still run. An uncertain submission (for example `WorkerMoveUncertain`), an owed continuation (`continuation_owed`), a paused worker's preserved queue (Phase 5), or a handed-off dispatch (`assign.sh` exit 4, `handed_off`: completion unknown, the turn belongs to the destination run) waits or resumes; it never sends the prompt again.
-- A turn still live after compaction (today exit 3): send `turn/interrupt`, wait 60 s; if still live, end the worker and open a replacement with the brief. The interrupt wait and the replacement wait keep every notice received before an RPC reply (Phase 3 drain rule).
+- A turn still live after compaction (today exit 3): send `turn/interrupt`, wait 60 s; if still live, end the worker with `codex_mesh.py end --to <worker> --expected-thread-id <thread>` (never `--idle-only`: the turn is live), so a racing replacement is never ended, and open a replacement with the brief. The interrupt wait and the replacement wait keep every notice received before an RPC reply (Phase 3 drain rule).
 - Second overflow with no progress: compact once and send the follow-up again; if that fails, open a replacement with the brief.
-- **Claude route state.** `UnitWorker.backend` holds exactly one `CodexThread` or `ClaudeSession` today. Add a third backend variant `WorkerRoutedToClaude(claude: ClaudeSession, parked: CodexThread, catch_up_from: str)`, where `catch_up_from` is the commit at route start. The name differs from `moves.RoutedToClaude` (the account route record) on purpose. `WorkerEvent.kind` gains `routed` and `returned`. Pause during a route pauses the Claude worker and keeps `parked`. Retire during a route ends both the Claude session and the parked thread. The route ends when the next dispatch resumes `parked`; the backend is then `CodexThread` again.
+- **Claude route state.** `UnitWorker.backend` holds exactly one `CodexThread` or `ClaudeSession` today. Add a third backend variant `WorkerRoutedToClaude(claude: ClaudeSession, parked: CodexThread, catch_up_from: str)`, where `catch_up_from` is the commit at route start. The name differs from `moves.RoutedToClaude` (the account route record) on purpose. `WorkerEvent.kind` gains `routed` and `returned`. Pause during a route pauses the Claude worker and keeps `parked`. Retire during a route ends both the Claude session and the parked thread: `workers.end_unit()` branches on backend (`CodexThread` -> `command_end` per run; `ClaudeSession` -> `claude rm`) and gains a `WorkerRoutedToClaude` branch that does both. `workers.held_claude_sessions()` also returns `WorkerRoutedToClaude.claude.session_id`, so phase-end `remove_workers.py` keeps a routed Claude worker. The route ends when the next dispatch resumes `parked`; the backend is then `CodexThread` again.
 - Quota refusal: after the capacity wait and the account move, `quota_alert.py` routes `direct` to Claude and writes `routed to claude`. `assign.sh` opens Claude workers (named background sessions through `agent_bg.sh`, which compact) under the same ledger entry (`WorkerRoutedToClaude`), sets `UNIT_WORKER=<address>`, and sends the same phase prompt again only under the no-duplicate rule above. When the route returns to Codex, the next dispatch resumes the parked thread with a catch-up message: the Claude worker's summaries and the diff since `catch_up_from`. A subagent is never in this chain.
 - Codex outage (non-local errors from two servers over 10 minutes): new cause `outage` in `quota_alert.py`, same routing, 30-minute hold; after the hold the next dispatch tries Codex again. `scripts/accounts/moves.py` validates `RoutedToClaude.cause` (today `refusal`, `credits off`, `auto`); add `outage` to its type and its check.
 - Nothing can start: `assign.sh` exits 3 with `blocked: no worker could start: <cause>` and sends the showrunner one message (`send.py`).
@@ -355,11 +325,11 @@ Dropped (showrunner, 2026-10-29). Reviewers become ordinary unit workers (`<work
 
 **Workers:** `1 writer + 1 tester`
 - `impl` — `workers.py`, `assign.sh`, `quota_alert.py`, `moves.py`, `codex_mesh.py`
-- `test` — fake-server cases (bounded real waits): lost thread gives a replacement with the brief in its prompt; a missing thread found during a live follow and during resolve gives `ThreadMissing` and one `workers.py` replacement, and `codex_mesh.py` starts no thread; live turn gives interrupt then replacement, and a notice received before the interrupt reply is kept; an uncertain submission, an owed continuation, a preserved paused queue or a handed-off dispatch is never sent again; second overflow gives compaction and one retry; outage gives a route with a 30-minute hold and a route back; the move journal accepts and reads back `outage`; quota route opens a Claude worker and returns to the parked Codex thread with the catch-up message; `WorkerRoutedToClaude` round-trips through the ledger; pause during a route keeps the parked thread, and retire during a route ends both backends; no case starts an Agent-tool subagent
+- `test` — fake-server cases (bounded real waits): lost thread gives a replacement with the brief in its prompt; a missing thread found during a live follow and during resolve gives `ThreadMissing` and one `workers.py` replacement, and `codex_mesh.py` starts no thread; live turn gives interrupt then replacement, and a notice received before the interrupt reply is kept; an uncertain submission, an owed continuation, a preserved paused queue or a handed-off dispatch is never sent again; second overflow gives compaction and one retry; outage gives a route with a 30-minute hold and a route back; the move journal accepts and reads back `outage`; quota route opens a Claude worker and returns to the parked Codex thread with the catch-up message; `WorkerRoutedToClaude` round-trips through the ledger; pause during a route keeps the parked thread, and retire during a route ends both backends; no case starts an Agent-tool subagent; phase end keeps a routed Claude worker; a dead-launcher worker is followed, not replaced; a live-turn replacement ends only the old thread id
 
 **Constraints from prior phases:**
 - Phase 4: ledger `replaced` event; `UnitWorker.backend` is `CodexThread | ClaudeSession`; lock order ledger, giving roster, taking roster, inbox; undecodable entries are quarantined once and kept; the reservation (`allocation_id`, owner pid, 120 s window) is released only by its own id.
-- Phase 5: pause keeps pending messages, owed continuations and detached runs, and the taking run's first follow drains them before new work; retire (`end_unit`) cancels them.
+- Phase 5: pause keeps pending messages, owed continuations and detached runs, and the taking run's first follow drains them before new work; retire (`end_unit`) cancels them. Run end pauses only when the unit director is gone. `codex_mesh.py end` takes the inbox lock, then the roster lock, with one 5 s budget; a retry on an ended worker drains and interrupts again. A worker left in `waiting_capacity`, `running` or `starting` by a launcher that died can be followed again (956114f0); it is not a lost thread and gets no replacement.
 - Phase 7: exit code 3 means blocked and 4 means handed off (status `handed_off`, destination run recorded, never resubmitted); `assign.sh` passes `--owner-pid $$` to `resolve`; the address and the shown name are separate.
 - Phase 3: a lifecycle decision runs only after buffered notices drain (`state_change_owed`, `capacity_backoff_owed`); fixtures block until their deadline and keep the 2,000-call guard.
 
@@ -408,6 +378,7 @@ Dropped (showrunner, 2026-10-29). Reviewers become ordinary unit workers (`<work
 - Phase 7: `assign.sh` turn end and `${PHASE_DIR}`; `--paths` writes `${PHASE_DIR}/dispatch_<n>_paths.json` (`worker`, `round`, `paths`) for `implement`, `test`, `fix`, and is refused for read-only roles; exit 4 (handed off) records no completion, so its turn line names the destination run and attests nothing.
 - Phase 9: Claude workers open only under a `routed to claude` entry, as a `WorkerRoutedToClaude` ledger backend; `moves.py` already holds the `outage` cause.
 - Phase 4: the worker address is the stable key in every record; the shown name is display only.
+- Phase 5: the taking run's first follow delivers a paused worker's carried detached results and messages, and runs its owed continuation, before the new prompt, in the same follow. Turns from that queue end under the new dispatch, so `record` attributes their paths with that dispatch's manifest.
 
 **Acceptance gate:** the merge gate is green; basedpyright on `scripts/direct scripts/hooks scripts/production scripts/whoami scripts/accounts` is 0/0.
 
@@ -423,7 +394,7 @@ Dropped (showrunner, 2026-10-29). Reviewers become ordinary unit workers (`<work
 - `/unit:assign <role> [--to <worker>] [--model m[:e]] [--effort <level>] [--paths <file>] <prompt file> [...]` composes the call: `--session-dir` is the run, `--cwd` the worktree, `--phase` the open phase.
 - **Per-launch model and effort (showrunner, 2026-10-29; user priority: `/showrunner:assign` with per-launch `--model` and `--effort` comes first).** Both skills take `--model m[:e]` and `--effort <level>` for one launch and pass them to `assign.sh`. Phase 7's identity rule then picks or opens a worker with that model and effort.
 - `/showrunner:assign`: same skill, showrunner defaults: `--session-dir ~/.local/state/unit-workers/<slug>/showrunner/`, `--cwd` the showrunner checkout. It allows `review` of a document; `research` and `propose` join when Phase 6 adds them to `assign.sh`. `implement`, `test` and `fix` are refused with one line: a showrunner never writes code; its units do.
-- **The showrunner's ledger.** `workers.ledger_for_run()` resolves a ledger from the run's progress-state `production` and `unit` keys, then the plan header, else an adhoc key; the showrunner folder has neither. So `assign.sh`, on first use of the showrunner form, creates the folder and runs `progress_history.py set-unit --session-dir <folder> --production <slug> --unit showrunner` (Phase 5). `ledger_for_run()` then resolves `~/.local/state/unit-workers/<slug>/showrunner.json`. `resolve` and `workers.py stop` at wrap address that one file.
+- **The showrunner's ledger.** `workers.ledger_for_run()` resolves a ledger from the run's progress-state `production` and `unit` keys, then the plan header, else an adhoc key; the showrunner folder has neither. So `assign.sh`, on first use of the showrunner form, creates the folder and runs `progress_history.py set-unit --session-dir <folder> --production <slug> --unit showrunner` (Phase 5). `ledger_for_run()` then resolves `~/.local/state/unit-workers/<slug>/showrunner.json`. `resolve` and `workers.py end --production <slug> --unit showrunner` (a new CLI over `workers.end_unit()`) at wrap address that one file.
 - The review role is what `assign.sh --role review` gives, with no pool (showrunner, 2026-10-29). `/astra_review` keeps its held-role path. Showrunner workers end at production wrap, with the production's reviewers (user, 2026-10-28).
 - Both skills print the worker address, its shown name (`workers.shown_name()`, Phase 7), the model and effort used, and the summary path. The address stays raw for `--to` and routing. They read no transcripts and hold no state.
 
@@ -431,21 +402,21 @@ Dropped (showrunner, 2026-10-29). Reviewers become ordinary unit workers (`<work
 - `commands/unit/assign.md` — new
 - `commands/showrunner/assign.md` — new
 - `scripts/direct/assign.sh` — showrunner session-dir default, `set-unit`, role refusal
-- `commands/showrunner/produce.md` — the wrap step (step 2, next to `review_pool.py stop`) runs `workers.py stop` for the showrunner's workers
-- `scripts/direct/workers.py` — `stop` covers the showrunner ledger file
+- `commands/showrunner/produce.md` — the wrap step (step 2, next to `review_pool.py stop`) runs `workers.py end --production <slug> --unit showrunner` for the showrunner's workers
+- `scripts/direct/workers.py` — `end` subcommand: `--production`, `--unit`; calls `end_unit()`; exit 2 on `WorkerUnavailable`
 - `scripts/direct/test_assign_launcher.py` — cases
 - `scripts/direct/test_workers.py` — cases
 
 **Workers:** `1 writer + 1 tester`
 - `impl` — the two commands, `produce.md`, `assign.sh`, `workers.py`
-- `test` — the showrunner form refuses `implement`; the showrunner folder gets `production` and `unit: showrunner` and `ledger_for_run()` gives `unit-workers/<slug>/showrunner.json`; `resolve` and `workers.py stop` touch that same file; `--model` and `--effort` reach `assign.sh` for one launch; both forms print address, shown name, model and summary path; `workers.py stop` ends the showrunner's workers and its reviewers
+- `test` — the showrunner form refuses `implement`; the showrunner folder gets `production` and `unit: showrunner` and `ledger_for_run()` gives `unit-workers/<slug>/showrunner.json`; `resolve` and `workers.py end` touch that same file; `--model` and `--effort` reach `assign.sh` for one launch; both forms print address, shown name, model and summary path; `workers.py end` ends the showrunner's workers and its reviewers; after a production rename (`rename._rename_unit_workers` moves `showrunner.json`, not the run folder), the next showrunner `resolve` on the new slug adopts each worker on its thread
 
 **Constraints from prior phases:**
-- Phase 5: `progress_history.py set-unit` writes the keys that `ledger_for_run()` reads first.
+- Phase 5: `progress_history.py set-unit` writes the keys that `ledger_for_run()` reads first. `workers.end_unit(production, unit)` cancels pending messages, owed continuations, detached runs and reservations, prints one line for each, ends each worker, reports each removed quarantined entry and deletes the ledger; it raises `WorkerUnavailable` (`cannot end worker <w> in <run>; retry retirement`) when a worker cannot end. The `workers.py` CLI has only `resolve`. The showrunner folder has no director record, so `resolve` there needs `--owner-pid` (`assign.sh` passes `$$`). Keep only ledger files in `unit-workers/<slug>/*.json`: `held_claude_sessions()` and `rename._rename_unit_workers` open each one through `locked()`, which rewrites it as a ledger.
 - Phase 7: call form, `--paths`, exit codes (4 = handed off), `workers.shown_name()` and the raw address.
 - Phase 4: lock order ledger, giving roster, taking roster, inbox; quarantined entries are kept; fixtures block until their deadline and keep `FixtureLoopBudget`.
 
-**Acceptance gate:** the merge gate is green; basedpyright on `scripts/direct` is 0/0.
+**Acceptance gate:** the merge gate is green; basedpyright on `scripts/direct scripts/production` is 0/0.
 
 ### Phase 12 — The rule and the cutover (WS P1 + WT P5, merged: both change the same docs)  · status: todo
 
@@ -462,12 +433,12 @@ Dropped (showrunner, 2026-10-29). Reviewers become ordinary unit workers (`<work
 - Pointers, no repeated text: `commands/unit/direct.md` gets a `<TagReferenceContract/>` row; `<LongLivedWorkers/>` becomes one line that points to `<WorkerRule/>`; `<CoreContract/>` keeps "does not write implementation code" and its exception "agreed doc-only/trivial post-review fixes" becomes "Markdown only". `docs/production_format.md`: the **Worker** definition and a new `<ProductionUnit/>` item 19 point to `<WorkerRule/>`. `commands/showrunner/produce.md`: one line — the showrunner never approves a flow without workers and sends an exception request to the user.
 - The design check (screenshots) moves to a UI reviewer (`assign.sh --role review --image`) when there is no `ui` pool.
 - In the same commit, call forms change to `assign.sh`: `commands/unit/direct.md` (`<LongLivedWorkers/>`, `<WorkerLaunchFailure/>`), `docs/direct/launch_implementation.md` step 5, `docs/direct/dual_review.md` step 3, `docs/direct/phase_end.md`, `commands/plan/phase_review.md`. Each writer call form passes `--paths` with the files the Work Order's **Workers** line gives that worker. Each doc names exit 4 (handed off: completion unknown, never resubmit).
-- **`workers.py switched --unit <unit>` is recoverable.** It writes the unit under `"state": "switching"` with the date into `~/.local/state/unit-workers/<slug>/switched.json`, then sets `"state": "switched"`. A rerun after a crash at any point finishes the switch. The pool import is dropped (showrunner, 2026-10-29): reviewers are ordinary unit workers that roles-unit (sdlc) builds.
-- `implement.sh` and `review.sh`: the first thing each does is check the run's unit (`SHOWRUNNER_UNIT_ID`, else `unit_runs.marker`) against `switched.json`. A unit in either state gets exit 2: `refused: <unit> switched to assign.sh on <date>; use assign.sh` (state `switched`) or `refused: <unit> is switching to assign.sh; use assign.sh` (state `switching`).
+- **`workers.py switched --unit <unit>` is recoverable.** It writes the unit under `"state": "switching"` with the date into the switch file `~/.local/state/worker-switch/<slug>.json`, then sets `"state": "switched"`. A rerun after a crash at any point finishes the switch. The file is not under `unit-workers/<slug>/`: `held_claude_sessions()` and `rename._rename_unit_workers` open every `*.json` there through `locked()`, which rewrites it as an empty ledger. A production rename moves the switch file in a new `rename.py` step next to `_rename_unit_workers`. The pool import is dropped (showrunner, 2026-10-29): reviewers are ordinary unit workers that roles-unit (sdlc) builds.
+- `implement.sh` and `review.sh`: the first thing each does is check the run's unit (`SHOWRUNNER_UNIT_ID`, else `unit_runs.marker`) against the switch file. A unit in either state gets exit 2: `refused: <unit> switched to assign.sh on <date>; use assign.sh` (state `switched`) or `refused: <unit> is switching to assign.sh; use assign.sh` (state `switching`).
 - **Switched-unit integration.** A switched unit's transfer and rename keep every worker thread id: Phase 5's `move_unit` moves the ledger. This phase tests that path end to end.
 - `commands/showrunner/produce.md`: the showrunner asks each unit director, one at a time, to switch, and runs `workers.py switched` on a yes. It asks first the units with a finished run or no run (style, messaging, builds), because only `assign.sh` starts or reopens their run.
 - New tag-reference test: every `<Tag/>` that `commands/unit/direct.md` and `docs/direct/*.md` name resolves to a definition.
-- New naming gate check (naming rule 5), tests-only: it fails on a new use of "seat" or "seats" as a role word in scripts, commands and docs. It allows an existing stored key, flag, file name or transport field that has a note next to it, and it does not read `docs/plans/`.
+- The naming gate exists: `scripts/production/roles_audit.py check` (sdlc-roles f8f5b962) runs in every merge gate and fails on a retired name such as "seat" outside a kept context. This phase adds no naming check.
 
 **Files:**
 - `docs/direct/worker_rule.md` — new
@@ -482,23 +453,24 @@ Dropped (showrunner, 2026-10-29). Reviewers become ordinary unit workers (`<work
 - `scripts/direct/implement.sh` — the refusal
 - `scripts/direct/review.sh` — the refusal
 - `scripts/hooks/test_tag_reference.py` — new
-- `scripts/hooks/test_worker_naming.py` — new: the naming gate check
+- `scripts/production/rename.py` — moves the switch file
+- `scripts/production/test_rename.py` — production rename moves the switch file
 - `scripts/direct/test_workers.py` — cases
 - `scripts/direct/test_implement_launcher.py` — cases
 - `scripts/direct/test_review_launcher.py` — cases
 - `scripts/production/test_transfer_unit.py` — switched-unit transfer case
 
 **Workers:** `2 writers` — docs and scripts split.
-- `impl` — `workers.py`, `implement.sh`, `review.sh`, `test_workers.py`, `test_implement_launcher.py`, `test_review_launcher.py`, `test_transfer_unit.py`: a crash after the `switching` write and before `"state": "switched"` is finished by a rerun; both refusal lines; a switched unit's transfer keeps every worker thread id
-- `test` (opens as impl) — every doc and command file, `test_tag_reference.py`, `test_worker_naming.py`; hub: `commands/unit/direct.md`
+- `impl` — `workers.py`, `implement.sh`, `review.sh`, `test_workers.py`, `test_implement_launcher.py`, `test_review_launcher.py`, `test_transfer_unit.py`, `rename.py`, `test_rename.py`: a crash after the `switching` write and before `"state": "switched"` is finished by a rerun; both refusal lines; a switched unit's transfer keeps every worker thread id; a production rename moves the switch file
+- `test` (opens as impl) — every doc and command file, `test_tag_reference.py`; hub: `commands/unit/direct.md`
 
 **Constraints from prior phases:**
-- Phase 5: `move_unit` and `rename_unit` move the ledger as a journalled migration (both ledger locks in path order); pause keeps work and retire alone ends it.
+- Phase 5: `move_unit` and `rename_unit` move the ledger as a journalled migration (both ledger locks in path order). Workers live as long as their unit director: run end pauses only when the director is gone, and while it lives, `stop --pause` keeps workers and servers. Pause keeps work; retire alone ends it. `<WorkerRule/>` and `docs/direct/phase_end.md` say this.
 - Phase 7: help, diagnostics and printed names in `codex_mesh.py` no longer say "seat"; stored compatibility fields keep their names with a note. `assign.sh` exit codes 0–4; `--paths` is required for writer roles.
 - Phase 9: `blocked:` exit 3. Phase 10: E4 lines from all three launchers; the grant attestation schema in `subagent_grants.json`. Phase 11: `/unit:assign`.
 - Phase 4: lock order ledger, giving roster, taking roster, inbox; quarantined entries are kept; fixtures block until their deadline and keep `FixtureLoopBudget`.
 
-**Acceptance gate:** the merge gate is green; basedpyright on `scripts/direct scripts/hooks` is 0/0; the tag-reference test resolves `<WorkerRule/>`; a grep test finds no "spawn a fresh Claude Agent helper" and no `implement.sh --to` in `docs/direct/`; a switched unit's `implement.sh --to` call exits 2 with the refusal line; a unit not yet switched runs as before; the naming gate check passes, and fails on a new "seat" role word.
+**Acceptance gate:** the merge gate is green; basedpyright on `scripts/direct scripts/hooks` is 0/0; the tag-reference test resolves `<WorkerRule/>`; a grep test finds no "spawn a fresh Claude Agent helper" and no `implement.sh --to` in `docs/direct/`; a switched unit's `implement.sh --to` call exits 2 with the refusal line; a unit not yet switched runs as before; `roles_audit.py --root . check` exits 0.
 
 ### Phase 13 — Worker gate E1–E3 (WS P5)  · status: todo
 
@@ -541,6 +513,7 @@ Dropped (showrunner, 2026-10-29). Reviewers become ordinary unit workers (`<work
 - Phase 9: self-heal exists, so a refused director always has a worker it can start; a Claude worker's ledger backend is `ClaudeSession` or `WorkerRoutedToClaude`.
 - Phase 10: the `subagent_grants.json` schema (`grants`, `attestations`); E5 accepts an attestation's blobs and refuses a path of an open grant.
 - Phase 12: the rule doc is `docs/direct/worker_rule.md`, and it names the `allow subagent:` grant.
+- Phase 5: `workers.held_claude_sessions()` gives the session ids of non-retired Claude ledger workers (Phase 9 adds routed ones). It locks and rewrites every ledger (`locked()` saves on exit), so the hook does not call it on each tool call: it checks `UNIT_WORKER` first, then reads ledger JSON without `locked()`.
 
 **Acceptance gate:** the merge gate is green; basedpyright on `scripts/hooks` is 0/0; the replay shows 0 refusals of `Explore`, `assign.sh`, `implement.sh` or `review.sh` calls.
 
@@ -572,13 +545,14 @@ Dropped (showrunner, 2026-10-29). Reviewers become ordinary unit workers (`<work
 
 **Constraints from prior phases:**
 - Phase 4: ledger and its quarantine (`quarantined_workers`, `quarantined_adoptions`, each with the original record and reason; kept until retire). Phase 5: retire reports each removed quarantined entry. Phase 7: `workers.shown_name()`; the address is the stable key. Phase 9: `replaced` events. Phase 10 and Phase 13: refusal texts and the `subagent_grants.json` schema.
+- Phase 5: a retired unit has no ledger (`end_unit` deletes it). `audit` reads ledgers without `locked()` (it finishes move journals, quarantines, raises `WorkerUnavailable` once and saves), and skips `*.move.json` and `*.lock`.
 
 **Acceptance gate:** the merge gate is green; the three-day audit lists every live unit with unauthorized writer subagents = 0.
 
 ### Phase 15 — Remove the old launchers; write the as-built (WT P6 + WS P6 as-built)  · status: todo
 
 **Depends on:** Phase 12, Phase 14
-**Blocked by:** every unit of every running production is in `switched.json`.
+**Blocked by:** every unit of every running production is in the switch file (`~/.local/state/worker-switch/<slug>.json`).
 
 #### Work Order
 
@@ -611,7 +585,7 @@ Dropped (showrunner, 2026-10-29). Reviewers become ordinary unit workers (`<work
 - `test` — `test_worker_gate.py`, the ported cases in `test_assign_launcher.py`, and `test_old_launchers_gone.py`: no active script, command or `docs/as-built/` file names `implement.sh`
 
 **Constraints from prior phases:**
-- Phase 12: `switched.json` path, its `switching`/`switched` states and the refusal. Phase 13: the allow list.
+- Phase 12: the switch file path (`~/.local/state/worker-switch/<slug>.json`), its `switching`/`switched` states and the refusal. Phase 13: the allow list.
 - Phase 4: the ledger, its lock order (ledger, giving roster, taking roster, inbox) and its quarantine stay as they are.
 
 **Acceptance gate:** the merge gate is green (the lib suite included); basedpyright on `scripts/direct scripts/hooks scripts/production` is 0/0; the tag-reference test resolves every tag; no active script, command or `docs/as-built/` file names `implement.sh`.
