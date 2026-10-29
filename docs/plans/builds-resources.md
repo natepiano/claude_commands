@@ -71,7 +71,7 @@ Own what a build may use and when it starts: memory admission and the memory que
 
 **Ruled out:** a second JSON/flock writer in bash (the shell delegates to `memory_admit.py tripwire`); the process table in the tripwire (the gate reads only the pids the test's ledger names).
 
-### Phase 2 — The merge gate sets the tripwire for every test module, and every caller's tests fake both readings  · status: todo
+### Phase 2 — The merge gate sets the tripwire for every test module, and every caller's tests fake both readings  · status: done
 **Depends on:** Phase 1
 
 #### Work Order

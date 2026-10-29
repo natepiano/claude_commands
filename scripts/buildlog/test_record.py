@@ -33,8 +33,10 @@ TEST_HANG_GUARD_SECS = 300
 
 if TYPE_CHECKING:
     from ..direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
+    from ..lint.memory_test_support import fake_memory_readings
 else:
     from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
+    from scripts.lint.memory_test_support import fake_memory_readings
 from test_index import point_root_at
 
 SCRIPT = Path(__file__).with_name("record.py")
@@ -104,6 +106,7 @@ class RecordTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.enterContext(mock.patch.dict(os.environ, fake_memory_readings(self.base)))
         tools = rust_tool_path(self.base / "tools")
         self.enterContext(mock.patch.dict(os.environ, {"PATH": tools}))
         self.root = self.base / "buildlog"
