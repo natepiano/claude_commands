@@ -619,7 +619,7 @@ class AddUnitTestCase(ShutdownTestCase):
         outcome: herdr.PromptSubmitOutcome = SUBMITTED_PROMPT,
     ) -> tuple[int, str, list[list[str]], int, int]:
         request = add_unit.UnitLaunch(
-            production=add_unit.read_production(self.doc),
+            production=production_units.read_production(self.doc),
             identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
             branch="build-followups-alpha",
             worktree=self.root / "project-alpha",

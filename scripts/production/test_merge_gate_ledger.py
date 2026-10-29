@@ -222,7 +222,7 @@ class MergeGateLedgerTests(MergeGateFixture):
         marker = Path(self.environment["MERGE_GATE_STATE_DIR"]) / "full-required"
         for red in (True, False):
             with self.subTest(red=red):
-                def suite_run(repo: Path, memory_cap_mib: int, *, module_time_limit_s: float,
+                def suite_run(repo: Path, memory_cap_mib: int, type_dirs: list[str], *, module_time_limit_s: float,
                               full: bool) -> merge_gate.GateRun:
                     self.assertNotEqual(repo, self.checkout)
                     self.assertTrue((repo / ".git/objects/info/alternates").is_file())
@@ -231,6 +231,7 @@ class MergeGateLedgerTests(MergeGateFixture):
                     self.assertTrue(full)
                     self.assertGreater(memory_cap_mib, 0)
                     self.assertGreater(module_time_limit_s, 0)
+                    self.assertEqual(type_dirs, ["scripts"])
                     self.write(repo / "subject.txt", "only the copy changes\n")
                     copies.append(repo)
                     return merge_gate.GateRun((merge_gate.GateJobResult("hooks", "test_first.py", int(red), 0, "fixture"),), 0, 0)

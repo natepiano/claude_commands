@@ -43,7 +43,8 @@ class MergeGateSuitesTests(MergeGateFixture):
         self.assertIn("sampled memory cap 268 MiB", result.stdout)
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
         self.assert_not_pushed()
-        self.assertFalse(any(call["tool"] in ("basedpyright", "ssh") for call in self.calls()))
+        self.assertEqual(len([call for call in self.calls() if call["tool"] == "basedpyright"]), 1)
+        self.assertFalse(any(call["tool"] == "ssh" for call in self.calls()))
 
     @gate_suites("lib", "hooks")
     def test_running_job_limit_bounds_overlap_without_dropping_modules(self) -> None:
@@ -357,6 +358,51 @@ class MergeGateSuitesTests(MergeGateFixture):
                          [["venv", "--clear", str(venv)],
                           ["pip", "install", "--python", str(venv / "bin" / "python"),
                            *merge_gate.TYPECHECK_REQUIREMENTS]])
+
+    def test_tests_only_runs_types_for_each_requested_directory(self) -> None:
+        result = self.run_gate("--tests-only", "--type-dirs", "scripts/production", "scripts/hooks")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        type_call, = [call for call in self.calls() if call["tool"] == "basedpyright"]
+        python = self.state / "runner/typecheck-venv/bin/python"
+        self.assertEqual(type_call["args"], ["--pythonpath", str(python), "scripts/production", "scripts/hooks"])
+        self.assertEqual(type_call["cwd"], str(self.checkout))
+        self.assertIn("basedpyright: OK", result.stdout)
+        self.assert_all_modules_started()
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+        self.assert_not_pushed()
+
+    def test_tests_only_runs_types_with_hooks_in_the_default_scope(self) -> None:
+        result = subprocess.run(
+            [*self.gate_command(), "--tests-only", "--repo", str(self.checkout)],
+            cwd=self.root, env=self.environment, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        type_call, = [call for call in self.calls() if call["tool"] == "basedpyright"]
+        python = self.state / "runner/typecheck-venv/bin/python"
+        self.assertEqual(type_call["args"], ["--pythonpath", str(python), "scripts"])
+        self.assertEqual(type_call["cwd"], str(self.checkout))
+
+    def test_tests_only_fails_when_reused_tests_have_a_red_type_job(self) -> None:
+        first = self.run_gate("--tests-only")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        records = self.pass_records()
+        self.clear_gate_events()
+        self.write(self.state / "types-red", "red")
+
+        result = self.run_gate("--tests-only")
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("tests reused from", result.stdout)
+        self.assertIn("basedpyright: RED", result.stdout)
+        self.assertIn("fixture type error", result.stdout)
+        self.assertEqual(len([call for call in self.calls() if call["tool"] == "basedpyright"]), 1)
+        self.assertEqual(self.module_events(), [])
+        self.assertEqual(self.pass_records(), records)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+        self.assert_not_pushed()
 
     @gate_suites("lib")
     def test_a_type_check_venv_that_cannot_be_built_is_red_and_names_the_command(self) -> None:
