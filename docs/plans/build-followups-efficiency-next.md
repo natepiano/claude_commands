@@ -1,3 +1,3 @@
 # efficiency — next items
 
-- **Launch scan sees accounts.py's nix shell guard** (from accounts-unit, 2026-10-28; showrunner ruled "next"). `scripts/lib/test_claude_launch_scan.py` lines 23-24 exempt `accounts/accounts.py` (`ACCOUNT_EXEC_OWNER`) with the comment "accounts-unit is wiring accounts.py exec". That wiring is done (accounts phase 92, adfb9f38): `accounts.py exec` calls `launch_shell_environment(Path.cwd())`, which calls `nix_env.ensure` through `import_module("scripts.lib.nix_env")`. The scan counts a start as guarded only when it sees a literal `nix_env.ensure` call. Fix at the cause: make the scan find a guard that is reached through a known helper or through the module import, then remove the exemption and its comment, so a future unguarded start in accounts.py fails the test. Starts after adfb9f38 is on origin/build-followups.
+None open. The launch scan item landed as phase 7.

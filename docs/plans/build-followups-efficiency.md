@@ -65,17 +65,13 @@ Showrunner of build-followups, 2026-10-28 (measured by builds-unit):
 
 **After the merge:** the showrunner adds PATH wrappers for bare `claude`, `claude1`-`claude4`, `codex`, `codex1` and `codex2` in /etc/nixos on both machines; accounts-unit wires `accounts.py exec`. Both get the merge commit.
 
-### Phase 7 — Launch scan sees accounts.py's nix shell guard  · status: in progress
+### Phase 7 — Launch scan sees accounts.py's nix shell guard  · status: done
 
-**Source:** accounts-unit, 2026-10-28; the showrunner ruled "next". accounts phase 92 (adfb9f38) is on origin/build-followups.
+**Goal:** `scripts/lib/test_claude_launch_scan.py` has no exemption, and the unused SessionStart nix-shell hook is gone.
 
-**Goal:** `scripts/lib/test_claude_launch_scan.py` has no exemption: `accounts/accounts.py` passes because the scan sees its guard, and a new unguarded start in accounts.py fails the test.
+#### As-built
 
-**Scope:**
-- The scan counts a scope as guarded when it calls a guard function of the same module (by name, followed transitively), and a function is a guard when it calls `ensure` on `nix_env` or on a value from `import_module("<...>nix_env")`. Today the scan sees only a literal `nix_env.ensure` call or a `nix_env.py` string in the same function, so accounts.py's `_exec_codex_account` and its Claude exec (lines 1317, 1425, 1428) fail without the exemption.
-- Remove `ACCOUNT_EXEC_OWNER`, its comment, its skip in `unguarded_launches`, and the "Account exec is owned by accounts-unit" docstring sentence. Replace the exemption test with tests for the helper rule: a start after a call to a same-module guard function passes; a start after a call to a function that only imports nix_env, or to a name from another module, fails.
-- `docs/as-built/nix-shell-launch.md`: the scan section states the helper rule and that no file is exempt.
-
-- **Drop the SessionStart nix-shell hook** (showrunner ruling, 2026-10-28: the 5-minute nix-heal timer and the PATH wrappers cover the case; revisit only if a failed build from such a session is seen). Remove `scripts/hooks/session-start-nix-shell.py`, its test, its load in `scripts/lib/test_nix_env_integration.py`, and the code in `scripts/nix_env/heal.py` that only it used (`--wait-idle`, `idle_budget`, `IdleDeadline`, `IDLE_WAIT_SECONDS`). The as-built and the phase 6 record drop the hook.
-
-**Acceptance:** `python3 -m unittest scripts.lib.test_claude_launch_scan` passes from the repo root; basedpyright clean on the test file; the full merge gate `--tests-only` adds no failure to the origin tip.
+- Checkpoint 4c174618. The full record is `docs/as-built/nix-shell-launch.md` (Launch scan, Timer registration).
+- The scan counts a same-module guard function as a guard: a top-level function that calls `ensure` on `nix_env` or on a value from `import_module("...nix_env")`, or that calls another guard by bare name (fixed point). Nested functions, methods and other-module attribute calls do not count. The `accounts/accounts.py` exemption is removed; its `launch_shell_environment` is seen as a guard.
+- The unregistered SessionStart hook `scripts/hooks/session-start-nix-shell.py`, its test, and the `heal.py --wait-idle` path only it used are removed (showrunner ruling, 2026-10-28: the five-minute nix-heal timer and the PATH wrappers cover the case; revisit only if a failed build from such a session is seen). `heal.py sweep --only <id> --check` stays for the `nix_heal.failed` push.
+- Checks: 41 tests pass, basedpyright clean. The full merge gate was stopped by a natedev build hold; the showrunner gates at merge.
