@@ -36,7 +36,7 @@ def age(since: float, now: float) -> int:
     return max(0, int((now - since) // 60))
 
 
-def reason_text(step: memory_admit.WaitingStep, view: memory_admit.QueueView) -> str:
+def reason_text(step: memory_admit.WaitingStep, view: memory_admit.QueueView, zone: ZoneInfo) -> str:
     reason = step.reason
     need = f"needs {step.need / memory_admit.GIB:.1f} GiB"
     capacity = f"{need}; {view.available / memory_admit.GIB:.1f} free"
@@ -56,6 +56,8 @@ def reason_text(step: memory_admit.WaitingStep, view: memory_admit.QueueView) ->
         case memory_admit.BehindHead():
             return (f"{capacity}; behind {field(reason.head_name)} "
                     + f"(waiting {age(reason.head_since, view.now)} min)")
+        case memory_admit.HeadAdmissionStatus():
+            return memory_admit.head_wait_text(reason, zone)
         case memory_admit.ReadyForAdmission():
             return f"{capacity}; ready for the next admission check"
         case _:
@@ -84,7 +86,7 @@ def render_queue(view: memory_admit.QueueView, zone: ZoneInfo) -> list[str]:
         lines.append(
             f"  {position}. {session}: {field(step.step)} in {field(step.folder)}; "
             + f"since {since} ({age(step.since, view.now)} min); "
-            + reason_text(step, view)
+            + reason_text(step, view, zone)
         )
     for step in view.running:
         session = session_label(step.session_id, step.session_name)
