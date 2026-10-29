@@ -14,8 +14,9 @@
 # runs nextest with --tests so no example is linked. No tests are lost:
 # the scan first refuses examples that hold a test or set test = true.
 #
-# Package selection is always --workspace. Commands use default features unless
-# the Work Order supplies --features; `lint`'s clippy always uses all features.
+# Package selection is always --workspace. Non-release check, test, final,
+# doc and build add workspace.metadata.dev.features to Work Order features.
+# `lint` is unchanged; its clippy always uses all features.
 # Cargo resolves features per invocation from the selected packages, so `-p <pkg>`
 # gives every member its own feature set for bevy and the rest of the
 # dependency tree, and each set is a separate compile of that tree in the
@@ -125,7 +126,10 @@
 #   … [--features <list>]                  check and test accept one trailing
 #                                          `--features a,b` when the Work Order names
 #                                          it. Names without a `/` are qualified as
-#                                          <package>/<name>
+#                                          <package>/<name>. check, test, final,
+#                                          doc and non-release build also add
+#                                          [workspace.metadata.dev] features,
+#                                          without duplicates; lint is unchanged
 #   … --no-cache                           test and lint: run even when this
 #                                          exact call already passed (or lint
 #                                          failed) on this tree, a flake hunt;
@@ -273,6 +277,31 @@ run() {
 usage() {
     sed -n '/^# Usage:/,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
 }
+
+DEV_FEATURES_PY='
+from pathlib import Path
+import sys
+import tomllib
+
+try:
+    with Path(sys.argv[1]).open("rb") as source:
+        value = tomllib.load(source)
+    for key in ("workspace", "metadata", "dev"):
+        if not isinstance(value, dict):
+            raise ValueError("expected a table")
+        value = value.get(key, {})
+    if not isinstance(value, dict):
+        raise ValueError("expected a table")
+    features = value.get("features", [])
+    if not isinstance(features, list) or any(not isinstance(name, str) for name in features):
+        raise ValueError("expected a list of strings")
+except FileNotFoundError:
+    sys.exit(0)
+except (OSError, ValueError):
+    print("verify.sh: workspace.metadata.dev.features must be a list of strings", file=sys.stderr)
+    sys.exit(2)
+print(",".join(features))
+'
 
 MEMBER_PY='
 import json
@@ -662,24 +691,46 @@ qualify_features() {
     for name in $list; do
         [[ -z "$name" ]] && continue
         [[ "$name" != */* ]] && name="$pkg/$name"
+        if [[ -n "${DEV_FEATURES:-}" ]]; then
+            case ",$out," in *",$name,"*) continue ;; esac
+        fi
         out="${out:+$out,}$name"
     done
     printf '%s' "$out"
 }
 
-# Optional trailing `--features <list>` on check and test. The Work Order
-# names the exact list; the worker still composes no flags of its own. Any
-# other leftover argument is a usage error rather than something to pass through.
-# The caller sets PKG before calling this.
+# With no dev list, retain the caller's exact feature list.
+merge_dev_features() {
+    local list="$1" name out="" dev="${DEV_FEATURES:-}"
+    if [[ -z "$dev" ]]; then
+        printf '%s' "$list"
+        return
+    fi
+    local IFS=,
+    for name in ${list:+$list,}$dev; do
+        [[ -z "$name" ]] && continue
+        case ",$out," in *",$name,"*) continue ;; esac
+        out="${out:+$out,}$name"
+    done
+    printf '%s' "$out"
+}
+
+# Optional trailing Work Order features on check and test join the repo list.
+# Any other leftover argument is a usage error. The caller sets PKG first.
 FEATURE_FLAGS=()
 take_features() {
+    local features=""
     if [[ $# -gt 0 && "$1" == "--features" && -n "${2:-}" ]]; then
-        FEATURE_FLAGS=(--features "$(qualify_features "$PKG" "$2")")
+        features=$2
         shift 2
     fi
     if [[ $# -ne 0 ]]; then
         usage
         exit 2
+    fi
+    features="$(merge_dev_features "$features")"
+    if [[ -n "$features" ]]; then
+        FEATURE_FLAGS=(--features "$(qualify_features "$PKG" "$features")")
     fi
 }
 
@@ -731,6 +782,8 @@ take_build_args() {
     done <<< "$words"
     if [[ "$BUILD_PROFILE_DIR" == release ]]; then
         BUILD_ARGS+=(--release)
+    else
+        features="$(merge_dev_features "$features")"
     fi
     if [[ -n "$features" ]]; then
         BUILD_ARGS+=(--features "$(qualify_features "$PKG" "$features")")
@@ -894,6 +947,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 set -- "${ARGS[@]}"
+DEV_FEATURES="$("$PY" -c "$DEV_FEATURES_PY" "$(git rev-parse --show-toplevel 2>/dev/null || pwd)/Cargo.toml")" || exit 2
 if [[ "$LOCAL_ONLY" -eq 1 ]]; then
     export BUILDLOG_LOCAL_REASON="$LOCAL_REASON"
 else
@@ -2588,11 +2642,16 @@ case "$CMD" in
         ;;
     doc)
         DOC_FEATURE_FLAGS=()
+        DOC_FEATURES=""
         if [[ $# -eq 2 && "$1" == --features && -n "$2" ]]; then
-            DOC_FEATURE_FLAGS=(--features "$2")
+            DOC_FEATURES=$2
         elif [[ $# -ne 0 ]]; then
             usage
             exit 2
+        fi
+        DOC_FEATURES="$(merge_dev_features "$DOC_FEATURES")"
+        if [[ -n "$DOC_FEATURES" ]]; then
+            DOC_FEATURE_FLAGS=(--features "$DOC_FEATURES")
         fi
         DOC_REPO_TOP="$(git rev-parse --show-toplevel)"
         # Cargo resolves its configured target at the original repo, never at
@@ -2637,8 +2696,12 @@ case "$CMD" in
         fi
         ;;
     final)
-        run cargo check --workspace --all-targets
-        run_nextest --workspace --tests
+        FINAL_FEATURES="$(merge_dev_features "")"
+        if [[ -n "$FINAL_FEATURES" ]]; then
+            FEATURE_FLAGS=(--features "$FINAL_FEATURES")
+        fi
+        run cargo check --workspace --all-targets "${FEATURE_FLAGS[@]}"
+        run_nextest --workspace --tests "${FEATURE_FLAGS[@]}"
         ;;
     *)
         usage
