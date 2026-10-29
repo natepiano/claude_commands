@@ -2852,11 +2852,13 @@ def _thread_has_no_active_turn(status: str) -> bool:
     return status in ("idle", "notLoaded", "systemError")
 
 
-def _ended_unseen(client: Client, thread_id: str) -> bool:
+def _ended_unseen(client: Client, thread_id: str, turn_id: str = "") -> bool:
     """True when no turn is active and nothing is queued, so no turn is left to end.
 
     A launcher that reads this while it waits for a completion notice has missed
-    the notice. The read asks for no turns, so it stays small on a long thread.
+    the notice. Given the watched turn, the thread must also list that turn as
+    ended: the server can read a thread idle just after its turn starts. With
+    no turn the read asks for none, so it stays small on a long thread.
     A call that is refused or times out says nothing, and the launcher keeps waiting.
     """
     try:
@@ -2865,11 +2867,19 @@ def _ended_unseen(client: Client, thread_id: str) -> bool:
         if isinstance(items, list) and items:
             return False
         reply = client.call(
-            "thread/read", {"threadId": thread_id, "includeTurns": False}, UNSEEN_END_CALL_SECS)
+            "thread/read", {"threadId": thread_id, "includeTurns": bool(turn_id)}, UNSEEN_END_CALL_SECS)
     except SystemExit:
         return False
     thread = _as_dict(_as_dict(reply.get("result")).get("thread"))
-    return _thread_has_no_active_turn(_as_str(_as_dict(thread.get("status")).get("type")))
+    if not _thread_has_no_active_turn(_as_str(_as_dict(thread.get("status")).get("type"))):
+        return False
+    if not turn_id:
+        return True
+    turns = thread.get("turns")
+    return isinstance(turns, list) and any(
+        (record := _as_dict(turn)).get("id") == turn_id
+        and record.get("status") in ("completed", "failed", "interrupted")
+        for turn in cast("list[object]", turns))
 
 
 def _more_work_coming(client: Client, thread_id: str, deadline: float) -> bool:
@@ -4167,7 +4177,9 @@ def _finish_if_ended_unseen(stream: TurnStream, log: TextIO) -> StreamStep:
     if _waiting_on_detached_run(stream.session_dir, stream.name, stream.thread_id, stream.runs):
         return StreamStep.NEXT_FRAME
     quota_owed = _continuation_is_owed(stream.session_dir, stream.name)
-    if stream.resume_owed or not _ended_unseen(stream.client, stream.thread_id):
+    if stream.resume_owed:
+        return StreamStep.NEXT_FRAME
+    if not _ended_unseen(stream.client, stream.thread_id, stream.turn_id):
         return StreamStep.NEXT_FRAME
     # The read-back RPC may have received the completion or answer ahead of
     # its reply. Process those frames before inferring a missing notice.

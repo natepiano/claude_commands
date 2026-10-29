@@ -31,6 +31,24 @@ from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorde
 DIRECT_DIR = Path(__file__).parent
 AGENTS_DIR = DIRECT_DIR.parent / "agents"
 
+LEGACY_RECORDER_ARGUMENTS = """
+# Compatibility for older launch cases whose subject is root-level artifacts.
+# The new launch-boundary tests remove this flag and use the recorder unchanged.
+import json as _fixture_json
+import os as _fixture_os
+from pathlib import Path as _FixturePath
+import sys as _fixture_sys
+if (_fixture_os.environ.get("TEST_LEGACY_LAUNCH") == "1"
+        and len(_fixture_sys.argv) > 1 and _fixture_sys.argv[1] in ("start-pass", "check-launch")):
+    if "--phase-id" not in _fixture_sys.argv:
+        _fixture_session = _FixturePath(
+            _fixture_sys.argv[_fixture_sys.argv.index("--session-dir") + 1])
+        _fixture_state = _fixture_json.loads(
+            (_fixture_session / "progress_history_state.json").read_text())
+        _fixture_sys.argv.extend(["--phase-id", _fixture_state["phase"]["id"]])
+
+"""
+
 # The wrapper calls this as: <task> write <working_dir> <prompt> <reply> <log>.
 # Writing both outputs and exiting immediately drives the wrapper's completion
 # branch without a model call; the wrapper copies the reply into the summary
@@ -40,6 +58,7 @@ STUB_AGENT_EXEC = """#!/usr/bin/env bash
 set -euo pipefail
 printf 'Wrote the retry path.\\n' > "$5"
 printf 'stub agent log\\n' > "$6"
+if [[ -n "${TEST_WORKER_STARTED:-}" ]]; then : > "$TEST_WORKER_STARTED"; fi
 """
 
 STUB_MESH = """#!/usr/bin/env python3
@@ -234,6 +253,7 @@ print('DELIVERED')
 
 
 class OpenPass(TypedDict):
+    worker_name: str
     kind: str
     status: str
 
@@ -290,7 +310,8 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
                 "MAX_FIX_ATTEMPTS=3", "MAX_REOPENS=3", "STALLED_ROUNDS=3",
                 "RUNAWAY_ROUNDS=10", "REPAIR_ROUNDS_PER_FINDING=2",
                 "MIN_REPAIR_BUDGET=2", "MAX_CONSECUTIVE_SAME_KIND_PASSES=6",
-                "MAX_REVIEW_CANCELLATIONS=1", "",
+                "MAX_REVIEW_CANCELLATIONS=1", "ROUTING_FROM_ROUND=4",
+                "ASTRA_AFTER_FAILED_FIXES=2", "",
             )),
             encoding="utf-8",
         )
@@ -332,6 +353,11 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
         for name in ("implement.sh", "worker_name.sh", "worker_state.py", "progress_history.py", "plan_history.py", "phase_reservation.py",
                      "recorder_state.py", "findings.py", "board.sh"):
             _ = shutil.copy2(DIRECT_DIR / name, direct_dir / name)
+        recorder = direct_dir / "progress_history.py"
+        _ = recorder.write_text(recorder.read_text().replace(
+            "from __future__ import annotations\n",
+            "from __future__ import annotations\n" + LEGACY_RECORDER_ARGUMENTS, 1,
+        ))
         launcher = direct_dir / "implement.sh"
         _ = launcher.write_text(
             launcher.read_text(encoding="utf-8").replace(
@@ -376,6 +402,7 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
         environment["TEST_WAIT_HELPER"] = str(DIRECT_DIR.resolve() / "wait_for_test_state.py")
         environment["TEST_HEARTBEAT_READY"] = str(self.root / "heartbeat-ready")
         environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
+        environment["TEST_LEGACY_LAUNCH"] = "1"
         environment["UNIT_CONFIG"] = str(self.config_file)
         environment["AGENTS_CONFIG_FILE"] = str(self.root / ".claude" / "config" / "agents.conf")
         # The plain launcher, so the stub above stands in for the agent. The mesh
@@ -425,6 +452,76 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
             env=self.environment(),
             timeout=300,
         )
+
+    def checked_launch(
+        self, session: Path, *options: str, kind: str = "impl",
+    ) -> subprocess.CompletedProcess[str]:
+        environment = self.environment()
+        _ = environment.pop("TEST_LEGACY_LAUNCH", None)
+        environment["TEST_WORKER_STARTED"] = str(session / "worker-started")
+        return subprocess.run(
+            ["bash", str(self.implement_script), *options, str(session), str(self.working_dir),
+             str(self.prompt_file), kind, "the retry path", kind, "writing the retry path", "0", "impl"],
+            check=False, capture_output=True, text=True, env=environment, timeout=300,
+        )
+
+    def launch_records(self, session: Path, kind: str) -> list[dict[str, object]]:
+        path = self.history_dir / "runs" / f"{session.name}.jsonl"
+        return [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()
+                if cast(dict[str, object], json.loads(line)).get("event_type") == kind]
+
+    def test_a_companion_fix_starts_after_the_resolver_lands_its_round(self) -> None:
+        session = self.start_phase("landed-companion")
+        self.open_repair_round(session)
+        landed = subprocess.run(
+            [sys.executable, str(DIRECT_DIR / "findings.py"), "landed",
+             "--session-dir", str(session)],
+            env=self.environment(), capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(landed.returncode, 0, landed.stderr)
+        result = self.checked_launch(session, "--phase", "3", kind="fix")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((session / "worker-started").exists())
+        started, = self.launch_records(session, "pass_started")
+        check = cast(dict[str, object], started["launch_check"])
+        self.assertEqual(check["fix_cause"], {"round": 1, "covered": ["F001"]})
+
+    def test_launcher_passes_its_prompt_to_the_launch_check(self) -> None:
+        session = self.start_phase("checked-launch")
+        _ = self.prompt_file.write_text("Phase 3 — Retry handling\nWrite the retry.\n")
+        result = self.checked_launch(session, "--phase", "3")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        started, = self.launch_records(session, "pass_started")
+        check = cast(dict[str, object], started["launch_check"])
+        self.assertEqual((check["phase_id"], check["phase_title"], check["prompt_phase_line"]),
+                         ("3", "Retry handling", "matched"))
+        self.assertTrue((session / "worker-started").exists())
+
+    def test_launcher_stops_on_stale_prompt_and_missing_phase_refusals(self) -> None:
+        for label, options, text in (
+            ("stale-prompt", ("--phase", "3"), "Phase 9 — Other work\n"),
+            ("missing-phase", (), "Write the retry.\n"),
+        ):
+            with self.subTest(label=label):
+                session = self.start_phase(f"refused-{label}")
+                _ = self.prompt_file.write_text(text)
+                result = self.checked_launch(session, *options)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((session / "worker-started").exists())
+                self.assertEqual(self.launch_records(session, "pass_started"), [])
+                refusal, = self.launch_records(session, "launch_refused")
+                self.assertEqual(refusal["prompt_file"], str(self.prompt_file))
+                self.assertTrue(refusal["reason"])
+                self.assertIn("prompt" if label == "stale-prompt" else "phase", result.stderr.lower())
+
+    def test_launcher_passes_the_explicit_failed_gate_cause_for_a_fix(self) -> None:
+        session = self.start_phase("checked-fix-cause")
+        result = self.checked_launch(session, "--phase", "3", "--fix-cause",
+                                     "retry tests fail after integration", kind="fix")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        started, = self.launch_records(session, "pass_started")
+        check = cast(dict[str, object], started["launch_check"])
+        self.assertEqual(check["fix_cause"], "retry tests fail after integration")
 
     def test_a_launch_naming_its_phase_writes_in_that_phase_directory(self) -> None:
         # Two phases running the same role each name their own, so neither overwrites the
@@ -644,12 +741,15 @@ printf '%s\\n' '{answer}'
         self, session_dir: Path, *, to: str = "", slot: str = "impl",
         kind: str = "impl", fail: bool = False, resolves_round: bool = False,
         compact_fail: bool = False, subtask: str = "", compact_still_live: bool = False,
+        fix_cause: str = "",
     ) -> subprocess.CompletedProcess[str]:
         arguments = [
             "bash", str(self.implement_script),
             str(session_dir), str(self.working_dir), str(self.prompt_file),
             subtask or kind, "the retry path", kind, "writing the retry path", "0", slot,
         ]
+        if fix_cause:
+            arguments[2:2] = ["--fix-cause", fix_cause]
         if to:
             arguments.insert(2, "--to")
             arguments.insert(3, to)
@@ -678,7 +778,7 @@ printf '%s\\n' '{answer}'
         for arguments in (
             ("open", "--severity", "blocker", "--title", "Repair retry",
              "--caught-by", "worker"),
-            ("dispatch", "--covers", "F001"),
+            ("dispatch", "--covers", "F001", "--accepted-checks", "Retry preserves queued data"),
         ):
             result = subprocess.run(
                 ["python3", str(findings), arguments[0], "--session-dir", str(session_dir),
@@ -1019,6 +1119,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         self.assertEqual(self.repair_outcome(session_dir), "landed")
         self.assertEqual(self.open_passes(session_dir)["impl"]["kind"], "fix")
         self.assertEqual(self.open_passes(session_dir)["impl"]["status"], "completed")
+        self.assertEqual(self.open_passes(session_dir)["impl"]["worker_name"], name)
         # A renamed unit's seat works in the worktree the launcher names, not the one its thread began in.
         self.assertEqual((session_dir / "follow_cwd.txt").read_text(encoding="utf-8"), str(self.working_dir))
         message = (session_dir / "follow_message.txt").read_text(encoding="utf-8")
@@ -1302,7 +1403,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         first = self.mesh_launch(session_dir)
         self.assertEqual(first.returncode, 0, first.stderr)
         impl = cast("dict[str, object]", json.loads((session_dir / "impl_worker_impl.json").read_text()))
-        repair = self.mesh_launch(session_dir, kind="fix")
+        repair = self.mesh_launch(session_dir, kind="fix", fix_cause="retry test failed after integration")
         self.assertEqual(repair.returncode, 0, repair.stderr)
         self.assertEqual(json.loads((session_dir / "impl_worker_impl.json").read_text()), impl)
         fix = cast("dict[str, object]", json.loads((session_dir / "impl_worker_fix.json").read_text()))

@@ -94,6 +94,10 @@ import record as recovery_store  # noqa: E402
 import launch_permission as restore_permission  # noqa: E402
 from remote import other_machine, run_remote  # noqa: E402
 import sessions  # noqa: E402
+from sessions import (  # noqa: E402
+    SessionNotLive as SessionNotLive,
+    SessionLivenessUnknown as SessionLivenessUnknown,
+)
 import remote_control  # noqa: E402
 import stop as stop_work  # noqa: E402
 from push_texts import RenderedPush, render  # noqa: E402
@@ -203,18 +207,6 @@ DEFAULT_RESTART_ALERTS = AlertWhenNotBack()
 @dataclass(frozen=True)
 class SessionLive:
     """The registry or saved process identity positively identifies a live owner."""
-
-
-@dataclass(frozen=True)
-class SessionNotLive:
-    """A readable session registry contains no live record for the session."""
-
-
-@dataclass(frozen=True)
-class SessionLivenessUnknown:
-    """The session registry cannot safely establish whether the session is live."""
-
-    reason: str
 
 
 @dataclass(frozen=True)
@@ -529,48 +521,15 @@ def _live_session_ids() -> frozenset[str]:
 
 
 def _process_liveness(pid: int, recorded_start: str) -> SessionLive | SessionNotLive | SessionLivenessUnknown:
-    if not recorded_start:
-        return SessionNotLive()
-    current = sessions.process_start(pid)
-    if current is not None and current != recorded_start:
-        return SessionNotLive()
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return SessionNotLive()
-    except PermissionError:
-        if current == recorded_start:
-            return SessionLive()
-    except (OSError, OverflowError) as error:
-        return SessionLivenessUnknown(f"process identity unreadable: {error}")
-    if current is None:
-        return SessionLivenessUnknown(f"process identity unreadable for pid {pid}")
-    return SessionLive()
+    observed = sessions.process_liveness(pid, recorded_start)
+    return SessionLive() if isinstance(observed, sessions.LiveSessionProcess) else observed
 
 
 def _session_liveness(
     session_id: str,
 ) -> SessionLive | SessionNotLive | SessionLivenessUnknown:
-    try:
-        paths = [path for path in sessions.sessions_dir().iterdir() if path.suffix == ".json"]
-    except OSError as error:
-        return SessionLivenessUnknown(f"session registry unreadable: {_error_reason(error)}")
-    unreadable_records: list[str] = []
-    for path in paths:
-        registered = sessions.read_session(path)
-        if isinstance(registered, sessions.UnreadableSessionRecord):
-            unreadable_records.append(path.name)
-            continue
-        if registered["sessionId"] != session_id:
-            continue
-        if sessions.running_session(registered):
-            return SessionLive()
-        observed = _process_liveness(registered["pid"], registered.get("procStart", ""))
-        if not isinstance(observed, SessionNotLive):
-            return observed
-    if unreadable_records:
-        return SessionLivenessUnknown("unreadable session registry record: " + unreadable_records[0])
-    return SessionNotLive()
+    observed = sessions.session_liveness(session_id)
+    return SessionLive() if isinstance(observed, sessions.LiveSessionProcess) else observed
 
 
 def _owner_liveness(owner: Session) -> SessionLive | SessionNotLive | SessionLivenessUnknown:
@@ -1699,6 +1658,25 @@ def clear_running_on_target(records: list[SessionShutdown]) -> TargetCheck:
     return TargetCheck(remaining, finished)
 
 
+def finish_attached_session(saved: SessionShutdown, target: str, outcome: herdr.PromptSubmitOutcome) -> TargetCheck:
+    """Treat a stopped session's explicit unit handoff as a manual relaunch, then finish it normally."""
+    if saved["progress"]["kind"] not in {"stopped", "already gone"}:
+        raise ValueError("attach requires a completed shutdown stop")
+
+    def await_confirmation(current: SessionShutdown) -> None:
+        if current["request_id"] != saved["request_id"] or current["progress"] != saved["progress"]:
+            raise ValueError("shutdown record changed during attach")
+        if target != current["label"]:
+            current["target"] = target
+            current["source_label"] = current["label"]
+        current["progress"] = SessionRestartFailed(kind="restart failed", at=settle.record_time(),
+                                                  reason="unit attach awaits live confirmation")
+
+    current = update_session(saved["login"], saved["session"]["session_id"], await_confirmation)
+    _save_prompt_outcome(current, outcome)
+    return clear_running_on_target([current])
+
+
 def _record_timer_restore_progress(
     record: SessionShutdown,
     failures: tuple[PendingTimer, ...],
@@ -2198,6 +2176,37 @@ def launch_entry(
     return EntryLaunched(relaunching_pending_timers)
 
 
+def _resume_phase_id(seat: PausedSeat) -> str:
+    """Use the phase recorded for this worker; a slot can belong to another worker."""
+    try:
+        raw = cast(object, json.loads((Path(seat["run_dir"]) / "progress_history_state.json").read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(raw, dict):
+        return ""
+    passes = cast(dict[str, object], raw).get("pass")
+    if not isinstance(passes, dict):
+        return ""
+    recorded_passes = cast(dict[str, object], passes)
+    # Older state holds one pass directly; newer state holds a pass per slot.
+    candidates = [recorded_passes] if "instance_id" in recorded_passes else recorded_passes.values()
+    phase_ids: set[str] = set()
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        record = cast(dict[str, object], candidate)
+        if record.get("worker_name") != seat["seat"]:
+            continue
+        phase = record.get("phase")
+        if not isinstance(phase, dict):
+            return ""
+        phase_id = cast(dict[str, object], phase).get("id")
+        if not isinstance(phase_id, str) or not phase_id.strip():
+            return ""
+        phase_ids.add(phase_id)
+    return next(iter(phase_ids)) if len(phase_ids) == 1 else ""
+
+
 def _resume_worker_command(seat: PausedSeat, cwd: str) -> str:
     """Build a complete launcher invocation that continues this worker's thread."""
     launcher = "review.sh" if seat["role"] == "review" else "implement.sh"
@@ -2205,15 +2214,24 @@ def _resume_worker_command(seat: PausedSeat, cwd: str) -> str:
     resumed = _resumed_launcher_command(seat["launcher_command"], seat["seat"], prompt) if seat["turn_live"] else None
     if resumed is not None:
         return resumed
-    # The launchers are not executable files: `bash` runs them as pasted.
-    start = ["bash", str(SCRIPTS / "direct" / launcher), "--to", seat["seat"], seat["run_dir"], cwd, prompt]
-    if launcher == "review.sh":
-        return shlex.join([*start, "review", "resume after a move", "resuming after a move"])
     from scripts.direct.worker_state import worker_slot
 
     # The roster role is the last pass kind; implement.sh claims the worker by the slot its identity names.
-    team_role = worker_slot(Path(seat["run_dir"]), seat["seat"]) or seat["role"]
+    recorded_slot = worker_slot(Path(seat["run_dir"]), seat["seat"]) or ""
+    team_role = recorded_slot or seat["role"]
+    phase_id = _resume_phase_id(seat)
+    # The launchers are not executable files: `bash` runs them as pasted.
+    start = ["bash", str(SCRIPTS / "direct" / launcher), "--to", seat["seat"]]
+    if phase_id:
+        start.extend(("--phase", phase_id))
     kind = team_role if team_role in {"impl", "test", "fix"} else "impl"
+    if seat["role"] == "fix":
+        kind = "fix"
+    if launcher == "implement.sh" and kind == "fix":
+        start.extend(("--fix-cause", "resume after a move"))
+    start.extend((seat["run_dir"], cwd, prompt))
+    if launcher == "review.sh":
+        return shlex.join([*start, "review", "resume after a move", "resuming after a move"])
     return shlex.join([*start, kind, "resume after a move", kind, "resuming after a move", "0", team_role])
 
 

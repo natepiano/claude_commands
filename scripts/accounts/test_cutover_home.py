@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from scripts.accounts import accounts, role_map
+from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader
 from scripts.message import sessions
 from scripts.whoami import agent_accounts
 from scripts.whoami.test_agent_accounts import ServiceKeychain, folder_service
@@ -38,6 +39,7 @@ class HomeCutoverTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        _ = cast(object, self.enterContext(patch.object(accounts, "import_module", side_effect=imports_with_nix_loader(fake_nix_loader()))))
         _ = self.enterContext(patch.object(sys, "platform", "linux"))
         self.enterContext(patch.dict(os.environ, {"HOME": str(self.home),
             "AGENT_NOTES_DIR": str(self.home / "notes")}, clear=True))

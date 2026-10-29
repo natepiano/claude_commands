@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -34,22 +35,53 @@ INVOKE = Path(__file__).with_name("invoke.sh")
 MEMORY_GATE = Path(__file__).with_name("memory_gate.sh")
 
 
-class DecisionTests(unittest.TestCase):
-    def test_alone_has_old_ceiling_and_earlyoom_reserve(self) -> None:
-        result = gate.decide(12 * GIB, 60 * GIB, 20 * GIB, [])
-        self.assertEqual((result.state, result.threshold, result.reserve), ("admit", 12 * GIB, 3 * GIB))
-        self.assertEqual(gate.decide(12 * GIB - 1, 60 * GIB, 20 * GIB, []).state, "hold")
+def setUpModule() -> None:
+    root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {
+        "BUILDLOG_MEMORY_PRESSURE": str(root / "pressure"),
+        "BUILDLOG_BUILD_BUDGET_GIB": "20",
+    })))
 
-    def test_measured_steps_do_not_keep_their_peak_promises(self) -> None:
-        running: list[gate.StepMemory] = [gate.MeasuredMemory(3 * GIB), gate.PromisedMemory(2 * GIB)]
+
+class DecisionTests(unittest.TestCase):
+    def test_alone_covers_need_and_earlyoom_reserve(self) -> None:
+        result = gate.decide(23 * GIB, 60 * GIB, 20 * GIB, [])
+        self.assertEqual((result.state, result.threshold, result.reserve), ("admit", 23 * GIB, 3 * GIB))
+        self.assertEqual(gate.decide(23 * GIB - 1, 60 * GIB, 20 * GIB, []).state, "hold")
+
+    def test_measured_use_is_not_charged_again_but_growth_is_reserved(self) -> None:
+        running: list[gate.StepMemory] = [gate.MeasuredMemory(3 * GIB, 3 * GIB), gate.PromisedMemory(2 * GIB)]
         result = gate.decide(10 * GIB, 60 * GIB, 5 * GIB, running)
         self.assertEqual((result.promised, result.measured, result.threshold, result.state),
                          (2 * GIB, 3 * GIB, 10 * GIB, "admit"))
         self.assertEqual(gate.decide(10 * GIB - 1, 60 * GIB, 5 * GIB, running).state, "hold")
 
+    def test_ramping_step_counts_promise_or_higher_measured_use(self) -> None:
+        for used, headroom, state in ((1, 11, "hold"), (11, 1, "admit"), (13, 0, "hold")):
+            with self.subTest(measured_gib=used):
+                result = gate.decide(15 * GIB, 60 * GIB, 8 * GIB,
+                                     [gate.MeasuredMemory(used * GIB, 12 * GIB)])
+                self.assertEqual((result.state, result.promised, result.measured),
+                                 (state, headroom * GIB, used * GIB))
+
     def test_no_total_has_no_reserve(self) -> None:
         result = gate.decide(5 * GIB, None, 5 * GIB, [])
         self.assertEqual((result.reserve, result.threshold, result.state), (0, 5 * GIB, "admit"))
+
+    def test_positive_budget_override_changes_admission_and_invalid_values_use_20(self) -> None:
+        for setting, state in (("24", "admit"), ("20", "hold"), ("0", "hold"), ("-1", "hold"),
+                               ("bad", "hold"), ("nan", "hold"), ("inf", "hold"), ("", "hold")):
+            with self.subTest(setting=setting), patch.dict(os.environ, {"BUILDLOG_BUILD_BUDGET_GIB": setting}):
+                decision = gate.decide(40 * GIB, 60 * GIB, 10 * GIB, [gate.MeasuredMemory(12 * GIB)])
+                self.assertEqual(decision.state, state)
+        with patch.dict(os.environ):
+            del os.environ["BUILDLOG_BUILD_BUDGET_GIB"]
+            self.assertEqual(gate.decide(40 * GIB, 60 * GIB, 10 * GIB, [gate.MeasuredMemory(12 * GIB)]).state, "hold")
+
+    def test_psi_11_holds_a_step_that_fits_memory_and_budget(self) -> None:
+        decision = gate.decide(40 * GIB, 60 * GIB, GIB, [], pressure=gate.MemoryPressure(11))
+        self.assertEqual(decision.state, "hold")
+
 
 
 class HistoryTests(unittest.TestCase):
@@ -180,7 +212,8 @@ class LedgerTests(unittest.TestCase):
         def caller_start(pid: int) -> str | None:
             return "start" if pid == self.pid else None
         _ = self.enterContext(patch.object(gate, "process_start_time", side_effect=caller_start))
-        _ = self.enterContext(patch.object(gate, "process_tree_memory", return_value=gate.MeasuredMemory(8 * GIB)))
+        _ = self.enterContext(patch.object(gate, "process_table", return_value={self.pid: gate.ProcessIdentity(1, "start")}))
+        _ = self.enterContext(patch.object(gate, "tree_memory", return_value=gate.MeasuredMemory(8 * GIB)))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root / "log")})))
 
     def check(self, available: int, *, force: bool = False, sidecar: str = "",
@@ -216,7 +249,7 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual([decision.state for decision, _ in results].count("admit"), 1)
         self.assertEqual(len(list((self.root / "admission").glob("*.reservation"))), 1)
 
-    def test_measured_tree_replaces_promise_and_release_records_maximum(self) -> None:
+    def test_ramping_tree_keeps_growth_and_release_records_maximum(self) -> None:
         scope = self.root / "scope"
         scope.mkdir()
         _ = (scope / "memory.stat").write_text(f"anon {8 * GIB}\nfile 1\n")
@@ -228,9 +261,9 @@ class LedgerTests(unittest.TestCase):
                 argv=["cargo", "nextest", "run", "--test-threads", "16"],
             )
         assert path is not None
-        with patch.object(gate, "step_memory", return_value=gate.MeasuredMemory(8 * GIB)):
+        with patch.object(gate, "step_memory", return_value=gate.MeasuredMemory(8 * GIB, 12 * GIB)):
             result, _ = self.check(12 * GIB)
-        self.assertEqual((result.promised, result.measured), (0, 8 * GIB))
+        self.assertEqual((result.promised, result.measured), (4 * GIB, 8 * GIB))
         _ = path.with_suffix(".max").write_text(str(8 * GIB))
         with patch.object(store, "host_name", return_value="test-host"):
             gate.release(path, 7, self.root)
@@ -293,15 +326,15 @@ class LedgerTests(unittest.TestCase):
                                  "test_threads": None, "call_id": None}
         _ = (gate.admission_dir(self.root) / f"{self.pid}-held.reservation").write_text(json.dumps(row))
 
-    def test_fresh_step_promises_until_its_first_process_reading(self) -> None:
-        self.held_reservation(str(self.sidecar), NOW - timedelta(seconds=gate.START_SECONDS - 1))
+    def test_step_reserves_growth_only_inside_the_ramp_window(self) -> None:
+        self.held_reservation(str(self.sidecar), NOW - timedelta(seconds=gate.RAMP_SECONDS - 1))
         decision, _ = self.check(12 * GIB)
-        self.assertEqual((decision.promised, decision.measured), (12 * GIB, 0))
-        self.held_reservation(str(self.sidecar), NOW - timedelta(seconds=gate.START_SECONDS))
+        self.assertEqual((decision.promised, decision.measured), (4 * GIB, 8 * GIB))
+        self.held_reservation(str(self.sidecar), NOW - timedelta(seconds=gate.RAMP_SECONDS))
         decision, _ = self.check(12 * GIB)
         self.assertEqual((decision.promised, decision.measured), (0, 8 * GIB))
 
-    def test_unscoped_step_is_measured_after_the_start_window(self) -> None:
+    def test_unscoped_step_counts_only_measured_use_after_the_ramp_window(self) -> None:
         self.held_reservation("", NOW - timedelta(hours=1))
         decision, _ = self.check(12 * GIB)
         self.assertEqual((decision.promised, decision.measured), (0, 8 * GIB))
@@ -323,7 +356,7 @@ class LedgerTests(unittest.TestCase):
         _, path = self.check(12 * GIB)
         assert path is not None
         result = gate.check(self.meminfo, self.pid, "", [], root=self.root, now=NOW)
-        self.assertEqual((result.decision.state, result.decision.promised, len(result.live)), ("hold", 12 * GIB, 1))
+        self.assertEqual((result.decision.state, result.decision.promised, len(result.live)), ("hold", 4 * GIB, 1))
         self.assertEqual(result.reservation, gate.NotReserved("launch"))
         self.assertEqual(len(list((self.root / "admission").glob("*.reservation"))), 1)
 
@@ -342,7 +375,8 @@ class LedgerTests(unittest.TestCase):
         first = gate.check(self.meminfo, self.pid, "", ["cargo", "nextest"], root=self.root, now=NOW)
         self.assertIsInstance(first.reservation, gate.Reserved)
         _ = self.meminfo.write_text("MemAvailable: 20971520 kB\n")
-        def grow(_row: gate.Reservation, _now: datetime) -> gate.StepMemory:
+        def grow(_row: gate.Reservation, _now: datetime, _processes: dict[int, gate.ProcessIdentity],
+                 _proc: Path) -> gate.StepMemory:
             _ = self.meminfo.write_text("MemAvailable: 8388608 kB\n")
             return gate.MeasuredMemory(8 * GIB)
         with patch.object(gate, "step_memory", side_effect=grow):
@@ -372,13 +406,17 @@ class MemoryQueueFixture(unittest.TestCase):
         self.meminfo = self.root / "meminfo"
         self.processes = {100: "first", 200: "second", 300: "head", 400: "warmup"}
         self.readings = {100: gate.MeasuredMemory(GIB), 200: gate.MeasuredMemory(2 * GIB)}
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root)})))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root), "BUILDLOG_PROC": str(self.root / "proc"), "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")})))
         _ = self.enterContext(patch.object(gate, "process_start_time", side_effect=self.processes.get))
-        def reading(pid: int, _start: str) -> gate.MeasuredMemory | gate.GoneMemory:
+        def table(_proc: Path) -> dict[int, gate.ProcessIdentity]:
+            return {pid: gate.ProcessIdentity(1, start) for pid, start in self.processes.items()}
+        _ = self.enterContext(patch.object(gate, "process_table", side_effect=table))
+        def reading(pid: int, _start: str, _processes: dict[int, gate.ProcessIdentity],
+                    _proc: Path) -> gate.MeasuredMemory | gate.GoneMemory:
             return self.readings[pid]
-        _ = self.enterContext(patch.object(gate, "process_tree_memory", side_effect=reading))
+        _ = self.enterContext(patch.object(gate, "tree_memory", side_effect=reading))
 
-    def running(self, pid: int, need: float, age: float = 60) -> Path:
+    def running(self, pid: int, need: float, age: float = 180) -> Path:
         row: gate.Reservation = {"pid": pid, "start_time": self.processes[pid], "need": int(need * GIB),
                                  "repo": "test", "step": "nextest", "worktree": "test", "sidecar": "",
                                  "admitted_at": store.utc_iso(NOW.timestamp() - age),
@@ -404,26 +442,71 @@ class MemoryQueueFixture(unittest.TestCase):
 
 
 class MeasuredAdmissionTests(MemoryQueueFixture):
-    def test_23_point_5_promised_with_3_measured_and_10_point_9_head_admits_warmup(self) -> None:
+    def test_five_mature_steps_with_43_point_4_promised_admit_10_point_8_on_6_point_8_used(self) -> None:
+        for pid in (100, 200, 500, 600, 700):
+            self.processes[pid] = str(pid)
+            self.readings[pid] = gate.MeasuredMemory(int(1.36 * GIB))
+            _ = self.running(pid, 8.68)
+        _ = self.meminfo.write_text(f"MemAvailable: {int(18.1 * GIB) // 1024} kB\nMemTotal: {int(60.5 * GIB) // 1024} kB\n")
+        result = gate.check(self.meminfo, 400, "", ["cargo", "check"], root=self.root, now=NOW,
+                            profile=gate.StepProfile("test", "check", "test", gate.ExpectedPeak(int(10.8 * GIB), "measured", 5)))
+        self.assertIsInstance(result.reservation, gate.Reserved)
+        self.assertEqual((result.decision.state, result.decision.promised), ("admit", 0))
+        self.assertAlmostEqual(result.decision.charged / GIB, 6.8)
+
+    def test_mature_steps_using_12_gib_hold_10_point_8_against_the_budget(self) -> None:
+        _ = self.running(100, 43.4)
+        self.readings[100] = gate.MeasuredMemory(12 * GIB)
+        result = self.check(need=10.8, free=18.1)
+        self.assertEqual((result.decision.state, result.decision.charged), ("hold", 12 * GIB))
+        self.assertGreater(result.available, result.decision.threshold)
+        with patch.dict(os.environ, {"BUILDLOG_MEMINFO": str(self.meminfo), "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")}):
+            view = gate.read_queue(gate.admission_dir(self.root), gate.process_table(gate.PROC), NOW.timestamp())[0]
+        self.assertEqual(view.waiting[0].reason, gate.NeedsBuildBudget(int(10.8 * GIB), 12 * GIB, 20 * GIB))
+
+    def test_two_10_point_8_steps_cannot_start_together_inside_ramp(self) -> None:
+        self.readings[100] = gate.MeasuredMemory(0)
+        first = self.check(pid=100, need=10.8, free=40)
+        self.assertIsInstance(first.reservation, gate.Reserved)
+        second = self.check(pid=200, need=10.8, free=40)
+        self.assertEqual((second.decision.state, second.decision.charged), ("hold", int(10.8 * GIB)))
+
+    def test_22_gib_step_runs_alone_despite_the_budget(self) -> None:
+        result = self.check(need=22, free=30)
+        self.assertIsInstance(result.reservation, gate.Reserved)
+
+    def test_memory_floor_still_holds_with_room_in_the_budget(self) -> None:
+        _ = self.running(100, 12)
+        result = self.check(need=10.8, free=9)
+        self.assertEqual(result.decision.state, "hold")
+        self.assertLess(result.decision.charged + result.peak.bytes, result.decision.budget)
+
+    def test_ramp_charge_covers_measured_growth_above_the_promise(self) -> None:
+        _ = self.running(100, 2, age=gate.RAMP_SECONDS - 1)
+        self.readings[100] = gate.MeasuredMemory(12 * GIB)
+        result = self.check(need=10, free=40)
+        self.assertEqual((result.decision.state, result.decision.charged, result.decision.promised), ("hold", 12 * GIB, 0))
+
+    def test_head_budget_keeps_room_before_warmup(self) -> None:
         _ = self.running(100, 12)
         _ = self.running(200, 11.5)
         _ = self.head()
         result = self.check()
-        self.assertEqual(result.decision.state, "admit")
+        self.assertEqual(result.decision.state, "hold")
         self.assertEqual((result.decision.promised, result.decision.measured), (0, 3 * GIB))
         self.assertEqual((result.head_need, result.head_label), (int(10.9 * GIB), "clone88ci nextest (verify pid 300)"))
 
     def test_dead_steps_promise_leaves_the_sum_at_once(self) -> None:
         path = self.running(100, 23.5, age=0)
         del self.processes[100]
-        result = self.check(free=12)
+        result = self.check(free=15)
         self.assertEqual((result.decision.state, result.decision.promised), ("admit", 0))
         self.assertFalse(path.exists())
 
     def test_fresh_step_keeps_its_promise_then_uses_its_first_reading(self) -> None:
         _ = self.running(100, 23.5, age=0)
-        self.assertEqual(self.check().decision.promised, int(23.5 * GIB))
-        _ = self.running(100, 23.5, age=gate.START_SECONDS)
+        self.assertEqual(self.check().decision.promised, int(22.5 * GIB))
+        _ = self.running(100, 23.5, age=gate.RAMP_SECONDS)
         result = self.check()
         self.assertEqual((result.decision.promised, result.decision.measured), (0, GIB))
 
@@ -431,28 +514,117 @@ class MeasuredAdmissionTests(MemoryQueueFixture):
         _ = self.running(100, 12)
         _ = self.running(200, 11.5)
         head = self.head()
-        result = self.check(pid=300, need=10.9, free=23.1, since=NOW.timestamp() - 2400)
+        result = self.check(pid=300, need=10.9, free=35, since=NOW.timestamp() - 2400)
         self.assertEqual((result.decision.state, result.head_need), ("admit", 0))
         self.assertFalse(head.exists())
 
-    def test_head_that_cannot_fit_reserves_nothing_from_smaller_steps(self) -> None:
-        _ = self.running(100, 12)
+    def test_head_beyond_memory_released_by_running_steps_does_not_hold_smaller_steps(self) -> None:
+        _ = self.running(100, 1)
         _ = self.head(20)
         result = self.check(need=2, free=8)
         self.assertEqual((result.decision.state, result.head_need), ("admit", 0))
 
+    def test_head_that_fits_after_measured_steps_end_holds_smaller_steps(self) -> None:
+        _ = self.running(100, 30)
+        self.readings[100] = gate.MeasuredMemory(int(21.5 * GIB))
+        _ = self.head(19.3)
+        result = self.check(need=2, free=15)
+        self.assertEqual(result.decision.state, "hold")
+        self.assertEqual((result.head_need, result.head_label),
+                         (int(19.3 * GIB), "clone88ci nextest (verify pid 300)"))
+        self.assertIsInstance(result.reservation, gate.NotReserved)
+
+    def test_pending_start_promise_cannot_make_a_head_fit_after_drain(self) -> None:
+        _ = self.running(100, 12, age=0)
+        _ = self.head(20)
+        result = self.check(need=2, free=18)
+        self.assertEqual((result.decision.state, result.head_need, result.decision.promised),
+                         ("admit", 0, 11 * GIB))
+
     def test_dead_head_is_removed_without_charging_its_need(self) -> None:
         head = self.head()
         del self.processes[300]
-        result = self.check(free=12)
+        result = self.check(free=15)
         self.assertEqual((result.decision.state, result.head_need), ("admit", 0))
         self.assertFalse(head.exists())
 
     def test_reading_a_finished_tree_does_not_keep_a_promise(self) -> None:
         _ = self.running(100, 23.5)
         self.readings[100] = gate.GoneMemory()
-        result = self.check(free=12)
+        result = self.check(free=15)
         self.assertEqual((result.decision.state, result.decision.promised), ("admit", 0))
+
+    def test_check_charges_only_measured_use_after_ramp(self) -> None:
+        path = self.running(100, 12)
+        for used, state in ((1, "admit"), (11, "admit"), (13, "hold")):
+            with self.subTest(measured_gib=used):
+                self.readings[100] = gate.MeasuredMemory(used * GIB)
+                result = self.check(need=8, free=15)
+                self.assertEqual((result.decision.state, result.decision.promised), (state, 0))
+                for reservation in (self.root / "admission").glob("*.reservation"):
+                    if reservation != path:
+                        reservation.unlink()
+
+
+class PressureAdmissionTests(MemoryQueueFixture):
+    pressure: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.pressure = self.root / "pressure"
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "BUILDLOG_MEMORY_PRESSURE": str(self.pressure),
+            "BUILDLOG_MEMINFO": str(self.meminfo), "BUILDLOG_PROC": str(self.root / "proc"),
+        })))
+
+    def assert_admission(self, held: bool) -> None:
+        result = self.check(need=8, free=40)
+        self.assertEqual(result.decision.state, "hold" if held else "admit")
+        self.assertEqual(isinstance(result.reservation, gate.Reserved), not held)
+        if isinstance(result.reservation, gate.Reserved):
+            result.reservation.path.unlink()
+        else:
+            view, _ = gate.read_queue(self.root / "admission", gate.process_table(self.root / "proc"), NOW.timestamp())
+            self.assertEqual(view.waiting[0].reason, result.decision.pressure)
+
+    def test_full_memory_stall_holds_only_above_ten(self) -> None:
+        for full in (11, 9, 10):
+            with self.subTest(full_avg10=full):
+                _ = self.pressure.write_text(f"some avg10=71.0 avg60=1.0 total=1\nfull avg10={full} avg60=1.0 total=1\n")
+                self.assert_admission(full > 10)
+
+    def test_idle_swap_at_ninety_nine_percent_does_not_hold_low_pressure_admission(self) -> None:
+        _ = self.pressure.write_text("full avg10=4.0 avg60=1.0 total=1\n")
+        _ = self.meminfo.write_text(
+            f"MemAvailable: {40 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n"
+            + "SwapTotal: 100 kB\nSwapFree: 1 kB\n")
+        profile = gate.StepProfile("test", "nextest", "test", gate.ExpectedPeak(8 * GIB, "measured", 5))
+        result = gate.check(self.meminfo, 400, "", ["cargo", "nextest"], root=self.root, now=NOW, profile=profile)
+        self.assertEqual(result.decision.state, "admit")
+        self.assertIsInstance(result.reservation, gate.Reserved)
+        self.assertIsInstance(result.decision.pressure, gate.NoPressureHold)
+
+    def test_unreadable_pressure_does_not_hold_but_memory_still_does(self) -> None:
+        self.pressure.mkdir()
+        self.assert_admission(False)
+        result = self.check(need=8, free=1)
+        self.assertEqual(result.decision.state, "hold")
+        self.assertIsInstance(result.decision.pressure, gate.NoPressureHold)
+
+    def test_pressure_is_in_checker_summary_even_with_no_running_step(self) -> None:
+        _ = self.pressure.write_text("full avg10=23.4 avg60=1.0 total=1\n")
+        _ = self.meminfo.write_text(f"MemAvailable: {40 * GIB // 1024} kB\n")
+        arguments = ["memory_admit.py", "check", str(self.meminfo), "400", "", "0", "repo", "check",
+                     "tree", str(8 * GIB), "fallback", "0", "cargo", "check"]
+        output = io.StringIO()
+        with patch.object(sys, "argv", arguments), patch.dict(os.environ, {"BUILDLOG_MEM_DETAIL": "1"}), redirect_stdout(output):
+            gate.main()
+        fields = output.getvalue().strip().split("|")
+        self.assertEqual(fields[0], "hold")
+        self.assertEqual(fields[8], "memory pressure: full avg10 23.4")
+        self.assertNotIn("swap", fields[8])
+        self.assertEqual(fields[6], "0")
 
 
 class QueueApiTests(MemoryQueueFixture):
@@ -484,7 +656,7 @@ class QueueApiTests(MemoryQueueFixture):
                 self.waiter(400, NOW.timestamp() - 300, "/tmp/warmup-tree", "warmup"),
                 self.waiter(500, NOW.timestamp() - 60, "/tmp/third", "third"))
 
-    def test_today_view_replaces_23_point_5_peak_promises_with_3_measured_and_names_head(self) -> None:
+    def test_view_counts_measured_use_after_ramp_and_keeps_the_head(self) -> None:
         _ = self.running(100, 12)
         _ = self.running(200, 11.5)
         _ = self.queue()
@@ -494,23 +666,25 @@ class QueueApiTests(MemoryQueueFixture):
             view = gate.queue_view()
         self.assertEqual(read.call_count, 1)
         self.assertEqual((view.promised, sum(step.promise for step in view.running)), (0, int(23.5 * GIB)))
-        self.assertCountEqual([step.measured for step in view.running], [gate.MeasuredMemory(GIB), gate.MeasuredMemory(2 * GIB)])
+        self.assertCountEqual([step.measured for step in view.running],
+                              [gate.MeasuredMemory(GIB), gate.MeasuredMemory(2 * GIB)])
         self.assertEqual(view.waiting[0].session_name, "clone88ci")
         self.assertIsInstance(view.waiting[0].reason, gate.ReadyForAdmission)
-        self.assertEqual(view.waiting[1].reason, gate.BehindHead("clone88ci", NOW.timestamp() - 2400))
+        self.assertTrue(all(isinstance(row.reason, gate.BehindHead) for row in view.waiting[1:]))
 
-    def test_queue_view_names_pending_starts_in_the_memory_reason(self) -> None:
+    def test_queue_view_names_ramp_growth_in_the_memory_floor_reason(self) -> None:
         _ = self.running(100, 12, age=0)
         _ = self.running(200, 11.5, age=0)
         _ = self.queue()
         view = gate.queue_view()
-        self.assertEqual(view.promised, int(23.5 * GIB))
+        self.assertEqual(view.promised, int(20.5 * GIB))
         reason = view.waiting[0].reason
         self.assertIsInstance(reason, gate.NeedsMemory)
         assert isinstance(reason, gate.NeedsMemory)
-        self.assertEqual((reason.need, reason.free, reason.promised_count, reason.promised),
-                         (int(10.9 * GIB), view.available, 2, int(23.5 * GIB)))
-        self.assertIsInstance(view.running[0].measured, gate.PromisedMemory)
+        self.assertEqual((reason.need, reason.free),
+                         (int(10.9 * GIB), view.available))
+        self.assertCountEqual([row.measured for row in view.running],
+                              [gate.MeasuredMemory(GIB, 12 * GIB), gate.MeasuredMemory(2 * GIB, int(11.5 * GIB))])
 
     def test_bump_by_position_session_id_session_name_and_folder_starts_the_selected_waiter_first(self) -> None:
         for selector in ("2", "session-400", "warmup", "/tmp/warmup-tree", "warmup-tree"):
@@ -577,18 +751,73 @@ class QueueApiTests(MemoryQueueFixture):
                          {"kind": "queue_bump", "actor": "actor-id", "session": "session-400", "step": "nextest",
                           "folder": "/tmp/warmup-tree", "old_position": 2, "at": store.utc_iso(NOW.timestamp())})
 
-    def test_queue_view_does_not_prune_dead_records_or_wait_for_the_lock(self) -> None:
+    def test_queue_view_and_check_agree_on_heads_that_can_and_cannot_fit_after_drain(self) -> None:
+        _ = self.running(100, 30)
+        self.readings[100] = gate.MeasuredMemory(int(21.5 * GIB))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"BUILDLOG_BUILD_BUDGET_GIB": "30"})))
+        for need, held in ((19.3, True), (38, False)):
+            with self.subTest(head_need=need):
+                path = self.head(need)
+                row = cast(gate.Waiter, json.loads(path.read_text()))
+                row["session_name"] = "clone88ci"
+                _ = path.write_text(json.dumps(row))
+                result = self.check(need=2, free=15)
+                if not held:
+                    assert isinstance(result.reservation, gate.Reserved)
+                    result.reservation.path.unlink()
+                    _ = self.waiter(400, NOW.timestamp(), "/tmp/warmup-tree", "warmup")
+                    waiter_path = self.root / "admission/400-warmup.waiting"
+                    follower = cast(gate.Waiter, json.loads(waiter_path.read_text()))
+                    follower["need"] = 2 * GIB
+                    _ = waiter_path.write_text(json.dumps(follower))
+                view = gate.queue_view()
+                reason = next(step.reason for step in view.waiting if step.pid == 400)
+                if held:
+                    self.assertEqual(result.decision.state, "hold")
+                    self.assertEqual(reason, gate.BehindHead("clone88ci", NOW.timestamp() - 2400))
+                else:
+                    self.assertEqual(result.decision.state, "admit")
+                    self.assertIsInstance(reason, gate.ReadyForAdmission)
+
+    def test_queue_view_waits_for_lock_and_keeps_real_reasons_without_pruning(self) -> None:
         paths = self.queue()
         del self.processes[300]
         _ = self.enterContext(patch.object(gate, "process_table", return_value={
             pid: gate.ProcessIdentity(1, start) for pid, start in self.processes.items()}))
         lock_path = self.root / "admission/lock"
+        released = threading.Event()
+        previous = signal.getsignal(signal.SIGALRM)
         with lock_path.open("a+") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            view = gate.queue_view()
+            def release() -> None:
+                released.set()
+                fcntl.flock(lock, fcntl.LOCK_UN)
+            timer = threading.Timer(0.05, release)
+            timer.start()
+            try:
+                view = gate.queue_view()
+                self.assertTrue(released.is_set())
+            finally:
+                timer.cancel()
+                timer.join()
         self.assertEqual([row.pid for row in view.waiting], [400, 500])
         self.assertTrue(paths[0].exists())
-        self.assertTrue(all(isinstance(row.reason, gate.ReadingUnavailable) for row in view.waiting))
+        self.assertTrue(all(isinstance(row.reason, gate.ReadyForAdmission) for row in view.waiting))
+        self.assertEqual(view.available, int(23.1 * GIB) // 1024 * 1024)
+        self.assertEqual(signal.getsignal(signal.SIGALRM), previous)
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL)[0], 0)
+
+    def test_queue_view_times_out_on_held_lock_and_restores_alarm(self) -> None:
+        _ = self.queue()
+        previous = signal.getsignal(signal.SIGALRM)
+        with (self.root / "admission/lock").open("a+") as lock, \
+             patch.object(gate, "QUEUE_LOCK_TIMEOUT_SECONDS", 0.03):
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with self.assertRaisesRegex(TimeoutError, "admission lock busy for 0.03 s; try again"):
+                _ = gate.queue_view()
+        self.assertEqual(signal.getsignal(signal.SIGALRM), previous)
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL)[0], 0)
+        self.assertEqual(len(gate.queue_view().waiting), 3)
 
     def test_missing_meminfo_is_a_reading_unavailable_reason(self) -> None:
         _ = self.queue()
@@ -611,9 +840,48 @@ class ProcessMemoryTests(unittest.TestCase):
                 fields = [state, str(parent), *(["0"] * 17), start]
                 _ = (path / "stat").write_text(f"{pid} (test process) " + " ".join(fields))
                 _ = (path / "status").write_text(f"VmRSS: {resident} kB\nVmSwap: {swap} kB\n")
-            self.assertEqual(gate.process_tree_memory(100, "start", proc), gate.MeasuredMemory(69 * 1024))
-            self.assertEqual(gate.process_tree_memory(100, "reused", proc), gate.GoneMemory())
-            self.assertEqual(gate.process_tree_memory(999, "gone", proc), gate.GoneMemory())
+            processes = gate.process_table(proc)
+            self.assertEqual(gate.tree_memory(100, "start", processes, proc), gate.MeasuredMemory(69 * 1024))
+            self.assertEqual(gate.tree_memory(100, "reused", processes, proc), gate.GoneMemory())
+            self.assertEqual(gate.tree_memory(999, "gone", processes, proc), gate.GoneMemory())
+
+    def test_check_reads_one_table_for_promised_measured_and_reused_reservations(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            proc = root / "proc"
+            for pid, parent, start, resident, swap in (
+                (100, 1, "fresh", 900, 0), (200, 1, "running", 20, 3),
+                (201, 200, "child", 30, 4), (300, 1, "reused", 800, 0),
+            ):
+                path = proc / str(pid)
+                path.mkdir(parents=True)
+                fields = ["S", str(parent), *(["0"] * 17), start]
+                _ = (path / "stat").write_text(f"{pid} (test process) " + " ".join(fields))
+                _ = (path / "status").write_text(f"VmRSS: {resident} kB\nVmSwap: {swap} kB\n")
+            directory = gate.admission_dir(root)
+            for pid, start, age in ((100, "fresh", 0), (200, "running", gate.RAMP_SECONDS), (300, "old", 0)):
+                row: gate.Reservation = {
+                    "pid": pid, "start_time": start, "need": 4 * GIB, "repo": "test",
+                    "step": "check", "worktree": "test", "sidecar": "",
+                    "admitted_at": store.utc_iso(NOW.timestamp() - age),
+                    "test_threads": None, "call_id": None,
+                }
+                _ = (directory / f"{pid}.reservation").write_text(json.dumps(row))
+            _ = (directory / "300.max").write_text("100")
+            meminfo = root / "meminfo"
+            _ = meminfo.write_text(f"MemAvailable: {8 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
+            starts = {100: "fresh", 200: "running", 300: "old", 400: "caller"}
+            with patch.dict(os.environ, {"BUILDLOG_DIR": str(root), "BUILDLOG_PROC": str(proc)}), \
+                 patch.object(gate, "process_start_time", side_effect=starts.get), \
+                 patch.object(gate, "process_table", wraps=gate.process_table) as tables:
+                result = gate.check(meminfo, 400, "", ["cargo", "check"], root=root, now=NOW,
+                                    profile=gate.StepProfile("test", "check", "test", gate.ExpectedPeak(2 * GIB, "fallback", 0)))
+            tables.assert_called_once_with(proc)
+            self.assertEqual((result.decision.state, result.decision.promised, result.decision.measured),
+                             ("hold", 4 * GIB - 900 * 1024, 957 * 1024))
+            self.assertCountEqual([row["pid"] for row in result.live], [100, 200])
+            self.assertFalse((directory / "300.reservation").exists())
+            self.assertFalse((directory / "300.max").exists())
 
 
 
@@ -759,8 +1027,9 @@ class ShellTests(unittest.TestCase):
             root = Path(folder)
             meminfo = root / "meminfo"
             _ = meminfo.write_text("MemAvailable: 8388608 kB\n")
+            # Advance a test clock so checker runtime cannot change notice order.
             command = (
-                'source "$1"; calls=0; sleep() { calls=$((calls + 1)); '
+                'source "$1"; unset SECONDS; SECONDS=0; calls=0; sleep() { calls=$((calls + 1)); '
                 'if (( calls == 1 )); then SECONDS=61; else printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO"; fi; }; '
                 'buildlog_wait_for_memory'
             )

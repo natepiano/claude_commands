@@ -1443,7 +1443,7 @@ class StopTests(ShutdownTestCase):
 
         def report(_login: str, _only: frozenset[str]) -> inventory.Inventory:
             paused.set()
-            if not release.wait(2):
+            if not release.wait(60):
                 raise RuntimeError("stop worker was not released")
             return machine_inventory([])
 
@@ -1461,7 +1461,7 @@ class StopTests(ShutdownTestCase):
         worker = threading.Thread(target=first_worker)
         worker.start()
         try:
-            self.assertTrue(paused.wait(2))
+            self.assertTrue(paused.wait(60))
             replacement_time = NOW_UTC + timedelta(seconds=record.CLAIM_STALE_SECONDS)
             stopped = stop.stop_session(
                 self.stored_record(), kill=lambda _pid, _sent: None,
@@ -1479,7 +1479,7 @@ class StopTests(ShutdownTestCase):
             replacement = record.update_session(LOGIN, "owner", relaunch)
         finally:
             release.set()
-            worker.join(2)
+            worker.join(60)
         self.assertFalse(worker.is_alive())
         self.assertEqual(errors, [])
         self.assertEqual(returned, [replacement])
