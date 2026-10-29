@@ -216,6 +216,7 @@ echo "seat"; test "$role" = "worker"
                 "CLAUDE.md": "worker", "commands/a.md": "seat", "docs/words.md": "worker",
                 "docs/plans/a.md": "seat", "skills/a/SKILL.md": "worker",
                 "scripts/a.py": 'print("seat")', "scripts/test_a.py": 'print("worker")',
+                "scripts/fake_tool.py": 'print("worker")', "scripts/tool_test_support.py": 'print("worker")',
                 "scripts/fixtures/a.py": 'print("worker")', "scripts/data.json": '"worker"',
             }.items():
                 path = root / name

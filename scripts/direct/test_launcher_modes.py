@@ -2,7 +2,7 @@
 """Every launcher in scripts/direct keeps git mode 100755.
 
 A launcher is a tracked file in scripts/direct whose first line starts with
-`#!` and whose name does not start with `test_`. Agents and scripts call these
+`#!` and which is not test code. Agents and scripts call these
 by path (`~/.claude/scripts/direct/verify.sh ...`), so a 100644 entry makes the
 call exit 126. Files with no `#!` line are imported modules and are not checked.
 A gate copy with no .git has no index, so there the test reads the modes of the
@@ -15,6 +15,8 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+
+from scripts.lib.code_kind import is_test_code
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DIRECT = "scripts/direct"
@@ -54,8 +56,8 @@ def tracked_modes(root: Path) -> tuple[dict[str, str], str]:
 
 
 def is_launcher(path: str, first_line: str) -> bool:
-    """A file with a `#!` first line and no `test_` name prefix."""
-    return first_line.startswith("#!") and not Path(path).name.startswith("test_")
+    """A production file with a `#!` first line."""
+    return first_line.startswith("#!") and not is_test_code(Path(path))
 
 
 def failures(modes: dict[str, str], first_lines: dict[str, str], source: str = "in git") -> list[str]:
@@ -87,12 +89,16 @@ class LauncherModeTests(unittest.TestCase):
             + "100644 bbbb 0\tscripts/direct/verify.sh\n"
             + "100644 cccc 0\tscripts/direct/plan_history.py\n"
             + "100644 dddd 0\tscripts/direct/test_findings.py\n"
+            + "100644 eeee 0\tscripts/direct/fake_tool.py\n"
+            + "100644 ffff 0\tscripts/direct/launcher_test_support.py\n"
         )
         first_lines = {
             "scripts/direct/board.sh": "#!/usr/bin/env bash\n",
             "scripts/direct/verify.sh": "#!/usr/bin/env bash\n",
             "scripts/direct/plan_history.py": '"""A module."""\n',
             "scripts/direct/test_findings.py": "#!/usr/bin/env python3\n",
+            "scripts/direct/fake_tool.py": "#!/usr/bin/env python3\n",
+            "scripts/direct/launcher_test_support.py": "#!/usr/bin/env python3\n",
         }
         self.assertEqual(
             failures(index_modes(output), first_lines),

@@ -11,6 +11,8 @@ import unittest
 from pathlib import Path
 from typing import override
 
+from scripts.lib.code_kind import is_test_code
+
 SCRIPT = Path(__file__).with_name("user_zone.py")
 PROBE = ("import sys; sys.path.insert(0, sys.argv[1]); import user_zone; from datetime import datetime, timezone; "
          "print(user_zone.user_zone().key, user_zone.zone_label(datetime(2026, 7, 1, 12, tzinfo=timezone.utc)), "
@@ -40,11 +42,6 @@ USES_THE_MACHINE_ZONE = {
     "whoami/note_file.py": "reads a reset time stored before the offset was, in the machine's zone",
 }
 SKIPPED_DIRS = {"__pycache__", "fixtures", "tests", "testdata", "node_modules"}
-
-
-def is_test_code(path: Path) -> bool:
-    """A test module or a shared test helper: its times are fixture data, never shown to the user."""
-    return path.name.startswith("test_") or path.stem.endswith("_test_support")
 
 
 class UserZoneTests(unittest.TestCase):
