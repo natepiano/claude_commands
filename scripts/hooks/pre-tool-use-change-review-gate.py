@@ -22,9 +22,12 @@ from typing import TYPE_CHECKING, TypedDict, cast
 
 if TYPE_CHECKING:
     from ..production import change_review
+    from ..direct import assertion_guard
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "direct"))
     import change_review
+    import assertion_guard
 
 COMMIT = re.compile(r"\bgit\b(?P<options>[^\n;&|]*?)\bcommit\b")
 DIRECTORY = re.compile(r"(?:^|\s)-C\s*(?P<path>\"[^\"]+\"|'[^']+'|\S+)")
@@ -97,8 +100,10 @@ def refusal(command: str, cwd: Path) -> str:
     if not every:
         arguments.append("--staged")
     try:
+        for base in assertion_guard.commit_bases(repo):
+            arguments.extend(("--base", base))
         result = subprocess.run(arguments, input=text, capture_output=True, text=True, check=False, timeout=10)
-    except (OSError, subprocess.TimeoutExpired) as error:
+    except (assertion_guard.GuardError, OSError, subprocess.TimeoutExpired) as error:
         return f"assertion guard could not run: {error}"
     if result.returncode == 1:
         return "\n".join(result.stdout.splitlines()[-20:])

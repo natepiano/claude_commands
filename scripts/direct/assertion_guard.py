@@ -101,11 +101,11 @@ class GuardParser(argparse.ArgumentParser):
 
 class GuardArguments(argparse.Namespace):
     repo: str = "."
-    base: str = ""
     head: str = ""
     staged: bool = False
     def __init__(self) -> None:
         super().__init__()
+        self.bases: list[str] = []
         self.rulings: list[str] = []
 
 
@@ -618,6 +618,19 @@ def default_base(repo: Path, explicit_base: str = "") -> str:
     raise GuardError("cannot determine branch base; set VERIFY_ASSERTION_BASE (or --base)")
 
 
+def commit_bases(repo: Path) -> tuple[str, ...]:
+    """The parents of the commit being made, including all pending merge heads."""
+    bases = [git(repo, "rev-parse", "--verify", "HEAD^{commit}").strip()]
+    merge_head = repo / git(repo, "rev-parse", "--git-path", "MERGE_HEAD").strip()
+    try:
+        merging = merge_head.read_text(encoding="ascii").splitlines()
+    except FileNotFoundError:
+        merging = []
+    for revision in merging:
+        bases.append(git(repo, "rev-parse", "--verify", f"{revision}^{{commit}}").strip())
+    return tuple(dict.fromkeys(bases))
+
+
 def name_tests(findings: list[Finding], sources: dict[tuple[str, Side], list[str]]) -> list[Finding]:
     groups: dict[tuple[str, Side], list[Finding]] = defaultdict(list)
     for finding in findings:
@@ -654,21 +667,8 @@ def read_rulings(sources: list[str], messages: str) -> dict[tuple[str, str], str
             if (why := match[3].strip().rstrip("\"'").strip())}
 
 
-def run(arguments: list[str]) -> int:
-    parser = GuardParser(description=__doc__)
-    _ = parser.add_argument("--repo", default=".")
-    _ = parser.add_argument("--base", default="")
-    new_side = parser.add_mutually_exclusive_group()
-    _ = new_side.add_argument("--head", default="")
-    _ = new_side.add_argument("--staged", action="store_true")
-    _ = parser.add_argument("--rulings", action="append", default=[])
-    args = GuardArguments()
-    _ = parser.parse_args(arguments, namespace=args)
-    repo = Path(args.repo).expanduser().resolve()
-    repo = Path(git(repo, "rev-parse", "--show-toplevel").strip())
-    base = default_base(repo, args.base)
-    head = args.head
-    staged = args.staged
+def findings_against_base(repo: Path, base: str, head: str, staged: bool) -> list[Finding]:
+    """Judge a single parent against the selected tree, index or revision."""
     diff_args = ["diff", "--no-color", "--no-ext-diff", "-U0", "--find-renames"]
     if staged:
         diff_args.append("--cached")
@@ -677,15 +677,52 @@ def run(arguments: list[str]) -> int:
         diff_args.append(head)
     diff_args.extend(("--", "*.rs", "*.py"))
     diff = git(repo, *diff_args)
-    messages = git(repo, "log", "--format=%B", f"{base}..{head or 'HEAD'}", "--")
     lines = parse_diff(diff)
     sources = read_sources(repo, base, head, staged, lines)
     code = {key: code_lines(rows, key[0].endswith(".rs")) for key, rows in sources.items()}
     assertions = touched_assertions(lines, sources, code)
-    findings = name_tests(find_changes(lines, assertions, code), sources)
+    return name_tests(find_changes(lines, assertions, code), sources)
+
+
+def finding_identity(finding: Finding) -> tuple[str, str, Kind, str, str]:
+    """Match the same change across parents even when source line numbers differ."""
+    return (finding.source.path, finding.test, finding.kind, normalized(finding.old), normalized(finding.new))
+
+
+def run(arguments: list[str]) -> int:
+    parser = GuardParser(description=__doc__)
+    _ = parser.add_argument("--repo", default=".")
+    _ = parser.add_argument("--base", dest="bases", action="append", default=[])
+    new_side = parser.add_mutually_exclusive_group()
+    _ = new_side.add_argument("--head", default="")
+    _ = new_side.add_argument("--staged", action="store_true")
+    _ = parser.add_argument("--rulings", action="append", default=[])
+    args = GuardArguments()
+    _ = parser.parse_args(arguments, namespace=args)
+    repo = Path(args.repo).expanduser().resolve()
+    repo = Path(git(repo, "rev-parse", "--show-toplevel").strip())
+    if args.bases:
+        bases = [default_base(repo, base) for base in args.bases]
+    else:
+        bases = [default_base(repo)]
+        bases.extend(git(repo, "rev-list", "--parents", "-n", "1", "HEAD").split()[2:])
+    bases = list(dict.fromkeys(bases))
+    findings = findings_against_base(repo, bases[0], args.head, args.staged)
+    common = Counter(finding_identity(finding) for finding in findings)
+    for base in bases[1:]:
+        common &= Counter(finding_identity(finding)
+                          for finding in findings_against_base(repo, base, args.head, args.staged))
+    shared: list[Finding] = []
+    for finding in findings:
+        identity = finding_identity(finding)
+        if common[identity]:
+            shared.append(finding)
+            common[identity] -= 1
+    messages = "\n".join(git(repo, "log", "--format=%B", f"{base}..{args.head or 'HEAD'}", "--")
+                         for base in bases)
     rulings = read_rulings(args.rulings, messages)
     blocking = 0
-    for finding in findings:
+    for finding in shared:
         why = rulings.get((finding.source.path, finding.test), "")
         prefix = "note: " if finding.kind == "changed" else ""
         suffix = f" — ruled: {why}" if why else ""
@@ -697,7 +734,7 @@ def run(arguments: list[str]) -> int:
     if blocking:
         print(f'assertion guard: {blocking} blocking; add "Assertion-Change: <path>::<test> — <why>" '
               + "to the work order or the commit message, or restore the assertion")
-    elif not findings:
+    elif not shared:
         print("assertion guard: no removed or weaker assertions")
     return 1 if blocking else 0
 

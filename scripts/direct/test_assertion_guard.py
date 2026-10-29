@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from typing import override
 
-from scripts.direct.assertion_guard import default_base
+from scripts.direct.assertion_guard import commit_bases, default_base
 
 GUARD = Path(__file__).with_name("assertion_guard.py")
 TILE_OLD = "assert_eq!(foot_cell.clip().bottom(), COLUMN_FOOT_TEST_AREA.bottom());"
@@ -484,6 +484,30 @@ class AssertionGuardTests(GitRepositoryFixture):
                 self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
                 self.assertNotIn(CLEAN, result.stdout)
 
+    def test_repeated_bases_do_not_combine_different_assertions_in_one_test(self) -> None:
+        _ = self.save("test_value.py", self.python("self.assertEqual(first, expected)"))
+        self.commit_base()
+        first_base = self.base
+        _ = self.save("test_value.py", self.python("self.assertEqual(second, expected)"))
+        _ = self.git("add", "test_value.py")
+        _ = self.git("commit", "-q", "-m", "other comparison base")
+        _ = self.save("test_value.py", self.python("pass"))
+        _ = self.git("add", "test_value.py")
+        self.assert_clean(self.guard("--base", first_base, "--base", "HEAD", "--staged"))
+
+    def test_repeated_bases_count_only_duplicate_assertions_present_in_every_base(self) -> None:
+        assertion = "self.assertEqual(actual, expected)"
+        _ = self.save("test_value.py", self.python(assertion))
+        self.commit_base()
+        first_base = self.base
+        _ = self.save("test_value.py", self.python(assertion + "\n    " + assertion))
+        _ = self.git("add", "test_value.py")
+        _ = self.git("commit", "-q", "-m", "duplicate assertion in second base")
+        _ = self.save("test_value.py", self.python("pass"))
+        _ = self.git("add", "test_value.py")
+        _ = self.assert_finding(self.guard("--base", first_base, "--base", "HEAD", "--staged"),
+                                "test_value.py", "removed")
+
     def test_untracked_files_and_other_extensions_have_no_findings(self) -> None:
         self.change("notes.txt", self.python("assert actual == expected"), self.python("pass"))
         _ = self.save("untracked.py", "@pytest.mark.skip\ndef test_untracked():\n    pass\n")
@@ -502,6 +526,77 @@ class AssertionGuardTests(GitRepositoryFixture):
                         - children_before.ru_utime - children_before.ru_stime)
         _ = self.assert_finding(result, "value.rs", "weaker")
         self.assertLess(cpu_seconds, 1.0, f"guard used {cpu_seconds:.3f} CPU seconds")
+
+
+class MergeInProgressFixture(GitRepositoryFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = self.save("test_merge.py", self.merge_source(incoming=True, ours=True))
+        self.commit_base()
+        _ = self.git("checkout", "-q", "-b", "incoming")
+        _ = self.save("test_merge.py", "# incoming branch comment\n"
+                      + self.merge_source(incoming=False, ours=True))
+        _ = self.git("add", "test_merge.py")
+        _ = self.git("commit", "-q", "-m", "incoming assertion removal")
+        _ = self.git("checkout", "-q", "unit")
+        _ = self.save("local.txt", "our unrelated branch change\n")
+        _ = self.git("add", "local.txt")
+        _ = self.git("commit", "-q", "-m", "our branch change")
+        _ = self.git("merge", "-q", "--no-ff", "--no-commit", "incoming")
+
+    def merge_source(self, *, incoming: bool, ours: bool) -> str:
+        return (self.python("self.assertEqual(incoming, expected)" if incoming else "pass", "test_incoming")
+                + "\n" + self.python("self.assertEqual(ours, expected)" if ours else "pass", "test_ours"))
+
+
+class MergeAssertionTests(MergeInProgressFixture):
+    def test_commit_bases_include_head_and_the_in_progress_merge_parent(self) -> None:
+        self.assertEqual(commit_bases(self.repo),
+                         (self.git("rev-parse", "HEAD"), self.git("rev-parse", "MERGE_HEAD")))
+
+    def test_repeated_bases_exclude_the_other_parents_assertion_removal(self) -> None:
+        # A HEAD-only comparison really does see the imported removal.
+        single = self.guard("--base", "HEAD", "--staged")
+        self.assertEqual(single.returncode, 1, single.stdout + single.stderr)
+        self.assertIn("test_incoming removed:", single.stdout)
+        for first, second in (("HEAD", "MERGE_HEAD"), ("MERGE_HEAD", "HEAD")):
+            with self.subTest(first=first):
+                result = self.guard("--base", first, "--base", second, "--staged")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout.strip(), CLEAN)
+                self.assertEqual(result.stderr, "")
+
+    def test_removal_during_merge_blocks_only_the_assertion_absent_against_both_parents(self) -> None:
+        _ = self.save("test_merge.py", self.merge_source(incoming=False, ours=False))
+        _ = self.git("add", "test_merge.py")
+        for first, second in (("HEAD", "MERGE_HEAD"), ("MERGE_HEAD", "HEAD")):
+            with self.subTest(first=first):
+                result = self.guard("--base", first, "--base", second, "--staged")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("test_ours removed:", result.stdout)
+                self.assertNotIn("test_incoming", result.stdout)
+                self.assertIn("assertion guard: 1 blocking;", result.stdout)
+                self.assertEqual(result.stderr, "")
+
+    def test_completed_merge_default_base_excludes_the_other_parents_removals(self) -> None:
+        _ = self.git("commit", "-q", "-m", "merge incoming")
+        explicit = self.guard("--base", "HEAD^1")
+        self.assertEqual(explicit.returncode, 1, explicit.stdout + explicit.stderr)
+        self.assertIn("test_incoming removed:", explicit.stdout)
+        result = self.guard()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.strip(), CLEAN)
+        self.assertEqual(result.stderr, "")
+
+    def test_completed_merge_still_blocks_our_new_assertion_removal(self) -> None:
+        _ = self.git("commit", "-q", "-m", "merge incoming")
+        _ = self.save("test_merge.py", self.merge_source(incoming=False, ours=False))
+        result = self.guard()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("test_ours removed:", result.stdout)
+        self.assertNotIn("test_incoming", result.stdout)
+        self.assertIn("assertion guard: 1 blocking;", result.stdout)
 
 
 class BranchBaseTests(GitRepositoryFixture):
