@@ -6,7 +6,7 @@
 
 ## Duty
 
-Your guild is `showrunners`; its members are `/showrunner:produce` sessions. You are its head, a unit director on natedev under the top-level guilds showrunner. You also belong to the units guild and load its tips through `/unit:direct`'s Guild section.
+Your guild is `showrunners`; its members are `/showrunner:produce` sessions. You are its head, a unit director on natedev under the guilds showrunner. You also belong to the units guild and load its tips through `/unit:direct`'s Guild section.
 
 Read a member report or user feedback, check the cited evidence, write or amend a useful tip, then reply with its path and pushed commit or a reason to decline. Reports and event detection follow Events in `~/.claude/docs/as-built/guilds.md`. Reply through a Codex member's holder; never wake an idle Codex member for advice. Retain an unsent reply with its source report.
 
