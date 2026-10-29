@@ -1248,11 +1248,98 @@ class HerdrTests(unittest.TestCase):
             ["--session", "fixture", "workspace", "close", "w1"],
             ["--session", "fixture", "workspace", "close", "w2"]])
 
+    def test_darwin_server_start_does_not_inherit_the_heal_proof(self) -> None:
+        spawn, _ = self.detached_server()
+        self.responses["--session fixture status server"] = [
+            {"stdout": "status: stopped\n", "code": 0}, {"stdout": "status: running\n", "code": 0}]
+        _ = self.responses_path.write_text(json.dumps(self.responses))
+        handoff = {herdr.nix_env.HEAL_SESSION_ENV: "healed-session",
+                   herdr.nix_env.HEAL_DIRECTORY_ENV: str(self.root),
+                   "IN_NIX_SHELL": "impure", "NIX_LDFLAGS": "-Lprepared"}
+        with patch.dict(os.environ, handoff):
+            self.assertIsInstance(herdr.start_server("fixture", 90_000), herdr.ServerCreated)
+            spawn.assert_called_once()
+            environment = cast(dict[str, str], spawn.call_args.kwargs["env"])
+            self.assertNotIn(herdr.nix_env.HEAL_SESSION_ENV, environment)
+            self.assertNotIn(herdr.nix_env.HEAL_DIRECTORY_ENV, environment)
+            self.assertEqual(environment["IN_NIX_SHELL"], "impure")
+            self.assertEqual(environment["NIX_LDFLAGS"], "-Lprepared")
+            self.assertEqual(os.environ[herdr.nix_env.HEAL_SESSION_ENV], "healed-session")
+            self.assertEqual(os.environ[herdr.nix_env.HEAL_DIRECTORY_ENV], str(self.root))
+
+    def test_a_pane_of_the_heal_started_server_can_launch_another_session(self) -> None:
+        spawn, _ = self.detached_server()
+        self.responses["--session fixture status server"] = [
+            {"stdout": "status: stopped\n", "code": 0}, {"stdout": "status: running\n", "code": 0}]
+        _ = self.responses_path.write_text(json.dumps(self.responses))
+        envrc = self.root / ".envrc"
+        _ = envrc.write_text("use flake\n")
+        handoff = {herdr.nix_env.HEAL_SESSION_ENV: "healed-session",
+                   herdr.nix_env.HEAL_DIRECTORY_ENV: str(self.root),
+                   "IN_NIX_SHELL": "impure", "NIX_LDFLAGS": "-Lprepared"}
+        with (patch.dict(os.environ, handoff),
+              patch.object(herdr.nix_env, "ensure", side_effect=AssertionError("the heal proof must avoid another load")) as ensure,
+              patch.object(herdr, "open_tab", return_value="pane") as opened,
+              patch.object(herdr, "start_agent", return_value=herdr.PromptSubmissionNotRequired()) as started):
+            _ = herdr.start_server("fixture", 90_000)
+            restored = herdr.launch_agent("fixture", "space", "healed", str(self.root), {}, "claude",
+                                          ["--resume", "healed-session"], herdr.NoOpeningPrompt(), 90_000, agent="healed")
+            self.assertIsInstance(restored, herdr.AgentLaunched)
+            ensure.assert_not_called()
+            # A pane inherits the server environment, with its launch overlay on top.
+            server_environment = cast(dict[str, str], spawn.call_args.kwargs["env"])
+            pane_overlay = cast(dict[str, str], opened.call_args.args[4])
+            pane_environment = {**server_environment, **pane_overlay}
+            with (patch.dict(os.environ, pane_environment, clear=True),
+                  patch.object(herdr.nix_env, "ensure", return_value=herdr.nix_env.Loaded(pane_environment, envrc)) as load):
+                result = herdr.launch_agent("fixture", "space", "other", str(self.root), {}, "claude",
+                                           ["--resume", "another-session"], herdr.NoOpeningPrompt(), 90_000, agent="other")
+                self.assertIsInstance(result, herdr.AgentLaunched)
+                load.assert_called_once()
+                self.assertEqual(cast(Path, load.call_args.args[0]), self.root)
+            self.assertEqual(started.call_count, 2)
+            second_overlay = cast(dict[str, str], opened.call_args.args[4])
+            self.assertNotIn(herdr.nix_env.HEAL_SESSION_ENV, second_overlay)
+            self.assertNotIn(herdr.nix_env.HEAL_DIRECTORY_ENV, second_overlay)
+            self.assertEqual(second_overlay["NIX_LDFLAGS"], "-Lprepared")
+
+    def test_child_commands_drop_heal_proof_from_inherited_and_explicit_environments(self) -> None:
+        handoff = {herdr.nix_env.HEAL_SESSION_ENV: "healed-session",
+                   herdr.nix_env.HEAL_DIRECTORY_ENV: str(self.root), "IN_NIX_SHELL": "impure"}
+        with (patch.dict(os.environ, handoff),
+              patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(["probe"], 0, "", "")) as run):
+            for environment in (None, handoff):
+                with self.subTest(environment=environment):
+                    _ = herdr.run_program(["probe"], environment=environment)
+                    child_environment = cast(dict[str, str], run.call_args.kwargs["env"])
+                    self.assertNotIn(herdr.nix_env.HEAL_SESSION_ENV, child_environment)
+                    self.assertNotIn(herdr.nix_env.HEAL_DIRECTORY_ENV, child_environment)
+                    self.assertEqual(child_environment["IN_NIX_SHELL"], "impure")
+            self.assertEqual(handoff[herdr.nix_env.HEAL_SESSION_ENV], "healed-session")
+
+    def test_agent_start_cli_does_not_inherit_the_heal_proof(self) -> None:
+        handoff = {herdr.nix_env.HEAL_SESSION_ENV: "healed-session",
+                   herdr.nix_env.HEAL_DIRECTORY_ENV: str(self.root), "IN_NIX_SHELL": "impure"}
+        process = WaitingAgentCLI(StartupClock(), 0, lambda: None)
+        with (patch.dict(os.environ, handoff),
+              patch.object(herdr.Herdr, "startup_processes", side_effect=herdr.HerdrFailure("fixture has no shell")),
+              patch.object(subprocess, "Popen", return_value=process) as spawn):
+            result = self.herdr.start_command(["agent-start"], "claude", "pane", 1.0)
+        self.assertEqual(result.returncode, 0)
+        spawn.assert_called_once()
+        environment = cast(dict[str, str], spawn.call_args.kwargs["env"])
+        self.assertNotIn(herdr.nix_env.HEAL_SESSION_ENV, environment)
+        self.assertNotIn(herdr.nix_env.HEAL_DIRECTORY_ENV, environment)
+        self.assertEqual(environment["IN_NIX_SHELL"], "impure")
+
     def test_linux_client_discovery_in_an_isolated_copy_does_not_need_darwin_launcher(self) -> None:
         _ = self.process(42, 1, ["herdr", "session", "attach", "fixture"], {})
         isolated = self.root / "isolated/scripts/herdr"
         isolated.mkdir(parents=True)
         _ = shutil.copy2(Path(herdr.__file__), isolated / "herdr.py")
+        library = isolated.parent / "lib"
+        library.mkdir()
+        _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "lib/nix_env.py", library / "nix_env.py")
         probe = (
             "import sys; sys.path.insert(0,sys.argv[1]); import herdr; "
             "herdr._PLATFORM='linux'; print(herdr.attached_clients('fixture'))"
@@ -1947,7 +2034,9 @@ class HerdrTests(unittest.TestCase):
         self.configure_herdr(["workspace", "create", *options], json.dumps({"result": {
             "root_pane": {"pane_id": "w1:p1"}, "tab": {"tab_id": "w1:t1"}}}))
         self.configure_herdr(["tab", "list"], json.dumps({"result": {"tabs": []}}))
-        self.assertEqual(herdr.open_tab("fixture", "boss", "boss", "/repo", {"SHOWRUNNER_UNIT": "prod"}), "w1:p1")
+        environment = {"SHOWRUNNER_UNIT": "prod", herdr.nix_env.HEAL_SESSION_ENV: "healed-session",
+                       herdr.nix_env.HEAL_DIRECTORY_ENV: "/repo"}
+        self.assertEqual(herdr.open_tab("fixture", "boss", "boss", "/repo", environment), "w1:p1")
         self.assertEqual(self.commands()[1:4], [["--session", "fixture", "workspace", "create", *options],
                                                 ["--session", "fixture", "tab", "rename", "w1:t1", "boss"],
                                                 ["--session", "fixture", "pane", "rename", "w1:p1", "boss"]])

@@ -8,6 +8,17 @@ from push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText, Se
 
 
 ENTRIES = (
+    PushText("nix_heal.failed", "nix-heal", "blocked", "{session} builds will fail: no nix shell",
+        ActionTemplate("On {machine}, fix the nix shell in {cwd}, then restart {session}"),
+        "The nix shell for {session}'s worktree did not load, so its builds will fail. "
+        + "{cause}\n\n"
+        + "The session's worktree changes stay on disk. This alert clears when the session has a nix shell.",
+        (PushExample("refused", {"session": "handler", "machine": "natedev", "cwd": "/home/natepiano/worktrees/handler",
+            "cause": "The automatic restart could not fix it. The .envrc file loaded, but no nix shell started."}),
+         PushExample("still_broken", {"session": "handler", "machine": "Mac", "cwd": "/Users/nate/worktrees/handler",
+            "cause": "An automatic restart did not fix it."})),
+        purpose="A session has no nix shell and automatic recovery failed.",
+        session=SessionTemplate("{session}")),
     # Stall-watch examples are the real prompts of 2026-10-23: a Bash call reads "run <command>" (cut to 89
     # characters and "…"), an edit "edit <file>", as stall_watch.prompt_request words them from the pending call.
     PushText("stall_watch.permission_prompt", "stall-watch", "blocked", "{unit} needs your answer",

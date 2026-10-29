@@ -213,12 +213,14 @@ def _launch(verb: str, arguments: list[str]) -> int:
         name = options.name or next(candidate for candidate in (
             herdr.generated_session_name(folder.name, str(suffix)) for suffix in itertools.count(1))
             if candidate not in taken)
-        pane = herdr.open_tab(shared, ADHOC_SPACE, name, str(folder), pane_environment)
         if verb == "resume":
             claude_arguments.extend(["--resume", options.session_id])
         claude_arguments.extend(["-n", name])
-        outcome = herdr.start_agent(shared, pane, kind="claude", agent=name, agent_arguments=claude_arguments,
-                                    opening=opening, timeout_ms=90_000)
+        launched = herdr.launch_agent(shared, ADHOC_SPACE, name, str(folder), pane_environment,
+            kind="claude", agent=name, agent_arguments=claude_arguments, opening=opening, timeout_ms=90_000)
+        if isinstance(launched, herdr.nix_env.Refused):
+            raise herdr.HerdrFailure(launched.reason)
+        pane, outcome = launched.pane, launched.outcome
         if isinstance(opening, herdr.OpeningPrompt) and not isinstance(outcome, herdr.PromptSubmitted):
             reason = outcome.reason if isinstance(outcome, herdr.PromptNotSubmitted) else "launcher supplied no submit proof"
             print(f"herdr_sessions: {name}: opening prompt not submitted: {reason}", file=sys.stderr)

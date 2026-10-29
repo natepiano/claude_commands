@@ -186,36 +186,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/scripts/hooks/post-tool-use-random-ack.sh --hook"
-          }
-        ]
-      },
-      {
-        "matcher": "Edit|MultiEdit|Write",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/post-tool-use-basedpyright.py\""
-          },
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/post-tool-use-fn-length.py\""
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/post-tool-use-context-usage.py\""
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/post-tool-use-banned-words.py\""
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/hook_dispatch.py\" post_tool_use",
+            "timeout": 2430
           }
         ]
       }
@@ -232,24 +204,12 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Bash|Write|NotebookEdit",
         "hooks": [
           {
             "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/pre-tool-use-heredoc-guard.py\""
-          },
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/pre-tool-use-tool-output-read.py\""
-          }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/pre-tool-use-showrunner-move-guard.py\""
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/hook_dispatch.py\" pre_tool_use",
+            "timeout": 3040
           }
         ]
       },
@@ -259,24 +219,6 @@
           {
             "type": "command",
             "command": "\"$HOME/.claude/scripts/hooks/pre-tool-use-build-hold-guard.sh\""
-          }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/pre-tool-use-change-review-gate.py\""
-          }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/pre-tool-use-checkpoint-doc-gate.py\""
           }
         ]
       },
@@ -306,16 +248,6 @@
             "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/pre-tool-use-push-gate.py\"",
             "timeout": 120
-          }
-        ]
-      },
-      {
-        "matcher": "Bash|Write|NotebookEdit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/pre-tool-use-scratch-guard.py\"",
-            "timeout": 10
           }
         ]
       }
@@ -382,19 +314,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/stop-direct-continue.py\""
-          },
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/stop-conversation-pause.py\""
-          },
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/stop-assistant-prose-banned-words.py\""
-          },
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/herdr_tab_title.py\""
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/hook_dispatch.py\" stop",
+            "timeout": 2430
           }
         ]
       }
