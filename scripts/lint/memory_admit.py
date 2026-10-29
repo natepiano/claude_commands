@@ -140,6 +140,8 @@ class MeasuredMemory:
     bytes: int
     # Only a step inside its ramp window reserves growth.
     ramp_promise: int = 0
+    # Swap counts toward the build charge, but its release does not free RAM.
+    swap_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -359,6 +361,38 @@ class StepProfile:
 
 
 @dataclass(frozen=True)
+class ReservationBlocker:
+    session_id: str
+    session_name: str
+    pool: Literal["memory"] = "memory"
+
+
+@dataclass(frozen=True)
+class UnitBlocker:
+    unit: str
+
+
+@dataclass(frozen=True)
+class NoSingleBlocker:
+    pass
+
+
+Blocker = ReservationBlocker | UnitBlocker | NoSingleBlocker
+
+
+class WaiterGone(FileNotFoundError):
+    """The requested waiter has left the admission ledger."""
+
+
+def blocker_fields(blocker: Blocker) -> dict[str, str]:
+    if isinstance(blocker, ReservationBlocker):
+        return {"session_id": blocker.session_id, "session_name": blocker.session_name, "pool": blocker.pool}
+    if isinstance(blocker, UnitBlocker):
+        return {"unit": blocker.unit}
+    return {}
+
+
+@dataclass(frozen=True)
 class CheckResult:
     decision: AdmissionDecision
     peak: ExpectedPeak
@@ -371,6 +405,7 @@ class CheckResult:
     head_need: int = 0
     head_label: str = ""
     head_reason: HeadAdmissionStatus | ReadyForAdmission = ReadyForAdmission()
+    blocker: Blocker = NoSingleBlocker()
 
 
 def build_budget_bytes() -> int:
@@ -665,7 +700,7 @@ def tree_memory(pid: int, start: str, processes: dict[int, ProcessIdentity],
     children: dict[int, list[int]] = {}
     for child, identity in processes.items():
         children.setdefault(identity.parent, []).append(child)
-    pending, seen, used = [pid], set[int](), 0
+    pending, seen, used, swapped = [pid], set[int](), 0, 0
     while pending:
         child = pending.pop()
         if child in seen:
@@ -676,10 +711,13 @@ def tree_memory(pid: int, start: str, processes: dict[int, ProcessIdentity],
             for line in (proc / str(child) / "status").read_text().splitlines():
                 parts = line.split()
                 if parts and parts[0] in ("VmRSS:", "VmSwap:"):
-                    used += int(parts[1]) * 1024
+                    size = int(parts[1]) * 1024
+                    used += size
+                    if parts[0] == "VmSwap:":
+                        swapped += size
         except (OSError, ValueError, IndexError):
             continue
-    return MeasuredMemory(used)
+    return MeasuredMemory(used, swap_bytes=swapped)
 
 
 def step_memory(row: Reservation, now: datetime, processes: dict[int, ProcessIdentity],
@@ -1056,6 +1094,8 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                 and waiter_order(head.waiter) < waiter_order(waiter)):
             head_need, head_label = head.waiter["need"], waiter_label(head.waiter)
         decision = queue_decision(available, total, waiter, running, head, pressure)
+        blocker = reservation_blocker(waiter, candidates, [row for _, row in live], running,
+                                      available, total, pressure, now.timestamp(), processes, proc)
         reservation: Reserved | NotReserved = NotReserved("held" if argv else "launch")
         if argv and decision.state == "hold" and start is not None:
             identity = waiter_identity(repo, step, worktree)
@@ -1083,7 +1123,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
         head_reason = (head_wait_reason(decision, peak.bytes, available, waiter, now.timestamp())
                        if candidates and candidates[0] is waiter else ReadyForAdmission())
         return CheckResult(decision, peak, [row for _, row in live], reservation, repo, step, available, profile,
-                           head_need, head_label, head_reason)
+                           head_need, head_label, head_reason, blocker)
 
 
 def waiter_identity(repo: str, step: str, worktree: str) -> WaiterIdentity:
@@ -1159,6 +1199,79 @@ def queue_rows(directory: Path, suffix: str, processes: dict[int, ProcessIdentit
         except (OSError, ValueError, KeyError, TypeError):
             continue
     return rows
+
+
+def reservation_blocker(waiter: Waiter, waiters: list[Waiter], reservations: list[Reservation],
+                        running: list[StepMemory], available: int, total: int | None,
+                        pressure: Pressure, now: float, processes: dict[int, ProcessIdentity],
+                        proc: Path) -> Blocker:
+    """Name the unique reservation whose release would admit this waiter."""
+    head = head_priority(waiters, available, total, running, now)
+    if queue_decision(available, total, waiter, running, head, pressure).state == "admit":
+        return NoSingleBlocker()
+    blockers: list[Reservation] = []
+    for index, memory in enumerate(running):
+        remaining = running[:index] + running[index + 1:]
+        freed = memory.bytes - memory.swap_bytes if isinstance(memory, MeasuredMemory) else 0
+        after_head = head_priority(waiters, available + freed, total, remaining, now)
+        if queue_decision(available + freed, total, waiter, remaining, after_head, pressure).state == "admit":
+            blockers.append(reservations[index])
+    if len(blockers) != 1:
+        return NoSingleBlocker()
+    row = blockers[0]
+    identity = QueueIdentityReader(processes, proc).identity(row["pid"], cast(dict[str, object], cast(object, row)))
+    if identity["session_id"]:
+        return ReservationBlocker(identity["session_id"], identity["session_name"])
+    if row["sidecar"]:
+        try:
+            unit = Path(Path(row["sidecar"]).read_text().strip()).name
+            if unit.endswith((".scope", ".service")):
+                return UnitBlocker(unit)
+        except OSError:
+            pass
+    return NoSingleBlocker()
+
+
+def blocker_snapshot(waiter_path: Path) -> Blocker:
+    # queue_rows is the queue view's read-only counterpart to live_reservations
+    # and live_waiters: stale rows are ignored, never removed under a shared lock.
+    if not waiter_path.exists():
+        raise WaiterGone(f"waiter file is gone: {waiter_path}")
+    directory = waiter_path.parent
+    proc = Path(os.environ.get("BUILDLOG_PROC", "/proc"))
+    processes = process_table(proc)
+    ordered = [(path, cast(Waiter, cast(object, row))) for path, row in queue_rows(directory, "waiting", processes)]
+    matching = [row for path, row in ordered if path == waiter_path]
+    if not matching:
+        if not waiter_path.exists():
+            raise WaiterGone(f"waiter file is gone: {waiter_path}")
+        return NoSingleBlocker()
+    now = time.time()
+    reservations: list[Reservation] = []
+    running: list[StepMemory] = []
+    for _, row in queue_rows(directory, "reservation", processes):
+        reservation = cast(Reservation, cast(object, row))
+        memory = step_memory(reservation, datetime.fromtimestamp(now, UTC), processes, proc)
+        if not isinstance(memory, GoneMemory):
+            reservations.append(reservation)
+            running.append(memory)
+    try:
+        available, total = read_meminfo(Path(os.environ.get("BUILDLOG_MEMINFO", "/proc/meminfo")))
+    except (OSError, ValueError):
+        return NoSingleBlocker()
+    return reservation_blocker(matching[0], [row for _, row in ordered], reservations, running,
+                               available, total, read_pressure(), now, processes, proc)
+
+
+def current_blocker(waiter_path: Path) -> Blocker:
+    """Read the waiter's blocker without changing the admission ledger."""
+    try:
+        lock = (waiter_path.parent / "lock").open("r")
+    except FileNotFoundError:
+        return blocker_snapshot(waiter_path)
+    with lock:
+        fcntl.flock(lock, fcntl.LOCK_SH)
+        return blocker_snapshot(waiter_path)
 
 
 def read_queue(directory: Path, processes: dict[int, ProcessIdentity], now: float) -> tuple[QueueView, list[tuple[Path, Waiter]]]:
@@ -1319,6 +1432,16 @@ def clean_field(value: str) -> str:
 
 def run_action() -> None:
     action = sys.argv[1]
+    if action == "blocker":
+        if len(sys.argv) != 4 or sys.argv[2] != "--waiter":
+            raise ValueError("usage: memory_admit.py blocker --waiter <waiter file>")
+        try:
+            blocker = current_blocker(Path(sys.argv[3]))
+        except WaiterGone as error:
+            print(str(error), file=sys.stderr)
+            sys.exit(2)
+        print(json.dumps(blocker_fields(blocker), separators=(",", ":")))
+        return
     if action == "tripwire":
         check_memory_reading(Path(sys.argv[2]))
         return
@@ -1369,7 +1492,11 @@ def run_action() -> None:
         if result.head_need:
             details += f"; head {result.head_label} needs {result.head_need / GIB:.1f} GiB"
         fields[8] = f"{summary}; {details}" if summary else details
-    print("|".join(clean_field(str(field)) for field in fields))
+    output = "|".join(clean_field(str(field)) for field in fields)
+    if os.environ.get("BUILDLOG_MEM_BLOCKER") == "1":
+        # Old shells enforce their field count. New callers opt into one JSON field.
+        output += "|" + json.dumps(blocker_fields(result.blocker), separators=(",", ":")).replace("|", "\\u007c")
+    print(output)
 
 
 def main() -> None:

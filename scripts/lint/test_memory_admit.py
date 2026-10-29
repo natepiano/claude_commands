@@ -17,6 +17,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+import contextlib
 from contextlib import closing, redirect_stdout
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -930,6 +931,152 @@ class MemoryQueueFixture(unittest.TestCase):
 
 
 
+class CurrentBlockerTests(MemoryQueueFixture):
+    reservation: Path = Path()
+    waiter_path: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, fake_memory_readings(
+            self.root, available_kib=26 * GIB // 1024, total_kib=60 * GIB // 1024))))
+        _ = self.enterContext(patch.object(time, "time", return_value=NOW.timestamp()))
+        _ = gate.admission_dir(self.root).joinpath("lock").write_text("")
+        self.readings[100] = gate.MeasuredMemory(12 * GIB)
+        self.reservation = self.running(100, 12)
+        process = self.root / "proc/100"
+        process.mkdir(parents=True)
+        _ = (process / "environ").write_bytes(
+            b"CLAUDE_CODE_SESSION_ID=owner-id\0CLAUDE_SESSION_NAME=owner-name\0")
+        self.waiter_path = self.root / "admission/400-warmup.waiting"
+        _ = self.waiter_path.write_text(json.dumps({
+            "pid": 400, "start_time": "warmup", "need": 12 * GIB, "since": NOW.timestamp(),
+        }))
+
+    def verb(self) -> tuple[int, dict[str, str]]:
+        output = io.StringIO()
+        code = 0
+        with patch.object(sys, "argv", ["memory_admit.py", "blocker", "--waiter", str(self.waiter_path)]), \
+                redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                gate.main()
+            except SystemExit as error:
+                code = cast(int, error.code)
+        lines = output.getvalue().splitlines()
+        if code == 0:
+            self.assertEqual(len(lines), 1)
+            return code, cast(dict[str, str], json.loads(lines[0]))
+        return code, {}
+
+    def test_blocker_names_the_session_that_would_release_admission(self) -> None:
+        result = gate.current_blocker(self.waiter_path)
+        self.assertIsInstance(result, gate.ReservationBlocker)
+        self.assertEqual(self.verb(), (0, {
+            "session_id": "owner-id", "session_name": "owner-name", "pool": "memory"}))
+
+    def test_blocker_names_only_the_scope_when_session_is_unknown(self) -> None:
+        (self.root / "proc/100/environ").unlink()
+        sidecar = self.root / "holder.cgroup"
+        _ = sidecar.write_text("/fake/cgroup/builds.slice/build-holder.scope\n")
+        row = cast(dict[str, object], json.loads(self.reservation.read_text()))
+        row["sidecar"] = str(sidecar)
+        _ = self.reservation.write_text(json.dumps(row))
+        self.assertIsInstance(gate.current_blocker(self.waiter_path), gate.UnitBlocker)
+        self.assertEqual(self.verb(), (0, {"unit": "build-holder.scope"}))
+
+    def test_no_single_blocker_for_pressure_ready_ambiguous_or_unknown_owner(self) -> None:
+        for reason in ("pressure", "ready", "ambiguous", "unknown-owner", "no-reservation"):
+            with self.subTest(reason=reason):
+                with patch.dict(os.environ, fake_memory_readings(
+                        self.root, available_kib=26 * GIB // 1024, total_kib=60 * GIB // 1024,
+                        full_avg10=11 if reason == "pressure" else 0)):
+                    self.readings[100] = gate.MeasuredMemory(GIB if reason == "ready" else 12 * GIB)
+                    extra = self.root / "admission/200.reservation"
+                    if reason == "ambiguous":
+                        self.readings[100] = gate.MeasuredMemory(6 * GIB)
+                        self.readings[200] = gate.MeasuredMemory(6 * GIB)
+                        extra = self.running(200, 6)
+                    if reason == "unknown-owner":
+                        (self.root / "proc/100/environ").unlink()
+                    if reason == "no-reservation":
+                        self.reservation.unlink()
+                    self.assertIsInstance(gate.current_blocker(self.waiter_path), gate.NoSingleBlocker)
+                    self.assertEqual(self.verb(), (0, {}))
+                    extra.unlink(missing_ok=True)
+
+    def test_removing_one_of_several_reservations_must_be_enough(self) -> None:
+        self.readings[100] = gate.MeasuredMemory(18 * GIB)
+        self.readings[200] = gate.MeasuredMemory(10 * GIB)
+        _ = self.running(200, 10)
+        self.assertEqual(self.verb(), (0, {}))
+        self.readings[200] = gate.MeasuredMemory(2 * GIB)
+        self.assertEqual(self.verb(), (0, {
+            "session_id": "owner-id", "session_name": "owner-name", "pool": "memory"}))
+
+    def test_queue_priority_is_not_blame_for_a_running_reservation(self) -> None:
+        _ = self.head(need=1)
+        self.assertEqual(self.verb(), (0, {}))
+
+    def test_measured_memory_release_can_remove_the_free_memory_hold(self) -> None:
+        _ = self.meminfo.write_text(f"MemAvailable: {8 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
+        self.assertEqual(self.verb(), (0, {
+            "session_id": "owner-id", "session_name": "owner-name", "pool": "memory"}))
+
+    def test_gone_waiter_exits_two_but_stale_waiter_has_no_blocker(self) -> None:
+        del self.processes[400]
+        self.assertEqual(self.verb(), (0, {}))
+        self.waiter_path.unlink()
+        self.assertEqual(self.verb()[0], 2)
+
+    def test_missing_process_reading_is_not_reported_as_a_gone_waiter(self) -> None:
+        with patch.object(gate, "process_table", side_effect=FileNotFoundError("missing process snapshot")):
+            with self.assertRaisesRegex(FileNotFoundError, "missing process snapshot"):
+                _ = self.verb()
+
+    def test_blocker_does_not_prune_or_change_state_bytes_or_mtimes(self) -> None:
+        directory = self.root / "admission"
+        _ = (directory / "stale.waiting").write_text('{"pid":999,"start_time":"gone"}')
+        _ = (directory / "stale.reservation").write_text('{"pid":999,"start_time":"gone"}')
+        _ = (directory / "stale.max").write_text("123")
+        _ = (directory / "broken.reservation").write_text("partial")
+        def snapshot() -> dict[str, tuple[bytes, int]]:
+            return {str(path.relative_to(self.root)): (path.read_bytes() if path.is_file() else b"", path.stat().st_mtime_ns)
+                    for path in [self.root, *self.root.rglob("*")]}
+        for has_lock in (True, False):
+            with self.subTest(lock=has_lock):
+                if not has_lock:
+                    (directory / "lock").unlink()
+                before = snapshot()
+                self.assertEqual(self.verb()[1].get("session_id"), "owner-id")
+                self.assertEqual(snapshot(), before)
+
+    def test_check_reports_holder_changes_on_existing_poll_with_opt_in_field(self) -> None:
+        arguments = ["memory_admit.py", "check", str(self.meminfo), "400", "", "0",
+                     "", "", "", "-", "", "0", "cargo", "nextest"]
+        for name in ("owner-name", "new-owner"):
+            _ = (self.root / "proc/100/environ").write_text(
+                f"CLAUDE_CODE_SESSION_ID=owner-id\0CLAUDE_SESSION_NAME={name}\0")
+            result = self.check(need=12)
+            self.assertEqual(result.decision.state, "hold")
+            self.assertEqual(result.blocker, gate.ReservationBlocker("owner-id", name))
+            for detail, old_count in (("", 15), ("1", 18)):
+                output = io.StringIO()
+                with patch.object(sys, "argv", arguments), \
+                        patch.dict(os.environ, {"BUILDLOG_MEM_DETAIL": detail, "BUILDLOG_MEM_BLOCKER": "1"}), \
+                        patch.object(gate, "git_identity", return_value=(gate.UnknownRepository(), "")), \
+                        redirect_stdout(output):
+                    gate.main()
+                fields = output.getvalue().strip().split("|")
+                self.assertEqual(len(fields), old_count + 1)
+                self.assertEqual(fields[0], "hold")
+                self.assertEqual(json.loads(fields[-1]), {
+                    "session_id": "owner-id", "session_name": name, "pool": "memory"})
+        self.readings[100] = gate.MeasuredMemory(GIB)
+        result = self.check(need=12)
+        self.assertEqual(result.decision.state, "admit")
+        self.assertIsInstance(result.blocker, gate.NoSingleBlocker)
+
+
 class MeasuredAdmissionTests(MemoryQueueFixture):
     def test_five_mature_steps_with_43_point_4_promised_admit_10_point_8_on_6_point_8_used(self) -> None:
         for pid in (100, 200, 500, 600, 700):
@@ -1663,6 +1810,39 @@ class QueueApiTests(MemoryQueueFixture):
 
 
 class ProcessMemoryTests(unittest.TestCase):
+    def test_swap_release_does_not_make_a_reservation_the_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            proc = root / "proc"
+            for pid, start in ((100, "holder"), (400, "waiter")):
+                process = proc / str(pid)
+                process.mkdir(parents=True)
+                fields = ["S", "1", *(["0"] * 17), start]
+                _ = (process / "stat").write_text(f"{pid} (test process) " + " ".join(fields))
+            _ = (proc / "100/status").write_text(
+                f"VmRSS: {GIB // 1024} kB\nVmSwap: {15 * GIB // 1024} kB\n")
+            _ = (proc / "100/environ").write_bytes(
+                b"CLAUDE_CODE_SESSION_ID=owner-id\0CLAUDE_SESSION_NAME=owner-name\0")
+            directory = gate.admission_dir(root)
+            reservation: gate.Reservation = {
+                "pid": 100, "start_time": "holder", "need": 16 * GIB,
+                "repo": "test", "step": "check", "worktree": "test", "sidecar": "",
+                "admitted_at": store.utc_iso(NOW.timestamp() - gate.RAMP_SECONDS),
+                "test_threads": None, "call_id": None,
+            }
+            _ = (directory / "100.reservation").write_text(json.dumps(reservation))
+            waiter = directory / "400-waiter.waiting"
+            _ = waiter.write_text(json.dumps({
+                "pid": 400, "start_time": "waiter", "need": 12 * GIB,
+                "since": NOW.timestamp(),
+            }))
+            environment = fake_memory_readings(
+                root, available_kib=2 * GIB // 1024, total_kib=60 * GIB // 1024)
+            environment.update({"BUILDLOG_DIR": str(root), "BUILDLOG_PROC": str(proc)})
+            with patch.dict(os.environ, environment), \
+                    patch.object(time, "time", return_value=NOW.timestamp()):
+                self.assertIsInstance(gate.current_blocker(waiter), gate.NoSingleBlocker)
+
     def test_tree_counts_resident_and_swap_and_excludes_other_processes(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             proc = Path(folder)
@@ -1677,7 +1857,8 @@ class ProcessMemoryTests(unittest.TestCase):
                 _ = (path / "stat").write_text(f"{pid} (test process) " + " ".join(fields))
                 _ = (path / "status").write_text(f"VmRSS: {resident} kB\nVmSwap: {swap} kB\n")
             processes = gate.process_table(proc)
-            self.assertEqual(gate.tree_memory(100, "start", processes, proc), gate.MeasuredMemory(69 * 1024))
+            self.assertEqual(gate.tree_memory(100, "start", processes, proc),
+                             gate.MeasuredMemory(69 * 1024, swap_bytes=9 * 1024))
             self.assertEqual(gate.tree_memory(100, "reused", processes, proc), gate.GoneMemory())
             self.assertEqual(gate.tree_memory(999, "gone", processes, proc), gate.GoneMemory())
 
