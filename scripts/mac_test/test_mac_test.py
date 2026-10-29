@@ -89,6 +89,7 @@ class GhFixture(TypedDict):
     jobs: dict[str, list[GhJob]]
     failures: list[GhFailure]
     delays: list[GhDelay]
+    graphql: NotRequired[dict[str, object]]
 
 
 GH_STUB = r'''from __future__ import annotations
@@ -96,6 +97,7 @@ GH_STUB = r'''from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import time
 
@@ -131,13 +133,38 @@ elif arguments[:2] == ["variable", "set"]:
     fixture["variable"] = arguments[body_index]
     fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
 elif arguments[:2] == ["run", "list"]:
-    if "--status" in arguments:
-        status_index = arguments.index("--status") + 1
-        print(json.dumps(fixture[arguments[status_index]]))
-    else:
-        print(json.dumps(fixture["created"]))
+    status_index = arguments.index("--status") + 1
+    print(json.dumps(fixture[arguments[status_index]]))
 elif arguments[:2] == ["run", "view"]:
     print(json.dumps({"jobs": fixture["jobs"].get(arguments[2], [])}))
+elif arguments[:2] == ["api", "graphql"]:
+    query = next(value.removeprefix("query=") for value in arguments if value.startswith("query="))
+    job = next(value.removeprefix("job=") for value in arguments if value.startswith("job="))
+    assert "checkRuns(first: 1, filterBy: {checkName: $job, conclusions: [SKIPPED]})" in query
+    assert "totalCount" in query
+    data = {}
+    for index, encoded in re.findall(r'batch(\d+): nodes\(ids: (\[.*?\])\)', query):
+        ids = json.loads(encoded)
+        assert 0 < len(ids) <= 100
+        nodes = []
+        for suite_id in reversed(ids):
+            run_id = suite_id.removeprefix("suite-")
+            count = sum(entry["name"] == job and entry.get("conclusion") == "skipped"
+                        for entry in fixture["jobs"].get(run_id, []))
+            nodes.append({"id": suite_id, "checkRuns": {"totalCount": count}})
+        data["batch" + index] = nodes
+    assert data
+    print(json.dumps(fixture.get("graphql", {"data": data})))
+elif arguments[0] == "api" and "/actions/workflows/" in arguments[1]:
+    assert arguments[arguments.index("--method") + 1] == "GET"
+    assert "per_page=100" in arguments and "--paginate" in arguments and "--slurp" in arguments
+    assert "--jq" not in arguments
+    assert any(value.startswith("created=>=") for value in arguments)
+    runs = [{"id": run["databaseId"], "head_branch": run["headBranch"],
+             "head_sha": run["headSha"], "check_suite_node_id": "suite-" + str(run["databaseId"])}
+            for run in fixture["created"]]
+    print(json.dumps([{"workflow_runs": runs[start:start + 100]}
+                      for start in range(0, max(1, len(runs)), 100)]))
 else:
     print("unexpected gh call: " + joined, file=sys.stderr)
     raise SystemExit(9)
@@ -2061,7 +2088,7 @@ for arguments in (
         _ = self.active_block()
         self.gh["variable"] = "false"
         self.gh["failures"] = [
-            {"match": "--created", "line": "list failed", "status": 1}
+            {"match": "created=", "line": "list failed", "status": 1}
         ]
         self.sync_gh()
         failed = self.command("unblock", "--holder", "alice")
@@ -2089,16 +2116,92 @@ for arguments in (
             str(index): [{"name": "another job", "conclusion": "success"}]
             for index in range(1, SKIPPED_REPORT_RUNS + 1)
         }
+        self.gh["jobs"]["1"] = [{"name": CI_JOB, "conclusion": "skipped"}]
+        self.gh["created"].append({"databaseId": 0, "headBranch": "outside-cap", "headSha": "000000000abcdef"})
+        self.gh["jobs"]["0"] = [{"name": CI_JOB, "conclusion": "skipped"}]
         self.sync_gh()
+        _ = self.write_block(free_message={"kind": "not_needed"}, ci="off_before")
         self.clear_log("gh")
         capped = self.command("unblock", "--holder", "alice")
         self.assertEqual(capped.returncode, 0, capped.stdout + capped.stderr)
-        self.assertEqual(self.gh_calls("run view"), SKIPPED_REPORT_RUNS)
-        self.assertIn("No CI run skipped the macOS job under this block.\n", capped.stdout)
+        self.assertLessEqual(len(self.logged_arguments("gh")), 2)
+        self.assertEqual(self.gh_calls("api graphql"), 1)
+        self.assertEqual(self.gh_calls("run view"), 0)
+        self.assertIn("  alpha: 1 runs, newest 000000001\n", capped.stdout)
+        self.assertNotIn("outside-cap", capped.stdout)
         self.assertIn(
             "Only the newest 200 runs were looked at; older ones under this block are not listed.\n",
             capped.stdout,
         )
+
+    def test_empty_skipped_run_report_starts_no_job_lookup(self) -> None:
+        _ = self.write_block(free_message={"kind": "not_needed"}, ci="off_before")
+
+        result = self.command("unblock", "--holder", "alice")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("No CI run skipped the macOS job under this block.\n", result.stdout)
+        self.assertEqual(len(self.logged_arguments("gh")), 1)
+        self.assertEqual(self.gh_calls("api graphql"), 0)
+
+    def test_failed_batched_jobs_keep_unblock_success_and_report_the_error(self) -> None:
+        _ = self.write_block(free_message={"kind": "not_needed"}, ci="off_before")
+        self.gh["created"] = [{"databaseId": 1, "headBranch": "alpha", "headSha": "abcdef123456"}]
+        self.gh["jobs"] = {"1": [{"name": CI_JOB, "conclusion": "skipped"}]}
+        self.gh["failures"] = [{"match": "api graphql", "line": "job lookup failed", "status": 1}]
+        self.sync_gh()
+
+        result = self.command("unblock", "--holder", "alice")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Could not list the CI runs that skipped the macOS job: job lookup failed\n", result.stdout)
+        self.assertNotIn("  alpha:", result.stdout)
+        self.assertFalse((self.state_directory / "block.json").exists())
+
+    def test_partial_batched_jobs_never_report_known_runs_as_a_complete_report(self) -> None:
+        self.gh["created"] = [
+            {"databaseId": 2, "headBranch": "alpha", "headSha": "222222222abcdef"},
+            {"databaseId": 1, "headBranch": "beta", "headSha": "111111111abcdef"},
+        ]
+        known = {"id": "suite-2", "checkRuns": {"totalCount": 1}}
+        answers: tuple[dict[str, object], ...] = (
+            {"data": {"batch0": [known]}},
+            {"data": {"batch0": [known, None]}},
+            {"data": {"batch0": [known, {"id": "suite-1", "checkRuns": {}}]}},
+            {"data": {"batch0": [known, known]}},
+            {"data": {"batch0": [known, {"id": "suite-1", "checkRuns": {"totalCount": 0}}]},
+             "errors": [{"message": "partial response"}]},
+        )
+        for answer in answers:
+            with self.subTest(answer=answer):
+                _ = self.write_block(free_message={"kind": "not_needed"}, ci="off_before")
+                self.gh["graphql"] = answer
+                self.sync_gh()
+
+                result = self.command("unblock", "--holder", "alice")
+
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("Could not list the CI runs that skipped the macOS job: gh returned invalid JSON\n",
+                              result.stdout)
+                self.assertNotIn("  alpha:", result.stdout)
+                self.assertNotIn("No CI run skipped", result.stdout)
+
+    def test_expiry_message_uses_batched_skipped_jobs(self) -> None:
+        now = datetime.now(timezone.utc)
+        _ = self.write_block(since=now - timedelta(hours=2), expires=now - timedelta(seconds=1),
+                             free_message={"kind": "not_needed"}, ci="off_before")
+        self.gh["created"] = [{"databaseId": 1, "headBranch": "alpha", "headSha": "abcdef123456"}]
+        self.gh["jobs"] = {"1": [{"name": CI_JOB, "conclusion": "skipped"}]}
+        self.sync_gh()
+
+        result = self.command("status")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        delivered = self.logged_arguments("send-delivered")
+        self.assertTrue(any("  alpha: 1 runs, newest abcdef123" in message[-1] for message in delivered))
+        self.assertEqual(self.gh_calls("api graphql"), 1)
+        self.assertEqual(self.gh_calls("run view"), 0)
+        self.assertFalse((self.state_directory / "block.json").exists())
 
     def test_failed_switch_on_block_is_retried_by_status(self) -> None:
         self.gh["failures"] = [
