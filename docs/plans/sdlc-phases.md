@@ -453,3 +453,109 @@ The showrunner returned change-review row C454 (2026-10-29): `phase_process.py b
 **Workers:** `1 impl`.
 
 **Acceptance gate:** a test renders the table from fixture phases with values in the millions and a not-recorded count, and checks every line is at most 60 characters, the short forms, and the not-recorded line; the live command's lines 6 to 11 are at most 60 characters.
+
+### Phase 15 — A rerun review lens checks every change that writes lasting state  · status: todo
+**Depends on:** none
+
+The user approved this work through the showrunner (2026-10-29, ranked before Phase 14: "we have been bit hard by this too many times"). Today shutdown kept old "stopped" records for 10 live sessions; each rerun of down/now trusted the record and did nothing; a failed restart moved the records to history/, so a rerun had nothing to restore; `set -e` stopped `herdr-up.sh` at the first failed account. Earlier faults had the same shape: `launch_pending` stayed true after a failed start; a "restarting" claim blocked a rerun until it timed out; a restart-job wait never cleared; a restore skipped a session whose record held an old path. No review lens asks these questions today.
+
+#### Work Order
+
+**Goal:** a phase that writes lasting state gets a third reviewer, the `rerun` lens, at the same time as `adversary` and `contract`; a phase that writes none does not.
+
+**Spec:**
+- `docs/direct/dual_review.md` `<TeamReview/>`: add the `rerun` lens row and its questions to the lens table and the question list. The lens reads, for each record, mark, lock, claim, state file or moved file the change writes:
+  1. If the command stops at any line and runs again, does it finish?
+  2. Does it trust a stored status without checking the live thing (pid and process start time, path, lock holder)?
+  3. Does a failure move or delete what a rerun needs?
+  4. Does one failure stop other, unrelated steps (`set -e` over a list)?
+  5. Does each mark have an expiry or an owner check, and a command that clears it?
+  Under the questions, one real case each, for the reviewer:
+  1. Restart of claude3 never ran after one account failed.
+  2. `down` trusted a "stopped" record for a session that was live.
+  3. A failed restore moved the records to `history/`, so the rerun had nothing to restore.
+  4. `set -e` in `herdr-up.sh` stopped every later account at the first failed one.
+  5. `launch_pending` and the "restarting" claim had no command to clear them.
+  A failed answer is a defect, fixed in the phase (severity blocker or minor, as for any finding). The prompt closes with the rerun case the reviewer built, or a statement that it could not build one.
+- When the lens runs: it is armed when the phase writes lasting state, that is, a record, mark, lock, claim, state file, a file move or delete, or a list of steps where one step can fail. Two triggers, either one arms it:
+  - the Work Order's `**State:**` line names what the phase writes (`none` and an absent line do not arm it);
+  - `scripts/direct/rerun_lens.py arm --diff <file>` finds such a write in the phase diff, so a missing or wrong `State:` line never skips the lens. It prints `armed` with each hit as `path:line — <kind>`, or `not armed`. Kinds: file write or append outside a test fixture; `os.replace`/`rename`/`shutil.move`/`unlink`/`rmtree`; `fcntl.flock` or a lock or claim file; a JSON/JSONL state write; in shell, `mv`, `rm`, `> file`, `mkdir` used as a lock, and `set -e` in a script that loops over a list; in Rust, `std::fs::write`, `File::create`, `OpenOptions` with append or write, `fs::rename`, `remove_file`, `remove_dir_all`, and the lock crates `fs2` and `fd-lock` (Rust tools here write lasting state too, such as cargo-berth reservations and claims). Hits in test files, docs and fixtures do not count. It reads only; it changes nothing.
+  - Pure computation and docs-only changes skip it. The diff check decides in every repo, Rust repos included. `<DualReview/>` runs the check before it launches the broad review; when armed, the `rerun` reviewer launches with the other two, on the same review copy, and its findings file is `review_findings_<pass>_rerun.txt`.
+- The `rerun` lens is a valid lens everywhere a lens is checked: `review.sh` (closed set and slot: `rerun` takes the `review` slot, as `ux` does; allowed on `--pool code`), `assign.py --lens` choices, `findings.py` `REVIEW_LENSES` and its `open --lens`, `usage/agents_log.py` `Lens`/`LENSES`, and every other reader of the lens set (`review_pool_report.py`, `progress_history.py`, `history/rounds.py`). Where the set is written twice, it is written once and imported, so a new lens is one edit.
+- `docs/direct/compose_work_order.md` and `docs/direct_plan_format.md`: add the optional `**State:**` field after `**Workers:**`: what lasting state the phase writes, or `none`. `berth.work_order validate` accepts a Work Order with or without it.
+- `commands/unit/direct.md`: the `findings.py open` row lists `rerun` among the lenses. No other route text changes.
+
+**Files:**
+- `docs/direct/dual_review.md`
+- `docs/direct/compose_work_order.md`
+- `docs/direct_plan_format.md`
+- `commands/unit/direct.md` — one table row
+- `scripts/direct/rerun_lens.py` — new
+- `scripts/direct/test_rerun_lens.py` — new
+- `scripts/direct/review.sh`
+- `scripts/direct/assign.py`
+- `scripts/direct/findings.py`
+- `scripts/usage/agents_log.py`
+- `scripts/direct/review_pool_report.py`
+- `scripts/direct/progress_history.py`
+- `scripts/history/rounds.py`
+- `scripts/direct/test_review_launcher.py`
+- `scripts/direct/test_review_launcher_pool.py`
+- `scripts/direct/test_assign_launcher.py`
+- `scripts/direct/test_findings.py`
+- `scripts/usage/test_agents_log.py`
+- `scripts/direct/test_review_pool_report.py`
+- `scripts/direct/test_progress_history.py`
+- `scripts/history/test_rounds.py`
+
+**Workers:** `2 writers`.
+- `fix3` (impl) — `scripts/**`: the lens set, `rerun_lens.py` and the tests
+- `design` (impl) — the four docs
+
+**State:** none — docs, review launch scripts and a read-only diff check.
+
+**Acceptance gate:** `rerun_lens.py arm` gives `armed` on a fixture diff that writes a state file, moves a record, takes a lock, and adds `set -e` over an account loop, each hit named with path:line; it gives `armed` on a Rust fixture diff that writes a reservation file with `std::fs::write`, renames it with `fs::rename` and takes an `fd-lock`; it gives `not armed` on a docs-only diff, a pure-computation diff and a diff whose only writes are in tests. On today's shutdown fix diffs (when present on main) it gives `armed`. `review.sh --lens rerun` passes its launch check; `findings.py open --lens rerun` records the lens; `assign.py --lens rerun` is accepted. The `review.sh`, `assign`, `findings`, `agents_log`, `review_pool_report`, `progress_history` and `rounds` suites stay green; basedpyright 0/0/0. `berth.work_order validate` passes this plan's todo phases.
+
+### Phase 16 — One rerun sweep of the scripts names each fault and its owner  · status: todo
+**Depends on:** Phase 15
+
+#### Work Order
+
+**Goal:** the showrunner has one list of rerun faults in `~/.claude/scripts`, each with path:line, the question it fails and the owner unit.
+
+**Spec:**
+- Run the `rerun` lens's five questions over the scripts in `~/.claude/scripts` at the sdlc merge-branch tip, in this order: shutdown, herdr, claims, holds, leases and review-pool scripts first, then the rest that `rerun_lens.py arm` marks armed when run on the whole file.
+- Each fault is one row: `path:line`, question number, what happens on a rerun (the stop line and the result), and the owner unit (from the file's last checkpoint subject, or the production doc's owner map). A fault already fixed on the tip is not a row.
+- The unit director checks each row against the file before it is sent; a row that does not hold is dropped.
+- Send the list to the showrunner as one message. This phase fixes nothing; the showrunner routes each row to its owner.
+
+**Files:**
+- `docs/plans/sdlc-rerun-sweep.md` — new: the list, with the tip hash and the time
+
+**Workers:** `2 writers` — `fix3` reads shutdown, herdr and claims scripts; `design` reads holds, leases, review-pool and the rest. Each writes only its own section of the report.
+
+**State:** none — read only; writes one report.
+
+**Acceptance gate:** every row names path:line, a question 1-5, the rerun result and an owner; the unit director has checked each row against the tip; the list is sent.
+
+### Phase 14 — A plan's Depends line counts only this plan's own phases  · status: todo
+**Depends on:** Phase 15 (order only: the showrunner ranks the rerun lens first)
+
+The showrunner sent a wrong result (2026-10-29): hierarchies-unit's phase 9 notice printed "Phase 6 needs Phase 2026 (not in the plan)". `phase_table.py parallel` reads each phase's `**Depends on:**` list from `plan_history.py`, which takes every number in the line (`re.findall(r"\b\d+[a-z]?\b", ...)`, near line 117). So a date (`2026-11-12`), a time (`19:00`), a commit hash with leading digits, another unit's phase (`phases-unit Phase 11`), and other numbered things (`Steps 1 and 4`) all count as this plan's phases.
+
+#### Work Order
+
+**Goal:** a phase's dependency list holds only the phases of its own plan that its `**Depends on:**` line names.
+
+**Spec:**
+- `scripts/direct/plan_history.py` reads phase ids only from `Phase <id>` and `Phases <id>, <id> and <id>` spans (either case). A span that another unit names (`phases-unit Phase 11`, `models-unit's phase 4`) does not count. Numbers outside a span (dates, times, hashes, `Steps 1 and 4`, `(numbering only)`) never count. `none` gives an empty list; an absent line stays `None`.
+- A named id that is not a phase of the plan still prints as `not in the plan`: that message is for a real wrong reference, and it stays.
+- Fix it in the parser, where the defect is; `phase_table.py` keeps reading `depends_on` as it does.
+
+**Files:**
+- `scripts/direct/plan_history.py`
+- `scripts/direct/test_progress_history.py` — the plan-parse tests
+
+**Workers:** `1 impl`.
+
+**Acceptance gate:** a test parses these Depends lines and gets exactly the ids shown: `the checkpoints of Phases 3, 4 and 5, and the three review records: the Phase 3 and Phase 5 re-runs, which the unit director runs on 2026-11-12 (two weeks after both merged into sdlc as 3c5dea67 on 2026-10-29) and records in the design doc under Steps 1 and 4` → 3, 4, 5; `phases-unit Phase 11 (the wait-holder field and the phase origin fields) merged into sdlc; sdlc said 2026-10-29 its ETA is 19:00 EDT.` → none; `Phase 7; postmaster-unit's reply record (main abc8344f)` → 7; `Phase 19 (numbering only)` → 19; `Phase 10b, Phase 11` → 10b, 11; `none` → none. `phase_table.py parallel` on hierarchies-unit's plan prints no `Phase 2026`. The `scripts.direct.test_phase_table` and `scripts.direct.test_progress_history` suites stay green.
