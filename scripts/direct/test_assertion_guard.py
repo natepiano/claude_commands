@@ -302,6 +302,83 @@ class AssertionGuardTests(GitRepositoryFixture):
                     self.python("pass", "test_other") + "\n" * 20 + self.python("assert actual == expected"))
         self.assert_clean(self.guard())
 
+    def test_added_python_string_markers_do_not_turn_tests_off(self) -> None:
+        strings = [
+            '''    single = '@unittest.skip("later")' ''',
+            '''    double = "@pytest.mark.skip" ''',
+            '''    triple_single = ''' + "'''self.skipTest('later')'''",
+            '''    triple_double = """pytest.skip("later")""" ''',
+            '''    formatted = f"@unittest.expectedFailure {value}" ''',
+            r'''    escaped = "say \" @unittest.skip('later')" ''',
+            '''    markers = ("#[ignore]", "@pytest.mark.xfail")''',
+        ]
+        before = self.python("pass")
+        after = before + "\n".join(strings) + "\n"
+        self.change("test_value.py", before, after)
+        self.assert_clean(self.guard())
+
+    def test_added_rust_string_markers_do_not_turn_tests_off(self) -> None:
+        strings = [
+            'let normal = "#[ignore]";',
+            'let raw = r"#[ignore]";',
+            'let hashed = r#"#[ignore = "later"]"#;',
+            'let hashes = r##"embedded "# #[ignore]"##;',
+            r'''let escaped = "say \" #[ignore]";''',
+        ]
+        self.change("value.rs", self.rust("helper();"), self.rust("\n    ".join(strings)))
+        self.assert_clean(self.guard())
+
+    def test_markers_added_inside_multiline_strings_have_no_finding(self) -> None:
+        for path, before, after in (
+            ("test_value.py", self.python('text = """\n        plain\n    """'),
+             self.python('text = """\n        @unittest.skip("later")\n    """')),
+            ("value.rs", self.rust('let text = r#"\n        plain\n    "#;'),
+             self.rust('let text = r#"\n        #[ignore = "later"]\n    "#;')),
+        ):
+            with self.subTest(path=path):
+                self.change(path, before, after)
+                self.assert_clean(self.guard())
+
+    def test_removed_assertion_text_inside_strings_has_no_finding(self) -> None:
+        for path, before, after in (
+            ("test_value.py", self.python(
+                '''text = "assert actual == expected; self.assertEqual(a, b); pytest.raises(ValueError)"\n'''
+                + '''    triple = ''' + "'''self.fail('missing')'''\n"
+                + '''    formatted = f"self.assertTrue({value})"\n    assert ok'''), self.python("assert ok")),
+            ("value.rs", self.rust(
+                'let text = "assert_eq!(a, b);";\n'
+                + '    let raw = r#"assert!(actual == expected); "quotes""#;\n    assert!(ok);'),
+             self.rust("assert!(ok);")),
+        ):
+            with self.subTest(path=path):
+                self.change(path, before, after)
+                self.assert_clean(self.guard())
+
+    def test_real_skip_decorator_after_string_markers_still_turns_test_off(self) -> None:
+        before = 'marker = "@pytest.mark.skip"\n' + self.python("pass")
+        after = 'marker = "@pytest.mark.skip"\n@unittest.skip("later")\n' + self.python("pass")
+        self.change("test_value.py", before, after)
+        line = self.assert_finding(self.guard(), "test_value.py", "test turned off", "?")
+        self.assertIn('@unittest.skip("later")', line)
+
+    def test_real_assertion_after_a_string_on_the_same_line_is_still_removed(self) -> None:
+        before = self.python('label = "assert fake"; assert actual == expected')
+        after = self.python('label = "assert fake"')
+        self.change("test_value.py", before, after)
+        line = self.assert_finding(self.guard(), "test_value.py", "removed")
+        self.assertIn("assert actual == expected -> (none)", line)
+
+    def test_escaped_newline_strings_do_not_hide_real_assertion_removals(self) -> None:
+        for path, before, after in (
+            ("test_value.py", self.python('text = "continued\\\n        @pytest.mark.skip"\n    assert ok'),
+             self.python('text = "continued\\\n        @pytest.mark.skip"')),
+            ("value.rs", self.rust('let text = "continued\\\n        #[ignore]";\n    assert!(ok);'),
+             self.rust('let text = "continued\\\n        #[ignore]";')),
+        ):
+            with self.subTest(path=path):
+                self.change(path, before, after)
+                _ = self.assert_finding(self.guard(), path, "removed")
+
     def test_whitespace_changes_and_stricter_assertions_are_not_findings(self) -> None:
         for path, before, after in (("value.rs", self.rust("assert_eq!( actual , expected );"),
                                      self.rust("assert_eq!(actual,expected);")),

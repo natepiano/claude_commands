@@ -29,6 +29,15 @@ EXACT_CALLS = frozenset((
     "assertTupleEqual", "assertSetEqual", "assertCountEqual", "assertMultiLineEqual", "assertSequenceEqual"))
 COMPARISON = re.compile(r"==|!=|<=|>=|(?<![<])<(?![<])|(?<![>])>(?![>])|\bis(?:\s+not)?\b")
 STATEMENT_TOKEN = re.compile(r'''"""|\'\'\'|["']|//|/\*|\*/|\#|[()[\]{}]''')
+PYTHON_LITERAL = re.compile(
+    r"'''(?:\\.|'(?!'')|[^'\\])*'''"
+    + r'|"""(?:\\.|"(?!"")|[^"\\])*"""'
+    + r'''|'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|\#[^\n]*''', re.DOTALL)
+RUST_LITERAL = re.compile(
+    r'''(?:br(?<!\wbr)|r(?<!\wr))(?P<hashes>\#*)"(?s:.*?)"(?P=hashes)'''
+    + r'''|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])'|//[^\n]*|/\*''', re.DOTALL)
+BLOCK_COMMENT = re.compile(r"/\*|\*/")
+FINDING_TOKEN = re.compile(r"assert|pytest\.raises|self\.fail|ignore|skip|expectedFailure|xfail")
 WEAKER = re.compile(
     r"\b(?:assert|debug_assert|prop_assert)!\s*\(|\bassert\s+"
     + r"|\bself\.(?:assertTrue|assertFalse|assertLess\w*|assertGreater\w*|assertIn|"
@@ -113,6 +122,34 @@ class TouchedAssertion(NamedTuple):
 
 def normalized(text: str) -> str:
     return "".join(text.split())
+
+
+def code_lines(lines: list[str], rust: bool) -> list[str]:
+    """Hide strings and comments, with the same line and column positions."""
+    token_pattern = RUST_LITERAL if rust else PYTHON_LITERAL
+    text = "\n".join(lines)
+    parts: list[str] = []
+    cursor = 0
+    scan = 0
+    while match := token_pattern.search(text, scan):
+        end = match.end()
+        if rust and match[0] == "/*":
+            depth = 1
+            end = len(text)
+            for delimiter in BLOCK_COMMENT.finditer(text, match.end()):
+                depth += 1 if delimiter[0] == "/*" else -1
+                if not depth:
+                    end = delimiter.end()
+                    break
+        if FINDING_TOKEN.search(text, match.start(), end):
+            parts.append(text[cursor:match.start()])
+            parts.append("\n".join(" " * len(row) for row in text[match.start():end].split("\n")))
+            cursor = end
+        scan = end
+    if not parts:
+        return lines
+    parts.append(text[cursor:])
+    return "".join(parts).split("\n")
 
 
 def diff_path(text: str) -> str:
@@ -233,7 +270,7 @@ def comparison_operands(text: str) -> tuple[tuple[str, ...], bool]:
 
 
 def parse_assertion(line: DiffLine, hunks: tuple[int, ...]) -> Assertion:
-    match = ASSERTION.search(line.text)
+    match = ASSERTION.search(code_lines([line.text], line.path.endswith(".rs"))[0])
     if match is None:
         raise GuardError("cannot read assertion")
     name = match.group("macro") or match.group("method") or match.group("bare") or match.group("raises")
@@ -249,7 +286,8 @@ def parse_assertion(line: DiffLine, hunks: tuple[int, ...]) -> Assertion:
     return Assertion(line, name, operands, exact, not exact and is_weaker(line.text), hunks, subject_text)
 
 
-def assertion_spans(lines: list[str], rust: bool, changes: list[DiffLine]) -> Iterable[AssertionSpan]:
+def assertion_spans(lines: list[str], code_rows: list[str], rust: bool,
+                    changes: list[DiffLine]) -> Iterable[AssertionSpan]:
     """Scan each assertion once and stop its statement after at most 40 lines."""
     index = 0
     cursor = 0
@@ -260,7 +298,7 @@ def assertion_spans(lines: list[str], rust: bool, changes: list[DiffLine]) -> It
             break
         # A statement more than 39 lines above the next change cannot hold it.
         index = max(index, changes[cursor].number - 40)
-        if not is_assertion(lines[index]):
+        if not is_assertion(code_rows[index]):
             index += 1
             continue
         first = index
@@ -314,14 +352,15 @@ def assertion_spans(lines: list[str], rust: bool, changes: list[DiffLine]) -> It
         index += 1
 
 
-def touched_assertions(lines: list[DiffLine], sources: dict[tuple[str, Side], list[str]]) -> list[TouchedAssertion]:
+def touched_assertions(lines: list[DiffLine], sources: dict[tuple[str, Side], list[str]],
+                       code: dict[tuple[str, Side], list[str]]) -> list[TouchedAssertion]:
     groups: dict[tuple[str, Side], list[DiffLine]] = defaultdict(list)
     for line in lines:
         groups[line.path, line.side].append(line)
     assertions: list[TouchedAssertion] = []
     for (path, side), changes in groups.items():
         cursor = 0
-        for span in assertion_spans(sources[path, side], path.endswith(".rs"), changes):
+        for span in assertion_spans(sources[path, side], code[path, side], path.endswith(".rs"), changes):
             while cursor < len(changes) and changes[cursor].number < span.first:
                 cursor += 1
             hunks: dict[int, None] = {}
@@ -441,7 +480,8 @@ def unmatched_lines(lines: list[DiffLine]) -> list[DiffLine]:
     return unmatched
 
 
-def find_changes(lines: list[DiffLine], touched: list[TouchedAssertion]) -> list[Finding]:
+def find_changes(lines: list[DiffLine], touched: list[TouchedAssertion],
+                 code: dict[tuple[str, Side], list[str]]) -> list[Finding]:
     statement_lines = unmatched_lines([assertion.source for assertion in touched])
     remaining = set(statement_lines)
     assertions = [parse_assertion(assertion.source, assertion.hunks)
@@ -454,7 +494,7 @@ def find_changes(lines: list[DiffLine], touched: list[TouchedAssertion]) -> list
     stronger: dict[int, deque[Assertion]] = defaultdict(deque)
     marker_keys = {line.key for line in lines if line.side == "new"
                    and ("#[" in line.text or "@" in line.text or "skip" in line.text)
-                   and TURNED_OFF.search(line.text)}
+                   and TURNED_OFF.search(code[line.path, line.side][line.number - 1])}
     marker_lines = unmatched_lines([line for line in lines if line.key in marker_keys]) if marker_keys else []
     findings = [Finding(line, "test turned off", "(none)", line.text.strip())
                 for line in marker_lines if line.side == "new"]
@@ -625,8 +665,9 @@ def run(arguments: list[str]) -> int:
     messages = git(repo, "log", "--format=%B", f"{base}..{head or 'HEAD'}", "--")
     lines = parse_diff(diff)
     sources = read_sources(repo, base, head, staged, lines)
-    assertions = touched_assertions(lines, sources)
-    findings = name_tests(find_changes(lines, assertions), sources)
+    code = {key: code_lines(rows, key[0].endswith(".rs")) for key, rows in sources.items()}
+    assertions = touched_assertions(lines, sources, code)
+    findings = name_tests(find_changes(lines, assertions, code), sources)
     rulings = read_rulings(args.rulings, messages)
     blocking = 0
     for finding in findings:
