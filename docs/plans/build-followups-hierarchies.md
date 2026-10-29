@@ -87,39 +87,25 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - The merge gate test `accounts/test_cutover_home` checks access times. It fails under heavy load and passes when run alone.
 
 ### Phase 2 — The design doc recommends the best hierarchy and the steps to reach it  · status: done
-**Depends on:** Phase 1
 
-#### Work Order
+#### As-built
 
-**Goal:** the design doc compares at least three hierarchies against the constraints and the baseline, recommends one, and splits the change into small steps, each with the measure it moves.
-
-**Spec:**
-- Section **Candidates.** At least three, each described by its roles, who decides priority, how work is admitted, how the user is reached, and how capacity (build slots, accounts, workers) is shared. Seeds, not limits:
-  - **Today's tree, repaired:** same roles; fix the measured friction (finished units that keep sessions, leaked workers, timers on on-demand productions, queues that grow faster than the user drains them).
-  - **Product-led, flat:** showrunners stay peers, but the ranked Hana backlog decides what every production admits; each non-Hana production supplies Hana, and each of its units names the Hana issue or the measured Hana cost (build minutes, screenshot minutes, review time) it cuts.
-  - **Capacity-led:** productions stay as they are; one owner shares build slots, accounts and workers by issue rank across all productions.
-- Every candidate places sdlc as a top-level showrunner and guilds as its child (the user, 2026-10-28), with the four guild heads as units of guilds, and keeps the organization flat (Decisions). A candidate that puts a showrunner above another breaks a `user` constraint.
-- Section **Comparison.** One table: each candidate scored on each Phase 1 measure (expected direction and size, with the reason) and each constraint (kept or broken). A candidate that breaks a `user` constraint is out.
-- Section **Recommendation.** The best candidate and why, in at most ten lines.
-- Section **Steps.** The change from today to the recommendation as numbered steps. Each step: what changes (files and roles), the measure it should move and by how much, how to undo it, and whether it needs the user (every role, promotion, rename or responsibility change does). Step 1 is the one with the largest expected effect on Hana delivery per unit of work.
-- Before the gate, the unit director runs `/adversarial` on the recommendation against the runner-up and `/astra_review` on the doc, and folds their findings into the doc.
+- The design doc holds Candidates, Comparison, Recommendation and Steps. The user's review decisions HI1-HI11 are folded in.
+- Candidate A (today's tree, repaired) runs as an experiment. Candidate B does not start. Candidate C is dropped.
+- The user approves Steps 1, 2 and 4. Each step has a Hana link, a measure and a review point. Constraints C53-C57 record the new rules.
+- sdlc is a top-level showrunner. guilds is its child, and the four guild heads are units of guilds.
+- `measure.py baseline` splits closures by project and leaves out declines. It also reports Hana merges per week, rank coverage of open issues, date-time window flags and one missing-value type per domain.
 
 **Files:**
-- `docs/plans/build-followups-hierarchies-design.md` — new sections above
-- `scripts/hierarchies/measure.py`, `scripts/hierarchies/test_measure.py` — review fixes to the Baseline measures: goal-1 closures split by project with declines left out, Hana merges per week, rank coverage of open issues with live units and a score-weighted ratio, date-time window flags
+- `docs/plans/build-followups-hierarchies-design.md` — Constraints, Map, Baseline, Questions, Candidates, Comparison, Recommendation, Steps.
+- `scripts/hierarchies/measure.py` — Baseline measures. Missing-value types: `TimeNotRecorded`, `DurationNotRecorded`, `ScoreNotRecorded`, `MergeHistoryNotRecorded`. Re-run with `~/.claude/scripts/lib/py scripts/hierarchies/measure.py baseline` from the worktree root (about 23 s).
+- `scripts/hierarchies/test_measure.py` — tests for those measures.
 
-**Workers:** `2 writers` — one doc and one module. `impl` takes the doc; `test` has no test lane, so it opens as impl, checks numbers, and then fixes the measures.
-- `impl` — `docs/plans/build-followups-hierarchies-design.md`
-- `test` — opens as impl — re-runs `measure.py baseline` for the doc's Comparison window and checks each number the doc cites against it; then fixes the measure rows the reviews found wrong in `scripts/hierarchies/measure.py` and `scripts/hierarchies/test_measure.py`, re-runs the Baseline, and sends `impl` the new rows
+**Binds later work:** The unit director writes each step's result into the design doc. The Step 2 work waits on phases-unit's HI7 phase, and must check that the wait record has a holder field. The four-week review counts a Hana wait as non-Hana-caused only when a record names the holder. The four-week review waits on the two-week re-runs of Steps 1 and 4. The Step 4 keep rule goes to models-unit as a requirement.
 
-**Constraints from prior phases:**
-- The design doc holds Constraints C01–C50 (each marked `user` or `derived`, with its source), the Map, the Baseline (run 2026-10-20 17:24 EDT, 7 days, natedev) and Questions Q1–Q5. Rank 1 of the user's goals is `1 - Ship Hana`.
-- Baseline facts the candidates answer: Hana has 11 of 41 live units (27%) and 66 of 187 workers, but 80% of build and check minutes, 82% of test minutes and 41% of tokens; 51 workers record no cwd and have no running director; 598 items wait on the user (315 changes, 161 proposals, 121 efficiency items, 1 question).
-- No source records phase wait kinds, issue activation times or question answer times; those rows print `not recorded`. A candidate that needs one of them to show its effect names the record it adds.
-- Q1–Q5 went to the user through the showrunner on 2026-10-20 at 17:43 EDT. Write the user's answers into the doc's Questions section as they arrive. While an answer is open, each candidate states its result under the recommended answer and under the other answer, and the Recommendation names which answers it rests on.
-- Re-run the baseline with `~/.claude/scripts/lib/py scripts/hierarchies/measure.py baseline` from the worktree root (about 23 s).
+**Gotchas:** The closure count treats any reason whose first word is "declined" as a decline. The run recorder writes `phase_instance_id` and `phase_id`, never `phase`. Each missing value has its own type, and all of them print "not recorded".
 
-**Acceptance gate:** the doc has the four sections; each candidate has a score on every measure and constraint; each step names its measure, its size and how to undo it; the adversarial and astra findings are folded in. At phase end the unit director sends the showrunner the Recommendation and Step 1 as one question for the user.
+**Ruled out:** candidate B, a shared rank order with a Hana-cost test (HI10); candidate C, capacity-led with natedev allocating workers (HI11); a fixed Hana share or measured Hana cost (HI2); a daily review budget (HI3); a size threshold for the four-week review's proposal (HI10).
 
 ### Phase 3 — Each user push after a failed text check names its approved exception, and unapproved paths are fixed  · status: todo
 **Depends on:** Phase 2
@@ -139,7 +125,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - `scripts/hierarchies/push_audit.py`, `scripts/hierarchies/test_push_audit.py` — new
 - `scripts/notify/` fixes — messaging-unit's files; this unit edits them (showrunner ruling 2026-10-28); the notice carries an also-touches line per build-followups owner
 - `scripts/message/send.py` fixes — shutdown-unit's file; `scripts/production/add_unit.py` and `commands/showrunner/add_unit.md` fixes — enh-showrunner-unit's files (build-followups production doc). Same rule as `scripts/notify/` (unit director's call, 2026-10-28, extending ruling 1 to every owner a confirmed fix reaches): this unit edits the file where the defect lives, tells the sdlc showrunner which owner's file before the edit, and the notice carries an also-touches line for each owner, trial-merged against its tip. Only files with a confirmed `Unapproved` path are edited.
-- `docs/plans/build-followups-hierarchies-design.md` — Step 1 result
+- `docs/plans/build-followups-hierarchies-design.md` — Step 1 result, written by the unit director at the checkpoint (Phase 5 runs in parallel and its result goes in the same doc, so no worker edits it)
 
 **Workers:** `1 writer + 1 tester`
 - `impl` — `push_audit.py`, the confirmed fixes
@@ -165,6 +151,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - The record shape went to phases-unit on 2026-10-28 (showrunner ruling 3) the design needs: per wait, phase, owner, UTC start and end, and one kind (`WaitingForQuotaRefusal`, `WaitingForMemoryOrSlot`, `WaitingForMergeGate`, `WaitingForUser`, `WaitingForSupplier`, `ReadyWithoutCapacity`); per merge, a receipt (project, issue or plan phase, commit, target branch, merge time). The duty text goes to roles-unit. phases-unit picks the file and writer; this phase adapts to it.
 - `measure.py baseline` fills the four `Hana wait /` rows and a receipts row from those records: minutes by kind with n, `HistoryNotRecorded` for a window with no records (never zero), and `ReceiptMissing` per merge with no receipt. Readers are read-only typed loaders; a corrupt source prints a source-problem row.
 - Design doc: the experiment's start (first records on `~/.claude` main) and its review date, four weeks later.
+- Phase 6 counts a Hana wait as non-Hana-caused only when a record names the non-Hana holder of the account, slot or memory. Check that phases-unit's record shape carries that holder; if it does not, ask phases-unit (through the sdlc showrunner) to add it before the experiment starts.
 
 **Files:**
 - `scripts/hierarchies/measure.py`, `scripts/hierarchies/test_measure.py`
@@ -191,17 +178,17 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - `scripts/hierarchies/worker_owners.py report`: list each Codex worker with its recorded run, unit and director session, and one class: `OwnedLive`, `PooledReviewer`, `DirectorGone`, `OwnerUnknown`. Read-only.
 - `worker_owners.py recover`: for each `OwnerUnknown` worker, try provenance recovery first (shutdown history records, the message log, launcher records naming its thread id); a recovered worker moves to its real class. The 2026-10-28 run-folder deletions made live units' workers look ownerless, this unit's included.
 - `worker_owners.py end --class DirectorGone|OwnerUnknown [--dry-run]`: end only those, through `codex_mesh.py end`, and log each one with its evidence. `OwnerUnknown` is ended only after recovery failed for that worker. Never an `OwnedLive` worker, a pooled reviewer, or a named worker of a live unit director. **The first run reports and ends nothing** (showrunner, 2026-10-28).
-- A worker survives its run's end: the change to `end_session.sh` and `codex_mesh.py` that keeps a live director's workers goes where the defect lives (`scripts/agents/` is owned by build-followups models-unit; this unit edits it under showrunner ruling 1, 2026-10-28). The <LongLivedWorkers/> text change ("run-scoped", "`end_session.sh` ends them") goes to phases-unit; the duty goes to roles-unit.
+- A worker survives its run's end: the keep rule in `end_session.sh` and `codex_mesh.py` belongs to build-followups models-unit, which lands it in its own phase 5 (worker lifecycle). This phase sends models-unit the requirement (a live director's workers are kept at run end) with a test case (build-followups showrunner, 2026-10-28). The <LongLivedWorkers/> text change ("run-scoped", "`end_session.sh` ends them") goes to phases-unit; the duty goes to roles-unit.
 - Timers: list notifier registrations (`scripts/message/notifier.sh`) with whether a user or showrunner asked for each; the showrunner removes the rest.
 
 **Files:**
 - `scripts/hierarchies/worker_owners.py`, `scripts/hierarchies/test_worker_owners.py` — new
-- `scripts/agents/codex_mesh.py`, `scripts/direct/end_session.sh` — the keep rule (models-unit's files; this unit edits them, showrunner ruling 2026-10-28; the notice carries an also-touches line per build-followups owner)
-- `docs/plans/build-followups-hierarchies-design.md` — Step 4 result
+- The keep rule in `scripts/agents/codex_mesh.py` and `scripts/direct/end_session.sh` — models-unit lands it in its own phase 5 (worker lifecycle); this phase sends it the requirement and a test case (build-followups showrunner, 2026-10-28, which replaces the earlier ruling that this unit edits them)
+- `docs/plans/build-followups-hierarchies-design.md` — Step 4 result, written by the unit director at the checkpoint (Phase 3 runs in parallel and its result goes in the same doc, so no worker edits it)
 
 **Workers:** `1 writer + 1 tester`
-- `impl` — `worker_owners.py`, the keep rule
-- `test` — `test_worker_owners.py`: fixtures for each class, a pooled reviewer, a director that restarted on another account
+- `impl2` — `worker_owners.py`, and the keep-rule requirement with its test case for models-unit (a second writer slot: Phase 3 holds `impl` and `test` in parallel)
+- `test2` — `test_worker_owners.py`: fixtures for each class, a pooled reviewer, a director that restarted on another account
 
 **Constraints from prior phases:** Baseline **Capacity on Hana**: 51 workers with no recorded cwd and no running director, n=51. A paused worker of a live director is `OwnedLive`. The 2026-10-28 run-folder loss (a paused run's roster deleted) is one case the report must name, not hide.
 
