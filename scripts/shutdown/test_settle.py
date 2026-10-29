@@ -1642,6 +1642,37 @@ class SettleTests(ShutdownTestCase):
             self.assertEqual(send.call_count, 2)
             self.assertEqual(self.sent(send)[1], "Unit did not come back: launch timed out")
 
+    def test_retire_reason_is_saved_and_sent_to_the_session_and_showrunner(self) -> None:
+        owner = unit("retiring", "Retiring")
+        owner["host"]["doc"] = "/tmp/demo-production.md"
+        added = settle.begin(LOGIN, only=["retiring"], request_id="retire-request",
+                             then="stop", why="retired; /showrunner:resume_unit brings it back.",
+                             report=machine_inventory([owner]))
+        self.assertEqual(len(added), 1)
+        saved = record.session_records(LOGIN)[0]
+        self.assertIn("retired; /showrunner:resume_unit brings it back.",
+                      settle._settle_text(saved, owner))  # pyright: ignore[reportPrivateUsage]
+        self.assertIn("retired; /showrunner:resume_unit brings it back.", settle.holdout_line(saved))
+        with (patch.object(settle_showrunners, "current_name", return_value="runner"),
+              patch.object(settle, "send_message", return_value={"kind": "sent"}) as send):
+            settle.tell_showrunner_stopping(saved)
+        self.assertEqual(self.sent(send), ("runner",
+            "Retiring is stopping: retired; /showrunner:resume_unit brings it back.",
+            "Retiring is stopping: retired; /showrunner:resume_unit brings it back."))
+
+    def test_normal_user_stop_keeps_the_showrunner_text(self) -> None:
+        saved = self.unit_for_showrunner(then="stop")
+        def user_stop(current: record.SessionShutdown) -> None:
+            _ = current.pop("why", None)
+            _ = current.pop("target", None)
+        saved = record.update_session(LOGIN, "unit", user_stop)
+        with (patch.object(settle_showrunners, "current_name", return_value="runner"),
+              patch.object(settle, "send_message", return_value={"kind": "sent"}) as send):
+            settle.tell_showrunner_stopping(saved)
+        self.assertEqual(self.sent(send), ("runner", "Unit is stopping: requested by the user",
+            "Unit is stopping: requested by the user; it stays stopped until the user restarts it. " +
+            "One more line follows when it is back or has not come back."))
+
     def test_only_a_unit_with_a_running_showrunner_is_announced(self) -> None:
         other = session_shutdown(top_level("other", "Other"))
         self.save(other)

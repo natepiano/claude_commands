@@ -6,11 +6,17 @@ Usage: resume_unit.py <slug> <unit> [--dry-run]
 A showrunner runs it through /showrunner:resume_unit. retire_unit.py leaves the unit's Units row with
 "(retired <date>, worktree removed, session <id>)" in front of its Plan cell, and the row still names
 the worktree path, the branch and the plan. resume_unit refuses, and changes nothing, when the row is
-not retired or names no session, when no Claude config dir holds that session's transcript under the
-worktree's project folder (`claude --resume` finds a transcript only there), when a folder at the
+not retired or names no session, when no Claude config dir holds that session's transcript under its
+start folder's project folder (`claude --resume` finds a transcript only there), when a folder at the
 worktree path is not the unit's worktree, or when the branch is still here or on origin without it.
 Every account links its `projects` folder to the shared one, so a units account that moved since the
 retire reads the same transcript.
+
+A note can include ", folder <path>" after the session id. Older notes find the transcript across
+all config dirs and read its first cwd; none, ambiguous project folders or no cwd refuse. When the
+start folder is outside the worktree, resume uses --cwd there and skips worktree and branch steps.
+When the note has no session id, the unit's mark, newest retained shutdown record or interactive
+transcript supplies it; no evidence refuses both a dry run and a real run.
 
 Then it makes the worktree again at the same path, on the branch, from the merge branch; resumes the
 session through `add_unit.py --resume` (the units account, the unit's name and Remote Control); and
@@ -36,13 +42,24 @@ import unit_lookup
 import unit_move
 import unit_names
 from add_unit import Production
+from record import InvalidRecord
 
 ADD_UNIT = Path(__file__).resolve().parent / "add_unit.py"
 RETIRED = re.compile(r"^\s*\(retired [^)]*\)\s*")
-SESSION = re.compile(r"^\s*\(retired [^)]*, session ([0-9A-Za-z-]+)\)")
+SESSION = re.compile(r"^\s*\(retired [^)]*, session ([0-9A-Za-z-]+)(?:, folder ([^)]*))?\)")
 
 
 class Refused(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class RecordedStartFolder:
+    path: Path
+
+
+@dataclass(frozen=True)
+class UnrecordedStartFolder:
     pass
 
 
@@ -55,6 +72,7 @@ class RetiredUnit:
     plan: str
     session_id: str
     retired: bool
+    start_folder: RecordedStartFolder | UnrecordedStartFolder
 
 
 def find_unit(slug: str, given: str) -> RetiredUnit:
@@ -66,11 +84,19 @@ def find_unit(slug: str, given: str) -> RetiredUnit:
     if len(matching) != 1:
         raise Refused(f"{name}: expected one Units row, found {len(matching)}")
     row = matching[0]
-    plan = production_units.cell_value(row.get("Plan", ""))
+    plan = row.get("Plan", "")
     session = SESSION.match(plan)
-    return RetiredUnit(production, name, Path(production_units.cell_value(row.get("Worktree", ""))).expanduser(),
-                       production_units.cell_value(row.get("Branch", "")), RETIRED.sub("", plan),
-                       session[1] if session else "", production_units.plan_cell_is_retired(plan))
+    worktree = Path(production_units.cell_value(row.get("Worktree", ""))).expanduser()
+    branch = production_units.cell_value(row.get("Branch", ""))
+    retired = production_units.plan_cell_is_retired(plan)
+    session_id = session[1] if session else ""
+    if retired and not session_id:
+        session_id = retire_unit.last_session(retire_unit.Unit(production, name, worktree, branch, retired))
+        if not session_id:
+            raise Refused(f"{name}: its Units row names no session to resume; no director session was found")
+    return RetiredUnit(production, name, worktree, branch, production_units.cell_value(RETIRED.sub("", plan)),
+                       session_id, retired,
+                       RecordedStartFolder(Path(session[2]).expanduser()) if session and session[2] else UnrecordedStartFolder())
 
 
 def _git(unit: RetiredUnit, *arguments: str) -> str:
@@ -85,8 +111,14 @@ def has_worktree(unit: RetiredUnit) -> bool:
             == unit.branch)
 
 
+def resume_folder(unit: RetiredUnit) -> Path:
+    if isinstance(unit.start_folder, RecordedStartFolder):
+        return unit.start_folder.path
+    return retire_unit.director_start_folder(unit.session_id)
+
+
 def has_transcript(unit: RetiredUnit) -> bool:
-    folder = unit_move.project_folder(str(unit.worktree))
+    folder = unit_move.project_folder(str(resume_folder(unit)))
     return any((directory / "projects" / folder / f"{unit.session_id}.jsonl").is_file()
                for directory in unit_move.config_dirs())
 
@@ -107,9 +139,15 @@ def refusals(unit: RetiredUnit) -> list[str]:
     if not unit.session_id:
         return [f"{unit.name}: its Units row names no session to resume"]
     refused: list[str] = []
-    if not has_transcript(unit):
-        refused.append(f"{unit.name}: no account has the transcript of session {unit.session_id} "
-                       + f"under {unit.worktree}")
+    folder = unit.worktree
+    try:
+        folder = resume_folder(unit)
+        if not has_transcript(unit):
+            refused.append(f"{unit.name}: no account has the transcript of session {unit.session_id} under {folder}")
+        if folder.resolve() != unit.worktree.resolve():
+            return refused
+    except (retire_unit.Refused, OSError) as error:
+        refused.append(f"{unit.name}: {error}")
     if unit.worktree.exists() and not has_worktree(unit):
         refused.append(f"{unit.worktree} exists and is not {unit.name}'s worktree on {unit.branch}")
     elif not unit.worktree.exists():
@@ -125,8 +163,10 @@ def plan_arguments(unit: RetiredUnit) -> list[str]:
 
 
 def launch_command(unit: RetiredUnit) -> list[str]:
-    return [sys.executable, str(ADD_UNIT), "--production", unit.production.slug, unit.name,
-            "--resume", unit.session_id, "--cwd", str(unit.worktree), *plan_arguments(unit)]
+    if not unit.session_id:
+        raise Refused(f"{unit.name}: its Units row names no session to resume")
+    return [sys.executable, str(ADD_UNIT), "--production", str(unit.production.doc), unit.name,
+            "--resume", unit.session_id, "--cwd", str(resume_folder(unit)), *plan_arguments(unit)]
 
 
 def make_worktree(unit: RetiredUnit) -> None:
@@ -147,7 +187,7 @@ def launch(unit: RetiredUnit) -> None:
         print(result.stdout.strip())
     if result.returncode:
         raise Refused(f"add_unit.py --resume: {retire_unit.failure(result)}")
-    print(f"resumed: session {unit.session_id} in {unit.worktree}")
+    print(f"resumed: session {unit.session_id} in {resume_folder(unit)}")
 
 
 def unmark(unit: RetiredUnit) -> None:
@@ -172,9 +212,13 @@ def dry_run(unit: RetiredUnit) -> int:
     print(f"resume {unit.name} of {unit.production.slug}: dry run, nothing changes")
     refused = refusals(unit)
     print("\n".join(f"refused: {reason}" for reason in refused))
-    if not has_worktree(unit):
+    if refused:
+        return 1
+    if resume_folder(unit).resolve() != unit.worktree.resolve():
+        print(f"would skip: worktree and branch steps; session starts in {resume_folder(unit)}")
+    elif not has_worktree(unit):
         print(f"would make: worktree {unit.worktree} on {unit.branch}, from {unit.production.merge_branch}")
-    print(f"would resume: session {unit.session_id} through add_unit.py --resume")
+    print(f"would resume: session {unit.session_id} through add_unit.py --resume --cwd {resume_folder(unit)}")
     print(f"would unmark: the Units row, committed on {unit.production.merge_branch}")
     return 1 if refused else 0
 
@@ -184,7 +228,8 @@ def resume(unit: RetiredUnit) -> int:
     if refused:
         print("\n".join(f"refused: {reason}" for reason in refused))
         return 1
-    make_worktree(unit)
+    if resume_folder(unit).resolve() == unit.worktree.resolve():
+        make_worktree(unit)
     launch(unit)
     unmark(unit)
     print(f"{unit.name} resumed")
@@ -200,7 +245,7 @@ def main(argv: list[str]) -> int:
     try:
         unit = find_unit(cast(str, options.slug), cast(str, options.unit))
         return dry_run(unit) if cast(bool, options.dry_run) else resume(unit)
-    except (Refused, retire_unit.Refused, production_units.Refusal, unit_names.BadName, OSError) as error:
+    except (Refused, retire_unit.Refused, production_units.Refusal, unit_names.BadName, InvalidRecord, OSError) as error:
         print(f"refused: {error}")
         return 1
 
