@@ -730,6 +730,31 @@ def _commit_unit(plan: RenamePlan, name: str, record: dict[str, object]) -> None
     _ = unit_move.git(plan.checkout, "push", "origin", f"{plan.branch}:refs/heads/{plan.branch}")
 
 
+def _repoint_unit_workers(plan: RenamePlan, name: str, record: dict[str, object], *, dry_run: bool = False) -> None:
+    from scripts.direct import workers
+    changes = workers.repoint_unit_worktree(
+        plan.new, name, Path(_string(record, "old_worktree")), Path(_string(record, "new_worktree")),
+        _string(record, "new_branch"), from_production=plan.old, dry_run=dry_run)
+    for change in changes:
+        print(f"{name}: {'would change' if dry_run else 'changed'} {change}")
+    if not changes:
+        print(f"{name}: workers have nothing to change")
+
+
+def repair_workers(new: str, *, dry_run: bool = False) -> None:
+    """Use completed worktree moves to repair worker ownership without moving git state."""
+    with _rename_journal(new) as (result, journal):
+        for name, raw in sorted(_object(journal.get("unit_moves", {})).items()):
+            record = _object(raw)
+            completed = record.get("step")
+            if type(completed) is not int or completed < 2:
+                continue
+            _repoint_unit_workers(result, name, record, dry_run=dry_run)
+            if not dry_run and not record.get("workers_repointed", False):
+                record["workers_repointed"] = True
+                write_json(result.journal, journal)
+
+
 def unit(new: str, name: str) -> None:
     """Move one stopped unit, resuming recorded branch, worktree and configuration steps."""
     with _rename_journal(new) as (result, journal):
@@ -771,6 +796,10 @@ def unit(new: str, name: str) -> None:
             _stopped_unit(result, name)
             _move_unit_worktree(result, record)
             record["step"] = 2
+            write_json(result.journal, journal)
+        if not record.get("workers_repointed", False):
+            _repoint_unit_workers(result, name, record)
+            record["workers_repointed"] = True
             write_json(result.journal, journal)
         if not record.get("restore_repointed", False):
             if restore["kind"] == "stopped":
@@ -842,6 +871,9 @@ def main(argv: list[str]) -> int:
     _ = command.add_argument("unit")
     command = actions.add_parser("finish")
     _ = command.add_argument("new")
+    command = actions.add_parser("repair-workers", help="repair worker paths for units moved before this fix")
+    _ = command.add_argument("new", metavar="production")
+    _ = command.add_argument("--dry-run", action="store_true")
     command = actions.add_parser("checkout", help="move the showrunner checkout through a shutdown restart")
     _ = command.add_argument("new", metavar="slug")
     _ = command.add_argument("path", nargs="?", default="")
@@ -850,6 +882,8 @@ def main(argv: list[str]) -> int:
     try:
         if action == "unit":
             unit(new, cast(str, args.unit))
+        elif action == "repair-workers":
+            repair_workers(new, dry_run=cast(bool, args.dry_run))
         elif action == "finish":
             finish(new)
         elif action == "checkout":
