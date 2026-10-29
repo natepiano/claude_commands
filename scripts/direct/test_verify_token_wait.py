@@ -1,15 +1,77 @@
 """Real verify.sh token wait behavior."""
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import unittest
 from pathlib import Path
 from typing import cast
-from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY, BOARD
+
+from scripts.direct import test_verify_step_routes as routes
+from scripts.direct.recorder_fixture import invoke_recorder
+from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY, BOARD, Record
 
 
 class VerifyTokenWaitTests(VerifyTokenWaitFixture):
+    def record_phase(self, session: Path) -> None:
+        self.environment.update({"UNIT_HISTORY_DIR": str(self.root / "history"),
+                                 "UNIT_PHASE_ID": "6", "UNIT_SYNC_WRITES": "0",
+                                 "UNIT_PASS_OWNER": "launcher", "CODEX_THREAD_ID": "thread-impl",
+                                 "CLAUDE_PROBE_SESSION": ""})
+        for arguments in (
+            ["start-run", "--session-dir", str(session), "--working-dir", str(self.root),
+             "--main-family", "codex", "--main-model", "fixture", "--main-effort", "high",
+             "--main-session-id", "fixture-director"],
+            ["start-phase", "--session-dir", str(session), "--phase-id", "6", "--phase-title", "Resources"],
+        ):
+            result = invoke_recorder(arguments, self.environment, self.root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        for slot in ("impl", "first", "second"):
+            arguments = ["start-pass", "--session-dir", str(session), "--phase-id", "6", "--pass-kind", "impl",
+                         "--activity", "verify", "--called-task", "direct.impl", "--called-family", "codex",
+                         "--called-model", "fixture", "--worker-name", f"fixture-{slot}"]
+            result = invoke_recorder(arguments, {**self.environment, "UNIT_TEAM_ROLE": slot}, self.root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+        _ = (session / "mesh_roster.json").write_text(json.dumps({
+            f"fixture-{slot}": {"thread_id": f"thread-{slot}"} for slot in ("impl", "first", "second")}))
+
+    def phase_waits(self, session: Path) -> list[dict[str, object]]:
+        return [row for row in (cast(dict[str, object], json.loads(line)) for line in
+                (self.root / "history" / "runs" / f"{session.name}.jsonl").read_text().splitlines())
+                if str(row["event_type"]).startswith("wait_")]
+
+    def test_unblocked_verification_records_no_resource_wait(self) -> None:
+        session = Path(self.environment["UNIT_SESSION_DIR"])
+        self.record_phase(session)
+        result = self.verify(self.environment)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.phase_waits(session), [])
+
+    def test_mac_routing_under_hold_skips_initial_token_acquisition(self) -> None:
+        holders = Path(self.environment["BUILD_HOLD_DIR"])
+        holders.mkdir()
+        _ = (holders / "other").write_text("fixture hold")
+        targets = self.root / "targets.py"
+        runner = self.root / "mac-runner.py"
+        _ = targets.write_text(routes.TARGETS)
+        _ = runner.write_text(routes.RUNNER)
+        self.environment.update({
+            "BUILD_TARGETS_SCRIPT": str(targets), "VERIFY_MAC_RUNNER": str(runner),
+            "TEST_ROUTE_EVENTS": str(self.root / "route-events"),
+            "TEST_MAC_EVENTS": str(self.root / "mac-events"),
+            "MAC_TEST_CONFIG": str(self.root / "mac-settings"), "TEST_MAC_ALLOWED": "1",
+        })
+        result = self.verify(self.environment)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rows = [cast(Record, json.loads(line)) for line in (self.root / "mac-events").read_text().splitlines()]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(cast(Record, rows[0]["record"])["state"], "on_mac")
+        self.assertFalse((self.root / "cargo-calls").exists())
+        self.assertFalse((self.root / "session" / "locks" / "cargo.d").exists())
+        self.assertEqual(self.records()[-1]["token_wait_s"], 0)
+
     def test_no_token_records_zero(self) -> None:
         # A session dir alone makes this a director's run, which takes the token.
         environment = {name: value for name, value in self.environment.items()
@@ -109,6 +171,7 @@ trap advance_elapsed_clock DEBUG
 
     def test_waiting_for_peer_call_records_token_seconds(self) -> None:
         board = self.root / "board"
+        self.record_phase(board)
         waiting = self.root / "waiting-for-token"
         resume = self.root / "resume-acquisition"
         first_clock = self.root / "first-clock"
@@ -125,10 +188,10 @@ exit 0
 ''')
         sleep.chmod(0o755)
         first_environment = {**self.environment, "UNIT_RUN_DIR": str(board),
-                             "UNIT_TEAM_ROLE": "first", "TEST_BLOCK": "1",
+                             "UNIT_TEAM_ROLE": "first", "CODEX_THREAD_ID": "thread-first", "TEST_BLOCK": "1",
                              "UNIT_TOKEN_CLOCK_FILE": str(first_clock)}
         second_environment = {**self.environment, "UNIT_RUN_DIR": str(board),
-                              "UNIT_TEAM_ROLE": "second", "TEST_WAITING": str(waiting),
+                              "UNIT_TEAM_ROLE": "second", "CODEX_THREAD_ID": "thread-second", "TEST_WAITING": str(waiting),
                               "TEST_WAIT_GATE": str(resume),
                               "UNIT_TOKEN_CLOCK_FILE": str(second_clock)}
         first = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
@@ -175,6 +238,70 @@ exit 0
         self.assertEqual(first_wait, 0)
         self.assertEqual(second_wait, 20)
         self.assertGreater(second_wait, first_wait)
+        started, = [row for row in self.phase_waits(board) if row["event_type"] == "wait_started"]
+        finished, = [row for row in self.phase_waits(board) if row["event_type"] == "wait_finished"]
+        self.assertEqual((started["wait_kind"], started["wait_reason"], started["phase_id"]),
+                         ("WaitingForMemoryOrSlot", "cargo token", "6"))
+        self.assertEqual(started["wait_id"], finished["wait_id"])
+
+    def test_a_memory_wait_gives_the_token_to_a_peer_and_takes_it_back_before_its_step(self) -> None:
+        # Phases 15 and 16 of one unit share the session's board and its role
+        # names. Phase 16 waits for memory without the token, so phase 15
+        # builds meanwhile. Phase 16's step then waits for the token, and phase
+        # 15's launcher ending cannot free it.
+        board = self.root / "board"
+        self.record_phase(board)
+        lock = board / "locks" / "cargo.d"
+        meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
+        _ = meminfo.write_text("MemAvailable: 0 kB\n")
+        peer_meminfo = self.root / "peer-meminfo"
+        _ = peer_meminfo.write_text("MemAvailable: 50331648 kB\n")
+        environment = {**self.environment, "UNIT_RUN_DIR": str(board),
+                       "UNIT_TEAM_ROLE": "impl", "BUILDLOG_MEM_POLL_S": "1"}
+        phase_16_errors = self.root / "phase-16.err"
+        phase_16 = self.start_memory_waiter(environment, phase_16_errors)
+        phase_15: subprocess.Popen[bytes] | None = None
+        try:
+            self.assertFalse(lock.exists(), "the memory wait kept the token")
+            phase_15 = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"],
+                                        cwd=self.root,
+                                        env={**environment, "BUILDLOG_MEMINFO": str(peer_meminfo),
+                                             "TEST_BLOCK": "1"},
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                        start_new_session=True)
+            self.started_groups.add(phase_15.pid)
+            self.wait_for_running(self.root / "running", phase_15)
+            self.assertEqual((lock / "holder_pid").read_text(), str(phase_15.pid))
+            launcher_release = subprocess.run(["bash", str(BOARD), "release", str(board), "impl",
+                                               "cargo"], capture_output=True, text=True,
+                                              check=False, timeout=300)
+            self.assertEqual(launcher_release.returncode, 1, launcher_release.stdout)
+            self.assertIn(f"held by live pid {phase_15.pid}", launcher_release.stderr)
+
+            _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
+            self.wait_for_output(phase_16_errors, "memory free after", phase_16)
+            self.assertIsNone(phase_16.poll(), phase_16_errors.read_text())
+            self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 1)
+            self.assertEqual((lock / "holder_pid").read_text(), str(phase_15.pid))
+
+            _ = (self.root / "release").touch()
+            self.assertEqual(phase_15.wait(timeout=300), 0)
+            self.assertEqual(phase_16.wait(timeout=300), 0, phase_16_errors.read_text())
+            self.assertNotIn("Traceback", phase_16_errors.read_text())
+            self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 2)
+            self.assertFalse(lock.exists())
+            starts = [row for row in self.phase_waits(board) if row["event_type"] == "wait_started"]
+            ends = [row for row in self.phase_waits(board) if row["event_type"] == "wait_finished"]
+            self.assertIn("memory admission", {row["wait_reason"] for row in starts})
+            self.assertEqual({row["wait_id"] for row in starts}, {row["wait_id"] for row in ends})
+        finally:
+            _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
+            _ = (self.root / "release").touch()
+            for process in (phase_16, phase_15):
+                if process is not None:
+                    if process.poll() is None:
+                        self.end_group(process.pid)
+                    _ = process.wait(timeout=300)
 
     def test_a_newer_call_supersedes_an_older_call_still_waiting_for_the_token(self) -> None:
         board = self.root / "board"

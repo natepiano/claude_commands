@@ -2616,39 +2616,33 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Also touches:** shutdown-unit (`scripts/shutdown`).
 
-#### Work Order
+#### As-built
 
-**Goal:** A `restart failed` record whose opening-prompt submit failed shows the last screen that submit saw. Phase 69 saves the screen in the receipt `<SHUTDOWN_STATE_DIR>/<login>/restart-note-<session id>.prompt-outcome.json` (`restart._prompt_outcome_path`), but no user surface shows it, so to diagnose `restart prompt not submitted` the user opens the receipt by hand.
-
-**Spec:**
-- One reader in `scripts/shutdown/restart.py`: `saved_prompt_screen(record) -> str | herdr.PromptScreenNotRead`. It reads the receipt through `_prompt_outcome(record)` (the request id, session id and target checks stay) and returns `outcome.screen` for a `herdr.PromptNotSubmitted` with a read screen, else `herdr.PromptScreenNotRead()`. The screen is ANSI-stripped, the last 40 lines (Phase 69).
-- Every surface that prints a `restart failed` record prints the screen under that record's line, when the reader returns one: a header line `  last screen of the failed prompt submit:`, then each screen line indented 4 spaces.
-  - `shutdown status`: `shutdown._shutdown_record_lines`, in both forms: the live-session line `settle.running_restart_line` and the lines of `settle.status_record_lines`. A screen added only to `status_record_lines` never shows for a live `restart failed` record.
-  - `shutdown follow`: `shutdown._follow_action` for a `restart failed` record, live or not.
-  - The stop report: `settle.report_stop`, after the `running_restart_line` line or the `<name>: <reason>` line of a `restart failed` record.
-- The receipt is in the record machine's `SHUTDOWN_STATE_DIR`. A peer record that `shutdown status` reads from `records --json` has no receipt here: it prints no screen.
-- The phone push stays the same (`restart.send_failure_pushes`, `settle.alert_user`), because a push carries only what the user must do. `settle.tell_showrunners_outcome` stays the same.
-- No other behavior changes.
+- A `restart failed` record whose opening-prompt submit failed shows the last screen that submit saw. The screen comes from the Phase 69 receipt `<SHUTDOWN_STATE_DIR>/<login>/restart-note-<session id>.prompt-outcome.json` (ANSI-stripped, last 40 lines).
+- `restart.saved_prompt_screen(record) -> str | herdr.PromptScreenNotRead` reads the receipt through `_prompt_outcome(record)`, with its request id, session id and target checks. It returns the screen of a `herdr.PromptNotSubmitted` that read one, else `herdr.PromptScreenNotRead()`.
+- `settle.failed_prompt_screen_lines(saved)` is the one render function: the header `  last screen of the failed prompt submit:`, then each screen line indented 4 spaces. It gives lines only for a `restart failed` record with a screen.
+- Three surfaces put these lines under the record line:
+  - `shutdown status`: `shutdown._shutdown_record_lines`, for the live form (`settle.running_restart_line`) and for `settle.status_record_lines`, only when `local_observation` is true. A peer record read from `records --json` has no local receipt and prints no screen.
+  - `shutdown follow`: `shutdown._follow_action`, for a live and a not-live `restart failed` record, with no machine check (follow reads only local records).
+  - The stop report: `settle.report_stop`, after the `running_restart_line` line or the `<name>: <reason>` line, when `saved["machine"].casefold() == local_machine().casefold()`.
+- Phone pushes (`restart.send_failure_pushes`, `settle.alert_user`) and `settle.tell_showrunners_outcome` do not change.
 
 **Files:**
 - `scripts/shutdown/restart.py` — `saved_prompt_screen`.
+- `scripts/shutdown/settle.py` — `failed_prompt_screen_lines`, `report_stop`.
 - `scripts/shutdown/shutdown.py` — `_shutdown_record_lines`, `_follow_action`.
-- `scripts/shutdown/settle.py` — `report_stop`, and one shared function that renders the screen lines.
 - `scripts/shutdown/test_restart.py` — the reader: a matching receipt with a screen, one with no screen, one of another request, a missing or unreadable file.
-- `scripts/shutdown/test_shutdown_cli.py`, `scripts/shutdown/test_settle.py` — status (live and not live), follow and the stop report print the screen; a peer record and a record without a screen print none; the push text is unchanged.
+- `scripts/shutdown/test_settle.py`, `scripts/shutdown/test_shutdown_cli.py` — the stop report (live, absent, mixed-case machine), status (live and not live), follow, a peer record, a receipt with no screen, unchanged push text.
 - `docs/as-built/shutdown-and-restart.md` — where the saved screen shows.
 
-**Workers:** 1 writer, no split (three modules in one directory share one render function).
-- `impl` — all files.
-
-**Constraints from prior phases:** Phase 70: a `restart failed` record can belong to a live session; the liveness reads (`_restart_failed_liveness`, `restart_failed_liveness`) and the printed commands stay as they are. Phase 71/72: `settle.running_restart_line` stays the one source of the live-session line, and its text does not change. Tests set `HOME` and `SHUTDOWN_STATE_DIR` to scratch folders and write fixture receipts; they never touch `~/.local/state/shutdown`, live dirs, ssh or real sessions.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py'` passes; `basedpyright scripts/shutdown/restart.py scripts/shutdown/shutdown.py scripts/shutdown/settle.py` and the three test files read `0 errors, 0 warnings, 0 notes`.
+**Binds later work:** `settle.failed_prompt_screen_lines` holds a function-local `import restart as restart_work`. It is a sibling shutdown import, the same as the other function-local ones in `settle.py`, and is not a shared whoami module import ("All consumers import shared whoami modules by one name").
 
 **Gotchas:**
-- A receipt holds a screen when the submit read the pane at least once. `herdr.wait_for_prompt_input` keeps the last screen it read, so a failure before any typing can hold one too (`destination never became ready for input` after a `destination has no empty composer` read). A receipt has `PromptScreenNotRead` when no pane read happened (the agent never became interactive-ready) or when `restart.py` saved its own reason (`launch has no submit proof`, `restart launcher supplied no submit proof`). The surfaces print nothing for it.
+- Compare machine names with `casefold()`: a record can name `Mac` on a host that reports `mac` (`test_stop_report_shows_saved_screen_when_local_machine_case_differs`).
+- A receipt holds a screen when the submit read the pane at least once. `herdr.wait_for_prompt_input` keeps the last screen it read, so a failure before any typing can hold one too (`destination never became ready for input` after a `destination has no empty composer` read). A receipt has `PromptScreenNotRead` when no pane read happened, or when `restart.py` saved its own reason (`launch has no submit proof`, `restart launcher supplied no submit proof`). The surfaces print nothing for it.
+- `scripts/accounts/test_unit_watchdog.py` calls `settle.report_stop`. A gate for a change to `report_stop` runs the accounts suite too, not only `scripts/shutdown`.
 
-### Phase 94b — Cut the top live cost of the notes timer pass  · status: todo
+### Phase 94b — Cut the top live cost of the notes timer pass  · status: done
 
 **Depends on:** Phase 95 (order only)
 
@@ -2662,8 +2656,9 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - Before and after numbers come from the same method: the profile script, then the timer runs (`notes_cpu` sampler and the service `Consumed` lines).
 
 **Files:**
-- `scripts/whoami/profile_notes_pass.py` (new) and its test `scripts/whoami/test_profile_notes_pass.py`: the patch list covers each side-effect call; a pass under the script writes nothing outside the scratch folder.
-- The module that holds the top live cost, and the test module beside it.
+- `scripts/whoami/profile_notes_pass.py` — new: the profile script.
+- `scripts/whoami/test_profile_notes_pass.py` — new: the patch list covers each side-effect call; a pass under the script writes nothing outside the scratch folder.
+- `scripts/whoami/`, `scripts/accounts/` — the module that holds the top live cost, and the test module beside it. The profile names the module; it can be in another directory.
 
 **Workers:** 1 writer, no split.
 - `impl` — the profile script, then the cut.
@@ -2672,9 +2667,69 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/<dir> -p 'test_*.py'` passes for `scripts/whoami`, `scripts/accounts` and each other touched dir; `basedpyright <changed files>` reads `0 errors, 0 warnings, 0 notes`. Live check (the director): the profile's total and the timer runs' CPU per run both drop after the cut, at a similar load.
 
+Assertion-Change: `scripts/accounts/test_refusal_watch.py` `test_idle_completion_and_later_watchdog_report_share_one_scan` (was `test_idle_completion_keeps_report_sharing_and_checks_members_fresh`): `self.assertEqual(scans.call_count, 2)` → `self.assertEqual(scans.call_count, 1)`; an idle pass does one scan (repair round 3, Astra review).
+
 **Gotchas:**
 - The machine load on natedev is often 100 or more, which makes CPU time read high. Compare runs at a similar load.
 - Never run `agent_notes.py` by hand without the profile script: it sends alerts and can move sessions.
+
+### Phase 94c — Each account problem says what is wrong, why, and what to do  · status: todo
+
+**Depends on:** Phase 94b (order only)
+
+#### Work Order
+
+**Goal:** The user reads each account problem once and knows what is wrong, what caused it, and what to do. User, 2026-10-29: the accounts board showed three lines for one cause, and the user could not read any of them. The lines were: `~/.codex: the usage read failed and no reading is stored yet; next try in 2 min`; `~/.codex holds a login; run accounts.py cutover-home ~/.codex`; `~/.codex — no account note, not selectable: add ~/rust/hanadocs/agents/codexN.md with login: mesh-fixture@example.invalid`. The cause: a test wrote a fake sign-in (`mesh-fixture@example.invalid`) into the real `~/.codex/auth.json` at 01:14. No line said so, and two lines told the user to make the fake login an account.
+
+**Spec:**
+- One typed problem in `scripts/accounts/accounts.py`: the subject (the home or account), what is wrong, the cause, and the step to fix it. One render function writes every problem line in that order, in Simplified Technical English. The terminal status and `status --json` `problems` (which the unit board shows as is, `mods/unit-board/hooks/data.ts`) use the same lines. `problems` stays `list[str]`.
+- One line per cause. When one cause makes several symptoms for the same subject, the status shows the cause's line only. Example: a login in `~/.codex` that has no account note makes the read failure, the cutover hint and the no-note hint: those become one line.
+- A test login is its own cause: a login whose address domain is reserved for tests (`.invalid`, `.test`, `.example`, `.localhost`, `example.com`, `example.net`, `example.org`; RFC 2606 and 6761). Its line says that a test wrote it, names the file and its creation time, and gives the step `delete <file>`. It never suggests cutover-home or an account note.
+- Apply the form to every problem that `accounts.py status` emits (read failures, role problems, home logins, unnoted homes, Codex problems, account state notes). Keep each problem's facts, times and commands; change only the words, the order and the merging.
+- The fixture leak itself (`select_fixture_workers(Path.home())` in `scripts/agents/test_codex_mesh.py`) is out of scope: the showrunner gave it to shutdown-unit, which owns that file now.
+- The fake file in the live `~/.codex` is removed only with the user's yes; it is not part of the code change.
+- `docs/accounts.md` shows the new line form and the test-login line.
+- No other behavior changes.
+
+**Files:**
+- `scripts/accounts/accounts.py` — the problem type, the render function, the merging and the test-login cause.
+- `scripts/accounts/test_accounts.py`, `scripts/accounts/test_cutover_home.py` — each problem's line; the merged `~/.codex` case; the test-login case for each reserved domain; a real login keeps its cutover and note steps.
+- `docs/accounts.md` — the problem lines.
+
+**Workers:** 1 writer, no split.
+- `impl` — all files.
+
+**Constraints from prior phases:** Phase 40's role map and Phase 54's Codex note texts keep their facts. Tests use a scratch `HOME`, `AGENT_NOTES_DIR` and Codex homes; they never touch a live home, `~/.local/state`, usage stores, ssh or real sessions. Never run `accounts.py status` against the live home.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/accounts -p 'test_*.py'` passes with a scratch HOME set before import; `basedpyright` on the changed Python files reads `0 errors, 0 warnings, 0 notes`. Text check (the director): each new line names the subject, what is wrong, the cause and the step, and a reader who knows nothing else can act on it.
+
+**Gotchas:**
+- Problem texts have had long review loops before (`attempts-*-text` memories). Pin the form in one render function and test the parts, not each word.
+
+### Phase 94d — The watchdog keeps recovery evidence until a fresh check confirms the unit  · status: todo
+
+**Depends on:** Phase 94b (order only)
+
+#### Work Order
+
+**Goal:** A unit watchdog pass never loses a finished recovery's result before it knows whether the unit is live. The Phase 94b closure review found: on the recovery-result path (`scripts/accounts/unit_watchdog.py`, the `job = outage.get("job")` branch), `_recovery_result` deletes the result file and the job is removed before `_live_account` reads; when that read is unreadable and raises, the result and the job are gone and the next pass cannot report the restart. The order is the same at `ed98b7dc` (before Phase 94b). Phase 94b fixed the same order on the observed-live branch.
+
+**Spec:**
+- On the recovery-result path, read the result without deleting it, confirm liveness fresh with `_live_account`, then delete the result and remove the job. A confirmed live unit: success cleanup and the `restarted on` line. An absent unit: the existing retry line and recovery handling. An unreadable read: keep the result file, the job and the outage; no line.
+- `scripts/whoami/test_profile_notes_pass.py` `test_child_launch_options_cannot_substitute_executable_or_run_hooks`: use argv forms the policy permits, so the test fails only when the launch-option check is missing (today argument rejection alone makes it pass).
+- No other behavior changes.
+
+**Files:**
+- `scripts/accounts/unit_watchdog.py` — the recovery-result order.
+- `scripts/accounts/test_unit_watchdog.py` — live, absent and unreadable after a finished result; the file and job stay for unreadable.
+- `scripts/whoami/test_profile_notes_pass.py` — the launch-options test.
+
+**Workers:** 1 writer, no split.
+- `impl` — all files.
+
+**Constraints from prior phases:** Phase 94b's one-scan idle pass and fresh reads before acts stay. Tests use a scratch `HOME` and state dirs; they never touch live dirs, `~/.local/state`, ssh or real sessions.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/accounts -p 'test_*.py'` and the same for `scripts/whoami` pass; `basedpyright` on the changed files reads `0 errors, 0 warnings, 0 notes`.
 
 ### Phase 96 — All consumers import shared whoami modules by one name  · status: todo
 
@@ -2702,7 +2757,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - No other behavior changes.
 
 **Files:**
-- `scripts/whoami/agent_accounts.py`, `account.py`, `note_file.py`, `session_table.py`, `run_out.py`, `usage_store.py` — the registration blocks.
+- `scripts/whoami/agent_accounts.py`, `scripts/whoami/account.py`, `scripts/whoami/note_file.py`, `scripts/whoami/session_table.py`, `scripts/whoami/run_out.py`, `scripts/whoami/usage_store.py` — the registration blocks.
 - `scripts/whoami/five_hour.py`, `scripts/whoami/quota_alert.py`, `scripts/whoami/codex_pacer.py`, `scripts/whoami/agent_notes.py`, `scripts/whoami/whoami.py` — consumers.
 - `scripts/accounts/accounts.py`, `scripts/accounts/new_account.py`, `scripts/accounts/refusal_watch.py`, `scripts/accounts/refusals.py`, `scripts/accounts/unit_watchdog.py` — consumers.
 - `scripts/shutdown/inventory.py`, `scripts/shutdown/pane_record.py`, `scripts/shutdown/pane_restore.py`, `scripts/shutdown/record.py`, `scripts/shutdown/restart.py`, `scripts/shutdown/settle.py`, `scripts/shutdown/shutdown.py` — consumers.
