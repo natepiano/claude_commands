@@ -5,6 +5,7 @@ import json
 import unittest
 from pathlib import Path
 from typing import Literal, cast
+from unittest import mock
 
 from scripts.issue_score import client, decide, questions
 
@@ -28,9 +29,9 @@ def choice_answer(probabilities: dict[str, float]) -> client.ChoiceAnswer:
 
 class DecideTests(unittest.TestCase):
     def test_configured_tuning_policy_controls_certainty_at_the_measured_boundaries(self) -> None:
-        # These are the adopted results from the complete version-3 tuning run.
+        # Phase 4 adds the adopted defined-area threshold to the tuned policy.
         expected = {"backlog_goal": .4, "category": .9,
-                    "backlog_impact": .4, "backlog_alignment": .4}
+                    "backlog_impact": .4, "backlog_alignment": .4, "area": .9}
         for field, threshold in expected.items():
             with self.subTest(field=field):
                 self.assertEqual(questions.THRESHOLDS[field], decide.Supported(threshold))
@@ -38,7 +39,6 @@ class DecideTests(unittest.TestCase):
                 at = decide.FieldDecision("fixture", threshold, "unsure")
                 self.assertFalse(decide.is_sure(field, below))
                 self.assertTrue(decide.is_sure(field, at))
-        self.assertIsInstance(questions.THRESHOLDS["area"], decide.Unsupported)
         for field in ("backlog_urgency", "backlog_effort"):
             self.assertIsInstance(questions.THRESHOLDS[field], decide.ReportOnly)
 
@@ -46,16 +46,18 @@ class DecideTests(unittest.TestCase):
         main = cast(client.Response, json.loads((FIXTURES / "main_response.json").read_text()))
         area = cast(client.Response, json.loads((FIXTURES / "area_response.json").read_text()))
         origins: tuple[Literal["choice", "area_fallback"], ...] = ("choice", "area_fallback")
+        thresholds = dict(questions.THRESHOLDS, area=decide.Unsupported())
         for confidence in (0., .4, .95, 1.):
             for origin in origins:
                 with self.subTest(confidence=confidence, origin=origin):
                     decision = decide.FieldDecision("unfiled", confidence, "unsure", origin=origin)
-                    self.assertFalse(decide.is_sure("area", decision))
+                    self.assertFalse(decide.is_sure("area", decision, thresholds))
         for fits in (0., 1.):
             area["answers"]["area_fits"] = {"type": "noul", "noul": fits}
             for name in ("area", "area_reverse"):
                 area["answers"][name] = choice_answer({"rendering": 1., "tooling": 0.})
-            result = decide.decide_answers(main["answers"], area["answers"])["area"]
+            with mock.patch.dict(questions.THRESHOLDS, area=decide.Unsupported()):
+                result = decide.decide_answers(main["answers"], area["answers"])["area"]
             self.assertEqual(result.certainty, "unsure")
             self.assertEqual(result.confidence, 1.)
 
@@ -258,7 +260,7 @@ class DecideTests(unittest.TestCase):
                 self.assertEqual(decision.value, "unfiled")
                 self.assertEqual(decision.origin, origin)
                 self.assertEqual(decision.hint, hint)
-                self.assertFalse(decide.is_sure("area", decision))
+                self.assertEqual(decide.is_sure("area", decision), origin == "area_fallback")
 
     def test_area_at_fit_cutoff_keeps_top_area(self) -> None:
         main = cast(client.Response, json.loads((FIXTURES / "main_response.json").read_text()))
@@ -267,7 +269,7 @@ class DecideTests(unittest.TestCase):
         decision = decide.decide_answers(main["answers"], area["answers"])["area"]
         self.assertEqual(decision.value, "rendering")
 
-    def test_absent_area_preserves_its_hint_but_unsupported_policy_prevents_certainty(self) -> None:
+    def test_absent_area_is_sure_at_the_adopted_threshold_despite_disagreeing_hint_orders(self) -> None:
         main = cast(client.Response, json.loads((FIXTURES / "main_response.json").read_text()))
         area = cast(client.Response, json.loads((FIXTURES / "area_response.json").read_text()))
         area["answers"]["area_fits"] = {"type": "noul", "noul": .1}
@@ -275,7 +277,7 @@ class DecideTests(unittest.TestCase):
         area["answers"]["area_reverse"] = choice_answer({"tooling": .6, "rendering": .4})
         decision = decide.decide_answers(main["answers"], area["answers"])["area"]
         self.assertEqual(decision.value, "unfiled")
-        self.assertEqual(decision.certainty, "unsure")
+        self.assertEqual(decision.certainty, "sure")
         self.assertAlmostEqual(decision.confidence, .9)
         self.assertEqual(decision.hint, "rendering")
 

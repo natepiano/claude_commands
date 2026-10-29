@@ -115,7 +115,7 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
    - All 86 rated style issues match the formula exactly. Frontmatter cannot tell an accepted proposal from a copied default.
    - **Rule:** a style issue (`style_rule:` or `style_rules:` set) is a label only when its values differ from the formula. Every other style issue is left out.
    - A non-style issue with a `Proposed ranking:` line is unrated (12 open now): its values are the filer's judgment, not yet confirmed. Non-style proposals rated through `stars` (tool-based-ui, research-unit and others) were confirmed by the user, so they count as labels.
-   - The user, after this answer: "once we get jef working - we should apply it to the defaulted and missing - and in fact i want to reassess all of our issues in case i like jev's categorization better". So the plan adds a reassessment phase (Phase 5) that scores every open issue, including style issues, issues with default ratings and unrated issues. Style issues need their own state, built from their rule fields because their body is empty.
+   - The user, after this answer: "once we get jef working - we should apply it to the defaulted and missing - and in fact i want to reassess all of our issues in case i like jev's categorization better". So the plan adds a reassessment phase (Phase 6) that scores every open issue, including style issues, issues with default ratings and unrated issues. Style issues need their own state, built from their rule fields because their body is empty.
 2. **Budget: $20.** The user: "i am happy to add $20 to jev". The scorer keeps a running total from each response's `usage.input_tokens` at $0.042 per million. It stops before a request that would pass $20, and asks the user before it spends more.
 3. **Open issues only.** The user: "we only need to score open issues - not closed". `score`, `compare` and `reassess` read open issues only, and closed issues are not labels either.
 4. **Baseline: blind preference.** The user: "blind preference for our teating". In Phase 3, about 20 held-out issues where Jev and the vault disagree are shown to the user. Each issue shows its two values as A and B, in random order, with no label saying which is Jev's. The user picks A, B or same. The share of picks for Jev decides how far the reassessment trusts Jev. This replaces the blind re-rating.
@@ -123,7 +123,7 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 
 ### Resource for other sessions
 
-`typesafe-unit` stays on to answer other sessions' TypeSafe questions. Phase 6 writes `docs/typesafe.md` so the knowledge outlasts this session: how to run a command under `with-typesafe`, how to reuse the client, the `questions.py` pattern, and the measured lessons from Phase 3. Those lessons cover which wordings won, the order-bias results, threshold values, and where Jev was wrong.
+`typesafe-unit` stays on to answer other sessions' TypeSafe questions. Phase 7 writes `docs/typesafe.md` so the knowledge outlasts this session: how to run a command under `with-typesafe`, how to reuse the client, the `questions.py` pattern, and the measured lessons from Phase 3. Those lessons cover which wordings won, the order-bias results, threshold values, and where Jev was wrong.
 
 ## Delegation Context
 
@@ -132,8 +132,8 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 - **Stack:** Python ≥ 3.11, standard library only, run through `~/.claude/scripts/lib/py`; TypeSafe HTTP API `POST https://api.typesafe.ai/v1/systemone`, model `jev-1.14.0`; schemas at `https://api.typesafe.ai/openapi.json` and `https://docs.typesafe.ai/api/system-one.md`.
 - **Layout:**
   - `scripts/issue_score/` — new: `client.py`, `vault.py`, `questions.py`, `decide.py`, `evaluate.py`, `score_issues.py` (CLI), `test_*.py`, `fixtures/`
-  - `commands/issue.md` — `/issue`; step 4 gains the `propose` call (Phase 4)
-  - `docs/typesafe.md` — new guide (Phase 6)
+  - `commands/issue.md` — `/issue`; step 4 gains the `propose` call (Phase 5)
+  - `docs/typesafe.md` — new guide (Phase 7)
   - `pyrightconfig.json` — one execution-environment entry for `scripts/issue_score`
 - **Key files:**
   - `~/rust/hanadocs/issues/*.md` — issues, read only; skip any with `style_rule:` in frontmatter, skip directories
@@ -220,55 +220,63 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 
 ### Phase 3 — tune wordings and thresholds; the user's review  · status: done
 
-**Depends on:** Phase 2
+#### As-built
 
-#### Work Order
-
-**Goal:** tuned `questions.py` and measured thresholds, and a held-out report the user reviews field by field.
-
-**Spec:**
-- Work on the tuning set only. To compare wordings, send each variant as a separate question in the same request, over the same state, then compare the variants with `compare`. When an answer looks wrong, check in this order: the payload, the state, the options, the question's scope, then the wording.
-- Watch for prompt gymnastics: no criteria that name test issues, no clause added per failure, no thresholds fitted to a few cases.
-- For each field, take the threshold from its risk-coverage table, using the lowest value whose error meets the target. Targets: goal, category and area 10% error; impact and alignment within one star on 90%; urgency and effort have no target and are reported only.
-- Bump `QUESTION_SET_VERSION`, then score the held-out set once. Write the held-out report, and run the repeat check on the tuning set.
-- Blind preference test (Review decisions 4): `score_issues.py blind <run-id> --count 20` picks held-out disagreements, spread across fields. It writes the A/B sheet with the order shuffled by a recorded seed, and keeps the key in a separate file the user does not see. `score_issues.py blind-score <sheet>` reads the user's picks and reports the share for Jev, the share for the vault and the share marked same, per field.
-- Send the user the report, the blind-preference result, the per-field recommendation (Jev proposes / agent proposes), and the disagreement lists. The user's verdict per field is recorded in `questions.py` as `JEV_FIELDS`.
-- Record the lessons in `~/.local/state/issue-score/lessons.md` for Phase 5.
+- `questions.py` holds the tuned wordings at `QUESTION_SET_VERSION` "3" (adopted wordings in `fixtures/adopted_wordings_v3.json`). `THRESHOLDS` maps each field to a named outcome, never a nullable number: `Supported(threshold)`, `Unsupported` (no threshold meets the error target, or sure coverage is zero; the field is agent-only) or `ReportOnly`. Goal, impact and alignment are `Supported(0.40)`; category is `Supported(0.90)`; area is `Unsupported`; urgency and effort are `ReportOnly`.
+- `JEV_FIELDS` = `backlog_goal`, `backlog_impact`, `backlog_alignment`: the user's verdict after the blind preference test, 2026-10-29.
+- One sure predicate in `decide.py`; `evaluate.py` risk coverage calls it, sweeps one field's threshold and holds every other field at its `THRESHOLDS` value. Split answers and Choice orders that disagree stay unsure at every threshold.
+- `compare <candidate> --baseline <run-id>` judges both runs on one cohort: the issues eligible in both, the same labels read once, `HISTORICAL_EFFORT_EXAMPLE_STEMS` excluded from both. That set is never empty.
+- `experiment.py` asks wording variants as `<name>__<variant>` questions in one request over one state, and maps each back to its production name before `decide`. A variant file replaces whole questions by production name, and a variant must keep the production option set.
+- `score_issues.py blind <run-id> --count 20` writes an A/B sheet of held-out disagreements across fields, shuffled by a recorded seed, with the key in a separate file. `blind-score <sheet>` reports the Jev, vault and same shares per field.
+- Held-out result: goal, impact and alignment pass; category at 0.90 fails (error .15). Blind result: Jev 12, vault 8.
 
 **Files:**
-- `scripts/issue_score/questions.py` — tuned wordings and thresholds
-- `scripts/issue_score/experiment.py` — the wording-variant adapter: sends `<name>__<variant>` questions and maps each variant back to its production name
-- `scripts/issue_score/decide.py` — the threshold outcome type; the sure rule `evaluate.py` shares
-- `scripts/issue_score/evaluate.py` — risk coverage through the `decide.py` sure rule; the shared cohort
-- `scripts/issue_score/records.py` — any new persisted shape (variant runs, blind key)
-- `scripts/issue_score/score_issues.py` — the `blind` and `blind-score` subcommands; `compare --baseline`
-- `scripts/issue_score/test_experiment.py` — variant projection tests
-- `scripts/issue_score/test_blind.py` — blind sheet tests
-- `scripts/issue_score/test_evaluate.py` — shared sure rule, cohort and exclusion tests
-- `scripts/issue_score/test_decide.py` — updated when thresholds move
+- `scripts/issue_score/questions.py` — wordings, `THRESHOLDS`, `JEV_FIELDS`, `QUESTION_SET_VERSION`, `HISTORICAL_EFFORT_EXAMPLE_STEMS`
+- `scripts/issue_score/decide.py` — threshold outcome type and the shared sure predicate
+- `scripts/issue_score/evaluate.py` — risk coverage through the shared predicate; one cohort
+- `scripts/issue_score/experiment.py` — variant questions in one request, mapped back to production names
+- `scripts/issue_score/blind.py` — blind sheet, key and tally
+- `scripts/issue_score/records.py` — variant runs and the blind key
+- `scripts/issue_score/score_issues.py` — `blind`, `blind-score`, `compare --baseline`, `--variants`
 
-**Workers:** `1 writer + 1 tester` — the unit director runs the experiments; `impl` owns `experiment.py`, `questions.py`, `decide.py`, `evaluate.py`, `records.py` and `score_issues.py`, applies the chosen wordings and thresholds and writes `blind`/`blind-score`; `test` owns `test_experiment.py`, `test_blind.py`, `test_evaluate.py`, `test_decide.py` and `test_questions.py` (variant projection; the seed reproduces the order; the key never appears in the sheet; tallies are correct; coverage matches production with unequal thresholds).
+**Binds later work:** **`/issue` proposes with Jev** and **reassess every open issue** read `JEV_FIELDS`; `test_questions.py` pins it, and it grows only on the user's verdict. **area and category definitions; route unsure answers to the user** re-tunes the category and area thresholds.
 
-**Constraints from prior phases:**
-- Fixed question names: `parse_response` and `decide_answers` read the production names (`goal`, `goal_reverse`, `category`, `category_reverse`, `impact`, `effort`, `pressure`, `alignment_<goal>`, the 4 evidence Nouls, `area`, `area_reverse`, `area_fits`). A wording variant goes in the same request under `<name>__<variant>`; the experiment code maps it back to its production name before it calls `decide`. Every adopted wording increments `QUESTION_SET_VERSION`.
-- The repeat check runs with `--fresh`; a cached answer is not a repeat.
-- `EFFORT_LEVELS` names open issues that are in the evaluation. Replace them with closed issues before the final held-out run, and increment the version. Keep the 10 open stems excluded from every comparison as `HISTORICAL_EFFORT_EXAMPLE_STEMS` (renamed from `EFFORT_EXAMPLE_STEMS`), because the baseline run had them in its prompt; never empty the set. Its test in `test_questions.py` changes in the same edit.
-- One cohort: `compare <candidate> --baseline <run-id>` judges both runs on the same issues (eligible in both, historical examples excluded from both) and the same labels, read once. Every wording and threshold comparison uses it; a report of one run alone is never compared with another run's report.
-- One sure rule: `evaluate.py` risk coverage calls the same predicate `decide.py` uses, sweeping the field's own threshold with every other field at its `THRESHOLDS` value. Today alignment coverage takes `min(goal, alignment)` against one threshold; a test with unequal goal and alignment thresholds proves coverage equals production.
-- Threshold outcome is a named type, not a nullable or sentinel number: `Supported(threshold)`, `Unsupported` (no threshold meets the target, or sure coverage is zero; the field is agent-only) and `ReportOnly` (urgency, effort).
-- High-priority group: composite Spearman is 0.55 overall but 0.08 for the 48 issues scoring 20 or more, and alignment within-one falls to 85%. The per-field recommendation and the message to the user state each field's result in that group, and Phase 5 does not treat a global pass as evidence for that group.
-- Coverage: thresholds and the held-out report come from complete runs. Rerun failed issues; a report still partial after a rerun names the missing issues in the message to the user and stays out of threshold selection.
-- `unfiled` has two meanings: a Choice pick of the real area `unfiled` (4 issues) is an ordinary answer; the fallback derived from `area_fits < EVIDENCE_ABSENT` is exact-match only and carries the hint. Tell them apart by the decision's origin, never by the value string.
-- Shared code from Phase 2: `records.py` owns persisted run shapes and `STATE_DIR`; `vault.Issue.is_style` marks style issues; the evaluation reads current labels, including `backlog_score`; reuse `evaluate.compare`, `score --fresh` and `--split`; do not add parallel versions.
-- The baseline to beat is run `20261027T085930.573291Z-970cbc23` (tune split). Urgency's 77% exact match comes from the 1-star majority (kappa 0.08): judge urgency by kappa and the 4–5 rows. Area (47%) and category (68%) are the weakest fields.
-- Deadline experiment: compare a version-identifier case (a title such as "Bevy 0.18 migration", the expected answer no) with an explicit completion deadline (the expected answer yes) on the tuning split. Carry the feature/enhancement/research confusion into the per-field recommendation.
-- Thresholds: when no threshold meets the error target, or "sure" coverage is zero, the result is the named outcome `unsupported`, and the field's recommendation is agent-only. Split answers and Choice orders that disagree stay "unsure" at every threshold; a test proves that confidence alone does not make them "sure".
+**Gotchas:**
+- The derived `unfiled` fallback (`area_fits < EVIDENCE_ABSENT`) and a Choice pick of the real area `unfiled` differ by the decision's origin, never by the value string.
+- A cache hit recomputes decisions under the current policy.
+- Area options carry no definitions, and each project has its own area names, so a variant file cannot express a defined-area variant; that needs code.
+- Feature, enhancement and research are the main category confusion.
 
-**Acceptance gate:** the merge gate is green; the held-out report exists; the user has filled in the blind sheet and the result is reported; the user's per-field verdict is recorded in `JEV_FIELDS`.
+**Ruled out:** Jev proposes category at 0.90 — held-out error .15.
 
-### Phase 4 — `/issue` proposes with Jev  · status: todo
+### Phase 4 — area and category definitions; route unsure answers to the user  · status: done
 
-**Depends on:** Phase 3
+#### As-built
+
+- `~/rust/hanadocs/conf/issue-areas.md` holds one draft definition line for each of the 116 areas in the global vocabulary, as a table `area | definition | issues`. The definitions are drafts that the user can correct. The file is outside `issues/`, which the prioritize and dailies scripts scan.
+- `vault.load_area_definitions()` reads the file read-only. It accepts the table with or without outer pipes. A missing file, or a file with no usable definitions, raises `ValueError` that names the path. An area with no line keeps the name-only option text.
+- `area_questions(areas, definitions)` uses each definition as the option criteria of that area, and keeps the production option keys. `content_hash(issue, areas, definitions)` puts the definitions in the cache key. Both functions take the definitions as required arguments.
+- `THRESHOLDS["area"]` is `Supported(0.90)` and `QUESTION_SET_VERSION` is "4". Category stays `Supported(0.90)` with the Phase 3 criteria, and stays agent-proposed.
+- The risk-coverage report names, for each field, the share taken (sure) and the share routed to the user (unsure).
+- Tune split: area accuracy .51 -> .67; at 0.90 the error is .083 and 38% is taken. Held-out run `20261029T125753.317576Z-3ac444e7` against the v3 held-out run `20261027T113121.673734Z-77e4d5ef`: area accuracy .49 -> .67; at 0.90 the error is .091, with 39% taken and 61% routed to the user. Category error at 0.90 is .15.
+
+**Files:**
+- `~/rust/hanadocs/conf/issue-areas.md` — draft area definitions (vault file)
+- `scripts/issue_score/vault.py` — `AREA_DEFINITIONS_PATH`, `load_area_definitions`
+- `scripts/issue_score/questions.py` — defined area options, area threshold, version
+- `scripts/issue_score/score_issues.py` — loads the definitions for scoring; definitions in `content_hash`
+- `scripts/issue_score/evaluate.py` — taken and routed shares in the risk-coverage report
+- `scripts/issue_score/experiment.py` — states its definitions explicitly
+
+**Binds later work:** **`/issue` proposes with Jev** and **reassess every open issue** load the definitions with `vault.load_area_definitions()` and pass them to `area_questions` and `content_hash`. A definition edit changes the hash of every issue, so a run scored before the edit is stale. Area joins `JEV_FIELDS` only after the user approves the drafted definitions.
+
+**Gotchas:** `THRESHOLDS["area"]` is calibrated on the defined options. Scoring with name-only options takes answers under an uncalibrated wording, so the loader fails loudly and never falls back to an empty mapping.
+
+**Ruled out:** sharper feature, enhancement and research criteria in `CATEGORIES` — they lowered category accuracy on the tune split (.74 -> .71).
+
+### Phase 5 — `/issue` proposes with Jev  · status: done
+
+**Depends on:** Phase 4
 
 #### Work Order
 
@@ -286,16 +294,19 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 **Workers:** `1 writer + 1 tester` — `impl` owns `score_issues.py` and `commands/issue.md`; `test` covers the output format, the unsure display and exit 2 on a failed fixture.
 
 **Constraints from prior phases:**
+- `JEV_FIELDS` is goal, impact and alignment (the user's verdict, 2026-10-29). Category and area join it only if Phase 4 meets their target and the user approves; `propose` reads `JEV_FIELDS`, never a fixed list. Phase 4 result: area met its target (held-out error .091 at `Supported(0.90)`, 39% taken) and waits on the user's review of the drafted definitions; category failed (held-out error .15) and stays agent-proposed.
+- Area definitions: `propose` loads them with `vault.load_area_definitions()` and passes them to `questions.area_questions(areas, definitions)`; both that and `content_hash(issue, areas, definitions)` take them as required arguments, with `areas` from the global `vault.area_vocabulary`. A missing or empty definitions file raises `ValueError` naming the path; `propose` exits 2 with that message on stderr, and a test covers it.
+- An unsure Jev field is routed to the user: the line shows its top two values and the user picks in the same reply (the user's routing rule, 2026-10-29).
 - `propose --project <short>` converts the shorthand to the canonical project name (`hana_diegetic`) before `vault.build_state`, which raises on an unknown project; a test covers each shorthand and an unknown one.
 - Show the derived flags: `split`, `check` (effort), `possible_five` (urgency 4) and the derived `unfiled` fallback with its hint. A Choice pick of the real area `unfiled` is an ordinary value with no hint; tell them apart by the decision's origin, and a test covers both.
-- Alignment follows the final proposed goal. The request asks `alignment_<goal>` for every goal; when `JEV_FIELDS` leaves goal to the agent, `propose` reads the alignment answer for the goal the agent picks. A fixture where the agent and Jev pick different goals proves it.
+- Alignment follows the final goal. The request asks `alignment_<goal>` for every goal, and `decide_answers` keeps only the winning goal's; `propose` keeps every goal's alignment answer. When goal is unsure, the line shows both goal candidates, each with its own alignment value, so the user's pick needs no second call. A named goal state (resolved goal, or unresolved first and second candidates) carries this, never an optional. A fixture with an unsure goal whose second candidate has a different alignment proves it.
 - Acceptance: the output for a fixture response is equal to a pinned expected text; the live check confirms only that the output is complete and usable, because a fresh response can differ from an earlier report row.
 
 **Acceptance gate:** the merge gate is green; basedpyright clean; the fixture output equals its pinned text; one live `propose` on a held-out issue's title and body prints a complete, usable line.
 
-### Phase 5 — reassess every open issue  · status: todo
+### Phase 6 — reassess every open issue  · status: todo
 
-**Depends on:** Phase 3
+**Depends on:** Phase 4
 
 #### Work Order
 
@@ -303,47 +314,36 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 
 **Spec:**
 - `score` covers all open issues: rated, default-rated (Review decisions 1), unrated, and style issues.
-- Style issue state: title, project, the rule's name and its one-line summary from the `style_rule` file, `style_crate`, and the finding count.
+- Style issue state: title, project, each rule's name and its one-line summary (from `style_rule`, or each entry of `style_rules`), `style_crate`, and the finding count. A rule file that is missing gives a named outcome in the review file, never a silent empty summary.
 - `score_issues.py reassess <run-id>` writes a review file, `~/.local/state/issue-score/reports/<run-id>-reassess.md`. Each issue gets one row: its current value and Jev's value for each field, sure or unsure, sorted so the largest differences come first. Unrated and default-rated issues come in their own group.
-- Writing approved values goes through `proposal_issue.py stars` or a direct frontmatter edit of only the five rating fields, `category` and `area`. The watcher recomputes score and rank. The scorer itself still never writes to the vault.
-
-**Pending decision: how the user approves reassessed values**
-
-Actual problem:
-About 640 open issues will each have up to seven Jev values. Reviewing every field of every issue one at a time is too much to read.
-
-What exists now:
-- `/prioritize` reviews one band of issues in a single proposal table and writes what the user approves.
-- `/showrunner:proposal` writes proposal stars through `proposal_issue.py stars`.
-
-What should change:
-- Decide after Phase 3 shows how often Jev is sure and right for each field.
-
-Recommendation:
-Accept in bulk every value Jev is sure of for the fields the user approved in Phase 3, write those for unrated and default-rated issues first, and walk the rest by `/prioritize` band.
+- Approval follows the user's routing rule (2026-10-29): decisions are rebuilt from the saved raw answers under the current policy. A `JEV_FIELDS` value for which `decide.is_sure()` holds is taken, unrated and default-rated issues first; every other value goes to the user, walked by `/prioritize` band. The review file shows the two groups apart, and shows the score >= 20 group's results on their own.
+- Unrated and default-rated issues: the agent proposes the missing agent-owned fields (category, area, urgency, effort) in the same review, as `/issue` does, so each issue gets a score and a band before band routing.
+- `apply_labels.py` writes approved values: a frontmatter edit of only the approved fields among the five rating fields, `category` and `area`. It refuses when the issue's content hash differs from the scored one, or when an approved field's current value differs from the value the review showed (`content_hash()` excludes labels). The watcher recomputes score and rank. The scorer itself never writes to the vault.
 
 **Files:**
 - `scripts/issue_score/vault.py` — style issue state from rule fields
 - `scripts/issue_score/questions.py` — any question changes the reassess needs
 - `scripts/issue_score/score_issues.py` — the `reassess` subcommand
+- `scripts/issue_score/records.py` — persisted style inputs in run records
+- `scripts/issue_score/apply_labels.py` — the approved-field writer
 - `scripts/issue_score/test_reassess.py` — reassess tests
+- `scripts/issue_score/test_apply_labels.py` — writer tests
 
-**Workers:** `1 writer + 1 tester` — `impl` owns the three modules; `test` covers the style state, the grouping and the sort order.
+**Workers:** `1 writer + 1 tester` — `impl` owns `vault.py`, `questions.py`, `score_issues.py`, `records.py` and `apply_labels.py`; `test` owns `test_reassess.py` and `test_apply_labels.py` (style state, grouping, sort order; only approved fields change; a stale hash or a changed approved value refuses; threshold equality, structural uncertainty and stale saved certainty).
 
 **Constraints from prior phases:**
 - Read open, non-style issues through `vault.load_open_issues`; style issues get the formula state that this phase adds. `score` already covers rated, default-rated and unrated open non-style issues; the new scoring work is style inclusion only.
-- The cache key holds title, project, body and the area vocabulary. Add every new style input (rule summary, `style_crate`, finding count) to it, with a test per input that a change misses the cache.
+- The cache key holds title, project, body, the area vocabulary and (from Phase 4) the area definitions. Add every new style input (rule summaries, `style_crate`, finding count) to it, with a test per input that a change misses the cache and that the definition-sensitive key is kept. `content_hash(issue, areas, definitions)` and `area_questions(areas, definitions)` take definitions as required arguments, loaded by `vault.load_area_definitions()`, which raises `ValueError` naming the path for a missing or empty file. A definition edit changes every issue's hash, so `apply_labels.py` refuses a run scored before the edit; its refusal says the hash changed and that a rescore is needed, and a test covers it.
 - The derived `unfiled` fallback and a Choice pick of the real area `unfiled` show as different outcomes in the review file; a test covers both.
-- The pending approval decision goes to the showrunner after Phase 3, with the Phase 3 results.
-- The writer: `proposal_issue.py stars` writes only the five ranking fields. Name the writer for `category` and `area` in this phase, write only the approved fields, and refuse a write when the issue's content hash differs from the scored one. Acceptance proves that only approved values change and that the scorer code stays read-only.
+- Acceptance proves that only approved values change and that the scorer code stays read-only.
 - A partial run (failed lines or a budget stop) shows the failed and unscored issues in the review files, kept apart from each other, and never presents them as complete; a test proves it.
-- `proposal_issue.py stars` takes all five ranking values, not a subset. Once the showrunner settles the approval decision, add the named writer to **Files**: `impl` owns it and the scorer integration; `test` owns the writer tests and the reassess tests (only approved fields change; a stale content hash refuses).
+- `proposal_issue.py stars` takes all five ranking values, not a subset, which is why this phase has its own writer.
 
 **Acceptance gate:** the merge gate is green; basedpyright clean; a full reassess run within budget; the user has the review file, and the values the user approved are written.
 
-### Phase 6 — the TypeSafe guide for other sessions  · status: todo
+### Phase 7 — the TypeSafe guide for other sessions  · status: todo
 
-**Depends on:** Phase 5
+**Depends on:** Phase 6
 
 #### Work Order
 
@@ -354,7 +354,7 @@ Accept in bulk every value Jev is sure of for the fields the user approved in Ph
 - how to reuse `scripts/issue_score/client.py`;
 - the `questions.py` pattern (all wording in one module, model pinned, payloads logged);
 - the skill's core rules, with links to the live docs;
-- the measured lessons from Phases 3 and 5 (`lessons.md`);
+- the measured lessons from Phases 3, 4 and 6 (`lessons.md`);
 - the cost of a pass;
 - the instruction to ask `typesafe-unit` for anything not covered.
 

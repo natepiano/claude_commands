@@ -219,7 +219,7 @@ The scheduled nightly review keeps firing but skips held accounts or unreadable 
 
 - Only `AllowedByShutdownState` permits a launch; the barrier spans check to spawn. The UPS alert is unaffected by holds. Neither implementation nor tests read notification credentials.
 
-- A shutdown stop never ends a Codex worker; run end (`end_session.sh`, plain `codex_mesh.py stop`) still ends every worker. A paused worker is resumed on its recorded thread, never replaced by a new worker. A held design role (`docs/as-built/guilds.md`) is not a worker: its mesh lives in the role store outside run directories, so neither a shutdown nor run end pauses or ends it, and `stop`, `stop --pause` and `reopen` refuse a held entry.
+- A shutdown stop never ends a Codex worker; run end (`end_session.sh`, plain `codex_mesh.py stop`) still ends every worker. A paused worker is resumed on its recorded thread, never replaced by a new worker. A held design role (`docs/as-built/long-lived-workers.md#lasting-roles`) is not a worker: its mesh lives in the role store outside run directories, so neither a shutdown nor run end pauses or ends it, and `stop`, `stop --pause` and `reopen` refuse a held entry.
 
 - Test cases derive from `ShutdownTestCase` and use temporary state and fake send, notifier, process, herdr and host commands. Tests start no real session and send no real alert.
 

@@ -19,7 +19,7 @@ TEST_HANG_GUARD_SECS = 300
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 
-import add_unit
+import production_units
 import pins
 import upgrade_record
 
@@ -45,7 +45,7 @@ class RecordTests(unittest.TestCase):
     @override
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
-        self.production = add_unit.Production(Path(), "demo", "demo", Path(), Path(), ZoneInfo("UTC"))
+        self.production = production_units.Production(Path(), "demo", "demo", Path(), Path(), ZoneInfo("UTC"))
         self.current_pins = pins.Pins((), frozenset(), ())
 
     @override
@@ -67,7 +67,7 @@ class RecordTests(unittest.TestCase):
             + "- **Log:** log.md\n- **User zone:** America/New_York\n\n## Units\n",
             encoding="utf-8",
         )
-        self.production = add_unit.read_production(doc)
+        self.production = production_units.read_production(doc)
         self.current_pins = pins.Pins(("0.19.1",), frozenset({"bevy_ecs"}),
                                       (dependent("alpha"), dependent("zeta")))
         _ = cast(object, self.enterContext(mock.patch.dict(

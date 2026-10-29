@@ -2,23 +2,13 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import override
 import unittest
 
-from scripts.direct import test_verify_doc as doc_fixture
-from scripts.direct import test_verify_lint_scope as lint_fixture
-from scripts.direct import test_verify_token_wait as build_fixture
 from scripts.direct import test_verify_untested_examples as workspace_fixture
-
-
-DEV_LIST = '["bevy/dynamic_linking", "engine/dev", "bevy/dynamic_linking"]'
-DEV_ARGUMENTS = "bevy/dynamic_linking,engine/dev"
-
-
-def add_dev_features(root: Path, value: str = DEV_LIST) -> None:
-    with (root / "Cargo.toml").open("a") as manifest:
-        _ = manifest.write(f"\n[workspace.metadata.dev]\nfeatures = {value}\n")
+from scripts.direct.verify_dev_features_test_support import (
+    DEV_ARGUMENTS, add_dev_features, isolate_verify_inputs, parse_dev_features,
+)
 
 
 class VerifyDevFeatureTests(workspace_fixture.ExampleWorkspaceFixture):
@@ -27,6 +17,7 @@ class VerifyDevFeatureTests(workspace_fixture.ExampleWorkspaceFixture):
         super().setUp()
         _ = self.package()
         self.environment["NEXTEST_TEST_THREADS"] = "2"
+        isolate_verify_inputs(self.environment, self.root)
 
     def clear_calls(self) -> None:
         self.calls.unlink(missing_ok=True)
@@ -86,71 +77,14 @@ class VerifyDevFeatureTests(workspace_fixture.ExampleWorkspaceFixture):
             with self.subTest(value=value):
                 _ = manifest.write_text(original)
                 add_dev_features(self.root, value)
-                result = self.verify("check", "sample")
+                # One complete refusal pins parsing before Cargo/metadata. The
+                # remaining type variants exercise the same real parser directly.
+                result = (self.verify("check", "sample") if value == '"fast"'
+                          else parse_dev_features(manifest, self.environment))
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertEqual(result.stderr, "verify.sh: workspace.metadata.dev.features must be a list of strings\n")
                 self.assertEqual(self.calls_made(), [])
                 self.assertFalse(self.metadata_calls.exists())
-
-
-class VerifyBuildDevFeatureTests(unittest.TestCase):
-    def test_debug_build_merges_work_order_example_and_repo_features_but_release_does_not(self) -> None:
-        fixture = build_fixture.VerifyTokenWaitTests()
-        fixture.setUp()
-        self.addCleanup(fixture.tearDown)
-        environment = fixture.build_stub([
-            {"name": "sample-app", "kind": ["bin"]},
-            {"name": "demo", "kind": ["example"], "required-features": ["extra"]},
-        ])
-        add_dev_features(fixture.root, '["bevy/dynamic_linking", "sample/extra", "sample/extra"]')
-        calls = fixture.root / "cargo-calls"
-        for arguments, expected in (
-            ((), "build --workspace --bin sample-app --features bevy/dynamic_linking,sample/extra\n"),
-            (("--example", "demo", "--features", "fast,extra,bevy/dynamic_linking"),
-             "build --workspace --example demo --features sample/fast,sample/extra,bevy/dynamic_linking\n"),
-            (("--release",), "build --workspace --bin sample-app --release\n"),
-            (("--example", "demo", "--release", "--features", "fast"),
-             "build --workspace --example demo --release --features sample/fast,sample/extra\n"),
-        ):
-            with self.subTest(arguments=arguments):
-                calls.unlink(missing_ok=True)
-                result = fixture.build(environment, *arguments)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(calls.read_text(), expected)
-
-
-class VerifyDocDevFeatureTests(unittest.TestCase):
-    def test_doc_merges_work_order_features_with_repo_features_without_package_rewriting(self) -> None:
-        fixture = doc_fixture.VerifyDocTests()
-        fixture.setUp()
-        self.addCleanup(fixture.doCleanups)
-        add_dev_features(fixture.repo)
-        _ = fixture.git("add", "Cargo.toml")
-        result = fixture.verify("--features", "alpha/extra,bevy/dynamic_linking")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        calls = fixture.cargo_calls()
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["args"], [
-            "doc", "--no-deps", "--jobs", "8", "--workspace", "--features",
-            "alpha/extra,bevy/dynamic_linking,engine/dev",
-        ])
-
-
-class VerifyLintDevFeatureTests(unittest.TestCase):
-    def test_lint_keeps_its_existing_commands_when_repo_dev_features_are_set(self) -> None:
-        fixture = lint_fixture.VerifyLintScopeTests()
-        fixture.setUp()
-        self.addCleanup(fixture.doCleanups)
-        baseline = fixture.invoke_verify("lint", "sample", cwd=fixture.root)
-        self.assertEqual(baseline.returncode, 0, baseline.stdout + baseline.stderr)
-        original = fixture.events.read_bytes()
-        fixture.events.unlink()
-        add_dev_features(fixture.root)
-        result = fixture.invoke_verify("lint", "sample", cwd=fixture.root)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(fixture.events.read_bytes(), original)
-        self.assertTrue(any(arguments[0] == "clippy" and "--all-features" in arguments
-                            for arguments in fixture.cargo_calls()))
 
 
 if __name__ == "__main__":

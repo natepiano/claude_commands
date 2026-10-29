@@ -15,6 +15,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from typing import cast, override
 
+from scripts.lib.socket_test_support import short_socket_directory
 import broadcast
 import codex_winddown
 import fake_unit_host
@@ -250,14 +251,15 @@ class MessageTests(unittest.TestCase):
         # A showrunner is recorded by its update timer; the one of `zz-gone` has no running session.
         _ = fake_showrunner.write_timer(self.root / "notifier", "show", "id-hana", "America/Los_Angeles", doc)
         _ = fake_showrunner.write_timer(self.root / "notifier", "zz-gone", "id-gone", "America/Los_Angeles", other)
+        socket_dir = Path(self.enterContext(short_socket_directory()))
         for name, pid in (("hana", os.getpid()), ("trunk", os.getppid())):
             listener = socket.socket(socket.AF_UNIX)
             self.addCleanup(listener.close)
-            listener.bind(str(self.root / f"{name}.sock"))
+            listener.bind(str(socket_dir / f"{name}.sock"))
             _ = (self.root / f"sessions/{pid}.json").write_text(json.dumps({
                 "pid": pid, "sessionId": f"id-{name}", "name": name, "updatedAt": 1,
                 "tmux": "",
-                "messagingSocketPath": str(self.root / f"{name}.sock"),
+                "messagingSocketPath": str(socket_dir / f"{name}.sock"),
             }), encoding="utf-8")
         _ = (self.root / "notifier.sh").write_text(NOTIFIER_STUB, encoding="utf-8")
         _ = (self.root / "send.py").write_text(SEND_STUB, encoding="utf-8")

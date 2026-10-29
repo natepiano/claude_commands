@@ -12,7 +12,7 @@ from typing import NamedTuple, cast
 import showrunners
 import tidy_wrapped
 import unit_lookup
-from add_unit import Production, read_production
+from production_units import Production, read_production
 from production_units import Refusal, cell_value, production_field, unit_table
 from merge_checkpoint import (CodeCheckpoint, MacCheckout, MergeEntry, NoMerge, NoPromotion,
                               PromotionAlreadyAtTip, PromotionOriginPushed, PromotionNotPushed,
@@ -207,10 +207,15 @@ def open_production(production: Production, lines: list[str]) -> None:
     report("doc", "ok", "running")
     rows = units(updated, production)
     paths = [doc_path_in_checkout(production, production.doc)]
-    paths.extend(doc_path_in_checkout(production, unit.plan) for unit in rows)
+    for unit in rows:
+        if unit.plan.exists():
+            paths.append(doc_path_in_checkout(production, unit.plan))
+        else:
+            report("plan", "ok", f"{unit.name}: no plan yet at {unit.plan}; not committed")
     subject = f"production({production_name(updated)}): plans for {len(rows)} units"
     subjects = checked(production.checkout, "commit", "log", "--format=%s", production.merge_branch)
-    if subject in subjects.splitlines():
+    committed_paths = checked(production.checkout, "commit", "ls-tree", "-r", "--name-only", "HEAD", "--", *paths)
+    if subject in subjects.splitlines() and set(paths).issubset(committed_paths.splitlines()):
         report("commit", "ok", "plans already committed")
     else:
         _ = checked(production.checkout, "commit", "add", "--", *paths)

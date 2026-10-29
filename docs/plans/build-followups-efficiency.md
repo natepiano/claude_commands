@@ -91,3 +91,15 @@ Showrunner of build-followups, 2026-10-28 (measured by builds-unit):
 **Tests** (`scripts/hooks/test_checkpoint_doc_gate.py`): the cargo-liner command above passes; `echo "checkpoint(x): commit message"` passes; a `$HOME/...py` command word with checkpoint text in its arguments passes; a real `git commit -F msg` with a checkpoint subject and no doc record is still refused; `$GIT commit` and `eval "git commit ..."` with checkpoint text are still refused.
 
 **Acceptance:** `python3 -m unittest scripts.hooks.test_checkpoint_doc_gate` passes from the repo root; basedpyright clean on both files.
+
+### Phase 9 — nix_env loads a trusted repo's linked worktree outside the trusted roots  · status: done
+
+**Source:** showrunner of natedev, 2026-10-29 (top priority: it blocks every style sync and merge in cargo-liner-style).
+
+**Defect:** `style_sync.py lint` makes its checkout with `git worktree add --detach` under `/tmp/claude/session/<id>/style-sync-lint-*/checkout`. verify.sh there runs under `nix_env.py exec`; `trusted_envrc` approves only files below `~/rust`, `~/worktrees` and `~/.claude*`, so direnv refuses: `.envrc is blocked. Run direnv allow`. The cause is phase 6 (187c88b9).
+
+**Fix:** in `scripts/lib/nix_env.py`, an `.envrc` is also trusted when its folder is the top of a linked worktree that a trusted repository registered. Prove it by reading files only, never by running git in the untrusted tree: the folder's `.git` is a file `gitdir: <path>`; that path resolves to `<common>/worktrees/<name>`; `<common>` (from that folder's `commondir` file, relative to it or absolute) resolves below a trusted root; and that folder's `gitdir` file resolves back to this folder's `.git`. Any other tree, a plain clone included, keeps direnv's explicit approval. No blanket `direnv allow`.
+
+**Tests** (`scripts/lib/test_nix_env.py`, real `git`): a `git worktree add` of a repo below the fake `~/rust`, made outside the trusted roots, is approved and loads; a plain `git clone` outside the roots is not approved; a hand-written `.git` file that points at a trusted repo's real worktree entry, from another folder, is not approved; a worktree of a repo outside the roots is not approved.
+
+**Acceptance:** `python3 -m unittest scripts.lib.test_nix_env scripts.lib.test_nix_env_launches scripts.lib.test_nix_env_integration` passes from the repo root; basedpyright clean on the changed files; `docs/as-built/nix-shell-launch.md` states the rule.
