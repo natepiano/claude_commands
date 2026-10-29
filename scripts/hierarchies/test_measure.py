@@ -1,6 +1,7 @@
 """Fixture checks for the baseline's counts and source boundaries."""
 from __future__ import annotations
 
+from collections.abc import Sequence
 from contextlib import closing, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,13 +15,27 @@ import re
 import subprocess
 from unittest.mock import patch
 
-from scripts.hierarchies import measure as m
+from scripts.hierarchies import measure as m, log_records, push_audit as audit
 from scripts.production.issues import Issue
+
+
+def push_fixture(at: datetime, title: str, outcome: str = "sent") -> log_records.JsonObject:
+    return {"time": at.isoformat(), "source": "fixture-unit", "priority": "0", "title": title,
+            "message": "No action needed.\n" + title, "outcome": outcome}
+
+
+def notification_report(
+    pushes: Sequence[log_records.JsonObject], reviews: Sequence[log_records.JsonObject], window: log_records.Window,
+) -> audit.AuditReport:
+    sources = audit.AuditSources([audit.parse_push(record) for record in pushes],
+                                [review for record in reviews for review in audit.parse_review(record)], [],
+                                audit.ProductionOwnership({}, {}), audit.TopLevelSessions(()))
+    return audit.audit(sources, window)
 
 
 class MeasuresTest(unittest.TestCase):
     start: datetime = datetime(2026, 10, 13, tzinfo=timezone.utc)
-    window: m.Window = m.Window(start, start + timedelta(days=7))
+    window: log_records.Window = log_records.Window(start, start + timedelta(days=7))
     at: str = start.isoformat()
 
     def issue(self, name: str, **fields: str) -> Issue:
@@ -50,17 +65,17 @@ class MeasuresTest(unittest.TestCase):
             m.BuildStep("hana", "check", self.start, 60),
             m.BuildStep("hana", "nextest", self.window.until, 900),
         ]
-        other_window = m.Window(self.window.until, self.window.until + timedelta(days=1))
+        other_window = log_records.Window(self.window.until, self.window.until + timedelta(days=1))
         tokens = [m.WindowTokenUsage(self.window, "hana", 1234, 3), m.WindowTokenUsage(other_window, "hana", 9000, 1)]
         rows = m.resource_use(builds, tokens, self.window)
         self.assertEqual([(r.value, r.n) for r in rows], [("1.0", 1), ("2.0", 1), ("1,234", 3)])
 
     def test_phase_flow_filters_hana_status_window_and_deduplicates_finishes(self) -> None:
-        base: m.JsonObject = {
+        base: log_records.JsonObject = {
             "working_dir": "/deleted/tool-based-ui-tools", "event_type": "phase_finished",
             "status": "completed", "timestamp": self.at,
         }
-        records: list[m.JsonObject] = [{**base, "event_id": str(i), "phase_elapsed_seconds": i * 60} for i in range(1, 11)]
+        records: list[log_records.JsonObject] = [{**base, "event_id": str(i), "phase_elapsed_seconds": i * 60} for i in range(1, 11)]
         records.extend([
             records[0], {**base, "event_id": "failed", "status": "failed", "phase_elapsed_seconds": 10000},
             {**base, "working_dir": "/tmp/other", "event_id": "other"},
@@ -87,25 +102,29 @@ class MeasuresTest(unittest.TestCase):
         self.assertEqual(m.issue_flow(found[2:], self.window)[0].value, "not recorded")
 
     def test_attention_uses_local_days_and_ignores_replay_reviews(self) -> None:
-        at = m.required_time("2026-10-14T01:00:00Z")
+        at = log_records.required_time("2026-10-14T01:00:00Z")
         pushes = [
-            m.PhonePush(at, "unit", "one", "sent"),
-            m.PhonePush(at + timedelta(hours=1), "unit", "two", "sent"),
-            m.PhonePush(self.start, "unit", "quiet", "silenced"),
+            push_fixture(at, "one"),
+            push_fixture(at + timedelta(hours=1), "two"),
+            push_fixture(self.start, "quiet", "silenced"),
         ]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "reviews.jsonl"
             records = [
-                {"time": "2026-10-14T01:00:01Z", "source": "unit", "verdict": "failed", "sent": {"title": "one"}},
-                {"time": "2026-10-14T02:00:01Z", "source": "unit", "verdict": "failed",
-                 "sent": {"title": "two"}, "replay": True},
+                {"time": "2026-10-14T01:00:01Z", "source": "fixture-unit", "verdict": "failed",
+                 "sent": {"title": "one", "body": "one"}},
+                {"time": "2026-10-14T02:00:01Z", "source": "fixture-unit", "verdict": "failed",
+                 "sent": {"title": "two", "body": "two"}, "replay": True},
             ]
             _ = path.write_text("\n".join(json.dumps(record) for record in records))
-            reviews = m.read_failed_reviews(path)
+            problems: list[log_records.SourceProblem] = []
+            reviews = [review for group in audit.read_log(path, audit.parse_review, problems) for review in group]
+        sources = audit.AuditSources([audit.parse_push(record) for record in pushes], reviews, problems,
+                                    audit.ProductionOwnership({}, {}), audit.TopLevelSessions(()))
         messages = [m.parse_message({"time": at.isoformat(), "from": sender, "to": target})
                     for sender, target in [("unit-a", "unit-b"), ("stall-watch", "unit-a"),
                                            ("natedev", "unit-a"), ("unit-a", "user")]]
-        rows = m.attention(pushes, reviews, messages, self.window)
+        rows = m.attention(audit.audit(sources, self.window), messages)
         selected = {row.measure: row.value for row in rows if "2026-10-13" in row.measure}
         self.assertEqual(selected["phone pushes / 2026-10-13"], "2; after failed review 1")
         self.assertEqual(selected["messages / 2026-10-13 / agent"], "2")
@@ -113,20 +132,20 @@ class MeasuresTest(unittest.TestCase):
         self.assertEqual(selected["messages / 2026-10-13 / user-bound"], "1")
 
     def test_pending_reports_unknown_ages_and_unrecorded_answer_history(self) -> None:
-        items = [m.WaitingItem("changes", self.start), m.WaitingItem("changes", m.TimeNotRecorded.MISSING)]
+        items = [m.WaitingItem("changes", self.start), m.WaitingItem("changes", log_records.TimeNotRecorded.MISSING)]
         rows = m.pending_attention(items, self.window.until, self.window)
         self.assertEqual(rows[0].value, "2; oldest 7.0 days (1 ages not recorded)")
         self.assertEqual([(row.value, row.n) for row in rows[-2:]], [("not recorded", 0), ("not recorded", 0)])
         self.assertTrue(all("showrunner/outstanding" in row.source for row in rows[-2:]))
 
     def test_missing_values_keep_separate_domain_types_and_output(self) -> None:
-        missing_time = m.moment(None)
+        missing_time = log_records.moment(None)
         rank = m.parse_rank({"name": "one", "rank": 1})
         phase = m.parse_phase({
             "event_type": "phase_finished", "status": "completed", "timestamp": self.at,
             "working_dir": "/deleted/tool-based-ui-tools",
         }, ())[0]
-        sources = m.BaselineSources([], [], [], [], [phase], [], [], [], [], [rank], [], [])
+        sources = m.BaselineSources([], [], [], [], [phase], notification_report([], [], self.window), [], [], [rank], [], [])
         missing_values = [missing_time, phase.seconds, rank.score, sources.merges]
         for index, value in enumerate(missing_values):
             for other in missing_values[index + 1:]:
@@ -140,7 +159,7 @@ class MeasuresTest(unittest.TestCase):
         self.assertEqual(m.merge_flow(sources.merges, self.window)[0].value, "not recorded")
 
     def test_message_metadata_overrides_sender_names(self) -> None:
-        records: list[m.JsonObject] = [
+        records: list[log_records.JsonObject] = [
             {"time": self.at, "from": "cron", "to": "unit", "kind": "agent"},
             {"time": self.at, "from": "natedev", "to": "unit", "kind": "automation"},
             {"time": self.at, "from": "timer", "to": "unit", "route": {"kind": "session"}},
@@ -148,19 +167,39 @@ class MeasuresTest(unittest.TestCase):
             {"time": self.at, "from": "unit", "to": "user", "kind": "agent"},
         ]
         messages = [m.parse_message(record) for record in records]
-        rows = m.attention([], [], messages, self.window)
+        rows = m.attention(notification_report([], [], self.window), messages)
         selected = {row.measure.rsplit(" / ", 1)[-1]: row.n for row in rows if "2026-10-12" in row.measure}
         self.assertEqual(selected, {"2026-10-12": 0, "agent": 2, "automation": 2, "user-bound": 1})
 
-    def test_failed_review_match_requires_source_title_and_time(self) -> None:
-        push = m.PhonePush(self.start, "hana", "one", "sent")
-        mismatches = [
-            m.FailedPushReview(self.start, "other", "one"),
-            m.FailedPushReview(self.start, "hana", "other"),
-            m.FailedPushReview(self.start + timedelta(seconds=6), "hana", "one"),
+    def test_attention_agrees_with_audit_on_failed_rules_pairing_and_delivery(self) -> None:
+        at = self.start + timedelta(days=1)
+        burst_at = at + timedelta(days=1)
+        rewrite_at = at + timedelta(days=2)
+        pushes = [push_fixture(at, "unreviewed"), push_fixture(burst_at, "burst"),
+                  push_fixture(burst_at + timedelta(seconds=2), "burst"), push_fixture(rewrite_at, "rewritten"),
+                  push_fixture(rewrite_at, "cancelled", "cancelled"), push_fixture(self.window.until, "later")]
+        reviews: list[log_records.JsonObject] = [
+            {"time": at.isoformat(), "source": "fixture-unit", "verdict": "unreviewed: timeout",
+             "failed_rules": ["context"], "sent": {"title": "unreviewed", "body": "unreviewed"}},
+            {"time": burst_at.isoformat(), "source": "fixture-unit", "verdict": "failed",
+             "sent": {"title": "burst", "body": "burst"}},
+            {"time": rewrite_at.isoformat(), "source": "fixture-unit", "verdict": "rewrite", "failed_rules": ["context"],
+             "draft": {"title": "rewritten", "body": "old body"},
+             "sent": {"title": "rewritten", "body": "rewritten"}},
         ]
-        self.assertFalse(m.sent_after_failed_review(push, mismatches))
-        self.assertTrue(m.sent_after_failed_review(push, [m.FailedPushReview(self.start, "hana", "one")]))
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            _ = (folder / "pushover.jsonl").write_text("\n".join(json.dumps(row) for row in pushes))
+            _ = (folder / "review.jsonl").write_text("\n".join(json.dumps(row) for row in reviews))
+            report = audit.audit(audit.load_sources(folder), self.window)
+        rows = {row.measure: row for row in m.attention(report, [])}
+        self.assertEqual(len(report.entries), 2)
+        self.assertEqual(rows["phone pushes after failed review"].value, str(len(report.entries)))
+        self.assertEqual(rows["phone pushes sent"].value, str(sum(report.pushes_by_showrunner.values())))
+        self.assertEqual(rows["phone pushes sent"].n, 4)
+        self.assertEqual(rows["phone pushes / 2026-10-13"].value, "1; after failed review 1")
+        self.assertEqual(rows["phone pushes / 2026-10-14"].value, "2; after failed review 1")
+        self.assertEqual(rows["phone pushes / 2026-10-15"].value, "1; after failed review 0")
 
     def test_rank_coverage_filters_goal_and_uses_twenty_ranked_open_issues(self) -> None:
         found = [
@@ -201,7 +240,7 @@ class MeasuresTest(unittest.TestCase):
         self.assertEqual(rows["Hana closure merge commit / conduit change"].value, "not recorded")
 
     def test_decline_first_word_excludes_dated_and_undated_closures(self) -> None:
-        window = m.window_bounds("2026-10-25", "2026-10-25", self.window.until)
+        window = log_records.window_bounds("2026-10-25", "2026-10-25", self.window.until)
         base = {"backlog_goal": "1 - Ship Hana", "status": "closed", "project": "hana",
                 "date_active": "2026-10-24", "date_closed": "2026-10-25"}
         for reason in ("declined", "Declined", "declined: Decline all", "  DECLINED:\tDecline all  "):
@@ -237,17 +276,17 @@ class MeasuresTest(unittest.TestCase):
         self.assertEqual(m.rank_coverage(found, [m.IssueRank("one", 1)], units, "snapshot")[2].value, "not recorded")
 
     def test_window_bounds_keep_date_days_and_exact_local_or_zoned_times(self) -> None:
-        now = m.required_time("2026-10-21T00:00Z")
-        dates = m.window_bounds("2026-10-13", "2026-10-20", now)
-        self.assertEqual(dates.since, m.required_time("2026-10-13T04:00Z"))
-        self.assertEqual(dates.until, m.required_time("2026-10-21T04:00Z"))
-        times = m.window_bounds("2026-10-13T17:24", "2026-10-20T17:24", now)
-        self.assertEqual(times.since, m.required_time("2026-10-13T21:24Z"))
-        self.assertEqual(times.until, m.required_time("2026-10-20T21:24Z"))
-        self.assertEqual(times, m.window_bounds("2026-10-13T17:24-04:00", "2026-10-20T21:24Z", now))
-        self.assertEqual(m.window_bounds("", "", now), m.Window(now - timedelta(days=7), now))
-        self.assertRaises(ValueError, m.window_bounds, "2026-10-20T17:24", "2026-10-20T17:24", now)
-        self.assertRaises(ValueError, m.window_bounds, "bad", "", now)
+        now = log_records.required_time("2026-10-21T00:00Z")
+        dates = log_records.window_bounds("2026-10-13", "2026-10-20", now)
+        self.assertEqual(dates.since, log_records.required_time("2026-10-13T04:00Z"))
+        self.assertEqual(dates.until, log_records.required_time("2026-10-21T04:00Z"))
+        times = log_records.window_bounds("2026-10-13T17:24", "2026-10-20T17:24", now)
+        self.assertEqual(times.since, log_records.required_time("2026-10-13T21:24Z"))
+        self.assertEqual(times.until, log_records.required_time("2026-10-20T21:24Z"))
+        self.assertEqual(times, log_records.window_bounds("2026-10-13T17:24-04:00", "2026-10-20T21:24Z", now))
+        self.assertEqual(log_records.window_bounds("", "", now), log_records.Window(now - timedelta(days=7), now))
+        self.assertRaises(ValueError, log_records.window_bounds, "2026-10-20T17:24", "2026-10-20T17:24", now)
+        self.assertRaises(ValueError, log_records.window_bounds, "bad", "", now)
         with patch.object(m, "load_sources") as load, patch.object(m, "render", return_value="fixture"), patch("builtins.print"):
             self.assertEqual(m.main(["baseline", "--since", "2026-10-13T17:24", "--until", "2026-10-20T17:24"]), 0)
             load.assert_called_once_with(times)
@@ -257,7 +296,7 @@ class MeasuresTest(unittest.TestCase):
 
 
 class BaselineOutputTest(unittest.TestCase):
-    window: m.Window = m.window_bounds("2026-10-21", "2026-10-27", datetime.now(timezone.utc))
+    window: log_records.Window = log_records.window_bounds("2026-10-21", "2026-10-27", datetime.now(timezone.utc))
 
     def sources(self) -> m.BaselineSources:
         found: list[Issue] = []
@@ -273,14 +312,16 @@ class BaselineOutputTest(unittest.TestCase):
                       "reason": reason, "date_closed": closed}
             found.append(Issue(Path(name + ".md"), {key: [value] for key, value in fields.items()}))
         start, end = self.window.since, self.window.until
-        pushes = [m.PhonePush(start, "unit", "one", "sent"),
-                  m.PhonePush(start + timedelta(days=1), "unit", "two", "sent"),
-                  m.PhonePush(start, "unit", "quiet", "silenced"),
-                  m.PhonePush(end, "unit", "later", "sent")]
-        reviews = [m.FailedPushReview(start + timedelta(seconds=1), "unit", "one")]
+        pushes = [push_fixture(start, "one"), push_fixture(start + timedelta(days=1), "two"),
+                  push_fixture(start, "quiet", "silenced"), push_fixture(end, "later")]
+        reviews: list[log_records.JsonObject] = [
+            {"time": (start + timedelta(seconds=1)).isoformat(), "source": "fixture-unit", "verdict": "failed",
+             "sent": {"title": "one", "body": "one"}},
+        ]
         merges = [m.HanaMerge("one", start), m.HanaMerge("two", start + timedelta(days=1)),
                   m.HanaMerge("later", end)]
-        return m.BaselineSources([], [], [], [], [], pushes, reviews, [], found, [], [], [], merges)
+        return m.BaselineSources([], [], [], [], [], notification_report(pushes, reviews, self.window),
+                                 [], found, [], [], [], merges)
 
     def output(self, sources: m.BaselineSources, full: bool = False) -> str:
         arguments = ["baseline", "--since", "2026-10-21", "--until", "2026-10-27"]
@@ -332,8 +373,8 @@ class BaselineOutputTest(unittest.TestCase):
     def test_source_problem_count_and_full_hint_show_with_and_without_problems(self) -> None:
         sources = self.sources()
         self.assertIn("Source problems: 0. Use --full to print the tables.", self.output(sources))
-        sources.problems = [m.SourceProblem("reviews", "missing review file"),
-                            m.SourceProblem("builds", "cannot read build file")]
+        sources.problems = [log_records.SourceProblem("reviews", "missing review file"),
+                            log_records.SourceProblem("builds", "cannot read build file")]
         summary = self.output(sources)
         self.assertIn("Source problems: 2. Use --full to print the tables.", summary)
         self.assertNotIn("missing review file", summary)
@@ -374,7 +415,7 @@ class SourcesTest(unittest.TestCase):
             _ = git(["update-ref", "refs/remotes/origin/init/catalyst", "HEAD"], "2026-10-20T21:24:00Z")
             before = git(["rev-parse", "HEAD"], "2026-10-20T21:24:00Z")
             merges = m.read_hana_merges(repo)
-            window = m.window_bounds("2026-10-13T17:24", "2026-10-20T17:24", m.required_time("2026-10-21"))
+            window = log_records.window_bounds("2026-10-13T17:24", "2026-10-20T17:24", log_records.required_time("2026-10-21"))
             rows = m.merge_flow(merges, window)
             self.assertEqual((rows[0].value, rows[0].n), ("2", 2))
             days = {row.measure: row.value for row in rows[1:]}
@@ -390,13 +431,13 @@ class SourcesTest(unittest.TestCase):
     def test_running_phase_uses_newest_run_and_removes_finished_phases(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            def save(name: str, tree: str, at: int, events: list[m.JsonObject]) -> None:
-                records: list[m.JsonObject] = [{"event_type": "run_started", "working_dir": tree, "run_started_at": at}, *events]
+            def save(name: str, tree: str, at: int, events: list[log_records.JsonObject]) -> None:
+                records: list[log_records.JsonObject] = [{"event_type": "run_started", "working_dir": tree, "run_started_at": at}, *events]
                 _ = (root / name).write_text("\n".join(json.dumps(record) for record in records))
 
-            phase_a: m.JsonObject = {"phase_instance_id": "A", "phase_id": "1", "phase_title": "First",
+            phase_a: log_records.JsonObject = {"phase_instance_id": "A", "phase_id": "1", "phase_title": "First",
                                      "phase_started_at": 1}
-            phase_b: m.JsonObject = {"phase_instance_id": "B", "phase_id": "2", "phase_title": "Second",
+            phase_b: log_records.JsonObject = {"phase_instance_id": "B", "phase_id": "2", "phase_title": "Second",
                                      "phase_started_at": 2}
             save("old.jsonl", "/done", 1, [{"event_type": "phase_started", **phase_a}])
             save("new.jsonl", "/done", 2, [{"event_type": "phase_started", **phase_a},
@@ -408,14 +449,14 @@ class SourcesTest(unittest.TestCase):
                                                       {"event_type": "phase_started", **phase_b, "phase_id": "1"},
                                                       {"event_type": "phase_finished", **phase_b, "phase_id": "1"}])
             save("finished.jsonl", "/finished", 1, [{"event_type": "phase_started", **phase_a}, {"event_type": "run_finished"}])
-            problems: list[m.SourceProblem] = []
+            problems: list[log_records.SourceProblem] = []
             self.assertEqual(m.running_phase_worktrees(root, problems), {"/live", "/repeated"})
             self.assertEqual(problems, [])
 
     def test_running_phase_uses_phase_id_fallback_and_ignores_missing_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            records: dict[str, list[m.JsonObject]] = {
+            records: dict[str, list[log_records.JsonObject]] = {
                 "fallback": [{"event_type": "phase_started", "phase_id": "1"},
                              {"event_type": "phase_started", "phase_instance_id": "", "phase_id": "2"},
                              {"event_type": "phase_finished", "phase_id": "2"}],
@@ -427,9 +468,9 @@ class SourcesTest(unittest.TestCase):
                                    {"event_type": "phase_finished"}],
             }
             for name, events in records.items():
-                run: m.JsonObject = {"event_type": "run_started", "working_dir": f"/{name}", "run_started_at": 1}
+                run: log_records.JsonObject = {"event_type": "run_started", "working_dir": f"/{name}", "run_started_at": 1}
                 _ = (root / f"{name}.jsonl").write_text("\n".join(json.dumps(record) for record in [run, *events]))
-            problems: list[m.SourceProblem] = []
+            problems: list[log_records.SourceProblem] = []
             self.assertEqual(m.running_phase_worktrees(root, problems), {"/fallback", "/missing-finish"})
             self.assertCountEqual([problem.source for problem in problems],
                                   [str(root / "missing-start.jsonl")] * 2 + [str(root / "missing-finish.jsonl")])
@@ -437,15 +478,15 @@ class SourcesTest(unittest.TestCase):
 
     def test_json_source_missing_and_bad_rows_report_source_without_crashing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "records.jsonl"
-            problems: list[m.SourceProblem] = []
+            path = Path(directory) / "log_records.jsonl"
+            problems: list[log_records.SourceProblem] = []
             self.assertEqual(m.read_source(str(path), lambda: m.json_lines(path, m.parse_message), [], problems), [])
             self.assertIn("missing", problems[0].reason)
             _ = path.write_text('{"time":"2026-10-13T00:00:00Z"}\nnot json\n')
             self.assertEqual(m.read_source(str(path), lambda: m.json_lines(path, m.parse_message), [], problems), [])
             self.assertIn("1 invalid JSON or field rows", problems[-1].reason)
             now = datetime(2026, 10, 20, tzinfo=timezone.utc)
-            rows = m.source_problem_rows(problems, m.Window(now - timedelta(days=7), now))
+            rows = log_records.source_problem_rows(problems, log_records.Window(now - timedelta(days=7), now))
             self.assertEqual(rows[0].source, str(path))
             self.assertIn("unreadable", rows[1].value)
 
@@ -473,14 +514,14 @@ class SourcesTest(unittest.TestCase):
                 '{"since":"2026-10-01T12:00","text":"A reminder"}]'
             )
             found = m.read_issues(vault / "issues")
-            problems: list[m.SourceProblem] = []
+            problems: list[log_records.SourceProblem] = []
             waiting = m.read_waiting(state, vault, found, problems)
             self.assertEqual(problems, [])
             self.assertEqual([item.kind for item in waiting], ["changes", "proposals", "proposals", "efficiency items", "questions"])
-            self.assertEqual(waiting[0].opened, m.moment("2026-10-02"))
-            self.assertEqual(waiting[-1].opened, m.moment("2026-10-05T12:00"))
-            snapshot = m.required_time("2026-10-07T12:00-04:00")
-            window = m.Window(snapshot - timedelta(days=7), snapshot)
+            self.assertEqual(waiting[0].opened, log_records.moment("2026-10-02"))
+            self.assertEqual(waiting[-1].opened, log_records.moment("2026-10-05T12:00"))
+            snapshot = log_records.required_time("2026-10-07T12:00-04:00")
+            window = log_records.Window(snapshot - timedelta(days=7), snapshot)
             rows = m.pending_attention(waiting, snapshot, window)
             self.assertEqual(rows[3].value, "1; oldest 2.0 days")
             self.assertIn("showrunner/outstanding", rows[3].source)
@@ -492,20 +533,20 @@ class SourcesTest(unittest.TestCase):
             changes.mkdir(parents=True)
             path = changes / "bad.md"
             _ = path.write_text("# Review list\n\n## Reviewed\n")
-            problems: list[m.SourceProblem] = []
+            problems: list[log_records.SourceProblem] = []
             waiting = m.read_waiting(root / "state", root / "vault", [], problems)
             self.assertEqual(waiting, [])
             issue = next(problem for problem in problems if problem.source == str(path))
             self.assertIn("no `## To review` section", issue.reason)
-            now = m.required_time("2026-10-20")
-            rows = m.source_problem_rows([issue], m.Window(now - timedelta(days=7), now))
+            now = log_records.required_time("2026-10-20")
+            rows = log_records.source_problem_rows([issue], log_records.Window(now - timedelta(days=7), now))
             self.assertEqual(rows[0].source, str(path))
             self.assertIn("unreadable", rows[0].value)
 
     def test_phase_loader_reports_each_corrupt_file_and_keeps_valid_finishes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            valid: m.JsonObject = {
+            valid: log_records.JsonObject = {
                 "event_type": "phase_finished", "status": "completed", "event_id": "one",
                 "timestamp": "2026-10-14T00:00:00Z", "working_dir": "/deleted/tool-based-ui-demo",
                 "phase_elapsed_seconds": 60,
@@ -513,7 +554,7 @@ class SourcesTest(unittest.TestCase):
             first, second = root / "one.jsonl", root / "two.jsonl"
             _ = first.write_text(json.dumps(valid) + "\n{bad json\n[]\n")
             _ = second.write_text("broken\n")
-            problems: list[m.SourceProblem] = []
+            problems: list[log_records.SourceProblem] = []
             phases = m.read_phases(root, problems)
             self.assertEqual([(phase.identity, phase.seconds) for phase in phases], [("one", 60)])
             counts = {problem.source: problem.reason for problem in problems}
@@ -526,11 +567,11 @@ class SourcesTest(unittest.TestCase):
             deleted_tree = root / "tool-based-ui-startup-polish"
             deleted_tree.mkdir()
             deleted_tree.rmdir()
-            base: m.JsonObject = {
+            base: log_records.JsonObject = {
                 "event_type": "phase_finished", "status": "completed", "timestamp": "2026-10-14T00:00:00Z",
                 "phase_elapsed_seconds": 60,
             }
-            origins: list[m.JsonObject] = [
+            origins: list[log_records.JsonObject] = [
                 {"working_dir": str(deleted_tree)},
                 {"working_dir": str(root / "unknown"), "plan_doc": "docs/plans/tool-based-ui-demo.md"},
                 {"working_dir": str(root / "unknown"), "production": "hana"},
@@ -540,10 +581,10 @@ class SourcesTest(unittest.TestCase):
             ]
             records = [{**base, **origin, "event_id": str(index)} for index, origin in enumerate(origins)]
             _ = (root / "events.jsonl").write_text("\n".join(json.dumps(record) for record in records))
-            problems: list[m.SourceProblem] = []
+            problems: list[log_records.SourceProblem] = []
             phases = m.read_phases(root, problems, ["widget-enhancements"])
-            start = m.required_time("2026-10-13T00:00:00Z")
-            rows = m.phase_flow(phases, m.Window(start, start + timedelta(days=7)))
+            start = log_records.required_time("2026-10-13T00:00:00Z")
+            rows = m.phase_flow(phases, log_records.Window(start, start + timedelta(days=7)))
             self.assertEqual(rows[0].n, 5)
             self.assertEqual(rows[1].value, "median 1.0 min; p90 1.0 min")
             self.assertEqual(problems, [])
@@ -552,13 +593,13 @@ class SourcesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "rankings.jsonl"
             _ = path.write_text('{"name":"one","rank":"first"}\n')
-            problems: list[m.SourceProblem] = []
+            problems: list[log_records.SourceProblem] = []
             ranks = m.read_source(str(path), lambda: m.json_lines(path, m.parse_rank), [], problems)
             self.assertEqual(ranks, [])
             self.assertIn("1 invalid JSON or field rows", problems[0].reason)
             self.assertRaisesRegex(ValueError, "from: expected text", m.parse_message,
                                    {"from": 123, "to": "unit", "time": "2026-10-14"})
-            self.assertRaisesRegex(ValueError, "timestamp", m.parse_push, {"time": "bad stamp", "outcome": "sent"})
+            self.assertRaisesRegex(ValueError, "timestamp", audit.parse_push, {"time": "bad stamp", "outcome": "sent"})
             self.assertRaisesRegex(ValueError, "phase_elapsed_seconds", m.parse_phase,
                                    {"event_type": "phase_finished", "status": "completed",
                                     "timestamp": "2026-10-14", "phase_elapsed_seconds": "one"}, ())
@@ -582,8 +623,8 @@ class SourcesTest(unittest.TestCase):
                 db.commit()
             before = path.read_bytes()
             self.assertEqual(m.read_builds(path)[0].seconds, 120)
-            start = m.required_time("2026-10-13T00:00:00Z")
-            window = m.Window(start, start + timedelta(days=7))
+            start = log_records.required_time("2026-10-13T00:00:00Z")
+            window = log_records.Window(start, start + timedelta(days=7))
             tokens = m.read_tokens(path, window)
             self.assertEqual(tokens[0].tokens, 20)
             self.assertEqual(tokens[0].repository, "cwd not recorded")
@@ -598,8 +639,8 @@ class SourcesTest(unittest.TestCase):
                 _ = db.execute("INSERT INTO steps VALUES (NULL,'check','2026-10-14',180,'natedev')")
                 _ = db.execute("INSERT INTO steps VALUES ('hana','nextest','2026-10-14',120,'natedev')")
                 db.commit()
-            start = m.required_time("2026-10-13")
-            rows = m.resource_use(m.read_builds(path), [], m.Window(start, start + timedelta(days=7)))
+            start = log_records.required_time("2026-10-13")
+            rows = m.resource_use(m.read_builds(path), [], log_records.Window(start, start + timedelta(days=7)))
             build_rows = {row.measure: (row.value, row.n) for row in rows if "minutes /" in row.measure}
             self.assertEqual(build_rows, {
                 "test minutes / hana": ("2.0", 1),
