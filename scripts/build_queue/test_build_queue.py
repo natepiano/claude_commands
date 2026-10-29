@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
+import fcntl
 import io
 import json
 import os
@@ -31,6 +32,8 @@ class QueueTests(unittest.TestCase):
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILDLOG_PROC": str(self.root / "proc"),
             "BUILDLOG_MEMINFO": str(self.root / "meminfo"),
+            "BUILDLOG_MEMORY_PRESSURE": str(self.root / "pressure"),
+            "BUILDLOG_SWAPINFO": str(self.root / "swap"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "USER_ZONE": "America/New_York",
         })))
@@ -59,7 +62,7 @@ class QueueTests(unittest.TestCase):
         self.assertTrue(lines[0].endswith("needs 10.9 GiB; 23.1 free; ready for the next admission check"))
         self.assertNotIn("promised", lines[1])
 
-    def test_memory_reason_charges_only_pending_starts_and_names_earlyoom_reserve(self) -> None:
+    def test_memory_reason_names_growth_headroom_and_earlyoom_reserve(self) -> None:
         pending = int(23.5 * GIB)
         waiting = memory_admit.WaitingStep(
             10, "waiting-id", "unit", "check", "/tmp/tree", NOW - 2400,
@@ -73,7 +76,27 @@ class QueueTests(unittest.TestCase):
         view = memory_admit.QueueView((waiting,), running, int(23.1 * GIB), pending, 3 * GIB, NOW)
         line = build_queue.render_queue(view, ZoneInfo("UTC"))[0]
         self.assertTrue(line.endswith(
-            "needs 11.6 GiB; 23.1 free; 3.0 kept for earlyoom; 23.5 promised to 2 starting steps"))
+            "needs 11.6 GiB; 23.1 free; 3.0 kept for earlyoom; 23.5 growth headroom for 2 running steps"))
+
+    def test_live_queue_pressure_reason_reaches_the_cli(self) -> None:
+        process = self.root / "proc/100"
+        process.mkdir()
+        fields = ["S", "1", *(["0"] * 17), "100"]
+        _ = (process / "stat").write_text(f"100 (verify) {' '.join(fields)}\n")
+        directory = self.root / "buildlog/admission"
+        directory.mkdir(parents=True)
+        _ = (directory / "100.waiting").write_text(json.dumps({
+            "pid": 100, "start_time": "100", "need": 8 * GIB, "since": NOW,
+            "session_name": "unit", "step": "check", "folder": "/tree",
+        }))
+        _ = (self.root / "pressure").write_text("full avg10=23.4 avg60=1.0 total=1\n")
+        _ = (self.root / "swap").write_text("SwapTotal: 100 kB\nSwapFree: 1 kB\n")
+        output = io.StringIO()
+        with mock.patch("sys.argv", ["build_queue.py"]), redirect_stdout(output):
+            self.assertEqual(build_queue.main(), 0)
+        self.assertIn("unit: check in /tree", output.getvalue())
+        self.assertIn("memory pressure: full avg10 23.4, swap 99%", output.getvalue())
+        self.assertNotIn("ready", output.getvalue())
 
     def test_unavailable_reading_does_not_claim_zero_free_memory(self) -> None:
         step = memory_admit.WaitingStep(
@@ -113,6 +136,20 @@ class QueueTests(unittest.TestCase):
             self.assertEqual(build_queue.main(), 0)
         read.assert_called_once_with()
         self.assertEqual(output.getvalue(), "memory queue: empty\n")
+
+    def test_cli_reports_admission_lock_timeout_with_status_two(self) -> None:
+        directory = self.root / "buildlog/admission"
+        directory.mkdir(parents=True)
+        errors = io.StringIO()
+        output = io.StringIO()
+        with (directory / "lock").open("a+") as lock, \
+             mock.patch.object(memory_admit, "QUEUE_LOCK_TIMEOUT_SECONDS", 0.03), \
+             mock.patch("sys.argv", ["build_queue.py"]), \
+             redirect_stderr(errors), redirect_stdout(output):
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.assertEqual(build_queue.main(), 2)
+        self.assertEqual(errors.getvalue(), "build queue: admission lock busy for 0.03 s; try again\n")
+        self.assertEqual(output.getvalue(), "")
 
     def test_ten_thousand_waiting_and_running_rows_render_in_under_one_second(self) -> None:
         waiting = tuple(memory_admit.WaitingStep(

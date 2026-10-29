@@ -4,6 +4,8 @@
 
 > **Production: sdlc** — unit `fix-rounds-unit`; production doc `docs/plans/sdlc-production.md`
 
+> **Issues:** ~/rust/hanadocs/issues/run command only repairs without a worker.md, ~/rust/hanadocs/issues/route missing criteria after landing.md, ~/rust/hanadocs/issues/route repeated repairs outside kept categories.md, ~/rust/hanadocs/issues/verify phase and activity boundaries.md, ~/rust/hanadocs/issues/preserve accepted behavior in repairs.md
+
 ## Source
 
 2026-10-20 16:47 EDT
@@ -31,7 +33,7 @@ For active process redesigns, as we are currently undergoing with promotions and
     - `pass_started` / `pass_finished` — `pass_kind` (`impl|test|fix|review`), `pass_activity` (free text, e.g. "repairing Phase 7 review findings"), `fix_pass`, `team_slot`, `called_agent`, `called_task`, `pass_elapsed_seconds`, `phase_id`, `phase_instance_id`, `run_id`.
     - `activity_started` / `activity_finished` — `activity_label`, `activity_text`, `activity_result`, `activity_elapsed_seconds`.
     - `finding_opened` (`finding_id`, `severity`, `lens`, `caught_by`, `file`, `title`), `finding_verdict` (`fix_attempts`, `reopen_count`), `finding_gate` (`round`, `advisory`, `open_counts`), `finding_batch_dispatched` (`round`, `covered`, `gating_open_before`, `gating_severities`, `advisory`), `finding_batch_landed` (`round`, `landed`). Ledger events carry `phase_instance_id` but not `run_id`: join them to their run through the `phase_instance_id` of that run's `phase_started`.
-  - `scripts/direct/findings.py` — the ledger: round 1 gates blockers and minors, later rounds blockers only; convergence advisories never stop a round. Limits in `config/delegate.conf` (`MAX_FIX_ATTEMPTS`, `STALLED_ROUNDS`, `REPAIR_ROUNDS_PER_FINDING=0.5`, `MIN_REPAIR_BUDGET`, `RUNAWAY_ROUNDS=5`).
+  - `scripts/direct/findings.py` — the ledger: round 1 gates blockers and minors, later rounds blockers only; convergence advisories never stop a round. Limits in `config/direct.conf` (`MAX_FIX_ATTEMPTS`, `STALLED_ROUNDS`, `REPAIR_ROUNDS_PER_FINDING=0.5`, `MIN_REPAIR_BUDGET`, `RUNAWAY_ROUNDS=5`).
   - `scripts/direct/progress_history.py` :4636 `_review_trial` — joins UX findings to ledger rounds through `covered` and to fix passes through `fix_pass`; the model for the joins Phase 1 uses.
   - `docs/production_format.md` → <ProductionUnit/> item 7 (:343–381) — the current repair rules: own change only, landing rule after round 2, hard landing from round 3 (user, 2026-10-01: "eleven repair rounds on one phase is way too many"), one batch per check, a fix that fails twice.
   - `commands/unit/direct.md` → <FindingsLedger/> (:520–560), <FixDispatch/> (:1056–1160) — how a round is gated and dispatched.
@@ -148,59 +150,80 @@ For active process redesigns, as we are currently undergoing with promotions and
 - The routing proposals (P2, P3) count repair rounds as `history.py rounds` numbers its repair intervals, not as ledger batches. `findings.py` numbers ledger dispatches differently.
 - Moved time is work that leaves the phase. It is not saved time.
 
-### Phase 5 — Apply the changes the user approved  · status: todo
-**Depends on:** Phase 4
+### Phase 5 — Apply the changes the user approved  · status: done
+
+#### As-built
+
+- P1 to P5 and an Astra step are in force (the user, 2026-10-28). P2 to P5 are 30-phase trials. Issues P699 to P703 in `~/rust/hanadocs/issues/` track P1 to P5.
+- `findings.py` sets `repair_round` to `len(phase_rounds(events)) + 1` over the run-record events of this phase instance, or to the ledger number when no run record exists. The ledger `round` and every limit keep their meaning.
+- New finding state `routed`: not resolved, out of the gating batch and the open counts. `findings.py route --id --reason <spec-gap|outside-kept> --owner --work-order --due [--evidence]` refuses an empty field, a finding in flight, pending review or accepted, and a finding with an Astra review due but not recorded. `findings.py close-route --from <run id>:<phase instance id>:<finding id> --evidence` closes it at the receiving checkpoint.
+- From `ROUTING_FROM_ROUND`, `dispatch` needs one `--keep <id>=<regression|broken|gate|ruling>:<evidence>` per covered finding. Every gating open finding that is not routed stays in `--covers`. Every `dispatch` needs `--accepted-checks "<checks>"` or `"none: <why>"`.
+- A gating open finding is due for Astra when `repair_round >= ROUTING_FROM_ROUND` or `fix_attempts >= ASTRA_AFTER_FAILED_FIXES`, with no record at its current `fix_attempts`. `findings.py astra --id --note <path> (--approach "<line>" | --unavailable "<reason>")` stores the record; `route` copies the newest approach. The director runs `/astra_review --run-directory --phase` on the note.
+- `findings.py exposure --proposal <P1|P2> --basis [--decision]` records P1 and P2 by hand. `gate` records P3, `dispatch` records P5 through `accepted_checks`, and the launch check records P4.
+- `progress_history.py check-launch` runs the launch check alone, for workers that start before `start-pass`; `start-pass` runs it on each launch. It refuses on a recorded run with no `--phase-id`, a phase that is not open, a `--prompt-file` whose first `Phase <id> — ` line names another phase, and a fix with no round in flight or landed with findings pending review, unless `--fix-cause` is given. `start-pass --worker-name` stores `pass.worker_name`. Both launchers pass `--phase-id` and `--prompt-file` and stop on a refusal; `implement.sh` takes `--fix-cause`.
+- `history.py routed [--open] [--since] [--format text|json]` lists routed findings with run, plan, phase, owner, work order, due, age and closure, joined by key.
+
+**Files:**
+- `scripts/direct/findings.py`, `config/direct.conf` — the counter, the `routed` state, the new commands and `dispatch` checks; `ROUTING_FROM_ROUND=4`, `ASTRA_AFTER_FAILED_FIXES=2`.
+- `scripts/direct/progress_history.py`, `implement.sh`, `review.sh` — the launch check and its options.
+- `scripts/history/routed.py`, `history.py`, `commands/history.md` — the `routed` command.
+- `scripts/shutdown/restart.py` — fallback resumes find the phase by `pass.worker_name`.
+- `commands/unit/direct.md` (`<FixDispatch/>`, `<FindingsLedger/>`, `<Synthesize/>` step 5, `<PassOwnership/>`), `docs/production_format.md` item 7 — the rule text.
+- Tests: `scripts/direct/test_findings.py`, `test_progress_history.py`, `test_implement_launcher.py`, `test_review_launcher.py`, `scripts/history/test_routed.py`, `scripts/shutdown/test_restart.py`.
+
+**Binds later work:** "Did the changes cut rounds and keep the work" reads these events. `trial_exposure`: `proposal`, `basis`, `decision`, `repair_round`. `finding_routed`: `finding_id`, `reason`, `owner`, `work_order`, `due`, `evidence`, `repair_round`, `round`, `fix_attempts`, `astra_approach`. `finding_route_closed`, joined by run, phase instance and finding id. `finding_astra_review`: `finding_id`, `note`, `approach`, `unavailable`, `fix_attempts`, `repair_round`. `launch_refused`: `reason`, `pass_kind`, `phase_id`, `prompt_file`. `launch_checked`. `pass_started.launch_check`: `phase_id`, `phase_title`, `prompt_phase_line` (`matched`|`absent`), `fix_cause`. `finding_gate` and `finding_batch_dispatched` carry `repair_round` beside `round`; the batch also carries `kept` and `accepted_checks`. The gate payload carries `astra_review_due`. `history.py routed --open` shows unclosed routes.
+
+**Gotchas:** A recorded-run launch with no phase is refused. A fix launch with no in-flight round and no landed round pending review is refused unless `--fix-cause` is given. Only the first `Phase <id> — ` line of a prompt is the identity line; a prompt with none passes.
+
+**Ruled out:** picking a resume phase by team slot, because a review sent to a fix seat records slot fix while the durable slot is impl.
+
+### Phase 6 — The round summary counts reviewed phases only  · status: todo
+**Depends on:** Phase 1
 
 #### Work Order
 
-**Pending decision: which proposals the user adopts, and in what form**
-
-Actual problem:
-Phase 4 sends the proposals to the user through the showrunner. This phase builds only what the user adopts, and the files it edits follow from those answers.
-
-What exists now:
-- The repair rules in `docs/production_format.md` item 7, `commands/unit/direct.md` <FindingsLedger/> and <FixDispatch/>, and the limits in `config/delegate.conf`.
-
-What should change:
-- The adopted proposals' **Change** text goes into those files, through cargo-berth for the two hub files.
-
-Recommendation:
-Write the user's answers into this Spec, Files and Acceptance gate when they arrive, then dispatch.
-
-**Goal:** the adopted changes are in the files `/unit:direct` runs from, merged to main, and the date they took effect is recorded for Phase 6.
+**Goal:** the `history.py rounds` summary reports the median, the share of phases with 3 or more rounds and the fix-time share over reviewed phases only, and counts the unreviewed phases on their own line.
 
 **Spec:**
-- One edit per adopted proposal, in the words the user approved.
-- Edits to `commands/unit/direct.md` (owner phases-unit) and `docs/production_format.md` (owner roles-unit) go through cargo-berth's normal flow; the checkpoint notice names each as `also touches <path> (owner <unit>), tested against <owner tip>`, and names the build-followups owner too.
-- Tooling proposals in `scripts/history/` need no question.
-- Add a line to the head of `docs/plans/sdlc-fix-rounds-study.md`: `Changes took effect: <checkpoint hash> on main, <YYYY-MM-DDTHH:MM:SS±HH:MM>`, the time the change reached main, with its offset. A bare date reads as local midnight in `rounds.run` and can take in work from before the change. Phase 6 compares from that time.
-- When P2 or P3 is adopted, a routed finding stays unresolved but leaves the current dispatch batch. Today `_dispatch` in `scripts/direct/findings.py` refuses to omit a gating finding. Define that lifecycle in `findings.py`, make `<FindingsLedger/>` and `<Synthesize/>` in `commands/unit/direct.md` agree with it, and test a batch that mixes kept and routed findings in `scripts/direct/test_findings.py`.
-- When P2 or P3 is adopted, one counter decides when routing starts. The proposals count repair rounds as `history.py rounds` numbers its repair intervals; `findings.py` numbers ledger dispatches as `len(_rounds(state)) + 1` (:865, :949), and the two differ with concurrent workers, repairs outside the ledger and abandoned starts. Make the approved counter the one the check reads, test that routing starts at the approved round, and leave the existing advisory limits unchanged.
-- For each adopted proposal, name who records each field Phase 6 needs and where: exposure (recorded before the treated step runs), routing reason, receiving owner, due checkpoint, closure evidence and director-command cost. Name where a director or showrunner sees routed work that is still open. Add an acceptance check that fails when a field is missing.
 
-- When the user adopts no process change, record `No process change adopted` at the head of the study with the date, mark this phase and Phase 6 done with that reason, and build only the tooling-only items Phase 4 named.
+Change review row C2 (`/history rounds`, merged 54774de4) came back from the user (via the sdlc showrunner, 2026-10-28): "does not work". The user asked "how can the median be 0 rounds?" With `--since 60d --status all`, 1456 of 2542 phases show 0 rounds, and 1167 of those have no review recorded (0 reviews when joined to `history.py phases` on run and phase). Among reviewed phases the median is 1.
+
+1. **A reviewed phase** has at least one recorded review pass: a `pass_started` event with `pass_kind` `review` in the same run with the same `phase_instance_id`. This definition is authoritative; `rounds.py` computes it. `history.py phases` groups by run and phase number, so it can differ where a phase number repeats, a review was interrupted, or a window edge cuts a phase. Tests cover each of those three cases.
+2. **The summary statistics** in `rounds.run` use reviewed phases only: the median rounds, the phases with 3 or more rounds and their share, and the share of fix time those phases hold. The counted line names both numbers, for example `2542 phases counted; 1375 reviewed; median 1 rounds over reviewed phases`.
+3. **Unreviewed phases** get their own summary line with a count, for example `1167 phases with no review recorded (not in the median or shares)`. They stay in the table and the JSON rows, and each row carries `reviewed` (true or false).
+4. **The JSON `_meta`** adds `reviewed_phases` and `unreviewed_phases`. `median_rounds`, `heavy_phases`, `heavy_phase_share`, `heavy_fix_seconds` and `heavy_fix_share` use the reviewed set, and a new `reviewed_fix_seconds` is the denominator of `heavy_fix_share`. `phases`, `fix_seconds`, `rounds` and the cause counts stay over all listed phases. Tests cover an empty reviewed set (median 0, shares 0, no error) and an unreviewed phase with repair time (kept out of the shares, kept in `fix_seconds`).
+5. **The API stays.** `phase_rounds`, `Round` and every existing `PhaseRounds` field are unchanged; phases-unit imports them. `PhaseRounds` may gain one field (`reviews: int`) when `load_phases` can count it from the events it already reads.
+6. **Tests** in `scripts/history/test_rounds.py`: a set with unreviewed zero-round phases gives the median of the reviewed phases; the unreviewed count line; the `reviewed` row field and the `_meta` fields; a phase with a review and no repair counts as reviewed with 0 rounds.
+7. **Docs.** The `rounds` line in `commands/history.md` says that the statistics cover reviewed phases. The unit director edits the Phase 1 As-built summary-line text in the plan doc at the checkpoint; workers do not edit the plan.
+8. **Study summary** (row C5, returned by the showrunner, 2026-10-28). `docs/plans/sdlc-fix-rounds-study.md` is 1106 lines and has no summary at the top. Add a short summary under its title: 15 phases, 260 rounds, 271 h; fix-failed 36% of rounds and 49% of time; spec-gap 17% and 19%; mechanical 15% and 11%. Take each number from `## Totals` and check it there. Remove the "median 0 rounds" figure. Every median in a footer or summary line of the study counts reviewed phases only, as item 2 does.
+9. **A check that shows the live cause** (row C6). The Change-Review line gives a command that prints the live cause for run `fb5b2c96` phase 202 (phase instance prefix `8013edcb`), filtering on `phase_instance_id` so it selects round 2 of that instance, for example a `--format json` `jq` filter that prints `[2,"live",...]`.
+10. **A short check for one phase's rounds** (row C7). The old check printed 397 KB of JSON. The Change-Review line gives a filter that prints only the two round lines of run `8f4c2e88` phase 38 (round 39: F001–F006, round 40: F007–F009).
+11. **A refusal demo a person can run** (row C24). The Phase 5 check needed a live `/unit:direct` run with open findings; in a fresh session folder `findings.py dispatch --covers F001` says `gate says converged; there is nothing to dispatch`. Add `scripts/direct/demo_refusals.sh`: it takes no arguments, makes its own scratch folders with `mktemp -d` under `/tmp`, isolates the recorder (`UNIT_HISTORY_DIR`, `PLAN_DELEGATE_HISTORY_DIR`, `HOME`, `AGENTS_CONFIG_FILE` set to scratch paths, `CLAUDE_CODE_SESSION_ID` unset), runs the `findings.py` and `progress_history.py` beside it, removes its folders on exit, and prints each refusal under a one-line heading that names the rule. The five refusals, in order: `--accepted-checks is required: name affected accepted checks or "none: <why>"`; `Astra review due for F001; record it with findings.py astra`; ``Missing --keep for F001: route it with `findings.py route` or give the kept category and its evidence``; `Missing phase: --phase-id is required for a recorded run`; `Stale prompt phase: Phase 9 — Some other phase; open phase is Phase 1 — Demo phase`. After each refusal it shows the call that passes. It exits 0 only when every refusal and every pass happened as expected, and names the first step that did not otherwise. The person types `~/.claude/scripts/direct/demo_refusals.sh` in any terminal. A test runs the script and checks the five refusal texts and exit 0.
+
 **Files:**
-- `commands/unit/direct.md` — `<FixDispatch/>`, `<FindingsLedger/>`, `<Synthesize/>` (owner phases-unit).
-- `docs/production_format.md` — item 7, the repair rules (owner roles-unit).
-- `config/delegate.conf` — repair limits.
-- `scripts/direct/findings.py` — routed-finding lifecycle and the round counter, for P2 or P3.
-- `scripts/direct/test_findings.py` — tests for that lifecycle and counter.
-- `docs/plans/sdlc-fix-rounds-study.md` — the `Changes took effect` line.
+- `scripts/history/rounds.py` — the reviewed count and the summary.
+- `scripts/history/test_rounds.py` — the tests above.
+- `commands/history.md` — the `rounds` line.
+- `docs/plans/sdlc-fix-rounds-study.md` — the summary at the top (item 8).
+- `scripts/direct/demo_refusals.sh` — the refusal demo (item 11).
+- `scripts/direct/test_demo_refusals.py` — its test.
 
-The user's answers pick which of these files change.
+**Workers:** `1 writer + 1 tester`
+- `impl` — `scripts/history/rounds.py`, `commands/history.md`, `docs/plans/sdlc-fix-rounds-study.md` (item 8), `scripts/direct/demo_refusals.sh` (item 11), and the two check commands for items 9 and 10, each run on the live records with its output in the summary.
+- `test` — `scripts/history/test_rounds.py` and `scripts/direct/test_demo_refusals.py`, written from this Spec alone.
 
-**Workers:** set by the decision.
+**Constraints from prior phases:** `rounds.py` is an importable API (Phase 1 **Binds later work**); `history.py routed` (Phase 5) reads the same run records and is not changed.
 
-**Constraints from prior phases:**
-- The proposals are in `## Proposals` of `docs/plans/sdlc-fix-rounds-study.md` (from :950): P1 run command-only follow-through without a repair worker (8 rounds), P2 route missing acceptance criteria after landing (5), P3 route repeated repairs outside the kept categories (3), P4 verify phase and activity boundaries (0), P5 preserve accepted behavior touched by a repair (0). Together they remove 16 rounds, move 24,033 s of work and save 0 s.
-- Issues P699–P703 in `~/rust/hanadocs/issues/` track P1–P5; close each adopted one at this phase's checkpoint and record each declined one as declined.
-- Every proposal is a process change. Phase 4 named no tooling-only item, so the no-adoption branch builds nothing.
-- `scripts/history/rounds.py` stays an importable API: phases-unit imports it.
+**Acceptance gate:**
+- `env HERDR_BIN=/nonexistent/herdr python3 ~/.claude/scripts/production/merge_gate.py --checkout <worktree> --tests-only` green, run from `~/.claude` main.
+- `basedpyright scripts/history` reports `0 errors, 0 warnings, 0 notes`.
+- `history.py rounds --since 60d --status all` on the live records prints the reviewed count, the unreviewed line and a median over reviewed phases. A cross-check against `history.py phases --since 60d` (reviews of 1 or more, joined on run and phase) names each difference and its cause from item 1.
+- The item 9 and item 10 commands print what their rows ask for when run on the live records, and the study summary numbers match `## Totals`.
+- `scripts/direct/demo_refusals.sh` run from a fresh terminal prints the five refusal texts of item 11 and exits 0.
+- Change-Review lines, one per returned row (C2, C5, C6, C7, C24): what changed | the check command | what it prints. Each fix comes back as a new row.
 
-**Acceptance gate:** set by the decision; at least the merge gate green and `basedpyright scripts/direct scripts/production scripts/history` `0 errors, 0 warnings`.
-
-### Phase 6 — Did the changes cut rounds and keep the work  · status: todo
-**Depends on:** Phase 5
+### Phase 7 — Did the changes cut rounds and keep the work  · status: todo
+**Depends on:** Phase 5, Phase 6 (it redefines the `history.py rounds` medians and shares)
 **Blocked by:** for each adopted proposal, 30 completed, non-mixed exposed phases that started after the time Phase 5 records, zero-repair phases included, with exposure as that proposal's **Measure** defines it.
 
 #### Work Order
@@ -208,6 +231,7 @@ The user's answers pick which of these files change.
 **Goal:** `docs/plans/sdlc-fix-rounds-study.md` ends with a before-and-after table per adopted change, a verdict on each, and any revert sent to the user as a question.
 
 **Spec:**
+- First add a line to the head of `docs/plans/sdlc-fix-rounds-study.md`: `Changes took effect: <Phase 5 checkpoint hash> on main, <YYYY-MM-DDTHH:MM:SS±HH:MM>`, the time that checkpoint reached `~/.claude` main (the first main commit that contains it), with its offset. A bare date reads as local midnight in `rounds.run` and can take in work from before the change. Every window below counts from that time.
 - Before window: the 30 days that end just before the time Phase 5 records. After window: from that time to the run. The windows do not overlap; a phase that started before the time and ended after it is listed apart and not judged.
 - **Fewer rounds:** from `history.py rounds`: median rounds per phase, share of phases with ≥3 rounds, share of fix time those hold, rounds past the hard landing, and rounds by root cause class for the causes each change targets.
 - **Work kept:** follow-up phases written after a landing and how many reached `done` (plan docs under each production's units); merge design-check defects per phase and holds per phase from `review_regime.py report` on rows in each window; findings routed to other units and whether their phases ran.
@@ -216,6 +240,9 @@ The user's answers pick which of these files change.
 - Apply `### Evaluation shared by all five questions` and each adopted proposal's **Measure** in `## Proposals` of the study as written: exposure decided before the treated step runs, zero-repair exposed phases kept, the work-kept margins, combined parent-plus-follow-up rounds and agent-seconds, moved seconds apart from saved seconds, closure of each follow-up due in the window, and defects that reach the user or merge. Missing evidence or unfinished due work gives `inconclusive`, never a pass. When adopted changes cannot be separated, each one's attribution is `inconclusive`.
 - When P4 is adopted, its accuracy target is not read from `history.py rounds` alone: `load_phases` drops a launch with no recorded `phase_started`, and the `mixed` check cannot prove each launch's phase. Reconcile launch evidence with phase boundaries and recorded activities, list each missing or wrong association, and count it against the target.
 
+- Proposal statistics come from the explicitly selected exposed rows of each proposal, unreviewed zero-repair exposures included; never from the reviewed-only `_meta` statistics of `history.py rounds`.
+- P4 accuracy judges three records apart: `launch_refused`, UX `launch_checked` and `pass_started.launch_check`, including refusals with no phase instance. A correct refusal of a stale or missing-phase request counts as a success. A false refusal, or a launch associated with the wrong phase, counts against the target. The `test` slot checks one case of each.
+- Routed-work closure: the recount checks an open route, a valid cross-run closure, a closure with a wrong key, and a closure event with no acceptance evidence (commit, test result or review). The last one is `inconclusive`, never closed.
 - Root counts use the Phase 2 study method by hand, one evidence line per round, with the second writer recounting each window on its own; `history.py rounds` gives only the Phase 1 causes.
 - Review rows come from `review_regime.py`'s shared row reader with both window bounds applied in the study's extraction, not from `report`'s fixed regimes; state the boundary field, the excluded rows and each window's sample size. Bound review rows on `merged`. Before any total, sort each `Row` as usable, excluded or insufficient evidence: an absent plan identity, review minutes or repair minutes is not a measured zero, and a required field that is absent blocks a pass instead of making the sample smaller.
 - The readiness count takes phases from `history.py rounds --since <time> --status all --format json --top 100000` with a `check` of `ok`, a start at or after the time, and exposure as each proposal's **Measure** defines it, zero rounds included; open and mixed phases are listed apart and not judged.

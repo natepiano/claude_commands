@@ -43,13 +43,15 @@ def reason_text(step: memory_admit.WaitingStep, view: memory_admit.QueueView) ->
     match reason:
         case memory_admit.ReadingUnavailable():
             return f"{need}; memory reading unavailable"
+        case memory_admit.MemoryPressure():
+            return memory_admit.pressure_text(reason)
         case memory_admit.NeedsMemory():
             text = (f"needs {reason.need / memory_admit.GIB:.1f} GiB; "
                     + f"{reason.free / memory_admit.GIB:.1f} free; "
                     + f"{view.reserve / memory_admit.GIB:.1f} kept for earlyoom")
             if reason.promised_count:
-                text += (f"; {reason.promised / memory_admit.GIB:.1f} promised to "
-                         + f"{reason.promised_count} starting steps")
+                text += (f"; {reason.promised / memory_admit.GIB:.1f} growth headroom for "
+                         + f"{reason.promised_count} running steps")
             return text
         case memory_admit.BehindHead():
             return (f"{capacity}; behind {field(reason.head_name)} "

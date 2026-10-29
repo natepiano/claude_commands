@@ -5483,7 +5483,7 @@ class MeshCommandTests(MeshCommandFixture):
                 director=codex_mesh.UnknownWorkerDirector(), client=client, port=self.server.port,
                 thread_id=THREAD_ID, failure_serving=client.serving,
                 runs=codex_mesh.DetachedRunWatch(str(self.session_dir), "worker"),
-                turn_id="capacity-turn", resume_owed=True)
+                turn_started_at=time.monotonic(), turn_id="capacity-turn", resume_owed=True)
             log = io.StringIO()
             step = codex_mesh._resume_owed_turn(stream, log, refused_for_capacity=False)  # pyright: ignore[reportPrivateUsage]
             self.assertIs(step, codex_mesh.StreamStep.NEXT_FRAME)
@@ -5774,7 +5774,7 @@ class MeshCommandTests(MeshCommandFixture):
 
     def test_an_idle_read_just_after_the_turn_starts_does_not_end_the_turn(self) -> None:
         # The server can read a thread idle for a moment after its turn starts.
-        # The launcher waits for a quiet stream before it calls the notice lost.
+        # The launcher waits a moment after the turn starts before it calls the notice lost.
         self.assertEqual(self.run_start()[0], 0)
         self.outcomes = ["answered_without_completion"]
         self.start_args_timeout = 5
@@ -7494,6 +7494,14 @@ class FollowEventRegressionTests(MeshCommandFixture):
 
     guard_frame_reads: bool = False
 
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        # These stand-in servers end the turn at once; the start-lag wait is pinned elsewhere.
+        quiet = patch.object(codex_mesh, "UNSEEN_END_QUIET_SECS", 0.0)
+        _ = quiet.start()
+        self.addCleanup(quiet.stop)
+
     def test_adopted_worker_wakes_a_real_file_wait_and_refuses_old_follow(self) -> None:
         self.write_pool_roster({"worker": {
             "thread_id": THREAD_ID, "status": "done", "role": "impl",
@@ -7755,7 +7763,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
             director=codex_mesh.UnknownWorkerDirector(), client=client, port=self.server.port,
             thread_id=THREAD_ID, failure_serving=client.serving,
             runs=codex_mesh.DetachedRunWatch(str(self.session_dir), "worker"),
-            turn_id="buffered-turn", followed_turn="buffered-turn",
+            turn_started_at=time.monotonic(), turn_id="buffered-turn", followed_turn="buffered-turn",
         )
 
     def test_due_run_scan_drains_raw_buffered_completion_before_its_next_wait(self) -> None:
