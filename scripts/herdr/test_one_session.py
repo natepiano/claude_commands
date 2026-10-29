@@ -26,7 +26,8 @@ FORBIDDEN = {
 def _sources() -> list[Path]:
     scripts = [path for path in (REPOSITORY / "scripts").rglob("*")
                if path.suffix in (".py", ".sh") and path.is_file()
-               and not path.name.startswith(("test_", "fake_")) and path != LIBRARY]
+               and not path.name.startswith(("test_", "fake_"))
+               and not path.stem.endswith("_test_support") and path != LIBRARY]
     return sorted([*scripts, *(REPOSITORY / "commands").rglob("*.md")])
 
 

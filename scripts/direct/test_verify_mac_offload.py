@@ -567,6 +567,8 @@ class VerifyMacOffloadTests(unittest.TestCase):
         self.write_executable(self.bin_directory / "taplo", "#!/bin/sh\nexit 0\n")
         self.write_executable(self.runner, RUNNER_STUB)
         self.write_executable(self.root / "free-now.py", FREE_NOW_STUB)
+        assertion_guard = self.root / "assertion-guard.py"
+        self.write_executable(assertion_guard, "raise SystemExit(0)\n")
         blocker = "#!/bin/sh\nexit 99\n"
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.write_executable(self.bin_directory / name, blocker)
@@ -680,6 +682,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
             "UNIT_RUN_DIR": str(self.board),
             "UNIT_TEAM_ROLE": "test",
             "VERIFY_MAC_RUNNER": str(self.runner),
+            "VERIFY_ASSERTION_GUARD_SCRIPT": str(assertion_guard),
             "VERIFY_MAC_COPY_WATCH": str(VERIFY.parent.parent / "mac_test" / "copy_watch.py"),
             "VERIFY_MAC_TEST_SCRIPT": str(self.root / "free-now.py"),
             "TEST_RUNNER_STATE": str(self.runner_state),
@@ -690,7 +693,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
             "TEST_REAL_RECORD": str(VERIFY.parent.parent / "buildlog" / "record.py"),
         }
 
-        cache = self.root / "cache/claude/python3-3.10"
+        cache = self.root / "cache/claude/python3-3.11"
         cache.parent.mkdir(parents=True, exist_ok=True)
         _ = cache.write_text(sys.executable + "\n")
         _ = self.environment.pop("CLAUDE_PYTHON", None)

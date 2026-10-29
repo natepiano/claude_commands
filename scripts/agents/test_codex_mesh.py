@@ -54,6 +54,9 @@ from scripts.guilds import astra_work, roles
 from scripts.whoami import account, agent_accounts
 
 
+TEST_HANG_GUARD_SECS = 300  # load 136 on natedev, 2026-10-29
+
+
 LegacyWorkerMoveRequest = TypedDict("LegacyWorkerMoveRequest", {
     "kind": Literal["requested"], "at": str, "tool": Literal["codex"],
     "subject": Literal["seats"], "move_id": str, "from": str, "to": str,
@@ -8080,7 +8083,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
         self.assert_retry_does_not_wake_itself(room_wait=False)
 
     def assert_trailing_status_finishes_promptly(self, *, failed: bool) -> None:
-        self.start_args_timeout = 3
+        self.start_args_timeout = TEST_HANG_GUARD_SECS
         self.server.coalesce_response_frames = True
         respond = self.respond
 
@@ -8102,11 +8105,102 @@ class FollowEventRegressionTests(MeshCommandFixture):
                 _notice("account/rateLimits/updated", {"rateLimits": {}})]
 
         self.server.respond = trailing_status
-        # Hold real grace semantics; unrelated frames must not count as a peer turn.
-        with patch.object(codex_mesh, "QUEUE_GRACE_SECS", 0.05):
-            started = time.perf_counter()
+        more_work = codex_mesh._more_work_coming  # pyright: ignore[reportPrivateUsage]
+        on_frame = codex_mesh._on_frame  # pyright: ignore[reportPrivateUsage]
+        finish_stream = codex_mesh._finish_stream  # pyright: ignore[reportPrivateUsage]
+        next_frame = codex_mesh.Client.next_frame
+        read = codex_mesh.Client._read  # pyright: ignore[reportPrivateUsage]
+        rpc = codex_mesh.Client.call
+        completed = False
+        grace_reads: list[list[str]] = []
+        replayed_notices: list[str] = []
+        finished = 0
+
+        def observed_frame(
+            stream: codex_mesh.TurnStream, log: TextIO, frame: codex_mesh.RpcMessage,
+        ) -> codex_mesh.StreamStep | codex_mesh.FailedWithThread:
+            nonlocal completed
+            if frame.get("method") == "turn/completed":
+                completed = True
+            return on_frame(stream, log, frame)
+
+        def stream_read(client: codex_mesh.Client, deadline: float) -> codex_mesh.RpcMessage | None:
+            if completed:
+                self.assertTrue(client.has_pending_frames, "stream waited again after turn/completed")
+            frame = next_frame(client, deadline)
+            if completed:
+                assert frame is not None
+                replayed_notices.append(str(frame.get("method")))
+                self.assertLessEqual(len(replayed_notices), 2, "trailing notices were replayed repeatedly")
+            return frame
+
+        def observed_more_work(client: codex_mesh.Client, thread_id: str, deadline: float) -> bool:
+            self.assertTrue(completed)
+            self.assertEqual(grace_reads, [], "trailing notices opened another grace window")
+            reads: list[str] = []
+            grace_reads.append(reads)
+            elapsed = 0.0
+
+            def real_rpc(
+                client: codex_mesh.Client, method: str, params: dict[str, object],
+                timeout: float = codex_mesh.CALL_TIMEOUT_SECS,
+            ) -> codex_mesh.RpcMessage:
+                with patch.object(codex_mesh, "time", time), patch.object(codex_mesh.Client, "_read", read):
+                    return rpc(client, method, params, timeout)
+
+            def grace_read(client: codex_mesh.Client, read_until: float) -> codex_mesh.RpcMessage | None:
+                nonlocal elapsed
+                self.assertLess(len(reads), 3, "grace window was re-armed after a notice")
+                self.assertLess(read_until, deadline, "grace read waited until the run deadline")
+                # Logical time starts at zero: every read must name the same
+                # single grace deadline, regardless of real scheduling delays.
+                self.assertEqual(read_until, codex_mesh.QUEUE_GRACE_SECS,
+                                 "a notice extended the grace deadline")
+                if client.has_pending_frames:
+                    # Read the actual buffered notices, with real I/O time isolated
+                    # from the logical grace clock so scheduler load cannot expire it.
+                    with patch.object(codex_mesh, "time", time), patch.object(codex_mesh.Client, "_read", read):
+                        frame = next_frame(client, time.time() + TEST_HANG_GUARD_SECS)
+                    assert frame is not None
+                    reads.append(str(frame.get("method")))
+                    elapsed += codex_mesh.QUEUE_GRACE_SECS / 3
+                    return frame
+                reads.append("grace expired")
+                elapsed = read_until
+                return None
+
+            # Two notices precede one empty read that expires the logical grace
+            # window. Keep real socket waits out of this count-based proof.
+            with (
+                patch.object(codex_mesh, "time", SimpleNamespace(
+                    time=lambda: elapsed, monotonic=lambda: elapsed, sleep=fixture_no_sleep)),
+                patch.object(codex_mesh.Client, "call", real_rpc),
+                patch.object(codex_mesh.Client, "next_frame", grace_read),
+                patch.object(codex_mesh.Client, "_read",
+                             side_effect=AssertionError("grace bypassed next_frame for a blocking read")),
+            ):
+                result = more_work(client, thread_id, deadline)
+            self.assertFalse(result, "trailing notices were counted as another turn")
+            return result
+
+        def observed_finish(stream: codex_mesh.TurnStream) -> codex_mesh.RunOutcome:
+            nonlocal finished
+            finished += 1
+            self.assertLess(time.time(), stream.deadline, "run finished at its hang guard")
+            return finish_stream(stream)
+
+        with (
+            patch.object(codex_mesh, "QUEUE_GRACE_SECS", 0.05),
+            patch.object(codex_mesh, "_more_work_coming", observed_more_work),
+            patch.object(codex_mesh, "_on_frame", observed_frame),
+            patch.object(codex_mesh, "_finish_stream", observed_finish),
+            patch.object(codex_mesh.Client, "next_frame", stream_read),
+        ):
             code, errors = self.run_start()
-        self.assertLess(time.perf_counter() - started, 1, "trailing notices delayed one-turn exit")
+        notices = ["thread/status/changed", "account/rateLimits/updated"]
+        self.assertEqual(grace_reads, [[*notices, "grace expired"]])
+        self.assertEqual(replayed_notices, notices)
+        self.assertEqual(finished, 1)
         self.assertEqual(code, 1 if failed else 0, errors)
         self.assertEqual(self.worker_record()["status"], "failed" if failed else "done")
         if failed:

@@ -122,6 +122,35 @@ class ScoreIssuesTests(unittest.TestCase):
         self.assertEqual(self.records(first), self.records(second))
         self.assertEqual((self.state / "spend.jsonl").read_bytes(), ledger_before)
 
+    def test_cache_reuses_raw_answers_but_refreshes_stale_certainty_under_current_policy(self) -> None:
+        _ = self.issue("Target graph")
+        _ = self.issue("Vocabulary seed", area="tooling")
+        with mock.patch.object(client, "urlopen", side_effect=self.replay):
+            cached_path = self.score()
+        cached = self.records(cached_path)[0]
+        current_decisions = cached["decided_fields"]
+        stale_decisions = dict(current_decisions)
+        for field in ("area", "backlog_urgency", "backlog_effort"):
+            stale_decisions[field] = dict(cast(dict[str, object], current_decisions[field]), certainty="sure")
+        cached["decided_fields"] = stale_decisions
+        _ = cached_path.write_text(json.dumps(cached) + "\n", encoding="utf-8")
+        cached_bytes = cached_path.read_bytes()
+        ledger_before = (self.state / "spend.jsonl").read_bytes()
+
+        with mock.patch.object(client, "urlopen", side_effect=AssertionError("Cache hit must not call HTTP")) as http:
+            refreshed_path = self.score()
+
+        http.assert_not_called()
+        refreshed = self.records(refreshed_path)[0]
+        self.assertEqual(refreshed["answers"], cached["answers"])
+        self.assertEqual(refreshed["payloads"], cached["payloads"])
+        self.assertEqual(refreshed["decided_fields"], current_decisions)
+        for field in ("area", "backlog_urgency", "backlog_effort"):
+            with self.subTest(field=field):
+                self.assertEqual(cast(dict[str, object], refreshed["decided_fields"][field])["certainty"], "unsure")
+        self.assertEqual(cached_path.read_bytes(), cached_bytes)
+        self.assertEqual((self.state / "spend.jsonl").read_bytes(), ledger_before)
+
     def test_tune_cli_never_sends_a_holdout_issue(self) -> None:
         tune = self.issue("Target A")  # SHA1(filename) % 10 == 1.
         _ = self.issue("Target G", area="tooling")  # Residue 8: holdout.

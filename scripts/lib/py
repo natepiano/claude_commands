@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Find a python3 new enough for this repo, then exec it with our arguments.
 #
-# This repo uses match statements and `X | Y` unions, so it needs Python >= 3.10
-# (30 files would fail on less). On macOS the `python3` on PATH is Apple's
+# This repo imports datetime.UTC, so it needs Python >= 3.11.
+# On macOS the `python3` on PATH is Apple's
 # /usr/bin/python3, which is 3.9 -- which is why the hooks used to hardcode
 # /opt/homebrew/bin/python3. That path does not exist on Linux, so every hook
 # silently failed there. Choosing by VERSION rather than by path works on both.
@@ -24,7 +24,7 @@
 set -uo pipefail
 
 NEED_MAJOR=3
-NEED_MINOR=10
+NEED_MINOR=11
 
 if [[ -n "${XDG_CACHE_HOME:-}" ]]; then
     cache_dir="$XDG_CACHE_HOME/claude"
