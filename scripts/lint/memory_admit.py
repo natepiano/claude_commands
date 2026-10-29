@@ -16,8 +16,12 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, NoReturn, NotRequired, Protocol, TypedDict, cast
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+
+from user_zone import user_zone
 
 
 class GitFacts(TypedDict):
@@ -59,11 +63,11 @@ FALLBACK = 12 * GIB
 ANON_SHARE = 0.65
 HISTORY_DAYS = 14
 # Build anon at 16–20 GiB averaged 10.4% full PSI; at 20–24 GiB it averaged 16.4%.
-BUILD_BUDGET_BYTES = 20 * GIB
+BUILD_BUDGET_BYTES = 21 * GIB
 RAMP_SECONDS = 120
 PROC = Path("/proc")
 # A step held this long gets room first when it can start.
-HEAD_SECONDS = 900
+HEAD_SECONDS = 600
 QUEUE_LOCK_TIMEOUT_SECONDS = 10.0
 
 
@@ -177,8 +181,21 @@ class BehindHead:
 
 
 @dataclass(frozen=True)
-class HeadWaitingForDrain:
-    running_count: int
+class BackfillUntil:
+    deadline: float
+
+
+@dataclass(frozen=True)
+class YoungerStepsWait:
+    pass
+
+
+@dataclass(frozen=True)
+class HeadAdmissionStatus:
+    decision: AdmissionDecision
+    need: int
+    available: int
+    backfill: BackfillUntil | YoungerStepsWait
 
 
 @dataclass(frozen=True)
@@ -191,7 +208,37 @@ class ReadingUnavailable:
     pass
 
 
-WaitReason = NeedsBuildBudget | NeedsMemory | BehindHead | HeadWaitingForDrain | ReadyForAdmission | ReadingUnavailable | MemoryPressure
+WaitReason = NeedsBuildBudget | NeedsMemory | BehindHead | HeadAdmissionStatus | ReadyForAdmission | ReadingUnavailable | MemoryPressure
+
+
+def head_wait_reason(decision: AdmissionDecision, need: int, available: int,
+                     waiter: Waiter, now: float) -> HeadAdmissionStatus:
+    backfill = (BackfillUntil(waiter["since"] + HEAD_SECONDS)
+                if now - waiter["since"] < HEAD_SECONDS and waiter.get("bump_order", 0) >= 0
+                and not waiter.get("holds_younger", False) else YoungerStepsWait())
+    return HeadAdmissionStatus(decision, need, available, backfill)
+
+
+def head_wait_text(reason: HeadAdmissionStatus, zone: ZoneInfo) -> str:
+    decision = reason.decision
+    parts: list[str] = []
+    if isinstance(decision.pressure, MemoryPressure):
+        parts.append(pressure_text(decision.pressure))
+    elif decision.state == "admit":
+        parts.append("ready for the next admission check")
+    else:
+        if decision.charged + reason.need > decision.budget:
+            parts.append(f"needs {reason.need / GIB:.1f} GiB; builds use {decision.charged / GIB:.1f} "
+                         + f"of the {decision.budget / GIB:.1f} GiB budget "
+                         + f"(starts when build use falls to {(decision.budget - reason.need) / GIB:.1f} GiB)")
+        if reason.available < decision.threshold:
+            parts.append(f"needs {decision.threshold / GIB:.1f} GiB free; {reason.available / GIB:.1f} free")
+    if isinstance(reason.backfill, BackfillUntil):
+        until = datetime.fromtimestamp(reason.backfill.deadline, zone).strftime("%H:%M")
+        parts.append(f"younger steps may start until {until}")
+    else:
+        parts.append("younger steps wait")
+    return "head: " + "; ".join(parts)
 
 
 @dataclass(frozen=True)
@@ -262,6 +309,7 @@ class CheckResult:
     profile: StepProfile
     head_need: int = 0
     head_label: str = ""
+    head_reason: HeadAdmissionStatus | ReadyForAdmission = ReadyForAdmission()
 
 
 def build_budget_bytes() -> int:
@@ -536,11 +584,12 @@ def waiter_order(row: Waiter) -> tuple[int, float, int]:
 
 def head_priority(waiters: list[Waiter], available: int, total: int | None,
                   running: list[StepMemory], now: float) -> HeadPriority | NoHeadPriority:
-    candidates = sorted((row for row in waiters if row.get("holds_younger", False)
-                         or row.get("bump_order", 0) < 0 or now - row["since"] >= HEAD_SECONDS),
-                        key=waiter_order)
-    if candidates:
-        head = candidates[0]
+    ordered = sorted(waiters, key=waiter_order)
+    if not ordered:
+        return NoHeadPriority()
+    head = ordered[0]
+    if (head.get("holds_younger", False) or head.get("bump_order", 0) < 0
+            or now - head["since"] >= HEAD_SECONDS):
         decision = decide(available, total, head["need"], running)
         if (head.get("holds_younger", False) or decision.state == "admit"
                 or available + decision.measured >= head["need"] + decision.reserve):
@@ -619,8 +668,9 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                 waiter["holds_younger"] = True
         available, total = read_meminfo(meminfo)
         pressure = read_pressure()
-        head = head_priority([row for path, row in waiting if path != mine] + ([waiter] if argv else []),
-                             available, total, running, now.timestamp())
+        candidates = sorted([row for path, row in waiting if path != mine] + ([waiter] if argv else []),
+                            key=waiter_order)
+        head = head_priority(candidates, available, total, running, now.timestamp())
         if isinstance(head, HeadPriority) and not head.waiter.get("holds_younger", False):
             head.waiter["holds_younger"] = True
             for head_path, head_row in waiting:
@@ -649,7 +699,10 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                 reservation = Reserved(path)
             else:
                 reservation = NotReserved("untracked")
-        return CheckResult(decision, peak, [row for _, row in live], reservation, repo, step, available, profile, head_need, head_label)
+        head_reason = (head_wait_reason(decision, peak.bytes, available, waiter, now.timestamp())
+                       if candidates and candidates[0] is waiter else ReadyForAdmission())
+        return CheckResult(decision, peak, [row for _, row in live], reservation, repo, step, available, profile,
+                           head_need, head_label, head_reason)
 
 
 def waiter_identity(repo: str, step: str, worktree: str) -> WaiterIdentity:
@@ -763,10 +816,10 @@ def read_queue(directory: Path, processes: dict[int, ProcessIdentity], now: floa
         elif isinstance(head, HeadPriority) and waiter_order(head.waiter) < waiter_order(row):
             head_identity = identities.identity(head.waiter["pid"], cast(dict[str, object], cast(object, head.waiter)))
             reason = BehindHead(head_identity["session_name"] or Path(head_identity["folder"]).name or str(head.waiter["pid"]), head.waiter["since"])
+        elif row is ordered[0][1]:
+            reason = head_wait_reason(own, row["need"], available, row, now)
         elif isinstance(own.pressure, MemoryPressure):
             reason = own.pressure
-        elif own.state == "hold" and isinstance(head, HeadPriority) and row is head.waiter and memory:
-            reason = HeadWaitingForDrain(len(memory))
         elif own.state == "hold":
             reason = (NeedsMemory(row["need"], available) if available < own.threshold
                       else NeedsBuildBudget(row["need"], own.charged, own.budget))
@@ -894,7 +947,9 @@ def main() -> None:
     result = check(Path(meminfo), int(pid), sidecar, argv, float(since or 0), profile=profile)
     decision, peak, live = result.decision, result.peak, result.live
     summary = ", ".join(f"{row['repo']} {row['step']} in {row['worktree']}" for row in live)
-    if isinstance(decision.pressure, MemoryPressure):
+    if isinstance(result.head_reason, HeadAdmissionStatus):
+        summary = f"{head_wait_text(result.head_reason, user_zone())}; {summary}".rstrip("; ")
+    elif isinstance(decision.pressure, MemoryPressure):
         summary = f"{pressure_text(decision.pressure)}; {summary}".rstrip("; ")
     reservation = result.reservation
     path = str(reservation.path) if isinstance(reservation, Reserved) else ""
