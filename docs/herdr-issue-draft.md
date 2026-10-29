@@ -8,7 +8,7 @@ Status: draft for the user to read. Nothing is filed on GitHub until the user ap
 
 ## What happens
 
-A Claude Code pane sits at a permission dialog ("Do you want to proceed?"), but herdr shows it as **idle**, not **blocked**. The pane stays idle for as long as the dialog is open. In one case, a pane waited at a Bash permission dialog for 5.5 hours, and herdr showed it idle for all of that time, so nobody was told that it needed an answer.
+A Claude Code pane sits at a permission dialog ("Do you want to proceed?"), but herdr shows it as **idle**, not **blocked**. The pane stays idle for as long as the dialog is open.
 
 `herdr agent explain` names `live_prompt_box` (idle, priority 950) as the rule that set the state. `bash_permission_prompt` (blocked, priority 850) also matches, but it has a lower priority.
 
