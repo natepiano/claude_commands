@@ -148,6 +148,13 @@ A unit that was not running has no record, so steps 9 and 10 do nothing for it.
   incoming prompt to them exactly, so a rewrite would break the match. In the held role store
   (`guilds/roles/`), `prompts/`, `replies/`, `adoption.json` and `transfer.json` are history, and role
   `name` and `aliases` in `design.json` and the entry names and `aliases` in a role mesh roster are identity, not live names. A hit outside the history classes fails and names its file. Shutdown paths print as `(masked)`.
+  Three owner-maintained records also keep their original names: `herdr-panes/` contains launch
+  snapshots (apply drops the old director's entries; SessionStart rewrites other panes, and
+  missing panes are ignored); `lint-sweep/target-deletes.json` records deletion timestamps whose
+  absent roots and entries older than a day expire; `mac-idle/calls/` contains verify registrations
+  admitted only by a current waiting step and matching live pid/start, with the repository read
+  from that step. The sweep leaves these files unchanged. Explicitly live files still override
+  these classifications.
   On natedev a sweep takes about 80 s.
 
 ## Tests
@@ -162,3 +169,5 @@ real CLI parser and handlers in-process, including the fake herdr response CLI;
 Git commands remain real. Entry-point errors, cross-process locks, shutdown and
 relaunch coordination retain subprocesses. Fixture file waits use directory
 events with a 300-second hang guard.
+`test_unit_rename_sweep.py` checks the three owner-maintained classes and that a live-file
+override still fails.
