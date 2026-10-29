@@ -23,6 +23,7 @@ import functools
 import io
 import json
 import os
+import pwd
 import select
 import shlex
 import signal
@@ -51,6 +52,55 @@ from scripts.usage import agents_log
 from scripts.accounts import accounts, moves, refusals, role_map
 from scripts.guilds import astra_work, roles
 from scripts.whoami import account, agent_accounts
+
+
+REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+
+
+def fixture_write_metadata(home: Path) -> dict[Path, tuple[int, int]]:
+    """Observe the synthetic sign-in's three files, never account contents or live trees.
+
+    Other home paths change during normal work (account moves, a pull of ~/.claude), so the
+    real-home refusal guards them; a snapshot of them would fail gates no test caused.
+    """
+    paths = [root / "auth.json" for root in home.glob(".codex*") if root.is_dir()]
+    # note_file.notes_dir's production default, anchored to passwd home rather than HOME.
+    paths.extend((home / ".claude/config/accounts.json", home / "rust/hanadocs/agents/codex9.md"))
+    metadata: dict[Path, tuple[int, int]] = {}
+    for path in paths:
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        metadata[path] = (info.st_size, info.st_mtime_ns)
+    return metadata
+
+
+REAL_FIXTURE_METADATA = fixture_write_metadata(REAL_HOME)
+
+
+def assert_real_codex_unchanged() -> None:
+    current = fixture_write_metadata(REAL_HOME)
+    changed = sorted(str(path) for path in REAL_FIXTURE_METADATA.keys() | current.keys()
+                     if REAL_FIXTURE_METADATA.get(path) != current.get(path))
+    if changed:
+        raise AssertionError("codex_mesh tests changed real-home fixture targets:\n" + "\n".join(changed))
+
+
+def refuse_real_home(path: Path, source: str) -> None:
+    if path.resolve().is_relative_to(REAL_HOME):
+        raise AssertionError(f"{source} points into the real home: {path}; use a fixture temp home (setUpModule required)")
+
+
+def assert_fixture_environment() -> None:
+    for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR"):
+        value = os.environ.get(name)
+        if not value:
+            raise AssertionError(f"{name} is unset; codex_mesh fixture requires setUpModule")
+        refuse_real_home(Path(value), name)
+
+
+TEST_HANG_GUARD_SECS = 300  # load 136 on natedev, 2026-10-29
 
 
 LegacyWorkerMoveRequest = TypedDict("LegacyWorkerMoveRequest", {
@@ -125,26 +175,30 @@ def set_environment(name: str, value: str) -> Callable[[], None]:
     return restore
 
 
-def select_fixture_workers(home: Path) -> None:
+def select_fixture_workers(home: Path, *, notes: Path) -> None:
     """Give fake-server tests an explicit selection backed by a synthetic sign-in."""
     default = home / ".codex"
+    auth = default / "auth.json"
+    config = home / ".claude/config/accounts.json"
+    for source, path in (("fixture home", home), ("fixture sign-in", auth),
+                         ("fixture note", notes / "codex9.md"), ("fixture account config", config)):
+        refuse_real_home(path, source)
     default.mkdir(exist_ok=True)
     login = "mesh-fixture@example.invalid"
     claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
-    auth = default / "auth.json"
     _ = auth.write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
     os.utime(auth, (1, 1))
-    notes = Path(os.environ["AGENT_NOTES_DIR"])
     notes.mkdir(parents=True, exist_ok=True)
     _ = (notes / "codex9.md").write_text(f"---\nlogin: {login}\n---\n")
-    config = home / ".claude/config/accounts.json"
     config.parent.mkdir(parents=True, exist_ok=True)
     _ = config.write_text('{"workers": "codex9"}')
 
 
 def setUpModule() -> None:
+    # Registered first, checked last; unittest reports cleanup assertions as module errors.
+    unittest.addModuleCleanup(assert_real_codex_unchanged)
     # No test sees a real sign-in; the synthetic selection predates every fake server.
-    home = tempfile.TemporaryDirectory()
+    home = tempfile.TemporaryDirectory(dir="/tmp", prefix="codex-mesh-home-")
     usage = tempfile.TemporaryDirectory()
     restore_usage = set_environment("USAGE_STATE_DIR", usage.name)
     restore_home = set_environment("HOME", home.name)
@@ -162,7 +216,7 @@ def setUpModule() -> None:
     authority = patch.object(role_map, "is_role_map_host", new=lambda: True)
     _ = authority.start()
     unittest.addModuleCleanup(authority.stop)
-    select_fixture_workers(Path(home.name))
+    select_fixture_workers(Path(home.name), notes=Path(home.name))
     previous = os.environ.get("CODEX_HOME")
     os.environ["CODEX_HOME"] = str(Path(home.name) / ".codex")
 
@@ -476,6 +530,7 @@ class MeshCommandFixture(unittest.TestCase):
     guard_frame_reads: bool = True
 
     temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
+    home: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     session_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     server: StubAppServer  # pyright: ignore[reportUninitializedInstanceVariable]
     outcomes: list[str]  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -518,8 +573,18 @@ class MeshCommandFixture(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        assert_fixture_environment()
         self.loop_budget = FixtureLoopBudget(self.id())
-        self.temporary = tempfile.TemporaryDirectory()
+        self.temporary = tempfile.TemporaryDirectory(dir="/tmp", prefix="codex-mesh-test-")
+        self.addCleanup(self.temporary.cleanup)
+        self.home = Path(self.temporary.name).resolve() / "home"
+        self.home.mkdir()
+        self.patches = contextlib.ExitStack()
+        self.addCleanup(self.patches.close)
+        _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {
+            "HOME": str(self.home), "CODEX_HOME": str(self.home / ".codex"),
+            "AGENT_NOTES_DIR": str(self.home),
+        })))
         # resolve(): macOS /tmp is a link to /private/tmp, and the mesh records resolved paths.
         self.session_dir = Path(self.temporary.name).resolve() / "run"
         self.session_dir.mkdir()
@@ -555,13 +620,12 @@ class MeshCommandFixture(unittest.TestCase):
         self.waits = []
         self.elapsed = 0.0
         self.start_args_timeout = 300.0
-        select_fixture_workers(Path.home())
+        select_fixture_workers(self.home, notes=self.home)
         self.server = StubAppServer(self.respond)
         _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(
             json.dumps({"port": self.server.port, "pid": os.getpid(), "codex_home": str(agent_accounts.workers_home()), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS}),
             encoding="utf-8",
         )
-        self.patches = contextlib.ExitStack()
         read_frame = codex_mesh.Client.next_frame
 
         def bounded_read(client: codex_mesh.Client, deadline: float) -> codex_mesh.RpcMessage | None:
@@ -1192,6 +1256,93 @@ class WorkerShownNameTests(MeshCommandFixture):
                     _ = codex_mesh.main([*command, "--help"])
                 self.assertEqual(ended.exception.code, 0)
                 self.assertNotRegex(output.getvalue().lower(), r"\bseats?\b")
+
+
+class FixtureHomeSafetyTests(unittest.TestCase):
+    def test_worker_selection_refuses_real_home_descendants_and_symlinks(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/tmp")))
+        real = root / "real"
+        real.mkdir()
+        alias = root / "alias"
+        alias.symlink_to(real, target_is_directory=True)
+        with patch(f"{__name__}.REAL_HOME", real):
+            for home in (real, real / "nested", alias):
+                with self.subTest(home=home), self.assertRaisesRegex(AssertionError, "real home"):
+                    select_fixture_workers(home, notes=root / "notes")
+        self.assertEqual(list(real.iterdir()), [])
+        self.assertFalse((root / "notes").exists())
+
+    def test_base_setup_rejects_unsafe_environment_before_creating_files(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/tmp")))
+        real = root / "real"
+        real.mkdir()
+        for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR"):
+            environment = {key: str(root / "safe") for key in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR")}
+            environment[name] = str(real / "nested")
+            with (self.subTest(variable=name), patch(f"{__name__}.REAL_HOME", real),
+                  patch.dict(os.environ, environment),
+                  patch.object(tempfile, "TemporaryDirectory", wraps=tempfile.TemporaryDirectory) as temporary):
+                with self.assertRaisesRegex(AssertionError, name + " points into the real home"):
+                    MeshCommandFixture().setUp()
+                temporary.assert_not_called()
+
+    def test_metadata_guard_catches_a_bypassed_refusal_in_an_absent_or_existing_tree(self) -> None:
+        for existing in (False, True):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory(dir="/tmp") as directory:
+                real = Path(directory)
+                auth = real / ".codex/auth.json"
+                if existing:
+                    auth.parent.mkdir()
+                    _ = auth.write_text("temporary account placeholder")
+                before = fixture_write_metadata(real)
+                with (patch(f"{__name__}.REAL_HOME", real),
+                      patch(f"{__name__}.REAL_FIXTURE_METADATA", before)):
+                    with self.assertRaisesRegex(AssertionError, "real home"):
+                        select_fixture_workers(real, notes=real / "notes")
+                    assert_real_codex_unchanged()
+                    # Live sessions may create and change unrelated files while tests run.
+                    session = real / ".codex/sessions/x.jsonl"
+                    session.parent.mkdir(parents=True, exist_ok=True)
+                    notes = real / "rust/hanadocs/agents"
+                    notes.mkdir(parents=True)
+                    live = [real / name for name in (".codex/config.toml", ".codex/hooks.json",
+                                                     ".claude/scripts/lib/py", ".local/state/accounts/moves.jsonl")]
+                    live.extend(notes / note_name(label) for label in ("codex1", "codex2"))
+                    for text in ("first event", "another event"):
+                        _ = session.write_text(text)
+                        for path in live:
+                            path.parent.mkdir(parents=True, exist_ok=True)
+                            _ = path.write_text(text)
+                        assert_real_codex_unchanged()
+                    # Fault injection only targets this disposable stand-in, never the login home.
+                    with patch(f"{__name__}.refuse_real_home"):
+                        select_fixture_workers(real, notes=real / "rust/hanadocs/agents")
+                    with self.assertRaises(AssertionError) as changed:
+                        assert_real_codex_unchanged()
+                    for name in (".codex/auth.json", ".claude/config/accounts.json",
+                                 "rust/hanadocs/agents/codex9.md"):
+                        self.assertIn(str(real / name), str(changed.exception))
+        # A sign-in in a Codex home that did not exist at import is caught too.
+        for name in (".codex22/auth.json",):
+            with self.subTest(path=name), tempfile.TemporaryDirectory(dir="/tmp") as directory:
+                real = Path(directory)
+                path = real / name
+                before = fixture_write_metadata(real)
+                with (patch(f"{__name__}.REAL_HOME", real),
+                      patch(f"{__name__}.REAL_FIXTURE_METADATA", before)):
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    _ = path.write_text("fixture content")
+                    with self.assertRaisesRegex(AssertionError, "fixture targets"):
+                        assert_real_codex_unchanged()
+                    written = fixture_write_metadata(real)
+                    with patch(f"{__name__}.REAL_FIXTURE_METADATA", written):
+                        _ = path.write_text("changed fixture content")
+                        with self.assertRaisesRegex(AssertionError, "fixture targets"):
+                            assert_real_codex_unchanged()
+                        path.unlink()
+                        with self.assertRaisesRegex(AssertionError, "fixture targets"):
+                            assert_real_codex_unchanged()
+                    assert_real_codex_unchanged()
 
 
 @final
@@ -4376,8 +4527,9 @@ class MeshCommandTests(MeshCommandFixture):
     def test_unreadable_serving_sign_in_reports_an_explicit_unknown_account(self) -> None:
         account = self.prepare_refusing_account()
         (account.home / "auth.json").unlink()
-        select_fixture_workers(Path.home())
-        selected = Path.home() / ".codex9"
+        home = account.home.parent
+        select_fixture_workers(home, notes=home / "notes")
+        selected = home / ".codex9"
         selected.mkdir()
         _ = (account.home / "auth.json").rename(selected / "auth.json")
         original = self.respond
@@ -7502,27 +7654,36 @@ class MeshCommandTests(MeshCommandFixture):
         new, _change, release = self.prepare_post_turn_home_change((message,))
         release()
         self.assertNotEqual(self.server.port, new.port)
-        failed = [False]
+        events: list[str] = []
         closed_ports: list[int] = []
+        start_turn = codex_mesh._start_turn  # pyright: ignore[reportPrivateUsage]
         write_pending = codex_mesh._write_pending  # pyright: ignore[reportPrivateUsage]
         update_roster = codex_mesh._update_roster  # pyright: ignore[reportPrivateUsage]
         close = codex_mesh.Client.close
         detail = f"local {write_site} write failed after target accepted turn"
 
-        def target_accepted() -> bool:
-            return any(request.get("method") == "turn/start" for request in new.requests)
+        def accepted(
+            client: codex_mesh.Client, args: argparse.Namespace, thread: str, sandbox: str,
+            message: str, pending: tuple[str, ...] = (),
+        ) -> str:
+            turn = start_turn(client, args, thread, sandbox, message, pending)
+            if client.port == new.port:
+                self.assertTrue(turn, "the target must accept the turn before the write fails")
+                events.append("accepted")
+            return turn
 
         def pending(handle: TextIO, thread: str, messages: list[str], *, accepting_messages: bool = True) -> None:
-            if write_site == "pending" and target_accepted() and not failed[0]:
+            if write_site == "pending" and events == ["accepted"]:
                 self.assertEqual(messages, [])
-                failed[0] = True
+                events.append("write failed")
                 raise OSError(detail)
             write_pending(handle, thread, messages, accepting_messages=accepting_messages)
 
         def roster(session: str, name: str, fields: codex_mesh.ThreadRecord) -> None:
-            if (write_site == "roster" and target_accepted() and not failed[0]
-                    and fields.get("status") == "running" and fields.get("port") == new.port):
-                failed[0] = True
+            if write_site == "roster" and events == ["accepted"]:
+                self.assertEqual(fields.get("status"), "running")
+                self.assertEqual(fields.get("port"), new.port)
+                events.append("write failed")
                 raise OSError(detail)
             update_roster(session, name, fields)
 
@@ -7531,6 +7692,9 @@ class MeshCommandTests(MeshCommandFixture):
             close(client)
 
         with (
+            # This fixture already released the old writer; its confirmation only needs a hang guard.
+            patch.object(codex_mesh, "THREAD_RELEASE_TIMEOUT_SECS", TEST_HANG_GUARD_SECS),
+            patch.object(codex_mesh, "_start_turn", wraps=accepted),
             patch.object(codex_mesh, "_write_pending", side_effect=pending),
             patch.object(codex_mesh, "_update_roster", side_effect=roster),
             patch.object(codex_mesh.Client, "close", closed),
@@ -7539,7 +7703,8 @@ class MeshCommandTests(MeshCommandFixture):
             patch.object(codex_mesh, "_end_unwatched_turn", return_value=codex_mesh.RelaunchAllowed()) as cleanup,
         ):
             code, errors = self.run_start()
-        self.assertTrue(failed[0], "the injected failure must follow target turn acceptance")
+        self.assertEqual(events, ["accepted", "write failed"],
+                         "exactly one write must fail, after target turn acceptance")
         self.assertEqual(code, 1)
         self.assertIn(f"state unknown ({detail})", errors)
         self.assertEqual(self.worker_record()["status"], "failed")
@@ -7624,6 +7789,8 @@ class MeshCommandTests(MeshCommandFixture):
                 attempts[0] += 1
             if attempts[0] == 3:
                 release()
+                # Release has happened; confirmation now needs only a hang guard.
+                _ = self.patches.enter_context(patch.object(codex_mesh, "THREAD_RELEASE_TIMEOUT_SECS", TEST_HANG_GUARD_SECS))
             result = move(args, session, name, thread, client, message=message)
             if isinstance(result, codex_mesh.MovedWorker) and result.port == new.port:
                 _ = (self.session_dir / "worker.end").write_text("end")
@@ -7841,16 +8008,29 @@ class FollowEventRegressionTests(MeshCommandFixture):
         self.server.respond = queued_peer
         self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "running"}})
         attempts = 0
-        second_wait = 0.0
         wake_marker = self.session_dir / "worker.pending.json"
-        timer = threading.Timer(0.2, lambda: wake_marker.touch())
-        with contextlib.closing(codex_mesh.Client(self.server.port, "worker", deadline=time.time() + 4)) as client:
+        activity_wait = codex_mesh.FollowEvents.wait
+        wakes: list[codex_mesh.FileWaitResult] = []
+
+        def wake_submission(events: codex_mesh.FollowEvents, connection: socket.socket,
+                            deadline: float) -> codex_mesh.FileWaitResult:
+            self.assertEqual(attempts, 2)
+            wake_marker.touch()
+            result = activity_wait(events, connection, deadline)
+            wakes.append(result)
+            self.assertIsInstance(result, codex_mesh.StateFilesChanged)
+            assert isinstance(result, codex_mesh.StateFilesChanged)
+            self.assertIn(wake_marker, result.paths)
+            return result
+
+        with contextlib.closing(codex_mesh.Client(
+                self.server.port, "worker", deadline=time.time() + TEST_HANG_GUARD_SECS)) as client:
             @bounded_fixture
             def move(
                 _args: argparse.Namespace, _session: str, _name: str, _thread: str, moving: codex_mesh.Client,
                 *, message: str,
             ) -> codex_mesh.WorkerMoveResult:
-                nonlocal attempts, second_wait
+                nonlocal attempts
                 self.assertEqual(message, "resume after overflow")
                 self.assertIs(moving, client)
                 attempts += 1
@@ -7859,31 +8039,26 @@ class FollowEventRegressionTests(MeshCommandFixture):
                     return codex_mesh.WorkerWaitingOnLiveTurn()
                 if attempts == 2:
                     _ = client.call("test/drain-peer", {})
-                    second_wait = time.perf_counter()
-                    timer.start()
                     return codex_mesh.WorkerWaitingOnLiveTurn()
                 self.assertEqual(attempts, 3, "retained notices caused a busy submission retry")
-                self.assertGreater(time.perf_counter() - second_wait, 0.1,
-                                   "pending notices woke a wait for new activity")
+                self.assertEqual(len(wakes), 1, "pending notices bypassed the wait for new activity")
                 return codex_mesh.MovedWorker(client, self.server.port, "queued-peer", THREAD_ID, False)
 
             args = self.start_args()
-            args.timeout = 3
-            try:
-                with patch.object(codex_mesh, "_move_resident", new=move):
-                    _ = codex_mesh._start_workers_turn(  # pyright: ignore[reportPrivateUsage]
-                        args, str(self.session_dir), "worker", THREAD_ID, client, "resume after overflow")
-            finally:
-                timer.cancel()
-                if timer.ident is not None:
-                    timer.join(timeout=1)
+            args.timeout = TEST_HANG_GUARD_SECS
+            with (patch.object(codex_mesh, "_move_resident", new=move),
+                  patch.object(codex_mesh.FollowEvents, "wait", new=wake_submission)):
+                _ = codex_mesh._start_workers_turn(  # pyright: ignore[reportPrivateUsage]
+                    args, str(self.session_dir), "worker", THREAD_ID, client, "resume after overflow")
+            self.assertEqual(attempts, 3)
+            self.assertEqual(len(wakes), 1)
             stream = self.stream_for(client)
             stream.follow = False
             stream.followed_turn = ""
             log = io.StringIO()
             with patch.object(codex_mesh, "_after_turn_end", return_value=codex_mesh.StreamStep.FINISH):
                 for expected in notices:
-                    frame = client.next_frame(time.time() + 1)
+                    frame = client.next_frame(time.time() + TEST_HANG_GUARD_SECS)
                     self.assertEqual(frame, expected, "submission wait lost or reordered a peer notice")
                     assert frame is not None
                     _ = codex_mesh._on_frame(stream, log, frame)  # pyright: ignore[reportPrivateUsage]
@@ -7915,17 +8090,30 @@ class FollowEventRegressionTests(MeshCommandFixture):
 
         self.server.respond = rate_notice_before_idle_reply
         self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done" if resident else "running"}})
-        with contextlib.closing(codex_mesh.Client(self.server.port, "worker", deadline=time.time() + 3)) as client:
+        with contextlib.closing(codex_mesh.Client(
+                self.server.port, "worker", deadline=time.time() + TEST_HANG_GUARD_SECS)) as client:
             stream = self.stream_for(client, resident=resident)
+            stream.timeout = TEST_HANG_GUARD_SECS
+            stream.deadline = time.time() + TEST_HANG_GUARD_SECS
             stream.final_answer = "answer without completion"
             # The answer arrived, so the turn's notices did too.
             stream.turn_start_seen = True
             stream.state_change_owed = True
-            started = time.perf_counter()
-            _ = codex_mesh._stream_frames(stream, io.StringIO())  # pyright: ignore[reportPrivateUsage]
+            next_frame = client.next_frame
+
+            def drain_notice(deadline: float) -> codex_mesh.RpcMessage | None:
+                self.assertTrue(client.has_pending_frames,
+                                "draining the rate notice postponed the idle check until another read")
+                frame = next_frame(deadline)
+                self.assertIsNotNone(frame)
+                assert frame is not None
+                self.assertEqual(frame.get("method"), "account/rateLimits/updated")
+                return frame
+
+            with patch.object(client, "next_frame", wraps=drain_notice) as reads:
+                _ = codex_mesh._stream_frames(stream, io.StringIO())  # pyright: ignore[reportPrivateUsage]
+            reads.assert_called_once()
             self.assertTrue(buffered)
-            self.assertLess(time.perf_counter() - started, 1,
-                            "draining the rate notice postponed the idle check until the next timeout")
             self.assertEqual(stream.failure, "")
 
     def stream_for(self, client: codex_mesh.Client, *, resident: bool = False) -> codex_mesh.TurnStream:
@@ -8069,7 +8257,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
         self.assert_retry_does_not_wake_itself(room_wait=False)
 
     def assert_trailing_status_finishes_promptly(self, *, failed: bool) -> None:
-        self.start_args_timeout = 3
+        self.start_args_timeout = TEST_HANG_GUARD_SECS
         self.server.coalesce_response_frames = True
         respond = self.respond
 
@@ -8091,11 +8279,75 @@ class FollowEventRegressionTests(MeshCommandFixture):
                 _notice("account/rateLimits/updated", {"rateLimits": {}})]
 
         self.server.respond = trailing_status
-        # Hold real grace semantics; unrelated frames must not count as a peer turn.
-        with patch.object(codex_mesh, "QUEUE_GRACE_SECS", 0.05):
-            started = time.perf_counter()
+        check_more_work = codex_mesh._more_work_coming  # pyright: ignore[reportPrivateUsage]
+        finish_stream = codex_mesh._finish_stream  # pyright: ignore[reportPrivateUsage]
+        next_frame = codex_mesh.Client.next_frame
+        read = codex_mesh.Client._read  # pyright: ignore[reportPrivateUsage]
+        grace_active = False
+        grace_checked = False
+        frame_read_active = False
+        grace_run_deadline = 0.0
+        opened_windows = 0
+        test = self
+        # Adding the real interval opens a grace window; notices must not open
+        # another. Counting additions tolerates rounding and early file wakes.
+        class SingleGraceWindow(float):
+            @override
+            def __radd__(self, opened: float, /) -> float:
+                nonlocal opened_windows
+                opened_windows += 1
+                test.assertEqual(opened_windows, 1, "a notice opened another grace window")
+                return opened + float(self)
+
+        def observed_more_work(client: codex_mesh.Client, thread_id: str, deadline: float) -> bool:
+            nonlocal grace_active, grace_checked, grace_run_deadline
+            grace_run_deadline = deadline
+            grace_active = True
+            try:
+                result = check_more_work(client, thread_id, deadline)
+            finally:
+                grace_active = False
+            grace_checked = True
+            self.assertFalse(result, "trailing notices were counted as another turn")
+            return result
+
+        def observed_next_frame(client: codex_mesh.Client, read_until: float) -> codex_mesh.RpcMessage | None:
+            nonlocal frame_read_active
+            if grace_active:
+                self.assertEqual(opened_windows, 1, "grace skipped its window and waited until the run deadline")
+                self.assertLess(read_until, grace_run_deadline, "grace waited until the run deadline")
+            elif grace_checked:
+                self.assertTrue(client.has_pending_frames, "stream waited again after the notices drained")
+            frame_read_active = True
+            try:
+                return next_frame(client, read_until)
+            finally:
+                frame_read_active = False
+
+        def observed_read(
+            client: codex_mesh.Client, deadline: float,
+            wake: codex_mesh.FollowEvents | codex_mesh.SocketOnlyWait = codex_mesh.SOCKET_ONLY_WAIT,
+        ) -> codex_mesh.RpcMessage | None:
+            frame = read(client, deadline, wake)
+            if grace_active and frame is None:
+                self.assertTrue(frame_read_active, "grace bypassed next_frame for a blocking read")
+            return frame
+
+        def observed_finish(stream: codex_mesh.TurnStream) -> codex_mesh.RunOutcome:
+            self.assertLess(time.time(), stream.deadline, "run finished at its hang guard")
+            return finish_stream(stream)
+
+        with (
+            patch.object(codex_mesh, "QUEUE_GRACE_SECS", SingleGraceWindow(0.05)),
+            patch.object(codex_mesh, "_more_work_coming", wraps=observed_more_work) as more_work,
+            patch.object(codex_mesh.Client, "next_frame", new=observed_next_frame),
+            patch.object(codex_mesh.Client, "_read", new=observed_read),
+            patch.object(codex_mesh, "_finish_stream", wraps=observed_finish) as finish,
+        ):
             code, errors = self.run_start()
-        self.assertLess(time.perf_counter() - started, 1, "trailing notices delayed one-turn exit")
+        more_work.assert_called_once()
+        self.assertEqual(opened_windows, 1)
+        finish.assert_called_once()
         self.assertEqual(code, 1 if failed else 0, errors)
         self.assertEqual(self.worker_record()["status"], "failed" if failed else "done")
         if failed:
@@ -8236,7 +8488,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
         self.assertNotIn("no completion notice arrived", log)
 
     def test_a_result_held_past_the_wall_clock_deadline_opens_the_next_turn(self) -> None:
-        self.start_args_timeout = 60
+        self.start_args_timeout = TEST_HANG_GUARD_SECS
         self.assertEqual(self.run_start(), (0, ""))
         self.outcomes = ["completed", "completed"]
         run = self.session_dir / codex_mesh.DETACHED_RUNS_DIR / "late.json"
@@ -8246,7 +8498,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
         clock_jumped = threading.Event()
         waiting = codex_mesh._waiting_on_detached_run  # pyright: ignore[reportPrivateUsage]
         quiet = codex_mesh._on_quiet_poll  # pyright: ignore[reportPrivateUsage]
-        budget = FixtureLoopBudget("held result past the deadline", seconds=20, max_calls=200)
+        budget = FixtureLoopBudget("held result past the deadline", seconds=TEST_HANG_GUARD_SECS, max_calls=200)
 
         def note_wait(session_dir: str, name: str, thread_id: str, runs: codex_mesh.DetachedRunWatch) -> bool:
             held = waiting(session_dir, name, thread_id, runs)
@@ -8258,23 +8510,33 @@ class FollowEventRegressionTests(MeshCommandFixture):
             stream: codex_mesh.TurnStream, log: TextIO,
         ) -> codex_mesh.StreamStep | codex_mesh.FailedWithThread:
             _ = budget.check()
-            if held_on_run.is_set():
+            step = quiet(stream, log)
+            if held_on_run.is_set() and not clock_jumped.is_set():
+                self.assertEqual(json.loads(run.read_text())["status"], "running",
+                                 "the result was published before the deadline jump")
                 # A suspended machine moves wall time past the deadline while
                 # the frame loop's monotonic clock keeps it running.
                 stream.deadline = time.time() - 1
                 clock_jumped.set()
-            return quiet(stream, log)
+            return step
 
         with (patch.object(codex_mesh, "_waiting_on_detached_run", note_wait),
               patch.object(codex_mesh, "_on_quiet_poll", jump_wall_clock),
               ThreadPoolExecutor(max_workers=1) as executor):
             future = executor.submit(self.run_follow)
-            self.assertTrue(held_on_run.wait(timeout=5), "launcher never waited on the live run")
-            _ = run.write_text(json.dumps({"worker": "worker", "status": "finished", "pid": os.getpid()}))
+            self.assertTrue(held_on_run.wait(timeout=TEST_HANG_GUARD_SECS),
+                            "launcher never waited on the live run")
+            # The live-run check can precede the quiet poll that applies the jump.
+            (self.session_dir / "worker.pending.json").touch()
+            self.assertTrue(clock_jumped.wait(timeout=TEST_HANG_GUARD_SECS),
+                            "launcher never observed the deadline jump")
             held = codex_mesh.hold_message(str(self.session_dir), "worker", "detached run result",
                                            without_launcher=False)
             self.assertIsInstance(held, codex_mesh.HeldForLauncher)
-            code, errors = future.result(timeout=10)
+            # Keep the inbox owned until its result is held, then announce run completion.
+            _ = run.write_text(json.dumps({"worker": "worker", "status": "finished", "pid": os.getpid()}))
+            (self.session_dir / "worker.pending.json").touch()
+            code, errors = future.result(timeout=TEST_HANG_GUARD_SECS)
         self.assertTrue(clock_jumped.is_set())
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(self.turn_inputs[-1], "detached run result")
@@ -8547,7 +8809,7 @@ class DirectorLifetimeTests(MeshCommandFixture):
         root = self.session_dir.parent
         home = root / "director-home"
         home.mkdir()
-        select_fixture_workers(home)
+        select_fixture_workers(home, notes=self.home)
         registry = root / "director-sessions"
         registry.mkdir()
         active = root / "active"
@@ -9779,6 +10041,12 @@ class RetryDecisionTests(unittest.TestCase):
 class QuotaRefusalTests(unittest.TestCase):
     """Which usage-limit failures are the provider's own, and so reported to the quota alert."""
 
+    home: Path  # pyright: ignore[reportUninitializedInstanceVariable]
+
+    @override
+    def setUp(self) -> None:
+        self.home = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/tmp")))
+
     @staticmethod
     def refused(outcome: codex_mesh.RunOutcome, tested: bool, resident: bool = False) -> bool:
         return codex_mesh._quota_refused(outcome, tested, resident)  # pyright: ignore[reportPrivateUsage]
@@ -9803,7 +10071,7 @@ class QuotaRefusalTests(unittest.TestCase):
         self.assertFalse(self.refused(codex_mesh.CapacityRetriesExhausted(THREAD_ID, 3, 20), tested=True))
 
     def test_refusal_handoff_preserves_named_window_or_unknown_and_observation_time(self) -> None:
-        identity = agent_accounts.KnownCodexAccount(Path.home() / ".codex", "serving@example.invalid", "codex1")
+        identity = agent_accounts.KnownCodexAccount(self.home / ".codex", "serving@example.invalid", "codex1")
         serving = codex_mesh.ServingCodexServer(4001, 99, identity.home, identity)
         for detail, window in ((USAGE_LIMIT + " Weekly limit reached", "weekly"),
                                (USAGE_LIMIT + " 5-hour limit reached", "five_hour"),
@@ -9888,7 +10156,7 @@ class QuotaRefusalTests(unittest.TestCase):
         self.assertNotIn("--stopped", cast(list[str], run.call_args.args[0]))
 
     def test_the_report_runs_the_blocked_verb_and_survives_its_failure(self) -> None:
-        identity = agent_accounts.KnownCodexAccount(Path.home() / ".codex", "serving@example.invalid", "codex1")
+        identity = agent_accounts.KnownCodexAccount(self.home / ".codex", "serving@example.invalid", "codex1")
         serving = codex_mesh.ServingCodexServer(4001, 99, identity.home, identity)
         done = subprocess.CompletedProcess([], 0, "switched to claude for codex1: worker\n", "")
         with patch.object(subprocess, "run", return_value=done) as run, \
@@ -12448,7 +12716,7 @@ class WorkersHomeTests(unittest.TestCase):
         self.session_dir = root / "run"
         self.session_dir.mkdir()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.home), "AGENT_NOTES_DIR": str(self.home)}, clear=True)))
-        select_fixture_workers(self.home)
+        select_fixture_workers(self.home, notes=self.home)
         _ = self.enterContext(patch.object(codex_mesh, "_server_folder", return_value=codex_mesh.NonMeshServerStderr()))
         _ = self.enterContext(patch.object(sessions, "running_sessions", return_value=[
             running_holder(holder) for holder in ("director-one", "director-two", "holder-id", "test-holder")]))
@@ -13752,15 +14020,28 @@ class ServerRecordTests(unittest.TestCase):
             },
         }), encoding="utf-8")
 
-        started = time.monotonic()
-        with patch.object(codex_mesh, "PAUSE_INTERRUPT_SECS", 0.5), \
-                contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+        connect = socket.create_connection
+        read = MagicMock(side_effect=TimeoutError("app-server handshake timed out"))
+
+        def silent_connection(address: tuple[str, int], *, timeout: float) -> socket.socket:
+            self.assertLessEqual(timeout, TEST_HANG_GUARD_SECS,
+                                 "pause omitted its deadline before a blocking handshake")
+            connection = connect(address, timeout=timeout)
+            self.addCleanup(connection.close)
+            # Keep real connect/send/timeout handling; deliver the hung read's timeout as an event.
+            return cast(socket.socket, MagicMock(wraps=connection, recv=read))
+
+        with (patch.object(codex_mesh, "PAUSE_INTERRUPT_SECS", TEST_HANG_GUARD_SECS),
+              patch.object(codex_mesh, "CONNECT_TIMEOUT_SECS", 2 * TEST_HANG_GUARD_SECS),
+              patch.object(socket, "create_connection", wraps=silent_connection) as connections,
+              contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO())):
             with self.assertRaisesRegex(SystemExit, "servers kept alive"):
                 _ = codex_mesh.command_stop(
                     argparse.Namespace(session_dir=str(self.session_dir), pause=True)
                 )
 
-        self.assertLess(time.monotonic() - started, 10)
+        connections.assert_called_once()
+        read.assert_called_once_with(4096)
         self.assertIsNone(self.spawned[0].poll(), "pause destroyed an unconfirmed queue")
         self.assertTrue((self.session_dir / codex_mesh.SERVER_FILE).exists())
         roster = cast("dict[str, dict[str, object]]", json.loads(

@@ -877,7 +877,7 @@ class QueueApiTests(MemoryQueueFixture):
         if isinstance(reason, gate.HeadAdmissionStatus):
             self.assertEqual(gate.head_wait_text(reason, ZoneInfo("America/New_York")),
                              "head: needs 10.9 GiB; builds use 23.5 of the 20.0 GiB budget "
-                             + "(starts when build use falls to 9.1 GiB); needs 34.4 GiB free; 23.1 free; younger steps wait")
+                             + "(starts when build use falls to 9.1 GiB); needs 34.4 GiB free; 23.1 free; younger steps wait until 18:10")
         self.assertCountEqual([row.measured for row in view.running],
                               [gate.MeasuredMemory(GIB, 12 * GIB), gate.MeasuredMemory(2 * GIB, int(11.5 * GIB))])
 
@@ -904,6 +904,51 @@ class QueueApiTests(MemoryQueueFixture):
         self.assertTrue(cast(gate.Waiter, json.loads(path.read_text())).get("holds_younger", False))
         self.assertEqual(self.check(need=1, free=40).decision.state, "hold")
 
+    def test_strict_backfill_strict_windows_keep_queue_and_admission_in_agreement(self) -> None:
+        _ = self.running(100, 12)
+        self.readings[100] = gate.MeasuredMemory(3 * GIB)
+        path = self.head(19.3)
+        self.readings[400] = gate.MeasuredMemory(0)
+        _ = self.meminfo.write_text(f"MemAvailable: {20 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
+        for elapsed, state, deadline, window in ((0, "hold", "18:10", "wait"),
+                                                  (600, "admit", "18:12", "may start"),
+                                                  (720, "hold", "18:22", "wait")):
+            clock = NOW + timedelta(seconds=elapsed)
+            if elapsed == 600:
+                with patch.object(time, "time", return_value=clock.timestamp()):
+                    before = gate.queue_view()
+                self.assertIsInstance(before.waiting[1].reason, gate.ReadyForAdmission)
+            profile = gate.StepProfile("test", "nextest", "test", gate.ExpectedPeak(GIB, "measured", 5))
+            result = gate.check(self.meminfo, 400, "", ["cargo", "nextest"], root=self.root,
+                                now=clock, profile=profile)
+            self.assertEqual(result.decision.state, state)
+            with patch.object(time, "time", return_value=clock.timestamp()):
+                view = gate.queue_view()
+            text = gate.head_wait_text(cast(gate.HeadAdmissionStatus, view.waiting[0].reason),
+                                       ZoneInfo("America/New_York"))
+            self.assertTrue(text.endswith(f"younger steps {window} until {deadline}"), text)
+            if state == "hold":
+                self.assertIsInstance(view.waiting[1].reason, gate.BehindHead)
+            else:
+                # While this child runs, the head still names its backfill window.
+                self.assertIsInstance(result.reservation, gate.Reserved)
+                if isinstance(result.reservation, gate.Reserved):
+                    result.reservation.path.unlink()
+            row = cast(gate.Waiter, json.loads(path.read_text()))
+            self.assertEqual(row.get("priority_since"), NOW.timestamp())
+
+    def test_bump_restarts_strict_window_during_backfill(self) -> None:
+        path = self.waiter(300, NOW.timestamp() - 2400, "/tmp/head", "head")
+        row = cast(gate.Waiter, json.loads(path.read_text()))
+        row["holds_younger"], row["priority_since"] = True, NOW.timestamp() - 600
+        _ = path.write_text(json.dumps(row))
+        self.assertIsInstance(gate.head_window(row, NOW.timestamp()), gate.BackfillUntil)
+        _ = gate.bump_waiter("head", "actor")
+        self.assertEqual(self.check(need=1, free=40).decision.state, "hold")
+        row = cast(gate.Waiter, json.loads(path.read_text()))
+        self.assertEqual(row.get("priority_since"), NOW.timestamp())
+        self.assertIsInstance(gate.head_window(row, NOW.timestamp()), gate.StrictUntil)
+
     def test_psi_11_holds_backfill_without_making_the_young_head_strict(self) -> None:
         _ = self.waiter(300, NOW.timestamp() - 540, "/tmp/head", "head")
         pressure = self.root / "pressure"
@@ -929,7 +974,7 @@ class QueueApiTests(MemoryQueueFixture):
         reason = view.waiting[0].reason
         self.assertIsInstance(reason, gate.HeadAdmissionStatus)
         if isinstance(reason, gate.HeadAdmissionStatus):
-            self.assertEqual(gate.head_wait_text(reason, ZoneInfo("America/New_York")), "head: needs 22.3 GiB free; 21.9 free; younger steps wait")
+            self.assertEqual(gate.head_wait_text(reason, ZoneInfo("America/New_York")), "head: needs 22.3 GiB free; 21.9 free; younger steps wait until 18:10")
         self.assertIsInstance(view.waiting[1].reason, gate.BehindHead)
 
     def test_mature_builds_hold_head_on_13_point_2_used_not_72_point_3_promised(self) -> None:
@@ -952,7 +997,7 @@ class QueueApiTests(MemoryQueueFixture):
         if isinstance(result.head_reason, gate.HeadAdmissionStatus):
             text = gate.head_wait_text(result.head_reason, ZoneInfo("America/New_York"))
             self.assertEqual(text, "head: needs 15.1 GiB; builds use 13.2 of the 20.0 GiB budget "
-                             + "(starts when build use falls to 4.9 GiB); younger steps wait")
+                             + "(starts when build use falls to 4.9 GiB); younger steps wait until 18:10")
             arguments = ["memory_admit.py", "check", str(self.meminfo), "300", "", "0",
                          "test", "nextest", "test", str(int(15.1 * GIB)), "measured", "5", "cargo", "nextest"]
             for detail in ("", "1"):
@@ -971,7 +1016,7 @@ class QueueApiTests(MemoryQueueFixture):
         self.assertEqual(gate.queue_view().waiting[0].reason, result.head_reason)
         self.assertIsInstance(result.head_reason, gate.HeadAdmissionStatus)
         if isinstance(result.head_reason, gate.HeadAdmissionStatus):
-            self.assertEqual(gate.head_wait_text(result.head_reason, ZoneInfo("America/New_York")), "head: needs 18.1 GiB free; 18.0 free; younger steps wait")
+            self.assertEqual(gate.head_wait_text(result.head_reason, ZoneInfo("America/New_York")), "head: needs 18.1 GiB free; 18.0 free; younger steps wait until 18:10")
 
     def test_drained_head_starts_below_memory_floor_and_a_younger_check_cannot_take_its_place(self) -> None:
         running = self.running(100, 12)
@@ -1049,7 +1094,8 @@ class QueueApiTests(MemoryQueueFixture):
         self.assertEqual((head.pid, head.since), (original.pid, original.since))
         self.assertIsInstance(head.reason, gate.HeadAdmissionStatus)
         self.assertEqual(cast(gate.HeadAdmissionStatus, head.reason).decision.state, "admit")
-        held = self.check(pid=original.pid, free=0, since=original.since)
+        with patch.object(gate, "read_pressure", return_value=gate.MemoryPressure(11)):
+            held = self.check(pid=original.pid, free=0, since=original.since)
         self.assertEqual(held.decision.state, "hold")
         row = cast(dict[str, object], json.loads(paths[-1].read_text()))
         self.assertEqual(row["since"], original.since)
@@ -1279,6 +1325,11 @@ class ShellTests(unittest.TestCase):
             root = Path(folder)
             meminfo = root / "meminfo"
             _ = meminfo.write_text("MemAvailable: 0 kB\n")
+            directory = gate.admission_dir(root)
+            _ = (directory / "400-start.waiting").write_text(json.dumps({
+                "pid": 400, "start_time": "start", "need": 12 * GIB, "since": time.time(),
+                "repo_identity": "", "test_scope": "full", "estimated_at": time.time(),
+            }))
             arguments = ["memory_admit.py", "check", str(meminfo), "400", "", "0", "repo", "nextest",
                          "clone88ci", str(12 * GIB), "fallback", "0", "cargo", "nextest"]
             for detail, count in (("", 15), ("1", 18)):
@@ -1291,6 +1342,87 @@ class ShellTests(unittest.TestCase):
                 fields = output.getvalue().strip().split("|")
                 self.assertEqual(len(fields), count)
                 self.assertEqual(fields[14], "clone88ci")
+
+    def test_shell_replaces_old_need_and_source_with_refreshed_estimate(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "proc").mkdir()
+            meminfo = root / "meminfo"
+            _ = meminfo.write_text("MemAvailable: 0 kB\n")
+            calls = root / "calls.jsonl"
+            wrapper = root / "checker.py"
+            _ = wrapper.write_text(
+                "import json, sys\nfrom pathlib import Path\n"
+                + f"sys.path.insert(0, {str(MEMORY_GATE.parent)!r})\nimport memory_admit as gate\n"
+                + f"calls = Path({str(calls)!r})\n"
+                + "previous = calls.read_text().splitlines() if calls.exists() else []\n"
+                + "with calls.open('a') as stream: stream.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                + "if not previous:\n"
+                + "    pid = int(sys.argv[3]); start = gate.process_start_time(pid)\n"
+                + "    row = {'pid': pid, 'start_time': start, 'need': int(19.3 * gate.GIB), 'since': float(sys.argv[5])}\n"
+                + "    (gate.admission_dir(gate.store.root()) / f'{pid}-{start}.waiting').write_text(json.dumps(row))\n"
+                + "    print('|'.join(map(str, ['hold', 23 * gate.GIB, row['need'], 'measured', 7, 0, 0, 3 * gate.GIB, '', '', 'repo', 'nextest', 0, 'held', 'repo', 0, 0, ''])))\n"
+                + "else:\n"
+                + "    gate.git_identity = lambda argv, cwd: (gate.RepositoryIdentity('https://example.org/hana', 'hana'), 'repo')\n"
+                + "    gate.expected_peak = lambda *args, **kwargs: gate.ExpectedPeak(2 * gate.GIB, 'pooled', 5)\n"
+                + "    gate.main()\n")
+            command = ('source "$1"; BUILDLOG_MEM_ADMIT_SCRIPT=$2; sleeps=0; '
+                       'sleep() { sleeps=$((sleeps + 1)); if (( sleeps == 2 )); then '
+                       'printf "MemAvailable: 41943040 kB\\n" > "$BUILDLOG_MEMINFO"; fi; }; '
+                       'buildlog_wait_for_memory cargo nextest')
+            result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE), str(wrapper)],
+                                    capture_output=True, text=True, check=False, timeout=300,
+                                    env={**os.environ, "HOME": folder, "BUILDLOG_DIR": str(root / "log"),
+                                         "BUILDLOG_MEMINFO": str(meminfo), "BUILDLOG_PROC": str(root / "proc"),
+                                         "BUILD_HOLD_DIR": str(root / "holders"),
+                                         "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+                                         "UNIT_ACTIVE_DIR": str(root / "active"), "UNIT_RUN_DIR": "",
+                                         "BUILDLOG_CALL_ID": "", "BUILDLOG_HOLD_WAIT_FILE": "",
+                                         "BUILDLOG_HOLD_WAITER_FILE": "", "LINT_QUEUE_LEAVE_HOOK": "",
+                                         "BUILDLOG_MAC_IDLE_HOOK": ""})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            arguments = [cast(list[str], json.loads(line)) for line in calls.read_text().splitlines()]
+            self.assertEqual(len(arguments), 3)
+            self.assertEqual((arguments[1][8], arguments[1][9]), (str(int(19.3 * GIB)), "measured"))
+            self.assertEqual((arguments[2][8], arguments[2][9]), (str(2 * GIB), "pooled"))
+            row = cast(gate.Reservation, json.loads(next((root / "log/admission").glob("*.reservation")).read_text()))
+            self.assertEqual((row["need"], row.get("repo_identity")), (2 * GIB, "https://example.org/hana"))
+
+    def test_old_waiter_reestimates_and_current_waiter_refreshes_after_ten_minutes(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            meminfo = root / "meminfo"
+            _ = meminfo.write_text("MemAvailable: 0 kB\n")
+            path = gate.admission_dir(root) / "400-start.waiting"
+            _ = path.write_text(json.dumps({"pid": 400, "start_time": "start",
+                                            "need": int(19.3 * GIB), "since": NOW.timestamp()}))
+            arguments = ["memory_admit.py", "check", str(meminfo), "400", "", str(NOW.timestamp()),
+                         "repo", "nextest", "repo", str(int(19.3 * GIB)), "measured", "7", "cargo", "nextest"]
+            with patch.dict(os.environ, {"BUILDLOG_DIR": folder}), \
+                 patch.object(gate, "process_start_time", return_value="start"), \
+                 patch.object(gate, "process_table", return_value={}), \
+                 patch.object(gate, "git_identity", return_value=(HANA, "repo")) as identity, \
+                 patch.object(gate, "expected_peak", side_effect=[gate.ExpectedPeak(2 * GIB, "pooled", 5),
+                                                                gate.ExpectedPeak(3 * GIB, "measured", 6)]) as history:
+                for elapsed, expected_need, expected_source, lookups in (
+                        (0, 2 * GIB, "pooled", 1), (599, 2 * GIB, "pooled", 1),
+                        (600, 3 * GIB, "measured", 2)):
+                    clock = NOW + timedelta(seconds=elapsed)
+                    output = io.StringIO()
+                    with patch.object(sys, "argv", arguments), redirect_stdout(output), \
+                         patch.object(time, "time", return_value=clock.timestamp()), \
+                         patch.object(gate, "datetime", wraps=datetime) as dates:
+                        dates.configure_mock(**{"now.return_value": clock})
+                        gate.main()
+                    fields = output.getvalue().strip().split("|")
+                    self.assertEqual((int(fields[2]), fields[3]), (expected_need, expected_source))
+                    row = cast(gate.Waiter, json.loads(path.read_text()))
+                    self.assertEqual((row["need"], row.get("repo_identity"), row.get("test_scope")),
+                                     (expected_need, HANA.key, "full"))
+                    self.assertEqual(history.call_count, lookups)
+                    self.assertEqual(identity.call_count, lookups)
+                    arguments = [*arguments[:6], fields[10], fields[11], fields[14],
+                                 fields[2], fields[3], fields[4], "cargo", "nextest"]
 
     def test_cached_poll_keeps_repository_and_filter_scope_in_the_recorded_peak(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

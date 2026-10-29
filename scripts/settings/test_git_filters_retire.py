@@ -9,6 +9,9 @@ import unittest
 from pathlib import Path
 from typing import final, override
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 TABLE = Path(__file__).with_name("git_filters_table.sh")
 BASH = shutil.which("bash") or "/bin/bash"
 DEFAULTS = "[direct.codex]\nimpl=gpt-a:xhigh\n"
@@ -58,7 +61,7 @@ class RetireTests(unittest.TestCase):
                        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
                        "GIT_COMMITTER_EMAIL": "t@t"}
         done = subprocess.run(["git", "-C", str(self.root), *arguments], capture_output=True, text=True,
-                              env=environment, check=True, timeout=30)
+                              env=environment, check=True, timeout=TEST_HANG_GUARD_SECS)
         return done.stdout
 
     def write_old(self, path: Path, text: str) -> None:
@@ -73,7 +76,7 @@ class RetireTests(unittest.TestCase):
         done = subprocess.run([BASH, "-c", 'source "$0" && git_filters_retire "$1"', str(TABLE), str(self.root)],
                               capture_output=True, text=True, env={**os.environ, "GIT_CONFIG_GLOBAL": os.devnull,
                                                                   "GIT_CONFIG_NOSYSTEM": "1"},
-                              check=True, timeout=30)
+                              check=True, timeout=TEST_HANG_GUARD_SECS)
         return done.stdout
 
     def test_local_rows_the_filter_hid_show_as_modified_and_checkout_resets_them(self) -> None:

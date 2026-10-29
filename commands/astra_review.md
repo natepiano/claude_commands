@@ -4,18 +4,6 @@ description: Ask a gpt-6-astra Codex reviewer, on the current workers account, t
 
 # astra_review
 
-<Guild>
-
-Your guild is `reviewers`. Your head is the `reviewers` unit director in the `guilds` production on natedev. At skill start, use the Tips lock/pull rule for `~/rust/nate_style` and load `guilds/common/` and `guilds/reviewers/`; a Codex holder does this for its worker. Report to your head when the user corrects you, a phase needs repair round 4, a finding meets the Events repeat rule, you use a workaround for a tool fault or slow rule, or a method saves measured time. Send one report of at most 100 words, with evidence and result. Resolve the head from `message/roster.py --json` by production `guilds` and unit `reviewers`; send with `message/send.py` or SendMessage. A Codex worker puts the report in its reply for its holder to send. Send only to the head. Never wake an idle Codex member for guild advice.
-
-Load tips: ~/.claude/scripts/lib/py ~/.claude/scripts/guilds/tips.py load --guild reviewers
-
-Use Events in `~/.claude/docs/as-built/guilds.md` for report detection and form.
-
-The script loads the reviewers block and tip text into each prompt. A Codex
-holder relays a guild report in the reply unchanged.
-</Guild>
-
 One Codex turn with gpt-6-astra at reasoning xhigh reads the document read-only
 and reviews it: clarity, correctness, gaps, risks and what it would change, with
 each finding tied to a section or a file and line. The user, showrunners and unit

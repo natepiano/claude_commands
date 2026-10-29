@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import override
 from unittest import mock
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import fake_unit_host
@@ -249,7 +252,7 @@ class UnitLookupTests(unittest.TestCase):
         # During an account move many sessions exit at once; their records are not evidence about other panes.
         self.hosts({"$1": marked("trunk", "w4:p1", "trunk-unit")})
         exited = subprocess.Popen(["true"])
-        _ = exited.wait(timeout=30)
+        _ = exited.wait(timeout=TEST_HANG_GUARD_SECS)
         _ = (self.records / f"{exited.pid}.json").write_text("{")
         self.assertIsInstance(unit_lookup.marked_units("show")["trunk-unit"].claude, ClaudeNotRunning)
 

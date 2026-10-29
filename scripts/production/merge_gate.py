@@ -648,7 +648,7 @@ class PassedTreeLedger:
             self.report_error(error)
         return NoCertifiedBase()
 
-    def record_pass(self, kind: Literal["full", "affected"] = "full") -> None:
+    def record_pass(self, selection: AffectedSelection | FullSuite) -> None:
         if self.unavailable or isinstance(self.tree, UnrecordableTestTree):
             return
         try:
@@ -659,7 +659,10 @@ class PassedTreeLedger:
                 return
             record = {"tree": self.tree.tree, "commit": self.tree.commit,
                       "at": datetime.now(UTC).isoformat(), "host": host_name(),
-                      "checkout": str(self.repo.resolve()), "suites": sorted(TEST_SUITES), "source": self.source, "kind": kind}
+                      "checkout": str(self.repo.resolve()), "suites": sorted(TEST_SUITES), "source": self.source,
+                      "kind": "full" if isinstance(selection, FullSuite) else "affected"}
+            if isinstance(selection, FullSuite):
+                record["reason"] = selection.reason
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as ledger:
                 line = (json.dumps(record) + "\n").encode("utf-8")
@@ -734,7 +737,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     selection: AffectedSelection | FullSuite = FullSuite("passed tree reused")
     if not reused:
         selection = (required if isinstance(required, FullSuite) else FullSuite("--full") if full else
-                     select_affected(repo, ledger.certified_base(), [path for _, path in modules]))
+                     select_affected(repo, ledger.certified_base(), [path for _, path in modules], state_dir=gate_state_dir()))
         report_selection(selection, len(modules))
         if isinstance(selection, AffectedSelection):
             selected = set(selection.modules)
@@ -898,8 +901,9 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
         print(f"Slow module: {slow} ({SLOW_MODULE_FACTOR:g}x or more)", flush=True)
     if hold.seconds > 0:
         print(f"Gate hold wait: {hold.seconds:.2f}s (excluded from Gate tests)", flush=True)
+    full_reason = f"; full suite: {selection.reason}" if isinstance(selection, FullSuite) and not reused else ""
     print(f"Gate tests: {elapsed:.2f}s; at most {max_running_jobs} modules at once; "
-          + f"peak memory: {admission.peak_mib / 1024:.3f} GiB (sampled memory); cap: {memory_cap_mib / 1024:.3f} GiB", flush=True)
+          + f"peak memory: {admission.peak_mib / 1024:.3f} GiB (sampled memory); cap: {memory_cap_mib / 1024:.3f} GiB{full_reason}", flush=True)
     print(f"Largest module peak: {largest_module_peak_mib / 1024:.3f} GiB (sampled memory); module: {largest_module or '(not sampled)'}", flush=True)
     print(f"One-minute load: start={starting_load:.2f} max={maximum_load:.2f} end={ending_load:.2f}", flush=True)
     if admission.peak_mib > memory_cap_mib:
@@ -907,7 +911,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     run = GateRun(tuple(results), elapsed, admission.peak_mib, admission.peak_mib <= memory_cap_mib, reused,
                   isinstance(selection, AffectedSelection))
     if run.passed and not reused:
-        ledger.record_pass("affected" if isinstance(selection, AffectedSelection) else "full")
+        ledger.record_pass(selection)
         if isinstance(selection, FullSuite):
             (gate_state_dir() / "full-required").unlink(missing_ok=True)
     return run

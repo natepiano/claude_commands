@@ -23,6 +23,9 @@ from scripts.usage.test_collect import (
 )
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 class DefaultSourcesTests(unittest.TestCase):
     def test_first_read_accepts_a_concurrent_baseline_conversion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -118,7 +121,7 @@ class OutcomeFixture(CollectorFixture):
                            GIT_COMMITTER_NAME="Fixture", GIT_COMMITTER_EMAIL="fixture@example.invalid",
                            GIT_AUTHOR_DATE=at, GIT_COMMITTER_DATE=at)
         result = subprocess.run(["git", "-C", str(repository), *arguments], env=environment,
-                                capture_output=True, text=True, check=False, timeout=10)
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result.stdout.strip()
 

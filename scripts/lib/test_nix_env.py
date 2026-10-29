@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import shlex
 import subprocess
 import sys
 from typing import cast
 from unittest.mock import patch
+
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import nix_env
@@ -104,7 +108,7 @@ class EnsureTests(NixFixture):
 
     def cli(self, *arguments: str, extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(HELPER), *arguments], cwd=self.work,
-                              env={**self.env, **(extra or {})}, capture_output=True, text=True, timeout=10, check=False)
+                              env={**self.env, **(extra or {})}, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
 
     def test_cli_ensure_json_and_refusal_exit(self) -> None:
         _ = self.envrc(self.work)
@@ -138,3 +142,109 @@ class EnsureTests(NixFixture):
         result = self.cli("exec", str(program), "argument with spaces")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), ["impure", ["argument with spaces"], str(self.work)])
+
+
+class RegisteredWorktreeTests(NixFixture):
+    def git(self, directory: Path, *arguments: str) -> str:
+        result = subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t", *arguments],
+            cwd=directory, env=self.env, capture_output=True, text=True, timeout=10, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def repository(self, directory: Path) -> Path:
+        _ = self.envrc(directory)
+        _ = self.git(directory, "init")
+        _ = self.git(directory, "add", ".envrc")
+        _ = self.git(directory, "commit", "-m", "fixture")
+        return directory
+
+    def worktree(self, repository: Path, directory: Path) -> Path:
+        directory.parent.mkdir(parents=True, exist_ok=True)
+        _ = self.git(repository, "worktree", "add", "--detach", str(directory), "HEAD")
+        return directory
+
+    def assert_explicit_approval_required(self, directory: Path) -> None:
+        before = len(self.direnv_calls())
+        outcome = nix_env.ensure(directory, {**self.env, "DIRENV_DENY": "1"})
+        self.assertIsInstance(outcome, nix_env.Refused)
+        if not isinstance(outcome, nix_env.Refused):
+            self.fail(str(outcome))
+        self.assertIn(shlex.join(["direnv", "allow", str(directory / ".envrc")]), outcome.reason)
+        self.assertEqual(self.direnv_calls()[before:], [
+            {"args": ["export", "json"], "cwd": str(directory)}])
+        self.assertFalse(Path(self.env["DIRENV_APPROVAL"]).exists())
+
+    def test_trusted_repository_registered_snapshot_is_automatically_allowed(self) -> None:
+        repository = self.repository(self.home / "rust/repo")
+        checkout = self.worktree(repository, self.root / "tmp/session/style-sync-lint-x/checkout")
+        outcome = nix_env.ensure(checkout, {**self.env, "DIRENV_DENY": "1"})
+        self.assertIsInstance(outcome, nix_env.Loaded)
+        self.assertEqual(self.direnv_calls(), [
+            {"args": ["allow", str(checkout / ".envrc")], "cwd": str(checkout)},
+            {"args": ["export", "json"], "cwd": str(checkout)}])
+        with patch.object(subprocess, "run", side_effect=AssertionError("trust checks must only read files")):
+            self.assertTrue(nix_env.registered_worktree(checkout))
+
+    def test_clone_of_trusted_repository_still_requires_explicit_approval(self) -> None:
+        repository = self.repository(self.home / "rust/repo")
+        clone = self.root / "tmp/clone"
+        clone.parent.mkdir(parents=True)
+        _ = self.git(self.root, "clone", str(repository), str(clone))
+        self.assert_explicit_approval_required(clone)
+
+    def test_forged_git_file_cannot_borrow_a_registered_entry(self) -> None:
+        repository = self.repository(self.home / "rust/repo")
+        checkout = self.worktree(repository, self.root / "tmp/real")
+        forged = self.root / "tmp/forged"
+        _ = self.envrc(forged)
+        _ = (forged / ".git").write_text((checkout / ".git").read_text(encoding="utf-8"), encoding="utf-8")
+        self.assert_explicit_approval_required(forged)
+
+    def test_worktree_of_untrusted_repository_still_requires_explicit_approval(self) -> None:
+        repository = self.repository(self.root / "outside/repo")
+        checkout = self.worktree(repository, self.root / "tmp/wt")
+        self.assert_explicit_approval_required(checkout)
+
+    def test_relative_registration_pointers_are_accepted(self) -> None:
+        repository = self.repository(self.home / "rust/repo")
+        checkout = self.worktree(repository, self.root / "tmp/wt")
+        entry = Path((checkout / ".git").read_text(encoding="utf-8").strip().removeprefix("gitdir: "))
+        _ = (checkout / ".git").write_text("gitdir: " + os.path.relpath(entry, checkout) + "\n", encoding="utf-8")
+        _ = (entry / "gitdir").write_text(os.path.relpath(checkout / ".git", entry) + "\n", encoding="utf-8")
+        self.assertTrue(nix_env.registered_worktree(checkout))
+
+    def test_missing_or_malformed_registration_files_fail_closed(self) -> None:
+        repository = self.repository(self.home / "rust/repo")
+        checkout = self.worktree(repository, self.root / "tmp/wt")
+        git_file = checkout / ".git"
+        entry = Path(git_file.read_text(encoding="utf-8").strip().removeprefix("gitdir: "))
+        for path in (git_file, entry / "commondir", entry / "gitdir"):
+            original = path.read_text(encoding="utf-8")
+            for replacement in (None, "", "missing\n", original + "extra line\n", "\0\n"):
+                with self.subTest(path=path.name, replacement=replacement):
+                    try:
+                        if replacement is None:
+                            path.unlink()
+                        else:
+                            _ = path.write_text(replacement, encoding="utf-8")
+                        self.assertFalse(nix_env.registered_worktree(checkout))
+                    finally:
+                        _ = path.write_text(original, encoding="utf-8")
+
+    def test_symlink_git_file_cannot_supply_registration(self) -> None:
+        repository = self.repository(self.home / "rust/repo")
+        checkout = self.worktree(repository, self.root / "tmp/wt")
+        git_file = checkout / ".git"
+        saved = checkout / "saved-git-file"
+        _ = git_file.rename(saved)
+        git_file.symlink_to(saved)
+        self.assert_explicit_approval_required(checkout)
+
+    def test_registered_worktree_cannot_approve_a_symlink_to_an_unrelated_envrc(self) -> None:
+        repository = self.repository(self.home / "rust/repo")
+        checkout = self.worktree(repository, self.root / "tmp/wt")
+        outside = self.envrc(self.root / "outside")
+        (checkout / ".envrc").unlink()
+        (checkout / ".envrc").symlink_to(outside)
+        self.assert_explicit_approval_required(checkout)

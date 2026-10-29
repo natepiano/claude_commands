@@ -7,6 +7,7 @@ import os
 import re
 import select
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -15,6 +16,9 @@ from pathlib import Path
 from threading import Barrier
 from typing import cast, override
 
+
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
 
 BOARD = Path(__file__).with_name("board.sh")
 
@@ -38,7 +42,7 @@ class BoardReclaimTests(unittest.TestCase):
         return subprocess.run(
             ["bash", str(BOARD), command, str(self.root), *arguments],
             env={**os.environ, "UNIT_NOW_EPOCH": str(epoch)},
-            capture_output=True, text=True, check=False, timeout=10,
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
 
     def holder_process(self) -> subprocess.Popen[bytes]:
@@ -63,7 +67,7 @@ class BoardReclaimTests(unittest.TestCase):
         self.assertIsNotNone(helper.stdout)
         if helper.stdout is None:
             self.fail("guard helper has no stdout")
-        ready, _, _ = select.select([helper.stdout], [], [], 5)
+        ready, _, _ = select.select([helper.stdout], [], [], TEST_HANG_GUARD_SECS)
         self.assertTrue(ready, "guard helper did not start")
         self.assertEqual(cast(str, helper.stdout.readline()).strip(), "locked")
         return helper
@@ -72,13 +76,13 @@ class BoardReclaimTests(unittest.TestCase):
     def stop_holder(holder: subprocess.Popen[bytes]) -> None:
         if holder.poll() is None:
             holder.kill()
-        _ = holder.wait(timeout=5)
+        _ = holder.wait(timeout=TEST_HANG_GUARD_SECS)
 
     @staticmethod
     def stop_guard(helper: subprocess.Popen[str]) -> None:
         if helper.poll() is None:
             helper.kill()
-        _ = helper.wait(timeout=5)
+        _ = helper.wait(timeout=TEST_HANG_GUARD_SECS)
         if helper.stdout is not None:
             helper.stdout.close()
 
@@ -101,7 +105,7 @@ class BoardReclaimTests(unittest.TestCase):
         self.assert_acquired(self.board("acquire", "holder", "cargo", "--pid", str(holder.pid)),
                              "acquired cargo")
         holder.kill()
-        _ = holder.wait(timeout=5)
+        _ = holder.wait(timeout=TEST_HANG_GUARD_SECS)
 
         self.assert_acquired(self.board("acquire", "next", "cargo", "--wait", "0"),
                              "acquired cargo (reclaimed from holder)")
@@ -121,9 +125,9 @@ class BoardReclaimTests(unittest.TestCase):
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
         )
         run.kill()
-        _ = run.wait(timeout=5)
+        _ = run.wait(timeout=TEST_HANG_GUARD_SECS)
 
-        _, errors = waiter.communicate(timeout=10)
+        _, errors = waiter.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(waiter.returncode, 4, errors)
         self.assertIn(f"gone cargo: pid {run.pid} ended while it waited", errors)
         self.assertEqual((self.lock / "holder_pid").read_text(), str(holder.pid))
@@ -133,7 +137,7 @@ class BoardReclaimTests(unittest.TestCase):
         self.assert_acquired(self.board("acquire", "holder", "cargo", "--pid", str(holder.pid)),
                              "acquired cargo")
         holder.kill()
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
         state = ""
         while time.monotonic() < deadline:
             state = subprocess.run(["ps", "-p", str(holder.pid), "-o", "stat="],
@@ -150,7 +154,7 @@ class BoardReclaimTests(unittest.TestCase):
         self.assert_acquired(self.board("acquire", "holder", "cargo", "--pid", str(holder.pid),
                                         "--hold", "10"), "acquired cargo")
         holder.kill()
-        _ = holder.wait(timeout=5)
+        _ = holder.wait(timeout=TEST_HANG_GUARD_SECS)
 
         self.assert_acquired(self.board("acquire", "next", "cargo", "--wait", "0", epoch=1011),
                              "acquired cargo (reclaimed from holder)")
@@ -183,7 +187,7 @@ class BoardReclaimTests(unittest.TestCase):
     def test_old_pid_file_does_not_trigger_reclaim(self) -> None:
         holder = self.holder_process()
         holder.kill()
-        _ = holder.wait(timeout=5)
+        _ = holder.wait(timeout=TEST_HANG_GUARD_SECS)
         self.lock.mkdir(parents=True)
         _ = (self.lock / "holder").write_text("holder")
         _ = (self.lock / "expires").write_text("4600")
@@ -214,11 +218,11 @@ class BoardReclaimTests(unittest.TestCase):
         self.assert_acquired(self.board("acquire", "holder", "cargo", "--pid", str(holder.pid)),
                              "acquired cargo")
         holder.kill()
-        _ = holder.wait(timeout=5)
+        _ = holder.wait(timeout=TEST_HANG_GUARD_SECS)
         start = Barrier(8)
 
         def contender(index: int) -> subprocess.CompletedProcess[str]:
-            _ = start.wait(timeout=10)
+            _ = start.wait(timeout=TEST_HANG_GUARD_SECS)
             return self.board("acquire", f"next{index}", "cargo", "--wait", "0")
 
         with ThreadPoolExecutor(max_workers=8) as workers:
@@ -235,7 +239,7 @@ class BoardReclaimTests(unittest.TestCase):
         self.assert_acquired(self.board("acquire", "holder", "cargo", "--pid", str(holder.pid)),
                              "acquired cargo")
         holder.kill()
-        _ = holder.wait(timeout=5)
+        _ = holder.wait(timeout=TEST_HANG_GUARD_SECS)
         original = {name: (self.lock / name).read_text()
                     for name in ("holder", "expires", "holder_pid")}
         guard_holder = self.guard_process()
@@ -253,16 +257,35 @@ class BoardReclaimTests(unittest.TestCase):
     def test_release_waits_for_guard_before_removing_lock(self) -> None:
         self.assert_acquired(self.board("acquire", "holder", "cargo"), "acquired cargo")
         guard_holder = self.guard_process()
+        # Observe the retry after a real failed lock attempt, then hold that
+        # retry until the parent has checked the lock and released the guard.
+        retry_read, retry_write = os.pipe()
+        continue_read, continue_write = os.pipe()
+        for descriptor in (retry_read, retry_write, continue_read, continue_write):
+            self.addCleanup(os.close, descriptor)
+        tools = self.root / "bin"
+        tools.mkdir()
+        sleeper = tools / "sleep"
+        _ = sleeper.write_text(
+            f"#!{sys.executable}\nimport os\n"
+            + f"os.write({retry_write}, b'R')\n"
+            + f"os.read({continue_read}, 1)\n"
+        )
+        sleeper.chmod(0o755)
         release = subprocess.Popen(
             ["bash", str(BOARD), "release", str(self.root), "holder", "cargo"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ["PATH"]},
+            pass_fds=(retry_write, continue_read),
         )
         self.addCleanup(self.stop_guard, release)
-        with self.assertRaises(subprocess.TimeoutExpired):
-            _ = release.wait(timeout=0.5)
+        ready, _, _ = select.select([retry_read], [], [], TEST_HANG_GUARD_SECS)
+        self.assertEqual(ready, [retry_read], "release did not retry its held guard")
+        self.assertEqual(os.read(retry_read, 1), b"R")
         self.assertTrue(self.lock.is_dir())
         self.stop_guard(guard_holder)
-        stdout, stderr = release.communicate(timeout=2)
+        _ = os.write(continue_write, b"C")
+        stdout, stderr = release.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(release.returncode, 0, stderr)
         self.assertEqual(stdout.strip(), "released cargo")
         self.assertFalse(self.lock.exists())
@@ -283,7 +306,7 @@ class BoardReclaimTests(unittest.TestCase):
         self.assert_acquired(self.board("acquire", "impl", "cargo", "--pid", str(holder.pid)),
                              "acquired cargo")
         holder.kill()
-        _ = holder.wait(timeout=5)
+        _ = holder.wait(timeout=TEST_HANG_GUARD_SECS)
         release = self.board("release", "impl", "cargo")
         self.assertEqual(release.returncode, 0, release.stderr)
         self.assertEqual(release.stdout.strip(), "released cargo")
@@ -328,7 +351,7 @@ class BoardReclaimTests(unittest.TestCase):
 
         # A record whose holder is gone is dropped at the next release.
         first.kill()
-        _ = first.wait(timeout=5)
+        _ = first.wait(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(self.board("release", "holder", "cargo", "--pid", str(second.pid)).returncode, 0)
         self.assertFalse((self.root / "locks" / "cargo.reclaimed").exists())
 

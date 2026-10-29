@@ -17,6 +17,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import cast, override
 from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.accounts import accounts
 from scripts.production import add_showrunner
 import add_unit
@@ -25,6 +28,9 @@ import usage_store
 import herdr as runtime
 from scripts.herdr import herdr
 from scripts.herdr.fake_herdr import CommandResponse
+
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
 
 SCRIPT = Path(__file__).with_name("add_showrunner.py")
 SHARED = herdr.SHARED_SESSION
@@ -190,7 +196,7 @@ class AddShowrunnerTests(unittest.TestCase):
     def close_processes(self) -> None:
         for process in self.processes:
             process.terminate()
-            _ = process.wait(timeout=2)
+            _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
 
     def record(self, session: str, name: str = "") -> tuple[str, str]:
         """A live session's record: where it is kept and what it holds. Its name is read from a live process's;
@@ -610,7 +616,7 @@ class AddShowrunnerTests(unittest.TestCase):
                 patch.object(add_showrunner, "herdr_tab_open", return_value=False) as destination:
             result = add_showrunner.checked(child, "top", config_dir=Path(self.env["HOME"]) / ".claude2")
         self.assertIsNone(result)
-        destination.assert_called_once_with("kid")
+        destination.assert_called_once_with("kid", add_showrunner.NoEndingTab())
 
     def test_recorded_herdr_resume_without_an_account_passes_check_using_configured_group(self) -> None:
         self.resume_record()
@@ -824,8 +830,11 @@ raise SystemExit(add_showrunner.main(sys.argv[2:]))
         self.assertEqual(result.stdout.strip(),
                          f"check: ok — would start kid in {self.root / 'kid-checkout'} and attach it to top")
         self.assertEqual(self.herdr_calls(), [["--session", "default", "session", "list", "--json"]])
+
+    def test_launch_check_with_no_ending_tab_refuses_a_same_named_shared_tab(self) -> None:
         (self.state / "live-agents").touch()
         self.refused(self.run_command("kid", "--check"), "a tab named kid is already open in herdr session agents")
+        self.assertIn(["--session", "agents", "pane", "list"], self.herdr_calls())
 
     def test_each_refusal_names_its_cause_and_starts_nothing(self) -> None:
         notes = self.root / "notes.md"

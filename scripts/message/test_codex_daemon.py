@@ -22,6 +22,9 @@ from unittest import mock
 import codex_daemon
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 RpcMessage = dict[str, object]
 
 
@@ -90,12 +93,12 @@ class FakeDaemon:
 
     def __enter__(self) -> FakeDaemon:
         self.thread.start()
-        if not self.ready.wait(2):
+        if not self.ready.wait(TEST_HANG_GUARD_SECS):
             raise AssertionError("fake daemon did not start")
         return self
 
     def __exit__(self, *_details: object) -> None:
-        self.thread.join(2)
+        self.thread.join(TEST_HANG_GUARD_SECS)
         self.server.close()
         if self.thread.is_alive():
             raise AssertionError("fake daemon did not finish")

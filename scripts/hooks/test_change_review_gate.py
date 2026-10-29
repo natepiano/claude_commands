@@ -52,6 +52,7 @@ class RefusalTest(unittest.TestCase):
         self.git("init", "-q", "-b", "unit")
         self.stage("base.py")
         self.git("commit", "-q", "-m", "base")
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
 
     def refused(self, command: str) -> str:
         return gate.refusal(command, self.repo)
@@ -111,6 +112,45 @@ class RefusalTest(unittest.TestCase):
         _ = (target / "code.py").write_text("changed", encoding="utf-8")
         _ = subprocess.run(["git", "-C", str(target), "add", "code.py"], capture_output=True, check=True)
         self.assertIn("no Change-Review line", self.refused(f'git -C"{target}" commit -m "checkpoint(u): code"'))
+
+    def weaken_assertion(self, *, stage: bool = True) -> None:
+        source = self.repo / "test_value.py"
+        _ = source.write_text("def test_bottom(self):\n    self.assertEqual(bottom, expected)\n", encoding="utf-8")
+        self.git("add", "test_value.py")
+        self.git("commit", "-q", "-m", "test baseline")
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        _ = source.write_text("def test_bottom(self):\n    self.assertLessEqual(bottom, expected)\n", encoding="utf-8")
+        if stage:
+            self.git("add", "test_value.py")
+
+    def test_checkpoint_with_weaker_assertion_is_refused_after_change_review_passes(self) -> None:
+        self.weaken_assertion()
+        reason = self.refused('git commit -m "checkpoint(u): bounds" -m "Change-Review: none — tests only"')
+        self.assertIn("test_value.py", reason)
+        self.assertIn("test_bottom", reason)
+        self.assertIn("weaker", reason)
+
+    def test_checkpoint_with_assertion_ruling_in_message_passes(self) -> None:
+        self.weaken_assertion()
+        command = ('git commit -m "checkpoint(u): bounds" -m "Change-Review: none — tests only"'
+                   + ' -m "Assertion-Change: test_value.py::test_bottom — Approved bound contract."')
+        self.assertEqual(self.refused(command), "")
+
+    def test_non_checkpoint_commit_does_not_check_weaker_assertions(self) -> None:
+        self.weaken_assertion()
+        self.assertEqual(self.refused('git commit -m "fix: bounds"'), "")
+
+    def test_checkpoint_all_checks_unstaged_assertion_changes(self) -> None:
+        self.weaken_assertion(stage=False)
+        message = ' -m "checkpoint(u): bounds" -m "Change-Review: none — tests only"'
+        self.assertEqual(self.refused("git commit" + message), "")
+        self.assertIn("weaker", self.refused("git commit -a" + message))
+
+    def test_checkpoint_guard_failure_refuses_when_no_default_base_exists(self) -> None:
+        self.weaken_assertion()
+        self.git("update-ref", "-d", "refs/remotes/origin/main")
+        reason = self.refused('git commit -m "checkpoint(u): bounds" -m "Change-Review: none — tests only"')
+        self.assertIn("assertion guard could not run", reason)
 
 
 class HookTest(unittest.TestCase):

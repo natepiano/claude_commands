@@ -161,7 +161,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertEqual(pid, PID)
         return self.alive.pop(0) if len(self.alive) > 1 else self.alive[0]
 
-    def child_checked(self, _child: Production, caller: str, ending: str = "", start_in: Path | None = None, *, config_dir: Path | None = None) -> None:
+    def child_checked(self, _child: Production, caller: str, ending: add_showrunner.EndingTab = add_showrunner.NO_ENDING_TAB, start_in: Path | None = None, *, config_dir: Path | None = None) -> None:
         self.events.append(f"check child for {caller}, ending {ending}, starting in {start_in}")
         self.assertEqual(config_dir, self.unit_account.dir)
         if self.child_refusal:
@@ -210,7 +210,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
             "demo-unit's pane: a form, prompt or menu is open": form,
             "demo-unit has a /unit:direct run open": run_open,
             "has uncommitted work; it checkpoints first": lambda: (self.worktree / "draft.py").write_text("x"),
-            "child already has a running showrunner (ending demo)": child_taken,
+            f"child already has a running showrunner (ending {add_showrunner.EndingUnitTab(PANE)})": child_taken,
         }
         for cause, arrange in cases.items():
             with self.subTest(cause=cause):
@@ -315,10 +315,10 @@ class PromoteShowrunnerTests(unittest.TestCase):
     def test_promotion_uses_showrunners_group_instead_of_retained_unit_account(self) -> None:
         selected = self.ready_showrunner_account()
         directory = selected.dir
-        def checked(_child: Production, _caller: str, ending: str = "", start_in: Path | None = None,
+        def checked(_child: Production, _caller: str, ending: add_showrunner.EndingTab = add_showrunner.NO_ENDING_TAB, start_in: Path | None = None,
                     *, config_dir: Path | None = None) -> None:
             self.assertEqual(config_dir, directory)
-            self.assertEqual((ending, start_in), ("demo", self.worktree))
+            self.assertEqual((ending, start_in), (add_showrunner.EndingUnitTab(PANE), self.worktree))
             self.events.append("check showrunner account")
             return None
         def resolved(role: str) -> accounts.ClaudeLaunchAccount:
@@ -342,10 +342,10 @@ class PromoteShowrunnerTests(unittest.TestCase):
         def resolved(role: str) -> accounts.ClaudeLaunchAccount:
             self.events.append("resolve " + role)
             return selected if role == "showrunner" else accounts.NamedAccount("claude2", self.root / ".claude2")
-        def checked(_child: Production, _caller: str, ending: str = "", start_in: Path | None = None,
+        def checked(_child: Production, _caller: str, ending: add_showrunner.EndingTab = add_showrunner.NO_ENDING_TAB, start_in: Path | None = None,
                     *, config_dir: Path | None = None) -> None:
             self.assertEqual(config_dir, selected.dir)
-            self.assertEqual((ending, start_in), ("demo", self.worktree))
+            self.assertEqual((ending, start_in), (add_showrunner.EndingUnitTab(PANE), self.worktree))
             return None
         with (mock.patch.object(accounts, "role_account", side_effect=resolved),
               mock.patch.object(add_showrunner, "checked", side_effect=checked)):
@@ -361,10 +361,10 @@ class PromoteShowrunnerTests(unittest.TestCase):
         """F004: returning to unit work also obeys units configuration."""
         selected = self.ready_showrunner_account()
         self.started = 2
-        def checked(_child: Production, _caller: str, ending: str = "", start_in: Path | None = None,
+        def checked(_child: Production, _caller: str, ending: add_showrunner.EndingTab = add_showrunner.NO_ENDING_TAB, start_in: Path | None = None,
                     *, config_dir: Path | None = None) -> None:
             self.assertEqual(config_dir, selected.dir)
-            self.assertEqual((ending, start_in), ("demo", self.worktree))
+            self.assertEqual((ending, start_in), (add_showrunner.EndingUnitTab(PANE), self.worktree))
             return None
         def resolved(role: str) -> accounts.ClaudeLaunchAccount:
             return selected if role == "showrunner" else accounts.NamedAccount("claude2", self.root / ".claude2")
@@ -459,27 +459,27 @@ class PromoteShowrunnerTests(unittest.TestCase):
             code, _out, err = self.run_main()
         self.assertEqual(code, 2, err)
         self.assertIn("a tab named child is already open in herdr session agents", err)
-        live.assert_called_once_with("child")
+        live.assert_called_once_with("child", add_showrunner.EndingUnitTab(PANE))
         self.assert_nothing_stopped()
         self.assertFalse(any(event.startswith("stop herdr ") for event in self.events))
 
-    def test_a_herdr_unit_exempts_its_own_same_named_destination_before_stopping_it(self) -> None:
-        self.native_unit()
+    def test_promotion_check_exempts_its_own_tab_in_the_shared_session(self) -> None:
         self.marked["demo-unit"] = unit_lookup.MarkedUnit(
             "demo-unit", unit_lookup.LiveClaude("demo", SESSION, "/sock", PID),
-            herdr.HerdrPlace("child", "w1:p1"))
-        with mock.patch.object(add_showrunner, "checked", CHILD_PREFLIGHT), \
-                mock.patch.object(showrunners, "descendants_of", return_value=[]), \
-                mock.patch.object(add_showrunner, "running", return_value=False), \
-                mock.patch.object(add_showrunner, "herdr_tab_open", return_value=True) as live, \
-                mock.patch.object(trust_reader, "claude_trust", return_value=trust_reader.Trusted(
-                    self.worktree, self.root / ".claude.json", self.worktree)), \
-                mock.patch.object(herdr, "stop_session") as stopped:
-            code, _out, err = self.run_main()
+            herdr.HerdrPlace("agents", PANE))
+        with (mock.patch.object(add_showrunner, "checked", CHILD_PREFLIGHT),
+              mock.patch.object(showrunners, "descendants_of", return_value=[]),
+              mock.patch.object(add_showrunner, "running", return_value=False),
+              mock.patch.object(herdr, "shared_session", return_value="agents"),
+              mock.patch.object(herdr, "live_sessions", return_value=[herdr.SessionEntry(
+                  name="agents", running=True, default=False, session_dir="/fixture", socket_path="/sock")]),
+              mock.patch.object(herdr.Herdr, "panes", return_value=[{"pane_id": PANE, "label": "child"}]),
+              mock.patch.object(trust_reader, "claude_trust", return_value=trust_reader.Trusted(
+                  self.worktree, self.root / ".claude.json", self.worktree))):
+            code, out, err = self.run_main("--check")
         self.assertEqual(code, 0, err)
-        live.assert_not_called()
-        stopped.assert_called_once_with("child")
-        self.assertTrue(any(event.startswith("start") for event in self.events))
+        self.assertIn("check: ok", out)
+        self.assert_nothing_stopped()
 
     def test_a_blocked_herdr_unit_is_never_stopped_or_restarted(self) -> None:
         self.native_unit()
@@ -505,22 +505,44 @@ class PromoteShowrunnerTests(unittest.TestCase):
                       + f"{self.parent_doc} demo --plan docs/demo.md --resume {SESSION} --cwd {self.worktree}", out)
         self.assertFalse(plan_cell_is_retired(self.demo_row()["Plan"]))
 
-    def test_the_childs_check_lets_the_units_own_session_carry_its_name(self) -> None:
-        child = read_production(self.child_doc)
+    def child_with_open_tabs(self, panes: list[herdr.PaneIdentity]) -> Production:
+        child_doc = self.worktree / "builds-production.md"
+        _ = child_doc.write_text(doc_text(self.worktree))
+        child = read_production(child_doc)
         config = self.root / "claude.json"
         _ = config.write_text(json.dumps({"projects": {str(child.checkout): {"hasTrustDialogAccepted": True}}}))
-        with (mock.patch.object(add_showrunner, "running", mock.Mock(return_value=False)),
-              mock.patch.object(add_showrunner, "herdr_tab_open", mock.Mock(return_value=True)),
-              mock.patch.object(add_showrunner, "claude_json", return_value=config),
-              mock.patch.object(showrunners, "descendants_of", mock.Mock(return_value=[]))):
-            self.assertIsNone(ORIGINAL_CHECKED(child, "parent", ending="child", config_dir=self.unit_account.dir))
-            with self.assertRaisesRegex(Refusal, "a tab named child is already open in herdr session agents"):
-                _ = ORIGINAL_CHECKED(child, "parent", config_dir=self.unit_account.dir)
+        _ = self.enterContext(mock.patch.object(add_showrunner, "running", return_value=False))
+        _ = self.enterContext(mock.patch.object(add_showrunner, "claude_json", return_value=config))
+        _ = self.enterContext(mock.patch.object(showrunners, "descendants_of", return_value=[]))
+        _ = self.enterContext(mock.patch.object(herdr, "shared_session", return_value="agents"))
+        _ = self.enterContext(mock.patch.object(herdr, "live_sessions", return_value=[herdr.SessionEntry(
+            name="agents", running=True, default=False, session_dir="/fixture", socket_path="/sock")]))
+        _ = self.enterContext(mock.patch.object(herdr.Herdr, "panes", return_value=panes))
+        return child
+
+    def test_the_childs_check_lets_the_units_own_tab_carry_its_name(self) -> None:
+        ending_place = herdr.HerdrPlace("agents", PANE)
+        child = self.child_with_open_tabs([{"pane_id": ending_place.pane, "label": "builds"}])
+        ORIGINAL_CHECKED(child, "parent", ending=add_showrunner.EndingUnitTab(ending_place.pane),
+                         config_dir=self.unit_account.dir)
+
+    def test_the_childs_check_refuses_another_same_named_tab_beside_the_ending_unit(self) -> None:
+        child = self.child_with_open_tabs([
+            {"pane_id": PANE, "label": "builds"},
+            {"pane_id": "w8:p2", "label": "builds"},
+        ])
+        with self.assertRaisesRegex(Refusal, "^a tab named builds is already open in herdr session agents$"):
+            ORIGINAL_CHECKED(child, "parent", ending=add_showrunner.EndingUnitTab(PANE),
+                             config_dir=self.unit_account.dir)
 
     def test_the_childs_check_is_for_the_units_worktree_which_must_be_trusted(self) -> None:
+        self.marked["demo-unit"] = unit_lookup.MarkedUnit(
+            "demo-unit", unit_lookup.LiveClaude("demo", SESSION, "/sock", PID),
+            herdr.HerdrPlace("agents", PANE))
         code, _out, err = self.run_main("--check")
         self.assertEqual(code, 0, err)
-        self.assertIn(f"check child for parent, ending demo, starting in {self.worktree}", self.events)
+        self.assertIn(f"check child for parent, ending {add_showrunner.EndingUnitTab(PANE)}, "
+                      + f"starting in {self.worktree}", self.events)
         config = self.root / "claude.json"
         _ = config.write_text(json.dumps({"projects": {str(self.root.resolve()): {"hasTrustDialogAccepted": True}}}))
         child = read_production(self.child_doc)
@@ -530,7 +552,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
               mock.patch.object(showrunners, "descendants_of", mock.Mock(return_value=[]))):
             with self.assertRaisesRegex(Refusal, f"child: Claude is not trusted in {self.worktree.resolve()} on "
                                         + "claude2. Run:"):
-                _ = ORIGINAL_CHECKED(child, "parent", ending="demo", start_in=self.worktree, config_dir=self.unit_account.dir)
+                _ = ORIGINAL_CHECKED(child, "parent", ending=add_showrunner.EndingUnitTab(PANE), start_in=self.worktree, config_dir=self.unit_account.dir)
 
 
 if __name__ == "__main__":

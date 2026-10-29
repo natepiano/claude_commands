@@ -26,6 +26,9 @@ import zlib
 from scripts.hana_shot import hana_shot
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 SCRIPT = Path(__file__).with_name("hana_shot.py")
 CAMERA_ENTITY = 5
 WINDOW_ENTITY = 3
@@ -744,7 +747,7 @@ class LaunchBuildWarningTests(unittest.TestCase):
     def git(self, *args: str) -> None:
         _ = subprocess.run(
             ["git", "-C", str(self.root), *args], stdin=subprocess.DEVNULL,
-            capture_output=True, check=True, timeout=5,
+            capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS,
         )
 
     def modify_source(self, mtime_ns: int) -> None:
@@ -1190,7 +1193,7 @@ class ViewsTests(HanaShotTest):
             "--out", str(self.scratch / "check"),
         )
         self.addCleanup(self.stop_script, process)
-        self.assertTrue(self.fake.screenshot_started.wait(10), "the second view never reached capture")
+        self.assertTrue(self.fake.screenshot_started.wait(TEST_HANG_GUARD_SECS), "the second view never reached capture")
         process.send_signal(signal.SIGTERM)
         _, stderr = process.communicate(timeout=60)
 
@@ -1657,7 +1660,7 @@ class RemoteTests(HanaShotTest):
             "--mode", "home", "--remote", REMOTE_HOST,
         )
         self.addCleanup(self.stop_script, process)
-        self.assertTrue(self.fake.screenshot_started.wait(10), "the screenshot call never reached the fake")
+        self.assertTrue(self.fake.screenshot_started.wait(TEST_HANG_GUARD_SECS), "the screenshot call never reached the fake")
         process.send_signal(signal_number)
         _, stderr = process.communicate(timeout=60)
         return cast(int, process.returncode), stderr

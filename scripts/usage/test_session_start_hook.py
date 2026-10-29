@@ -16,6 +16,9 @@ from unittest.mock import patch
 from scripts.usage import agents_log
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 REPOSITORY = Path(__file__).resolve().parents[2]
 HOOK = REPOSITORY / "scripts/hooks/session-start-agents-log.py"
 REGISTERED_COMMAND = ('"$HOME/.claude/scripts/lib/py" '
@@ -41,7 +44,7 @@ class SessionStartHookTests(unittest.TestCase):
         return subprocess.run(
             [sys.executable, str(HOOK)],
             input=payload, cwd=self.root, env=os.environ.copy(),
-            capture_output=True, text=True, timeout=20, check=False,
+            capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False,
         )
 
     def deliver(self, **payload: object) -> subprocess.CompletedProcess[str]:
@@ -79,7 +82,7 @@ class SessionStartHookTests(unittest.TestCase):
         })
         return subprocess.run(
             ["sh", "-c", commands[0]], input=json.dumps(payload), cwd=working_directory,
-            env=environment, capture_output=True, text=True, timeout=20, check=False,
+            env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False,
         )
 
     def records(self) -> list[dict[str, object]]:
