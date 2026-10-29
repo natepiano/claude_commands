@@ -25,6 +25,9 @@ from scripts.usage import collect
 from scripts.usage.agents_log import RoleLog
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 SCRIPT = Path(__file__).with_name("review_pool_report.py")
 SINCE = "2026-10-12"
 EPOCH = datetime(2026, 10, 12, tzinfo=timezone.utc).timestamp()
@@ -201,7 +204,7 @@ class ReviewPoolReportTests(unittest.TestCase):
         if explicit_root:
             command.extend(("--root", str(self.history)))
         result = subprocess.run([*command, *options], env=environment, capture_output=True,
-                                text=True, check=False, timeout=10)
+                                text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("Traceback", result.stderr)
         return result
@@ -859,7 +862,7 @@ class ReviewPoolReportTests(unittest.TestCase):
         if explicit_root:
             command.extend(("--root", str(self.history)))
         result = subprocess.run([*command, *options], env=environment, capture_output=True, text=True,
-                                check=False, timeout=10)
+                                check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
         return result.stdout
@@ -1127,7 +1130,7 @@ class ReviewPoolReportTests(unittest.TestCase):
 
     def test_cost_report_still_requires_since(self) -> None:
         result = subprocess.run([sys.executable, str(SCRIPT), "--root", str(self.history), "--no-mac"],
-                                capture_output=True, text=True, check=False, timeout=10)
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 2)
         self.assertIn("--since is required unless --shadow is used", result.stderr)
 

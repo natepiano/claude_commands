@@ -21,6 +21,9 @@ from pathlib import Path
 from typing import Literal, Protocol, TypedDict, cast, final, override
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 REPOSITORY = Path(__file__).resolve().parents[2]
 COLLECTOR = Path(__file__).with_name("collect.py")
 FAILING_WATCH = """import sys
@@ -205,7 +208,7 @@ class CollectorFixture(unittest.TestCase):
             env=environment,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=TEST_HANG_GUARD_SECS,
             check=False,
         )
 
@@ -631,11 +634,11 @@ with open(sys.argv[1], 'a') as lock:
                 _ = self.db_path.write_bytes(before)
                 assert process.stdin is not None
                 process.stdin.close()
-                self.assertEqual(process.wait(timeout=5), 0)
+                self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 0)
             finally:
                 if process.poll() is None:
                     process.terminate()
-                    _ = process.wait(timeout=5)
+                    _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
         _ = self.collect()
 
     def test_pass_uses_wal_and_finishes_while_a_reader_holds_its_snapshot(self) -> None:
@@ -1394,7 +1397,7 @@ class MacCollectTests(CollectorFixture):
         with subprocess.Popen(command, env=environment, cwd=REPOSITORY, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, text=True) as process:
             try:
-                deadline = time.monotonic() + 10
+                deadline = time.monotonic() + TEST_HANG_GUARD_SECS
                 while not waiting.exists() and process.poll() is None and time.monotonic() < deadline:
                     time.sleep(0.01)
                 self.assertTrue(waiting.exists(), "The fixture pass must reach its Mac read")
@@ -1410,13 +1413,13 @@ class MacCollectTests(CollectorFixture):
                         for table, rows in before.items():
                             self.assertEqual(self.all_values(self.rows('SELECT * FROM "' + table + '"')), rows, table)
                 _ = release.write_bytes(b"")
-                output, errors = process.communicate(timeout=15)
+                output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(process.returncode, 0, output + errors)
             finally:
                 _ = release.touch()
                 if process.poll() is None:
                     process.terminate()
-                    _ = process.communicate(timeout=5)
+                    _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertTrue(report.is_file())
         _ = cast(object, json.loads(report.read_text(encoding="utf-8")))
         report.unlink()
@@ -1970,7 +1973,7 @@ class MacCollectTests(CollectorFixture):
         remote_command = shlex.join((sys.executable, "-c", writer, str(finished))) + '; printf "\\nrc=%s\\n" "$?"'
         result = subprocess.run(
             [str(self.root / "bin/ssh"), remote_command],
-            input=b"fixture request", capture_output=True, timeout=30, check=False,
+            input=b"fixture request", capture_output=True, timeout=TEST_HANG_GUARD_SECS, check=False,
             env={**os.environ, "USAGE_TEST_SSH_CONFIG": str(config)},
         )
         self.assertEqual(result.stderr, b"", result.stderr.decode(errors="replace"))
