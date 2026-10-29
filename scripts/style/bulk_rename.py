@@ -315,7 +315,10 @@ class BindingText:
 
     def __init__(self, source: str) -> None:
         self.source: str = source
-        self.spans: tuple[style_footprint.TokenSpan, ...] = style_footprint.token_spans(source)
+        try:
+            self.spans: tuple[style_footprint.TokenSpan, ...] = style_footprint.token_spans(source)
+        except style_footprint.UnreadableTokenSpans as error:
+            raise BulkRenameError(str(error)) from error
         self.words: tuple[str, ...] = tuple(span.token.value for span in self.spans)
         self.ends: dict[int, int] = style_footprint.delimiter_ends(self.words)
         self.macros: tuple[tuple[int, int], ...] = style_footprint.macro_spans(self.words, self.ends)
@@ -453,7 +456,10 @@ def docs_name_binding(docs: tuple[str, ...], comments: BindingComments, old: str
 
 def rename_file(server: RenameServer, path: Path, relative: str, source: str,
                 findings: tuple[RenameFinding, ...], docs: tuple[str, ...] = ()) -> FileRenames:
-    original = BindingText(source)
+    try:
+        original = BindingText(source)
+    except BulkRenameError as error:
+        return FileRenames(relative, source, source, (), tuple(Refusal(f.finding_id, str(error)) for f in findings))
     located: list[LocatedRename] = []
     refused: list[Refusal] = []
     for finding in findings:

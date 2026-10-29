@@ -12,7 +12,7 @@ import socket
 import subprocess
 import sys
 import tempfile
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -707,7 +707,8 @@ def _reading_values_fingerprint() -> str:
     return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 
-def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_FILTER) -> list[str]:
+def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_FILTER, *,
+         refresh_usage: Callable[[], None] = lambda: None) -> list[str]:
     state = _load_state()
     original_state = deepcopy(state)
     configured = read_auto_move_rules() if not proof_group else ()
@@ -732,11 +733,17 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
     reported_unconfigured: set[accounts.ClaudeGroup] = set()
     detected = {session["sessionId"]: session_refusal(session["sessionId"]) for session in sessions.live_sessions()
         if session["sessionId"] not in open_ids and (not proof_group or session["sessionId"] in proof_group)}
-    refused_ids = frozenset(session_id for session_id, refusal in detected.items() if isinstance(refusal, (TranscriptRefusal, ProofRefusal)))
+    refused_ids = frozenset(session_id for session_id, refusal in detected.items()
+        if isinstance(refusal, (TranscriptRefusal, ProofRefusal))
+        and not ((previous := state["sessions"].get(session_id)) and previous["entry_id"] == refusal.entry_id
+                 and previous["state"] in ("requested", "cancelled", "continued", "group selected")))
     refusing_logins: set[str] = set()
     owners = live_owners(only=refused_ids) if refused_ids else []
     owners = [session for session in owners if not isinstance(detected[session["session_id"]], ProofRefusal)
               or accounts.session_group(session) == "ungrouped"]
+    if owners and not dry_run:
+        refresh_usage()
+        now = max(now, datetime.now(timezone.utc))
     waiting_groups: set[accounts.ClaudeGroup] = set()
     blocked_groups: set[accounts.ClaudeGroup] = set()
     tick_logins = frozenset(identity.login.casefold() for session in owners
@@ -1260,7 +1267,8 @@ def renew_expired_logins(now: datetime, dry_run: bool) -> list[str]:
 
 
 @role_map.role_map_command
-def run(now: datetime | None = None, *, dry_run: bool = False, proof_group: frozenset[str] = NO_SESSION_FILTER) -> list[str]:
+def run(now: datetime | None = None, *, dry_run: bool = False, proof_group: frozenset[str] = NO_SESSION_FILTER,
+        refresh_usage: Callable[[], None] = lambda: None) -> list[str]:
     from scripts.accounts import unit_watchdog
 
     at = now or datetime.now(timezone.utc)
@@ -1272,7 +1280,7 @@ def run(now: datetime | None = None, *, dry_run: bool = False, proof_group: froz
         renewed = renew_expired_logins(at, False)
         # A probe can save a reading after the pass started.
         after_renewal = max(at, datetime.now(timezone.utc)) if renewed else at
-        return [*renewed, *_run(after_renewal, False, proof_group),
+        return [*renewed, *_run(after_renewal, False, proof_group, refresh_usage=refresh_usage),
                 *(unit_watchdog.run(after_renewal, dry_run=False) if not proof_group else [])]
 
 

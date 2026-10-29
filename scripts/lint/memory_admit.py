@@ -6,12 +6,13 @@ from __future__ import annotations
 import fcntl
 import importlib
 import json
+import math
 import os
 import signal
 import sqlite3
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, NoReturn, NotRequired, Protocol, TypedDict, cast
@@ -57,8 +58,9 @@ FALLBACK = 12 * GIB
 # clippy had 65%, so 0.65 covers the measured p90 process-memory share.
 ANON_SHARE = 0.65
 HISTORY_DAYS = 14
-# Reserve a new step until its process tree has had time to start.
-START_SECONDS = 5
+# Build anon at 16–20 GiB averaged 10.4% full PSI; at 20–24 GiB it averaged 16.4%.
+BUILD_BUDGET_BYTES = 20 * GIB
+RAMP_SECONDS = 120
 PROC = Path("/proc")
 # A step held this long gets room first when it can start.
 HEAD_SECONDS = 900
@@ -93,6 +95,8 @@ class PromisedMemory:
 @dataclass(frozen=True)
 class MeasuredMemory:
     bytes: int
+    # Only a step inside its ramp window reserves growth.
+    ramp_promise: int = 0
 
 
 @dataclass(frozen=True)
@@ -101,6 +105,20 @@ class GoneMemory:
 
 
 StepMemory = PromisedMemory | MeasuredMemory | GoneMemory
+
+
+@dataclass(frozen=True)
+class NoPressureHold:
+    pass
+
+
+@dataclass(frozen=True)
+class MemoryPressure:
+    full_avg10: float
+
+
+Pressure = NoPressureHold | MemoryPressure
+NO_PRESSURE_HOLD = NoPressureHold()
 
 
 class Waiter(TypedDict):
@@ -123,14 +141,22 @@ class AdmissionDecision:
     promised: int
     reserve: int
     measured: int
+    pressure: Pressure = NO_PRESSURE_HOLD
+    charged: int = 0
+    budget: int = BUILD_BUDGET_BYTES
+
+
+@dataclass(frozen=True)
+class NeedsBuildBudget:
+    need: int
+    charged: int
+    budget: int
 
 
 @dataclass(frozen=True)
 class NeedsMemory:
     need: int = 0
     free: int = 0
-    promised_count: int = 0
-    promised: int = 0
 
 
 @dataclass(frozen=True)
@@ -149,7 +175,7 @@ class ReadingUnavailable:
     pass
 
 
-WaitReason = NeedsMemory | BehindHead | ReadyForAdmission | ReadingUnavailable
+WaitReason = NeedsBuildBudget | NeedsMemory | BehindHead | ReadyForAdmission | ReadingUnavailable | MemoryPressure
 
 
 @dataclass(frozen=True)
@@ -222,15 +248,45 @@ class CheckResult:
     head_label: str = ""
 
 
+def build_budget_bytes() -> int:
+    try:
+        value = float(os.environ["BUILDLOG_BUILD_BUDGET_GIB"]) * GIB
+        if math.isfinite(value) and value > 0:
+            return max(1, int(value))
+    except (KeyError, ValueError):
+        pass
+    return BUILD_BUDGET_BYTES
+
+
 def decide(available: int, total: int | None, need: int, running: list[StepMemory],
-           head_need: int = 0) -> AdmissionDecision:
-    """MemAvailable already excludes resident use. Add only pending starts."""
-    promised = sum(row.bytes for row in running if isinstance(row, PromisedMemory))
+           head_need: int = 0, pressure: Pressure = NO_PRESSURE_HOLD) -> AdmissionDecision:
+    """Apply the build budget, free-memory floor and pressure limit together."""
+    promised = sum(growth_headroom(row) for row in running)
     measured = sum(row.bytes for row in running if isinstance(row, MeasuredMemory))
+    charged = sum(build_charge(row) for row in running)
+    budget = build_budget_bytes()
     reserve = total * 5 // 100 if total is not None else 0
-    active = any(not isinstance(row, GoneMemory) for row in running)
-    threshold = (need + promised + reserve if active else min(need + reserve, FALLBACK)) + head_need
-    return AdmissionDecision("admit" if available >= threshold else "hold", threshold, promised, reserve, measured)
+    threshold = need + promised + reserve + head_need
+    fits_budget = charged + need + head_need <= budget or all(isinstance(row, GoneMemory) for row in running)
+    admit = fits_budget and available >= threshold and isinstance(pressure, NoPressureHold)
+    return AdmissionDecision("admit" if admit else "hold", threshold, promised, reserve, measured,
+                             pressure, charged, budget)
+
+
+def build_charge(memory: StepMemory) -> int:
+    if isinstance(memory, PromisedMemory):
+        return memory.bytes
+    if isinstance(memory, MeasuredMemory):
+        return max(memory.ramp_promise, memory.bytes)
+    return 0
+
+
+def growth_headroom(memory: StepMemory) -> int:
+    if isinstance(memory, PromisedMemory):
+        return memory.bytes
+    if isinstance(memory, MeasuredMemory):
+        return max(0, memory.ramp_promise - memory.bytes)
+    return 0
 
 
 def _head_holds_later(available: int, total: int | None, need: int,
@@ -375,9 +431,12 @@ def step_memory(row: Reservation, now: datetime, processes: dict[int, ProcessIde
     identity = processes.get(row["pid"])
     if identity is None or identity.start != row["start_time"]:
         return GoneMemory()
-    if now.timestamp() - _epoch(row["admitted_at"]) < START_SECONDS:
-        return PromisedMemory(row["need"])
-    return tree_memory(row["pid"], row["start_time"], processes, proc)
+    reading = tree_memory(row["pid"], row["start_time"], processes, proc)
+    if isinstance(reading, MeasuredMemory) and now.timestamp() - _epoch(row["admitted_at"]) < RAMP_SECONDS:
+        if reading.bytes == 0:
+            return PromisedMemory(row["need"])
+        return replace(reading, ramp_promise=row["need"])
+    return reading
 
 
 def read_meminfo(path: Path) -> tuple[int, int | None]:
@@ -393,6 +452,24 @@ def read_meminfo(path: Path) -> tuple[int, int | None]:
     if available is None:
         raise ValueError(f"MemAvailable missing from {path}")
     return available, total
+
+
+def read_pressure() -> Pressure:
+    """An unreadable pressure file does not block; the memory rule still applies."""
+    full = 0.0
+    try:
+        path = Path(os.environ.get("BUILDLOG_MEMORY_PRESSURE", "/proc/pressure/memory"))
+        for line in path.read_text().splitlines():
+            parts = line.split()
+            if parts and parts[0] == "full":
+                full = next(float(part.removeprefix("avg10=")) for part in parts[1:] if part.startswith("avg10="))
+    except (OSError, ValueError, StopIteration):
+        pass
+    return MemoryPressure(full) if full > 10.0 else NO_PRESSURE_HOLD
+
+
+def pressure_text(pressure: MemoryPressure) -> str:
+    return f"memory pressure: full avg10 {pressure.full_avg10:.1f}"
 
 
 def admission_dir(root: Path) -> Path:
@@ -474,7 +551,8 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
     repo, step, worktree, peak = profile.repo, profile.step, profile.worktree, profile.peak
     if not argv and not (root / "admission").exists():
         available, total = read_meminfo(meminfo)
-        return CheckResult(decide(available, total, peak.bytes, []), peak, [], NotReserved("launch"), repo, step, available, profile)
+        pressure = read_pressure()
+        return CheckResult(decide(available, total, peak.bytes, [], pressure=pressure), peak, [], NotReserved("launch"), repo, step, available, profile)
     directory = admission_dir(root)
     with (directory / "lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -503,14 +581,15 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
             waited_from = min(waited_from, previous["since"])
         own_order = (previous.get("bump_order", 0) if previous is not None else 0, waited_from, pid)
         available, total = read_meminfo(meminfo)
+        pressure = read_pressure()
         head_need, head_label = 0, ""
         if heads and waiter_order(heads[0]) < own_order:
             head = heads[0]
             if _head_holds_later(available, total, head["need"], running):
                 head_need, head_label = head["need"], waiter_label(head)
-        decision = decide(available, total, peak.bytes, running, head_need)
+        decision = decide(available, total, peak.bytes, running, head_need, pressure)
         if head_need and heads[0].get("bump_order", 0) < 0:
-            decision = AdmissionDecision("hold", decision.threshold, decision.promised, decision.reserve, decision.measured)
+            decision = replace(decision, state="hold")
         reservation: Reserved | NotReserved = NotReserved("held" if argv else "launch")
         if argv and decision.state == "hold" and start is not None:
             waiter: Waiter = {"pid": pid, "start_time": start, "need": peak.bytes, "since": waited_from,
@@ -620,9 +699,7 @@ def read_queue(directory: Path, processes: dict[int, ProcessIdentity], now: floa
     for _, row in queue_rows(directory, "reservation", processes):
         reservation = cast(Reservation, cast(object, row))
         pid = reservation["pid"]
-        reading: StepMemory = (PromisedMemory(reservation["need"])
-                               if now - _epoch(reservation["admitted_at"]) < START_SECONDS
-                               else tree_memory(pid, reservation["start_time"], processes, proc))
+        reading = step_memory(reservation, datetime.fromtimestamp(now, UTC), processes, proc)
         if isinstance(reading, GoneMemory):
             continue
         identity = identities.identity(pid, row)
@@ -635,20 +712,23 @@ def read_queue(directory: Path, processes: dict[int, ProcessIdentity], now: floa
         available, total = read_meminfo(Path(os.environ.get("BUILDLOG_MEMINFO", "/proc/meminfo")))
     except (OSError, ValueError):
         unavailable = True
+    pressure = read_pressure()
     ordered = sorted(((path, cast(Waiter, cast(object, row))) for path, row in queue_rows(directory, "waiting", processes)),
                      key=lambda item: waiter_order(item[1]))
     head = next((row for _, row in ordered if row.get("bump_order", 0) < 0 or now - row["since"] >= HEAD_SECONDS), None)
-    pending = sum(item.bytes for item in memory if isinstance(item, PromisedMemory))
-    count = sum(isinstance(item, PromisedMemory) for item in memory)
+    pending = sum(growth_headroom(item) for item in memory)
     waiting: list[WaitingStep] = []
     for _, row in ordered:
         identity = identities.identity(row["pid"], cast(dict[str, object], cast(object, row)))
-        own = decide(available, total, row["need"], memory)
+        own = decide(available, total, row["need"], memory, pressure=pressure)
         reason: WaitReason = ReadyForAdmission()
         if unavailable:
             reason = ReadingUnavailable()
+        elif isinstance(own.pressure, MemoryPressure):
+            reason = own.pressure
         elif own.state == "hold":
-            reason = NeedsMemory(row["need"], available, count, pending)
+            reason = (NeedsMemory(row["need"], available) if available < own.threshold
+                      else NeedsBuildBudget(row["need"], own.charged, own.budget))
         elif head is not None and waiter_order(head) < waiter_order(row) and _head_holds_later(available, total, head["need"], memory):
             if head.get("bump_order", 0) < 0 or decide(available, total, row["need"], memory, head["need"]).state == "hold":
                 head_identity = identities.identity(head["pid"], cast(dict[str, object], cast(object, head)))
@@ -705,7 +785,7 @@ def bump_waiter(selector: str, actor: str) -> WaitingStep:
         _ = temporary.write_text(json.dumps(row, separators=(",", ":")))
         os.replace(temporary, path)
         record.queue_bump(actor, moved.session_id or moved.session_name, moved.step, moved.folder, position + 1, view.now)
-        reason = moved.reason if isinstance(moved.reason, (NeedsMemory, ReadingUnavailable)) else ReadyForAdmission()
+        reason = moved.reason if isinstance(moved.reason, (NeedsBuildBudget, NeedsMemory, ReadingUnavailable, MemoryPressure)) else ReadyForAdmission()
         return WaitingStep(moved.pid, moved.session_id, moved.session_name, moved.step, moved.folder,
                            row["since"], moved.need, reason)
 
@@ -777,6 +857,8 @@ def main() -> None:
     result = check(Path(meminfo), int(pid), sidecar, argv, float(since or 0), profile=profile)
     decision, peak, live = result.decision, result.peak, result.live
     summary = ", ".join(f"{row['repo']} {row['step']} in {row['worktree']}" for row in live)
+    if isinstance(decision.pressure, MemoryPressure):
+        summary = f"{pressure_text(decision.pressure)}; {summary}".rstrip("; ")
     reservation = result.reservation
     path = str(reservation.path) if isinstance(reservation, Reserved) else ""
     reason = "reserved" if isinstance(reservation, Reserved) else reservation.reason

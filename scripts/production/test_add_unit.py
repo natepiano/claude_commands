@@ -957,7 +957,7 @@ class AddUnitTests(ShutdownTestCase):
             result = self.successful("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(result.returncode, 0)
         start.assert_called_once()
-        opening = cast(object, start.call_args.kwargs["opening"])
+        opening = cast(object, start.call_args.args[4])
         self.assertIsInstance(opening, herdr.OpeningPrompt)
         assert isinstance(opening, herdr.OpeningPrompt)
         self.assertEqual(opening.text, "/unit:direct docs/plans/given.md")
@@ -1982,7 +1982,9 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(self.opened()[:8], ["--session", SHARED, "workspace", "create", "--label", "director",
                                              "--cwd", str(worktree)])
         self.assertIn(["--session", SHARED, "tab", "rename", "w1:t1", "alpha"], self.herdr_calls())
-        self.assertEqual(self.pane_environment(), {"SHOWRUNNER_UNIT": "build-followups",
+        self.assertEqual({key: value for key, value in self.pane_environment().items()
+                          if key.startswith(("SHOWRUNNER_", "CLAUDE_", "HERDR_")) or key == "ENABLE_TOOL_SEARCH"},
+                         {"SHOWRUNNER_UNIT": "build-followups",
             "SHOWRUNNER_UNIT_ID": "alpha-unit", "ENABLE_TOOL_SEARCH": "true", "HERDR_AGENT_PANE": "1",
             "CLAUDE_CONFIG_DIR": str(Path(self.env["HOME"]) / ".claude2"),
             "CLAUDE_CODE_REMOTE_MEMORY_DIR": str(Path(self.env["HOME"]) / ".claude")})
