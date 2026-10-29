@@ -23,6 +23,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from scripts.lib.socket_test_support import short_socket_directory
 import add_unit
 import production_units
 import dailies_render
@@ -222,7 +223,7 @@ class WaitingTests(unittest.TestCase):
 
     def claude(self, name: str, pane: str) -> None:
         """Record a live Claude called `name` in the fixture pane."""
-        path = self.root / f"claude-{pane.removeprefix("w").split(":")[0]}.sock"
+        path = Path(self.enterContext(short_socket_directory())) / f"claude-{pane.removeprefix("w").split(":")[0]}.sock"
         if not path.exists():
             held = socket.socket(socket.AF_UNIX)
             held.bind(str(path))
