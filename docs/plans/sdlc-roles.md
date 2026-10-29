@@ -105,42 +105,99 @@ For active process redesigns, as we are currently undergoing with promotions and
 - Claims of fewer wrong-party asks: message records have no sender or recipient roles.
 - D16 as a duplicate duty: it has one owner.
 
-### Phase 3 — Build the first approved step  · status: todo
-**Depends on:** Phase 2, and the user's approval of Step 1
+### Phase 3 — Build the first approved step  · status: done
+
+#### As-built
+
+- Live prose, commands and scripts call a Codex thread that a unit director sends work to a "worker". Role labels changed; runtime behavior, identifiers, API fields, flags, transport addresses and filenames did not.
+- `commands/unit/direct.md` carries its 9 worker-role word changes, and its kept contexts are gone.
+- `roles_audit.py` counts singular and plural forms. The forms are explicit inflected forms in the term data, not a general English plural rule.
+- `roles_audit.py check` exits non-zero and names the file and line of each retired name outside a kept context.
+- `test_roles_audit.py` holds fixture tests and the source-only repository test `test_repository_sources_have_no_unkept_retired_names`. The fixtures cover singular and plural, overlap, protocol and history contexts, copied context, changed kept text and a returning retired use. `merge_gate --tests-only` discovers the repository test, so every merge gate runs it. The test reads repository sources only, not home-state records.
+- `role_terms.toml` points `defined_in` at live defining files, such as `docs/as-built/guilds.md`. It keeps both `docs/delegate/` and `docs/direct/` as kept paths until no live file is under `docs/delegate/`.
+
+**Files:**
+- `scripts/production/role_terms.toml` — terms, retired forms, inflected forms, per-file kept contexts with reasons
+- `scripts/production/roles_audit.py` — the measure and the `check` action
+- `scripts/production/test_roles_audit.py` — fixtures and the repository check test
+- `docs/plans/sdlc-roles-design.md` — Step log (frozen classification, before and after measures), answered Questions and term table rows
+- Renamed prose and scripts: `commands/showrunner/{rename,retire,transfer}_unit.md`, `commands/unit/direct.md`, `docs/production_format.md`, `docs/direct/dual_review.md`, `docs/as-built/` (agent-registry, build-memory-admission, guilds, long-lived-workers, shutdown-and-restart, unit-rename, rustdoc-once-and-final-targets), `scripts/berth/install/README.md`, `scripts/agents/{codex_mesh,mesh_runs}.py`, `scripts/direct/{implement,board,review}.sh`, `scripts/direct/phase_reservation.py`, `scripts/production/{rename,retire,transfer}_unit.py`, `scripts/shutdown/{restart,inventory}.py`, `scripts/hooks/pre-tool-use-berth.py`; pinned label tests in `test_restart.py`, `test_rename_unit.py`, `test_mesh_runs.py`, `test_retire_unit.py`, `test_transfer_unit.py`
+
+**Binds later work:**
+- Each kept context in `scripts/production/role_terms.toml` applies once, in its named file only. Kept text that is changed or copied to another file is flagged.
+- Names keeps independent counts for each term. Only `check` uses the longest matching phrase.
+- The stored `seat` field and `codex_seats` stay as kept contracts. A change to them must add a kept context in the same change.
+- The lexical after measure is in the design doc Step log: merged tree, n=596 live files; `seat` 15, `seats` 7, `Codex seat` 1, `Codex seats` 0; 22 kept, 0 eligible.
+- Kept history and migration values: `docs/as-built/message-clarity.md`, `docs/as-built/usage-ledger.md`, `scripts/usage/collect.py`.
+
+**Gotchas:**
+- `check` took about 38 s wall (28 s CPU) on the full tree. The retired-name speed work makes it fast.
+- If a later edit rewords a file that has a kept context, the repository test fails until that file's kept text in `role_terms.toml` is refreshed. Example: a reword of `build-memory-admission.md`.
+
+**Ruled out:** extending the global kept-path masking (per-file kept contexts are used instead); a general English plural rule for every term (explicit inflected forms are used instead).
+
+### Phase 4 — The retired-name check runs in a few seconds  · status: done
+
+#### As-built
+
+- `roles_audit.py check` selects candidate files before extraction. A file is a candidate when its raw text holds a retired form. A Python file is also a candidate when any string Constant in its AST holds a form after escape decoding and literal joins. Shell files select on raw text only.
+- `read_live_file(root, retired, select_candidates, path)` returns `(files, issues)` for one path. `read_live_files` runs it in `ProcessPoolExecutor(max_workers=8)` with `chunksize=4` when retired forms are present and 64 or more paths are selected; otherwise it runs serially. `map` keeps sorted order, so output is byte-equal to full extraction.
+- `check_sources(root, *, full_extraction=False)`: `full_extraction=True` extracts every file and runs serially. The parity test uses it.
+- Findings, exit status, kept contexts, physical source lines and source-read errors are the same as before. Untracked sources, fixture roots and non-Git roots stay covered.
+- On natedev at 1-minute load 67-69, `check` takes 1.1-1.3 s wall and the `test_roles_audit.py` suite takes 1.5-1.7 s wall (before: `check` 39.8 s at load 78).
+
+**Files:**
+- `scripts/production/roles_audit.py` — candidate selection and the parallel per-file scan
+- `scripts/production/test_roles_audit.py` — fixtures for joined literals, escapes, read errors, a non-Git root, and parity with full extraction on a bounded repository sample
+- `docs/plans/sdlc-roles-design.md` — Step log section "Retired-name check timing — 2026-10-28"
+
+**Gotchas:** After candidate selection, most of the cost is parsing every Python file, because syntax diagnostics must still report. Only parallel reading removes it. Timings above load 80 do not count against the 5 s budget; record the load with each time.
+
+**Ruled out:** a literal `git grep` prefilter, because it misses joined literals and escapes that Python extraction decodes; candidate selection alone, because it reached 8.4 s at load 38-44.
+
+### Phase 5 — Each session records its role apart from its name  · status: todo
+**Depends on:** Phase 4
 
 #### Work Order
 
-**Goal:** the step the user approved is live, and its measure is recorded before and after.
+**Goal:** every session records its role apart from its name, so many sessions can hold one role and no session needs a role in its name.
 
 **Spec:**
-- Before dispatch, the unit director copies the approved step from the design doc's Steps into this Spec verbatim (files, the change, the measure, how to undo it) and fills **Files** and **Workers** from it. A phase with no approved step does not dispatch: it waits on the showrunner's answer.
-- Record the step's measure with `roles_audit.py baseline` before the change, into the design doc under **Step log**.
-- An edit to `commands/unit/direct.md` goes to phases-unit as a change request through the showrunner; this phase does not edit it. Edits to `docs/production_format.md` and `commands/showrunner/produce.md` merge with any pending edits from guilds-unit or fix-rounds-unit that touch the same tags; the Work Order names each.
-- A rename changes every live file the measure names in one phase, and adds the old name to `role_terms.toml` as `retired`.
+- Decided by the user (R1b, 2026-10-21; production doc Decisions): a session's name and its role are separate. Every session records its role apart from its name. roles-unit defines the role record; the unit board's owner and cargo-liner add the name and role columns (the showrunner asks them).
+- Packaging: the showrunner's call, 2026-10-28 — this phase follows Step 1. Bring the user only a choice R1b leaves open.
+- Decided by the user (R5b, 2026-10-28, via the showrunner): every shown name carries production · unit · job, for example `sdlc · roles · code reviewer 6`, in reports, messages and Codex thread names. The address stays as it is. The role record supplies the job part.
+- Three meanings of role already exist and stay distinct: the organizational role (`RosterEntry.role`, apart from its name), the worker assignment in mesh records (`impl`, `test`, `fix`, `review`), and the guild responsibility in guild records. Define each, and how it maps to the R5b job. Keep current routing and permission meanings; do not replace every `role` with one vocabulary.
+- Types: distinct semantic types for organizational role, worker assignment and shown job, with explicit states for unassigned, legacy-unrecorded and unreadable records; no interchangeable strings or bare optional fields. If `LiveUnit.session: MarkedUnit | None` joins the role-record boundary, give its absence an explicit state.
+- Fixture tests: old records, missing production or unit, a freestanding session, several sessions holding one job, reassignment, rename, transfer, restart and account move. The role survives each; shown names and Codex thread titles follow R5b; addresses and thread identities stay valid.
+- Files at phase start name every record writer and reader, the renderers of reports and messages, the code that sets Codex thread titles, and their tests. The unit board's owner and cargo-liner are named dependencies with their own deliverables; sending them the definition does not count as their change landing.
+- The unit director writes the Work Order from the current session records at phase start (roster, `showrunners.py`, `units_table.py`), with the role values from the approved names (Q3: design reviewer, code reviewer, UI reviewer, designer; Q6: showrunner, unit director; Q7: worker, small-fix helper).
 
 **Files:**
-- `docs/plans/sdlc-roles-design.md` — Step log
-- `scripts/production/role_terms.toml` — when the step changes a name
+- `docs/plans/sdlc-roles-design.md` — role record definition
+- `scripts/message/roster.py` — organizational role, worker assignment and shown job types; the shown name
+- `scripts/agents/codex_mesh.py` — Codex thread titles carry the shown name; the roster record keeps its worker assignment
+- `scripts/production/production_tree.py` — reads the role record, not a name suffix
+- `scripts/production/broadcast.py` — selects by organizational role
+- `scripts/message/send.py` — shown sender name
+- `scripts/message/test_roster.py`, `scripts/agents/test_codex_mesh.py`, `scripts/production/test_production_tree.py`, `scripts/production/test_broadcast.py`, `scripts/message/test_send.py` — fixture tests
 
-**Workers:** filled from the approved step.
+**Workers:** `1 writer + 1 tester`. `impl` holds the five scripts; `test` holds the five test files.
 
-**Constraints from prior phases:** the Steps section and the user's answer, plus these facts from Phase 2:
-- Step 1 (as committed in e02e6370) covers 19 measured files plus 4 test files that assert the changed text (`scripts/shutdown/test_restart.py`, `scripts/production/test_rename_unit.py`, `scripts/agents/test_mesh_runs.py`, `scripts/production/test_retire_unit.py`). The expected reduction is n=66 (singular and plural), with n=18 kept uses; re-run the classification before dispatch.
-- The match becomes plural-aware through explicit inflected forms in `role_terms.toml`; `roles_audit.py` today matches the singular only (`name_pattern`) and masks kept strings globally (`without_paths`), so per-file kept contexts are new code.
-- The phase's first task, before any rename, replays a plural-aware check prototype over `4ddd7b52..HEAD` (n=21 commits add the word after its retirement) and counts real flags against false failures and run time. If that reverses the case for the check, the phase stops and asks again through the showrunner.
-- The check runs as a test that `merge_gate --tests-only` discovers. A source-only scan of all n=546 files and n=36 terms took 10.5–10.8 s at load 50–54 on 32 cores (2026-10-20).
-- Memory prose that uses the retired word is director-owned cleanup with no count credit; quoted command output stays as recorded.
+**Constraints from prior phases:** the approved names; Step 1's worker words. Stored fields `seat` and `codex_seats` stay as they are: a role field never renames them, and a retirement that leaves a live key, value or flag adds it to the kept contexts in `scripts/production/role_terms.toml` in the same change.
 
-**Acceptance gate:** the gates in Delegation Context green; the change is live on main per the production's rule for `~/.claude`; the Step log has the before measure, the command and its file set or window.
+**Acceptance gate:** the gates in Delegation Context green; each role-holding record type has a role field apart from its name; shown names follow R5b; the record definition is in the design doc and sent to the showrunner for the column owners.
 
-### Phase 4 — Measure the first step and propose the next  · status: todo
-**Depends on:** Phase 3
+### Phase 6 — Measure the first step and propose the next  · status: todo
+**Depends on:** Phase 5
 
 #### Work Order
 
 **Goal:** the design doc says whether Step 1 moved its measure, and the next step goes to the user.
 
 **Spec:**
+- The lexical after measure is done: the Step log's Phase 3 after measure (n=596 live files) reads 15 singular and 7 plural kept uses, 0 eligible. On the comparable merged set the reduction is 104 to 22 (n=82); this supersedes the earlier expected reduction of n=66. Do not mix the n=563 and n=596 snapshots.
+- The windowed measure names the merge timestamp of f8f5b962 into sdlc and a complete observation interval of at least 3 days after it. Sent-contact counts are descriptive and have no Step 1 reduction target. Keep unknown roles unknown: a current role record gives no historical roles or request intent, so never infer a role from a shown name.
+- Add the merge-gate cost of the retired-name check (Phase 4 budget) as measured in real gates over the window.
 - Run `roles_audit.py baseline` after the change, on the same file set; for a measure with a window (sent contacts per recipient), the after window is at least 3 days from the merge. Wrong-party asks are not measurable until message records carry roles; do not report them. Add the after numbers to the Step log with n for each.
 - If the measure did not move by at least half the expected size, the Step log says so, names the likely reason, and proposes undoing it or changing it; that proposal is the question.
 - Otherwise update Steps with what the measure taught, and pick the next step.

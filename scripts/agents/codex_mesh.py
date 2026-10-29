@@ -268,7 +268,7 @@ MESH_RUNS_SCRIPT = Path(__file__).with_name("mesh_runs.py")
 DEAD_RUN_END_TIMEOUT_SECS = 300
 BOARD_HELPER = Path(__file__).resolve().parent.parent / "direct" / "board.sh"
 # The folders that hold unit run folders. An app-server whose session directory is one of their
-# children serves that run alone, so its seats get the run as UNIT_RUN_DIR.
+# children serves that run alone, so its workers get the run as UNIT_RUN_DIR.
 RUN_ROOTS: tuple[Path, ...] = unit_runs.run_roots()
 # Servers dropped by _retire_server, kept so `stop` can still reap them. A
 # retired server is abandoned rather than signalled: it may still be finishing a
@@ -1539,7 +1539,7 @@ def _lookup_state(session_dir: str, name: str) -> RosterThread:
 
 
 def _seat_sandbox(args: argparse.Namespace, session_dir: str, name: str) -> str:
-    """Select the sandbox from the seat's resolved access policy."""
+    """Select the sandbox from the worker's resolved access policy."""
     record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
     policy = roster_access_policy(record)
     if isinstance(policy, ReadOnlyReviewer):
@@ -2696,7 +2696,7 @@ def ensure_server(session_dir: str, home: Path | None = None, cwd: str | None = 
 def _server_environment(session_dir: str, workers_home: Path) -> dict[str, str]:
     """The app-server's environment: the caller's, with the workers home and, for a unit run, the run.
 
-    A seat's hooks and verify.sh runs read the run from UNIT_RUN_DIR. The caller's copy
+    A worker's hooks and verify.sh runs read the run from UNIT_RUN_DIR. The caller's copy
     cannot be trusted: implement.sh exports it only after its claim step, whose `compact` call may
     already have started this server. A run folder is known here, so the server names it itself. A
     review pool's mesh directory, or any other mesh directory, is not a run: one pool server
@@ -5941,7 +5941,7 @@ def _pause_roster(session_dir: str) -> None:
 
 
 def command_stop(args: argparse.Namespace) -> int:
-    """Reap the run servers, ending seats unless a director restart pauses them."""
+    """Reap the run servers, ending workers unless a director restart pauses them."""
     session_dir = _as_str(_attr(args, "session_dir"))
     for value in _read_json_object(_session_path(session_dir, ROSTER_FILE)).values():
         entry = _as_dict(value)

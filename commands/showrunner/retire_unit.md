@@ -23,10 +23,10 @@ Then it stops everything the unit owns. It finds each thing by its own record, n
 pattern, and prints one line for each thing it stops and for each thing it leaves running, with
 the reason:
 
-1. Each Claude session that works in the worktree, the unit director and its Claude seats, and the director of each of the worktree's runs wherever it works, stops
+1. Each Claude session that works in the worktree, the unit director and its Claude workers, and the director of each of the worktree's runs wherever it works, stops
    through `shutdown.py down`: it pauses and stops at its ready mark. Its restore is then forgotten,
    so no restart brings it back.
-2. Each run of the worktree with an app-server stops it and ends its Codex seats.
+2. Each run of the worktree with an app-server stops it and ends its Codex workers.
 3. The unit's review-pool reviewers retire. A reviewer still reviewing stays.
 4. The build holds of the unit's sessions release, its berth reservations release, and the process
    of each Mac claim on the worktree stops.
