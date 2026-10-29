@@ -82,6 +82,28 @@ A refusal is a `permissionDecision: deny` with a reason. The reason names the ca
 
 `final` runs `cargo check --workspace --all-targets`, then `run_nextest --workspace --tests`. The check type-checks every example once. `--tests` selects each target with `test = true`. By default that is each lib, bin and integration test, and no example. `final` does not pass `--lib`, so a workspace with no library works.
 
+`final` always runs these commands, even when a prior pass exists. On exit 0,
+it records a pass only when the checkout was clean at call start and remains
+clean with the same Git tree at exit. Staged changes, unstaged changes and
+untracked files prevent a record. A failed run or a changed tree prints one
+line and writes no record.
+
+The machine-wide record is `~/.local/state/verify/final_pass/<tree>.json`.
+`VERIFY_STATE_DIR` changes the `verify` folder for private state. The record
+has `tree`, `head`, `repo` (origin URL, or repo top when there is no origin),
+`rustc` (`rustc -vV`), `verify_sha256`, `features` (the merged dev feature
+list passed to Cargo), `host`, `status` (0) and `at` (UTC ISO time). The file
+and folder are synced after an atomic write. Writes prune JSON records older
+than 14 days. The record survives session cleanup and can be reused from a
+second checkout of the same tree.
+
+`verify.sh final-pass [<tree>]` reads this proof. Without a tree argument, it
+requires the current clean HEAD tree. It prints the JSON record and exits 0
+only when the tree, status, compiler text and verify.sh hash match. A missing,
+unreadable or different record exits 1 with one reason. This query runs before
+environment setup, uses no Cargo or build admission, and needs no unit session.
+It never writes state or prunes records.
+
 ### The example scan
 
 `UNTESTED_EXAMPLES_PY` reads `cargo metadata --no-deps`. It runs before the cache lookup and before any build, for `final` (the whole workspace) and for `verify.sh test <package>` with or without `--features`. It does not run for `--filter` or for a named integration test. For each example target, it scans the source for a line that starts with `#[cfg(test)]` or `#[...test]` (with optional `path::` segments). For an example at `examples/<name>/main.rs`, it scans every `.rs` file in that folder. A commented attribute does not match. Each offender gets two lines on stderr, a reason and a fix:
