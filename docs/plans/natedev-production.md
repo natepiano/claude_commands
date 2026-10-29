@@ -8,7 +8,7 @@
 - **Source plans:** `docs/plans/build-followups.md` (now `docs/as-built/build-followups.md`), `docs/plans/build-followups-stalls.md` (now `docs/as-built/buildlog-memory-stalls.md`), `docs/plans/build-followups-ratio.md` (now `docs/as-built/buildlog-tests-per-edit-rust-release.md`), `docs/plans/build-followups-memory.md` (the user, 2026-10-04 11:46 PDT; now `docs/as-built/build-memory-admission.md`), `docs/plans/build-followups-notifier.md` (now `docs/as-built/validate-and-push-cancel-prior.md`), `docs/plans/build-followups-screen-record.md` (the user, 2026-10-06; now `docs/as-built/screen-record.md`), `docs/as-built/build-followups-fn-length-hook.md (run done; as-built 4ab5e4c)` (the user, 2026-10-06), `docs/plans/build-followups-mul-add.md` (now `docs/as-built/build-followups-mul-add.md`) (the user, 2026-10-06 08:2x PDT), `docs/plans/build-followups-screenshot.md` and `docs/plans/build-followups-enh-showrunner.md` (the user, 2026-10-06; now `docs/as-built/showrunner-automation.md`), and `docs/plans/build-followups-kill-order.md` (natedev, 2026-10-06, after earlyoom killed CI compilers before a hung 15 GB test; now `docs/as-built/build-memory-admission.md`), and `docs/plans/build-followups-test-speed.md` (the user, 2026-10-13; now `docs/as-built/merge-gate-and-test-speed.md`) — written 2026-10-04 by natedev from the adhoc review's five follow-up tasks (user: "launch it as a plan for a unit director to execute"; "you must use /showrunner:produce for this and start running dailies")
 - **Repository:** `/home/natepiano/.claude`
 - **Merge branch:** `natedev` — every unit merges here; only the showrunner pushes it
-- **Showrunner checkout:** `/home/natepiano/worktrees/claude-build-followups-trunk`
+- **Showrunner checkout:** `/home/natepiano/worktrees/claude-natedev-trunk`
 - **Showrunner session:** natedev
 - **Log:** `docs/plans/natedev-log.md` — git-excluded; one line per event
 - **Change review:** `~/rust/hanadocs/change-review/change-review - natedev.md` — changes for the user to check, read only when the user asks; never open questions
@@ -57,7 +57,6 @@
 | typesafe-unit | docs/plans/build-followups-typesafe.md | `/home/natepiano/worktrees/claude-natedev-typesafe` | `natedev-typesafe` | — | — |
 | postmaster-unit | permanent | `/home/natepiano/worktrees/claude-natedev-postmaster` | `natedev-postmaster` | — | — |
 | ups-unit | permanent | `/home/natepiano/worktrees/claude-natedev-ups` | `natedev-ups` | — | — |
-| verify-unit | docs/plans/natedev-verify.md | /home/natepiano/worktrees/claude-build-followups-verify | natedev-verify | — | `scripts/direct/verify.sh`, `scripts/direct/final_pass.py`, the verify cache, lint and test scope, verify speed, the Mac test code (`scripts/mac_test/`), from builds-unit |
 
 ## Hub files
 
