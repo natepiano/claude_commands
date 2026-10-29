@@ -127,6 +127,69 @@ Each command shows its script's output unchanged; each script answers in about a
   - With no shared group the table is replaced by `No step ran with the same kind, caller and rebuild class on both sides.` A latest change older than the 7 days gives only the `Profile now:` line; with no profiled natedev sample the section is omitted.
 - Report layouts, the share lists, interval rules and the same-tree comparison are in [mac-test-offload.md](mac-test-offload.md) ("Build log and report", "Hold events and tree evidence").
 
+### Build output retained by the sweep
+
+`scripts/lint/sweep.py` keeps the configured free-space floor (300 GiB on natedev).
+When free space is below the floor, it takes only the shortfall. After orphaned
+copies, it takes output from idle targets in last-use order, oldest first,
+across all locations. `/tmp` targets have no special priority. A target's last
+use is the newer of its `.lint-sweep-used` stamp and its build units' last uses.
+Build locks, live processes and build holds still keep their targets out of the sweep.
+Candidate and size scans hold no cargo locks. Up to four target scans run
+together; combined inode accounting counts shared blocks once. The floor takes one target's locks
+without waiting, deletes its selected output, and releases the locks before
+moving on. A busy target, or one used since candidate discovery began, is skipped.
+File identity, size and mtime are checked before deletion; changed output stays.
+Removing a hard link in another target does not change this check.
+The pass stops when successful deletions cover
+the shortfall.
+
+`recent_minutes=60` in `[sweep]` of `config/lint.conf` puts targets used in the
+last hour after all older targets. Recent output can go when the older output
+cannot meet the floor. The per-target budget sweep uses the same rule for build
+units: older units first, then recent units. Within each group, whole days
+since last use come first, then oldest compile time. Orphaned
+copies and the separate rustdoc index limit keep their existing rules.
+
+Run `python3 scripts/lint/sweep.py rebuilds --days 7` to see cold rebuild
+compile-hours by clone kind and cause: `floor take`, `budget take`, `tmp sweep`
+or `none`. The command reads natedev's monthly build-log JSON lines, the
+journal and `~/.local/state/lint-sweep/removals.jsonl`. It writes no report, index or sweep state. `BUILDLOG_DIR` selects a
+different build-log root.
+
+A cold step has `crates_compiled >= 50`. Its cause is the latest matching
+removal between the same workspace's previous step end and the cold step start.
+The workspace is `worktree` when set, otherwise `cwd`; it also sets the clone
+kind. A tmp sweep can match the workspace or working folder and their ancestors.
+The journal's `the floor took` lines name floor removals. A `lint sweep: removed`
+line for build units uses the budget header from the same journal stream;
+orphan cleanup does not count. `tmp sweep: deleted`
+lines name removed folders. The report groups gate and merge copies, phase
+clones, mktemp folders, scratchpad clones, scratch.py folders, other `/tmp`,
+`~/rust` worktrees, and other folders. Compile-hours use `finished_s`, with
+`duration_s` when that field is absent. The table also gives totals per day.
+
+Real budget and floor removals append one JSON record per affected target to
+`removals.jsonl`, with `at` (epoch seconds), `path` (target directory) and
+`cause` (`budget take` or `floor take`). This keeps evidence when a background
+caller discards output. The floor writes each target's record after its deletions
+and before releasing its locks, so a build can use the record while the pass continues.
+Orphan cleanup does not count as a rebuild cause.
+Dry runs write no removal record. A write failure prints one line and does
+not fail the sweep. Once the file exceeds 1 MiB, a writer drops records older
+than 35 days and keeps only the newest rows that fit in 512 KiB. This leaves
+room for later appends without another rewrite. A read error prints one line
+and leaves the journal as the source of evidence. Writers lock the file for
+append and retention. The existing
+`LINT_SWEEP_STATE_DIR` override also selects this file's directory.
+The report merges the file and journal into one event per path, cause and
+second. It reads sweep state without changing it.
+
+`none` means no matching evidence, including a workspace's first recorded step.
+It does not prove that no deletion occurred. Attribution uses recorded paths;
+it cannot connect an external custom target directory to a workspace when
+the log does not record that connection. Journal retention also limits the evidence.
+
 ## Invariants
 
 - A Mac pass or failure ends a `verify.sh test` call (`passed_full`, `passed_filter`, `failed`; since 2026-10-16 natedev does not confirm it). CI's Linux jobs catch a Linux-only failure. `check`, `build`, `lint`, `doc`, `example` and `final` never leave natedev.
