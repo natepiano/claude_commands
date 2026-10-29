@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Generator
+from datetime import UTC, datetime
 import json
 import contextlib
 import io
@@ -20,11 +21,13 @@ from typing import TypedDict, cast, final, override
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 from scripts.production import change_review, merge_gate
 from scripts.direct.wait_for_test_state import wait_for_file
 from scripts.direct.local_release_wait import IntervalReleasePolling
 from scripts.build_hold.test_hold_applies import TemporaryHoldTest
+from scripts.buildlog.store import host_name
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -34,6 +37,7 @@ EXPECTED_SUITES = (
     "mac_test", "usage", "bevy_upgrade", "bevy_migration_plan", "production", "direct", "buildlog",
     "lint", "nightly_review", "build_targets", "shutdown", "feature_log",
     "model_study", "herdr", "notify", "statusline", "astra", "style", "history", "guilds", "issue_score",
+    "hierarchies",
 )
 # Each suite's fixture holds test_first.py, and lib also test_second.py.
 MODULES = len(EXPECTED_SUITES) + 1
@@ -267,6 +271,7 @@ class MergeGateTests(unittest.TestCase):
             "MERGE_GATE_BASEDPYRIGHT": str(self.bin / "basedpyright"),
             "MERGE_GATE_UV": str(self.bin / "uv"),
             "MERGE_GATE_STATE_DIR": str(self.state / "runner"),
+            "MERGE_GATE_PASSED_DIR": str(self.state / "passes"),
             "MERGE_GATE_STYLE_SYNC": str(self.bin / "style_sync.py"),
             "BUILDLOG_SCOPE": "0",
             "BUILD_HOLD_DIR": str(self.root / "holders"),
@@ -375,6 +380,188 @@ class MergeGateTests(unittest.TestCase):
     def module_events(self) -> list[ModuleEvent]:
         path = self.state / "modules.jsonl"
         return [cast(ModuleEvent, json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def pass_records(self) -> list[dict[str, object]]:
+        path = Path(self.environment["MERGE_GATE_PASSED_DIR"]) / "passed-trees.jsonl"
+        return [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def clear_gate_events(self) -> None:
+        for name in ("modules.jsonl", "tools.jsonl", "types-ran"):
+            (self.state / name).unlink(missing_ok=True)
+
+    def assert_all_modules_started(self) -> None:
+        starts = [(row["suite"], row["module"]) for row in self.module_events() if row["event"] == "start"]
+        self.assertCountEqual(starts, [(suite, "test_first.py") for suite in EXPECTED_SUITES]
+                              + [("lib", "test_second.py")])
+
+    def test_clean_pass_records_tree_commit_host_time_checkout_suites_and_source(self) -> None:
+        result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_all_modules_started()
+        record, = self.pass_records()
+        self.assertEqual(record["tree"], self.git(self.checkout, "rev-parse", "HEAD^{tree}"))
+        self.assertEqual(record["commit"], self.base)
+        self.assertEqual(record["host"], host_name())
+        self.assertEqual(record["checkout"], str(self.checkout))
+        self.assertEqual(record["suites"], sorted(EXPECTED_SUITES))
+        self.assertEqual(record["source"], "tests-only")
+        at = datetime.fromisoformat(cast(str, record["at"]))
+        self.assertEqual(at.utcoffset(), UTC.utcoffset(at))
+
+    def test_dirty_and_failed_runs_do_not_record_a_pass(self) -> None:
+        for state in ("tracked", "staged", "untracked", "failed"):
+            with self.subTest(state=state):
+                self.environment["MERGE_GATE_PASSED_DIR"] = str(self.state / state)
+                self.clear_gate_events()
+                if state == "tracked":
+                    self.write(self.checkout / "subject.txt", "edited\n")
+                elif state == "staged":
+                    _ = self.git(self.checkout, "add", "subject.txt")
+                elif state == "untracked":
+                    _ = self.git(self.checkout, "restore", "--staged", "--worktree", "subject.txt")
+                    self.write(self.checkout / "notes", "untracked\n")
+                else:
+                    (self.checkout / "notes").unlink()
+                    self.write(self.state / "red-hooks", "red")
+                result = self.run_gate("--tests-only")
+                self.assertEqual(result.returncode, 1 if state == "failed" else 0, result.stdout + result.stderr)
+                self.assertEqual(self.pass_records(), [])
+                self.assertTrue(self.module_events())
+
+    def test_second_tests_only_run_reuses_without_starting_any_module(self) -> None:
+        first = self.run_gate("--tests-only")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.clear_gate_events()
+        self.environment["USER_ZONE"] = "America/New_York"
+        second = self.run_gate("--tests-only")
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(self.module_events(), [])
+        record, = self.pass_records()
+        when = datetime.fromisoformat(cast(str, record["at"])).astimezone(
+            ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S %Z")
+        self.assertIn(f"tests reused from {cast(str, record['tree'])[:12]} ({when}, tests-only, {self.checkout})", second.stdout)
+
+    def test_checkpoint_reuses_unit_tree_and_still_runs_types_and_checks_settings(self) -> None:
+        first = self.run_gate("--tests-only", "--repo", str(self.unit))
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.clear_gate_events()
+        second = self.run_gate()
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(self.module_events(), [])
+        self.assertTrue((self.state / "types-ran").exists())
+        self.assertIn("tests reused from", second.stdout)
+        self.assertEqual(self.git(self.origin, "rev-parse", "integration"), self.git(self.checkout, "rev-parse", "HEAD"))
+        self.clear_gate_events()
+        refused = self.run_gate("--settings-blob", "00000000")
+        self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+        self.assertIn("tests reused from", refused.stdout)
+        self.assertIn("settings.json differs", refused.stderr)
+        self.assertEqual(self.module_events(), [])
+
+    def test_checkpoint_full_pass_records_and_tests_only_reuses_it(self) -> None:
+        first = self.run_gate()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assert_all_modules_started()
+        record, = self.pass_records()
+        self.assertEqual(record["source"], "checkpoint")
+        self.assertEqual(record["commit"], self.git(self.checkout, "rev-parse", "HEAD"))
+        self.clear_gate_events()
+        second = self.run_gate("--tests-only")
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(self.module_events(), [])
+        self.assertIn(", checkpoint, ", second.stdout)
+
+    def test_tree_dirty_host_or_suite_mismatch_runs_all_modules(self) -> None:
+        first = self.run_gate("--tests-only")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        original = self.pass_records()[0]
+        path = Path(self.environment["MERGE_GATE_PASSED_DIR"]) / "passed-trees.jsonl"
+        for mismatch in ("host", "suites", "dirty", "tree"):
+            with self.subTest(mismatch=mismatch):
+                record = dict(original)
+                if mismatch == "host":
+                    record["host"] = "other-host"
+                elif mismatch == "suites":
+                    record["suites"] = [*EXPECTED_SUITES, "other-suite"]
+                else:
+                    self.write(self.checkout / "subject.txt", "new tree\n")
+                    if mismatch == "tree":
+                        _ = self.commit(self.checkout, "different tree")
+                self.write(path, json.dumps(record) + "\n")
+                self.clear_gate_events()
+                result = self.run_gate("--tests-only")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertNotIn("tests reused from", result.stdout)
+                self.assert_all_modules_started()
+
+    def test_unavailable_ledger_runs_all_modules_and_reports_once(self) -> None:
+        directory = Path(self.environment["MERGE_GATE_PASSED_DIR"])
+        first = self.run_gate("--tests-only")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        path = directory / "passed-trees.jsonl"
+        saved = path.read_text()
+        for failure in ("unreadable", "unwritable", "invalid"):
+            with self.subTest(failure=failure):
+                self.write(path, "invalid json\n" if failure == "invalid" else saved)
+                path.chmod(0o200 if failure == "unreadable" else 0o400 if failure == "unwritable" else 0o600)
+                self.clear_gate_events()
+                try:
+                    result = self.run_gate("--tests-only")
+                finally:
+                    path.chmod(0o600)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout.count("Test pass ledger unavailable;"), 1, result.stdout)
+                self.assert_all_modules_started()
+
+    def test_changed_checkout_or_failed_append_cannot_record_a_pass(self) -> None:
+        finish = merge_gate.finish_gate_job
+        for state in ("dirty-at-end", "dirty-at-start", "new-head", "append-fails"):
+            with self.subTest(state=state):
+                self.environment["MERGE_GATE_PASSED_DIR"] = str(self.state / state)
+                self.clear_gate_events()
+                if state == "dirty-at-start":
+                    self.write(self.checkout / "subject.txt", "temporary edit\n")
+
+                def finish_and_change(job: merge_gate.RunningGateJob, status: int) -> merge_gate.GateJobResult:
+                    result = finish(job, status)
+                    if state == "dirty-at-end":
+                        self.write(self.checkout / "subject.txt", "edit during run\n")
+                    elif state == "dirty-at-start":
+                        _ = self.git(self.checkout, "restore", "subject.txt")
+                    elif state == "new-head":
+                        self.write(self.checkout / "subject.txt", "new commit during run\n")
+                        _ = self.commit(self.checkout, "changed during tests")
+                    else:
+                        path = Path(self.environment["MERGE_GATE_PASSED_DIR"]) / "passed-trees.jsonl"
+                        path.unlink()
+                        path.mkdir()
+                    return result
+
+                output = io.StringIO()
+                with mock.patch.dict(os.environ, self.environment), \
+                        mock.patch.object(merge_gate, "TEST_SUITES", ("hooks",)), \
+                        mock.patch.object(merge_gate, "finish_gate_job", side_effect=finish_and_change), redirect_stdout(output):
+                    run = merge_gate.run_suites(self.checkout)
+                self.assertTrue(run.passed, output.getvalue())
+                self.assertEqual(len(run.jobs), 1)
+                if state == "append-fails":
+                    self.assertEqual(output.getvalue().count("Test pass ledger unavailable;"), 1)
+                else:
+                    self.assertEqual(self.pass_records(), [])
+                _ = self.git(self.checkout, "restore", "subject.txt")
+
+    def test_reused_modules_do_not_hide_a_red_type_job(self) -> None:
+        first = self.run_gate("--tests-only", "--repo", str(self.unit))
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.clear_gate_events()
+        self.write(self.state / "types-red", "red")
+        result = self.run_gate()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("tests reused from", result.stdout)
+        self.assertIn("basedpyright: RED", result.stdout)
+        self.assertEqual(self.module_events(), [])
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+        self.assert_not_pushed()
 
     def assert_not_pushed(self) -> None:
         self.assertEqual(self.git(self.origin, "rev-parse", "integration"), self.base)
@@ -841,6 +1028,7 @@ class MergeGateTests(unittest.TestCase):
     def test_scope_skips_disabled_failed_probe_and_existing_builds_slice(self) -> None:
         for reason in ("disabled", "probe", "existing"):
             with self.subTest(reason=reason):
+                self.environment["MERGE_GATE_PASSED_DIR"] = str(self.state / ("passes-" + reason))
                 self.environment["BUILDLOG_SCOPE"] = "0" if reason == "disabled" else "1"
                 self.write(self.state / "scope-fails", "fail")
                 (self.state / "tools.jsonl").unlink(missing_ok=True)
@@ -1473,6 +1661,7 @@ class MergeGateHoldTests(TemporaryHoldTest):
                      "--main-repo", str(self.gate.main), "--ssh", str(self.gate.bin / "ssh")]
         for mode in ([], ["--tests-only"], ["--promote-only"]):
             with self.subTest(mode=mode):
+                os.environ["MERGE_GATE_PASSED_DIR"] = str(self.gate.state / ("passes-" + "-".join(mode)))
                 (self.gate.state / "modules.jsonl").unlink(missing_ok=True)
                 (self.gate.state / "tools.jsonl").unlink(missing_ok=True)
                 self.hold()
@@ -1587,6 +1776,7 @@ class MergeGateHoldTests(TemporaryHoldTest):
     def test_signalled_module_and_types_jobs_resume_after_hold_release(self) -> None:
         for suite in ("hooks", "types"):
             with self.subTest(suite=suite):
+                os.environ["MERGE_GATE_PASSED_DIR"] = str(self.gate.state / ("passes-" + suite))
                 (self.gate.state / "modules.jsonl").unlink(missing_ok=True)
                 self.gate.write(self.gate.state / "signal-hooks", "once")
                 if suite == "types":

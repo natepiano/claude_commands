@@ -1282,6 +1282,26 @@ def list_roles() -> dict[str, object]:
     return {'roles': entries, 'problems': problems}
 
 
+def render_roles(report: dict[str, object]) -> str:
+    lines: list[str] = []
+    for entry in cast(list[dict[str, object]], report['roles']):
+        holder = _holder(_object(entry['holder']))
+        holder_name = (f'{holder.unit_name} ({holder.production_slug})' if isinstance(holder, UnitHolder)
+                       else holder.production_slug + ' showrunner')
+        reach = _object(entry['holder_reach'])
+        route = ('session ' + _text(reach, 'session_id') if reach.get('kind') == 'HolderReach'
+                 else 'unavailable: ' + _text(reach, 'reason'))
+        lifecycle = _object(entry['lifecycle'])
+        thread = ' | thread ' + _text(lifecycle, 'thread_id') if lifecycle.get('thread_id') else ''
+        lines.append(f"{entry['instance_id']} | {entry['role']} | {_text(lifecycle, 'kind')} | "
+                     + f"{holder_name} | {route}{thread} | {entry['document']}")
+    if not lines:
+        lines.append('no held roles')
+    for problem in cast(list[dict[str, str]], report['problems']):
+        lines.append(f"problem: {problem['path']}: {problem['reason']}")
+    return '\n'.join(lines)
+
+
 def held_document(document: Path) -> HeldDesign | None:
     found = [read_design(path.parent.name) for path in state_root().glob('*/design.json')
              if _read(path).get('document') == str(document.resolve())]
@@ -1559,7 +1579,8 @@ def main(argv: list[str]) -> int:
                 raise RoleRefused('this host is not the ownership authority')
             print(json.dumps(_authority_local(argument('operation'), _object(cast(object, json.load(sys.stdin))))))
         else:
-            print(json.dumps(list_roles()))
+            report = list_roles()
+            print(json.dumps(report) if args.get('json') else render_roles(report))
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, configparser.Error) as error:
         print('roles: ' + str(error).replace('\n', ' '), file=sys.stderr)
         return 2

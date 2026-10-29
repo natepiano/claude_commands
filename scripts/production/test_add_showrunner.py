@@ -303,10 +303,13 @@ class AddShowrunnerTests(unittest.TestCase):
         opened = self.opened()
         self.assertEqual(opened[:8], ["--session", "agents", "workspace", "create", "--label", "kid",
                                      "--cwd", str(self.root / "kid-checkout")])
-        self.assertEqual(opened[8:], ["--env", "ENABLE_TOOL_SEARCH=true",
-            "--env", f"CLAUDE_CONFIG_DIR={Path(self.env['HOME']) / '.claude2'}",
-            "--env", f"CLAUDE_CODE_REMOTE_MEMORY_DIR={Path(self.env['HOME']) / '.claude'}",
-            "--env", "HERDR_AGENT_PANE=1", "--no-focus"])
+        environment = dict(value.split("=", 1) for flag, value in zip(opened[8:], opened[9:]) if flag == "--env")
+        self.assertEqual({key: value for key, value in environment.items()
+                          if key.startswith(("CLAUDE_", "SHOWRUNNER_", "HERDR_")) or key == "ENABLE_TOOL_SEARCH"},
+                         {"ENABLE_TOOL_SEARCH": "true", "HERDR_AGENT_PANE": "1",
+                          "CLAUDE_CONFIG_DIR": str(Path(self.env["HOME"]) / ".claude2"),
+                          "CLAUDE_CODE_REMOTE_MEMORY_DIR": str(Path(self.env["HOME"]) / ".claude")})
+        self.assertEqual(opened[-1], "--no-focus")
         started = self.started()
         self.assertEqual(started[started.index("--") + 1:], ["--model", "opus", "--effort", "high",
             "--session-id", started[started.index("--session-id") + 1], "--remote-control", "kid", "-n", "kid", "--settings", '{"disableAgentView": true}'])
@@ -409,10 +412,10 @@ class AddShowrunnerTests(unittest.TestCase):
             self.assertEqual(code, add_showrunner.SESSION_NOT_READY)
             self.assertIn("kid: opening prompt not submitted", error.getvalue())
             appeared.assert_not_called()
-            opening = cast(runtime.OpeningPrompt, start.call_args.kwargs["opening"])
+            opening = cast(runtime.OpeningPrompt, start.call_args.args[4])
             assert isinstance(opening.transcript, runtime.SessionTranscript)
             self.assertEqual(opening.transcript.config_dir, Path(self.env["HOME"]) / ".claude2")
-            arguments = cast(list[str], start.call_args.kwargs["agent_arguments"])
+            arguments = cast(list[str], start.call_args.args[3])
             self.assertEqual(opening.transcript.session_id, arguments[arguments.index("--session-id") + 1])
         self.assertEqual(self.parent_of("kid"), "")
 
@@ -652,10 +655,13 @@ class AddShowrunnerTests(unittest.TestCase):
         self.starts("kid-session", registers="kid")
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.opened()[8:], ["--env", "ENABLE_TOOL_SEARCH=true",
-            "--env", f"CLAUDE_CONFIG_DIR={Path(self.env['HOME']) / '.claude2'}",
-            "--env", f"CLAUDE_CODE_REMOTE_MEMORY_DIR={Path(self.env['HOME']) / '.claude'}",
-            "--env", "HERDR_AGENT_PANE=1", "--no-focus"])
+        environment = dict(value.split("=", 1) for flag, value in zip(self.opened()[8:], self.opened()[9:]) if flag == "--env")
+        self.assertEqual({key: value for key, value in environment.items()
+                          if key.startswith(("CLAUDE_", "SHOWRUNNER_", "HERDR_")) or key == "ENABLE_TOOL_SEARCH"},
+                         {"ENABLE_TOOL_SEARCH": "true", "HERDR_AGENT_PANE": "1",
+                          "CLAUDE_CONFIG_DIR": str(Path(self.env["HOME"]) / ".claude2"),
+                          "CLAUDE_CODE_REMOTE_MEMORY_DIR": str(Path(self.env["HOME"]) / ".claude")})
+        self.assertEqual(self.opened()[-1], "--no-focus")
         self.assertNotIn("caller-token", json.dumps(self.herdr_calls()))
 
     def test_showrunner_start_not_ready_returns_a_distinct_status_and_sends_no_prompt_or_key(self) -> None:
@@ -673,11 +679,7 @@ class AddShowrunnerTests(unittest.TestCase):
         self.assertEqual(self.parent_of("kid"), "")
 
     def test_showrunner_start_failure_is_reported_without_attaching(self) -> None:
-        self.herdr_overrides["--session agents workspace create --label kid --cwd "
-            + str(self.root / "kid-checkout") + " --env ENABLE_TOOL_SEARCH=true"
-            + f" --env CLAUDE_CONFIG_DIR={Path(self.env['HOME']) / '.claude2'}"
-            + f" --env CLAUDE_CODE_REMOTE_MEMORY_DIR={Path(self.env['HOME']) / '.claude'}"
-            + " --env HERDR_AGENT_PANE=1 --no-focus"] = CommandResponse(
+        self.herdr_overrides["workspace create"] = CommandResponse(
                 code=1, stdout="", stderr="fixture could not open workspace")
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)

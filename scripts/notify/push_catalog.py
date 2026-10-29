@@ -8,6 +8,17 @@ from push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText, Se
 
 
 ENTRIES = (
+    PushText("nix_heal.failed", "nix-heal", "blocked", "{session} builds will fail: no nix shell",
+        ActionTemplate("On {machine}, fix the nix shell in {cwd}, then restart {session}"),
+        "The nix shell for {session}'s worktree did not load, so its builds will fail. "
+        + "{cause}\n\n"
+        + "The session's worktree changes stay on disk. This alert clears when the session has a nix shell.",
+        (PushExample("refused", {"session": "handler", "machine": "natedev", "cwd": "/home/natepiano/worktrees/handler",
+            "cause": "The automatic restart could not fix it. The .envrc file loaded, but no nix shell started."}),
+         PushExample("still_broken", {"session": "handler", "machine": "Mac", "cwd": "/Users/nate/worktrees/handler",
+            "cause": "An automatic restart did not fix it."})),
+        purpose="A session has no nix shell and automatic recovery failed.",
+        session=SessionTemplate("{session}")),
     # Stall-watch examples are the real prompts of 2026-10-23: a Bash call reads "run <command>" (cut to 89
     # characters and "…"), an edit "edit <file>", as stall_watch.prompt_request words them from the pending call.
     PushText("stall_watch.permission_prompt", "stall-watch", "blocked", "{unit} needs your answer",
@@ -246,8 +257,9 @@ ENTRIES = (
         + "Work cannot resume until it starts again. It should start automatically when mains power returns.",
         (PushExample("typical", {}),),
         purpose="Power is out, and the battery is low. natedev shuts down."),
-    # /nate templates (user spec, 2026-10-20): the sending agent fills each value. The user asked that the template
-    # name close each push; pushover.py's "Template:" line now does that for every push (user, 2026-10-27).
+    # /nate adhoc: an agent writes the values at send time; review them like free text (user, 2026-10-28).
+    # The user asked that the template name close each push; pushover.py's "Template:" line does that
+    # for every push (user, 2026-10-27).
     PushText("nate.adhoc", "{sender}", "note", "{sender} {title}", NoActionNeeded(),
         "{description}",
         (PushExample("typical", {"sender": "natedev", "title": "the /nate skill is ready",
@@ -257,7 +269,7 @@ ENTRIES = (
                                      "description": "You asked to be told when the tile and handler renames finish. "
                                      + "Both are done, and both units run under their new names."})),
         purpose="An update that an agent writes for you with /nate adhoc.",
-        header=False),
+        header=False, agent_written=True),
     # Auto-mode refusal (user approved 2026-10-21): a session sends it with send.py --text-id auto_mode.refused.
     # send.py fills sender from the session's own name, action from the commands' first words (rca.action_of),
     # refused from the command values (one per line), waits_line from waits when the 30 s push review passes it
