@@ -34,6 +34,7 @@ NOW = datetime(2026, 10, 6, 22, 0, tzinfo=UTC)
 HISTORY_AT = NOW - timedelta(seconds=1)
 INVOKE = Path(__file__).with_name("invoke.sh")
 MEMORY_GATE = Path(__file__).with_name("memory_gate.sh")
+HANA = gate.RepositoryIdentity("https://example.org/nate/hana", "hana", "hana")
 
 
 def setUpModule() -> None:
@@ -127,7 +128,7 @@ class HistoryTests(unittest.TestCase):
                                (self.host, "hana", "nextest", store.utc_iso(at.timestamp()), (index + 1) * GIB))
 
     def peak(self) -> gate.ExpectedPeak:
-        return gate.expected_peak("hana", "nextest", self.host, NOW, self.root)
+        return gate.expected_peak(HANA, "nextest", self.host, NOW, self.root)
 
     def test_measured_overrides_index_at_five(self) -> None:
         self.add_index()
@@ -160,11 +161,11 @@ class HistoryTests(unittest.TestCase):
         self.add_measured(5, test_threads=16)
         self.add_measured(5, test_threads=4, start_gib=6)
         self.assertEqual(
-            gate.expected_peak("hana", "nextest", self.host, NOW, self.root, test_threads=16),
+            gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, test_threads=16),
             gate.ExpectedPeak(5 * GIB, "measured", 5),
         )
         self.assertEqual(
-            gate.expected_peak("hana", "nextest", self.host, NOW, self.root),
+            gate.expected_peak(HANA, "nextest", self.host, NOW, self.root),
             gate.ExpectedPeak(9 * GIB, "measured", 10),
         )
 
@@ -178,6 +179,187 @@ class HistoryTests(unittest.TestCase):
         """F002: a historical report excludes index rows beyond its end."""
         self.add_index(at=NOW + timedelta(seconds=1))
         self.assertEqual(self.peak(), gate.ExpectedPeak(gate.FALLBACK, "fallback", 0))
+
+    def test_buildlog_tier_keeps_filtered_runs_separate(self) -> None:
+        self.add_index()
+        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+            _ = db.execute("ALTER TABLE steps ADD COLUMN argv TEXT")
+            _ = db.execute("UPDATE steps SET argv = ?", (json.dumps(["cargo", "nextest", "run"]),))
+            for _ in range(5):
+                _ = db.execute("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?)",
+                               (self.host, "hana", "nextest", store.utc_iso(HISTORY_AT.timestamp()), 2 * GIB,
+                                json.dumps(["cargo", "nextest", "run", "-E", "test(one)"])))
+        self.assertEqual(self.peak(), gate.ExpectedPeak(int(5 * GIB * gate.ANON_SHARE), "buildlog", 5))
+        self.assertEqual(gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, scope="filtered"),
+                         gate.ExpectedPeak(int(2 * GIB * gate.ANON_SHARE), "buildlog", 5))
+
+    def test_scratch_checkout_cannot_take_legacy_buildlog_samples_by_repository_name(self) -> None:
+        self.add_index()
+        scratch = gate.RepositoryIdentity(HANA.key, HANA.name)
+        self.assertEqual(gate.expected_peak(scratch, "nextest", self.host, NOW, self.root).source,
+                         "fallback")
+
+
+class RepositoryHistoryTests(unittest.TestCase):
+    root: Path = Path()
+    admission: Path = Path()
+    host: str = "test-host"
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.admission = self.root / "admission"
+        self.admission.mkdir()
+
+    def checkout(self, folder: str, remote: str = "", content: str = "first") -> Path:
+        directory = self.root / folder
+        directory.mkdir(parents=True)
+        for arguments in (("init", "-q"), ("config", "user.email", "test@example.org"),
+                          ("config", "user.name", "Test"), ("config", "commit.gpgSign", "false"),
+                          ("config", "core.hooksPath", "/dev/null")):
+            _ = subprocess.run(["git", "-C", str(directory), *arguments], check=True, capture_output=True)
+        _ = (directory / "source").write_text(content)
+        _ = subprocess.run(["git", "-C", str(directory), "add", "source"], check=True, capture_output=True)
+        _ = subprocess.run(["git", "-C", str(directory), "commit", "-qm", "first"], check=True, capture_output=True)
+        if remote:
+            _ = subprocess.run(["git", "-C", str(directory), "remote", "add", "origin", remote], check=True, capture_output=True)
+        return directory
+
+    def identity(self, directory: Path) -> gate.RepositoryIdentity:
+        repository, worktree = gate.git_identity(["cargo", "nextest", "run"], str(directory))
+        self.assertEqual(worktree, directory.name)
+        self.assertIsInstance(repository, gate.RepositoryIdentity)
+        assert isinstance(repository, gate.RepositoryIdentity)
+        return repository
+
+    def samples(self, repository: gate.RepositoryIdentity, gib: int, *, scope: gate.TestScope = "full") -> None:
+        with (self.admission / "anon_peaks.jsonl").open("a") as out:
+            for _ in range(5):
+                _ = out.write(json.dumps({"host": self.host, "repo": "repo", "step": "nextest",
+                                          "repo_identity": repository.key, "test_scope": scope,
+                                          "anon_peak_bytes": gib * GIB,
+                                          "ended_at": store.utc_iso(HISTORY_AT.timestamp())}) + "\n")
+
+    def estimate(self, repository: gate.Repository, scope: gate.TestScope = "full") -> gate.ExpectedPeak:
+        return gate.expected_peak(repository, "nextest", self.host, NOW, self.root, scope=scope)
+
+    def test_unrelated_repositories_named_repo_use_their_own_peaks(self) -> None:
+        first = self.identity(self.checkout("one/repo", "git@example.org:nate/first.git"))
+        second = self.identity(self.checkout("two/repo", "https://example.org/nate/second.git"))
+        self.samples(first, 19)
+        self.samples(second, 2)
+        self.assertEqual(self.estimate(first), gate.ExpectedPeak(19 * GIB, "measured", 5))
+        self.assertEqual(self.estimate(second), gate.ExpectedPeak(2 * GIB, "measured", 5))
+
+    def test_same_repository_shares_peaks_across_folders_and_remote_forms(self) -> None:
+        first = self.identity(self.checkout("one/repo", "git@example.org:nate/first.git"))
+        second = self.identity(self.checkout("two/different", "https://user@example.org/nate/first/"))
+        self.samples(first, 2)
+        self.assertEqual(self.estimate(second), gate.ExpectedPeak(2 * GIB, "measured", 5))
+
+    def test_worktree_uses_main_checkout_name_for_old_anon_and_buildlog_rows(self) -> None:
+        checkout = self.checkout("hana", "https://example.org/nate/hana.git")
+        worktree = self.root / "hana-fix"
+        _ = subprocess.run(["git", "-C", str(checkout), "worktree", "add", "-q", "--detach", str(worktree)],
+                           check=True, capture_output=True)
+        identity = self.identity(worktree)
+        peaks = self.admission / "anon_peaks.jsonl"
+        rows = [{"host": self.host, "repo": "hana", "step": "nextest",
+                 "anon_peak_bytes": 3 * GIB, "ended_at": store.utc_iso(HISTORY_AT.timestamp())}] * 5
+        _ = peaks.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        self.assertEqual(self.estimate(identity), gate.ExpectedPeak(3 * GIB, "measured", 5))
+        peaks.unlink()
+        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+            _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, peak_mem_bytes INTEGER)")
+            _ = db.executemany("INSERT INTO steps VALUES (?, ?, ?, ?, ?)",
+                               [(self.host, "hana", "nextest", store.utc_iso(HISTORY_AT.timestamp()), 4 * GIB)] * 5)
+        self.assertEqual(self.estimate(identity), gate.ExpectedPeak(int(4 * GIB * gate.ANON_SHARE), "buildlog", 5))
+        scratch = self.identity(self.checkout("repo", "https://example.org/nate/hana.git"))
+        self.assertEqual(self.estimate(scratch).source, "fallback")
+
+    def test_filtered_and_full_runs_never_use_each_others_samples(self) -> None:
+        identity = self.identity(self.checkout("repo", "https://example.org/nate/first"))
+        self.samples(identity, 19)
+        self.assertEqual(self.estimate(identity, "filtered").source, "fallback")
+        self.samples(identity, 2, scope="filtered")
+        self.assertEqual(self.estimate(identity, "filtered"), gate.ExpectedPeak(2 * GIB, "measured", 5))
+        self.assertEqual(self.estimate(identity), gate.ExpectedPeak(19 * GIB, "measured", 5))
+
+    def test_generic_legacy_rows_cannot_supply_an_estimate_to_a_scratch_clone(self) -> None:
+        identity = self.identity(self.checkout("repo", "https://example.org/nate/first"))
+        with (self.admission / "anon_peaks.jsonl").open("w") as out:
+            for _ in range(7):
+                _ = out.write(json.dumps({"host": self.host, "repo": "repo", "step": "nextest",
+                                          "anon_peak_bytes": 19 * GIB,
+                                          "ended_at": store.utc_iso(HISTORY_AT.timestamp())}) + "\n")
+        self.assertEqual(self.estimate(identity).source, "fallback")
+
+    def test_clone_uses_other_repositories_pooled_samples_without_a_basename_key(self) -> None:
+        first = self.identity(self.checkout("one/repo", "https://example.org/nate/first"))
+        second = self.identity(self.checkout("two/checkout", "https://example.org/nate/second"))
+        self.samples(first, 3)
+        self.assertEqual(self.estimate(second), gate.ExpectedPeak(3 * GIB, "pooled", 5))
+
+    def test_no_origin_uses_root_commit_across_clones(self) -> None:
+        original = self.checkout("original")
+        clone = self.root / "copy"
+        _ = subprocess.run(["git", "clone", "-q", str(original), str(clone)], check=True, capture_output=True)
+        _ = subprocess.run(["git", "-C", str(clone), "remote", "remove", "origin"], check=True, capture_output=True)
+        self.samples(self.identity(original), 4)
+        self.assertEqual(self.estimate(self.identity(clone)), gate.ExpectedPeak(4 * GIB, "measured", 5))
+        unrelated = self.identity(self.checkout("other", content="different"))
+        self.assertEqual(self.estimate(unrelated).source, "pooled")
+
+    def test_missing_identity_uses_only_the_fallback(self) -> None:
+        self.samples(HANA, 19)
+        self.assertEqual(self.estimate(gate.UnknownRepository()), gate.ExpectedPeak(gate.FALLBACK, "fallback", 0))
+
+    def test_test_selection_is_carried_from_cargo_arguments(self) -> None:
+        full = (["cargo", "nextest", "run", "-p", "hana", "--test-threads", "16"],
+                ["cargo", "test", "--manifest-path", "/test/Cargo.toml", "--", "--nocapture"])
+        filtered = (["cargo", "nextest", "run", "one_test"],
+                    ["cargo", "test", "run"],
+                    ["cargo", "nextest", "run", "run"],
+                    ["cargo", "+nightly", "nextest", "run", "-E", "test(one)"],
+                    ["cargo", "nextest", "run", "--filterset=test(one)"],
+                    ["cargo", "test", "-p", "hana", "one_test"],
+                    ["cargo", "test", "--", "--skip", "one_test"])
+        for arguments in full:
+            with self.subTest(arguments=arguments):
+                self.assertEqual(gate.test_scope(arguments), "full")
+        for arguments in filtered:
+            with self.subTest(arguments=arguments):
+                self.assertEqual(gate.test_scope(arguments), "filtered")
+
+    def test_verify_package_and_target_runs_share_full_history_but_name_filter_does_not(self) -> None:
+        identity = self.identity(self.checkout("hana", "https://example.org/nate/hana.git"))
+        self.samples(identity, 9)
+        self.samples(identity, 2, scope="filtered")
+        cases = ((["-E", "package(hana)"], 9),
+                 (["--test", "render", "-E", "package(hana)"], 9),
+                 (["-E", "package(hana) & test(render)"], 2))
+        for arguments, gib in cases:
+            with self.subTest(arguments=arguments):
+                scope = gate.test_scope(["cargo", "nextest", "run", *arguments])
+                self.assertEqual(self.estimate(identity, scope), gate.ExpectedPeak(gib * GIB, "measured", 5))
+
+    def test_filter_expressions_and_option_values_do_not_become_test_names(self) -> None:
+        for option in ("-E", "--filter-expr", "--filterset"):
+            for predicate, expected in (("package(hana)", "full"), ("kind(lib)", "full"),
+                                        ("package(hana) & test(render)", "filtered")):
+                for arguments in ([option, predicate], [option + "=" + predicate]):
+                    with self.subTest(arguments=arguments):
+                        self.assertEqual(gate.test_scope(["cargo", "nextest", "run", *arguments]), expected)
+        for option in ("-F", "--exclude", "-P", "--run-ignored", "-Z", "--no-tests",
+                       "--max-fail", "--tool-config-file", "--test-group"):
+            for arguments in ([option, "value"], [option + "=value"]):
+                with self.subTest(arguments=arguments):
+                    argv = ["cargo", "nextest", "run", *arguments]
+                    self.assertEqual(gate.test_scope(argv), "full")
+                    self.assertEqual(gate.test_scope([*argv, "--", "render"]), "filtered")
+        for arguments in (["--exact"], ["--skip", "render"], ["--", "render"], ["-Etest(render)"]):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(gate.test_scope(["cargo", "nextest", "run", *arguments]), "filtered")
 
 
 class TestThreadParsingTests(unittest.TestCase):
@@ -221,6 +403,8 @@ class LedgerTests(unittest.TestCase):
         _ = self.enterContext(patch.object(gate, "process_start_time", side_effect=caller_start))
         _ = self.enterContext(patch.object(gate, "process_table", return_value={self.pid: gate.ProcessIdentity(1, "start")}))
         _ = self.enterContext(patch.object(gate, "tree_memory", return_value=gate.MeasuredMemory(8 * GIB)))
+        _ = self.enterContext(patch.object(gate, "git_identity", return_value=(HANA, "test-worktree")))
+        _ = self.enterContext(patch.object(store, "host_name", return_value="test-host"))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root / "log")})))
 
     def check(self, available: int, *, force: bool = False, sidecar: str = "",
@@ -233,11 +417,9 @@ class LedgerTests(unittest.TestCase):
 
     def admit(self, *, force: bool = False, sidecar: str = "",
               argv: list[str] | None = None) -> tuple[gate.AdmissionDecision, Path | None]:
-        with patch.object(gate, "git_identity", return_value=("hana", "test-worktree")), \
-             patch.object(store, "host_name", return_value="test-host"):
-            result = gate.check(
-                self.meminfo, self.pid, sidecar, argv or ["cargo", "nextest"], force, self.root, NOW
-            )
+        result = gate.check(
+            self.meminfo, self.pid, sidecar, argv or ["cargo", "nextest"], force, self.root, NOW
+        )
         path = result.reservation.path if isinstance(result.reservation, gate.Reserved) else None
         return result.decision, path
 
@@ -279,6 +461,7 @@ class LedgerTests(unittest.TestCase):
         line = cast(dict[str, object], json.loads((self.root / "admission/anon_peaks.jsonl").read_text()))
         self.assertEqual((line["anon_peak_bytes"], line["status"]), (8 * GIB, 7))
         self.assertEqual((line["test_threads"], line["call_id"]), (16, "call-width-16"))
+        self.assertEqual((line["repo_identity"], line["test_scope"]), (HANA.key, "full"))
 
     def test_a_run_is_admitted_on_the_history_of_every_width(self) -> None:
         # One width's history is thin; a run asking for 32 threads may claim 4 after admission.
@@ -391,7 +574,7 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual((result.available, result.decision.state), (8 * GIB, "hold"))
 
     def test_profile_lookups_run_once_across_three_polls(self) -> None:
-        with patch.object(gate, "git_identity", return_value=("hana", "tree")) as identity, \
+        with patch.object(gate, "git_identity", return_value=(HANA, "tree")) as identity, \
              patch.object(gate, "expected_peak", return_value=gate.ExpectedPeak(12 * GIB, "fallback", 0)) as history:
             profile = None
             for _ in range(3):
@@ -1052,7 +1235,44 @@ class ShellTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(len(result.stderr.splitlines()), 1)
                 self.assertIn("head clone88ci nextest (verify pid 300) needs 10.9 GiB", result.stderr)
-                self.assertIn("0.0 GiB promised, 3.0 GiB measured", result.stderr)
+                self.assertTrue(result.stderr.endswith(
+                    "0.0 GiB promised, 3.0 GiB measured across 2 running steps: test steps; "
+                    + "2.8 GiB kept for earlyoom)\n"))
+
+    def test_wait_line_shows_reason_in_place_of_zero_running_steps(self) -> None:
+        command = ('source "$1"; BUILDLOG_MEM_WAIT_S=120; buildlog_memory_python() { echo UTC; }; '
+                   + 'buildlog_memory_line "$2" 19327352832 19434727014 16213501542 measured 5 0 0 '
+                   + '3221225472 "$3" test nextest 0')
+        reasons = ("memory pressure: full avg10 11.0",
+                   "head: needs 18.1 GiB free; 18.0 free; younger steps may start until 18:10")
+        with tempfile.TemporaryDirectory() as folder:
+            for kind in ("first", "periodic"):
+                for reason in reasons:
+                    with self.subTest(kind=kind, reason=reason):
+                        result = subprocess.run(
+                            ["bash", "-c", command, "test", str(MEMORY_GATE), kind, reason],
+                            env={**os.environ, "BUILDLOG_DIR": folder}, capture_output=True,
+                            text=True, check=False, timeout=300)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(len(result.stderr.splitlines()), 1)
+                        self.assertTrue(result.stderr.endswith(f"; {reason}; 3.0 GiB kept for earlyoom)\n"))
+                        self.assertNotIn("0 running steps", result.stderr)
+                        self.assertNotIn("GiB promised", result.stderr)
+                        self.assertNotIn("GiB measured", result.stderr)
+
+    def test_wait_line_keeps_zero_running_text_when_reason_is_empty(self) -> None:
+        command = ('source "$1"; BUILDLOG_MEM_WAIT_S=120; buildlog_memory_python() { echo UTC; }; '
+                   + 'buildlog_memory_line "$2" 0 0 0 fallback 0 0 0 0 "" test check 0')
+        with tempfile.TemporaryDirectory() as folder:
+            for kind in ("first", "periodic"):
+                with self.subTest(kind=kind):
+                    result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE), kind],
+                                            env={**os.environ, "BUILDLOG_DIR": folder}, capture_output=True,
+                                            text=True, check=False, timeout=300)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(len(result.stderr.splitlines()), 1)
+                    self.assertTrue(result.stderr.endswith(
+                        "; 0.0 GiB promised, 0.0 GiB measured across 0 running steps)\n"))
 
     def test_old_shell_keeps_its_field_count_and_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -1071,6 +1291,40 @@ class ShellTests(unittest.TestCase):
                 fields = output.getvalue().strip().split("|")
                 self.assertEqual(len(fields), count)
                 self.assertEqual(fields[14], "clone88ci")
+
+    def test_cached_poll_keeps_repository_and_filter_scope_in_the_recorded_peak(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            meminfo = root / "meminfo"
+            sidecar = root / "step.cgroup"
+            _ = meminfo.write_text("MemAvailable: 0 kB\n")
+            _ = sidecar.write_text("unused")
+            argv = ["cargo", "nextest", "run", "-E", "test(one)"]
+            first = ["memory_admit.py", "check", str(meminfo), "400", str(sidecar), "0",
+                     "", "", "", "-", "", "0", *argv]
+            output = io.StringIO()
+            with patch.dict(os.environ, {"BUILDLOG_DIR": folder}), \
+                 patch.object(gate, "process_start_time", return_value="start"), \
+                 patch.object(gate, "process_table", return_value={}), \
+                 patch.object(gate, "git_identity", return_value=(HANA, "clone")) as identity, \
+                 patch.object(gate, "expected_peak", return_value=gate.ExpectedPeak(2 * GIB, "measured", 5)) as history:
+                with patch.object(sys, "argv", first), redirect_stdout(output):
+                    gate.main()
+                fields = output.getvalue().strip().split("|")
+                self.assertEqual(fields[0], "hold")
+                cached = [*first[:6], fields[10], fields[11], fields[14], fields[2], fields[3], fields[4], *argv]
+                _ = meminfo.write_text(f"MemAvailable: {40 * GIB // 1024} kB\n")
+                output = io.StringIO()
+                with patch.object(sys, "argv", cached), redirect_stdout(output):
+                    gate.main()
+                fields = output.getvalue().strip().split("|")
+                self.assertEqual(fields[0], "admit")
+                reservation = Path(fields[9])
+                _ = reservation.with_suffix(".max").write_text(str(GIB))
+                gate.release(reservation, 0, root)
+            self.assertEqual((identity.call_count, history.call_count), (1, 1))
+            sample = cast(dict[str, object], json.loads((root / "admission/anon_peaks.jsonl").read_text()))
+            self.assertEqual((sample["repo_identity"], sample["test_scope"]), (HANA.key, "filtered"))
 
     def test_invoke_twice_with_temporary_home(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -1126,7 +1380,7 @@ class ShellTests(unittest.TestCase):
             _ = stat.write_text(f"anon {GIB}\n")
             sidecar = root / "step.cgroup"
             _ = sidecar.write_text(str(scope) + "\n")
-            with patch.object(gate, "git_identity", return_value=("hana", "test-worktree")), \
+            with patch.object(gate, "git_identity", return_value=(HANA, "test-worktree")), \
                  patch.object(store, "host_name", return_value="test-host"):
                 meminfo = root / "meminfo"
                 _ = meminfo.write_text("MemAvailable: 12582912 kB\n")

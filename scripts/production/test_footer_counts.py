@@ -3,16 +3,18 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import final, override
+from typing import cast, final, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import change_review
 import footer_counts
+import next_item
 import proposal_issue
 import proposals_folder
 import showrunners
@@ -30,7 +32,7 @@ LIST = """# Change review
 
 LEDGER = """# Plan backlog
 
-- 2026-10-09 Open idea (a.md) — proposed (user via a unit)
+- 2026-10-09 Open idea (a.md) — proposed
 - 2026-10-09 Waiting idea (b.md) — accepted 2026-10-12, build after the reviewers
 - 2026-10-09 Handed out (c.md) — accepted 2026-10-12, assigned enh-showrunner-unit
 - 2026-10-09 Done (d.md) — accepted 2026-10-09, applied (nixos b5c7d91)
@@ -79,6 +81,7 @@ class FooterCountsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"NEXT_STATE_DIR": str(self.root / "next")})))
         # The doc's own line names the list; no live showrunner's list is looked up.
         _ = self.enterContext(mock.patch.object(change_review, "showrunner_of",
                                                 side_effect=change_review.ChangeReviewError("not running")))
@@ -117,7 +120,59 @@ class FooterCountsTests(unittest.TestCase):
         _ = efficiency.write_text(EFFICIENCY_LEDGER, encoding="utf-8")
         doc = self.doc(f"- **Change review:** `{listing}`", f"- **Proposals:** {folder}",
                        f"- **Improvement queue:** {ledger}", f"- **Efficiency ledger:** `{efficiency}`")
-        self.assertEqual(footer_counts.read_counts(doc, questions=1), FooterCounts(2, 1, 2, 1, 2))
+        self.assertEqual(footer_counts.read_counts(doc, questions=1),
+                         FooterCounts(changes=2, proposals=2, questions=1, efficiency=2))
+
+    def test_proposed_backlog_line_counts_as_a_proposal_and_next_shows_it(self) -> None:
+        ledger = self.root / "ledger.md"
+        _ = ledger.write_text("# Plan backlog\n", encoding="utf-8")
+        doc = self.doc(f"- **Improvement queue:** {ledger}")
+        before = footer_counts.read_counts(doc)
+        _ = ledger.write_text("- 2026-10-28 Faster tests (tests.md) — proposed\n", encoding="utf-8")
+        counts = footer_counts.read_counts(doc)
+        self.assertEqual(counts, before._replace(proposals=before.proposals + 1))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = next_item.main(["show", "--kind", "proposal", "--production", str(doc)])
+        self.assertEqual(code, 0)
+        self.assertEqual(out.getvalue(), f"proposal\nFaster tests\n{ledger}\n")
+        row = footer_counts.counts_line(counts)
+        self.assertEqual(row, "For you: 1 proposal")
+        self.assertNotIn("project", row or "")
+        self.assertIn(ledger, footer_counts.sources(doc))
+
+    def test_accepted_unsettled_backlog_line_changes_no_count_or_next_proposal(self) -> None:
+        ledger = self.root / "ledger.md"
+        _ = ledger.write_text("- 2026-10-28 Faster tests (tests.md) — proposed\n", encoding="utf-8")
+        doc = self.doc(f"- **Improvement queue:** {ledger}")
+        before = footer_counts.read_counts(doc)
+        queue = next_item.read_queue("proposal", doc)
+        _ = ledger.write_text(ledger.read_text(encoding="utf-8")
+                              + "- 2026-10-28 New checks (checks.md) — accepted, build later\n",
+                              encoding="utf-8")
+        self.assertEqual(footer_counts.read_counts(doc), before)
+        self.assertEqual(next_item.read_queue("proposal", doc), queue)
+
+    def test_backlog_and_issue_count_matches_each_productions_own_next_proposals(self) -> None:
+        folder = self.root / "issues"
+        folder.mkdir()
+        top = production_doc(self.root, "top", folder, "top-unit")
+        child = production_doc(self.root, "child", folder, "child-unit")
+        self.tree = {"top": top, "child": child}
+        self.below = {"top": ["child"]}
+        issue(folder, "own issue", "open", "proposal", "top-unit")
+        issue(folder, "child issue", "open", "proposal", "child-unit")
+        for doc, titles in ((top, ["Own plan"]), (child, ["Child plan", "Second child plan"])):
+            ledger = doc.with_suffix(".ledger.md")
+            _ = ledger.write_text("".join(f"- 2026-10-28 {title} — proposed\n" for title in titles),
+                                  encoding="utf-8")
+            _ = doc.write_text(doc.read_text(encoding="utf-8") + f"\n- **Improvement queue:** {ledger}\n",
+                               encoding="utf-8")
+            queue = next_item.read_queue("proposal", doc)
+            self.assertEqual(footer_counts.proposals(doc), 1 + len(titles))
+            self.assertEqual(footer_counts.proposals(doc), len(queue.entries))
+            for title in titles:
+                self.assertIn(f"{title}\n{ledger}", [entry.item for entry in queue.entries])
 
     def test_efficiency_counts_only_dated_proposed_and_deferred_first_statuses(self) -> None:
         ledger = self.root / "efficiency.md"
@@ -228,25 +283,25 @@ class FooterCountsTests(unittest.TestCase):
         self.assertEqual(footer_counts.read_counts(missing), FooterCounts())
 
     def test_the_line_names_each_count_once_and_leaves_out_zeros(self) -> None:
-        self.assertEqual(footer_counts.counts_line(FooterCounts(2, 1, 3, 1)),
-                         "For you: 1 question, 2 changes, 1 proposal, 3 projects")
+        self.assertEqual(footer_counts.counts_line(FooterCounts(changes=2, proposals=1, questions=1)),
+                         "For you: 1 question, 2 changes, 1 proposal")
         self.assertEqual(footer_counts.counts_line(FooterCounts(changes=1, questions=2)),
                          "For you: 2 questions, 1 change")
         self.assertIsNone(footer_counts.counts_line(FooterCounts()))
 
-    def test_the_line_orders_questions_changes_efficiency_proposals_then_projects(self) -> None:
-        self.assertEqual(footer_counts.counts_line(FooterCounts(changes=2, proposals=4, projects=3, questions=5,
+    def test_the_line_orders_questions_changes_efficiency_then_proposals(self) -> None:
+        self.assertEqual(footer_counts.counts_line(FooterCounts(changes=2, proposals=4, questions=5,
                                                                 efficiency=130)),
-                         "For you: 5 questions, 2 changes, 130 efficiency, 4 proposals, 3 projects")
+                         "For you: 5 questions, 2 changes, 130 efficiency, 4 proposals")
 
     def test_each_count_of_one_takes_the_singular_and_efficiency_has_no_plural(self) -> None:
-        self.assertEqual(footer_counts.counts_line(FooterCounts(1, 1, 1, 1, 1)),
-                         "For you: 1 question, 1 change, 1 efficiency, 1 proposal, 1 project")
+        self.assertEqual(footer_counts.counts_line(FooterCounts(1, 1, 1, 1)),
+                         "For you: 1 question, 1 change, 1 efficiency, 1 proposal")
         self.assertEqual(footer_counts.counts_line(FooterCounts(efficiency=2)), "For you: 2 efficiency")
 
     def test_counts_add_across_productions(self) -> None:
-        self.assertEqual(footer_counts.total([FooterCounts(1, 0, 2, 0, 4), FooterCounts(0, 3, 1, 0, 7)]),
-                         FooterCounts(1, 3, 3, 0, 11))
+        self.assertEqual(footer_counts.total([FooterCounts(1, 0, 0, 4), FooterCounts(0, 3, 0, 7)]),
+                         FooterCounts(1, 3, 0, 11))
         self.assertEqual(footer_counts.total([]), FooterCounts())
 
 

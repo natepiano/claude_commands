@@ -40,6 +40,9 @@ import restart as restart_work
 from account import Account, UnreadableAccount
 
 
+# Hang guard: natedev reached load 136 on 2026-10-29; scheduling delays are not failures.
+HANG_GUARD_SECONDS = 300
+
 LOGIN = "owner@example.com"
 LABEL = "claude2"
 OCTOBER = "2026-10-09T21:49:10+00:00"
@@ -1271,7 +1274,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                         + f"module = importlib.import_module({mode!r}); "
                         + "assert module.__package__ == module.__spec__.parent"))
                 result = subprocess.run(command, capture_output=True, text=True, check=False,
-                    timeout=10, cwd=self.root,
+                    timeout=HANG_GUARD_SECONDS, cwd=self.root,
                     env={**self.environment, "XDG_STATE_HOME": str(self.root / "state")})
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(result.stderr, "")
@@ -1319,7 +1322,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
             text=True,
             capture_output=True,
             check=False,
-            timeout=10,
+            timeout=HANG_GUARD_SECONDS,
         )
 
     def conflicting_legacy_record(self, conflict: str) -> str:
@@ -1828,7 +1831,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
             text=True,
             capture_output=True,
             check=False,
-            timeout=10,
+            timeout=HANG_GUARD_SECONDS,
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)

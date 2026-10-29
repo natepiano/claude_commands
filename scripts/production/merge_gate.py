@@ -15,7 +15,9 @@ After the parallel pass, up to eight failed test modules run once more, alone.
 Runner-killed jobs and the type check do not run again. Each test module uses a
 builds.slice scope when its probe succeeds, unless disabled or already in that slice.
 --tests-only runs the same suite runner without changing git refs or files.
-Clean trees reuse passed test modules on the same host; type jobs still run.
+Clean trees reuse full passes on the same host, or select affected modules from a
+certified ancestor. --full forces all modules; --nightly validates a shared clone.
+Type jobs still run as before.
 A unit checkpoint commit without its Change-Review line is refused before the merge. After the
 push, each visible change becomes a row in the change-review list that --change-review names, or
 the production's top-level showrunner keeps (`change_review.list_path`), with the doc stamped into
@@ -49,6 +51,9 @@ from typing import Literal, TextIO, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import change_review  # noqa: E402
+from scripts.production.affected_modules import (  # noqa: E402
+    AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
+)
 from scripts.direct.local_release_wait import local_release_waiter  # noqa: E402
 from scripts.build_targets import build_targets  # noqa: E402
 from scripts.build_hold import build_hold  # noqa: E402
@@ -123,6 +128,8 @@ class GateArguments(argparse.Namespace):
     module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S
     tests_only: bool = False
     promote_only: bool = False
+    full: bool = False
+    nightly: bool = False
 
 
 @dataclass(frozen=True)
@@ -143,10 +150,13 @@ class GateRun:
     peak_memory_mib: float
     memory_within_cap: bool = True
     tests_reused: bool = False
+    # A valid affected selection may have no test modules at all.
+    selection_certified: bool = False
 
     @property
     def passed(self) -> bool:
-        return self.memory_within_cap and (bool(self.jobs) or self.tests_reused) and all(job.returncode == 0 for job in self.jobs)
+        return (self.memory_within_cap and (bool(self.jobs) or self.tests_reused or self.selection_certified)
+                and all(job.returncode == 0 for job in self.jobs))
 
 
 @dataclass
@@ -579,34 +589,42 @@ class PassedTreeLedger:
             print(f"Test pass ledger unavailable; tests cannot be reused or recorded: {str(error).replace(chr(10), '; ')}", flush=True)
         self.unavailable = True
 
+    def records(self) -> list[dict[str, object]]:
+        if self.unavailable:
+            return []
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Both operations require append access; unavailable certification runs
+        # all modules and cannot silently reuse a record it cannot extend.
+        with self.path.open("a+", encoding="utf-8") as ledger:
+            _ = ledger.seek(0)
+            records: list[dict[str, object]] = []
+            for line in ledger:
+                value = cast(object, json.loads(line))
+                if not isinstance(value, dict):
+                    raise ValueError("invalid test pass record")
+                record = cast(dict[str, object], value)
+                if (not all(isinstance(record.get(key), str) for key in
+                            ("tree", "commit", "at", "host", "checkout", "source"))
+                        or not isinstance(record.get("suites"), list)
+                        or not all(isinstance(name, str) for name in cast(list[object], record["suites"]))
+                        or record["source"] not in ("tests-only", "checkpoint")
+                        or record.get("kind", "full") not in ("full", "affected")):
+                    raise ValueError("invalid test pass fields")
+                at = datetime.fromisoformat(cast(str, record["at"]))
+                if at.tzinfo is None:
+                    raise ValueError("test pass time has no zone")
+                records.append(record)
+        return records
+
     def reuse(self) -> bool:
         if isinstance(self.tree, UnrecordableTestTree):
             return False
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            # Opening for both operations also refuses reuse when recording is
-            # unavailable. Missing history starts with an empty ledger.
-            with self.path.open("a+", encoding="utf-8") as ledger:
-                _ = ledger.seek(0)
-                records: list[dict[str, object]] = []
-                for line in ledger:
-                    value = cast(object, json.loads(line))
-                    if not isinstance(value, dict):
-                        raise ValueError("invalid test pass record")
-                    record = cast(dict[str, object], value)
-                    if (not all(isinstance(record.get(key), str) for key in
-                                ("tree", "commit", "at", "host", "checkout", "source"))
-                            or not isinstance(record.get("suites"), list)
-                            or not all(isinstance(name, str) for name in cast(list[object], record["suites"]))
-                            or record["source"] not in ("tests-only", "checkpoint")):
-                        raise ValueError("invalid test pass fields")
-                    records.append(record)
-            for record in reversed(records):
-                if (record["tree"] == self.tree.tree and record["host"] == host_name()
+            for record in reversed(self.records()):
+                if (record.get("kind", "full") == "full"
+                        and record["tree"] == self.tree.tree and record["host"] == host_name()
                         and record["suites"] == sorted(TEST_SUITES)):
                     at = datetime.fromisoformat(cast(str, record["at"]))
-                    if at.tzinfo is None:
-                        raise ValueError("test pass time has no zone")
                     when = at.astimezone(user_zone()).strftime("%Y-%m-%d %H:%M:%S %Z")
                     print(f"tests reused from {self.tree.tree[:12]} ({when}, {record['source']}, {record['checkout']})", flush=True)
                     return True
@@ -614,7 +632,23 @@ class PassedTreeLedger:
             self.report_error(error)
         return False
 
-    def record_pass(self) -> None:
+    def certified_base(self) -> CertifiedBase | NoCertifiedBase:
+        if isinstance(self.tree, UnrecordableTestTree):
+            return NoCertifiedBase()
+        try:
+            records = sorted(self.records(), key=lambda record: datetime.fromisoformat(cast(str, record["at"])), reverse=True)
+            for record in records:
+                if (record.get("kind", "full") != "full" or record["host"] != host_name()
+                        or record["suites"] != sorted(TEST_SUITES)):
+                    continue
+                commit = cast(str, record["commit"])
+                if not git(self.repo, "merge-base", "--is-ancestor", commit, "HEAD").returncode:
+                    return CertifiedBase(commit, cast(str, record["at"]))
+        except (OSError, ValueError) as error:
+            self.report_error(error)
+        return NoCertifiedBase()
+
+    def record_pass(self, kind: Literal["full", "affected"] = "full") -> None:
         if self.unavailable or isinstance(self.tree, UnrecordableTestTree):
             return
         try:
@@ -625,7 +659,8 @@ class PassedTreeLedger:
                 return
             record = {"tree": self.tree.tree, "commit": self.tree.commit,
                       "at": datetime.now(UTC).isoformat(), "host": host_name(),
-                      "checkout": str(self.repo.resolve()), "suites": sorted(TEST_SUITES), "source": self.source}
+                      "checkout": str(self.repo.resolve()), "suites": sorted(TEST_SUITES), "source": self.source, "kind": kind}
+            self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as ledger:
                 line = (json.dumps(record) + "\n").encode("utf-8")
                 if os.write(ledger.fileno(), line) != len(line):
@@ -634,10 +669,38 @@ class PassedTreeLedger:
             self.report_error(error)
 
 
+@dataclass(frozen=True)
+class NoFullRunRequired:
+    pass
+
+
+def full_required() -> FullSuite | NoFullRunRequired:
+    marker = gate_state_dir() / "full-required"
+    try:
+        value = cast(dict[str, object], json.loads(marker.read_text()))
+        return FullSuite(f"last nightly run was red ({value['tree']}, {value['at']})")
+    except FileNotFoundError:
+        return NoFullRunRequired()
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        return FullSuite(f"last nightly run was red (unreadable marker: {error})")
+
+
+def report_selection(selection: AffectedSelection | FullSuite, total: int) -> None:
+    if isinstance(selection, FullSuite):
+        print(f"full suite: {selection.reason}", flush=True)
+        return
+    when = datetime.fromisoformat(selection.base.at).astimezone(user_zone()).strftime("%Y-%m-%d %H:%M:%S %Z")
+    print(f"affected: {len(selection.modules)} of {total} modules (base {selection.base.commit[:12]}, {when}), "
+          + f"{len(selection.changed_files)} changed files", flush=True)
+    if len(selection.modules) <= 10:
+        print(", ".join(f"{path.parent.name}/{path.name}" for path in selection.modules) or "(none)", flush=True)
+    print(f"Tree-scanning modules: {len(selection.tree_scanners)} (always affected)", flush=True)
+
+
 def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_dirs: Sequence[str] = (),
                module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S,
                max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS, *,
-               source: Literal["tests-only", "checkpoint"] = "tests-only") -> GateRun:
+               source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False) -> GateRun:
     if memory_cap_mib <= 0:
         raise GateRefused("memory cap must be positive")
     if module_time_limit_s <= 0:
@@ -666,7 +729,16 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
         tested_tree = UnrecordableTestTree(str(error))
         print(f"Test tree unavailable; tests cannot be reused or recorded: {str(error).replace(chr(10), '; ')}", flush=True)
     ledger = PassedTreeLedger(repo, source, tested_tree)
-    reused = ledger.reuse()
+    required = full_required()
+    reused = not full and not isinstance(required, FullSuite) and ledger.reuse()
+    selection: AffectedSelection | FullSuite = FullSuite("passed tree reused")
+    if not reused:
+        selection = (required if isinstance(required, FullSuite) else FullSuite("--full") if full else
+                     select_affected(repo, ledger.certified_base(), [path for _, path in modules]))
+        report_selection(selection, len(modules))
+        if isinstance(selection, AffectedSelection):
+            selected = set(selection.modules)
+            modules = [(suite, path) for suite, path in modules if path in selected]
     print(f"Runner: {len(modules)} modules, sampled memory cap {memory_cap_mib} MiB", flush=True)
     scope_prefix = suite_scope_prefix()
     timings_path = gate_state_dir() / "module_seconds.json"
@@ -805,6 +877,9 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
         if reused:
             print(f"{suite}: OK reused", flush=True)
             continue
+        if suite not in suite_started:
+            print(f"{suite}: skipped (not affected)", flush=True)
+            continue
         failed = [module for module in results if module.suite == suite and module.returncode]
         print(f"{suite}: {'RED' if failed else 'OK'} {suite_finished[suite] - suite_started[suite]:.2f}s", flush=True)
         for module in (result for result in results if result.suite == suite):
@@ -829,9 +904,12 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     print(f"One-minute load: start={starting_load:.2f} max={maximum_load:.2f} end={ending_load:.2f}", flush=True)
     if admission.peak_mib > memory_cap_mib:
         print("RED: sampled memory exceeded the cap", flush=True)
-    run = GateRun(tuple(results), elapsed, admission.peak_mib, admission.peak_mib <= memory_cap_mib, reused)
+    run = GateRun(tuple(results), elapsed, admission.peak_mib, admission.peak_mib <= memory_cap_mib, reused,
+                  isinstance(selection, AffectedSelection))
     if run.passed and not reused:
-        ledger.record_pass()
+        ledger.record_pass("affected" if isinstance(selection, AffectedSelection) else "full")
+        if isinstance(selection, FullSuite):
+            (gate_state_dir() / "full-required").unlink(missing_ok=True)
     return run
 
 
@@ -843,11 +921,47 @@ def check_settings(repo: Path, revision: str, approved: str) -> None:
         raise GateRefused(f"settings.json differs from approved blob {approved}: {actual}")
 
 
+# Use a fresh index for the file comparison. The live index can hide edits
+# with assume-unchanged or skip-worktree flags. Never change that index.
+PROMOTION_TRACKED_CHECK = '''import json, os, subprocess, tempfile
+from pathlib import Path
+
+environment = dict(os.environ)
+environment.pop("GIT_INDEX_FILE", None)
+environment["GIT_OPTIONAL_LOCKS"] = "0"
+
+def git(*arguments, env=environment):
+    return subprocess.run(["git", *arguments], env=env, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, check=True).stdout
+
+try:
+    staged = git("diff", "--cached", "--no-ext-diff", "--name-only", "-z", "HEAD", "--")
+    with tempfile.TemporaryDirectory(prefix="promotion-index-") as temporary:
+        private = {**environment, "GIT_INDEX_FILE": str(Path(temporary) / "index")}
+        git("read-tree", "HEAD", env=private)
+        files = git("diff", "--no-ext-diff", "--name-only", "-z", "HEAD", "--", env=private)
+    changed = sorted({os.fsdecode(path) for path in (staged + files).split(b"\\0") if path})
+    if changed:
+        print("tracked edits differ from HEAD: " + "; ".join(json.dumps(path) for path in changed))
+        raise SystemExit(1)
+except (OSError, subprocess.SubprocessError) as error:
+    print("tracked edit check failed: " + str(error))
+    raise SystemExit(1)
+'''
+
+
+def require_clean_promotion(repo: Path) -> None:
+    result = command([sys.executable, "-c", PROMOTION_TRACKED_CHECK], repo)
+    if result.returncode:
+        raise GateRefused("promotion refused: " + (result.stdout.strip() or result.stderr.strip()))
+
+
 def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WAIT_S,
             release_lock_poll_s: float = 0.2) -> None:
+    main_repo = Path(str(args.main_repo)).expanduser().resolve()
+    require_clean_promotion(main_repo)
     hold = BuildHoldWait()
     hold.wait_until_free()
-    main_repo = Path(str(args.main_repo)).expanduser().resolve()
     wait_for_release_lock(release_lock_wait_s, release_lock_poll_s)
     if checked_git(main_repo, "branch", "--show-current") != "main":
         raise GateRefused("promotion checkout must be on main")
@@ -858,14 +972,17 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
         raise GateRefused("main is not an ancestor of the merge branch")
     check_settings(main_repo, f"origin/{args.merge_branch}", str(args.settings_blob))
     hold.wait_until_free()
+    require_clean_promotion(main_repo)
     _ = checked_git(main_repo, "merge", "--ff-only", f"origin/{args.merge_branch}")
     _ = checked_git(main_repo, "push", "origin", "main")
     promoted = checked_git(main_repo, "rev-parse", "HEAD")
     # Retain shell expansion of ~, while quoting arbitrary non-home paths.
     mac_repo = str(args.mac_repo)
     remote_path = '"$HOME"/' + shlex.quote(mac_repo[2:]) if mac_repo.startswith("~/") else shlex.quote(mac_repo)
-    remote = (f"(cd {remote_path} && git fetch -q origin +refs/heads/main:refs/remotes/origin/main && "
-              "git merge --ff-only -q origin/main); rc=$?; "
+    remote_check = "python3 -c " + shlex.quote(PROMOTION_TRACKED_CHECK)
+    remote = (f"(cd {remote_path} && {remote_check} && "
+              "git fetch -q origin +refs/heads/main:refs/remotes/origin/main && "
+              f"{remote_check} && git merge --ff-only -q origin/main); rc=$?; "
               "printf 'ff_rc=%s\\n' \"$rc\"; exit 0")
     try:
         result = subprocess.run([args.ssh, "-o", "ConnectTimeout=10", args.mac_host, remote],
@@ -876,7 +993,8 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
     print(result.stdout, end="", flush=True)
     statuses = re.findall(r"^ff_rc=(\d+)\s*$", result.stdout, re.MULTILINE)
     if result.returncode or statuses != ["0"]:
-        raise GateRefused(f"main promoted to {promoted}; Mac fast-forward failed: ssh exit={result.returncode}, ff_rc={statuses}; {result.stderr.strip()}; the claude-sync job on the Mac retries within 15 minutes")
+        detail = "; ".join(result.stdout.splitlines() + result.stderr.splitlines())
+        raise GateRefused(f"main promoted to {promoted}; Mac fast-forward failed: ssh exit={result.returncode}, ff_rc={statuses}; {detail}; the claude-sync job on the Mac retries within 15 minutes")
 
 
 def rollback_merge(repo: Path, baseline: str) -> None:
@@ -967,7 +1085,8 @@ def merge_checkpoint(args: GateArguments) -> int:
             abort = git(repo, "merge", "--abort")
             raise GateRefused(f"merge failed; conflicts: {conflicts or '(none)'}; {result.stderr.strip()}"
                               + (f"; abort failed: {abort.stderr.strip()}" if abort.returncode else ""))
-        suites = run_suites(repo, int(args.memory_cap_mib), args.type_dirs, float(args.module_time_limit_s), source="checkpoint")
+        suites = run_suites(repo, int(args.memory_cap_mib), args.type_dirs, float(args.module_time_limit_s),
+                            source="checkpoint", full=args.full)
         if not suites.passed:
             raise GateRefused("RED: types or suites failed")
         check_settings(repo, "HEAD", str(args.settings_blob))
@@ -1032,6 +1151,82 @@ def record_changes(repo: Path, review_list: Path, production: Path, commits: lis
         print(f"Change review drift: {line}", file=sys.stderr, flush=True)
 
 
+def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str]) -> None:
+    from scripts.production import showrunners
+    from scripts.production.production_units import Refusal, production_field
+
+    try:
+        try:
+            doc = change_review.production_doc(args.production)
+        except change_review.ChangeReviewError:
+            # A user timer has no calling Claude session. Its merge branch
+            # identifies a registered production without assuming slug == branch.
+            matching: list[Path] = []
+            for candidate in showrunners.timer_docs().values():
+                try:
+                    branch = production_field(candidate.read_text().splitlines(), "Merge branch")
+                except Refusal:
+                    continue
+                if branch == args.merge_branch:
+                    matching.append(candidate)
+            if len(matching) != 1:
+                raise ValueError(f"cannot identify one production for {args.merge_branch}; pass --production <doc>")
+            doc = matching[0]
+        slug = showrunners.production_slug(str(doc))
+        outcome = showrunners.tell(slug, f"merge-gate-nightly:{tree}",
+                                   f"Nightly merge gate is red: {args.merge_branch} tree {tree}. "
+                                   + f"Failed modules: {', '.join(failed) or '(runner failure)'}. "
+                                   + "Every gate now requires the full suite until a full run passes.")
+        print(f"Nightly notice: {outcome}", flush=True)
+    except (change_review.ChangeReviewError, OSError, ValueError) as error:
+        print(f"Nightly notice could not be sent: {error}; full-required marker kept", flush=True)
+
+
+def nightly_git(repo: Path, *arguments: str) -> str:
+    environment = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "Never",
+                   "GIT_SSH_COMMAND": os.environ.get("GIT_SSH_COMMAND", "ssh") + " -oBatchMode=yes"}
+    result = subprocess.run(["git", "-C", str(repo), *arguments], env=environment, stdin=subprocess.DEVNULL,
+                            capture_output=True, text=True, timeout=300, check=False)
+    if result.returncode:
+        raise GateRefused(f"nightly git {' '.join(arguments)}: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def nightly(args: GateArguments) -> int:
+    repo = Path(args.repo).expanduser().resolve()
+    _ = nightly_git(repo, "check-ref-format", f"refs/heads/{args.merge_branch}")
+    _ = nightly_git(repo, "fetch", "origin",
+                    f"+refs/heads/{args.merge_branch}:refs/remotes/origin/{args.merge_branch}")
+    commit = checked_git(repo, "rev-parse", f"refs/remotes/origin/{args.merge_branch}")
+    with tempfile.TemporaryDirectory(prefix="merge-gate-nightly-") as temporary:
+        clone = Path(temporary) / "checkout"
+        _ = nightly_git(repo, "clone", "--shared", "--no-checkout", "--", str(repo), str(clone))
+        _ = nightly_git(clone, "checkout", "--detach", commit)
+        tree = checked_git(clone, "rev-parse", "HEAD^{tree}")
+        try:
+            run = run_suites(clone, args.memory_cap_mib, module_time_limit_s=args.module_time_limit_s, full=True)
+        except (GateRefused, OSError, subprocess.SubprocessError) as error:
+            print(f"Nightly suite runner failed: {error}", flush=True)
+            run = GateRun((GateJobResult("runner", "suite-run", 1, 0, str(error)),), 0, 0)
+        marker = gate_state_dir() / "full-required"
+        if run.passed:
+            marker.unlink(missing_ok=True)
+            return 0
+        failed = [f"{job.suite}/{job.module}" for job in run.jobs if job.returncode]
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", dir=marker.parent, delete=False) as output:
+            pending = Path(output.name)
+            try:
+                _ = output.write(json.dumps({"tree": tree, "at": datetime.now(UTC).isoformat(),
+                                              "failed_modules": failed}) + "\n")
+                output.close()
+                _ = pending.replace(marker)
+            finally:
+                pending.unlink(missing_ok=True)
+        tell_nightly_red(args, tree, failed)
+        return 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--repo", "--checkout", default=str(Path.cwd()))
@@ -1053,21 +1248,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     _ = parser.add_argument("--module-time-limit-s", type=float, default=DEFAULT_MODULE_TIME_LIMIT_S,
                             help="kill a module still running after this many seconds (default: 1800); slowest measured: 387 s at load 152")
     _ = parser.add_argument("--tests-only", action="store_true")
+    _ = parser.add_argument("--full", action="store_true", help="run all test modules even with a certified base")
+    _ = parser.add_argument("--nightly", action="store_true", help="fetch and fully test origin/<merge-branch> in a shared clone")
     _ = parser.add_argument("--promote-only", action="store_true",
                             help="only promote origin/<merge-branch> to main and the Mac (needs --merge-branch)")
     args = cast(GateArguments, parser.parse_args(argv))
     if args.promote_only and not args.merge_branch:
         parser.error("--promote-only needs --merge-branch")
-    if not args.tests_only and not args.promote_only:
+    if args.nightly and not args.merge_branch:
+        parser.error("--nightly needs --merge-branch")
+    if args.nightly and (args.tests_only or args.promote_only or args.promote):
+        parser.error("--nightly cannot be combined with --tests-only or promotion")
+    if not args.tests_only and not args.promote_only and not args.nightly:
         required = ("merge_branch", "unit_branch", "checkpoint", "previous_checkpoint", "unit", "phase")
         missing = [name.replace("_", "-") for name in required if not getattr(args, name)]
         if missing:
             parser.error(f"required: {', '.join('--' + name for name in missing)}")
     try:
         with rollback_signals():
+            if args.nightly:
+                return nightly(args)
             if args.tests_only:
                 return 0 if run_suites(Path(str(args.repo)).resolve(), int(args.memory_cap_mib),
-                                       module_time_limit_s=float(args.module_time_limit_s)).passed else 1
+                                       module_time_limit_s=float(args.module_time_limit_s), full=args.full).passed else 1
             if args.promote_only:
                 promote(args)
                 return 0

@@ -24,6 +24,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 from scripts.production import change_review, merge_gate
+from scripts.production.affected_modules import CertifiedBase
 from scripts.direct.wait_for_test_state import wait_for_file
 from scripts.direct.local_release_wait import IntervalReleasePolling
 from scripts.build_hold.test_hold_applies import TemporaryHoldTest
@@ -471,12 +472,12 @@ class MergeGateTests(unittest.TestCase):
         self.assertEqual(self.module_events(), [])
         self.assertIn(", checkpoint, ", second.stdout)
 
-    def test_tree_dirty_host_or_suite_mismatch_runs_all_modules(self) -> None:
+    def test_dirty_host_or_suite_mismatch_runs_all_modules(self) -> None:
         first = self.run_gate("--tests-only")
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         original = self.pass_records()[0]
         path = Path(self.environment["MERGE_GATE_PASSED_DIR"]) / "passed-trees.jsonl"
-        for mismatch in ("host", "suites", "dirty", "tree"):
+        for mismatch in ("host", "suites", "dirty"):
             with self.subTest(mismatch=mismatch):
                 record = dict(original)
                 if mismatch == "host":
@@ -485,14 +486,156 @@ class MergeGateTests(unittest.TestCase):
                     record["suites"] = [*EXPECTED_SUITES, "other-suite"]
                 else:
                     self.write(self.checkout / "subject.txt", "new tree\n")
-                    if mismatch == "tree":
-                        _ = self.commit(self.checkout, "different tree")
                 self.write(path, json.dumps(record) + "\n")
                 self.clear_gate_events()
                 result = self.run_gate("--tests-only")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertNotIn("tests reused from", result.stdout)
                 self.assert_all_modules_started()
+
+    def test_affected_modules_are_reported_run_and_recorded_without_certifying_a_full_pass(self) -> None:
+        subject = self.checkout / "scripts/hooks/affected_subject.py"
+        self.write(subject, "VALUE = 1\n")
+        test = self.checkout / "scripts/hooks/test_first.py"
+        self.write(test, "import affected_subject\n" + SUITE_MODULE)
+        base = self.commit(self.checkout, "dependency fixture")
+        first = self.run_gate("--tests-only")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.write(subject, "VALUE = 2\n")
+        _ = self.commit(self.checkout, "subject changed")
+        for _attempt in range(2):
+            self.clear_gate_events()
+            result = self.run_gate("--tests-only")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            starts = [(row["suite"], row["module"]) for row in self.module_events() if row["event"] == "start"]
+            self.assertEqual(starts, [("hooks", "test_first.py")])
+            self.assertIn(f"affected: 1 of {MODULES} modules (base {base[:12]}, ", result.stdout)
+            self.assertIn("), 1 changed files\nhooks/test_first.py\n", result.stdout)
+            self.assertIn("message: skipped (not affected)", result.stdout)
+            self.assertIn("Tree-scanning modules: 0 (always affected)", result.stdout)
+            self.assertNotIn("tests reused from", result.stdout)
+        self.assertEqual([record["kind"] for record in self.pass_records()], ["full", "affected", "affected"])
+
+    def test_unrelated_change_can_pass_with_zero_selected_modules(self) -> None:
+        first = self.run_gate("--tests-only")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.write(self.checkout / "subject.txt", "unrelated document\n")
+        _ = self.commit(self.checkout, "documentation changed")
+        self.clear_gate_events()
+        result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"affected: 0 of {MODULES} modules", result.stdout)
+        self.assertEqual(self.module_events(), [])
+        self.assertEqual(self.pass_records()[-1]["kind"], "affected")
+
+    def test_full_flag_and_red_marker_force_all_modules_and_green_clears_the_marker(self) -> None:
+        first = self.run_gate("--tests-only")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        marker = Path(self.environment["MERGE_GATE_STATE_DIR"]) / "full-required"
+        for trigger in ("--full", "red marker"):
+            with self.subTest(trigger=trigger):
+                if trigger == "red marker":
+                    self.write(marker, json.dumps({"tree": "red-tree", "at": "2026-10-29T00:00:00+00:00"}))
+                self.clear_gate_events()
+                result = self.run_gate("--tests-only", *(["--full"] if trigger == "--full" else []))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assert_all_modules_started()
+                self.assertNotIn("tests reused from", result.stdout)
+                self.assertIn("full suite: " + ("--full" if trigger == "--full" else
+                              "last nightly run was red (red-tree, 2026-10-29T00:00:00+00:00)"), result.stdout)
+                self.assertFalse(marker.exists())
+                self.assertEqual(self.pass_records()[-1]["kind"], "full")
+
+    def test_base_search_uses_only_newest_full_same_host_suite_ancestor_and_accepts_legacy_records(self) -> None:
+        ledger = merge_gate.PassedTreeLedger(self.checkout, "tests-only", merge_gate.clean_test_tree(self.checkout))
+        with mock.patch.dict(os.environ, self.environment):
+            ledger.record_pass()
+            original = self.pass_records()[0]
+            _ = original.pop("kind")  # Older full certifications remain usable.
+            self.write(self.checkout / "subject.txt", "a descendant\n")
+            head = self.commit(self.checkout, "descendant")
+            detached = self.git(self.checkout, "commit-tree", self.git(self.checkout, "rev-parse", "HEAD^{tree}"),
+                                "-m", "not an ancestor")
+            records = [original]
+            for index, changes in enumerate((
+                {"kind": "affected", "commit": head}, {"host": "another-host", "commit": head},
+                {"suites": ["hooks"], "commit": head}, {"commit": detached},
+            )):
+                records.append({**original, "at": f"2099-01-0{index + 1}T00:00:00+00:00", **changes})
+            self.write(ledger.path, "".join(json.dumps(record) + "\n" for record in records))
+            selected = ledger.certified_base()
+            self.assertIsInstance(selected, CertifiedBase)
+            assert isinstance(selected, CertifiedBase)
+            self.assertEqual(selected.commit, self.base)
+            # A newer qualifying certification wins even if appended earlier.
+            records.insert(0, {**original, "commit": head, "at": "2099-02-01T00:00:00+00:00"})
+            self.write(ledger.path, "".join(json.dumps(record) + "\n" for record in records))
+            selected = ledger.certified_base()
+            self.assertIsInstance(selected, CertifiedBase)
+            assert isinstance(selected, CertifiedBase)
+            self.assertEqual(selected.commit, head)
+
+    def test_nightly_uses_a_disposable_shared_clone_and_marks_and_notifies_only_red(self) -> None:
+        _ = self.git(self.unit, "push", "origin", "HEAD:integration")
+        self.write(self.checkout / "untracked.txt", "keep the caller's edits\n")
+        before_head = self.git(self.checkout, "rev-parse", "HEAD")
+        before_status = self.git(self.checkout, "status", "--porcelain")
+        before_branches = self.git(self.checkout, "show-ref", "--heads")
+        copies: list[Path] = []
+        marker = Path(self.environment["MERGE_GATE_STATE_DIR"]) / "full-required"
+        for red in (True, False):
+            with self.subTest(red=red):
+                def suite_run(repo: Path, memory_cap_mib: int, *, module_time_limit_s: float,
+                              full: bool) -> merge_gate.GateRun:
+                    self.assertNotEqual(repo, self.checkout)
+                    self.assertTrue((repo / ".git/objects/info/alternates").is_file())
+                    self.assertEqual(merge_gate.checked_git(repo, "rev-parse", "HEAD"), self.checkpoint)
+                    self.assertEqual(merge_gate.checked_git(repo, "status", "--porcelain"), "")
+                    self.assertTrue(full)
+                    self.assertGreater(memory_cap_mib, 0)
+                    self.assertGreater(module_time_limit_s, 0)
+                    self.write(repo / "subject.txt", "only the copy changes\n")
+                    copies.append(repo)
+                    return merge_gate.GateRun((merge_gate.GateJobResult("hooks", "test_first.py", int(red), 0, "fixture"),), 0, 0)
+
+                output = io.StringIO()
+                with mock.patch.dict(os.environ, self.environment), \
+                        mock.patch.object(merge_gate, "run_suites", side_effect=suite_run), \
+                        mock.patch.object(merge_gate, "tell_nightly_red") as notice, redirect_stdout(output):
+                    code = merge_gate.main(["--nightly", "--repo", str(self.checkout), "--merge-branch", "integration"])
+                self.assertEqual(code, int(red), output.getvalue())
+                self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), before_head)
+                self.assertEqual(self.git(self.checkout, "status", "--porcelain"), before_status)
+                self.assertEqual(self.git(self.checkout, "show-ref", "--heads"), before_branches)
+                self.assertEqual((self.checkout / "subject.txt").read_text(), "base\n")
+                self.assertTrue(all(not path.exists() for path in copies))
+                if red:
+                    record = cast(dict[str, object], json.loads(marker.read_text()))
+                    self.assertEqual(record["tree"], self.git(self.checkout, "rev-parse", f"{self.checkpoint}^{{tree}}"))
+                    self.assertEqual(record["failed_modules"], ["hooks/test_first.py"])
+                    notice.assert_called_once()
+                    self.assertEqual(notice.call_args.args[2], ["hooks/test_first.py"])
+                else:
+                    self.assertFalse(marker.exists())
+                    notice.assert_not_called()
+
+    def test_nightly_notice_resolves_the_production_from_its_branch_without_a_calling_session(self) -> None:
+        from scripts.production import showrunners
+
+        self.write(self.quiet_production, "- **Merge branch:** `integration`\n")
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, {**self.environment, "CLAUDE_CODE_SESSION_ID": ""}), \
+                mock.patch.object(showrunners, "timer_docs", return_value={"quiet": self.quiet_production}), \
+                mock.patch.object(showrunners, "tell", return_value="could not tell quiet: offline") as send, \
+                redirect_stdout(output):
+            merge_gate.tell_nightly_red(merge_gate.GateArguments(merge_branch="integration"),
+                                        "fixture-tree", ["hooks/test_first.py"])
+        send.assert_called_once()
+        arguments = send.call_args
+        assert arguments is not None
+        self.assertEqual(arguments.args[:2], ("quiet", "merge-gate-nightly:fixture-tree"))
+        self.assertIn("hooks/test_first.py", cast(str, arguments.args[2]))
+        self.assertIn("could not tell quiet: offline", output.getvalue())
 
     def test_unavailable_ledger_runs_all_modules_and_reports_once(self) -> None:
         directory = Path(self.environment["MERGE_GATE_PASSED_DIR"])
@@ -1553,14 +1696,109 @@ with Path(sys.argv[1]).open("r+") as lock:
         self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.checkpoint)
         self.assertEqual(len([call for call in self.calls() if call["tool"] == "ssh"]), 2)
 
-    def test_promote_preserves_unrelated_local_edits_and_untracked_files(self) -> None:
+    def test_promote_refuses_unrelated_local_edits_and_keeps_untracked_files(self) -> None:
+        _ = self.publish_for_promotion()
         self.write(self.main / "subject.txt", "uncommitted main\n")
+        self.write(self.main / "settings.json", "local settings\n")
         self.write(self.main / "accounts.lock", "untracked\n")
-        result = self.run_gate("--promote")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = self.run_promote_only()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('"subject.txt"', result.stderr)
+        self.assertIn('"settings.json"', result.stderr)
         self.assertEqual((self.main / "subject.txt").read_text(), "uncommitted main\n")
         self.assertEqual((self.main / "accounts.lock").read_text(), "untracked\n")
-        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.git(self.checkout, "rev-parse", "HEAD"))
+        self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+        self.assertFalse(any(call["tool"] == "ssh" for call in self.calls()))
+
+    def test_promotion_refuses_staged_edits_even_when_the_file_matches_head(self) -> None:
+        _ = self.publish_for_promotion()
+        self.write(self.main / "subject.txt", "staged main\n")
+        _ = self.git(self.main, "add", "subject.txt")
+        self.write(self.main / "subject.txt", "base\n")
+        result = self.run_promote_only()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('"subject.txt"', result.stderr)
+        self.assertEqual(self.git(self.main, "show", ":subject.txt"), "staged main")
+        self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+
+    def test_promotion_refuses_edits_hidden_by_index_flags(self) -> None:
+        self.write(self.unit / "subject.txt", "promoted contents\n")
+        self.checkpoint = self.commit(self.unit, "update subject")
+        _ = self.publish_for_promotion()
+        for flag in ("assume-unchanged", "skip-worktree"):
+            with self.subTest(flag=flag):
+                _ = self.git(self.main, "update-index", "--" + flag, "subject.txt")
+                self.write(self.main / "subject.txt", "live contents\n")
+                self.assertEqual(self.git(self.main, "status", "--porcelain", "--untracked-files=no"), "")
+                result = self.run_promote_only()
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('"subject.txt"', result.stderr)
+                self.assertEqual((self.main / "subject.txt").read_text(), "live contents\n")
+                self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.base)
+                self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+                _ = self.git(self.main, "update-index", "--no-" + flag, "subject.txt")
+
+    def test_promotion_checks_edits_after_the_last_hold_wait(self) -> None:
+        args = self.publish_for_promotion()
+        waits = 0
+
+        def edit_during_wait() -> None:
+            nonlocal waits
+            waits += 1
+            if waits == 2:
+                self.write(self.main / "subject.txt", "edited during hold\n")
+
+        with mock.patch.dict(os.environ, self.environment), \
+                mock.patch.object(merge_gate.BuildHoldWait, "wait_until_free", side_effect=edit_during_wait):
+            with self.assertRaisesRegex(merge_gate.GateRefused, 'tracked edits differ from HEAD: "subject.txt"'):
+                merge_gate.promote(args)
+        self.assertEqual((self.main / "subject.txt").read_text(), "edited during hold\n")
+        self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+        self.assertFalse(any(call["tool"] == "ssh" for call in self.calls()))
+
+    def test_promotion_allows_untracked_files(self) -> None:
+        _ = self.publish_for_promotion()
+        self.write(self.main / "accounts.lock", "untracked\n")
+        result = self.run_promote_only()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.main / "accounts.lock").read_text(), "untracked\n")
+        self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.checkpoint)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.checkpoint)
+
+    def test_mac_promotion_checks_real_files_and_index_in_a_private_clone(self) -> None:
+        args = self.publish_for_promotion()
+        self.write(self.bin / "ssh", f'#!{sys.executable}\nimport subprocess, sys\n'
+                   + 'raise SystemExit(subprocess.call(["sh", "-c", sys.argv[-1]]))\n')
+        for state in ("modified", "staged", "assume-unchanged", "skip-worktree", "untracked", "clean"):
+            with self.subTest(state=state):
+                mac = self.root / ("mac-" + state)
+                _ = self.git(self.root, "clone", "-q", "--branch", "main", str(self.origin), str(mac))
+                # Keep each Mac at the old promotion, even after natedev advances.
+                _ = self.git(mac, "reset", "--hard", self.base)
+                args.mac_repo = str(mac)
+                if state in ("assume-unchanged", "skip-worktree"):
+                    _ = self.git(mac, "update-index", "--" + state, "subject.txt")
+                if state not in ("untracked", "clean"):
+                    self.write(mac / "subject.txt", "Mac local contents\n")
+                if state == "staged":
+                    _ = self.git(mac, "add", "subject.txt")
+                if state == "untracked":
+                    self.write(mac / "local.lock", "keep\n")
+                with mock.patch.dict(os.environ, self.environment), redirect_stdout(io.StringIO()):
+                    if state in ("untracked", "clean"):
+                        merge_gate.promote(args)
+                        self.assertEqual(self.git(mac, "rev-parse", "HEAD"), self.checkpoint)
+                    else:
+                        with self.assertRaisesRegex(merge_gate.GateRefused, 'Mac fast-forward failed:.*"subject.txt"'):
+                            merge_gate.promote(args)
+                        self.assertEqual(self.git(mac, "rev-parse", "HEAD"), self.base)
+                        self.assertEqual((mac / "subject.txt").read_text(), "Mac local contents\n")
+                self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.checkpoint)
+                if state == "untracked":
+                    self.assertEqual((mac / "local.lock").read_text(), "keep\n")
 
     def test_promote_preserves_local_edits_that_block_fast_forward(self) -> None:
         self.write(self.unit / "subject.txt", "checkpoint changes this file\n")

@@ -100,9 +100,22 @@ AGENT_PID="${3:?missing agent pid}"
 AGENT_LOG="${4:?missing agent log path}"
 INTERVAL_SECS="${5:-60}"
 
+SLEEP_PID=""
+stop_watcher() {
+    if [[ -n "${SLEEP_PID}" ]]; then
+        kill "${SLEEP_PID}" 2>/dev/null || true
+        wait "${SLEEP_PID}" 2>/dev/null || true
+    fi
+    exit 0
+}
+trap stop_watcher TERM INT HUP
+
 waited=0
 while kill -0 "${AGENT_PID}" 2>/dev/null; do
-    sleep "${INTERVAL_SECS}"
+    sleep "${INTERVAL_SECS}" &
+    SLEEP_PID=$!
+    wait "${SLEEP_PID}"
+    SLEEP_PID=""
     kill -0 "${AGENT_PID}" 2>/dev/null || exit 0
     waited=$((waited + INTERVAL_SECS))
     activity="$(digest 2>/dev/null || true)"
