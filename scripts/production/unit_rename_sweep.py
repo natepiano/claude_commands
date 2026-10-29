@@ -27,6 +27,14 @@ STATE_HISTORY = (
     # Copies of queued prompt texts, which the pause hook matches exactly against each prompt that
     # comes in; the session's next stop rebuilds them from its wakeups. A rewrite breaks the match.
     "conversation-pause/scheduled-prompts/",
+    # Pane launch snapshots: forget_unit drops the old director; other panes keep their last launch
+    # until SessionStart rewrites it. Missing panes are ignored by pane_record's reader.
+    "herdr-panes/",
+    # lint/sweep.py records target deletion times, expiring absent roots and entries older than a day.
+    "lint-sweep/target-deletes.json",
+    # buildlog/mac_idle.py owns these registrations. Only a live pid/start and a current waiting
+    # step record admit a call; its repo comes from that step, not this saved launch snapshot.
+    "mac-idle/calls/",
 )
 # Under a production's own state folder.
 PRODUCTION_HISTORY = ("log-backups/", "dailies_last.json", "rename_unit.json", "rename.json")
