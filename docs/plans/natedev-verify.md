@@ -2,7 +2,7 @@
 
 > **Status: IMPLEMENTATION PLAN — phased, direct-ready.** Owner of `verify.sh`, its final pass, its cache, its lint and test scope, its speed and the Mac test code; first change: cut the Python helper start time in each verify run.
 
-> **Production: natedev** — unit `verify-unit`; production doc `docs/plans/natedev-production.md`
+> **Production: builds** — unit `verify-unit`; production doc `docs/plans/builds-production.md`
 
 ## Source
 
