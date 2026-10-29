@@ -1,7 +1,7 @@
 import type { SessionReceiveInput } from "claude-code";
 import { stateDirectory } from "./outbox";
 import { PATHS, REPLY_WINDOW_MS, isDeliveryRouteFile } from "./protocol";
-import type { DeliveryRoute, DeliveryRouteFile, PostmasterCalls, Replies, ReplyDestination, ReplyLog } from "./protocol";
+import type { DeliveryRoute, DeliveryRouteFile, ForwardLog, PostmasterCalls, Replies, ReplyDestination, ReplyLog } from "./protocol";
 
 type ReplyWrapper = { kind: "reply"; socket: string; name: string; body: string } | { kind: "not a reply" };
 
@@ -113,22 +113,21 @@ export async function startReplies(calls: PostmasterCalls): Promise<Replies> {
       const replying = matching[matching.length - 1];
       if (replying === undefined) return { kind: "pass" };
       const answerTo = senders.length === 1 ? senders.join(", ") : `one of ${senders.join(", ")}`;
-      const logPath = path(PATHS.replies, `${at_ms}-${++replyCount}`);
+      const key = `${at_ms}-${++replyCount}`;
       const log: ReplyLog = {
-        at_ms, socket: reply.socket, name: reply.name, session_id: replying.sessionId, senders, body: reply.body,
-        targets: [...targets], forward: "pending", forwarded: [],
+        at_ms, socket: reply.socket, name: reply.name, session_id: replying.sessionId, senders, body: reply.body, targets: [...targets],
       };
-      // The record exists before any forward, so a recipient's hook can check where the reply came from.
-      await calls.fs.write(logPath, JSON.stringify(log));
+      // Each file is written once, before any reader can need it: the engine fs has no rename, so a rewrite could be read torn.
+      await calls.fs.write(path(PATHS.replies, key), JSON.stringify(log));
+      const forwarded: string[] = [];
       for (const sessionId of targets) {
         const text = `Message from ${reply.name} (their answer to ${answerTo}, passed on by postmaster) [${at_ms}-${++forwardCount}]:\n\n${reply.body}`;
         try {
           const answer = await calls.session.send({ to: { sessionId }, text });
-          if (answer.isDelivered) log.forwarded.push(sessionId);
+          if (answer.isDelivered) forwarded.push(sessionId);
         } catch { /* The answer is still logged and consumed when forwarding fails. */ }
       }
-      log.forward = "done";
-      await calls.fs.write(logPath, JSON.stringify(log));
+      await calls.fs.write(path(PATHS.forwards, key), JSON.stringify({ forwarded } satisfies ForwardLog));
       return { kind: "consumed", reason: "postmaster reply" };
     },
   };

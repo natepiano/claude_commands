@@ -116,6 +116,20 @@ class BerthHookTests(unittest.TestCase):
         _ = (phase_reservation.phase_directory(self.session_dir, "16") / phase_reservation.FILES_FILE).write_text(
             "./src/panels/\ndocs/panels.md\n")
 
+    def claim_phase_worktree(self, phase: str, root: Path) -> None:
+        directory = phase_reservation.phase_directory(self.session_dir, phase)
+        state = directory / phase_reservation.STATE_FILE
+        before = state.read_bytes()
+        state.unlink()
+        try:
+            with mock.patch.dict(os.environ, self.environment, clear=True), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as errors:
+                code = phase_reservation.main(["claim", "--session-dir", str(self.session_dir),
+                                               "--phase", phase, "--repo", str(root)])
+            self.assertEqual(code, 0, errors.getvalue())
+        finally:
+            _ = state.write_bytes(before)
+
     def berth_calls(self) -> list[dict[str, object]]:
         log = self.root / "berth.log"
         lines = log.read_text().splitlines() if log.exists() else []
@@ -560,6 +574,67 @@ class BerthHookTests(unittest.TestCase):
         self.assertEqual([call["argv"] for call in self.berth_calls()[1:]],
                          [["check", "src/lib.rs", "--json"], ["check", "src/panels/info.rs", "--json"]])
         self.assertEqual(cast(dict[str, str], self.state()["active_phase_reservation"])["phase"], "15")
+
+    def test_same_path_in_two_worktrees_checks_only_that_worktrees_phase(self) -> None:
+        self.open_second_phase()
+        other = self.root / "other-worktree"
+        _ = subprocess.run(["git", "-C", str(self.repo), "worktree", "add", "-q", "-b", "other", str(other)],
+                           check=True, capture_output=True, timeout=60)
+        self.claim_phase_worktree("15", self.repo)
+        self.claim_phase_worktree("16", other)
+        directory = phase_reservation.phase_directory(self.session_dir, "16")
+        _ = (directory / phase_reservation.FILES_FILE).write_text("src/lib.rs\n")
+        untouched = (directory / phase_reservation.STATE_FILE).read_bytes()
+
+        first = self.hook(patch_text("*** Update File: src/lib.rs"), cwd=self.repo)
+
+        self.assertEqual((first.returncode, first.stdout), (0, ""), first.stderr)
+        self.assertEqual(cast(dict[str, str], self.state()["active_phase_reservation"])["phase"], "15")
+        self.assertEqual((directory / phase_reservation.STATE_FILE).read_bytes(), untouched)
+        first_state = self.state()
+        reservation_16 = "01a13f9c-0000-7000-8000-000000000016"
+        self.answer(envelope("clear", acquisition=acquired(reservation_16)))
+
+        second = self.hook(patch_text("*** Update File: src/lib.rs"), cwd=other)
+
+        self.assertEqual((second.returncode, second.stdout), (0, ""), second.stderr)
+        self.assertEqual(self.state(), first_state)
+        self.assertEqual(cast(dict[str, str], self.state(phase="16")["active_phase_reservation"]),
+                         {"reservation_id": reservation_16, "coordination_run_id": RUN, "phase": "16",
+                          "phase_start_head": HEAD})
+        self.assertEqual(self.berth_calls(), [
+            {"argv": ["check", "src/lib.rs", "--json"], "cwd": str(self.repo), "session": f"{DIRECTOR}.phase-15"},
+            {"argv": ["check", "src/lib.rs", "--json"], "cwd": str(other), "session": f"{DIRECTOR}.phase-16"},
+        ])
+
+    def test_edit_outside_all_claimed_phase_worktrees_checks_the_bare_session(self) -> None:
+        other = self.root / "other-worktree"
+        _ = subprocess.run(["git", "-C", str(self.repo), "worktree", "add", "-q", "-b", "other", str(other)],
+                           check=True, capture_output=True, timeout=60)
+        self.claim_phase_worktree("15", other)
+        directory = phase_reservation.phase_directory(self.session_dir, "15")
+        before = {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()}
+
+        result = self.hook(patch_text("*** Update File: src/lib.rs"), cwd=self.repo)
+
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertEqual(self.berth_calls(), [
+            {"argv": ["check", "src/lib.rs", "--json"], "cwd": str(self.repo), "session": DIRECTOR},
+        ])
+        self.assertEqual({path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()}, before)
+
+    def test_record_active_outside_the_phases_worktree_keeps_its_state(self) -> None:
+        other = self.root / "other-worktree"
+        _ = subprocess.run(["git", "-C", str(self.repo), "worktree", "add", "-q", "-b", "other", str(other)],
+                           check=True, capture_output=True, timeout=60)
+        self.claim_phase_worktree("15", other)
+        _ = (self.repo / "src/lib.rs").write_text("fn changed() {}\n")
+
+        code, output = self.backstop()
+
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self.berth_calls(), [])
+        self.assertEqual(self.state(), AWAITING)
 
     def test_with_two_open_phases_a_path_neither_files_list_owns_is_refused(self) -> None:
         self.open_second_phase()

@@ -114,14 +114,14 @@ def decide(raw: str) -> int:
         # An unreadable recorder state gives no recorder list; check as before the recorder listed phases.
         phases = phase_reservation.held_phases(session_dir)
     phases = phase_reservation.enrolled_phases(phases, root, session_id)
-    missing = phase_reservation.missing_record_phases(phases, scopes)
+    missing = phase_reservation.missing_record_phases(phases, scopes, root)
     if missing:
         commands = "; ".join(phase_reservation.repair_command(session_dir, phase.phase, root) for phase in missing)
         return _refuse(f"phase reservation record missing; restore it from berth's ledger: {commands}.")
-    attribution = phase_reservation.attribute(phases, scopes) if phases else None
-    if attribution is not None and attribution.refused:
+    attribution = phase_reservation.attribute(phases, scopes, root)
+    if isinstance(attribution, phase_reservation.Attribution) and attribution.refused:
         return _refuse(phase_reservation.refusal_reason(phases, attribution.refused))
-    groups = list(attribution.by_phase.items()) if attribution is not None else [(None, scopes)]
+    groups = list(attribution.by_phase.items()) if isinstance(attribution, phase_reservation.Attribution) else [(None, scopes)]
     for phase, phase_scopes in groups:
         answer = phase_reservation.phase_check(root, phase_scopes, session_id, phase)
         if answer.status in phase_reservation.FAILS_OPEN:
