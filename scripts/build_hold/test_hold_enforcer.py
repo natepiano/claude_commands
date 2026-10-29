@@ -16,11 +16,16 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal, cast, override
+from typing import TYPE_CHECKING, Literal, cast, override
 from unittest import mock
 
 import build_hold
 import hold_enforcer
+
+if TYPE_CHECKING:
+    from ..direct import step_record
+else:
+    import step_record
 
 
 EMPTY_PROCESS_ENVIRONMENT: Mapping[str, str] = MappingProxyType({})
@@ -47,6 +52,8 @@ class HoldEnforcerTests(unittest.TestCase):
             "HOME": str(self.root), "BUILD_HOLD_DIR": str(self.holders),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "BUILD_HOLD_ENFORCER_DIR": str(self.root / "enforcer"),
+            "VERIFY_STEPS_DIR": str(self.root / "steps"),
+            "VERIFY_PROC_ROOT": str(self.proc),
             "BUILD_HOLD_CGROUP_ROOT": str(self.root / "cgroup"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
@@ -92,7 +99,7 @@ class HoldEnforcerTests(unittest.TestCase):
         return directory
 
     def table(self) -> dict[int, build_hold.AuditProcess]:
-        return build_hold.read_audit_processes(self.proc, build_hold.HoldBuildCandidates(self.uid), self.root / "cgroup")
+        return hold_enforcer.read_processes(self.proc, self.uid, self.root / "cgroup")
 
     def decisions(self, enforcer_pid: int = 999) -> tuple[hold_enforcer.BuildDecision, ...]:
         return hold_enforcer.decide_builds(self.table(), build_hold.natedev_holds(self.holders).in_force,
@@ -101,6 +108,105 @@ class HoldEnforcerTests(unittest.TestCase):
     def rows(self) -> list[dict[str, object]]:
         return [cast(dict[str, object], json.loads(line)) for path in (self.root / "buildlog").glob("*/*.jsonl")
                 for line in path.read_text().splitlines()]
+
+    def write_step(self, call_id: str, state: step_record.StepState, pid: int) -> None:
+        step_record.write(step_record.StepRecord(
+            call_id, pid, step_record.process_start(pid), self.root, "check", None,
+            step_record.MacAllowed(), state, "2026-10-28T12:00:00+00:00",
+        ))
+
+    def test_verify_controller_survives_every_live_state_while_local_compile_child_stops(self) -> None:
+        _ = self.process(10, "bash", argv=("bash", "verify.sh", "check"), session="other")
+        decision, = self.decisions()
+        self.assertIsInstance(decision, hold_enforcer.AllowedBuild)
+        _ = self.process(10, "bash", argv=("bash", "verify.sh", "check"), session="other",
+                         environment={"BUILDLOG_CALL_ID": "verify-call"})
+        _ = self.process(20, "cargo", parent=10, argv=("cargo", "check"), session="other",
+                         environment={"BUILDLOG_CALL_ID": "verify-call"})
+        for state in step_record.StepState:
+            with self.subTest(state=state):
+                self.write_step("verify-call", state, 10)
+                decisions = {item.process.identity.pid: item for item in self.decisions()}
+                self.assertIsInstance(decisions[10], hold_enforcer.AllowedBuild)
+                expected = (hold_enforcer.WouldStopBuild if state == step_record.StepState.ON_NATEDEV
+                            else hold_enforcer.AllowedBuild)
+                self.assertIsInstance(decisions[20], expected)
+
+    def test_call_record_decides_unknown_commands_and_cargo_without_name_rules(self) -> None:
+        _ = self.process(90, "coordinator")
+        for pid, (command, argv) in enumerate((("worker", ("worker", "compile")),
+                                             ("cargo", ("cargo", "check"))), 10):
+            _ = self.process(pid, command, argv=argv, session="other",
+                             environment={"BUILDLOG_CALL_ID": f"call-{pid}"})
+        for state in step_record.StepState:
+            for pid in (10, 11):
+                self.write_step(f"call-{pid}", state, 90)
+            table = self.table()
+            decisions = hold_enforcer.decide_builds(table, build_hold.natedev_holds(self.holders).in_force,
+                                                    self.uid, 999)
+            self.assertEqual({item.process.identity.pid for item in decisions}, {10, 11})
+            sent: list[int] = []
+            stopper = hold_enforcer.StopBuildsAndTests(self.proc, signal_process=lambda pid, _signum: sent.append(pid))
+            for decision in decisions:
+                if isinstance(decision, hold_enforcer.WouldStopBuild):
+                    stopper.stop(decision, table, build_hold.natedev_holds(self.holders).in_force, 999)
+            self.assertEqual(sent, [10, 11] if state == step_record.StepState.ON_NATEDEV else [])
+        self.assertEqual({(row["pid"], row["call_id"], row["action"]) for row in self.rows()},
+                         {(10, "call-10", "stopped"), (11, "call-11", "stopped")})
+
+    def test_missing_stale_and_unreadable_call_records_stop_a_verify_process(self) -> None:
+        _ = self.process(10, "bash", argv=("bash", "verify.sh", "check"), session="other",
+                         environment={"BUILDLOG_CALL_ID": "verify-call"})
+        for condition in ("missing", "stale", "unreadable"):
+            with self.subTest(condition=condition):
+                if condition == "stale":
+                    self.write_step("verify-call", step_record.StepState.ON_MAC, 10)
+                    _ = self.process(10, "bash", start=12_000, argv=("bash", "verify.sh", "check"), session="other",
+                                     environment={"BUILDLOG_CALL_ID": "verify-call"})
+                elif condition == "unreadable":
+                    _ = step_record.record_path("verify-call").write_text("{broken")
+                table = self.table()
+                decision, = self.decisions()
+                self.assertIsInstance(decision, hold_enforcer.WouldStopBuild)
+                sent: list[int] = []
+                if isinstance(decision, hold_enforcer.WouldStopBuild):
+                    stopper = hold_enforcer.StopBuildsAndTests(
+                        self.proc, signal_process=lambda pid, _signum: sent.append(pid))
+                    stopper.stop(decision, table, build_hold.natedev_holds(self.holders).in_force, 999)
+                self.assertEqual(sent, [10])
+
+    def test_reroute_keeps_kill_for_old_compiler_and_protects_new_mac_children(self) -> None:
+        _ = self.process(90, "coordinator")
+        _ = self.process(10, "cargo", argv=("cargo", "check"), session="other",
+                         environment={"BUILDLOG_CALL_ID": "verify-call"})
+        _ = self.process(11, "worker", parent=10, start=11_001, session="other",
+                         environment={"BUILDLOG_CALL_ID": "mac-call"})
+        self.write_step("verify-call", step_record.StepState.ON_NATEDEV, 90)
+        self.write_step("mac-call", step_record.StepState.ON_MAC, 90)
+        table = self.table()
+        decision = next(item for item in self.decisions() if item.process.identity.pid == 10)
+        assert isinstance(decision, hold_enforcer.WouldStopBuild)
+        sent: list[tuple[int, int]] = []
+        stopper = hold_enforcer.StopBuildsAndTests(
+            self.proc, signal_process=lambda pid, signum: sent.append((pid, signum)), clock=lambda: self.now)
+        stopper.stop(decision, table, build_hold.natedev_holds(self.holders).in_force, 999)
+        self.write_step("verify-call", step_record.StepState.WAITING_MAC, 90)
+        _ = self.process(12, "worker", parent=90, start=11_002, session="other",
+                         environment={"BUILDLOG_CALL_ID": "verify-call"})
+        self.now = 3
+        stopper.kill_survivors(self.table(), build_hold.natedev_holds(self.holders).in_force, 999)
+        self.assertEqual(sent, [(10, signal.SIGTERM), (10, signal.SIGKILL)])
+        self.assertEqual(stopper.terminating, {})
+        decisions = {item.process.identity.pid: item for item in self.decisions()}
+        self.assertIsInstance(decisions[12], hold_enforcer.AllowedBuild)
+
+    def test_sole_holder_keeps_its_on_natedev_record_process(self) -> None:
+        _ = self.process(90, "coordinator")
+        _ = self.process(10, "worker", session="holder", environment={"BUILDLOG_CALL_ID": "holder-call"})
+        self.write_step("holder-call", step_record.StepState.ON_NATEDEV, 90)
+        decision, = self.decisions()
+        self.assertIsInstance(decision, hold_enforcer.AllowedBuild)
+        self.assertEqual(decision.owner, build_hold.OwningSession("holder"))
 
     def test_stopped_run_writes_reason_and_log_registers_notice_then_terms_root_first_and_kills_survivor(self) -> None:
         root = self.process(30, "cargo", argv=("cargo", "check", "--workspace"), session="other")
@@ -303,20 +409,21 @@ class HoldEnforcerTests(unittest.TestCase):
         self.assertIsInstance(decisions[5], hold_enforcer.AllowedBuild)
         self.assertIsInstance(decisions[30], hold_enforcer.WouldStopBuild)
 
-    def test_reader_limits_details_to_candidates_and_ancestors(self) -> None:
+    def test_reader_checks_other_environments_but_limits_arguments_to_candidates_and_records(self) -> None:
         _ = self.process(10, "claude", start=1000, session="other")
         _ = self.process(20, "cargo", parent=10, argv=("cargo", "build"))
         _ = self.process(30, "cargo-port")
         read_bytes = Path.read_bytes
-        detailed: set[int] = set()
+        detailed: set[tuple[int, str]] = set()
 
         def read(path: Path) -> bytes:
-            detailed.add(int(path.parent.name))
+            detailed.add((int(path.parent.name), path.name))
             return read_bytes(path)
 
         with mock.patch.object(Path, "read_bytes", read):
             table = self.table()
-        self.assertEqual(detailed, {10, 20})
+        self.assertEqual(detailed, {(10, "cmdline"), (10, "environ"), (20, "cmdline"),
+                                    (20, "environ"), (30, "environ")})
         self.assertEqual(table[30].environment, {})
 
     def test_other_uid_and_enforcer_ancestors_are_never_stopped(self) -> None:

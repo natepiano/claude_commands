@@ -179,7 +179,7 @@ class VerifyLintScopeTests(unittest.TestCase):
         self.write_executable(bin_directory / "git", GIT_STUB)
         self.write_executable(bin_directory / "rustc", 'print("rustc fixture")\n')
         targets = self.root / "build-targets.py"
-        self.write_executable(targets, "raise SystemExit(0)\n")
+        self.write_executable(targets, 'import sys\nif sys.argv[1] == "eligible": print("natedev_only test target\\nnatedev\\teligible\\t-\\t-")\n')
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.write_executable(bin_directory / name, "raise SystemExit(99)\n")
         for directory in ("tmp", "state", "cache", "runtime", "target", "cargo-home", ".git"):
@@ -237,6 +237,7 @@ class VerifyLintScopeTests(unittest.TestCase):
             "XDG_RUNTIME_DIR": str(self.root / "runtime"),
             "CARGO_HOME": str(self.root / "cargo-home"),
             "CARGO_TARGET_DIR": str(self.root / "target"),
+            "VERIFY_STEPS_DIR": str(self.root / "verify-steps"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILDLOG_OFF": "1",
             "BUILDLOG_SCOPE": "0",

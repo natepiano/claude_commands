@@ -681,6 +681,18 @@ class MacTestCommandTests(unittest.TestCase):
         self.stop_child(owner)
         return record
 
+    def test_claims_record_each_mac_verb_and_workspace_scope(self) -> None:
+        worktree = self.repository("hana")
+        owner = self.start_child()
+        for verb in ("nextest", "check", "clippy", "mend-check", "doc"):
+            with self.subTest(verb=verb):
+                claim = self.command("claim", "--pid", str(owner.pid), "--what", f"{verb} workspace",
+                                     "--worktree", str(worktree))
+                self.assert_command(claim, 0, "claimed\n")
+                self.assertEqual(self.repository_claim("hana")["what"], f"{verb} workspace")
+                self.assertIn(f"running: {verb} workspace", self.command("status").stdout)
+                self.assert_command(self.command("release", "--pid", str(owner.pid)), 0, "")
+
     def test_remote_claim_outlives_its_owner_and_remains_live_to_state_readers(self) -> None:
         record = self.kept_claim()
         paths = mac_test.StatePaths(self.state_directory)

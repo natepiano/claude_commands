@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Coordinate test use of the Mac: one claim per repository, and the Mac block."""
+"""Coordinate build-step use of the Mac: one claim per repository, and the Mac block."""
 
 from __future__ import annotations
 
@@ -847,7 +847,7 @@ def run_is_kept(run: RunRecord) -> TypeGuard[RemoteJobClaim]:
 
 
 def copy_gives_way(run: RunRecord) -> bool:
-    """A live copy claim whose process still runs, so a new test can stop it.
+    """A live test copy whose process still runs, so a new step can stop it.
 
     A kept copy claim holds leftovers like any other kept claim and never gives way.
     """
@@ -1838,7 +1838,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope) -> Clai
         print(f"blocked by {block.holder}: {block.reason}")
         return ClaimFinished(10)
     if overlapping:
-        # A copy gives way to any new test; a copy never replaces a copy.
+        # A test copy gives way to any new step; a copy never replaces a copy.
         if not args.copy and all(copy_gives_way(claim.record) for claim in overlapping):
             return ClaimHeldByCopy(tuple(claim.record for claim in overlapping))
         return ClaimBusy(overlapping[0].record)

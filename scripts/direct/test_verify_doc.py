@@ -92,7 +92,7 @@ class VerifyDocTests(unittest.TestCase):
         self.executable(tools / "cargo", CARGO_STUB)
         self.executable(tools / "rustc", 'print("rustc fixture")\n')
         targets = tools / "build-targets.py"
-        self.executable(targets, "raise SystemExit(0)\n")
+        self.executable(targets, 'import sys\nif sys.argv[1] == "eligible": print("natedev_only test target\\nnatedev\\teligible\\t-\\t-")\n')
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.executable(tools / name, "raise SystemExit(99)\n")
         for name in ("tmp", "state", "cache", "runtime", "target", "session"):
@@ -132,6 +132,7 @@ class VerifyDocTests(unittest.TestCase):
             "TMPDIR": str(self.root / "tmp"), "XDG_STATE_HOME": str(self.root / "state"),
             "XDG_CACHE_HOME": str(self.root / "cache"), "XDG_RUNTIME_DIR": str(self.root / "runtime"),
             "CARGO_HOME": str(self.root / "cargo-home"), "CARGO_TARGET_DIR": str(self.root / "target"),
+            "VERIFY_STEPS_DIR": str(self.root / "verify-steps"),
             "BUILDLOG_DIR": str(self.root / "buildlog"), "BUILDLOG_OFF": "1", "BUILDLOG_SCOPE": "0",
             "BUILDLOG_MEMINFO": str(meminfo),
             "BUILD_HOLD_DIR": str(self.root / "build-hold"), "BUILD_TARGETS_SCRIPT": str(targets),
@@ -201,6 +202,76 @@ class VerifyDocTests(unittest.TestCase):
         self.assertIn("--no-deps", calls[0]["args"])
         self.assertNotIn("-p", calls[0]["args"])
         self.assertIn("-D warnings", calls[0]["rustdocflags"])
+
+    def enable_held_mac_doc(self) -> None:
+        holders = Path(self.environment["BUILD_HOLD_DIR"])
+        holders.mkdir()
+        _ = (holders / "other").write_text("private hold")
+        settings = self.root / "mac.conf"
+        _ = settings.write_text("offload=on\n")
+        self.environment["MAC_TEST_CONFIG"] = str(settings)
+        self.environment["MAC_IDLE_STATE_DIR"] = str(self.root / "mac-idle")
+        self.environment["MAC_TEST_STATE_DIR"] = str(self.root / "mac-state")
+        targets = Path(self.environment["BUILD_TARGETS_SCRIPT"])
+        self.executable(targets, '''
+import os
+from pathlib import Path
+import sys
+if sys.argv[1] == "eligible":
+    print("mac_allowed")
+    print("natedev\\teligible\\t-\\t-")
+    print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"])
+elif sys.argv[1] in ("register-local", "check-local"):
+    raise SystemExit(10)
+''')
+        runner = self.root / "mac-doc.py"
+        self.executable(runner, '''
+import os
+from pathlib import Path
+import sys
+words = sys.argv[1:]
+assert words[words.index("--verb") + 1] == "doc"
+assert words[words.index("--repo-root") + 1] == os.environ["TEST_ORIGINAL_REPO"]
+os.chdir(words[words.index("--source-root") + 1])
+result = "failed" if int(os.environ.get("TEST_DOC_STATUS", "0")) else "passed"
+Path(words[words.index("--result") + 1]).write_text("mac=" + result + "\\nseconds=0\\n")
+''' + CARGO_STUB.replace('arguments = sys.argv[1:]', 'arguments = ["doc", *words[words.index("--") + 1:]]'))
+        self.environment["VERIFY_MAC_RUNNER"] = str(runner)
+
+    def test_held_mac_doc_judges_staged_snapshot_and_records_pass_without_index_changes(self) -> None:
+        self.enable_held_mac_doc()
+        source = self.repo / "alpha/src/lib.rs"
+        _ = source.write_text("pub fn staged() {}\n")
+        _ = self.git("add", "alpha/src/lib.rs")
+        tree = self.git("write-tree")
+        _ = source.write_text("pub fn unstaged() {}\n")
+        _ = (self.repo / "notes.md").write_text("untracked")
+        index = (self.repo / ".git/index").read_bytes()
+        result = self.verify()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        call, = self.cargo_calls()
+        self.assertEqual(call["sources"]["alpha/src/lib.rs"], "pub fn staged() {}\n")
+        self.assertFalse(call["notes_present"])
+        self.assertNotEqual(call["cwd"], str(self.repo))
+        record_path, = self.pass_records()
+        record = cast(DocPassRecord, json.loads(record_path.read_text()))
+        self.assertEqual((record["tree_id"], record["repo_top"], record["call_id"]), (tree, str(self.repo), call["call_id"]))
+        self.assertEqual((self.repo / ".git/index").read_bytes(), index)
+        self.assertEqual(source.read_text(), "pub fn unstaged() {}\n")
+
+    def test_held_mac_doc_failure_or_changed_staged_tree_does_not_record_pass(self) -> None:
+        self.enable_held_mac_doc()
+        self.environment["TEST_DOC_STATUS"] = "41"
+        failed = self.verify()
+        self.assertEqual(failed.returncode, 41, failed.stdout + failed.stderr)
+        self.assertEqual(self.pass_records(), [])
+        self.environment["TEST_DOC_STATUS"] = "0"
+        self.environment["TEST_EDIT_DURING_DOC"] = str(self.repo / "alpha/src/lib.rs")
+        self.environment["TEST_STAGE_DURING_DOC"] = "1"
+        changed = self.verify()
+        self.assertEqual(changed.returncode, 0, changed.stdout + changed.stderr)
+        self.assertIn("staged tree changed", changed.stdout)
+        self.assertEqual(self.pass_records(), [])
 
     def test_doc_failure_leaves_no_durable_pass(self) -> None:
         self.environment["TEST_DOC_STATUS"] = "41"
