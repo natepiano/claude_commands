@@ -4627,6 +4627,44 @@ with patch.object(fcntl, "flock", admission):
             + "ux check minutes 0, ux repair minutes 0",
         )
 
+    def test_a_recorded_zero_review_does_not_fall_back_to_director_findings(self) -> None:
+        self.write_full_config()
+        started_at = 71_600
+        session = self.start_run("zero-review-evidence", started_at)
+        self.start_phase(session, started_at + 10)
+        state = cast(dict[str, object], json.loads((session / "progress_history_state.json").read_text()))
+        instance = str(cast(dict[str, object], state["phase"])["instance_id"])
+        _ = self.run_findings(session, "open", "--severity", "minor", "--title", "director finding",
+                              "--caught-by", "worker", "--lens", "contract", at=started_at + 20)
+        with patch.object(plan_history, "history_root", return_value=self.history_dir):
+            self.assertIsInstance(progress_history._raised_code_findings(session, instance),  # pyright: ignore[reportPrivateUsage]
+                                  progress_history.NoRecordedCodeReview)
+        self.assertIn("code 1 findings", self.run_command("review-trial", "--session-dir", str(session), at=started_at + 30))
+        records = self.history_dir / "review_turns" / session.name
+        records.mkdir(parents=True)
+        _ = (records / "71620-123-0.json").write_text(json.dumps({
+            "phase_instance_id": instance, "arm": "own", "kind": "broad", "status": "reviewed", "raised": 0,
+        }))
+        with patch.object(plan_history, "history_root", return_value=self.history_dir):
+            self.assertEqual(progress_history._raised_code_findings(session, instance),  # pyright: ignore[reportPrivateUsage]
+                             progress_history.RecordedCodeFindings(0))
+        self.assertIn("code 0 findings", self.run_command("review-trial", "--session-dir", str(session), at=started_at + 40))
+
+    def test_pool_and_own_review_records_with_one_launcher_sequence_all_count(self) -> None:
+        self.write_full_config()
+        started_at = 71_700
+        session = self.start_run("mixed-review-evidence", started_at)
+        self.start_phase(session, started_at + 10)
+        state = cast(dict[str, object], json.loads((session / "progress_history_state.json").read_text()))
+        instance = cast(dict[str, object], state["phase"])["instance_id"]
+        records = self.history_dir / "review_turns" / session.name
+        records.mkdir(parents=True)
+        for sequence, arm, raised in ((0, "pool", 2), (1, "own", 3), (2, "own", 0)):
+            _ = (records / f"71720-123-{sequence}.json").write_text(json.dumps({
+                "phase_instance_id": instance, "arm": arm, "kind": "broad", "status": "reviewed", "raised": raised,
+            }))
+        self.assertIn("code 5 findings", self.run_command("review-trial", "--session-dir", str(session), at=started_at + 40))
+
     def test_review_trial_reports_the_screenshot_check_and_its_repair_minutes(self) -> None:
         """The check's own minutes, and only the fix rounds that covered a ux finding."""
         self.write_full_config()

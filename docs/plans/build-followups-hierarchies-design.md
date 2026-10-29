@@ -113,7 +113,7 @@ These rows describe contracts. They do not assign new duties.
 | Child showrunner | `docs/production_format.md`, Words | Runs its own production and units | Parent showrunner; user may speak directly |
 | Unit director | `commands/unit/direct.md`; `docs/production_format.md`, ProductionUnit | Writes orders, dispatches workers, gates and checkpoints work | Its showrunner |
 | Codex worker | `commands/unit/direct.md`, LongLivedWorkers and WorkerRuns | Writes, repairs, tests, or reviews assigned files | Unit director |
-| Pooled reviewer | `docs/production_format.md`, Words and item 16 | Reviews read-only in a persistent thread | Unit director through review lease |
+| Pooled reviewer | `docs/production_format.md`, Words | Reviews read-only in a persistent thread | Unit director through review lease |
 | Review template | `docs/production_format.md`, Words | Holds the standing review prompt | Review-pool scripts; never leased |
 | Small-fix helper | `nixos/small-fixes-by-subagent-in-main.md` | Writes a small unowned fix in place | Sending showrunner |
 | Guilds showrunner | `docs/plans/guilds-production.md` | Runs the `guilds` production and its four head units | sdlc showrunner (child of sdlc since 2026-10-28; its herdr space stays top level) |

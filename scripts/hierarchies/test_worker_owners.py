@@ -72,7 +72,7 @@ class WorkerOwnersTest(unittest.TestCase):
 
     def director_entry(self, session: str = "director-one", account: str = "account-one") -> roster.RosterEntry:
         return roster.RosterEntry(
-            machine="natedev", kind="claude", role="unit-director", name="unit-director", status="running",
+            machine="natedev", kind="claude", role="unit director", name="unit-director", status="running",
             reach=roster.Messageable("session:" + session), cwd="/work/hierarchies",
             showrunner=roster.NoShowrunner(), director=roster.DirectsUnit("hierarchies"),
             assignment=roster.NotAWorker(), session=roster.ClaudeSession(session), account=roster.AccountLabel(account),

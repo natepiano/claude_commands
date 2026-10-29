@@ -12,6 +12,9 @@ file replaced by its last chat reply.
 
 from __future__ import annotations
 
+from scripts.lib import names
+from scripts.lib.test_names import fixture_names
+
 from scripts.whoami.note_file import note_name
 
 import argparse
@@ -48,7 +51,7 @@ from scripts.agents import codex_mesh
 from scripts.direct import plan_history, workers as unit_workers
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.lib import nix_env
-from scripts.message import process_table, sessions
+from scripts.message import process_table, sessions, roster as message_roster
 from scripts.usage import agents_log
 from scripts.accounts import accounts, moves, refusals, role_map
 from scripts.guilds import astra_work, roles
@@ -574,6 +577,7 @@ class MeshCommandFixture(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(patch.object(names, "load_names", return_value=fixture_names()))
         assert_fixture_environment()
         self.loop_budget = FixtureLoopBudget(self.id())
         self.temporary = tempfile.TemporaryDirectory(dir="/tmp", prefix="codex-mesh-test-")
@@ -1244,12 +1248,62 @@ class WorkerShownNameTests(MeshCommandFixture):
         names = [_as_test_dict(request["params"])["name"] for request in self.methods("thread/name/set")]
         self.assertTrue(names)
         for name in names:
-            self.assertTrue(str(name).startswith("natedev · models-unit · "), name)
+            self.assertTrue(str(name).startswith("natedev · models · "), name)
             self.assertNotIn("(worker)", str(name))
         notice = (self.session_dir / "board.log").read_text()
         self.assertIn(str(names[-1]), notice)
         self.assertIn(f"continues as new thread {THREAD_ID}", notice)
         self.assertEqual(len(self.methods("turn/start")), 1)
+
+    def test_a_refused_unit_reviewer_follow_keeps_the_existing_thread_title(self) -> None:
+        self.configure_context()
+        self.start_args_timeout = 0.1
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done",
+                                          "role": "review", "port": self.server.port,
+                                          "unit_ledger": str(unit_workers.ledger_for_run(self.session_dir).path)}})
+        old_title = "A title kept from the last accepted review"
+        title = old_title
+        respond = self.server.respond
+
+        @bounded_fixture
+        def remember_title(request: dict[str, object]) -> list[dict[str, object]] | None:
+            nonlocal title
+            if request.get("method") == "thread/resume":
+                self.live_turn = "another-review-turn"
+            if request.get("method") == "thread/name/set":
+                title = str(_as_test_dict(request["params"])["name"])
+            return respond(request)
+
+        self.server.respond = remember_title
+        code, errors = self.run_follow(role="review")
+        self.assertNotEqual(code, 0, errors)
+        self.assertIn("live turn", errors)
+        self.assertTrue(self.methods("thread/resume"), "follow must reach the later idle check")
+        self.assertTrue(self.methods("thread/read"))
+        self.assertEqual(self.methods("thread/name/set"), [])
+        self.assertEqual(self.methods("turn/start"), [])
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(title, old_title)
+
+    def test_an_accepted_unit_reviewer_follow_uses_the_configured_shown_name(self) -> None:
+        self.configure_context()
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done", "role": "review",
+                                          "port": self.server.port,
+                                          "unit_ledger": str(unit_workers.ledger_for_run(self.session_dir).path)}})
+        configured = fixture_names()
+        jobs = dict(configured.jobs)
+        jobs["code_reviewer"] = ("code checker",)
+        with patch.object(names, "runtime_names", return_value=names.Names(jobs, configured.audiences)):
+            code, errors = self.run_follow(role="review")
+        self.assertEqual(code, 0, errors)
+        titles = self.methods("thread/name/set")
+        self.assertTrue(titles)
+        for request in titles:
+            self.assertEqual(_as_test_dict(request["params"]), {
+                "threadId": THREAD_ID, "name": "natedev · models · code checker"})
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(self.worker_record()["role"], "review")
+        self.assertEqual(self.methods("thread/start"), [])
 
     def test_help_for_addressable_commands_uses_the_worker_vocabulary(self) -> None:
         for command in ([], ["start"], ["follow"], ["prime"], ["fork"], ["reopen"], ["adopt"]):
@@ -1506,6 +1560,11 @@ class MeshCommandTests(MeshCommandFixture):
                     self.assertEqual([_as_test_dict(request["params"])["threadId"]
                                       for request in self.methods("thread/resume")], [THREAD_ID])
                     self.assertEqual(self.methods("thread/start"), [])
+                    titles = self.methods("thread/name/set")
+                    self.assertTrue(titles)
+                    for request in titles:
+                        self.assertEqual(request["params"], {
+                            "threadId": THREAD_ID, "name": "demo · design · designer"})
                     turn = _as_test_dict(self.methods("turn/start")[0]["params"])
                     self.assertIn("Keep this pending design correction.", json.dumps(turn["input"]))
                     self.assertEqual(turn["sandboxPolicy"], {"type": "dangerFullAccess"})
@@ -1968,7 +2027,7 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(params.get("model"), "gpt-test")
         self.assertEqual(params.get("serviceTier"), "fast")
         self.assertEqual(requests[1]["params"], {
-            "threadId": THREAD_ID, "name": "natedev · models-unit · code reviewer"})
+            "threadId": THREAD_ID, "name": "natedev · models · code reviewer"})
         self.assert_review_record("template", THREAD_ID)
         self.assertEqual(self.roster()["other"], {"thread_id": "other-thread", "status": "done"})
         self.assertEqual(_as_test_dict(self.roster()["template"]).get("context_tokens"), 0)
@@ -2018,7 +2077,7 @@ class MeshCommandTests(MeshCommandFixture):
             "threadId": THREAD_ID, "sandbox": "read-only", "approvalPolicy": "never",
         })
         self.assertEqual(requests[2]["params"], {
-            "threadId": self.fork_thread_id, "name": "natedev · models-unit · code reviewer 2"})
+            "threadId": self.fork_thread_id, "name": "natedev · models · code reviewer 2"})
         self.assert_review_record("reviewer", self.fork_thread_id)
         self.assertEqual(self.roster()["template"], source)
         self.assertEqual(self.methods("turn/start"), [])
@@ -2124,6 +2183,10 @@ class MeshCommandTests(MeshCommandFixture):
             "sandbox": "read-only", "approvalPolicy": "never",
         }])
         self.assertEqual(self.worker_record().get("instructions_file"), str(path))
+
+        self.assertEqual(self.worker_record()["role"], "review")
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(set(self.roster()), {"worker"})
 
     def test_replacement_worker_keeps_standing_instructions_and_read_only_policy(self) -> None:
         path = self.standing_instructions()
@@ -2415,7 +2478,7 @@ class MeshCommandTests(MeshCommandFixture):
 
                 self.assertEqual(code, 1, errors)
                 self.assertEqual(output, "")
-                label = "natedev · models-unit · code reviewer" if arguments[0] == "follow" else name
+                label = "natedev · models · code reviewer" if arguments[0] == "follow" else name
                 self.assertTrue(errors.startswith(f"codex_mesh: {label}: "), errors)
                 self.assertIn(path.name, errors)
                 self.assertEqual(self.methods("turn/start"), [])
@@ -3064,6 +3127,8 @@ class MeshCommandTests(MeshCommandFixture):
             code, errors = self.run_follow()
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(self.worker_record()["role"], "impl")
+        self.assertEqual(set(self.roster()), {"worker"})
         self.assertEqual(self.methods("thread/start"), [])
         self.assertEqual(len(self.methods("thread/resume")), 1)
 
@@ -3266,20 +3331,20 @@ class MeshCommandTests(MeshCommandFixture):
     def test_follow_name_taken_during_resume_releases_fallback_without_touching_new_owner(self) -> None:
         self.configure_context()
         code, errors = self.follow_with_name_taken("thread/resume")
-        self.assertEqual((code, errors), (1, "codex_mesh: natedev · models-unit · implementer: name was taken while the follow-up ran; "
+        self.assertEqual((code, errors), (1, "codex_mesh: natedev · models · implementer: name was taken while the follow-up ran; "
                                          + "follow-up did not start\n"))
 
     def test_follow_name_taken_after_fallback_is_named_releases_it_without_starting_a_turn(self) -> None:
         self.configure_context()
         code, errors = self.follow_with_name_taken("thread/name/set")
-        self.assertEqual((code, errors), (1, "codex_mesh: natedev · models-unit · implementer: name was taken while the follow-up ran; "
+        self.assertEqual((code, errors), (1, "codex_mesh: natedev · models · implementer: name was taken while the follow-up ran; "
                                          + "follow-up did not start\n"))
 
     def test_follow_name_taken_reports_unconfirmed_fallback_release_and_keeps_new_owner(self) -> None:
         self.configure_context()
         code, errors = self.follow_with_name_taken("thread/resume", release_unknown=True)
         self.assertEqual(code, 1)
-        self.assertEqual(errors, "codex_mesh: natedev · models-unit · implementer: name was taken while the follow-up ran; "
+        self.assertEqual(errors, "codex_mesh: natedev · models · implementer: name was taken while the follow-up ran; "
                          + f"replacement thread {THREAD_ID} not released: "
                          + "old thread release could not be confirmed: codex_mesh: thread/unsubscribe failed: "
                          + '{"message": "invented release refusal"}\n')
@@ -3300,7 +3365,7 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(self.worker_record()["status"], "done")
         self.assertEqual(self.worker_record()["context_tokens"], 123)
         self.assertEqual([_as_test_dict(request["params"]).get("threadId")
-                          for request in self.methods("thread/name/set")], [THREAD_ID])
+                          for request in self.methods("thread/name/set")], [THREAD_ID, THREAD_ID])
         self.assertEqual([_as_test_dict(request["params"]).get("threadId")
                           for request in self.methods("turn/start")], [THREAD_ID])
         self.assertEqual([record["id"] for record in self.usage_records()], ["old-follow-thread", THREAD_ID])
@@ -3330,6 +3395,111 @@ class MeshCommandTests(MeshCommandFixture):
 
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(self.worker_record()["role"], "impl")
+
+    def test_thread_titles_follow_assignment_at_each_turn_without_renaming_the_worker(self) -> None:
+        roster = message_roster
+        place = (roster.ProductionWithoutRunningShowrunner("sdlc"),
+                 roster.UnderDirector("roles-unit", "director", "session:director"), "")
+        with patch.object(roster, "_pool_context", return_value=place):
+            self.assertEqual(self.run_start(), (0, ""))
+            self.assertEqual(self.methods("thread/name/set")[-1]["params"], {
+                "threadId": THREAD_ID, "name": "sdlc · roles · worker worker"})
+            self.server.requests.clear()
+            self.assertEqual(self.run_follow(role="review"), (0, ""))
+        self.assertEqual(self.methods("thread/name/set")[-1]["params"], {
+            "threadId": THREAD_ID, "name": "sdlc · roles · code reviewer worker"})
+        self.assertEqual(self.worker_record()["role"], "review")
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(set(self.roster()), {"worker"})
+        self.assertEqual([_as_test_dict(request["params"]).get("threadId")
+                          for request in self.methods("turn/start")], [THREAD_ID])
+
+    def test_display_rename_reaches_the_next_thread_title_without_changing_record_identity(self) -> None:
+        roster = message_roster
+        place = (roster.ProductionWithoutRunningShowrunner("sdlc"),
+                 roster.UnderDirector("roles-unit", "director", "session:director"), "")
+        with patch.object(roster, "_pool_context", return_value=place):
+            self.assertEqual(self.run_start(), (0, ""))
+            before = dict(self.worker_record())
+            with patch.object(names, "runtime_names", return_value=fixture_names(worker="builder")):
+                self.assertEqual(self.run_follow(), (0, ""))
+        self.assertEqual(self.methods("thread/name/set")[-1]["params"], {
+            "threadId": THREAD_ID, "name": "sdlc · roles · builder worker"})
+        after = self.worker_record()
+        self.assertEqual((after["role"], after["thread_id"]), (before["role"], before["thread_id"]))
+        self.assertEqual(set(self.roster()), {"worker"})
+
+    def test_unplaced_thread_keeps_its_address_as_title(self) -> None:
+        roster = message_roster
+        with patch.object(roster, "_pool_context", return_value=(roster.NoShowrunner(), roster.NoDirector(), "")):
+            self.assertEqual(self.run_start(), (0, ""))
+        self.assertEqual(self.methods("thread/name/set")[-1]["params"], {"threadId": THREAD_ID, "name": "worker"})
+        self.assertEqual(self.worker_record()["role"], "impl")
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+
+    def test_prime_and_fork_send_shown_titles_and_keep_mesh_addresses(self) -> None:
+        roster = message_roster
+        place = (roster.ProductionWithoutRunningShowrunner("sdlc"),
+                 roster.UnderDirector("roles-unit", "director", "session:director"), "")
+        with patch.object(roster, "_pool_context", return_value=place):
+            result, output, errors = self.run_mesh(self.prime_cli())
+            self.assertEqual((result, output, errors), (0, f"{THREAD_ID}\n", ""))
+            self.assertEqual(self.methods("thread/name/set")[-1]["params"], {
+                "threadId": THREAD_ID, "name": "sdlc · roles · code reviewer template"})
+            result, output, errors = self.run_mesh(["fork", "--from", "template", "--name", "reviewer"])
+        self.assertEqual((result, output, errors), (0, f"{self.fork_thread_id}\n", ""))
+        self.assertEqual(self.methods("thread/name/set")[-1]["params"], {
+            "threadId": self.fork_thread_id, "name": "sdlc · roles · code reviewer reviewer"})
+        self.assert_review_record("template", THREAD_ID)
+        self.assert_review_record("reviewer", self.fork_thread_id)
+        self.assertEqual(set(self.roster()), {"template", "reviewer"})
+
+    def test_prime_held_titles_use_the_design_holder_before_the_mesh_record_exists(self) -> None:
+        for index, (holder, prefix) in enumerate((
+                (roles.UnitHolder("sdlc", "roles-unit"), "sdlc · roles"),
+                (roles.ShowrunnerHolder("sdlc"), "sdlc"))):
+            for role, job in (("designer", "designer"), ("reviewer", "design reviewer")):
+                with self.subTest(holder=holder, role=role):
+                    design_id = f"00000000-0000-4000-8000-00000000009{index}"
+                    directory = roles.design_directory(design_id)
+                    claim = directory / f"{role}.creation-claimed"
+                    claim.unlink(missing_ok=True)
+                    design = roles.HeldDesign(roles.DesignPlacement(design_id, "fixture-host", 1),
+                        "fixture-repo", str(self.session_dir), str(self.session_dir / "design.md"), "design",
+                        "2026-10-21T12:00:00+00:00", holder, roles.DesignUnbound(),
+                        (roles.RoleInstance("designer", "template" if role == "designer" else "other-designer",
+                                            roles.RoleNotOpened("claim")),
+                         roles.RoleInstance("reviewer", "template" if role == "reviewer" else "other-reviewer",
+                                            roles.RoleNotOpened("claim"))))
+                    roles._save(design)  # pyright: ignore[reportPrivateUsage]
+                    self.write_pool_roster({})
+                    self.server.requests.clear()
+                    with patch.object(roles, "resolve_holder", return_value=roles.HolderReach("fixture-holder")), \
+                            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "fixture-holder"}):
+                        result, output, errors = self.run_mesh(self.prime_cli(
+                            "--held-design", design_id, "--held-role", role))
+                    self.assertEqual((result, output, errors), (0, f"{THREAD_ID}\n", ""))
+                    self.assertEqual(self.methods("thread/name/set")[-1]["params"], {
+                        "threadId": THREAD_ID, "name": f"{prefix} · {job}"})
+                    record = _as_test_dict(self.roster()["template"])
+                    self.assertEqual((record["held_design_id"], record["held_role"], record["thread_id"]),
+                                     (design_id, role, THREAD_ID))
+
+    def test_resume_fallback_sets_shown_title_and_retains_assignment(self) -> None:
+        roster = message_roster
+        self.write_pool_roster({"worker": {"thread_id": "old-thread", "status": "done", "role": "impl"}})
+        self.failing_method = "thread/resume"
+        place = (roster.ProductionWithoutRunningShowrunner("sdlc"),
+                 roster.UnderDirector("roles-unit", "director", "session:director"), "")
+        with patch.object(roster, "_pool_context", return_value=place):
+            self.assertEqual(self.run_follow(), (0, ""))
+        titles = self.methods("thread/name/set")
+        self.assertTrue(titles)
+        for request in titles:
+            self.assertEqual(request["params"], {"threadId": THREAD_ID, "name": "sdlc · roles · worker worker"})
+        self.assertEqual(self.worker_record()["role"], "impl")
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(set(self.roster()), {"worker"})
 
     def test_start_appends_usage_without_a_lens(self) -> None:
         code, errors = self.run_start()
@@ -9579,7 +9749,7 @@ class WorkerPauseTests(MeshCommandFixture):
         codex_mesh._post_board_status(str(self.session_dir), "w7", "Waiting for assignment")  # pyright: ignore[reportPrivateUsage]
         line = (self.session_dir / "board.log").read_text()
         self.assertEqual(len(line.splitlines()), 1)
-        self.assertIn("[fix] status: natedev · models-unit · repair worker: Waiting for assignment", line)
+        self.assertIn("[fix] status: natedev · models · repair worker: Waiting for assignment", line)
 
 
 @final
@@ -9709,6 +9879,25 @@ class WorkerAdoptionTests(MeshCommandFixture):
         self.assertEqual(len(starts), 1)
         self.assertEqual(_as_test_dict(starts[0]["params"]).get("serviceTier"), "fast")
         self.assertEqual(self.methods("turn/start"), [], "allocating an idle worker submitted work")
+
+    def test_new_review_thread_has_its_configured_shown_name_before_any_turn(self) -> None:
+        self.configure_allocation()
+        registry = self.session_dir / "workers-agents.conf"
+        _ = registry.write_text(registry.read_text().replace("impl=gpt-fixture-sol:xhigh\n",
+                                                          "impl=gpt-fixture-sol:xhigh\nreview=gpt-fixture-sol:xhigh\n"))
+        state = self.session_dir / plan_history.STATE_FILENAME
+        _ = state.write_text(json.dumps({"working_dir": str(self.session_dir),
+                                         "production": "sdlc", "unit": "roles-unit"}))
+        configured = fixture_names()
+        jobs = dict(configured.jobs)
+        jobs["code_reviewer"] = ("code checker",)
+        with patch.object(names, "runtime_names", return_value=names.Names(jobs, configured.audiences)):
+            record = codex_mesh.open_unit_worker(str(self.session_dir), "repository-review2", "review")
+        self.assertEqual(self.methods("thread/name/set")[-1]["params"], {
+            "threadId": THREAD_ID, "name": "sdlc · roles · code checker"})
+        self.assertEqual(record["role"], "review")
+        self.assertEqual(record["access_policy"], {"kind": "ReadOnlyReviewer"})
+        self.assertEqual(self.methods("turn/start"), [])
 
     def test_a_new_thread_is_released_if_naming_or_recording_its_worker_fails(self) -> None:
         self.configure_allocation()
