@@ -2862,7 +2862,7 @@ def _recent_turns(client: Client, thread_id: str, timeout: float = CALL_TIMEOUT_
     from the paged list. A refused call lists none.
     """
     reply = client.call("thread/turns/list", {
-        "threadId": thread_id, "limit": RECENT_TURNS, "sortDirection": "desc"}, timeout)
+        "threadId": thread_id, "limit": RECENT_TURNS, "sortDirection": "desc"}, timeout=timeout)
     turns = _as_dict(reply.get("result")).get("data")
     if not isinstance(turns, list):
         return []
