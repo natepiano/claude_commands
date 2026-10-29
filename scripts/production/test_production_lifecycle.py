@@ -18,7 +18,7 @@ from unittest import mock
 import fake_unit_host
 import production_lifecycle
 import showrunners
-from add_unit import read_production
+from production_units import read_production
 from fake_unit_host import HostedUnit
 
 
@@ -1006,7 +1006,7 @@ class PermanentUnitTests(unittest.TestCase):
     def test_wrap_neither_waits_on_nor_retires_a_permanent_unit(self) -> None:
         sys.path.insert(0, str(SCRIPT.parent))
         import production_lifecycle
-        from add_unit import Production
+        from production_units import Production
         from zoneinfo import ZoneInfo
 
         lines = ["## Units", "", "| Unit | Plan | Worktree | Branch | Port | Owns |", "| --- | --- | --- | --- | --- | --- |",

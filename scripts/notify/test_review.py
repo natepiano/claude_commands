@@ -798,6 +798,61 @@ class LocalReviewTests(unittest.TestCase):
                 self.assertIsInstance(result, expected)
                 configured.assert_called_once()
 
+    def test_unavailable_rewrite_check_keeps_original_failures_in_the_delivery_log(self) -> None:
+        revised = replace(self.draft, body="Choose whether to retry the nightly build.")
+        cases: tuple[tuple[str, Literal["none", "timeout", "json"], VerdictJSON], ...] = (
+            ("timeout", "timeout", verdict(revised)),
+            ("json", "json", verdict(revised)),
+            ("validation", "none", verdict(revised, action=None)),
+        )
+        for label, failure, second in cases:
+            with self.subTest(failure=label):
+                first = verdict(self.draft, "rewrite", body=revised.body)
+                passes = iter((FakeReviewer(first), FakeReviewer(second, failure=failure)))
+
+                def runner(argv: list[str], *, timeout: float, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+                    selected = next(passes) if Path(argv[0]).name == "claude" else FakeReviewer(first)
+                    return selected(argv, timeout=timeout, env=env)
+
+                outcome = review.review(self.draft, False, runner=runner)
+                self.assertIsInstance(outcome, review.Unreviewed)
+                self.assertEqual(review.best_version(self.draft, outcome), self.draft)
+                review.log_review(self.draft, outcome, review.Sent(self.draft))
+                entry = self.entries()[-1]
+                self.assertIn("reader-starts-cold", cast(list[str], entry["failed_rules"]))
+                self.assertEqual(entry["draft"], entry["sent"])
+                self.assertTrue(cast(str, entry["verdict"]).startswith("unreviewed:"))
+
+    def test_failed_rewrite_check_logs_only_failures_from_the_draft_that_was_sent(self) -> None:
+        revised = replace(self.draft, body="Choose whether to retry the nightly build.")
+        first = verdict(self.draft, "rewrite", body=revised.body)
+        second = verdict(revised, "rewrite", action=None)
+        replies = iter((first, second))
+
+        def runner(argv: list[str], *, timeout: float, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+            value = next(replies) if Path(argv[0]).name == "claude" else first
+            return FakeReviewer(value)(argv, timeout=timeout, env=env)
+
+        outcome = review.review(self.draft, False, runner=runner)
+        self.assertIsInstance(outcome, review.Unreviewed)
+        self.assertEqual(review.best_version(self.draft, outcome), self.draft)
+        review.log_review(self.draft, outcome, review.Sent(self.draft))
+        entry = self.entries()[-1]
+        self.assertEqual(entry["draft"], entry["sent"])
+        self.assertEqual(entry["failed_rules"], ["reader-starts-cold"])
+        self.assertEqual(entry["failures"], [{"rule": "reader-starts-cold", "quote": self.draft.body[:10]}])
+
+    def test_first_pass_validation_error_keeps_supported_failures_in_the_log(self) -> None:
+        value = verdict(self.draft, "rewrite", action=None)
+        outcome = review.review(self.draft, False, runner=FakeReviewer(value))
+        self.assertIsInstance(outcome, review.Unreviewed)
+        assert isinstance(outcome, review.Unreviewed)
+        self.assertEqual(outcome.why, "action form changed")
+        review.log_review(self.draft, outcome, review.Sent(self.draft))
+        entry = self.entries()[-1]
+        self.assertEqual(entry["failed_rules"], ["reader-starts-cold"])
+        self.assertEqual(entry["draft"], entry["sent"])
+
     def test_a_review_limit_caps_the_whole_review_and_a_review_out_of_time_is_unreviewed(self) -> None:
         revised = replace(self.draft, body="Choose whether to retry the nightly build.")
         elapsed = [0.0]

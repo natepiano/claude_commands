@@ -472,6 +472,7 @@ raise SystemExit(offload.main())
         runner_directory.mkdir(parents=True)
         runner = runner_directory / "offload.py"
         _ = shutil.copyfile(SCRIPT, runner)
+        _ = shutil.copyfile(SCRIPT.with_name("cargo_manifest.py"), runner_directory / "cargo_manifest.py")
         self.write_executable(runner_directory / "mac_test.py", CLAIM_STUB)
         (scripts_directory / "lint").symlink_to(
             SCRIPT.parent.parent / "lint", target_is_directory=True

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import add_unit  # noqa: E402
+from production_units import read_production  # noqa: E402
 import production_units  # noqa: E402
 import showrunners  # noqa: E402
 import stall_watch  # noqa: E402
@@ -203,7 +203,7 @@ def _build(old: str, new: str) -> RenamePlan:
     checked = showrunners.checked_doc(instance)
     if isinstance(checked, showrunners.NoCheckedDoc):
         raise RenameRefused(f"{old} has no readable update timer: {checked.reason}")
-    production = add_unit.read_production(checked.path)
+    production = read_production(checked.path)
     _ = unit_move.git(production.checkout, "check-ref-format", "--branch", new)
     if showrunners.production_slug(str(production.doc)) != old:
         raise RenameRefused(f"{old}'s timer names a different production doc: {production.doc}")

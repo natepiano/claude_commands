@@ -19,6 +19,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 import add_unit
+import production_units
 import autocompact
 import conversation_pause
 import launch_permission
@@ -115,7 +116,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.assertIn("restart-prompt-outcome: ", output.getvalue())
 
     def test_each_production_names_its_unit_session_and_a_restore_keeps_the_recorded_name(self) -> None:
-        production = add_unit.read_production(self.doc)
+        production = production_units.read_production(self.doc)
         request = add_unit.UnitLaunch(
             production=production, identity=add_unit.UnitIdentity("review-unit", "review"),
             branch="build-followups-review", worktree=self.root / "project-review",
@@ -146,7 +147,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
               patch.object(herdr, "start_agent", side_effect=herdr.AgentExited("restored-unit", "w1:p1")),
               patch.object(herdr, "close_agent") as closed):
             request = add_unit.UnitLaunch(
-                production=add_unit.read_production(self.doc),
+                production=production_units.read_production(self.doc),
                 identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
                 branch="build-followups-alpha", worktree=self.root / "project-alpha",
                 plan=add_unit.PlanGiven(Path("docs/plans/given.md")),
@@ -471,7 +472,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         note = self.root / "restart-note"
         _ = note.write_text("Resume this unit.", encoding="utf-8")
         request = add_unit.UnitLaunch(
-            production=add_unit.read_production(self.doc),
+            production=production_units.read_production(self.doc),
             identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
             branch="build-followups-alpha",
             worktree=self.root / "project-alpha",
@@ -799,17 +800,17 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.assertIsInstance(ordinary_resume.launch_kind, add_unit.NewWorkLaunch)
         self.assertIsInstance(new_work.launch_kind, add_unit.NewWorkLaunch)
 
-    def test_guilds_designer_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
-        self.assert_guild_head_launch_and_restart("designers")
+    def test_named_designer_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
+        self.assert_named_unit_launch_and_restart("designers")
 
-    def test_guilds_reviewer_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
-        self.assert_guild_head_launch_and_restart("reviewers")
+    def test_named_reviewer_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
+        self.assert_named_unit_launch_and_restart("reviewers")
 
-    def test_guilds_showrunner_head_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
-        self.assert_guild_head_launch_and_restart("showrunners")
+    def test_named_showrunner_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
+        self.assert_named_unit_launch_and_restart("showrunners")
 
-    def test_guilds_unit_head_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
-        self.assert_guild_head_launch_and_restart("units")
+    def test_named_unit_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
+        self.assert_named_unit_launch_and_restart("units")
 
     def test_restore_flags_are_atomic_and_require_resume(self) -> None:
         note = self.root / "restart-note.txt"

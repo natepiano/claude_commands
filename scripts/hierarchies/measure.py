@@ -4,6 +4,8 @@
 Counts describe recorded work, not proof that commits reached Hana main. Windows
 are half open. Date bounds use the user's zone; a date-only --until includes that
 whole day. A date-time --until is the excluded end.
+The baseline command prints a short summary. Add --full to print the tables
+after the summary.
 """
 from __future__ import annotations
 
@@ -582,10 +584,14 @@ def attention(
             message_days[(day_text, message.kind)] += 1
     day = window.since.astimezone(zone).date()
     last_day = (window.until - timedelta(microseconds=1)).astimezone(zone).date()
+    total_pushes = 0
+    total_failed = 0
     while day <= last_day:
         day_text = day.isoformat()
         group = push_days.get(day_text, [])
         failed = sum(sent_after_failed_review(push, reviews) for push in group)
+        total_pushes += len(group)
+        total_failed += failed
         rows.append(MeasureRow(
             f"phone pushes / {day_text}", f"{len(group)}; after failed review {failed}",
             len(group), window.label, "pushover + review log; natedev only",
@@ -597,6 +603,11 @@ def attention(
                 "message log; kind/route, else sender-name heuristic; natedev only",
             ))
         day += timedelta(days=1)
+    source = "pushover + review log; natedev only"
+    rows.extend([
+        MeasureRow("phone pushes sent", str(total_pushes), total_pushes, window.label, source),
+        MeasureRow("phone pushes after failed review", str(total_failed), total_pushes, window.label, source),
+    ])
     return rows
 
 
@@ -958,24 +969,48 @@ def load_sources(window: Window) -> BaselineSources:
     return BaselineSources(units, workers, builds, tokens, phases, pushes, reviews, messages, found, rankings, waiting, problems, merges)
 
 
-def render(sources: BaselineSources, window: Window, now: datetime) -> str:
-    snapshot = f"snapshot {now.astimezone(user_zone()):%Y-%m-%d %H:%M %Z}"
-    capacity_rows = capacity(sources.units, sources.workers, snapshot)
-    capacity_rows.extend(resource_use(sources.builds, sources.tokens, window))
+def baseline_summary(
+    window: Window, flow_rows: Sequence[MeasureRow], attention_rows: Sequence[MeasureRow],
+    problem_rows: Sequence[MeasureRow],
+) -> str:
+    values = {row.measure: row.value for row in (*flow_rows, *attention_rows)}
+    start, end = window.since.astimezone(user_zone()), window.until.astimezone(user_zone())
+    start_format = "%Y-%m-%d %H:%M" if start.tzname() == end.tzname() else "%Y-%m-%d %H:%M %Z"
+    return "\n".join([
+        f"Window: {start.strftime(start_format)} to {end:%Y-%m-%d %H:%M %Z} (end excluded).",
+        f"Hana: {values['Hana merges / origin/init/catalyst']} merges to origin/init/catalyst; "
+        + f"{values['goal 1 Hana-project issues closed']} Hana-project issues closed.",
+        f"Goal 1: {values['goal 1 issues closed']} issues closed; "
+        + f"{values['goal 1 declined closures excluded']} declined closures left out.",
+        f"User attention: {values['phone pushes sent']} pushes sent to user; "
+        + f"{values['phone pushes after failed review']} after a failed text check.",
+        f"Source problems: {len(problem_rows)}. Use --full to print the tables.",
+    ])
+
+
+def render(sources: BaselineSources, window: Window, now: datetime, full: bool = False) -> str:
     flow_rows = phase_flow(sources.phases, window)
     flow_rows.extend(issue_flow(sources.issue_records, window))
     flow_rows.extend(merge_flow(sources.merges, window))
     attention_rows = attention(sources.pushes, sources.reviews, sources.messages, window)
+    problem_rows = source_problem_rows(sources.problems, window)
+    summary = baseline_summary(window, flow_rows, attention_rows, problem_rows)
+    if not full:
+        return summary
+    snapshot = f"snapshot {now.astimezone(user_zone()):%Y-%m-%d %H:%M %Z}"
+    capacity_rows = capacity(sources.units, sources.workers, snapshot)
+    capacity_rows.extend(resource_use(sources.builds, sources.tokens, window))
     attention_rows.extend(pending_attention(sources.waiting, now, window))
     coverage_rows = rank_coverage(sources.issue_records, sources.rankings, sources.units, snapshot)
     groups = [
+        summary,
         table("Capacity on Hana", capacity_rows),
         table("Flow to Hana main (recorded phase/issue completion; local-ref merge commits)", flow_rows),
         table("User attention", attention_rows),
         table("Rank coverage", coverage_rows),
     ]
-    if sources.problems:
-        groups.append(table("Source problems (dependent counts can be incomplete)", source_problem_rows(sources.problems, window)))
+    if problem_rows:
+        groups.append(table("Source problems (dependent counts can be incomplete)", problem_rows))
     return "\n\n".join(groups)
 
 
@@ -994,6 +1029,7 @@ def main(arguments: Sequence[str] = ()) -> int:
     _ = parser.add_argument("command", choices=("baseline",))
     _ = parser.add_argument("--since", metavar="DATE_OR_TIME", default="")
     _ = parser.add_argument("--until", metavar="DATE_OR_TIME", default="")
+    _ = parser.add_argument("--full", action="store_true", help="print the tables after the summary")
     args = parser.parse_args(arguments)
     now = datetime.now(timezone.utc)
     since_text = cast(str, args.since)
@@ -1002,7 +1038,7 @@ def main(arguments: Sequence[str] = ()) -> int:
         window = window_bounds(since_text, until_text, now)
     except ValueError as error:
         parser.error(str(error))
-    print(render(load_sources(window), window, now))
+    print(render(load_sources(window), window, now, full=cast(bool, args.full)))
     return 0
 
 

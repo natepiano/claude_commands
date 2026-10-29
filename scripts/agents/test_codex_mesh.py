@@ -23,6 +23,7 @@ import functools
 import io
 import json
 import os
+import pwd
 import select
 import shlex
 import signal
@@ -51,6 +52,52 @@ from scripts.usage import agents_log
 from scripts.accounts import accounts, moves, refusals, role_map
 from scripts.guilds import astra_work, roles
 from scripts.whoami import account, agent_accounts
+
+
+REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+
+
+def fixture_write_metadata(home: Path) -> dict[Path, tuple[int, int]]:
+    """Observe the synthetic sign-in's three files, never account contents or live trees.
+
+    Other home paths change during normal work (account moves, a pull of ~/.claude), so the
+    real-home refusal guards them; a snapshot of them would fail gates no test caused.
+    """
+    paths = [root / "auth.json" for root in home.glob(".codex*") if root.is_dir()]
+    # note_file.notes_dir's production default, anchored to passwd home rather than HOME.
+    paths.extend((home / ".claude/config/accounts.json", home / "rust/hanadocs/agents/codex9.md"))
+    metadata: dict[Path, tuple[int, int]] = {}
+    for path in paths:
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        metadata[path] = (info.st_size, info.st_mtime_ns)
+    return metadata
+
+
+REAL_FIXTURE_METADATA = fixture_write_metadata(REAL_HOME)
+
+
+def assert_real_codex_unchanged() -> None:
+    current = fixture_write_metadata(REAL_HOME)
+    changed = sorted(str(path) for path in REAL_FIXTURE_METADATA.keys() | current.keys()
+                     if REAL_FIXTURE_METADATA.get(path) != current.get(path))
+    if changed:
+        raise AssertionError("codex_mesh tests changed real-home fixture targets:\n" + "\n".join(changed))
+
+
+def refuse_real_home(path: Path, source: str) -> None:
+    if path.resolve().is_relative_to(REAL_HOME):
+        raise AssertionError(f"{source} points into the real home: {path}; use a fixture temp home (setUpModule required)")
+
+
+def assert_fixture_environment() -> None:
+    for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR"):
+        value = os.environ.get(name)
+        if not value:
+            raise AssertionError(f"{name} is unset; codex_mesh fixture requires setUpModule")
+        refuse_real_home(Path(value), name)
 
 
 TEST_HANG_GUARD_SECS = 300  # load 136 on natedev, 2026-10-29
@@ -128,26 +175,30 @@ def set_environment(name: str, value: str) -> Callable[[], None]:
     return restore
 
 
-def select_fixture_workers(home: Path) -> None:
+def select_fixture_workers(home: Path, *, notes: Path) -> None:
     """Give fake-server tests an explicit selection backed by a synthetic sign-in."""
     default = home / ".codex"
+    auth = default / "auth.json"
+    config = home / ".claude/config/accounts.json"
+    for source, path in (("fixture home", home), ("fixture sign-in", auth),
+                         ("fixture note", notes / "codex9.md"), ("fixture account config", config)):
+        refuse_real_home(path, source)
     default.mkdir(exist_ok=True)
     login = "mesh-fixture@example.invalid"
     claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
-    auth = default / "auth.json"
     _ = auth.write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
     os.utime(auth, (1, 1))
-    notes = Path(os.environ["AGENT_NOTES_DIR"])
     notes.mkdir(parents=True, exist_ok=True)
     _ = (notes / "codex9.md").write_text(f"---\nlogin: {login}\n---\n")
-    config = home / ".claude/config/accounts.json"
     config.parent.mkdir(parents=True, exist_ok=True)
     _ = config.write_text('{"workers": "codex9"}')
 
 
 def setUpModule() -> None:
+    # Registered first, checked last; unittest reports cleanup assertions as module errors.
+    unittest.addModuleCleanup(assert_real_codex_unchanged)
     # No test sees a real sign-in; the synthetic selection predates every fake server.
-    home = tempfile.TemporaryDirectory()
+    home = tempfile.TemporaryDirectory(dir="/tmp", prefix="codex-mesh-home-")
     usage = tempfile.TemporaryDirectory()
     restore_usage = set_environment("USAGE_STATE_DIR", usage.name)
     restore_home = set_environment("HOME", home.name)
@@ -165,7 +216,7 @@ def setUpModule() -> None:
     authority = patch.object(role_map, "is_role_map_host", new=lambda: True)
     _ = authority.start()
     unittest.addModuleCleanup(authority.stop)
-    select_fixture_workers(Path(home.name))
+    select_fixture_workers(Path(home.name), notes=Path(home.name))
     previous = os.environ.get("CODEX_HOME")
     os.environ["CODEX_HOME"] = str(Path(home.name) / ".codex")
 
@@ -479,6 +530,7 @@ class MeshCommandFixture(unittest.TestCase):
     guard_frame_reads: bool = True
 
     temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
+    home: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     session_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     server: StubAppServer  # pyright: ignore[reportUninitializedInstanceVariable]
     outcomes: list[str]  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -521,8 +573,18 @@ class MeshCommandFixture(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        assert_fixture_environment()
         self.loop_budget = FixtureLoopBudget(self.id())
-        self.temporary = tempfile.TemporaryDirectory()
+        self.temporary = tempfile.TemporaryDirectory(dir="/tmp", prefix="codex-mesh-test-")
+        self.addCleanup(self.temporary.cleanup)
+        self.home = Path(self.temporary.name).resolve() / "home"
+        self.home.mkdir()
+        self.patches = contextlib.ExitStack()
+        self.addCleanup(self.patches.close)
+        _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {
+            "HOME": str(self.home), "CODEX_HOME": str(self.home / ".codex"),
+            "AGENT_NOTES_DIR": str(self.home),
+        })))
         # resolve(): macOS /tmp is a link to /private/tmp, and the mesh records resolved paths.
         self.session_dir = Path(self.temporary.name).resolve() / "run"
         self.session_dir.mkdir()
@@ -558,13 +620,12 @@ class MeshCommandFixture(unittest.TestCase):
         self.waits = []
         self.elapsed = 0.0
         self.start_args_timeout = 300.0
-        select_fixture_workers(Path.home())
+        select_fixture_workers(self.home, notes=self.home)
         self.server = StubAppServer(self.respond)
         _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(
             json.dumps({"port": self.server.port, "pid": os.getpid(), "codex_home": str(agent_accounts.workers_home()), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS}),
             encoding="utf-8",
         )
-        self.patches = contextlib.ExitStack()
         read_frame = codex_mesh.Client.next_frame
 
         def bounded_read(client: codex_mesh.Client, deadline: float) -> codex_mesh.RpcMessage | None:
@@ -1156,6 +1217,132 @@ class MeshCommandFixture(unittest.TestCase):
         if stub_ensure:
             _ = self.patches.enter_context(patch.object(codex_mesh, "ensure_server", return_value=(self.server.port, True)))
         return agent_accounts.KnownCodexAccount(selected, login, "codex2")
+
+
+    def configure_context(self) -> None:
+        self.patches.enter_context(patch.dict(os.environ, {
+            "UNIT_WORKERS_STATE": str(self.session_dir / "unit-workers"),
+        }))
+        _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps({
+            "production": "natedev", "unit": "models-unit", "working_dir": str(self.session_dir),
+        }))
+
+
+@final
+class WorkerShownNameTests(MeshCommandFixture):
+    def test_replacement_thread_and_its_followup_notice_use_the_current_unit_context(self) -> None:
+        self.configure_context()
+        self.write_pool_roster({"worker": {"thread_id": "old-follow-thread", "status": "done",
+                                          "role": "review", "port": self.server.port}})
+        self.failing_method = "thread/resume"
+
+        code, errors = self.run_follow(role="review")
+
+        self.assertEqual(code, 0, errors)
+        names = [_as_test_dict(request["params"])["name"] for request in self.methods("thread/name/set")]
+        self.assertTrue(names)
+        for name in names:
+            self.assertTrue(str(name).startswith("natedev · models-unit · "), name)
+            self.assertNotIn("(worker)", str(name))
+        notice = (self.session_dir / "board.log").read_text()
+        self.assertIn(str(names[-1]), notice)
+        self.assertIn(f"continues as new thread {THREAD_ID}", notice)
+        self.assertEqual(len(self.methods("turn/start")), 1)
+
+    def test_help_for_addressable_commands_uses_the_worker_vocabulary(self) -> None:
+        for command in ([], ["start"], ["follow"], ["prime"], ["fork"], ["reopen"], ["adopt"]):
+            with self.subTest(command=command), contextlib.redirect_stdout(io.StringIO()) as output:
+                with self.assertRaises(SystemExit) as ended:
+                    _ = codex_mesh.main([*command, "--help"])
+                self.assertEqual(ended.exception.code, 0)
+                self.assertNotRegex(output.getvalue().lower(), r"\bseats?\b")
+
+
+class FixtureHomeSafetyTests(unittest.TestCase):
+    def test_worker_selection_refuses_real_home_descendants_and_symlinks(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/tmp")))
+        real = root / "real"
+        real.mkdir()
+        alias = root / "alias"
+        alias.symlink_to(real, target_is_directory=True)
+        with patch(f"{__name__}.REAL_HOME", real):
+            for home in (real, real / "nested", alias):
+                with self.subTest(home=home), self.assertRaisesRegex(AssertionError, "real home"):
+                    select_fixture_workers(home, notes=root / "notes")
+        self.assertEqual(list(real.iterdir()), [])
+        self.assertFalse((root / "notes").exists())
+
+    def test_base_setup_rejects_unsafe_environment_before_creating_files(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/tmp")))
+        real = root / "real"
+        real.mkdir()
+        for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR"):
+            environment = {key: str(root / "safe") for key in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR")}
+            environment[name] = str(real / "nested")
+            with (self.subTest(variable=name), patch(f"{__name__}.REAL_HOME", real),
+                  patch.dict(os.environ, environment),
+                  patch.object(tempfile, "TemporaryDirectory", wraps=tempfile.TemporaryDirectory) as temporary):
+                with self.assertRaisesRegex(AssertionError, name + " points into the real home"):
+                    MeshCommandFixture().setUp()
+                temporary.assert_not_called()
+
+    def test_metadata_guard_catches_a_bypassed_refusal_in_an_absent_or_existing_tree(self) -> None:
+        for existing in (False, True):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory(dir="/tmp") as directory:
+                real = Path(directory)
+                auth = real / ".codex/auth.json"
+                if existing:
+                    auth.parent.mkdir()
+                    _ = auth.write_text("temporary account placeholder")
+                before = fixture_write_metadata(real)
+                with (patch(f"{__name__}.REAL_HOME", real),
+                      patch(f"{__name__}.REAL_FIXTURE_METADATA", before)):
+                    with self.assertRaisesRegex(AssertionError, "real home"):
+                        select_fixture_workers(real, notes=real / "notes")
+                    assert_real_codex_unchanged()
+                    # Live sessions may create and change unrelated files while tests run.
+                    session = real / ".codex/sessions/x.jsonl"
+                    session.parent.mkdir(parents=True, exist_ok=True)
+                    notes = real / "rust/hanadocs/agents"
+                    notes.mkdir(parents=True)
+                    live = [real / name for name in (".codex/config.toml", ".codex/hooks.json",
+                                                     ".claude/scripts/lib/py", ".local/state/accounts/moves.jsonl")]
+                    live.extend(notes / note_name(label) for label in ("codex1", "codex2"))
+                    for text in ("first event", "another event"):
+                        _ = session.write_text(text)
+                        for path in live:
+                            path.parent.mkdir(parents=True, exist_ok=True)
+                            _ = path.write_text(text)
+                        assert_real_codex_unchanged()
+                    # Fault injection only targets this disposable stand-in, never the login home.
+                    with patch(f"{__name__}.refuse_real_home"):
+                        select_fixture_workers(real, notes=real / "rust/hanadocs/agents")
+                    with self.assertRaises(AssertionError) as changed:
+                        assert_real_codex_unchanged()
+                    for name in (".codex/auth.json", ".claude/config/accounts.json",
+                                 "rust/hanadocs/agents/codex9.md"):
+                        self.assertIn(str(real / name), str(changed.exception))
+        # A sign-in in a Codex home that did not exist at import is caught too.
+        for name in (".codex22/auth.json",):
+            with self.subTest(path=name), tempfile.TemporaryDirectory(dir="/tmp") as directory:
+                real = Path(directory)
+                path = real / name
+                before = fixture_write_metadata(real)
+                with (patch(f"{__name__}.REAL_HOME", real),
+                      patch(f"{__name__}.REAL_FIXTURE_METADATA", before)):
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    _ = path.write_text("fixture content")
+                    with self.assertRaisesRegex(AssertionError, "fixture targets"):
+                        assert_real_codex_unchanged()
+                    written = fixture_write_metadata(real)
+                    with patch(f"{__name__}.REAL_FIXTURE_METADATA", written):
+                        _ = path.write_text("changed fixture content")
+                        with self.assertRaisesRegex(AssertionError, "fixture targets"):
+                            assert_real_codex_unchanged()
+                        path.unlink()
+                        with self.assertRaisesRegex(AssertionError, "fixture targets"):
+                            assert_real_codex_unchanged()
+                    assert_real_codex_unchanged()
 
 
 @final
@@ -1759,6 +1946,7 @@ class MeshCommandTests(MeshCommandFixture):
                          + '{"message": "invented release refusal"}\n')
 
     def test_prime_creates_and_names_a_read_only_review_template_without_a_turn(self) -> None:
+        self.configure_context()
         arguments = self.prime_cli("--model", "gpt-test", "--service-tier", "fast", "--task", "delegate.review")
         instructions = (self.session_dir / "review-instructions.txt").read_text(encoding="utf-8")
         self.write_pool_roster({"other": {"thread_id": "other-thread", "status": "done"}})
@@ -1777,7 +1965,8 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(params.get("cwd"), str(self.session_dir))
         self.assertEqual(params.get("model"), "gpt-test")
         self.assertEqual(params.get("serviceTier"), "fast")
-        self.assertEqual(requests[1]["params"], {"threadId": THREAD_ID, "name": "template"})
+        self.assertEqual(requests[1]["params"], {
+            "threadId": THREAD_ID, "name": "natedev · models-unit · code reviewer"})
         self.assert_review_record("template", THREAD_ID)
         self.assertEqual(self.roster()["other"], {"thread_id": "other-thread", "status": "done"})
         self.assertEqual(_as_test_dict(self.roster()["template"]).get("context_tokens"), 0)
@@ -1812,6 +2001,7 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(self.methods("thread/start"), [])
 
     def test_fork_resumes_the_source_before_creating_and_naming_a_read_only_review_thread(self) -> None:
+        self.configure_context()
         source = {"thread_id": THREAD_ID, "status": "done", "role": "review"}
         self.write_pool_roster({"template": source})
 
@@ -1825,7 +2015,8 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(requests[1]["params"], {
             "threadId": THREAD_ID, "sandbox": "read-only", "approvalPolicy": "never",
         })
-        self.assertEqual(requests[2]["params"], {"threadId": self.fork_thread_id, "name": "reviewer"})
+        self.assertEqual(requests[2]["params"], {
+            "threadId": self.fork_thread_id, "name": "natedev · models-unit · code reviewer 2"})
         self.assert_review_record("reviewer", self.fork_thread_id)
         self.assertEqual(self.roster()["template"], source)
         self.assertEqual(self.methods("turn/start"), [])
@@ -2208,6 +2399,7 @@ class MeshCommandTests(MeshCommandFixture):
                     self.assertEqual(request["params"], {"threadId": THREAD_ID})
 
     def test_unreadable_standing_instructions_fail_before_any_turn(self) -> None:
+        self.configure_context()
         path = self.session_dir / "missing-standing-instructions.txt"
         cases = [(self.follow_cli(), "worker"), (["compact", "--to", "worker"], "worker"),
                  (["reset", "--to", "worker"], "worker"),
@@ -2221,7 +2413,8 @@ class MeshCommandTests(MeshCommandFixture):
 
                 self.assertEqual(code, 1, errors)
                 self.assertEqual(output, "")
-                self.assertTrue(errors.startswith(f"codex_mesh: {name}: "), errors)
+                label = "natedev · models-unit · code reviewer" if arguments[0] == "follow" else name
+                self.assertTrue(errors.startswith(f"codex_mesh: {label}: "), errors)
                 self.assertIn(path.name, errors)
                 self.assertEqual(self.methods("turn/start"), [])
                 self.assertEqual(self.methods("thread/compact/start"), [])
@@ -2771,7 +2964,7 @@ class MeshCommandTests(MeshCommandFixture):
         roster_path = self.session_dir / codex_mesh.ROSTER_FILE
         before = roster_path.read_bytes()
         with self.assertRaisesRegex(SystemExit, r"roles\.py recover"):
-            _ = codex_mesh._seat_sandbox(  # pyright: ignore[reportPrivateUsage]
+            _ = codex_mesh._worker_sandbox(  # pyright: ignore[reportPrivateUsage]
                 self.start_args(), str(self.session_dir), "worker")
         with self.assertRaisesRegex(SystemExit, r"roles\.py recover"):
             _ = codex_mesh._resume_params(  # pyright: ignore[reportPrivateUsage]
@@ -3069,19 +3262,22 @@ class MeshCommandTests(MeshCommandFixture):
         return result
 
     def test_follow_name_taken_during_resume_releases_fallback_without_touching_new_owner(self) -> None:
+        self.configure_context()
         code, errors = self.follow_with_name_taken("thread/resume")
-        self.assertEqual((code, errors), (1, "codex_mesh: worker: name was taken while the follow-up ran; "
+        self.assertEqual((code, errors), (1, "codex_mesh: natedev · models-unit · implementer: name was taken while the follow-up ran; "
                                          + "follow-up did not start\n"))
 
     def test_follow_name_taken_after_fallback_is_named_releases_it_without_starting_a_turn(self) -> None:
+        self.configure_context()
         code, errors = self.follow_with_name_taken("thread/name/set")
-        self.assertEqual((code, errors), (1, "codex_mesh: worker: name was taken while the follow-up ran; "
+        self.assertEqual((code, errors), (1, "codex_mesh: natedev · models-unit · implementer: name was taken while the follow-up ran; "
                                          + "follow-up did not start\n"))
 
     def test_follow_name_taken_reports_unconfirmed_fallback_release_and_keeps_new_owner(self) -> None:
+        self.configure_context()
         code, errors = self.follow_with_name_taken("thread/resume", release_unknown=True)
         self.assertEqual(code, 1)
-        self.assertEqual(errors, "codex_mesh: worker: name was taken while the follow-up ran; "
+        self.assertEqual(errors, "codex_mesh: natedev · models-unit · implementer: name was taken while the follow-up ran; "
                          + f"replacement thread {THREAD_ID} not released: "
                          + "old thread release could not be confirmed: codex_mesh: thread/unsubscribe failed: "
                          + '{"message": "invented release refusal"}\n')
@@ -3270,6 +3466,27 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertTrue(errors.startswith("agents_log: "), errors)
         self.assertEqual(self.worker_record()["status"], "done")
         self.assertEqual(len(self.methods("turn/start")), 2)
+
+    def test_a_preclaimed_follow_reports_handoff_if_ownership_moves_before_the_child_check(self) -> None:
+        self.assertEqual(self.run_start(), (0, ""))
+        args = self.start_args()
+        args.to = "worker"
+        args.role = "review"
+        args.claim_pid = os.getpid()
+        self.assertEqual(codex_mesh.command_can_follow(args), 0)
+        record = self.worker_record()
+        destination = str(self.session_dir.parent / "taking-run")
+        record["adopted_to"] = destination
+        codex_mesh.advance_worker_roster_revision(record)
+        self.write_pool_roster({"worker": record})
+        args.message_file = str(self.session_dir / "follow-up.txt")
+        _ = Path(args.message_file).write_text("Do not send work after losing ownership")
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            code = codex_mesh.command_follow(args)
+        self.assertEqual(code, 2, errors.getvalue())
+        self.assertIn(f"worker handed off to {destination}", errors.getvalue())
+        self.assertEqual(len(self.methods("turn/start")), 1)
+        self.assertEqual(self.worker_record()["adopted_to"], destination)
 
     def test_preclaimed_follow_survives_a_deeply_nested_usage_line(self) -> None:
         self.assertEqual(self.run_start(), (0, ""))
@@ -4310,8 +4527,9 @@ class MeshCommandTests(MeshCommandFixture):
     def test_unreadable_serving_sign_in_reports_an_explicit_unknown_account(self) -> None:
         account = self.prepare_refusing_account()
         (account.home / "auth.json").unlink()
-        select_fixture_workers(Path.home())
-        selected = Path.home() / ".codex9"
+        home = account.home.parent
+        select_fixture_workers(home, notes=home / "notes")
+        selected = home / ".codex9"
         selected.mkdir()
         _ = (account.home / "auth.json").rename(selected / "auth.json")
         original = self.respond
@@ -7208,7 +7426,7 @@ class MeshCommandTests(MeshCommandFixture):
 
         # Finish the original turn before selecting the new account: startup
         # file wakes do not establish an idle resident or a retry tick.
-        # Advance the duration seam after real quiet reads, independently of load.
+        # Advance the simulated clock after real quiet reads, independently of load.
         with (patch.object(codex_mesh.Client, "call", rpc),
               patch.object(codex_mesh.Client, "next_frame", poll),
               patch.object(codex_mesh, "_deliver_reply", reply),
@@ -7571,6 +7789,8 @@ class MeshCommandTests(MeshCommandFixture):
                 attempts[0] += 1
             if attempts[0] == 3:
                 release()
+                # Release has happened; confirmation now needs only a hang guard.
+                _ = self.patches.enter_context(patch.object(codex_mesh, "THREAD_RELEASE_TIMEOUT_SECS", TEST_HANG_GUARD_SECS))
             result = move(args, session, name, thread, client, message=message)
             if isinstance(result, codex_mesh.MovedWorker) and result.port == new.port:
                 _ = (self.session_dir / "worker.end").write_text("end")
@@ -8589,7 +8809,7 @@ class DirectorLifetimeTests(MeshCommandFixture):
         root = self.session_dir.parent
         home = root / "director-home"
         home.mkdir()
-        select_fixture_workers(home)
+        select_fixture_workers(home, notes=self.home)
         registry = root / "director-sessions"
         registry.mkdir()
         active = root / "active"
@@ -8911,8 +9131,7 @@ raise SystemExit(codex_mesh.main(['end', '--session-dir', sys.argv[1], '--to', '
                     try:
                         _ = update.result(timeout=2)
                     finally:
-                        # Only our child may be stopped; this also frees the
-                        # inversion's roster lock on the unrepaired code.
+                        # Only our child may be stopped; this also frees its roster lock when the lock order is inverted.
                         if not update.done():
                             child.kill()
                             _ = child.wait(timeout=3)
@@ -9218,11 +9437,12 @@ class WorkerPauseTests(MeshCommandFixture):
         self.assertEqual(other_server.read_bytes(), before)
 
     def test_board_slot_comes_from_stored_role_for_an_arbitrary_address(self) -> None:
+        self.configure_context()
         self.write_pool_roster({"w7": {"thread_id": THREAD_ID, "status": "done", "role": "fix"}})
-        with patch.object(subprocess, "run") as run:
-            codex_mesh._post_board_status(str(self.session_dir), "w7", "Waiting for assignment")  # pyright: ignore[reportPrivateUsage]
-        command = cast(list[str], run.call_args.args[0])
-        self.assertEqual(command[3:6], [str(self.session_dir), "fix", "status"])
+        codex_mesh._post_board_status(str(self.session_dir), "w7", "Waiting for assignment")  # pyright: ignore[reportPrivateUsage]
+        line = (self.session_dir / "board.log").read_text()
+        self.assertEqual(len(line.splitlines()), 1)
+        self.assertIn("[fix] status: natedev · models-unit · repair worker: Waiting for assignment", line)
 
 
 @final
@@ -9821,6 +10041,12 @@ class RetryDecisionTests(unittest.TestCase):
 class QuotaRefusalTests(unittest.TestCase):
     """Which usage-limit failures are the provider's own, and so reported to the quota alert."""
 
+    home: Path  # pyright: ignore[reportUninitializedInstanceVariable]
+
+    @override
+    def setUp(self) -> None:
+        self.home = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/tmp")))
+
     @staticmethod
     def refused(outcome: codex_mesh.RunOutcome, tested: bool, resident: bool = False) -> bool:
         return codex_mesh._quota_refused(outcome, tested, resident)  # pyright: ignore[reportPrivateUsage]
@@ -9845,7 +10071,7 @@ class QuotaRefusalTests(unittest.TestCase):
         self.assertFalse(self.refused(codex_mesh.CapacityRetriesExhausted(THREAD_ID, 3, 20), tested=True))
 
     def test_refusal_handoff_preserves_named_window_or_unknown_and_observation_time(self) -> None:
-        identity = agent_accounts.KnownCodexAccount(Path.home() / ".codex", "serving@example.invalid", "codex1")
+        identity = agent_accounts.KnownCodexAccount(self.home / ".codex", "serving@example.invalid", "codex1")
         serving = codex_mesh.ServingCodexServer(4001, 99, identity.home, identity)
         for detail, window in ((USAGE_LIMIT + " Weekly limit reached", "weekly"),
                                (USAGE_LIMIT + " 5-hour limit reached", "five_hour"),
@@ -9930,7 +10156,7 @@ class QuotaRefusalTests(unittest.TestCase):
         self.assertNotIn("--stopped", cast(list[str], run.call_args.args[0]))
 
     def test_the_report_runs_the_blocked_verb_and_survives_its_failure(self) -> None:
-        identity = agent_accounts.KnownCodexAccount(Path.home() / ".codex", "serving@example.invalid", "codex1")
+        identity = agent_accounts.KnownCodexAccount(self.home / ".codex", "serving@example.invalid", "codex1")
         serving = codex_mesh.ServingCodexServer(4001, 99, identity.home, identity)
         done = subprocess.CompletedProcess([], 0, "switched to claude for codex1: worker\n", "")
         with patch.object(subprocess, "run", return_value=done) as run, \
@@ -12490,7 +12716,7 @@ class WorkersHomeTests(unittest.TestCase):
         self.session_dir = root / "run"
         self.session_dir.mkdir()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.home), "AGENT_NOTES_DIR": str(self.home)}, clear=True)))
-        select_fixture_workers(self.home)
+        select_fixture_workers(self.home, notes=self.home)
         _ = self.enterContext(patch.object(codex_mesh, "_server_folder", return_value=codex_mesh.NonMeshServerStderr()))
         _ = self.enterContext(patch.object(sessions, "running_sessions", return_value=[
             running_holder(holder) for holder in ("director-one", "director-two", "holder-id", "test-holder")]))

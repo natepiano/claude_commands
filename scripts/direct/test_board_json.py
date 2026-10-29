@@ -14,7 +14,6 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from time import monotonic
 from typing import cast, override
 from unittest.mock import patch
 
@@ -743,16 +742,16 @@ class BoardJsonTests(unittest.TestCase):
         self.addCleanup(writer.close)
         _ = writer.execute("BEGIN EXCLUSIVE")
 
-        started = monotonic()
-        document, unit = self.unit(fixture)
-        elapsed = monotonic() - started
+        # Count the nonblocking read; scheduler load is not a ledger wait.
+        with patch("sqlite3.connect", wraps=sqlite3.connect) as connect:
+            document, unit = self.unit(fixture)
 
         self.assertEqual(unit["phase"], {
             "kind": "ticket", "id": "types-unit-124", "title": "", "merged": 0,
         })
         self.assertEqual(unit["stage"], "Ticket types-unit-124 running")
         self.assertIn(str(database), array_items(document["sources"]))
-        self.assertLess(elapsed, 1.0)
+        connect.assert_called_once_with(f"file:{database}?mode=ro", uri=True, timeout=0)
 
     def test_ticket_keeps_build_test_review_and_repair_stages(self) -> None:
         fixture = self.production(unit_name="names-unit")
@@ -799,7 +798,7 @@ class BoardJsonTests(unittest.TestCase):
             and call.kwargs.get("uri") is True for call in connect.call_args_list
         ), connect.call_args_list)
 
-    def test_exclusively_locked_ledger_gives_zero_in_under_one_second(self) -> None:
+    def test_exclusively_locked_ledger_gives_zero_with_one_zero_timeout_read(self) -> None:
         fixture = self.production()
         self.standing_plan(fixture)
         database = self.ledger(fixture)
@@ -807,15 +806,15 @@ class BoardJsonTests(unittest.TestCase):
         self.addCleanup(writer.close)
         _ = writer.execute("BEGIN EXCLUSIVE")
 
-        started = monotonic()
-        document, unit = self.unit(fixture)
-        elapsed = monotonic() - started
+        # Count the nonblocking read; scheduler load is not a ledger wait.
+        with patch("sqlite3.connect", wraps=sqlite3.connect) as connect:
+            document, unit = self.unit(fixture)
 
         self.assertEqual(unit["phase"], {
             "kind": "ticket", "id": "alpha-unit-63", "title": "Fix names", "merged": 0,
         })
         self.assertIn(str(database), array_items(document["sources"]))
-        self.assertLess(elapsed, 1.0, "a locked ledger must not delay the board refresh")
+        connect.assert_called_once_with(f"file:{database}?mode=ro", uri=True, timeout=0)
 
     def test_standing_plan_without_a_ledger_gives_zero_and_does_not_create_one(self) -> None:
         fixture = self.production()

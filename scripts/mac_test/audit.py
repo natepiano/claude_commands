@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 from bisect import bisect_right
 from dataclasses import dataclass
-import glob
 import os
 from pathlib import Path
 import re
@@ -20,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 import override_guard
 import sweep
 
+import cargo_manifest
 import offload
 
 
@@ -91,51 +91,6 @@ def parser() -> argparse.ArgumentParser:
     _ = root.add_argument("repo_dir")
     _ = root.add_argument("--check", action="store_true")
     return root
-
-
-def toml_table(path: Path) -> dict[str, object]:
-    with path.open("rb") as handle:
-        decoded = cast(object, tomllib.load(handle))
-    if not isinstance(decoded, dict):
-        raise ValueError(f"{path} does not contain a TOML table")
-    return cast(dict[str, object], decoded)
-
-
-def nested_table(values: dict[str, object], key: str) -> dict[str, object]:
-    value = values.get(key)
-    return cast(dict[str, object], value) if isinstance(value, dict) else {}
-
-
-def string_sequence(values: dict[str, object], key: str) -> tuple[str, ...]:
-    value = values.get(key)
-    if not isinstance(value, list):
-        return ()
-    items = cast(list[object], value)
-    return tuple(item for item in items if isinstance(item, str))
-
-
-def within(root: Path, candidate: Path) -> bool:
-    return candidate == root or root in candidate.parents
-
-
-def expanded_directories(root: Path, patterns: tuple[str, ...]) -> set[Path]:
-    directories: set[Path] = set()
-    for pattern in patterns:
-        for raw_path in glob.glob(str(root / pattern)):
-            path = Path(raw_path).resolve()
-            if within(root, path) and path.is_dir():
-                directories.add(path)
-    return directories
-
-
-def member_directories(root: Path, manifest: dict[str, object]) -> tuple[Path, ...]:
-    workspace = nested_table(manifest, "workspace")
-    members = expanded_directories(root, string_sequence(workspace, "members"))
-    excluded = expanded_directories(root, string_sequence(workspace, "exclude"))
-    members.difference_update(excluded)
-    if nested_table(manifest, "package"):
-        members.add(root)
-    return tuple(sorted(members))
 
 
 def predicate_occurrences(text: str) -> tuple[PredicateOccurrence, ...]:
@@ -227,7 +182,7 @@ def source_files(member: Path, directory: str) -> tuple[Path, ...]:
     return tuple(
         path
         for path in sorted(root.rglob("*"))
-        if path.is_file() and within(member, path.resolve())
+        if path.is_file() and cargo_manifest.within(member, path.resolve())
     )
 
 
@@ -292,7 +247,7 @@ def target_conditions(
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     dependencies: set[str] = set()
     predicates: list[str] = []
-    for target_name, raw_target in nested_table(manifest, "target").items():
+    for target_name, raw_target in cargo_manifest.nested_table(manifest, "target").items():
         if not isinstance(raw_target, dict):
             continue
         match = re.fullmatch(r"cfg\((.*)\)", target_name.strip())
@@ -352,13 +307,13 @@ def audit_member(
     repository: offload.RepositoryIdentity,
     listed_packages: frozenset[str],
 ) -> MemberAudit:
-    manifest = toml_table(member / "Cargo.toml")
-    package = nested_table(manifest, "package").get("name")
+    manifest = cargo_manifest.toml_table(member / "Cargo.toml")
+    package = cargo_manifest.nested_table(manifest, "package").get("name")
     if not isinstance(package, str):
         raise ValueError(f"{member / 'Cargo.toml'} has no package name")
     source_paths = source_files(member, "src")
     build_script = member / "build.rs"
-    if build_script.is_file() and within(member, build_script.resolve()):
+    if build_script.is_file() and cargo_manifest.within(member, build_script.resolve()):
         source_paths += (build_script,)
     source_conditions = scan_files(source_paths, root)
     test_conditions = scan_files(source_files(member, "tests"), root)
@@ -450,14 +405,14 @@ def run(repo_dir: str, check: bool) -> int:
     root = Path(repo_dir).expanduser().resolve()
     manifest_path = root / "Cargo.toml"
     try:
-        manifest = toml_table(manifest_path)
+        manifest = cargo_manifest.toml_table(manifest_path)
         repository = offload.repository_identity(root)
         listed_packages = configured_packages(repository)
         members = tuple(
             sorted(
                 (
                     audit_member(root, member, repository, listed_packages)
-                    for member in member_directories(root, manifest)
+                    for member in cargo_manifest.member_directories(root, manifest)
                 ),
                 key=lambda member: (-member.site_count(), member.package),
             )

@@ -18,7 +18,7 @@ sys.path.insert(0, str(SCRIPTS / "production"))
 import showrunners
 from add_showrunner import NoEndingTab, herdr_tab_open
 import herdr
-from add_unit import Production, read_production
+from production_units import Production, read_production
 from production_units import Refusal, cell_value, production_field, unit_table
 
 import rules

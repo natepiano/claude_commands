@@ -17,6 +17,7 @@ from unittest.mock import call, patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 import add_unit
+import production_units
 import unit_lookup
 import session_pane
 from herdr import HerdrPlace
@@ -561,7 +562,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
 
     def test_remote_control_polling_reads_each_host_through_its_place(self) -> None:
         request = add_unit.UnitLaunch(
-            production=add_unit.read_production(self.doc), identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
+            production=production_units.read_production(self.doc), identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
             branch="build-followups-alpha", worktree=self.root / "project-alpha", plan=add_unit.Standby(),
             port=add_unit.OmittedCell(), owns=add_unit.OmittedCell(), session=add_unit.NewSession(),
             launch_kind=add_unit.NewWorkLaunch(), timeout=0,
@@ -580,7 +581,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
 
     def test_remote_control_is_read_from_the_session_record_after_the_pane_line_scrolls_off(self) -> None:
         request = add_unit.UnitLaunch(
-            production=add_unit.read_production(self.doc), identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
+            production=production_units.read_production(self.doc), identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
             branch="build-followups-alpha", worktree=self.root / "project-alpha", plan=add_unit.Standby(),
             port=add_unit.OmittedCell(), owns=add_unit.OmittedCell(), session=add_unit.NewSession(),
             launch_kind=add_unit.NewWorkLaunch(), timeout=0,
