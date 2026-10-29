@@ -25,6 +25,8 @@ from unittest import mock
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import memory_admit as gate
 import nextest_budget as budget
 store = gate.store
@@ -849,6 +851,39 @@ class QueueApiTests(MemoryQueueFixture):
                 self.waiter(400, NOW.timestamp() - 300, "/tmp/warmup-tree", "warmup"),
                 self.waiter(500, NOW.timestamp() - 60, "/tmp/third", "third"))
 
+    def test_waiter_identity_keeps_the_bare_step_and_caller_identity(self) -> None:
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": "worker-id", "CLAUDE_CODE_SESSION_ID": "parent-id",
+                                     "CLAUDE_SESSION_NAME": "recorded-name"}), \
+             patch("os.getcwd", return_value="/tmp/hana-tree"):
+            for step in ("nextest", "clippy", "mend", "doc"):
+                with self.subTest(step=step):
+                    self.assertEqual(gate.waiter_identity(step, "hana-tree"), {
+                        "session_id": "worker-id", "session_name": "recorded-name",
+                        "step": step, "folder": "/tmp/hana-tree",
+                    })
+
+    def test_held_step_is_stored_and_read_without_the_repository_prefix(self) -> None:
+        _ = self.meminfo.write_text(f"MemAvailable: 0 kB\nMemTotal: {60 * GIB // 1024} kB\n")
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": "worker-id", "CLAUDE_SESSION_NAME": "recorded-name"}):
+            result = gate.check(self.meminfo, 400, "", ["cargo", "nextest"], root=self.root, now=NOW,
+                                profile=gate.StepProfile("hana", "nextest", "hana-tree",
+                                                         gate.ExpectedPeak(12 * GIB, "measured", 5), HANA))
+        self.assertEqual(result.decision.state, "hold")
+        row = cast(gate.Waiter, json.loads((self.root / "admission/400-warmup.waiting").read_text()))
+        self.assertEqual(row.get("step"), "nextest")
+        self.assertEqual(row.get("repository_name"), "hana")
+        view = gate.queue_view()
+        self.assertEqual([(step.session_id, step.step) for step in view.waiting], [("worker-id", "nextest")])
+
+    def test_behind_head_carries_head_identity_and_unmatched_name(self) -> None:
+        for name, expected_name in (("clone88ci", "clone88ci"), ("", "clone88ci")):
+            with self.subTest(recorded_name=name):
+                _ = self.waiter(300, NOW.timestamp() - 2400, "/tmp/clone88ci", name)
+                _ = self.waiter(400, NOW.timestamp() - 300, "/tmp/warmup-tree", "warmup")
+                view = gate.queue_view()
+                self.assertEqual(view.waiting[1].reason, gate.BehindHead(
+                    head_name=expected_name, head_since=NOW.timestamp() - 2400, head_session_id="session-300"))
+
     def test_view_counts_measured_use_after_ramp_and_keeps_the_head(self) -> None:
         _ = self.running(100, 12)
         _ = self.running(200, 11.5)
@@ -1155,7 +1190,7 @@ class QueueApiTests(MemoryQueueFixture):
                 reason = next(step.reason for step in view.waiting if step.pid == 400)
                 if held:
                     self.assertEqual(result.decision.state, "hold")
-                    self.assertEqual(reason, gate.BehindHead("clone88ci", NOW.timestamp() - 2400))
+                    self.assertEqual(reason, gate.BehindHead("clone88ci", NOW.timestamp() - 2400, ""))
                 else:
                     self.assertEqual(result.decision.state, "admit")
                     self.assertIsInstance(reason, gate.ReadyForAdmission)

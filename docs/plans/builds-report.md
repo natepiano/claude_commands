@@ -2,7 +2,7 @@
 
 > **Status: IMPLEMENTATION PLAN — phased, direct-ready.** `/build:queue` names each step's showrunner, unit director and session, shows the bare step name in both tables, and gives free memory its own column.
 
-> **As-built disposition: amend** — `docs/as-built/build-memory-admission.md` (Queue API and Queue order bullets)
+> **As-built disposition: amend** — `docs/as-built/build-memory-admission.md` (Queue API and Queue order bullets); `docs/as-built/buildlog-memory-stalls.md` (machine samples and the report section)
 
 > **Production: builds** — unit `report-unit`; production doc `docs/plans/builds-production.md`
 
@@ -20,9 +20,14 @@ Own what the build log records and what its reports show: the build log, /build:
 
 [Image #3] needs, free, should be their own columns
 
+2026-10-29 (the showrunner's request after phase 1, relayed for the builds production)
+
+Add to `buildlog sample` and its samples table the /proc/pressure/cpu and /proc/pressure/io totals (some, and full where present), and the /proc/stat idle and iowait counters. Show them in /build:report's Memory pressure section, or in a section next to it, as share of time. Tests fake every reading, as in phase 1. Reason: the build log records memory only, so history cannot say whether natedev was CPU or disk bound.
+
 ## Delegation Context
 
 - **Project:** `~/.claude` — the build system scripts; this plan changes the `/build:queue` tables.
+- **Project started:** 2026-10-29T14:37:53.345+00:00
 - **Stack:** Python 3.13, stdlib only; `unittest`; basedpyright with zero errors and zero warnings, no file-level ignores, no `Any`.
 - **Layout:**
   - `scripts/build_queue/` — the `/build:queue` command script and its tests
@@ -47,7 +52,7 @@ Own what the build log records and what its reports show: the build log, /build:
 
 ## Phases
 
-### Phase 1 — Queue tables name who runs each step  · status: todo
+### Phase 1 — Queue tables name who runs each step  · status: done
 
 #### Work Order
 
@@ -106,3 +111,54 @@ Own what the build log records and what its reports show: the build log, /build:
 - `basedpyright scripts/build_queue scripts/lint/memory_admit.py scripts/lint/test_memory_admit.py`: `0 errors, 0 warnings`.
 - Live check on natedev from the worktree: `python3 scripts/build_queue/build_queue.py`. Each step whose session the roster lists (`~/.claude/scripts/lib/py ~/.claude/scripts/message/roster.py --here`) shows that entry's showrunner, unit director and session name; every Step cell in both tables is one bare word; Waiting has a Free column, and no Reason cell starts with `needs <amount> GiB; <amount> free`.
 - Speed: run `build_queue.py` and `roster.py --here --json` back to back three times. The median `build_queue.py` wall time is at most the median roster wall time plus 0.5 s (before this phase: queue 2.2 s, roster 3.3 s on 2026-10-29 10:30 EDT).
+
+### Phase 2 — Samples record CPU and disk pressure  · status: todo
+
+#### Work Order
+
+**Goal:** each 60 s machine sample records CPU and IO stall totals and the CPU idle and iowait counters, and `/build:report` shows them as share of time beside Memory pressure, so the build history says whether natedev was CPU bound, disk bound or neither.
+
+**Spec:**
+
+1. **New readings in `buildlog sample`** (`scripts/buildlog/sample.py`, `sample()` line ~150). Add module paths beside `PRESSURE`: `CPU_PRESSURE = Path("/proc/pressure/cpu")`, `IO_PRESSURE = Path("/proc/pressure/io")`, `STAT = Path("/proc/stat")`. Read each once per sample:
+   - CPU and IO PSI: `parse_pressure(text, require_both=False)`. `some` and `full` totals in microseconds. The kernel may omit the `full` line for CPU; that value is `None`.
+   - `/proc/stat`: the first line that starts with `cpu ` (all CPUs). Record field 4 `idle` and field 5 `iowait` (USER_HZ ticks since boot), and the sum of fields 1–8 (user, nice, system, idle, iowait, irq, softirq, steal) as the total. Guest time is already inside user and nice, so it is not added. Add a parser `parse_cpu_ticks(text) -> CpuTicks` (NamedTuple: `idle`, `iowait`, `total`) beside `parse_meminfo`; it raises `ValueError` on a missing or short `cpu ` line.
+   - A missing file or a parse error makes only that reading `None`. The memory readings stay required (the Linux-only check at line ~150 does not change): a sample with no CPU or IO reading is still written.
+   - Record fields: `cpu_stall_some_us`, `cpu_stall_full_us`, `io_stall_some_us`, `io_stall_full_us`, `cpu_idle_ticks`, `cpu_iowait_ticks`, `cpu_total_ticks`.
+
+   **Director's call:** the total ticks are recorded too. A share of time needs a denominator; wall time times CPU count goes wrong when CPUs go offline, the tick total does not. One field; a one-line revert if not wanted.
+
+2. **Samples table** (`scripts/buildlog/index.py` `SAMPLE_COLUMNS`, line ~245). Add the seven columns as `INTEGER`, NULL when not recorded, each with a one-line description in the existing style (`"machine CPU some stall counter since boot, microseconds; NULL when not recorded"`, `"CPU idle ticks since boot from /proc/stat, USER_HZ"`, and so on). Raise `SCHEMA_VERSION` (22 → 23) so the index rebuilds from the JSONL files, the way earlier sample columns were added. Older sample rows load with NULL in the new columns.
+
+3. **Shared counter deltas** (`scripts/buildlog/report.py`). `memory_pressure_section` sums counter deltas between samples inside its loop (line ~846): same host, gap at most `MAX_SAMPLE_GAP_S`, same boot id (a new boot counts the counter from zero). Move that rule into one function that the memory stall and the new section both use, so the boot and gap rules live in one place. A pair where either value is NULL adds nothing to that counter, and adds nothing to its time denominator. The memory stall line keeps its current text and numbers.
+
+4. **New report section** `### CPU and disk pressure`, right after `### Memory pressure` (line ~1796), from the same day's samples. Per host that has at least one counted pair, one line:
+
+   `natedev: CPU some 41.2%, full —; IO some 3.1%, full 1.0%; CPU idle 52.0%, iowait 0.4% (of 14 h 20 min sampled)`
+
+   - PSI share = summed stall delta in microseconds / summed wall-time delta of the same counted pairs in microseconds.
+   - Idle and iowait share = summed tick delta / summed total-tick delta of the same pairs.
+   - A value with no counted pair shows `—`. A host with no counted pair for any of the seven is left out. When no host has one, the section says `CPU and IO samples: none.`
+   - One decimal place, like the report's other percentages. The `(of …)` part is the sampled wall time counted for the PSI shares, written the way the report writes other durations.
+   - The section's Source line: `Source: 60 s machine samples (/proc/pressure/cpu, /proc/pressure/io, /proc/stat).`
+
+5. **Docs.** `commands/build/report.md`: name the new section in one sentence. `docs/as-built/buildlog-memory-stalls.md`: the sample record's new fields and the new section.
+
+**Files:**
+- `scripts/buildlog/sample.py` — paths, `parse_cpu_ticks`, the seven record fields
+- `scripts/buildlog/index.py` — seven `SAMPLE_COLUMNS`, `SCHEMA_VERSION` 23
+- `scripts/buildlog/report.py` — shared counter delta function, the new section
+- `scripts/buildlog/test_sample.py`, `scripts/buildlog/test_report.py`, and `scripts/buildlog/test_index.py` when it pins the schema
+- `commands/build/report.md`, `docs/as-built/buildlog-memory-stalls.md`
+
+**Workers:** `2 writers` — the open phase 1 workers, `test` still opened as impl.
+- `impl` — `sample.py`, `index.py`, `report.py`, `commands/build/report.md`, `docs/as-built/buildlog-memory-stalls.md`
+- `test` — `test_sample.py`, `test_report.py`, `test_index.py`. Fake every reading with `patch.object(sample, …)` on the module paths, as `test_sample.py` fakes `MEMINFO` and `PRESSURE` now; never read live `/proc`. Cases: all readings present; CPU without a `full` line; a missing CPU, IO or stat file (sample still written, that field `None`); a malformed `/proc/stat`; the report shares for two hosts with known deltas; a reboot between samples; a gap over `MAX_SAMPLE_GAP_S`; old rows with NULL columns next to new rows; no samples; the memory stall line unchanged.
+
+**Constraints from prior phases:** Phase 1 changed only `/build:queue`; nothing here depends on it.
+
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` green, and the production Merge tests (`env HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only`) green.
+- `basedpyright scripts/buildlog`: `0 errors, 0 warnings`.
+- Live check on natedev from the worktree: run the sampler once with `BUILDLOG_DIR` set to a scratch folder and read the JSONL line: all seven fields hold integers (`cpu_stall_full_us` may be `null` if the kernel omits it). Then build a report from a scratch log with two such samples a minute apart and see the new section with shares between 0% and 100%.
+- Speed: one sample reads three more small `/proc` files. Time 20 runs of `sample()` before and after with live readings: the median grows by at most 2 ms.
