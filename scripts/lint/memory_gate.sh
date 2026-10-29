@@ -242,7 +242,9 @@ buildlog_wait_for_memory() {
             return 2
         fi
         available=$fresh
-        cached_repo=$repo cached_step=$step cached_worktree=$worktree cached_need=$need cached_source=$source cached_count=$count
+        # A refreshed estimate replaces the shell cache on every answer.
+        cached_repo=$repo cached_step=$step cached_worktree=$worktree
+        cached_need=$need cached_source=$source cached_count=$count
         if [[ "$state" == admit ]]; then
             BUILDLOG_MEM_RESERVATION="$reservation"
             BUILDLOG_MEM_OUTCOME=Granted
