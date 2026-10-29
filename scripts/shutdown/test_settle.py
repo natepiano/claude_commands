@@ -3472,10 +3472,58 @@ class SettleTests(ShutdownTestCase):
         assert current is not None
         self.assertEqual(current.get("restore_alerted"), settle.not_back_text(current))
 
+    def test_stop_report_shows_saved_submit_screen_for_live_and_absent_sessions(self) -> None:
+        saved = session_shutdown(top_level("screen-owner", "Screen owner"), then="restart",
+            progress={"kind": "restart failed", "at": NOW, "reason": "restart prompt not submitted"})
+        saved["alerts"] = "none"
+        self.save(saved)
+        for live in (True, False):
+            for screen in ("Claude fixture\n❯ unsent opening prompt", herdr.PromptScreenNotRead()):
+                with self.subTest(live=live, screen=screen):
+                    restart_work._save_prompt_outcome(saved, herdr.PromptNotSubmitted("not submitted", screen))  # pyright: ignore[reportPrivateUsage]
+                    with (patch.object(restart_work, "clear_running_on_target", return_value=restart_work.TargetCheck(remaining=[saved], finished=[])),
+                          patch.object(restart_work, "restart_failed_liveness", return_value=restart_work.SessionLive() if live else restart_work.SessionNotLive()),
+                          patch.object(settle, "run_remote", return_value=(0, "[]")),
+                          patch.object(settle, "tell_showrunners_outcome"),
+                          patch.object(settle, "alert_user") as alert,
+                          redirect_stdout(io.StringIO()) as output):
+                        settle.report_stop([saved])
+                    text = output.getvalue()
+                    if isinstance(screen, str):
+                        line = settle.running_restart_line(saved) if live else "Screen owner: restart prompt not submitted"
+                        self.assertIn("  " + line + "\n  last screen of the failed prompt submit:\n    Claude fixture\n    ❯ unsent opening prompt\n", text)
+                    else:
+                        self.assertNotIn("last screen of the failed prompt submit:", text)
+                    alert.assert_not_called()
+
+    def test_stop_report_shows_saved_screen_when_local_machine_case_differs(self) -> None:
+        saved = session_shutdown(top_level("screen-owner", "Screen owner"), then="restart",
+            progress={"kind": "restart failed", "at": NOW, "reason": "restart prompt not submitted"})
+        saved["machine"] = "Mac"
+        saved["alerts"] = "none"
+        self.save(saved)
+        restart_work._save_prompt_outcome(saved, herdr.PromptNotSubmitted(  # pyright: ignore[reportPrivateUsage]
+            "not submitted", "Claude fixture\n❯ unsent opening prompt"))
+        for live in (True, False):
+            with self.subTest(live=live):
+                with (patch.object(settle, "local_machine", return_value="mac"),
+                      patch.object(restart_work, "clear_running_on_target", return_value=restart_work.TargetCheck(remaining=[saved], finished=[])),
+                      patch.object(restart_work, "restart_failed_liveness", return_value=restart_work.SessionLive() if live else restart_work.SessionNotLive()),
+                      patch.object(settle, "run_remote", return_value=(0, "[]")),
+                      patch.object(settle, "tell_showrunners_outcome"),
+                      patch.object(settle, "alert_user") as alert,
+                      redirect_stdout(io.StringIO()) as output):
+                    settle.report_stop([saved])
+                line = settle.running_restart_line(saved) if live else "Screen owner: restart prompt not submitted"
+                self.assertIn("  " + line + "\n  last screen of the failed prompt submit:\n    Claude fixture\n    ❯ unsent opening prompt\n", output.getvalue())
+                alert.assert_not_called()
+
     def test_automatic_restart_with_an_unsent_prompt_pushes_the_failed_session_name(self) -> None:
         saved = session_shutdown(top_level("unsent-owner", "Unsent owner"), then="restart",
             progress={"kind": "restart failed", "at": NOW, "reason": "restart prompt not submitted"})
         self.save(saved)
+        restart_work._save_prompt_outcome(saved, herdr.PromptNotSubmitted(  # pyright: ignore[reportPrivateUsage]
+            "not submitted", "Claude fixture\n❯ unsent opening prompt"))
         with (patch.object(sessions, "live_sessions", return_value=[]),
               patch.object(settle, "run_remote", return_value=(0, "[]")),
               patch.object(settle, "send_message") as sender,
@@ -3487,6 +3535,10 @@ class SettleTests(ShutdownTestCase):
         push = cast(RenderedPush, alert.call_args.args[0])
         self.assertEqual(push.id, "shutdown.restart_failed")
         self.assertIn("Unsent owner", push.title + "\n" + push.body)
+        expected = restart_work.restart_push(LABEL, [restart_work.FailedSessionRestart(
+            "Unsent owner", "restart prompt not submitted")], machine="natedev")
+        self.assertEqual(push, expected[0])
+        self.assertNotIn("Claude fixture", push.title + "\n" + push.body)
         self.assertIn("Unsent owner: restart prompt not submitted", output.getvalue())
         current = record.find_session(LOGIN, "unsent-owner")
         assert current is not None
