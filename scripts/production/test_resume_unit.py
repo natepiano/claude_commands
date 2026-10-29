@@ -246,6 +246,33 @@ class ResumeUnitTests(unittest.TestCase):
         self.assertIn(["--cwd", str(folder)], [call[index:index + 2] for call in self.calls for index in range(len(call) - 1)])
         self.assertFalse(self.worktree.exists())
 
+    def test_renamed_transcript_resumes_in_its_current_project_folder(self) -> None:
+        transcript = self.configs[0] / "projects" / unit_move.project_folder(str(self.worktree)) / f"{DIRECTOR}.jsonl"
+        old = self.root / "alpha-old-wt"
+        _ = transcript.write_text("\n".join(json.dumps({"cwd": str(cwd)})
+                                            for cwd in (old, old, self.worktree, self.worktree)) + "\n")
+        code, output = self.resume("--dry-run")
+        self.assertEqual(code, 0, output)
+        self.assertIn(f"--cwd {self.worktree}", output)
+        self.assertNotIn(str(old), output)
+        self.assertEqual(self.calls, [])
+        self.assertFalse(self.worktree.exists())
+        self.assert_resumed(*self.resume())
+        self.assertEqual(len(self.calls), 1)
+
+    def test_no_cwd_matches_the_holding_project_folder(self) -> None:
+        transcript = self.configs[0] / "projects" / unit_move.project_folder(str(self.worktree)) / f"{DIRECTOR}.jsonl"
+        _ = transcript.write_text(json.dumps({"cwd": str(self.root / "alpha-old-wt")}) + "\n")
+        before = self.doc.read_bytes()
+        for arguments in (("--dry-run",), ()):
+            with self.subTest(arguments=arguments):
+                code, output = self.resume(*arguments)
+                self.assertEqual(code, 1, output)
+                self.assertIn(f"no cwd matching its project folder {transcript.parent.name}", output)
+                self.assertEqual(self.calls, [])
+                self.assertFalse(self.worktree.exists())
+                self.assertEqual(self.doc.read_bytes(), before)
+
     def test_older_note_refuses_no_transcript_or_two_project_folders(self) -> None:
         first = self.external_transcript()
         second = self.root / "another-checkout"

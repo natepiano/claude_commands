@@ -347,6 +347,29 @@ class RetireUnitTests(unittest.TestCase):
         self.assertIn(f"session {DIRECTOR}, folder {folder})", self.doc.read_text())
         self.assertFalse(self.worktree.exists())
 
+    def test_retired_note_uses_the_folder_holding_a_renamed_directors_transcript(self) -> None:
+        folder = self.outside_director()
+        transcript = self.config / "projects" / unit_move.project_folder(str(folder)) / f"{DIRECTOR}.jsonl"
+        old = self.root / "old-checkout"
+        _ = transcript.write_text("\n".join(json.dumps({"cwd": str(cwd)})
+                                            for cwd in (old, old, folder, folder)) + "\n")
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertIn(f"session {DIRECTOR}, folder {folder})", self.doc.read_text())
+        self.assertNotIn(str(old), self.doc.read_text())
+        self.assertFalse(self.worktree.exists())
+
+    def test_transcript_without_a_matching_cwd_refuses_retire_before_stopping(self) -> None:
+        transcript = self.config / "projects" / unit_move.project_folder(str(self.worktree)) / f"{DIRECTOR}.jsonl"
+        _ = transcript.write_text(json.dumps({"cwd": str(self.root / "old-checkout")}) + "\n")
+        before = self.doc.read_bytes()
+        code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertIn(f"no cwd matching its project folder {transcript.parent.name}", output)
+        self.assertEqual(self.stops(), [])
+        self.assertEqual(self.doc.read_bytes(), before)
+        self.assertTrue(self.worktree.exists())
+
     def test_final_live_mark_prevents_marking_and_removal_including_an_already_retired_row(self) -> None:
         for retired in (False, True):
             with self.subTest(already_retired=retired):

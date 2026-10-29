@@ -20,7 +20,7 @@ uncommitted work: no person wrote it. Then it stops what the unit owns. It finds
 - each process that still works inside the worktree gets SIGTERM.
 
 When nothing is left running, the Units row's Plan cell gets "(retired <date>, worktree removed,
-session <id>)", adding ", folder <path>" when its transcript started outside the worktree,
+session <id>)", adding ", folder <path>" when its transcript resumes outside the worktree,
 committed on the merge branch, and the worktree, the local branch and the origin branch go.
 Shutdown completion and forgetting its restore must succeed; a final liveness and record check
 refuses marking or removal while a known session still runs or its shutdown is unfinished.
@@ -96,7 +96,7 @@ class Refused(Exception):
 @dataclass(frozen=True)
 class DirectorSession:
     session_id: str
-    start_folder: Path
+    resume_folder: Path
 
 
 @dataclass(frozen=True)
@@ -437,7 +437,8 @@ def transcript_locations(session_id: str) -> list[Path]:
                    for path in (directory / "projects").glob(f"*/{session_id}.jsonl")})
 
 
-def transcript_start_folder(transcript: Path) -> Path:
+def transcript_resume_folder(transcript: Path) -> Path:
+    """The first recorded cwd whose project folder still holds this transcript after renames."""
     with transcript.open(encoding="utf-8") as lines:
         for line in lines:
             try:
@@ -447,16 +448,18 @@ def transcript_start_folder(transcript: Path) -> Path:
             if isinstance(value, dict):
                 cwd = cast(dict[str, object], value).get("cwd")
                 if isinstance(cwd, str) and cwd:
-                    return Path(cwd).expanduser()
-    raise Refused(f"transcript {transcript} has no start folder (cwd)")
+                    folder = Path(cwd).expanduser()
+                    if unit_move.project_folder(str(folder)) == transcript.parent.name:
+                        return folder
+    raise Refused(f"transcript {transcript} has no cwd matching its project folder {transcript.parent.name}")
 
 
-def director_start_folder(session_id: str) -> Path:
+def director_resume_folder(session_id: str) -> Path:
     transcripts = transcript_locations(session_id)
     if len(transcripts) != 1:
         places = ", ".join(str(path.parent) for path in transcripts) or "none"
         raise Refused(f"no account has the transcript of session {session_id} in exactly one project folder; found: {places}")
-    return transcript_start_folder(transcripts[0])
+    return transcript_resume_folder(transcripts[0])
 
 
 def unit_shutdowns(unit: Unit, ids: frozenset[str]) -> list[shutdown_record.SessionShutdown]:
@@ -493,7 +496,7 @@ def last_session(unit: Unit) -> str:
 
 def director_session(unit: Unit) -> DirectorSession | NoDirectorSession:
     session_id = last_session(unit)
-    return DirectorSession(session_id, director_start_folder(session_id)) if session_id else NoDirectorSession()
+    return DirectorSession(session_id, director_resume_folder(session_id)) if session_id else NoDirectorSession()
 
 
 def retired_note(unit: Unit, director: DirectorSession | NoDirectorSession) -> str:
@@ -501,8 +504,8 @@ def retired_note(unit: Unit, director: DirectorSession | NoDirectorSession) -> s
     session = ""
     if isinstance(director, DirectorSession):
         session = SESSION_NOTE.format(id=director.session_id)
-        if director.start_folder.resolve() != unit.worktree.resolve():
-            session += f", folder {director.start_folder}"
+        if director.resume_folder.resolve() != unit.worktree.resolve():
+            session += f", folder {director.resume_folder}"
     return RETIRED_NOTE.format(date=date, session=session)
 
 
