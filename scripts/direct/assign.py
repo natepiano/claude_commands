@@ -24,6 +24,7 @@ from scripts.direct import workers
 from scripts.direct.worker_state import worker_claim_lock, worker_record_path
 from scripts.guilds import roles as guild_roles
 from scripts.lib import unit_runs
+from scripts.usage.agents_log import LENSES
 
 SCRIPTS = Path(__file__).resolve().parent
 PYTHON = str(SCRIPTS / "../lib/py")
@@ -105,7 +106,7 @@ def parse_arguments() -> Arguments:
         _ = parser.add_argument("--" + option, default="")
     _ = parser.add_argument("--prompt", required=True)
     _ = parser.add_argument("--cwd", default=str(Path.cwd()))
-    _ = parser.add_argument("--lens", choices=("adversary", "contract", "craft", "ux"), default="")
+    _ = parser.add_argument("--lens", choices=LENSES, default="")
     _ = parser.add_argument("--pass", dest="pass_number", type=int, default=1)
     _ = parser.add_argument("--image", action="append", default=[])
     args = parser.parse_args(namespace=Arguments())

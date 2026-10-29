@@ -455,7 +455,7 @@ The showrunner returned change-review row C454 (2026-10-29): `phase_process.py b
 
 **Acceptance gate:** a test renders the table from fixture phases with values in the millions and a not-recorded count, and checks every line is at most 60 characters, the short forms, and the not-recorded line; the live command's lines 6 to 11 are at most 60 characters.
 
-### Phase 15 — A rerun review lens checks every change that writes lasting state  · status: todo
+### Phase 15 — A rerun review lens checks every change that writes lasting state  · status: done
 **Depends on:** none
 
 The user approved this work through the showrunner (2026-10-29, ranked before Phase 14: "we have been bit hard by this too many times"). Today shutdown kept old "stopped" records for 10 live sessions; each rerun of down/now trusted the record and did nothing; a failed restart moved the records to history/, so a rerun had nothing to restore; `set -e` stopped `herdr-up.sh` at the first failed account. Earlier faults had the same shape: `launch_pending` stayed true after a failed start; a "restarting" claim blocked a rerun until it timed out; a restart-job wait never cleared; a restore skipped a session whose record held an old path. No review lens asks these questions today.

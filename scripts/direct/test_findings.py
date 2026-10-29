@@ -70,6 +70,15 @@ class FindingsLedgerTests(unittest.TestCase):
         environment["UNIT_HISTORY_DIR"] = str(self.root / "history")
         return environment
 
+    def test_rerun_finding_keeps_its_lens_in_ledger_and_history(self) -> None:
+        self.write_progress_state("instance-rerun")
+        _ = self.run_command("open", "--severity", "blocker", "--title", "Restore loses records",
+                             "--caught-by", "worker", "--lens", "rerun")
+        findings = cast(list[dict[str, object]], self.status()["findings"])
+        self.assertEqual([entry["lens"] for entry in findings], ["rerun"])
+        self.assertEqual([event["lens"] for event in self.events() if event["event_type"] == "finding_opened"],
+                         ["rerun"])
+
     def test_event_write_syncs_by_default_and_flushes_without_sync_for_disposable_state(self) -> None:
         self.write_progress_state("phase-probe")
         append = cast(Callable[[Path, dict[str, object], dict[str, object]], None], vars(findings)["_append_event"])

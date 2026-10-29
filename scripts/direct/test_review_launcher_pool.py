@@ -16,6 +16,16 @@ from scripts.direct.wait_for_test_state import wait_until
 
 
 class ReviewLauncherPassTests(support.ReviewLauncherFixture):
+    def test_code_pool_runs_rerun_lens_and_records_its_findings(self) -> None:
+        session = self.start_implementation("pool-rerun")
+        self.finish_implementation(session)
+        result = subprocess.run(self.pool_command(session, lens="rerun"), env=self.pool_fixture(),
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record, = self.turn_records(session)
+        self.assertEqual((record["lens"], record["kind"], record["status"]), ("rerun", "broad", "reviewed"))
+        self.assertTrue((session / "review_findings_1_rerun.txt").is_file())
+
     def test_pool_mesh_claim_compaction_release_use_allocated_dir_and_unit_records_stay_local(self) -> None:
         session = self.start_implementation("pool-routing")
         self.finish_implementation(session)
