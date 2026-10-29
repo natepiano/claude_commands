@@ -696,6 +696,10 @@ class MeshCommandFixture(unittest.TestCase):
             if outcome == "idle_before_listed":
                 self.unlisted_turn = turn_id
                 return turn_submission_frames
+            if outcome == "listed_before_notices":
+                # The server reads the thread idle and lists the new turn as
+                # ended before it sends any notice for it.
+                return turn_submission_frames[:1]
             if outcome == "completed_then_peer":
                 self.live_turn = "peer-turn"
                 self.announce_live_completion = True
@@ -4627,7 +4631,9 @@ class MeshCommandTests(MeshCommandFixture):
     def test_quiet_poll_resumes_a_marked_account_move_after_a_system_error(self) -> None:
         _target, destination = self.prepare_workers_move()
         self.outcomes = ["disconnect", "completed"]
-        self.start_args_timeout = 5
+        # The run ends on the resumed turn's completion; the budget only bounds
+        # a failure, so it sits far above full-suite load.
+        self.start_args_timeout = 120
         marker_injected = False
         on_frame = codex_mesh._on_frame  # pyright: ignore[reportPrivateUsage]
 
@@ -6167,6 +6173,18 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(self.worker_record()["status"], "done")
 
+    def test_follow_recovers_a_capacity_wait_whose_launcher_died(self) -> None:
+        self.assertEqual(self.run_start()[0], 0)
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            "worker": {"thread_id": THREAD_ID, "status": codex_mesh.WAITING_CAPACITY,
+                     "launcher_pid": 99999999}
+        }), encoding="utf-8")
+
+        code, errors = self.run_follow()
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.worker_record()["status"], "done")
+
     def test_running_roster_without_turn_id_has_no_active_state(self) -> None:
         state = codex_mesh._roster_thread({  # pyright: ignore[reportPrivateUsage]
             "thread_id": THREAD_ID, "status": "running", "turn_id": ""
@@ -7328,9 +7346,9 @@ class MeshCommandTests(MeshCommandFixture):
         self.server.respond = no_answer
         ended = codex_mesh._ended_unseen  # pyright: ignore[reportPrivateUsage]
 
-        def check(client: codex_mesh.Client, thread: str, turn: str = "") -> bool:
+        def check(client: codex_mesh.Client, thread: str, turn: str = "", *, start_seen: bool = True) -> bool:
             change()
-            return ended(client, thread, turn)
+            return ended(client, thread, turn, start_seen=start_seen)
 
         with patch.object(codex_mesh, "_post_board_status") as board, patch.object(codex_mesh, "_ended_unseen", side_effect=check):
             code, errors = self.run_follow()
@@ -7791,6 +7809,8 @@ class FollowEventRegressionTests(MeshCommandFixture):
         with contextlib.closing(codex_mesh.Client(self.server.port, "worker", deadline=time.time() + 3)) as client:
             stream = self.stream_for(client, resident=resident)
             stream.final_answer = "answer without completion"
+            # The answer arrived, so the turn's notices did too.
+            stream.turn_start_seen = True
             stream.state_change_owed = True
             started = time.perf_counter()
             _ = codex_mesh._stream_frames(stream, io.StringIO())  # pyright: ignore[reportPrivateUsage]
@@ -8047,6 +8067,107 @@ class FollowEventRegressionTests(MeshCommandFixture):
         if not resident:
             self.assertEqual(self.turn_inputs[-1], "detached run result")
         self.assertTrue(run.exists(), "run discovery removed a lookup record")
+
+    def test_last_detached_run_result_turn_is_watched_not_interrupted(self) -> None:
+        self.start_args_timeout = 60
+        self.assertEqual(self.run_start(), (0, ""))
+        self.outcomes = ["completed", "listed_before_notices"]
+        run = self.session_dir / codex_mesh.DETACHED_RUNS_DIR / "last.json"
+        run.parent.mkdir()
+        _ = run.write_text(json.dumps({"worker": "worker", "status": "running", "pid": os.getpid()}))
+        held_on_run = threading.Event()
+        polled_result_turn = threading.Event()
+        steps: list[codex_mesh.StreamStep | codex_mesh.FailedWithThread] = []
+        waiting = codex_mesh._waiting_on_detached_run  # pyright: ignore[reportPrivateUsage]
+        quiet = codex_mesh._on_quiet_poll  # pyright: ignore[reportPrivateUsage]
+        budget = FixtureLoopBudget("last run result turn", seconds=20, max_calls=200)
+
+        def note_wait(session_dir: str, name: str, thread_id: str, runs: codex_mesh.DetachedRunWatch) -> bool:
+            held = waiting(session_dir, name, thread_id, runs)
+            if held:
+                held_on_run.set()
+            return held
+
+        def note_result_turn_poll(
+            stream: codex_mesh.TurnStream, log: TextIO,
+        ) -> codex_mesh.StreamStep | codex_mesh.FailedWithThread:
+            _ = budget.check()
+            watched = stream.turn_id
+            step = quiet(stream, log)
+            if self.server.held_turn_ready.is_set() and watched == f"turn-{self.turn_starts}":
+                steps.append(step)
+                polled_result_turn.set()
+            return step
+
+        with (patch.object(codex_mesh, "_waiting_on_detached_run", note_wait),
+              patch.object(codex_mesh, "_on_quiet_poll", note_result_turn_poll),
+              ThreadPoolExecutor(max_workers=1) as executor):
+            future = executor.submit(self.run_follow)
+            try:
+                self.assertTrue(held_on_run.wait(timeout=5), "launcher never waited on the live run")
+                self.server.hold_turn_completion = True
+                self.server.answer_requests_during_held_turn = True
+                self.server.held_turn_completes_successfully = True
+                _ = run.write_text(json.dumps({"worker": "worker", "status": "finished", "pid": os.getpid()}))
+                held = codex_mesh.hold_message(str(self.session_dir), "worker", "detached run result",
+                                               without_launcher=False)
+                self.assertIsInstance(held, codex_mesh.HeldForLauncher)
+                self.assertTrue(self.server.held_turn_ready.wait(timeout=5), "the held result opened no turn")
+                self.assertTrue(polled_result_turn.wait(timeout=5), "no lifecycle check ran on the result turn")
+                self.assertNotIn(codex_mesh.StreamStep.FINISH, steps)
+                self.assertFalse(future.done(), "launcher left the result turn before its completion")
+            finally:
+                self.server.release_held_turn.set()
+            code, errors = future.result(timeout=10)
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.methods("turn/interrupt"), [])
+        self.assertEqual(self.turn_inputs[-1], "detached run result")
+        log = (self.session_dir / "worker.log").read_text() if (self.session_dir / "worker.log").exists() else ""
+        self.assertNotIn("no completion notice arrived", log)
+
+    def test_a_result_held_past_the_wall_clock_deadline_opens_the_next_turn(self) -> None:
+        self.start_args_timeout = 60
+        self.assertEqual(self.run_start(), (0, ""))
+        self.outcomes = ["completed", "completed"]
+        run = self.session_dir / codex_mesh.DETACHED_RUNS_DIR / "late.json"
+        run.parent.mkdir()
+        _ = run.write_text(json.dumps({"worker": "worker", "status": "running", "pid": os.getpid()}))
+        held_on_run = threading.Event()
+        clock_jumped = threading.Event()
+        waiting = codex_mesh._waiting_on_detached_run  # pyright: ignore[reportPrivateUsage]
+        quiet = codex_mesh._on_quiet_poll  # pyright: ignore[reportPrivateUsage]
+        budget = FixtureLoopBudget("held result past the deadline", seconds=20, max_calls=200)
+
+        def note_wait(session_dir: str, name: str, thread_id: str, runs: codex_mesh.DetachedRunWatch) -> bool:
+            held = waiting(session_dir, name, thread_id, runs)
+            if held:
+                held_on_run.set()
+            return held
+
+        def jump_wall_clock(
+            stream: codex_mesh.TurnStream, log: TextIO,
+        ) -> codex_mesh.StreamStep | codex_mesh.FailedWithThread:
+            _ = budget.check()
+            if held_on_run.is_set():
+                # A suspended machine moves wall time past the deadline while
+                # the frame loop's monotonic clock keeps it running.
+                stream.deadline = time.time() - 1
+                clock_jumped.set()
+            return quiet(stream, log)
+
+        with (patch.object(codex_mesh, "_waiting_on_detached_run", note_wait),
+              patch.object(codex_mesh, "_on_quiet_poll", jump_wall_clock),
+              ThreadPoolExecutor(max_workers=1) as executor):
+            future = executor.submit(self.run_follow)
+            self.assertTrue(held_on_run.wait(timeout=5), "launcher never waited on the live run")
+            _ = run.write_text(json.dumps({"worker": "worker", "status": "finished", "pid": os.getpid()}))
+            held = codex_mesh.hold_message(str(self.session_dir), "worker", "detached run result",
+                                           without_launcher=False)
+            self.assertIsInstance(held, codex_mesh.HeldForLauncher)
+            code, errors = future.result(timeout=10)
+        self.assertTrue(clock_jumped.is_set())
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.turn_inputs[-1], "detached run result")
 
     def test_missing_completion_keeps_the_inbox_open_for_a_new_detached_run(self) -> None:
         self.assert_inbox_stays_open_for_late_run(resident=False)
