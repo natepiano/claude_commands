@@ -164,32 +164,55 @@ Loop/verbose only:
    phase checkpoints, the final gate, one-off fix commits, and merges concluded
    with a checkpoint subject. After staging, run
    `~/.claude/scripts/direct/verify.sh doc` as its own command and as the last
-   command before `git commit`. Include every
-   untracked or unstaged file in the commit or remove it: the judged working
-   tree must equal the committed tree. On failure, repair through
+   command before `git commit`. `doc` runs rustdoc on a checkout of the
+   staged tree in a stable, locked checkout under the repo's target directory. Unstaged and untracked files are not in that
+   tree, and a plain `git commit` leaves them out too. With `-a`, `--only`,
+   `--include` or paths, stage those changes before `doc`: the record must be
+   for exactly the tree the commit writes. On failure, repair through
    <FixDispatch/>, stage the repairs, then run `doc` again. The checkpoint
    hook refuses a commit without a passing record for its exact tree;
-   `lint.conf` cannot disable this gate. A rerun after a plan-doc edit compiles
-   nothing new and takes seconds. Workers may run `doc` at any time; their
-   Work Orders do not require it.
+   `lint.conf` cannot disable this gate. `doc` uses `CARGO_TARGET_DIR` when set,
+   else the repo-top metadata target. Its private index updates the stable
+   checkout with `read-tree -m -u`, preserving unchanged mtimes and dependency
+   artifacts; a damaged checkout gets one fresh checkout. Workers may run `doc` at any
+   time; their Work Orders do not require it.
 
    **Every repository:** run the checkpoint commit as the first command in
    its own Bash call. Put `cd`, `git add`, and all other commands in earlier
    calls. Commands after the commit, such as a push, are allowed.
 
-   The hook treats every commit in a Bash call as a checkpoint when the call's
-   text contains `checkpoint(` after quote removal: backslash-newline pairs,
-   then quotes and backslashes are removed. A body line or example counts too.
-   Use literal `-m` text, a `-F` file, or the `"$(cat <<'EOF' … EOF)"` heredoc
-   form. A subject it cannot read, such as shell expansion or `$'…'`, counts
-   as a checkpoint and needs the record in a Cargo repository. It also scans
-   message files, reused commit subjects (`--amend`, `-C`/`-c`), and
-   `MERGE_MSG`/`SQUASH_MSG`, including merges concluded with `--no-edit`.
+   The gate catches ordinary agent commit forms, not deliberate hiding in
+   scripts, aliases or functions from earlier calls. It is not a shell interpreter.
+   A checkpoint is a line of the commit's own message matching `checkpoint(...):`.
+   Only a `git` command word (or `/path/git`), after assignments and
+   `env`/`command`/`exec`/`sudo`/`nice`/`time`, starts a commit or merge.
+   `env -C`/`--chdir` and `git -C` select its repo. Conditions, ordinary for
+   loops, while/until loops, case arms, groups, `!`, `time` and function bodies
+   inspect command words; quoted arguments and heredoc bodies never count.
+   The hook reads literal `-m`, `-F`, reused subjects (`--amend`, `-C`/`-c`),
+   and commit `MERGE_MSG`/`SQUASH_MSG`. Unreadable messages, including shell
+   expansions and the `"$(cat <<'EOF' … EOF)"` form, count only in Cargo repos.
+   A merge without a message option uses git's ordinary default subject;
+   `--log` does not supply a message. Literal merge messages follow every
+   checkpoint rule; `-e`/`--edit` and unreadable `-F` count only in Cargo repos.
+   Opaque commands (`eval`, expanded command words, sh/bash/zsh `-c`, unmodeled
+   `env` options, `coproc`, `select`, `[[ ]]`, `(( ))`, arithmetic for) refuse
+   when their own quote-removed words hold `git` with `commit`/`merge` and
+   `checkpoint(`, in every cwd. Without checkpoint text they refuse only in
+   a Cargo cwd with git commit/merge words. Unrelated `$EDITOR file` and
+   `eval "$(direnv hook zsh)"` pass. Options end at `--`; later `--fixup` or
+   `--squash` words are paths and require the exact tree record.
 
    For these commits, the hook refuses `--git-dir`, `--work-tree`, `GIT_DIR=`,
    `GIT_INDEX_FILE=`, and `GIT_WORK_TREE=` overrides, and `git -C` directories
-   it cannot resolve, including shell expansions and unquoted globs. Each
-   refusal names the fix: remove overrides or use a literal directory.
+   it cannot resolve, including shell expansions and unquoted globs. In a
+   Cargo repository it also refuses `-p`/`--patch`/`--interactive`,
+   `--pathspec-from-file`, paths with expansions or globs, conflicting
+   selection options, and a checkpoint merge. For a checkpoint merge, run
+   `git merge --no-commit` with a literal `-m` message that is not a
+   checkpoint, stage the result, run `doc`, then commit with the checkpoint
+   subject. Each refusal names the fix: remove overrides, or use a literal
+   directory, path or command.
 
    Every `checkpoint(...)` commit that changes more than Markdown carries
    `Change-Review: <what changed for you> | <how to try it: where and what to type> | <what you see>`, one line per visible change, or
