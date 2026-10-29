@@ -155,7 +155,7 @@ buildlog_memory_refuse() {
     build_check_stop 2 "memory admission check failed ($1)"
 }
 
-buildlog_memory_line() {
+buildlog_memory_line_inner() {
     local kind=$1 available=$2 threshold=$3 need=$4 source=$5 count=$6 promised=$7 running=$8 reserve=$9 summary=${10}
     local description
     case "$source" in
@@ -174,6 +174,10 @@ buildlog_memory_line() {
     else
         printf 'memory free after %d min %d s: starting\n' "$(( BUILDLOG_MEM_WAIT_S / 60 ))" "$(( BUILDLOG_MEM_WAIT_S % 60 ))" >&2
     fi
+}
+
+buildlog_memory_line() {
+    buildlog_memory_line_inner "$@"
 }
 
 buildlog_wait_for_memory() {

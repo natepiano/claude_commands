@@ -23,6 +23,11 @@ from typing import TYPE_CHECKING, TypedDict, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+if TYPE_CHECKING:
+    from ..lib.socket_test_support import short_socket_directory
+else:
+    from scripts.lib.socket_test_support import short_socket_directory
+
 import build_hold
 import unit_runs
 from sessions import SessionRecord
@@ -80,12 +85,14 @@ def recorded_hold_events(root: Path, expected: int) -> list[HoldEventRecord]:
 
 class IsolatedBuildHoldTest(unittest.TestCase):
     scratch: Path = Path()
+    socket_dir: Path = Path()
     lifetime_reader: int = -1
     lifetime_writer: int = -1
 
     @override
     def setUp(self) -> None:
         self.scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.socket_dir = Path(self.enterContext(short_socket_directory()))
         proc = self.scratch / "proc"
         proc.mkdir()
         _ = self.enterContext(mock.patch.object(build_hold, "PROC_ROOT", proc))
@@ -658,7 +665,7 @@ class TargetCommandTests(IsolatedBuildHoldTest):
         self.assert_no_natedev_record()
 
     def session(self, name: str, *former: str) -> None:
-        path = self.scratch / "renamed-session.sock"
+        path = self.socket_dir / "renamed-session.sock"
         if not path.exists():
             connection = socket.socket(socket.AF_UNIX)
             connection.bind(str(path))
@@ -810,7 +817,7 @@ class CommandTests(IsolatedBuildHoldTest):
 
     def session(self, session_id: str, name: str, *former: str) -> None:
         """Record a live Claude session, or its rename: this test process stands in for it."""
-        path = self.scratch / f"{session_id}.sock"
+        path = self.socket_dir / f"{session_id}.sock"
         if not path.exists():
             held = socket.socket(socket.AF_UNIX)
             held.bind(str(path))

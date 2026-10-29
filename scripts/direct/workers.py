@@ -12,7 +12,6 @@ import fcntl
 import hashlib
 import json
 import os
-import re
 import signal
 import subprocess
 import sys
@@ -434,23 +433,17 @@ def _repository_name(worktree: Path) -> str:
 
 def _ledger_for_run(run: Path) -> UnitWorkerLedger:
     """Use explicit unit metadata, then the plan's production header, else the worktree."""
+    from scripts.direct.progress_history import ProductionUnitIdentity, resolve_production_unit
+
     state = _read(run / STATE)
-    production, unit = _text(state.get("production")), _text(state.get("unit"))
     worktree = Path(_text(state.get("working_dir")) or str(run)).expanduser().resolve()
-    if not production or not unit:
-        plan = _text(state.get("project_plan_doc")) or _text(state.get("plan_doc"))
-        try:
-            content = (worktree / plan).read_text(encoding="utf-8") if plan else ""
-        except OSError:
-            content = ""
-        match = re.search(r'^> \*\*Production:(?: (.+?)\*\*|\*\* (.+?)) — unit `([^`]+)`;', content, re.MULTILINE)
-        if match:
-            production = match.group(1) or match.group(2)
-            unit = match.group(3)
-            from scripts.production import showrunners
-            notifier = Path(os.environ.get("NOTIFIER_STATE_DIR", str(Path.home() / ".local/state/notifier")))
-            production = showrunners.canonical_slug(production, notifier)
-    if not production or not unit:
+    identity = resolve_production_unit({**state, "working_dir": str(worktree)})
+    if isinstance(identity, ProductionUnitIdentity):
+        from scripts.production import showrunners
+        notifier = Path(os.environ.get("NOTIFIER_STATE_DIR", str(Path.home() / ".local/state/notifier")))
+        production = showrunners.canonical_slug(identity.production, notifier)
+        unit = identity.unit
+    else:
         production = "adhoc"
         digest = hashlib.sha256(str(worktree).encode()).hexdigest()[:12]
         unit = f"{_repository_name(worktree)}-{digest}"
@@ -1372,12 +1365,9 @@ def _plan_unit(state: dict[str, object], old: Path, current: UnitWorktree) -> tu
         path = Path(_moved_path(str(path), old, current.path))
     else:
         path = current.path / path
-    try:
-        content = path.read_text(encoding="utf-8")
-    except OSError:
-        return "", ""
-    match = re.search(r'^> \*\*Production:(?: (.+?)\*\*|\*\* (.+?)) — unit `([^`]+)`;', content, re.MULTILINE)
-    return (match.group(1) or match.group(2), match.group(3)) if match else ("", "")
+    from scripts.direct.progress_history import ProductionUnitIdentity, resolve_production_unit
+    identity = resolve_production_unit({"plan_doc": str(path), "working_dir": str(current.path)})
+    return (identity.production, identity.unit) if isinstance(identity, ProductionUnitIdentity) else ("", "")
 
 
 def find_moved_unit_runs(units: tuple[UnitWorktree, ...], former: tuple[str, ...]) -> WorkerRepairSearch:

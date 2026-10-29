@@ -23,10 +23,12 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from scripts.lib.socket_test_support import short_socket_directory
 import add_unit
 import production_units
 import dailies_render
 import merge_checkpoint
+from scripts.production import production_doc
 import update_registration
 import waiting
 from cli_fixture import invoke_cli
@@ -222,7 +224,7 @@ class WaitingTests(unittest.TestCase):
 
     def claude(self, name: str, pane: str) -> None:
         """Record a live Claude called `name` in the fixture pane."""
-        path = self.root / f"claude-{pane.removeprefix("w").split(":")[0]}.sock"
+        path = Path(self.enterContext(short_socket_directory())) / f"claude-{pane.removeprefix("w").split(":")[0]}.sock"
         if not path.exists():
             held = socket.socket(socket.AF_UNIX)
             held.bind(str(path))
@@ -341,7 +343,7 @@ class WaitingTests(unittest.TestCase):
         request = merge_checkpoint.MergeRequest(
             production._replace(log=producer_log), unit, phase, unit_tip, (),
             merge_checkpoint.ShrinkCommit(), merge_checkpoint.ValidateAndPush(),
-            merge_checkpoint.NoPromotion(), (), frozenset(), frozenset(), (unit,), (), self.root,
+            production_doc.NoPromotion(), (), frozenset(), frozenset(), (unit,), (), self.root,
             (), merge_checkpoint.NoReviewTrial(), "", False, "", "", 0, 0, "",
         )
         with redirect_stdout(io.StringIO()):

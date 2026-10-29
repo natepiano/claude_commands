@@ -14,11 +14,12 @@ import tidy_wrapped
 import unit_lookup
 from production_units import Production, read_production
 from production_units import Refusal, cell_value, production_field, unit_table
-from merge_checkpoint import (CodeCheckpoint, MacCheckout, MergeEntry, NoMerge, NoPromotion,
+from merge_checkpoint import (CodeCheckpoint, MergeEntry, NoMerge,
                               PromotionAlreadyAtTip, PromotionOriginPushed, PromotionNotPushed,
-                              PromoteTo, Stop,
+                              Stop,
                               git, good, merge_branch_history, promote_local_checkout,
-                              promotion_from_doc, pull_mac_checkout, report)
+                              pull_mac_checkout, report)
+from scripts.production import production_doc
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import berth_board
@@ -207,10 +208,15 @@ def open_production(production: Production, lines: list[str]) -> None:
     report("doc", "ok", "running")
     rows = units(updated, production)
     paths = [doc_path_in_checkout(production, production.doc)]
-    paths.extend(doc_path_in_checkout(production, unit.plan) for unit in rows)
+    for unit in rows:
+        if unit.plan.exists():
+            paths.append(doc_path_in_checkout(production, unit.plan))
+        else:
+            report("plan", "ok", f"{unit.name}: no plan yet at {unit.plan}; not committed")
     subject = f"production({production_name(updated)}): plans for {len(rows)} units"
     subjects = checked(production.checkout, "commit", "log", "--format=%s", production.merge_branch)
-    if subject in subjects.splitlines():
+    committed_paths = checked(production.checkout, "commit", "ls-tree", "-r", "--name-only", "HEAD", "--", *paths)
+    if subject in subjects.splitlines() and set(paths).issubset(committed_paths.splitlines()):
         report("commit", "ok", "plans already committed")
     else:
         _ = checked(production.checkout, "commit", "add", "--", *paths)
@@ -284,8 +290,8 @@ def promote_main(production: Production, lines: list[str], no_ci: bool,
     if git(production.checkout, "merge-base", "--is-ancestor", "origin/main", tip).returncode:
         raise LifecycleStop("main", "held", f"origin/main has commits absent from {tip}")
     report("main", "ok", f"origin/main is behind {tip}")
-    promotion = promotion_from_doc(lines)
-    if isinstance(promotion, NoPromotion) or not promotion.checkouts:
+    promotion = production_doc.promotion_from_doc(lines)
+    if isinstance(promotion, production_doc.NoPromotion) or not promotion.checkouts:
         remote = checked(production.checkout, "promote", "rev-parse", "origin/main")
         if remote != tip:
             _ = checked(production.checkout, "push", "push", "origin", f"{tip}:refs/heads/main")
@@ -304,7 +310,7 @@ def promote_main(production: Production, lines: list[str], no_ci: bool,
             else:
                 detail = f"{destination}: advanced to {tip}"
             report("promote", "ok", detail)
-    if isinstance(promotion, PromoteTo) and isinstance(promotion.mac, MacCheckout):
+    if isinstance(promotion, production_doc.PromoteTo) and isinstance(promotion.mac, production_doc.MacCheckout):
         source = promotion.checkouts[0] if promotion.checkouts else production.checkout
         pull_mac_checkout(promotion.mac.path, source)
         report("promote", "ok", f"mac {promotion.mac.path} main pulled")

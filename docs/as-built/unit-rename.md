@@ -149,3 +149,16 @@ A unit that was not running has no record, so steps 9 and 10 do nothing for it.
   (`guilds/roles/`), `prompts/`, `replies/`, `adoption.json` and `transfer.json` are history, and role
   `name` and `aliases` in `design.json` and the entry names and `aliases` in a role mesh roster are identity, not live names. A hit outside the history classes fails and names its file. Shutdown paths print as `(masked)`.
   On natedev a sweep takes about 80 s.
+
+## Tests
+
+`test_rename_unit.py` covers Git moves, planning and refusals. The neighboring
+`test_rename_unit_{style,sessions,waits,state,processes}.py` modules cover style
+identities, session records and verification, live coordination and locks, moved
+state and journal retries, and stopped-run process ownership respectively.
+`rename_unit_test_support.py` builds one Git fixture per class and restores a
+private copy at the same absolute path for each test. Synchronous cases use the
+real CLI parser and handlers in-process, including the fake herdr response CLI;
+Git commands remain real. Entry-point errors, cross-process locks, shutdown and
+relaunch coordination retain subprocesses. Fixture file waits use directory
+events with a 300-second hang guard.

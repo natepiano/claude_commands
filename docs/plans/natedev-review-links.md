@@ -16,7 +16,7 @@ The user asks any session, on natedev or on the Mac, for a link to an output (a 
 ## Facts measured 2026-10-29
 
 - natedev: `natedev.tail21e383.ts.net`, 100.103.14.30. Mac: `nates-macbook-pro-2023.tail21e383.ts.net`, 100.111.54.14. Mac python3 3.13.15 at `/run/current-system/sw/bin/python3`.
-- A hand-run `http.server` on natedev bound to 100.103.14.30:8765 answered 200 to `curl` from the Mac. The natedev firewall is active, and no `tailscale0` rule names 8765 (only the Sunshine ports in `modules/linux/remote-desktop.nix`). Phase 2 finds out why the request got in, and adds an explicit `networking.firewall.interfaces.tailscale0.allowedTCPPorts = [ 8765 ]` unless the measurement shows that the rule cannot take effect.
+- A hand-run `http.server` on natedev bound to 100.103.14.30:8765 answered 200 to `curl` from the Mac. The natedev firewall is active, and no `tailscale0` rule names 8765 (only the Sunshine ports in `modules/linux/remote-desktop.nix`). The active firewall script (`systemctl cat firewall.service` → `firewall-start`) trusts only `lo`; `tailscale0` is not in `trustedInterfaces`. The likely path is tailscaled's own `ts-input` chain, which accepts traffic on `tailscale0` ahead of `nixos-fw` (reading it needs root: `iptables -S ts-input`). Phase 2 confirms that, and adds an explicit `networking.firewall.interfaces.tailscale0.allowedTCPPorts = [ 8765 ]` unless the measurement shows that the rule cannot take effect.
 - Mac application firewall: off, stealth mode off.
 - natedev has no pandoc and no python `markdown` module. The page embeds the markdown text and renders it with `marked` from cdnjs (exact version, for example 12.0.2); with no network, the `<pre>` copy shows.
 - A module pair to copy for both machines: `modules/linux/hanadocs-prioritize.nix` and `modules/darwin/hanadocs-prioritize.nix`.
@@ -35,7 +35,7 @@ The user asks any session, on natedev or on the Mac, for a link to an output (a 
   - Prints one URL per file: `http://<this machine's MagicDNS name>:8765/<path>`. The name comes from `tailscale status --self --json` (`Self.DNSName`, with the trailing dot removed).
   - Refuses to copy a directory or a missing file, and does nothing in that case.
 - `serve.py`:
-  - Binds to `tailscale ip -4`. When Tailscale is down, it exits nonzero so that the service manager starts it again.
+  - Binds to `tailscale ip -4`. When `tailscale ip -4` gives no address, at start or at a check once a minute, or gives a different address, it exits nonzero so that the service manager starts it again. A stopped Tailscale that still reports the same address does not stop it: the socket stays bound to that address (review ruling, 2026-10-29).
   - Serves only files under the root folder, with no directory listings: a request for a directory, or for a path that leaves the root, gets 404.
   - Content types: `.md` and `.txt` as `text/plain; charset=utf-8`, `.html` as `text/html; charset=utf-8`.
   - Deletes snapshot folders older than 7 days at start and every hour after that.
