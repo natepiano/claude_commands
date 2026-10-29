@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 import conversation_pause
 import session_pane
 from unit_lookup import Place
+from scripts.hooks import hook_dispatch
 
 
 LIBRARY = Path(__file__).with_name("conversation_pause.py")
@@ -32,7 +33,8 @@ NOW = 10_000
 # The hooks' real 5 s budget trips on a loaded machine; tests of the budget
 # itself set it to 1. The wall stays above the budget.
 TEST_HOOK_BUDGET = 60
-TEST_WALL = 90
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_WALL = 300
 QUESTION = (
     "conversation-pause: the user has been quiet here for 15 minutes. Ask them this, "
     "word for word, and nothing else: Return to automatic updates? (yes / no) They "
@@ -90,9 +92,10 @@ class ConversationPauseRegistrationTests(unittest.TestCase):
 
         stop_command = (
             '"$HOME/.claude/scripts/lib/py" '
-            '"$HOME/.claude/scripts/hooks/stop-conversation-pause.py"'
+            '"$HOME/.claude/scripts/hooks/hook_dispatch.py" stop'
         )
         self.assertEqual(registered_commands(hooks["Stop"]).count(stop_command), 1)
+        self.assertIn("stop-conversation-pause.py", [spec.filename for spec in hook_dispatch.STOP])
 
         resume_prefix = conversation_pause.RESUME_COMMAND.rsplit(" ", 1)[0]
         self.assertEqual(
@@ -623,7 +626,7 @@ print("SENT: delivered")
 
     def activity_calls(self, expected: int) -> list[list[str]]:
         """The detached call lands after the hook exits: wait for `expected` lines, briefly."""
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + TEST_WALL
         while time.monotonic() < deadline:
             lines = self.activity_log.read_text().splitlines() if self.activity_log.exists() else []
             if len(lines) >= expected:
@@ -1064,7 +1067,7 @@ print("SENT: delivered")
             result = self.run_prompt(
                 "hello",
                 extra_env={"CONVERSATION_PAUSE_HOOK_BUDGET": "1"},
-                timeout=3,
+                timeout=TEST_WALL,
             )
         self.assertEqual((result.returncode, result.stdout), (0, ""))
         self.assertEqual(len(result.stderr.splitlines()), 1)
@@ -1076,7 +1079,7 @@ print("SENT: delivered")
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             result = self.run_stop(
                 extra_env={"CONVERSATION_PAUSE_HOOK_BUDGET": "1"},
-                timeout=3,
+                timeout=TEST_WALL,
             )
         self.assertEqual((result.returncode, result.stdout), (0, ""))
         self.assertEqual(len(result.stderr.splitlines()), 1)
@@ -1090,7 +1093,7 @@ print("SENT: delivered")
                 "CONVERSATION_PAUSE_HOOK_BUDGET": "1",
                 "STOP_DELAY": "30",
             },
-            timeout=3,
+            timeout=TEST_WALL,
         )
         self.assertEqual((result.returncode, result.stdout), (0, ""))
         self.assertEqual(len(result.stderr.splitlines()), 1)
@@ -1144,7 +1147,7 @@ print("SENT: delivered")
         finally:
             if process.poll() is None:
                 process.kill()
-                _ = process.wait(timeout=3)
+                _ = process.wait(timeout=TEST_WALL)
         self.assertEqual(process.returncode, 0, stderr)
 
     def test_message_arrived_uses_named_reply_variants(self) -> None:
@@ -1670,7 +1673,7 @@ print("SENT: delivered")
         finally:
             if process.poll() is None:
                 process.kill()
-                _ = process.wait(timeout=3)
+                _ = process.wait(timeout=TEST_WALL)
         self.assertEqual(process.returncode, 0, stderr)
         self.assertEqual(
             self.record()["phase"], {"kind": "replying", "user_wrote_at": 160}

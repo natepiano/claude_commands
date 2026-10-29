@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# Admit when MemAvailable covers this step's expected anon peak, unfinished
-# growth promised to running builds (memory_admit.joint_promise), and earlyoom's
-# 5% reserve. Alone, the old 12 GiB threshold caps the threshold, so a wait ends
-# when builds end. No wait ends in a start without memory: at
+# Admit when MemAvailable covers this step, pending starts, and earlyoom's
+# 5% reserve. Running steps use measured resident plus swap memory.
+# The gate does not charge their historical peaks again. At
 # BUILDLOG_MEM_WAIT_LIMIT_S the gate prints one notice and goes on waiting, and
 # the step becomes first in line. BUILDLOG_MEM_WAIT_SINCE (epoch seconds) keeps
 # the place of a step that waits again; the gate sets BUILDLOG_MEM_WAIT_FROM. The first check resolves git and history;
-# held polls read only meminfo and the ledger under its lock. Release starts
+# held polls read meminfo, process trees and the ledger under its lock. Release starts
 # Python once more. With hana nextest's 5,397 index rows, measured first check
 # 431 ms, cached poll 102 ms, and release 97 ms (temporary ledger and real
 # read-only index, 2026-10-06 PDT).
@@ -35,14 +34,14 @@ buildlog_memory_python() {
     fi
 }
 
-# Status 0 only when the holder directory is a readable directory with no
-# entry at all and this shell expands patterns unfiltered; any doubt starts
-# the Python, which decides as before.
+# Status 0 when the holder directory is missing or readable with no entry.
+# This shell must expand patterns unfiltered; any doubt starts Python.
 build_hold_nothing_held() {
     [[ -n "${BUILD_HOLD_DIR-x}" ]] || return 1
     [[ "$-" != *f* && -z "${GLOBIGNORE-}" ]] || return 1
     if shopt -q failglob; then return 1; fi
     local holder_dir="${BUILD_HOLD_DIR-$HOME/.local/state/build-hold}" entry
+    if [[ ! -e "$holder_dir" && ! -L "$holder_dir" ]]; then return 0; fi
     [[ -d "$holder_dir" && -r "$holder_dir" && -x "$holder_dir" ]] || return 1
     for entry in "$holder_dir"/* "$holder_dir"/.[!.]* "$holder_dir"/..?*; do
         if [[ -e "$entry" || -L "$entry" ]]; then return 1; fi
@@ -60,13 +59,12 @@ BUILDLOG_HOLD_CALL_ID="${BUILDLOG_HOLD_CALL_ID:-}" BUILDLOG_HOLD_CALLER=""
 
 # Status 0 when natedev's hold applies to this step's caller. The Mac leg of a
 # test (verify-mac) and every run on the Mac answer to the Mac's claims, not
-# to natedev's hold. A holder directory that does not exist holds nothing:
-# build_hold.read_holders gives the same answer, with no Python start.
+# to natedev's hold. Other callers ask the check when the fast path cannot
+# prove that the holder directory is empty.
 build_hold_applies() {
     if [[ -n "${BUILDLOG_CALL_ID:-}" && "${BUILDLOG_CALLER:-}" == verify ]]; then return 0; fi
     [[ "${BUILDLOG_CALLER:-}" != verify-mac && "${OSTYPE:-}" != darwin* ]] || return 1
-    local holder_dir="${BUILD_HOLD_DIR-$HOME/.local/state/build-hold}"
-    [[ -z "$holder_dir" || -e "$holder_dir" || -L "$holder_dir" ]]
+    return 0
 }
 
 # Sets BUILDLOG_HOLD_CALL_ID and BUILDLOG_HOLD_CALLER for build_targets.py.
@@ -82,26 +80,79 @@ build_hold_call() {
     fi
 }
 
+# Only the check's allow status permits local work. Keep hold and leave
+# statuses for callers that wait or select another machine.
+build_check_stop() {
+    local status=$1 reason=$2
+    if [[ -n "${BUILDLOG_CHECK_FAILED_FILE:-}" ]]; then
+        printf '%s\n' "$reason" > "$BUILDLOG_CHECK_FAILED_FILE" || true
+    fi
+    printf '%s; step refused\n' "$reason" >&2
+    return "$status"
+}
+
+build_hold_check_result() {
+    local status=$1 check=$2
+    case "$check:$status" in
+        *:0|check-local:10|register-local:10|wait-local:10|wait-local:12|wait-local:75) return "$status" ;;
+    esac
+    build_check_stop "$status" "build hold check $check failed (exit $status)"
+}
+
 build_hold_wait_local() {
     build_hold_applies || return 0
     if build_hold_nothing_held; then return 0; fi
     build_hold_call
-    local waiter_pid status=0 arguments=(wait-local --call-id "$BUILDLOG_HOLD_CALL_ID" --pid "${BUILDLOG_HOLD_PID:-$$}")
+    local waiter_pid status=0 diagnostics output_fd output_pid output_status=0
+    local arguments=(wait-local --call-id "$BUILDLOG_HOLD_CALL_ID" --pid "${BUILDLOG_HOLD_PID:-$$}")
     if [[ -n "$BUILDLOG_HOLD_CALLER" ]]; then arguments+=(--caller "$BUILDLOG_HOLD_CALLER"); fi
     # A held natedev cannot start the step, so the leave hook also runs here:
     # status 75 (LINT_LEFT_QUEUE_STATUS) means another machine is free.
-    if [[ -n "${LINT_QUEUE_LEAVE_HOOK:-}" ]]; then arguments+=(--leave-hook "$LINT_QUEUE_LEAVE_HOOK"); fi
-    python3 "$BUILD_TARGETS_SCRIPT" "${arguments[@]}" &
+    if [[ -n "${LINT_QUEUE_LEAVE_HOOK:-${BUILDLOG_MAC_IDLE_HOOK:-}}" ]]; then
+        arguments+=(--leave-hook "${LINT_QUEUE_LEAVE_HOOK:-$BUILDLOG_MAC_IDLE_HOOK}")
+    fi
+    diagnostics=$(mktemp "${TMPDIR:-/tmp}/hold-check.XXXXXX") || {
+        build_check_stop 2 'cannot record build hold check output'
+        return 2
+    }
+    # Keep wait messages visible and check that a refusal included its reason.
+    if ! exec {output_fd}> >(tee "$diagnostics" >&2); then
+        rm -f "$diagnostics"
+        build_check_stop 2 'cannot read build hold check output'
+        return 2
+    fi
+    output_pid=$!
+    python3 "$BUILD_TARGETS_SCRIPT" "${arguments[@]}" 2>&"$output_fd" &
     waiter_pid=$!
+    exec {output_fd}>&-
     wait "$waiter_pid" || status=$?
-    return "$status"
+    wait "$output_pid" || output_status=$?
+    if (( output_status != 0 )); then
+        rm -f "$diagnostics"
+        build_check_stop 2 'cannot read build hold check output'
+        return 2
+    fi
+    if [[ ( "$status" == 10 || "$status" == 12 ) && ! -s "$diagnostics" ]]; then
+        rm -f "$diagnostics"
+        build_check_stop "$status" "build hold check wait-local gave no reason (exit $status)"
+        return "$status"
+    fi
+    rm -f "$diagnostics"
+    build_hold_check_result "$status" wait-local
 }
 
 build_hold_check_local() {
     build_hold_applies || return 0
     if build_hold_nothing_held; then return 0; fi
     build_hold_call
-    python3 "$BUILD_TARGETS_SCRIPT" check-local --caller "${BUILDLOG_HOLD_CALLER:-verify}"
+    local status=0
+    python3 "$BUILD_TARGETS_SCRIPT" check-local --caller "${BUILDLOG_HOLD_CALLER:-verify}" || status=$?
+    build_hold_check_result "$status" check-local
+}
+
+buildlog_memory_refuse() {
+    BUILDLOG_MEM_OUTCOME=CheckFailed
+    build_check_stop 2 "memory admission check failed ($1)"
 }
 
 buildlog_memory_line() {
@@ -113,13 +164,11 @@ buildlog_memory_line() {
         pooled) description="the 90th percentile of $count measured runs of this step in every repo" ;;
         *) description="no history, so the fallback" ;;
     esac
-    if [[ "$kind" == first ]]; then
+    if [[ "$kind" == first || "$kind" == periodic ]]; then
         awk -v a="$available" -v t="$threshold" -v n="$need" -v p="$promised" -v m="$running" -v r="$reserve" \
-            -v since="$(TZ="$(buildlog_memory_python "$USER_ZONE_SCRIPT" 2>/dev/null)" date '+%H:%M %Z')" -v repo="${11}" -v step="${12}" -v desc="$description" -v summary="$summary" \
-            'BEGIN { subject=(repo == "" ? step : repo " " step); printf "waiting for memory since %s: the machine has %.1f GiB free; a build starts at %.1f (%s needs %.1f GiB, %s", since,a/1073741824,t/1073741824,subject,n/1073741824,desc > "/dev/stderr"; if (m>0) printf "; %.1f GiB still promised to %d running steps: %s",p/1073741824,m,summary > "/dev/stderr"; if (r>0) printf "; %.1f GiB kept for earlyoom",r/1073741824 > "/dev/stderr"; print ")" > "/dev/stderr" }'
-    elif [[ "$kind" == periodic ]]; then
-        awk -v a="$available" -v t="$threshold" -v m="$(( BUILDLOG_MEM_WAIT_S / 60 ))" \
-            'BEGIN { printf "still waiting for memory (%d min): the machine has %.1f GiB free; a build starts at %.1f\n",m,a/1073741824,t/1073741824 > "/dev/stderr" }'
+            -v measured="${13:-0}" -v head_need="${14:-0}" -v head_label="${15:-}" -v kind="$kind" -v minutes="$(( BUILDLOG_MEM_WAIT_S / 60 ))" \
+            -v since="$(TZ="$(buildlog_memory_python "$USER_ZONE_SCRIPT" 2>/dev/null)" date '+%H:%M %Z')" -v repo="${11:-}" -v step="${12:-build}" -v desc="$description" -v summary="$summary" \
+            'BEGIN { subject=(repo == "" ? step : repo " " step); if (kind == "first") printf "waiting for memory since %s: ",since > "/dev/stderr"; else printf "still waiting for memory (%d min): ",minutes > "/dev/stderr"; printf "the machine has %.1f GiB free; a build starts at %.1f (%s needs %.1f GiB",a/1073741824,t/1073741824,subject,n/1073741824 > "/dev/stderr"; if (kind == "first") printf ", %s",desc > "/dev/stderr"; if (head_need>0) printf "; head %s needs %.1f GiB",head_label,head_need/1073741824 > "/dev/stderr"; if (m==0 && summary!="") printf "; %s",summary > "/dev/stderr"; else { printf "; %.1f GiB promised, %.1f GiB measured across %d running steps",p/1073741824,measured/1073741824,m > "/dev/stderr"; if (m>0) printf ": %s",summary > "/dev/stderr"; }; if (r>0) printf "; %.1f GiB kept for earlyoom",r/1073741824 > "/dev/stderr"; print ")" > "/dev/stderr" }'
     elif [[ "$kind" == left ]]; then
         printf 'another machine is free after %d min %d s: leaving the memory wait\n' "$(( BUILDLOG_MEM_WAIT_S / 60 ))" "$(( BUILDLOG_MEM_WAIT_S % 60 ))" >&2
     else
@@ -129,9 +178,14 @@ buildlog_memory_line() {
 
 buildlog_wait_for_memory() {
     BUILDLOG_MEM_WAIT_S=0 BUILDLOG_MEM_OUTCOME=MeminfoUnavailable BUILDLOG_MEM_RESERVATION=""
+    # This admission gate serves Linux. The Mac uses its claim admission.
+    if [[ "${OSTYPE:-}" == darwin* && -z "${BUILDLOG_MEMINFO+x}" ]]; then
+        BUILDLOG_MEM_OUTCOME=Granted
+        return 0
+    fi
     local meminfo="${BUILDLOG_MEMINFO:-/proc/meminfo}" line available_kb available result error_line
     local started=0 announced=0 next_notice=60 interval="${BUILDLOG_MEM_POLL_S:-5}" limit="${BUILDLOG_MEM_WAIT_LIMIT_S:-900}"
-    local state threshold need source count promised running reserve summary reservation repo step fresh reason worktree noticed=0 caller_pid=$BASHPID
+    local state threshold need source count promised running reserve summary reservation repo step fresh reason worktree measured head_need head_label fields numeric noticed=0 caller_pid=$BASHPID
     local cached_repo="" cached_step="" cached_worktree="" cached_need=- cached_source="" cached_count=0
     [[ "$interval" =~ ^[0-9]+$ && "$interval" -gt 0 ]] || interval=5
     [[ "$limit" =~ ^[0-9]+$ && "$limit" -ge 0 ]] || limit=900
@@ -157,19 +211,42 @@ buildlog_wait_for_memory() {
                 printf 'still waiting for memory after %d min: this step is now first in line, and no build starts without memory\n' "$(( BUILDLOG_MEM_WAIT_S / 60 ))" >&2
             fi
         fi
-        if ! result="$(buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" check "$meminfo" "$caller_pid" "${BUILDLOG_PEAK:+$BUILDLOG_PEAK.cgroup}" "$BUILDLOG_MEM_WAIT_FROM" "$cached_repo" "$cached_step" "$cached_worktree" "$cached_need" "$cached_source" "$cached_count" "$@" 2>&1)"; then
+        if ! result="$(BUILDLOG_MEM_DETAIL=1 buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" check "$meminfo" "$caller_pid" "${BUILDLOG_PEAK:+$BUILDLOG_PEAK.cgroup}" "$BUILDLOG_MEM_WAIT_FROM" "$cached_repo" "$cached_step" "$cached_worktree" "$cached_need" "$cached_source" "$cached_count" "$@" 2>&1)"; then
             error_line=${result##*$'\n'}
-            printf 'memory gate failed (%s); starting anyway\n' "$error_line" >&2
-            break
+            buildlog_memory_refuse "${error_line:-checker returned an error}"
+            return 2
         fi
-        IFS='|' read -r state threshold need source count promised running reserve summary reservation repo step fresh reason worktree <<< "$result"
+        fields=${result//[^|]/}
+        if [[ "$result" == *$'\n'* || ( ${#fields} != 14 && ${#fields} != 17 ) ]]; then
+            buildlog_memory_refuse 'invalid checker output'
+            return 2
+        fi
+        IFS='|' read -r state threshold need source count promised running reserve summary reservation repo step fresh reason worktree measured head_need head_label <<< "$result"
+        if [[ ${#fields} == 14 ]]; then measured=0 head_need=0; fi
+        case "$state:$reason" in
+            admit:reserved|admit:launch|hold:held|hold:launch) ;;
+            *) buildlog_memory_refuse "invalid admission answer $state:$reason"; return 2 ;;
+        esac
+        case "$source" in
+            measured|buildlog|pooled|fallback) ;;
+            *) buildlog_memory_refuse 'invalid memory source'; return 2 ;;
+        esac
+        for numeric in "$threshold" "$need" "$count" "$promised" "$running" "$reserve" "$fresh" "$measured" "$head_need"; do
+            if [[ ! "$numeric" =~ ^[0-9]+$ ]]; then
+                buildlog_memory_refuse 'invalid memory reading'
+                return 2
+            fi
+        done
+        if [[ "$state" == admit && $# -gt 0 && ( "$reason" != reserved || -z "$reservation" ) ]]; then
+            buildlog_memory_refuse 'step has no memory reservation'
+            return 2
+        fi
         available=$fresh
-        cached_repo=$repo cached_step=$step cached_worktree=$worktree cached_need=$need cached_source=$source cached_count=$count
+        # A refreshed estimate replaces the shell cache on every answer.
+        cached_repo=$repo cached_step=$step cached_worktree=$worktree
+        cached_need=$need cached_source=$source cached_count=$count
         if [[ "$state" == admit ]]; then
             BUILDLOG_MEM_RESERVATION="$reservation"
-            if [[ "$reason" == untracked ]]; then
-                echo 'memory gate could not track this step; starting without a reservation' >&2
-            fi
             BUILDLOG_MEM_OUTCOME=Granted
             if (( announced != 0 )); then
                 buildlog_memory_line done "$available" "$threshold" "$need" "$source" "$count" "$promised" "$running" "$reserve" "$summary"
@@ -178,26 +255,29 @@ buildlog_wait_for_memory() {
         fi
         # An app launch (no argv) has no reservation and its hook a 960 s timeout: it alone keeps the limit.
         if (( $# == 0 && announced != 0 && BUILDLOG_MEM_WAIT_S >= limit )) || (( $# == 0 && limit == 0 )); then
-            echo 'memory wait limit reached after 15 min; starting the launch anyway' >&2
-            BUILDLOG_MEM_OUTCOME=TimedOut
-            break
+            buildlog_memory_refuse 'launch wait limit reached without admission'
+            return 2
         fi
         if (( announced == 0 )); then
             started=$SECONDS
             announced=1
-            buildlog_memory_line first "$available" "$threshold" "$need" "$source" "$count" "$promised" "$running" "$reserve" "$summary" "$repo" "$step"
-        elif [[ -n "${LINT_QUEUE_LEAVE_HOOK:-}" ]] \
-              && /bin/sh -c "$LINT_QUEUE_LEAVE_HOOK" </dev/null >/dev/null 2>&1; then
+            buildlog_memory_line first "$available" "$threshold" "$need" "$source" "$count" "$promised" "$running" "$reserve" "$summary" "$repo" "$step" "${measured:-0}" "${head_need:-0}" "${head_label:-}"
+        elif [[ -n "${LINT_QUEUE_LEAVE_HOOK:-${BUILDLOG_MAC_IDLE_HOOK:-}}" ]] \
+              && /bin/sh -c "${LINT_QUEUE_LEAVE_HOOK:-$BUILDLOG_MAC_IDLE_HOOK}" </dev/null >/dev/null 2>&1; then
             BUILDLOG_MEM_OUTCOME=LeftQueue
             buildlog_memory_line left "$available" "$threshold" "$need" "$source" "$count" "$promised" "$running" "$reserve" "$summary"
             break
         elif (( BUILDLOG_MEM_WAIT_S >= next_notice )); then
-            buildlog_memory_line periodic "$available" "$threshold" "$need" "$source" "$count" "$promised" "$running" "$reserve" "$summary"
+            buildlog_memory_line periodic "$available" "$threshold" "$need" "$source" "$count" "$promised" "$running" "$reserve" "$summary" "$repo" "$step" "${measured:-0}" "${head_need:-0}" "${head_label:-}"
             next_notice=$(( next_notice + 60 ))
         fi
         sleep "$interval"
     done
     if (( announced != 0 )); then BUILDLOG_MEM_WAIT_S=$(( SECONDS - started )); fi
+    case "$BUILDLOG_MEM_OUTCOME" in
+        Granted|LeftQueue) return 0 ;;
+        *) buildlog_memory_refuse "cannot read MemAvailable from $meminfo" ;;
+    esac
 }
 
 buildlog_release_memory() {

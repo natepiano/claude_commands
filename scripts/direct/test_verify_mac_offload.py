@@ -7,6 +7,8 @@ import ctypes
 import json
 import os
 import signal
+import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -27,6 +29,35 @@ from scripts.build_hold import build_hold
 VERIFY = Path(__file__).with_name("verify.sh")
 # Paths and process exits advance tests; this is only a hung-process guard.
 HANG_GUARD_S = 300
+
+
+def stub_build_tool_path(directory: Path) -> str:
+    """Use private build stubs and wrappers for shell tools."""
+    for name in (
+        "bash", "sh", "python3", "git", "awk", "sed", "grep", "tee", "date",
+        "sleep", "mktemp", "dirname", "basename", "cat", "head", "uname", "tr",
+        "cut", "find", "xargs", "ps", "kill", "readlink", "stat", "mkdir", "rm",
+        "mv", "cp", "sort", "wc", "touch", "env", "chmod", "id", "hostname",
+        "flock", "timeout", "seq", "tail", "realpath", "perl", "nproc", "getconf",
+        "lscpu", "du", "df", "journalctl", "which", "setsid", "ln", "printf",
+        "cmp", "rmdir", "true", "false", "install", "readelf", "file",
+    ):
+        target = directory / name
+        source = shutil.which(name)
+        if source and not target.exists():
+            _ = target.write_text(f'#!/bin/sh\nexec {shlex.quote(source)} "$@"\n')
+            target.chmod(0o755)
+    for name in (
+        "cargo", "rustc", "rustdoc", "rustup", "nextest", "cargo-nextest",
+        "clippy-driver", "cargo-clippy", "rustfmt", "cargo-fmt", "cargo-mend",
+        "sccache", "cc", "gcc", "clang", "c++", "g++", "clang++", "make",
+        "cmake", "ninja", "ld", "lld", "ar",
+    ):
+        target = directory / name
+        if not target.exists():
+            _ = target.write_text('#!/bin/sh\necho "Unexpected build tool: $0" >&2\nexit 99\n')
+            target.chmod(0o755)
+    return str(directory)
 
 
 def restore_sigint() -> None:
@@ -539,6 +570,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
         blocker = "#!/bin/sh\nexit 99\n"
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.write_executable(self.bin_directory / name, blocker)
+        self.write_executable(self.bin_directory / "ssh", '#!/bin/sh\nprintf "free_gib=1000\\nhost=test-mac\\nrc=0\\n"\n')
         reader = self.root / "lint-config.sh"
         _ = reader.write_text(
             "lint_config_enabled() { return 1; }\n"
@@ -607,10 +639,14 @@ class VerifyMacOffloadTests(unittest.TestCase):
                     "BUILDLOG_MAC_REASON",
                     "BUILDLOG_LOCAL_REASON",
                     "BUILDLOG_MAC_S",
+                    "BASH_ENV",
+                    "ENV",
                 }
+                and not name.startswith("BASH_FUNC_")
             },
             "HOME": str(self.home),
-            "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
+            "PATH": stub_build_tool_path(self.bin_directory),
+            "RUSTUP_HOME": str(self.root / "rustup"),
             "PACKAGE_ROOT": str(self.root),
             "CARGO_TARGET_DIR": str(self.root / "target"),
             "CARGO_HOME": str(self.root / "cargo-home"),
@@ -618,6 +654,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
             "XDG_RUNTIME_DIR": str(self.root / "runtime"),
             "XDG_STATE_HOME": str(self.root / "state"),
             "XDG_CACHE_HOME": str(self.root / "cache"),
+            "VERIFY_STEPS_DIR": str(self.root / "verify-steps"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILDLOG_BUILDS_CGROUP": str(self.root / "cgroup"),
             "BUILDLOG_CI_CGROUP": str(self.root / "cgroup"),
@@ -633,6 +670,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
             "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "MAC_TEST_STATE_DIR": str(self.root / "mac-state"),
+            "MAC_IDLE_STATE_DIR": str(self.root / "mac-idle"),
             "BUILD_TARGETS_CONFIG": str(config),
             "MAC_TEST_CONFIG": str(settings),
             "CLAUDE_CODE_SESSION_ID": "", "BUILD_TARGETS_NOW": "",
@@ -656,6 +694,23 @@ class VerifyMacOffloadTests(unittest.TestCase):
         cache.parent.mkdir(parents=True, exist_ok=True)
         _ = cache.write_text(sys.executable + "\n")
         _ = self.environment.pop("CLAUDE_PYTHON", None)
+
+    def test_build_tools_cannot_use_the_host_path(self) -> None:
+        host_tools = self.root / "host-tools"
+        host_tools.mkdir()
+        reached = self.root / "host-build-tool-ran"
+        for name in ("cargo", "rustc", "nextest"):
+            self.write_executable(host_tools / name, f'#!/bin/sh\ntouch "{reached}"\nexit 98\n')
+        private_tools = self.root / "private-tools"
+        private_tools.mkdir()
+        with mock.patch.dict(os.environ, {"PATH": f"{host_tools}{os.pathsep}{os.environ['PATH']}"}):
+            private_path = stub_build_tool_path(private_tools)
+        for name in ("cargo", "rustc", "nextest"):
+            with self.subTest(tool=name):
+                result = subprocess.run([name, "--version"], env={**self.environment, "PATH": private_path},
+                                        capture_output=True, text=True, check=False, timeout=HANG_GUARD_S)
+                self.assertEqual(result.returncode, 99, result.stdout + result.stderr)
+        self.assertFalse(reached.exists())
 
     def write_executable(self, path: Path, source: str) -> None:
         _ = path.write_text(source if source.startswith("#!") else f"#!{sys.executable}\n" + source,
@@ -989,7 +1044,7 @@ signal.pause()
 
     def test_alternate_target_settings_are_passed_to_runner(self) -> None:
         alternate = self.root / "alternate Mac.conf"
-        _ = alternate.write_text(f"linux_only.{self.root.name}=\n")
+        _ = alternate.write_text(f"offload=on\nlinux_only.{self.root.name}=\n")
         config = Path(self.environment["BUILD_TARGETS_CONFIG"])
         _ = config.write_text(config.read_text().replace("mac settings.conf", alternate.name))
         result = self.verify("test", "sample", "--filter", "alpha", "--no-cache",
@@ -1002,7 +1057,7 @@ signal.pause()
         self.assertEqual(self.routing_record()["target"], "mac")
 
     def test_excluded_mac_reason_is_recorded_without_calling_offload(self) -> None:
-        for settings, reason in (("", "repo"), (f"linux_only.{self.root.name}=sample\n", "linux_only")):
+        for settings, reason in (("offload=on\n", "repo"), (f"offload=on\nlinux_only.{self.root.name}=sample\n", "linux_only")):
             with self.subTest(reason=reason):
                 self.clear_observations()
                 _ = Path(self.environment["MAC_TEST_CONFIG"]).write_text(settings)
@@ -1024,20 +1079,22 @@ signal.pause()
                 self.assertIn("verify.sh: running on natedev", result.stdout)
                 self.assertEqual(len(self.local_runs()), 1)
 
-    def test_unreadable_local_first_route_still_tries_the_eligible_mac(self) -> None:
+    def test_unreadable_local_first_route_refuses_before_either_machine_starts(self) -> None:
         config = Path(self.environment["BUILD_TARGETS_CONFIG"])
         _ = config.write_text(config.read_text().replace("targets=mac,natedev", "targets=natedev,mac"))
         damaged = self.root / "damaged-holders"
         _ = damaged.write_text("a file cannot be a hold directory\n")
         self.environment["BUILD_HOLD_DIR"] = str(damaged)
-        for outcome, reason, status, expected in (("passed", "", "0", 0), ("declined", "busy", "75", 12)):
+        for outcome, reason, status in (("passed", "", "0"), ("declined", "busy", "75")):
             with self.subTest(outcome=outcome):
                 self.clear_observations()
                 result = self.verify("test", "sample", "--filter", "alpha", "--no-cache", extra={
                     "TEST_RUNNER_MAC": outcome, "TEST_RUNNER_REASON": reason, "TEST_RUNNER_STATUS": status})
-                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
-                self.assertEqual(len(self.runner_events()), 1)
-                self.assertEqual(self.local_runs(), [])
+                self.assertEqual(result.returncode, 12, result.stdout + result.stderr)
+                self.assertIn("build hold check register-local failed (exit 12); step refused", result.stderr)
+                self.assertEqual(self.runner_events(), [])
+                self.assertEqual([event for event in self.cargo_events()
+                                  if event["args"][:1] != ["metadata"]], [])
                 self.assertIn("natedev's hold state cannot be read", result.stderr)
 
     def test_unreadable_local_first_route_without_eligible_mac_exits_twelve(self) -> None:
@@ -1717,6 +1774,45 @@ trap hold_after_routing DEBUG
     def test_lost_mac_run_retries_from_the_memory_wait(self) -> None:
         self.check_temporary_mac_decline("memory", "lost", "")
 
+    def check_idle_marker(self, wait_kind: str) -> None:
+        _ = self.control_routing_clock()
+        self.environment["MAC_IDLE_STATE_DIR"] = str(self.root / "idle-watch")
+        self.environment["TEST_FREE_NOW_FREE"] = "1"
+        if wait_kind == "routing":
+            _ = self.routing_fixture()
+        elif wait_kind == "memory":
+            _ = self.hold_memory()
+        else:
+            board = VERIFY.with_name("board.sh")
+            acquired = subprocess.run(["bash", str(board), "acquire", str(self.board), "peer", "cargo",
+                "--pid", str(os.getpid())], env=self.environment, capture_output=True, text=True, timeout=HANG_GUARD_S)
+            self.assertEqual(acquired.returncode, 0, acquired.stderr)
+        self.set_mac_answer("lost", "", 75)
+        process = self.start_verify("test", "sample", "--no-cache")
+        self.addCleanup(self.stop_verify, process)
+        self.wait_for_retry_probe(100, process)
+        self.assertEqual(len(self.runner_events()), 1)
+        paths = list((self.root / "idle-watch/calls").glob("*.json"))
+        self.assertEqual(len(paths), 1)
+        self.set_mac_answer("passed", "", 0)
+        _ = paths[0].with_suffix(".retry").write_text("retry_delayed\n")
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertEqual(len(self.runner_events()), 2)
+        self.assertEqual(self.local_runs(), [])
+        self.assertEqual(self.last_call()["mac"], "passed_full")
+        self.assertFalse(paths[0].with_suffix(".retry").exists())
+        self.assertEqual(list((self.board / "token_waiters").glob("*")), [])
+
+    def test_idle_marker_bypasses_memory_retry_spacing(self) -> None:
+        self.check_idle_marker("memory")
+
+    def test_idle_marker_bypasses_routing_retry_spacing(self) -> None:
+        self.check_idle_marker("routing")
+
+    def test_idle_marker_bypasses_token_retry_spacing(self) -> None:
+        self.check_idle_marker("token")
+
     def test_runner_decline_retries_from_the_routing_wait(self) -> None:
         self.check_temporary_mac_decline("routing", "none", "")
 
@@ -1931,7 +2027,7 @@ trap hold_after_routing DEBUG
                     "verify.sh: --local is only for a test that cannot pass on macOS, not to keep "
                     + f'tests off the Mac ("{reason}"). To reserve the Mac, its holder runs '
                     + "/build:hold hold <why> target mac: tests then skip the Mac by themselves, "
-                    + "/build:targets shows the hold, and it ends at its expiry. Leave --local off.\n",
+                    + "/build:status shows the hold, and it ends at its expiry. Leave --local off.\n",
                 )
                 self.assertEqual(self.cargo_events(), [])
                 self.assertEqual(self.runner_events(), [])

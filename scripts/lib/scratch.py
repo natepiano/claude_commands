@@ -50,6 +50,7 @@ import string
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -351,20 +352,20 @@ def unsaved_work(path: Path) -> str | None:
     return None
 
 
-def end(task: str, now: float | None = None) -> list[Path]:
+def end(task: str, now: float | None = None, *, keep: Callable[[Path], bool] = lambda _: False) -> list[Path]:
     """Remove every folder and held folder of the task. A held folder whose repo holds unsaved work
-    stays, and its hold is marked ended."""
+    stays, and its hold is marked ended. Folders selected by keep stay unchanged."""
     _ = checked_task(task, False)
     removed: list[Path] = []
     for folder in folders():
-        if folder.task == task:
+        if folder.task == task and not keep(folder.path):
             remove(folder.path)
             removed.append(folder.path)
     found = holds()
     moment = time.time() if now is None else now
     changed = False
     for path, record in list(found.items()):
-        if record["task"] != task:
+        if record["task"] != task or keep(Path(path)):
             continue
         changed = True
         held = Path(path)

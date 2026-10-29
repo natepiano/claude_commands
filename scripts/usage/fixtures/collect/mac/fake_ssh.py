@@ -128,6 +128,9 @@ def main() -> int:
             return 255
         if behavior == "python_error":
             print("fixture remote Python error", file=sys.stderr)
+            # The collector stops SSH when it reads a failed status, so the
+            # report must exist before the status line can reach it.
+            save_stream_report(Path(configuration["report"]), report)
             _ = output.write(b"rc=1\n")
             return 0
         environment = os.environ.copy()

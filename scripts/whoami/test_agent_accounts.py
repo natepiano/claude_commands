@@ -26,6 +26,9 @@ from unittest.mock import patch
 from scripts.whoami import agent_accounts, usage_store
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 def folder_service(folder: Path) -> str:
     """Independent vector from the service-name contract supplied by the director."""
     value = unicodedata.normalize("NFC", str(folder)).encode("utf-8")
@@ -165,17 +168,72 @@ class SharedUsageReadTests(unittest.TestCase):
         with patch.object(urllib.request, "urlopen", side_effect=unlocked_response):
             self.assertEqual(self.read().usage_read_outcome, agent_accounts.UsageReadOutcome.OK)
 
+    def test_named_live_read_uses_disk_identity_without_starting_claude(self) -> None:
+        folder = self.home / ".claude2"
+        folder.mkdir()
+        _ = (folder / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "shared@example.invalid"}}))
+        with patch.object(agent_accounts, "claude_credentials", return_value={
+                "claudeAiOauth": {"accessToken": "fixture", "subscriptionType": "max"}}), \
+             patch.object(agent_accounts, "command_json", side_effect=AssertionError("CLI started")) as cli, \
+             patch.object(urllib.request, "urlopen", side_effect=self.response):
+            report = agent_accounts.claude_live(folder, use_disk_identity=True)
+        cli.assert_not_called()
+        self.assertEqual(report.email, "shared@example.invalid")
+        self.assertEqual(report.plan, "max")
+        self.assertEqual(report.weekly_remaining, 75)
+
+    def test_missing_disk_subscription_keeps_cli_plan_label(self) -> None:
+        folder = self.home / ".claude2"
+        folder.mkdir()
+        _ = (folder / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "shared@example.invalid"}}))
+        with (patch.object(agent_accounts, "command_json", return_value={
+                "loggedIn": True, "email": "shared@example.invalid", "authMethod": "claude.ai",
+                "subscriptionType": "max"}) as cli,
+              patch.object(urllib.request, "urlopen", side_effect=self.response)):
+            report = agent_accounts.claude_live(folder, use_disk_identity=True)
+        cli.assert_called_once()
+        self.assertEqual(report.plan, "max")
+        self.assertEqual(report.weekly_remaining, 75)
+
+    def test_unreadable_disk_credentials_keeps_cli_plan_label(self) -> None:
+        folder = self.home / ".claude2"
+        folder.mkdir()
+        _ = (folder / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "shared@example.invalid"}}))
+        with (patch.object(agent_accounts, "claude_credentials", side_effect=OSError("fixture")),
+              patch.object(agent_accounts, "command_json", return_value={
+                "loggedIn": True, "email": "shared@example.invalid", "authMethod": "claude.ai",
+                "subscriptionType": "max"}) as cli):
+            report = agent_accounts.claude_live(folder, use_disk_identity=True)
+        cli.assert_called_once()
+        self.assertEqual(report.plan, "max")
+
+    def test_named_disk_subscription_reads_credentials_once(self) -> None:
+        folder = self.home / ".claude2"
+        folder.mkdir()
+        _ = (folder / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "shared@example.invalid"}}))
+        with (patch.object(agent_accounts, "claude_credentials", return_value={
+                "claudeAiOauth": {"accessToken": "fixture", "subscriptionType": "max"}}) as credentials,
+              patch.object(urllib.request, "urlopen", side_effect=self.response)):
+            report = agent_accounts.claude_live(folder, use_disk_identity=True)
+        credentials.assert_called_once_with(folder)
+        self.assertEqual(report.plan, "max")
+        self.assertEqual(report.weekly_remaining, 75)
+
     def test_threads_share_one_read_then_a_read_after_ninety_seconds_runs(self) -> None:
         start = Barrier(2)
 
         def read_together() -> agent_accounts.Report:
-            _ = start.wait(timeout=2)
+            _ = start.wait(timeout=TEST_HANG_GUARD_SECS)
             return self.read()
 
         with patch.object(urllib.request, "urlopen", side_effect=self.response) as http:
             with ThreadPoolExecutor(max_workers=2) as pool:
                 first, second = pool.submit(read_together), pool.submit(read_together)
-                reports = [first.result(timeout=3), second.result(timeout=3)]
+                reports = [first.result(timeout=TEST_HANG_GUARD_SECS), second.result(timeout=TEST_HANG_GUARD_SECS)]
             self.assertCountEqual([report.usage_read_outcome for report in reports],
                 [agent_accounts.UsageReadOutcome.OK, agent_accounts.UsageReadOutcome.HELD])
             held = next(report for report in reports if report.usage_read_outcome == agent_accounts.UsageReadOutcome.HELD)
@@ -210,7 +268,7 @@ with (patch.object(agent_accounts, 'command_json', return_value={
                   + "claim = usage_store.claim_read\n"
                   + f"usage_store.claim_read = lambda login, now: claim(login, datetime.fromisoformat({self.now.isoformat()!r}))\n"
                   + script)
-        result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=5)
+        result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_rate_limit_holds_for_ten_minutes_even_when_the_caller_does_not_save(self) -> None:

@@ -142,7 +142,7 @@ These all use this path: effort changes (`unit_effort.py`), promotion, relays an
 - `every_marked_unit() -> MarkedProductions(units, faults)` reads all units once and raises `OSError` when herdr cannot be read. Two sessions carrying one unit's mark is a fault, and that production is left out. `marked_units(slug)` raises the fault as `OSError`. Slugs resolve through `canonical_slug`.
 - CLI: `list <slug>` prints `unit, herdr:<session>:<pane>, session, live|unknown|stopped, name, session id, socket`. `pane <slug> <unit>` prints `place_text(place)`. Exit 0, 1 no such unit, 2 usage, 3 cannot tell.
 
-Marks are `SHOWRUNNER_UNIT` (production slug) and `SHOWRUNNER_UNIT_ID` (unit). They are set only in the pane environment when a unit launches, so an existing session cannot be adopted as a unit later.
+Marks are `SHOWRUNNER_UNIT` (production slug) and `SHOWRUNNER_UNIT_ID` (unit). They are set in the pane environment when a unit launches; adopting an existing conversation requires a safe stop and marked relaunch with `add_unit.py --attach`.
 
 ### Launchers
 
@@ -156,11 +156,16 @@ Marks are `SHOWRUNNER_UNIT` (production slug) and `SHOWRUNNER_UNIT_ID` (unit). T
 `add_unit.main` does this:
 
 - It picks the account with `accounts.account_for_group_launch("unit", ...)`, checks it with `accounts.check`, and takes the launch barrier and permission (`RecordedSessionRestoreLaunchPurpose` for a restore). Then it runs `preflight`.
+- Every `--resume`, including restores, refuses in `preflight` before any stub, Units row, commit, worktree or tab is written when the shared session registry identifies a running session (naming its pid), or when registry or process identity is unreadable (naming the reason).
+- A plain `--resume` of an existing Units row, active or retired, continues its transcript without requiring a Production header in the row’s own plan document, so a condensed as-built remains usable; new units and attaches still require the header, and a resume with a different plan still refuses.
+- A plain `--resume` of a retired Units row may use `--cwd` outside its worktree: the raw Plan cell supplies the retired state, the row keeps its worktree and branch, and the launch creates neither and leaves the row for resume_unit to unmark; other cwd mismatches retain their refusal.
 - On a resume of a marked unit, `ClaudeUnknown` refuses, and `ClaudeNotRunning` closes that place's tab with `close_agent` before the relaunch.
 - A restore records its prompt as scheduled (`record_scheduled_restore_prompt`). The resumed model is the transcript's last real assistant model unless `--model` is given.
 - A new unit waits until `read_place` shows `/remote-control is active`.
 - It prints `<unit> started: <attach_hint>` or `<unit> restore launched: <attach_hint>`, the unit's tab in its production's workspace.
 - Exit 1 on `AgentNotReady` (prints the screen), 2 on a refusal, 1 on other failures.
+
+`--attach <id> --cwd <dir>` accepts a running session with `--plan`, `--standby` or `--permanent`. It checks the row, worktree, trust and source account before requesting `shutdown.py down <account> --here --only <id>`, follows the request within shutdown's pause limit, and requires both a stopped record and no surviving process. It then writes the unit, resumes the same conversation once with unit marks, finishes the shutdown record through `clear_running_on_target`, and proves one new registered pid. Unknown liveness or account, an incomplete stop, a surviving old process, or an ambiguous final process count refuses; an incomplete stop prints its cancel command. Plain `--resume` refuses a running session and directs the caller to `--attach`.
 
 **Lower showrunners.** `add_showrunner.launch(child, model, effort, resume, cwd, selected)` uses no marks. The pane gets `ENABLE_TOOL_SEARCH=true` and the account variables. Arguments are `--model --effort [--resume] --remote-control <slug> -n <slug> --settings '{"disableAgentView": true}'`. It runs `start_server(agents, 90_000)`, opens a tab titled `<slug>` in `herdr_space(<slug>, <doc>)` and sends the prompt `/showrunner:produce <doc>[ resume]`. `checked` refuses when a tab of the shared session already has the slug's title (`herdr_tab_open`). Exit 3 (`SESSION_NOT_READY`) on `AgentNotReady`. It prints `started <slug>: <attach_hint>`, then waits up to `ADD_SHOWRUNNER_WAIT_S` (180 s, poll 2 s) for the showrunner to appear before attaching it to the caller.
 

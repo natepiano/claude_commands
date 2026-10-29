@@ -7,6 +7,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -112,6 +113,15 @@ class TmpSweepCase(unittest.TestCase):
         output = io.StringIO()
         with redirect_stdout(output), redirect_stderr(io.StringIO()):
             status = tmp_sweep.run(dry_run, self.now, self.roots(), str(self.proc))
+        return status, output.getvalue()
+
+    def command(self, *arguments: str) -> tuple[int, str]:
+        output = io.StringIO()
+        with (redirect_stdout(output), redirect_stderr(output),
+              mock.patch.object(tmp_sweep, "default_roots", return_value=self.roots()),
+              mock.patch.object(tmp_sweep, "PROC_DIR", str(self.proc)),
+              mock.patch("time.time", return_value=self.now)):
+            status = tmp_sweep.main(list(arguments))
         return status, output.getvalue()
 
     def log(self) -> list[dict[str, object]]:
@@ -550,7 +560,7 @@ class RunFolderTests(TmpSweepCase):
                 _ = self.sweep()
                 self.assertTrue(payload.is_file())
 
-    def test_an_unended_roster_seat_keeps_its_idle_run(self) -> None:
+    def test_an_unended_roster_worker_keeps_its_idle_run(self) -> None:
         for status in ("starting", "running", "done", "failed"):
             with self.subTest(status=status):
                 payload = write(self.unit / status / "board.log")
@@ -558,7 +568,7 @@ class RunFolderTests(TmpSweepCase):
                 _ = self.sweep()
                 self.assertTrue(payload.is_file())
 
-    def test_a_paused_roster_seat_keeps_the_run_and_its_temp_entries(self) -> None:
+    def test_a_paused_roster_worker_keeps_the_run_and_its_temp_entries(self) -> None:
         payload = write(self.delegate / "paused" / "tmp" / "old" / "file")
         roster = write(payload.parents[2] / "mesh_roster.json", json.dumps({"fix": {"status": "paused"}}))
         _ = self.sweep()
@@ -635,6 +645,319 @@ class RunFolderTests(TmpSweepCase):
                 result = self.sweep()
                 self.assertFalse(run.exists())
                 self.assertIn(str(run), [entry["path"] for entry in result.deleted])
+
+
+class HandCleanupTests(TmpSweepCase):
+    def ended_run(self, name: str) -> Path:
+        run = write(self.unit / name / "board.log").parent
+        _ = write(run / "mesh_roster.json", json.dumps({"fix": {"status": "ended"}}))
+        return run
+
+    def test_plan_lists_keep_and_remove_reasons_and_changes_nothing(self) -> None:
+        ended = self.ended_run("ended")
+        paused = self.ended_run("paused")
+        _ = write(paused / "mesh_roster.json", json.dumps({"fix": {"status": "paused"}}))
+        plan = self.tmp.parent / "plan.json"
+        status, output = self.command("--plan", str(plan))
+        self.assertEqual(status, 0, output)
+        self.assertTrue((ended / "board.log").is_file())
+        self.assertTrue((paused / "board.log").is_file())
+        self.assertIn(f"remove {ended}: all recorded workers ended", output)
+        self.assertIn(f"keep {paused}: a worker has not ended", output)
+        self.assertIn(f"tmp sweep: plan {plan}", output)
+        self.assertEqual(tmp_sweep.planned_removals(plan), [str(ended)])
+        self.assertFalse(self.state.exists())
+
+    def test_age_without_end_evidence_keeps_an_unused_folder(self) -> None:
+        idle = write(self.tmp / "unknown" / "file").parent
+        plan = self.tmp.parent / "plan.json"
+        status, output = self.command("--plan", str(plan))
+        self.assertEqual(status, 0, output)
+        self.assertIn(f"keep {idle}: no recorded end", output)
+        status, output = self.command("--apply", str(plan))
+        self.assertEqual(status, 0, output)
+        self.assertTrue((idle / "file").is_file())
+
+    def test_apply_removes_only_planned_paths_and_logs_each_removal(self) -> None:
+        ended = self.ended_run("ended")
+        kept = self.ended_run("kept")
+        _ = write(kept / "mesh_roster.json", json.dumps({"fix": {"status": "paused"}}))
+        plan = self.tmp.parent / "plan.json"
+        status, output = self.command("--plan", str(plan))
+        self.assertEqual(status, 0, output)
+        added = self.ended_run("added-after-plan")
+        _ = write(kept / "mesh_roster.json", json.dumps({"fix": {"status": "ended"}}))
+        status, output = self.command("--apply", str(plan))
+        self.assertEqual(status, 0, output)
+        self.assertFalse(ended.exists())
+        self.assertTrue((added / "board.log").is_file())
+        self.assertTrue((kept / "board.log").is_file())
+        self.assertIn(f"tmp sweep: deleted {ended}", output)
+        deleted = cast(list[dict[str, object]], self.log()[0]["deleted"])
+        self.assertEqual([entry["path"] for entry in deleted], [str(ended)])
+
+    def test_apply_rechecks_worker_marker_process_and_unreadable_record(self) -> None:
+        for change in ("worker", "marker", "process", "unreadable"):
+            with self.subTest(change=change):
+                run = self.ended_run(change)
+                plan = self.tmp.parent / f"{change}.json"
+                status, output = self.command("--plan", str(plan))
+                self.assertEqual(status, 0, output)
+                if change == "worker":
+                    _ = write(run / "mesh_roster.json", json.dumps({"fix": {"status": "paused"}}))
+                elif change == "marker":
+                    _ = write(self.unit / "active" / change, str(run) + "\n")
+                elif change == "process":
+                    fake_process(self.proc, 123, cwd=str(run))
+                else:
+                    _ = write(run / "mesh_roster.json", "{")
+                status, output = self.command("--apply", str(plan))
+                self.assertEqual(status, 0, output)
+                self.assertTrue((run / "board.log").is_file())
+                self.assertIn(f"keep {run}:", output)
+                self.assertNotIn(f"deleted {run}", output)
+
+    def test_apply_cannot_delete_a_path_outside_the_current_candidates(self) -> None:
+        outside = write(self.tmp.parent / "outside" / "file").parent
+        plan = write(self.tmp.parent / "plan.json", json.dumps({"version": 1, "entries": [
+            {"path": str(outside), "action": "remove", "reason": "all recorded workers ended"},
+        ]}))
+        status, output = self.command("--apply", str(plan))
+        self.assertEqual(status, 0, output)
+        self.assertTrue((outside / "file").is_file())
+        self.assertIn(f"keep {outside}: no current sweep candidate", output)
+
+    def test_an_existing_plan_is_preserved_and_bad_plans_remove_nothing(self) -> None:
+        run = self.ended_run("ended")
+        plan = write(self.tmp.parent / "plan.json", "not json")
+        status, output = self.command("--plan", str(plan))
+        self.assertEqual(status, 1, output)
+        self.assertEqual(plan.read_text(), "not json")
+        status, output = self.command("--apply", str(plan))
+        self.assertEqual(status, 1, output)
+        self.assertTrue((run / "board.log").is_file())
+
+
+class WorkerAndGitTests(TmpSweepCase):
+    def git(self, repo: Path, *arguments: str) -> None:
+        _ = subprocess.run(["git", "-C", str(repo), "-c", "user.name=test", "-c", "user.email=test@test",
+                            *arguments], check=True, capture_output=True, timeout=10,
+                           env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+
+    def clone(self, name: str, *options: str) -> Path:
+        source = self.tmp.parent / f"source-{name}"
+        source.mkdir()
+        self.git(source, "init", "-q")
+        _ = write(source / "file", "saved\n")
+        self.git(source, "add", "file")
+        self.git(source, "commit", "-qm", "saved")
+        destination = self.tmp / "scratch" / name / "repo"
+        destination.parent.mkdir(parents=True)
+        self.git(source, "clone", "-q", *options, str(source), str(destination))
+        self.now: float = time.time() + 5 * 3600
+        return destination
+
+    def live_worker(self, cwd: Path, status: str = "paused") -> Path:
+        run = self.unit / "worker-run"
+        _ = write(run / "mesh_roster.json", json.dumps({
+            "impl": {"status": status, "thread_id": "worker-thread"},
+        }))
+        _ = write(run / "mesh_runs" / "run.json", json.dumps({"cwd": str(cwd)}))
+        return run
+
+    def test_dirty_clone_without_worker_stays_and_plan_names_unsaved_work(self) -> None:
+        repo = self.clone("dirty")
+        _ = write(repo / "file", "unsaved edit\n")
+        plan = self.tmp.parent / "dirty-plan.json"
+        status, output = self.command("--plan", str(plan))
+        self.assertEqual(status, 0, output)
+        self.assertIn(f"keep {repo.parent}: {tmp_sweep.UNSAVED_WORK}", output)
+        result = self.sweep()
+        self.assertEqual((repo / "file").read_text(), "unsaved edit\n")
+        self.assertIn(str(repo.parent), result.kept[tmp_sweep.UNSAVED_WORK])
+        self.assertIn(str(repo.parent), tmp_sweep.record(result, False, self.now)["kept_paths"][tmp_sweep.UNSAVED_WORK])
+
+    def test_untracked_file_and_unpublished_commit_keep_clean_or_dirty_clones(self) -> None:
+        for kind in ("untracked", "commit", "detached"):
+            with self.subTest(kind=kind):
+                repo = self.clone(kind)
+                _ = write(repo / "new", "work\n")
+                if kind != "untracked":
+                    self.git(repo, "add", "new")
+                    self.git(repo, "commit", "-qm", "local work")
+                    if kind == "detached":
+                        self.git(repo, "checkout", "-q", "--detach")
+                result = self.sweep()
+                self.assertTrue((repo / "new").exists())
+                self.assertIn(str(repo.parent), result.kept[tmp_sweep.UNSAVED_WORK])
+
+    def test_clean_pushed_clone_without_worker_is_removed(self) -> None:
+        repo = self.clone("pushed")
+        result = self.sweep()
+        self.assertFalse(repo.exists())
+        self.assertIn(str(repo.parent), [entry["path"] for entry in result.deleted])
+
+    def test_clone_source_refs_save_a_local_clone_without_remote_tracking_refs(self) -> None:
+        for kind in ("local", "shared"):
+            with self.subTest(kind=kind):
+                repo = self.clone(kind, *(('--shared',) if kind == "shared" else ()))
+                self.git(repo, "remote", "remove", "origin")
+                if kind == "local":
+                    self.git(repo, "remote", "add", "origin", str(self.tmp.parent / f"source-{kind}"))
+                result = self.sweep()
+                self.assertFalse(repo.exists())
+                self.assertIn(str(repo.parent), [entry["path"] for entry in result.deleted])
+
+    def test_git_file_worktree_with_an_unsaved_edit_stays(self) -> None:
+        repo = self.clone("linked-source")
+        linked = self.tmp / "scratch" / "linked"
+        self.git(repo, "worktree", "add", "-q", "--detach", str(linked))
+        _ = write(linked / "file", "local edit\n")
+        result = self.sweep()
+        self.assertTrue((linked / ".git").is_file())
+        self.assertIn(str(linked), result.kept[tmp_sweep.UNSAVED_WORK])
+
+    def test_source_tag_without_a_branch_does_not_replace_a_remote_copy(self) -> None:
+        for kind in ("local-tag", "shared-tag"):
+            with self.subTest(kind=kind):
+                repo = self.clone(kind, *(('--shared',) if kind == "shared-tag" else ()))
+                source = self.tmp.parent / f"source-{kind}"
+                self.git(source, "branch", "-M", "source-branch")
+                self.git(source, "tag", "saved")
+                self.git(source, "update-ref", "-d", "refs/heads/source-branch")
+                self.git(repo, "remote", "remove", "origin")
+                if kind == "local-tag":
+                    self.git(repo, "remote", "add", "origin", str(source))
+                result = self.sweep()
+                self.assertTrue(repo.exists())
+                self.assertIn(str(repo.parent), result.kept[tmp_sweep.UNSAVED_WORK])
+
+    def test_git_failure_or_timeout_keeps_the_idle_clone(self) -> None:
+        repo = self.clone("error")
+        for error in (ValueError("git failed"), subprocess.TimeoutExpired("git", 10)):
+            with self.subTest(error=type(error).__name__), mock.patch.object(tmp_sweep, "checked_git", side_effect=error):
+                result = self.sweep()
+                self.assertTrue(repo.exists())
+                self.assertIn(str(repo.parent), result.kept[tmp_sweep.UNREADABLE])
+
+    def test_git_directory_link_is_not_followed_and_keeps_the_entry(self) -> None:
+        repo = self.clone("git-link")
+        outside = self.tmp.parent / "outside-git"
+        os.rename(repo / ".git", outside)
+        (repo / ".git").symlink_to(outside)
+        with mock.patch.object(tmp_sweep, "checked_git", side_effect=AssertionError("followed git link")):
+            result = self.sweep()
+        self.assertTrue(repo.exists())
+        self.assertTrue(outside.exists())
+        self.assertIn(str(repo.parent), result.kept[tmp_sweep.UNREADABLE])
+
+    def test_live_worker_cwd_keeps_idle_folder_until_all_workers_end(self) -> None:
+        folder = write(self.tmp / "scratch" / "worker-clone" / "repo" / "file").parents[1]
+        run = self.live_worker(folder / "repo")
+        plan = self.tmp.parent / "worker-plan.json"
+        status, output = self.command("--plan", str(plan))
+        self.assertEqual(status, 0, output)
+        self.assertIn(f"keep {folder}: {tmp_sweep.WORKER_USES}", output)
+        result = self.sweep()
+        self.assertTrue(folder.exists())
+        self.assertIn(str(folder), tmp_sweep.record(result, False, self.now)["kept_paths"][tmp_sweep.WORKER_USES])
+        _ = write(run / "mesh_roster.json", json.dumps({"impl": {"status": "ended", "thread_id": "worker-thread"}}))
+        _ = self.sweep()
+        self.assertFalse(folder.exists())
+
+    def test_active_run_mesh_record_keeps_its_working_folder_under_any_root(self) -> None:
+        folder = write(self.tmp / "copy" / "repo" / "file").parents[1]
+        run = self.unit / "marked-run"
+        _ = write(run / "mesh_runs" / "run.json", json.dumps({"cwd": str(folder / "repo")}))
+        _ = write(self.unit / "active" / LIVE_SESSION, str(run))
+        result = self.sweep()
+        self.assertTrue(folder.exists())
+        self.assertIn(str(folder), result.kept[tmp_sweep.WORKER_USES])
+
+    def test_empty_pending_and_mesh_run_files_do_not_keep_an_idle_pushed_clone(self) -> None:
+        for kind in ("pending", "mesh", "both"):
+            with self.subTest(kind=kind):
+                repo = self.clone(f"empty-{kind}")
+                run = self.live_worker(self.tmp.parent / "outside")
+                if kind in ("pending", "both"):
+                    _ = write(run / "impl.pending.json", "")
+                if kind in ("mesh", "both"):
+                    _ = write(run / "mesh_runs" / "empty.json", "")
+                errors = io.StringIO()
+                with redirect_stderr(errors):
+                    result = self.sweep()
+                self.assertFalse(repo.exists())
+                self.assertIn(str(repo.parent), [entry["path"] for entry in result.deleted])
+                self.assertEqual(errors.getvalue(), "")
+
+    def test_unreadable_live_worker_record_keeps_scratch_and_plain_entries_and_names_record(self) -> None:
+        folder = write(self.tmp / "scratch" / "unknown-clone" / "file").parent
+        other = write(self.tmp / "unknown-copy" / "file").parent
+        run = self.live_worker(self.tmp.parent / "unknown")
+        temp = write(self.tmp / "session" / "worker-thread" / "tmpabcdefgh" / "file").parent
+        broken = write(run / "mesh_runs" / "bad.json", "{")
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            result = self.sweep()
+        self.assertTrue(folder.exists())
+        self.assertTrue(other.exists())
+        self.assertFalse(temp.exists())
+        self.assertIn(str(temp), [entry["path"] for entry in result.deleted])
+        self.assertIn(str(broken), errors.getvalue())
+        self.assertIn(str(folder), result.kept[tmp_sweep.UNREADABLE])
+        self.assertIn(str(other), result.kept[tmp_sweep.UNREADABLE])
+
+    def test_known_worker_folder_keeps_its_reason_when_another_record_is_unreadable(self) -> None:
+        folder = write(self.tmp / "scratch" / "known" / "file").parent
+        run = self.live_worker(folder)
+        _ = write(run / "mesh_runs" / "bad.json", "{")
+        with redirect_stderr(io.StringIO()):
+            result = self.sweep()
+        self.assertTrue(folder.exists())
+        self.assertIn(str(folder), result.kept[tmp_sweep.WORKER_USES])
+
+    def test_only_mesh_run_cwd_keeps_a_working_folder(self) -> None:
+        folder = write(self.tmp / "scratch" / "listed" / "file").parent
+        unrelated = write(self.tmp / "unrelated" / "file").parent
+        run = self.live_worker(folder)
+        _ = write(run / "evidence.json", json.dumps(["pass", {"cwd": str(unrelated)}]))
+        _ = write(run / "impl.pending.json", json.dumps({"working_dir": str(unrelated)}))
+        _ = write(run / "mesh_runs" / "results.json", json.dumps(["pass", {"cwd": str(unrelated)}]))
+        _ = write(run / "mesh_runs" / "run.json", json.dumps({
+            "cwd": str(folder), "metadata": {"cwd": str(unrelated)},
+        }))
+        result = self.sweep()
+        self.assertTrue(folder.exists())
+        self.assertFalse(unrelated.exists())
+        self.assertIn(str(folder), result.kept[tmp_sweep.WORKER_USES])
+
+    def test_live_worker_session_parent_stays_while_old_entries_go(self) -> None:
+        parent = self.tmp / "session" / "worker-thread"
+        run = self.live_worker(parent)
+        old = write(parent / "old" / "file").parent
+        fresh = write(parent / "fresh" / "file")
+        self.recent(fresh)
+        _ = self.sweep()
+        self.assertTrue(parent.exists())
+        self.assertFalse(old.exists())
+        self.assertTrue(fresh.exists())
+        _ = write(run / "mesh_roster.json", json.dumps({"impl": {"status": "ended", "thread_id": "worker-thread"}}))
+        os.utime(fresh, (0, 0))
+        _ = self.sweep()
+        self.assertFalse(parent.exists())
+
+    def test_apply_rechecks_unsaved_work_added_after_a_remove_plan(self) -> None:
+        repo = self.clone("apply")
+        scratch.write_record(repo.parent, scratch.until_task(self.now - 60), 0.0)
+        plan = self.tmp.parent / "apply-plan.json"
+        status, output = self.command("--plan", str(plan))
+        self.assertEqual(status, 0, output)
+        self.assertIn(f"remove {repo.parent}:", output)
+        _ = write(repo / "file", "unsaved after plan\n")
+        status, output = self.command("--apply", str(plan))
+        self.assertEqual(status, 0, output)
+        self.assertTrue(repo.exists())
+        self.assertIn(f"keep {repo.parent}: {tmp_sweep.UNSAVED_WORK}", output)
 
 
 class RunningSessionTests(unittest.TestCase):

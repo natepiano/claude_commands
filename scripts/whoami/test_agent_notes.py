@@ -89,7 +89,185 @@ class AgentNotesTests(unittest.TestCase):
     def snapshot(self, reports: list[Report]) -> agent_notes.UpdatedAgentNotes:
         selection = agent_accounts.ClaudeAccountsInUse(agent_accounts.UnreadableIdentity(Path.home() / ".claude", "fixture identity unavailable"), False, (), frozenset())
         with patch.object(agent_notes, "live_reports", return_value=reports), patch.object(five_hour, "watch", return_value=[]):
-            return agent_notes.update_alert_pass(selection, agent_accounts.observe_workers_home())
+            return agent_notes.update_alert_pass(selection, agent_accounts.observe_workers_home(), force_usage=True)
+
+    def test_timer_reuses_usage_but_updates_session_sections_each_pass(self) -> None:
+        home = self.root / ".codex"
+        self.codex_login(home, "timer@example.invalid")
+        note = self.note("codex1.md", "timer@example.invalid")
+        report = Report("Codex", email="timer@example.invalid", source=CodexHomeSource(home),
+                        quotas=[Quota("Weekly", 20, self.future)], credit_balance="0")
+        selection = agent_accounts.ClaudeAccountsInUse(
+            agent_accounts.UnreadableIdentity(self.root / ".claude", "fixture"), False, (), frozenset())
+        with (patch.object(agent_notes, "live_reports", return_value=[report]) as collect,
+              patch.object(five_hour, "watch", return_value=[])):
+            first = agent_notes.update_alert_pass(selection, home)
+            before = note.path.read_bytes()
+            second = agent_notes.update_alert_pass(selection, home)
+        self.assertEqual(collect.call_count, 1)
+        self.assertEqual(self.rows.call_count, 2)
+        self.assertEqual(note.path.read_bytes(), before)
+        self.assertEqual(second.codex_readings.checked_homes[0].observed_at,
+                         first.codex_readings.checked_homes[0].observed_at)
+        self.assertEqual(second.codex_readings.checked_homes[0].report.weekly_remaining, 80)
+
+    def test_explicit_usage_refresh_bypasses_recent_timer_reading(self) -> None:
+        with (patch.object(agent_notes, "live_reports", return_value=[]) as collect,
+              patch.object(five_hour, "watch", return_value=[])):
+            _ = agent_notes.update()
+            with patch.object(sys, "argv", ["agent_notes.py", "refresh"]), \
+                 patch.object(agent_notes, "refresh", return_value=[]), \
+                 patch.object(agent_notes, "current_session", return_value=None), \
+                 patch.object(codex_pacer, "tick"), patch.object(agent_notes, "mark_tier"), \
+                 redirect_stdout(io.StringIO()):
+                agent_notes.main()
+        self.assertEqual(collect.call_count, 2)
+
+    def test_refusal_reads_once_per_pass_and_does_not_repeat_session_collection(self) -> None:
+        from collections.abc import Callable
+
+        def refuse(*, refresh_usage: Callable[[], None]) -> list[str]:
+            refresh_usage()
+            return []
+
+        with (patch.object(agent_notes, "live_reports", return_value=[]) as collect,
+              patch.object(five_hour, "watch", return_value=[]),
+              patch.object(sys, "argv", ["agent_notes.py"]),
+              patch.object(agent_notes, "alert", return_value=[]),
+              patch.object(codex_pacer, "tick"), patch.object(agent_notes, "mark_tier"),
+              patch.object(refusal_watch, "run", side_effect=refuse), redirect_stdout(io.StringIO())):
+            agent_notes.main()
+            self.assertEqual(collect.call_count, 1)
+            agent_notes.main()
+        self.assertEqual(collect.call_count, 2)
+        self.assertEqual(self.rows.call_count, 2)
+
+    def test_timer_signature_is_stable_when_session_order_changes(self) -> None:
+        from dataclasses import replace
+        selection = agent_accounts.ClaudeAccountsInUse(
+            agent_accounts.UnreadableIdentity(self.root / ".claude", "fixture"), False, (),
+            frozenset(("first@example.invalid", "second@example.invalid")),
+            (self.root / ".claude2", self.root / ".claude3"))
+        reordered = replace(selection, live_directories=tuple(reversed(selection.live_directories)))
+        self.assertEqual(agent_notes.timer_usage_signature(selection, self.root / ".codex"),
+                         agent_notes.timer_usage_signature(reordered, self.root / ".codex"))
+
+    def test_refusal_refresh_saves_the_same_login_labels_as_the_main_pass(self) -> None:
+        from collections.abc import Callable
+
+        _ = self.note("claude1.md", "timer@example.invalid")
+
+        def refuse(*, refresh_usage: Callable[[], None]) -> list[str]:
+            refresh_usage()
+            return []
+
+        with (patch.object(agent_notes, "live_reports", return_value=[]),
+              patch.object(five_hour, "watch", return_value=[]),
+              patch.object(sys, "argv", ["agent_notes.py"]),
+              patch.object(agent_notes, "alert", return_value=[]),
+              patch.object(codex_pacer, "tick"), patch.object(agent_notes, "mark_tier"),
+              patch.object(refusal_watch, "run", side_effect=refuse),
+              patch.object(usage_store, "save") as save, redirect_stdout(io.StringIO())):
+            agent_notes.main()
+            agent_notes.main()
+        self.assertEqual(save.call_count, 2)
+        for saved in save.call_args_list:
+            self.assertEqual(saved.args[2:], ({"claude1": "timer@example.invalid"},))
+
+    def test_low_in_use_quota_keeps_two_minute_reads_until_exhaustion(self) -> None:
+        for tool in ("Claude", "Codex"):
+            for window in ("weekly", "five_hour"):
+                for left in (1, 10):
+                    with self.subTest(tool=tool, window=window, left=left):
+                        home = self.root / ".codex"
+                        report = Report(tool, email="timer@example.invalid",
+                            source=CodexHomeSource(home) if tool == "Codex" else ClaudeDirectorySource(self.root / ".claude1"),
+                            quotas=[Quota("Weekly", 100 - left if window == "weekly" else 20, self.future)],
+                            five_hour=Quota("5-hour", 100 - left if window == "five_hour" else 20, self.future))
+                        exhausted = Report(tool, email=report.email, source=report.source,
+                            quotas=[Quota("Weekly", 100, self.future)], five_hour=Quota("5-hour", 100, self.future))
+                        selection = agent_accounts.ClaudeAccountsInUse(
+                            agent_accounts.UnreadableIdentity(self.root / ".claude", "fixture"), False, (),
+                            frozenset(("timer@example.invalid",)) if tool == "Claude" else frozenset())
+                        with (patch.object(agent_notes, "live_reports", side_effect=[[report], [exhausted]]) as collect,
+                              patch.object(five_hour, "watch", return_value=[])):
+                            _ = agent_notes.update_alert_pass(selection, home, force_usage=True)
+                            result = agent_notes.update_alert_pass(selection, home)
+                        self.assertEqual(collect.call_count, 2)
+                        self.assertFalse(result.usage_reused)
+
+    def test_timer_reads_again_when_a_codex_login_changes(self) -> None:
+        home = self.root / ".codex"
+        self.codex_login(home, "first@example.invalid")
+        selection = agent_accounts.ClaudeAccountsInUse(
+            agent_accounts.UnreadableIdentity(self.root / ".claude", "fixture"), False, (), frozenset())
+        with (patch.object(agent_notes, "live_reports", return_value=[]) as collect,
+              patch.object(five_hour, "watch", return_value=[])):
+            _ = agent_notes.update_alert_pass(selection, home)
+            self.codex_login(home, "second@example.invalid")
+            _ = agent_notes.update_alert_pass(selection, home)
+        self.assertEqual(collect.call_count, 2)
+
+    def test_timer_refreshes_at_ten_minutes(self) -> None:
+        selection = agent_accounts.ClaudeAccountsInUse(
+            agent_accounts.UnreadableIdentity(self.root / ".claude", "fixture"), False, (), frozenset())
+        observed = self.now
+
+        class ObservationTime(datetime):
+            @classmethod
+            @override
+            def now(cls, tz: tzinfo | None = None) -> Self:
+                return cls.fromtimestamp(observed.timestamp(), tz)
+
+        with (patch.object(agent_notes, "live_reports", return_value=[]) as collect,
+              patch.object(five_hour, "watch", return_value=[]),
+              patch.object(agent_notes, "datetime", ObservationTime)):
+            _ = agent_notes.update_alert_pass(selection, self.root / ".codex")
+            observed = self.now + timedelta(minutes=9, seconds=59)
+            _ = agent_notes.update_alert_pass(selection, self.root / ".codex")
+            self.assertEqual(collect.call_count, 1)
+            observed = self.now + timedelta(minutes=10)
+            _ = agent_notes.update_alert_pass(selection, self.root / ".codex")
+        self.assertEqual(collect.call_count, 2)
+
+    def test_timer_reads_again_for_exhaustion_or_pending_move(self) -> None:
+        from scripts.accounts import next_moves
+        for exhausted in (False, True):
+            with self.subTest(exhausted=exhausted):
+                _ = self.note("claude1.md", "timer@example.invalid",
+                              "weekly_remaining_usage: 0\n" if exhausted else "")
+                selection = agent_accounts.ClaudeAccountsInUse(
+                    agent_accounts.UnreadableIdentity(self.root / ".claude", "fixture"), False, (),
+                    frozenset(("timer@example.invalid",)))
+                with (patch.object(agent_notes, "live_reports", return_value=[]) as collect,
+                      patch.object(five_hour, "watch", return_value=[]),
+                      patch.object(next_moves, "read_next_moves", return_value=() if exhausted else (object(),))):
+                    _ = agent_notes.update_alert_pass(selection, self.root / ".codex")
+                    _ = agent_notes.update_alert_pass(selection, self.root / ".codex")
+                self.assertEqual(collect.call_count, 2)
+
+    def test_exhausted_inactive_spare_does_not_disable_timer_reuse(self) -> None:
+        _ = self.note("claude1.md", "spare@example.invalid", "weekly_remaining_usage: 0\n")
+        report = Report("Claude", email="spare@example.invalid", quotas=[Quota("Weekly", 100, self.future)])
+        selection = agent_accounts.ClaudeAccountsInUse(
+            agent_accounts.UnreadableIdentity(self.root / ".claude", "fixture"), False, (), frozenset())
+        with (patch.object(agent_notes, "live_reports", return_value=[report]) as collect,
+              patch.object(five_hour, "watch", return_value=[])):
+            _ = agent_notes.update_alert_pass(selection, self.root / ".codex")
+            _ = agent_notes.update_alert_pass(selection, self.root / ".codex")
+        self.assertEqual(collect.call_count, 1)
+
+    def test_exhausted_selected_five_hour_window_requires_fresh_usage(self) -> None:
+        home = self.root / ".codex"
+        report = Report("Codex", source=CodexHomeSource(home), quotas=[Quota("Weekly", 20, self.future)],
+                        five_hour=Quota("5-hour", 100, self.future))
+        selection = agent_accounts.ClaudeAccountsInUse(
+            agent_accounts.UnreadableIdentity(self.root / ".claude", "fixture"), False, (), frozenset())
+        with (patch.object(agent_notes, "live_reports", return_value=[report]) as collect,
+              patch.object(five_hour, "watch", return_value=[])):
+            _ = agent_notes.update_alert_pass(selection, home)
+            _ = agent_notes.update_alert_pass(selection, home)
+        self.assertEqual(collect.call_count, 2)
 
     def test_held_usage_adds_no_note_message_or_quota_change(self) -> None:
         note = self.note("claude2.md", "main@example.invalid",
@@ -389,9 +567,9 @@ class AgentNotesTests(unittest.TestCase):
     def test_argument_free_notes_update_runs_watcher_after_notes_alert_and_pacer(self) -> None:
         events: list[str] = []
         update = agent_notes.update_alert_pass
-        def updated(selection: agent_accounts.ClaudeAccountsInUse, home: Path) -> agent_notes.UpdatedAgentNotes:
+        def updated(selection: agent_accounts.ClaudeAccountsInUse, home: Path, *, force_usage: bool = False) -> agent_notes.UpdatedAgentNotes:
             events.append("notes")
-            return update(selection, home)
+            return update(selection, home, force_usage=force_usage)
         def alerted(*_args: object, **_kwargs: object) -> list[str]:
             events.append("alert")
             return []
@@ -444,7 +622,7 @@ class AgentNotesTests(unittest.TestCase):
             self.fail(f"{name} did not parse as a note")
         return note
 
-    def account_dir(self, label: str, login: str, token: str) -> Path:
+    def account_dir(self, label: str, login: str, token: str, *, subscription_type: str = "") -> Path:
         if label == "default":
             directory = self.root / ".claude"
             directory.mkdir(exist_ok=True)
@@ -455,7 +633,7 @@ class AgentNotesTests(unittest.TestCase):
             config = directory / ".claude.json"
         _ = config.write_text(json.dumps({"oauthAccount": {"emailAddress": login}}))
         _ = (directory / ".credentials.json").write_text(json.dumps({
-            "claudeAiOauth": {"accessToken": token},
+            "claudeAiOauth": {"accessToken": token, "subscriptionType": subscription_type},
         }))
         return directory
 
@@ -631,6 +809,7 @@ class AgentNotesTests(unittest.TestCase):
         for reports in ([workers_report, spare_report], [spare_report, workers_report]):
             with (
                 self.subTest(order=[report.email for report in reports]),
+                patch.object(usage_store, "recent_timer_usage", return_value=usage_store.TimerUsageDue()),
                 patch.object(agent_notes, "live_reports", return_value=reports),
                 patch.object(five_hour, "watch", return_value=[]) as watch,
             ):
@@ -696,6 +875,7 @@ class AgentNotesTests(unittest.TestCase):
             workers_report.email = current_login
             with (
                 self.subTest(current_login=current_login),
+                patch.object(usage_store, "recent_timer_usage", return_value=usage_store.TimerUsageDue()),
                 patch.object(agent_notes, "live_reports", return_value=[spare_report, workers_report]),
                 patch.object(five_hour, "watch", return_value=[]) as watch,
             ):
@@ -858,9 +1038,9 @@ class AgentNotesTests(unittest.TestCase):
         self.assertEqual(watch.call_args.args[0], [reports[0]])
 
     def test_update_reads_two_active_accounts_and_an_inactive_spare(self) -> None:
-        default = self.account_dir("default", "main@example.com", "main-fixture-token")
-        unit = self.account_dir("claude3", "unit@example.com", "unit-fixture-token")
-        spare = self.account_dir("claude1", "spare@example.com", "spare-fixture-token")
+        default = self.account_dir("default", "main@example.com", "main-fixture-token", subscription_type="max")
+        unit = self.account_dir("claude3", "unit@example.com", "unit-fixture-token", subscription_type="max")
+        spare = self.account_dir("claude1", "spare@example.com", "spare-fixture-token", subscription_type="max")
         (self.root / ".claude9").mkdir()
         self.select_unit("claude3")
         _ = self.note("claude2.md", "main@example.com")
@@ -898,7 +1078,7 @@ class AgentNotesTests(unittest.TestCase):
         ):
             _ = agent_notes.update()
 
-        self.assertCountEqual(observed, [default, unit, spare])
+        self.assertEqual(observed, [])
         notes = {note.label: note for note in note_file.read_notes()}
         self.assertEqual({label: note.get("weekly_remaining_usage") for label, note in notes.items()}, {
             "claude1": "90", "claude2": "80", "claude3": "4",
@@ -908,6 +1088,7 @@ class AgentNotesTests(unittest.TestCase):
         self.assertCountEqual([(reading["account"], reading["remaining"]) for reading in readings],
                               [("claude2", 80), ("claude3", 4), ("claude1", 90)])
         watched = cast(list[Report], watch.call_args.args[0])
+        self.assertEqual({report.plan for report in watched}, {"max"})
         self.assertEqual([(report.tool, report.email) for report in watched],
                          [("Claude", "unit@example.com"), ("Claude", "main@example.com")])
         self.assertEqual(watched[1].source, ClaudeDirectorySource(default))
@@ -1016,7 +1197,8 @@ class AgentNotesTests(unittest.TestCase):
             if directory == Path.home() / ".claude" and isinstance(home_state, account.LegacyHomeLogin):
                 return home_state.account
             return account.Account("claude", logins[directory], "fixture") if directory is not None else None
-        def live(directory: Path) -> Report:
+        def live(directory: Path, *, use_disk_identity: bool = False) -> Report:
+            self.assertTrue(use_disk_identity)
             return Report("Claude", email=logins[directory], quotas=[Quota("Weekly", 96, self.future)],
                           source=agent_accounts.ClaudeDirectorySource(directory))
         with (patch.object(sessions, "live_sessions", return_value=owners) as observed_sessions,
@@ -1034,12 +1216,12 @@ class AgentNotesTests(unittest.TestCase):
               patch.object(five_hour, "watch", return_value=[]),
               patch.object(agent_notes, "alert", return_value=[])):
             _ = agent_notes.update_for_selection(selection, self.root / ".codex")
-            self.assertCountEqual(reads.call_args_list, [call(directory) for directory in logins])
+            self.assertCountEqual(reads.call_args_list, [call(directory, use_disk_identity=True) for directory in logins])
             reads.reset_mock()
             output = io.StringIO()
             with redirect_stdout(output):
                 asyncio.run(whoami.main())
-            self.assertCountEqual(reads.call_args_list, [call(directory) for directory in logins])
+            self.assertCountEqual(reads.call_args_list, [call(directory, use_disk_identity=True) for directory in logins])
         for login in logins.values():
             self.assertIn(login, output.getvalue())
 
@@ -1057,6 +1239,7 @@ class AgentNotesTests(unittest.TestCase):
             main.email = main_email
             with (
                 self.subTest(main_email=main_email),
+                patch.object(usage_store, "recent_timer_usage", return_value=usage_store.TimerUsageDue()),
                 patch.object(agent_notes, "live_reports", return_value=[unit, codex, main]),
                 patch.object(five_hour, "watch", return_value=[]) as watch,
             ):
@@ -1098,7 +1281,7 @@ class AgentNotesTests(unittest.TestCase):
               patch.object(agent_accounts, "codex_live", return_value=Report("Codex")),
               patch.object(five_hour, "watch", return_value=[])):
             _ = agent_notes.update()
-        claude.assert_called_once_with(self.root / ".claude")
+        claude.assert_called_once_with(self.root / ".claude", use_disk_identity=True)
         updated = {note.label: note for note in note_file.read_notes()}
         self.assertEqual(updated[active.label].get("weekly_remaining_usage"), "80")
         self.assertEqual(updated[spare.label].get("weekly_remaining_usage"), "null")

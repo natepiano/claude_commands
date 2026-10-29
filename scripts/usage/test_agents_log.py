@@ -17,6 +17,9 @@ from unittest.mock import patch
 from scripts.usage import agents_log
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 REPOSITORY = Path(__file__).resolve().parents[2]
 SCRIPT = Path(__file__).with_name("agents_log.py")
 AT = datetime(2026, 10, 11, 17, 30, tzinfo=timezone.utc)
@@ -44,7 +47,7 @@ class AgentsLogTests(unittest.TestCase):
             env=os.environ.copy(),
             capture_output=True,
             text=True,
-            timeout=20,
+            timeout=TEST_HANG_GUARD_SECS,
             check=False,
         )
 
@@ -319,7 +322,7 @@ print(json.dumps(register_default('shared-session', 'interactive', datetime.now(
                 _ = process.stdin.write("go\n")
                 process.stdin.flush()
             for process in processes:
-                output, errors = process.communicate(timeout=20)
+                output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual((process.returncode, errors), (0, ""))
                 wrote = cast(object, json.loads(output))
                 self.assertIsInstance(wrote, bool)
@@ -505,7 +508,7 @@ for index in range(20):
                 _ = process.stdin.write("go\n")
                 process.stdin.flush()
             for process in processes:
-                output, errors = process.communicate(timeout=20)
+                output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual((process.returncode, output, errors), (0, "", ""))
         finally:
             for process in processes:
@@ -580,7 +583,7 @@ exec(compile(sys.stdin.read(), module.__file__, 'exec'), module.__dict__)
 """
         result = subprocess.run([sys.executable, "-I", "-c", program],
                                 input=Path(agents_log.__file__).read_text(),
-                                capture_output=True, text=True, check=False, timeout=10)
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_archive_backfill_links_the_old_ledger_and_preserves_its_timestamp(self) -> None:

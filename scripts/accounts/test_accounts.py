@@ -30,6 +30,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
+from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader, installed_program
 from scripts.production import showrunners
 from scripts.agents import codex_mesh
 from scripts.message import roster
@@ -39,6 +40,9 @@ import agent_accounts
 import usage_store
 import quota_alert
 from scripts.whoami import run_out
+
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
 
 send_role_map_command = role_map.ssh_role_map
 
@@ -57,16 +61,8 @@ def named_environment(config_dir: Path) -> dict[str, str]:
     }
 
 
-def installed_program(home: Path, tool: str) -> str:
-    """Put an executable fixture in the shared installer directory. Never run it."""
-    program = home / ".local" / "bin" / tool
-    program.parent.mkdir(parents=True, exist_ok=True)
-    _ = program.write_text("#!/bin/sh\nexit 99\n")
-    program.chmod(0o700)
-    return str(program)
-
-
 def setUpModule() -> None:
+    _ = cast(object, unittest.enterModuleContext(patch.object(accounts, "import_module", side_effect=imports_with_nix_loader(fake_nix_loader()))))
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory())).resolve()
     _ = unittest.enterModuleContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
     _ = unittest.enterModuleContext(patch.object(accounts, "WORKERS_RUN_ROOTS", (root / "worker-runs",)))
@@ -516,6 +512,41 @@ class AccountsTests(unittest.TestCase):
         path = accounts.groups_file()
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text(json.dumps({"units": label}))
+
+    def test_exec_claude_uses_default_home_and_removes_inherited_account_settings(self) -> None:
+        from scripts.shutdown import launch_permission
+
+        arguments = ["--resume", "conversation id", "--", "quoted argument"]
+        for tty, probe in ((False, False), (True, False), (False, True)):
+            with (self.subTest(tty=tty, probe=probe),
+                  patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root / "inherited"),
+                      "CLAUDE_CODE_REMOTE_MEMORY_DIR": str(self.root / "inherited-memory"),
+                      "CLAUDE_CODE_OAUTH_TOKEN": "fixture-token", "KEEP": "yes",
+                      "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
+                      "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")}),
+                  patch.object(accounts, "prepared_account") as prepare,
+                  patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()),
+                  patch.object(subprocess, "run", side_effect=AssertionError("unexpected subprocess")),
+                  patch.object(subprocess, "Popen", side_effect=AssertionError("unexpected subprocess")),
+                  patch.object(sys.stdin, "isatty", return_value=tty),
+                  patch.object(os, "execvpe") as launch):
+                self.assertEqual(self.run_cli("exec", *(["--probe"] if probe else []),
+                                              "claude", *arguments), (0, "", ""))
+                prepare.assert_not_called()
+                launch.assert_called_once()
+                program, argv, environment = cast(tuple[str, list[str], dict[str, str]], launch.call_args.args)
+                claude = str(self.home / ".local/bin/claude")
+                if tty:
+                    self.assertEqual(program, sys.executable)
+                    self.assertEqual(argv, [sys.executable, str(accounts.SCRIPTS / "lib/relaunch.py"),
+                                           "run", "--", claude, *arguments])
+                else:
+                    self.assertEqual((program, argv), (claude, [claude, *arguments]))
+                self.assertNotIn("CLAUDE_CONFIG_DIR", environment)
+                self.assertNotIn("CLAUDE_CODE_REMOTE_MEMORY_DIR", environment)
+                self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", environment)
+                self.assertEqual(environment["KEEP"], "yes")
+                self.assertEqual(environment.get("CLAUDE_PROBE_SESSION"), "1" if probe else None)
 
     def test_exec_default_login_without_named_dirs_preserves_arguments_and_removes_config_override(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -5077,7 +5108,7 @@ _ = sys.stdin.read()
         process = subprocess.Popen([sys.executable, str(Path(accounts.__file__)), "setup", "codex1"],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment)
         try:
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + TEST_HANG_GUARD_SECS
             while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
                 time.sleep(0.01)
             self.assertTrue(ready.exists(), "The fake server must wait for its startup answer")
@@ -5087,7 +5118,7 @@ _ = sys.stdin.read()
             output_pipe = cast(TextIO, process.stdout)
             with selectors.DefaultSelector() as selector:
                 _ = selector.register(output_pipe, selectors.EVENT_READ)
-                self.assertTrue(selector.select(timeout=1), "The setup wait line must be flushed to its pipe")
+                self.assertTrue(selector.select(timeout=TEST_HANG_GUARD_SECS), "The setup wait line must be flushed to its pipe")
             line = output_pipe.readline()
             self.assertIn("initialize", line)
             self.assertIn("limit", line)
@@ -5095,7 +5126,7 @@ _ = sys.stdin.read()
         finally:
             release.touch()
             try:
-                output, errors = process.communicate(timeout=5)
+                output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
             except subprocess.TimeoutExpired:
                 process.kill()
                 output, errors = process.communicate()

@@ -16,12 +16,18 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal, Protocol, cast
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 import build_hold
 from hold_applies import BUILDING_CARGO_VERBS, cargo_verb
+
+if TYPE_CHECKING:
+    from ..direct import step_record
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
+    import step_record
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "buildlog"))
 
@@ -69,6 +75,33 @@ def state_directory() -> Path:
     return Path(os.environ.get("BUILD_HOLD_ENFORCER_DIR", str(Path.home() / ".local/state/build-hold-enforcer")))
 
 
+def read_processes(
+    proc_root: Path, uid: int, cgroup_root: Path = build_hold.SYSTEM_CGROUP_ROOT,
+) -> dict[int, build_hold.AuditProcess]:
+    """Include call-id processes even when their names are not build commands."""
+    processes = build_hold.read_audit_processes(proc_root, build_hold.HoldBuildCandidates(uid), cgroup_root)
+    for pid, process in tuple(processes.items()):
+        if process.uid != uid or process.argv:
+            continue
+        directory = proc_root / str(pid)
+        try:
+            environment = dict(part.decode("utf-8", "replace").split("=", 1) for part in
+                               (directory / "environ").read_bytes().split(b"\0") if b"=" in part)
+        except OSError:
+            continue
+        process = replace(process, environment=environment)
+        if environment.get("BUILDLOG_CALL_ID"):
+            try:
+                argv = tuple(part.decode("utf-8", "replace") for part in
+                             (directory / "cmdline").read_bytes().split(b"\0") if part)
+                cwd = str((directory / "cwd").readlink())
+            except OSError:
+                argv, cwd = (), ""
+            process = replace(process, argv=argv, cwd=cwd)
+        processes[pid] = process
+    return processes
+
+
 def python_target(arguments: tuple[str, ...]) -> tuple[str, ...]:
     """Read the Python entry point, not arguments passed to another script."""
     skip_value = False
@@ -91,8 +124,12 @@ def is_waiting_gate(process: build_hold.AuditProcess) -> bool:
     if not process.argv:
         return False
     executable = Path(process.argv[0]).name
-    if executable == "verify.sh":
+    if executable in {"verify.sh", "merge_gate.py"}:
         return True
+    if executable.startswith("python"):
+        target = python_target(process.argv[1:])
+        return (target[:2] == ("-m", "scripts.production.merge_gate")
+                or bool(target) and Path(target[0]).name == "merge_gate.py")
     if executable not in {"bash", "sh", "dash", "zsh"}:
         return False
     for argument in process.argv[1:]:
@@ -107,19 +144,25 @@ def is_build(process: build_hold.AuditProcess) -> bool:
     names = {process.executable, Path(process.argv[0]).name if process.argv else process.command}
     if "cargo" in names:
         return cargo_verb(process.argv[1:]) in BUILDING_CARGO_VERBS
+    if "rustc" in names:
+        arguments = process.argv[1:]
+        if arguments and arguments[0].startswith("+"):
+            arguments = arguments[1:]
+        if arguments in {("-vV",), ("-V",), ("--version",)}:
+            return False
     if names & ((build_hold.AUDIT_COMMANDS - {"cargo"}) | {"clippy-driver", "pytest", "py.test", "basedpyright", "merge_gate.py"}):
         return True
     if "rust-analyzer" in names:
         # Ownership needs ancestors, so it is checked by decide_builds.
         return True
     if any(name.startswith("python") for name in names):
-        if any(Path(name).match("test_*.py") or Path(name).match("*_test.py") for name in names):
+        if any(Path(name).match("test_*.py") for name in names):
             return True
         target = python_target(process.argv[1:])
         return (target[:2] in {("-m", "unittest"), ("-m", "pytest")}
                 or target[:2] == ("-m", "scripts.production.merge_gate")
                 or bool(target) and (Path(target[0]).name in {"pytest", "py.test", "merge_gate.py", "basedpyright"}
-                                     or Path(target[0]).match("test_*.py") or Path(target[0]).match("*_test.py")))
+                                     or Path(target[0]).match("test_*.py")))
     if names & {"node", "nodejs"}:
         return any(Path(argument).name in {"basedpyright", "basedpyright.js"} for argument in process.argv[1:])
     if names & {"bash", "sh", "dash", "zsh"}:
@@ -134,7 +177,7 @@ def is_build(process: build_hold.AuditProcess) -> bool:
 
 
 def is_build_like(process: build_hold.AuditProcess) -> bool:
-    return is_build(process) or is_waiting_gate(process)
+    return bool(process.environment.get("BUILDLOG_CALL_ID")) or is_build(process) or is_waiting_gate(process)
 
 
 def is_sccache_server(process: build_hold.AuditProcess) -> bool:
@@ -152,12 +195,25 @@ def protected_reason(
 ) -> str:
     if process.identity in enforcer_ancestors:
         return "enforcer or its ancestor"
-    if is_waiting_gate(process):
-        return "verify.sh sends tests to the Mac and waits at its own gate"
-    if any(is_sccache_server(item) for item in (process, *ancestors)):
-        return "sccache server compiles for the holder too"
     if build_hold.owner_is_sole_holder(owner, holders):
         return "owned by the sole in-force holder"
+    call_id = process.environment.get("BUILDLOG_CALL_ID", "")
+    if call_id:
+        record = step_record.read(call_id)
+        if isinstance(record, step_record.StepRecord):
+            if process.identity == build_hold.ProcessIdentity(record.pid, record.proc_start):
+                return f"step {call_id} controller stays alive to route the step"
+            if record.state in {
+                step_record.StepState.ON_MAC, step_record.StepState.WAITING_HOLD, step_record.StepState.WAITING_MAC,
+                step_record.StepState.LOCAL_NONCOMPILING,
+            }:
+                return f"step {call_id} is {record.state.value}"
+        # Missing, stale and unreadable records grant no permission.
+        return ""
+    if is_waiting_gate(process):
+        return "verify.sh or merge_gate.py waits at its own hold gate"
+    if any(is_sccache_server(item) for item in (process, *ancestors)):
+        return "sccache server compiles for the holder too"
     lineage = (process, *ancestors)
     markers = {"CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "UNIT_RUN_DIR", "UNIT_SESSION_DIR",
                "PLAN_DELEGATE_BOARD_DIR", "PLAN_DELEGATE_SESSION_DIR"}
@@ -183,7 +239,8 @@ def decide_builds(
         ancestors = build_hold.audit_ancestors(process, processes)
         owner = build_hold.audit_owner(process, ancestors)
         names = {process.executable, Path(process.argv[0]).name if process.argv else process.command}
-        if "rust-analyzer" in names and isinstance(owner, build_hold.NoOwningSession):
+        if (not process.environment.get("BUILDLOG_CALL_ID") and "rust-analyzer" in names
+                and isinstance(owner, build_hold.NoOwningSession)):
             continue
         reason = protected_reason(process, ancestors, owner, holders, protected)
         if reason or not holders:
@@ -235,7 +292,7 @@ def record_build(
             "pid": identity.pid, "proc_start": identity.start_time, "class": build.classification,
             "session": build.owner.session_id if isinstance(build.owner, build_hold.OwningSession) else "",
             "command": shlex.join(build.process.argv) or build.process.command, "cwd": build.process.cwd,
-            "action": action,
+            "action": action, "call_id": build.process.environment.get("BUILDLOG_CALL_ID", ""),
         })
 
 
@@ -284,12 +341,15 @@ class StopBuildsAndTests:
         if not self.terminating:
             return
         now = self.clock()
-        allowed = {item.process.identity for item in decide_builds(processes, holders,
-                   os.getuid(), enforcer_pid) if not isinstance(item, WouldStopBuild)}
+        enforcer = processes.get(enforcer_pid)
+        protected: set[build_hold.ProcessIdentity] = {item.identity for item in (enforcer, *build_hold.audit_ancestors(enforcer, processes))} if enforcer else set()
         for identity, deadline in tuple(self.terminating.items()):
             process = processes.get(identity.pid)
             lineage = (process, *build_hold.audit_ancestors(process, processes)) if process is not None else ()
-            if identity in allowed or any(item.identity in holder.keep for holder in holders for item in lineage):
+            owner = build_hold.audit_owner(process, lineage[1:]) if process is not None else build_hold.NoOwningSession()
+            # A route change cannot cancel termination of an old process.
+            if (not holders or identity in protected or build_hold.owner_is_sole_holder(owner, holders)
+                    or any(item.identity in holder.keep for holder in holders for item in lineage)):
                 del self.terminating[identity]
                 continue
             if now >= deadline:
@@ -380,7 +440,7 @@ def run(
             holders = build_hold.natedev_holds(holder_directory).in_force
             if not holders:
                 return 0
-            processes = build_hold.read_audit_processes(proc_root, build_hold.HoldBuildCandidates(uid), cgroup_root)
+            processes = read_processes(proc_root, uid, cgroup_root)
             stopper.kill_survivors(processes, holders, enforcer_pid)
             for decision in decide_builds(processes, holders, uid, enforcer_pid):
                 if isinstance(decision, WouldStopBuild):
@@ -411,7 +471,7 @@ def report(proc_root: Path, directory: Path) -> list[str]:
     holders = build_hold.natedev_holds(directory).in_force
     lines = [f"kept by {holder.name}: pid {run.pid}, start {run.start_time}"
              for holder in holders for run in holder.keep]
-    processes = build_hold.read_audit_processes(proc_root, build_hold.HoldBuildCandidates(os.getuid()))
+    processes = read_processes(proc_root, os.getuid())
     return lines + decision_lines(decide_builds(processes, holders, os.getuid(), os.getpid()))
 
 
@@ -419,7 +479,7 @@ def scan(proc_root: Path, holder_directory: Path, uid: int, enforcer_pid: int,
          cgroup_root: Path = build_hold.SYSTEM_CGROUP_ROOT) -> None:
     began = time.monotonic()
     holders = build_hold.natedev_holds(holder_directory).in_force
-    processes = build_hold.read_audit_processes(proc_root, build_hold.HoldBuildCandidates(uid), cgroup_root)
+    processes = read_processes(proc_root, uid, cgroup_root)
     for line in decision_lines(decide_builds(processes, holders, uid, enforcer_pid)):
         print(line)
     print(f"pass: {time.monotonic() - began:.6f} s; {len(processes)} processes")

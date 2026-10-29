@@ -27,6 +27,9 @@ from scripts.shot_report.episodes import (
 from scripts.shot_report.transcripts import AvailableTimingSource, ExactAttemptCountFromOrderedCaptures
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 def setUpModule() -> None:
     """Pin fixture dates so the user's zone setting does not change test windows."""
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Vancouver"}))
@@ -740,7 +743,7 @@ class ShotReportTest(unittest.TestCase):
 
             def read(prior: dict[str, object]) -> list[dict[str, object]]:
                 result = subprocess.run([sys.executable, "-c", source], input=json.dumps(prior),
-                                        capture_output=True, text=True, timeout=10, check=False,
+                                        capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False,
                                         env={**os.environ, "HOME": directory})
                 self.assertEqual(result.returncode, 0, result.stderr)
                 return [cast(dict[str, object], json.loads(line)) for line in result.stdout.splitlines()]
@@ -776,7 +779,7 @@ class ShotReportTest(unittest.TestCase):
             root.mkdir(parents=True)
             _ = (root / "capture.jsonl").write_text('{"cmd":"hana_shot.py shot"}\n')
             result = subprocess.run([sys.executable, "-c", report_module._mac_reader_source(0)],  # pyright: ignore[reportPrivateUsage]
-                                    input="{}", capture_output=True, text=True, timeout=10, check=False,
+                                    input="{}", capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False,
                                     env={**os.environ, "HOME": directory})
         self.assertEqual(result.returncode, 0, result.stderr)
         records = [cast(dict[str, object], json.loads(line)) for line in result.stdout.splitlines()]
@@ -815,7 +818,7 @@ class ShotReportTest(unittest.TestCase):
             with mock.patch.object(report_module, "CODEX_PREFILTER", ("custom_capture_marker",)):
                 source = report_module._mac_reader_source()  # pyright: ignore[reportPrivateUsage]
             result = subprocess.run([sys.executable, "-c", source], input="{}", capture_output=True,
-                                    text=True, timeout=10, check=False, env={**os.environ, "HOME": directory})
+                                    text=True, timeout=TEST_HANG_GUARD_SECS, check=False, env={**os.environ, "HOME": directory})
         self.assertEqual(result.returncode, 0, result.stderr)
         records = [cast(dict[str, object], json.loads(line)) for line in result.stdout.splitlines()]
         self.assertTrue(any(record.get("kind") == "chunk" and record.get("key") == "codex/custom.jsonl"
@@ -829,7 +832,7 @@ class ShotReportTest(unittest.TestCase):
             _ = source.write_bytes(content)
             clock = "import time\ntime.monotonic = lambda: 0\n"
             result = subprocess.run([sys.executable, "-c", clock + report_module._mac_reader_source()],  # pyright: ignore[reportPrivateUsage]
-                                    input="{}", capture_output=True, text=True, timeout=10, check=False,
+                                    input="{}", capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False,
                                     env={**os.environ, "HOME": directory})
         self.assertEqual(result.returncode, 0, result.stderr)
         rows = [cast(dict[str, object], json.loads(line)) for line in result.stdout.splitlines()]
@@ -872,7 +875,7 @@ class ShotReportTest(unittest.TestCase):
                 clock = "import time\ntime.monotonic = lambda: 0\n"
                 result = real_run([sys.executable, "-c", clock + reader],
                                   input=cast(bytes, options["input"]), stdout=cast(BinaryIO, options["stdout"]),
-                                  stderr=subprocess.PIPE, timeout=10, check=False,
+                                  stderr=subprocess.PIPE, timeout=TEST_HANG_GUARD_SECS, check=False,
                                   env={**os.environ, "HOME": str(home)})
                 return subprocess.CompletedProcess(args, result.returncode,
                                                    stderr=f"rc={result.returncode}\n".encode() + result.stderr)
@@ -928,7 +931,7 @@ class ShotReportTest(unittest.TestCase):
                 clock = "import time\ntime.monotonic = lambda: 0\n"
                 result = real_run([sys.executable, "-c", clock + reader],
                                   input=cast(bytes, options["input"]), stdout=cast(BinaryIO, options["stdout"]),
-                                  stderr=subprocess.PIPE, timeout=10, check=False,
+                                  stderr=subprocess.PIPE, timeout=TEST_HANG_GUARD_SECS, check=False,
                                   env={**os.environ, "HOME": str(home)})
                 return subprocess.CompletedProcess(args, result.returncode,
                                                    stderr=f"rc={result.returncode}\n".encode() + result.stderr)
@@ -975,7 +978,7 @@ class ShotReportTest(unittest.TestCase):
                          "time.monotonic = lambda: next(ticks)\n")
                 result = real_run([sys.executable, "-c", clock + reader],
                                   input=cast(bytes, options["input"]), stdout=cast(BinaryIO, options["stdout"]),
-                                  stderr=subprocess.PIPE, timeout=10, check=False,
+                                  stderr=subprocess.PIPE, timeout=TEST_HANG_GUARD_SECS, check=False,
                                   env={**os.environ, "HOME": str(home)})
                 return subprocess.CompletedProcess(args, result.returncode,
                                                    stderr=f"rc={result.returncode}\n".encode() + result.stderr)

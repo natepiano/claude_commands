@@ -127,6 +127,19 @@ a branch starting `<old>-`, a linked worktree on that branch, no existing
 showrunner checkout on the merge branch after the rename. An unfinished move must be
 completed before another unit starts, and a finished rename refuses new moves.
 
+A shutdown record that is not stopped refuses before any branch or worktree
+change. After the worktree moves, `unit` updates the stopped record through
+`rename_unit.repoint_shutdown_worktree`: the session and worker folders, plan
+paths under the worktree, paused Codex worker launchers and resume notes, and
+a herdr name made from the old branch. The unit id and Claude session name
+stay the same. The record also takes the new production slug and doc path.
+`restore_repointed` journals this update separately from the numbered steps;
+a retry skips it once saved. An interrupted update repeats safely.
+
+The command prints `shutdown.py restart --only <session-id>` from the record.
+Use that command after the move succeeds. With no record, the move continues
+and reports that the unit has no shutdown record to relaunch from.
+
 Herdr observation failures refuse the move. The old local branch, while it
 exists, must stay at the recorded tip before each later change.
 

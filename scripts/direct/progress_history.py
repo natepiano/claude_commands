@@ -20,12 +20,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import cache
 from pathlib import Path
-from typing import NoReturn, TypedDict, cast
+from typing import Literal, NoReturn, TypedDict, cast
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.direct import phase_reservation, plan_history, recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
+from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
 from scripts.lib import agents_registry, unit_runs  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
@@ -198,6 +199,70 @@ AGENTS_CONFIG_ENV = "AGENTS_CONFIG_FILE"
 DEFAULT_AGENTS_CONFIG_PATH = Path("~/.claude/config/agents.conf").expanduser()
 
 
+class ContractFileHash(TypedDict):
+    state: Literal["Recorded"]
+    sha256: str
+
+
+class ContractFileUnavailable(TypedDict):
+    state: Literal["Missing", "NotRecorded"]
+    reason: str
+
+
+class ContractMainHead(TypedDict):
+    state: Literal["Recorded"]
+    commit: str
+
+
+class ContractHeadUnavailable(TypedDict):
+    state: Literal["NotRecorded"]
+    reason: str
+
+
+class ContractRevision(TypedDict):
+    main_head: ContractMainHead | ContractHeadUnavailable
+    direct_md: ContractFileHash | ContractFileUnavailable
+    files: dict[str, ContractFileHash | ContractFileUnavailable]
+
+
+def _contract_file(path: Path) -> ContractFileHash | ContractFileUnavailable:
+    try:
+        contents = path.read_bytes()
+    except FileNotFoundError:
+        return ContractFileUnavailable(state="Missing", reason=f"Missing file: {path}")
+    except OSError as error:
+        return ContractFileUnavailable(state="NotRecorded", reason=str(error))
+    return ContractFileHash(state="Recorded", sha256=hashlib.sha256(contents).hexdigest())
+
+
+def _contract_revision() -> ContractRevision:
+    """Read the deployed main checkout afresh at each phase boundary."""
+    root = Path.home() / ".claude"
+    head: ContractMainHead | ContractHeadUnavailable
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True, timeout=5,
+        )
+        head = ContractMainHead(state="Recorded", commit=result.stdout.strip())
+    except (OSError, subprocess.SubprocessError) as error:
+        head = ContractHeadUnavailable(state="NotRecorded", reason=str(error))
+    direct = root / "commands/unit/direct.md"
+    files: dict[str, ContractFileHash | ContractFileUnavailable] = {}
+    try:
+        contents = direct.read_bytes()
+        direct_hash: ContractFileHash | ContractFileUnavailable = ContractFileHash(
+            state="Recorded", sha256=hashlib.sha256(contents).hexdigest(),
+        )
+        for path in contract_table_paths(contents.decode("utf-8")):
+            files[path] = _contract_file(root / path)
+    except FileNotFoundError:
+        direct_hash = ContractFileUnavailable(state="Missing", reason=f"Missing file: {direct}")
+    except (OSError, UnicodeError) as error:
+        direct_hash = ContractFileUnavailable(state="NotRecorded", reason=str(error))
+    return ContractRevision(main_head=head, direct_md=direct_hash, files=files)
+
+
 def _config_path() -> Path:
     configured = os.environ.get("UNIT_CONFIG") or os.environ.get("PLAN_DELEGATE_CONFIG")
     return Path(configured) if configured else DEFAULT_CONFIG_PATH
@@ -338,6 +403,29 @@ def _session_dir(args: argparse.Namespace) -> Path:
     if not value:
         raise SystemExit("--session-dir is required")
     return Path(value).expanduser().resolve()
+
+
+def set_unit(session_dir: Path, production: str, unit: str) -> None:
+    """Persist unit identity without changing the run's history or workers."""
+    if any(not value or value in (".", "..") or "/" in value or "\\" in value
+           for value in (production, unit)):
+        raise ValueError("invalid production or unit identity")
+    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = _read_state(session_dir)
+        state.update({"production": production, "unit": unit})
+        _write_state(session_dir, state)
+
+
+def _set_unit(args: argparse.Namespace) -> None:
+    # main already holds this lock; the public API takes it for other callers.
+    state = _read_state(_session_dir(args))
+    production, unit = _arg_string(args, "production"), _arg_string(args, "unit")
+    if any(not value or value in (".", "..") or "/" in value or "\\" in value
+           for value in (production, unit)):
+        raise SystemExit("invalid production or unit identity")
+    state.update({"production": production, "unit": unit})
+    _write_state(_session_dir(args), state)
 
 
 def _state_path(session_dir: Path) -> Path:
@@ -1120,6 +1208,7 @@ def _event(
                 "pass_started_at": _number(current_pass.get("started_at")),
                 "called_agent": current_pass.get("called_agent", {}),
                 "called_task": _string(current_pass.get("called_task")),
+                "worker_name": _string(current_pass.get("worker_name")),
             }
         )
     activity = _object_dict(state.get("activity")) if phase_record is None else None
@@ -1339,6 +1428,24 @@ def _start_phase(args: argparse.Namespace) -> None:
             + f"`### Phase {phase_id} — <title>  · status: todo` under ## Phases, then start it."
         )
     started_at = _optional_epoch(args, "started_at", "--started-at", now)
+    if _string(state.get("status")) != "active" and "finished_at" in state:
+        previous_status = _string(state.get("status"))
+        state["status"] = "active"
+        _ = state.pop("finished_at", None)
+        reopened = _event(state, "reopened", now)
+        reopened.update({"previous_status": previous_status, "cause": "start-phase", "phase_id": phase_id})
+        _append_event(state, reopened)
+        _write_state(session_dir, state)
+        director = unit_runs.director(session_dir) or _string(
+            (_object_dict(state.get("main_agent")) or {}).get("session_id"))
+        if director:
+            active_root = os.environ.get("UNIT_ACTIVE_DIR")
+            # A temporary run stays within its temporary root unless explicitly configured.
+            marker = unit_runs.marker(director, Path(active_root) if active_root else session_dir.parent / "active")
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            temporary = marker.with_name(f".{marker.name}.{os.getpid()}")
+            _ = temporary.write_text(f"{session_dir}\n", encoding="utf-8")
+            os.replace(temporary, marker)
     _close_active_activity(session_dir, state, "interrupted", "", now)
     state = _read_state(session_dir)
     active = _object_dict(state.get("phase"))
@@ -1362,12 +1469,118 @@ def _start_phase(args: argparse.Namespace) -> None:
     state["pending_calibration"] = None
     _write_state(session_dir, state)
     event = _event(state, "phase_started", started_at)
+    event["contract_revision"] = _contract_revision()
     if started_at != now:
         event["recorded_at"] = _iso_time(now)
         event["backfilled"] = True
     event.update(_work_order_metrics(_arg_string(args, "work_order_file")))
     _append_event(state, event)
     _refresh_phase_table(session_dir)
+
+
+class LedgerRepairCause(TypedDict):
+    """The repair batch that still authorizes work before closure review finishes."""
+
+    round: int
+    covered: list[str]
+
+
+class LaunchCheck(TypedDict):
+    """A launch checked against its open phase and prompt before any pass starts."""
+
+    phase_id: str
+    phase_title: str
+    prompt_phase_line: Literal["matched", "absent"]
+    fix_cause: str | LedgerRepairCause
+
+
+def _launch_refused(
+    state: dict[str, object], args: argparse.Namespace, reason: str,
+) -> NoReturn:
+    event = _event(state, "launch_refused", plan_history.now_epoch(), phase_record={})
+    event.update(reason=reason, pass_kind=_arg_string(args, "pass_kind"),
+                 phase_id=_optional_arg(args, "phase_id"), prompt_file=_optional_arg(args, "prompt_file"),
+                 lens=_optional_arg(args, "lens"))
+    _append_event(state, event)
+    raise SystemExit(reason)
+
+
+def _launch_check(
+    args: argparse.Namespace, state: dict[str, object], phase: dict[str, object], session_dir: Path,
+) -> LaunchCheck:
+    """Check prompt identity and a fix's cause before changing any open pass."""
+    prompt_phase_line: Literal["matched", "absent"] = "absent"
+    prompt_file = _optional_arg(args, "prompt_file")
+    if prompt_file:
+        try:
+            text = Path(prompt_file).expanduser().read_text(encoding="utf-8")
+        except OSError as error:
+            _launch_refused(state, args, f"Unable to read prompt file {prompt_file}: {error}")
+        for line in text.splitlines():
+            named = re.match(r"^Phase (\S+) — (.*)$", line)
+            if named is None:
+                continue
+            if named.group(1) != _string(phase.get("id")) or named.group(2).strip() != _string(phase.get("title")).strip():
+                _launch_refused(state, args, f"Stale prompt phase: {line}; open phase is Phase {phase.get('id')} — {phase.get('title')}")
+            prompt_phase_line = "matched"
+            break
+    fix_cause: str | LedgerRepairCause = _optional_arg(args, "fix_cause").strip()
+    if _arg_string(args, "pass_kind") == "fix":
+        instance = _string(phase.get("instance_id"))
+        for path in (session_dir / "findings_state.json", session_dir / f"findings_state-{instance}.json"):
+            try:
+                ledger = _json_object(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                _launch_refused(state, args, f"Unable to read findings ledger {path}: {error}")
+            if ledger is None:
+                _launch_refused(state, args, f"Invalid findings ledger: {path}")
+            if _string(ledger.get("phase_instance_id")) != instance:
+                continue
+            rounds: object = ledger.get("rounds")
+            if isinstance(rounds, list) and rounds:
+                repair = _object_dict(cast(list[object], rounds)[-1])
+                if repair is not None:
+                    covered = _string_list(repair.get("covered"))
+                    findings = _object_dict(ledger.get("findings")) or {}
+                    pending = any(
+                        _string((_object_dict(findings.get(finding_id)) or {}).get("state")) == "fixed_pending_review"
+                        for finding_id in covered
+                    )
+                    outcome = _string(repair.get("outcome"))
+                    if outcome == "in_flight" or (outcome == "landed" and pending):
+                        fix_cause = LedgerRepairCause(round=_integer(repair.get("round")), covered=covered)
+            break
+        if not fix_cause:
+            _launch_refused(state, args, "Fix launch has no ledger round in flight or awaiting closure; give --fix-cause naming the failed gate or defect")
+    return {"phase_id": _string(phase.get("id")), "phase_title": _string(phase.get("title")),
+            "prompt_phase_line": prompt_phase_line, "fix_cause": fix_cause}
+
+
+def _checked_launch(
+    args: argparse.Namespace, state: dict[str, object], session_dir: Path,
+) -> tuple[dict[str, object], LaunchCheck]:
+    """Validate a named open phase and its launch without changing any pass."""
+    phase_id = _optional_arg(args, "phase_id")
+    if not phase_id:
+        _launch_refused(state, args, "Missing phase: --phase-id is required for a recorded run")
+    phase = _open_phase_named(state, phase_id)
+    if phase is None:
+        open_ids = ", ".join(recorder_state.open_phase_ids(state)) or "none"
+        _launch_refused(state, args, f"Phase {phase_id} is not open; open phases: {open_ids}. {CLOSED_PHASE_RULE}")
+    return phase, _launch_check(args, state, phase, session_dir)
+
+
+def _check_launch(args: argparse.Namespace) -> None:
+    session_dir = _session_dir(args)
+    state = _read_state(session_dir)
+    phase, launch_check = _checked_launch(args, state, session_dir)
+    if _optional_arg(args, "lens") == "ux":
+        event = _event(state, "launch_checked", plan_history.now_epoch(), phase_record=phase)
+        event.update(launch_check=launch_check, pass_kind=_arg_string(args, "pass_kind"),
+                     lens="ux", prompt_file=_optional_arg(args, "prompt_file"))
+        _append_event(state, event)
 
 
 def _start_pass(args: argparse.Namespace) -> None:
@@ -1386,13 +1599,7 @@ def _start_pass(args: argparse.Namespace) -> None:
     state = _read_state(session_dir)
     # A phase running beside the current one names itself, so its pass is not stamped with
     # the current phase's.
-    phase_id = _optional_arg(args, "phase_id")
-    phase = _open_phase_named(state, phase_id) if phase_id else _object_dict(state.get("phase"))
-    if phase_id and phase is None:
-        open_ids = ", ".join(recorder_state.open_phase_ids(state)) or "none"
-        raise SystemExit(f"Phase {phase_id} is not open; open phases: {open_ids}. {CLOSED_PHASE_RULE}")
-    if phase is None or _string(phase.get("status")) != "active":
-        raise SystemExit("Start a phase before starting a pass")
+    phase, launch_check = _checked_launch(args, state, session_dir)
     now = plan_history.now_epoch()
     # This slot's stale pass and no other. The peers belong to launchers still
     # waiting on their own agents, and a phase team opens both within the same
@@ -1408,6 +1615,7 @@ def _start_pass(args: argparse.Namespace) -> None:
         "activity": _arg_string(args, "activity"),
         "started_at": now,
         "called_task": _arg_string(args, "called_task"),
+        "worker_name": _optional_arg(args, "worker_name"),
         "called_agent": called_agent,
         "team_slot": team_slot,
         "phase": _phase_stamp(phase),
@@ -1417,6 +1625,7 @@ def _start_pass(args: argparse.Namespace) -> None:
     slots[team_slot] = current_pass
     _write_state(session_dir, state)
     event = _event(state, "pass_started", now, current_pass)
+    event["launch_check"] = launch_check
     event["config_digest"] = _config_digest()
     event["team_slot"] = team_slot
     _append_event(state, event)
@@ -4589,6 +4798,7 @@ def _finish_phase(args: argparse.Namespace) -> None:
         _ = _clear_armed_review(session_dir, state, "phase ended", now)
     status = _arg_string(args, "status")
     event = _event(state, "phase_finished", finished_at, phase_record=phase)
+    event["contract_revision"] = _contract_revision()
     event["status"] = status
     event["phase_elapsed_seconds"] = max(0, int(finished_at - started_at))
     if finished_at != now:
@@ -4815,6 +5025,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    identity = subparsers.add_parser("set-unit")
+    _ = identity.add_argument("--session-dir", required=True)
+    _ = identity.add_argument("--production", required=True)
+    _ = identity.add_argument("--unit", required=True)
+    identity.set_defaults(handler=_set_unit)
+
     start_run = subparsers.add_parser("start-run")
     _ = start_run.add_argument("--session-dir", required=True)
     _ = start_run.add_argument("--working-dir", required=True)
@@ -4850,16 +5066,28 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     finish_activity.set_defaults(handler=_finish_activity)
 
+    check_launch = subparsers.add_parser("check-launch")
+    _ = check_launch.add_argument("--session-dir", required=True)
+    _ = check_launch.add_argument("--pass-kind", choices=("impl", "test", "fix", "review"), required=True)
+    _ = check_launch.add_argument("--phase-id", default="")
+    _ = check_launch.add_argument("--prompt-file", default="")
+    _ = check_launch.add_argument("--fix-cause", default="")
+    _ = check_launch.add_argument("--lens", default="")
+    check_launch.set_defaults(handler=_check_launch)
+
     start_pass = subparsers.add_parser("start-pass")
     _ = start_pass.add_argument("--session-dir", required=True)
     _ = start_pass.add_argument("--pass-kind", choices=("impl", "test", "fix", "review"), required=True)
     _ = start_pass.add_argument("--fix-pass", type=int, default=0)
     _ = start_pass.add_argument("--activity", required=True)
     _ = start_pass.add_argument("--called-task", required=True)
+    _ = start_pass.add_argument("--worker-name", default="", help="the worker this pass was launched to")
     _ = start_pass.add_argument("--called-family", required=True)
     _ = start_pass.add_argument("--called-model", required=True)
     _ = start_pass.add_argument("--called-effort", default="unset")
-    _ = start_pass.add_argument("--phase-id", default="", help="the open phase this pass belongs to; default the current one")
+    _ = start_pass.add_argument("--phase-id", default="", help="the open phase this pass belongs to; required for recorded runs")
+    _ = start_pass.add_argument("--prompt-file", default="")
+    _ = start_pass.add_argument("--fix-cause", default="")
     start_pass.set_defaults(handler=_start_pass)
 
     finish_pass = subparsers.add_parser("finish-pass")

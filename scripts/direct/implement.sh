@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # implement.sh — Invoke the configured worker agent to implement code changes.
 #
-# Usage: implement.sh [--to <worker>] [--phase <id>] <session_dir> [working_dir] [prompt_file] [task]
+# Usage: implement.sh [--to <worker>] [--phase <id>] [--fix-cause <text>] <session_dir> [working_dir] [prompt_file] [task]
 #                     [role_description] [pass_kind] [pass_activity] [fix_pass]
 #                     <team_role> [mesh_prefix]
 #   role_description — 1-2 lines describing this dispatch's responsibility,
@@ -57,10 +57,12 @@ FOLLOW_TO=""
 # A phase running beside another names itself: start-pass stamps its pass with it, and its
 # per-role files go to <session_dir>/phases/<id>/.
 PHASE_ID=""
+FIX_CAUSE=""
 while [[ "${1:-}" == --* ]]; do
   case "$1" in
     --to) FOLLOW_TO="${2:?Usage: implement.sh --to <worker> <session_dir> ...}" ;;
     --phase) PHASE_ID="${2:?--phase requires a phase id}" ;;
+    --fix-cause) FIX_CAUSE="${2:?--fix-cause requires a failed gate or defect}" ;;
     *) echo "ERROR: unknown implement option '$1'." >&2; exit 2 ;;
   esac
   shift 2
@@ -236,9 +238,7 @@ claim_file = root / f"impl_claim_{slot}.json"
 sys.path.insert(0, str(Path(mesh_script).resolve().parents[2]))
 from scripts.guilds import roles as guild_roles
 sys.path.insert(0, str(Path(mesh_script).parent.parent / "direct"))
-from worker_state import worker_claim_lock, worker_ledger, worker_record_path, worker_slot
-
-identity_file = worker_record_path(root, name, slot)
+from worker_state import worker_claim_lock, worker_ledger, worker_record_path
 
 def fail(message):
     print(f"implement.sh: {message}", file=sys.stderr)
@@ -266,6 +266,7 @@ def claude_session(short_id):
     return ""
 
 with worker_claim_lock(root):
+    identity_file = worker_record_path(root, name, slot, role=pass_kind)
     roster = read(root / "mesh_roster.json")
     entry = roster.get(name, {}) if isinstance(roster, dict) else {}
     ledger_path = worker_ledger(root)
@@ -287,8 +288,7 @@ with worker_claim_lock(root):
         expected = {"name": name, "slot": slot, "family": family, "model": model, "worker_id": worker_id}
         # A run from before the repair worker had its own record lost the fix worker's identity
         # to the impl worker's, and a reopened worker keeps only its roster thread: record it from there.
-        # A worker recorded under another slot is followed in the wrong role and stays refused.
-        if not identity and worker_id and worker_slot(root, name) is None:
+        if not identity and worker_id:
             identity_file.write_text(json.dumps(expected))
             identity = expected
         # A resumed worker keeps the model it was recorded with: the registry row may have
@@ -296,6 +296,10 @@ with worker_claim_lock(root):
         stored_model = identity.get("model")
         if isinstance(stored_model, str) and stored_model:
             expected["model"] = stored_model
+        # Earlier records included the opening assignment role; it is not part
+        # of durable identity. Keep compatibility without writing it again.
+        identity.pop("role", None)
+        # A worker recorded under another slot stays refused by this comparison.
         if identity != expected:
             fail(f"{name} has no matching durable worker identity for slot {slot}")
         print(expected["model"])
@@ -423,9 +427,12 @@ if [[ -f "${PROGRESS_STATE}" ]]; then
   if ! UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" start-pass \
     --session-dir "${SESSION_DIR}" \
     --pass-kind "${PASS_KIND}" \
+    --prompt-file "${PROMPT_FILE}" \
+    --fix-cause "${FIX_CAUSE}" \
     --fix-pass "${FIX_PASS}" \
     --activity "${PASS_ACTIVITY}" \
     --called-task "${TASK}" \
+    --worker-name "${MESH_NAME}" \
     --called-family "${AGENT_FAMILY}" \
     --called-model "${AGENT_MODEL}" \
     --called-effort "${AGENT_EFFORT:-unset}" \

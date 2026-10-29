@@ -14,6 +14,9 @@ from contextlib import redirect_stderr
 from pathlib import Path
 from typing import cast, final, override
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import detection_rules
@@ -169,7 +172,7 @@ class HerdrMatcherTests(unittest.TestCase):
         _ = path.write_text("\n".join(screen) + "\n", encoding="utf-8")
         environment = {**os.environ, "XDG_CONFIG_HOME": str(self.root if fixed else self.root / "none")}
         result = subprocess.run([cast(str, HERDR), "agent", "explain", "--file", str(path), "--agent", "claude"],
-                                capture_output=True, text=True, timeout=30, env=environment, check=True)
+                                capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, env=environment, check=True)
         return next(line for line in result.stdout.splitlines() if line.startswith("state:")).removeprefix("state: ")
 
     def test_a_dialog_under_a_stray_rule_reads_blocked(self) -> None:

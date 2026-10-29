@@ -2,7 +2,7 @@
 
 > **Status: IMPLEMENTATION PLAN — phased, direct-ready; approved by the user 2026-10-26.** A script that has TypeSafe's Jev score each hanadocs issue field, measured against the values the vault holds now, and then used by `/issue` to propose fields for a new issue.
 
-> **Production: build-followups** — unit `typesafe-unit`; production doc `docs/plans/build-followups-production.md`
+> **Production: natedev** — unit `typesafe-unit`; production doc `docs/plans/natedev-production.md`
 
 ## Source
 

@@ -11,8 +11,15 @@ import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
+if TYPE_CHECKING:
+    from ..direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
+else:
+    from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
 from test_index import Record, call, encode, point_root_at, sample, step
 
 HERE = Path(__file__).parent
@@ -33,6 +40,8 @@ class MemoryRecordTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        tools = rust_tool_path(self.base / "tools")
+        self.enterContext(mock.patch.dict(os.environ, {"PATH": tools}))
         self.root = self.base / "buildlog"
         point_root_at(self, self.root)
 
@@ -47,7 +56,7 @@ class MemoryRecordTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
-            timeout=30,
+            timeout=TEST_HANG_GUARD_SECS,
         )
 
     def records(self) -> list[Record]:
@@ -84,7 +93,7 @@ class MemoryRecordTests(unittest.TestCase):
         def take_sample() -> None:
             result = subprocess.run(
                 [sys.executable, "-c", command, str(HERE), str(proc)],
-                env=env, capture_output=True, text=True, check=False, timeout=30,
+                env=env, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -115,6 +124,7 @@ class MemoryRecordTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         records = self.records()
         self.assertEqual([row["slice"] for row in records if row["kind"] == "step"], ["builds", "fallback", "none"])
+        self.assertEqual([row["rustc"] for row in records if row["kind"] == "step"], [FIXED_RUSTC] * 3)
         self.assertEqual([row["mem_kills"] for row in records if row["kind"] == "call"], [1, 2, 0])
         self.assertEqual([row["mem_kill_stopped"] for row in records if row["kind"] == "call"], [False, True, False])
         query = self.run_script(CLI, "query", "--json", "SELECT slice FROM steps ORDER BY rowid")

@@ -13,6 +13,9 @@ from typing import override
 import test_build_hold
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 MEMORY_GATE = Path(__file__).resolve().parent.parent / "lint" / "memory_gate.sh"
 BASH = shutil.which("bash") or "/bin/bash"
 EMPTY_ENVIRONMENT: Mapping[str, str] = MappingProxyType({})
@@ -34,7 +37,12 @@ class HoldShortcutTests(test_build_hold.IsolatedBuildHoldTest):
         bin_dir = self.scratch / "bin"
         bin_dir.mkdir()
         python = bin_dir / "python3"
-        _ = python.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$TEST_STARTS"\nexit "$TEST_STATUS"\n')
+        _ = python.write_text(
+            '#!/bin/bash\nprintf "%s\\n" "$*" >> "$TEST_STARTS"\n'
+            + 'if [[ "$2" == wait-local && ( "$TEST_STATUS" == 10 || "$TEST_STATUS" == 12 ) ]]; then\n'
+            + '    printf "hold refused (exit %s)\\n" "$TEST_STATUS" >&2\nfi\n'
+            + 'exit "$TEST_STATUS"\n'
+        )
         python.chmod(0o755)
         self.environment = {
             **os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
@@ -55,14 +63,17 @@ printf '%s %s %s\\n' "$shortcut" "$wait_status" "$admission"
 '''
         return subprocess.run([BASH, "-c", script, "bash", str(MEMORY_GATE)],
                               cwd=self.scratch, env={**self.environment, **extra},
-                              capture_output=True, text=True, check=False, timeout=5)
+                              capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def assert_checks(self, *, shortcut: int, status: int = 0, setting: str = "",
                       extra: Mapping[str, str] = EMPTY_ENVIRONMENT, starts: bool = True) -> None:
         result = self.run_checks(setting, extra={"TEST_STATUS": str(status), **extra})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), f"{shortcut} {status} {status}")
-        self.assertEqual(result.stderr, "")
+        errors = f"hold refused (exit {status})\n" if status in (10, 12) else ""
+        if status == 12:
+            errors += "build hold check check-local failed (exit 12); step refused\n"
+        self.assertEqual(result.stderr, errors)
         commands = self.starts.read_text().splitlines() if self.starts.exists() else []
         script = MEMORY_GATE.parent.parent / "build_targets" / "build_targets.py"
         self.assertEqual(commands, [f"{script} wait-local --call-id c1 --pid 12345",
@@ -95,7 +106,7 @@ printf '%s %s %s\\n' "$shortcut" "$wait_status" "$admission"
         self.assert_checks(shortcut=0, starts=False)
 
     def test_any_doubt_starts_the_check(self) -> None:
-        for kind in ("subdirectory", "dot", "two dots", "link", "missing", "file", "no read", "no search", "empty variable", "holder"):
+        for kind in ("subdirectory", "dot", "two dots", "link", "file", "no read", "no search", "empty variable", "holder"):
             with self.subTest(kind=kind):
                 if kind in ("no read", "no search") and os.getuid() == 0:
                     self.skipTest("Root can read directories without permission")
@@ -103,7 +114,7 @@ printf '%s %s %s\\n' "$shortcut" "$wait_status" "$admission"
                 extra = {"BUILD_HOLD_DIR": str(folder)}
                 if kind == "file":
                     _ = folder.write_text("file")
-                elif kind != "missing":
+                else:
                     folder.mkdir()
                     if kind == "subdirectory":
                         (folder / "child").mkdir()
@@ -157,8 +168,11 @@ printf '%s %s %s\\n' "$shortcut" "$wait_status" "$admission"
                 self.assertEqual(admission, f"{script} check-local --caller {name}")
 
     def test_caller_without_a_holder_directory_starts_no_check(self) -> None:
-        extra = {"BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "cargo-port", "BUILD_HOLD_DIR": str(self.scratch / "missing")}
-        self.assert_checks(shortcut=1, extra=extra, starts=False)
+        for call_id, caller in (("", "cargo-port"), ("c1", "verify")):
+            with self.subTest(caller=caller):
+                extra = {"BUILDLOG_CALL_ID": call_id, "BUILDLOG_CALLER": caller,
+                         "BUILD_HOLD_DIR": str(self.scratch / "missing")}
+                self.assert_checks(shortcut=0, extra=extra, starts=False)
 
     def test_nothing_held_starts_no_process(self) -> None:
         empty_path = self.scratch / "empty-path"
@@ -174,7 +188,7 @@ trap 'if (( BASH_SUBSHELL > 0 )); then printf "%s\\n" "$BASH_SUBSHELL" >&3; fi' 
 for ((n=0; n<2000; n++)); do build_hold_nothing_held; done
 [[ "$n" -eq 2000 ]]
 ''', "bash", str(MEMORY_GATE), str(empty_path), str(forks)], cwd=self.scratch,
-                                env=self.environment, capture_output=True, text=True, check=False, timeout=30)
+                                env=self.environment, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
         self.assertEqual(forks.read_text(), "", "the shortcut must not fork subshells")

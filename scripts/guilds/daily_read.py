@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Print a guild's local evidence for one UTC interval; read no turns or live sessions."""
+"""Print a plain guild summary or full JSON for one UTC interval; read no turns or live sessions."""
 from __future__ import annotations
 
 import argparse
@@ -8,7 +8,7 @@ import math
 import os
 import socket
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -340,8 +340,9 @@ def phase_rows(events: list[SourcedEvent], measured: tuple[phase_process.Event, 
         flags: list[str] = []
         phase_events = [event for event in events
                         if (text(event.fields, "run_id"), text(event.fields, "phase_instance_id")) == key]
-        repairs = rounds.phase_rounds([event.fields for event in phase_events])
-        if len(repairs) >= 4:
+        repairs = [repair for repair in rounds.phase_rounds([event.fields for event in phase_events])
+                   if window.contains(repair["started_at"])]
+        if any(repair["round"] >= 4 for repair in repairs):
             flags.append("RepairRoundsBeyondThree")
         if phase["check"] == "mixed":
             flags.append("MixedPhaseRecord")
@@ -467,9 +468,34 @@ def read_daily(guild: str, since: datetime, until: datetime, sources: LocalSourc
 
 
 def render(report: dict[str, object]) -> str:
-    lines = [f"Host: {report['host']} | Guild: {report['guild']}"]
-    for section in ("interval", "coverage", "counts", "assignments", "phases", "repeats", "waits", "receipts", "flagged", "problems"):
-        lines.append(section + ": " + json.dumps(report[section], ensure_ascii=False, sort_keys=True))
+    interval = cast(dict[str, str], report["interval"])
+    coverage = cast(dict[str, object], report["coverage"])
+    counts = cast(dict[str, int], report["counts"])
+    lines = [f"Host: {report['host']} | Guild: {report['guild']}",
+             f"UTC: {interval['since']} to {interval['until']}",
+             f"Local ({interval['local_zone']}): {interval['local_since']} to {interval['local_until']}",
+             "Coverage: " + ", ".join(f"{name} {coverage[name]}" for name in
+                                     ("members", "runs", "assignments", "phases"))
+             + f"; partial {'yes' if coverage['partial'] else 'no'}",
+             "Counts: " + ", ".join(f"{name.replace('_', ' ')} {value}" for name, value in counts.items())]
+    for phase in cast(list[dict[str, object]], report["phases"]):
+        members = ", ".join(cast(list[str], phase["members"]))
+        flags = ", ".join(cast(list[str], phase["flags"])) or "no flags"
+        lines.append(f"Phase {phase['phase_id']} | run {phase['run_id']} | members {members} | "
+                     + f"repair rounds started in window {phase['repair_rounds']} | {flags}")
+    for repeat in cast(list[dict[str, object]], report["repeats"]):
+        phases = ", ".join(cast(list[str], repeat["phase_refs"]))
+        lines.append(f"Repeat: {repeat['state']} | run {repeat['run_id']} | phases {phases} | {repeat['title']}")
+    for flagged in cast(list[dict[str, object]], report["flagged"]):
+        detail = text(flagged, "title") or text(flagged, "phase_instance_id")
+        lines.append(f"Flag: {flagged['kind']} | run {flagged['run_id']} | {detail}")
+    problems = cast(list[dict[str, str]], report["problems"])
+    for state, count in sorted(Counter(problem["state"] for problem in problems).items()):
+        lines.append(f"Problems: {state}: {count}")
+    for problem in problems[:5]:
+        lines.append(f"problem: {problem['state']}: {problem['source']}: {problem['reason']}")
+    if len(problems) > 5:
+        lines.append(f"and {len(problems) - 5} more")
     lines.append("Phase totals are shared context, not an individual's delay. Read turns only for flagged records.")
     return "\n".join(lines)
 

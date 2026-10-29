@@ -171,7 +171,7 @@ State:
   - **Give the Mac to one unit with a Mac hold, never with words.** Run
     `/build:mac block <why> [hours N]`, or tell that unit to run
     `/build:hold hold <why> target mac`. Tests skip a held Mac by themselves,
-    `/build:targets` shows the hold, and it ends at its expiry. Never tell
+    `/build:status` shows the hold, and it ends at its expiry. Never tell
     units "make no Mac claim" or to run tests with `--local`: nothing records
     that, and nothing ends it. On 2026-10-18 such a ruling, a day old, kept a
     unit's tests waiting on a held natedev while the Mac was free. `verify.sh`
@@ -270,8 +270,9 @@ State:
   item from `open_for_user` in that turn; it returns, in full, when the
   research reports (user, 2026-10-15).
   The user sees the count at all times in the Claude Code status line's
-  `For you: …` row, under the quota row, with the changes, proposals and
-  projects.
+  `For you: …` row, under the quota row, with changes, efficiency and
+  proposals. Proposed plan-backlog lines count as proposals; accepted lines
+  do not count. Each kind is available through `/next`.
   When the user asks for the next question, show only the current item
   (`/next question`).
   List the questions in full only when the user asks what they are: run
@@ -332,7 +333,7 @@ State:
 ---
 
 <Guild>
-Your guild is `showrunners`. Your head is the `showrunners` unit director in the top-level `guilds` production on natedev. At skill start, use the Tips lock/pull rule for `~/rust/nate_style` and load `guilds/common/` and `guilds/showrunners/`; a Codex holder does this for its worker. Report to your head when the user corrects you, a phase needs repair round 4, a finding meets the Events repeat rule, you use a workaround for a tool fault or slow rule, or a method saves measured time. Send one report of at most 100 words, with evidence and result. Resolve the head from `message/roster.py --json` by production `guilds` and unit `showrunners`; send with `message/send.py` or SendMessage. A Codex worker puts the report in its reply for its holder to send. Send only to the head. Never wake an idle Codex member for guild advice.
+Your guild is `showrunners`. Your head is the `showrunners` unit director in the `guilds` production on natedev. At skill start, use the Tips lock/pull rule for `~/rust/nate_style` and load `guilds/common/` and `guilds/showrunners/`; a Codex holder does this for its worker. Report to your head when the user corrects you, a phase needs repair round 4, a finding meets the Events repeat rule, you use a workaround for a tool fault or slow rule, or a method saves measured time. Send one report of at most 100 words, with evidence and result. Resolve the head from `message/roster.py --json` by production `guilds` and unit `showrunners`; send with `message/send.py` or SendMessage. A Codex worker puts the report in its reply for its holder to send. Send only to the head. Never wake an idle Codex member for guild advice.
 
 Load tips: ~/.claude/scripts/lib/py ~/.claude/scripts/guilds/tips.py load --guild showrunners
 

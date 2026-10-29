@@ -12,7 +12,7 @@ import unittest
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal, TypedDict, Unpack, cast, override
+from typing import TYPE_CHECKING, Literal, TypedDict, Unpack, cast, override
 from unittest.mock import patch
 
 import index
@@ -20,6 +20,13 @@ import launches
 import mac_report
 import mac_outcome
 import store
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
+if TYPE_CHECKING:
+    from ..direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
+else:
+    from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
 from test_holds import hold_event, timed_hold_events, write_mac_block
 from test_index import Record, call, encode, point_root_at, step
 from test_report import MeasuredCliRun, measure_cli_work
@@ -51,6 +58,8 @@ class MacReportTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())) / "buildlog"
         point_root_at(self, self.root)
+        tools = rust_tool_path(self.root.parent / "tools")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"PATH": tools})))
         self.log = self.root / "natedev" / "2026-10.jsonl"
         self.log.parent.mkdir(parents=True)
         previous = os.environ.get("TZ")
@@ -222,6 +231,7 @@ class MacReportTests(unittest.TestCase):
         ]
         mac_steps = [row for row in rows if row.get("kind") == "step" and row.get("caller") == "verify-mac"]
         self.assertEqual(len(mac_steps), 1)
+        self.assertEqual(mac_steps[0]["rustc"], FIXED_RUSTC)
         self.assertEqual((mac_steps[0]["call_id"], mac_steps[0]["tree_key"]), (call_id, sent_key))
 
     def test_sent_key_on_recorded_mac_step_counts_a_natedev_pass_of_the_same_selection(self) -> None:
@@ -529,7 +539,7 @@ class MacReportTests(unittest.TestCase):
         for args in (["mac-report", "--hours", "2"], ["schema"]):
             result = subprocess.run(
                 [sys.executable, str(CLI), *args], env={**os.environ, "BUILDLOG_DIR": str(self.root)},
-                capture_output=True, text=True, check=False, timeout=30,
+                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             if args[0] == "mac-report":

@@ -11,17 +11,15 @@
 # marker names one, and phases run side by side each keep their own folder,
 # which records its director. A run of another director is never touched.
 #
-# Removes every claude worker those runs launched, and any a dead run left
-# alive (remove_workers.py). Also stops each run's codex app-server, if one was
-# started. That server is detached on purpose -- it has to outlive each
-# worker so a peer can still reach a thread between turns -- so the end of
-# the run is the only point that knows nobody needs it any more.
+# Keeps workers and app-servers while their unit director is live. Otherwise,
+# pauses Codex workers and stops this run's servers after preserving queues.
+# Removes only Claude workers no longer held by a unit or live director.
 #
 # Deletes each run's scratch copies (remove_run_scratch.py): its verify.sh pass
 # records (verify_cache/), whose saved time is already in
 # ~/.local/state/verify/saved.jsonl, and every git checkout and cargo target in
-# the run folder, at any depth. Gate copies and before/after builds otherwise
-# stay in /tmp until the disk fills.
+# the run folder, at any depth, except any non-retired worker's live command cwd and
+# its containing checkout. Tracked run scratch follows the same retention rule.
 #
 # UNIT_RUN_ROOT, set by tests, replaces both run roots for the scan.
 #
@@ -91,15 +89,11 @@ if (( ${#RUNS[@]} > 0 )); then
   "$PY" "${SCRIPT_DIR}/remove_workers.py" "${REMOVE_ARGS[@]}" || true
   for run in "${RUNS[@]}"; do
     if [[ -f "${run}/mesh_roster.json" || -f "${run}/mesh_server.json" || -f "${run}/mesh_retired.json" ]]; then
-      "$PY" "${MESH}" stop --session-dir "${run}" || true
+      "$PY" "${MESH}" stop --pause --session-dir "${run}" || true
     fi
   done
-  "$PY" "${MESH}" sweep --root "$(dirname "${RUNS[0]}")" --stop || true
-  "$PY" "${SCRIPT_DIR}/remove_run_scratch.py" "${RUNS[@]}" || true
-  # Each run's scratch folders (scripts/lib/scratch.py) end with the run.
-  for run in "${RUNS[@]}"; do
-    "$PY" "${SCRIPT_DIR}/../lib/scratch.py" end --task "run:$(basename "${run}")" || true
-  done
+  "$PY" "${SCRIPT_DIR}/remove_run_scratch.py" --tracked "${RUNS[@]}" || true
+  # remove_run_scratch also ends tracked run scratch while keeping live commands' cwd.
 fi
 
 if [[ -f "${MARKER}" ]]; then

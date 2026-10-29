@@ -355,6 +355,85 @@ class EligibleCommandTests(IsolatedBuildTargetTest):
                 self.assertEqual(output.getvalue(), f"natedev\teligible\t-\t-\nmac\t{disposition}\t{reason}\t{self.settings}\n")
 
 
+class StepKindEligibilityTests(IsolatedBuildTargetTest):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        config = self.write_config(
+            "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+            + "kind.natedev=local\nplatform.natedev=linux\n")
+        _ = self.settings.write_text("offload=on\nlinux_only.hana=linux-part\nfree_floor_gib=60\n")
+        _ = (self.root / "Cargo.toml").write_text('[workspace]\nmembers=["crates/*"]\nexclude=["crates/excluded"]\n')
+        for directory, name in (("portable", "portable"), ("excluded", "linux-part")):
+            member = self.root / "crates" / directory
+            member.mkdir(parents=True)
+            _ = (member / "Cargo.toml").write_text(f'[package]\nname="{name}"\nversion="0.1.0"\n')
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)})))
+        _ = self.enterContext(mock.patch.object(offload, "repository_identity", return_value=offload.KnownRepository("hana")))
+
+    def kind_output(self, kind: str, package: str = "", free_gib: float = 60) -> str:
+        output = io.StringIO()
+        with (mock.patch.object(sys, "argv", ["build_targets.py", "eligible", "--repo-root", str(self.root),
+                                               "--kind", kind, "--package", package]),
+              mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(free_gib, "fake-mac")),
+              redirect_stdout(output)):
+            self.assertEqual(build_targets.main(), 0)
+        return output.getvalue()
+
+    def kind_answer(self, kind: str, package: str = "", free_gib: float = 60) -> str:
+        return self.kind_output(kind, package, free_gib).splitlines()[0] + "\n"
+
+    def test_kind_table_keeps_target_order_settings_and_each_mac_decision(self) -> None:
+        other_settings = self.settings.with_name("other.conf")
+        _ = other_settings.write_text("offload=off\nlinux_only.hana=\n")
+        _ = self.write_config(
+            "targets=natedev,other,mac\nkind.natedev=local\nplatform.natedev=linux\n"
+            + "kind.other=ssh\nplatform.other=macos\nsettings.other=other.conf\n"
+            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+        self.assertEqual(self.kind_output("check"),
+                         "mac_allowed\nnatedev\teligible\t-\t-\n"
+                         + f"other\texcluded\toff\t{other_settings}\nmac\teligible\t-\t{self.settings}\n")
+        self.assertEqual(self.kind_output("build"),
+                         "natedev_only makes natedev artifacts\nnatedev\teligible\t-\t-\n"
+                         + f"other\texcluded\tmakes natedev artifacts\t{other_settings}\n"
+                         + f"mac\texcluded\tmakes natedev artifacts\t{self.settings}\n")
+
+    def test_local_only_configuration_keeps_artifact_and_gate_reasons(self) -> None:
+        _ = self.write_config("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
+        for kind, reason in (("build", "makes natedev artifacts"), ("example", "makes natedev artifacts"),
+                             ("final", "full gate runs on natedev")):
+            with self.subTest(kind=kind):
+                self.assertEqual(self.kind_output(kind), f"natedev_only {reason}\nnatedev\teligible\t-\t-\n")
+
+    def test_kind_answers_allow_portable_judgments_and_keep_artifacts_local(self) -> None:
+        for kind in ("check", "doc", "lint", "test"):
+            with self.subTest(kind=kind):
+                self.assertEqual(self.kind_answer(kind, "portable"), "mac_allowed\n")
+        for kind in ("build", "example"):
+            with self.subTest(kind=kind):
+                self.assertEqual(self.kind_answer(kind), "natedev_only makes natedev artifacts\n")
+        self.assertEqual(self.kind_answer("final"), "natedev_only full gate runs on natedev\n")
+
+    def test_workspace_linux_only_member_refuses_workspace_verbs_but_not_other_package_tests(self) -> None:
+        _ = (self.root / "Cargo.toml").write_text('[workspace]\nmembers=["crates/*"]\n')
+        for kind in ("check", "doc", "lint"):
+            with self.subTest(kind=kind):
+                self.assertEqual(self.kind_answer(kind, "portable"), "natedev_only linux_only\n")
+        self.assertEqual(self.kind_answer("test", "portable"), "mac_allowed\n")
+        self.assertEqual(self.kind_answer("test", "linux-part"), "natedev_only linux_only\n")
+
+    def test_off_backoff_and_disk_floor_refuse_mac_steps(self) -> None:
+        self.assertEqual(self.kind_answer("check", free_gib=59), "natedev_only disk\n")
+        offload.write_backoff(time.time() + 60)
+        self.assertEqual(self.kind_answer("doc"), "natedev_only backoff\n")
+        _ = self.settings.write_text("offload=off\nlinux_only.hana=\n")
+        self.assertEqual(self.kind_answer("lint"), "natedev_only off\n")
+
+    def test_unreadable_workspace_cannot_be_sent_to_the_mac(self) -> None:
+        _ = (self.root / "Cargo.toml").write_text("[")
+        self.assertEqual(self.kind_answer("doc"), "natedev_only repo\n")
+
+
 class WaitLocalTests(IsolatedBuildTargetTest):
     sleeps: int = 0
 
@@ -517,6 +596,15 @@ class WaitLocalTests(IsolatedBuildTargetTest):
         self.assertEqual(code, 0, errors)
         self.assertNotIn("the Mac is free", errors)
         self.assertFalse((self.holders / "hana").exists())
+
+    def test_held_call_uses_its_marker_hook_when_no_hook_argument_was_given(self) -> None:
+        self.begin_hold()
+        with mock.patch.dict(os.environ, {"BUILDLOG_MAC_IDLE_HOOK": "exit 0"}), \
+             mock.patch.object(build_targets, "wait_sleep", side_effect=self.count_sleep):
+            code, errors = self.leave_wait("")
+        self.assertEqual(code, build_targets.LEFT_QUEUE_STATUS, errors)
+        self.assertEqual(self.sleeps, 1)
+        self.assertTrue((self.holders / "hana").exists())
 
     def test_unheld_call_never_runs_the_leave_hook(self) -> None:
         marker = self.root / "hook-ran"

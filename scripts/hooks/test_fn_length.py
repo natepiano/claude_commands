@@ -15,7 +15,13 @@ from pathlib import Path
 from typing import Callable, cast, override
 from unittest.mock import patch
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import fn_length_lib
+from scripts.hooks import hook_dispatch
 
 
 HOOK = Path(__file__).with_name("post-tool-use-fn-length.py")
@@ -282,7 +288,7 @@ class FunctionScopeTests(SyntheticPackageTests):
         )
         result = subprocess.run(
             [sys.executable, "-c", script, str(HOOK.parent), str(self.rs_file)],
-            capture_output=True, text=True, check=False, timeout=10,
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "\n")
@@ -412,7 +418,7 @@ class FunctionHookTests(SyntheticPackageTests):
             })
         return subprocess.run(
             [sys.executable, str(HOOK)], input=payload, capture_output=True,
-            text=True, check=False, env=self.environment, timeout=10,
+            text=True, check=False, env=self.environment, timeout=TEST_HANG_GUARD_SECS,
         )
 
     def test_edit_blocks_with_exact_reason_and_logs_claude(self) -> None:
@@ -483,7 +489,7 @@ class FunctionHookTests(SyntheticPackageTests):
         })
         result = subprocess.run(
             [sys.executable, "-X", "importtime", str(HOOK)], input=payload,
-            capture_output=True, text=True, check=False, env=self.environment, timeout=10,
+            capture_output=True, text=True, check=False, env=self.environment, timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "")
@@ -500,15 +506,19 @@ class FunctionHookTests(SyntheticPackageTests):
     def test_settings_registers_hook_after_basedpyright(self) -> None:
         settings = cast(dict[str, object], json.loads(SETTINGS.read_text()))
         hooks = cast(dict[str, list[dict[str, object]]], settings["hooks"])
+        dispatcher = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/hook_dispatch.py" post_tool_use'
         groups = [group for group in hooks["PostToolUse"]
-                  if group.get("matcher") == "Edit|MultiEdit|Write"]
+                  if any(handler.get("command") == dispatcher
+                         for handler in cast(list[dict[str, object]], group["hooks"]))]
         self.assertEqual(len(groups), 1)
+        self.assertFalse(groups[0].get("matcher"))
         commands = cast(list[dict[str, object]], groups[0]["hooks"])
+        self.assertEqual([handler["command"] for handler in commands], [dispatcher])
         self.assertEqual(
-            [cast(str, handler["command"]) for handler in commands[:2]],
+            [(spec.filename, spec.matcher) for spec in hook_dispatch.POST_TOOL_USE[:2]],
             [
-                '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/post-tool-use-basedpyright.py"',
-                '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/post-tool-use-fn-length.py"',
+                ("post-tool-use-basedpyright.py", "Edit|MultiEdit|Write"),
+                ("post-tool-use-fn-length.py", "Edit|MultiEdit|Write"),
             ],
         )
 
@@ -537,7 +547,7 @@ class CodexApplyPatchTests(SyntheticPackageTests):
         return subprocess.run(
             [sys.executable, str(HOOK)], input=json.dumps(payload),
             capture_output=True, text=True, check=False,
-            env=self.environment, timeout=10,
+            env=self.environment, timeout=TEST_HANG_GUARD_SECS,
         )
 
     def records(self) -> list[dict[str, object]]:

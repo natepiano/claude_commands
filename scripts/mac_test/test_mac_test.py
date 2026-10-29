@@ -29,11 +29,8 @@ SCRIPT = Path(__file__).with_name("mac_test.py")
 LOCAL_ZONE = ZoneInfo("America/New_York")
 CI_JOB = "macOS: Compile and Test"
 SKIPPED_REPORT_RUNS = 200
-# An unblock that reports this many runs starts the stand-in gh once for the
-# switch, once for the list and once for each run, one after another. A start
-# costs about 20 ms of processor time, so the whole report needs about 4 s on
-# an idle machine; 0.3 s for each start leaves room for cores shared with builds.
-SKIPPED_REPORT_TIMEOUT_S = (SKIPPED_REPORT_RUNS + 2) * 0.3
+# Guard hung fixture commands without timing their Python starts under load.
+COMMAND_TIMEOUT_S = 5 * 60
 
 
 class RunState(TypedDict):
@@ -325,6 +322,8 @@ class MacTestCommandTests(unittest.TestCase):
             "BUILD_HOLD_DIR": str(self.root / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
+            "PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": "",
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
         }
         self.children = []
@@ -347,7 +346,7 @@ class MacTestCommandTests(unittest.TestCase):
         os.close(self.writer_write_fd)
         self.writer_write_fd = -1
         try:
-            readable, _, _ = select.select([self.writer_read_fd], [], [], 30)
+            readable, _, _ = select.select([self.writer_read_fd], [], [], COMMAND_TIMEOUT_S)
             self.assertTrue(readable, "Fixture descendants did not finish before directory cleanup")
             self.assertEqual(os.read(self.writer_read_fd, 1), b"")
         finally:
@@ -366,7 +365,7 @@ class MacTestCommandTests(unittest.TestCase):
             "ci_job": CI_JOB,
             # Long enough for the Python gh stand-in under load; a test about
             # the limit sets its own.
-            "gh_timeout_s": "60",
+            "gh_timeout_s": str(COMMAND_TIMEOUT_S),
             "block_hours": "4",
             "block_max_hours": "48",
             "block_warn_minutes": "15",
@@ -390,12 +389,13 @@ class MacTestCommandTests(unittest.TestCase):
         self,
         *arguments: str,
         environment: dict[str, str] | None = None,
-        timeout: float = 60,
+        timeout: float = COMMAND_TIMEOUT_S,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [sys.executable, str(SCRIPT), *arguments],
             cwd=self.root,
             env=self.environment if environment is None else environment,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             check=False,
@@ -410,6 +410,7 @@ class MacTestCommandTests(unittest.TestCase):
             [sys.executable, str(SCRIPT), *arguments],
             cwd=self.root,
             env=self.environment if environment is None else environment,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -682,6 +683,18 @@ class MacTestCommandTests(unittest.TestCase):
         self.stop_child(owner)
         return record
 
+    def test_claims_record_each_mac_verb_and_workspace_scope(self) -> None:
+        worktree = self.repository("hana")
+        owner = self.start_child()
+        for verb in ("nextest", "check", "clippy", "mend-check", "doc"):
+            with self.subTest(verb=verb):
+                claim = self.command("claim", "--pid", str(owner.pid), "--what", f"{verb} workspace",
+                                     "--worktree", str(worktree))
+                self.assert_command(claim, 0, "claimed\n")
+                self.assertEqual(self.repository_claim("hana")["what"], f"{verb} workspace")
+                self.assertIn(f"running: {verb} workspace", self.command("status").stdout)
+                self.assert_command(self.command("release", "--pid", str(owner.pid)), 0, "")
+
     def test_remote_claim_outlives_its_owner_and_remains_live_to_state_readers(self) -> None:
         record = self.kept_claim()
         paths = mac_test.StatePaths(self.state_directory)
@@ -728,6 +741,80 @@ class MacTestCommandTests(unittest.TestCase):
         self.assert_command(self.command("claim", "--pid", str(owner.pid), "--what", "unowned tests",
                                          environment=environment), 0, "claimed\n")
         self.assertNotIn("holder_session", self.run_state())
+
+    def unit_environment(self, session: str) -> dict[str, str]:
+        active = self.root / "active"
+        active.mkdir(exist_ok=True)
+        run = str(self.root / "unit-run")
+        _ = (active / session).write_text(run)
+        return {**self.environment, "UNIT_RUN_DIR": run,
+                "CLAUDE_CODE_SESSION_ID": "worker-session"}
+
+    def test_active_and_pending_blocks_admit_their_session_claims(self) -> None:
+        owner = self.start_child()
+        environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": "session-a"}
+        for state in ("active", "pending"):
+            with self.subTest(state=state):
+                _ = self.write_block(session="session-a", state=state,
+                                     waiting_on={"kind": "ci_job"} if state == "pending" else None,
+                                     free_message={"kind": "not_needed"} if state == "active" else None)
+                self.assert_command(self.command("claim", "--pid", str(owner.pid), "--what", "own tests",
+                                                 environment=environment), 0, "claimed\n")
+                self.assertEqual(self.run_state().get("holder_session"), "session-a")
+                self.assert_command(self.command("release", "--pid", str(owner.pid)), 0, "")
+
+    def test_unit_worker_claim_uses_director_identity_for_block_and_record(self) -> None:
+        owner = self.start_child()
+        environment = self.unit_environment("session-a")
+        _ = self.write_block(session="session-a", free_message={"kind": "not_needed"})
+        self.assert_command(self.command("claim", "--pid", str(owner.pid), "--what", "unit tests",
+                                         environment=environment), 0, "claimed\n")
+        self.assertEqual(self.run_state().get("holder_session"), "session-a")
+
+    def test_block_refuses_other_and_unknown_sessions_without_writing_claims(self) -> None:
+        owner = self.start_child()
+        _ = self.write_block(session="session-a", free_message={"kind": "not_needed"})
+        for session in ("session-b", ""):
+            with self.subTest(session=session):
+                environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": session}
+                self.assert_command(self.command("claim", "--pid", str(owner.pid), "--what", "other tests",
+                                                 environment=environment), 10, "blocked by alice: release work\n")
+                self.assertFalse((self.state_directory / "run.json").exists())
+
+    def test_holder_queue_block_refuses_claims_from_every_session(self) -> None:
+        owner = self.start_child()
+        _ = self.write_block(free_message={"kind": "not_needed"})
+        for session in ("alice", "session-b", ""):
+            with self.subTest(session=session):
+                environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": session}
+                self.assert_command(self.command("claim", "--pid", str(owner.pid), "--what", "tests",
+                                                 environment=environment), 10, "blocked by alice: release work\n")
+                self.assertFalse((self.state_directory / "run.json").exists())
+
+    def test_free_now_reads_past_own_block_to_free_or_busy(self) -> None:
+        self.write_config(offload="on")
+        _ = self.write_block(session="session-a", free_message={"kind": "not_needed"})
+        environment = self.unit_environment("session-a")
+        self.assert_command(self.command("free-now", environment=environment), 0, "free\n")
+        other = {**self.environment, "CLAUDE_CODE_SESSION_ID": "session-b"}
+        self.assert_command(self.command("free-now", environment=other), 1, "blocked\n")
+        owner = self.start_child()
+        self.assert_command(self.command("claim", "--pid", str(owner.pid), "--what", "own tests",
+                                         environment=environment), 0, "claimed\n")
+        self.assert_command(self.command("free-now", environment=environment), 1, "busy\n")
+        self.assertEqual(self.logged_arguments("gh"), [])
+
+    def test_unit_block_records_director_session_and_keeps_ci_off(self) -> None:
+        environment = self.unit_environment("session-a")
+        result = self.command("block", "--holder", "alice", "--for", "unit tests",
+                              environment=environment)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.block_state()["session"], "session-a")
+        self.assertEqual(self.read_fixture_variable(), "false")
+        owner = self.start_child()
+        self.assert_command(self.command("claim", "--pid", str(owner.pid), "--what", "unit tests",
+                                         environment=environment), 0, "claimed\n")
+        self.assertEqual(self.run_state().get("holder_session"), "session-a")
 
     def test_takeover_keeps_holder_session_and_starts_claim_watcher(self) -> None:
         previous = self.kept_claim()
@@ -1154,7 +1241,7 @@ class MacTestCommandTests(unittest.TestCase):
         with log.open("a+") as held_log:
             fcntl.flock(held_log, fcntl.LOCK_EX)
             try:
-                result = self.command("block", "--holder", "alice", "--for", "rendering", timeout=60)
+                result = self.command("block", "--holder", "alice", "--for", "rendering")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 block = self.block_state()
                 for name in ("state.lock", "control.lock"):
@@ -1312,6 +1399,66 @@ for arguments in (
         _ = self.command("status")
         self.assertEqual(self.block_state()["state"], "active")
         self.assertEqual(len(self.hold_events()), 1)
+
+    def test_pending_block_with_only_own_claim_activates_without_free_message(self) -> None:
+        self.write_config(ci_repo=None)
+        owner = self.start_child()
+        environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": "session-a"}
+        self.assert_command(self.command("claim", "--pid", str(owner.pid), "--what", "own tests",
+                                         environment=environment), 0, "claimed\n")
+        _ = self.write_block(session="session-a", state="pending",
+                             waiting_on={"kind": "local_run", "what": "own tests"})
+
+        result = self.command("status")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.block_state()["state"], "active")
+        self.assertEqual(self.block_state()["free_message"], {"kind": "not_needed"})
+        self.assertEqual(self.run_state().get("holder_session"), "session-a")
+        self.assertEqual(self.logged_arguments("send"), [])
+        self.assertEqual(self.logged_arguments("send-delivered"), [])
+
+    def test_pending_block_waits_on_other_or_unrecorded_claim_beside_own_claim(self) -> None:
+        own_repository = self.repository("alpha")
+        other_repository = self.repository("beta")
+        owner = self.start_child()
+        other = self.start_child()
+        environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": "session-a"}
+        self.assert_command(self.command("claim", "--pid", str(owner.pid), "--what", "own tests",
+                                         "--worktree", str(own_repository), environment=environment),
+                            0, "claimed\n")
+        for session in ("session-b", ""):
+            with self.subTest(session=session):
+                (self.state_directory / "block.json").unlink(missing_ok=True)
+                other_environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": session}
+                self.assert_command(self.command("claim", "--pid", str(other.pid), "--what", "other tests",
+                                                 "--worktree", str(other_repository), environment=other_environment),
+                                    0, "claimed\n")
+                _ = self.write_block(session="session-a", state="pending",
+                                     waiting_on={"kind": "local_run", "what": "own tests"})
+
+                result = self.command("status")
+
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.block_state()["state"], "pending")
+                self.assertEqual(self.block_state()["waiting_on"], {"kind": "local_run", "what": "other tests"})
+                self.assert_command(self.command("release", "--pid", str(other.pid)), 0, "")
+        self.assertEqual(self.logged_arguments("send-delivered"), [])
+
+    def test_block_placed_during_own_claim_is_active_without_free_message(self) -> None:
+        owner = self.start_child()
+        environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": "session-a"}
+        self.assert_command(self.command("claim", "--pid", str(owner.pid), "--what", "own tests",
+                                         environment=environment), 0, "claimed\n")
+
+        result = self.command("block", "--holder", "alice", "--for", "own work", environment=environment)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.block_state()["state"], "active")
+        self.assertEqual(self.block_state()["free_message"], {"kind": "not_needed"})
+        self.assertEqual(self.run_state().get("holder_session"), "session-a")
+        self.assertEqual(self.read_fixture_variable(), "false")
+        self.assertEqual(self.logged_arguments("send-delivered"), [])
 
     def test_block_records_state_and_turns_the_switch_off(self) -> None:
         environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": "session-123"}
@@ -1944,9 +2091,7 @@ for arguments in (
         }
         self.sync_gh()
         self.clear_log("gh")
-        capped = self.command(
-            "unblock", "--holder", "alice", timeout=SKIPPED_REPORT_TIMEOUT_S
-        )
+        capped = self.command("unblock", "--holder", "alice")
         self.assertEqual(capped.returncode, 0, capped.stdout + capped.stderr)
         self.assertEqual(self.gh_calls("run view"), SKIPPED_REPORT_RUNS)
         self.assertIn("No CI run skipped the macOS job under this block.\n", capped.stdout)
@@ -2241,7 +2386,7 @@ subprocess.run = expire_gh
         self.sync_gh()
         first = self.start_command("watch")
         self.wait_for_path(self.stub_directory / "watch-gh-started")
-        second = self.command("watch", timeout=60)
+        second = self.command("watch")
         self.assert_command(second, 0, "")
         self.assertIsNone(first.poll())
         _ = (self.stub_directory / "continue-watch-gh").write_text(
@@ -2308,7 +2453,7 @@ subprocess.run = expire_gh
             **self.environment,
             "MAC_TEST_MESSAGE_TIMEOUT_S": "0.05",
         }
-        status = self.command("status", environment=environment, timeout=60)
+        status = self.command("status", environment=environment)
         self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
         self.assertIn(
             'The "Mac is free" message has not reached dana yet.\n',

@@ -1,22 +1,86 @@
 #!/usr/bin/env python3
-"""Exercise verify.sh's example gate through real command routing and metadata."""
+"""Exercise verify.sh's example gate with private Cargo metadata and command stubs."""
 
 from __future__ import annotations
 
+import json
 import os
-import shutil
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
-from typing import override
+from typing import cast, override
+
+from scripts.direct.test_verify_mac_offload import stub_build_tool_path
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
 # A hang limit, not a speed check: a verify.sh call starts many processes, and at load 150 one took
 # over 30 s (a merge gate went red at 30 s, 2026-10-18). A real hang still fails, after this many seconds.
 HANG_SECONDS = 300
-REAL_CARGO = shutil.which("cargo")
+FIXED_RUSTC = "rustc 1.90.0 (1159e78c4 2025-09-14)"
+
+
+def rust_tool_path(directory: Path) -> str:
+    """Allow version reads; all other Rust tool calls must have a test stub."""
+    directory.mkdir(parents=True, exist_ok=True)
+    tool_path = stub_build_tool_path(directory)
+    compiler = directory / "rustc"
+    _ = compiler.write_text(
+        '#!/bin/sh\n'
+        + 'case "$*" in\n'
+        + f'  -V|"+nightly -V") printf "%s\\n" "{FIXED_RUSTC}" ;;\n'
+        + f'  -vV) printf "%s\\nhost: x86_64-unknown-linux-gnu\\n" "{FIXED_RUSTC}" ;;\n'
+        + '  *) echo "Unexpected rustc call: $*" >&2; exit 99 ;;\n'
+        + 'esac\n'
+    )
+    compiler.chmod(0o755)
+    return tool_path
+
+
+def workspace_metadata(root: Path) -> dict[str, object]:
+    """Metadata for the small manifests and source files made by these tests."""
+    manifest = cast(dict[str, object], tomllib.loads((root / "Cargo.toml").read_text()))
+    workspace = cast(dict[str, object], manifest.get("workspace", {}))
+    manifests = [root / "Cargo.toml"] if "package" in manifest else []
+    manifests += [root / member / "Cargo.toml" for member in cast(list[str], workspace.get("members", []))]
+    packages: list[dict[str, object]] = []
+    for path in manifests:
+        fields = cast(dict[str, object], tomllib.loads(path.read_text()))
+        package = cast(dict[str, object], fields["package"])
+        name = str(package["name"])
+        folder = path.parent
+        targets: list[dict[str, object]] = []
+        for source, kind, target_name in ((folder / "src/lib.rs", "lib", name),
+                                          (folder / "src/main.rs", "bin", name)):
+            if source.exists():
+                targets.append({"name": target_name, "kind": [kind], "src_path": str(source), "test": True})
+        examples = cast(list[dict[str, object]], fields.get("example", []))
+        named_examples = {str(example["name"]) for example in examples}
+        for source in sorted((folder / "examples").glob("*.rs")):
+            if source.stem not in named_examples:
+                examples.append({"name": source.stem, "path": str(source.relative_to(folder))})
+        for source in sorted((folder / "examples").glob("*/main.rs")):
+            has_path = any(example.get("path") == str(source.relative_to(folder)) for example in examples)
+            if source.parent.name not in named_examples and not has_path:
+                examples.append({"name": source.parent.name, "path": str(source.relative_to(folder))})
+        for example in examples:
+            source = folder / str(example.get("path", f"examples/{example['name']}.rs"))
+            targets.append({"name": example["name"], "kind": ["example"], "src_path": str(source),
+                            "test": example.get("test", False)})
+        for source in sorted((folder / "tests").glob("*.rs")):
+            targets.append({"name": source.stem, "kind": ["test"], "src_path": str(source), "test": True})
+        dependencies: list[dict[str, object]] = []
+        for dependency, value in cast(dict[str, object], fields.get("dependencies", {})).items():
+            if isinstance(value, dict):
+                detail = cast(dict[str, object], value)
+                if "path" in detail:
+                    dependencies.append({"name": dependency, "path": str((folder / str(detail["path"])).resolve())})
+        packages.append({"name": name, "id": name, "manifest_path": str(path), "targets": targets,
+                         "features": {}, "dependencies": dependencies})
+    return {"workspace_root": str(root), "target_directory": str(root / "target"),
+            "workspace_members": [package["id"] for package in packages], "packages": packages}
 
 
 class ExampleWorkspaceFixture(unittest.TestCase):
@@ -28,18 +92,19 @@ class ExampleWorkspaceFixture(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.assertIsNotNone(REAL_CARGO, "cargo is required for real metadata")
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.calls = self.root / "cargo-calls"
         self.metadata_calls = self.root / "metadata-calls"
         stubs = self.root / "stubs"
-        stubs.mkdir()
+        tool_path = rust_tool_path(stubs)
         cargo = stubs / "cargo"
         _ = cargo.write_text(r'''#!/bin/sh
 if [ "$1" = metadata ]; then
     printf "metadata\n" >> "$METADATA_CALLS"
-    exec "$REAL_CARGO" "$@"
+    [ "$*" = "metadata --no-deps --format-version 1" ] || { echo "Unexpected cargo metadata call: $*" >&2; exit 99; }
+    printf "%s\n" "$TEST_METADATA"
+    exit 0
 fi
 printf "%s\n" "$*" >> "$CARGO_CALLS"
 if [ "$1 $2" = "nextest run" ]; then
@@ -48,13 +113,9 @@ if [ "$1 $2" = "nextest run" ]; then
             python3 - <<'PY' || exit $?
 import json
 import os
-import subprocess
 import sys
 
-metadata = json.loads(subprocess.check_output(
-    [os.environ["REAL_CARGO"], "metadata", "--no-deps", "--format-version", "1"],
-    text=True,
-))
+metadata = json.loads(os.environ["TEST_METADATA"])
 members = [package for package in metadata["packages"] if package["id"] in metadata["workspace_members"]]
 if not any(
     set(target["kind"]) & {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}
@@ -72,11 +133,12 @@ fi
 case "$1 $2" in
     "check --workspace") exit "$FAKE_CHECK_EXIT" ;;
     "nextest --version"|"nextest run"|"+nightly fmt") exit 0 ;;
-    *) exit 97 ;;
+    *) echo "Unexpected cargo call: $*" >&2; exit 99 ;;
 esac
 ''')
         cargo.chmod(0o755)
         git = stubs / "git"
+        git.unlink()
         _ = git.write_text(r'''#!/bin/sh
 case " $* " in
     *"rev-parse --show-toplevel"*) printf "%s\n" "$PACKAGE_ROOT" ;;
@@ -103,10 +165,9 @@ esac
                 if name not in {"UNIT_RUN_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID",
                                 "CODEX_SESSION_ID", "UNIT_DETACHED_RUN"}
             },
-            "PATH": f"{stubs}:{os.environ['PATH']}",
+            "PATH": tool_path,
             "HOME": str(self.root),
-            "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup")),
-            "REAL_CARGO": str(REAL_CARGO),
+            "RUSTUP_HOME": str(self.root / "rustup"),
             "PACKAGE_ROOT": str(self.root),
             "CARGO_CALLS": str(self.calls),
             "METADATA_CALLS": str(self.metadata_calls),
@@ -117,6 +178,7 @@ esac
             "XDG_RUNTIME_DIR": str(self.root / "runtime"),
             "XDG_STATE_HOME": str(self.root / "state"),
             "XDG_CACHE_HOME": str(self.root / "cache"),
+            "VERIFY_STEPS_DIR": str(self.root / "verify-steps"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILDLOG_BUILDS_CGROUP": str(self.root / "cgroup"),
             "BUILDLOG_CI_CGROUP": str(self.root / "cgroup"),
@@ -166,6 +228,7 @@ esac
         return example
 
     def verify(self, *args: str) -> subprocess.CompletedProcess[str]:
+        self.environment["TEST_METADATA"] = json.dumps(workspace_metadata(self.root))
         return subprocess.run(
             ["bash", str(VERIFY), *args],
             cwd=self.root,
