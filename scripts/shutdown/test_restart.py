@@ -838,8 +838,9 @@ class RestartTests(ShutdownTestCase):
                 self.assertIn("project-impl (fix, idle): paused on its thread; nothing to run now. "
                               + "Your next dispatch with --to project-impl resumes it.", lines)
                 self.assertEqual(restart._resume_worker_command(seats[3], owner["cwd"]), shlex.join([  # pyright: ignore[reportPrivateUsage]
-                    "bash", str(restart.SCRIPTS / "direct" / "implement.sh"), "--to", "project-impl", str(run), owner["cwd"],
-                    str(run / "project-impl.resume-prompt.md"), "impl", "resume after a move", "impl", "resuming after a move", "0", "impl"]))
+                    "bash", str(restart.SCRIPTS / "direct" / "implement.sh"), "--to", "project-impl",
+                    "--fix-cause", "resume after a move", str(run), owner["cwd"],
+                    str(run / "project-impl.resume-prompt.md"), "fix", "resume after a move", "fix", "resuming after a move", "0", "impl"]))
                 self.assertNotIn("usual arguments", text)
                 self.assertIn(owner["cwd"], text)
                 self.assertNotIn(old_prompt, text)

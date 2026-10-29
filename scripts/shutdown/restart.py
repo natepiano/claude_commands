@@ -2188,6 +2188,37 @@ def launch_entry(
     return EntryLaunched(relaunching_pending_timers)
 
 
+def _resume_phase_id(seat: PausedSeat) -> str:
+    """Use the phase recorded for this worker; a slot can belong to another worker."""
+    try:
+        raw = cast(object, json.loads((Path(seat["run_dir"]) / "progress_history_state.json").read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(raw, dict):
+        return ""
+    passes = cast(dict[str, object], raw).get("pass")
+    if not isinstance(passes, dict):
+        return ""
+    recorded_passes = cast(dict[str, object], passes)
+    # Older state holds one pass directly; newer state holds a pass per slot.
+    candidates = [recorded_passes] if "instance_id" in recorded_passes else recorded_passes.values()
+    phase_ids: set[str] = set()
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        record = cast(dict[str, object], candidate)
+        if record.get("worker_name") != seat["seat"]:
+            continue
+        phase = record.get("phase")
+        if not isinstance(phase, dict):
+            return ""
+        phase_id = cast(dict[str, object], phase).get("id")
+        if not isinstance(phase_id, str) or not phase_id.strip():
+            return ""
+        phase_ids.add(phase_id)
+    return next(iter(phase_ids)) if len(phase_ids) == 1 else ""
+
+
 def _resume_worker_command(seat: PausedSeat, cwd: str) -> str:
     """Build a complete launcher invocation that continues this worker's thread."""
     launcher = "review.sh" if seat["role"] == "review" else "implement.sh"
@@ -2195,15 +2226,24 @@ def _resume_worker_command(seat: PausedSeat, cwd: str) -> str:
     resumed = _resumed_launcher_command(seat["launcher_command"], seat["seat"], prompt) if seat["turn_live"] else None
     if resumed is not None:
         return resumed
-    # The launchers are not executable files: `bash` runs them as pasted.
-    start = ["bash", str(SCRIPTS / "direct" / launcher), "--to", seat["seat"], seat["run_dir"], cwd, prompt]
-    if launcher == "review.sh":
-        return shlex.join([*start, "review", "resume after a move", "resuming after a move"])
     from scripts.direct.worker_state import worker_slot
 
     # The roster role is the last pass kind; implement.sh claims the worker by the slot its identity names.
-    team_role = worker_slot(Path(seat["run_dir"]), seat["seat"]) or seat["role"]
+    recorded_slot = worker_slot(Path(seat["run_dir"]), seat["seat"]) or ""
+    team_role = recorded_slot or seat["role"]
+    phase_id = _resume_phase_id(seat)
+    # The launchers are not executable files: `bash` runs them as pasted.
+    start = ["bash", str(SCRIPTS / "direct" / launcher), "--to", seat["seat"]]
+    if phase_id:
+        start.extend(("--phase", phase_id))
     kind = team_role if team_role in {"impl", "test", "fix"} else "impl"
+    if seat["role"] == "fix":
+        kind = "fix"
+    if launcher == "implement.sh" and kind == "fix":
+        start.extend(("--fix-cause", "resume after a move"))
+    start.extend((seat["run_dir"], cwd, prompt))
+    if launcher == "review.sh":
+        return shlex.join([*start, "review", "resume after a move", "resuming after a move"])
     return shlex.join([*start, kind, "resume after a move", kind, "resuming after a move", "0", team_role])
 
 
