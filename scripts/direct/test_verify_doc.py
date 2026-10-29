@@ -82,6 +82,8 @@ class VerifyDocTests(unittest.TestCase):
             self.executable(tools / name, "raise SystemExit(99)\n")
         for name in ("tmp", "state", "cache", "runtime", "target", "session"):
             (self.root / name).mkdir()
+        meminfo = self.root / "meminfo"
+        _ = meminfo.write_text("MemAvailable: 67108864 kB\n", encoding="utf-8")
         _ = (self.repo / "Cargo.toml").write_text(
             '[workspace]\nmembers = ["alpha", "beta"]\nresolver = "2"\n', encoding="utf-8",
         )
@@ -114,7 +116,7 @@ class VerifyDocTests(unittest.TestCase):
             "XDG_CACHE_HOME": str(self.root / "cache"), "XDG_RUNTIME_DIR": str(self.root / "runtime"),
             "CARGO_HOME": str(self.root / "cargo-home"), "CARGO_TARGET_DIR": str(self.root / "target"),
             "BUILDLOG_DIR": str(self.root / "buildlog"), "BUILDLOG_OFF": "1", "BUILDLOG_SCOPE": "0",
-            "BUILDLOG_MEMINFO": str(self.root / "missing-meminfo"),
+            "BUILDLOG_MEMINFO": str(meminfo),
             "BUILD_HOLD_DIR": str(self.root / "build-hold"), "BUILD_TARGETS_SCRIPT": str(targets),
             "LINT_CONFIG_READER": str(SCRIPTS / "lint/lint_config.sh"),
             "LINT_CONFIG_FILE": str(self.config),

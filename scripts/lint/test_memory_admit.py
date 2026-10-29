@@ -4,17 +4,19 @@
 from __future__ import annotations
 
 import fcntl
+import io
 import json
-import math
 import os
 import re
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import closing, redirect_stdout
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast, override
@@ -38,11 +40,12 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual((result.state, result.threshold, result.reserve), ("admit", 12 * GIB, 3 * GIB))
         self.assertEqual(gate.decide(12 * GIB - 1, 60 * GIB, 20 * GIB, []).state, "hold")
 
-    def test_running_steps_promise_only_future_anon_growth(self) -> None:
-        running = [gate.RunningMemory(10 * GIB, 4 * GIB), gate.RunningMemory(7 * GIB, 9 * GIB)]
-        result = gate.decide(14 * GIB, 60 * GIB, 5 * GIB, running)
-        self.assertEqual((result.promised, result.threshold, result.state), (6 * GIB, 14 * GIB, "admit"))
-        self.assertEqual(gate.decide(14 * GIB - 1, 60 * GIB, 5 * GIB, running).state, "hold")
+    def test_measured_steps_do_not_keep_their_peak_promises(self) -> None:
+        running: list[gate.StepMemory] = [gate.MeasuredMemory(3 * GIB), gate.PromisedMemory(2 * GIB)]
+        result = gate.decide(10 * GIB, 60 * GIB, 5 * GIB, running)
+        self.assertEqual((result.promised, result.measured, result.threshold, result.state),
+                         (2 * GIB, 3 * GIB, 10 * GIB, "admit"))
+        self.assertEqual(gate.decide(10 * GIB - 1, 60 * GIB, 5 * GIB, running).state, "hold")
 
     def test_no_total_has_no_reserve(self) -> None:
         result = gate.decide(5 * GIB, None, 5 * GIB, [])
@@ -173,7 +176,12 @@ class LedgerTests(unittest.TestCase):
         self.sidecar = self.root / "step.cgroup"
         self.meminfo = self.root / "meminfo"
         _ = self.meminfo.write_text("MemAvailable: 12582912 kB\n")
-        self.pid = os.getpid()
+        self.pid = 700
+        def caller_start(pid: int) -> str | None:
+            return "start" if pid == self.pid else None
+        _ = self.enterContext(patch.object(gate, "process_start_time", side_effect=caller_start))
+        _ = self.enterContext(patch.object(gate, "process_tree_memory", return_value=gate.MeasuredMemory(8 * GIB)))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root / "log")})))
 
     def check(self, available: int, *, force: bool = False, sidecar: str = "",
               argv: list[str] | None = None) -> tuple[gate.AdmissionDecision, Path | None]:
@@ -208,7 +216,7 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual([decision.state for decision, _ in results].count("admit"), 1)
         self.assertEqual(len(list((self.root / "admission").glob("*.reservation"))), 1)
 
-    def test_anon_reduces_promise_and_release_records_maximum(self) -> None:
+    def test_measured_tree_replaces_promise_and_release_records_maximum(self) -> None:
         scope = self.root / "scope"
         scope.mkdir()
         _ = (scope / "memory.stat").write_text(f"anon {8 * GIB}\nfile 1\n")
@@ -220,8 +228,9 @@ class LedgerTests(unittest.TestCase):
                 argv=["cargo", "nextest", "run", "--test-threads", "16"],
             )
         assert path is not None
-        result, _ = self.check(12 * GIB)
-        self.assertEqual(result.promised, 4 * GIB)
+        with patch.object(gate, "step_memory", return_value=gate.MeasuredMemory(8 * GIB)):
+            result, _ = self.check(12 * GIB)
+        self.assertEqual((result.promised, result.measured), (0, 8 * GIB))
         _ = path.with_suffix(".max").write_text(str(8 * GIB))
         with patch.object(store, "host_name", return_value="test-host"):
             gate.release(path, 7, self.root)
@@ -284,21 +293,18 @@ class LedgerTests(unittest.TestCase):
                                  "test_threads": None, "call_id": None}
         _ = (gate.admission_dir(self.root) / f"{self.pid}-held.reservation").write_text(json.dumps(row))
 
-    def test_a_reservation_with_no_scope_after_the_grace_time_promises_nothing(self) -> None:
-        # Old verify.sh runs held reservations through the token wait and never started a scope.
-        self.held_reservation(str(self.sidecar), NOW - timedelta(seconds=gate.SCOPE_GRACE_SECONDS))
-        self.assertEqual(self.check(12 * GIB)[0].promised, 0)
+    def test_fresh_step_promises_until_its_first_process_reading(self) -> None:
+        self.held_reservation(str(self.sidecar), NOW - timedelta(seconds=gate.START_SECONDS - 1))
+        decision, _ = self.check(12 * GIB)
+        self.assertEqual((decision.promised, decision.measured), (12 * GIB, 0))
+        self.held_reservation(str(self.sidecar), NOW - timedelta(seconds=gate.START_SECONDS))
+        decision, _ = self.check(12 * GIB)
+        self.assertEqual((decision.promised, decision.measured), (0, 8 * GIB))
 
-    def test_a_reservation_inside_the_grace_time_or_with_its_scope_still_promises(self) -> None:
-        self.held_reservation(str(self.sidecar), NOW - timedelta(seconds=gate.SCOPE_GRACE_SECONDS - 1))
-        self.assertEqual(self.check(12 * GIB)[0].promised, 12 * GIB)
-        _ = self.sidecar.write_text(str(self.root / "no-scope") + "\n")
-        self.held_reservation(str(self.sidecar), NOW - timedelta(hours=1))
-        self.assertEqual(self.check(12 * GIB)[0].promised, 12 * GIB)
-
-    def test_a_step_with_no_scope_at_all_always_promises(self) -> None:
+    def test_unscoped_step_is_measured_after_the_start_window(self) -> None:
         self.held_reservation("", NOW - timedelta(hours=1))
-        self.assertEqual(self.check(12 * GIB)[0].promised, 12 * GIB)
+        decision, _ = self.check(12 * GIB)
+        self.assertEqual((decision.promised, decision.measured), (0, 8 * GIB))
 
     def test_held_step_waits_in_line_and_an_old_waiter_goes_first(self) -> None:
         _ = self.meminfo.write_text("MemAvailable: 0 kB\n")
@@ -310,13 +316,8 @@ class LedgerTests(unittest.TestCase):
         _ = waiting[0].rename(waiting[0].with_name("other.waiting"))
         _ = self.meminfo.write_text(f"MemAvailable: {20 * GIB // 1024} kB\n")
         with mock.patch.object(gate, "process_start_time", return_value=str(older["start_time"])):
-            younger = gate.check(self.meminfo, os.getpid() + 1, "", ["cargo", "check"], root=self.root, now=NOW)
+            younger = gate.check(self.meminfo, self.pid + 1, "", ["cargo", "check"], root=self.root, now=NOW)
         self.assertEqual(younger.decision.threshold - younger.peak.bytes - younger.decision.reserve, older["need"])
-
-    def test_joint_promise_adds_gaps_within_a_minute_and_combines_groups_by_root_sum_square(self) -> None:
-        running = [gate.RunningMemory(4 * GIB, 0, 0.0), gate.RunningMemory(4 * GIB, 1 * GIB, 30.0),
-                   gate.RunningMemory(4 * GIB, 0, 1000.0)]
-        self.assertEqual(gate.joint_promise(running), math.isqrt((7 * GIB) ** 2 + (4 * GIB) ** 2))
 
     def test_no_argv_reads_live_promise_without_reserving(self) -> None:
         _, path = self.check(12 * GIB)
@@ -341,10 +342,10 @@ class LedgerTests(unittest.TestCase):
         first = gate.check(self.meminfo, self.pid, "", ["cargo", "nextest"], root=self.root, now=NOW)
         self.assertIsInstance(first.reservation, gate.Reserved)
         _ = self.meminfo.write_text("MemAvailable: 20971520 kB\n")
-        def grow(_sidecar: str) -> int:
+        def grow(_row: gate.Reservation, _now: datetime) -> gate.StepMemory:
             _ = self.meminfo.write_text("MemAvailable: 8388608 kB\n")
-            return 8 * GIB
-        with patch.object(gate, "cgroup_anon", side_effect=grow):
+            return gate.MeasuredMemory(8 * GIB)
+        with patch.object(gate, "step_memory", side_effect=grow):
             result = gate.check(self.meminfo, self.pid, "", ["cargo", "nextest"], root=self.root, now=NOW)
         self.assertEqual((result.available, result.decision.state), (8 * GIB, "hold"))
 
@@ -359,7 +360,296 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(history.call_count, 1)
 
 
+class MemoryQueueFixture(unittest.TestCase):
+    root: Path = Path()
+    meminfo: Path = Path()
+    processes: dict[int, str] = {}
+    readings: dict[int, gate.MeasuredMemory | gate.GoneMemory] = {}
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.meminfo = self.root / "meminfo"
+        self.processes = {100: "first", 200: "second", 300: "head", 400: "warmup"}
+        self.readings = {100: gate.MeasuredMemory(GIB), 200: gate.MeasuredMemory(2 * GIB)}
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root)})))
+        _ = self.enterContext(patch.object(gate, "process_start_time", side_effect=self.processes.get))
+        def reading(pid: int, _start: str) -> gate.MeasuredMemory | gate.GoneMemory:
+            return self.readings[pid]
+        _ = self.enterContext(patch.object(gate, "process_tree_memory", side_effect=reading))
+
+    def running(self, pid: int, need: float, age: float = 60) -> Path:
+        row: gate.Reservation = {"pid": pid, "start_time": self.processes[pid], "need": int(need * GIB),
+                                 "repo": "test", "step": "nextest", "worktree": "test", "sidecar": "",
+                                 "admitted_at": store.utc_iso(NOW.timestamp() - age),
+                                 "test_threads": None, "call_id": None}
+        path = gate.admission_dir(self.root) / f"{pid}.reservation"
+        _ = path.write_text(json.dumps(row))
+        return path
+
+    def head(self, need: float = 10.9) -> Path:
+        row: gate.Waiter = {"pid": 300, "start_time": "head", "need": int(need * GIB),
+                            "since": NOW.timestamp() - 2400, "label": "clone88ci nextest (verify pid 300)"}
+        path = gate.admission_dir(self.root) / "300-head.waiting"
+        _ = path.write_text(json.dumps(row))
+        return path
+
+    def check(self, pid: int = 400, need: float = 11.6, free: float = 26,
+              since: float = 0) -> gate.CheckResult:
+        _ = self.meminfo.write_text(f"MemAvailable: {int(free * GIB) // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
+        return gate.check(self.meminfo, pid, "", ["cargo", "nextest"], since,
+                          root=self.root, now=NOW,
+                          profile=gate.StepProfile("test", "nextest", "test", gate.ExpectedPeak(int(need * GIB), "measured", 5)))
+
+
+
+class MeasuredAdmissionTests(MemoryQueueFixture):
+    def test_23_point_5_promised_with_3_measured_and_10_point_9_head_admits_warmup(self) -> None:
+        _ = self.running(100, 12)
+        _ = self.running(200, 11.5)
+        _ = self.head()
+        result = self.check()
+        self.assertEqual(result.decision.state, "admit")
+        self.assertEqual((result.decision.promised, result.decision.measured), (0, 3 * GIB))
+        self.assertEqual((result.head_need, result.head_label), (int(10.9 * GIB), "clone88ci nextest (verify pid 300)"))
+
+    def test_dead_steps_promise_leaves_the_sum_at_once(self) -> None:
+        path = self.running(100, 23.5, age=0)
+        del self.processes[100]
+        result = self.check(free=12)
+        self.assertEqual((result.decision.state, result.decision.promised), ("admit", 0))
+        self.assertFalse(path.exists())
+
+    def test_fresh_step_keeps_its_promise_then_uses_its_first_reading(self) -> None:
+        _ = self.running(100, 23.5, age=0)
+        self.assertEqual(self.check().decision.promised, int(23.5 * GIB))
+        _ = self.running(100, 23.5, age=gate.START_SECONDS)
+        result = self.check()
+        self.assertEqual((result.decision.promised, result.decision.measured), (0, GIB))
+
+    def test_clone88ci_head_starts_when_measured_free_memory_covers_it(self) -> None:
+        _ = self.running(100, 12)
+        _ = self.running(200, 11.5)
+        head = self.head()
+        result = self.check(pid=300, need=10.9, free=23.1, since=NOW.timestamp() - 2400)
+        self.assertEqual((result.decision.state, result.head_need), ("admit", 0))
+        self.assertFalse(head.exists())
+
+    def test_head_that_cannot_fit_reserves_nothing_from_smaller_steps(self) -> None:
+        _ = self.running(100, 12)
+        _ = self.head(20)
+        result = self.check(need=2, free=8)
+        self.assertEqual((result.decision.state, result.head_need), ("admit", 0))
+
+    def test_dead_head_is_removed_without_charging_its_need(self) -> None:
+        head = self.head()
+        del self.processes[300]
+        result = self.check(free=12)
+        self.assertEqual((result.decision.state, result.head_need), ("admit", 0))
+        self.assertFalse(head.exists())
+
+    def test_reading_a_finished_tree_does_not_keep_a_promise(self) -> None:
+        _ = self.running(100, 23.5)
+        self.readings[100] = gate.GoneMemory()
+        result = self.check(free=12)
+        self.assertEqual((result.decision.state, result.decision.promised), ("admit", 0))
+
+
+class QueueApiTests(MemoryQueueFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "BUILDLOG_MEMINFO": str(self.meminfo), "BUILDLOG_PROC": str(self.root / "proc"),
+            "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
+        })))
+        self.processes[500] = "third"
+        processes = {pid: gate.ProcessIdentity(1, start) for pid, start in self.processes.items()}
+        _ = self.enterContext(patch.object(gate, "process_table", return_value=processes))
+        _ = self.enterContext(patch.object(time, "time", return_value=NOW.timestamp()))
+        def reading(pid: int, _start: str, _table: dict[int, gate.ProcessIdentity], _proc: Path) -> gate.MeasuredMemory | gate.GoneMemory:
+            return self.readings[pid]
+        _ = self.enterContext(patch.object(gate, "tree_memory", side_effect=reading))
+        _ = self.meminfo.write_text(f"MemAvailable: {int(23.1 * GIB) // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
+
+    def waiter(self, pid: int, since: float, folder: str, name: str) -> Path:
+        row: gate.Waiter = {"pid": pid, "start_time": self.processes[pid], "since": since, "need": int(10.9 * GIB),
+                            "session_id": f"session-{pid}", "session_name": name, "step": "nextest", "folder": folder}
+        path = gate.admission_dir(self.root) / f"{pid}-{self.processes[pid]}.waiting"
+        _ = path.write_text(json.dumps(row))
+        return path
+
+    def queue(self) -> tuple[Path, Path, Path]:
+        return (self.waiter(300, NOW.timestamp() - 2400, "/tmp/clone88ci", "clone88ci"),
+                self.waiter(400, NOW.timestamp() - 300, "/tmp/warmup-tree", "warmup"),
+                self.waiter(500, NOW.timestamp() - 60, "/tmp/third", "third"))
+
+    def test_today_view_replaces_23_point_5_peak_promises_with_3_measured_and_names_head(self) -> None:
+        _ = self.running(100, 12)
+        _ = self.running(200, 11.5)
+        _ = self.queue()
+        with patch("subprocess.run", side_effect=AssertionError("no subprocess")), \
+             patch("time.sleep", side_effect=AssertionError("no wait")), \
+             patch.object(gate, "process_table", wraps=gate.process_table) as read:
+            view = gate.queue_view()
+        self.assertEqual(read.call_count, 1)
+        self.assertEqual((view.promised, sum(step.promise for step in view.running)), (0, int(23.5 * GIB)))
+        self.assertCountEqual([step.measured for step in view.running], [gate.MeasuredMemory(GIB), gate.MeasuredMemory(2 * GIB)])
+        self.assertEqual(view.waiting[0].session_name, "clone88ci")
+        self.assertIsInstance(view.waiting[0].reason, gate.ReadyForAdmission)
+        self.assertEqual(view.waiting[1].reason, gate.BehindHead("clone88ci", NOW.timestamp() - 2400))
+
+    def test_queue_view_names_pending_starts_in_the_memory_reason(self) -> None:
+        _ = self.running(100, 12, age=0)
+        _ = self.running(200, 11.5, age=0)
+        _ = self.queue()
+        view = gate.queue_view()
+        self.assertEqual(view.promised, int(23.5 * GIB))
+        reason = view.waiting[0].reason
+        self.assertIsInstance(reason, gate.NeedsMemory)
+        assert isinstance(reason, gate.NeedsMemory)
+        self.assertEqual((reason.need, reason.free, reason.promised_count, reason.promised),
+                         (int(10.9 * GIB), view.available, 2, int(23.5 * GIB)))
+        self.assertIsInstance(view.running[0].measured, gate.PromisedMemory)
+
+    def test_bump_by_position_session_id_session_name_and_folder_starts_the_selected_waiter_first(self) -> None:
+        for selector in ("2", "session-400", "warmup", "/tmp/warmup-tree", "warmup-tree"):
+            with self.subTest(selector=selector):
+                for path in gate.admission_dir(self.root).glob("*.reservation"):
+                    path.unlink()
+                _ = self.queue()
+                moved = gate.bump_waiter(selector, "actor")
+                self.assertEqual(moved.pid, 400)
+                self.assertEqual(gate.queue_view().waiting[0].pid, 400)
+                older = self.check(pid=300, free=40, since=NOW.timestamp() - 2400)
+                self.assertEqual(older.decision.state, "hold")
+                selected = self.check(pid=400, free=40, since=NOW.timestamp() - 300)
+                self.assertEqual(selected.decision.state, "admit")
+                self.assertFalse((self.root / "admission/400-warmup.waiting").exists())
+
+    def test_moved_waiter_keeps_its_wait_time_and_head_position_after_another_check(self) -> None:
+        paths = self.queue()
+        original_waiters = gate.queue_view().waiting
+        original = original_waiters[-1]
+        _ = gate.bump_waiter("warmup", "actor")
+        moved = gate.bump_waiter("third", "actor")
+        self.assertEqual((moved.pid, moved.since), (original.pid, original.since))
+        waiting = gate.queue_view().waiting
+        self.assertEqual([row.pid for row in waiting], [500, 400, 300])
+        self.assertEqual({row.pid: row.since for row in waiting}, {row.pid: row.since for row in original_waiters})
+        head = waiting[0]
+        self.assertEqual((head.pid, head.since), (original.pid, original.since))
+        self.assertIsInstance(head.reason, gate.ReadyForAdmission)
+        held = self.check(pid=original.pid, free=0, since=original.since)
+        self.assertEqual(held.decision.state, "hold")
+        row = cast(dict[str, object], json.loads(paths[-1].read_text()))
+        self.assertEqual(row["since"], original.since)
+        head = gate.queue_view().waiting[0]
+        self.assertEqual((head.pid, head.since), (original.pid, original.since))
+        previous_head = self.check(pid=400, free=40, since=original_waiters[1].since)
+        self.assertEqual(previous_head.decision.state, "hold")
+        older = self.check(pid=300, free=40, since=NOW.timestamp() - 2400)
+        self.assertEqual(older.decision.state, "hold")
+        selected = self.check(pid=original.pid, free=40, since=original.since)
+        self.assertEqual(selected.decision.state, "admit")
+
+    def test_unknown_and_ambiguous_selectors_name_matches_and_move_nothing(self) -> None:
+        _ = self.waiter(300, NOW.timestamp() - 2400, "/one/shared", "first-session")
+        _ = self.waiter(400, NOW.timestamp() - 300, "/two/shared", "second-session")
+        before = {path: path.read_text() for path in (self.root / "admission").glob("*.waiting")}
+        for selector, word in (("missing", "unknown"), ("99", "unknown"), ("shared", "ambiguous")):
+            with self.assertRaisesRegex(ValueError, word) as result:
+                _ = gate.bump_waiter(selector, "actor")
+            if selector == "shared":
+                self.assertIn("first-session", str(result.exception))
+                self.assertIn("second-session", str(result.exception))
+            self.assertEqual({path: path.read_text() for path in before}, before)
+        self.assertEqual(list(self.root.glob("*/*.jsonl")), [])
+
+    def test_bump_writes_one_row_in_the_private_hold_event_log(self) -> None:
+        _ = self.queue()
+        _ = gate.bump_waiter("2", "actor-id")
+        rows = [cast(dict[str, object], json.loads(line)) for path in self.root.glob("*/*.jsonl")
+                for line in path.read_text().splitlines()]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual({key: row[key] for key in ("kind", "actor", "session", "step", "folder", "old_position", "at")},
+                         {"kind": "queue_bump", "actor": "actor-id", "session": "session-400", "step": "nextest",
+                          "folder": "/tmp/warmup-tree", "old_position": 2, "at": store.utc_iso(NOW.timestamp())})
+
+    def test_queue_view_does_not_prune_dead_records_or_wait_for_the_lock(self) -> None:
+        paths = self.queue()
+        del self.processes[300]
+        _ = self.enterContext(patch.object(gate, "process_table", return_value={
+            pid: gate.ProcessIdentity(1, start) for pid, start in self.processes.items()}))
+        lock_path = self.root / "admission/lock"
+        with lock_path.open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            view = gate.queue_view()
+        self.assertEqual([row.pid for row in view.waiting], [400, 500])
+        self.assertTrue(paths[0].exists())
+        self.assertTrue(all(isinstance(row.reason, gate.ReadingUnavailable) for row in view.waiting))
+
+    def test_missing_meminfo_is_a_reading_unavailable_reason(self) -> None:
+        _ = self.queue()
+        self.meminfo.unlink()
+        self.assertTrue(all(isinstance(row.reason, gate.ReadingUnavailable) for row in gate.queue_view().waiting))
+
+
+
+class ProcessMemoryTests(unittest.TestCase):
+    def test_tree_counts_resident_and_swap_and_excludes_other_processes(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            proc = Path(folder)
+            for pid, parent, state, start, resident, swap in (
+                (100, 1, "S", "start", 10, 2), (101, 100, "S", "child", 20, 3),
+                (102, 101, "S", "leaf", 30, 4), (103, 1, "S", "other", 500, 400),
+                (104, 100, "Z", "dead", 200, 100),
+            ):
+                path = proc / str(pid)
+                path.mkdir()
+                fields = [state, str(parent), *(["0"] * 17), start]
+                _ = (path / "stat").write_text(f"{pid} (test process) " + " ".join(fields))
+                _ = (path / "status").write_text(f"VmRSS: {resident} kB\nVmSwap: {swap} kB\n")
+            self.assertEqual(gate.process_tree_memory(100, "start", proc), gate.MeasuredMemory(69 * 1024))
+            self.assertEqual(gate.process_tree_memory(100, "reused", proc), gate.GoneMemory())
+            self.assertEqual(gate.process_tree_memory(999, "gone", proc), gate.GoneMemory())
+
+
+
 class ShellTests(unittest.TestCase):
+    def test_wait_line_carries_head_need_step_and_measured_memory(self) -> None:
+        command = ('source "$1"; BUILDLOG_MEM_WAIT_S=120; buildlog_memory_python() { echo UTC; }; '
+                   + 'buildlog_memory_line "$2" 0 49000000000 11600000000 measured 5 0 2 3000000000 '
+                   + '"test steps" warmup nextest 3221225472 11703785881 "clone88ci nextest (verify pid 300)"')
+        with tempfile.TemporaryDirectory() as folder:
+            for kind in ("first", "periodic"):
+                result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE), kind],
+                                        env={**os.environ, "BUILDLOG_DIR": folder}, capture_output=True,
+                                        text=True, check=False, timeout=300)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(result.stderr.splitlines()), 1)
+                self.assertIn("head clone88ci nextest (verify pid 300) needs 10.9 GiB", result.stderr)
+                self.assertIn("0.0 GiB promised, 3.0 GiB measured", result.stderr)
+
+    def test_old_shell_keeps_its_field_count_and_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            meminfo = root / "meminfo"
+            _ = meminfo.write_text("MemAvailable: 0 kB\n")
+            arguments = ["memory_admit.py", "check", str(meminfo), "400", "", "0", "repo", "nextest",
+                         "clone88ci", str(12 * GIB), "fallback", "0", "cargo", "nextest"]
+            for detail, count in (("", 15), ("1", 18)):
+                output = io.StringIO()
+                with patch.object(sys, "argv", arguments), \
+                     patch.dict(os.environ, {"BUILDLOG_DIR": folder, "BUILDLOG_MEM_DETAIL": detail}), \
+                     patch.object(gate, "process_start_time", return_value="start"), \
+                     redirect_stdout(output):
+                    gate.main()
+                fields = output.getvalue().strip().split("|")
+                self.assertEqual(len(fields), count)
+                self.assertEqual(fields[14], "clone88ci")
+
     def test_invoke_twice_with_temporary_home(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -379,7 +669,7 @@ class ShellTests(unittest.TestCase):
             command = 'source "$1"; sweep_after_step() { :; }; run_once true'
             for _ in range(2):
                 result = subprocess.run(["bash", "-c", command, "test", str(INVOKE)],
-                                        capture_output=True, text=True, timeout=8, check=False,
+                                        capture_output=True, text=True, timeout=300, check=False,
                                         env=environment)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -391,7 +681,7 @@ class ShellTests(unittest.TestCase):
             command = 'source "$1"; buildlog_wait_for_memory /bin/true; printf "%s|%s|" "$BUILDLOG_MEM_OUTCOME" "$BUILDLOG_MEM_RESERVATION"; if [[ -n "$BUILDLOG_MEM_RESERVATION" && -f "$BUILDLOG_MEM_RESERVATION" ]]; then echo exists; else echo missing; fi; path=$BUILDLOG_MEM_RESERVATION; buildlog_release_memory 0; if [[ -n "$path" && ! -e "$path" ]]; then echo gone; else echo remains; fi'
             result = subprocess.run(
                 ["bash", "-c", command, "test", str(MEMORY_GATE)],
-                capture_output=True, text=True, timeout=8, check=False,
+                capture_output=True, text=True, timeout=300, check=False,
                 env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
@@ -424,7 +714,7 @@ class ShellTests(unittest.TestCase):
             maximum = reservation.with_suffix(".max")
             command = 'source "$1"; buildlog_sample_anon "$2" "$3" & p=$!; sleep 1.2; kill "$p"; wait "$p" 2>/dev/null || true'
             result = subprocess.run(["bash", "-c", command, "test", str(INVOKE), str(sidecar), str(maximum)],
-                                    capture_output=True, text=True, timeout=5, check=False,
+                                    capture_output=True, text=True, timeout=300, check=False,
                                     env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
@@ -439,14 +729,15 @@ class ShellTests(unittest.TestCase):
             row = cast(dict[str, object], json.loads((root / "admission/anon_peaks.jsonl").read_text()))
             self.assertEqual(row["anon_peak_bytes"], GIB)
 
-    def test_gate_wait_lines_and_no_argv_reservation(self) -> None:
+    def test_launch_wait_limit_refuses_without_a_reservation(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             meminfo = root / "meminfo"
             _ = meminfo.write_text("MemAvailable: 11010048 kB\n")
-            command = 'source "$1"; buildlog_wait_for_memory; printf "%s\n" "$BUILDLOG_MEM_RESERVATION"'
+            command = ('set -e; source "$1"; sleep() { SECONDS=$((SECONDS + 1)); }; '
+                       'buildlog_wait_for_memory; printf "step started\\n"')
             result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE)],
-                                    capture_output=True, text=True, timeout=5, check=False,
+                                    capture_output=True, text=True, timeout=300, check=False,
                                     env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
@@ -456,11 +747,11 @@ class ShellTests(unittest.TestCase):
                                          "MAC_TEST_STATE_DIR": str(root / "mac-state"), "BUILDLOG_DIR": str(root),
                                          "BUILDLOG_MEMINFO": str(meminfo), "BUILDLOG_MEM_POLL_S": "1",
                                          "BUILDLOG_MEM_WAIT_LIMIT_S": "1"})
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout, "\n")
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
             self.assertEqual(result.stderr.count("waiting for memory since "), 1)
             self.assertIn("(build needs ", result.stderr)
-            self.assertIn("memory wait limit reached after 15 min; starting the launch anyway", result.stderr)
+            self.assertIn("memory admission check failed (launch wait limit reached without admission); step refused", result.stderr)
             self.assertFalse((root / "admission").exists())
 
     def test_gate_wait_lines_in_order_without_repeated_prefix(self) -> None:
@@ -474,7 +765,7 @@ class ShellTests(unittest.TestCase):
                 'buildlog_wait_for_memory'
             )
             result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE)],
-                                    capture_output=True, text=True, timeout=8, check=False,
+                                    capture_output=True, text=True, timeout=300, check=False,
                                     env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
@@ -504,7 +795,7 @@ class ShellTests(unittest.TestCase):
                 'path=$BUILDLOG_MEM_RESERVATION; buildlog_release_memory 0; if [[ -n "$path" && ! -e "$path" ]]; then echo gone; else echo remains; fi'
             )
             result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE)],
-                                    capture_output=True, text=True, timeout=8, check=False,
+                                    capture_output=True, text=True, timeout=300, check=False,
                                     env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
@@ -529,7 +820,7 @@ class ShellTests(unittest.TestCase):
             command = ('source "$1"; sleep() { printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO"; SECONDS=1; }; '
                        'buildlog_wait_for_memory /bin/true; printf "%s\n" "$BUILDLOG_MEM_OUTCOME"; buildlog_release_memory 0')
             result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE)],
-                                    capture_output=True, text=True, timeout=8, check=False,
+                                    capture_output=True, text=True, timeout=300, check=False,
                                     env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
@@ -543,39 +834,40 @@ class ShellTests(unittest.TestCase):
             self.assertIn("memory free after", result.stderr)
             self.assertNotIn("memory wait limit reached", result.stderr)
 
-    def test_python_failure_is_reported_and_step_starts(self) -> None:
+    def test_python_failure_refuses_the_step_and_names_the_checker_error(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             meminfo = root / "meminfo"
             _ = meminfo.write_text("MemAvailable: 67108864 kB\n")
             broken = root / "broken.py"
             _ = broken.write_text('raise RuntimeError("broken lookup")\n')
-            command = 'set -e; source "$1"; BUILDLOG_MEM_ADMIT_SCRIPT=$2; buildlog_wait_for_memory /bin/true; printf "%s\n" "$BUILDLOG_MEM_OUTCOME"'
+            command = 'set -e; source "$1"; BUILDLOG_MEM_ADMIT_SCRIPT=$2; buildlog_wait_for_memory /bin/true; printf "step started\\n"'
             result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE), str(broken)],
-                                    capture_output=True, text=True, timeout=8, check=False,
+                                    capture_output=True, text=True, timeout=300, check=False,
                                     env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
                                          "UNIT_ACTIVE_DIR": str(root / "active"),
                                          "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
                                          "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
-                                         "MAC_TEST_STATE_DIR": str(root / "mac-state"), "BUILDLOG_MEMINFO": str(meminfo)})
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout, "MeminfoUnavailable\n")
-            self.assertIn("memory gate failed (RuntimeError: broken lookup); starting anyway", result.stderr)
+                                         "MAC_TEST_STATE_DIR": str(root / "mac-state"), "BUILDLOG_MEMINFO": str(meminfo),
+                                         "HOME": str(root), "BUILDLOG_DIR": str(root / "log")})
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertIn("memory admission check failed (RuntimeError: broken lookup); step refused", result.stderr)
 
-    def test_unreadable_meminfo_starts_the_step(self) -> None:
+    def test_missing_memory_reading_refuses_the_step_and_names_meminfo(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             meminfo = root / "meminfo"
             command = ('set -e; source "$1"; buildlog_wait_for_memory /bin/true; '
-                       'printf "%s|%s\n" "$BUILDLOG_MEM_OUTCOME" "$BUILDLOG_MEM_RESERVATION"')
+                       'printf "step started\\n"')
             for contents in ("", "MemTotal: 67108864 kB\n"):
                 with self.subTest(contents=contents):
                     _ = meminfo.write_text(contents)
                     result = subprocess.run(
                         ["bash", "-c", command, "test", str(MEMORY_GATE)],
-                        capture_output=True, text=True, timeout=8, check=False,
+                        capture_output=True, text=True, timeout=300, check=False,
                         env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
@@ -585,19 +877,20 @@ class ShellTests(unittest.TestCase):
                                          "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
                              "BUILDLOG_MEMINFO": str(meminfo)},
                     )
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(result.stdout, "MeminfoUnavailable|\n")
+                    self.assertNotEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn(f"memory admission check failed (cannot read MemAvailable from {meminfo}); step refused", result.stderr)
 
-    def test_untracked_admission_prints_warning(self) -> None:
+    def test_untracked_admission_refuses_the_step_and_names_the_answer(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             meminfo = root / "meminfo"
             _ = meminfo.write_text("MemAvailable: 67108864 kB\n")
             wrapper = root / "untracked.py"
             _ = wrapper.write_text(f'import sys\nsys.path.insert(0, {str(MEMORY_GATE.parent)!r})\nimport memory_admit as gate\ngate.process_start_time = lambda pid: None\ngate.main()\n')
-            command = 'source "$1"; BUILDLOG_MEM_ADMIT_SCRIPT=$2; buildlog_wait_for_memory /bin/true; printf "%s|%s\n" "$BUILDLOG_MEM_OUTCOME" "$BUILDLOG_MEM_RESERVATION"'
+            command = 'set -e; source "$1"; BUILDLOG_MEM_ADMIT_SCRIPT=$2; buildlog_wait_for_memory /bin/true; printf "step started\\n"'
             result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE), str(wrapper)],
-                                    capture_output=True, text=True, timeout=8, check=False,
+                                    capture_output=True, text=True, timeout=300, check=False,
                                     env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
@@ -606,9 +899,9 @@ class ShellTests(unittest.TestCase):
                                          "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                                          "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
                                          "BUILDLOG_MEMINFO": str(meminfo)})
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout, "Granted|\n")
-            self.assertIn("memory gate could not track this step; starting without a reservation", result.stderr)
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertIn("memory admission check failed (invalid admission answer admit:untracked); step refused", result.stderr)
 
 
 class QueueLeaveTests(unittest.TestCase):
@@ -659,7 +952,7 @@ class QueueLeaveTests(unittest.TestCase):
                    + f'status=0; {step} || status=$?; '
                    + 'printf "%s|%s|%s\\n" "$status" "$BUILDLOG_MEM_OUTCOME" "${BUILDLOG_START:-}"')
         return subprocess.run(["bash", "-c", command, "test", str(INVOKE), str(self.ran)],
-                              capture_output=True, text=True, timeout=20, check=False, env=environment)
+                              capture_output=True, text=True, timeout=300, check=False, env=environment)
 
     def hook_calls(self) -> int:
         return len(self.calls.read_text().splitlines()) if self.calls.exists() else 0

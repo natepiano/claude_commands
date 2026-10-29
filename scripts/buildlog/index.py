@@ -30,7 +30,7 @@ from urllib.parse import quote
 
 import store
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 # Step and call fields under a former name, renamed in the file on its next read.
 FORMER_FIELDS = (("seat", "worker"), ("delegate_session", "unit_session"))
 LOCK_NAME = "index.lock"
@@ -308,7 +308,20 @@ MAC_IDLE_COLUMNS: list[Column] = [
     ("action", "TEXT", "created_session_temp_root, retry_marker, message_builds_unit or message_pending (send retried; row stays once)"),
 ]
 
+QUEUE_BUMP_COLUMNS: list[Column] = [
+    ("id", "TEXT PRIMARY KEY", "one queue move"),
+    ("src", "TEXT", "source file"),
+    ("host", "TEXT", "queue host"),
+    ("at", "TEXT", "UTC instant of the move"),
+    ("actor", "TEXT", "session or user who moved the waiter"),
+    ("session", "TEXT", "moved session id"),
+    ("step", "TEXT", "moved build step"),
+    ("folder", "TEXT", "moved build folder"),
+    ("old_position", "INTEGER", "waiting position before the move, starting at one"),
+]
+
 TABLES: dict[str, tuple[list[Column], str, str]] = {
+    "queue_bumps": (QUEUE_BUMP_COLUMNS, "", "one row per user or session move to the head of the memory queue"),
     "mac_idle": (MAC_IDLE_COLUMNS, "", "one Mac idle case per cause per verify call; actions keep the call as the test owner"),
     "hold_builds": (HOLD_BUILD_COLUMNS, "", "one row per build, hold and action: audit or stopped"),
     "hold_events": (HOLD_EVENT_COLUMNS, "", "one row per began or ended event; current holds come from coordination files"),
@@ -617,7 +630,11 @@ def add_mac_idle(connection: sqlite3.Connection, record: dict[str, object], src:
     insert(connection, "mac_idle", pick({**record, "src": src}, MAC_IDLE_COLUMNS))
 
 
-ADDERS = {"mac_idle": add_mac_idle, "hold_build": add_hold_build, "hold_event": add_hold_event, "step": add_step, "call": add_call, "ci_run": add_ci_run, "sample": add_sample,
+def add_queue_bump(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
+    insert(connection, "queue_bumps", pick({**record, "src": src}, QUEUE_BUMP_COLUMNS))
+
+
+ADDERS = {"queue_bump": add_queue_bump, "mac_idle": add_mac_idle, "hold_build": add_hold_build, "hold_event": add_hold_event, "step": add_step, "call": add_call, "ci_run": add_ci_run, "sample": add_sample,
           "memory_snapshot": add_memory_snapshot}
 
 

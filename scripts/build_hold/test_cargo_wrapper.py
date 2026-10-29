@@ -15,7 +15,6 @@ from typing import override
 
 
 SCRIPTS = Path(__file__).resolve().parent
-ROOT = SCRIPTS.parents[1]
 SCOPE_FLAGS = [
     "--user", "--scope", "--quiet", "--collect", "--expand-environment=no",
     "--slice=builds.slice", "--",
@@ -75,7 +74,7 @@ class CargoWrapperTest(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(
-            prefix=".cargo-test-", dir=ROOT,
+            prefix="cargo-test-", dir="/tmp",
         )))
         self.wrapper = self.root / "scripts" / "cargo"
         self.wrapper.parent.mkdir()

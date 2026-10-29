@@ -153,10 +153,11 @@ class HoldEnforcerTests(unittest.TestCase):
         self.assertEqual(decisions[21].process.cwd, "/dev/shm/mac-idle-suite-123/tmp456")
         self.assertEqual(decisions[40].owner, build_hold.OwningSession("detached-session"))
 
-    def test_merge_gate_stops_before_module_children_but_verify_is_never_signalled(self) -> None:
+    def test_waiting_merge_gate_and_verify_survive_while_their_build_children_stop(self) -> None:
         _ = self.process(30, "python3", argv=("python3", "merge_gate.py", "--checkout", "/tree", "--tests-only"), session="gate")
         _ = self.process(20, "python3", parent=30, start=11_001, argv=("python3", "-m", "unittest", "suite"))
         _ = self.process(10, "rustc", parent=20, start=11_002)
+        _ = self.process(21, "basedpyright", parent=30, start=11_001, argv=("basedpyright", "src"))
         _ = self.process(40, "bash", argv=("bash", "verify.sh", "test"), session="verify")
         _ = self.process(41, "cargo", parent=40, start=11_001,
                          argv=("/home/user/.rustup/toolchains/stable/bin/cargo", "test"))
@@ -166,8 +167,30 @@ class HoldEnforcerTests(unittest.TestCase):
         for item in decisions:
             if isinstance(item, hold_enforcer.WouldStopBuild):
                 stopper.stop(item, self.table(), build_hold.natedev_holds(self.holders).in_force, 999)
-        self.assertEqual(sent, [30, 20, 10, 41])
+        self.assertEqual(sent, [20, 10, 21, 41])
+        self.assertIsInstance(next(item for item in decisions if item.process.identity.pid == 30), hold_enforcer.AllowedBuild)
         self.assertIsInstance(next(item for item in decisions if item.process.identity.pid == 40), hold_enforcer.AllowedBuild)
+        self.assertEqual({row["pid"] for row in self.rows()}, {20, 21, 41})
+        self.assertTrue(all(row["action"] == "stopped" for row in self.rows()))
+
+    def test_merge_gate_entry_points_wait_but_mentions_do_not_protect_tests(self) -> None:
+        for argv in (
+            ("/tree/merge_gate.py", "--tests-only"),
+            ("python3", "-u", "/tree/merge_gate.py", "--promote-only"),
+            ("python3", "-m", "scripts.production.merge_gate", "--tests-only"),
+        ):
+            with self.subTest(argv=argv):
+                _ = self.process(30, "python3", argv=argv, session="other")
+                decision, = self.decisions()
+                self.assertIsInstance(decision, hold_enforcer.AllowedBuild)
+        for argv in (
+            ("python3", "-m", "unittest", "merge_gate.py"),
+            ("python3", "/tree/test_driver.py", "merge_gate.py"),
+        ):
+            with self.subTest(argv=argv):
+                _ = self.process(30, "python3", argv=argv, session="other")
+                decision, = self.decisions()
+                self.assertIsInstance(decision, hold_enforcer.WouldStopBuild)
 
     def test_old_nextest_stops_keep_covers_children_and_reused_keep_pid_does_not(self) -> None:
         _ = self.process(10, "cargo-nextest", start=1000, session="other")
@@ -217,7 +240,7 @@ class HoldEnforcerTests(unittest.TestCase):
     def test_all_test_entry_points_and_executable_path_match_without_treating_lookup_or_language_server_as_builds(self) -> None:
         cases = (
             ("python3", ("python3", "-m", "pytest")), ("py.test", ("/venv/bin/py.test",)),
-            ("python3", ("python3", "/tree/test_driver.py")), ("python3", ("python3", "/tree/driver_test.py")),
+            ("python3", ("python3", "/tree/test_driver.py")),
             ("bash", ("bash", "-e", "/tree/test_build.sh")), ("clippy-driver", ("clippy-driver",)),
             ("node", ("node", "/tools/basedpyright.js", "src")),
         )
@@ -232,9 +255,53 @@ class HoldEnforcerTests(unittest.TestCase):
         _ = self.process(42, "python3", argv=("python3", "-c", "print('pytest')"))
         _ = self.process(43, "basedpyright-langserver")
         _ = self.process(44, "rust-analyzer")
+        _ = self.process(45, "python3", argv=("python3", "/tree/driver_test.py"))
         decisions = self.decisions()
         self.assertEqual({item.process.identity.pid for item in decisions}, expected)
         self.assertTrue(all(isinstance(item, hold_enforcer.WouldStopBuild) for item in decisions))
+
+    def test_hold_stops_natedev_tests_but_spares_mac_coordination(self) -> None:
+        for pid, verb in enumerate(("watch-claim", "free-now", "claim", "release"), 10):
+            _ = self.process(pid, "python3", session="other", argv=(
+                "python3", "-u", "/tree/scripts/mac_test/mac_test.py", verb,
+            ))
+        _ = self.process(20, "python3", session="other", argv=(
+            "python3", "-m", "scripts.mac_test.mac_test", "watch-claim",
+        ))
+        _ = self.process(21, "mac_test.py", session="other", executable="/tools/python3", argv=(
+            "/tree/scripts/mac_test/mac_test.py", "release",
+        ))
+        _ = self.process(30, "python3", session="other", argv=("python3", "-m", "unittest", "suite"))
+        _ = self.process(31, "cargo", session="other", argv=("cargo", "nextest", "run"))
+        table = self.table()
+        holders = build_hold.natedev_holds(self.holders).in_force
+        decisions = hold_enforcer.decide_builds(table, holders, self.uid, 999)
+        self.assertEqual({item.process.identity.pid for item in decisions}, {30, 31})
+        sent: list[tuple[int, int]] = []
+        stopper = hold_enforcer.StopBuildsAndTests(
+            self.proc, signal_process=lambda pid, signum: sent.append((pid, signum)),
+        )
+        for decision in decisions:
+            self.assertIsInstance(decision, hold_enforcer.WouldStopBuild)
+            if isinstance(decision, hold_enforcer.WouldStopBuild):
+                stopper.stop(decision, table, holders, 999)
+        self.assertEqual(sent, [(30, signal.SIGTERM), (31, signal.SIGTERM)])
+        self.assertEqual([row["pid"] for row in self.rows()], [30, 31])
+
+    def test_verify_version_and_metadata_probes_are_not_builds_during_hold(self) -> None:
+        _ = self.process(5, "bash", session="verify", argv=("bash", "verify.sh", "test"))
+        probes = (
+            ("rustc", "-vV"), ("rustc", "--version"), ("rustc", "-V"),
+            ("rustc", "+nightly", "-vV"), ("cargo", "--version"),
+            ("cargo", "metadata"), ("cargo", "+nightly", "metadata", "--format-version", "1"),
+        )
+        for pid, argv in enumerate(probes, 10):
+            _ = self.process(pid, argv[0], parent=5, argv=argv)
+        _ = self.process(30, "rustc", parent=5, argv=("rustc", "/tree/lib.rs"))
+        decisions = {item.process.identity.pid: item for item in self.decisions()}
+        self.assertEqual(set(decisions), {5, 30})
+        self.assertIsInstance(decisions[5], hold_enforcer.AllowedBuild)
+        self.assertIsInstance(decisions[30], hold_enforcer.WouldStopBuild)
 
     def test_reader_limits_details_to_candidates_and_ancestors(self) -> None:
         _ = self.process(10, "claude", start=1000, session="other")

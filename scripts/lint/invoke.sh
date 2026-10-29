@@ -86,7 +86,10 @@ fi
 # CI (100) and sessions (200), the largest first.
 BUILDLOG_RECORD="$HOME/.claude/scripts/buildlog/record.py"
 BUILDLOG_SCOPE_SH='exec 2>&3 3>&-; { : > "$0"; } 2>/dev/null || exit 125; cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"; printf "%s\n" "$cgroup" > "$0.cgroup"; { echo 500 > /proc/self/oom_score_adj; } 2>/dev/null || true; "$@"; s=$?; cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null; exit $s'
-source "$(dirname "${BASH_SOURCE[0]}")/memory_gate.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/memory_gate.sh" || {
+    printf 'invoke.sh: cannot load admission and hold checks; step refused\n' >&2
+    return 2
+}
 
 buildlog_now() {
     if [[ -n "${EPOCHREALTIME:-}" ]]; then
@@ -209,6 +212,10 @@ buildlog_finish_memory() {
 LINT_LEFT_QUEUE_STATUS=75
 
 run_once() {
+    if [[ -n "${BUILDLOG_CHECK_FAILED_FILE:-}" && -f "$BUILDLOG_CHECK_FAILED_FILE" ]]; then
+        build_check_stop 2 'a prior admission or hold check failed'
+        return 2
+    fi
     printf '+ %s\n' "$*"
     if buildlog_step_compiles "$@"; then
         build_hold_wait_local || return $?
@@ -217,12 +224,21 @@ run_once() {
     local sampler_pid="" parent_pid=$BASHPID status=0 memory_wait=0
     if buildlog_step_compiles "$@"; then
         while :; do
-            buildlog_wait_for_memory "$@"
+            buildlog_wait_for_memory "$@" || {
+                status=$?
+                buildlog_release_memory "$status"
+                return "$status"
+            }
             memory_wait=$(( memory_wait + BUILDLOG_MEM_WAIT_S ))
             if [[ "$BUILDLOG_MEM_OUTCOME" == LeftQueue ]]; then
                 buildlog_release_memory 0
                 BUILDLOG_MEM_WAIT_S=$memory_wait BUILDLOG_START="" BUILDLOG_TREE=""
                 return "$LINT_LEFT_QUEUE_STATUS"
+            fi
+            if [[ "$BUILDLOG_MEM_OUTCOME" != Granted ]]; then
+                buildlog_release_memory 2
+                build_check_stop 2 'memory admission check did not allow the step'
+                return 2
             fi
             if build_hold_check_local; then
                 break
@@ -334,7 +350,8 @@ sweep_after_step() {
     [[ "$last" =~ ^[0-9]+$ ]] || last=0
     (( now - last >= SWEEP_EVERY_S )) || return 0
     mkdir -p "$dir" && printf '%s\n' "$now" > "$stamp" || return 0
-    ( trap '' HUP; invoke_sweep </dev/null >/dev/null 2>&1 & )
+    # Detached work and its descendants do not own verify.sh's foreground step.
+    ( trap '' HUP; TOKEN_HELD=0; invoke_sweep </dev/null >/dev/null 2>&1 & )
 }
 
 have_nextest() {

@@ -7,6 +7,14 @@ source "$(dirname "${BASH_SOURCE[0]}")/../lint/memory_gate.sh"
 unset BUILDLOG_CALL_ID
 admission=0
 reason="$(python3 "$BUILD_TARGETS_SCRIPT" check-local)" || admission=$?
+if [[ "$admission" == 0 ]]; then
+    memory_output="$(buildlog_wait_for_memory 2>&1)" || admission=$?
+    [[ -z "$memory_output" ]] || printf '%s\n' "$memory_output" >&2
+    if [[ "$admission" != 0 ]]; then
+        reason="BRP launch memory check failed (exit $admission)"
+        [[ -z "$memory_output" ]] || reason+=": ${memory_output##*$'\n'}"
+    fi
+fi
 if [[ "$admission" != 0 ]]; then
     [[ -n "$reason" ]] || reason="natedev's hold state could not be read; not starting."
     python3 - "$reason" <<'PY_DENY'
@@ -17,5 +25,4 @@ print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
 PY_DENY
     exit 0
 fi
-buildlog_wait_for_memory || true
 exit 0

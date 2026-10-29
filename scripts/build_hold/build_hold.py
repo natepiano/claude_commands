@@ -1054,8 +1054,8 @@ def register_wait(session_id: str, name: str = "") -> str:
     with release_lock():
         if isinstance(read_holders(holder_directory()), NoHolders):
             return "no build hold"
-        cycle = read_cycle_for_change()
-        if isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
+        cycle = read_cycle()
+        if cycle is None:
             return "no hold cycle: wait for the release broadcast"
         _ = cycle["recipients"].setdefault(session_id, name or session_id)
         if not any(entry["session_id"] == session_id for entry in cycle["entries"]):

@@ -42,6 +42,7 @@ class BrpLaunchGateTests(unittest.TestCase):
     root: Path = Path()
     environment: dict[str, str] = {}
     cycle_file: Path = Path()
+    hook: Path = HOOK
 
     @override
     def setUp(self) -> None:
@@ -100,9 +101,40 @@ class BrpLaunchGateTests(unittest.TestCase):
         if include_session:
             hook_input["session_id"] = session_id
         return subprocess.run(
-            ["bash", str(HOOK)], input=json.dumps(hook_input),
+            ["bash", str(self.hook)], input=json.dumps(hook_input),
             capture_output=True, text=True, check=False, env=self.environment, timeout=10,
         )
+
+    def use_memory_wait_stub(self, body: str) -> None:
+        hooks = self.root / "hooks"
+        lint = self.root / "lint"
+        hooks.mkdir()
+        lint.mkdir()
+        self.hook = hooks / HOOK.name
+        _ = self.hook.write_text(HOOK.read_text())
+        _ = (lint / "memory_gate.sh").write_text(
+            "buildlog_wait_for_memory() {\n" + body + "\n}\n"
+        )
+
+    def test_failed_memory_wait_denies_launch_with_its_last_reason_line(self) -> None:
+        self.use_memory_wait_stub(
+            "printf 'memory check started\\nchecker could not read meminfo\\n' >&2\nreturn 7"
+        )
+        self.assert_denied(
+            self.run_hook(),
+            "BRP launch memory check failed (exit 7): checker could not read meminfo",
+        )
+
+    def test_failed_memory_wait_without_output_denies_launch_with_exit_status(self) -> None:
+        self.use_memory_wait_stub("return 9")
+        self.assert_denied(self.run_hook(), "BRP launch memory check failed (exit 9)")
+
+    def test_allowed_memory_wait_passes_launch_without_a_deny_answer(self) -> None:
+        self.use_memory_wait_stub("printf 'memory admitted\\n' >&2\nreturn 0")
+        result = self.run_hook()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "memory admitted\n")
 
     def test_low_memory_wait_leaves_old_release_record_unchanged(self) -> None:
         meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
