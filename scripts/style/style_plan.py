@@ -240,7 +240,12 @@ def ticket_sync_check(changes: MainChanges | UnknownMainChanges, files: tuple[st
             return SyncNeeded(f"touched set unknown: unknown crate for {path}")
         protected.update(str(PurePosixPath(crate) / name) for name in ("Cargo.toml", "build.rs"))
     touched = sorted(protected & changes.paths)
-    return SyncNeeded(f"main touched {touched[0]}") if touched else SyncNotNeeded()
+    if not touched:
+        return SyncNotNeeded()
+    paths = ", ".join(touched[:3])
+    if len(touched) > 3:
+        paths += f" +{len(touched) - 3}"
+    return SyncNeeded(f"main touched {paths}")
 
 
 def ticket_sync_wait(ledger: style_ledger.Ledger, changes: MainChanges | UnknownMainChanges,
@@ -2977,8 +2982,8 @@ def refill_outcome(result: NextPhase) -> str:
             return "repair first"
         case WaitingForMerge():
             return "waiting for merge"
-        case WaitingForSync():
-            return "waiting for sync"
+        case WaitingForSync(reason=reason):
+            return "waiting for sync" + (f": {reason}" if reason else "")
         case WaitingForStructure(crates):
             return f"waiting for structure: {', '.join(crates)}"
         case MergeStyleBranchFirst():
