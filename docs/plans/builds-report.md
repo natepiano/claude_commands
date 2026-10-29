@@ -149,28 +149,17 @@ verify-unit's Work Order for the copy folder name (roster.py join `<showrunner>-
 
 ### Phase 4 — Copy folders take one showrunner-unit name  · status: done
 
-**Depends on:** Phase 3
+#### As-built
 
-#### Work Order
-
-**Goal:** One function in `roster.py` gives the `<showrunner>-<unit>` folder name that verify-unit's copies helper puts in `/tmp/claude/copies/<showrunner>-<unit>/<phase>-<purpose>`, from Phase 3's `UnitLabels`, so no caller joins names itself.
-
-**Spec:**
-
-1. **`UnitLabels.folder_name() -> str`** (`scripts/message/roster.py`). It joins the showrunner and unit names with `-`: showrunner `hana`, unit `lfo` gives `hana-lfo`.
-2. **No doubled showrunner.** When the unit name is the showrunner name, or starts with the showrunner name and `-`, the unit name alone is the folder name: showrunner `cargo-liner-style`, unit `cargo-liner-style-types` gives `cargo-liner-style-types`.
-3. **A missing part is dropped.** A `—` part is left out with its hyphen: showrunner `builds` and no unit gives `builds`; no showrunner and unit `lfo` gives `lfo`. With both missing, the session name is the folder name.
-4. **Callers pass the director's session.** The docstring says: look up labels with `unit_labels_for([<session id from build_hold.owning_session()>], environment)`, so a Codex worker resolves to its unit director. This phase changes no caller; verify-unit's copies helper is the first.
+- `UnitLabels.folder_name() -> str` in `roster.py` gives the `<showrunner>-<unit>` folder name for `/tmp/claude/copies/<showrunner>-<unit>/<phase>-<purpose>`, so no caller joins names itself. Showrunner `hana`, unit `lfo` gives `hana-lfo`.
+- When the unit name equals the showrunner name, or starts with the showrunner name and `-`, the unit name alone is the folder name: `cargo-liner-style` + `cargo-liner-style-types` gives `cargo-liner-style-types`.
+- A `—` part is left out with its hyphen: `builds` alone gives `builds`, `lfo` alone gives `lfo`. With both parts `—`, the session name is the folder name.
+- The docstring tells callers to look up labels with `unit_labels_for([<session id from build_hold.owning_session()>], environment)`, so a Codex worker resolves to its unit director. No caller uses it yet; verify-unit's copies helper is the first.
 
 **Files:**
 - `scripts/message/roster.py` — `UnitLabels.folder_name`
-- `scripts/message/test_roster.py` — four tests
+- `scripts/message/test_roster.py` — four `UnitLabelsTests.test_folder_name_*` tests built from direct `UnitLabels` values: plain join, unit that starts with its showrunner's name, one part missing (each side), both missing
 
-**Workers:** `1 writer` — `impl2` (it wrote Phase 3's `UnitLabels`): both files. Tests build `UnitLabels` values directly; they read no live roster or session. Cases: plain join; unit that leads with its showrunner's name; one part missing (each side); both missing.
-
-**Constraints from prior phases:** Phase 3 put `UnitLabels`, `unit_labels` and `unit_labels_for` in `roster.py`; `—` marks a missing relationship. `roster.py` belongs to natedev's `scripts/message/` owner (shutdown-unit), so the checkpoint notice carries its also-touches line, trial-merged against origin/natedev and origin/natedev-shutdown. A changed existing expectation needs its own `Assertion-Change: <path>::<test> — <why>` line.
-
-**Acceptance gate:**
-- `python3 -m unittest scripts.message.test_roster` green, and the production Merge tests green.
-- `basedpyright scripts/message/roster.py scripts/message/test_roster.py`: `0 errors, 0 warnings, 0 notes`.
-- Live check on natedev from the worktree: `unit_labels_for` for this session's id, then `folder_name()`, prints `builds-report`.
+**Gotchas:**
+- The prefix rule needs the hyphen: `hana` + `hanami` gives `hana-hanami`, and a test pins it.
+- `basedpyright` exits 3 in the worktree because the configured `.venv` is absent; read its footer (`0 errors, 0 warnings, 0 notes`).
