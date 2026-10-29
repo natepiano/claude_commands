@@ -8268,7 +8268,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
         self.assertNotIn("no completion notice arrived", log)
 
     def test_a_result_held_past_the_wall_clock_deadline_opens_the_next_turn(self) -> None:
-        self.start_args_timeout = 60
+        self.start_args_timeout = TEST_HANG_GUARD_SECS
         self.assertEqual(self.run_start(), (0, ""))
         self.outcomes = ["completed", "completed"]
         run = self.session_dir / codex_mesh.DETACHED_RUNS_DIR / "late.json"
@@ -8278,7 +8278,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
         clock_jumped = threading.Event()
         waiting = codex_mesh._waiting_on_detached_run  # pyright: ignore[reportPrivateUsage]
         quiet = codex_mesh._on_quiet_poll  # pyright: ignore[reportPrivateUsage]
-        budget = FixtureLoopBudget("held result past the deadline", seconds=20, max_calls=200)
+        budget = FixtureLoopBudget("held result past the deadline", seconds=TEST_HANG_GUARD_SECS, max_calls=200)
 
         def note_wait(session_dir: str, name: str, thread_id: str, runs: codex_mesh.DetachedRunWatch) -> bool:
             held = waiting(session_dir, name, thread_id, runs)
@@ -8290,23 +8290,33 @@ class FollowEventRegressionTests(MeshCommandFixture):
             stream: codex_mesh.TurnStream, log: TextIO,
         ) -> codex_mesh.StreamStep | codex_mesh.FailedWithThread:
             _ = budget.check()
-            if held_on_run.is_set():
+            step = quiet(stream, log)
+            if held_on_run.is_set() and not clock_jumped.is_set():
+                self.assertEqual(json.loads(run.read_text())["status"], "running",
+                                 "the result was published before the deadline jump")
                 # A suspended machine moves wall time past the deadline while
                 # the frame loop's monotonic clock keeps it running.
                 stream.deadline = time.time() - 1
                 clock_jumped.set()
-            return quiet(stream, log)
+            return step
 
         with (patch.object(codex_mesh, "_waiting_on_detached_run", note_wait),
               patch.object(codex_mesh, "_on_quiet_poll", jump_wall_clock),
               ThreadPoolExecutor(max_workers=1) as executor):
             future = executor.submit(self.run_follow)
-            self.assertTrue(held_on_run.wait(timeout=5), "launcher never waited on the live run")
-            _ = run.write_text(json.dumps({"worker": "worker", "status": "finished", "pid": os.getpid()}))
+            self.assertTrue(held_on_run.wait(timeout=TEST_HANG_GUARD_SECS),
+                            "launcher never waited on the live run")
+            # The live-run check can precede the quiet poll that applies the jump.
+            (self.session_dir / "worker.pending.json").touch()
+            self.assertTrue(clock_jumped.wait(timeout=TEST_HANG_GUARD_SECS),
+                            "launcher never observed the deadline jump")
             held = codex_mesh.hold_message(str(self.session_dir), "worker", "detached run result",
                                            without_launcher=False)
             self.assertIsInstance(held, codex_mesh.HeldForLauncher)
-            code, errors = future.result(timeout=10)
+            # Keep the inbox owned until its result is held, then announce run completion.
+            _ = run.write_text(json.dumps({"worker": "worker", "status": "finished", "pid": os.getpid()}))
+            (self.session_dir / "worker.pending.json").touch()
+            code, errors = future.result(timeout=TEST_HANG_GUARD_SECS)
         self.assertTrue(clock_jumped.is_set())
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(self.turn_inputs[-1], "detached run result")

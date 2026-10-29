@@ -42,6 +42,11 @@ USES_THE_MACHINE_ZONE = {
 SKIPPED_DIRS = {"__pycache__", "fixtures", "tests", "testdata", "node_modules"}
 
 
+def is_test_code(path: Path) -> bool:
+    """A test module or a shared test helper: its times are fixture data, never shown to the user."""
+    return path.name.startswith("test_") or path.stem.endswith("_test_support")
+
+
 class UserZoneTests(unittest.TestCase):
     conf: Path = Path()
 
@@ -90,7 +95,7 @@ class UserZoneTests(unittest.TestCase):
         found: set[str] = set()
         for path in scripts.rglob("*"):
             relative = path.relative_to(scripts)
-            if (path.suffix not in (".py", ".sh") or path.name.startswith("test_")
+            if (path.suffix not in (".py", ".sh") or is_test_code(path)
                     or SKIPPED_DIRS.intersection(relative.parts) or not path.is_file()):
                 continue
             if HARDCODED.search(path.read_text(encoding="utf-8", errors="replace")):
@@ -103,7 +108,7 @@ class UserZoneTests(unittest.TestCase):
         found: set[str] = set()
         for path in scripts.rglob("*.py"):
             relative = path.relative_to(scripts)
-            if path.name.startswith("test_") or SKIPPED_DIRS.intersection(relative.parts) or not path.is_file():
+            if is_test_code(path) or SKIPPED_DIRS.intersection(relative.parts) or not path.is_file():
                 continue
             if MACHINE_ZONE.search(path.read_text(encoding="utf-8", errors="replace")):
                 found.add(relative.as_posix())
