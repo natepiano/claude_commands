@@ -18,7 +18,9 @@ from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 from unittest import mock
+
 from scripts.guilds import roles
+from scripts.lib.socket_test_support import short_socket_directory
 
 SCRIPTS = Path(__file__).parents[1]
 sys.path.insert(0, str(Path(__file__).parent))
@@ -175,7 +177,7 @@ class RosterTests(unittest.TestCase):
         proc_start: str = "",
         entrypoint: str = "cli",
     ) -> None:
-        socket_path = self.sessions / f"{file_name}.sock"
+        socket_path = Path(self.enterContext(short_socket_directory())) / f"{file_name}.sock"
         if with_socket:
             listener = socket.socket(socket.AF_UNIX)
             listener.bind(str(socket_path))
