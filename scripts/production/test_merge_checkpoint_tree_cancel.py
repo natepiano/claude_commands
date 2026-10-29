@@ -56,6 +56,8 @@ class CheckpointTreeCancelTests(unittest.TestCase):
 
 class CancelledHandoffResumeTests(unittest.TestCase):
     def handoff_fixture(self, resume_status: int) -> checkpoint_fixture.MergeCheckpointTests:
+        checkpoint_fixture.MergeCheckpointTests.setUpClass()
+        self.addCleanup(checkpoint_fixture.MergeCheckpointTests.doClassCleanups)
         fixture = checkpoint_fixture.MergeCheckpointTests()
         self.addCleanup(fixture.doCleanups)
         fixture.setUp()

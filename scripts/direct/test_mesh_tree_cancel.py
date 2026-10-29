@@ -60,6 +60,8 @@ class MeshTreeCancelTests(VerifyTreeCancelFixture):
         return cast(dict[str, object], json.loads((fixture.board / (identity + ".pending.json")).read_text()))
 
     def test_two_simultaneous_callers_receive_only_their_own_cancellation_or_pass(self) -> None:
+        VerifyTreeCancelFixture.setUpClass()
+        self.addCleanup(VerifyTreeCancelFixture.doClassCleanups)
         other = VerifyTreeCancelFixture()
         other.setUp()
         self.addCleanup(other.tearDown)
