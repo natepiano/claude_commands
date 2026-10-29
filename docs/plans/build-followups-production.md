@@ -54,6 +54,7 @@
 | review-unit | (retired 2026-10-18, worktree removed) docs/plans/build-followups-review.md | /home/natepiano/worktrees/claude-build-followups-review | build-followups-review | — | — |
 | efficiency-unit | docs/as-built/token-efficiency-study.md | /home/natepiano/worktrees/claude-build-followups-efficiency | build-followups-efficiency | — | the efficiency proposals ledger (~/.local/state/nightly-review/ledger.md and its night reports); the token-efficiency investigation |
 | typesafe-unit | docs/plans/build-followups-typesafe.md | /home/natepiano/worktrees/claude-build-followups-typesafe | build-followups-typesafe | — | — |
+| postmaster-unit | permanent | /home/natepiano/worktrees/claude-build-followups-postmaster | build-followups-postmaster | — | — |
 
 ## Hub files
 
