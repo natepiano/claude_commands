@@ -23,6 +23,8 @@ SHARED_TEST_HELPERS = frozenset({
     "scripts/production/add_unit_test_support.py",
     "scripts/usage/fixtures/collect/mac/fake_ssh.py",
     "scripts/direct/recorder_fixture.py", "scripts/direct/wait_for_test_state.py",
+    "scripts/direct/verify_mac_offload_test_support.py",
+    "scripts/direct/verify_token_wait_test_support.py",
     "scripts/direct/test_verify_mac_offload.py", "scripts/direct/test_verify_doc.py",
     "scripts/direct/test_verify_lint_scope.py", "scripts/direct/test_verify_token_wait.py",
     "scripts/direct/test_verify_untested_examples.py", "scripts/accounts/nix_env_fake.py",
