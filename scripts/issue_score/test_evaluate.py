@@ -132,11 +132,11 @@ class CompareTests(unittest.TestCase):
         issue = next(issue for issue in vault.load_rated_issues(self.issues).issues if issue.path == path)
         state = vault.build_state(issue)
         area_state: questions.AreaState = {"issue": state["issue"], "areas": ["rendering", "tooling"]}
-        main_questions, area_questions = questions.main_questions(), questions.area_questions(area_state["areas"])
+        main_questions, area_questions = questions.main_questions(), questions.area_questions(area_state["areas"], {})
         main = client.parse_response(cast(object, json.loads((FIXTURES / "main_response.json").read_text())), main_questions)
         area = client.parse_response(cast(object, json.loads((FIXTURES / "area_response.json").read_text())), area_questions)
         return {
-            "issue_path": str(path), "content_hash": score_issues.content_hash(issue, area_state["areas"]),
+            "issue_path": str(path), "content_hash": score_issues.content_hash(issue, area_state["areas"], {}),
             "question_set_version": questions.QUESTION_SET_VERSION, "model": questions.MODEL,
             "payloads": {"main": {"model": questions.MODEL, "state": state, "questions": main_questions},
                          "area": {"model": questions.MODEL, "state": area_state, "questions": area_questions}},
@@ -309,7 +309,7 @@ class CompareTests(unittest.TestCase):
                     "type": "choice", "choice": "feature", "confidence": confidence,
                     "probabilities": {"feature": confidence, "refactor": 1 - confidence},
                 }
-            # Perfectly confident area answers cannot override Unsupported.
+            # Preserve the historical Unsupported behavior independently of adoption.
             for name in ("area", "area_reverse"):
                 record["answers"]["area"]["answers"][name] = {
                     "type": "choice", "choice": "rendering", "confidence": 1.,
@@ -318,7 +318,8 @@ class CompareTests(unittest.TestCase):
             record["answers"]["area"]["answers"]["area_fits"] = {"type": "noul", "noul": 1.}
             self.refresh_decisions(record)
         _ = self.run_file("tuned-heldout", entries)
-        with mock.patch.object(decide, "select_threshold", side_effect=AssertionError("Held-out data must not select thresholds")):
+        with mock.patch.dict(questions.THRESHOLDS, area=decide.Unsupported()), \
+                mock.patch.object(decide, "select_threshold", side_effect=AssertionError("Held-out data must not select thresholds")):
             report = self.compare("tuned-heldout", split="holdout")
         risk = section(report, "## Risk-coverage")
         for field, threshold, count in (("backlog_goal", "0.40", 2), ("category", "0.90", 1),
@@ -339,6 +340,38 @@ class CompareTests(unittest.TestCase):
         recommendations = table(section(report, "## Per-field recommendations and score ≥ 20 results"), "Field")
         area_recommendation = next(row["Recommendation"] for row in recommendations if row["Field"] == "area")
         self.assertIn("agent-only", area_recommendation)
+
+    def test_routing_reports_taken_and_user_shares_at_the_configured_area_threshold(self) -> None:
+        entries = [self.record(self.issue(f"Routing {number}")) for number in range(4)]
+        for record, confidence, fits, agrees in zip(
+                entries, (.9, .89, .99, .99), (.95, .95, .5, .95), (True, True, True, False)):
+            answers = record["answers"]["area"]["answers"]
+            answers["area"] = {
+                "type": "choice", "choice": "rendering", "confidence": confidence,
+                "probabilities": {"rendering": confidence, "tooling": 1 - confidence},
+            }
+            answers["area_reverse"] = copy.deepcopy(answers["area"]) if agrees else {
+                "type": "choice", "choice": "tooling", "confidence": .51,
+                "probabilities": {"rendering": .49, "tooling": .51},
+            }
+            answers["area_fits"] = {"type": "noul", "noul": fits}
+            self.refresh_decisions(record)
+        _ = self.run_file("routing", entries)
+        risk = section(self.compare("routing"), "## Risk-coverage")
+        area = section(risk, "### area")
+        self.assertIn("Routing at configured threshold 0.90: taken (sure): 0.2500; "
+                      + "routed to the user (unsure): 0.7500", area)
+        rows = table(area, "Threshold")
+        by_threshold = {row["Threshold"]: row for row in rows}
+        self.assertEqual(by_threshold["0.90"]["Coverage"], "0.2500")
+        self.assertEqual(by_threshold["0.90"]["Routed to user"], "0.7500")
+        self.assertEqual(by_threshold["0.85"]["Coverage"], "0.5000")
+        self.assertEqual(by_threshold["0.85"]["Routed to user"], "0.5000")
+        self.assertEqual(by_threshold["0.95"]["Routed to user"], "1.0000")
+        for field in ("backlog_urgency", "backlog_effort"):
+            with self.subTest(field=field):
+                self.assertIn("taken (sure): 0.0000; routed to the user (unsure): 1.0000",
+                              section(risk, "### " + field))
 
     def test_partial_report_counts_success_failure_and_unattempted_rated_issues(self) -> None:
         scored = self.issue("Target A")
@@ -469,7 +502,7 @@ class CompareTests(unittest.TestCase):
         _ = path.write_text(path.read_text().replace('area: "[[rendering]]"', 'area: unfiled'))
         record["payloads"]["area"]["state"] = {"issue": record["payloads"]["main"]["state"]["issue"],
                                                 "areas": ["rendering", "unfiled"]}
-        record["payloads"]["area"]["questions"] = questions.area_questions(["rendering", "unfiled"])
+        record["payloads"]["area"]["questions"] = questions.area_questions(["rendering", "unfiled"], {})
         area_answers = record["answers"]["area"]["answers"]
         area_answers["area"] = {"type": "choice", "choice": "unfiled", "confidence": .99,
                                 "probabilities": {"unfiled": .99, "rendering": .01}}
@@ -495,7 +528,7 @@ class CompareTests(unittest.TestCase):
         _ = path.write_text(path.read_text().replace('area: "[[rendering]]"', 'area: unfiled'))
         record["payloads"]["area"]["state"] = {"issue": record["payloads"]["main"]["state"]["issue"],
                                                 "areas": ["rendering", "unfiled"]}
-        record["payloads"]["area"]["questions"] = questions.area_questions(["rendering", "unfiled"])
+        record["payloads"]["area"]["questions"] = questions.area_questions(["rendering", "unfiled"], {})
         area_answers = record["answers"]["area"]["answers"]
         for name in ("area", "area_reverse"):
             area_answers[name] = {"type": "choice", "choice": "unfiled", "confidence": .8,

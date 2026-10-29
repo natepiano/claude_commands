@@ -249,7 +249,7 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 
 **Ruled out:** Jev proposes category at 0.90 — held-out error .15.
 
-### Phase 4 — area and category definitions; route unsure answers to the user  · status: todo
+### Phase 4 — area and category definitions; route unsure answers to the user  · status: done
 
 **Depends on:** Phase 3
 
