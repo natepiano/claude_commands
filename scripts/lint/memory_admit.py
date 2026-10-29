@@ -344,10 +344,6 @@ def process_table(proc: Path = PROC) -> dict[int, ProcessIdentity]:
     return processes
 
 
-def process_tree_memory(pid: int, start: str, proc: Path = PROC) -> MeasuredMemory | GoneMemory:
-    return tree_memory(pid, start, process_table(proc), proc)
-
-
 def tree_memory(pid: int, start: str, processes: dict[int, ProcessIdentity],
                 proc: Path = PROC) -> MeasuredMemory | GoneMemory:
     """Sum resident and swapped bytes from one process table reading."""
@@ -374,12 +370,14 @@ def tree_memory(pid: int, start: str, processes: dict[int, ProcessIdentity],
     return MeasuredMemory(used)
 
 
-def step_memory(row: Reservation, now: datetime) -> StepMemory:
-    if process_start_time(row["pid"]) != row["start_time"]:
+def step_memory(row: Reservation, now: datetime, processes: dict[int, ProcessIdentity],
+                proc: Path = PROC) -> StepMemory:
+    identity = processes.get(row["pid"])
+    if identity is None or identity.start != row["start_time"]:
         return GoneMemory()
     if now.timestamp() - _epoch(row["admitted_at"]) < START_SECONDS:
         return PromisedMemory(row["need"])
-    return process_tree_memory(row["pid"], row["start_time"])
+    return tree_memory(row["pid"], row["start_time"], processes, proc)
 
 
 def read_meminfo(path: Path) -> tuple[int, int | None]:
@@ -480,10 +478,12 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
     directory = admission_dir(root)
     with (directory / "lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        proc = Path(os.environ.get("BUILDLOG_PROC", "/proc"))
+        processes = process_table(proc)
         live: list[tuple[Path, Reservation]] = []
         running: list[StepMemory] = []
         for path, row in live_reservations(directory):
-            memory = step_memory(row, now)
+            memory = step_memory(row, now, processes, proc)
             if isinstance(memory, GoneMemory):
                 path.unlink(missing_ok=True)
                 path.with_suffix(".max").unlink(missing_ok=True)
