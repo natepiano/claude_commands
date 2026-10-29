@@ -3260,6 +3260,30 @@ class RestartTests(ShutdownTestCase):
 
 
 
+    def test_herdr_resume_drops_conductor_variables_from_recorded_and_caller_environments(self) -> None:
+        owner, _, _ = self.herdr_restart_fixture()
+        conductor = {"REFUSAL_WATCH_INVENTORY": "read existing", "PYTHONUNBUFFERED": "1"}
+        parts = restart._resume_parts(owner, "restart")  # pyright: ignore[reportPrivateUsage]
+        parts = replace(parts, environment={**parts.environment, **conductor})
+
+        def ensure(_directory: Path, base_env: dict[str, str]) -> herdr.nix_env.Refused:
+            for variable in conductor:
+                self.assertFalse(variable in base_env, variable)
+            return herdr.nix_env.Refused("fixture ends before launch")
+
+        with (patch.dict(os.environ, conductor), patch.object(herdr.nix_env, "ensure", side_effect=ensure),
+              self.assertRaisesRegex(OSError, "fixture ends before launch")):
+            _ = restart._herdr_launch(parts, restart.RecordedHerdrPane("writing", "w1:p1"),  # pyright: ignore[reportPrivateUsage]
+                                      owner, dry_run=False)
+
+    def test_unit_launcher_drops_conductor_variables_from_caller_environment(self) -> None:
+        with (patch.dict(os.environ, {"REFUSAL_WATCH_INVENTORY": "read existing", "PYTHONUNBUFFERED": "1"}),
+              patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(["fake unit"], 0)) as launch):
+            _ = restart._run(["fake unit"], dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        environment = cast(dict[str, str], launch.call_args.kwargs["env"])
+        self.assertFalse("REFUSAL_WATCH_INVENTORY" in environment, "REFUSAL_WATCH_INVENTORY")
+        self.assertFalse("PYTHONUNBUFFERED" in environment, "PYTHONUNBUFFERED")
+
     def test_herdr_account_move_sets_prepared_variables_and_omits_removed_names(self) -> None:
         from scripts.accounts import accounts
 

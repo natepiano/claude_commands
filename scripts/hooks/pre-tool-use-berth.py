@@ -19,7 +19,10 @@ nothing; an unreadable recorder state leaves the phases whose directories hold a
 
 For a worker it runs `cargo-berth check <paths> --json` from the repository root once per owning
 phase, as that phase's berth session `<director session id>.phase-<phase>`, so two open phases
-hold separate reservations. A path a sibling phase already holds is allowed and records nothing:
+hold separate reservations. A phase whose session berth's map already names, as a reservation
+the board shows active, skips that check (`phase_reservation.phase_check`): its claim covered the
+whole files list, and a check over many paths can outlast Codex's 30 s limit on this hook.
+A path a sibling phase already holds is allowed and records nothing:
 the engine leaves the session unmapped and names the sibling's reservation. A clear answer allows the edit and, when it carries the acquired reservation,
 writes `Active` into that phase's state file. An unenrolled repository is allowed, and so is a
 ledger the engine cannot read (`ledger_unreadable`, as in a scratch clone with no ledger): the
@@ -120,8 +123,7 @@ def decide(raw: str) -> int:
         return _refuse(phase_reservation.refusal_reason(phases, attribution.refused))
     groups = list(attribution.by_phase.items()) if attribution is not None else [(None, scopes)]
     for phase, phase_scopes in groups:
-        berth_session = phase_reservation.phase_session_id(session_id, phase.phase) if phase else session_id
-        answer = phase_reservation.check(root, phase_scopes, berth_session)
+        answer = phase_reservation.phase_check(root, phase_scopes, session_id, phase)
         if answer.status in phase_reservation.FAILS_OPEN:
             return _refuse("binding reservation ledger is unreadable") if held else 0
         if answer.status != phase_reservation.CLEAR:

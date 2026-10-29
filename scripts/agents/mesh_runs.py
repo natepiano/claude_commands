@@ -445,8 +445,10 @@ def deliver(record: RunRecord, exit_code: int | None) -> str:
                                 text, message_id=message_id)
         return f"queued for held role {name}; its holder controls the next assignment"
     held = codex_mesh.hold_message(session_dir, name, text, without_launcher=False)
-    if isinstance(held, (codex_mesh.HeldForLauncher, codex_mesh.HeldForNextDispatch)):
+    if isinstance(held, codex_mesh.HeldForLauncher):
         return f"held for {name}'s attached launcher on thread {held.thread_id}"
+    if isinstance(held, codex_mesh.HeldForNextDispatch):
+        return f"held for {name}'s next dispatch on thread {held.thread_id}"
     state = held.reason if isinstance(held, codex_mesh.WorkerEnded) else f"{name} is {held.status or 'unknown'}"
     note = (f"Worker {name}'s run {record['label']} finished ({_exit_words(exit_code)}); no launcher is attached "
             + f"({state}), so the result comes to you. Dispatch the worker (implement.sh --to {name}) "
