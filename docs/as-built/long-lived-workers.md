@@ -287,7 +287,7 @@ Other public functions: `queue_message`, `pending_messages`, `held_document`, `e
 
 **Authorization.** `_authorize` requires placement host = local host, a live holder from `resolve_holder` (unit holder: `unit_lookup.every_marked_unit` with a `LiveClaude`; showrunner holder: `production_tree.showrunner_sessions` and `sessions.running_sessions`), and `CLAUDE_CODE_SESSION_ID` equal to that session. A missing or ambiguous holder blocks dispatch but does not change the holder.
 
-**Models.** `resolve_model(role)` sources `scripts/agents/agents_config.sh` and runs `agents_resolve "guild.<role>"`; the family must be `codex`. `config/agents.conf` has `[assignments] guild=codex` and `[guild.codex] designer=gpt-6-astra:xhigh`, `reviewer=gpt-6-astra:xhigh`. A missing or invalid row refuses; there is no fallback model.
+**Models.** `resolve_model(role)` sources `scripts/agents/agents_config.sh` and runs `agents_resolve "guild.<role>"`; the family must be `codex`. `config/agents.conf` has `[assignments] guild=codex` and `[guild.codex] designer=astra:xhigh`, `reviewer=astra:xhigh` (the `astra` word resolves to `gpt-6-astra`). A missing or invalid row refuses; there is no fallback model.
 
 **Prompts.** A designer prompt is `config/guilds/designer.md` + `Use apply_patch for all repository edits. Edit only the bound output paths.` A reviewer prompt is `astra_review.review_prompt(document, "")`. `_prompt` writes the `astra_work.header_line` first (`PhaseWork` from the binding, else `StandaloneWork`), then the instructions, the holder's text and each pending message as `Pending message <id> from <source>: <text>`.
 

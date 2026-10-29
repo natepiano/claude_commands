@@ -196,7 +196,7 @@ class StylePlanTests(StylePlanFixture):
               mock.patch.object(style_proposals, "ranked_below_unit", return_value=False),
               mock.patch.object(style_proposals, "proposal_command"), redirect_stdout(baseline_output)):
             baseline = style_plan._select_phase(ledger, "names-unit", "demo-style-names", self.plan, self.repo,  # pyright: ignore[reportPrivateUsage]
-                                               self.doc, original, unit_plans.AllCrates(), busy, frozenset(), definitions, style_plan.MainChanges(self.tip))
+                                               self.doc, original, unit_plans.AllCrates(), busy, frozenset(), definitions, style_plan.MainChanges(self.tip), family="names")
         self.assertIsInstance(baseline, style_plan.PhaseWritten)
         expected_phase = self.plan.read_bytes()
         with closing(sqlite3.connect(ledger.database)) as connection, connection:
@@ -221,7 +221,7 @@ class StylePlanTests(StylePlanFixture):
               mock.patch.object(style_proposals, "proposal_command") as command,
               mock.patch.object(style_proposals, "renumber") as renumber, redirect_stdout(output)):
             result = style_plan._select_phase(ledger, "names-unit", "demo-style-names", self.plan, self.repo,  # pyright: ignore[reportPrivateUsage]
-                                             self.doc, original, unit_plans.AllCrates(), busy, frozenset(), definitions, style_plan.MainChanges(self.tip))
+                                             self.doc, original, unit_plans.AllCrates(), busy, frozenset(), definitions, style_plan.MainChanges(self.tip), family="names")
         self.assertIsInstance(result, style_plan.PhaseWritten)
         read_paths.assert_called_once_with(self.repo, self.tip, (paths["first"],))
         self.assertEqual(self.plan.read_bytes(), expected_phase)
@@ -238,6 +238,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(write.call_count, 1)
         command.assert_called_once_with("start", str(first))
         renumber.assert_not_called()
+
 
 if __name__ == "__main__":
     _ = unittest.main()

@@ -90,9 +90,12 @@ class StylePlanTests(StylePlanFixture):
         with redirect_stdout(output):
             code = style_plan.main(["next-phase", "--unit", "modules-unit", "--plan", str(plan), "--repo", str(worktree)])
 
-        self.assertEqual((code, output.getvalue()), (3, "waiting for sync\n"))
+        self.assertEqual((code, output.getvalue()), (
+            3, "no available work: modules no available work, types no family unit, values no family unit, names none approved\n"
+            + "waiting for sync\n"))
         self.assertEqual(self.count_tickets(), 0)
         self.assertEqual([row[0] for row in self.sync_wait_rows()], ["modules-unit"])
+
 
     def test_structure_wait_uses_pending_crates_from_the_second_selection_pass(self) -> None:
         _ = self.rule("structure", "tier: D\nfamily: modules\n")
@@ -201,8 +204,11 @@ class StylePlanTests(StylePlanFixture):
                 self.record(rule, path, self.tip, ticket["id"])
         self.ledger().ticket_checkpoint(ticket["id"], self.tip)
         self.seed_sync_wait()
-        self.assertEqual(self.run_next()[0], 5)
+        # Disjoint work now refills; block it here to retain the merge-wait preservation case.
+        with mock.patch.object(berth_board, "read_board", return_value=self.board(*self.sources)):
+            self.assertEqual(self.run_next()[0], 5)
         self.assertEqual(self.sync_wait_rows(), expected)
+
 
     def test_legacy_only_waits_with_action_and_mixed_catalog_selects_only_classified_rules(self) -> None:
         _ = self.rule("legacy", "")
@@ -250,7 +256,8 @@ class StylePlanTests(StylePlanFixture):
                         for path in ticket["files"]:
                             self.record(rule, path, self.tip, ticket["id"])
                     ledger.ticket_checkpoint("names-unit-2", self.tip)
-                with mock.patch.object(berth_board, "read_board", side_effect=AssertionError("board read")):
+                with mock.patch.object(berth_board, "read_board", return_value=self.board(*self.sources),
+                                       side_effect=AssertionError("board read on resume") if state == "assigned" else None):
                     code, output, errors = self.run_next()
                 self.assertEqual((code, errors), (0 if state == "assigned" else 5, ""))
                 self.assertIn("discarded names-unit-1: dropped\n", output)
@@ -258,6 +265,7 @@ class StylePlanTests(StylePlanFixture):
                 self.assertNotIn("### Phase 1", self.plan.read_text())
                 self.assertIn("### Phase 2", self.plan.read_text())
                 self.assertEqual(self.count_tickets(), 2)
+
 
     def test_rebuild_after_rule_edit_restores_old_pinned_text_and_instructions(self) -> None:
         _ = self.rule("read")
@@ -298,8 +306,9 @@ class StylePlanTests(StylePlanFixture):
                 self.record(rule, path, self.tip, ticket["id"])
         ledger.ticket_checkpoint(ticket["id"], self.tip)
         before = self.plan.read_bytes()
-        with mock.patch.object(berth_board, "read_board", side_effect=AssertionError("board read")):
-            self.assertEqual(self.run_next(), (5, f"waiting for merge: names-unit-1 checkpointed at {self.tip[:7]}\n", ""))
+        with mock.patch.object(berth_board, "read_board", return_value=self.board(*self.sources)):
+            self.assertEqual(self.run_next(), (
+                5, f"waiting for merge: names-unit-1 checkpointed at {self.tip[:7]}; no disjoint ticket available\n", ""))
         self.assertEqual(self.plan.read_bytes(), before)
         _ = ledger.ticket_merge(ticket["id"])
         code, output, errors = self.run_next()
@@ -308,6 +317,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertIn("phase written: names-unit-2", output)
         self.assertNotIn("### Phase 1 — names-unit-1", self.plan.read_text())
         self.assertIn("### Phase 2 — names-unit-2", self.plan.read_text())
+
 
     def test_reconcile_dropped_ticket_phase_is_removed_after_unit_branch_disappears(self) -> None:
         _ = self.rule("read")

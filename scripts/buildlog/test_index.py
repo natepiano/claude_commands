@@ -351,6 +351,41 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(self.rows("SELECT mem_wait_s FROM steps ORDER BY id"), [(7,), (None,)])
         self.assertEqual(self.rows("SELECT builds_anon_bytes, ci_anon_bytes FROM samples ORDER BY at"), [(2**30, 2 * 2**30), (None, None)])
 
+    def test_cpu_io_sample_columns_preserve_old_nulls_and_new_counters(self) -> None:
+        path = self.root / "natedev" / "samples-2026-10.jsonl"
+        self.write(path, sample(STAMP), sample("2026-10-02T12:01:00.000Z",
+                   cpu_stall_some_us=12_000_000, cpu_stall_full_us=0,
+                   io_stall_some_us=4_000_000, io_stall_full_us=1_000_000,
+                   cpu_idle_ticks=400, cpu_iowait_ticks=50, cpu_total_ticks=621))
+        original = path.read_bytes()
+        self.assertEqual(index.update(), 2)
+        self.assertEqual(self.rows(
+            "SELECT cpu_stall_some_us, cpu_stall_full_us, io_stall_some_us, io_stall_full_us,"
+            + " cpu_idle_ticks, cpu_iowait_ticks, cpu_total_ticks FROM samples ORDER BY at"),
+            [(None, None, None, None, None, None, None), (12_000_000, 0, 4_000_000, 1_000_000, 400, 50, 621)])
+        column_types = {row[1]: row[2] for row in self.rows("PRAGMA table_info(samples)")}
+        for name in ("cpu_stall_some_us", "cpu_stall_full_us", "io_stall_some_us", "io_stall_full_us",
+                     "cpu_idle_ticks", "cpu_iowait_ticks", "cpu_total_ticks"):
+            self.assertEqual(column_types[name], "INTEGER")
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_schema_twenty_two_rebuilds_cpu_io_counters_from_json_lines(self) -> None:
+        path = self.root / "natedev" / "samples-2026-10.jsonl"
+        self.write(path, sample(STAMP, cpu_stall_some_us=123, cpu_stall_full_us=12,
+                               io_stall_some_us=456, io_stall_full_us=45,
+                               cpu_idle_ticks=789, cpu_iowait_ticks=7, cpu_total_ticks=1000))
+        _ = index.update()
+        with closing(sqlite3.connect(index.index_path())) as connection:
+            _ = connection.execute("PRAGMA user_version = 22")
+            _ = connection.execute("DELETE FROM samples")
+            connection.commit()
+        self.assertEqual(index.update(), 1)
+        self.assertEqual(self.rows("PRAGMA user_version"), [(23,)])
+        self.assertEqual(self.rows(
+            "SELECT cpu_stall_some_us, cpu_stall_full_us, io_stall_some_us, io_stall_full_us,"
+            + " cpu_idle_ticks, cpu_iowait_ticks, cpu_total_ticks FROM samples"),
+            [(123, 12, 456, 45, 789, 7, 1000)])
+
     def test_schema_command_lists_samples_and_stall_columns(self) -> None:
         result = subprocess.run(
             [sys.executable, str(CLI), "schema"], capture_output=True, text=True, check=False, timeout=60
@@ -596,7 +631,7 @@ class IndexTests(unittest.TestCase):
                 ("old", None, None, None, None),
             ],
         )
-        self.assertEqual(index.SCHEMA_VERSION, 22)
+        self.assertEqual(index.SCHEMA_VERSION, 23)
 
     def test_copy_call_fields_reach_index_and_old_records_read_as_null(self) -> None:
         self.write(

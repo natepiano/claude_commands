@@ -206,11 +206,12 @@ class StylePlanTests(StylePlanFixture):
                                               style_plan.BusyFiles(self.board(), frozenset()), definitions, cache, measured_at)
             _ = style_plan._select_phase(ledger, "names-unit", "demo-style-names", self.plan, self.repo,  # pyright: ignore[reportPrivateUsage]
                                          self.doc, self.plan.read_text(), unit_plans.AllCrates(),
-                                         style_plan.BusyFiles(self.board(), frozenset()), frozenset(), definitions, style_plan.MainChanges(self.tip))
+                                         style_plan.BusyFiles(self.board(), frozenset()), frozenset(), definitions, style_plan.MainChanges(self.tip), family="names")
         self.assertEqual(split, style_ledger.RecordedSplit(0, 1, 1, 0, measured_at))
         self.assertIn(f"waiting names: {self.sources[0]} has open types work\n", output.getvalue())
         changed = next(finding for finding in findings if finding.path == self.sources[1])
         self.assertIn(f"waiting {issue}: {changed.finding_id} {changed.path} changed since it was judged\n", output.getvalue())
+
 
     def test_split_changes_only_refill_results_and_keeps_the_plan_and_decisions(self) -> None:
         rule = self.rule("read-only-split")

@@ -269,7 +269,9 @@ class StylePlanFixture(unittest.TestCase):
         output, errors = io.StringIO(), io.StringIO()
         with redirect_stdout(output), redirect_stderr(errors):
             code = style_plan.main(["next-phase", "--unit", "names-unit", "--plan", str(self.plan), "--repo", str(self.repo)])
-        return code, output.getvalue(), errors.getvalue()
+        return code, "".join(line for line in output.getvalue().splitlines(keepends=True)
+                             if not line.startswith("no available work: ")), errors.getvalue()
+
 
     def record(self, rule: str, path: str, commit: str, ticket: str = "outside") -> None:
         with style_ledger.open_ledger(self.repo) as ledger:
@@ -766,3 +768,24 @@ class StylePlanFixture(unittest.TestCase):
         for path in self.sources[1:]:
             self.record(read, path, self.tip)
         return read
+
+    def waiting_ticket(self) -> tuple[style_ledger.Ledger, str, str]:
+        rule = self.rule("read")
+        self.sync()
+        ledger = self.ledger()
+        ledger.ticket_add("names-unit-1", "names-unit", "read", "names", "crates/alpha", [self.sources[0]], [rule])
+        ledger.ticket_assign("names-unit-1", "demo-style-names")
+        _ = ledger.ticket_base("names-unit-1")
+        _ = (self.unit / self.sources[0]).write_text("pub fn checkpoint_work() {}\n")
+        _ = self.git("add", self.sources[0], cwd=self.unit)
+        _ = self.git("commit", "-qm", "Waiting ticket", cwd=self.unit)
+        checkpoint = self.git("rev-parse", "HEAD", cwd=self.unit)
+        self.record(rule, self.sources[0], checkpoint, "names-unit-1")
+        ledger.ticket_checkpoint("names-unit-1", checkpoint)
+        return ledger, rule, checkpoint
+
+
+    def widen_for_pipeline(self, ticket: str, path: str) -> None:
+        with redirect_stdout(io.StringIO()):
+            style_plan.widen(self.repo, ticket, (path,), "reference needed", "showrunner")
+
