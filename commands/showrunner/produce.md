@@ -387,11 +387,9 @@ after a failed step; it resumes at the first unfinished step.
 ---
 
 <LaunchUnits>
-When the production doc has a **Review pool** line, no unit runs the pool:
-the first review of each type primes it. Each unit keeps one permanent reviewer per type, and every
-code review goes to it (`docs/production_format.md`, unit rule 16). Before
-you mark a unit `retired`, run `review_pool.py retire` for it
-(`docs/production_format.md`, Units).
+Each unit owns its read-only reviewers. `assign.sh --role review` resumes
+`review`, then `review2` when the first is busy. Their context lasts across
+phases and plans; unit pause, move and end apply to them too.
 
 For each unit without a live unit director, run
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC <name> --plan <unit plan>`.
@@ -1160,11 +1158,6 @@ condition: wrap neither waits on it nor retires its worktree or branch.
    - any other item that cannot be undone gets the user's OK first;
    - back up user data before migrating it.
    Finish each item before passing its exact text as `--close-out-done "<item>"`.
-   With a **Review pool** line, run
-   `~/.claude/scripts/lib/py ~/.claude/scripts/direct/review_pool.py stop --production <slug>`.
-   On failure, report its reason and run `stop` again; do not finish wrap
-   until it succeeds. `<slug>` is the production doc's file name without
-   `-production.md`.
 3. Run `python3 ~/.claude/scripts/production/production_lifecycle.py wrap
    --production PRODUCTION_DOC --ci-green <sha> --smoke-passed <sha>
    --close-out-done "<item>"` (repeat the last flag for every item), or pass

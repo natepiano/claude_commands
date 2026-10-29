@@ -60,7 +60,7 @@ class QueueTests(unittest.TestCase):
               showrunner: roster.ShowrunnerRelationship = NO_SHOWRUNNER,
               director: roster.DirectorRelationship = NO_DIRECTOR) -> roster.RosterEntry:
         return roster.RosterEntry(
-            machine="test-machine", kind="codex" if codex else "claude", role="agent",
+            machine="test-machine", kind="codex" if codex else "claude", role="freestanding",
             name=name, status="running", reach=roster.CannotReceiveMessages("test"), cwd="/tmp/tree",
             showrunner=showrunner, director=director, assignment=roster.NotAWorker(),
             thread=roster.CodexThread(session) if codex else roster.NoCodexThread(),
@@ -92,15 +92,15 @@ class QueueTests(unittest.TestCase):
     def test_both_tables_resolve_workers_directors_showrunners_and_unmatched_sessions(self) -> None:
         self.roster_read.return_value = roster.Roster([
             self.entry("worker-id", "organon-ci88", codex=True,
-                       showrunner=roster.UnderShowrunner("hana-production", "hana", "session:hana"),
+                       showrunner=roster.UnderShowrunner("hana", "hana-showrunner", "session:hana"),
                        director=roster.UnderDirector("organon-unit", "organon", "session:organon")),
             self.entry("director-id", "merge-gate",
-                       showrunner=roster.UnderShowrunner("hana-production", "hana", "session:hana"),
+                       showrunner=roster.UnderShowrunner("hana", "hana-showrunner", "session:hana"),
                        director=roster.DirectsUnit("merge-unit")),
-            self.entry("showrunner-id", "hana", showrunner=roster.RunsProduction("hana-production")),
+            self.entry("showrunner-id", "hana-showrunner", showrunner=roster.RunsProduction("hana")),
             self.entry("standalone-id", "standalone"),
             self.entry("orphan-id", "orphan",
-                       showrunner=roster.ProductionWithoutRunningShowrunner("offline-production")),
+                       showrunner=roster.ProductionWithoutRunningShowrunner("offline")),
         ], [])
         identities = (("worker-id", "clone88ci"), ("director-id", "old-director"),
                       ("showrunner-id", "old-showrunner"), ("standalone-id", "old-standalone"),
@@ -113,8 +113,8 @@ class QueueTests(unittest.TestCase):
             session, name, "clippy", f"/tmp/tree-{index}", GIB, memory_admit.MeasuredMemory(GIB),
         ) for index, (session, name) in enumerate(identities, 1))
         output = self.cli_output(memory_admit.QueueView(waiting, running, 20 * GIB, 0, GIB, NOW))
-        labels = ("hana | organon | organon-ci88", "hana | merge-gate | merge-gate", "hana | — | hana",
-                  "— | — | standalone", "— | — | orphan", "— | — | recorded", "— | — | tree-7")
+        labels = ("hana | organon | organon-ci88", "hana | merge | merge-gate", "hana | — | hana-showrunner",
+                  "— | — | standalone", "offline | — | orphan", "— | — | recorded", "— | — | tree-7")
         for index, label in enumerate(labels, 1):
             for step in ("nextest", "clippy"):
                 with self.subTest(index=index, step=step):
@@ -125,7 +125,7 @@ class QueueTests(unittest.TestCase):
 
     def test_roster_problems_preserve_matches_and_report_only_the_first_problem_after_totals(self) -> None:
         self.roster_read.return_value = roster.Roster(
-            [self.entry("known", "live-name", showrunner=roster.RunsProduction("production"))],
+            [self.entry("known", "live-name", showrunner=roster.RunsProduction("builds"))],
             ["one session unreadable", "second problem"],
         )
         running = (
@@ -133,7 +133,7 @@ class QueueTests(unittest.TestCase):
             memory_admit.RunningStep("unknown", "recorded", "doc", "/tmp/other", GIB, memory_admit.MeasuredMemory(GIB)),
         )
         output = self.cli_output(memory_admit.QueueView((), running, 20 * GIB, 0, GIB, NOW))
-        self.assertIn("| 1 | live-name | — | live-name | mend |", output)
+        self.assertIn("| 1 | builds | — | live-name | mend |", output)
         self.assertIn("| 2 | — | — | recorded | doc |", output)
         lines = output.splitlines()
         totals = next(index for index, line in enumerate(lines) if line.startswith("Totals:"))

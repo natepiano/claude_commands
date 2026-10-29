@@ -12,7 +12,9 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from collections.abc import Generator, Iterator
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 from unittest import mock
@@ -130,6 +132,45 @@ class TmpSweepCase(unittest.TestCase):
 
 
 class IdleTests(TmpSweepCase):
+    def test_a_recent_entry_stops_the_scan_before_the_rest_is_loaded(self) -> None:
+        folder = write(self.tmp / "large" / "recent").parent
+        self.recent(folder / "recent")
+        with os.scandir(folder) as entries:
+            first = next(entries)
+        closed: list[bool] = []
+
+        def remaining_entries() -> Iterator[os.DirEntry[str]]:
+            yield first
+            self.fail("The scan loaded more entries after it could decide to keep this folder")
+
+        @contextmanager
+        def streamed_entries(_path: str) -> Generator[Iterator[os.DirEntry[str]]]:
+            try:
+                yield remaining_entries()
+            finally:
+                closed.append(True)
+
+        with mock.patch.object(os, "scandir", side_effect=streamed_entries):
+            result = tmp_sweep.last_change(str(folder), tmp_sweep.Limit(self.now - DAY, tmp_sweep.RECENT))
+
+        self.assertEqual(result, tmp_sweep.RECENT)
+        self.assertEqual(closed, [True])
+        self.assertTrue((folder / "recent").is_file())
+
+    def test_streamed_scan_counts_each_hard_linked_file_once(self) -> None:
+        folder = self.tmp / "linked"
+        source = write(folder / "first" / "output")
+        second = folder / "second"
+        second.mkdir()
+        os.link(source, second / "copy")
+        independent = write(second / "independent")
+
+        result = tmp_sweep.last_change(str(folder), tmp_sweep.Limit(self.now - DAY, tmp_sweep.RECENT))
+
+        self.assertIsInstance(result, tuple)
+        assert isinstance(result, tuple)
+        self.assertEqual(result[1], (source.stat().st_blocks + independent.stat().st_blocks) * 512)
+
     def test_an_idle_entry_goes_and_a_recent_one_stays(self) -> None:
         idle = write(self.tmp / "shots" / "1.png")
         loose = write(self.tmp / "notes.txt")
@@ -228,6 +269,35 @@ class ProcessUseTests(TmpSweepCase):
         self.assertFalse(idle.exists())
         self.assertTrue(used.is_file())
         self.assertEqual(result.kept[tmp_sweep.IN_USE], [f"{used.parent}: pid 42 works in it"])
+
+    def test_process_scan_distinguishes_known_empty_from_unavailable(self) -> None:
+        known = tmp_sweep.process_paths(str(self.proc), str(self.tmp) + os.sep)
+        self.assertIsInstance(known, tmp_sweep.ProcessUsesKnown)
+        assert isinstance(known, tmp_sweep.ProcessUsesKnown)
+        self.assertEqual(known.paths, [])
+        unavailable = tmp_sweep.process_paths(str(self.proc / "missing"), str(self.tmp) + os.sep)
+        self.assertIsInstance(unavailable, tmp_sweep.ProcessUsesUnavailable)
+        fake_process(self.proc, 17, cwd=str(self.tmp / "used"))
+        used = tmp_sweep.process_paths(str(self.proc), str(self.tmp) + os.sep)
+        assert isinstance(used, tmp_sweep.ProcessUsesKnown)
+        self.assertEqual(used.paths, [(str(self.tmp / "used"), 17, "works in it")])
+
+    def test_lsof_scan_has_explicit_known_and_unavailable_results(self) -> None:
+        for output in ("p17\nfcwd\nn/tmp/used\n", "p17\nfcwd\nn/elsewhere\n"):
+            with self.subTest(output=output):
+                completed = subprocess.CompletedProcess(tmp_sweep.LSOF, 1, output, "")
+                with mock.patch.object(subprocess, "run", return_value=completed):
+                    known = tmp_sweep.lsof_paths("/tmp/")
+                self.assertIsInstance(known, tmp_sweep.ProcessUsesKnown)
+                assert isinstance(known, tmp_sweep.ProcessUsesKnown)
+                expected = [("/tmp/used", 17, "works in it")] if "/tmp/used" in output else []
+                self.assertEqual(known.paths, expected)
+        empty = subprocess.CompletedProcess(tmp_sweep.LSOF, 1, "", "")
+        with mock.patch.object(subprocess, "run", return_value=empty):
+            self.assertIsInstance(tmp_sweep.lsof_paths("/tmp/"), tmp_sweep.ProcessUsesUnavailable)
+        for error in (OSError("no lsof"), subprocess.TimeoutExpired("lsof", 1)):
+            with self.subTest(error=type(error).__name__), mock.patch.object(subprocess, "run", side_effect=error):
+                self.assertIsInstance(tmp_sweep.lsof_paths("/tmp/"), tmp_sweep.ProcessUsesUnavailable)
 
     def test_lsof_output_names_how_each_process_uses_a_path(self) -> None:
         text = "p7\nfcwd\nn/tmp/a\nftxt\nn/tmp/b/lib\nf4\nn/tmp/c/log\nf5\nn/var/x\np8\nfmem\nn/tmp/d\n"
@@ -519,6 +589,20 @@ class OwnerTests(TmpSweepCase):
 
 
 class LogTests(TmpSweepCase):
+    def test_log_retention_keeps_the_boundary_and_newer_records_in_order(self) -> None:
+        # Whole seconds keep the boundary exact after the ISO timestamp round trip.
+        now = float(int(self.now))
+        cutoff = now - tmp_sweep.LOG_KEEP_SECONDS
+        records = [{"at": datetime.fromtimestamp(at, UTC).isoformat(), "marker": marker}
+                   for at, marker in ((cutoff - 1, "expired"), (cutoff, "boundary"), (now - 60, "recent"))]
+        path = write(self.state / tmp_sweep.LOG_NAME,
+                     "".join(json.dumps(record) + "\n" for record in records))
+        current = tmp_sweep.record(tmp_sweep.Sweep(), False, now)
+
+        tmp_sweep.append_log(path, current, now)
+
+        self.assertEqual(self.log(), [*records[1:], current])
+
     def test_each_run_logs_what_went_and_why_the_rest_stayed(self) -> None:
         _ = write(self.tmp / "shots" / "1.png")
         self.recent(write(self.tmp / "fresh.txt"))
@@ -539,7 +623,13 @@ class LogTests(TmpSweepCase):
 
     def test_a_run_waits_an_hour_after_the_last(self) -> None:
         idle = write(self.tmp / "shots" / "1.png")
+        run = tmp_sweep.run
+
+        def fixture_run(dry_run: bool, now: float) -> int:
+            return run(dry_run, now, self.roots(), str(self.proc))
+
         with (mock.patch.object(tmp_sweep, "default_roots", return_value=self.roots()),
+              mock.patch.object(tmp_sweep, "run", side_effect=fixture_run),
               redirect_stdout(io.StringIO())):
             self.assertEqual(tmp_sweep.run_if_due(False, self.now), 0)
             self.assertFalse(idle.exists())

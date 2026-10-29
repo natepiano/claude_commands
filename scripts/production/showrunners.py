@@ -310,6 +310,13 @@ def adopt_session_state(slug: str) -> list[str]:
     return copy_session_state(slug, scratch) if scratch is not None else []
 
 
+def former_slugs(text: str) -> tuple[str, ...]:
+    """Read former names only from the production's Production Context section."""
+    context = re.search(r"^## Production Context\n(.*?)(?=^## |\Z)", text, re.MULTILINE | re.DOTALL)
+    formerly = re.search(r"^- \*\*Formerly:\*\*(.*)$", context[1] if context else "", re.MULTILINE)
+    return tuple(re.findall(r"`([^`]+)`", formerly[1])) if formerly else ()
+
+
 def canonical_slug(slug: str, state_dir: Path | None = None) -> str:
     """Map a former production name to its current slug; leave other slugs unchanged."""
     timers: list[Timer] = []
@@ -326,10 +333,7 @@ def canonical_slug(slug: str, state_dir: Path | None = None) -> str:
             text = timer.doc.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
             continue
-        # Only Production Context carries the line; an example elsewhere in the doc claims nothing.
-        context = re.search(r"^## Production Context\n(.*?)(?=^## |\Z)", text, re.MULTILINE | re.DOTALL)
-        formerly = re.search(r"^- \*\*Formerly:\*\*(.*)$", context[1] if context else "", re.MULTILINE)
-        if formerly and slug in re.findall(r"`([^`]+)`", formerly[1]):
+        if slug in former_slugs(text):
             return timer.slug
     return slug
 

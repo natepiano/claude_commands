@@ -24,6 +24,31 @@ from rename_state import rename_claim
 @final
 class UnitRenameStateTests(UnitRenameFixture):
 
+    def test_resume_looks_up_the_checkout_even_with_legacy_journal_paths(self) -> None:
+        self.assert_refused(self.rename("apply", refuse="push origin demo:refs/heads/demo"), "simulated failure")
+        saved = self.journal()
+        for name in ("doc", "checkout"):
+            self.assertNotIn(name, saved)
+        saved.update(doc=str(self.doc), checkout=str(self.checkout))
+        self.write(self.state / SLUG / "rename_unit.json", json.dumps(saved))
+        old = self.checkout
+        self.checkout = old.with_name("claude-demo-relocated")
+        _ = old.rename(self.checkout)
+        self.doc = self.checkout / "docs/plans/demo-production.md"
+        _ = self.git("worktree", "repair")
+        self.write(self.doc, self.doc.read_text().replace(str(old), str(self.checkout)))
+        _ = self.git("add", str(self.doc))
+        _ = self.git("commit", "-m", "relocate showrunner checkout")
+        conf = self.root / "state/notifier/showrunner-demo/conf"
+        self.write(conf, conf.read_text().replace(str(old), str(self.checkout)))
+        self.assertFalse(old.exists())
+        self.assert_ok(self.rename("apply"))
+        self.assertIs(self.journal()["done"], True)
+        self.assertIn("| gamma-unit |", self.doc.read_text())
+        self.assert_ok(self.rename("verify"))
+        for name in ("doc", "checkout"):
+            self.assertNotIn(name, self.journal())
+
     def test_rename_keeps_the_worker_address_and_rebinds_the_ledger_context(self) -> None:
         run = self.root / "runs" / "carried"
         run.mkdir(parents=True)

@@ -399,17 +399,28 @@ def code_merged(request: MergeRequest) -> bool:
     return history.has_code_merge(request.unit.name, request.phase)
 
 
-def on_origin(request: MergeRequest) -> bool:
-    """Fetch the unit branch and say whether it holds the checkpoint."""
+def on_origin(request: MergeRequest) -> str | None:
+    """Find an origin branch holding the checkpoint, trying the Units row first."""
     checkout = request.production.checkout
     fetched = git(checkout, "fetch", "origin", request.unit.branch)
-    # A branch not pushed yet holds no commit: ls-remote exits 2 when origin lacks the ref.
-    if fetched.returncode and git(checkout, "ls-remote", "--exit-code", "origin",
-                                  f"refs/heads/{request.unit.branch}").returncode == 2:
-        return False
-    _ = good(fetched, "ancestry")
-    return git(checkout, "merge-base", "--is-ancestor", request.commit,
-               f"origin/{request.unit.branch}").returncode == 0
+    # A missing Units-row branch is not a failure: another head may hold this phase.
+    missing = fetched.returncode and git(checkout, "ls-remote", "--exit-code", "origin",
+                                        f"refs/heads/{request.unit.branch}").returncode == 2
+    if not missing:
+        _ = good(fetched, "ancestry")
+        if git(checkout, "merge-base", "--is-ancestor", request.commit, "FETCH_HEAD").returncode == 0:
+            return f"origin/{request.unit.branch}"
+    # Explicit heads also work with a narrow fetch refspec. Prune so a deleted
+    # remote branch cannot certify a checkpoint through its stale tracking ref.
+    _ = good(git(checkout, "fetch", "--prune", "origin",
+                 "+refs/heads/*:refs/remotes/origin/*"), "ancestry")
+    refs = good(git(checkout, "for-each-ref", "--contains", request.commit,
+                    "--format=%(refname) %(symref)", "refs/remotes/origin/"), "ancestry")
+    for line in refs.splitlines():
+        fields = line.split()
+        if len(fields) == 1:  # origin/HEAD is an alias, not an origin branch.
+            return fields[0].removeprefix("refs/remotes/")
+    return None
 
 
 def ancestry(request: MergeRequest) -> bool:
@@ -421,7 +432,8 @@ def ancestry(request: MergeRequest) -> bool:
         if git(checkout, "merge-base", "--is-ancestor", request.commit, request.production.merge_branch).returncode:
             raise Stop("ancestry", "held", "checkpoint drops an earlier merge",
                        "merge the latest unit checkpoint and send a new hash")
-    if not on_origin(request):
+    origin_branch = on_origin(request)
+    if origin_branch is None:
         raise Stop("ancestry", "held", "commit is not on origin",
                    "push your branch to origin and resend the checkpoint")
     already = git(checkout, "merge-base", "--is-ancestor", request.commit,
@@ -429,7 +441,7 @@ def ancestry(request: MergeRequest) -> bool:
     if not isinstance(request.kind, CodeCheckpoint) and not code_merged(request):
         raise Stop("ancestry", "held", f"phase {request.phase} code checkpoint has not merged",
                    "wait for the phase code checkpoint to merge, then resend the shrink")
-    report("ancestry", "ok", "checkpoint exists, follows history, and is on origin" +
+    report("ancestry", "ok", f"checkpoint exists, follows history, and is on {origin_branch}" +
            ("; already merged" if already else ""))
     return already
 

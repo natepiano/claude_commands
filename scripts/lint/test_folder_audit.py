@@ -72,6 +72,42 @@ class FolderAuditTests(unittest.TestCase):
         self.enterContext(unittest.mock.patch.dict(os.environ, {"FOLDER_SWEEP_STATE_DIR": str(state),
                                                                 "SCRATCH_HOLDS": str(state / "holds.json")}))
 
+    def test_process_uses_distinguishes_known_empty_from_unavailable(self) -> None:
+        proc = self.root / "proc"
+        proc.mkdir()
+        candidate = self.temp / "candidate"
+        for paths in ([], [candidate]):
+            with self.subTest(paths=paths):
+                with unittest.mock.patch.object(tmp_sweep, "lsof_paths", side_effect=AssertionError("unexpected fallback")):
+                    known = folder_audit.process_uses(paths, str(proc))
+                self.assertIsInstance(known, tmp_sweep.ProcessUsesKnown)
+                assert isinstance(known, tmp_sweep.ProcessUsesKnown)
+                self.assertEqual(known.paths, [])
+        with unittest.mock.patch.object(tmp_sweep, "LSOF", (str(self.root / "no-lsof"),)):
+            unavailable = folder_audit.process_uses([candidate], str(self.root / "no-proc"))
+        self.assertIsInstance(unavailable, tmp_sweep.ProcessUsesUnavailable)
+
+    def test_unavailable_process_uses_keeps_due_folders(self) -> None:
+        candidate = folder(self.temp / "candidate", 8)
+        now = time.time()
+        with (unittest.mock.patch.object(tmp_sweep, "LSOF", (str(self.root / "no-lsof"),)),
+              unittest.mock.patch.object(folder_audit, "remove", side_effect=AssertionError("removed without a process scan"))):
+            outcomes = folder_audit.judge([(candidate, now - 8 * DAY)], now, True,
+                                         proc=str(self.root / "no-proc"), sockets=str(self.root / "no-sockets"))
+        self.assertEqual(outcomes[candidate], tmp_sweep.NO_PROC)
+        self.assertTrue(candidate.exists())
+
+    def test_lsof_fallback_keeps_used_folders_and_judges_unused_folders(self) -> None:
+        used = folder(self.temp / "used", 8)
+        idle = folder(self.temp / "idle", 8)
+        now = time.time()
+        output = f"p42\nfcwd\nn{used}\n"
+        completed = subprocess.CompletedProcess(tmp_sweep.LSOF, 1, output, "")
+        with unittest.mock.patch.object(subprocess, "run", return_value=completed):
+            outcomes = folder_audit.judge([(used, now - 8 * DAY), (idle, now - 8 * DAY)], now, False,
+                                         proc=str(self.root / "no-proc"), sockets=str(self.root / "no-sockets"))
+        self.assertEqual(outcomes, {used: "pid 42 works in it", idle: folder_audit.WOULD_REMOVE})
+
     def test_the_roots_file_ignores_comments_and_blank_lines(self) -> None:
         roots = self.root / "rust_roots.txt"
         _ = roots.write_text("# top\nhana\n\nbevy  # engine\n  hana videos\n")
