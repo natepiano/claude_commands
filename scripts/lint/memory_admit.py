@@ -7,13 +7,14 @@ import fcntl
 import importlib
 import json
 import os
+import signal
 import sqlite3
 import sys
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal, NotRequired, Protocol, TypedDict, cast
+from typing import Literal, NoReturn, NotRequired, Protocol, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
 
@@ -61,6 +62,7 @@ START_SECONDS = 5
 PROC = Path("/proc")
 # A step held this long gets room first when it can start.
 HEAD_SECONDS = 900
+QUEUE_LOCK_TIMEOUT_SECONDS = 10.0
 
 
 class Reservation(TypedDict):
@@ -231,6 +233,14 @@ def decide(available: int, total: int | None, need: int, running: list[StepMemor
     return AdmissionDecision("admit" if available >= threshold else "hold", threshold, promised, reserve, measured)
 
 
+def _head_holds_later(available: int, total: int | None, need: int,
+                      running: list[StepMemory]) -> bool:
+    decision = decide(available, total, need, running)
+    # Leave room if the head fits now or after measured running steps end.
+    # Pending starts have no measured use to return.
+    return decision.state == "admit" or available + decision.measured >= need + decision.reserve
+
+
 def percentile(values: list[int]) -> int:
     values.sort()
     return values[(90 * len(values) + 99) // 100 - 1]
@@ -334,10 +344,6 @@ def process_table(proc: Path = PROC) -> dict[int, ProcessIdentity]:
     return processes
 
 
-def process_tree_memory(pid: int, start: str, proc: Path = PROC) -> MeasuredMemory | GoneMemory:
-    return tree_memory(pid, start, process_table(proc), proc)
-
-
 def tree_memory(pid: int, start: str, processes: dict[int, ProcessIdentity],
                 proc: Path = PROC) -> MeasuredMemory | GoneMemory:
     """Sum resident and swapped bytes from one process table reading."""
@@ -364,12 +370,14 @@ def tree_memory(pid: int, start: str, processes: dict[int, ProcessIdentity],
     return MeasuredMemory(used)
 
 
-def step_memory(row: Reservation, now: datetime) -> StepMemory:
-    if process_start_time(row["pid"]) != row["start_time"]:
+def step_memory(row: Reservation, now: datetime, processes: dict[int, ProcessIdentity],
+                proc: Path = PROC) -> StepMemory:
+    identity = processes.get(row["pid"])
+    if identity is None or identity.start != row["start_time"]:
         return GoneMemory()
     if now.timestamp() - _epoch(row["admitted_at"]) < START_SECONDS:
         return PromisedMemory(row["need"])
-    return process_tree_memory(row["pid"], row["start_time"])
+    return tree_memory(row["pid"], row["start_time"], processes, proc)
 
 
 def read_meminfo(path: Path) -> tuple[int, int | None]:
@@ -470,10 +478,12 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
     directory = admission_dir(root)
     with (directory / "lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        proc = Path(os.environ.get("BUILDLOG_PROC", "/proc"))
+        processes = process_table(proc)
         live: list[tuple[Path, Reservation]] = []
         running: list[StepMemory] = []
         for path, row in live_reservations(directory):
-            memory = step_memory(row, now)
+            memory = step_memory(row, now, processes, proc)
             if isinstance(memory, GoneMemory):
                 path.unlink(missing_ok=True)
                 path.with_suffix(".max").unlink(missing_ok=True)
@@ -496,8 +506,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
         head_need, head_label = 0, ""
         if heads and waiter_order(heads[0]) < own_order:
             head = heads[0]
-            # A head that cannot fit holds no unused memory away from smaller steps.
-            if decide(available, total, head["need"], running).state == "admit":
+            if _head_holds_later(available, total, head["need"], running):
                 head_need, head_label = head["need"], waiter_label(head)
         decision = decide(available, total, peak.bytes, running, head_need)
         if head_need and heads[0].get("bump_order", 0) < 0:
@@ -603,8 +612,7 @@ def queue_rows(directory: Path, suffix: str, processes: dict[int, ProcessIdentit
     return rows
 
 
-def read_queue(directory: Path, processes: dict[int, ProcessIdentity], now: float,
-               unavailable: bool = False) -> tuple[QueueView, list[tuple[Path, Waiter]]]:
+def read_queue(directory: Path, processes: dict[int, ProcessIdentity], now: float) -> tuple[QueueView, list[tuple[Path, Waiter]]]:
     proc = Path(os.environ.get("BUILDLOG_PROC", "/proc"))
     identities = QueueIdentityReader(processes, proc)
     running: list[RunningStep] = []
@@ -622,6 +630,7 @@ def read_queue(directory: Path, processes: dict[int, ProcessIdentity], now: floa
                                    identity["folder"], reservation["need"], reading))
         memory.append(reading)
     available, total = 0, 0
+    unavailable = False
     try:
         available, total = read_meminfo(Path(os.environ.get("BUILDLOG_MEMINFO", "/proc/meminfo")))
     except (OSError, ValueError):
@@ -640,7 +649,7 @@ def read_queue(directory: Path, processes: dict[int, ProcessIdentity], now: floa
             reason = ReadingUnavailable()
         elif own.state == "hold":
             reason = NeedsMemory(row["need"], available, count, pending)
-        elif head is not None and waiter_order(head) < waiter_order(row) and decide(available, total, head["need"], memory).state == "admit":
+        elif head is not None and waiter_order(head) < waiter_order(row) and _head_holds_later(available, total, head["need"], memory):
             if head.get("bump_order", 0) < 0 or decide(available, total, row["need"], memory, head["need"]).state == "hold":
                 head_identity = identities.identity(head["pid"], cast(dict[str, object], cast(object, head)))
                 reason = BehindHead(head_identity["session_name"] or Path(head_identity["folder"]).name or str(head["pid"]), head["since"])
@@ -649,18 +658,25 @@ def read_queue(directory: Path, processes: dict[int, ProcessIdentity], now: floa
     return QueueView(tuple(waiting), tuple(running), available, pending, total * 5 // 100 if total else 0, now), ordered
 
 
+def _queue_lock_timeout(_signum: int, _frame: object) -> NoReturn:
+    raise TimeoutError(f"admission lock busy for {QUEUE_LOCK_TIMEOUT_SECONDS:g} s; try again")
+
+
 def queue_view() -> QueueView:
     directory = store.root() / "admission"
-    processes, now = process_table(Path(os.environ.get("BUILDLOG_PROC", "/proc"))), time.time()
     try:
-        with (directory / "lock").open("r") as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return read_queue(directory, processes, now, unavailable=True)[0]
-            return read_queue(directory, processes, now)[0]
+        lock = (directory / "lock").open("r")
     except FileNotFoundError:
-        return read_queue(directory, processes, now)[0]
+        return read_queue(directory, process_table(Path(os.environ.get("BUILDLOG_PROC", "/proc"))), time.time())[0]
+    with lock:
+        previous = signal.signal(signal.SIGALRM, _queue_lock_timeout)
+        try:
+            _ = signal.setitimer(signal.ITIMER_REAL, QUEUE_LOCK_TIMEOUT_SECONDS)
+            fcntl.flock(lock, fcntl.LOCK_SH)
+        finally:
+            _ = signal.setitimer(signal.ITIMER_REAL, 0)
+            _ = signal.signal(signal.SIGALRM, previous)
+        return read_queue(directory, process_table(Path(os.environ.get("BUILDLOG_PROC", "/proc"))), time.time())[0]
 
 
 def bump_waiter(selector: str, actor: str) -> WaitingStep:

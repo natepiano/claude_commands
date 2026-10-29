@@ -39,8 +39,9 @@ rather than enforced:
 
 Every one of those limits is set in `~/.claude/config/direct.conf`, which is
 authoritative: no limit has a compiled default, and a missing or unusable value
-stops the run before any command executes. The limits decide when an advisory
-is worth printing; none of them decides whether a round runs.
+stops the run before any command executes. The convergence limits decide when an advisory
+is worth printing. Routing and Astra thresholds require repair evidence before
+dispatch (the user, 2026-10-28).
 
 Findings live in `<session_dir>/findings_state.json` and are also appended to
 the run's durable event stream when `progress_history.py` has started a run.
@@ -65,6 +66,7 @@ from typing import TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import unit_runs  # noqa: E402
+from scripts.history.rounds import phase_rounds  # noqa: E402
 
 # What history written before the rename records for a finding a worker caught.
 FORMER_WORKER = "delegate"
@@ -98,6 +100,8 @@ STATE_OPEN = "open"
 STATE_IN_FLIGHT = "repair_in_flight"
 STATE_PENDING = "fixed_pending_review"
 STATE_ACCEPTED = "accepted"
+STATE_ROUTED = "routed"
+KEEP_CATEGORIES = ("regression", "broken", "gate", "ruling")
 
 # Every convergence limit is set in `~/.claude/config/direct.conf` and nowhere
 # else -- there are no compiled defaults, so a missing key or an unusable value
@@ -185,6 +189,8 @@ MAX_FIX_ATTEMPTS = _configured_int(_CONFIG, "MAX_FIX_ATTEMPTS")
 MAX_REOPENS = _configured_int(_CONFIG, "MAX_REOPENS")
 STALLED_ROUNDS = _configured_int(_CONFIG, "STALLED_ROUNDS")
 RUNAWAY_ROUNDS = _configured_int(_CONFIG, "RUNAWAY_ROUNDS")
+ROUTING_FROM_ROUND = _configured_int(_CONFIG, "ROUTING_FROM_ROUND")
+ASTRA_AFTER_FAILED_FIXES = _configured_int(_CONFIG, "ASTRA_AFTER_FAILED_FIXES")
 
 # Repairs are dispatched one batch per round, so N confirmed findings should
 # close in about N/2 rounds. A phase that needs materially more than that is
@@ -507,6 +513,43 @@ def _history_root() -> Path:
     return unit_runs.history_root()
 
 
+def _repair_round(state: dict[str, object], session_dir: Path) -> int:
+    """The next repair interval, using the same join as `history.py rounds`."""
+    path = _history_root() / "runs" / f"{session_dir.name}.jsonl"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return len(_rounds(state)) + 1
+    except OSError as error:
+        raise SystemExit(f"Unable to read repair history {path}: {error}") from error
+    instance = _string(state.get("phase_instance_id"))
+    events = [event for line in lines if (event := _json_object(line)) is not None
+              and _string(event.get("phase_instance_id")) == instance]
+    return len(phase_rounds(events)) + 1
+
+
+def _astra_due(entry: dict[str, object], repair_round: int) -> bool:
+    if _string(entry.get("state")) != STATE_OPEN:
+        return False
+    attempts = _integer(entry.get("fix_attempts"))
+    triggered = repair_round >= ROUTING_FROM_ROUND or attempts >= ASTRA_AFTER_FAILED_FIXES
+    return triggered and not any(
+        _integer(record.get("fix_attempts"), -1) == attempts
+        for record in _object_list(entry.get("astra_reviews"))
+    )
+
+
+def _trial_exposure(
+    session_dir: Path, state: dict[str, object], now: float,
+    proposal: str, basis: str, decision: str = "",
+) -> None:
+    _append_event(session_dir, state, {
+        "event_type": "trial_exposure", "timestamp": _iso_time(now),
+        "timestamp_epoch": now, "proposal": proposal, "basis": basis,
+        "decision": decision, "repair_round": _repair_round(state, session_dir),
+    })
+
+
 class PhasePass(TypedDict):
     """One pass a phase ran: what work it was, which worker ran it, how it ended.
 
@@ -663,6 +706,9 @@ def _summarize(entry: dict[str, object]) -> dict[str, object]:
     detail = _string(entry.get("detail"))
     if detail:
         summary["detail"] = detail
+    for key in ("route", "astra_reviews"):
+        if key in entry:
+            summary[key] = entry[key]
     return summary
 
 
@@ -822,6 +868,8 @@ def _verdict(args: argparse.Namespace) -> None:
             f"{finding_id} has a repair in flight; record `landed` once its worker"
             + " exits cleanly, or `abandon --reason ...` if it died, before any verdict"
         )
+    if current == STATE_ROUTED:
+        raise SystemExit(f"{finding_id} is routed; its receiving checkpoint must use close-route")
     if outcome == "accepted":
         entry["state"] = STATE_ACCEPTED
         entry["accepted_at"] = now
@@ -869,8 +917,12 @@ def _gate_payload(state: dict[str, object], session_dir: Path) -> dict[str, obje
     gating_open = sum(counts[severity] for severity in gating)
     passes = _phase_passes(session_dir, _string(state.get("phase_instance_id")))
     kind, run = _consecutive_same_kind(passes)
+    repair_round = _repair_round(state, session_dir)
     payload: dict[str, object] = {
         "round": len(_rounds(state)) + 1,
+        "repair_round": repair_round,
+        "astra_review_due": [_string(entry.get("id")) for entry in batch
+                             if _astra_due(entry, repair_round)],
         "gating_severities": list(gating),
         "open_counts": counts,
         "batch": [_summarize(entry) for entry in batch],
@@ -926,10 +978,122 @@ def _gate(args: argparse.Namespace) -> None:
             "verdict": payload.get("verdict"),
             "advisory": payload.get("advisory"),
             "round": payload.get("round"),
+            "repair_round": payload.get("repair_round"),
+            "astra_review_due": payload.get("astra_review_due"),
             "open_counts": payload.get("open_counts"),
         },
     )
+    if _integer(payload.get("repair_round")) >= ROUTING_FROM_ROUND and any(
+        _integer(entry.get("fix_attempts")) >= 1
+        for entry in _open_entries(state, _gating_severities(state))
+    ):
+        _trial_exposure(session_dir, state, now, "P3", "round-4-or-later decision with a repeated open finding")
     print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _kept_evidence(args: argparse.Namespace, covered: set[str]) -> dict[str, dict[str, str]]:
+    raw: object = getattr(args, "keep", [])
+    values = cast(list[object], raw) if isinstance(raw, list) else []
+    kept: dict[str, dict[str, str]] = {}
+    for value in values:
+        finding_id, equals, detail = _string(value).partition("=")
+        category, colon, evidence = detail.partition(":")
+        if not equals or not colon or category not in KEEP_CATEGORIES or not evidence.strip():
+            raise SystemExit("--keep must be F003=<regression|broken|gate|ruling>:<evidence>")
+        if finding_id not in covered:
+            raise SystemExit(f"--keep {finding_id} is not in --covers")
+        if finding_id in kept:
+            raise SystemExit(f"Duplicate --keep for {finding_id}")
+        kept[finding_id] = {"category": category, "evidence": evidence.strip()}
+    return kept
+
+
+def _required_text(args: argparse.Namespace, name: str) -> str:
+    value = _arg_string(args, name).strip()
+    if not value:
+        raise SystemExit(f"--{name.replace('_', '-')} must not be empty")
+    return value
+
+
+def _route(args: argparse.Namespace) -> None:
+    session_dir = _session_dir(args)
+    now = _now_epoch()
+    state = _read_state(session_dir, now, _arg_string(args, "phase"))
+    finding_id = _arg_string(args, "id")
+    entry = _finding(state, finding_id)
+    if _string(entry.get("state")) != STATE_OPEN:
+        raise SystemExit(f"{finding_id} is {entry.get('state')}; only open findings can be routed")
+    repair_round = _repair_round(state, session_dir)
+    if _string(entry.get("severity")) in _gating_severities(state) and _astra_due(entry, repair_round):
+        raise SystemExit(f"Astra review due for {finding_id}; record it with findings.py astra before routing")
+    records = _object_list(entry.get("astra_reviews"))
+    route: dict[str, object] = {
+        "finding_id": finding_id, "reason": _arg_string(args, "reason"),
+        "owner": _required_text(args, "owner"), "work_order": _required_text(args, "work_order"),
+        "due": _required_text(args, "due"), "evidence": _arg_string(args, "evidence"),
+        "repair_round": repair_round, "round": len(_rounds(state)) + 1,
+        "fix_attempts": _integer(entry.get("fix_attempts")),
+        "astra_approach": _string(records[-1].get("approach")) if records else "",
+        "timestamp": _iso_time(now), "timestamp_epoch": now,
+    }
+    entry["state"] = STATE_ROUTED
+    entry["route"] = route.copy()
+    _write_state(session_dir, state)
+    _append_event(session_dir, state, {"event_type": "finding_routed", **route})
+    print(f"{finding_id} routed to {route['owner']}: {route['work_order']}")
+
+
+def _astra(args: argparse.Namespace) -> None:
+    session_dir = _session_dir(args)
+    now = _now_epoch()
+    state = _read_state(session_dir, now, _arg_string(args, "phase"))
+    finding_id = _arg_string(args, "id")
+    entry = _finding(state, finding_id)
+    note = Path(_required_text(args, "note")).expanduser().resolve()
+    if not note.is_file():
+        raise SystemExit(f"Astra note does not exist: {note}")
+    approach = _arg_string(args, "approach").strip()
+    unavailable = _arg_string(args, "unavailable").strip()
+    if bool(approach) == bool(unavailable):
+        raise SystemExit("Give --approach or --unavailable with a non-empty value")
+    record: dict[str, object] = {
+        "finding_id": finding_id, "note": str(note), "approach": approach,
+        "unavailable": unavailable, "fix_attempts": _integer(entry.get("fix_attempts")),
+        "repair_round": _repair_round(state, session_dir),
+        "timestamp": _iso_time(now), "timestamp_epoch": now,
+    }
+    records = _object_list(entry.get("astra_reviews"))
+    records.append(record)
+    entry["astra_reviews"] = records
+    _write_state(session_dir, state)
+    _append_event(session_dir, state, {"event_type": "finding_astra_review", **record})
+    print(f"{finding_id} Astra review recorded")
+
+
+def _exposure(args: argparse.Namespace) -> None:
+    session_dir = _session_dir(args)
+    now = _now_epoch()
+    state = _read_state(session_dir, now, _arg_string(args, "phase"))
+    _trial_exposure(session_dir, state, now, _arg_string(args, "proposal"),
+                    _required_text(args, "basis"), _arg_string(args, "decision"))
+    print("trial exposure recorded")
+
+
+def _close_route(args: argparse.Namespace) -> None:
+    session_dir = _session_dir(args)
+    now = _now_epoch()
+    state = _read_state(session_dir, now, _arg_string(args, "phase"))
+    source = _required_text(args, "from")
+    parts = source.split(":")
+    if len(parts) != 3 or any(not part.strip() for part in parts):
+        raise SystemExit("--from must be <run id>:<phase instance id>:<finding id>")
+    if _history_file(session_dir) is None:
+        raise SystemExit("Start a recorded run before closing routed work")
+    _append_event(session_dir, state, {
+        "event_type": "finding_route_closed", "timestamp": _iso_time(now),
+        "timestamp_epoch": now, "from": source, "evidence": _required_text(args, "evidence"),
+    })
+    print(f"route {source} closed")
 
 
 def _dispatch(args: argparse.Namespace) -> None:
@@ -952,6 +1116,30 @@ def _dispatch(args: argparse.Namespace) -> None:
             "A fix round must repair every gating open finding together. Missing: "
             + ", ".join(missing)
         )
+    invalid = sorted(finding_id for finding_id in covered
+                     if _string(_finding(state, finding_id).get("state")) != STATE_OPEN)
+    if invalid:
+        raise SystemExit("Only open findings can be covered: " + ", ".join(invalid))
+    if _in_flight_ids(state) or _pending_ids(state):
+        raise SystemExit("Record the in-flight repair and its closure verdicts before dispatch")
+    accepted_checks = _arg_string(args, "accepted_checks").strip()
+    if not accepted_checks:
+        raise SystemExit('--accepted-checks is required: name affected accepted checks or "none: <why>"')
+    if accepted_checks == "none:":
+        raise SystemExit('--accepted-checks "none:" requires a reason')
+    repair_round = _integer(payload.get("repair_round"))
+    due = sorted(finding_id for finding_id in covered & expected
+                 if _astra_due(_finding(state, finding_id), repair_round))
+    if due:
+        raise SystemExit("Astra review due for " + ", ".join(due) + "; record it with findings.py astra")
+    kept = _kept_evidence(args, covered)
+    if repair_round >= ROUTING_FROM_ROUND:
+        missing_kept = sorted(covered - set(kept))
+        if missing_kept:
+            raise SystemExit(
+                "Missing --keep for " + ", ".join(missing_kept)
+                + ": route it with `findings.py route` or give the kept category and its evidence"
+            )
     counts = _open_counts(state)
     gating_open = sum(counts[severity] for severity in gating)
     round_number = len(_rounds(state)) + 1
@@ -980,6 +1168,9 @@ def _dispatch(args: argparse.Namespace) -> None:
         state,
         {
             "event_type": "finding_batch_dispatched",
+            "repair_round": repair_round,
+            "kept": kept,
+            "accepted_checks": accepted_checks,
             "timestamp": _iso_time(now),
             "timestamp_epoch": now,
             "round": round_number,
@@ -1107,6 +1298,8 @@ def _status(args: argparse.Namespace) -> None:
         "rounds_completed": len(_live_rounds(state)),
         "rounds_dispatched": len(_rounds(state)),
         "in_flight": _in_flight_ids(state),
+        "repair_round": _repair_round(state, session_dir),
+        "routed": [_summarize(_finding(state, key)) for key in _ids_in_state(state, STATE_ROUTED)],
         "gating_severities": list(_gating_severities(state)),
         "open_counts": _open_counts(state),
         "findings": findings,
@@ -1180,7 +1373,41 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = dispatch.add_argument("--session-dir", required=True)
     _ = dispatch.add_argument("--phase", default="", help=PHASE_HELP)
     _ = dispatch.add_argument("--covers", required=True)
+    _ = dispatch.add_argument("--keep", action="append", default=[])
+    _ = dispatch.add_argument("--accepted-checks", default="")
     dispatch.set_defaults(handler=_dispatch)
+
+    route = subparsers.add_parser("route", help="move open work to an owned follow-up Work Order")
+    _ = route.add_argument("--id", required=True)
+    _ = route.add_argument("--reason", choices=("spec-gap", "outside-kept"), required=True)
+    _ = route.add_argument("--owner", required=True)
+    _ = route.add_argument("--work-order", required=True)
+    _ = route.add_argument("--due", required=True)
+    _ = route.add_argument("--evidence", default="")
+    route.set_defaults(handler=_route)
+
+    astra = subparsers.add_parser("astra", help="record Astra's approach at the current fix attempt")
+    _ = astra.add_argument("--id", required=True)
+    _ = astra.add_argument("--note", required=True)
+    outcome = astra.add_mutually_exclusive_group(required=True)
+    _ = outcome.add_argument("--approach")
+    _ = outcome.add_argument("--unavailable")
+    astra.set_defaults(handler=_astra)
+
+    exposure = subparsers.add_parser("exposure", help="record a P1 or P2 trial exposure")
+    _ = exposure.add_argument("--proposal", choices=("P1", "P2"), required=True)
+    _ = exposure.add_argument("--basis", required=True)
+    _ = exposure.add_argument("--decision", default="")
+    exposure.set_defaults(handler=_exposure)
+
+    close_route = subparsers.add_parser("close-route", help="record a receiving checkpoint's closure")
+    _ = close_route.add_argument("--from", required=True)
+    _ = close_route.add_argument("--evidence", required=True)
+    close_route.set_defaults(handler=_close_route)
+
+    for command in (route, astra, exposure, close_route):
+        _ = command.add_argument("--session-dir", required=True)
+        _ = command.add_argument("--phase", default="", help=PHASE_HELP)
 
     landed = subparsers.add_parser(
         "landed", help="promote an in-flight round to review after a clean worker exit"
