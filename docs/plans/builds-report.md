@@ -30,6 +30,10 @@ i don't mind columns in reports showing a showerunner and a unit as long as they
 
 The showrunner: keep the separate Showrunner and Unit columns, and fill each with the short name the user uses: Showrunner "builds" or "hana", Unit "report" or "lfo", never "report-unit" or a long session name. Only file paths join them with a hyphen (builds-report). Take the name from the one place that names sessions, never a second copy of that logic. Put it in Phase 2 if it fits, or in a small phase right after.
 
+2026-10-29 14:12 EDT (the showrunner, approving verify-unit's Work Order for the copy folder name)
+
+verify-unit's Work Order for the copy folder name (roster.py join `<showrunner>-<unit>`, drop a leading showrunner name from the unit name, drop a missing part, callers pass the director's session from owning_session(), 4 tests) is approved. Add it as the phase after your Phase 3, because it builds on Phase 3's unit_labels.
+
 ## Delegation Context
 
 - **Project:** `~/.claude` — the build system scripts; this plan changes the `/build:queue` tables.
@@ -86,7 +90,7 @@ The showrunner: keep the separate Showrunner and Unit columns, and fill each wit
 
 **Ruled out:** a read-side strip of the `<repository_name> ` prefix from waiter steps — the write-side fix is enough once installed.
 
-### Phase 2 — Samples record CPU and disk pressure  · status: todo
+### Phase 2 — Samples record CPU and disk pressure  · status: done
 
 **Depends on:** Phase 1
 
@@ -173,3 +177,31 @@ The showrunner: keep the separate Showrunner and Unit columns, and fill each wit
 - `basedpyright` on the six Python files: `0 errors, 0 warnings`.
 - Live check on natedev from the worktree: `/build:queue` shows `Unit` with short unit names; `/build:status` shows `(showrunner <name>, unit <name>)` after each running Mac claim whose holder runs.
 - Speed: `/build:status` median of 10 runs grows by at most 0.2 s (now about 0.3 s); `/build:queue` does not get slower.
+
+### Phase 4 — Copy folders take one showrunner-unit name  · status: todo
+
+**Depends on:** Phase 3
+
+#### Work Order
+
+**Goal:** One function in `roster.py` gives the `<showrunner>-<unit>` folder name that verify-unit's copies helper puts in `/tmp/claude/copies/<showrunner>-<unit>/<phase>-<purpose>`, from Phase 3's `UnitLabels`, so no caller joins names itself.
+
+**Spec:**
+
+1. **`UnitLabels.folder_name() -> str`** (`scripts/message/roster.py`). It joins the showrunner and unit names with `-`: showrunner `hana`, unit `lfo` gives `hana-lfo`.
+2. **No doubled showrunner.** When the unit name is the showrunner name, or starts with the showrunner name and `-`, the unit name alone is the folder name: showrunner `cargo-liner-style`, unit `cargo-liner-style-types` gives `cargo-liner-style-types`.
+3. **A missing part is dropped.** A `—` part is left out with its hyphen: showrunner `builds` and no unit gives `builds`; no showrunner and unit `lfo` gives `lfo`. With both missing, the session name is the folder name.
+4. **Callers pass the director's session.** The docstring says: look up labels with `unit_labels_for([<session id from build_hold.owning_session()>], environment)`, so a Codex worker resolves to its unit director. This phase changes no caller; verify-unit's copies helper is the first.
+
+**Files:**
+- `scripts/message/roster.py` — `UnitLabels.folder_name`
+- `scripts/message/test_roster.py` — four tests
+
+**Workers:** `1 writer` — `impl2` (it wrote Phase 3's `UnitLabels`): both files. Tests build `UnitLabels` values directly; they read no live roster or session. Cases: plain join; unit that leads with its showrunner's name; one part missing (each side); both missing.
+
+**Constraints from prior phases:** Phase 3 put `UnitLabels`, `unit_labels` and `unit_labels_for` in `roster.py`; `—` marks a missing relationship. `roster.py` belongs to natedev's `scripts/message/` owner (shutdown-unit), so the checkpoint notice carries its also-touches line, trial-merged against origin/natedev and origin/natedev-shutdown. A changed existing expectation needs its own `Assertion-Change: <path>::<test> — <why>` line.
+
+**Acceptance gate:**
+- `python3 -m unittest scripts.message.test_roster` green, and the production Merge tests green.
+- `basedpyright scripts/message/roster.py scripts/message/test_roster.py`: `0 errors, 0 warnings, 0 notes`.
+- Live check on natedev from the worktree: `unit_labels_for` for this session's id, then `folder_name()`, prints `builds-report`.

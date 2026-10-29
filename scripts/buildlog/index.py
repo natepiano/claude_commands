@@ -30,7 +30,7 @@ from urllib.parse import quote
 
 import store
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 # Step and call fields under a former name, renamed in the file on its next read.
 FORMER_FIELDS = (("seat", "worker"), ("delegate_session", "unit_session"))
 LOCK_NAME = "index.lock"
@@ -251,6 +251,13 @@ SAMPLE_COLUMNS: list[Column] = [
     ("ci_anon_bytes", "INTEGER", "anon memory in hana-ci.slice; process memory"),
     ("stall_some_us", "INTEGER", "machine memory some stall counter since boot, microseconds"),
     ("stall_full_us", "INTEGER", "machine memory full stall counter since boot, microseconds"),
+    ("cpu_stall_some_us", "INTEGER", "machine CPU some stall counter since boot, microseconds; NULL when not recorded"),
+    ("cpu_stall_full_us", "INTEGER", "machine CPU full stall counter since boot, microseconds; NULL when not recorded"),
+    ("io_stall_some_us", "INTEGER", "machine IO some stall counter since boot, microseconds; NULL when not recorded"),
+    ("io_stall_full_us", "INTEGER", "machine IO full stall counter since boot, microseconds; NULL when not recorded"),
+    ("cpu_idle_ticks", "INTEGER", "CPU idle ticks since boot from /proc/stat, USER_HZ; NULL when not recorded"),
+    ("cpu_iowait_ticks", "INTEGER", "CPU iowait ticks since boot from /proc/stat, USER_HZ; NULL when not recorded"),
+    ("cpu_total_ticks", "INTEGER", "CPU total ticks since boot from /proc/stat, USER_HZ, excluding guest fields; NULL when not recorded"),
     ("power_profile", "TEXT", "power-profiles-daemon profile; NULL when not recorded"),
     ("power_profile_since", "TEXT", "UTC ISO mtime of the daemon's state file: when the profile was set"),
 ]
