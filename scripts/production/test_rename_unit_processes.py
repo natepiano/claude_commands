@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -30,7 +31,7 @@ else:
     # rename_unit puts the shutdown folder on the path.
     import record as shutdown_record
 
-from scripts.production.rename_unit_test_support import SLUG
+from scripts.production.rename_unit_test_support import SLUG, TEST_HANG_GUARD_SECS, UnitRenameFixture
 
 
 # An app-server's idle-stop watcher, as codex_mesh starts it: the run folder is its fourth argument.
@@ -135,7 +136,7 @@ class RunProcessTests(unittest.TestCase):
         return path
 
     def watcher(self, folder: Path) -> list[str]:
-        return ["sh", "-c", WATCHER, "/scripts/agents/codex_mesh.py", "555", "51101", str(folder.resolve()),
+        return ["sh", "-c", WATCHER, str(retire_unit.MESH.resolve()), "900", "51101", str(folder.resolve()),
                 "python3", "300"]
 
     def no_units(self, _slug: str) -> dict[str, object]:
@@ -190,6 +191,41 @@ class RunProcessTests(unittest.TestCase):
         self.assertIn(101, self.processes)
         self.assertIn(102, self.processes)
         self.assertTrue(record.exists())
+
+    def test_dead_server_watchers_and_their_children_need_no_matching_run_folder(self) -> None:
+        for folder in (self.root / "runs/run-b", self.root / "elsewhere/run-a", self.root / "gone"):
+            for shell in ("sh", "/bin/sh"):
+                with self.subTest(folder=folder, shell=shell):
+                    arguments = self.watcher(folder)
+                    arguments[0], arguments[4] = shell, "555"
+                    self.processes[203] = FakeProcess(self.worktree, 203, arguments)
+                    self.processes[204] = FakeProcess(self.worktree, 203, ["sleep", "300"])
+                    found = retire_unit.run_processes(self.worktree, [203, 204])
+                    self.assertEqual(set(found), {203, 204})
+                    for name in found.values():
+                        self.assertIn("app-server watcher 203 of dead server 555", name)
+        self.assertEqual(self.signalled, [])
+
+    def test_a_live_servers_watcher_still_needs_matching_run_history(self) -> None:
+        cases: tuple[tuple[Path, set[int]], ...] = (
+            (self.root / "runs/run-a", {203}), (self.root / "runs/run-b", set()),
+            (self.root / "elsewhere/run-a", set()), (self.root / "gone", set()))
+        for folder, expected in cases:
+            with self.subTest(folder=folder):
+                self.processes[203] = FakeProcess(self.worktree, 203, self.watcher(folder))
+                self.assertEqual(set(retire_unit.run_processes(self.worktree, [203])), expected)
+        self.assertEqual(self.signalled, [])
+
+    def test_dead_server_watcher_requires_the_mesh_entry_point_and_valid_server_pid(self) -> None:
+        for index, value in ((0, "bash"), (1, "-x"), (2, "echo idle"),
+                             (3, str(self.root / "codex_mesh.py")), (4, "bad"), (4, "0"), (4, "-1")):
+            with self.subTest(index=index, value=value):
+                arguments = self.watcher(self.root / "gone")
+                arguments[4] = "555"
+                arguments[index] = value
+                self.processes[203] = FakeProcess(self.worktree, 203, arguments)
+                self.assertEqual(retire_unit.run_processes(self.worktree, [203]), {})
+        self.assertEqual(self.signalled, [])
 
     def test_the_stop_ends_the_runs_supervisor_and_watcher_and_leaves_the_rest(self) -> None:
         printed = self.stop()
@@ -268,6 +304,33 @@ class RunProcessTests(unittest.TestCase):
             rename_unit._check_stopped(self.rename())  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(sorted(self.signalled), [401, 402])
         self.assertIn("of the run supervisor 401 of lint-old in run run-old", output.getvalue())
+
+
+@final
+class DeadServerWatcherTests(UnitRenameFixture):
+    def test_apply_ends_the_dead_servers_watcher_without_matching_run_history_and_moves_the_worktree(self) -> None:
+        old = self.rust / "claude-demo-alpha"
+        watcher = self.dead_server_watcher(old, self.root / "runs/run-a")
+        self.assertIn(watcher.pid, unit_move.processes_inside(old))
+        with mock.patch.dict(os.environ, self.env):
+            self.assertNotIn(self.root / "runs/run-a", retire_unit.runs_of(old))
+        server = retire_unit.command_line(watcher.pid)[4]
+        # Reap the actual child on exit: kill(pid, 0) otherwise still sees its zombie.
+        reaper = threading.Thread(target=lambda: watcher.wait(timeout=TEST_HANG_GUARD_SECS), daemon=True)
+        reaper.start()
+        def stop_watcher() -> None:
+            watcher.kill()
+            reaper.join(TEST_HANG_GUARD_SECS)
+        self.addCleanup(stop_watcher)
+        result = self.rename("apply")
+        self.assert_ok(result)
+        reaper.join(TEST_HANG_GUARD_SECS)
+        self.assertFalse(reaper.is_alive())
+        self.assertEqual(watcher.returncode, -15)
+        self.assertIn(f"app-server watcher {watcher.pid} of dead server {server}", result.stdout)
+        self.assertFalse(old.exists())
+        self.assertTrue((self.rust / "claude-demo-gamma").is_dir())
+        self.assertTrue(self.journal()["done"])
 
 
 if __name__ == "__main__":
