@@ -318,6 +318,9 @@ class ProductionRenameTests(unittest.TestCase):
     def journal(self) -> dict[str, object]:
         return cast(dict[str, object], json.loads((self.state / "new/rename.json").read_text()))
 
+    def completed_steps(self) -> int:
+        return len(cast(list[str], self.journal()["completed"]))
+
     def unit_worktree(self, slug: str, unit: str) -> Path:
         return self.worktrees / f"repo.name_with_punctuation-{slug}-{unit}"
 
@@ -429,7 +432,7 @@ class ProductionRenameTests(unittest.TestCase):
         self.assertEqual(self.git("ls-remote", "origin", "refs/heads/new"), f"{new_tip}\trefs/heads/new")
         self.assertEqual(self.git("ls-remote", "origin", "refs/heads/old"), f"{self.old_tip}\trefs/heads/old")
         self.assertEqual(self.git("status", "--porcelain"), "")
-        self.assertEqual(self.journal()["step"], 8)
+        self.assertEqual(self.completed_steps(), 8)
         self.assertIs(self.journal()["done"], False)
 
     def test_plan_ignores_as_built_paths_and_prose_in_plan_cells(self) -> None:
@@ -624,11 +627,11 @@ class ProductionRenameTests(unittest.TestCase):
             cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False, timeout=60)
         self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
         self.assertIn("simulated unit header rewrite failure", failed.stderr)
-        self.assertEqual(self.journal()["step"], 1)
+        self.assertEqual(self.completed_steps(), 1)
         self.assertTrue((self.notifier / "showrunner-old/conf").exists())
         self.assertFalse((self.notifier / "showrunner-new").exists())
         self.assert_success(self.run_rename("apply", source="ancient"))
-        self.assertEqual(self.journal()["step"], 8)
+        self.assertEqual(self.completed_steps(), 8)
         self.assertEqual(self.git("rev-parse", "new^"), base)
         self.assertEqual(self.git("status", "--porcelain"), "")
 
@@ -638,7 +641,7 @@ class ProductionRenameTests(unittest.TestCase):
             cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False, timeout=60)
         self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
         self.assertIn("simulated git mv index failure", failed.stderr)
-        self.assertEqual(self.journal()["step"], 0)
+        self.assertEqual(self.completed_steps(), 0)
         self.assertFalse(self.doc.exists())
         self.assertTrue(self.new_doc.exists())
         self.assertEqual(self.git("ls-files", "--", "docs/plans/old-production.md",
@@ -711,7 +714,7 @@ class ProductionRenameTests(unittest.TestCase):
             self.assertTrue(self.stall_path(OLD, unit).exists())
             self.assertRegex(self.plan_path(unit).read_text(),
                              r"(?m)^> \*\*Production:(?: new\*\*|\*\* new) — unit")
-        self.assertEqual(self.journal()["step"], 3)
+        self.assertEqual(self.completed_steps(), 3)
         self.assertIs(self.journal()["done"], False)
         self.assert_success(self.run_rename("apply"))
         self.assert_applied()
@@ -755,6 +758,25 @@ class ProductionRenameTests(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertIn(destination, result.stdout + result.stderr)
                     self.assertEqual(self.snapshot(), before)
+
+    def test_a_journal_that_counted_seven_steps_finishes_with_the_worker_step_only(self) -> None:
+        self.prepare_unit_moves()
+        self.marked_unit("alpha-unit")
+        self.assert_success(self.run_rename("apply"))
+        journal = self.journal()
+        del journal["completed"]
+        journal["step"] = 7
+        _ = (self.state / "new/rename.json").write_text(json.dumps(journal))
+        branch_tip = self.git("rev-parse", NEW)
+        refused = self.run_command("unit", NEW, "alpha-unit")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("apply must complete _rename_unit_workers first", refused.stdout + refused.stderr)
+        self.assert_success(self.run_rename("apply"))
+        self.assertEqual(self.journal()["completed"], [
+            "_rename_doc", "_rewrite_plans", "_rename_timer", "_rename_showrunner_state", "_rename_stall_watch",
+            "_rename_review_pool", "_rename_branch", "_rename_unit_workers"])
+        self.assertEqual(self.git("rev-parse", NEW), branch_tip)
+        self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
 
     def test_unit_moves_punctuated_transcript_paths_and_default_and_named_account_trust(self) -> None:
         self.prepare_unit_moves()
@@ -958,13 +980,13 @@ class ProductionRenameTests(unittest.TestCase):
     def test_unit_and_finish_wait_for_apply_to_complete(self) -> None:
         failed = self.run_rename("apply", fail_state=True)
         self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
-        self.assertEqual(self.journal()["step"], 3)
+        self.assertEqual(self.completed_steps(), 3)
         for arguments in (("unit", NEW, "alpha-unit"), ("finish", NEW)):
             with self.subTest(arguments=arguments):
                 before = self.snapshot()
                 refused = self.run_command(*arguments)
                 self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
-                self.assertIn("step 8", refused.stderr)
+                self.assertIn("apply must complete _rename_showrunner_state, ", refused.stderr)
                 self.assertEqual(self.snapshot(), before)
 
     def test_unit_retry_repairs_a_worktree_already_moved_before_interruption(self) -> None:
@@ -1069,7 +1091,7 @@ class ProductionRenameTests(unittest.TestCase):
         self.assertEqual((archived["old"], archived["new"]), (OLD, NEW))
         current = cast(dict[str, object], json.loads((self.state / "next/rename.json").read_text()))
         self.assertIs(current["done"], False)
-        self.assertEqual(current["step"], 8)
+        self.assertEqual(len(cast(list[str], current["completed"])), 8)
 
     def test_a_merge_branch_not_named_for_the_production_is_kept(self) -> None:
         self.prepare_unit_moves()
