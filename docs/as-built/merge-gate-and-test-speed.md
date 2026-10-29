@@ -8,6 +8,8 @@
 
 **Build-hold tests.** `scripts/build_hold/test_build_hold.py` uses a class fixture seed copied into the same private path for each test. `build_hold_test_support.py` invokes the real argument parser and command handlers in-process for holder-state checks, while shell wait status, detached recording, lock ownership and child reaping retain real processes. Record assertions wait for recorder threads and the child-lifetime FIFO to finish instead of polling log files. Real recorder output and every original assertion remain covered.
 
+**Mac memory retry tests.** The four cases formerly grouped in `test_verify_mac_memory_retry.py` run by outcome: a second busy decline (`memory_retry`), a successful Mac handoff (`memory_handoff`), an excluded Mac (`memory_excluded`) and a permanent decline (`memory_decline`). They reuse the committed Mac fixture's class seed, interpreter cache and event waits through `verify_mac_memory_retry_test_support.py`; each class restores its private seed at the same path. The real Bash retry, admission and process boundaries and every original assertion remain exercised.
+
 ## How it works
 
 ### The gate: `scripts/production/merge_gate.py`
