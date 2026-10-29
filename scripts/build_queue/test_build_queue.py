@@ -86,6 +86,15 @@ class QueueTests(unittest.TestCase):
         line = build_queue.render_queue(view, ZoneInfo("UTC"))[0]
         self.assertTrue(line.endswith("needs 10.8 GiB; builds 17.6 of 20.0 GiB budget"))
 
+    def test_head_reason_names_the_steps_that_must_end(self) -> None:
+        waiting = memory_admit.WaitingStep(
+            10, "waiting-id", "unit", "nextest", "/tmp/tree", NOW - 2400,
+            int(19.3 * GIB), memory_admit.HeadWaitingForDrain(2),
+        )
+        view = memory_admit.QueueView((waiting,), (), 20 * GIB, 0, 3 * GIB, NOW)
+        line = build_queue.render_queue(view, ZoneInfo("UTC"))[0]
+        self.assertTrue(line.endswith("head: waits for 2 running steps to end"))
+
     def test_live_queue_pressure_reason_reaches_the_cli(self) -> None:
         process = self.root / "proc/100"
         process.mkdir()
