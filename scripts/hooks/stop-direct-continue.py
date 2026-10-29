@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 from typing import cast
 
 from context_usage import (
@@ -59,17 +60,18 @@ Waiting on a user decision instead? State it in one line and end the turn — th
 will not block twice."""
 
 
+class StopPayload(HookInput, total=False):
+    last_assistant_message: str
+
+
 def build_reason(tokens: int, trigger: int) -> str:
     percent = round(100 * tokens / trigger) if trigger else 100
     return REASON.format(tokens=tokens, trigger=trigger, percent=percent)
 
 
 def main() -> None:
-    payload = cast(HookInput, json.loads(sys.stdin.read()))
+    payload = cast(StopPayload, json.loads(sys.stdin.read()))
 
-    # Already continuing because of a previous block -- let this one through.
-    if payload.get("stop_hook_active"):
-        return
     # Subagents do not orchestrate /unit:direct runs; their stop is a real result.
     if payload.get("agent_id"):
         return
@@ -79,6 +81,17 @@ def main() -> None:
         return
     session_dir = active_run(session_id)
     if session_dir is None:
+        return
+    # A declared wait is a real stop, including a restated decision after a
+    # compaction block. Record before the compaction and background-work guards.
+    final_message = payload.get("last_assistant_message", "")
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.direct.progress_history import record_turn_wait
+
+    if record_turn_wait(session_dir, session_id, final_message):
+        return
+    # Already continuing because of a previous block -- let this one through.
+    if payload.get("stop_hook_active"):
         return
     # Parked on a completion waiter: the worker's own notification will supply
     # the next request, and compaction fires there. Nothing to force.
