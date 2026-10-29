@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from scripts.lib import names
+from scripts.lib.test_names import fixture_names
+
 import json
 import io
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
@@ -2055,9 +2058,10 @@ class HerdrTests(unittest.TestCase):
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
             {"pane_id": "w1:p1", "tab_id": "w1:t1"}, {"pane_id": "w1:p2", "tab_id": "w1:t2"}]}}))
         self.assertEqual(herdr.open_tab("fixture", "boss", "alpha", "/wt", {}), "w1:p2")
-        self.assertEqual([command[2:] for command in self.commands()[-8:]], [
+        self.assertEqual([command[2:] for command in self.commands()[-9:]], [
             tab, ["pane", "rename", "w1:p2", "alpha"], ["tab", "list", "--workspace", "w1"], ["workspace", "list"],
-            ["tab", "list", "--workspace", "w1"], ["pane", "list"], ["workspace", "list"], ["tab", "list"]])
+            ["tab", "list", "--workspace", "w1"], ["pane", "list"], ["workspace", "list"], ["tab", "list"],
+            ["pane", "list"]])
         saved = herdr.saved_layout("fixture")
         self.assertEqual([(space["name"], [tab["name"] for tab in space["tabs"]]) for space in saved["workspaces"]],
                          [("boss", ["boss", "alpha"])])
@@ -3043,6 +3047,20 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(herdr.herdr_place_of(13), herdr.HerdrPlace("fixture", "native"))
         self.assertEqual([row.pid for row in herdr.herdr_processes() if row.command == "claude"], [13])
 
+    def test_linux_deleted_cwd_preserves_the_process_marks_and_place(self) -> None:
+        server = self.process(10, 1, ["/fixture/herdr", "server"], {})
+        self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)
+        self.socket_fd(server, 100)
+        marks = {"SHOWRUNNER_UNIT": "prod", "SHOWRUNNER_UNIT_ID": "unit"}
+        process = self.process(12, 10, ["/bin/claude"], {**marks, "HERDR_PANE_ID": "pane-1"})
+        (process / "cwd").unlink()
+        (process / "cwd").symlink_to(self.root / "deleted-directory")
+        rows = herdr.herdr_processes()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0].pid, rows[0].command, rows[0].place, rows[0].marks),
+                         (12, "claude", herdr.HerdrPlace("fixture", "pane-1"), marks))
+        self.assertIsInstance(rows[0].working_directory, herdr.UnreadableCwd)
+
     def test_process_place_named_default_and_nonherdr(self) -> None:
         server = self.process(10, 1, ["/fixture/herdr", "--session", "fixture", "server"], {})
         self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)
@@ -3180,7 +3198,7 @@ class HerdrTests(unittest.TestCase):
                   "agent": "codex", "pane_id": "pane-codex", "agent_status": "idle",
               }]),
               patch.object(lookup, "_claudes", return_value=(
-                  {herdr.HerdrPlace("fixture", "pane-unit"): live}, lookup.UnreadAt({}, lookup.RecordsRead()))),
+                  {12: live}, lookup.UnreadAt({}, lookup.RecordsRead()))),
               patch.object(lookup, "_lookup_slug", side_effect=current_slug),
               patch.object(roster, "_process_account", return_value=roster.AccountLabel("codex2")),
               patch.object(herdr, "_process_sessions", wraps=PROCESS_SESSIONS) as scans):
@@ -3313,7 +3331,7 @@ class HerdrTests(unittest.TestCase):
         unreadable.joinpath("environ").mkdir()
         self.assertEqual(herdr.herdr_processes(), [herdr.HerdrProcess(12, herdr.HerdrPlace("fixture", "pane-1"), {"SHOWRUNNER_UNIT": "prod", "SHOWRUNNER_UNIT_ID": "unit"}, "claude", str(self.root))])
 
-    def test_ancestry_loop_and_vanished_cwd_are_skipped(self) -> None:
+    def test_ancestry_loop_is_skipped_and_vanished_cwd_keeps_placement(self) -> None:
         _ = self.process(10, 11, ["/bin/sh"], {"HERDR_PANE_ID": "pane-1"})
         _ = self.process(11, 10, ["/bin/sh"], {})
         self.assertEqual(herdr.herdr_place_of(10), herdr.NotInHerdr())
@@ -3322,7 +3340,10 @@ class HerdrTests(unittest.TestCase):
         self.socket_fd(server, 100)
         process = self.process(21, 20, ["/bin/sleep"], {"HERDR_PANE_ID": "pane-2"})
         process.joinpath("cwd").unlink()
-        self.assertEqual(herdr.herdr_processes(), [])
+        rows = herdr.herdr_processes()
+        self.assertEqual([(row.pid, row.place) for row in rows],
+                         [(21, herdr.HerdrPlace("default", "pane-2"))])
+        self.assertIsInstance(rows[0].working_directory, herdr.UnreadableCwd)
 
     def test_trust_ignores_inherited_git_repository_and_configuration(self) -> None:
         requested = self.root / "requested"
@@ -3582,6 +3603,27 @@ class LayoutHerdr(herdr.Herdr):
         return "{}"
 
 
+class TitledLayoutHerdr(LayoutHerdr):
+    """Model distinct tab titles and pane labels through the real layout code."""
+
+    @override
+    def result(self, *arguments: str) -> dict[str, object]:
+        if arguments[:2] == ("agent", "list"):
+            return {"agents": []}
+        if arguments[:2] == ("pane", "list"):
+            return {"panes": [{"pane_id": tab["pane_id"], "tab_id": tab["tab_id"],
+                               "workspace_id": tab["workspace_id"],
+                               "label": tab.get("pane_label", tab["label"])} for tab in self.tabs]}
+        return super().result(*arguments)
+
+    @override
+    def run(self, *arguments: str) -> str:
+        if arguments[:2] == ("pane", "rename"):
+            next(tab for tab in self.tabs if tab["pane_id"] == arguments[2])["pane_label"] = arguments[3]
+            return "{}"
+        return super().run(*arguments)
+
+
 @final
 class SavedLayoutTests(unittest.TestCase):
     """A restart puts every session back in its saved workspace and tab, in the saved order (user, 2026-10-21)."""
@@ -3613,6 +3655,32 @@ class SavedLayoutTests(unittest.TestCase):
             for title in titles:
                 _ = client.open_tab(space, title, "/repo", {})
         return client
+
+    def test_display_rename_restores_saved_tab_order_and_resolves_each_pane_by_key(self) -> None:
+        from scripts.message import roster
+
+        def title(key: str) -> str:
+            return roster.ShownName(roster.ProductionPart("sdlc"), roster.UnitPart(key + "-unit"),
+                                    roster.ShownJob("unit_director", roster.Unqualified()), key).render()
+
+        old = TitledLayoutHerdr()
+        with patch.object(names, "runtime_names", return_value=fixture_names()):
+            for key in ("sdlc", "zulu", "alpha"):
+                _ = old.open_tab("sdlc", title(key), "/repo", {}, label=key)
+        order = [tab["pane_label"] for tab in old.tabs]
+        self.assertEqual([tab["name"] for tab in herdr.saved_layout("fixture")["workspaces"][0]["tabs"]], order)
+        fresh = TitledLayoutHerdr()
+        with patch.object(names, "runtime_names", return_value=fixture_names(director="coordinator")):
+            for key in reversed(order):
+                _ = fresh.open_tab("sdlc", title(key), "/repo", {}, label=key)
+        self.assertEqual([tab["pane_label"] for tab in fresh.tabs], order)
+        for tab in fresh.tabs:
+            key = tab["pane_label"]
+            self.assertEqual(fresh.lookup(key), herdr.PaneFound(tab["pane_id"]))
+            self.assertIsInstance(fresh.lookup(tab["label"]), herdr.NoPane)
+            self.assertIn("coordinator", tab["label"])
+            self.assertTrue(herdr.attach_hint("sdlc", key).endswith("tab " + key))
+        self.assertEqual([tab["name"] for tab in herdr.saved_layout("fixture")["workspaces"][0]["tabs"]], order)
 
     def test_a_reboot_restart_in_any_order_brings_back_every_workspace_and_tab_in_place(self) -> None:
         self.assertEqual(self.running().layout(), self.BEFORE)

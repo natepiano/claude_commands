@@ -1,0 +1,302 @@
+{
+  "generated_on": "2026-10-29",
+  "sources": [
+    "docs/plans/builds-production.md",
+    "docs/plans/natedev-production.md",
+    "docs/plans/sdlc-production.md"
+  ],
+  "rules": [
+    {
+      "path": "scripts/agents/codex_mesh.py",
+      "owner": "models-unit"
+    },
+    {
+      "path": "scripts/buildlog/mac_idle.py",
+      "owner": "verify-unit"
+    },
+    {
+      "path": "scripts/buildlog/port_lint.py",
+      "owner": "verify-unit"
+    },
+    {
+      "path": "scripts/buildlog/test_mac_idle.py",
+      "owner": "verify-unit"
+    },
+    {
+      "path": "scripts/buildlog/test_port_lint.py",
+      "owner": "verify-unit"
+    },
+    {
+      "path": "scripts/direct/final_pass.py",
+      "owner": "verify-unit"
+    },
+    {
+      "path": "scripts/direct/local_release_wait.py",
+      "owner": "verify-unit"
+    },
+    {
+      "path": "scripts/direct/phase_process.py",
+      "owner": "phases-unit"
+    },
+    {
+      "path": "scripts/direct/remove_run_scratch.py",
+      "owner": "resources-unit"
+    },
+    {
+      "path": "scripts/direct/step_record.py",
+      "owner": "verify-unit"
+    },
+    {
+      "path": "scripts/direct/test_phase_process.py",
+      "owner": "phases-unit"
+    },
+    {
+      "path": "scripts/direct/test_remove_run_scratch.py",
+      "owner": "resources-unit"
+    },
+    {
+      "path": "scripts/direct/test_step_record.py",
+      "owner": "verify-unit"
+    },
+    {
+      "path": "scripts/direct/test_verify_*.py",
+      "owner": "verify-unit"
+    },
+    {
+      "path": "scripts/direct/verify.sh",
+      "owner": "verify-unit"
+    },
+    {
+      "path": "scripts/direct/verify_saved.py",
+      "owner": "verify-unit"
+    },
+    {
+      "path": "scripts/hooks/pre-tool-use-brp-launch-gate.sh",
+      "owner": "resources-unit"
+    },
+    {
+      "path": "scripts/hooks/pre-tool-use-build-hold-guard.py",
+      "owner": "resources-unit"
+    },
+    {
+      "path": "scripts/hooks/pre-tool-use-build-hold-guard.sh",
+      "owner": "resources-unit"
+    },
+    {
+      "path": "scripts/hooks/pre-tool-use-checkpoint-doc-gate.py",
+      "owner": "verify-unit"
+    },
+    {
+      "path": "scripts/hooks/pre-tool-use-scratch-guard.py",
+      "owner": "resources-unit"
+    },
+    {
+      "path": "scripts/hooks/session-start-temp-root.py",
+      "owner": "resources-unit"
+    },
+    {
+      "path": "scripts/hooks/test_brp_launch_gate.py",
+      "owner": "resources-unit"
+    },
+    {
+      "path": "scripts/hooks/test_build_hold_guard.py",
+      "owner": "resources-unit"
+    },
+    {
+      "path": "scripts/hooks/test_checkpoint_doc_gate.py",
+      "owner": "verify-unit"
+    },
+    {
+      "path": "scripts/hooks/test_scratch_guard.py",
+      "owner": "resources-unit"
+    },
+    {
+      "path": "scripts/hooks/test_session_temp_root.py",
+      "owner": "resources-unit"
+    },
+    {
+      "path": "scripts/lib/scratch.py",
+      "owner": "resources-unit"
+    },
+    {
+      "path": "scripts/lib/test_scratch.py",
+      "owner": "resources-unit"
+    },
+    {
+      "path": "scripts/lint/config_values.py",
+      "owner": "verify-unit"
+    },
+    {
+      "path": "scripts/lint/folder_audit.py",
+      "owner": "resources-unit"
+    },
+    {
+      "path": "scripts/lint/invoke.sh",
+      "owner": "verify-unit"
+    },
+    {
+      "path": "scripts/lint/lint",
+      "owner": "verify-unit"
+    },
+    {
+      "path": "scripts/lint/lint_config.sh",
+      "owner": "verify-unit"
+    },
+    {
+      "path": "scripts/lint/memory_admit.py",
+      "owner": "resources-unit"
+    },
+    {
+      "path": "scripts/lint/memory_gate.sh",
+      "owner": "resources-unit"
+    },
+    {
+      "path": "scripts/lint/nextest_budget.py",
+      "owner": "verify-unit"
+    },
+    {
+      "path": "scripts/lint/port-lint",
+      "owner": "verify-unit"
+    },
+    {
+      "path": "scripts/lint/scope.py",
+      "owner": "verify-unit"
+    },
+    {
+      "path": "scripts/lint/sweep.py",
+      "owner": "resources-unit"
+    },
+    {
+      "path": "scripts/lint/test_folder_audit.py",
+      "owner": "resources-unit"
+    },
+    {
+      "path": "scripts/lint/test_invoke_scope.py",
+      "owner": "verify-unit"
+    },
+    {
+      "path": "scripts/lint/test_memory_admit.py",
+      "owner": "resources-unit"
+    },
+    {
+      "path": "scripts/lint/test_nextest_budget.py",
+      "owner": "verify-unit"
+    },
+    {
+      "path": "scripts/lint/test_nextest_width.py",
+      "owner": "verify-unit"
+    },
+    {
+      "path": "scripts/lint/test_sweep.py",
+      "owner": "resources-unit"
+    },
+    {
+      "path": "scripts/lint/test_tmp_sweep.py",
+      "owner": "resources-unit"
+    },
+    {
+      "path": "scripts/lint/tmp_sweep.py",
+      "owner": "resources-unit"
+    },
+    {
+      "path": "scripts/notify/pushover.py",
+      "owner": "shutdown-unit"
+    },
+    {
+      "path": "scripts/production/broadcast.py",
+      "owner": "shutdown-unit"
+    },
+    {
+      "path": "scripts/production/mac_run.sh",
+      "owner": "verify-unit"
+    },
+    {
+      "path": "scripts/production/role_terms.toml",
+      "owner": "roles-unit"
+    },
+    {
+      "path": "scripts/production/roles_audit.py",
+      "owner": "roles-unit"
+    },
+    {
+      "path": "scripts/production/test_roles_audit.py",
+      "owner": "roles-unit"
+    },
+    {
+      "path": "scripts/build_hold/",
+      "owner": "resources-unit"
+    },
+    {
+      "path": "scripts/build_queue/",
+      "owner": "report-unit"
+    },
+    {
+      "path": "scripts/build_targets/",
+      "owner": "resources-unit"
+    },
+    {
+      "path": "scripts/buildlog/",
+      "owner": "report-unit"
+    },
+    {
+      "path": "scripts/delegate/",
+      "owner": "models-unit"
+    },
+    {
+      "path": "scripts/hana_shot/",
+      "owner": "screenshot-unit"
+    },
+    {
+      "path": "scripts/hierarchies/",
+      "owner": "hierarchies-unit"
+    },
+    {
+      "path": "scripts/history/",
+      "owner": "fix-rounds-unit"
+    },
+    {
+      "path": "scripts/mac_test/",
+      "owner": "verify-unit"
+    },
+    {
+      "path": "scripts/message/",
+      "owner": "shutdown-unit"
+    },
+    {
+      "path": "scripts/model_study/",
+      "owner": "models-unit"
+    },
+    {
+      "path": "scripts/shot_report/",
+      "owner": "screenshot-unit"
+    },
+    {
+      "path": "scripts/usage/",
+      "owner": "models-unit"
+    },
+    {
+      "path": "scripts/production/add_unit.py",
+      "owner": "enh-showrunner-unit"
+    },
+    {
+      "path": "scripts/production/merge_checkpoint.py",
+      "owner": "enh-showrunner-unit"
+    },
+    {
+      "path": "scripts/production/showrunners.py",
+      "owner": "enh-showrunner-unit"
+    },
+    {
+      "path": "scripts/production/stall_watch.py",
+      "owner": "enh-showrunner-unit"
+    },
+    {
+      "path": "scripts/bevy_upgrade/",
+      "owner": "bevy-upgrade-unit"
+    },
+    {
+      "path": "scripts/notify/",
+      "owner": "messaging-unit"
+    }
+  ]
+}

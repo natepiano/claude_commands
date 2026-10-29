@@ -135,6 +135,24 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(reply.status, 200)
         self.assertEqual(reply.body, payload)
 
+    def test_flat_and_legacy_snapshot_urls_both_keep_serving_their_files(self) -> None:
+        for folder in ("k3x9qa", "da928300/20261029T151117462923Z-review-46806d56e97e"):
+            with self.subTest(folder=folder):
+                snapshot = self.root / folder
+                snapshot.mkdir(parents=True)
+                _ = (snapshot / "draft.html").write_bytes(b"<title>Review snapshot</title>")
+                reply = self.request(f"/{folder}/draft.html")
+                self.assertEqual(reply.status, 200)
+                self.assertEqual(reply.body, b"<title>Review snapshot</title>")
+
+    def test_index_and_unfinished_writes_are_not_served(self) -> None:
+        for filename in (".index.json", ".review-link-unfinished"):
+            _ = (self.root / filename).write_text("private source paths or incomplete bytes", encoding="utf-8")
+            self.assertEqual(self.request("/" + filename).status, 404)
+            self.assertEqual(self.request("/./" + filename).status, 404)
+        (self.root / "index-alias.txt").symlink_to(self.root / ".index.json")
+        self.assertEqual(self.request("/index-alias.txt").status, 404)
+
 
 class SnapshotSweepTests(unittest.TestCase):
     root: Path = Path()
@@ -169,21 +187,98 @@ class SnapshotSweepTests(unittest.TestCase):
         _ = serve.sweep_snapshots(missing, 1_800_000_000.0)
         self.assertFalse(missing.exists())
 
+    def test_sweep_expires_flat_ids_and_legacy_snapshots_in_the_same_root(self) -> None:
+        now = 1_800_000_000.0
+        recent = now - 6 * 24 * 60 * 60
+        expired = now - 8 * 24 * 60 * 60
+        flat_kept = self.snapshot("", "abc123", recent)
+        flat_removed = self.snapshot("", "def456", expired)
+        legacy_kept = self.snapshot("da928300", "20261029T151117462923Z-review-46806d56e97e", recent)
+        legacy_removed = self.snapshot("da928300", "20261020T151117462923Z-review-46806d56e97e", expired)
+        manual_kept = self.snapshot("manual", "20261029T151117462923Z-review-46806d56e97e", recent)
+        manual_removed = self.snapshot("manual", "20261020T151117462923Z-review-46806d56e97e", expired)
+        os.utime(self.root / "manual", (expired, expired))
+        self.assertEqual(serve.sweep_snapshots(self.root, now), 3)
+        for kept in (flat_kept, legacy_kept, manual_kept):
+            self.assertTrue((kept / "review.html").is_file())
+        for removed in (flat_removed, legacy_removed, manual_removed):
+            self.assertFalse(removed.exists())
+
+    def test_flat_snapshot_id_manual_expires_when_it_contains_files(self) -> None:
+        now = 1_800_000_000.0
+        folder = self.snapshot("", "manual", now - 8 * 24 * 60 * 60)
+        self.assertEqual(serve.sweep_snapshots(self.root, now), 1)
+        self.assertFalse(folder.exists())
+
+    def test_expired_manual_session_with_only_a_symlink_keeps_link_and_target(self) -> None:
+        now = 1_800_000_000.0
+        expired = now - 8 * 24 * 60 * 60
+        target = self.root / "outside" / "snapshot"
+        target.mkdir(parents=True)
+        artifact = target / "keep.txt"
+        _ = artifact.write_text("outside the snapshot root", encoding="utf-8")
+        os.utime(target, (expired, expired))
+        root = self.root / "served"
+        manual = root / "manual"
+        manual.mkdir(parents=True)
+        link = manual / "old-snapshot"
+        link.symlink_to(target, target_is_directory=True)
+        os.utime(manual, (expired, expired))
+        self.assertEqual(serve.sweep_snapshots(root, now), 0)
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(artifact.read_text(encoding="utf-8"), "outside the snapshot root")
+
+    def test_sweep_ignores_index_and_temporary_files(self) -> None:
+        now = 1_800_000_000.0
+        expired = now - 8 * 24 * 60 * 60
+        for name in (".index.json", ".review-link-unfinished"):
+            file = self.root / name
+            _ = file.write_text("keep", encoding="utf-8")
+            os.utime(file, (expired, expired))
+        self.assertEqual(serve.sweep_snapshots(self.root, now), 0)
+        self.assertEqual({file.name for file in self.root.iterdir()}, {".index.json", ".review-link-unfinished"})
+
+    def test_sweep_skips_flat_and_legacy_symlinks_and_non_directories(self) -> None:
+        now = 1_800_000_000.0
+        outside = self.root / "outside"
+        outside.mkdir()
+        kept_file = outside / "keep.txt"
+        _ = kept_file.write_text("outside snapshot storage", encoding="utf-8")
+        os.utime(outside, (now - 8 * 24 * 60 * 60, now - 8 * 24 * 60 * 60))
+        served = self.root / "served"
+        served.mkdir()
+        (served / "abc123").symlink_to(outside, target_is_directory=True)
+        legacy = served / "da928300"
+        legacy.mkdir()
+        (legacy / "old-snapshot").symlink_to(outside, target_is_directory=True)
+        plain = served / "def456"
+        _ = plain.write_text("not a directory", encoding="utf-8")
+        _ = serve.sweep_snapshots(served, now)
+        self.assertTrue(kept_file.is_file())
+        self.assertTrue((served / "abc123").is_symlink())
+        self.assertTrue((legacy / "old-snapshot").is_symlink())
+        self.assertTrue(plain.is_file())
+
     def test_server_sweeps_on_startup_and_again_after_an_hour(self) -> None:
         now = 1_800_000_000.0
         expired_at_start = self.snapshot("session", "expired-at-start", now - 8 * 24 * 60 * 60)
+        flat_at_start = self.snapshot("", "abc123", now - 8 * 24 * 60 * 60)
         with (patch.object(time, "time", return_value=now),
               patch.object(time, "monotonic", return_value=100.0) as elapsed,
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
               serve.ReviewLinksServer(("127.0.0.1", 0), self.root) as server):
             self.assertFalse(expired_at_start.exists())
+            self.assertFalse(flat_at_start.exists())
             expires_later = self.snapshot("session", "expires-later", now - 8 * 24 * 60 * 60)
+            flat_later = self.snapshot("", "def456", now - 8 * 24 * 60 * 60)
             elapsed.return_value = 100.0 + 3599.0
             server.service_actions()
             self.assertTrue(expires_later.exists())
+            self.assertTrue(flat_later.exists())
             elapsed.return_value = 100.0 + 3600.0
             server.service_actions()
             self.assertFalse(expires_later.exists())
+            self.assertFalse(flat_later.exists())
 
     def test_sweep_does_not_follow_a_session_symlink_outside_the_root(self) -> None:
         outside = self.root / "outside"

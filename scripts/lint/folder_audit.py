@@ -218,18 +218,15 @@ def held(path: Path, holds: dict[str, scratch.Hold]) -> bool:
                for held_path, hold in holds.items())
 
 
-def process_uses(paths: list[Path], proc: str = tmp_sweep.PROC_DIR) -> dict[str, str] | None:
-    """How a process uses each path, from one /proc scan, or one lsof scan where /proc is missing;
-    None when neither can run."""
+def process_uses(paths: list[Path], proc: str = tmp_sweep.PROC_DIR) -> tmp_sweep.ProcessUsesKnown | tmp_sweep.ProcessUsesUnavailable:
+    """Process paths from /proc, or lsof where /proc is missing; unavailable when neither can run."""
     if not paths:
-        return {}
+        return tmp_sweep.ProcessUsesKnown([])
     prefixes = tuple(dict.fromkeys(str(path.parent) + os.sep for path in paths))
     found = tmp_sweep.process_paths(proc, prefixes)
-    if found is None:
-        found = tmp_sweep.lsof_paths(prefixes)
-    if found is None:
-        return None
-    return tmp_sweep.entry_uses(found, sorted({str(path.parent) for path in paths}))
+    if isinstance(found, tmp_sweep.ProcessUsesUnavailable):
+        return tmp_sweep.lsof_paths(prefixes)
+    return found
 
 
 def worktree_sources(path: Path) -> list[Path]:
@@ -281,15 +278,17 @@ def judge(found: list[tuple[Path, float]], now: float, removing: bool, proc: str
         return outcomes
     holds = scratch.holds()
     uses = process_uses(due, proc)
+    used_entries = (tmp_sweep.entry_uses(uses.paths, sorted({str(path.parent) for path in due}))
+                    if isinstance(uses, tmp_sweep.ProcessUsesKnown) else {})
     bound = bound_sockets(sockets)
     changed = dict(found)
     for path in due:
         if held(path, holds):
             outcomes[path] = HELD
-        elif uses is None:
+        elif isinstance(uses, tmp_sweep.ProcessUsesUnavailable):
             outcomes[path] = tmp_sweep.NO_PROC
-        elif str(path) in uses:
-            outcomes[path] = uses[str(path)]
+        elif str(path) in used_entries:
+            outcomes[path] = used_entries[str(path)]
         elif live_socket(path, bound):
             outcomes[path] = LIVE_SOCKET
         elif (git := tmp_sweep.git_work(path)) is not tmp_sweep.GitWork.SAVED:

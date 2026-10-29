@@ -955,8 +955,9 @@ def launch_session(
     host = herdr.shared_session()
     _ = herdr.start_server(host, timeout_ms)
     production = request.production
+    title = herdr.session_title(session_name, production.slug, request.identity.unit)
     launched = herdr.launch_agent(host, showrunners.herdr_space(production.slug, str(production.doc)),
-        session_name, str(request.session_cwd), environment, kind="claude", agent=host_session_name(request),
+        title, str(request.session_cwd), environment, kind="claude", agent=host_session_name(request), label=session_name,
         agent_arguments=arguments, opening=herdr.OpeningPrompt(prompt, herdr.SessionTranscript(selected.dir, session_id)),
         timeout_ms=timeout_ms)
     if isinstance(launched, herdr.nix_env.Refused):
@@ -1322,10 +1323,14 @@ def main(argv: list[str]) -> int:
                     marked_unit = NoMarkedUnit()
             if isinstance(handoff, StoppedSessionHandoff) and isinstance(marked_unit, MarkedUnitFound):
                 raise Refusal(f"cannot attach {handoff.session_id}: unit tab already runs")
-            if isinstance(ready.plan_transition, BriefToPlanTransition) and isinstance(marked_unit, MarkedUnitFound):
+            if isinstance(marked_unit, MarkedUnitFound):
                 retry = shlex.join(["add_unit.py", *argv])
-                raise Refusal(f"unit {request.identity.unit} runs its brief in session {marked_unit.unit.place.session}; "
-                              + f"end that session, then run {retry}")
+                if isinstance(ready.row, NoUnitRow):
+                    raise Refusal(f"unit {request.identity.unit} already runs in session {marked_unit.unit.place.session} "
+                                  + f"but has no Units row; end that session, then run {retry}")
+                if isinstance(ready.plan_transition, BriefToPlanTransition):
+                    raise Refusal(f"unit {request.identity.unit} runs its brief in session {marked_unit.unit.place.session}; "
+                                  + f"end that session, then run {retry}")
             if cast(str, args.autocompact) and isinstance(request.session, ResumedSession):
                 autocompact.record(request.session.session_id, cast(str, args.autocompact))
             if not isinstance(request.launch_kind, ResumeInStartFolderLaunch):

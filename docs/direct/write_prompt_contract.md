@@ -60,6 +60,11 @@ opening in <ReviewPromptContract/>; one to a Codex reviewer also carries item
    `wait`, loop on a status file, or post a waiting status.
    Status 77 means cancelled because the tree changed: resubmit after your
    edits are done; it is not a test failure.
+   When a later edit or result makes a run of yours useless, cancel it in
+   the same turn: take `pid` from the run's record (the `.json` beside its
+   log), check that `ps -p <pid> -o args=` still shows
+   `mesh_runs.py supervise` with that record's path, then run
+   `kill -TERM -- -<pid>`.
    ```
 
    Every model call resends the worker's whole context, and on 2026-10-15
