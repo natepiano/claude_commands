@@ -13,6 +13,7 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
+from scripts.lib.socket_test_support import short_socket_directory
 from dailies_input import (ClaudeNotRunning, Decision, SessionGone, StatusBlock, StillWaiting, UnitRow,
                            status_blocks)
 from unit_lookup import UnitState
@@ -103,7 +104,7 @@ exit "$NOTIFIER_HEALTH_EXIT"
                 if unit in missing_units:
                     continue
                 if unit not in stopped_units:
-                    address = root / f"{unit}.sock"
+                    address = Path(self.enterContext(short_socket_directory())) / f"{unit}.sock"
                     held = socket.socket(socket.AF_UNIX)
                     held.bind(str(address))
                     self.addCleanup(held.close)

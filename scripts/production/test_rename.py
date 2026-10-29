@@ -18,6 +18,7 @@ from unittest import mock
 
 from scripts.guilds import roles
 from scripts.direct import workers
+from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import fake_unit_host
 
 SCRIPT = Path(__file__).with_name("rename.py")
@@ -385,7 +386,7 @@ class ProductionRenameTests(unittest.TestCase):
 
     def live_unit(self) -> None:
         fake_unit_host.place_process(self.env, os.getpid(), "w4:p1")
-        path = self.root / "live.sock"
+        path = Path(self.enterContext(short_socket_directory())) / "live.sock"
         held = socket.socket(socket.AF_UNIX)
         held.bind(str(path))
         self.addCleanup(held.close)

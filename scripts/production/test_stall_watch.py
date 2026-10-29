@@ -10,7 +10,6 @@ import shutil
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 import unittest
 from types import ModuleType
@@ -26,6 +25,7 @@ TEST_HANG_GUARD_SECS = 300
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 
+from scripts.lib.socket_test_support import short_socket_directory
 import fake_unit_host
 from fake_unit_host import HostedUnit
 import fake_herdr
@@ -111,7 +111,7 @@ class StallWatchTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(self.enterContext(short_socket_directory()))
         self.bin = self.root / "bin"
         self.bin.mkdir()
         self.notifier = self.root / "notifier"

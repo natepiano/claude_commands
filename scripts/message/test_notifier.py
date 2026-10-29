@@ -17,6 +17,8 @@ from typing import override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+from scripts.lib.socket_test_support import short_socket_directory
+
 
 # Hang guards allow for load 136 on natedev (2026-10-29).
 TEST_HANG_GUARD_SECS = 300
@@ -64,7 +66,7 @@ class NotifierTests(unittest.TestCase):
         launcher.chmod(0o755)
         self.launcher_dir = launcher_dir
         self.addCleanup(self.live_socket.close)
-        self.socket_path = self.root / "live.sock"
+        self.socket_path = Path(self.enterContext(short_socket_directory())) / "live.sock"
         self.live_socket.bind(str(self.socket_path))
         self.record("sid-1")
 
@@ -401,7 +403,7 @@ class NotifierTests(unittest.TestCase):
         self.assertIn(" | skip hold", self.lines()[-1])
         other = socket.socket(socket.AF_UNIX)
         self.addCleanup(other.close)
-        new_path = self.root / "replacement.sock"
+        new_path = Path(self.enterContext(short_socket_directory())) / "replacement.sock"
         other.bind(str(new_path))
         self.record("sid-1", new_path, updated=2)
         _ = self.successful("tick", now=MINUTE + 360)
