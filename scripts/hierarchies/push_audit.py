@@ -560,13 +560,13 @@ def render(report: AuditReport) -> str:
     return "\n\n".join(output)
 
 
-def report_summary(report: AuditReport) -> str:
+def report_summary(report: AuditReport, full: bool = False) -> str:
     counts = Counter(type(entry.classification) for entry in report.entries)
     return "\n".join([
         f"Window: {report.window.label}.",
         f"Pushes: {len(report.delivered_pushes)} delivered; {len(report.entries)} after a failed text check.",
         "; ".join(f"{kind.__name__}: {counts[kind]}" for kind in CLASSIFICATIONS) + ".",
-        f"Source problems: {len(report.problems)}. Use --full to print the tables.",
+        f"Source problems: {len(report.problems)}." + ("" if full else " Use --full to print the tables."),
     ])
 
 
@@ -583,7 +583,7 @@ def main(arguments: Sequence[str] = ()) -> int:
     except ValueError as error:
         parser.error(str(error))
     report = audit(load_sources(STATE_DIR), window)
-    print(report_summary(report))
+    print(report_summary(report, full=cast(bool, args.full)))
     if cast(bool, args.full):
         print()
         print(render(report))

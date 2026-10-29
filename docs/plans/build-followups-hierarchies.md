@@ -269,7 +269,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Ruled out:** a list name on every row ID — it orphans saved pins and moved-row state.
 
-### Phase 10 — The measure reads who holds a wait, and the experiment start is set  · status: todo
+### Phase 10 — The measure reads who holds a wait, and the experiment start is set  · status: done
 **Depends on:** phases-unit Phase 11 (the wait-holder field and the phase origin fields), merged as 49fd1b0f (sdlc b8ec8a99, 2026-10-29); Phase 11 of this plan (its repair reads the new origin shape). Not at the same time as Phase 12 (both edit `measure.py`).
 
 #### Work Order
