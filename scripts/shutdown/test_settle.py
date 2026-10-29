@@ -53,6 +53,9 @@ from scripts.production import showrunners
 from account import Account
 
 
+# Hang guard: natedev reached load 136 on 2026-10-29; scheduling delays are not failures.
+HANG_GUARD_SECONDS = 300
+
 LOGIN = "owner@example.com"
 LABEL = "claude2"
 NOW = "2026-10-09T21:49:10+00:00"
@@ -2152,7 +2155,7 @@ class SettleTests(ShutdownTestCase):
         entered, release = threading.Event(), threading.Event()
         def kill(_pid: int, _signal: int) -> None:
             entered.set()
-            self.assertTrue(release.wait(1))
+            self.assertTrue(release.wait(HANG_GUARD_SECONDS))
         errors: list[Exception] = []
         def worker() -> None:
             try:
@@ -2165,7 +2168,7 @@ class SettleTests(ShutdownTestCase):
         thread = threading.Thread(target=worker)
         thread.start()
         try:
-            self.assertTrue(entered.wait(1))
+            self.assertTrue(entered.wait(HANG_GUARD_SECONDS))
             with patch.object(settle, "run_notifier") as notifier:
                 self.assertEqual(settle.cancel(Account("claude", LOGIN, LABEL), True), 1)
                 notifier.assert_not_called()
@@ -2175,7 +2178,7 @@ class SettleTests(ShutdownTestCase):
                 self.assertEqual(current["progress"]["kind"], "stopping")
         finally:
             release.set()
-            thread.join(1)
+            thread.join(HANG_GUARD_SECONDS)
         self.assertEqual(errors, [])
 
     def test_now_marks_a_failed_stop_for_its_conductor(self) -> None:
@@ -2197,7 +2200,7 @@ class SettleTests(ShutdownTestCase):
         completed: list[str] = []
         def stop(saved: record.SessionShutdown) -> record.SessionShutdown:
             self.assertEqual(saved["force"], "now")
-            _ = entered.wait(2)
+            _ = entered.wait(HANG_GUARD_SECONDS)
             result = self.fake_stop(saved)
             completed.append(saved["session"]["session_id"])
             return result
@@ -2316,11 +2319,11 @@ class SettleTests(ShutdownTestCase):
         entered, release = threading.Event(), threading.Event()
         def pause() -> None:
             entered.set()
-            self.assertTrue(release.wait(2))
+            self.assertTrue(release.wait(HANG_GUARD_SECONDS))
         with patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as sender:
             with ThreadPoolExecutor(max_workers=1) as pool:
                 blocker = pool.submit(pause)
-                self.assertTrue(entered.wait(2))
+                self.assertTrue(entered.wait(HANG_GUARD_SECONDS))
                 queued = pool.submit(settle._send_settle_message, saved)  # pyright: ignore[reportPrivateUsage]
                 try:
                     _ = record.withdraw_session(LOGIN, "owner", lambda _saved: None)
@@ -2835,7 +2838,7 @@ class SettleTests(ShutdownTestCase):
         def stop(saved: record.SessionShutdown) -> record.SessionShutdown:
             if saved["session"]["session_id"] == "slow":
                 entered.set()
-                self.assertTrue(release.wait(1))
+                self.assertTrue(release.wait(HANG_GUARD_SECONDS))
             result = self.fake_stop(saved)
             if saved["session"]["session_id"] == "fast":
                 self.assertEqual(saved["progress"]["kind"], "ready")
@@ -2846,13 +2849,13 @@ class SettleTests(ShutdownTestCase):
             del timeout
             calls[0] += 1
             if calls[0] == 1:
-                self.assertTrue(entered.wait(1))
+                self.assertTrue(entered.wait(HANG_GUARD_SECONDS))
                 def ready(current: record.SessionShutdown) -> None:
                     current["progress"] = {"kind": "ready", "at": NOW}
                 _ = record.update_session(LOGIN, "fast", ready)
                 elapsed[0] = 16.0
             else:
-                self.assertTrue(fast_done.wait(1))
+                self.assertTrue(fast_done.wait(HANG_GUARD_SECONDS))
                 release.set()
             return wait_futures(futures, timeout=0.01, return_when=return_when)
         with (
@@ -2892,7 +2895,7 @@ class SettleTests(ShutdownTestCase):
         def registry(ids: frozenset[str], _timeout: float) -> restart_work.RegistryConfirmation:
             if ids == frozenset({"slow"}):
                 registry_entered.set()
-                self.assertTrue(release.wait(1))
+                self.assertTrue(release.wait(HANG_GUARD_SECONDS))
             else:
                 self.assertEqual(ids, frozenset({"fast"}))
             return registry_confirmation(ids)
@@ -3141,8 +3144,8 @@ class SettleTests(ShutdownTestCase):
         _ = sender.write_text('import sys\nverb = sys.argv[1]\nif verb not in {"retire", "pending"}:\n    print(sys.stdin.read())\n')
         for verb in ("retire", "pending"):
             with subprocess.Popen([sys.executable, str(sender), verb], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
-                self.assertEqual(process.wait(timeout=0.8), 0)
-        result = subprocess.run([sys.executable, str(sender), "send"], input="body", capture_output=True, text=True, check=False, timeout=0.8)
+                self.assertEqual(process.wait(timeout=HANG_GUARD_SECONDS), 0)
+        result = subprocess.run([sys.executable, str(sender), "send"], input="body", capture_output=True, text=True, check=False, timeout=HANG_GUARD_SECONDS)
         self.assertEqual(result.stdout, "body\n")
 
     def test_conductor_report_includes_current_local_and_peer_requests_but_keeps_older_stopped_records(self) -> None:
@@ -3269,11 +3272,11 @@ class SettleTests(ShutdownTestCase):
         def save_snapshot(login: str, session_id: str, change: object) -> record.SessionShutdown:
             result = update(login, session_id, cast('Callable[[record.SessionShutdown], None]', change))
             saved_snapshot.set()
-            self.assertTrue(cancelled.wait(2))
+            self.assertTrue(cancelled.wait(HANG_GUARD_SECONDS))
             return result
         def cancel_waiter() -> None:
             try:
-                self.assertTrue(saved_snapshot.wait(2))
+                self.assertTrue(saved_snapshot.wait(HANG_GUARD_SECONDS))
                 _ = settle.cancel(Account("claude", LOGIN, LABEL), True)
             except Exception as error:
                 failures.append(error)
@@ -3287,7 +3290,7 @@ class SettleTests(ShutdownTestCase):
             try:
                 _ = settle.begin(LOGIN, only=["owner"], request_id="timer-request")
             finally:
-                worker.join(2)
+                worker.join(HANG_GUARD_SECONDS)
         self.assertFalse(worker.is_alive())
         self.assertEqual(failures, [])
         self.assertEqual(events, ["stop", "start"])
@@ -4096,10 +4099,10 @@ class SettleTests(ShutdownTestCase):
                 def pause(*_args: object, **_kwargs: object) -> settle.MessageSent:
                     self.assertNotEqual(threading.get_ident(), main_thread)
                     entered.set()
-                    self.assertTrue(stopped.wait(2))
+                    self.assertTrue(stopped.wait(HANG_GUARD_SECONDS))
                     return settle.MessageSent(kind="sent")
                 def stop(saved: record.SessionShutdown) -> record.SessionShutdown:
-                    self.assertTrue(entered.wait(2))
+                    self.assertTrue(entered.wait(HANG_GUARD_SECONDS))
                     result = self.fake_stop(saved)
                     stopped.set()
                     return result
@@ -4133,7 +4136,7 @@ class SettleTests(ShutdownTestCase):
                 def check(_records: object, _timeout: float) -> frozenset[str]:
                     self.assertNotEqual(threading.get_ident(), main_thread)
                     checking.set()
-                    self.assertTrue(stopped.wait(2))
+                    self.assertTrue(stopped.wait(HANG_GUARD_SECONDS))
                     return frozenset()
                 def stop(saved: record.SessionShutdown) -> record.SessionShutdown:
                     self.assertEqual(saved["progress"]["kind"], "ready")
@@ -4204,7 +4207,7 @@ class SettleTests(ShutdownTestCase):
         def launch_fixer(*_args: object, **_kwargs: object) -> None:
             self.assertNotEqual(threading.get_ident(), main_thread)
             entered.set()
-            self.assertTrue(stopped.wait(2))
+            self.assertTrue(stopped.wait(HANG_GUARD_SECONDS))
         def observe(_login: str, _only: object = (), *, refresh_desktops: bool = True) -> inventory.Inventory:
             del refresh_desktops
             if entered.is_set():

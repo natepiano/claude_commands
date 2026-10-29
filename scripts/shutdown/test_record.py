@@ -12,7 +12,8 @@ import unittest
 from datetime import datetime, tzinfo
 from pathlib import Path
 from typing import Literal, TypedDict, NotRequired, cast, final, override
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from unittest.mock import Mock, patch
 
 from test_support import ShutdownTestCase
@@ -21,8 +22,29 @@ import record
 from launch_permission import launch_barrier
 
 
+# Hang guard: natedev reached load 136 on 2026-10-29; scheduling delays are not failures.
+HANG_GUARD_SECONDS = 300
+
 NOW = "2026-10-09T21:49:10+00:00"
 LATER = "2026-10-09T21:50:10+00:00"
+
+
+@contextmanager
+def observe_lock_contention(blocked: threading.Event) -> Generator[None, None, None]:
+    """Report an actually held lock before entering its normal blocking wait."""
+    real_flock = fcntl.flock
+
+    def flock(descriptor: int, operation: int) -> None:
+        if operation == fcntl.LOCK_EX:
+            try:
+                real_flock(descriptor, operation | fcntl.LOCK_NB)
+                return
+            except BlockingIOError:
+                blocked.set()
+        real_flock(descriptor, operation)
+
+    with patch.object(fcntl, "flock", side_effect=flock):
+        yield
 
 
 class ProgressWriteTime(datetime):
@@ -648,13 +670,13 @@ class SessionRecordTests(ShutdownTestCase):
         start = threading.Barrier(2)
         claims: list[bool] = []
         def contender() -> None:
-            _ = start.wait(timeout=5)
+            _ = start.wait(timeout=HANG_GUARD_SECONDS)
             claims.append(record.claim_restore_alert(saved, "move failed"))
         threads = [threading.Thread(target=contender) for _ in range(2)]
         for thread in threads:
             thread.start()
         for thread in threads:
-            thread.join(timeout=5)
+            thread.join(timeout=HANG_GUARD_SECONDS)
             self.assertFalse(thread.is_alive())
         self.assertEqual(sorted(claims), [False, True])
         record.clear_restore_alert(saved)
@@ -1036,11 +1058,13 @@ class SessionRecordTests(ShutdownTestCase):
                     finally:
                         done.set()
 
-                with launch_barrier():
+                blocked = threading.Event()
+                with launch_barrier(), observe_lock_contention(blocked):
                     worker = threading.Thread(target=create)
                     worker.start()
-                    self.assertFalse(done.wait(0.05))
-                worker.join(2)
+                    self.assertTrue(blocked.wait(HANG_GUARD_SECONDS))
+                    self.assertFalse(done.is_set())
+                worker.join(HANG_GUARD_SECONDS)
                 self.assertFalse(worker.is_alive())
                 self.assertEqual(failures, [])
                 self.assertTrue(done.is_set())
@@ -1562,13 +1586,12 @@ class SessionRecordTests(ShutdownTestCase):
     def test_failed_stop_withdrawal_loses_to_a_competing_stop_claim(self) -> None:
         saved = session_shutdown(progress={"kind": "stop failed", "at": NOW, "reason": "still live"})
         self.assertTrue(record.create_session(saved))
-        ready, finished = threading.Event(), threading.Event()
+        blocked, finished = threading.Event(), threading.Event()
         outcomes: list[record.SessionWithdrawn | record.SessionRetained] = []
         failures: list[BaseException] = []
         identity, restore = Mock(return_value=True), Mock()
         def cancel() -> None:
             try:
-                ready.set()
                 outcomes.append(record.withdraw_failed_stop(saved["login"], "session-1", identity, restore))
             except BaseException as error:
                 failures.append(error)
@@ -1576,14 +1599,15 @@ class SessionRecordTests(ShutdownTestCase):
                 finished.set()
         def claim(current: record.SessionShutdown) -> None:
             worker.start()
-            self.assertTrue(ready.wait(2))
-            self.assertFalse(finished.wait(0.05))
+            self.assertTrue(blocked.wait(HANG_GUARD_SECONDS))
+            self.assertFalse(finished.is_set())
             current["progress"] = {"kind": "stopping", "at": LATER}
         worker = threading.Thread(target=cancel)
-        try:
-            claimed = record.update_session(saved["login"], "session-1", claim)
-        finally:
-            worker.join(2)
+        with observe_lock_contention(blocked):
+            try:
+                claimed = record.update_session(saved["login"], "session-1", claim)
+            finally:
+                worker.join(HANG_GUARD_SECONDS)
         self.assertFalse(worker.is_alive())
         self.assertEqual(failures, [])
         self.assertEqual(len(outcomes), 1)
@@ -1622,24 +1646,28 @@ class SessionRecordTests(ShutdownTestCase):
         with record.conductor_lock(login):
             pass
         path = self.directory / "conduct.lock"
-        started = threading.Event()
+        retrying, released = threading.Event(), threading.Event()
         outcomes: list[record.ConductorAcquired | record.ConductorAlreadyRunning] = []
         failures: list[BaseException] = []
+        def retry(_seconds: float) -> None:
+            retrying.set()
+            self.assertTrue(released.wait(HANG_GUARD_SECONDS))
         def start() -> None:
             try:
-                started.set()
                 with record.conductor_lock(login) as outcome:
                     outcomes.append(outcome)
             except BaseException as error:
                 failures.append(error)
-        with path.open("r") as observation:
+        with path.open("r") as observation, patch.object(time, "sleep", side_effect=retry):
             fcntl.flock(observation.fileno(), fcntl.LOCK_EX)
             worker = threading.Thread(target=start)
             worker.start()
-            self.assertTrue(started.wait(2))
-            time.sleep(0.05)
-            fcntl.flock(observation.fileno(), fcntl.LOCK_UN)
-        worker.join(2)
+            try:
+                self.assertTrue(retrying.wait(HANG_GUARD_SECONDS))
+            finally:
+                fcntl.flock(observation.fileno(), fcntl.LOCK_UN)
+                released.set()
+                worker.join(HANG_GUARD_SECONDS)
         self.assertFalse(worker.is_alive())
         self.assertEqual(failures, [])
         self.assertEqual(len(outcomes), 1)
