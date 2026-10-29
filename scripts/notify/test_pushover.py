@@ -620,6 +620,9 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(form["priority"], ["2"])
         detail = f"registered text, approved {approved}"
+        rendered = push_texts.render_entry(entry, values)
+        self.assertEqual(form["title"], [rendered.title])
+        self.assertEqual(form["message"], [footed(rendered.message, rendered.sender, entry.id)])
         self.assertEqual(self.reviews()[0]["detail"], detail)
         self.assertEqual(self.log_lines()[-1]["outcome"], "sent, " + detail)
         self.assertNotIn("failed review", output.getvalue())
@@ -635,22 +638,70 @@ class PushoverTests(unittest.TestCase):
         read.assert_called_once()
         self.assertEqual(push_texts.approval_date("test"), "")
 
-    def test_nate_adhoc_is_sent_exactly_as_rendered_even_when_review_rewrites_it(self) -> None:
+    def adhoc(self) -> tuple[review.Draft, list[str]]:
         description = "You asked to be told when the /nate skill is ready. It is ready now."
         values = {"sender": "natedev", "title": "the /nate skill is ready", "description": description}
         argv = ["--text-id", "nate.adhoc", *(item for key, value in values.items() for item in ("--value", f"{key}={value}"))]
-        rewrite = review.Draft("natedev", "0", "The /nate skill is ready", NoActionRequired(), "Rewritten body", False)
-        for outcome in (review.Rewritten(rewrite, ["reader-starts-cold"]), review.Failed(rewrite, ["reader-starts-cold"])):
+        draft = review.Draft("natedev", "0", "natedev the /nate skill is ready", NoActionRequired(), description, False)
+        return draft, argv
+
+    def test_approved_nate_adhoc_runs_live_review_and_keeps_its_template_footer(self) -> None:
+        draft, argv = self.adhoc()
+        self.assertRegex(push_texts.approval_date("nate.adhoc"), r"^\d{4}-\d{2}-\d{2}$")
+        with (mock.patch.object(review, "review", side_effect=approve) as read,
+              redirect_stdout(io.StringIO()) as output):
+            code, form = self.run_send(argv)
+        read.assert_called_once_with(draft, revision=False)
+        self.assertEqual(code, 0)
+        self.assertEqual(form["title"], [draft.title])
+        self.assertEqual(form["message"], [footed(draft.body, draft.source, "nate.adhoc")])
+        self.assertIn('"text_id": "nate.adhoc"', output.getvalue())
+        self.assertEqual(self.reviews()[0]["text_id"], "nate.adhoc")
+        self.assertEqual(self.reviews()[0]["verdict"], "send")
+
+    def test_failed_nate_adhoc_is_held_and_records_its_text_id(self) -> None:
+        draft, argv = self.adhoc()
+        for outcome in (review.Failed(draft, ["reader-starts-cold"]), review.Withheld(draft, "No timely information.")):
             with (self.subTest(outcome=type(outcome).__name__),
-                  mock.patch.object(push_texts, "approval_date", return_value=""),
                   mock.patch.object(review, "review", return_value=outcome),
-                  redirect_stdout(io.StringIO()) as output):
-                code, form = self.run_send(argv)
-            self.assertEqual(code, 0)
-            self.assertEqual(form["title"], ["natedev the /nate skill is ready"])
-            self.assertEqual(form["message"], [footed(description, "natedev", "nate.adhoc")])
-            self.assertEqual(form["priority"], ["0"])
-            self.assertNotIn("sent as rewritten", output.getvalue())
+                  mock.patch.object(pushover, "read_keys", side_effect=AssertionError("held push read keys")),
+                  mock.patch.object(pushover, "request_template_fix") as fix,
+                  redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(self.run_send(argv), (6, {}))
+            record = cast(pushover.ReviewedPushRecord, json.loads(output.getvalue().splitlines()[0].removeprefix("pushover: reviewed JSON: ")))
+            self.assertIs(record.get("held"), True)
+            self.assertEqual(record.get("text_id"), "nate.adhoc")
+            self.assertIn("pushover: not sent: ", errors.getvalue())
+            self.assertEqual(self.reviews()[-1]["text_id"], "nate.adhoc")
+            self.assertIsNone(self.reviews()[-1]["sent"])
+            fix.assert_not_called()
+
+    def test_nate_adhoc_sends_and_reports_the_reviewers_rewrite(self) -> None:
+        draft, argv = self.adhoc()
+        rewrite = replace(draft, title="The /nate skill is ready", body="Rewritten body")
+        with (mock.patch.object(review, "review", return_value=review.Rewritten(rewrite, ["reader-starts-cold"])),
+              redirect_stdout(io.StringIO()) as output):
+            code, form = self.run_send(argv)
+        self.assertEqual(code, 0)
+        self.assertEqual(form["title"], [rewrite.title])
+        self.assertEqual(form["message"], [footed(rewrite.body, draft.source, "nate.adhoc")])
+        self.assertIn("pushover: sent as rewritten:\n" + rewrite.title, output.getvalue())
+        self.assertIn(rewrite.body, output.getvalue())
+        self.assertEqual(self.reviews()[0]["text_id"], "nate.adhoc")
+        self.assertEqual(cast(dict[str, object], self.reviews()[0]["sent"])["body"], rewrite.body)
+
+    def test_nate_adhoc_looks_up_and_claims_its_sources_hold(self) -> None:
+        draft, argv = self.adhoc()
+        held = review.Held(draft.source, 1000, draft, draft, ["Which update?"])
+        review.hold(held)
+        with (mock.patch.object(review, "held_for", wraps=review.held_for) as lookup,
+              mock.patch.object(review, "review", side_effect=approve) as read,
+              redirect_stdout(io.StringIO()) as output):
+            code, _form = self.run_send(argv)
+        self.assertEqual(code, 0)
+        self.assertEqual(lookup.call_args_list, [mock.call(draft.source), mock.call(draft.source)])
+        read.assert_called_once_with(draft, revision=True)
+        self.assertIn('"held_source": "natedev"', output.getvalue())
 
     def test_cancelled_revision_drops_its_claim_without_posting_or_reporting_a_rewrite(self) -> None:
         draft = self.draft(answerable=True)
