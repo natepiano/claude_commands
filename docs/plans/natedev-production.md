@@ -47,7 +47,7 @@
 | messaging-unit | `docs/as-built/message-clarity.md` (run done; as-built) | /home/natepiano/worktrees/claude-build-followups-messaging | build-followups-messaging | — | scripts/notify/ |
 | herdr-trial-unit | (retired 2026-10-18, worktree removed) done, as-built `docs/as-built/herdr-adoption.md` (trial: `docs/as-built/herdr-trial.md`) | /home/natepiano/worktrees/claude-build-followups-herdr-trial | build-followups-herdr-trial | — | scripts/herdr/; docs/plans/build-followups-herdr-*.md; docs/as-built/herdr-*.md |
 | herdr-trust-unit | (retired 2026-10-18, worktree removed) `docs/as-built/herdr-adoption.md` (run done; as-built) | /home/natepiano/worktrees/claude-build-followups-herdr-trust | build-followups-herdr-trust | — | — |
-| herdr-unit | docs/as-built/herdr-adoption.md | /home/natepiano/worktrees/claude-build-followups-herdr | build-followups-herdr | — | — |
+| herdr-unit | docs/as-built/herdr-adoption.md | `/home/natepiano/worktrees/claude-natedev-herdr` | `natedev-herdr` | — | — |
 | nightly-review-unit | (retired 2026-10-19, worktree removed) permanent | /home/natepiano/worktrees/claude-build-followups-nightly-review | build-followups-nightly-review | — | — |
 | style-unit | `docs/as-built/style-showrunner.md` (run done; as-built) | /home/natepiano/worktrees/claude-build-followups-style | build-followups-style | — | — |
 | unit-board-unit | docs/as-built/unit-board.md | /home/natepiano/worktrees/claude-build-followups-unit-board | build-followups-unit-board | — | — |
