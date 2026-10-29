@@ -178,6 +178,7 @@ esac
             "XDG_RUNTIME_DIR": str(self.root / "runtime"),
             "XDG_STATE_HOME": str(self.root / "state"),
             "XDG_CACHE_HOME": str(self.root / "cache"),
+            "VERIFY_STEPS_DIR": str(self.root / "verify-steps"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILDLOG_BUILDS_CGROUP": str(self.root / "cgroup"),
             "BUILDLOG_CI_CGROUP": str(self.root / "cgroup"),

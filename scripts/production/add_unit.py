@@ -55,8 +55,8 @@ class ProductionPlanRequired(NamedTuple):
     """The launch needs a plan with a Production header."""
 
 
-class RetiredConversationPlan(NamedTuple):
-    """A retired director continues its transcript after its plan was condensed."""
+class ExistingConversationPlan(NamedTuple):
+    """An existing director resumes with its own recorded plan, even after condensation."""
 
 
 class PlanGiven(NamedTuple):
@@ -583,12 +583,11 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
     lines = production.doc.read_text(encoding="utf-8").splitlines()
     existing = row_is_present(request, lines)
     restoring = isinstance(request.launch_kind, UnitRestoreLaunch)
-    plan_context: ProductionPlanRequired | RetiredConversationPlan = ProductionPlanRequired()
+    plan_context: ProductionPlanRequired | ExistingConversationPlan = ProductionPlanRequired()
     if (not restoring and isinstance(existing, ExistingUnitRow)
-            and isinstance(existing.state, RetiredUnitRow)
             and isinstance(request.session, ResumedSession)
             and isinstance(request.session.handoff, ResumeStoppedSession)):
-        plan_context = RetiredConversationPlan()
+        plan_context = ExistingConversationPlan()
     if restoring:
         if isinstance(existing, NoUnitRow):
             raise Refusal(f"unit {request.unit} has no Units row; a restore never adds one")
