@@ -94,23 +94,41 @@ class QueueTests(unittest.TestCase):
             decision = memory_admit.decide(available, 60 * GIB, need, memory)
         waiting = memory_admit.WaitingStep(
             10, "waiting-id", "unit", "nextest", "/tmp/tree", NOW - 2400,
-            need, memory_admit.head_wait_reason(decision, need, available),
+            need, memory_admit.head_wait_reason(decision, need, available,
+                {"pid": 10, "start_time": "10", "need": need, "since": NOW - 2400}, NOW),
         )
         view = memory_admit.QueueView((waiting,), (), available, 0, 3 * GIB, NOW)
         line = build_queue.render_queue(view, ZoneInfo("UTC"))[0]
         self.assertTrue(line.endswith("head: needs 15.1 GiB; builds use 13.2 of the 20.0 GiB budget "
-                                      + "(starts when build use falls to 4.9 GiB)"))
+                                      + "(starts when build use falls to 4.9 GiB); younger steps wait"))
 
     def test_head_reason_names_only_free_memory_when_budget_passes(self) -> None:
         need, available = int(15.1 * GIB), 18 * GIB
         decision = memory_admit.decide(available, 60 * GIB, need, [memory_admit.MeasuredMemory(GIB)])
         waiting = memory_admit.WaitingStep(
             10, "waiting-id", "unit", "nextest", "/tmp/tree", NOW - 2400,
-            need, memory_admit.head_wait_reason(decision, need, available),
+            need, memory_admit.head_wait_reason(decision, need, available,
+                {"pid": 10, "start_time": "10", "need": need, "since": NOW - 2400}, NOW),
         )
         view = memory_admit.QueueView((waiting,), (), available, 0, 3 * GIB, NOW)
         line = build_queue.render_queue(view, ZoneInfo("UTC"))[0]
-        self.assertTrue(line.endswith("head: needs 18.1 GiB free; 18.0 free"))
+        self.assertTrue(line.endswith("head: needs 18.1 GiB free; 18.0 free; younger steps wait"))
+
+    def test_head_backfill_label_uses_the_since_zone_and_becomes_strict_at_ten_minutes(self) -> None:
+        need, available = int(15.1 * GIB), 18 * GIB
+        decision = memory_admit.decide(available, 60 * GIB, need, [memory_admit.MeasuredMemory(GIB)])
+        for waited, bump, suffix in ((540, 0, "younger steps may start until 15:01"),
+                                      (600, 0, "younger steps wait"),
+                                      (60, -1, "younger steps wait")):
+            with self.subTest(waited=waited, bump=bump):
+                row: memory_admit.Waiter = {"pid": 10, "start_time": "10", "need": need,
+                                           "since": NOW - waited, "bump_order": bump}
+                waiting = memory_admit.WaitingStep(
+                    10, "waiting-id", "unit", "nextest", "/tmp/tree", row["since"], need,
+                    memory_admit.head_wait_reason(decision, need, available, row, NOW))
+                view = memory_admit.QueueView((waiting,), (), available, 0, 3 * GIB, NOW)
+                line = build_queue.render_queue(view, ZoneInfo("America/New_York"))[0]
+                self.assertTrue(line.endswith("head: needs 18.1 GiB free; 18.0 free; " + suffix))
 
     def test_live_queue_pressure_reason_reaches_the_cli(self) -> None:
         process = self.root / "proc/100"
