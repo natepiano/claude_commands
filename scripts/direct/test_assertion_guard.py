@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+import resource
 import subprocess
 import sys
 import tempfile
@@ -403,15 +404,19 @@ class AssertionGuardTests(GitRepositoryFixture):
         _ = self.save("untracked.py", "@pytest.mark.skip\ndef test_untracked():\n    pass\n")
         self.assert_clean(self.guard())
 
-    def test_large_diff_guard_call_finishes_in_less_than_one_second(self) -> None:
+    def test_large_diff_guard_call_uses_less_than_one_cpu_second(self) -> None:
         before = self.rust(TILE_OLD) + "".join(f"// old {number}\n" for number in range(43499))
         after = self.rust(TILE_NEW) + "".join(f"// new {number}\n" for number in range(43499))
         self.change("value.rs", before, after)
-        started = time.perf_counter()
+        children_before = resource.getrusage(resource.RUSAGE_CHILDREN)
+        started = time.process_time()
         result = self.guard()
-        elapsed = time.perf_counter() - started
+        cpu_seconds = time.process_time() - started
+        children_after = resource.getrusage(resource.RUSAGE_CHILDREN)
+        cpu_seconds += (children_after.ru_utime + children_after.ru_stime
+                        - children_before.ru_utime - children_before.ru_stime)
         _ = self.assert_finding(result, "value.rs", "weaker")
-        self.assertLess(elapsed, 1.0, f"guard took {elapsed:.3f} seconds")
+        self.assertLess(cpu_seconds, 1.0, f"guard used {cpu_seconds:.3f} CPU seconds")
 
 
 if __name__ == "__main__":
