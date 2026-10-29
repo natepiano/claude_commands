@@ -83,7 +83,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 
    Phase 2 also edits `settings.json`: allow rules and sandbox write entries for `~/.claude1`–`~/.claude3`. That edit reaches main only with the user's go.
 2. **Shell commands and the guide (Phase 5). Nothing live changes.**
-   - The aliases are `claude1`, `claude2`, `claude3` and `claude-unit`; plain `claude` is unchanged. natedev commits them to `/etc/nixos`, and the user rebuilds when ready. Until a dir exists, each alias runs plain `claude` or refuses.
+   - The aliases are `claude1`, `claude2` and `claude3`; plain `claude` is unchanged. natedev commits them to `/etc/nixos`, and the user rebuilds when ready. Until a dir exists, each alias runs plain `claude` or refuses.
    - `~/.claude/docs/accounts.md` says how to start a session on each account, how to log in and out without moving `~/.claude` off claude 2, and how to see which account a session is on.
 3. **Prove one account dir works (Phase 6). The first live step, only when the user says go; about 15 minutes of their time.**
    - The unit creates `~/.claude3`. The user runs `claude3` and logs in as claude 3 (`rubrics.dogwood-1f@icloud.com`).
@@ -299,7 +299,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 - `account_directory_readiness(label) -> AccountDirectoryReadiness` returns one frozen tagged value: `AccountDirectoryReady(login)`, `AccountDirectoryLoggedOut`, `AccountDirectoryWrongLogin(login)`, `AccountDirectoryNotSetUp`, `AccountDirectoryBrokenLinks` or `AccountDirectoryUnreadable`, each carrying every coexisting problem. It reads the dir's `.claude.json` (`ClaudeDirectoryLogin | ClaudeDirectoryLoggedOut | UnreadableClaudeDirectoryIdentity`) and the label's note (`ExpectedClaudeLogin | MissingClaudeAccountNote | UnreadableClaudeAccountNote`) at the filesystem boundary. `exec` and `check` both read it; `check(label)` returns its problems, so only ready passes.
 - `check` requires the dir's login to match `login:` in the requested label's note (case-insensitive); a dir with no `claude N` note is a problem. Through the selection, a mismatched dir leaves `named_accounts`, a mismatched unit dir makes `unit_account` an `UnreadableClaudeAccount` (unit launch and swap refuse), and `multiple_accounts` stays true; `account_identity` still reports the dir's actual login.
 - `setup` creates the missing always-linked shared targets (`projects`, `sessions`) under `~/.claude` before linking; `_link_problems` inspects a named entry even when its optional source is gone and reports a dangling expected link as `accounts: <path> is broken`. `note_file.read_note` returns None for a non-UTF-8 note.
-- Aliases `claude1`, `claude2`, `claude3` and `claude-unit`, each `"~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec 'claude N'"` (`exec unit` for `claude-unit`). The alias text lives in natedev's `/etc/nixos` `modules/linux/shell.nix` under `programs.zsh.shellAliases`; committing and rebuilding are outside this repo, and the Mac has none. Plain `claude` stays `~/.claude`'s account.
+- Aliases `claude1`, `claude2` and `claude3`, each `"~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec 'claude N'"`. The alias text lives in natedev's `/etc/nixos` `modules/linux/shell.nix` under `programs.zsh.shellAliases`; committing and rebuilding are outside this repo, and the Mac has none. Plain `claude` stays `~/.claude`'s account.
 - `docs/accounts.md` covers which account a session is on, starting a session (aliases and the alias-free `accounts.py exec` form), Log out and in, swapping the unit account with every refusal and recovery line, setting up a dir, low-quota alerts, and a unit that will not start.
 
 **Files:**
@@ -431,7 +431,7 @@ Asked for by the user through the showrunner. Text above this section that names
 - `commands/showrunner/produce.md` — unit resume through `add_unit.py --resume`.
 - `docs/accounts.md` ("Move a session"), `commands/showrunner/accounts.md`, `docs/as-built/shutdown-and-restart.md`; `pyrightconfig.json` — shutdown extraPaths include the repo root.
 
-**Binds later work:** "Claude sessions move on a refusal", "An account picked by room, not by role" and "Readout of the moves" call `accounts.move()` / `down --to`. Removing the unit role takes `swap unit` with it, but `exec unit` stays because nixos `shell.nix` aliases `claude-unit` to `accounts.py exec unit`. The readout counts `SessionShutdown` records with a `target` as moves.
+**Binds later work:** "Claude sessions move on a refusal", "An account picked by room, not by role" and "Readout of the moves" call `accounts.move()` / `down --to`. Removing the unit role takes `swap unit` with it, but `exec unit` stays. The readout counts `SessionShutdown` records with a `target` as moves.
 
 **Gotchas:**
 - Live Ghostty titles carry a status glyph (`✳ natedev`) and the shell retitles the window after exit.
@@ -761,9 +761,9 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `scripts/nightly_review/nightly_review.py` — launches on the picked account.
 - `scripts/whoami/agent_accounts.py`, `agent_notes.py`, `quota_alert.py`, `whoami.py` — `ClaudeAccountsInUse` and its readers.
 - `scripts/shutdown/restart.py` — wrote `@claude_config_dir` on a tmux respawn with a target; it now resumes a tmux session in a new herdr session and writes no option.
-- `docs/accounts.md`, `commands/showrunner/accounts.md`, `docs/quota_alerts.md` — `pick`, no unit role, `claude-unit` on the picked account.
+- `docs/accounts.md`, `commands/showrunner/accounts.md`, `docs/quota_alerts.md` — `pick`, no unit role.
 
-**Binds later work:** "Codex workers move on a refusal" and "Claude sessions move on a refusal" call `accounts.pick(tool, now, *, exclude, keep) -> PickedAccount | NoAccountWithRoom` with `exclude={refusing label}`; `pick` never returns an excluded label, and with no fresh reading anywhere it returns `keep` else `default`, else `NoAccountWithRoom` when readings exist but none has room. Both write refusals through `refusals.py`: `AccountRefusal{tool, login, window: KnownWindow | UnknownWindow, reset: KnownReset | NoResetKnown, at}`, `write_refusal` (locked, atomic, an older refusal never replaces a newer one) and `resolved(refusal, reading, now)`. `accounts.stored_reading(tool, login, now) -> FreshReading | StaleReading | NoReading` is the only path from `StoredUsage` into picker types. `restart.py` resumes a targeted tmux record in a new herdr session (`_herdr_launch`, the target's environment on its pane) and writes no `@claude_config_dir`; restart edits sit beside `_herdr_launch`. `ClaudeAccountsInUse` carries `live_logins` and `live_directories` (a live login on a dir failing `check` still reports). `set-role unit` and `swap unit` refuse with `UNIT_ROLE_GONE`; `exec unit` stays because `/etc/nixos/modules/linux/shell.nix` aliases `claude-unit` to it. A Codex move line parallels `unit_swap_line`'s move line.
+**Binds later work:** "Codex workers move on a refusal" and "Claude sessions move on a refusal" call `accounts.pick(tool, now, *, exclude, keep) -> PickedAccount | NoAccountWithRoom` with `exclude={refusing label}`; `pick` never returns an excluded label, and with no fresh reading anywhere it returns `keep` else `default`, else `NoAccountWithRoom` when readings exist but none has room. Both write refusals through `refusals.py`: `AccountRefusal{tool, login, window: KnownWindow | UnknownWindow, reset: KnownReset | NoResetKnown, at}`, `write_refusal` (locked, atomic, an older refusal never replaces a newer one) and `resolved(refusal, reading, now)`. `accounts.stored_reading(tool, login, now) -> FreshReading | StaleReading | NoReading` is the only path from `StoredUsage` into picker types. `restart.py` resumes a targeted tmux record in a new herdr session (`_herdr_launch`, the target's environment on its pane) and writes no `@claude_config_dir`; restart edits sit beside `_herdr_launch`. `ClaudeAccountsInUse` carries `live_logins` and `live_directories` (a live login on a dir failing `check` still reports). `set-role unit` and `swap unit` refuse with `UNIT_ROLE_GONE`; `exec unit` stays. A Codex move line parallels `unit_swap_line`'s move line.
 
 **Gotchas:** The Mac has no usage timer, so every launch there lands on keep/default; `--explain` says `no fresh readings on this machine; using <label>`. A missing reading is never a refusal: only `refusals.json` excludes an account regardless of readings, because the usage store keeps the last good reading after a failed read. A showrunner resume must never take an unrelated session that shares its name: `add_showrunner.py` refuses when a herdr session of that name is live. A relative `--config-dir` resolves against the invoking cwd, not the script's.
 
@@ -2533,3 +2533,19 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - Weekly and 5-hour usage alerts can come up to 10 minutes later. The showrunner accepted this, because those alerts only give information.
 - An in-use account that runs out from above 10% inside the 10 minutes is not moved from the reading. It moves on its first refusal: Codex at once through `codex_mesh`'s `blocked` path, Claude on the next 2-minute refusal pass. The worst case is one refused request before the move.
 - Measure a timer cut on the real timer runs (`journalctl --user -u agent-sessions-snapshot.service`, "Consumed … CPU time"). A by-hand `refresh` always reads live, so it shows no reuse.
+
+### Phase 92 — Every claude and codex launch loads the folder's nix shell  · status: done
+
+**Depends on:** Phase 91
+
+#### Work Order
+
+User, via the showrunner, 2026-10-28: "i need to be able to run claude, claude1,...claude4 and have it work everywhere same for codex, codex1, codex2."
+
+- `accounts.py exec` loads the nix shell of the launch folder before it execs Claude or Codex, for every label (`claudeN`, `codexN`, `units`, `workers`, `showrunners`) on Linux and the Mac. Use efficiency-unit's helper (it allows the nearest `.envrc`, returns the direnv environment, and refuses without `IN_NIX_SHELL`); its name and contract come from efficiency-unit. Do not write a second loader.
+- Add `exec claude` for the default `~/.claude` home, so a bare `claude` alias can use the same path. The showrunner adds the aliases in /etc/nixos on both machines after this merges.
+- Tests: a launch folder whose `.envrc` is not allowed yet, and a folder with no `.envrc`; the helper and the exec leaf are fakes. The live check is the director's, after the build hold ends.
+
+**Files:** `scripts/accounts/accounts.py`, `scripts/accounts/test_accounts.py`, `scripts/accounts/test_launch_accounts.py`, `docs/accounts.md`.
+
+**Verification:** `scripts.accounts.test_accounts scripts.accounts.test_launch_accounts scripts.lib.test_user_zone`, basedpyright on `scripts/accounts scripts/whoami`, then the full merge gate, after the build hold ends.
