@@ -57,7 +57,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 #### As-built
 
-- `history.py rounds` lists `/unit:direct` phases by repair rounds, most first. Columns: `run  phase  title  plan  rounds  review-ux  review-code  gate  merge  live  other  findings  fix-time  span  check`; `--format json|csv`; flags `--since`, `--until` (on `rounds` only), `--status`, `--top N` (default 25), `--plan <substring>`. Summary lines: phases counted, median rounds, share of phases with 3 or more rounds and the share of fix time they hold, rounds by cause, count of `mixed` records. The JSON row also carries `past_landing`, the number of rounds from round 4 on.
+- `history.py rounds` lists `/unit:direct` phases by repair rounds, most first. Columns: `run  phase  title  plan  reviewed  rounds  review-ux  review-code  gate  merge  live  other  findings  fix-time  span  check`; `--format json|csv`; flags `--since`, `--until` (on `rounds` only), `--status`, `--top N` (default 25), `--plan <substring>`. Summary lines: phases counted and reviewed, with the median rounds over reviewed phases; the count of phases with no review recorded; the reviewed phases with 3 or more rounds, their share and the share of reviewed fix time they hold; rounds by cause over all phases; count of `mixed` records. A phase is reviewed when its run and phase instance have a `pass_started` review pass. The JSON row also carries `reviewed` and `past_landing`, the number of rounds from round 4 on; `_meta` carries `reviewed_phases`, `unreviewed_phases` and `reviewed_fix_seconds`.
 - A repair round is the set of concurrent `fix` passes of one `phase_instance_id`; a ledger round (`finding_batch_dispatched`) matched by `round == fix_pass` is the same round. Ledger events join their run through `phase_instance_id`.
 - Cause, first match wins: `review-ux` / `review-code` (a ledger round; `ux` when any covered finding's lens holds `ux`), `gate`, `merge`, `live` (a live, shot or smoke activity finished within 30 minutes before), `other`.
 - A record is `mixed` when a pass activity names another phase number, its passes span more than 72 hours, or its merge rounds are more than 24 hours apart. A `mixed` record is listed and marked, never dropped.
@@ -177,7 +177,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Ruled out:** picking a resume phase by team slot, because a review sent to a fix seat records slot fix while the durable slot is impl.
 
-### Phase 6 — The round summary counts reviewed phases only  · status: todo
+### Phase 6 — The round summary counts reviewed phases only  · status: done
 **Depends on:** Phase 1
 
 #### Work Order
