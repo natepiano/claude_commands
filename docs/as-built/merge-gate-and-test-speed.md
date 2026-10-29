@@ -183,7 +183,7 @@ The largest module peaks near 0.5 GiB. The gate's wall time is its slowest modul
 
 - **Bindings, not containers.** `invoke_cli` restores module bindings, not mutable containers in module globals.
 
-- **Shell override defaults** are pinned by unset-default tests in `test_review_launcher.py`, `test_implement_launcher.py` and `test_verify_token_wait.py`; each pops all four shell overrides.
+- **Shell override defaults** are pinned by unset-default tests in `test_review_launcher_delivery.py`, `test_implement_launcher_claims.py` and `test_verify_token_wait.py`; each pops all four shell overrides.
 
 - **Mac ssh status.** The Mac ssh command always exits 0; read `ff_rc=`.
 
