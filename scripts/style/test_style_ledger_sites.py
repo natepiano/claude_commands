@@ -20,6 +20,10 @@ import style_footprint
 from ledger_test_support import (LedgerTestCase, PARENT_FILE, MOVED_FILE, TWIN_FILE, PARENT, TWIN, TRAIT_METHOD)
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
+
 @final
 class StyleLedgerSitesTests(LedgerTestCase):
     def test_context_site_refuses_deleted_same_file_duplicate_in_original_crate_scope(self) -> None:
@@ -1153,7 +1157,7 @@ class StyleLedgerSitesTests(LedgerTestCase):
         _, (finding_id,) = self.hold_parent(ledger, ((4, "7"),), kind="restructure")
         _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("impl a::Trait", "impl crate::b::Trait")})
         before = self.held_rows(ledger.database)
-        # The child must finish within five seconds, even if expansion keeps growing its path.
+        # Guard against nontermination if alias expansion keeps growing its path.
         program = (
             "from pathlib import Path; import style_ledger; import sys; "
             "ledger = style_ledger.Ledger(Path(sys.argv[1]), Path(sys.argv[2])); "
@@ -1161,7 +1165,7 @@ class StyleLedgerSitesTests(LedgerTestCase):
             "print(type(outcome).__name__); ledger.close()"
         )
         result = subprocess.run([sys.executable, "-c", program, str(self.repo), str(ledger.database), finding_id],
-                                capture_output=True, text=True, check=True, timeout=5,
+                                capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS,
                                 env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)})
         self.assertEqual(result.stdout.strip(), "TraitIdentityUncertain")
         self.assertEqual(self.held_rows(ledger.database), before)

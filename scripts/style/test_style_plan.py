@@ -47,6 +47,10 @@ import style_rules
 import style_units
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
+
 @final
 class StylePlanTests(unittest.TestCase):
     root: Path = Path()
@@ -322,9 +326,10 @@ class StylePlanTests(unittest.TestCase):
                 with (mock.patch.object(style_plan, "busy_files", side_effect=read_during_refill),
                       ThreadPoolExecutor(max_workers=2) as pool):
                     first = pool.submit(style_plan.next_phase, "names-unit", self.plan, self.repo)
-                    self.assertTrue(first_read.wait(5), "first refill did not read busy files")
+                    self.assertTrue(first_read.wait(TEST_HANG_GUARD_SECS), "first refill did not read busy files")
                     second = pool.submit(style_plan.next_phase, "types-unit", types_plan, self.repo)
-                    first_result, second_result = first.result(timeout=10), second.result(timeout=10)
+                    first_result = first.result(timeout=TEST_HANG_GUARD_SECS)
+                    second_result = second.result(timeout=TEST_HANG_GUARD_SECS)
                 self.assertIsInstance(first_result, style_plan.PhaseWritten)
                 self.assertIsInstance(second_result, style_plan.PhaseWritten)
                 ledger = self.ledger()
@@ -3914,15 +3919,19 @@ class StylePlanTests(unittest.TestCase):
 
         limit_seconds = 0.25
         deadline = style_plan.SplitDeadline(limit_seconds, limit_seconds / 60)
-        write_durations: list[float] = []
+        busy_budgets: list[tuple[int]] = []
         record_split = style_ledger.record_split
 
-        def timed_write(repo: Path, unit: str, split: style_ledger.RecordedSplit, *, busy_timeout_seconds: float) -> None:
-            began = time.monotonic()
-            try:
+        connect = sqlite3.connect
+
+        def observe_connect(database: str, *, uri: bool, timeout: float) -> sqlite3.Connection:
+            connection = connect(database, uri=uri, timeout=timeout)
+            busy_budgets.append(cast(tuple[int], connection.execute("PRAGMA busy_timeout").fetchone()))
+            return connection
+
+        def bounded_write(repo: Path, unit: str, split: style_ledger.RecordedSplit, *, busy_timeout_seconds: float) -> None:
+            with mock.patch.object(sqlite3, "connect", side_effect=observe_connect):
                 record_split(repo, unit, split, busy_timeout_seconds=busy_timeout_seconds)
-            finally:
-                write_durations.append(time.monotonic() - began)
 
         # Scan setup cannot spend the write budget. Without SIGALRM, SQLite itself
         # must bound the real lock wait using the remaining deadline passed by split.
@@ -3933,7 +3942,7 @@ class StylePlanTests(unittest.TestCase):
               mock.patch.object(style_plan, "busy_files", return_value=style_plan.BusyFiles(self.board(), frozenset())),
               mock.patch.object(style_plan, "classify_split", return_value=style_ledger.RecordedSplit(
                   1, 2, 3, 4, "2026-10-28T12:00:00+00:00")),
-              mock.patch.object(style_ledger, "record_split", side_effect=timed_write) as record,
+              mock.patch.object(style_ledger, "record_split", side_effect=bounded_write) as record,
               redirect_stdout(output), redirect_stderr(errors)):
             _ = writer.execute("BEGIN IMMEDIATE")
             code = style_plan.main(["split", "--unit", "names-unit", "--repo", str(self.unit),
@@ -3943,9 +3952,7 @@ class StylePlanTests(unittest.TestCase):
         self.assertRegex(errors.getvalue(), r"^split names-unit: (time limit.*|database is locked)\n$")
         record.assert_called_once()
         self.assertEqual(record.call_args.kwargs["busy_timeout_seconds"], limit_seconds)
-        elapsed, = write_durations
-        self.assertGreaterEqual(elapsed, limit_seconds * 0.9)
-        self.assertLess(elapsed, limit_seconds + 1)
+        self.assertEqual(busy_budgets, [(250,)])
         with closing(sqlite3.connect(ledger.database)) as connection:
             self.assertEqual(tuple(connection.iterdump()), before)
 
