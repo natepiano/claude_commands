@@ -1,14 +1,16 @@
 """Fixture checks for the baseline's counts and source boundaries."""
 from __future__ import annotations
 
-from contextlib import closing
+from contextlib import closing, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
 import json
+import io
 import os
+import re
 import subprocess
 from unittest.mock import patch
 
@@ -252,6 +254,94 @@ class MeasuresTest(unittest.TestCase):
         with patch.object(m, "load_sources") as load, patch.object(m, "render", return_value="fixture"), patch("builtins.print"):
             self.assertEqual(m.main(["baseline", "--since", "2026-10-13", "--until", "2026-10-20"]), 0)
             load.assert_called_once_with(dates)
+
+
+class BaselineOutputTest(unittest.TestCase):
+    window: m.Window = m.window_bounds("2026-10-21", "2026-10-27", datetime.now(timezone.utc))
+
+    def sources(self) -> m.BaselineSources:
+        found: list[Issue] = []
+        for name, project, reason, closed in [
+            ("hana-one", "hana", "done", "2026-10-22"),
+            ("hana-two", "hana", "done", "2026-10-23"),
+            ("other", "cargo-port", "done", "2026-10-24"),
+            ("declined-one", "hana", "declined: Decline all", "2026-10-25"),
+            ("declined-two", "hana", "Declined", "2026-10-25"),
+            ("later", "hana", "done", "2026-10-28"),
+        ]:
+            fields = {"backlog_goal": "1 - Ship Hana", "status": "closed", "project": project,
+                      "reason": reason, "date_closed": closed}
+            found.append(Issue(Path(name + ".md"), {key: [value] for key, value in fields.items()}))
+        start, end = self.window.since, self.window.until
+        pushes = [m.PhonePush(start, "unit", "one", "sent"),
+                  m.PhonePush(start + timedelta(days=1), "unit", "two", "sent"),
+                  m.PhonePush(start, "unit", "quiet", "silenced"),
+                  m.PhonePush(end, "unit", "later", "sent")]
+        reviews = [m.FailedPushReview(start + timedelta(seconds=1), "unit", "one")]
+        merges = [m.HanaMerge("one", start), m.HanaMerge("two", start + timedelta(days=1)),
+                  m.HanaMerge("later", end)]
+        return m.BaselineSources([], [], [], [], [], pushes, reviews, [], found, [], [], [], merges)
+
+    def output(self, sources: m.BaselineSources, full: bool = False) -> str:
+        arguments = ["baseline", "--since", "2026-10-21", "--until", "2026-10-27"]
+        if full:
+            arguments.append("--full")
+        output = io.StringIO()
+        with patch.object(m, "load_sources", return_value=sources), redirect_stdout(output):
+            result = m.main(arguments)
+        self.assertEqual(result, 0)
+        return output.getvalue()
+
+    def test_default_cli_prints_short_summary_in_user_zone_without_tables(self) -> None:
+        output = self.output(self.sources())
+        lines = output.splitlines()
+        self.assertGreaterEqual(len(lines), 3)
+        self.assertLessEqual(len(lines), 5)
+        self.assertTrue(all(len(line) <= 100 for line in lines), lines)
+        self.assertEqual(lines[0], "Window: 2026-10-21 00:00 to 2026-10-28 00:00 EDT (end excluded).")
+        self.assertEqual(lines[1], "Hana: 2 merges to origin/init/catalyst; 2 Hana-project issues closed.")
+        self.assertEqual(lines[2], "Goal 1: 3 issues closed; 2 declined closures left out.")
+        self.assertEqual(lines[3], "User attention: 2 pushes sent to user; 1 after a failed text check.")
+        self.assertNotIn("Capacity on Hana", output)
+        self.assertNotRegex(output, r"Measure\s+Value\s+n\s+Window\s+Source")
+
+    def test_full_cli_keeps_summary_first_and_uses_the_table_values(self) -> None:
+        sources = self.sources()
+        summary = self.output(sources)
+        output = self.output(sources, full=True)
+        self.assertTrue(output.startswith(summary + "\nCapacity on Hana\n"))
+        self.assertRegex(output, r"Measure\s+Value\s+n\s+Window\s+Source")
+        rows = {cells[0]: cells[1] for line in output.splitlines()
+                if len(cells := re.split(r"\s{2,}", line)) == 5}
+        self.assertIn(f"Goal 1: {rows['goal 1 issues closed']} issues closed; "
+                      + f"{rows['goal 1 declined closures excluded']} declined closures left out.", summary)
+        self.assertIn(f"Hana: {rows['Hana merges / origin/init/catalyst']} merges to origin/init/catalyst; "
+                      + f"{rows['goal 1 Hana-project issues closed']} Hana-project issues closed.", summary)
+        self.assertIn(f"User attention: {rows['phone pushes sent']} pushes sent to user; "
+                      + f"{rows['phone pushes after failed review']} after a failed text check.", summary)
+
+    def test_missing_merge_history_prints_not_recorded_in_summary_and_table(self) -> None:
+        sources = self.sources()
+        sources.merges = m.MergeHistoryNotRecorded.MISSING
+        output = self.output(sources, full=True)
+        summary = output.split("\n\n", 1)[0]
+        self.assertIn("Hana: not recorded merges to origin/init/catalyst; 2 Hana-project issues closed.", summary)
+        self.assertTrue(all(len(line) <= 100 for line in summary.splitlines()), summary)
+        self.assertRegex(output, r"Hana merges / origin/init/catalyst\s+not recorded\s+0\s+")
+
+    def test_source_problem_count_and_full_hint_show_with_and_without_problems(self) -> None:
+        sources = self.sources()
+        self.assertIn("Source problems: 0. Use --full to print the tables.", self.output(sources))
+        sources.problems = [m.SourceProblem("reviews", "missing review file"),
+                            m.SourceProblem("builds", "cannot read build file")]
+        summary = self.output(sources)
+        self.assertIn("Source problems: 2. Use --full to print the tables.", summary)
+        self.assertNotIn("missing review file", summary)
+        output = self.output(sources, full=True)
+        problem_table = output.split("Source problems (dependent counts can be incomplete)\n", 1)[1]
+        self.assertEqual(problem_table.count("source unavailable"), 2)
+        self.assertIn("missing review file", problem_table)
+        self.assertIn("cannot read build file", problem_table)
 
 
 class SourcesTest(unittest.TestCase):

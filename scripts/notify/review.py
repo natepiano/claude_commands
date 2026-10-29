@@ -634,6 +634,11 @@ def validate(value: object, draft: Draft, revision: bool,
             return Questions(version, questions, failed, metadata, tuple(failures))
         return Rewritten(version, failed, metadata, tuple(failures))
     except ValueError as error:
+        if not failures:
+            try:
+                failures = supported_failures(_object(value).get("failed_rules"), draft, reply=content_only)
+            except ValueError:
+                pass
         return Unreviewed(str(error), metadata, tuple(failures))
 
 
@@ -784,7 +789,7 @@ def review(draft: Draft, revision: bool, *, runner: ProcessRunner = run_process,
     if isinstance(checked, Approved):
         return replace(outcome, metadata=metadata)
     if isinstance(checked, Unreviewed):
-        return replace(checked, metadata=metadata)
+        return replace(checked, metadata=metadata, failures=outcome.failures)
     if isinstance(checked, Withheld):
         return replace(checked, metadata=metadata)
     questions = tuple(checked.questions) if isinstance(checked, Questions) else ()
