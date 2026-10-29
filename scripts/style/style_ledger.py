@@ -18,7 +18,7 @@ import tempfile
 import tomllib
 import uuid
 from collections import Counter
-from collections.abc import Callable, Generator, Iterable, Iterator, Mapping
+from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -1975,6 +1975,13 @@ MIGRATIONS = {
         ALTER TABLE held_findings ADD COLUMN built_at TEXT NOT NULL DEFAULT '';
         UPDATE held_findings SET built_at={legacy_built_at_sql()} WHERE state='built';
     """,
+    # Proposal tickets keep their original decisions; a workspace batch shares only its binding proof.
+    26: """
+        CREATE TABLE IF NOT EXISTS bulk_workspace_tickets (
+            ticket TEXT PRIMARY KEY, batch TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS bulk_workspace_batch ON bulk_workspace_tickets(batch);
+    """,
 }
 
 
@@ -2486,6 +2493,58 @@ class Ledger:
         ).fetchall())
         return tuple(BulkRefusal(*row) for row in rows)
 
+    def bulk_share_checkpoint(self, ids: Sequence[str]) -> None:
+        """Persist one workspace proof group after every decision ticket reaches the same checkpoint.
+
+        This shares rename evidence, never approval or finding ownership. A partial checkpoint is recoverable:
+        repeat the ordinary checkpoints, then this operation. No proof group exists until all have succeeded.
+        """
+        members = tuple(sorted(set(ids)))
+        if not members:
+            return
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            tickets = tuple(self._ticket(id) for id in members)
+            first = tickets[0]
+            signature = (first["base"], first["branch"], first["checkpoint"], first["rules"])
+            if (not all(signature[:3]) or len(first["rules"]) != 1
+                    or any(ticket["kind"] != "proposal" or ticket["family"] != "names"
+                           or ticket["crate"] != "." or ticket["state"] not in ("checkpointed", "merged")
+                           or (ticket["base"], ticket["branch"], ticket["checkpoint"], ticket["rules"]) != signature
+                           for ticket in tickets)):
+                raise LedgerError("workspace proof requires one rule, base, branch and checkpoint on names proposal tickets")
+            existing = cast(list[tuple[str, str]], self._connection.execute(
+                "SELECT ticket,batch FROM bulk_workspace_tickets WHERE batch IN "
+                + "(SELECT batch FROM bulk_workspace_tickets WHERE ticket IN ("
+                + ",".join("?" for _ in members) + "))", members,
+            ).fetchall())
+            if existing and (set(id for id, _ in existing) != set(members)
+                             or any(batch != members[0] for _, batch in existing)):
+                raise LedgerError("workspace ticket already belongs to another proof group")
+            _ = self._connection.executemany(
+                "INSERT OR IGNORE INTO bulk_workspace_tickets VALUES (?,?)", [(id, members[0]) for id in members],
+            )
+        self._binding_proofs.clear()
+
+    def _binding_renames(self, ticket: TicketRecord, path: str, commit: str) -> tuple[BindingRename, ...]:
+        """The ticket's own renames plus recorded companions at this exact checkpoint."""
+        membership = "t.id=?"
+        parameters: tuple[str, ...] = (path, ticket["id"])
+        if ticket["checkpoint"] == commit:
+            membership += (" OR (t.id IN (SELECT ticket FROM bulk_workspace_tickets WHERE batch="
+                           + "(SELECT batch FROM bulk_workspace_tickets WHERE ticket=?)) "
+                           + "AND t.state IN ('checkpointed','merged') AND t.base=? AND t.branch=? "
+                           + "AND t.checkpoint=? AND t.rules=?)")
+            parameters += (ticket["id"], ticket["base"], ticket["branch"], commit, json.dumps(ticket["rules"]))
+        # Filter by path in SQL: a workspace proof must not load every finding once per edited file.
+        rows = cast(list[tuple[str, str, str, int, str]], self._connection.execute(
+            "SELECT h.kind,h.before,h.after,h.line,h.text FROM tickets t JOIN json_each(t.finding_ids) f "
+            + "JOIN held_findings h ON h.finding_id=f.value WHERE h.path=? AND (" + membership + ") "
+            + "ORDER BY t.id,h.finding_id", parameters,
+        ).fetchall())
+        return tuple(pair for kind, before, after, line, text in rows
+                     if isinstance(pair := binding_rename(kind, before, after, line, text), BindingRename))
+
     def bulk_release(self, id: str, reasons: Mapping[str, str]) -> tuple[BulkRefusal, ...]:
         """Record refusals and release only those findings, atomically; repeated refusals change nothing.
 
@@ -2701,10 +2760,7 @@ class Ledger:
                     self._binding_proofs[key] = BindingProof({}, {}, False, {})
                     return NoAppliedCheck("rename")
                 # Read ticket membership rather than state: the same proof serves findings already marked built.
-                renames = tuple(pair for identity in ticket["finding_ids"]
-                                if (held := self._held(identity)).path == finding.path
-                                and isinstance(pair := binding_rename(held.kind, held.before, held.after,
-                                                                     held.line, held.text), BindingRename))
+                renames = self._binding_renames(ticket, finding.path, commit)
                 self._binding_proofs[key] = binding_rename_check(
                     finding.path, before.decode(errors="replace"), after.decode(errors="replace"), renames)
                 return self._binding_proofs[key].checks.get(rename, NoAppliedCheck("rename"))
@@ -2884,7 +2940,7 @@ class Ledger:
         for path in ticket["files"]:
             if path not in base.blobs or path not in tip.blobs or base.blobs[path] == tip.blobs[path]:
                 continue
-            pairs = tuple(renames.get(path, ()))
+            pairs = self._binding_renames(ticket, path, checkpoint) if path in renames else ()
             if not pairs:
                 continue
             key = (ticket["id"], path, checkpoint)

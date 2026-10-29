@@ -17,6 +17,9 @@ from unittest import mock
 import codex_hooks
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 INSTALLER = Path(__file__).with_name("codex_hooks.py")
 FN_COMMAND = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/post-tool-use-fn-length.py"'
 RETIRED_COMMAND = FN_COMMAND.replace("fn-length", "mul-add")
@@ -159,7 +162,7 @@ class CodexHookInstallerTests(unittest.TestCase):
         return subprocess.run(
             [sys.executable, str(INSTALLER), action],
             capture_output=True, text=True, check=False,
-            env=self.environment, cwd=cwd, timeout=35,
+            env=self.environment, cwd=cwd, timeout=TEST_HANG_GUARD_SECS,
         )
 
     def state(self) -> dict[str, object]:
@@ -666,7 +669,7 @@ class CodexHookInstallerTests(unittest.TestCase):
     # whichever comes first. The two tests below fix the order each way; both must read the same.
     def test_a_server_gone_before_the_request_is_written_reads_as_closed(self) -> None:
         server = self.started_server("#!/bin/sh\nexit 7\n")
-        _ = server.process.wait(timeout=10)
+        _ = server.process.wait(timeout=TEST_HANG_GUARD_SECS)
         with self.assertRaisesRegex(codex_hooks.HookError, "^app-server closed before replying$"):
             _ = server.call("initialize", {})
 

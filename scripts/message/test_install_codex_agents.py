@@ -14,6 +14,9 @@ from pathlib import Path
 from typing import TypedDict, cast, override
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 SCRIPT = Path(__file__).with_name("install_codex_agents.py")
 MESSAGING_TEXT = Path(__file__).parents[2] / "codex" / "AGENTS-messaging.md"
 BEGIN = b"<!-- claude-messaging: begin -->"
@@ -63,7 +66,7 @@ class InstallCodexAgentsTests(unittest.TestCase):
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [sys.executable, str(SCRIPT), *arguments],
-            input="", capture_output=True, text=True, check=False, timeout=10,
+            input="", capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
             env={"HOME": str(self.home), "PATH": str(self.bin), "LC_ALL": "C"},
             preexec_fn=preexec_fn,
         )
@@ -269,7 +272,7 @@ class InstallCodexAgentsTests(unittest.TestCase):
                 "result = subprocess.run(",
                 "    ['/bin/sh', '-c', sys.argv[-1]], input=payload, capture_output=True,",
                 f"    env={{**os.environ, 'HOME': {str(peer_home)!r}}},",
-                f"    cwd={str(peer_home)!r}, timeout=5, check=False,",
+                f"    cwd={str(peer_home)!r}, timeout={TEST_HANG_GUARD_SECS}, check=False,",
                 ")",
                 "sys.stdout.buffer.write(result.stdout)",
                 "sys.stderr.buffer.write(result.stderr)",

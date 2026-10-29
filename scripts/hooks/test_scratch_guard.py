@@ -17,6 +17,9 @@ from typing import TypedDict, cast, override
 from unittest import mock
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 HOOK = Path(__file__).with_name("pre-tool-use-scratch-guard.py")
 sys.path.insert(0, str(HOOK.parent))
 remake_session_temp = cast(Callable[[str], None],
@@ -58,7 +61,7 @@ class ScratchGuardTests(unittest.TestCase):
                               "cwd": str(cwd or self.home)})
         environment = {**os.environ, "HOME": str(self.home), "TMPDIR": str(temp or self.temp)}
         result = subprocess.run([str(HOOK)], input=payload, capture_output=True, text=True, check=False,
-                                timeout=10, env=environment)
+                                timeout=TEST_HANG_GUARD_SECS, env=environment)
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout
 
@@ -77,7 +80,7 @@ class ScratchGuardTests(unittest.TestCase):
         payload = json.dumps({"session_id": "scratch-session", "tool_name": tool,
                               "tool_input": {key: str(path)}, "cwd": str(self.home)})
         environment = {**os.environ, "HOME": str(self.home), "TMPDIR": str(self.temp)}
-        return subprocess.run([str(HOOK)], input=payload, capture_output=True, text=True, check=True, timeout=10,
+        return subprocess.run([str(HOOK)], input=payload, capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS,
                               env=environment).stdout
 
     def test_a_write_into_a_new_folder_of_a_root_is_refused_and_rust_scratch_is_a_root(self) -> None:

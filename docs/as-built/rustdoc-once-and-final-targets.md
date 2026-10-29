@@ -130,7 +130,7 @@ One example can get both refusals; the test refusal comes first. Offenders follo
 - The hook loads `SUBJECT` and `ALL` from `pre-tool-use-change-review-gate.py`. A change to those patterns changes both hooks. The hook finds git commands with its own shell parser, not with the change-review `COMMIT` pattern.
 - `final` must not link examples, and the example scan must run before any build. Together they make sure no test is lost.
 - `final` must not pass `--lib`.
-- Tests that pin this: `test_verify_doc.py`, `test_verify_lint_scope.py`, `test_checkpoint_doc_gate.py`, `test_verify_final_targets.py` and `test_verify_untested_examples.py`.
+- Tests that pin this: `test_verify_doc.py`, the `test_verify_lint_*.py` modules (shared fixture: `verify_lint_scope_test_support.py`), `test_checkpoint_doc_gate.py`, `test_verify_final_targets.py` and `test_verify_untested_examples.py`.
 - A repo with no `Cargo.toml`, such as `~/.claude`, needs no doc record, but its checkpoints still follow the own-call rule.
 
 ## Calibration / gotchas

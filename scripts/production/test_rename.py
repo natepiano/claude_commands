@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import fake_unit_host
 import os
 import re
 import shlex
@@ -19,6 +18,7 @@ from unittest import mock
 
 from scripts.guilds import roles
 from scripts.direct import workers
+from scripts.production import fake_unit_host
 
 SCRIPT = Path(__file__).with_name("rename.py")
 OLD = "old"
@@ -218,6 +218,7 @@ class ProductionRenameTests(unittest.TestCase):
             "SHOWRUNNERS_CONFIG": str(config / "showrunners.json"),
             "UNIT_ACTIVE_DIR": str(self.root / "active"),
             "UNIT_HISTORY_DIR": str(self.root / "history"),
+            "PHASE_TABLE_VAULT": str(self.root / "vault/showrunners"),
             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
             "HERDR_PROC": str(self.root / "proc"),
             "HERDR_PLATFORM": "linux",
@@ -469,7 +470,7 @@ class ProductionRenameTests(unittest.TestCase):
         self.assertEqual(self.git("ls-remote", "origin", "refs/heads/new"), f"{new_tip}\trefs/heads/new")
         self.assertEqual(self.git("ls-remote", "origin", "refs/heads/old"), f"{self.old_tip}\trefs/heads/old")
         self.assertEqual(self.git("status", "--porcelain"), "")
-        self.assertEqual(self.completed_steps(), 8)
+        self.assertEqual(self.completed_steps(), 9)
         self.assertIs(self.journal()["done"], False)
 
     def test_plan_ignores_as_built_paths_and_prose_in_plan_cells(self) -> None:
@@ -558,7 +559,7 @@ class ProductionRenameTests(unittest.TestCase):
             self.assertIn(str(path), result.stdout)
         self.assertIn(f"{self.state}/*/parent", result.stdout)
         steps = [int(line.split(".", 1)[0]) for line in result.stdout.splitlines()]
-        self.assertEqual(set(steps), set(range(1, 8)))
+        self.assertEqual(set(steps), set(range(1, 9)))
         self.assertEqual(steps, sorted(steps))
         self.assertIn("merge branch old -> new", result.stdout)
         self.assertIn("push origin new", result.stdout)
@@ -668,7 +669,7 @@ class ProductionRenameTests(unittest.TestCase):
         self.assertTrue((self.notifier / "showrunner-old/conf").exists())
         self.assertFalse((self.notifier / "showrunner-new").exists())
         self.assert_success(self.run_rename("apply", source="ancient"))
-        self.assertEqual(self.completed_steps(), 8)
+        self.assertEqual(self.completed_steps(), 9)
         self.assertEqual(self.git("rev-parse", "new^"), base)
         self.assertEqual(self.git("status", "--porcelain"), "")
 
@@ -871,7 +872,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(prompt.read_bytes(), note)
         self.assertIn("shutdown.py restart --only sid-alpha", result.stdout)
 
-    def test_a_journal_that_counted_seven_steps_finishes_with_the_worker_step_only(self) -> None:
+    def test_a_journal_that_counted_seven_steps_finishes_with_the_new_steps_only(self) -> None:
         self.prepare_unit_moves()
         self.marked_unit("alpha-unit")
         self.assert_success(self.run_rename("apply"))
@@ -882,11 +883,13 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         branch_tip = self.git("rev-parse", NEW)
         refused = self.run_command("unit", NEW, "alpha-unit")
         self.assertNotEqual(refused.returncode, 0)
-        self.assertIn("apply must complete _rename_unit_workers first", refused.stdout + refused.stderr)
+        self.assertIn("apply must complete _rename_unit_workers", refused.stdout + refused.stderr)
         self.assert_success(self.run_rename("apply"))
-        self.assertEqual(self.journal()["completed"], [
+        completed = cast(list[str], self.journal()["completed"])
+        self.assertEqual(completed[:8], [
             "_rename_doc", "_rewrite_plans", "_rename_timer", "_rename_showrunner_state", "_rename_stall_watch",
             "_rename_review_pool", "_rename_branch", "_rename_unit_workers"])
+        self.assertEqual(len(completed), 9)
         self.assertEqual(self.git("rev-parse", NEW), branch_tip)
         self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
 
@@ -1411,7 +1414,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual((archived["old"], archived["new"]), (OLD, NEW))
         current = cast(dict[str, object], json.loads((self.state / "next/rename.json").read_text()))
         self.assertIs(current["done"], False)
-        self.assertEqual(len(cast(list[str], current["completed"])), 8)
+        self.assertEqual(len(cast(list[str], current["completed"])), 9)
 
     def test_a_merge_branch_not_named_for_the_production_is_kept(self) -> None:
         self.prepare_unit_moves()

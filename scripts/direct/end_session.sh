@@ -32,7 +32,7 @@ UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
-# repo needs >= 3.10.
+# repo needs >= 3.11.
 PY="${HOME}/.claude/scripts/lib/py"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MESH="${SCRIPT_DIR}/../agents/codex_mesh.py"

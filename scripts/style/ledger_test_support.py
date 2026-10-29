@@ -12,7 +12,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-import time
 import unittest
 from collections.abc import Callable
 from pathlib import Path
@@ -26,6 +25,10 @@ from approved_renames import AppliedCheck
 import style_plan
 import style_rules
 import declarations
+
+
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
 
 
 # A release checkpoints the current worktree; each fake berth keeps its own board.
@@ -710,14 +713,14 @@ class LedgerTestCase(unittest.TestCase):
         self.write(relative, "// A note.\n/// Returns the value.\n" + content.replace("{ 1 }", "{\n    // One.\n    1\n}"))
 
     def record_while_stalled(self, stalled: str, write: Callable[[style_ledger.Ledger], object]) -> None:
-        """A second ledger records a verdict while write waits 2 s in style_ledger.<stalled>."""
+        """A second ledger records a verdict before write may leave style_ledger.<stalled>."""
         original = cast(Callable[..., object], getattr(style_ledger, stalled))
-        started = threading.Event()
+        started, release = threading.Event(), threading.Event()
 
         def stall(*arguments: object) -> object:
             if not started.is_set():
                 started.set()
-                time.sleep(2)
+                self.assertTrue(release.wait(TEST_HANG_GUARD_SECS), "stalled writer was not released")
             return original(*arguments)
 
         _ = self.enterContext(mock.patch.object(style_ledger, "BUSY_TIMEOUT_SECONDS", 0.5))
@@ -736,10 +739,14 @@ class LedgerTestCase(unittest.TestCase):
         with mock.patch.object(style_ledger, stalled, side_effect=stall):
             thread = threading.Thread(target=run)
             thread.start()
-            self.assertTrue(started.wait(10))
-            recorder.record(rule, self.sources[2], self.initial_tip, self.blob(rule), "clean",
-                            ticket="unit-1", worker="test-worker")
-            thread.join()
+            try:
+                self.assertTrue(started.wait(TEST_HANG_GUARD_SECS), "writer did not reach its stalled operation")
+                recorder.record(rule, self.sources[2], self.initial_tip, self.blob(rule), "clean",
+                                ticket="unit-1", worker="test-worker")
+            finally:
+                release.set()
+                thread.join(timeout=TEST_HANG_GUARD_SECS)
+            self.assertFalse(thread.is_alive(), "released writer did not finish")
         self.assertEqual(failures, [])
         self.assertEqual(self.states(rule)[self.sources[2]], "current")
 

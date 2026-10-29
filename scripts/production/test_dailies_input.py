@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import json
+import runpy
+from collections.abc import Sequence
+from types import ModuleType
 import dailies_input
 import fake_unit_host
+import fake_herdr
 import dailies_render
 from cli_fixture import ImmutableGitSeed, invoke_cli
 import os
@@ -18,7 +22,7 @@ from typing import ClassVar, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from add_unit import read_production
+from production_units import read_production
 from dailies_render import LENGTHS
 from dailies_input import (Activity, BevyUpgradeUnavailable, Block, ClaudeNotRunning, Decision, FormWaiting,
                            Running, SessionGone, StillWaiting, TicksFailing, UnitRow,
@@ -27,7 +31,9 @@ import unit_lookup
 from unit_lookup import UnitState
 
 
-# Script completion deadlines only bound hangs; startup can be slow under load.
+# load 136 on natedev, 2026-10-29
+TEST_HANG_GUARD_SECS = 300
+
 SCRIPT = Path(__file__).with_name("dailies_input.py")
 RENDERER = SCRIPT.with_name("dailies_render.py")
 CI_POINTS = SCRIPT.with_name("ci_points.py")
@@ -210,6 +216,39 @@ class DailiesInputTests(unittest.TestCase):
         self.production_doc()
         self.status_lines(f"== {ALPHA}", "● Checking panel labels", "ETA 23:40")
         self.judgment_file()
+        real_run = subprocess.run
+
+        def run(argv: Sequence[str], *, capture_output: bool, text: bool, check: bool,
+                timeout: float | None = None, env: dict[str, str] | None = None,
+                cwd: str | Path | None = None) -> subprocess.CompletedProcess[str]:
+            environment = dict(os.environ) if env is None else env
+            directory = Path.cwd() if cwd is None else Path(cwd)
+            if argv[0] == self.env["HERDR_BIN"]:
+                self.assertTrue(capture_output and text)
+                self.assertFalse(check)
+                self.assertIsNotNone(env, "herdr must supply its sanitized child environment")
+                return invoke_cli(fake_herdr, lambda: fake_herdr.main(list(argv[1:])),
+                                  list(argv[1:]), environment, directory)
+            script = Path(argv[1] if argv[0] == sys.executable and len(argv) > 1 else argv[0])
+            arguments = list(argv[2:] if argv[0] == sys.executable else argv[1:])
+            # Execute the actual fixture scripts; their logs, mutations, status
+            # and nested commands remain the evidence consumed by the tests.
+            fixtures = {self.notifier, self.phase_table, self.root / "bevy upgrade stub.py",
+                        self.root / "bin/review_regime.py", self.root / "race-review.py",
+                        self.home / ".claude/scripts/message/send.py"}
+            if script.exists() and (script in fixtures or script == SCRIPT.with_name("review_regime.py")):
+                module = ModuleType("dailies_fixture_command")
+                module.__file__ = str(script)
+
+                def main() -> int:
+                    _ = runpy.run_path(str(script), run_name="__main__")
+                    return 0
+
+                return invoke_cli(module, main, arguments, environment, directory)
+            return real_run(argv, capture_output=capture_output, text=text, check=check,
+                            timeout=timeout, env=env, cwd=cwd)
+
+        _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=run))
 
     def git(self, *arguments: str) -> str:
         result = subprocess.run(["git", "-C", str(self.checkout), *arguments],
@@ -281,7 +320,7 @@ class DailiesInputTests(unittest.TestCase):
              "--at", AT, *state_args, *extra]
         if subprocess_cli:
             return subprocess.run([sys.executable, str(SCRIPT), *arguments], cwd=self.checkout,
-                                  env=self.env, capture_output=True, text=True, check=False, timeout=300)
+                                  env=self.env, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         return invoke_cli(dailies_input, dailies_input.main, arguments, self.env, self.checkout, production_state=True)
 
     def report(self) -> dict[str, object]:
@@ -382,13 +421,13 @@ class DailiesInputTests(unittest.TestCase):
     def run_merge_watch(self) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(CI_POINTS), "watch", "--production", str(self.doc),
                                "--state-dir", str(self.state)], cwd=self.checkout, env=self.env,
-                              capture_output=True, text=True, check=False, timeout=300)
+                              capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def run_eta_request(self, phase: str = "Phase 2 of 3: panel labels stay clear") -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(WAITING), "eta-request", ALPHA,
                                "--phase", phase, "--production", str(self.doc),
                                "--state-dir", str(self.state)], cwd=self.checkout, env=self.env,
-                              capture_output=True, text=True, check=False, timeout=300)
+                              capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def rename_unit(self, name: str) -> None:
         for path in (self.doc, self.status, self.judgment):
@@ -1914,7 +1953,6 @@ class DailiesInputTests(unittest.TestCase):
         self.assertEqual(cast(dict[str, object], self.unit()["eta"])["why"],
                          "the unit found another panel repair")
 
-
     def timer(self, slug: str) -> None:
         """A production with a complete update timer, so the tree counts it."""
         instance = self.root / "notifier-state" / f"showrunner-{slug}"
@@ -1975,7 +2013,7 @@ class DailiesInputTests(unittest.TestCase):
     def style_ledger_cli(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         ledger = SCRIPT.parent.parent / "style/style_ledger.py"
         result = subprocess.run([sys.executable, str(ledger), *arguments, "--repo", str(self.checkout)],
-                                env=self.env, capture_output=True, text=True, check=False, timeout=30)
+                                env=self.env, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
 

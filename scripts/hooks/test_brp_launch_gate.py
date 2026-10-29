@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import TypedDict, cast, override
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 HOOK = Path(__file__).with_name("pre-tool-use-brp-launch-gate.sh")
 SETTINGS = HOOK.parent.parent.parent / "settings.json"
 CYCLE_ID = "a" * 32
@@ -102,7 +105,7 @@ class BrpLaunchGateTests(unittest.TestCase):
             hook_input["session_id"] = session_id
         return subprocess.run(
             ["bash", str(self.hook)], input=json.dumps(hook_input),
-            capture_output=True, text=True, check=False, env=self.environment, timeout=10,
+            capture_output=True, text=True, check=False, env=self.environment, timeout=TEST_HANG_GUARD_SECS,
         )
 
     def use_memory_wait_stub(self, body: str) -> None:

@@ -32,6 +32,9 @@ import showrunners
 from scripts.direct import test_verify_lint_scope as verify_fixture
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 class RecordedCall(TypedDict):
     arguments: list[str]
 
@@ -647,9 +650,9 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
 
         holder = threading.Thread(target=first_sync)
         holder.start()
-        self.addCleanup(holder.join, 30)
+        self.addCleanup(holder.join, TEST_HANG_GUARD_SECS)
         self.addCleanup(attempted.set)
-        self.assertTrue(locked.wait(30))
+        self.assertTrue(locked.wait(TEST_HANG_GUARD_SECS))
 
         def second_sync_lock(fd: int, operation: int) -> None:
             self.assertEqual(operation, fcntl.LOCK_EX)
@@ -659,7 +662,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
             attempted.set()
             real_flock(fd, operation)
             # No thread remains when verify_lint uses preexec_fn.
-            holder.join(30)
+            holder.join(TEST_HANG_GUARD_SECS)
             self.assertFalse(holder.is_alive())
 
         real_git = style_sync.git
@@ -725,7 +728,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
                     self.assertTrue(wait_until(lambda: pids.exists() or process.poll() is not None, 30))
                     self.addCleanup(kill_group, int(pids.read_text().split()[0]))
                     process.send_signal(signum)
-                    _, stderr = process.communicate(timeout=30)
+                    _, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                 finally:
                     if process.poll() is None:
                         process.kill()

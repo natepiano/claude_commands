@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import add_unit
+import production_units
 import dailies_render
 import merge_checkpoint
 import update_registration
@@ -293,7 +294,7 @@ class WaitingTests(unittest.TestCase):
     def test_named_unit_refuses_retired_row(self) -> None:
         content = self.doc.read_text(encoding="utf-8")
         self.write(self.doc, content.replace("`docs/alpha.md`", "(retired by the user)", 1))
-        production = add_unit.read_production(self.doc)
+        production = production_units.read_production(self.doc)
         with self.assertRaisesRegex(waiting.WaitingFailure, f"unknown unit {ALPHA}"):
             _ = waiting.named_unit(production, ALPHA)
 
@@ -310,7 +311,7 @@ class WaitingTests(unittest.TestCase):
         return path
 
     def producer_launch_line(self, moment: datetime, *, session: str = ALPHA) -> str:
-        production = add_unit.read_production(self.doc)
+        production = production_units.read_production(self.doc)
         producer_log = self.root / "launch-producer.log"
         _ = producer_log.unlink(missing_ok=True)
         request = add_unit.UnitLaunch(
@@ -332,7 +333,7 @@ class WaitingTests(unittest.TestCase):
 
     def producer_merge_line(self, moment: datetime, unit_tip: str, merge_tip: str,
                             phase: str = "1") -> str:
-        production = add_unit.read_production(self.doc)
+        production = production_units.read_production(self.doc)
         producer_log = self.root / "merge-producer.log"
         _ = producer_log.unlink(missing_ok=True)
         unit = merge_checkpoint.Unit(ALPHA, self.root / "alpha-plan.md", self.alpha,
@@ -349,7 +350,7 @@ class WaitingTests(unittest.TestCase):
         return f"- {moment:%H:%M %Z}: {produced}"
 
     def producer_state_block(self, moment: datetime, phases: dict[str, str]) -> str:
-        production = add_unit.read_production(self.doc)
+        production = production_units.read_production(self.doc)
         judgments = tuple(update_registration.UnitJudgment(session, phase, "none")
                           for session, phase in phases.items())
         state = update_registration.ShowrunnerState(judgments, (), update_registration.KeepOutstanding())
@@ -873,7 +874,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
 
         output = io.StringIO()
         with mock.patch.object(waiting, "datetime", AgendaClock), redirect_stdout(output):
-            waiting.agenda(add_unit.read_production(self.doc), self.state)
+            waiting.agenda(production_units.read_production(self.doc), self.state)
         self.assertIn("agenda: ok — 0 new items", output.getvalue())
         self.assertFalse((self.state / "agenda_seen.json").exists())
 
@@ -904,7 +905,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         output = io.StringIO()
         clock = mock.Mock(wraps=datetime, now=mock.Mock(return_value=now))
         with mock.patch.dict(os.environ, self.env), mock.patch.object(waiting, "datetime", clock), redirect_stdout(output):
-            waiting.waits(add_unit.read_production(self.doc))
+            waiting.waits(production_units.read_production(self.doc))
         found = re.search(r"open (\d+) minutes", output.getvalue())
         self.assertIsNotNone(found, output.getvalue())
         age = int(found.group(1)) if found else 0

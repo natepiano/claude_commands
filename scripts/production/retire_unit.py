@@ -59,7 +59,7 @@ import unit_lookup  # noqa: E402
 import unit_move  # noqa: E402
 import unit_names  # noqa: E402
 import unit_runs  # noqa: E402
-from add_unit import Production  # noqa: E402
+from production_units import Production, read_production  # noqa: E402
 
 if TYPE_CHECKING:
     from scripts.message import sessions
@@ -156,7 +156,7 @@ def production_of(slug: str) -> Production:
     checked = showrunners.checked_doc(showrunners.NOTIFIER_STATE_DIR / f"showrunner-{slug}")
     if isinstance(checked, showrunners.NoCheckedDoc):
         raise Refused(f"{slug} has no readable update timer: {checked.reason}")
-    return add_unit.read_production(checked.path)
+    return read_production(checked.path)
 
 
 def find_unit(slug: str, given: str) -> Unit:
