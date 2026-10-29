@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import itertools
 import os
 import re
 import signal
@@ -225,6 +226,7 @@ class Dispatch:
     stage_cancel: socket.socket | None = None
     stage_errors: list[str] = field(default_factory=list)
     stage_message: str = ""
+    started_at: float = field(default_factory=time.time)
 
     def mesh_call(self, verb: str, *options: str, capture: bool = False,
                   check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -415,13 +417,54 @@ def stage_two_submitted(receipts: Path, message: str) -> bool:
     return False
 
 
+def record_review(dispatch: Dispatch, completed: bool, summary: Path) -> None:
+    """Keep each launcher's review evidence, including a recorded zero."""
+    if dispatch.role != "review":
+        return
+    state = object_map(cast(object, json.loads((dispatch.run / "progress_history_state.json").read_text())))
+    phase = object_map(state.get("phase"))
+    for candidate in cast(list[object], state.get("open_phases", [])):
+        item = object_map(candidate)
+        if item.get("id") == dispatch.phase:
+            phase = item
+            break
+    record = read_roster(dispatch.run, dispatch.worker)
+    raised = len(re.findall(r"^\s*\d+[.)]\s+", summary.read_text(), re.MULTILINE))
+    store = workers.ledger_for_run(dispatch.run)
+    evidence: dict[str, object] = {
+        "arm": "own", "pool": store.path.parent.name, "unit": store.path.stem,
+        "phase": dispatch.phase, "phase_instance_id": phase.get("instance_id", ""),
+        "history_file": state.get("history_file", ""), "reviewer": dispatch.worker,
+        "thread_id": record.get("thread_id", ""), "lens": dispatch.args.lens,
+        "kind": "ux" if dispatch.args.lens == "ux" else "broad" if dispatch.args.pass_number == 1 and dispatch.args.lens else "closure",
+        "pass": dispatch.args.pass_number, "started_at": int(dispatch.started_at),
+        "finished_at": time.time(), "status": "reviewed" if completed else "error",
+        "raised": raised, "lease_ordinal": 0, "prime_hash": "",
+    }
+    root = unit_runs.history_root() / "review_turns" / dispatch.run.name
+    root.mkdir(parents=True, exist_ok=True)
+    for sequence in itertools.count():
+        try:
+            output = (root / f"{int(dispatch.started_at)}-{os.getpid()}-{sequence}.json").open("x", encoding="utf-8")
+        except FileExistsError:
+            continue
+        with output:
+            json.dump(evidence, output)
+            _ = output.write("\n")
+        break
+
+
 def settle_dispatch(dispatch: Dispatch, code: int, completed: bool, shown: str,
                     status: Path, summary: Path, reply: Path) -> int:
     """Completed work wins; otherwise ownership loss precedes refusal or failure."""
     record = read_roster(dispatch.run, dispatch.worker)
+    if dispatch.args.early_ready:
+        lens_suffix = f"_{dispatch.args.lens}" if dispatch.args.lens else ""
+        _ = (status.parent / f"review_status{lens_suffix}").write_text("reviewed\n" if completed else "error\n")
     if not completed and record.get("adopted_to"):
         destination = text(record["adopted_to"])
         _ = status.write_text("handed_off\n")
+        record_review(dispatch, False, summary)
         _ = summary.write_text(f"{shown}: handed off to {destination}; completion unknown\n")
         print(f"handed off: {dispatch.worker} to {destination}; completion unknown")
         return 4
@@ -430,6 +473,7 @@ def settle_dispatch(dispatch: Dispatch, code: int, completed: bool, shown: str,
         code = 1
     if not summary.read_text().strip() and reply.exists():
         _ = summary.write_text(reply.read_text())
+    record_review(dispatch, completed, summary)
     if shown not in summary.read_text():
         _ = summary.write_text(shown + "\n\n" + summary.read_text())
     if dispatch.args.summary:
@@ -456,6 +500,10 @@ def execute(dispatch: Dispatch, paths: list[str]) -> int:
     reply = phase_dir / f"{dispatch.role}_reply{suffix}.txt"
     _ = summary.write_text("")
     _ = status.write_text("running\n")
+    if args.early_ready:
+        lens_suffix = f"_{args.lens}" if args.lens else ""
+        _ = (phase_dir / f"review_status{lens_suffix}").write_text("reviewing\n")
+        _ = (phase_dir / f"review_pid{lens_suffix}").write_text(f"{os.getpid()}\n")
     try:
         dispatch.claim = claim_worker(dispatch)
     except SystemExit as error:

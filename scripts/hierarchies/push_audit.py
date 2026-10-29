@@ -4,6 +4,7 @@
 This module defines the audit's failed-check rule. Date-time ends are excluded;
 a date-only --until includes that local day. Ownership comes from current
 production tables and cannot reconstruct historical ownership.
+The report opens with a summary. Use --full to print the tables after it.
 """
 from __future__ import annotations
 
@@ -559,18 +560,33 @@ def render(report: AuditReport) -> str:
     return "\n\n".join(output)
 
 
+def report_summary(report: AuditReport) -> str:
+    counts = Counter(type(entry.classification) for entry in report.entries)
+    return "\n".join([
+        f"Window: {report.window.label}.",
+        f"Pushes: {len(report.delivered_pushes)} delivered; {len(report.entries)} after a failed text check.",
+        "; ".join(f"{kind.__name__}: {counts[kind]}" for kind in CLASSIFICATIONS) + ".",
+        f"Source problems: {len(report.problems)}. Use --full to print the tables.",
+    ])
+
+
 def main(arguments: Sequence[str] = ()) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("command", choices=("report",))
     _ = parser.add_argument("--since", metavar="DATE_OR_TIME", default="")
     _ = parser.add_argument("--until", metavar="DATE_OR_TIME", default="")
+    _ = parser.add_argument("--full", action="store_true", help="print the tables after the summary")
     args = parser.parse_args(arguments)
     now = datetime.now(timezone.utc)
     try:
         window = log_records.window_bounds(cast(str, args.since), cast(str, args.until), now)
     except ValueError as error:
         parser.error(str(error))
-    print(render(audit(load_sources(STATE_DIR), window)))
+    report = audit(load_sources(STATE_DIR), window)
+    print(report_summary(report))
+    if cast(bool, args.full):
+        print()
+        print(render(report))
     return 0
 
 

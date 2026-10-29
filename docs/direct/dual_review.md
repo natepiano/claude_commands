@@ -41,33 +41,25 @@ the reviewer built, or a plain statement that it could not build one.
 The `craft` lens is off since 2026-10-04 (user: review trial ended); the unit
 director's main review audits style each phase.
 
-When the production doc names a review pool, the launcher allocates each
-lens's reviewer from the unit's own; the worker choice and role reassignment
-below do not apply.
+Each lens uses the unit's own read-only reviewer. Dispatch with
+`assign.sh --role review`; it resumes `review`, or `review2` when `review` is
+busy. Keep both threads across phases and plans. Writers keep their own roles.
 
-Otherwise each lens gets a different open worker, and an idle open worker
-always takes a lens before a new one opens. Writers count: a worker that wrote
-the phase is still a reviewer. Among the idle workers, give a lens first to one
-that did not write the files it reviews. When none is left, a writer takes it;
-on the `adversary` lens it argues against its own choices. Move each worker
-under <RoleReassignment/>. Open a role-named review worker only when every open
-worker is busy, and keep it for reuse.
-
-The worker is the address and the lens is the judgment. Pass both to `review.sh`;
-findings remain keyed by lens even when a different slot takes it, and each
-worker's agent log carries its slot (`review_agent_<pass>_<lens>-<slot>.log`).
+The worker is the address and the lens is the judgment. Pass the lens to
+`assign.sh`; its returned handle names the selected worker and summary. Each
+lens has its own artifact paths.
 
 The adversary's brief is to break the change, not to check it. It reports the
 concrete failing case it built, or reports plainly that it could not build one:
 "no failing case found" from a reader who was trying is evidence. The same rule
 applies to the `rerun` reviewer's attempt to build a rerun case.
 
-Findings come back as one `review_findings_<pass>_<lens>.txt` per lens, in
-`${PHASE_DIR}` because every launch names its phase with `--phase`: two phases
-reviewing at once never share a pass's files. That file is the whole review
-result: <Synthesize/> reads every selected lens's file, including `rerun` when
-armed, tags each finding with its lens, and can tell two independent findings
-from one finding found twice.
+Findings come back in each dispatch's summary under `${PHASE_DIR}`. Every
+launch names its phase, lens and pass, so concurrent reviews keep separate
+files. The summary is the whole review result: <Synthesize/> reads every
+selected lens's summary, including `rerun` when armed, tags each finding
+with the lens that caught it, and can tell two independent findings from
+one finding found twice.
 
 **A repair is not reviewed this way.** <ClosureReview/> is one reader over one
 batch of ids, and splitting a path-limited read two ways buys two passes over
@@ -75,27 +67,20 @@ the same few hunks.
 </TeamReview>
 
 <ReviewPromptContract>
-When the production doc names a review pool, every code review prompt opens
-with:
+Every review prompt opens with:
 
 ```
-You are a pooled reviewer for <unit>, phase <N>. Edit nothing. Your first command is git -C <worktree> rev-parse HEAD; if it is not <head>, report error. Re-read the tree; trust nothing from memory about its state.
-```
-
-Otherwise every review prompt opens with the selected worker's role switch:
-
-```
-You are slot <slot>, now working as a reviewer. Edit nothing. Read the diff
-cold as if someone else wrote it. If you wrote any of the code, argue against
-your own choices as an adversary would.
+You are the unit's code reviewer for <unit>, phase <N>. Edit nothing. Read
+config/review/code.md at your first review and when it changes. Your first
+command is git -C <worktree> rev-parse HEAD; if it is not <head>, report error.
+Re-read the tree; trust nothing from memory about its state.
 ```
 
 In a run's own-worker review, the opening also gives the concrete
 `board.sh role ... review` command for the worker's first tool call. The reviewer
 narrates each change of activity as a short output line so the wrapper
 heartbeat remains live, and never polls, sleeps or narrates a wait. It receives no
-heartbeat path and never receives `${IMPL_SUMMARY}`. `review.sh` verifies that
-the working tree did not change.
+heartbeat path and never receives `${IMPL_SUMMARY}`. The reviewer runs read-only.
 
 Do not repeat the implementer's listed verification or audit style. A reviewer
 may run one specific omitted check only when a plausible regression lies
@@ -104,11 +89,9 @@ with `verify.sh` per the `## Builds and tests` section of
 <WritePromptContract/> item 3, which every Codex review prompt carries verbatim. Broad reviews apply
 <TypeDesignContract/>; closure reviews apply only <ClosureReview/>.
 
-For a pool review, the Three Gods and Type Design Contract sections each hold
-the one line `As in your standing instructions.` and name no file; this also
-applies to the broad and closure prompt forms below. Otherwise every review
-prompt carries the inline Three Gods sentence and the Type Design Contract: verbatim
-for a new worker, or by <WritePromptContract/> item 7's pointer for a follow-up.
+Every review prompt carries the Three Gods sentence and the Type Design
+Contract under <WritePromptContract/>. Its standing-instructions line names
+`config/review/code.md`.
 
 A broad review's prompt names its lens per <TeamReview/> and asks that lens's
 questions and no others; a closure review names no lens.
@@ -223,8 +206,10 @@ final diff only.
 <DualReview>
 1. If `EARLY_REVIEW=launched`, the `adversary` is already armed and
    `${REVIEW_PASS}` already incremented: apply <ReviewDiffContract/> to the
-   completed tree, keep the final diff and ready sentinel for step 3, and keep
-   `${REVIEW_DISPATCH_HANDLE}` as that lens's handle. Otherwise increment
+   completed tree, deliver the final diff and ready sentinel per
+   <EarlyReviewArm/> (the assign dispatch then sends that reviewer its Stage 2),
+   reset `EARLY_REVIEW=none`, and keep `${REVIEW_DISPATCH_HANDLE}` as that
+   lens's handle. Otherwise increment
    `${REVIEW_PASS}`. Pass 1 is the phase's broad review and runs the selected
    lenses of <TeamReview/> over <BroadReviewPrompt/>; later passes are one
    reviewer over one repair, per <ClosureReview/>.
@@ -249,61 +234,22 @@ final diff only.
 
    Use the completed diff for this decision even when `adversary` was armed
    early. All broad reviewers read the same review copy and final diff.
-   In a production whose doc names a review pool, create each prompt with
-   <ReviewPromptContract/>'s pooled opening. Otherwise choose each lens's open
-   worker under <TeamReview/>, apply <RoleReassignment/> when its role changes,
-   and create the prompt with that slot's role-switch opening.
-3. Launch each reviewer under <DispatchContract/>, pass 1's in one message so
-   they run concurrently — `contract` and, when armed, `rerun` if the adversary
-   was armed early; otherwise `adversary`, `contract`, and `rerun` when armed.
-   If `EARLY_REVIEW=launched`, deliver its final diff and ready sentinel in that
-   message per <EarlyReviewArm/> so `review.sh` sends it Stage 2; then reset
-   `EARLY_REVIEW=none`. Do not launch a second adversary.
-   The `rerun` result is `${PHASE_DIR}/review_findings_${REVIEW_PASS}_rerun.txt`.
-   When the production doc names a review pool:
+   Create each lens's prompt under <ReviewPromptContract/>.
+3. Launch each reviewer under <DispatchContract/>. Launch pass 1's lenses in
+   one message so they run at once: `adversary`, `contract`, and `rerun`
+   when armed. When the adversary is already armed, launch `contract` and,
+   when armed, `rerun`. Each call uses:
 
    ```sh
-   bash ~/.claude/scripts/direct/review.sh --pool code \
-     --lease "<slug>/<unit>/<phase>" \
-     --phase "<phase id>" "${SESSION_DIR}" "${WORKING_DIR}" \
-     "${PHASE_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md" review \
-     "<responsibility>" "<activity>" "${REVIEW_PASS}" <lens>
+   bash ~/.claude/scripts/direct/assign.sh --role review --lens <lens> \
+     --pass "${REVIEW_PASS}" --phase "<phase id>" \
+     --session-dir "${SESSION_DIR}" --cwd "${WORKING_DIR}" \
+     --prompt "${PHASE_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md"
    ```
 
-   A pool closure uses `review_prompt_${REVIEW_PASS}.md` and omits the lens.
-   Otherwise, for an open worker:
-
-   ```sh
-   bash ~/.claude/scripts/direct/review.sh --to "<full-worker-name>" \
-     --phase "<phase id>" "${SESSION_DIR}" "${WORKING_DIR}" \
-     "${PHASE_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md" review \
-     "<responsibility>" "<activity>" "${REVIEW_PASS}" <lens>
-   ```
-
-   A closure review passes no lens and keeps the unsuffixed artifacts:
-
-   ```sh
-   bash ~/.claude/scripts/direct/review.sh --to "<full-worker-name>" \
-     --phase "<phase id>" "${SESSION_DIR}" "${WORKING_DIR}" \
-     "${PHASE_DIR}/review_prompt_${REVIEW_PASS}.md" review \
-     "<responsibility>" "<activity>" "${REVIEW_PASS}"
-   ```
-
-   If every open worker is busy, choose an unused role-named slot (`review`, then
-   `review2`) and open and retain it; for example:
-
-   ```sh
-   bash ~/.claude/scripts/direct/review.sh --slot review \
-     --phase "<phase id>" "${SESSION_DIR}" "${WORKING_DIR}" \
-     "${PHASE_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md" review \
-     "<responsibility>" "<activity>" "${REVIEW_PASS}" <lens>
-   ```
-
-   Only a review outside a run calls `review.sh` with neither `--to` nor
-   `--slot`.
-
-   Keep every blind-review handle; the run's one notifier instance covers the
-   whole Claude set, and the Codex poll covers its set.
+   A closure review omits `--lens` and uses `review_prompt_${REVIEW_PASS}.md`.
+   Keep each dispatch handle. The allocator resumes `review`, then `review2`
+   when the first is busy. Read the summary path each dispatch returns.
 4. While they run, perform the main review. Pass 1 reads changed code in risk
    order: Work Order paths, public API/traits/registration/plugin wiring, then
    remaining hunks. Verify spec, extras, codebase fit, <TypeDesignContract/>, and
@@ -327,19 +273,16 @@ final diff only.
    while blind reviewers remain active, read each log once, cancel them all, and
    close each one's own pass with
    `UNIT_TEAM_ROLE=<worker> … finish-pass --status canceled
-   --orphaned-launcher` per <PassOwnership/>, using each selected review slot
-   unless the production doc names a review pool. With a pool, read each
-   review's slot from the one line in `${PHASE_DIR}/review_slot_<lens>`;
-   for a closure, use `${PHASE_DIR}/review_slot`. A missing file means that
-   launcher opened no pass, so skip its cancel call. Then open and gate the
+   --orphaned-launcher` per <PassOwnership/>, using each selected review slot.
+   A missing slot means that launcher opened no pass; skip its cancel call.
+   Then open and gate the
    finding and apply <FixDispatch/> with useful
    partial-review evidence. Preempt at most once per phase; never edit while an
    old-diff review remains active. A canceled review supplies no verdict or
    direct-fix agreement.
 6. Otherwise finish the main pass and let <DispatchContract/> await every blind
-   reviewer by its host-specific path. Each `reviewed` loads its own
-   `${PHASE_DIR}/review_findings_${REVIEW_PASS}_<lens>.txt` — a closure review, its unnumbered
-   symlink — into `${AGENT_REVIEW}`. A lens that reports `error` is named in one
+   reviewer by its host-specific path. Each completed dispatch loads the summary
+   named by its handle into `${AGENT_REVIEW}`. A lens that reports `error` is named in one
    line and the pass continues on the readings that landed, so the synthesis
    records which lens is missing rather than counting it as a completed reading.
    Numbered artifacts remain available.

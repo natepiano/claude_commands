@@ -71,54 +71,29 @@ Own what a build may use and when it starts: memory admission and the memory que
 
 **Ruled out:** a second JSON/flock writer in bash (the shell delegates to `memory_admit.py tripwire`); the process table in the tripwire (the gate reads only the pids the test's ledger names).
 
-### Phase 2 — The merge gate sets the tripwire for every test module, and every caller's tests fake both readings  · status: todo
-**Depends on:** Phase 1
+### Phase 2 — The merge gate sets the tripwire for every test module, and every caller's tests fake both readings  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** every test module in the merge gate runs with the tripwire set; a module that reads live memory fails the gate with the reading named, and no module in the suite does.
-
-**Spec:**
-
-1. **The gate sets the tripwire.** `test_module_environment` adds `BUILDLOG_LIVE_MEMORY_TRIPWIRE=<root>/live-memory-reads.jsonl` (`root` is the module's temporary folder). The `types` suite does not get it.
-2. **The gate fails a tripped module.** `finish_gate_job` reads `live-memory-reads.jsonl` like `build-tool-calls.jsonl`: for each line it appends `<module>: a test read live memory <reading>: <shlex-joined argv>` to the output, and any line sets status 1. Each line is a JSON object `{"reading": <path>, "argv": [...], "pid": <pid>}`, not the argv list that `build-tool-calls.jsonl` holds. Rename `GateJobResult.build_tool_started` to `tripwire_tripped` (true for a build-tool call or a live memory reading); :859 keeps a tripped module out of the alone rerun, as it does now for build tools. Update every reader of the old field name.
-3. **Find the set.** With items 1–2 in place, run the full merge gate with the worktree's own runner, since `~/.claude` main's copy has neither item: `env HERDR_BIN=/nonexistent/herdr python3 <worktree>/scripts/production/merge_gate.py --checkout <worktree> --tests-only --full` (`--checkout` selects the test tree only; the runner code is the file that runs). Every module that fails with `a test read live memory` goes on the list in the phase report, with its owner (Delegation Context survey).
-4. **Fix each module on the list.** Each module takes its memory variables from `fake_memory_readings` (Phase 1). Where a module already writes its own meminfo for a test value (for example `test_record.py` :249 compares `MemAvailable: 12582912 kB`), it keeps that value and writes it to the helper's file, or keeps its own file and adds the helper's `BUILDLOG_MEMORY_PRESSURE` entry. Assertions stay as they are. A module whose fix needs more than adding the helper goes to the unit director, who routes it to its owner with the gate output; it does not block the rest.
-5. **The pressure-only leaks the survey names** get the helper's `BUILDLOG_MEMORY_PRESSURE` entry even when the gate run in item 3 does not trip them: `scripts/buildlog/test_record.py`, `scripts/buildlog/test_mac_idle.py`, `scripts/direct/test_verify_doc.py`, `test_verify_release_ack.py`, `scripts/production/test_dailies_render_holds.py`. The tripwire trips on the read itself, not on a wait, so item 3 lists them on any machine; this item is the check that it did. Where a module takes its environment from a shared fixture module (`verify_*_test_support.py`, or another test module it imports), the fix goes in that fixture module, not in each consumer. The modules the survey lists under fake both need no change.
-6. **A test of the gate** in `scripts/production/test_merge_gate_suites.py`, beside `test_module_tool_calls_fail_even_when_its_tests_pass` :132: a module folder whose `live-memory-reads.jsonl` has one line gives status 1, the `a test read live memory` line and `tripwire_tripped` true; an empty or absent file leaves status as the module returned it. And an end-to-end case through `run_gate`, like the build-tool test: a fixture module whose tests pass but which writes one record line to the `BUILDLOG_LIVE_MEMORY_TRIPWIRE` path it receives makes the gate exit 1, prints `<module>: a test read live memory <reading>: <args>`, runs the module once (no `Rerun alone:`), and gives two modules distinct record paths; the `types` job gets no `BUILDLOG_LIVE_MEMORY_TRIPWIRE`. The build-tool tests stay as they are.
-7. **Docs.** `docs/as-built/merge-gate-and-test-speed.md`: the tripwire line names the live memory tripwire next to the build-tool tripwires. `docs/as-built/build-memory-admission.md`: the tests invariant says that the merge gate sets the tripwire for every module, and names its two limits: `test_memory_admit.py` `test_default_pressure_still_returns_pressure_when_tripwire_is_unset_or_empty` reads live pressure with the tripwire removed, by design; and a reading whose record write fails still refuses but leaves no record, so the gate sees only recorded readings. The same doc's floor sweep **Order** paragraph (:209) still teaches the order before Phase 3: correct it to the shipped order in `build-targets.md`, and say that the 60-minute window gives recent output a lower eviction priority, not full protection (Phase 3 architect review, F14).
+- `test_module_environment` sets `BUILDLOG_LIVE_MEMORY_TRIPWIRE=<module tmp>/live-memory-reads.jsonl` for every test module. The `types` suite gets no tripwire.
+- `finish_gate_job` reads that file. Each line is `{"reading": <path>, "argv": [...], "pid": <pid>}` and adds `<module>: a test read live memory <reading>: <args>` to the output and sets status 1. A line that does not parse also trips the module, with its raw text in the output.
+- `GateJobResult.tripwire_tripped` (was `build_tool_started`) is true for a build-tool call or a live memory reading. A tripped module is not rerun alone, and the hold retry keeps the result.
+- The five pressure-only leaks (`test_record.py`, `test_mac_idle.py`, `test_verify_doc.py`, `test_verify_release_ack.py`, `test_dailies_render_holds.py`) fake both readings with `fake_memory_readings`. No other module in the suite reads live memory.
 
 **Files:**
-- `scripts/production/merge_gate.py` — items 1–2 (owner: natedev showrunner).
-- `scripts/production/test_merge_gate_suites.py` — item 6 (owner: natedev showrunner).
-- `scripts/direct/test_verify_doc.py`, `scripts/direct/test_verify_release_ack.py` — item 5 (owner verify-unit).
-- `scripts/buildlog/test_mac_idle.py` — item 5 (owner verify-unit).
-- `scripts/buildlog/test_record.py` — item 5 (owner report-unit).
-- `scripts/production/test_dailies_render_holds.py` — item 5 (owner natedev showrunner).
-- `docs/as-built/merge-gate-and-test-speed.md`, `docs/as-built/build-memory-admission.md` — item 7.
+- `scripts/production/merge_gate.py` — tripwire environment, record read, tripped result.
+- `scripts/production/test_merge_gate_suites.py` — unit and end-to-end tripwire tests.
+- `scripts/buildlog/test_record.py`, `scripts/buildlog/test_mac_idle.py`, `scripts/direct/test_verify_doc.py`, `scripts/direct/test_verify_release_ack.py`, `scripts/production/test_dailies_render_holds.py` — fake both readings.
+- `docs/as-built/merge-gate-and-test-speed.md`, `docs/as-built/build-memory-admission.md` — the tripwire, its two limits, and the shipped floor sweep order.
 
-The item 3 gate run listed no other module, so the folder entries are now exact paths (Phase 3 architect review, F12).
+**Binds later work:** every test module runs under the tripwire in the merge gate, so a new test fakes both readings with `fake_memory_readings` or fails the gate. A test that trips on purpose uses a private record path, never the inherited one.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — items 1–5 and 7: the gate change, the full gate run, and each module's environment change. The writer reports the item 3 list with each module's owner and the failing test names.
-- `test` — item 6, written from this Spec alone.
+**Gotchas:**
+- `test_memory_admit.py` `test_default_pressure_still_returns_pressure_when_tripwire_is_unset_or_empty` reads live pressure with the tripwire removed, by design.
+- A reading whose record write fails still refuses but leaves no record. The gate sees only recorded readings.
+- A shell-side read records through `memory_admit.py tripwire <path>`, so `argv` names the checker, not the test. The output line takes the module name from the job.
 
-**Showrunner approval (2026-10-29):** edits to other owners' test files only add the helper to each test; nothing else in those files changes. verify-unit is a natedev unit until natedev transfers it: trial-merge its files against `origin/natedev-verify` and `origin/natedev`, and name each owner in the notice's also-touches line.
-
-**Constraints from prior phases:**
-- Phase 1's `fake_memory_readings` signature (`scripts/lint/memory_test_support.py`). An inherited `BUILDLOG_LIVE_MEMORY_TRIPWIRE` stays in use, an inherited empty value stays empty, and the default `root/"live-memory-reads.jsonl"` applies only when the variable is absent. So under item 1 a module's helper calls write to the gate's record file.
-- The refusal text: `live memory reading <live path> in a test; fake BUILDLOG_MEMINFO and BUILDLOG_MEMORY_PRESSURE (scripts/lint/memory_test_support.py)`. `memory_admit.py` `check_memory_reading` writes the record and raises `LiveMemoryReading`; a record write that fails still raises but leaves no line. The gate's record folder exists for the whole module run, so only a test that removes it can lose a record; the gate detects recorded readings only.
-- A shell-side read (`memory_gate.sh`) records through `memory_admit.py tripwire <path>`, so its `argv` names the checker, not the test. The gate's output line names the module from the job, not from `argv`.
-- Tests that trip on purpose use a private record path and never the inherited one: `test_memory_admit.py` :1128 and :1215, `test_brp_launch_gate.py` :136. Keep that rule in every fix, or the gate fails the module.
-- `test_memory_admit.py` `test_default_pressure_still_returns_pressure_when_tripwire_is_unset_or_empty` :1228 reads live `/proc/pressure/memory` with the tripwire removed, by design (it proves live behavior is unchanged). It writes no record; do not change it.
-- The worktree carries natedev 367da4f1 and c495a0b2 (director merge 73a8d903 of `origin/builds` ff44142b). Anchors in this Work Order are that tree's `merge_gate.py` and split tests.
-
-**Acceptance gate:**
-- A `--full` merge gate run with the worktree's runner (item 3's command) green with no `a test read live memory` line; the summary gives the item 3 list before the fixes and its count after (0).
-- `basedpyright` over the Lint directories and the directory of every changed module reports `0 errors, 0 warnings, 0 notes`.
-- The checkpoint notice has one `also touches` line per owner (verify-unit, report-unit, natedev showrunner), each with `git merge-tree --write-tree HEAD origin/<owner branch>` clean, and a trial merge against `origin/natedev`.
-- Module times for `test_brp_launch_gate.py`, `test_record.py` and `test_verify_token_wait.py` from this gate run next to their medians from the merge gate's own module history (`/build:report` has no module rows).
-- Change-Review line: the merge gate fails a test module that reads live machine memory | in a scratch copy of `~/.claude` (`git clone --shared ~/.claude <scratch>`), remove the `BUILDLOG_MEMORY_PRESSURE` entry from `test_brp_launch_gate.py` `setUp`, then run `env HERDR_BIN=/nonexistent/herdr python3 ~/.claude/scripts/production/merge_gate.py --checkout <scratch> --tests-only` | the module fails with `a test read live memory /proc/pressure/memory: …`.
+**Ruled out:** module medians from `/build:report`, which has no module rows; the merge gate's own timing history is the source.
 
 ### Phase 3 — The floor sweep keeps build output that is in use  · status: done
 
@@ -216,7 +191,9 @@ The item 3 gate run listed no other module, so the folder entries are now exact 
 - Change-Review line: temp-clone builds and mend runs reuse the compile cache | in a terminal on natedev, `sccache --show-stats` before and after a second clone's build | the Rust hit count rises by the workspace crates of the second build.
 
 ### Phase 6 — A session can launch an app that is already built without waiting at the BRP launch gate  · status: todo
-**Depends on:** Phase 1
+**Depends on:** Phase 1. verify-unit's cancel-on-change and memory phases also change `verify.sh` and merge first. Merge `origin/builds` after they land. Before the checkpoint notice, trial-merge against `origin/natedev-verify-cancel`, `origin/natedev-verify-memory`, `origin/natedev-verify` and `origin/natedev-verify-token`. The notice names verify-unit in its also-touches line.
+
+**Ruling:** showrunner 2026-10-29 17:00 EDT: the hook decides from a build record that `verify.sh`'s build step writes.
 
 #### Work Order
 
@@ -224,24 +201,25 @@ The item 3 gate run listed no other module, so the folder entries are now exact 
 
 **Spec:**
 
-1. **The hook decides from facts, not a claim.** For a `brp_launch_bevy_app` or `brp_launch_bevy_example` call, the hook finds the target's binary for the exact launch target and profile, and decides freshness without starting a compiler. `cargo build --offline` is still a build and is not allowed (Phase 3 architect review, F5): compare the binary's mtime with the newest input the fingerprint names. A fresh binary skips memory admission; a stale, missing or uncertain one keeps the current wait. The hook's build-hold check stays as it is.
+1. **The hook decides from a build record that the build wrote.** `scripts/direct/verify.sh`'s build step (only the build step) writes a record beside each binary it builds: the `rustc -vV` hash, profile, target, rustflags, features and the build start time. For a `brp_launch_bevy_app` or `brp_launch_bevy_example` call, the hook skips the memory wait only when the launch's inputs match the record AND every dep-info input time is older than the build start. The launch's path comes from `tool_input.path`. No path means the launch waits, because BRP searches from the MCP server's working directory. A missing record, a missing path or any difference means the launch waits. No compiler starts; `cargo build --offline` is still a build and is not allowed (Phase 3 architect review, F5). The hook's build-hold check stays as it is.
 2. **A session can also say so.** A launch call whose session set `BRP_LAUNCH_PREBUILT=1` (or the tool's own flag, if the BRP tool has one) skips admission only when item 1 confirms the binary is fresh; a stale binary still waits, and the hook prints why.
-3. **Tests** in `scripts/hooks/test_brp_launch_gate.py`: fresh binary skips the wait; stale, missing and uncertain binaries wait and start no compiler; the session flag with a stale binary waits; fake memory readings throughout (Phase 1 helper).
+3. **Tests** in `scripts/hooks/test_brp_launch_gate.py`: fresh binary skips the wait; stale, missing and uncertain binaries wait and start no compiler; the session flag with a stale binary waits; fake memory readings throughout (Phase 1 helper). Add a test of the record write in `verify.sh`'s build step with a fake cargo. Keep the suite fast: it grew to 100 s; the target is the old 55 s or less. The hook's probe stays under 1 s.
 
 **Files:**
 - `scripts/hooks/pre-tool-use-brp-launch-gate.sh` — items 1–2.
 - `scripts/hooks/test_brp_launch_gate.py` — item 3.
+- `scripts/direct/verify.sh` — the build-step record only (item 1; owner verify-unit).
+- `scripts/direct/test_verify_token_wait.py` — the record-write test (item 3); it holds the tests of `verify.sh`'s build step.
 - `docs/as-built/build-memory-admission.md` — the hook section. Phases 2 and 10 also edit this doc; the writer puts the section in the phase folder (`as_built_section.md`) and the director places it.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — items 1–2 and the doc section.
-- `test` — item 3.
+**Workers:** `1 writer`
+- `test` — items 1–3 and the doc section, this round (it holds the thread).
 
 **Acceptance gate:**
 - `test_brp_launch_gate.py` passes; the hook's added checks take under 1 s on a fresh hana binary.
 - Change-Review line: launching an already-built Bevy app through BRP starts at once | in a Claude session on natedev with a built hana, launch it with the BRP launch tool | it starts without a `waiting for memory` line.
 
-### Phase 7 — A one-line command summarizes the machine's working set, and the disk-floor sweep uses less memory  · status: todo
+### Phase 7 — A one-line command summarizes the machine's working set, and the disk-floor sweep uses less memory  · status: done
 **Depends on:** Phase 3
 
 #### Work Order
@@ -318,59 +296,42 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 - The notice has `also touches` lines for verify.sh and invoke.sh (verify-unit, against `origin/natedev-verify` and `origin/natedev`), merge_gate.py and the hold callers (their owners, against `origin/natedev`), and build_queue.py (report-unit, against `origin/builds-report`); it confirms no read-side prefix strip remains in `memory_admit.py` or `build_queue.py`.
 - Change-Review line: `/build:queue` shows the repository and the step in separate columns | in a Claude session on natedev while a build waits, type `/build:queue` | each row shows e.g. `hana` and `clippy` apart, and no row reads "hana clippy".
 
-### Phase 9 — The floor sweep counts what a deletion really frees  · status: todo
-**Depends on:** Phase 3
+### Phase 9 — The floor sweep counts what a deletion really frees  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** the floor sweep stops only when its deletions have covered the shortfall. Moved from Phase 3 by the hard-landing rule (closure review pass 3, 2026-10-29): it is new in repair round 3, it is not a regression that Phase 3 caused (the old locked pass had the same gap, because `ln` takes no cargo lock), it breaks nothing that worked, and no test fails. Its effect is small: one pass stops short, and the next step's sweep reads free space again.
-
-**Spec:**
-
-1. `scripts/lint/sweep.py`: `shrink_floor()` calls `freed_by()` after `remove()` has deleted the paths, but budget selection calls it before deletion through `choose()`. Separate the two: a typed reclamation estimate (before deletion, from the scan) and a confirmed deletion account (from link counts read with `lstat` just before each unlink). A file's blocks count as freed only when no other link remains. Links that the same pass removed earlier still count as removed, so the pass does not reject its own unlinks. Both callers use the same two types.
-2. Tests: after the scan, add a hard link from outside the target to one output file; the pass does not count that file's blocks and takes the next candidate until the shortfall is covered. Also: links removed earlier in the pass, a failed removal, and a dry run, through both callers. When no candidate covers the shortfall, the existing exhaustion alert still goes out; the busy-skip and exhaustion tests stay as gates.
+- `scripts/lint/sweep.py` keeps two typed counts apart. `ReclamationEstimate(bytes)` comes from the scan's link counts: `freed_by()` returns it, before any deletion. `ConfirmedDeletion(bytes, failures)` comes from the deletion: `remove()` returns it, summed from each unlink.
+- `remove_entry_at()` reads `os.lstat` just before each unlink. A file's blocks (`st_blocks * 512`) count as freed only when `st_nlink` is 1, so a file with a link outside the target frees nothing. A link that the same pass removed earlier has already lowered the count, so the last link still counts as freed. A failed or partial removal credits only the files it removed.
+- `reclaim(group, scan, remaining, dry_run)` returns the estimate on a dry run and the confirmed account on a real run. Both callers, `shrink()` (orphans and the budget pass) and `shrink_floor()`, use it and the same two types. A dry run deletes nothing and records nothing.
+- `choose()` is gone. `shrink()` and `shrink_floor()` take the next candidate in removal order and subtract the confirmed bytes, until the account covers the shortfall. When no candidate covers it, the exhaustion alert still goes out.
+- `remove_entry()` opens the parent with `O_DIRECTORY | O_NOFOLLOW`. The recursive delete walks with directory fds and checks each directory's identity with `os.path.samestat` before it opens it and again before `rmdir`. A path replaced by a symlink during the pass is not followed and not credited.
 
 **Files:**
-- `scripts/lint/sweep.py` — item 1.
-- `scripts/lint/test_sweep.py` — item 2.
+- `scripts/lint/sweep.py` — the two types, `reclaim`, `remove_entry`, `remove_entry_at`, and the loops in `shrink` and `shrink_floor`.
+- `scripts/lint/test_sweep.py` — tests for an outside link added after the scan, an earlier unlink in the same pass, a failed and a partial removal, the dry run, a directory swapped for a symlink, and the exhaustion alert when an outside link leaves the floor short.
 
-**Workers:** `1 writer`
+**Binds later work:** Phase 4 extends this sweep; its deletions go through `reclaim` and credit only `ConfirmedDeletion` bytes. A new caller of the sweep uses the same two types and does not count from the scan on a real run.
 
-**Acceptance gate:**
-- `test_sweep.py` passes; `basedpyright` over both files reports `0 errors, 0 warnings, 0 notes`.
-- Change-Review line: the floor sweep stops only after it frees the shortfall | run the sweep tests: `python3 -m unittest discover -s scripts/lint -p test_sweep.py` | the outside-link test passes, and the pass takes the next candidate.
+### Phase 10 — Memory admission names the reservation a waiting step waits on  · status: done
 
-### Phase 10 — Memory admission names the reservation a waiting step waits on  · status: todo
-**Depends on:** none
+#### As-built
 
-**Approved:** showrunner 2026-10-29, one writer, ready by 17:00 EDT for verify-unit's Phase 8 (it names the holder of a wait for hierarchies' wait experiment; starts about 18:30 EDT). Form agreed with verify-unit.
-
-#### Work Order
-
-**Goal:** a waiting build step can ask memory admission which reservation blocks it now, with no extra Python start per wait poll.
-
-**Spec:**
-
-1. `scripts/lint/memory_admit.py` gets `current_blocker(waiter_path)`, read only: it takes the admission lock in shared mode (or reads one snapshot) and writes nothing. It returns one of three typed results: one reservation blocks the step (its owner `session_id`, `session_name`, and `pool: "memory"`); only the unit is known (`unit`); or no single reservation blocks it. Build it from the existing queue view, `decide`, `live_reservations` and `live_waiters`; do not add a second admission rule.
-2. A verb `memory_admit.py blocker --waiter <waiter file>` prints that result as one JSON line: `{"session_id": …, "session_name": …, "pool": "memory"}`, `{"unit": …}`, or `{}`. Exit 0 in all three cases; exit 2 only when the waiter file is gone.
-3. The result `memory_admit.py check` already prints on each wait poll (read by `memory_gate.sh` at :192 and :218) carries the same blocker object, so the wait loop sees a holder change on the poll it already makes. Existing fields and callers of that output stay as they are.
-4. Tests in `scripts/lint/test_memory_admit.py` for each result shape, the exit codes, the `check` field, and that the verb writes nothing (state folder bytes and mtimes unchanged). Tests fake both memory readings (`memory_test_support.py`).
-5. Docs: `docs/as-built/build-memory-admission.md` names the verb, the field and the three shapes.
+- `memory_admit.py` has `current_blocker(waiter_path)`. It reads the admission ledger under a shared lock. It does not create the lock, prune stale records or change state files. It uses the same queue view and `decide` rule as `check`; there is no second admission rule.
+- The lookup names a reservation only when removing it alone admits the waiter and no other single reservation does. It removes that reservation's full build charge and growth promise, then applies the admission rule. It never assigns a pressure hold to a reservation.
+- The verb `memory_admit.py blocker --waiter <waiter file>` prints one JSON line and exits 0: `{"session_id":…,"session_name":…,"pool":"memory"}` when the session is known; `{"unit":…}` when only the cgroup sidecar names a systemd scope or service; `{}` for a ready step, a pressure hold, queue priority, several possible blockers or unknown ownership. A gone waiter file gives exit 2. A stale waiter still on disk gives `{}` and exit 0.
+- `CheckResult.blocker` carries the same typed result from the snapshot that admission uses. With `BUILDLOG_MEM_BLOCKER=1`, `check` appends one JSON blocker field to its pipe-separated output: field 16, or field 19 with `BUILDLOG_MEM_DETAIL=1`. JSON escapes a pipe in a name as `\u007c`. Without the opt-in, the 15-field and 18-field forms do not change.
 
 **Files:**
-- `scripts/lint/memory_admit.py` — items 1-3.
-- `scripts/lint/test_memory_admit.py` — item 4.
-- `docs/as-built/build-memory-admission.md` — item 5 (Phase 2 also edits it; this phase adds a section only).
+- `scripts/lint/memory_admit.py` — `current_blocker`, the `blocker` verb and the `check` blocker field.
+- `scripts/lint/test_memory_admit.py` — tests for each result shape, the exit codes, the `check` field, and that the verb writes nothing.
+- `docs/as-built/build-memory-admission.md` — the "Name the reservation that blocks a waiter" section.
 
-**Workers:** `1 writer`
+**Binds later work:** A change to the admission charge or holds flows into the blocker lookup, because the lookup reuses `decide`; the lookup must follow each new charge and hold. The verify memory wait reads the blocker as `check` field 16 (19 with detail) under `BUILDLOG_MEM_BLOCKER=1`, so it sees a holder change on the poll it already makes, with no separate Python start.
 
-**Acceptance gate:**
-- The memory admission tests pass; `basedpyright` over both Python files reports `0 errors, 0 warnings, 0 notes`; the merge gate is green.
-- The commit is messaged to verify-unit.
-- Change-Review line: a waiting build step can name what it waits on | in a Claude session on natedev while a build waits for memory, run `python3 ~/.claude/scripts/lint/memory_admit.py blocker --waiter <its waiter file in ~/.local/state/buildlog/admission>` | it prints one JSON line naming the session that holds the blocking reservation, or `{}`.
+**Gotchas:** Releasing a measured reservation frees only its resident bytes. Its swap bytes stay part of the build charge but do not count as freed RAM.
 
 ### Phase 11 — Memory admission promises what each repository's steps really use  · status: todo
-**Depends on:** Phase 10 and Phase 12 (same file, `memory_admit.py`)
+**Depends on:** Phase 10 and Phase 12 (same file, `memory_admit.py`); verify-unit's Phase 4 (branch `natedev-verify-memory`). Start after that merge reaches `origin/builds`, and merge `origin/builds` first.
 
 **Approved:** showrunner 2026-10-29 (ETA 22:00 EDT, after Phase 12), from the widget wait study (07:09–11:43 EDT): a measured floor per repository for filtered test runs, and the promises that are 3x or more too high.
 
@@ -385,11 +346,11 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 
 **Spec:**
 
-1. Replay first: for every step in the 14-day history, compute the promise that today's `expected_peak` gives from the history before that step, and compare it to the step's measured anon peak. Report, per repository and step, the count of promises under half the measured peak and over 3x the measured peak. Save the table in the as-built doc. The replay runs again on the result: neither count rises for any repository, and each count falls in total.
+1. Replay first: for every step in the 14-day history, compute the promise that today's `expected_peak` gives from the history before that step, and compare it to the step's measured anon peak. Report, per repository and step, the count of promises under half the measured peak and over 3x the measured peak. Fresh runs (`crates_compiled` 0) and compile runs are separate rows. Save the table in the as-built doc. The replay runs again on the result: neither count rises for any repository, and each count falls in total.
 2. `expected_peak` (`scripts/lint/memory_admit.py`): when a repository has 5 or more keyed rows, use only keyed rows; old unkeyed rows count only when keyed rows are fewer than 5.
 3. A repository with 1 to 4 own runs does not take the all-repository pool p90. Use the largest of its own runs, or the pool when that is lower. A repository with no own runs keeps today's rule.
-4. Filtered runs: replace the single `FILTERED_FLOOR` with a floor per repository, from that repository's measured filtered runs that compiled (check or build work in the same step). Keep 1 GiB as the floor for a repository with no such runs. `expected_peak()` returns `min(filtered, full)` today, so a floor above the full-run estimate would not hold: the floor wins over that minimum, and a test covers a floor above the full estimate; the replay includes that case (Phase 3 architect review, F11). Comment each new constant with the measurement that set it, as the current constants are.
-5. Tests in `scripts/lint/test_memory_admit.py`: keyed rows win over unkeyed rows; 1–4 own runs do not take the pool; the per-repository filtered floor; each test fakes both memory readings.
+4. A promise does not mix compile runs and no-compile runs (showrunner 2026-10-29 17:11 EDT, from the user's rule). A compile run's promise comes only from earlier runs with `crates_compiled > 0`, in the same order as `filtered_peak` today: the exact filter set, then the package's filtered runs, then the check/build peaks. The 1 GiB floor stays only for fresh runs (`crates_compiled` 0) and for a repository with no compile history; do not raise the fresh floor. Fresh runs are verify Phase 4's: they get the p90 of earlier fresh runs of the same package and scope, at least `FILTERED_FLOOR`. `expected_peak()` returns `min(filtered, full)` today, so a compile-run promise above the full-run estimate would not hold: the compile-run promise wins over that minimum, and a test covers a promise above the full estimate; the replay includes that case (Phase 3 architect review, F11). Comment each new constant with the measurement that set it, as the current constants are.
+5. Tests in `scripts/lint/test_memory_admit.py`: keyed rows win over unkeyed rows; 1–4 own runs do not take the pool; a compile run's promise uses only compile runs; a fresh run gets the fresh-run p90, at least `FILTERED_FLOOR`; each test fakes both memory readings.
 6. Docs: `docs/as-built/build-memory-admission.md` gets the replay table before and after, and the new rules. The replay script lives in the session folder and is not committed.
 
 **Files:**
