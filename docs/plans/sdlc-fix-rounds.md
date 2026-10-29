@@ -178,49 +178,27 @@ For active process redesigns, as we are currently undergoing with promotions and
 **Ruled out:** picking a resume phase by team slot, because a review sent to a fix seat records slot fix while the durable slot is impl.
 
 ### Phase 6 — The round summary counts reviewed phases only  · status: done
-**Depends on:** Phase 1
 
-#### Work Order
+#### As-built
 
-**Goal:** the `history.py rounds` summary reports the median, the share of phases with 3 or more rounds and the fix-time share over reviewed phases only, and counts the unreviewed phases on their own line.
-
-**Spec:**
-
-Change review row C2 (`/history rounds`, merged 54774de4) came back from the user (via the sdlc showrunner, 2026-10-28): "does not work". The user asked "how can the median be 0 rounds?" With `--since 60d --status all`, 1456 of 2542 phases show 0 rounds, and 1167 of those have no review recorded (0 reviews when joined to `history.py phases` on run and phase). Among reviewed phases the median is 1.
-
-1. **A reviewed phase** has at least one recorded review pass: a `pass_started` event with `pass_kind` `review` in the same run with the same `phase_instance_id`. This definition is authoritative; `rounds.py` computes it. `history.py phases` groups by run and phase number, so it can differ where a phase number repeats, a review was interrupted, or a window edge cuts a phase. Tests cover each of those three cases.
-2. **The summary statistics** in `rounds.run` use reviewed phases only: the median rounds, the phases with 3 or more rounds and their share, and the share of fix time those phases hold. The counted line names both numbers, for example `2542 phases counted; 1375 reviewed; median 1 rounds over reviewed phases`.
-3. **Unreviewed phases** get their own summary line with a count, for example `1167 phases with no review recorded (not in the median or shares)`. They stay in the table and the JSON rows, and each row carries `reviewed` (true or false).
-4. **The JSON `_meta`** adds `reviewed_phases` and `unreviewed_phases`. `median_rounds`, `heavy_phases`, `heavy_phase_share`, `heavy_fix_seconds` and `heavy_fix_share` use the reviewed set, and a new `reviewed_fix_seconds` is the denominator of `heavy_fix_share`. `phases`, `fix_seconds`, `rounds` and the cause counts stay over all listed phases. Tests cover an empty reviewed set (median 0, shares 0, no error) and an unreviewed phase with repair time (kept out of the shares, kept in `fix_seconds`).
-5. **The API stays.** `phase_rounds`, `Round` and every existing `PhaseRounds` field are unchanged; phases-unit imports them. `PhaseRounds` may gain one field (`reviews: int`) when `load_phases` can count it from the events it already reads.
-6. **Tests** in `scripts/history/test_rounds.py`: a set with unreviewed zero-round phases gives the median of the reviewed phases; the unreviewed count line; the `reviewed` row field and the `_meta` fields; a phase with a review and no repair counts as reviewed with 0 rounds.
-7. **Docs.** The `rounds` line in `commands/history.md` says that the statistics cover reviewed phases. The unit director edits the Phase 1 As-built summary-line text in the plan doc at the checkpoint; workers do not edit the plan.
-8. **Study summary** (row C5, returned by the showrunner, 2026-10-28). `docs/plans/sdlc-fix-rounds-study.md` is 1106 lines and has no summary at the top. Add a short summary under its title: 15 phases, 260 rounds, 271 h; fix-failed 36% of rounds and 49% of time; spec-gap 17% and 19%; mechanical 15% and 11%. Take each number from `## Totals` and check it there. Remove the "median 0 rounds" figure. Every median in a footer or summary line of the study counts reviewed phases only, as item 2 does.
-9. **A check that shows the live cause** (row C6). The Change-Review line gives a command that prints the live cause for run `fb5b2c96` phase 202 (phase instance prefix `8013edcb`), filtering on `phase_instance_id` so it selects round 2 of that instance, for example a `--format json` `jq` filter that prints `[2,"live",...]`.
-10. **A short check for one phase's rounds** (row C7). The old check printed 397 KB of JSON. The Change-Review line gives a filter that prints only the two round lines of run `8f4c2e88` phase 38 (round 39: F001–F006, round 40: F007–F009).
-11. **A refusal demo a person can run** (row C24). The Phase 5 check needed a live `/unit:direct` run with open findings; in a fresh session folder `findings.py dispatch --covers F001` says `gate says converged; there is nothing to dispatch`. Add `scripts/direct/demo_refusals.sh`: it takes no arguments, makes its own scratch folders with `mktemp -d` under `/tmp`, isolates the recorder (`UNIT_HISTORY_DIR`, `PLAN_DELEGATE_HISTORY_DIR`, `HOME`, `AGENTS_CONFIG_FILE` set to scratch paths, `CLAUDE_CODE_SESSION_ID` unset), runs the `findings.py` and `progress_history.py` beside it, removes its folders on exit, and prints each refusal under a one-line heading that names the rule. The five refusals, in order: `--accepted-checks is required: name affected accepted checks or "none: <why>"`; `Astra review due for F001; record it with findings.py astra`; ``Missing --keep for F001: route it with `findings.py route` or give the kept category and its evidence``; `Missing phase: --phase-id is required for a recorded run`; `Stale prompt phase: Phase 9 — Some other phase; open phase is Phase 1 — Demo phase`. After each refusal it shows the call that passes. It exits 0 only when every refusal and every pass happened as expected, and names the first step that did not otherwise. The person types `~/.claude/scripts/direct/demo_refusals.sh` in any terminal. A test runs the script and checks the five refusal texts and exit 0.
+- A phase is reviewed when its run and phase instance record a `pass_started` event with `pass_kind` `review`. `PhaseRounds` gains `reviews: int`, counted in `load_phases`; `phase_rounds`, `Round` and the other `PhaseRounds` fields do not change.
+- `rounds.run` takes the median rounds, the share of phases with 3 or more rounds and the fix-time share of those phases over reviewed phases only. An empty reviewed set gives median 0 and shares 0. `phases`, `fix_seconds`, `rounds` and the cause counts stay over all listed phases.
+- The table has a `reviewed` column (`yes`/`no`). The summary prints `<n> phases counted; <r> reviewed; median <m> rounds over reviewed phases`, then `<u> phases with no review recorded (not in the median or shares)`, then `<h> reviewed phases with >=3 rounds (<s>%) hold <f>% of reviewed fix time`.
+- Each JSON row carries `reviewed` (bool). `_meta` adds `reviewed_phases`, `unreviewed_phases` and `reviewed_fix_seconds`, the denominator of `heavy_fix_share`.
+- `docs/plans/sdlc-fix-rounds-study.md` opens with a summary taken from `## Totals`: 15 phases, 260 repair rounds, 271 h; failed fixes 36% of rounds and 49% of time; spec gaps 17% and 19%; mechanical 15% and 11%. The study has no "median 0 rounds" figure, and its evaluation section takes medians and shares over reviewed phases.
+- `scripts/direct/demo_refusals.sh` takes no arguments (exit 2 with any). It makes its own scratch folder with `mktemp -d` under `/tmp` and removes it on exit. It sets `HOME`, `XDG_CACHE_HOME`, `UNIT_HISTORY_DIR`, `PLAN_DELEGATE_HISTORY_DIR`, `AGENTS_CONFIG_FILE`, `AGENTS_LOCAL_CONFIG_FILE` and `UNIT_CONFIG`/`PLAN_DELEGATE_CONFIG` to scratch paths, writes fixed thresholds to that config, unsets `CLAUDE_CODE_SESSION_ID`, and adds PATH fallbacks for the system, per-user and Homebrew tool folders. It runs `findings.py` and `progress_history.py` beside it through `../lib/py`, prints each of the five refusals under a heading that names the rule, shows the passing call after each, then prints `all five refusals shown` and exits 0. A failed step prints `FAILED: <step>` and exits 1.
+- `scripts/lib/py` needs Python 3.11 or later, because `findings.py` and `progress_history.py` import `datetime.UTC`. Its cache key is `python3-3.11`.
 
 **Files:**
-- `scripts/history/rounds.py` — the reviewed count and the summary.
-- `scripts/history/test_rounds.py` — the tests above.
-- `commands/history.md` — the `rounds` line.
-- `docs/plans/sdlc-fix-rounds-study.md` — the summary at the top (item 8).
-- `scripts/direct/demo_refusals.sh` — the refusal demo (item 11).
-- `scripts/direct/test_demo_refusals.py` — its test.
+- `scripts/history/rounds.py`, `scripts/history/test_rounds.py` — the reviewed count, the summary and their tests.
+- `commands/history.md` — the `rounds` line says the median and shares cover phases with a recorded review start.
+- `docs/plans/sdlc-fix-rounds-study.md` — the summary at the top.
+- `scripts/direct/demo_refusals.sh`, `scripts/direct/test_demo_refusals.py` — the refusal demo and its test.
+- `scripts/lib/py` — the 3.11 floor; the scripts and test fixtures that name the floor say 3.11.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — `scripts/history/rounds.py`, `commands/history.md`, `docs/plans/sdlc-fix-rounds-study.md` (item 8), `scripts/direct/demo_refusals.sh` (item 11), and the two check commands for items 9 and 10, each run on the live records with its output in the summary.
-- `test` — `scripts/history/test_rounds.py` and `scripts/direct/test_demo_refusals.py`, written from this Spec alone.
+**Binds later work:** "Did the changes cut rounds and keep the work" takes proposal statistics from exposed rows, not from the reviewed-only `_meta`.
 
-**Constraints from prior phases:** `rounds.py` is an importable API (Phase 1 **Binds later work**); `history.py routed` (Phase 5) reads the same run records and is not changed.
-
-**Acceptance gate:**
-- `env HERDR_BIN=/nonexistent/herdr python3 ~/.claude/scripts/production/merge_gate.py --checkout <worktree> --tests-only` green, run from `~/.claude` main.
-- `basedpyright scripts/history` reports `0 errors, 0 warnings, 0 notes`.
-- `history.py rounds --since 60d --status all` on the live records prints the reviewed count, the unreviewed line and a median over reviewed phases. A cross-check against `history.py phases --since 60d` (reviews of 1 or more, joined on run and phase) names each difference and its cause from item 1.
-- The item 9 and item 10 commands print what their rows ask for when run on the live records, and the study summary numbers match `## Totals`.
-- `scripts/direct/demo_refusals.sh` run from a fresh terminal prints the five refusal texts of item 11 and exits 0.
-- Change-Review lines, one per returned row (C2, C5, C6, C7, C24): what changed | the check command | what it prints. Each fix comes back as a new row.
+**Gotchas:** A Python 3.10 interpreter cannot run `findings.py` or `progress_history.py`; `lib/py` skips it. A cache file under the old `python3-3.10` key is not read.
 
 ### Phase 7 — Did the changes cut rounds and keep the work  · status: todo
 **Depends on:** Phase 5, Phase 6 (it redefines the `history.py rounds` medians and shares)
