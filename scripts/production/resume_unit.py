@@ -13,7 +13,8 @@ Every account links its `projects` folder to the shared one, so a units account 
 retire reads the same transcript.
 
 A note can include ", folder <path>" after the session id. Older notes find the transcript across
-all config dirs and read its first cwd; none, ambiguous project folders or no cwd refuse. When the
+all config dirs and read the first cwd matching the project folder that holds it; none, ambiguous
+project folders or no matching cwd refuse. When the
 start folder is outside the worktree, resume uses --cwd there and skips worktree and branch steps.
 When the note has no session id, the unit's mark, newest retained shutdown record or interactive
 transcript supplies it; no evidence refuses both a dry run and a real run.
@@ -114,7 +115,7 @@ def has_worktree(unit: RetiredUnit) -> bool:
 def resume_folder(unit: RetiredUnit) -> Path:
     if isinstance(unit.start_folder, RecordedStartFolder):
         return unit.start_folder.path
-    return retire_unit.director_start_folder(unit.session_id)
+    return retire_unit.director_resume_folder(unit.session_id)
 
 
 def has_transcript(unit: RetiredUnit) -> bool:
