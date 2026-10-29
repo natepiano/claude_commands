@@ -7,7 +7,9 @@ A Bash call that runs `git commit` with a checkpoint(...) subject must carry a l
 its -F file. A checkpoint that stages only
 Markdown needs none, and every other commit passes untouched. The merge gate reads the same lines
 and refuses a unit checkpoint without one, so this hook is the early half of that gate.
-A broken hook never blocks a call.
+After that check, the assertion guard checks Rust and Python edits. It refuses
+unruled assertion removals, weaker assertions and disabled tests. A guard error
+also refuses the checkpoint. A broken payload does not block a call.
 """
 from __future__ import annotations
 
@@ -83,10 +85,26 @@ def refusal(command: str, cwd: Path) -> str:
         return ""
     directory = DIRECTORY.search(commit.group("options"))
     every = ALL.search(command[commit.end():].split("\n", 1)[0]) is not None
-    files = staged(_path(directory.group("path"), cwd) if directory else cwd, every)
+    repo = _path(directory.group("path"), cwd) if directory else cwd
+    files = staged(repo, every)
     values = "\n".join(f"{change_review.TRAILER}: " + found.group("value").rstrip().rstrip("\"')").rstrip()
                        for found in LINE.finditer(text))
-    return change_review.problem(subject.group("subject").strip(), values, files or ("unknown",))
+    problem = change_review.problem(subject.group("subject").strip(), values, files or ("unknown",))
+    if problem or not any(path.endswith((".rs", ".py")) for path in files):
+        return problem
+    arguments = [sys.executable, str(Path(__file__).resolve().parents[1] / "direct" / "assertion_guard.py"),
+                 "--repo", str(repo), "--rulings", "-"]
+    if not every:
+        arguments.append("--staged")
+    try:
+        result = subprocess.run(arguments, input=text, capture_output=True, text=True, check=False, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return f"assertion guard could not run: {error}"
+    if result.returncode == 1:
+        return "\n".join(result.stdout.splitlines()[-20:])
+    if result.returncode:
+        return "assertion guard could not run: " + (result.stderr.strip() or f"exit {result.returncode}")
+    return ""
 
 
 def decide(raw: str) -> str:
