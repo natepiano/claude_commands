@@ -4,7 +4,7 @@ Status: draft for the user to read. Nothing is filed on GitHub until the user ap
 
 ---
 
-**Title:** Claude detection: `live_prompt_box` reads an open permission dialog as idle when a stray `─` rule is above it
+**Title:** Claude detection: `live_prompt_box` reads an open permission dialog as idle when a stray horizontal line (`─`) is above it
 
 ## What happens
 
@@ -14,16 +14,16 @@ A Claude Code pane sits at a permission dialog ("Do you want to proceed?"), but 
 
 ## Cause
 
-`live_prompt_box` uses region `prompt_box_body`: the text between the last two horizontal `─` rules on the screen. It matches when a line in that text starts with `❯`.
+`live_prompt_box` uses region `prompt_box_body`: the text between the last two horizontal lines on the screen (full-width rows of the box-drawing character `─`, U+2500, which Claude Code draws above and below its input box and at the top of a dialog). It matches when a line in that text starts with `❯`.
 
-While a permission dialog is open, the last `─` rule on the screen is the top border of the dialog, not the input box. If the transcript above the dialog holds one more `─` rule (for example, a rule in tool output or in a rendered message), the text between that stray rule and the dialog's top border is taken as the input box. When that text holds a line that starts with `❯` (an echoed earlier prompt, or a `❯` in tool output), `live_prompt_box` matches.
+While a permission dialog is open, the last horizontal line on the screen is the top border of the dialog, not the input box. If the transcript above the dialog holds one more horizontal line (for example, a separator in tool output or in a rendered message), the text between that stray line and the dialog's top border is taken as the input box. When that text holds a line that starts with `❯` (an echoed earlier prompt, or a `❯` in tool output), `live_prompt_box` matches.
 
-The rule's `not` clauses (`esc to cancel`, `enter to select`, …) do not help, because they test the same region, and the dialog's footer is below the last rule, outside that region.
+The rule's `not` clauses (`esc to cancel`, `enter to select`, …) do not help, because they test the same region, and the dialog's footer is below the last horizontal line, outside that region.
 
 ## How to reproduce
 
 1. Start Claude Code in a herdr pane in default permission mode.
-2. Make the transcript show a `─` rule and, below it, a line that starts with `❯`. For example, ask Claude to print a line of `─` characters, then send a second prompt so that the echoed `❯ <prompt>` line is below the rule.
+2. Make the transcript show a horizontal line of `─` characters and, below it, a line that starts with `❯`. For example, ask Claude to print a line of `─` characters, then send a second prompt so that the echoed `❯ <prompt>` line is below that line.
 3. Ask Claude to run a Bash command that needs approval, so that the permission dialog opens at the bottom of the screen.
 4. Run `herdr pane get <pane>` and `herdr agent explain <pane>`.
 
