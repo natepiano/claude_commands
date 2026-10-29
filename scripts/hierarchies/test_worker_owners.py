@@ -216,6 +216,78 @@ class WorkerOwnersTest(unittest.TestCase):
         self.assertEqual({str(path): path.read_bytes() for path in self.root.rglob("*") if path.is_file()}, before)
         self.assertFalse((self.root / "state").exists())
 
+    def test_empty_roster_keeps_other_workers_and_ends_reports_with_totals(self) -> None:
+        self.write_text("pool/build-followups/mesh/0/mesh_roster.json", "")
+        self.write_json("unit/good/mesh_roster.json", {
+            "valid-worker": {"thread_id": "thread-valid", "status": "paused"},
+        })
+        for command in ("report", "recover"):
+            with self.subTest(command=command):
+                output = io.StringIO()
+                with patch.object(roster, "roster", return_value=roster.Roster([], [])), redirect_stdout(output):
+                    result = owners.main([command])
+                self.assertEqual(result, 0)
+                lines = output.getvalue().splitlines()
+                self.assertTrue(lines[0].startswith("valid-worker\tOwnerUnknown"), output.getvalue())
+                self.assertIn("thread=thread-valid", lines[0])
+                problems = [line for line in lines if line.startswith("source problem:")]
+                self.assertEqual(len(problems), 1)
+                self.assertIn("pool/build-followups/mesh/0/mesh_roster.json", problems[0])
+                self.assertIn("Expecting value", problems[0])
+                self.assertLess(lines.index(problems[0]), len(lines) - 2)
+                self.assertTrue(lines[-2].startswith("Timers:"))
+                self.assertTrue(lines[-1].startswith("Totals:"))
+                self.assertIn("OwnerUnknown=1", lines[-1])
+                self.assertIn("source_problems=1", lines[-1])
+
+    def test_timer_details_require_full_and_json_keeps_each_registration(self) -> None:
+        self.write_text("notifiers/asked/conf", "TARGET=unit-director\nREQUESTED_BY=user\n")
+        self.write_text("notifiers/approved/conf", "TARGET=unit-director\nAPPROVED_BY=user\n")
+        self.write_text("notifiers/unasked/conf", "TARGET=unit-director\n")
+        outputs: dict[str, str] = {}
+        for flag in ("", "--full", "--json"):
+            output = io.StringIO()
+            with patch.object(roster, "roster", return_value=roster.Roster([], [])), redirect_stdout(output):
+                result = owners.main(["report"] + ([flag] if flag else []))
+            self.assertEqual(result, 0)
+            outputs[flag] = output.getvalue()
+        self.assertEqual(outputs[""].splitlines()[:-1], [
+            "Timers: 3 registered, 1 with no recorded request (the showrunner checks these; --full lists each)",
+        ])
+        full_lines = outputs["--full"].splitlines()
+        self.assertEqual({line.split("\t")[0] for line in full_lines[:-1]},
+                         {"timer asked", "timer approved", "timer unasked"})
+        self.assertIn("requested_by=user", outputs["--full"])
+        self.assertIn("request provenance not recorded", outputs["--full"])
+        self.assertEqual(full_lines[-1], outputs[""].splitlines()[-1])
+        report = cast(dict[str, object], json.loads(outputs["--json"]))
+        self.assertEqual(set(report), {"workers", "totals", "problems", "timers", "notes"})
+        timers = cast(list[dict[str, object]], report["timers"])
+        self.assertEqual({timer["name"]: timer["requested_by"] for timer in timers},
+                         {"asked": "user", "approved": "user", "unasked": ""})
+        self.assertEqual(set(cast(dict[str, object], report["totals"])), {kind.value for kind in owners.WorkerClass})
+
+    def test_applied_end_keeps_worker_when_roster_or_timer_source_cannot_be_read(self) -> None:
+        self.write_json("unit/good/mesh_roster.json", {
+            "valid-worker": {"thread_id": "thread-valid", "status": "paused"},
+        })
+        self.write_json("state/first-report.json", {})
+        for relative, content in (("pool/review/mesh/0/mesh_roster.json", b""),
+                                  ("notifiers/bad/conf", b"\xff")):
+            with self.subTest(source=relative):
+                path = self.root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                _ = path.write_bytes(content)
+                output = io.StringIO()
+                with patch.object(roster, "roster", return_value=roster.Roster([], [])), \
+                        patch.object(subprocess, "run") as end_call, redirect_stdout(output):
+                    result = owners.main(["end", "--class", "OwnerUnknown", "--apply"])
+                self.assertEqual(result, 1)
+                end_call.assert_not_called()
+                self.assertIn("valid-worker: kept: source problems", output.getvalue())
+                self.assertIn("source_problems=1", output.getvalue().splitlines()[-1])
+                path.unlink()
+
     def test_worker_with_a_live_director_is_owned(self) -> None:
         worker = self.worker()
         result = owners.classify_worker(worker, [owners.Director("director-one", "unit-director", "hierarchies")])
