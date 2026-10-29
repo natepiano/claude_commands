@@ -203,45 +203,36 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Ruled out:** live retitle of open tabs after a config edit — the old title stays until restart or session rename; guild head names in the config — guild heads are retired and `config/guilds.conf` keeps guild ownership.
 
-### Phase 7 — Each unit director owns its reviewers  · status: todo
-**Depends on:** Phase 6, and `assign.sh` from models-unit's worker-seats plan on main; the showrunner says when. Start no code before that message.
+### Phase 7 — Each unit director's reviewers can move to it  · status: done
+**Depends on:** Phase 6. It needs no `assign.sh` (showrunner, 2026-10-29: start now; the launcher switch and the pool removal wait for `assign.sh` on main).
 
 #### Work Order
 
-**Goal:** a unit director owns its code reviewers as it owns its writers, testers and fixers. It resumes the same reviewers across phases and plans, so their context builds up. The review pool is gone.
+**Goal:** everything that moves code reviewers from the review pool to their unit director is built and tested, while the pool still runs every review.
 
 **Spec:**
-- Move each pool reviewer to its unit with one explicit, recoverable transfer whose states are migrated, deferred and conflict, with no nullable fields (showrunner, 2026-10-29). A busy reviewer stays reachable until its move ends. The pool readers go, and unused pool servers stop, only after every move ends. Delete the transfer code in this same phase once every pool reviewer is migrated or ended, so no migration layer stays.
-- Remove `scripts/direct/review_pool.py`, `scripts/direct/test_review_pool.py`, their callers and the review-pool as-built (moved here from worker-seats Phase 15 by models' plan change d8873d42).
 - Decided by the user (2026-10-28, through the showrunner): "unit directors own their own reviews just as they have their own implementers and testers and fixers and they should restart sessions rather than start new ones so context builds up"; the pool "feels unnecessarily complex"; the roles unit director owns the retirement.
-- Reviewers are ordinary unit workers in the unit worker ledger (worker-seats Phase 4), role `review`: addresses `<worktree>-review` and `<worktree>-review2`. `assign.sh --role review` resumes `review`; when `review` is busy (the two lenses of one review run at once), `workers.py resolve` gives `review2`. They are read-only and persist, pause, move and end exactly as writers do (`docs/as-built/long-lived-workers.md`). Never a fresh reviewer while its thread exists.
-- Context carries over (unit director's call): a one-time step makes each unit's leased pool code reviewer (`~/.local/state/review-pool/<slug>/pool.json`) its `review` worker on the same thread. A unit with no leased reviewer opens `review` at its next review. A reviewer still reviewing is not moved; a rerun moves it. A rerun after the move changes nothing.
-- Standing instructions: `config/review_pool/code.md` moves to `config/review/code.md`. Every review prompt carries one line that names that file; the reviewer reads it at its first review and again when the file changes (`<ReviewPromptContract/>` keeps its standing-instructions line).
-- Remove: `scripts/direct/review_pool.py`, `test_review_pool.py`, `review_pool_report.py` and its test; the pool paths in `review.sh` (`--pool` and `--lease` are accepted and ignored for one release: one stderr line, then the unit's own `review` worker takes the review); the pool code in `rename.py`, `rename_unit.py`, `retire_unit.py`, `transfer_unit.py`, `restart.py`; the pool reviewer rows and `worker:review-pool/...` addresses in `roster.py` and `send.py` (phase 5); the `**Review pool:**` lines in the production docs; `docs/production_format.md` rule 16 (later rules renumbered, with every reference); the pool text in `commands/unit/direct.md`, `docs/direct/dual_review.md`, `commands/showrunner/produce.md`. `scripts/feature_log/inventory.py --pool` is a different thing and stays.
-- UI design checks (unit director's call): no `ui_adopted` marker exists, so the UI pool only ran in shadow. Its shadow trial ends; the fresh Claude helper, which already governs, stays the one design check. `config/review_pool/ui.md` is removed.
-- `progress_history.py` keeps reading old review records that carry `arm: pool`; new records write `own`.
-- Pool state on disk: after the one-time step, `~/.local/state/review-pool/` stays as an archive for one release and nothing reads it; the step prints its path. The production reviewer app-servers end when no reviewer uses them.
-- `role_terms.toml` gains `review pool` as a retired term, so the retired-name check lists every doc and script that still says it.
-- Docs match: `docs/as-built/review-pool.md` and `review-pool-probes.md` are removed; `long-lived-workers.md` gains the reviewer rows; every other as-built that names the pool (Files at phase start list each) says what is true now.
+- The transfer: one explicit, recoverable step that moves each unit's leased pool code reviewer (`~/.local/state/review-pool/<slug>/pool.json`) to that unit's `review` worker on the same thread. Its result for each reviewer is one of three typed states, migrated, deferred (the reviewer is busy; a rerun moves it) and conflict (the unit already has a different `review` worker), with no nullable fields (showrunner, 2026-10-29). A rerun after a move changes nothing. A unit with no leased reviewer gets no entry. Build it with a dry-run mode that prints each result and writes nothing; the live run happens when launchers switch, so this phase never runs it live.
+- Reviewers are ordinary unit workers in the unit worker ledger, role `review`: addresses `<worktree>-review` and `<worktree>-review2`, job key `code_reviewer`, qualifiers `JobSlot("review")` and `JobSlot("review2")`. Reuse `workers.resolve` and `open_unit_worker` (it makes `review` read-only); do not write a second allocator. Take addresses from the worker-seats address contract.
+- Standing instructions: `config/review_pool/code.md` moves to `config/review/code.md`; every reader of the old path (`review_pool.py` and its tests, `docs/as-built/review-pool.md`) reads the new one, so the pool keeps working.
+- `role_terms.toml` gains `review pool` as a retired term. The retired-name check stays green: until the pool is removed, each current use is a kept context or listed exception, which the pool removal deletes.
+- `role_terms.toml`: every `defined_in` and plan path names a file that exists; fix each entry that points at a deleted plan (the showrunner names `sdlc-guilds.md`).
+- Docs: `docs/as-built/long-lived-workers.md` gains the reviewer rows (role `review`, `review2`, read-only, persist, pause, move and end as writers do) and the transfer command; `docs/as-built/review-pool.md` names the new standing-instructions path.
+- Review turn records (showrunner add-on, 2026-10-29): `review.sh` names each turn record `<started>-<pid>.json`, so two attempts of one launcher in the same second collide (`FileExistsError`, then a failed tree check; seen on main d18712b3). The record write uses exclusive create with a unique name, and a test writes two records in the same second.
 
 **Files:**
-- `scripts/production/production_tree.py`, `scripts/production/test_production_tree.py`, `scripts/agents/mesh_runs.py`, `scripts/agents/test_mesh_runs.py`, `scripts/production/test_rename.py`, `scripts/production/test_rename_unit.py`
-- `scripts/direct/review.sh` — pool paths removed; `--pool`/`--lease` accepted and ignored
-- `scripts/direct/assign.sh`, `scripts/direct/workers.py` — the `review`/`review2` resolve and the one-time reviewer step (models-unit dropped worker-seats Phase 8, its Phase 12 import-pool call and its Phase 15 `review_pool.py` removal, 2026-10-29: all reviewer work is in this phase)
-- `scripts/direct/review_pool.py`, `scripts/direct/test_review_pool.py`, `scripts/direct/review_pool_report.py`, `scripts/direct/test_review_pool_report.py` — removed
-- `scripts/production/rename.py`, `scripts/production/rename_unit.py`, `scripts/production/retire_unit.py`, `scripts/production/transfer_unit.py`, `scripts/shutdown/restart.py` — pool code removed
-- `scripts/message/roster.py`, `scripts/message/send.py` — pool reviewer rows and addresses removed
-- `scripts/production/role_terms.toml` — `review pool` retired
-- `config/review/code.md` — moved from `config/review_pool/code.md`; `config/review_pool/ui.md` removed
-- `docs/production_format.md`, `commands/unit/direct.md`, `docs/direct/dual_review.md`, `commands/showrunner/produce.md`, `docs/plans/sdlc-production.md`, `docs/plans/build-followups-production.md` — pool text and Review pool lines
-- `docs/as-built/review-pool.md`, `docs/as-built/review-pool-probes.md` — removed; `docs/as-built/long-lived-workers.md` and each other as-built that names the pool
-- `scripts/direct/test_review_launcher.py`, `scripts/direct/test_workers.py`, `scripts/production/test_retire_unit.py`, `scripts/production/test_transfer_unit.py`, `scripts/production/test_stall_watch.py`, `scripts/production/test_add_unit.py`, `scripts/message/test_roster.py`, `scripts/message/test_send.py` — pool cases removed, reviewer cases added
+- `scripts/direct/workers.py`, `scripts/direct/test_workers.py` — reviewer roles and the transfer
+- `config/review/code.md` — moved from `config/review_pool/code.md`
+- `scripts/direct/review_pool.py`, `scripts/direct/test_review_pool.py` — read the new standing-instructions path only
+- `scripts/production/role_terms.toml`, `scripts/production/test_roles_audit.py` — `review pool` retired; stale `defined_in` paths fixed
+- `docs/as-built/long-lived-workers.md`, `docs/as-built/review-pool.md`
+- `scripts/direct/review.sh`, `scripts/direct/test_review_launcher.py` — unique review turn record names
 
-**Workers:** `1 writer + 1 tester`. `impl` holds the scripts, config and docs above; `test` holds the test files. Files owned by build-followups units (`review.sh`, `assign.sh`, `workers.py`, `codex_mesh.py`, `docs/production_format.md`, the commands) go on the checkpoint notice's also-touches lines, trial-merged against each owner's tip.
+**Workers:** `1 writer + 1 tester`. `impl` holds `workers.py`, `review_pool.py`, `role_terms.toml`, `config/review/code.md` and the docs; `test` holds `test_workers.py`, `test_review_pool.py` and `test_roles_audit.py`. `workers.py` is a build-followups file: name it on the checkpoint notice's also-touches line, trial-merged against its owner's tip.
 
-**Constraints from prior phases:** phase 5 role record: `Job` keeps `code reviewer`; a reviewer's shown name is `<production> · <unit> · code reviewer[ N]`. Phase 6 names config: the reviewer's shown job reads `config/names.toml`. Worker-seats Phase 7: `assign.sh` options, exit codes, the address and shown name kept apart. Reuse `workers.resolve` (it reuses idle workers, adopts prior-run workers, reopens threads and numbers new ones) and `open_unit_worker` (it makes `review` read-only); do not write a second allocator. The job key is `code_reviewer`; ordinary reviewer qualifiers are `JobSlot("review")` and `JobSlot("review2")`, not the pool's numbers. Take reviewer addresses from the worker-seats address contract; do not invent a second form. Two pool readers still read the archive: `production_tree.py` builds reviewer edges from `pool.json` (line 231) and `mesh_runs.py` `_roster_folders` scans pool meshes; the pool part of the design doc's Role record section changes with them.
+**Constraints from prior phases:** phase 5 role record: `Job` keeps `code reviewer`; a reviewer's shown name is `<production> · <unit> · code reviewer[ N]`. Phase 6 names config: the reviewer's shown job reads `config/names.toml`. The retired-name check is a merge gate (`roles_audit.py check`, exit 0 on the live tree).
 
-**Acceptance gate:** the gates in Delegation Context green, with the direct, production and message suites; a fixture-backed check finds no operational pool reader or caller, with named exceptions for the migration decoder, compatibility flags and kept history (the retired-name check stays the separate prose gate). Live check: this unit's next review runs on its own `review` and `review2` workers, and the review after it resumes the same threads (same thread ids in the roster).
+**Acceptance gate:** the gates in Delegation Context green, with the direct and production suites. The transfer's dry run on this machine prints one typed result per leased pool reviewer and writes nothing (compare `pool.json` and the worker ledger before and after). `roles_audit.py --root . check` exits 0 with `review pool` retired.
 
 ### Phase 8 — The retired-name baseline reads at a glance  · status: done
 
@@ -291,3 +282,44 @@ For active process redesigns, as we are currently undergoing with promotions and
 **Constraints from prior phases:** the Step log before measure and the change Phase 3 shipped. Phase 8: `baseline` prints a short summary by default and the full tables only with `--tables`; a sent-contact count it cannot attribute prints as unknown, never zero, and an unreadable source prints as a named warning.
 
 **Acceptance gate:** the Step log has before and after numbers with n and file set or window; the question is sent.
+
+### Phase 10 — Each unit director owns its reviewers  · status: todo
+**Depends on:** Phase 7 (the transfer, the moved standing instructions and the retired term), and `assign.sh` from models-unit's worker-seats plan on main; the showrunner says when. Start no code before that message.
+
+#### Work Order
+
+**Goal:** a unit director owns its code reviewers as it owns its writers, testers and fixers. It resumes the same reviewers across phases and plans, so their context builds up. The review pool is gone.
+
+**Spec:**
+- Move each pool reviewer to its unit with one explicit, recoverable transfer whose states are migrated, deferred and conflict, with no nullable fields (showrunner, 2026-10-29). A busy reviewer stays reachable until its move ends. The pool readers go, and unused pool servers stop, only after every move ends. Delete the transfer code in this same phase once every pool reviewer is migrated or ended, so no migration layer stays.
+- Remove `scripts/direct/review_pool.py`, `scripts/direct/test_review_pool.py`, their callers and the review-pool as-built (moved here from worker-seats Phase 15 by models' plan change d8873d42).
+- Decided by the user (2026-10-28, through the showrunner): "unit directors own their own reviews just as they have their own implementers and testers and fixers and they should restart sessions rather than start new ones so context builds up"; the pool "feels unnecessarily complex"; the roles unit director owns the retirement.
+- Reviewers are ordinary unit workers in the unit worker ledger (worker-seats Phase 4), role `review`: addresses `<worktree>-review` and `<worktree>-review2`. `assign.sh --role review` resumes `review`; when `review` is busy (the two lenses of one review run at once), `workers.py resolve` gives `review2`. They are read-only and persist, pause, move and end exactly as writers do (`docs/as-built/long-lived-workers.md`). Never a fresh reviewer while its thread exists.
+- Context carries over (unit director's call): a one-time step makes each unit's leased pool code reviewer (`~/.local/state/review-pool/<slug>/pool.json`) its `review` worker on the same thread. A unit with no leased reviewer opens `review` at its next review. A reviewer still reviewing is not moved; a rerun moves it. A rerun after the move changes nothing.
+- Standing instructions live in `config/review/code.md` (moved by the transfer phase). Every review prompt carries one line that names that file; the reviewer reads it at its first review and again when the file changes (`<ReviewPromptContract/>` keeps its standing-instructions line).
+- Remove: `scripts/direct/review_pool.py`, `test_review_pool.py`, `review_pool_report.py` and its test; the pool paths in `review.sh` (`--pool` and `--lease` are accepted and ignored for one release: one stderr line, then the unit's own `review` worker takes the review); the pool code in `rename.py`, `rename_unit.py`, `retire_unit.py`, `transfer_unit.py`, `restart.py`; the pool reviewer rows and `worker:review-pool/...` addresses in `roster.py` and `send.py` (phase 5); the `**Review pool:**` lines in the production docs; `docs/production_format.md` rule 16 (later rules renumbered, with every reference); the pool text in `commands/unit/direct.md`, `docs/direct/dual_review.md`, `commands/showrunner/produce.md`. `scripts/feature_log/inventory.py --pool` is a different thing and stays.
+- UI design checks (unit director's call): no `ui_adopted` marker exists, so the UI pool only ran in shadow. Its shadow trial ends; the fresh Claude helper, which already governs, stays the one design check. `config/review_pool/ui.md` is removed.
+- `progress_history.py` keeps reading old review records that carry `arm: pool`; new records write `own`.
+- Pool state on disk: after the one-time step, `~/.local/state/review-pool/` stays as an archive for one release and nothing reads it; the step prints its path. The production reviewer app-servers end when no reviewer uses them.
+- Remove the `review pool` kept contexts and exceptions from `role_terms.toml` as the pool text goes.
+- Run the transfer live (first a dry run), then delete the transfer code once every pool reviewer is migrated or ended.
+- Docs match: `docs/as-built/review-pool.md` and `review-pool-probes.md` are removed; `long-lived-workers.md` gains the reviewer rows; every other as-built that names the pool (Files at phase start list each) says what is true now.
+
+**Files:**
+- `scripts/production/production_tree.py`, `scripts/production/test_production_tree.py`, `scripts/agents/mesh_runs.py`, `scripts/agents/test_mesh_runs.py`, `scripts/production/test_rename.py`, `scripts/production/test_rename_unit.py`
+- `scripts/direct/review.sh` — pool paths removed; `--pool`/`--lease` accepted and ignored
+- `scripts/direct/assign.sh`, `scripts/direct/workers.py` — the `review`/`review2` resolve and the one-time reviewer step (models-unit dropped worker-seats Phase 8, its Phase 12 import-pool call and its Phase 15 `review_pool.py` removal, 2026-10-29: all reviewer work is in this phase)
+- `scripts/direct/review_pool.py`, `scripts/direct/test_review_pool.py`, `scripts/direct/review_pool_report.py`, `scripts/direct/test_review_pool_report.py` — removed
+- `scripts/production/rename.py`, `scripts/production/rename_unit.py`, `scripts/production/retire_unit.py`, `scripts/production/transfer_unit.py`, `scripts/shutdown/restart.py` — pool code removed
+- `scripts/message/roster.py`, `scripts/message/send.py` — pool reviewer rows and addresses removed
+- `scripts/production/role_terms.toml` — `review pool` kept contexts removed
+- `config/review_pool/ui.md` — removed
+- `docs/production_format.md`, `commands/unit/direct.md`, `docs/direct/dual_review.md`, `commands/showrunner/produce.md`, `docs/plans/sdlc-production.md`, `docs/plans/build-followups-production.md` — pool text and Review pool lines
+- `docs/as-built/review-pool.md`, `docs/as-built/review-pool-probes.md` — removed; `docs/as-built/long-lived-workers.md` and each other as-built that names the pool
+- `scripts/direct/test_review_launcher.py`, `scripts/direct/test_workers.py`, `scripts/production/test_retire_unit.py`, `scripts/production/test_transfer_unit.py`, `scripts/production/test_stall_watch.py`, `scripts/production/test_add_unit.py`, `scripts/message/test_roster.py`, `scripts/message/test_send.py` — pool cases removed, reviewer cases added
+
+**Workers:** `1 writer + 1 tester`. `impl` holds the scripts, config and docs above; `test` holds the test files. Files owned by build-followups units (`review.sh`, `assign.sh`, `workers.py`, `codex_mesh.py`, `docs/production_format.md`, the commands) go on the checkpoint notice's also-touches lines, trial-merged against each owner's tip.
+
+**Constraints from prior phases:** phase 5 role record: `Job` keeps `code reviewer`; a reviewer's shown name is `<production> · <unit> · code reviewer[ N]`. Phase 6 names config: the reviewer's shown job reads `config/names.toml`. Worker-seats Phase 7: `assign.sh` options, exit codes, the address and shown name kept apart. Reuse `workers.resolve` (it reuses idle workers, adopts prior-run workers, reopens threads and numbers new ones) and `open_unit_worker` (it makes `review` read-only); do not write a second allocator. The job key is `code_reviewer`; ordinary reviewer qualifiers are `JobSlot("review")` and `JobSlot("review2")`, not the pool's numbers. Take reviewer addresses from the worker-seats address contract; do not invent a second form. Two pool readers still read the archive: `production_tree.py` builds reviewer edges from `pool.json` (line 231) and `mesh_runs.py` `_roster_folders` scans pool meshes; the pool part of the design doc's Role record section changes with them.
+
+**Acceptance gate:** the gates in Delegation Context green, with the direct, production and message suites; a fixture-backed check finds no operational pool reader or caller, with named exceptions for the migration decoder, compatibility flags and kept history (the retired-name check stays the separate prose gate). Live check: this unit's next review runs on its own `review` and `review2` workers, and the review after it resumes the same threads (same thread ids in the roster).

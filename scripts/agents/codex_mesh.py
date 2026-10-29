@@ -5988,7 +5988,12 @@ def open_unit_worker(session_dir: str, name: str, role: str) -> dict[str, object
             raise unit_workers.WorkerUnavailable("thread/start returned no thread id")
         allocation = UnrecordedWorkerThread(thread_id)
         ledger_path = unit_workers.ledger_for_run(Path(session_dir)).path
-        display_name = f"{ledger_path.parent.name} · {ledger_path.stem} · {role} ({name})"
+        slot = name.rpartition("-")[2] if role == "review" else name
+        display_name = message_roster.ShownName(
+            message_roster.ProductionPart(ledger_path.parent.name),
+            message_roster.UnitPart(ledger_path.stem),
+            message_roster.ShownJob("code_reviewer" if role == "review" else "worker",
+                                    message_roster.JobSlot(slot)), name).render()
         _ = _require(client.call("thread/name/set", {"threadId": thread_id, "name": display_name}), "thread/name/set")
         record: FollowableRecord = {"thread_id": thread_id, "status": "paused", "role": cast(WorkerRole, role),
                                     "model": model, "effort": effort, "access_policy": policy}

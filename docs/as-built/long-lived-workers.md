@@ -4,6 +4,47 @@
 
 A `/unit:direct` run opens its Codex workers once and keeps them for the rest of the run. Every later phase, repair round, broad review lens, closure review and phase-review architect pass goes to a worker that is already open, with `--to <full-worker-name>`. The exception is a phase on the pool arm of a production with a review pool: its code reviews go to the production's pooled reviewers, which are not workers of the run (`docs/as-built/review-pool.md`). A worker can change role between tasks: a writer becomes a tester, a tester becomes a reviewer, or a writer takes the adversary lens against its own code. Before an open worker gets new work, the launcher compacts its thread if the recorded context is over a threshold. A turn that fills the context window gets the follow-up "Continue where you stopped." When a phase finishes, its turns end but its threads stay open. The threads end only when `end_session.sh` stops the run's app-server. `scripts/whoami/worker_usage.py` checks whether this saves Codex usage. It reads the usage store (`docs/as-built/usage-ledger.md`), compares weighted Codex usage per checkpointed phase before and after the go-live time, and reports account switches per week and credits used per day alongside.
 
+## Unit code reviewers
+
+Code reviewers use the ordinary unit worker ledger. The pool still runs every
+review until the launchers switch. This step prepares that switch; it changes no
+review launcher.
+
+| Worker slot | Role | Access | Lifetime |
+| --- | --- | --- | --- |
+| `review` | `review` | Read only | Keep the thread across phases and restarts. |
+| `review2` (and later numbers) | `review` | Read only | Keep each concurrent reviewer's thread. |
+
+A reviewer's address is `<worktree>-review` or `<worktree>-review2`. Its record
+keeps `slot: review` or `slot: review2` apart from `role: review`. Its shown job
+uses the `code_reviewer` key from `config/names.toml`. Reviewers persist, pause,
+move and end by the same ledger operations as writers. `workers.py resolve
+--role review` reuses an idle reviewer; it opens a read-only thread only when no
+reviewer can take the work.
+
+### Transfer the leased code reviewers
+
+Read the proposed transfer first. Name each destination run explicitly:
+
+```sh
+python3 scripts/direct/workers.py transfer-reviewers --production <slug> \
+  --session-dir <unit-run> --session-dir <another-unit-run>
+```
+
+The default is a dry run. It reads the pool and worker ledgers, prints one result
+per leased code reviewer, and writes nothing. `migrated` means the thread can
+move to the named worker; `deferred` means it is busy; `conflict` names a different
+review worker or a missing or wrong destination. Units with no leased code
+reviewer add no result. UI reviewers and unleased reviewers stay in the pool.
+
+Run the same command with `--apply` only when the launchers switch. Do not apply
+it during the preparation phase. A transfer keeps the thread id, account home,
+account-move marker, standing instructions and queued messages. It fences the
+old transport, registers the worker through `workers.resolve`, and removes its
+pool lease. The journal under `worker-transfers/<generation>/` lets the same
+command finish after an interrupted write. A rerun after completion changes
+nothing. A busy reviewer remains leased; rerun after its turn ends.
+
 ## How it works
 
 ### Worker lifecycle in `scripts/agents/codex_mesh.py`

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import io
 import json
 import os
 import re
@@ -25,10 +26,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 from importlib import import_module
 from pathlib import Path
-from typing import Literal, Protocol, TextIO, cast
+from typing import TYPE_CHECKING, Literal, Protocol, TextIO, cast
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+if TYPE_CHECKING:
+    from scripts.direct.review_pool import Pool, ProductionPool
 
 ROSTER = "mesh_roster.json"
 STATE = "progress_history_state.json"
@@ -46,9 +50,65 @@ class ClaudeCommandLookup(Protocol):
 
 
 class WorkerArguments(argparse.Namespace):
+    command: str = ""
     session_dir: Path = Path()
     role: str = ""
     owner_pid: int = 0
+    production: str = ""
+    transfer_runs: list[Path] = []
+    apply: bool = False
+
+
+@dataclass(frozen=True)
+class ReviewerMigrated:
+    reviewer: str
+    unit: str
+    worker: str
+    thread_id: str
+
+
+@dataclass(frozen=True)
+class ReviewerDeferred:
+    reviewer: str
+    unit: str
+    reason: str
+
+
+class ReviewerConflictCause(Enum):
+    NO_DESTINATION = "no destination run is named"
+    WRONG_UNIT = "destination belongs to another production or unit"
+    FINISHED = "destination run is finished"
+    SAVED_DESTINATION = "saved transfer names another destination"
+    THREAD_MISMATCH = "pool and mesh thread records differ"
+    DIFFERENT_WORKER = "unit already has a different review worker"
+
+
+@dataclass(frozen=True)
+class ReviewerConflict:
+    reviewer: str
+    unit: str
+    cause: ReviewerConflictCause
+
+    @property
+    def reason(self) -> str:
+        return self.cause.value
+
+
+ReviewerTransfer = ReviewerMigrated | ReviewerDeferred | ReviewerConflict
+
+
+@dataclass(frozen=True)
+class IncomingReviewer:
+    name: str
+    record: dict[str, object]
+
+
+@dataclass(frozen=True)
+class NoIncomingReviewer:
+    """Allocate or reuse a worker without importing a thread."""
+
+
+NO_INCOMING_REVIEWER = NoIncomingReviewer()
 
 
 @dataclass(frozen=True)
@@ -837,12 +897,22 @@ def _reserve(run: Path, name: str, store: UnitWorkerLedger, owner_pid: int, *, p
             _write_roster(handle, roster)
 
 
-def resolve(run: Path, role: str) -> str:
+def _next_worker_name(ledger: UnitWorkers, roster: Mapping[str, object], role: str) -> str:
+    ordinal = 1
+    name = role
+    while name in ledger.workers or name in roster:
+        ordinal += 1
+        name = f"{role}{ordinal}"
+    return name
+
+
+def resolve(run: Path, role: str, *, incoming: IncomingReviewer | NoIncomingReviewer = NO_INCOMING_REVIEWER) -> str:
     """Return an idle worker, carry one over, reopen one, or open the next name."""
-    return _resolve(run, role, os.getpid())
+    return _resolve(run, role, os.getpid(), incoming=incoming)
 
 
-def _resolve(run: Path, role: str, owner_pid: int) -> str:
+def _resolve(run: Path, role: str, owner_pid: int, *,
+             incoming: IncomingReviewer | NoIncomingReviewer = NO_INCOMING_REVIEWER) -> str:
     from scripts.agents import codex_mesh
     if role not in ROLES:
         raise WorkerUnavailable(f"unsupported worker role: {role}")
@@ -854,6 +924,10 @@ def _resolve(run: Path, role: str, owner_pid: int) -> str:
             raise WorkerUnavailable("run is finished; use progress_history.py start-phase to reactivate it, " +
                                     "or workers.py resolve --session-dir <new-run> to carry the worker forward")
         roster = _read_roster(run)
+        if isinstance(incoming, IncomingReviewer):
+            if role != "review":
+                raise WorkerUnavailable("incoming reviewer requires review role")
+            return _register_reviewer(run, ledger, incoming)
         for name, value in roster.items():
             record = _object(value)
             if record.get("role") != role or record.get("adopted_to"):
@@ -909,16 +983,330 @@ def _resolve(run: Path, role: str, owner_pid: int) -> str:
                 ledger.workers[name].ownership = HeldBy(str(run))
                 return name
         # Roles are metadata; suffixes only distinguish concurrent workers.
-        ordinal = 1
-        name = role
-        while name in ledger.workers or name in roster:
-            ordinal += 1
-            name = f"{role}{ordinal}"
+        name = _next_worker_name(ledger, roster, _reviewer_destination(run) if role == "review" else role)
         record = codex_mesh.open_unit_worker(str(run), name, role)
         ledger.workers[name] = _worker_from_record(name, run, record)
         ledger.workers[name].events = [_event("opened", "no idle worker for role", run)]
         _reserve(run, name, store, owner_pid)
         return name
+
+
+def _register_reviewer(run: Path, ledger: UnitWorkers, incoming: IncomingReviewer) -> str:
+    """Register an imported thread while the caller holds the unit ledger lock."""
+    roster = _read_roster(run)
+    name = incoming.name
+    current = _object(roster.get(name))
+    if current and current.get("thread_id") != incoming.record.get("thread_id"):
+        raise WorkerUnavailable(f"{name}: destination has another thread")
+    registered = ledger.workers.get(name)
+    if registered is not None:
+        if registered.backend != _worker_from_record(name, run, incoming.record).backend:
+            raise WorkerUnavailable(f"{name}: ledger has another thread")
+        if isinstance(registered.ownership, Retired):
+            raise WorkerUnavailable(f"{name}: ledger worker is retired")
+    if not current:
+        with _roster_locked(run) as (handle, records):
+            if name in records:
+                raise WorkerUnavailable(f"{name}: worker name was claimed")
+            records[name] = dict(incoming.record)
+            _write_roster(handle, records)
+    if name not in ledger.workers:
+        ledger.workers[name] = _worker_from_record(name, run, incoming.record)
+    return name
+
+
+def _reviewer_destination(run: Path) -> str:
+    state = _read(run / STATE)
+    result = subprocess.run(
+        ["bash", str(Path(__file__).with_name("worker_name.sh")),
+         _required(state, "working_dir"), "review", "review"],
+        capture_output=True, text=True, check=False, timeout=10)
+    if result.returncode or not result.stdout.strip():
+        raise WorkerUnavailable(result.stderr.strip() or "cannot name reviewer")
+    return result.stdout.strip()
+
+
+@dataclass(frozen=True)
+class NoReviewerConflict:
+    """No different unit reviewer prevents this transfer."""
+
+
+def _transfer_conflict(run: Path, source: Path, thread_id: str) -> ReviewerConflictCause | NoReviewerConflict:
+    store = _ledger_for_run(run)
+    data = _read(store.path)
+    for value in _object(data.get("workers")).values():
+        worker = _object(value)
+        if worker.get("role") != "review" or _object(worker.get("ownership")).get("kind") == "Retired":
+            continue
+        backend = _object(worker.get("backend"))
+        if backend.get("thread_id") == thread_id:
+            continue
+        name = _text(worker.get("name"))
+        record = _object(_read_roster(run).get(name))
+        if record.get("reviewer_source") != str(source):
+            return ReviewerConflictCause.DIFFERENT_WORKER
+    for name, value in _read_roster(run).items():
+        record = _object(value)
+        if (record.get("role") == "review" and not record.get("adopted_to")
+                and record.get("thread_id") != thread_id and record.get("reviewer_source") != str(source)):
+            return ReviewerConflictCause.DIFFERENT_WORKER
+    return NoReviewerConflict()
+
+
+def _finish_reviewer_transfer(journal: Path, transaction: dict[str, object]) -> ReviewerMigrated | ReviewerConflict:
+    destination = Path(_required(transaction, "destination"))
+    source = Path(_required(transaction, "source"))
+    store = _ledger_for_run(destination)
+    with store.locked() as ledger:
+        _recover(store, ledger)
+        after = _object(transaction["after"])
+        reviewer = _required(transaction, "reviewer")
+        current = _object(_read_roster(source).get(reviewer))
+        fenced = current.get("reviewer_transfer") == transaction["id"]
+        conflict = _transfer_conflict(destination, source, _required(after, "thread_id"))
+        if not fenced and isinstance(conflict, ReviewerConflictCause):
+            return ReviewerConflict(reviewer, _required(transaction, "unit"), conflict)
+        name = _required(transaction, "worker")
+        records = _read_roster(destination)
+        registered = ledger.workers.get(name)
+        occupied = _object(records.get(name))
+        backend = _worker_from_record(name, destination, after).backend
+        if ((occupied and occupied.get("thread_id") != after.get("thread_id"))
+                or (registered is not None and registered.backend != backend)):
+            previous = transaction.get("previous_workers", [])
+            previous_names = [item for item in cast(list[object], previous) if isinstance(item, str)] if isinstance(previous, list) else []
+            transaction["previous_workers"] = [*previous_names, name]
+            name = _next_worker_name(ledger, records, _reviewer_destination(destination))
+            transaction["worker"] = name
+            after["slot"] = "review" + name.removeprefix(_reviewer_destination(destination))
+            transaction["after"] = after
+            _atomic(journal, transaction)
+        previous = transaction.get("previous_workers", [])
+        if isinstance(previous, list):
+            for old_name in cast(list[object], previous):
+                if not isinstance(old_name, str):
+                    raise WorkerUnavailable("invalid prior reviewer name")
+                old_inbox = destination / f"{old_name}.pending.json"
+                if not old_inbox.exists():
+                    continue
+                with ExitStack() as locks:
+                    inbox, pending = _giving_inbox(locks, destination, old_name)
+                    if pending.get("adoption_id") == transaction["id"]:
+                        target, saved = _giving_inbox(locks, destination, name)
+                        if saved.get("thread_id", after["thread_id"]) != after["thread_id"]:
+                            raise WorkerUnavailable(f"{name}: destination inbox has another thread")
+                        merged: object = saved.get("reviewer_inbox_sources", []) if saved.get("adoption_id") == transaction["id"] else []
+                        if not isinstance(merged, list):
+                            raise WorkerUnavailable(f"{name}: invalid inbox transfer record")
+                        merged_sources = cast(list[object], merged)
+                        if old_name not in merged_sources:
+                            queue: list[str] = []
+                            for record in (pending, saved):
+                                messages = record.get("messages", [])
+                                if not isinstance(messages, list) or any(not isinstance(item, str) for item in cast(list[object], messages)):
+                                    raise WorkerUnavailable(f"{name}: invalid pending messages")
+                                queue.extend(cast(list[str], messages))
+                            saved.update({"thread_id": after["thread_id"], "messages": queue,
+                                          "accepting_messages": True, "adoption_id": transaction["id"],
+                                          "reviewer_inbox_sources": [*merged_sources, old_name]})
+                            # Persist the receipt with the messages before clearing the old
+                            # queue, so recovery after either write cannot copy them twice.
+                            _write_inbox(target, saved)
+                        pending.update({"messages": [], "accepting_messages": False})
+                        _write_inbox(inbox, pending)
+        return _finish_reviewer_transfer_locked(journal, transaction, ledger)
+
+
+def _finish_reviewer_transfer_locked(journal: Path, transaction: dict[str, object],
+                                     ledger: UnitWorkers) -> ReviewerMigrated:
+    """Roll the saved transfer forward; every write can be repeated after a stop."""
+    from scripts.agents import codex_mesh
+    source = Path(_required(transaction, "source"))
+    destination = Path(_required(transaction, "destination"))
+    reviewer, name = _required(transaction, "reviewer"), _required(transaction, "worker")
+    after = _object(transaction["after"])
+    identity = _required(transaction, "id")
+    # The durable intent precedes fencing the pool transport. A pool allocation
+    # holds pool.lock too, so it cannot launch between this fence and removal.
+    with _roster_locked(source) as (handle, records):
+        current = _object(records.get(reviewer))
+        if current.get("thread_id") != after.get("thread_id"):
+            raise WorkerUnavailable(f"{reviewer}: source thread changed during transfer")
+        if current.get("reviewer_transfer") != identity:
+            if current != _object(transaction["before"]):
+                raise WorkerUnavailable(f"{reviewer}: source record changed during transfer")
+            current = dict(current)
+            current.update({"status": "ended", "reviewer_transfer": identity})
+            codex_mesh.advance_worker_roster_revision(current)
+            records[reviewer] = current
+            _write_roster(handle, records)
+        with ExitStack() as locks:
+            inbox, messages = _giving_inbox(locks, source, reviewer)
+            destination.mkdir(parents=True, exist_ok=True)
+            _transfer_pending(locks, inbox, destination, name, after, identity, messages)
+    marker = _object(transaction.get("account_move"))
+    if marker:
+        _atomic(destination / f"{name}.account-move.json", marker)
+    instructions = _text(transaction.get("instructions"))
+    if instructions:
+        path = destination / f"{name}.standing.md"
+        with path.open("w", encoding="utf-8") as output:
+            _ = output.write(instructions)
+            output.flush()
+            os.fsync(output.fileno())
+        after["instructions_file"] = str(path)
+    _ = _register_reviewer(destination, ledger, IncomingReviewer(name, after))
+    # Retain the completed intent until the pool has removed its lease. Recovery
+    # can then finish a stop after any ledger or pool write without a new thread.
+    if transaction.get("complete") is not True:
+        transaction["complete"] = True
+        _atomic(journal, transaction)
+    return ReviewerMigrated(reviewer, _required(transaction, "unit"), name, _required(after, "thread_id"))
+
+
+def _reviewer_busy_reason(source: Path, reviewer: str, record: Mapping[str, object]) -> str:
+    """Use the mesh idle rule without creating an absent pending inbox."""
+    from scripts.agents import codex_mesh
+    with ExitStack() as locks:
+        try:
+            inbox = locks.enter_context((source / f"{reviewer}.pending.json").open(encoding="utf-8"))
+            fcntl.flock(inbox, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except FileNotFoundError:
+            inbox = locks.enter_context(io.StringIO())
+        except BlockingIOError:
+            return "pending inbox is in use; retry allocation"
+        return codex_mesh._worker_idle_reason_with_inbox(  # pyright: ignore[reportPrivateUsage]
+            str(source), reviewer, record, inbox, prior_runs=(), paused=False, adopting=True,
+            deadline=time.time() + codex_mesh.THREAD_RELEASE_TIMEOUT_SECS)
+
+
+def transfer_reviewers(production: str, runs: Mapping[str, Path], *, dry_run: bool = True) -> tuple[ReviewerTransfer, ...]:
+    """Move leased code reviewers to explicit unit runs; dry runs create no files."""
+    from scripts.direct import review_pool
+    pool_store = review_pool.production_pool(production)
+    pool_path = pool_store.directory / "pool.json"
+    if not pool_path.is_file():
+        return ()
+    if dry_run:
+        # Do not enter ProductionPool.locked: it creates a lock file and folder.
+        pool = review_pool.decode_pool(cast(review_pool.PoolJson, cast(object, _read(pool_path))))
+        return _transfer_reviewers(pool_store, pool, runs, dry_run=True)
+    with pool_store.locked(write=False) as pool:
+        if pool.stopping:
+            raise WorkerUnavailable("reviewer pool is stopping")
+        before = set(pool.reviewers)
+        results = _transfer_reviewers(pool_store, pool, runs, dry_run=False)
+        if set(pool.reviewers) != before:
+            pool_store.save(pool)
+        return results
+
+
+def _transfer_reviewers(pool_store: ProductionPool, pool: Pool, runs: Mapping[str, Path], *, dry_run: bool) -> tuple[ReviewerTransfer, ...]:
+    from scripts.direct import review_pool
+    from scripts.agents import codex_mesh
+    source = pool_store.mesh_dir(pool.generation)
+    results: list[ReviewerTransfer] = []
+    planned: dict[Path, set[str]] = {}
+    for reviewer, leased in sorted(pool.reviewers.items()):
+        lease = leased.lease
+        if leased.type != "code" or not isinstance(lease, review_pool.UnitLease):
+            continue
+        unit = lease.unit
+        target = runs.get(unit)
+        if target is None:
+            target = runs.get(unit.removesuffix("-unit")) if unit.endswith("-unit") else runs.get(f"{unit}-unit")
+        if target is None:
+            results.append(ReviewerConflict(reviewer, unit, ReviewerConflictCause.NO_DESTINATION))
+            continue
+        destination = target.expanduser().resolve()
+        target_store = _ledger_for_run(destination)
+        if (target_store.path.parent.name != pool_store.directory.name
+                or target_store.path.stem.removesuffix("-unit") != unit.removesuffix("-unit")):
+            results.append(ReviewerConflict(reviewer, unit, ReviewerConflictCause.WRONG_UNIT))
+            continue
+        if codex_mesh.finished_run_status(str(destination)):
+            results.append(ReviewerConflict(reviewer, unit, ReviewerConflictCause.FINISHED))
+            continue
+        journal = pool_store.directory / "worker-transfers" / str(pool.generation) / f"{reviewer}.json"
+        transaction = _read(journal)
+        if transaction:
+            current = _object(_read_roster(source).get(reviewer))
+            if (current.get("reviewer_transfer") != transaction.get("id")
+                    and current != _object(transaction.get("before"))):
+                if not dry_run:
+                    journal.unlink()
+                transaction = {}
+        if transaction:
+            if (transaction.get("destination") != str(destination)
+                    or _object(transaction.get("after")).get("thread_id") != leased.thread_id):
+                results.append(ReviewerConflict(reviewer, unit, ReviewerConflictCause.SAVED_DESTINATION))
+                continue
+            current = _object(_read_roster(source).get(reviewer))
+            if current.get("reviewer_transfer") != transaction.get("id"):
+                reason = _reviewer_busy_reason(source, reviewer, current)
+                if not review_pool.reviewer_is_idle(leased) or reason:
+                    results.append(ReviewerDeferred(reviewer, unit, reason or "reviewer is busy"))
+                    continue
+            if dry_run:
+                results.append(ReviewerMigrated(reviewer, unit, _required(transaction, "worker"), leased.thread_id))
+                continue
+            result = _finish_reviewer_transfer(journal, transaction)
+            if isinstance(result, ReviewerMigrated):
+                _ = pool.reviewers.pop(reviewer)
+            results.append(result)
+            continue
+        if not review_pool.reviewer_is_idle(leased):
+            results.append(ReviewerDeferred(reviewer, unit, "reviewer is busy"))
+            continue
+        before = _object(_read_roster(source).get(reviewer))
+        if not before or before.get("thread_id") != leased.thread_id:
+            results.append(ReviewerConflict(reviewer, unit, ReviewerConflictCause.THREAD_MISMATCH))
+            continue
+        if before.get("status") in ("running", "starting") or codex_mesh.worker_launcher_attached(before) or allocation_is_live(before):
+            results.append(ReviewerDeferred(reviewer, unit, "reviewer is busy"))
+            continue
+        conflict = _transfer_conflict(destination, source, leased.thread_id)
+        if isinstance(conflict, ReviewerConflictCause):
+            results.append(ReviewerConflict(reviewer, unit, conflict))
+            continue
+        data = _read(_ledger_for_run(destination).path)
+        occupied: dict[str, object] = {**_object(data.get("workers")), **_read_roster(destination)}
+        occupied.update({name: "planned" for name in planned.get(destination, set())})
+        name = _next_worker_name(UnitWorkers(), occupied, _reviewer_destination(destination))
+        planned.setdefault(destination, set()).add(name)
+        reason = _reviewer_busy_reason(source, reviewer, before)
+        if reason:
+            results.append(ReviewerDeferred(reviewer, unit, reason))
+            continue
+        if dry_run:
+            results.append(ReviewerMigrated(reviewer, unit, name, leased.thread_id))
+            continue
+        after = dict(before)
+        for key in ("launcher_pid", "port", "turn_id", "paused_from", "paused_turn", "adopted_to"):
+            _ = after.pop(key, None)
+        clear_allocation(after)
+        after.update({"role": "review", "slot": "review" + name.removeprefix(_reviewer_destination(destination)),
+                      "status": "paused", "cwd": _required(_read(destination / STATE), "working_dir"),
+                      "reviewer_source": str(source),
+                      "reviewer_name": reviewer, "adopted_from": str(source), "giving_runs": [str(source)],
+                      "unit_ledger": str(_ledger_for_run(destination).path),
+                      "access_policy": {"kind": "ReadOnlyReviewer"}})
+        # Keep the account home that owns the existing thread rather than the
+        # destination server's home. No server starts during the transfer.
+        if not after.get("codex_home"):
+            after["codex_home"] = str(codex_mesh.server_record_home(_read(source / "mesh_server.json")))
+        identity = str(uuid.uuid4())
+        instructions_file = _text(before.get("instructions_file"))
+        instructions = Path(instructions_file).read_text(encoding="utf-8") if instructions_file else ""
+        transaction: dict[str, object] = {"id": identity, "reviewer": reviewer, "unit": unit, "source": str(source),
+                       "destination": str(destination), "worker": name, "before": before, "after": after,
+                       "instructions": instructions, "account_move": _read(source / f"{reviewer}.account-move.json")}
+        _atomic(journal, transaction)
+        result = _finish_reviewer_transfer(journal, transaction)
+        if isinstance(result, ReviewerMigrated):
+            _ = pool.reviewers.pop(reviewer)
+        results.append(result)
+    return tuple(results)
 
 
 @dataclass(frozen=True)
@@ -1286,10 +1674,29 @@ def main() -> int:
     _ = command.add_argument("--session-dir", type=Path, required=True)
     _ = command.add_argument("--role", choices=ROLES, required=True)
     _ = command.add_argument("--owner-pid", type=int, default=0)
+    transfer = commands.add_parser("transfer-reviewers", help="move leased code reviewers to unit workers")
+    _ = transfer.add_argument("--production", required=True)
+    _ = transfer.add_argument("--session-dir", dest="transfer_runs", type=Path, action="append", required=True)
+    _ = transfer.add_argument("--apply", action="store_true", help="write the transfer; omit to read only")
     args = parser.parse_args(namespace=WorkerArguments())
     run = args.session_dir
     role = args.role
     try:
+        if args.command == "transfer-reviewers":
+            runs: dict[str, Path] = {}
+            for destination in args.transfer_runs:
+                unit = _ledger_for_run(destination).path.stem
+                if unit in runs:
+                    raise WorkerUnavailable(f"more than one destination for {unit}")
+                runs[unit] = destination
+            for result in transfer_reviewers(args.production, runs, dry_run=not args.apply):
+                if isinstance(result, ReviewerMigrated):
+                    print(f"migrated: {result.unit}: {result.reviewer} -> {result.worker} ({result.thread_id})")
+                elif isinstance(result, ReviewerDeferred):
+                    print(f"deferred: {result.unit}: {result.reviewer}: {result.reason}")
+                else:
+                    print(f"conflict: {result.unit}: {result.reviewer}: {result.reason}")
+            return 0
         print(_resolve(run, role, args.owner_pid or director_pid(run)))
         return 0
     except (WorkerUnavailable, OSError, ValueError) as error:

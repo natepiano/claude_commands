@@ -469,6 +469,7 @@ write_turn_record() {
     "${POOL_TYPE}" "${POOL_PRODUCTION}" "${REVIEW_WORKER}" "${TURN_THREAD_ID}" \
     "${TURN_LEASE}" "${TURN_PROGRESS}" "${LENS}" "${PASS_INDEX}" \
     "${LEASE_ORDINAL}" "${PRIME_HASH}" "${TURN_RAISED}" <<'PY'
+import itertools
 import json
 import os
 import sys
@@ -495,9 +496,15 @@ sys.path.insert(0, os.environ["UNIT_LIB_DIR"])
 from unit_runs import history_root
 root = history_root() / "review_turns" / Path(session).name
 root.mkdir(parents=True, exist_ok=True)
-with (root / f"{started}-{pid}.json").open("x", encoding="utf-8") as output:
-    json.dump(record, output, ensure_ascii=False)
-    output.write("\n")
+for sequence in itertools.count():
+    try:
+        output = (root / f"{started}-{pid}-{sequence}.json").open("x", encoding="utf-8")
+    except FileExistsError:
+        continue
+    with output:
+        json.dump(record, output, ensure_ascii=False)
+        output.write("\n")
+    break
 PY
 }
 

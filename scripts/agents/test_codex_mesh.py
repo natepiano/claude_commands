@@ -9367,6 +9367,25 @@ class WorkerAdoptionTests(MeshCommandFixture):
         self.assertEqual(_as_test_dict(starts[0]["params"]).get("serviceTier"), "fast")
         self.assertEqual(self.methods("turn/start"), [], "allocating an idle worker submitted work")
 
+    def test_new_review_thread_has_its_configured_shown_name_before_any_turn(self) -> None:
+        self.configure_allocation()
+        registry = self.session_dir / "workers-agents.conf"
+        _ = registry.write_text(registry.read_text().replace("impl=gpt-fixture-sol:xhigh\n",
+                                                          "impl=gpt-fixture-sol:xhigh\nreview=gpt-fixture-sol:xhigh\n"))
+        state = self.session_dir / plan_history.STATE_FILENAME
+        _ = state.write_text(json.dumps({"working_dir": str(self.session_dir),
+                                         "production": "sdlc", "unit": "roles-unit"}))
+        configured = fixture_names()
+        jobs = dict(configured.jobs)
+        jobs["code_reviewer"] = ("code checker",)
+        with patch.object(names, "runtime_names", return_value=names.Names(jobs, configured.audiences)):
+            record = codex_mesh.open_unit_worker(str(self.session_dir), "repository-review2", "review")
+        self.assertEqual(self.methods("thread/name/set")[-1]["params"], {
+            "threadId": THREAD_ID, "name": "sdlc · roles · code checker review2"})
+        self.assertEqual(record["role"], "review")
+        self.assertEqual(record["access_policy"], {"kind": "ReadOnlyReviewer"})
+        self.assertEqual(self.methods("turn/start"), [])
+
     def test_a_new_thread_is_released_if_naming_or_recording_its_worker_fails(self) -> None:
         self.configure_allocation()
         for failure in ("naming", "recording"):

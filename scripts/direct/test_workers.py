@@ -19,11 +19,11 @@ from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import TextIO, cast, override
+from typing import Literal, TextIO, cast, override
 from unittest.mock import patch
 
 from scripts.agents import codex_mesh, test_codex_mesh as mesh_fixture
-from scripts.direct import progress_history, workers
+from scripts.direct import progress_history, review_pool, workers
 from scripts.direct.recorder_fixture import invoke_recorder
 
 
@@ -196,6 +196,471 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         cast(dict[str, object], roster[name])["unit_ledger"] = str(store.path)
         _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(roster))
         return store
+
+    def leased_pool_reviewer(self, *, busy: bool = False) -> tuple[Path, Path]:
+        state = json_object(self.session_dir / workers.STATE)
+        state.update({"production": "production", "unit": "builders-unit"})
+        _ = (self.session_dir / workers.STATE).write_text(json.dumps(state), encoding="utf-8")
+        pool_root = self.session_dir.parent / "review-pool"
+        self.patches.enter_context(patch.dict(os.environ, {"REVIEW_POOL_STATE": str(pool_root)}))
+        pool = pool_root / "production" / "pool.json"
+        source = pool.parent / "mesh" / "0"
+        source.mkdir(parents=True)
+        _ = (source / codex_mesh.SERVER_FILE).write_bytes(
+            (self.session_dir / codex_mesh.SERVER_FILE).read_bytes())
+        instructions = source / "code.md"
+        _ = instructions.write_text("Review only; keep the thread's context.\n", encoding="utf-8")
+        _ = (source / codex_mesh.ROSTER_FILE).write_text(json.dumps({"code6": {
+            "thread_id": mesh_fixture.THREAD_ID, "status": "done", "role": "review",
+            "model": "gpt-kept-sol", "effort": "xhigh", "family": "codex",
+            "codex_home": os.environ["CODEX_HOME"], "port": self.server.port,
+            "cwd": str(self.session_dir.parent / "repository"),
+            "instructions_file": str(instructions), "access_policy": {"kind": "ReadOnlyReviewer"},
+        }}), encoding="utf-8")
+        _ = pool.write_text(json.dumps({"generation": 0, "templates": {}, "reviewers": {
+            "code6": {"type": "code", "thread_id": mesh_fixture.THREAD_ID,
+                      "prime_hash": "kept-prompt", "lease": {"unit": "builders-unit", "ordinal": 6},
+                      "busy_pid": os.getpid() if busy else None, "reviews": 6},
+        }}), encoding="utf-8")
+        with review_pool.ProductionPool(pool.parent).locked():
+            pass
+        return pool, source
+
+    def test_pool_reviewer_moves_to_the_unit_on_its_existing_thread_and_rerun_changes_nothing(self) -> None:
+        pool, source = self.leased_pool_reviewer()
+        results = workers.transfer_reviewers("production", {"builders-unit": self.session_dir}, dry_run=False)
+        self.assertEqual(results, (workers.ReviewerMigrated(
+            "code6", "builders-unit", "repository-review", mesh_fixture.THREAD_ID),))
+        with workers.ledger_for_run(self.session_dir).locked() as ledger:
+            reviewer = ledger.workers["repository-review"]
+            self.assertEqual(reviewer.role, "review")
+            self.assertEqual(reviewer.backend, workers.CodexThread(mesh_fixture.THREAD_ID, os.environ["CODEX_HOME"]))
+            self.assertEqual(reviewer.ownership, workers.HeldBy(str(self.session_dir)))
+            self.assertEqual(reviewer.access_policy.get("kind"), "ReadOnlyReviewer")
+        destination = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
+        record = cast(dict[str, object], destination["repository-review"])
+        self.assertEqual(record["thread_id"], mesh_fixture.THREAD_ID)
+        self.assertEqual(record["role"], "review")
+        self.assertEqual(record["model"], "gpt-kept-sol")
+        self.assertEqual(Path(cast(str, record["instructions_file"])).read_text(encoding="utf-8"),
+                         "Review only; keep the thread's context.\n")
+        self.assertNotIn("code6", cast(dict[str, object], json_object(pool)["reviewers"]))
+        self.assertEqual(self.methods("thread/start"), [])
+        self.assertEqual(self.methods("thread/fork"), [])
+        ledger_path = workers.ledger_for_run(self.session_dir).path
+        paths = (pool, ledger_path, source / codex_mesh.ROSTER_FILE,
+                 self.session_dir / codex_mesh.ROSTER_FILE)
+        before = {path: path.read_bytes() for path in paths}
+        self.assertEqual(workers.transfer_reviewers("production", {"builders-unit": self.session_dir}, dry_run=False), ())
+        self.assertEqual({path: path.read_bytes() for path in paths}, before)
+
+    def test_busy_pool_reviewer_is_deferred_then_moves_after_release(self) -> None:
+        pool, source = self.leased_pool_reviewer(busy=True)
+        before = pool.read_bytes(), (source / codex_mesh.ROSTER_FILE).read_bytes()
+        result, = workers.transfer_reviewers("production", {"builders-unit": self.session_dir}, dry_run=False)
+        assert isinstance(result, workers.ReviewerDeferred), result
+        self.assertEqual((result.reviewer, result.unit), ("code6", "builders-unit"))
+        self.assertTrue(result.reason)
+        self.assertEqual((pool.read_bytes(), (source / codex_mesh.ROSTER_FILE).read_bytes()), before)
+        self.assertFalse(workers.ledger_for_run(self.session_dir).path.exists())
+        data = json_object(pool)
+        cast(dict[str, object], cast(dict[str, object], data["reviewers"])["code6"])["busy_pid"] = None
+        _ = pool.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(workers.transfer_reviewers("production", {"builders-unit": self.session_dir}, dry_run=False),
+                         (workers.ReviewerMigrated("code6", "builders-unit", "repository-review", mesh_fixture.THREAD_ID),))
+
+    def test_a_different_unit_reviewer_conflicts_without_replacing_either_thread(self) -> None:
+        pool, source = self.leased_pool_reviewer()
+        self.open_worker("repository-review", "review")
+        roster = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
+        cast(dict[str, object], roster["repository-review"])["thread_id"] = "unit-owned-thread"
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(roster), encoding="utf-8")
+        store = workers.ledger_for_run(self.session_dir)
+        with store.locked() as ledger:
+            ledger.workers["repository-review"] = workers.UnitWorker(
+                "repository-review", "review", "codex", "gpt-kept-sol", "xhigh", {"kind": "ReadOnlyReviewer"},
+                workers.CodexThread("unit-owned-thread", os.environ["CODEX_HOME"]),
+                workers.HeldBy(str(self.session_dir)), [])
+        paths = (pool, store.path, source / codex_mesh.ROSTER_FILE, self.session_dir / codex_mesh.ROSTER_FILE)
+        before = {path: path.read_bytes() for path in paths}
+        result, = workers.transfer_reviewers("production", {"builders-unit": self.session_dir}, dry_run=False)
+        assert isinstance(result, workers.ReviewerConflict), result
+        self.assertEqual((result.reviewer, result.unit), ("code6", "builders-unit"))
+        self.assertTrue(result.reason)
+        self.assertEqual({path: path.read_bytes() for path in paths}, before)
+
+    def test_transfer_dry_run_reports_the_move_without_writing_pool_or_ledger(self) -> None:
+        pool, source = self.leased_pool_reviewer()
+        store = workers.ledger_for_run(self.session_dir)
+        with store.locked():
+            pass
+        paths = (pool, store.path, source / codex_mesh.ROSTER_FILE)
+        before = {path: path.read_bytes() for path in paths}
+        files_before = {path.relative_to(self.session_dir.parent) for path in self.session_dir.parent.rglob("*")}
+        output = io.StringIO()
+        with patch.object(sys, "argv", [str(SCRIPT), "transfer-reviewers", "--production", "production",
+                                        "--session-dir", str(self.session_dir)]), redirect_stdout(output):
+            self.assertEqual(workers.main(), 0)
+        self.assertEqual(output.getvalue(), "migrated: builders-unit: code6 -> repository-review "
+                         + f"({mesh_fixture.THREAD_ID})\n")
+        self.assertEqual({path: path.read_bytes() for path in paths}, before)
+        self.assertEqual({path.relative_to(self.session_dir.parent) for path in self.session_dir.parent.rglob("*")},
+                         files_before)
+
+    def test_unfenced_transfer_replans_after_the_pool_uses_its_thread_again(self) -> None:
+        pool, source = self.leased_pool_reviewer()
+        atomic = workers._atomic  # pyright: ignore[reportPrivateUsage]
+
+        def interrupted(path: Path, data: Mapping[str, object]) -> None:
+            atomic(path, data)
+            if "worker-transfers" in path.parts:
+                raise AdoptionWriteInterrupted()
+
+        with patch.object(workers, "_atomic", new=interrupted), self.assertRaises(AdoptionWriteInterrupted):
+            _ = workers.transfer_reviewers("production", {"builders-unit": self.session_dir}, dry_run=False)
+        roster = json_object(source / codex_mesh.ROSTER_FILE)
+        record = cast(dict[str, object], roster["code6"])
+        record.update({"status": "running", "turn_id": "later-pool-turn"})
+        _ = (source / codex_mesh.ROSTER_FILE).write_text(json.dumps(roster))
+        result, = workers.transfer_reviewers("production", {"builders-unit": self.session_dir}, dry_run=False)
+        self.assertIsInstance(result, workers.ReviewerDeferred)
+        record["status"] = "done"
+        _ = (source / codex_mesh.ROSTER_FILE).write_text(json.dumps(roster))
+        self.assertEqual(workers.transfer_reviewers("production", {"builders-unit": self.session_dir}, dry_run=False),
+                         (workers.ReviewerMigrated("code6", "builders-unit", "repository-review", mesh_fixture.THREAD_ID),))
+        self.assertEqual(json_object(pool)["reviewers"], {})
+        self.assertEqual(self.methods("thread/start"), [])
+
+    def test_fenced_transfer_uses_the_next_name_when_its_saved_name_is_claimed(self) -> None:
+        pool, source = self.leased_pool_reviewer()
+        write_roster = workers._write_roster  # pyright: ignore[reportPrivateUsage]
+
+        def interrupted(handle: TextIO, data: dict[str, object]) -> None:
+            write_roster(handle, data)
+            if Path(cast(str, handle.name)) == source / codex_mesh.ROSTER_FILE:
+                raise AdoptionWriteInterrupted()
+
+        with patch.object(workers, "_write_roster", new=interrupted), self.assertRaises(AdoptionWriteInterrupted):
+            _ = workers.transfer_reviewers("production", {"builders-unit": self.session_dir}, dry_run=False)
+        self.open_worker("repository-review", "impl")
+        roster = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
+        cast(dict[str, object], roster["repository-review"])["thread_id"] = "competing-thread"
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(roster))
+        self.assertEqual(workers.transfer_reviewers("production", {"builders-unit": self.session_dir}, dry_run=False),
+                         (workers.ReviewerMigrated("code6", "builders-unit", "repository-review2", mesh_fixture.THREAD_ID),))
+        roster = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
+        self.assertEqual(cast(dict[str, object], roster["repository-review"])["thread_id"], "competing-thread")
+        self.assertEqual(cast(dict[str, object], roster["repository-review2"])["slot"], "review2")
+        self.assertEqual(json_object(pool)["reviewers"], {})
+
+    def test_retargeted_transfer_keeps_an_inbox_moved_before_registration_stopped(self) -> None:
+        pool, source = self.leased_pool_reviewer()
+        _ = (source / "code6.pending.json").write_text(json.dumps({
+            "thread_id": mesh_fixture.THREAD_ID, "messages": ["review this change"]}))
+        write_roster = workers._write_roster  # pyright: ignore[reportPrivateUsage]
+
+        def interrupted(handle: TextIO, data: dict[str, object]) -> None:
+            if Path(cast(str, handle.name)) == self.session_dir / codex_mesh.ROSTER_FILE:
+                raise AdoptionWriteInterrupted()
+            write_roster(handle, data)
+
+        with patch.object(workers, "_write_roster", new=interrupted), self.assertRaises(AdoptionWriteInterrupted):
+            _ = workers.transfer_reviewers("production", {"builders-unit": self.session_dir}, dry_run=False)
+        self.open_worker("repository-review", "impl")
+        roster = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
+        cast(dict[str, object], roster["repository-review"])["thread_id"] = "competing-thread"
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(roster))
+        result, = workers.transfer_reviewers("production", {"builders-unit": self.session_dir}, dry_run=False)
+        self.assertEqual(result, workers.ReviewerMigrated("code6", "builders-unit", "repository-review2", mesh_fixture.THREAD_ID))
+        self.assertEqual(json_object(self.session_dir / "repository-review2.pending.json")["messages"], ["review this change"])
+        self.assertEqual(json_object(pool)["reviewers"], {})
+
+    def prepare_retargeted_inboxes(self, replacement_messages: list[str]) -> tuple[Path, Path, Path]:
+        pool, source = self.leased_pool_reviewer()
+        _ = (source / "code6.pending.json").write_text(json.dumps({
+            "thread_id": mesh_fixture.THREAD_ID,
+            "messages": ["review this change", "review this change"]}))
+        write_roster = workers._write_roster  # pyright: ignore[reportPrivateUsage]
+
+        def interrupted(handle: TextIO, data: dict[str, object]) -> None:
+            if Path(cast(str, handle.name)) == self.session_dir / codex_mesh.ROSTER_FILE:
+                raise AdoptionWriteInterrupted()
+            write_roster(handle, data)
+
+        with patch.object(workers, "_write_roster", new=interrupted), self.assertRaises(AdoptionWriteInterrupted):
+            _ = workers.transfer_reviewers("production", {"builders-unit": self.session_dir}, dry_run=False)
+        self.open_worker("repository-review", "impl")
+        roster = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
+        cast(dict[str, object], roster["repository-review"])["thread_id"] = "competing-thread"
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(roster))
+        old_inbox = self.session_dir / "repository-review.pending.json"
+        target_inbox = self.session_dir / "repository-review2.pending.json"
+        content = json.dumps({"thread_id": mesh_fixture.THREAD_ID, "messages": replacement_messages}) if replacement_messages else ""
+        _ = target_inbox.write_text(content)
+        return pool, old_inbox, target_inbox
+
+    def test_retargeted_transfer_moves_messages_into_an_existing_empty_inbox(self) -> None:
+        pool, old_inbox, target_inbox = self.prepare_retargeted_inboxes([])
+        result, = workers.transfer_reviewers("production", {"builders-unit": self.session_dir}, dry_run=False)
+        self.assertEqual(result, workers.ReviewerMigrated("code6", "builders-unit", "repository-review2", mesh_fixture.THREAD_ID))
+        self.assertEqual(json_object(target_inbox)["messages"], ["review this change", "review this change"])
+        self.assertEqual(json_object(old_inbox)["messages"], [])
+        self.assertFalse(json_object(old_inbox)["accepting_messages"])
+        self.assertEqual(json_object(pool)["reviewers"], {})
+        before = old_inbox.read_bytes(), target_inbox.read_bytes(), pool.read_bytes()
+        self.assertEqual(workers.transfer_reviewers("production", {"builders-unit": self.session_dir}, dry_run=False), ())
+        self.assertEqual((old_inbox.read_bytes(), target_inbox.read_bytes(), pool.read_bytes()), before)
+
+    def test_retargeted_transfer_merges_existing_messages_once_after_an_interrupted_write(self) -> None:
+        pool, old_inbox, target_inbox = self.prepare_retargeted_inboxes(["already queued"])
+        write_inbox = workers._write_inbox  # pyright: ignore[reportPrivateUsage]
+
+        def interrupted(handle: TextIO, data: Mapping[str, object]) -> None:
+            write_inbox(handle, data)
+            if Path(cast(str, handle.name)) == target_inbox:
+                raise AdoptionWriteInterrupted()
+
+        with patch.object(workers, "_write_inbox", new=interrupted), self.assertRaises(AdoptionWriteInterrupted):
+            _ = workers.transfer_reviewers("production", {"builders-unit": self.session_dir}, dry_run=False)
+        expected = ["review this change", "review this change", "already queued"]
+        self.assertEqual(json_object(target_inbox)["messages"], expected)
+        self.assertEqual(json_object(old_inbox)["messages"], ["review this change", "review this change"])
+        self.assertIn("code6", cast(dict[str, object], json_object(pool)["reviewers"]))
+        result, = workers.transfer_reviewers("production", {"builders-unit": self.session_dir}, dry_run=False)
+        self.assertEqual(result, workers.ReviewerMigrated("code6", "builders-unit", "repository-review2", mesh_fixture.THREAD_ID))
+        self.assertEqual(json_object(target_inbox)["messages"], expected)
+        self.assertEqual(json_object(old_inbox)["messages"], [])
+        self.assertEqual(json_object(pool)["reviewers"], {})
+        before = old_inbox.read_bytes(), target_inbox.read_bytes(), pool.read_bytes()
+        self.assertEqual(workers.transfer_reviewers("production", {"builders-unit": self.session_dir}, dry_run=False), ())
+        self.assertEqual((old_inbox.read_bytes(), target_inbox.read_bytes(), pool.read_bytes()), before)
+
+    def test_destination_ledger_stays_locked_from_source_fence_through_registration(self) -> None:
+        pool, source = self.leased_pool_reviewer()
+        write_roster = workers._write_roster  # pyright: ignore[reportPrivateUsage]
+        lock_path = workers.ledger_for_run(self.session_dir).path.with_suffix(".lock")
+        checked: list[bool] = []
+
+        def inspect_lock(handle: TextIO, data: dict[str, object]) -> None:
+            if Path(cast(str, handle.name)) in (source / codex_mesh.ROSTER_FILE,
+                                               self.session_dir / codex_mesh.ROSTER_FILE):
+                with lock_path.open() as other:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                checked.append(True)
+            write_roster(handle, data)
+
+        with patch.object(workers, "_write_roster", new=inspect_lock):
+            result, = workers.transfer_reviewers("production", {"builders-unit": self.session_dir}, dry_run=False)
+        self.assertIsInstance(result, workers.ReviewerMigrated)
+        self.assertEqual(len(checked), 2)
+        self.assertEqual(json_object(pool)["reviewers"], {})
+
+    def test_dry_run_checks_live_turns_and_detached_work_without_creating_files(self) -> None:
+        pool, source = self.leased_pool_reviewer()
+        paths = {path: path.read_bytes() for path in self.session_dir.parent.rglob("*") if path.is_file()}
+        original = self.server.respond
+
+        @mesh_fixture.bounded_fixture
+        def active_thread(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/loaded/list":
+                return [{"id": request["id"], "result": {"data": [mesh_fixture.THREAD_ID]}}]
+            if request.get("method") == "thread/read":
+                return [{"id": request["id"], "result": {"thread": {"id": mesh_fixture.THREAD_ID,
+                    "status": {"type": "active"}, "turns": [{"id": "live", "status": "inProgress"}]}}}]
+            return original(request)
+
+        self.server.respond = active_thread
+        dry, = workers.transfer_reviewers("production", {"builders-unit": self.session_dir})
+        self.assertIsInstance(dry, workers.ReviewerDeferred)
+        self.assertEqual({path: path.read_bytes() for path in self.session_dir.parent.rglob("*") if path.is_file()}, paths)
+        applied, = workers.transfer_reviewers("production", {"builders-unit": self.session_dir}, dry_run=False)
+        self.assertEqual(dry, applied)
+        self.server.respond = original
+        runs = source / codex_mesh.DETACHED_RUNS_DIR
+        runs.mkdir()
+        _ = (runs / "review-command.json").write_text(json.dumps({
+            "worker": "code6", "status": "running", "pid": os.getpid()}))
+        dry, = workers.transfer_reviewers("production", {"builders-unit": self.session_dir})
+        self.assertIsInstance(dry, workers.ReviewerDeferred)
+        self.assertIn("detached", dry.reason if isinstance(dry, workers.ReviewerDeferred) else "")
+        self.assertIn("code6", cast(dict[str, object], json_object(pool)["reviewers"]))
+
+    def test_transfer_cli_reads_unit_identity_from_the_existing_plan(self) -> None:
+        pool, source = self.leased_pool_reviewer()
+        state = json_object(self.session_dir / workers.STATE)
+        _ = state.pop("unit")
+        _ = state.pop("production")
+        plan = self.session_dir.parent / "repository" / "unit.md"
+        _ = plan.write_text('> **Production: production** — unit `builders-unit`; fixture\n')
+        state["project_plan_doc"] = "unit.md"
+        _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
+        paths = {path: path.read_bytes() for path in self.session_dir.parent.rglob("*") if path.is_file()}
+        with patch.object(sys, "argv", [str(SCRIPT), "transfer-reviewers", "--production", "production",
+                                        "--session-dir", str(self.session_dir)]), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(workers.main(), 0)
+        self.assertIn("migrated: builders-unit: code6 -> repository-review", output.getvalue())
+        self.assertEqual({path: path.read_bytes() for path in self.session_dir.parent.rglob("*") if path.is_file()}, paths)
+        self.assertTrue(pool.exists() and source.exists())
+
+    def test_reviewer_names_use_the_launcher_rule_for_nested_unusual_worktrees(self) -> None:
+        working = self.session_dir.parent / ("odd worktree !" + "x" * 50)
+        working.mkdir()
+        _ = subprocess.run(["git", "init", "-q", str(working)], check=True, capture_output=True)
+        nested = working / "nested"
+        nested.mkdir()
+        state = json_object(self.session_dir / workers.STATE)
+        state["working_dir"] = str(nested)
+        _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
+        expected = subprocess.run(["bash", str(SCRIPT.with_name("worker_name.sh")), str(nested), "review", "review"],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+        self.configure_new_worker()
+        registry = self.session_dir.parent / "registry.conf"
+        with registry.open("a") as output:
+            _ = output.write("review=gpt-kept-sol:xhigh\n")
+        self.assertEqual(self.resolve(self.session_dir, "review"), expected)
+        self.assertTrue(expected.startswith("odd-worktree--"), expected)
+        self.assertEqual(len(expected.removesuffix("-review")), 40)
+
+    def test_transfer_conflicts_keep_closed_causes_and_plain_cli_messages(self) -> None:
+        pool, source = self.leased_pool_reviewer()
+        missing, = workers.transfer_reviewers("production", {})
+        self.assertIsInstance(missing, workers.ReviewerConflict)
+        if isinstance(missing, workers.ReviewerConflict):
+            self.assertIs(missing.cause, workers.ReviewerConflictCause.NO_DESTINATION)
+            self.assertEqual(missing.reason, "no destination run is named")
+        state = json_object(self.session_dir / workers.STATE)
+        state["unit"] = "another-unit"
+        _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
+        wrong, = workers.transfer_reviewers("production", {"builders-unit": self.session_dir})
+        self.assertIsInstance(wrong, workers.ReviewerConflict)
+        if isinstance(wrong, workers.ReviewerConflict):
+            self.assertIs(wrong.cause, workers.ReviewerConflictCause.WRONG_UNIT)
+        self.assertTrue(pool.exists() and source.exists())
+
+    def test_a_unit_with_no_leased_code_reviewer_has_no_transfer_entry(self) -> None:
+        pool, source = self.leased_pool_reviewer()
+        data = json_object(pool)
+        reviewers = cast(dict[str, object], data["reviewers"])
+        leased = cast(dict[str, object], reviewers["code6"])
+        reviewers["ui2"] = {**leased, "type": "ui"}
+        leased["lease"] = None
+        _ = pool.write_text(json.dumps(data), encoding="utf-8")
+        before = pool.read_bytes(), (source / codex_mesh.ROSTER_FILE).read_bytes()
+        self.assertEqual(workers.transfer_reviewers("production", {"builders-unit": self.session_dir}, dry_run=False), ())
+        self.assertEqual((pool.read_bytes(), (source / codex_mesh.ROSTER_FILE).read_bytes()), before)
+        self.assertFalse(workers.ledger_for_run(self.session_dir).path.exists())
+
+    def test_two_leased_reviewers_keep_their_threads_in_distinct_unit_slots(self) -> None:
+        pool, source = self.leased_pool_reviewer()
+        data = json_object(pool)
+        reviewers = cast(dict[str, object], data["reviewers"])
+        reviewers["code7"] = {**cast(dict[str, object], reviewers["code6"]),
+                              "thread_id": "second-pool-thread",
+                              "lease": {"unit": "builders-unit", "ordinal": 7}}
+        _ = pool.write_text(json.dumps(data), encoding="utf-8")
+        records = json_object(source / codex_mesh.ROSTER_FILE)
+        records["code7"] = {**cast(dict[str, object], records["code6"]), "thread_id": "second-pool-thread"}
+        _ = (source / codex_mesh.ROSTER_FILE).write_text(json.dumps(records), encoding="utf-8")
+        self.assertEqual(workers.transfer_reviewers("production", {"builders-unit": self.session_dir}, dry_run=False), (
+            workers.ReviewerMigrated("code6", "builders-unit", "repository-review", mesh_fixture.THREAD_ID),
+            workers.ReviewerMigrated("code7", "builders-unit", "repository-review2", "second-pool-thread"),
+        ))
+        destination = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
+        with workers.ledger_for_run(self.session_dir).locked() as ledger:
+            for name, slot, thread in (("repository-review", "review", mesh_fixture.THREAD_ID),
+                                       ("repository-review2", "review2", "second-pool-thread")):
+                record = cast(dict[str, object], destination[name])
+                self.assertEqual((record["slot"], record["role"], record["thread_id"]), (slot, "review", thread))
+                self.assertEqual(ledger.workers[name].backend, workers.CodexThread(thread, os.environ["CODEX_HOME"]))
+                self.assertEqual(ledger.workers[name].access_policy.get("kind"), "ReadOnlyReviewer")
+        self.assertEqual(json_object(pool)["reviewers"], {})
+        self.assertEqual(self.methods("thread/start"), [])
+
+    def test_transfer_preserves_queued_messages_and_account_move_identity(self) -> None:
+        pool, source = self.leased_pool_reviewer()
+        inbox = source / "code6.pending.json"
+        messages = ["finish the existing review", "keep the reply address"]
+        _ = inbox.write_text(json.dumps({"thread_id": mesh_fixture.THREAD_ID,
+                                        "messages": messages, "accepting_messages": True}), encoding="utf-8")
+        marker = {"thread_id": mesh_fixture.THREAD_ID, "turn_id": "original-turn",
+                  "label": "next-account", "move_id": "original-account-move"}
+        _ = (source / "code6.account-move.json").write_text(json.dumps(marker), encoding="utf-8")
+        self.assertEqual(workers.transfer_reviewers("production", {"builders-unit": self.session_dir}, dry_run=False),
+                         (workers.ReviewerMigrated("code6", "builders-unit", "repository-review", mesh_fixture.THREAD_ID),))
+        target_inbox = self.session_dir / "repository-review.pending.json"
+        queued = json_object(target_inbox)
+        self.assertEqual((queued["thread_id"], queued["messages"], queued["accepting_messages"]),
+                         (mesh_fixture.THREAD_ID, messages, True))
+        self.assertEqual(json_object(inbox)["messages"], [])
+        self.assertFalse(json_object(inbox)["accepting_messages"])
+        self.assertEqual(json_object(self.session_dir / "repository-review.account-move.json"), marker)
+        before = target_inbox.read_bytes(), pool.read_bytes()
+        self.assertEqual(workers.transfer_reviewers("production", {"builders-unit": self.session_dir}, dry_run=False), ())
+        self.assertEqual((target_inbox.read_bytes(), pool.read_bytes()), before)
+
+    def assert_pool_transfer_recovers_after(self, stage: Literal["intent", "source", "destination", "ledger"]) -> None:
+        pool, source = self.leased_pool_reviewer()
+        atomic = workers._atomic  # pyright: ignore[reportPrivateUsage]
+        write_roster = workers._write_roster  # pyright: ignore[reportPrivateUsage]
+        ledger_path = workers.ledger_for_run(self.session_dir).path
+        observed: list[str] = []
+        _ = (source / "code6.pending.json").write_text(json.dumps({"thread_id": mesh_fixture.THREAD_ID,
+            "messages": ["keep this review request"], "accepting_messages": True}), encoding="utf-8")
+
+        def interrupt(written: str) -> None:
+            if written == stage:
+                observed.append(written)
+                raise AdoptionWriteInterrupted()
+
+        def persist_intent(path: Path, data: Mapping[str, object]) -> None:
+            atomic(path, data)
+            if "worker-transfers" in path.parts:
+                interrupt("intent")
+            elif path == ledger_path:
+                interrupt("ledger")
+
+        def roster_written(handle: TextIO, roster: dict[str, object]) -> None:
+            write_roster(handle, roster)
+            path = Path(cast(str, handle.name))
+            if path == source / codex_mesh.ROSTER_FILE:
+                interrupt("source")
+            elif path == self.session_dir / codex_mesh.ROSTER_FILE:
+                interrupt("destination")
+
+        with (patch.object(workers, "_atomic", new=persist_intent),
+              patch.object(workers, "_write_roster", new=roster_written)):
+            with self.assertRaises(AdoptionWriteInterrupted):
+                _ = workers.transfer_reviewers("production", {"builders-unit": self.session_dir}, dry_run=False)
+        self.assertEqual(observed, [stage])
+        self.assertIn("code6", cast(dict[str, object], json_object(pool)["reviewers"]))
+        if stage == "intent":
+            self.assertFalse(ledger_path.exists())
+        self.assertEqual(workers.transfer_reviewers("production", {"builders-unit": self.session_dir}, dry_run=False),
+                         (workers.ReviewerMigrated("code6", "builders-unit", "repository-review", mesh_fixture.THREAD_ID),))
+        with workers.ledger_for_run(self.session_dir).locked() as ledger:
+            self.assertEqual(set(ledger.workers), {"repository-review"})
+            self.assertEqual(ledger.workers["repository-review"].backend,
+                             workers.CodexThread(mesh_fixture.THREAD_ID, os.environ["CODEX_HOME"]))
+        self.assertNotIn("code6", cast(dict[str, object], json_object(pool)["reviewers"]))
+        self.assertEqual(cast(dict[str, object], json_object(source / codex_mesh.ROSTER_FILE)["code6"])["status"],
+                         "ended")
+        self.assertEqual(json_object(self.session_dir / "repository-review.pending.json")["messages"],
+                         ["keep this review request"])
+        self.assertEqual(json_object(source / "code6.pending.json")["messages"], [])
+        self.assertEqual(self.methods("thread/start"), [])
+
+    def test_interrupted_pool_transfer_resumes_the_saved_thread_without_duplicate_workers(self) -> None:
+        self.assert_pool_transfer_recovers_after("intent")
+
+    def test_pool_transfer_recovers_after_fencing_the_source(self) -> None:
+        self.assert_pool_transfer_recovers_after("source")
+
+    def test_pool_transfer_recovers_after_writing_the_destination(self) -> None:
+        self.assert_pool_transfer_recovers_after("destination")
+
+    def test_pool_transfer_recovers_after_writing_the_unit_ledger(self) -> None:
+        self.assert_pool_transfer_recovers_after("ledger")
 
     def test_pause_keeps_backend_queued_work_and_reservation_until_retirement(self) -> None:
         store = self.lifecycle_worker()
@@ -808,6 +1273,38 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         self.assertEqual(self.resolve(self.session_dir, "review"), "reviewer-address")
         with workers.ledger_for_run(self.session_dir).locked() as ledger:
             self.assertEqual(ledger.workers["reviewer-address"].access_policy.get("kind"), "ReadOnlyReviewer")
+
+    def test_concurrent_reviews_open_distinct_read_only_unit_workers(self) -> None:
+        self.configure_new_worker()
+        registry = self.session_dir.parent / "registry.conf"
+        with registry.open("a", encoding="utf-8") as handle:
+            _ = handle.write("review=gpt-kept-sol:xhigh\n")
+        original = self.server.respond
+        opened: list[str] = []
+
+        @mesh_fixture.bounded_fixture
+        def open_reviewer(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/start":
+                identity = f"review-thread-{len(opened) + 1}"
+                opened.append(identity)
+                return [{"id": request["id"], "result": {"thread": {"id": identity}}}]
+            return original(request)
+
+        self.server.respond = open_reviewer
+        first = self.resolve(self.session_dir, "review")
+        second = self.resolve(self.session_dir, "review")
+        self.assertEqual((first, second), ("repository-review", "repository-review2"))
+        with workers.ledger_for_run(self.session_dir).locked() as ledger:
+            for name, thread in zip((first, second), opened, strict=True):
+                worker = ledger.workers[name]
+                self.assertEqual(worker.role, "review")
+                self.assertEqual(worker.backend, workers.CodexThread(thread, os.environ["CODEX_HOME"]))
+                self.assertEqual(worker.access_policy.get("kind"), "ReadOnlyReviewer")
+                self.assertEqual(worker.ownership, workers.HeldBy(str(self.session_dir)))
+        self.assertEqual(len(self.methods("thread/start")), 2)
+        for request in self.methods("thread/start"):
+            self.assertEqual(cast(dict[str, object], request["params"]).get("sandbox"), "read-only")
+        self.assertEqual(self.methods("turn/start"), [])
 
     def test_missing_identities_and_invalid_events_are_refused_when_loading_the_ledger(self) -> None:
         self.open_worker()

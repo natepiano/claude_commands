@@ -766,6 +766,32 @@ class ReviewLauncherPassTests(unittest.TestCase):
         return [cast("dict[str, object]", json.loads(path.read_text(encoding="utf-8")))
                 for path in sorted(directory.glob("*.json"))]
 
+    def test_one_launcher_keeps_two_turn_records_with_the_same_start_second(self) -> None:
+        session = self.start_implementation("two-turn-records")
+        self.finish_implementation(session)
+        # Exercise both writes in one launcher's exit path. The start time and
+        # shell pid stay the same, while the finding counts distinguish them.
+        source = self.review_script.read_text(encoding="utf-8")
+        _ = self.review_script.write_text(source.replace(
+            "  if ! write_turn_record; then\n",
+            "  TURN_RAISED=3\n"
+            + "  write_turn_record || exit 1\n"
+            + "  TURN_RAISED=7\n"
+            + "  if ! write_turn_record; then\n",
+            1,
+        ), encoding="utf-8")
+        result = subprocess.run(self.pool_command(session), env=self.pool_fixture(),
+                                capture_output=True, text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((session / "review_status_contract").read_text().strip(), "reviewed")
+        records = self.turn_records(session)
+        self.assertEqual(len(records), 2)
+        self.assertCountEqual([record["raised"] for record in records], [3, 7])
+        self.assertEqual(records[0]["started_at"], records[1]["started_at"])
+        for record in records:
+            self.assertEqual(record["status"], "reviewed")
+            self.assertEqual(record["thread_id"], "thread-pool")
+
     def call_records(self, filename: str) -> list[dict[str, object]]:
         return [cast("dict[str, object]", json.loads(line)) for line in
                 (self.root / filename).read_text(encoding="utf-8").splitlines()]

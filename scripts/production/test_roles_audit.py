@@ -702,6 +702,21 @@ class SourceCheckTests(unittest.TestCase):
         issues = audit.check_sources(root)
         self.assertEqual(issues, (), "\n".join(issues))
 
+    def test_term_definitions_point_to_existing_repository_files(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        terms = audit.parse_terms((root / "scripts/production/role_terms.toml").read_text(encoding="utf-8"))
+        for item in terms:
+            for definition in item.defined_in:
+                with self.subTest(term=item.name, definition=definition):
+                    self.assertTrue((root / definition.split("#", 1)[0]).is_file(), definition)
+
+    def test_retired_pool_name_flags_a_new_use_outside_its_kept_contexts(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        terms = audit.parse_terms((root / "scripts/production/role_terms.toml").read_text(encoding="utf-8"))
+        uses = audit.check_retired(terms, (audit.LiveFile("docs/new-review.md", "Use the review pool."),))
+        self.assertEqual([(use.path, use.line, use.name) for use in uses],
+                         [("docs/new-review.md", 1, "review pool")])
+
 
 class ProductionNameTests(unittest.TestCase):
     def test_reads_only_units_and_finds_format_and_cross_role_collisions(self) -> None:
