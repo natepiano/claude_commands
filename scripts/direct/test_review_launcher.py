@@ -20,6 +20,17 @@ from scripts.direct.wait_for_test_state import wait_until
 
 
 class ReviewLauncherPassTests(support.ReviewLauncherFixture):
+    def test_named_review_phase_reaches_verification_environment(self) -> None:
+        session = self.start_implementation("review-phase-environment")
+        self.finish_implementation(session)
+        _ = self.prompt_file.write_text("Phase 3 — Retry handling\nReview the diff.\n")
+        stub = self.root / "scripts" / "agents" / "agent_exec.sh"
+        with stub.open("a") as output:
+            _ = output.write('printf "%s|%s" "$UNIT_RUN_DIR" "$UNIT_TEAM_ROLE" > "$UNIT_RUN_DIR/wait-context"\n')
+        result = self.checked_review(session, "--phase", "3")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((session / "wait-context").read_text(), f"{session}|")
+
     def test_interpreter_cache_reuses_the_resolved_python_without_a_version_probe(self) -> None:
         launcher = self.root / "scripts" / "lib" / "py"
         binaries = self.root / "binaries"

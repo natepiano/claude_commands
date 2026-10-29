@@ -103,6 +103,51 @@ def json_object(path: Path) -> dict[str, object]:
 
 
 class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
+    def test_ledger_uses_canonical_production_for_both_headers_and_saved_metadata(self) -> None:
+        worktree = self.session_dir.parent / "repository"
+        plan = worktree / "plan.md"
+        production_doc = worktree / "production.md"
+        _ = production_doc.write_text("## Production Context\n\n- **Formerly:** `demo`\n")
+        notifier = Path(os.environ["NOTIFIER_STATE_DIR"]) / "showrunner-renamed"
+        notifier.mkdir(parents=True)
+        _ = (notifier / "conf").write_text(
+            "TARGET=session:fixture\nCHECK="
+            + shlex.join(["zsh", "/opt/tools/production_check.sh", str(production_doc)]) + "\n")
+        for source in ("**Production: demo**", "**Production:** demo", "saved metadata"):
+            with self.subTest(source=source):
+                self.write_run_context(self.session_dir)
+                state = json_object(self.session_dir / workers.STATE)
+                if source == "saved metadata":
+                    state.update({"production": "demo", "unit": "builders"})
+                else:
+                    _ = plan.write_text(f'> {source} — unit `builders`; plan\n')
+                    state["plan_doc"] = str(plan)
+                _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
+                self.assertEqual(progress_history.resolve_production_unit(state),
+                                 progress_history.ProductionUnitIdentity("demo", "builders"))
+                self.assertEqual(workers.ledger_for_run(self.session_dir).path,
+                                 workers.ledger_path("renamed", "builders"))
+
+    def test_plan_header_metadata_resolves_without_completing_a_pending_worker_move(self) -> None:
+        state = json_object(self.session_dir / workers.STATE)
+        worktree = Path(str(state["working_dir"]))
+        plan = worktree / "unit-plan.md"
+        _ = plan.write_text('> **Production: fixture-production** — unit `fixture-unit`; production doc `production.md`\n')
+        state["project_plan_doc"] = plan.name
+        _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
+        # A read-only metadata caller must not recover even an invalid pending
+        # migration; recovery is exclusively ledger_for_run's responsibility.
+        journal = workers.ledger_path("fixture-production", "fixture-unit").with_suffix(".move.json")
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        _ = journal.write_text('{"pending": "do not migrate during a hook"}')
+        before = {path: path.read_bytes() for path in (journal, plan, self.session_dir / workers.STATE)}
+        identity = progress_history.resolve_production_unit(state)
+        self.assertEqual(identity, progress_history.ProductionUnitIdentity("fixture-production", "fixture-unit"))
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+        journal.unlink()
+        self.assertEqual(workers.ledger_for_run(self.session_dir).path,
+                         workers.ledger_path("fixture-production", "fixture-unit"))
+
     @override
     def setUp(self) -> None:
         super().setUp()

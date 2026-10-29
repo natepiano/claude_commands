@@ -13,6 +13,7 @@ from typing import override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 
+from scripts.lib.socket_test_support import short_socket_directory
 from fake_herdr import herdr_listener
 import fake_showrunner
 import fake_unit_host
@@ -60,7 +61,7 @@ class LiveUnitsTests(unittest.TestCase):
         """Record a live Claude in `pane`: this test process stands in for it."""
         if pane:
             fake_unit_host.place_process(self.environment, os.getpid(), pane)
-        path = self.root / f"{name}.sock"
+        path = Path(self.enterContext(short_socket_directory())) / f"{name}.sock"
         held = socket.socket(socket.AF_UNIX)
         held.bind(str(path))
         self.addCleanup(held.close)

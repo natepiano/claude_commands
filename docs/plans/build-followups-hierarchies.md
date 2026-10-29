@@ -107,37 +107,30 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Ruled out:** candidate B, a shared rank order with a Hana-cost test (HI10); candidate C, capacity-led with natedev allocating workers (HI11); a fixed Hana share or measured Hana cost (HI2); a daily review budget (HI3); a size threshold for the four-week review's proposal (HI10).
 
-### Phase 3 — Each user push after a failed text check names its approved exception, and unapproved paths are fixed  · status: todo
-**Depends on:** Phase 2
+### Phase 3 — Each user push after a failed text check names its approved exception, and unapproved paths are fixed  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** design Step 1 (HI6, approved 2026-10-28) is live: every send to the user that passes a failed text check is classified as an approved exception or an unapproved path, and each unapproved path is fixed.
-
-**Hana link:** indirect. Each unapproved push takes the user's attention from Hana decisions.
-
-**Spec:**
-- `scripts/hierarchies/push_audit.py report [--since DATE|DATETIME] [--until DATE|DATETIME]`: read `~/.local/state/notify/pushover.jsonl` and `review.jsonl` read-only; for each user push after a failed text check, print the sender, the text id or key, and the class: `ApprovedPriorityTwo`, `ApprovedRegisteredText` (the exceptions in `scripts/notify/pushover.py:316-319`), or `Unapproved` with the code path that sent it. Totals per showrunner, with window and n.
-- Trace each `Unapproved` class to its sending path (`scripts/notify/review.py`, `scripts/notify/pushover.py`, `scripts/message/send.py`, `commands/showrunner/add_unit.md`, `scripts/production/add_unit.py`). Fix only paths confirmed as not approved, where the defect lives. Do not change an exception: a change to one is its own question for the user.
-- The showrunner duty (run the report, record which exception each send uses) goes to roles-unit through the sdlc showrunner as a text proposal; this phase does not edit `commands/showrunner/produce.md`.
+- `push_audit.py report` reads `pushover.jsonl` and `review.jsonl`, read-only, and lists each delivered push that followed a failed text check, with its class (ApprovedPriorityTwo, ApprovedRegisteredText, Unapproved), sending path and owner.
+- Baseline window: 64 delivered, 17 after a failed check (priority-2 1, registered 16), Unapproved 0. 2026-10-21 20:23 to 2026-10-28 20:23 EDT: 55 delivered, 12 (priority-2 3, registered 9), Unapproved 0. No sending path needed a fix.
+- `review.py`: a rewrite check that returns unreviewed keeps the failures of the draft that was sent (it dropped them before).
+- User ruling 2026-10-28: `nate.adhoc` loses the registered-text exception; messaging-unit builds it.
 
 **Files:**
-- `scripts/hierarchies/push_audit.py`, `scripts/hierarchies/test_push_audit.py` — new
-- `scripts/notify/` fixes — messaging-unit's files; this unit edits them (showrunner ruling 2026-10-28); the notice carries an also-touches line per build-followups owner
-- `scripts/message/send.py` fixes — shutdown-unit's file; `scripts/production/add_unit.py` and `commands/showrunner/add_unit.md` fixes — enh-showrunner-unit's files (build-followups production doc). Same rule as `scripts/notify/` (unit director's call, 2026-10-28, extending ruling 1 to every owner a confirmed fix reaches): this unit edits the file where the defect lives, tells the sdlc showrunner which owner's file before the edit, and the notice carries an also-touches line for each owner, trial-merged against its tip. Only files with a confirmed `Unapproved` path are edited.
-- `docs/plans/build-followups-hierarchies-design.md` — Step 1 result, written by the unit director at the checkpoint (Phase 5 runs in parallel and its result goes in the same doc, so no worker edits it)
+- `scripts/hierarchies/push_audit.py` — `report`; owners from current production tables (`ProductionOwnership`: exact names, and `-unit` aliases for `send.py in <session>` names only).
+- `scripts/hierarchies/test_push_audit.py` — tests on real log record shapes.
+- `scripts/notify/review.py`, `test_review.py` — messaging-unit's files, edited with showrunner approval.
+- `docs/plans/build-followups-hierarchies-design.md` — Step 1 result and corrected counts.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — `push_audit.py`, the confirmed fixes
-- `test` — `test_push_audit.py`: fixtures for each class, a priority-2 send, a registered text, an unapproved send, a missing log
+**Binds later work:** Phase 6 re-runs `report` two weeks after the merge. After messaging-unit's change, a failed `nate.adhoc` check is held, not delivered. The push-audit duty went to sdlc for roles-unit.
 
-**Constraints from prior phases:** Baseline **User attention**: 64 pushes, 16 after a failed review, n=64 (2026-10-13 17:24 to 2026-10-20 17:24 EDT). The 16 are not 16 faults. The audit reads only; it sends nothing (C49).
+**Gotchas:** Neither log records a key. Older sends can show a session no current production names. `measure.py` counts 16 for the Baseline by a narrower rule; the audit is the reference. The audit reads this machine's logs only.
 
-**Acceptance gate:** unit tests green; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; the report on the Baseline window and on the last 7 days shows each send's class; zero `Unapproved` sends after the fixes, or each one left names its open question. **Measure:** unapproved sends per week, from 16 after-failed-review pushes in the Baseline (n=64). **Review point (C53):** re-run the report 2 weeks after the merge; Phase 6 keeps or drops the duty on it.
+**Ruled out:** changing an approved exception without the user (nate.adhoc went to the user); limiting the `validate()` change to push review (it adds failure quotes to held-question text and breaks nothing).
 
 ### Phase 4 — The measure reads wait records and merge receipts, and the 4-week experiment starts  · status: todo
-**Depends on:** Phase 2; and a wait on sdlc phases-unit (approved by the sdlc showrunner 2026-10-28; the row for the sdlc production doc's Gates table goes to the sdlc showrunner with the Phase 2 notice):
-- **Supplier:** phases-unit's HI7 phase, the phase it plans right after its phase 3 (phases-unit, 2026-10-28).
+**Depends on:** Phase 2; and sdlc gate G1, the wait records from phases-unit:
+- **Supplier:** phases-unit's HI7 phase, its Phase 6 (sdlc gate G1, 2026-10-28).
 - **Record contract:** the shape sent to phases-unit on 2026-10-28, given under Spec below. phases-unit picks the file and the writer and sends both, with the commit, when its phase lands.
 - **Clears when:** that phase's checkpoint is merged to `origin/sdlc` and on `~/.claude` main, its message names the record file and commit, and the file holds at least one wait record and one merge receipt written by a real phase. Until then this phase does not start.
 
@@ -165,34 +158,26 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Acceptance gate:** unit tests green; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; `measure.py baseline` over the first records prints real wait and receipt rows. **Measure:** share of Hana phase time with a recorded wait kind, and share of merges with a receipt. **Review point (C53):** four weeks after the first records land; Phase 6 keeps or drops the step on it.
 
-### Phase 5 — A run end ends only workers whose unit director is gone or whose owner cannot be found  · status: todo
-**Depends on:** Phase 2
+### Phase 5 — A run end ends only workers whose unit director is gone or whose owner cannot be found  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** design Step 4 (HI9, approved with the user's rule): workers live as long as their unit director, across runs, and are reused by name; a check ends only workers with no live director or no known owner, and each showrunner removes timers nobody asked for.
-
-**Hana link:** indirect. Workers with no owner hold quota and memory on the accounts and the machine Hana shares.
-
-**Spec:**
-- `scripts/hierarchies/worker_owners.py report`: list each Codex worker with its recorded run, unit and director session, and one class: `OwnedLive`, `PooledReviewer`, `DirectorGone`, `OwnerUnknown`. Read-only.
-- `worker_owners.py recover`: for each `OwnerUnknown` worker, try provenance recovery first (shutdown history records, the message log, launcher records naming its thread id); a recovered worker moves to its real class. The 2026-10-28 run-folder deletions made live units' workers look ownerless, this unit's included.
-- `worker_owners.py end --class DirectorGone|OwnerUnknown [--dry-run]`: end only those, through `codex_mesh.py end`, and log each one with its evidence. `OwnerUnknown` is ended only after recovery failed for that worker. Never an `OwnedLive` worker, a pooled reviewer, or a named worker of a live unit director. **The first run reports and ends nothing** (showrunner, 2026-10-28).
-- A worker survives its run's end: the keep rule in `end_session.sh` and `codex_mesh.py` belongs to build-followups models-unit, which lands it in its own phase 5 (worker lifecycle). This phase sends models-unit the requirement (a live director's workers are kept at run end) with a test case (build-followups showrunner, 2026-10-28). The <LongLivedWorkers/> text change ("run-scoped", "`end_session.sh` ends them") goes to phases-unit; the duty goes to roles-unit.
-- Timers: list notifier registrations (`scripts/message/notifier.sh`) with whether a user or showrunner asked for each; the showrunner removes the rest.
+- `worker_owners.py report` names a class for each Codex worker: OwnedLive, PooledReviewer, DirectorGone or OwnerUnknown. On 2026-10-28 21:32 EDT: 185, 141, 0, 0 (n=326; the Baseline had 51 with no known owner).
+- `recover` finds owners from launcher files and director messages and saves them in `recovered.json`; a saved owner stays when its first evidence goes away.
+- `end` previews by default. An applied end acts only on the selected class (DirectorGone or OwnerUnknown), keeps attached, ended and unrecorded workers, ends nothing on its first run, and logs each decision in `ends.jsonl`.
+- `measure.py baseline` prints a five-line summary; `--full` adds the tables (showrunner C21 return).
 
 **Files:**
-- `scripts/hierarchies/worker_owners.py`, `scripts/hierarchies/test_worker_owners.py` — new
-- The keep rule in `scripts/agents/codex_mesh.py` and `scripts/direct/end_session.sh` — models-unit lands it in its own phase 5 (worker lifecycle); this phase sends it the requirement and a test case (build-followups showrunner, 2026-10-28, which replaces the earlier ruling that this unit edits them)
-- `docs/plans/build-followups-hierarchies-design.md` — Step 4 result, written by the unit director at the checkpoint (Phase 3 runs in parallel and its result goes in the same doc, so no worker edits it)
+- `scripts/hierarchies/worker_owners.py` — `report`, `recover`, `end`; classes `WorkerClass`, `WorkerTurnState` (with `Ended`), `WorkerKept`.
+- `scripts/hierarchies/test_worker_owners.py` — tests; no real end command runs.
+- `scripts/hierarchies/measure.py`, `test_measure.py` — `baseline_summary`, `--full`.
+- `docs/plans/build-followups-hierarchies-design.md` — Step 4 result.
 
-**Workers:** `1 writer + 1 tester`
-- `impl2` — `worker_owners.py`, and the keep-rule requirement with its test case for models-unit (a second writer slot: Phase 3 holds `impl` and `test` in parallel)
-- `test2` — `test_worker_owners.py`: fixtures for each class, a pooled reviewer, a director that restarted on another account
+**Binds later work:** Phase 6 re-runs `report` two weeks after the merge. Each end sends `--expected-thread-id` and `--idle-only`; models-unit's `codex_mesh.py end` must accept both and check them under its lock. Until then every end is refused and nothing is ended.
 
-**Constraints from prior phases:** Baseline **Capacity on Hana**: 51 workers with no recorded cwd and no running director, n=51. A paused worker of a live director is `OwnedLive`. The 2026-10-28 run-folder loss (a paused run's roster deleted) is one case the report must name, not hide.
+**Gotchas:** The live state folder holds `recovered.json` and `ends.jsonl`; tests use temporary folders. basedpyright exits 3 because the configured `.venv` is absent; only the footer counts.
 
-**Acceptance gate:** unit tests green; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; `report` on the live roster names an owner or a class for every worker; the first run ends no worker. **Measure:** Baseline 51 workers with no known owner; target zero after recovery. **Review point (C53):** re-run 2 weeks after the merge; Phase 6 keeps or drops the step on it.
+**Ruled out:** ending a named worker of a live director; ending OwnerUnknown before recovery fails; editing `codex_mesh.py` or `end_session.sh` from this unit.
 
 ### Phase 6 — The four-week review: which waits slow Hana, which links helped, and which trial steps stay  · status: todo
 **Depends on:** the checkpoints of Phases 3, 4 and 5, and the three review records: the Phase 3 and Phase 5 re-runs 2 weeks after each merge, recorded in the design doc under Steps 1 and 4, and four weeks of Phase 4 records. The phase starts on the latest of these dates, never before.
@@ -217,3 +202,28 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - `test` — `test_measure.py`: `compare` on fixtures with known before and after values
 
 **Acceptance gate:** unit tests green; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; Results holds real numbers for each step, judged on the measure and review point each of Phases 3–5 names. **Measure and review point:** this phase is the review point for Steps 1, 2 and 4. At phase end the unit director sends the showrunner the Results and the keep-or-drop list as one question for the user.
+
+### Phase 7 — The baseline measure and the push audit count failed checks by one rule, and session names come from config  · status: done
+**Depends on:** Phases 3 and 5 (showrunner ruling 2026-10-28: runs now, while Phase 4 waits on sdlc gate G1).
+
+#### Work Order
+
+**Goal:** the baseline measure and the push audit give the same count of pushes sent after a failed text check, and the audit takes the names of bare sessions from config, not from code.
+
+**Hana link:** indirect. Two reports that disagree on user attention mislead the Phase 6 review.
+
+**Spec:**
+- `measure.py` counts a push after a failed text check with `push_audit.after_failed_check`, the reference rule; it keeps no second rule. The Baseline window then reads 17 in both reports (n=64), and the last 7 days agree too.
+- The names of top-level sessions that send bare sources (today `hana`) live in one config file as a key and a display name, per the user's names-through-config rule (2026-10-28). `push_audit.owner()` reads that config; no session name is written in code. A test fails when a session name is written in `push_audit.py`.
+- A `nate.adhoc` push that fails its check is held (messaging-unit c73a2d02): it has no delivered push row, so the audit leaves it out. A test pins this with the real record shapes.
+
+**Files:**
+- `scripts/hierarchies/measure.py`, `scripts/hierarchies/test_measure.py` — the shared rule
+- `scripts/hierarchies/push_audit.py`, `scripts/hierarchies/test_push_audit.py` — config read, tests
+- `scripts/hierarchies/log_records.py` — the log-record helpers both reports read (new). `push_audit.py` imports `measure.py` today, so `measure.py` cannot import the rule back without a cycle; the shared helpers move here and both import them, one way
+- `config/hierarchies/sessions.toml` — session keys and display names (new)
+
+**Workers:** `1 writer`
+- `impl` — all files
+
+**Acceptance gate:** unit tests green; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; `measure.py baseline --since 2026-10-13T17:24 --until 2026-10-20T17:24` and `push_audit.py report` over the same window both print 17. **Measure:** the two counts agree in both windows. **Review point (C53):** the Phase 3 two-week re-run.

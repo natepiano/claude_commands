@@ -15,6 +15,7 @@ from typing import cast, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
+from scripts.lib.socket_test_support import short_socket_directory
 from test_support import ShutdownTestCase
 import sessions
 
@@ -41,7 +42,7 @@ class SessionLookupTests(ShutdownTestCase):
         self.sessions = self.root / "sessions"
         self.sessions.mkdir()
         self.addCleanup(self.socket.close)
-        self.socket_path = self.root / "live.sock"
+        self.socket_path = Path(self.enterContext(short_socket_directory())) / "live.sock"
         self.socket.bind(str(self.socket_path))
 
     def record(
@@ -125,7 +126,7 @@ class SessionLookupTests(ShutdownTestCase):
     def test_a_relay_named_like_a_session_is_never_found_or_listed(self) -> None:
         relay_socket = socket.socket(socket.AF_UNIX)
         self.addCleanup(relay_socket.close)
-        relay_path = self.root / "relay.sock"
+        relay_path = Path(self.enterContext(short_socket_directory())) / "relay.sock"
         relay_socket.bind(str(relay_path))
         self.record("session.json", name="natedev", session_id="sid-session", updated=10, entrypoint="cli")
         # send.py's relay is a newer `claude -p` run started with `-n natedev`.
@@ -144,7 +145,7 @@ class SessionLookupTests(ShutdownTestCase):
     def test_newest_live_match_wins(self) -> None:
         other = socket.socket(socket.AF_UNIX)
         self.addCleanup(other.close)
-        other_path = self.root / "newer.sock"
+        other_path = Path(self.enterContext(short_socket_directory())) / "newer.sock"
         other.bind(str(other_path))
         self.record("old.json", name="same", session_id="same-id", updated=10)
         self.record("new.json", name="same", session_id="same-id", socket_path=other_path, updated=20)

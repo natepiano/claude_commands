@@ -18,6 +18,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
+from scripts.lib.socket_test_support import short_socket_directory
 import push_texts  # noqa: E402
 import rca  # noqa: E402
 import review  # noqa: E402
@@ -135,7 +136,7 @@ class RcaTests(unittest.TestCase):
         """A session record for this test's process, with a bound socket, so the record counts as live."""
         listener = socket.socket(socket.AF_UNIX)
         self.addCleanup(listener.close)
-        socket_path = self.root / f"{name}.sock"
+        socket_path = Path(self.enterContext(short_socket_directory())) / f"{name}.sock"
         listener.bind(str(socket_path))
         record = {"pid": os.getpid(), "name": name, "sessionId": session_id, "messagingSocketPath": str(socket_path),
                   "updatedAt": 1, "procStart": sessions.process_start(os.getpid()) or ""}

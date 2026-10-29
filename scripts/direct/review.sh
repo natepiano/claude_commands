@@ -189,6 +189,7 @@ BEAT_TAG="${SUBTASK}${LENS:+:${LENS}}"
 # leaving the variable unset instead would let an inherited one decide it, which
 # is how a lone reviewer ends up closing a live worker's pass.
 export UNIT_TEAM_ROLE="${TEAM_SLOT}"
+export UNIT_RUN_DIR="${SESSION_DIR}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${FOLLOW_TO}" ]]; then

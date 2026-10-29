@@ -25,11 +25,14 @@ import subprocess
 import sys
 import time
 import tomllib
+from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import cache
 from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime, timezone
 from pathlib import Path
-from collections.abc import Mapping, Sequence, Set
+from collections.abc import Callable, Generator, Mapping, Sequence, Set
 from typing import NamedTuple, NotRequired, TypedDict, cast, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
@@ -2974,7 +2977,7 @@ def unit_director_panes(session: str, processes: Sequence[HerdrProcess]) -> set[
             if process.place.session == session and has_unit_marks(process.marks)}
 
 
-def herdr_processes() -> list[HerdrProcess]:
+def _scan_herdr_processes() -> list[HerdrProcess]:
     if _platform() == "darwin":
         return _darwin_herdr_processes()
     processes: list[HerdrProcess] = []
@@ -3001,6 +3004,76 @@ def herdr_processes() -> list[HerdrProcess]:
         except (OSError, ValueError, RuntimeError):
             continue
     return processes
+
+
+@dataclass
+class _ProcessSnapshot:
+    """A report-only reader whose lifetime ends for all copied contexts at once."""
+    parent: Callable[[], list[HerdrProcess]]
+    active: bool = True
+    saved: Callable[[], list[HerdrProcess]] = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.saved = cache(self.parent)
+
+    def __call__(self) -> list[HerdrProcess]:
+        reader: Callable[[], list[HerdrProcess]] = self
+        while isinstance(reader, _ProcessSnapshot):
+            if not reader.active:
+                return _scan_herdr_processes()
+            reader = reader.parent
+        return self.saved()
+
+
+# Only report reads may share a snapshot. Action decisions always scan afresh.
+_process_reader: ContextVar[Callable[[], list[HerdrProcess]]] = ContextVar(
+    "herdr_process_reader", default=lambda: _scan_herdr_processes())
+_process_action: ContextVar[bool] = ContextVar("herdr_process_action", default=False)
+
+
+@contextmanager
+def process_snapshot() -> Generator[None]:
+    """Share one successful report scan while this scope is open.
+
+    Errors propagate and are retried. Closed ancestors also close descendants.
+    Nested report scopes share their parent's scan; action scopes never cache.
+    """
+    if _process_action.get():
+        yield
+        return
+    reader = _ProcessSnapshot(_process_reader.get())
+    token = _process_reader.set(reader)
+    try:
+        yield
+    finally:
+        reader.active = False
+        _process_reader.reset(token)
+
+
+@contextmanager
+def process_action() -> Generator[None]:
+    """Read fresh for an action decision and retire reports from before it.
+
+    Enter before classifying owners or members for placement, moves or recovery.
+    Callers that only report can keep their shared scan until an action is needed.
+    """
+    reader = _process_reader.get()
+    while isinstance(reader, _ProcessSnapshot):
+        reader.active = False
+        reader = reader.parent
+    token = _process_reader.set(lambda: _scan_herdr_processes())
+    action = _process_action.set(True)
+    try:
+        yield
+    finally:
+        _process_action.reset(action)
+        _process_reader.reset(token)
+
+
+def herdr_processes() -> list[HerdrProcess]:
+    """Read current processes, or the snapshot held by an explicit scope."""
+    return [HerdrProcess(row.pid, row.place, dict(row.marks), row.command, row.working_directory)
+            for row in _process_reader.get()()]
 
 
 def _check_agent_arguments(kind: str, agent_arguments: list[str]) -> None:

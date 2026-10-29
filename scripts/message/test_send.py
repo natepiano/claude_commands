@@ -23,6 +23,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.socket_test_support import short_socket_directory
 import send
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
@@ -163,7 +164,7 @@ class SendTests(ShutdownTestCase):
     def setUp(self) -> None:
         _ = self.enterContext(mock.patch.object(names, "load_names", return_value=fixture_names()))
         super().setUp()
-        directory = tempfile.TemporaryDirectory()
+        directory = short_socket_directory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         # No test opens a real rca.py case: it would write the machine's cases and message its owner.

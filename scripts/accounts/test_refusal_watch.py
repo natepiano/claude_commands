@@ -1006,6 +1006,144 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(next_moves.read_next_moves(), (entry,))
         self.assertEqual(self.commands, [])
 
+    def test_ready_next_move_reads_new_unit_members_after_report_snapshot(self) -> None:
+        if TYPE_CHECKING:
+            from scripts.herdr import herdr
+        else:
+            herdr = import_module("herdr")
+
+        _ = self.groups()
+        _ = self.owner("new-unit", host="unit")
+        self.next_entries(self.low_rule())
+        self.reading(SOURCE_LOGIN, 1)
+        fresh = herdr.HerdrProcess(1000, herdr.HerdrPlace("agents", "new-pane"),
+            {"SHOWRUNNER_UNIT": "fixture", "SHOWRUNNER_UNIT_ID": "new-unit"}, "claude", str(self.home))
+        def observed(login: str | None = None, *,
+                     registrations: inventory.ShowrunnerRegistrations | Literal["read timers"] = "read timers") -> list[inventory.ListedSession]:
+            return self.listing(login, registrations=registrations) if herdr.herdr_processes() else []
+        processes: list[herdr.HerdrProcess] = []
+        with (patch.object(herdr, "_scan_herdr_processes", side_effect=lambda: list(processes)),
+              patch.object(inventory, "listing", side_effect=observed),
+              herdr.process_snapshot()):
+            self.assertEqual(herdr.herdr_processes(), [])
+            processes.append(fresh)
+            _ = refusal_watch.run_auto_moves(NOW)
+        self.assertEqual(len(self.commands), 1)
+        self.assertIn("new-unit", self.commands[0])
+
+    def test_committed_group_completion_sees_unit_started_after_report_snapshot(self) -> None:
+        if TYPE_CHECKING:
+            from scripts.herdr import herdr
+        else:
+            herdr = import_module("herdr")
+
+        _ = self.groups(units="claude3")
+        processes: list[herdr.HerdrProcess] = []
+
+        def observed(login: str | None = None, *,
+                     registrations: inventory.ShowrunnerRegistrations | Literal["read timers"] = "read timers") -> list[inventory.ListedSession]:
+            return self.listing(login, registrations=registrations) if herdr.herdr_processes() else []
+
+        with (patch.object(herdr, "_scan_herdr_processes", side_effect=lambda: list(processes)) as scans,
+              patch.object(inventory, "listing", side_effect=observed),
+              refusal_watch.session_observation(), herdr.process_snapshot()):
+            self.assertEqual(herdr.herdr_processes(), [])
+            owner = self.owner("new-unit", host="unit")
+            processes.append(herdr.HerdrProcess(owner["pid"], herdr.HerdrPlace("agents", "new-pane"),
+                {"SHOWRUNNER_UNIT": "fixture", "SHOWRUNNER_UNIT_ID": "new-unit"}, "claude", str(self.home)))
+            _ = refusal_watch.run(NOW)
+        self.assertGreater(scans.call_count, 1)
+        self.assertEqual(len(self.commands), 1)
+        self.assertIn("new-unit", self.commands[0])
+        self.assertEqual(self.commands[0][self.commands[0].index("--to") + 1], "claude3")
+
+    def test_idle_completion_and_later_watchdog_report_share_one_scan(self) -> None:
+        if TYPE_CHECKING:
+            from scripts.herdr import herdr
+        else:
+            herdr = import_module("herdr")
+
+        _ = self.groups(units="claude1")
+        _ = self.owner("unit", host="unit")
+
+        def observed(login: str | None = None, *,
+                     registrations: inventory.ShowrunnerRegistrations | Literal["read timers"] = "read timers") -> list[inventory.ListedSession]:
+            _ = herdr.herdr_processes()
+            return self.listing(login, registrations=registrations)
+
+        with (patch.object(herdr, "_scan_herdr_processes", return_value=[]) as scans,
+              patch.object(inventory, "listing", side_effect=observed),
+              refusal_watch.session_observation(), herdr.process_snapshot()):
+            _ = herdr.herdr_processes()
+            _ = herdr.herdr_processes()
+            self.assertEqual(scans.call_count, 1)
+            _ = refusal_watch.run(NOW)
+            _ = herdr.herdr_processes()  # The watchdog report follows completion.
+            self.assertEqual(scans.call_count, 1)
+        self.assertEqual(self.commands, [])
+
+    def test_changed_registered_process_identity_confirms_completion_fresh(self) -> None:
+        if TYPE_CHECKING:
+            from scripts.herdr import herdr
+        else:
+            herdr = import_module("herdr")
+        _ = self.groups(units="claude1")
+        _ = self.owner("unit", host="unit")
+        def observed(login: str | None = None, *,
+                     registrations: inventory.ShowrunnerRegistrations | Literal["read timers"] = "read timers") -> list[inventory.ListedSession]:
+            _ = herdr.herdr_processes()
+            return self.listing(login, registrations=registrations)
+        for changed in ("pid", "procStart"):
+            with (self.subTest(identity_field=changed),
+                  patch.object(herdr, "_scan_herdr_processes", return_value=[]) as scans,
+                  patch.object(inventory, "listing", side_effect=observed),
+                  refusal_watch.session_observation(), herdr.process_snapshot()):
+                _ = herdr.herdr_processes()
+                if changed == "pid":
+                    self.live[0]["pid"] += 1
+                else:
+                    self.live[0]["procStart"] = "new-process-start"
+                _ = refusal_watch.run(NOW)
+                self.assertEqual(scans.call_count, 2)
+        self.assertEqual(self.commands, [])
+
+    def test_refusal_placement_sees_unit_pane_started_after_report_snapshot(self) -> None:
+        if TYPE_CHECKING:
+            from scripts.herdr import herdr
+        else:
+            herdr = import_module("herdr")
+
+        path = self.groups()
+        owner = self.owner("new-unit", host="unit")
+        _ = self.transcript("new-unit", "weekly limit")
+        fresh = herdr.HerdrProcess(owner["pid"], herdr.HerdrPlace("agents", "new-pane"),
+            {"SHOWRUNNER_UNIT": "fixture", "SHOWRUNNER_UNIT_ID": "new-unit"}, "claude", str(self.home))
+        original_inventory = self.inventory_for
+        def observed(login: str, only: frozenset[str] = NO_SESSION_FILTER, *,
+                     refresh_desktops: bool = True) -> inventory.Inventory:
+            rows = herdr.herdr_processes()
+            found = original_inventory(login, only, refresh_desktops=refresh_desktops)
+            if not rows:
+                # The report predates the new marked pane, so this is top-level.
+                ungrouped: list[inventory.Session] = []
+                for item in found["sessions"]:
+                    fields: dict[str, object] = dict(item)
+                    fields.update(kind="top-level", host=inventory.TerminalHost(kind="terminal"))
+                    ungrouped.append(cast(inventory.TopLevelSession, cast(object, fields)))
+                found["sessions"] = ungrouped
+            return found
+        processes: list[herdr.HerdrProcess] = []
+        with (patch.object(herdr, "_scan_herdr_processes", side_effect=lambda: list(processes)),
+              patch.object(inventory, "inventory", side_effect=observed),
+              patch.object(accounts, "placement", wraps=accounts.placement) as placement,
+              herdr.process_snapshot()):
+            self.assertEqual(herdr.herdr_processes(), [])
+            processes.append(fresh)
+            _ = refusal_watch.run(NOW)
+        self.assertTrue(placement.called)
+        self.assertEqual(placement.call_args.args[0], "units")
+        self.assertEqual(stored_group_labels(path)["units"], "claude3")
+
     def test_pending_head_preserves_a_waited_sessions_continuation_on_its_current_account(self) -> None:
         path = self.groups()
         _ = self.owner("refused-unit", host="unit")

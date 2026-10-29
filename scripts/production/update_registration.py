@@ -21,7 +21,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, cast
 
-from add_unit import Production, read_production
+from production_units import Production, read_production
 from production_units import Refusal, cell_value, unit_table
 from merge_checkpoint import NoMerge, merge_branch_history, report
 
