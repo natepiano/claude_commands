@@ -110,6 +110,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         working.mkdir()
         self.patches.enter_context(patch.dict(os.environ, {
             "UNIT_WORKERS_STATE": str(self.session_dir.parent / "unit-workers"),
+            "NOTIFIER_STATE_DIR": str(self.session_dir.parent / "notifier"),
         }))
         self.write_run_context(self.session_dir)
 
@@ -949,6 +950,82 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         self.assertEqual(source["adopted_to"], str(destination))
         self.assertEqual(target["thread_id"], mesh_fixture.THREAD_ID)
         self.assertEqual(target["model"], "gpt-kept-sol")
+        self.assertEqual(self.methods("thread/start"), [])
+
+    def test_plan_unit_identity_survives_the_worktree_move(self) -> None:
+        old = self.session_dir.parent / "repository"
+        plan = old / "plan.md"
+        _ = plan.write_text('> **Production: demo** — unit `builders`; plan\n')
+        state = json_object(self.session_dir / workers.STATE)
+        state["plan_doc"] = str(plan)
+        _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
+        self.open_worker("impl")
+        self.assertEqual(self.resolve(self.session_dir), "impl")
+        self.complete_assignment("impl")
+        workers.pause_unit("demo", "builders")
+        new = old.with_name("moved-repository")
+        _ = old.rename(new)
+        destination = self.next_run("after-worktree-move")
+        state = json_object(destination / workers.STATE)
+        state.update({"working_dir": str(new), "plan_doc": str(new / "plan.md")})
+        _ = (destination / workers.STATE).write_text(json.dumps(state))
+        self.assertEqual(workers.adopt(self.session_dir, destination, "impl"), "impl")
+        self.assertEqual(workers.ledger_for_run(self.session_dir).path,
+                         workers.ledger_for_run(destination).path)
+
+    def test_moved_paused_worker_resumes_in_a_new_run_with_its_thread_and_home(self) -> None:
+        old = self.session_dir.parent / "repository"
+        plan = old / "plan.md"
+        _ = plan.write_text('> **Production:** demo — unit `builders`; plan\n')
+        state = json_object(self.session_dir / workers.STATE)
+        state.update({"plan_doc": str(plan), "project_plan_doc": str(plan)})
+        _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
+        self.open_worker("impl")
+        self.assertEqual(self.resolve(self.session_dir), "impl")
+        self.complete_assignment("impl")
+        workers.pause_unit("demo", "builders")
+        roster = json_object(self.session_dir / workers.ROSTER)
+        cast(dict[str, object], roster["impl"]).update({"status": "paused", "cwd": str(old)})
+        _ = (self.session_dir / workers.ROSTER).write_text(json.dumps(roster))
+        original_home = os.environ["CODEX_HOME"]
+        new = old.with_name("moved-repository")
+        _ = old.rename(new)
+        with patch.dict(os.environ, {"UNIT_RUN_ROOT": str(self.session_dir.parent)}):
+            changes = workers.repoint_unit_worktree("demo", "builders", old, new, "new-branch", from_production="demo")
+            self.assertTrue(changes)
+            before = {path: path.read_bytes() for path in self.session_dir.rglob("*") if path.is_file()}
+            self.assertEqual(workers.repoint_unit_worktree(
+                "demo", "builders", old, new, "new-branch", from_production="demo"), ())
+            self.assertEqual({path: path.read_bytes() for path in before}, before)
+        state = json_object(self.session_dir / workers.STATE)
+        self.assertEqual((state["working_dir"], state["plan_doc"], state["project_plan_doc"]),
+                         (str(new), str(new / "plan.md"), str(new / "plan.md")))
+        record = cast(dict[str, object], json_object(self.session_dir / workers.ROSTER)["impl"])
+        self.assertEqual(record["cwd"], str(new))
+        self.assertEqual(record["status"], "paused")
+        with workers.ledger_for_run(self.session_dir).locked() as ledger:
+            self.assertIsInstance(ledger.workers["impl"].ownership, workers.Paused)
+        destination = self.next_run("after-path-repair")
+        state = json_object(destination / workers.STATE)
+        state.update({"working_dir": str(new), "plan_doc": str(new / "plan.md")})
+        _ = (destination / workers.STATE).write_text(json.dumps(state))
+        self.assertEqual(workers.adopt(self.session_dir, destination, "impl"), "impl")
+        prompt = destination / "continue.txt"
+        _ = prompt.write_text("Continue after the unit move.")
+        with bounded_worker_change(), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
+            code = codex_mesh.main([
+                "follow", "--session-dir", str(destination), "--to", "impl", "--role", "impl",
+                "--message-file", str(prompt), "--summary-file", str(destination / "summary.txt"),
+                "--log-file", str(destination / "impl.log"), "--timeout", "5",
+            ])
+        self.assertEqual(code, 0, errors.getvalue())
+        resumed = self.methods("thread/resume")
+        self.assertTrue(resumed)
+        self.assertTrue(all(cast(dict[str, object], request["params"])["threadId"] == mesh_fixture.THREAD_ID
+                            for request in resumed))
+        with workers.ledger_for_run(destination).locked() as ledger:
+            self.assertEqual(ledger.workers["impl"].backend,
+                             workers.CodexThread(mesh_fixture.THREAD_ID, original_home))
         self.assertEqual(self.methods("thread/start"), [])
 
     def test_a_message_arriving_after_adoption_intent_moves_once_to_the_new_owner(self) -> None:
