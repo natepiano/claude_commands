@@ -1579,6 +1579,50 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(self.repository_state(), before)
         self.assertFalse((self.root / "project-alpha").exists())
 
+    def test_retired_as_built_plan_resumes_without_a_production_header(self) -> None:
+        plan = "docs/as-built/alpha.md"
+        path = self.checkout / plan
+        path.parent.mkdir(parents=True)
+        _ = path.write_text("# Alpha as built\n\nThe plan is complete.\n", encoding="utf-8")
+        _ = self.git("add", plan)
+        self.commit_prepared_row(self.unit_row(
+            plan=f"(retired 2026-10-28, worktree removed, session session-123) `{plan}` (run done)"))
+        worktree = self.root / "project-alpha"
+        _ = self.git("worktree", "add", str(worktree), "-b", "build-followups-alpha")
+        document = self.doc.read_bytes()
+
+        _ = self.successful("alpha", "--plan", plan, "--resume", "session-123", "--cwd", str(worktree))
+
+        starts = [row for row in self.herdr_calls() if row[2:4] == ["agent", "start"]]
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0][starts[0].index("--resume") + 1], "session-123")
+        self.assertEqual(self.opened()[self.opened().index("--cwd") + 1], str(worktree))
+        self.assertEqual(self.doc.read_bytes(), document)
+
+    def test_active_as_built_plan_resume_still_requires_a_production_header(self) -> None:
+        plan = "docs/as-built/alpha.md"
+        path = self.checkout / plan
+        path.parent.mkdir(parents=True)
+        _ = path.write_text("# Alpha as built\n", encoding="utf-8")
+        _ = self.git("add", plan)
+        self.commit_prepared_row(self.unit_row(plan=plan))
+        worktree = self.root / "project-alpha"
+        _ = self.git("worktree", "add", str(worktree), "-b", "build-followups-alpha")
+        before = self.repository_state()
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+
+        result = self.cli("alpha", "--plan", plan, "--resume", "session-123",
+                          "--cwd", str(self.root / "project-alpha"))
+
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertEqual(result.stderr,
+                         f"add_unit: plan {plan} is missing on build-followups or lacks the Production header\n")
+        self.assertEqual(self.doc.read_text(), document)
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        self.assertEqual(self.repository_state(), before)
+        self.assertEqual(self.servers_started(), [])
+
     def test_retired_plan_resume_reuses_its_worktree_after_a_failed_launch(self) -> None:
         self.commit_prepared_row(self.unit_row(
             plan="(retired 2026-10-28, worktree removed, session session-123) docs/plans/given.md"))

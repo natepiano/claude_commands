@@ -51,6 +51,14 @@ class Production(NamedTuple):
     zone: ZoneInfo
 
 
+class ProductionPlanRequired(NamedTuple):
+    """The launch needs a plan with a Production header."""
+
+
+class RetiredConversationPlan(NamedTuple):
+    """A retired director continues its transcript after its plan was condensed."""
+
+
 class PlanGiven(NamedTuple):
     path: Path
 
@@ -575,6 +583,12 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
     lines = production.doc.read_text(encoding="utf-8").splitlines()
     existing = row_is_present(request, lines)
     restoring = isinstance(request.launch_kind, UnitRestoreLaunch)
+    plan_context: ProductionPlanRequired | RetiredConversationPlan = ProductionPlanRequired()
+    if (not restoring and isinstance(existing, ExistingUnitRow)
+            and isinstance(existing.state, RetiredUnitRow)
+            and isinstance(request.session, ResumedSession)
+            and isinstance(request.session.handoff, ResumeStoppedSession)):
+        plan_context = RetiredConversationPlan()
     if restoring:
         if isinstance(existing, NoUnitRow):
             raise Refusal(f"unit {request.unit} has no Units row; a restore never adds one")
@@ -626,7 +640,7 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
     if (local_branch or remote_head(production, request.branch)) and not (
             isinstance(existing, ExistingUnitRow) and has_worktree):
         raise Refusal(f"branch {request.branch} already exists")
-    if isinstance(launch.plan, PlanGiven):
+    if isinstance(launch.plan, PlanGiven) and isinstance(plan_context, ProductionPlanRequired):
         result = git(production, "show", f"{production.merge_branch}:{launch.plan.path.as_posix()}", check=False)
         valid_plan = (_is_excluded_standing_plan(production, launch.plan.path) if result.returncode != 0
                       else any(line.startswith("> **Production:") for line in result.stdout.splitlines()))
