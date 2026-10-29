@@ -491,8 +491,10 @@ def verify_failures(transfer: UnitTransfer) -> list[str]:
         if not _live(transfer.to_slug, unit):
             failures.append(f"{unit} is not running under {transfer.to_slug}; relaunch it with "
                             + f"shutdown.py restart --here --only {transfer.session_id}")
-    if unit in unit_lookup.marked_units(transfer.from_slug):
-        failures.append(f"a session still carries the marks {transfer.from_slug} {unit}")
+    holder = unit_lookup.marked_units(transfer.from_slug).get(unit)
+    if holder is not None and isinstance(holder.claude, (unit_lookup.LiveClaude, unit_lookup.ClaudeUnknown)):
+        failures.append(f"a session still carries the marks {transfer.from_slug} {unit}: "
+                        + unit_lookup.holder_text(holder))
     if leased := _leased(transfer.from_slug, unit):
         failures.append(f"review pool {transfer.from_slug}: {', '.join(leased)} still leased to {unit}")
     from scripts.guilds import roles

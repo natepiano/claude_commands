@@ -2969,7 +2969,13 @@ def _scan_herdr_processes() -> list[HerdrProcess]:
             arguments = _process_arguments(process)
             if not arguments:
                 continue
-            cwd = str(process.joinpath("cwd").resolve(strict=True))
+            # Placement and marks remain evidence when a moved/deleted worktree
+            # makes cwd unreadable, just as on Darwin.
+            cwd: str | UnreadableCwd
+            try:
+                cwd = str(process.joinpath("cwd").resolve(strict=True))
+            except (OSError, ValueError, RuntimeError) as error:
+                cwd = UnreadableCwd(str(error))
             marks = {key: environment[key] for key in UNIT_MARKS if key in environment}
             processes.append(HerdrProcess(pid, HerdrPlace(session, pane), marks, Path(arguments[0]).name, cwd))
         except (OSError, ValueError, RuntimeError):
