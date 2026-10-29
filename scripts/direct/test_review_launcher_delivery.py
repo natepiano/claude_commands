@@ -102,28 +102,48 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         binaries = session / "bin"
         binaries.mkdir()
         sleep = binaries / "sleep"
-        _ = sleep.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$TEST_POLL_ARGUMENTS"\n'
-                             + ': > "$TEST_POLL_ENTERED"\n'
-                             + ': > "$TEST_EARLY_READY"\n')
+        # The watcher also calls sleep. Force it to arrive first, but only the
+        # launcher's own probe may publish the delivery sentinel. Match callers
+        # by pid, not by the expected argument, so a wrong default still fails.
+        _ = sleep.write_text(
+            '#!/bin/bash\nset -eu\n'
+            + 'if [[ "$PPID" == "$TEST_REVIEW_LAUNCHER_PID" ]]; then\n'
+            + '  "$TEST_PYTHON" "$TEST_WAIT_HELPER_DIR/wait_for_test_state.py" "$TEST_HEARTBEAT_ENTERED"\n'
+            + '  printf "%s\\n" "$*" >> "$TEST_POLL_ARGUMENTS"\n'
+            + '  : > "$TEST_POLL_ENTERED"\n'
+            + '  : > "$TEST_EARLY_READY"\n'
+            + 'else\n'
+            + '  printf "%s\\n" "$*" >> "$TEST_HEARTBEAT_ARGUMENTS"\n'
+            + '  : > "$TEST_HEARTBEAT_ENTERED"\n'
+            + '  exec "$TEST_PYTHON" "$TEST_WAIT_HELPER_DIR/wait_for_test_state.py" "$STUB_REVIEW_FINISH_FILE"\n'
+            + 'fi\n'
+        )
         sleep.chmod(0o755)
         entered = session / "poll-entered"
         arguments = session / "poll-arguments"
+        heartbeat_arguments = session / "heartbeat-arguments"
         environment = self.environment()
         for key in ("UNIT_WORKER_POLL_SECS", "UNIT_WORKER_WAIT_ATTEMPTS",
                     "UNIT_EARLY_POLL_SECS", "UNIT_TOKEN_CLOCK_FILE"):
             _ = environment.pop(key, None)
         environment.update({"PATH": str(binaries) + os.pathsep + environment["PATH"],
                             "TEST_POLL_ARGUMENTS": str(arguments), "TEST_POLL_ENTERED": str(entered),
+                            "TEST_HEARTBEAT_ARGUMENTS": str(heartbeat_arguments),
+                            "TEST_HEARTBEAT_ENTERED": str(session / "heartbeat-entered"),
+                            "TEST_PYTHON": sys.executable,
                             "TEST_EARLY_READY": str(ready), "STUB_REVIEW_FINISH_FILE": str(finish)})
-        process = subprocess.Popen(self.review_command(session, "adversary", str(ready), worker),
+        command = ["bash", "-c", 'export TEST_REVIEW_LAUNCHER_PID=$$; exec "$@"', "review-under-test",
+                   *self.review_command(session, "adversary", str(ready), worker)]
+        process = subprocess.Popen(command,
                                    env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                    start_new_session=True)
         try:
-            wait_until(entered.exists, session, processes=(process,))
+            wait_until(entered.exists, session, timeout=TEST_HANG_GUARD_SECS, processes=(process,))
+            self.assertEqual(heartbeat_arguments.read_text().splitlines(), ["1"])
             self.assertEqual(arguments.read_text().splitlines(), ["5"])
             self.assertIsNone(process.poll())
             wait_until(lambda: any(event.get("pass_kind") == "review" for event in self.pass_events(session.name)),
-                       self.history_dir / "runs", processes=(process,))
+                       self.history_dir / "runs", timeout=TEST_HANG_GUARD_SECS, processes=(process,))
         finally:
             output, errors = self.finish_early_launcher(process, ready, finish)
         self.assertEqual(process.returncode, 0, output + errors)
