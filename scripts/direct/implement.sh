@@ -236,7 +236,7 @@ root = Path(root_text)
 compact_above = int(compact_above_text)
 claim_file = root / f"impl_claim_{slot}.json"
 sys.path.insert(0, str(Path(mesh_script).resolve().parents[2]))
-from scripts.guilds import roles as guild_roles
+from scripts.astra import design_roles
 sys.path.insert(0, str(Path(mesh_script).parent.parent / "direct"))
 from worker_state import worker_claim_lock, worker_ledger, worker_record_path
 
@@ -327,11 +327,11 @@ with worker_claim_lock(root):
         if family == "codex":
             if mesh != "1":
                 fail(f"{name} has mesh=none")
-            if entry.get("transferring_role") or entry.get("role_redirect") or guild_roles.transfer_route(
+            if entry.get("transferring_role") or entry.get("role_redirect") or design_roles.transfer_route(
                     str(entry.get("thread_id", "")), str(entry.get("held_design_id", ""))):
                 fail(f"{name}: TransferringRole; use its destination holder")
             if entry.get("held_design_id"):
-                fail(f"{name}: held roles resume through roles.py")
+                fail(f"{name}: held roles resume through design_roles.py")
             context_tokens = entry.get("context_tokens")
             if isinstance(context_tokens, int) and context_tokens > compact_above:
                 compact = subprocess.run(

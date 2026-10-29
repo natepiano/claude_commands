@@ -612,7 +612,7 @@ def _event(kind: Literal["opened", "replaced", "adopted"], cause: str, run: Path
 
 def _worker_from_record(name: str, run: Path, record: dict[str, object]) -> UnitWorker:
     from scripts.agents import codex_mesh
-    from scripts.guilds.roles import PhaseBoundDesigner
+    from scripts.astra.design_roles import PhaseBoundDesigner
     access = codex_mesh.roster_access_policy(record)
     policy: dict[str, object] = {"kind": type(access).__name__}
     if isinstance(access, PhaseBoundDesigner):

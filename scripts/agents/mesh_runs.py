@@ -143,8 +143,8 @@ def _roster_folders() -> Iterator[Path]:
             yield path.parent
     for path in sorted(_pool_state().glob(f"*/mesh/*/{codex_mesh.ROSTER_FILE}")):
         yield path.parent
-    from scripts.guilds import roles
-    yield from roles.durable_meshes()
+    from scripts.astra import design_roles
+    yield from design_roles.durable_meshes()
 
 
 def caller_from_environment(environment: dict[str, str]) -> Caller:
@@ -438,8 +438,8 @@ def deliver(record: RunRecord, exit_code: int | None) -> str:
     session_dir, name = record["session_dir"], record["worker"]
     roster = codex_mesh._read_json_object(Path(session_dir) / codex_mesh.ROSTER_FILE)  # pyright: ignore[reportPrivateUsage]
     entry = codex_mesh._as_dict(roster.get(name))  # pyright: ignore[reportPrivateUsage]
-    from scripts.guilds import roles
-    destination = roles.transfer_route(record["thread_id"])
+    from scripts.astra import design_roles
+    destination = design_roles.transfer_route(record["thread_id"])
     if destination:
         destination_roster = codex_mesh._read_json_object(Path(destination) / codex_mesh.ROSTER_FILE)  # pyright: ignore[reportPrivateUsage]
         for value in destination_roster.values():
@@ -450,7 +450,7 @@ def deliver(record: RunRecord, exit_code: int | None) -> str:
     design_id, role = entry.get("held_design_id"), entry.get("held_role")
     if isinstance(design_id, str) and design_id and role in ("designer", "reviewer"):
         message_id = str(uuid5(NAMESPACE_URL, str(Path(session_dir).resolve()) + "/" + record["run_id"]))
-        _ = roles.queue_message(design_id, role, "mesh_runs:" + record["run_id"],
+        _ = design_roles.queue_message(design_id, role, "mesh_runs:" + record["run_id"],
                                 text, message_id=message_id)
         return f"queued for held role {name}; its holder controls the next assignment"
     held = codex_mesh.hold_message(session_dir, name, text, without_launcher=False)

@@ -727,6 +727,34 @@ class SourceCheckTests(unittest.TestCase):
         self.assertEqual([(use.path, use.line, use.name) for use in uses],
                          [("docs/new-review.md", 1, "review pool")])
 
+    def test_retired_design_role_names_fail_the_live_source_check(self) -> None:
+        repository = Path(__file__).resolve().parents[2]
+        data = (repository / "scripts/production/role_terms.toml").read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config/names.toml"
+            config.parent.mkdir()
+            _ = config.write_text(NAMES_TOML, encoding="utf-8")
+            terms = root / "scripts/production/role_terms.toml"
+            terms.parent.mkdir(parents=True)
+            _ = terms.write_text(data, encoding="utf-8")
+            document = root / "docs/roles.md"
+            document.parent.mkdir()
+            _ = document.write_text("A held design role keeps its thread.\n", encoding="utf-8")
+            with patch.object(Path, "home", side_effect=AssertionError("source checks must not read home")):
+                with redirect_stdout(StringIO()):
+                    self.assertEqual(audit.main(["check", "--root", str(root)]), 0)
+                for name in ("guild", "guilds", "guild head", "guild heads"):
+                    with self.subTest(name=name):
+                        _ = document.write_text(f"Use the {name}.\n", encoding="utf-8")
+                        output = StringIO()
+                        with redirect_stdout(output):
+                            self.assertEqual(audit.main(["check", "--root", str(root)]), 1)
+                        self.assertEqual(output.getvalue().splitlines(), [
+                            f"docs/roles.md:1: retired {name!r}; use 'held design role'",
+                            "role words in sentences: 0 (list with --prose)",
+                        ])
+
 
 class ProductionNameTests(unittest.TestCase):
     def test_reads_only_units_and_finds_format_and_cross_role_collisions(self) -> None:

@@ -336,7 +336,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 **Acceptance gate:** the gates in Delegation Context green, with the direct, production, message, agents, hierarchies and shutdown suites; a fixture-backed check finds no operational pool reader or caller, with named exceptions for the migration decoder, compatibility flags and kept history (the retired-name check stays the separate prose gate). Live check: this unit's next review runs on its own `review` and `review2` workers, and the review after it resumes the same threads (same thread ids in the roster).
 
 
-### Phase 12 — The guilds name is gone  · status: todo
+### Phase 12 — The guilds name is gone  · status: done
 **Depends on:** Phase 10 (it changes the same launcher and roster files). Runs before Phase 11, which waits on Phase 10 on `~/.claude` main (unit director's call, 2026-10-29).
 
 #### Work Order
@@ -358,6 +358,49 @@ For active process redesigns, as we are currently undergoing with promotions and
 - Commands: `commands/unit/direct.md` <HeldAstraRoles/> (models from `design_roles` in `agents.conf`, `config/design_roles/designer.md`, `config/design_roles.conf`, `roles.py` → `design_roles.py`); `commands/showrunner/produce.md` <HeldProductionDesign/> (`design_roles` models). Check `commands/astra_review.md` and `codex/` for the old names too.
 - As-builts: `long-lived-workers.md` (18 uses), `agent-registry.md`, `merge-gate-and-test-speed.md`, `session-roster.md`, `unit-rename.md`, `unit-transfer.md` say what is true now.
 - Plans: delete `docs/plans/guilds-production.md`, `guilds-designers.md`, `guilds-reviewers.md`, `guilds-showrunners.md`, `guilds-units.md` (the guilds production is retired; git history keeps them). In `docs/plans/sdlc-production.md`, the "Guild heads" section becomes "Held design roles", 3 lines: what `design_roles.py` keeps, where its state is, which commands use it, linking `long-lived-workers.md`. The guilds-unit section, the G1-G10 and R2 review decisions and the retired guild-process-unit row stay as dated history. In other plans, fix only current-state lines that name a moved path (for example `build-followups-worker-seats.md` line 42, `scripts/guilds/roles.py`); done-phase and dated design records stay.
+- Assertion changes (each is a rename, none is weaker; `scripts/guilds/test_roles.py` is the old path of `scripts/astra/test_design_roles.py`, and a line the guard reads as removed is the same assertion wrapped onto more lines):
+  - Assertion-Change: scripts/agents/test_agents_overlay.py::test_an_overlay_row_wins_and_an_overlay_only_row_and_section_are_read — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/agents/test_codex_mesh.py::start_fixture_server — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/agents/test_codex_mesh.py::test_held_record_without_policy_names_recovery_and_stays_unchanged — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/agents/test_codex_mesh.py::test_held_design_identity_is_also_applied_after_the_dev_shell — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/astra/test_astra_review.py::dispatch — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/astra/test_astra_review.py::test_busy_held_reviewer_is_reported_without_a_fresh_thread_or_prompt — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/direct/test_end_session.py::test_roster_without_server_record_still_runs_mesh_stop — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/guilds/test_roles.py::dispatch — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/guilds/test_roles.py::test_unknown_thread_creation_retains_the_claim_instead_of_launching_again — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/guilds/test_roles.py::test_incomplete_inventory_and_inventoried_legacy_source_refuse_new_threads — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/guilds/test_roles.py::test_lost_creation_acknowledgement_never_launches_a_second_thread — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/guilds/test_roles.py::test_unreachable_authority_and_host_mismatch_cannot_create_roles — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/guilds/test_roles.py::test_missing_or_disallowed_configured_model_never_uses_a_fallback — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/guilds/test_roles.py::test_showrunner_cannot_open_unbound_writer_but_reviewer_is_read_only — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/guilds/test_roles.py::test_pending_messages_clear_only_after_successful_turn_acceptance — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/guilds/test_roles.py::test_successful_assignment_consumes_its_pending_ids_without_waking_on_send — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/guilds/test_roles.py::dispatch_with_message — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/guilds/test_roles.py::resolve — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/guilds/test_roles.py::test_durable_hold_survives_run_removal_and_keeps_one_census_edge — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/guilds/test_roles.py::start_server — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/guilds/test_roles.py::test_stale_rebind_and_busy_rebind_preserve_the_current_binding — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/guilds/test_roles.py::list_output — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/guilds/test_roles.py::test_patch_checks_use_the_current_run_and_refuse_stale_or_mixed_paths — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/guilds/test_roles.py::test_a_binding_to_an_ad_hoc_phase_open_beside_another_accepts_its_patch — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/guilds/test_roles.py::test_patch_cannot_follow_a_symlink_outside_the_reserved_repository — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/guilds/test_roles.py::test_unbind_keeps_evidence_and_threads_but_refuses_the_next_writer_turn — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/guilds/test_roles.py::test_end_is_terminal_and_keeps_saved_prompts — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/guilds/test_roles.py::test_unit_rename_retry_keeps_both_original_threads_and_updates_live_paths — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/guilds/test_roles.py::test_uncertain_server_release_blocks_rename_before_holder_changes — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/guilds/test_roles.py::request — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/guilds/test_roles.py::test_refused_adoption_leaves_the_authority_without_a_transfer_claim — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/guilds/test_roles.py::end_command — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/guilds/test_roles.py::test_adoption_refuses_a_thread_or_holder_outside_the_recorded_source — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/guilds/test_roles.py::test_showrunner_notifier_target_requires_a_live_local_session — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/production/test_rename_unit_state.py::test_busy_held_role_blocks_rename_state_then_retry_updates_live_routes — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/production/test_rename_workers.py::test_held_roles_move_to_the_new_slug_with_the_showrunner_and_each_unit — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/production/test_transfer_unit.py::test_a_held_role_moves_to_the_receiving_holder_and_keeps_its_thread_and_paths — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/agents/test_codex_mesh.py::test_run_owned_values_are_reapplied_after_direnv_without_overwriting_dev_shell_flags — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/astra/test_design_roles.py::test_server_refresh_uses_current_run_holder_and_generation_on_the_same_account — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/direct/test_end_session.py::test_every_run_the_director_holds_is_cleaned_and_no_other — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/production/merge_gate_test_support.py::MergeGateFixture.setUpClass — rename only: the moved module, its path or a renamed setting; the expected value is the same
+  - Assertion-Change: scripts/production/test_unit_rename_sweep.py::GuildRenameSweepTests — rename only: the moved module, its path or a renamed setting; the expected value is the same
 - `~/rust/nate_style/guilds/` (separate repository): the unit director checks again that nothing loads it (`grep -rn 'nate_style/guilds'` in `~/.claude`, `~/rust/nate_style` and the hooks), then deletes it in one commit on nate_style main, fast-forward push only. The workers do not touch it.
 - The unit director removes the empty `~/.local/state/guilds/` after the merge gate, once the check above still finds no held role.
 

@@ -35,7 +35,7 @@ import unit_runs  # noqa: E402
 import herdr  # noqa: E402
 import codex_daemon  # noqa: E402
 import process_table  # noqa: E402
-from scripts.guilds import roles  # noqa: E402
+from scripts.astra import design_roles  # noqa: E402
 from scripts.lib import names  # noqa: E402
 from scripts.lib.names import JobKey  # noqa: E402
 if TYPE_CHECKING:
@@ -1093,9 +1093,9 @@ def _pool_context(run: Path, name: str) -> tuple[ShowrunnerRelationship, Directo
     return ProductionWithoutRunningShowrunner(slug), reviewer.director, reviewer.reviewer_type
 
 
-def _held_location(holder: roles.Holder) -> tuple[ShowrunnerRelationship, DirectorRelationship]:
+def _held_location(holder: design_roles.Holder) -> tuple[ShowrunnerRelationship, DirectorRelationship]:
     return (ProductionWithoutRunningShowrunner(holder.production_slug),
-            UnderDirector(holder.unit_name, "", "") if isinstance(holder, roles.UnitHolder) else NoDirector())
+            UnderDirector(holder.unit_name, "", "") if isinstance(holder, design_roles.UnitHolder) else NoDirector())
 
 
 def unit_worker_title(production: str, unit: str, job: JobKey, ordinal: int, address: str) -> str:
@@ -1114,7 +1114,7 @@ def mesh_shown_name(session_dir: str, name: str, record: Mapping[str, object]) -
     if design_id := _as_string(record.get("held_design_id")):
         held_role = record.get("held_role")
         try:
-            design = roles.read_design(design_id)
+            design = design_roles.read_design(design_id)
         except (OSError, UnicodeError, ValueError, TypeError):
             return ShownName(NoProduction(), NoUnit(), JobUnassigned("design unreadable"), name)
         if held_role not in ("designer", "reviewer"):
@@ -1600,24 +1600,24 @@ def _pool_workers(
 def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], problems: list[str]) -> tuple[list[RosterEntry], set[str]]:
     entries: list[RosterEntry] = []
     threads: set[str] = set()
-    for path in sorted(roles.state_root().glob('*/design.json')):
+    for path in sorted(design_roles.state_root().glob('*/design.json')):
         try:
-            design = roles.read_design(path.parent.name)
-            reach = roles.resolve_holder(design.holder)
-            session = claude.get(reach.session_id) if isinstance(reach, roles.HolderReach) else None
+            design = design_roles.read_design(path.parent.name)
+            reach = design_roles.resolve_holder(design.holder)
+            session = claude.get(reach.session_id) if isinstance(reach, design_roles.HolderReach) else None
             showrunner, director = _held_location(design.holder)
-            if isinstance(design.holder, roles.UnitHolder):
+            if isinstance(design.holder, design_roles.UnitHolder):
                 director = UnderDirector(design.holder.unit_name, session.name if session else design.holder.unit_name,
-                                         f'session:{reach.session_id}' if isinstance(reach, roles.HolderReach) else '')
+                                         f'session:{reach.session_id}' if isinstance(reach, design_roles.HolderReach) else '')
                 if session:
                     showrunner = session.showrunner
             elif session:
                 showrunner = UnderShowrunner(design.holder.production_slug, session.name,
-                                              f'session:{reach.session_id}' if isinstance(reach, roles.HolderReach) else '')
-            mesh = roles.mesh_directory(design.placement.design_id)
+                                              f'session:{reach.session_id}' if isinstance(reach, design_roles.HolderReach) else '')
+            mesh = design_roles.mesh_directory(design.placement.design_id)
             roster = _read_object(mesh / 'mesh_roster.json') if (mesh / 'mesh_roster.json').exists() else {}
             for instance in design.roles:
-                if isinstance(instance.lifecycle, (roles.RoleNotOpened, roles.RoleEnded)):
+                if isinstance(instance.lifecycle, (design_roles.RoleNotOpened, design_roles.RoleEnded)):
                     continue
                 thread = instance.lifecycle.thread_id
                 if thread in threads:
@@ -1627,7 +1627,7 @@ def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], problems: li
                     raise ValueError('durable roster entry is not an object')
                 entry = cast(dict[str, object], raw_entry)
                 if (entry.get('transferring_role') or entry.get('role_redirect')
-                        or roles.transfer_route(thread, design.placement.design_id)):
+                        or design_roles.transfer_route(thread, design.placement.design_id)):
                     continue
                 threads.add(thread)
                 status = _as_string(entry.get('status')) or type(instance.lifecycle).__name__

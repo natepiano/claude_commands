@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from typing import cast, final
 from unittest import mock
-from scripts.guilds import roles
+from scripts.astra import design_roles
 from scripts.direct import workers
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -126,25 +126,25 @@ class UnitRenameStateTests(UnitRenameFixture):
     def test_busy_held_role_blocks_rename_state_then_retry_updates_live_routes(self) -> None:
         old = self.rust / "claude-demo-alpha"
         new = self.rust / "claude-demo-gamma"
-        config = self.root / "guilds.conf"
+        config = self.root / "design_roles.conf"
         self.write(config, "[ownership]\nhost=fixture-host\n")
-        self.env.update({"GUILD_CONFIG_FILE": str(config), "GUILD_ROLES_HOST": "fixture-host"})
-        design = roles.HeldDesign(roles.DesignPlacement("00000000-0000-4000-8000-000000000056", "fixture-host", 1),
+        self.env.update({"DESIGN_ROLES_CONFIG": str(config), "DESIGN_ROLES_HOST": "fixture-host"})
+        design = design_roles.HeldDesign(design_roles.DesignPlacement("00000000-0000-4000-8000-000000000056", "fixture-host", 1),
             "fixture-repo", str(old), str(old / "docs/plans/alpha.md"), "design", "2026-10-21T12:00:00+00:00",
-            roles.UnitHolder("demo", "alpha-unit"), roles.DesignUnbound(),
-            (roles.RoleInstance("designer", "original-designer-alias", roles.RoleOpen("original-designer-thread")),
-             roles.RoleInstance("reviewer", "original-reviewer-alias", roles.RoleOpen("original-reviewer-thread"))))
+            design_roles.UnitHolder("demo", "alpha-unit"), design_roles.DesignUnbound(),
+            (design_roles.RoleInstance("designer", "original-designer-alias", design_roles.RoleOpen("original-designer-thread")),
+             design_roles.RoleInstance("reviewer", "original-reviewer-alias", design_roles.RoleOpen("original-reviewer-thread"))))
         with mock.patch.dict(os.environ, self.env):
-            roles.register_repository("fixture-repo", {"fixture-host": str(old)}, inventory_complete=True)
-            placement = roles.authority_request("reserve", {"repository_id": "fixture-repo",
+            design_roles.register_repository("fixture-repo", {"fixture-host": str(old)}, inventory_complete=True)
+            placement = design_roles.authority_request("reserve", {"repository_id": "fixture-repo",
                 "document": "docs/plans/alpha.md", "host": "fixture-host", "request_id": "rename-fixture"})
-            design = roles.HeldDesign(roles.DesignPlacement(str(placement["design_id"]), "fixture-host", 1),
+            design = design_roles.HeldDesign(design_roles.DesignPlacement(str(placement["design_id"]), "fixture-host", 1),
                 design.repository_id, design.repository, design.document, design.area, design.created_at_utc,
                 design.holder, design.binding, design.roles)
-            roles._save(design)  # pyright: ignore[reportPrivateUsage]
-            mesh = roles.mesh_directory(design.placement.design_id)
+            design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
+            mesh = design_roles.mesh_directory(design.placement.design_id)
         mesh.mkdir(parents=True)
-        roster = {instance.name: {"thread_id": cast(roles.RoleOpen, instance.lifecycle).thread_id,
+        roster = {instance.name: {"thread_id": cast(design_roles.RoleOpen, instance.lifecycle).thread_id,
                                   "status": "running" if instance.role == "designer" else "done", "cwd": str(old)}
                   for instance in design.roles}
         self.write(mesh / "mesh_roster.json", json.dumps(roster))
@@ -152,13 +152,13 @@ class UnitRenameStateTests(UnitRenameFixture):
         self.assert_refused(result, "busy")
         self.assertFalse(self.journal()["done"])
         with mock.patch.dict(os.environ, self.env):
-            self.assertEqual(roles.read_design(design.placement.design_id).holder, design.holder)
+            self.assertEqual(design_roles.read_design(design.placement.design_id).holder, design.holder)
         roster["original-designer-alias"]["status"] = "done"
         self.write(mesh / "mesh_roster.json", json.dumps(roster))
         self.assert_ok(self.rename("apply"))
         with mock.patch.dict(os.environ, self.env):
-            renamed = roles.read_design(design.placement.design_id)
-        self.assertEqual(renamed.holder, roles.UnitHolder("demo", "gamma-unit"))
+            renamed = design_roles.read_design(design.placement.design_id)
+        self.assertEqual(renamed.holder, design_roles.UnitHolder("demo", "gamma-unit"))
         self.assertEqual((renamed.repository, renamed.document), (str(new), str(new / "docs/plans/alpha.md")))
         self.assertEqual([(instance.name, instance.lifecycle) for instance in renamed.roles],
                          [(instance.name, instance.lifecycle) for instance in design.roles])

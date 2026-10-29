@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
 
-from scripts.guilds import roles
+from scripts.astra import design_roles
 from scripts.direct import workers
 
 SCRIPT = Path(__file__).with_name("transfer_unit.py")
@@ -264,29 +264,29 @@ class UnitTransferTests(unittest.TestCase):
         self.assert_ok(self.transfer("verify"))
 
     def test_a_held_role_moves_to_the_receiving_holder_and_keeps_its_thread_and_paths(self) -> None:
-        config = self.root / "guilds.conf"
+        config = self.root / "design_roles.conf"
         self.write(config, "[ownership]\nhost=fixture-host\n")
-        self.env.update({"GUILD_CONFIG_FILE": str(config), "GUILD_ROLES_HOST": "fixture-host",
-                         "GUILD_ROLES_STATE": str(self.root / "state/guilds/roles"),
-                         "GUILD_OWNERSHIP_STATE": str(self.root / "state/guilds/ownership")})
+        self.env.update({"DESIGN_ROLES_CONFIG": str(config), "DESIGN_ROLES_HOST": "fixture-host",
+                         "DESIGN_ROLES_STATE": str(self.root / "state/astra/design-roles"),
+                         "DESIGN_OWNERSHIP_STATE": str(self.root / "state/astra/design-ownership")})
         document = str(self.unit / "docs/plans/alpha.md")
         with mock.patch.dict(os.environ, self.env):
-            roles.register_repository("fixture-repo", {"fixture-host": str(self.unit)}, inventory_complete=True)
-            placement = roles.authority_request("reserve", {"repository_id": "fixture-repo",
+            design_roles.register_repository("fixture-repo", {"fixture-host": str(self.unit)}, inventory_complete=True)
+            placement = design_roles.authority_request("reserve", {"repository_id": "fixture-repo",
                 "document": "docs/plans/alpha.md", "host": "fixture-host", "request_id": "transfer-fixture"})
-            design = roles.HeldDesign(roles.DesignPlacement(str(placement["design_id"]), "fixture-host", 1),
+            design = design_roles.HeldDesign(design_roles.DesignPlacement(str(placement["design_id"]), "fixture-host", 1),
                 "fixture-repo", str(self.unit), document, "design", "2026-10-22T12:00:00+00:00",
-                roles.UnitHolder("demo", "alpha-unit"), roles.DesignUnbound(),
-                (roles.RoleInstance("designer", "demo-design-astra-designer", roles.RoleOpen("designer-thread")),
-                 roles.RoleInstance("reviewer", "demo-design-astra-reviewer", roles.RoleNotOpened())))
-            roles._save(design)  # pyright: ignore[reportPrivateUsage]
-            mesh = roles.mesh_directory(design.placement.design_id)
+                design_roles.UnitHolder("demo", "alpha-unit"), design_roles.DesignUnbound(),
+                (design_roles.RoleInstance("designer", "demo-design-astra-designer", design_roles.RoleOpen("designer-thread")),
+                 design_roles.RoleInstance("reviewer", "demo-design-astra-reviewer", design_roles.RoleNotOpened())))
+            design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
+            mesh = design_roles.mesh_directory(design.placement.design_id)
         self.write(mesh / "mesh_roster.json", json.dumps({"demo-design-astra-designer": {
             "thread_id": "designer-thread", "status": "done", "cwd": str(self.unit)}}))
         self.assert_ok(self.transfer("apply"))
         with mock.patch.dict(os.environ, self.env):
-            moved = roles.read_design(design.placement.design_id)
-        self.assertEqual(moved.holder, roles.UnitHolder("other", "alpha-unit"))
+            moved = design_roles.read_design(design.placement.design_id)
+        self.assertEqual(moved.holder, design_roles.UnitHolder("other", "alpha-unit"))
         self.assertEqual((moved.repository, moved.document, moved.roles), (design.repository, design.document, design.roles))
         self.assertEqual(moved.placement.generation, 2)
         roster = cast(dict[str, dict[str, str]], json.loads((mesh / "mesh_roster.json").read_text(encoding="utf-8")))
