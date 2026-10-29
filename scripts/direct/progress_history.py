@@ -13,7 +13,6 @@ import statistics
 import subprocess
 import sys
 import tempfile
-import time
 import uuid
 from collections import defaultdict
 from collections.abc import Callable, Generator, Iterable, Mapping
@@ -5237,8 +5236,6 @@ class PostmasterReplyRecord:
     senders: tuple[str, ...]
     body: str
     targets: tuple[str, ...]
-    forward: Literal["pending", "done"]
-    forwarded: tuple[str, ...]
 
     @classmethod
     def from_fields(cls, fields: dict[str, object]) -> PostmasterReplyRecord:
@@ -5258,39 +5255,24 @@ class PostmasterReplyRecord:
         name = fields.get("name")
         session_id = fields.get("session_id")
         body = fields.get("body")
-        forward = fields.get("forward")
         if (type(at_ms) is not int or not 0 <= at_ms <= 9007199254740991
                 or not isinstance(socket, str) or not socket.startswith("uds:/")
                 or not isinstance(name, str) or not name
                 or not isinstance(session_id, str) or not session_id
-                or not isinstance(body, str) or forward not in ("pending", "done")):
+                or not isinstance(body, str)):
             raise ValueError("invalid postmaster reply fields")
         senders = session_names(fields.get("senders"))
         if not senders:
             raise ValueError("reply must name a sender")
         return cls(at_ms, socket, name, session_id, senders, body,
-                   session_names(fields.get("targets")),
-                   "pending" if forward == "pending" else "done",
-                   session_names(fields.get("forwarded")))
+                   session_names(fields.get("targets")))
 
 
 def _read_postmaster_reply_record(path: Path) -> PostmasterReplyRecord:
-    # The postmaster rewrites pending records in place after forwarding. Retry
-    # unreadable or torn JSON up to five times, with at most 80 ms of pauses.
-    retries = 4
-    while True:
-        try:
-            fields = _json_object(path.read_text(encoding="utf-8"))
-            if fields is None:
-                raise ValueError("reply record is not a JSON object")
-        except (OSError, ValueError):
-            if retries == 0:
-                raise
-            retries -= 1
-            time.sleep(0.02)
-            continue
-        # A complete object with invalid fields is not a torn read.
-        return PostmasterReplyRecord.from_fields(fields)
+    fields = _json_object(path.read_text(encoding="utf-8"))
+    if fields is None:
+        raise ValueError("reply record is not a JSON object")
+    return PostmasterReplyRecord.from_fields(fields)
 
 
 def _supplier_message(identity: str, prompt: str, owner_session: str) -> VerifiedSupplierMessage | UnverifiedSupplierMessage:
@@ -5356,8 +5338,7 @@ def _supplier_message(identity: str, prompt: str, owner_session: str) -> Verifie
         return UnverifiedSupplierMessage(SupplierMessageRejection.NOT_A_TARGET)
     if len(records) != 1:
         return UnverifiedSupplierMessage(SupplierMessageRejection.SEVERAL_RECORDS)
-    # targets proves intent even while pending. forwarded records confirmations
-    # and is deliberately not used to decide whether this session is a target.
+    # The write-once reply record's targets establish the intended recipients.
     return VerifiedSupplierMessage(forward[2], SupplierMessageRoute.POSTMASTER_REPLY)
 
 

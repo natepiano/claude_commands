@@ -385,6 +385,9 @@ The sdlc showrunner's add-on for hierarchies-unit (2026-10-29). Wait records (Ph
   - A holder can change during one wait (the queue moves). A new verb `wait-holder --session-dir D --wait-id ID <holder flags>` appends a `wait_holder_seen` event for an open wait; it refuses a closed or unknown wait id.
   - `waits` output gives each wait `holders`: every holder seen, in order, each with its time, or one `HolderNotNamed`. Old records with no holder events read as `HolderNotNamed("recorded before holders")`.
   - Holders apply only to the three wait kinds above; a holder flag on another kind is refused.
+- Two `waits` defects the showrunner folded in (2026-10-29, found by hierarchies' Phase 4 review; both give wrong results):
+  - A wait event row with no `wait_id` is dropped without a count: `_waits_by_id()` skips it and `ignored_n` does not count it, so a reader sees zero covered waits for that phase. Count each such row in `ignored_n` and in a new top-level `wait_without_id_n`; the phase row it names (same `run_id` and `phase_instance_id`) reads `HistoryNotRecorded` with reason `wait record has no wait id` and `wait_without_id_n`, never `Covered`.
+  - The phase rows keep only the worktree name and drop the plan, production and repository, so a retired phase (worktree `widget-enhancements`, plan `tool-based-ui-widget.md`) cannot be traced to its production and its `HistoryNotRecorded` row drops out of the Hana counts. Each phase row carries `plan_doc`, `production` and `repository`. `phase_started` records `production`, `unit` and `repository` from now on; an older event resolves them once per run from disk (the plan header's `> **Production:**` line and the worktree's git common directory). A value that cannot be found is a typed `{"state": "NotRecorded", "reason": ...}`, never an empty string.
 - Producers are other units' files. Write a hand-off for each, with the exact flags, and send it through the sdlc showrunner:
   - builds (verify-unit, resources-unit): `verify.sh`'s `phase_wait_start` passes the board token owner for a slot wait, the memory reservation owner for a memory wait, and the build hold's holder for a hold wait, and calls `wait-holder` when the holder changes. Agree it with builds [a703f3].
   - natedev models-unit: `codex_mesh.py`'s `_mesh_phase_wait` passes the account label it waits on for quota and capacity waits.
@@ -399,4 +402,54 @@ The sdlc showrunner's add-on for hierarchies-unit (2026-10-29). Wait records (Ph
 
 **Constraints from prior phases:** Phase 6 and 7 wait identities (`owner_session`, `wait_attribution`, `expected_supplier`) stay as they are. Phase 8's typed record pattern (frozen dataclass from fields, `ValueError` on bad fields) is the model for the holder type. Type check: `basedpyright scripts/direct/progress_history.py scripts/direct/test_progress_history.py` reads 0 errors, 0 warnings, 0 notes. Tests: `python3 -m unittest scripts.direct.test_progress_history`.
 
-**Acceptance gate:** a test opens each of the three wait kinds with a named session holder and a named unit holder, changes the holder once with `wait-holder`, and reads both holders back in order from `waits`; a wait opened with no holder flags reads `HolderNotNamed`; a partial flag set, a holder on `WaitingForUser`, and `wait-holder` on a closed wait each exit 2; an old history file with no holder events reads `HolderNotNamed("recorded before holders")`. The two hand-offs are sent.
+**Acceptance gate:** a test opens each of the three wait kinds with a named session holder and a named unit holder, changes the holder once with `wait-holder`, and reads both holders back in order from `waits`; a wait opened with no holder flags reads `HolderNotNamed`; a partial flag set, a holder on `WaitingForUser`, and `wait-holder` on a closed wait each exit 2; an old history file with no holder events reads `HolderNotNamed("recorded before holders")`. A wait row with no `wait_id` raises `ignored_n` and `wait_without_id_n` and makes its phase `HistoryNotRecorded`; a new phase row and an old one whose worktree and plan are on disk both carry `plan_doc`, `production` and `repository`, and an old one whose worktree is gone carries the typed not-recorded value. The two hand-offs are sent.
+
+### Phase 12 — The postmaster reply reader reads write-once records  · status: done
+**Depends on:** Phase 8
+
+postmaster-unit takes Phase 8's atomic-write note (showrunner, 2026-10-29; natedev-postmaster dfb1ef64). No reply file is rewritten: `replies/<at_ms>-<n>.json` is written once before the first forward with `{at_ms, socket, name, session_id, senders, body, targets}`, and a new `forwards/<at_ms>-<n>.json` with `{forwarded}` is written once after the last forward. When that change is on main, Phase 8's reader refuses every new record (it requires `forward`), so forwarded replies no longer end waits. This phase checkpoints ahead of Phase 11 and the showrunner merges it at once.
+
+#### Work Order
+
+**Goal:** a forwarded supplier reply whose record has the write-once form ends the wait, exactly as Phase 8's checks decide.
+
+**Spec:**
+- `PostmasterReplyRecord` drops `forward` and `forwarded`; `from_fields` no longer reads them. A record that still carries them (written before the change) reads the same, its extra fields unread.
+- `_read_postmaster_reply_record` drops the re-reads: one read; unreadable or invalid JSON is a rejected record.
+- The reader does not read `forwards/`: `targets` decides intent, and no check uses the confirmed ids.
+- The match rules, rejections and wait ending of Phase 8 stay as they are.
+
+**Files:**
+- `scripts/direct/progress_history.py`
+- `scripts/direct/test_progress_history.py`
+
+**Workers:** `1 impl` — writes the reader change and its tests in a review copy, because Phase 11's edits to the same file are uncommitted in the worktree.
+
+**Constraints from prior phases:** Phase 8's typed record pattern and rejections stay. Type check: `basedpyright scripts/direct/progress_history.py scripts/direct/test_progress_history.py` reads 0 errors, 0 warnings, 0 notes. Tests: `python3 -m unittest scripts.direct.test_progress_history`.
+
+Assertion-Change: `test_forwarded_reply_is_verified_when_a_torn_record_read_recovers` is removed, because the re-read it pins is removed.
+Assertion-Change: `test_persistently_malformed_reply_record_is_rejected_after_bounded_retries` expects one read and no sleep, not five reads and four sleeps; the rejection and the open wait stay.
+Assertion-Change: `test_invalid_reply_record_schema_leaves_the_supplier_wait_open` drops its `forward="unknown"` and `forwarded="director"` cases, because those fields are no longer read; a record that carries them is accepted.
+
+**Acceptance gate:** a forwarded reply whose record has the write-once fields ends the wait, with and without a `forwards/` file; an old-form record still ends it; a missing, mismatched or duplicate record still leaves it open. Tests pass on a trial merge with natedev-postmaster dfb1ef64 (not merged into this branch), and postmaster's own tests pass there too.
+
+### Phase 13 — The trial measures table fits a phone  · status: todo
+**Depends on:** Phase 11
+
+The showrunner returned change-review row C454 (2026-10-29): `phase_process.py baseline --exposure before --before-at HEAD --detail trial` prints its trial measures table 95-106 characters wide, which wraps on a phone, and the row stated a fixed n that has since moved.
+
+#### Work Order
+
+**Goal:** the trial measures table reads on a phone without wrapping.
+
+**Spec:**
+- `scripts/direct/phase_process.py` trial table: values in short form (`2.7M`, `20.1M`, `61K`; whole numbers below 1,000 as they are), no `not recorded` column (a not-recorded count above 0 prints as one line under the table), and a header and title no wider than the rows. Every line is at most 60 characters.
+- The checkpoint's Change-Review line states no fixed n.
+
+**Files:**
+- `scripts/direct/phase_process.py`
+- `scripts/direct/test_phase_process.py`
+
+**Workers:** `1 impl`.
+
+**Acceptance gate:** a test renders the table from fixture phases with values in the millions and a not-recorded count, and checks every line is at most 60 characters, the short forms, and the not-recorded line; the live command's lines 6 to 11 are at most 60 characters.

@@ -1822,12 +1822,12 @@ print('two homes isolated; recorder lock retained; caller restored')
         }]))
         self.assertTrue(progress_history.record_turn_wait(session, "director", "blocked: waiting on uds:/supplier.sock"))
         replies = self.root / "state/message/postmaster/replies"
-        replies.mkdir(parents=True)
+        replies.mkdir(parents=True, exist_ok=True)
         record = replies / "1030000-2.json"
         _ = record.write_text(json.dumps({
             "at_ms": 1030000, "socket": "uds:/supplier.sock", "name": "renamed-supplier",
             "session_id": "supplier-session", "senders": ["another-director", "director"],
-            "body": body, "targets": ["another-director", "director"], "forward": "pending", "forwarded": [],
+            "body": body, "targets": ["another-director", "director"],
         }))
         prompt = ('<cross-session-message from="uds:/fixture/postmaster/socket" from-name="postmaster">'
                   + "Message from renamed-supplier (their answer to one of another-director, director, "
@@ -1845,6 +1845,7 @@ print('two homes isolated; recorder lock retained; caller restored')
     def test_pending_forward_preserves_body_whitespace_and_ignores_the_record_counter(self) -> None:
         name = "pending-exact-body"
         session, _, prompt = self.forwarded_supplier_wait(name, "\nThe checkpoint is merged.\n\n")
+        self.assertFalse((self.root / "state/message/postmaster/forwards").exists())
         progress_history.finish_turn_wait(session, "director", source="PEER", prompt=prompt)
         progress_history.finish_turn_wait(session, "director", source="PEER", prompt=prompt)
         waits = [event for event in self.read_events(name) if str(event["event_type"]).startswith("wait_")]
@@ -1854,37 +1855,83 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertEqual(cast(dict[str, object], waits[1]["wait_end"])["epoch"], 1030)
         self.assertFalse((session / "turn_wait.json").exists())
 
-    def test_forwarded_reply_is_verified_when_a_torn_record_read_recovers(self) -> None:
-        session, record, prompt = self.forwarded_supplier_wait("forward-read-recovers")
-        complete = record.read_text()
-        for first_read in ('{"at_ms":', "[]", OSError("record rewrite in progress")):
-            with self.subTest(first_read=first_read), patch.object(
-                Path, "read_text", side_effect=[first_read, complete]
-            ) as read_record, patch("scripts.direct.progress_history.time.sleep") as pause:
-                message = _supplier_message("uds:/supplier.sock", prompt, "director")
-                if not isinstance(message, progress_history.VerifiedSupplierMessage):
-                    self.fail(f"recovered record was rejected: {message.reason}")
-                self.assertEqual(message.route, progress_history.SupplierMessageRoute.POSTMASTER_REPLY)
-                self.assertEqual(message.body, "The checkpoint is merged.")
-                self.assertEqual(read_record.call_count, 2)
-                pause.assert_called_once_with(0.02)
-        # The same recovered evidence must finish the declared wait.
+    def test_write_once_reply_ends_wait_with_a_forward_completion_record(self) -> None:
+        name = "forward-complete"
+        session, record, prompt = self.forwarded_supplier_wait(name)
+        forwards = record.parent.parent / "forwards"
+        forwards.mkdir()
+        # Completion ids do not decide whether this director was a target.
+        _ = (forwards / record.name).write_text(json.dumps({"forwarded": ["another-director"]}))
         progress_history.finish_turn_wait(session, "director", source="PEER", prompt=prompt)
+        waits = [event for event in self.read_events(name) if str(event["event_type"]).startswith("wait_")]
+        self.assertEqual([event["event_type"] for event in waits], ["wait_started", "wait_finished"])
+        self.assertEqual(waits[1]["wait_id"], waits[0]["wait_id"])
         self.assertFalse((session / "turn_wait.json").exists())
 
-    def test_persistently_malformed_reply_record_is_rejected_after_bounded_retries(self) -> None:
+    def test_old_form_reply_ends_wait_without_validating_extra_fields(self) -> None:
+        old_fields: tuple[tuple[str, object], ...] = (
+            ("pending", []), ("done", ["director"]), ("unknown", []), ("pending", "director"),
+        )
+        for index, (forward, forwarded) in enumerate(old_fields):
+            with self.subTest(forward=forward, forwarded=forwarded):
+                name = f"forward-old-form-{index}"
+                session, record, prompt = self.forwarded_supplier_wait(name)
+                fields = cast(dict[str, object], json.loads(record.read_text()))
+                fields.update(forward=forward, forwarded=forwarded)
+                _ = record.write_text(json.dumps(fields))
+                progress_history.finish_turn_wait(session, "director", source="PEER", prompt=prompt)
+                waits = [event for event in self.read_events(name) if str(event["event_type"]).startswith("wait_")]
+                self.assertEqual([event["event_type"] for event in waits], ["wait_started", "wait_finished"])
+                self.assertEqual(waits[1]["wait_id"], waits[0]["wait_id"])
+                self.assertFalse((session / "turn_wait.json").exists())
+
+    def test_missing_reply_record_leaves_the_supplier_wait_open(self) -> None:
+        name = "forward-missing"
+        session, record, prompt = self.forwarded_supplier_wait(name)
+        record.unlink()
+        self.assert_forwarded_supplier_wait_stays_open(name, session, prompt)
+
+    def test_duplicate_reply_records_leave_the_supplier_wait_open(self) -> None:
+        name = "forward-duplicate"
+        session, record, prompt = self.forwarded_supplier_wait(name)
+        _ = record.with_name("1030000-3.json").write_bytes(record.read_bytes())
+        self.assert_forwarded_supplier_wait_stays_open(name, session, prompt)
+
+    def test_reply_socket_and_target_must_match_the_supplier_wait(self) -> None:
+        name = "forward-address-mismatch"
+        session, record, prompt = self.forwarded_supplier_wait(name)
+        valid = cast(dict[str, object], json.loads(record.read_text()))
+        mismatches: tuple[tuple[str, object], ...] = (
+            ("socket", "uds:/another-supplier.sock"), ("targets", ["another-director"]),
+        )
+        for field, value in mismatches:
+            with self.subTest(field=field):
+                _ = record.write_text(json.dumps({**valid, field: value}))
+                self.assert_forwarded_supplier_wait_stays_open(name, session, prompt)
+
+    def test_direct_supplier_reply_ends_wait_without_a_reply_record(self) -> None:
+        name = "direct-supplier-reply"
+        session, record, _ = self.forwarded_supplier_wait(name)
+        record.unlink()
+        prompt = '<cross-session-message from="uds:/supplier.sock">The checkpoint is merged.</cross-session-message>'
+        progress_history.finish_turn_wait(session, "director", source="PEER", prompt=prompt)
+        waits = [event for event in self.read_events(name) if str(event["event_type"]).startswith("wait_")]
+        self.assertEqual([event["event_type"] for event in waits], ["wait_started", "wait_finished"])
+        self.assertEqual(waits[1]["wait_id"], waits[0]["wait_id"])
+        self.assertFalse((session / "turn_wait.json").exists())
+
+    def test_malformed_reply_record_is_rejected_after_one_read_without_sleep(self) -> None:
         session, record, prompt = self.forwarded_supplier_wait("forward-read-malformed")
         for malformed in ('{"at_ms":', "[]", OSError("record is unreadable")):
             with self.subTest(malformed=malformed), patch.object(
-                Path, "read_text", side_effect=[malformed] * 5
-            ) as read_record, patch("scripts.direct.progress_history.time.sleep") as pause:
+                Path, "read_text", side_effect=[malformed]
+            ) as read_record, patch("time.sleep") as pause:
                 message = _supplier_message("uds:/supplier.sock", prompt, "director")
                 if not isinstance(message, progress_history.UnverifiedSupplierMessage):
                     self.fail("malformed record verified a reply")
                 self.assertEqual(message.rejection, progress_history.SupplierMessageRejection.NO_RECORD)
-                self.assertEqual(read_record.call_count, 5)
-                self.assertEqual(pause.call_count, 4)
-                pause.assert_called_with(0.02)
+                self.assertEqual(read_record.call_count, 1)
+                pause.assert_not_called()
         _ = record.write_text('{"at_ms":')
         self.assert_forwarded_supplier_wait_stays_open("forward-read-malformed", session, prompt)
 
@@ -1892,7 +1939,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         session, record, prompt = self.forwarded_supplier_wait("forward-invalid-no-retry")
         complete = record.read_text()
         with patch.object(Path, "read_text", side_effect=["{}", complete]) as read_record, patch(
-            "scripts.direct.progress_history.time.sleep"
+            "time.sleep"
         ) as pause:
             message = _supplier_message("uds:/supplier.sock", prompt, "director")
             if not isinstance(message, progress_history.UnverifiedSupplierMessage):
@@ -1923,8 +1970,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         session, record, prompt = self.forwarded_supplier_wait(name)
         valid = cast(dict[str, object], json.loads(record.read_text()))
         invalid_fields: tuple[tuple[str, object], ...] = (
-            ("targets", "director"), ("forward", "unknown"),
-            ("forwarded", "director"), ("at_ms", True), ("senders", []),
+            ("targets", "director"), ("at_ms", True), ("senders", []),
         )
         for field, invalid in invalid_fields:
             with self.subTest(field=field):
