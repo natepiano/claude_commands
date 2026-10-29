@@ -5772,6 +5772,23 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertIn("thread is idle and no completion notice arrived",
                       (self.session_dir / "worker.log").read_text(encoding="utf-8"))
 
+    def test_an_idle_read_just_after_the_turn_starts_does_not_end_the_turn(self) -> None:
+        # The server can read a thread idle for a moment after its turn starts.
+        # The launcher waits for a quiet stream before it calls the notice lost.
+        self.assertEqual(self.run_start()[0], 0)
+        self.outcomes = ["answered_without_completion"]
+        self.start_args_timeout = 5
+
+        started = time.monotonic()
+        with (patch.object(codex_mesh, "UNSEEN_END_CHECK_SECS", 0.05),
+              patch.object(codex_mesh, "UNSEEN_END_QUIET_SECS", 1.0)):
+            code, errors = self.run_follow()
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assertGreaterEqual(time.monotonic() - started, 1.0)
+        self.assertEqual(self.methods("turn/interrupt"), [])
+        self.assertEqual(self.worker_record()["status"], "done")
+
     def test_an_idle_thread_with_no_notice_and_no_answer_finishes_as_failed(self) -> None:
         self.assertEqual(self.run_start()[0], 0)
         self.outcomes = ["earlier_only"]
