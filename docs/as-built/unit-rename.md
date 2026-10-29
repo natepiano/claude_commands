@@ -50,7 +50,14 @@ steps:
    an app-server still alive with its children, such as `codex-code-mode-host`. Each leads its own
    session, so the shutdown path does not end it (2026-10-20: a lint run and a day-old watcher
    refused the move; 2026-10-21: modules-unit's 8-hour app-server refused it).
-   `retire_unit.run_processes` finds them and `retire_unit.terminate` stops them; one alive after
+   `retire_unit.run_processes` finds them and `retire_unit.terminate` stops them.
+   A dead server's idle-stop shell can still be asleep with its cwd in the worktree.
+   The shared classifier checks the shell's `sh -c` arguments, the idle-stop script and the
+   resolved `codex_mesh.py` entry point. When `kill -0` reports its server pid gone, it admits
+   the watcher and its session children even if the run folder is missing or its history names
+   another worktree. SIGTERM goes only to the classified pids. A live server's watcher still
+   requires a run folder from `runs_of(worktree)`; unrelated processes still refuse the move.
+   Preflight uses the same classification so apply can stop these leftovers. One alive after
    `TERM_WAIT_SECONDS` refuses, and a rerun resumes. Refused up front: the new id
    already running, a Claude that cannot be read, and other processes inside the worktree of a unit
    with no Claude to stop.
@@ -169,5 +176,8 @@ real CLI parser and handlers in-process, including the fake herdr response CLI;
 Git commands remain real. Entry-point errors, cross-process locks, shutdown and
 relaunch coordination retain subprocesses. Fixture file waits use directory
 events with a 300-second hang guard.
-`test_unit_rename_sweep.py` checks the three owner-maintained classes and that a live-file
-override still fails.
+The process suite applies a rename with a real dead-server watcher blocked on a pipe; a readiness
+event establishes that it holds the old cwd before the server exits, and its run history names
+another worktree. Classification tests leave live servers' watchers alone when their run history
+does not match. `test_unit_rename_sweep.py` checks the three snapshot/history classes and verifies
+that live-file overrides still fail.
