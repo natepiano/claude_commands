@@ -369,8 +369,8 @@ class ReviewLauncherPassTests(unittest.TestCase):
         """Copy the real wrapper beside a stub agent, so nothing calls a model.
 
         Resolution, heartbeat writing, board and recorder helpers stay real.
-        Mesh, agent execution, pool allocation and the waiting heartbeat watcher
-        are controlled so tests spend no model tokens or minute-long sleeps.
+        Mesh, agent execution and pool allocation are controlled so tests spend
+        no model tokens. The real heartbeat watcher uses a short interval.
         """
         direct_dir = self.root / "scripts" / "direct"
         agents = self.root / "scripts" / "agents"
@@ -394,30 +394,14 @@ class ReviewLauncherPassTests(unittest.TestCase):
             "from __future__ import annotations\n",
             "from __future__ import annotations\n" + LEGACY_RECORDER_ARGUMENTS, 1,
         ))
-        for name in ("agents_config.sh", "agents_overlay.sh", "agents_overlay.awk", "heartbeat.sh"):
-            _ = shutil.copy2(AGENTS_DIR / name, agents / name)
-        # Keep the watcher alive for early-launch tests without a shell sleep
-        # child inheriting the subprocess output pipes for sixty seconds.
-        _ = (agents / "heartbeat_watch.sh").write_text(
-            """#!/usr/bin/env bash
-exec "$(dirname "$0")/../lib/py" -c '
-import os, select, sys, time
-try: descriptor = os.pidfd_open(int(sys.argv[1]))
-except ProcessLookupError: pass
-except AttributeError:
-    deadline = time.monotonic() + 300
-    while True:
-        try: os.kill(int(sys.argv[1]), 0)
-        except ProcessLookupError: break
-        if time.monotonic() >= deadline: raise TimeoutError("watcher child did not exit")
-        time.sleep(0.01)
-else:
-    if not select.select([descriptor], [], [], 300)[0]:
-        raise TimeoutError("watcher child did not exit")
-    os.close(descriptor)
-' "$3"
-""", encoding="utf-8",
+        launcher = direct_dir / "review.sh"
+        _ = launcher.write_text(
+            launcher.read_text(encoding="utf-8").replace(
+                "HEARTBEAT_INTERVAL_SECS=60", "HEARTBEAT_INTERVAL_SECS=1"
+            ), encoding="utf-8",
         )
+        for name in ("agents_config.sh", "agents_overlay.sh", "agents_overlay.awk", "heartbeat.sh", "heartbeat_watch.sh"):
+            _ = shutil.copy2(AGENTS_DIR / name, agents / name)
         stub = agents / "agent_exec.sh"
         _ = stub.write_text(STUB_AGENT_EXEC, encoding="utf-8")
         stub.chmod(0o755)
@@ -426,39 +410,6 @@ else:
         mesh.chmod(0o755)
         _ = (direct_dir / "review_pool.py").write_text(STUB_POOL, encoding="utf-8")
         return direct_dir / "review.sh"
-
-    def test_heartbeat_watcher_ends_without_pidfd_support(self) -> None:
-        marker = self.root / "portable-watcher-ready"
-        _ = (self.root / "sitecustomize.py").write_text(
-            "import os\nfrom pathlib import Path\n"
-            + "os.__dict__.pop('pidfd_open', None)\n"
-            + f"Path({str(marker)!r}).touch()\n"
-        )
-        child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
-                                 stdin=subprocess.PIPE)
-        environment = self.environment()
-        environment["PYTHONPATH"] = str(self.root)
-        watcher = subprocess.Popen(
-            ["bash", str(self.root / "scripts" / "agents" / "heartbeat_watch.sh"),
-             "fixture", "fixture", str(child.pid)],
-            env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-        try:
-            wait_for_file(marker)
-            assert child.stdin is not None
-            child.stdin.close()
-            self.assertEqual(child.wait(timeout=300), 0)
-            output, errors = watcher.communicate(timeout=300)
-            self.assertEqual(watcher.returncode, 0, output + errors)
-        finally:
-            for process in (child, watcher):
-                if process.poll() is None:
-                    process.kill()
-                _ = process.wait(timeout=300)
-            if watcher.stdout is not None:
-                watcher.stdout.close()
-            if watcher.stderr is not None:
-                watcher.stderr.close()
 
     def test_interpreter_cache_reuses_the_resolved_python_without_a_version_probe(self) -> None:
         launcher = self.root / "scripts" / "lib" / "py"
