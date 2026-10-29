@@ -23,31 +23,19 @@ The showrunner relayed a request from the user (via the showrunner of cargo-line
 
 ### Phase 25 — the units report's style table says what each unit does, and names what it counts  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** In the units report's style table, Step says in words what the unit does now, ETA has its own column, and the Built and Left headers say what they count.
-
-**Depends on:** none
-
-**Spec:**
-1. Step says in words what the unit does now, from the unit's open run step and its ticket, for example `writing 17 renames`, `testing on the Mac`, `reviewing`, `waiting for the showrunner to merge`, `refilling`. It never shows only a raw step word such as `impl` or `checkpoint sent`. A unit with nothing open says what it waits for (for example the idle refill outcome).
-2. ETA is its own column after Step, holding the unit's recorded ETA as a clock time, or `—` when there is none. Step no longer carries ` · ETA`.
-3. The Built header is `Findings built (24 h)`, and its cell is `<built> (<built in the last 24 h>)`, for example `118 (62)`.
-4. The Left header is `Findings left`. Left counts filed findings whose decision is approved. When the count of all filed findings differs, the cell also shows it, for example `40 approved of 55 filed`, and keeps the split detail after it. The totals line names what it counts the same way.
-5. `docs/as-built/style-showrunner.md` describes the new columns and what Left counts.
+- The units report's style table has the header `| Unit | Ticket | Step | ETA | Findings built (24 h) | Findings left |`.
+- `style_units.format_step(step, ticket, idle)` gives Step in words. It uses the run step's activity text when that text is more specific than a generic word. Otherwise it maps `impl` → `writing <ticket work>`, `fix` → `fixing review findings`, `review` → `reviewing`, `test` → `testing`, `checkpoint sent` → `waiting for the showrunner to merge`. An assigned ticket with no open step gives `starting <ticket work>`, a checkpointed one gives `waiting for the showrunner to merge`, and a unit with no ticket gives `idle` or `idle — <refill outcome>`. `ticket_work` gives `<n> files|sites|findings` for both Ticket and Step. `NoTicket` names a unit without an open ticket.
+- `eta_cell` shows the recorded ETA as a clock time in the user's zone, or `—`.
+- `FamilyCounts.filed` counts filed findings per family. `left_cell(approved, filed, split, now)` shows `<approved>`, or `<approved> approved of <filed> filed` when they differ, then the split detail.
+- `LedgerSnapshot.total_filed` counts every filed finding in a ledger, also findings with no resolvable family. The totals line reads `All families: <built> findings built · <approved> approved findings left[ of <filed> filed] · <recent> built in the last 24 h · ETA …`.
 
 **Files:**
-- `scripts/production/style_units.py`
-- `scripts/production/test_style_units.py`
-- `docs/as-built/style-showrunner.md`
+- `scripts/production/style_units.py` — Step words, ETA cell, filed counts, headers, totals
+- `scripts/production/test_style_units.py` — Step wordings, ETA column, headers, Left and totals counts
+- `scripts/production/test_units_table.py` — row assertions for the new layout
+- `scripts/style/test_style_plan.py` — report-table assertions; the locked-ledger split deadline test controls `style_plan`'s clock
+- `docs/as-built/style-showrunner.md` — the table's columns and what Left counts
 
-**Workers:** 1 writer
-- impl: every file above.
-
-**Acceptance gate:**
-- Tests pin each Step wording for an open writing, testing, review and checkpointed step and an idle unit; the ETA column with and without an ETA; the two new headers; a Left cell where approved and filed differ and one where they match.
-- basedpyright on every touched Python file: `0 errors, 0 warnings, 0 notes`.
-- `cd scripts/production && python3 -m unittest test_style_units` passes, and every test module that imports `style_units` passes.
-
-**Constraints from prior phases:**
-- The report stays read-only and reads `built_at` through `style_ledger.legacy_built_at_sql` on a ledger before schema 25.
+**Gotchas:** The split deadline test with a 0.25 s real deadline failed under a full-suite load, because scan setup used the time before the write. It now freezes `style_plan.time.monotonic` and patches `split_time_limit`.
