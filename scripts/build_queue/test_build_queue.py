@@ -33,7 +33,6 @@ class QueueTests(unittest.TestCase):
             "BUILDLOG_PROC": str(self.root / "proc"),
             "BUILDLOG_MEMINFO": str(self.root / "meminfo"),
             "BUILDLOG_MEMORY_PRESSURE": str(self.root / "pressure"),
-            "BUILDLOG_SWAPINFO": str(self.root / "swap"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "USER_ZONE": "America/New_York",
         })))
@@ -90,12 +89,12 @@ class QueueTests(unittest.TestCase):
             "session_name": "unit", "step": "check", "folder": "/tree",
         }))
         _ = (self.root / "pressure").write_text("full avg10=23.4 avg60=1.0 total=1\n")
-        _ = (self.root / "swap").write_text("SwapTotal: 100 kB\nSwapFree: 1 kB\n")
         output = io.StringIO()
         with mock.patch("sys.argv", ["build_queue.py"]), redirect_stdout(output):
             self.assertEqual(build_queue.main(), 0)
         self.assertIn("unit: check in /tree", output.getvalue())
-        self.assertIn("memory pressure: full avg10 23.4, swap 99%", output.getvalue())
+        self.assertIn("memory pressure: full avg10 23.4", output.getvalue())
+        self.assertNotIn("swap", output.getvalue())
         self.assertNotIn("ready", output.getvalue())
 
     def test_unavailable_reading_does_not_claim_zero_free_memory(self) -> None:
