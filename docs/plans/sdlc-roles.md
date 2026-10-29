@@ -155,40 +155,102 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Ruled out:** a literal `git grep` prefilter, because it misses joined literals and escapes that Python extraction decodes; candidate selection alone, because it reached 8.4 s at load 38-44.
 
-### Phase 5 — Each session records its role apart from its name  · status: todo
+### Phase 5 — Each session records its role apart from its name  · status: done
 **Depends on:** Phase 4
 
-#### Work Order
+#### As-built
 
-**Goal:** every session records its role apart from its name, so many sessions can hold one role and no session needs a role in its name.
+- `scripts/message/roster.py` keeps three role meanings apart: `Role` (the organizational role, the `RosterEntry.role` value), `WorkerAssignment` (its `WorkerRole`: `impl`, `test`, `fix`, `review`) and `Job` (the shown job). The guild responsibility in guild records is separate. A session with no job holds `JobUnassigned`, as `AssignmentUnrecorded` (old record) or `AssignmentUnreadable`; no role is a bare string or optional. The Role record section of `docs/plans/sdlc-roles-design.md` defines each meaning and its map to the job.
+- `ShownName` (built by `shown_name()`) renders R5b, `production · unit · job`, for example `sdlc · roles · code reviewer 6`; `--json` adds `shown_name`. Codex thread titles in `codex_mesh.py` carry it.
+- `production_tree.py` reads the role record, not a name suffix. `broadcast.py` selects by organizational role and prints `<shown name> [<address>] - <outcome>[: <detail>]`, with the bracket only when the address differs.
+- `send.py` resolves the shown sender once, on the sending machine, and carries it as a `Shown sender:` line (about 1 s per uds or named-machine send).
+- Addresses and the stored fields `seat` and `codex_seats` do not change.
 
-**Spec:**
-- Decided by the user (R1b, 2026-10-21; production doc Decisions): a session's name and its role are separate. Every session records its role apart from its name. roles-unit defines the role record; the unit board's owner and cargo-liner add the name and role columns (the showrunner asks them).
-- Packaging: the showrunner's call, 2026-10-28 — this phase follows Step 1. Bring the user only a choice R1b leaves open.
-- Decided by the user (R5b, 2026-10-28, via the showrunner): every shown name carries production · unit · job, for example `sdlc · roles · code reviewer 6`, in reports, messages and Codex thread names. The address stays as it is. The role record supplies the job part.
-- Three meanings of role already exist and stay distinct: the organizational role (`RosterEntry.role`, apart from its name), the worker assignment in mesh records (`impl`, `test`, `fix`, `review`), and the guild responsibility in guild records. Define each, and how it maps to the R5b job. Keep current routing and permission meanings; do not replace every `role` with one vocabulary.
-- Types: distinct semantic types for organizational role, worker assignment and shown job, with explicit states for unassigned, legacy-unrecorded and unreadable records; no interchangeable strings or bare optional fields. If `LiveUnit.session: MarkedUnit | None` joins the role-record boundary, give its absence an explicit state.
-- Fixture tests: old records, missing production or unit, a freestanding session, several sessions holding one job, reassignment, rename, transfer, restart and account move. The role survives each; shown names and Codex thread titles follow R5b; addresses and thread identities stay valid.
-- Files at phase start name every record writer and reader, the renderers of reports and messages, the code that sets Codex thread titles, and their tests. The unit board's owner and cargo-liner are named dependencies with their own deliverables; sending them the definition does not count as their change landing.
-- The unit director writes the Work Order from the current session records at phase start (roster, `showrunners.py`, `units_table.py`), with the role values from the approved names (Q3: design reviewer, code reviewer, UI reviewer, designer; Q6: showrunner, unit director; Q7: worker, small-fix helper).
+**Files:** the five scripts above; `docs/as-built/session-roster.md`; fixture tests in `test_roster.py`, `test_codex_mesh.py`, `test_production_tree.py`, `test_broadcast.py`, `test_send.py`, `test_codex_winddown.py` (old records, freestanding session, one job on many sessions, reassignment, rename, transfer, restart, account move).
+
+**Binds later work:** the names config phase reads `Job` display names from config for `ShownName.render`, the Codex thread title, the broadcast line and the tab label. It also owns two gaps: human roster output hides why a job is missing, and `--json` has no structured job field for the column owners.
+
+**Gotchas:**
+- Each `Job` value equals its first display name, so key and display text look the same. Code uses the key.
+- herdr finds panes by label (`herdr.Herdr.lookup`), so a tab label is an identity.
+- The broadcast line is a contract with its readers: `zone.py` counts ` - sent\b`, and the Codex winddown tests parse it. Change them together.
+
+**Ruled out:** a second lexical baseline run — the file set is not the same after the role and names changes.
+
+### Phase 6 — Names that can change live in one config file  · status: done
+
+#### As-built
+
+- `config/names.toml` has `[jobs]` and `[audiences]` tables. Each stable key holds an ordered list of display names: the current name first, retired names after it. A rename is one edit: put the new name first and keep the rest.
+- `scripts/lib/names.py` has key types `JobKey` and `AudienceKey`, and `load_names(path) -> Names | NamesError`. `NamesError` is `UnknownKey | MissingKey | MissingDisplayName | DuplicateDisplayName | UnreadableNames | InvalidNames`. `Names` gives `job(key)`, `audience(key)`, `current()` and `retired()`. `error_text(error)` names the file, table and key; `report_error` prints it once per process; `runtime_names()` loads once per process and caches the result.
+- Roster shown names, broadcast lines, Codex thread titles, `add_unit` and restart show display names. Record keys, addresses, session names and pane labels keep the key. A shown sender that `send.py` captured keeps its text on replay and remote delivery.
+- `roster.py` human output shows a missing job's reason. `roster.py --json` adds a `job` field: `{"state": "assigned", "key", "display", "qualifier"}` or `{"state": "unassigned", "reason"}`; all earlier fields stay.
+- herdr: `session_title(name, production, unit)` renders the tab title, and `Herdr.retitle(pane, title, *, label)` sets the title apart from the pane label. The Stop hook `scripts/hooks/herdr_tab_title.py` keeps both.
+- `roles_audit.py check` fails on a printed display label: a whole literal, the job part of a shown name, each branch of a printed conditional, and `cat >&2 <<EOF` heredoc bodies at their physical source lines. It counts role words in sentences in one line and lists them only with `--prose`. Each retired name joins the retired-name check by itself.
 
 **Files:**
-- `docs/plans/sdlc-roles-design.md` — role record definition
-- `scripts/message/roster.py` — organizational role, worker assignment and shown job types; the shown name
-- `scripts/agents/codex_mesh.py` — Codex thread titles carry the shown name; the roster record keeps its worker assignment
-- `scripts/production/production_tree.py` — reads the role record, not a name suffix
-- `scripts/production/broadcast.py` — selects by organizational role
-- `scripts/message/send.py` — shown sender name
-- `scripts/message/test_roster.py`, `scripts/agents/test_codex_mesh.py`, `scripts/production/test_production_tree.py`, `scripts/production/test_broadcast.py`, `scripts/message/test_send.py` — fixture tests
+- `config/names.toml` — keys and ordered display-name lists
+- `scripts/lib/names.py` — the one loader, key types, error states
+- `scripts/message/roster.py` — display-name render, missing-job reason, `--json` `job` field
+- `scripts/herdr/herdr.py`, `scripts/hooks/herdr_tab_title.py` — tab title apart from pane label
+- `scripts/production/add_unit.py`, `scripts/shutdown/restart.py` — tab title writers
+- `scripts/production/roles_audit.py` — fixed-display label check, sentence count, heredoc and `conditional_fragments` extraction
+- `docs/plans/sdlc-roles-design.md` — "Name config" section and the Role record `job` field
 
-**Workers:** `1 writer + 1 tester`. `impl` holds the five scripts; `test` holds the five test files.
+**Binds later work:** a names-config error prints `names.error_text` once per process, and renderers fall back to the address. `runtime_names()` caches once per process; read shown jobs (the code reviewer too) through it. The tab title (shown display title) is not the pane label (session and record identity); restart and layout restore find panes by the label key. `roles_audit.py` keeps label failures apart from the sentence count (211 sentence uses on the live tree).
 
-**Constraints from prior phases:** the approved names; Step 1's worker words. Stored fields `seat` and `codex_seats` stay as they are: a role field never renames them, and a retirement that leaves a live key, value or flag adds it to the kept contexts in `scripts/production/role_terms.toml` in the same change.
+**Gotchas:** a config edit does not retitle a live tab; launch, restart or a session rename sets the next title. Fixtures pass a config path or patch `runtime_names`; they never read the live config. A pane-restore stub must take the `label` keyword.
 
-**Acceptance gate:** the gates in Delegation Context green; each role-holding record type has a role field apart from its name; shown names follow R5b; the record definition is in the design doc and sent to the showrunner for the column owners.
+**Ruled out:** live retitle of open tabs after a config edit — the old title stays until restart or session rename; guild head names in the config — guild heads are retired and `config/guilds.conf` keeps guild ownership.
 
-### Phase 6 — Measure the first step and propose the next  · status: todo
-**Depends on:** Phase 5
+### Phase 7 — Each unit director's reviewers can move to it  · status: done
+
+#### As-built
+
+- Code reviewers are ordinary unit workers in the unit worker ledger, role `review`: addresses `<worktree>-review` and `<worktree>-review2`, job key `code_reviewer`, qualifiers `JobSlot("review")` and `JobSlot("review2")`. They are read-only. They persist, pause, move and end as writers do. Allocation reuses `workers.resolve` and `open_unit_worker`.
+- `python3 scripts/direct/workers.py transfer-reviewers --production <slug> --session-dir <run>... [--apply]` moves each unit's leased pool code reviewer (`~/.local/state/review-pool/<slug>/pool.json`) to that unit's `review` worker on the same thread. Dry run is the default and writes nothing. It prints one line per reviewer: `ReviewerMigrated`, `ReviewerDeferred` (reviewer busy; a rerun moves it) or `ReviewerConflict(reviewer, unit, cause: ReviewerConflictCause)`, with a closed cause enum and no nullable fields. A unit with no leased reviewer gets no line. A rerun after a move changes nothing.
+- `--apply` writes a journal under `worker-transfers/<generation>/`, fences the source and registers under the destination ledger lock, and merges the inbox once with a durable `reviewer_inbox_sources` receipt. An interrupted apply resumes from the journal.
+- `codex_mesh.open_unit_worker` gives a new review thread its configured shown name (`code_reviewer` display + slot) at open.
+- `review.sh` names each turn record `<started>-<pid>-<sequence>.json` and writes it with exclusive create.
+
+**Files:**
+- `scripts/direct/workers.py`, `scripts/direct/test_workers.py` — reviewer roles and the transfer
+- `scripts/agents/codex_mesh.py` — reviewer shown name at open
+- `config/review/code.md` — code reviewer standing instructions
+- `scripts/direct/review_pool.py`, `scripts/direct/test_review_pool.py` — standing-instructions paths
+- `scripts/direct/review.sh`, `scripts/direct/test_review_launcher.py` — turn record names
+- `scripts/production/role_terms.toml`, `scripts/production/test_roles_audit.py` — `review pool` retired
+- `docs/as-built/long-lived-workers.md` — reviewer rows and the transfer command; `docs/as-built/review-pool.md` — new standing-instructions path
+
+**Binds later work:** The reviewer cutover runs the transfer live (dry run first) and then deletes the transfer code, its journal and its receipt. The dry run checks busy turns and detached work as apply does. A destination inbox that holds valid JSON of the wrong shape is still replaced; the cutover adds a refusal that names the inbox before the live run. `review_pool.standing_prompt` keeps a per-type default table: code reads `config/review/code.md`, ui still reads `config/review_pool/ui.md`, and `REVIEW_POOL_CONFIG` overrides both. `role_terms.toml` has `retired = ["review pool"]` with 39 kept contexts; the pool removal deletes them. Turn record readers glob `*.json`.
+
+**Gotchas:** The CLI takes each unit from `_ledger_for_run` (plan-header fallback); live runs have no `state["unit"]`. Reviewer addresses come from `worker_name.sh` (git root, sanitize, truncate). An apply interrupted after the inbox move but before registration merges into an existing replacement inbox; it never skips it.
+
+**Ruled out:** a second allocator for reviewers; a basename rule for reviewer addresses.
+
+### Phase 8 — The retired-name baseline reads at a glance  · status: done
+
+#### As-built
+
+- `roles_audit.py baseline` prints a short summary by default: the other-name share, the top other names with counts, definition and unit-name findings, the file set (n), the message window, and sent-contact and director-contact coverage. `--tables` adds the full tables.
+- The summary shows fixed-display label failures (a person must fix them) apart from the count of role words in sentences (information only). `check` keeps its exit codes and `--prose` keeps its listing.
+- `SentContactCoverage` and `measure_sent_contacts` replace `WrongPartyCounts` and `measure_wrong_party`. The counts show sent contacts, not wrong-party asks. Unknown coverage prints as unknown, never 0. The full table drops rows that are all zero or all unknown.
+- `report(..., *, tables, source_result, unread_production_docs)` takes the source result as a required argument, so a missing source check cannot print as zero labels.
+- Typed `UnreadSource(path, reason)` and `LiveSources(files, unread_sources)`: `baseline()` reads the tree once and passes it to `check_live_sources`. Each unreadable file prints as a warning with its path and reason.
+- A names-config error fails the baseline with `names.error_text` (file, table and key). It never reads as zero findings.
+
+**Files:**
+- `scripts/production/roles_audit.py` — baseline summary, `--tables` flag, single tree read, unread-source warnings
+- `scripts/production/test_roles_audit.py` — summary lines, `--tables`, dropped rows, unread-source warning, unknown coverage, window, sentence-only fixture, required source result, single-read regression
+
+**Binds later work:** contact measures use `measure_sent_contacts` and `SentContactCoverage`. The baseline prints the summary by default and the tables only with `--tables`. Unknown coverage stays unknown, never 0. Unread sources show as warnings.
+
+**Gotchas:** `check` and `check_sources` still call `source_check(root)`, which reads the tree itself. Only `baseline` shares one read.
+
+**Ruled out:** a second tree read in `baseline` (about 3.6 s of a 25.6 s run, and its result can disagree with the first read).
+
+### Phase 9 — Measure the first step and propose the next  · status: todo
+**Depends on:** Phase 5 (it needs only the Phase 3 merge window, so it may run beside Phases 6, 7 and 8)
 
 #### Work Order
 
@@ -197,19 +259,122 @@ For active process redesigns, as we are currently undergoing with promotions and
 **Spec:**
 - The lexical after measure is done: the Step log's Phase 3 after measure (n=596 live files) reads 15 singular and 7 plural kept uses, 0 eligible. On the comparable merged set the reduction is 104 to 22 (n=82); this supersedes the earlier expected reduction of n=66. Do not mix the n=563 and n=596 snapshots.
 - The windowed measure names the merge timestamp of f8f5b962 into sdlc and a complete observation interval of at least 3 days after it. Sent-contact counts are descriptive and have no Step 1 reduction target. Keep unknown roles unknown: a current role record gives no historical roles or request intent, so never infer a role from a shown name.
-- Add the merge-gate cost of the retired-name check (Phase 4 budget) as measured in real gates over the window.
-- Run `roles_audit.py baseline` after the change, on the same file set; for a measure with a window (sent contacts per recipient), the after window is at least 3 days from the merge. Wrong-party asks are not measurable until message records carry roles; do not report them. Add the after numbers to the Step log with n for each.
-- If the measure did not move by at least half the expected size, the Step log says so, names the likely reason, and proposes undoing it or changing it; that proposal is the question.
-- Otherwise update Steps with what the measure taught, and pick the next step.
-- At phase end, the unit director sends the showrunner the result and the next step as one question for the user. The next approved step becomes a new phase after this one, with the Work Order of Phase 3 and the step's own Spec.
+- Add the merge-gate cost of the retired-name check (Phase 4 budget) as measured in real gates over the window. Take it only from recorded gate logs tied to a checkpoint and a time in the window; the gate's rolling module-duration history names no revision or time, so it is not evidence. Report the audit suite's duration apart from the check's own run time. Where no recorded log exists, say the cost is unavailable; never substitute a fresh timing.
+- Do not run the lexical baseline again: the recorded 104-to-22 reduction (n=82) is the lexical result, and a new run on the current tree has no same file set, because Phases 5–8 change sources, config and output. The lexical half-size decision is closed by that result.
+- Measure contacts alone, without the combined `baseline` command (it reads lexical sources first): call `parse_messages` over one fixed `AuditWindow` and `measure_sent_contacts` in `roles_audit.py`, which returns a `SentContactCoverage`. Keep unknown coverage and historical intent as unknown. Report gate timings for each implementation checkpoint, because Phase 6 changed extraction and classification after the Phase 4 timings.
+- For the windowed measure, report what `measure_sent_contacts` returns: `SentContactCoverage.senders`, each sender's sent-contact count and recipient categories, with unknown attribution kept unknown; do not build a new per-recipient grouping. The after window is at least 3 days from the merge. Wrong-party asks are not measurable until message records carry roles; do not report them. Add each number to the Step log with its n or window and its source.
+- Update Steps with what the measure taught, and propose the next step; that proposal is the question.
+- At phase end, the unit director sends the showrunner the result and the next step as one question for the user. The next approved step becomes a new phase after this one, with its own self-contained Work Order: the step's files, owners, compatibility constraints, measures and gates. Phase 3 is now an As-built and holds no Work Order to copy.
 
 **Files:**
 - `docs/plans/sdlc-roles-design.md` — Step log, Steps
 
-**Workers:** `1 writer + 1 tester` — one doc. `impl` runs the measure and writes the Step log.
+**Workers:** `1 writer + 1 tester` — one doc. `impl` runs the windowed measure and writes the Step log.
 - `impl` — `docs/plans/sdlc-roles-design.md`
-- `test` — opens as impl — re-runs the measure and checks each number in the Step log; it writes no doc text
+- `test` — checks each number in the Step log against its recorded evidence (the exact window, the message records read, the per-sender counts, the gate logs); it edits nothing
 
-**Constraints from prior phases:** the Step log before measure and the change Phase 3 shipped.
+**Constraints from prior phases:** the Step log before measure and the change Phase 3 shipped. Phase 8: `baseline` prints a short summary by default and the full tables only with `--tables`; a sent-contact count it cannot attribute prints as unknown, never zero, and an unreadable source prints as a named warning.
 
 **Acceptance gate:** the Step log has before and after numbers with n and file set or window; the question is sent.
+
+### Phase 10 — Each unit director owns its reviewers  · status: done
+
+#### As-built
+
+- `review.sh` with no worker flag and no pool flag keeps the fresh read-only reviewer. Lens slots: adversary→`test`, contract→`impl`, craft/ux→`review`.
+- `--pool code` and `--lease` print `review.sh: --pool code and --lease are ignored; using the unit reviewer.` on stderr. Then `workers.py resolve --role review` gives the unit's own reviewer: `<worktree>-review`, or `<worktree>-review2` when `review` is busy. Reviewers are read-only unit-ledger workers (`docs/as-built/long-lived-workers.md`).
+- The first resolve adopts the unit's leased pool code reviewer on the same thread and sets the unit ledger field `reviewers_adopted`. The flag survives `rename_unit` and `move_unit`. A busy leased reviewer counts as a busy `review`.
+- `--pool ui` refuses with `ERROR: --pool ui is retired; use the fresh Claude helper in <UXReview/> for the design check.` and exit 2. A resolver refusal writes status `error`, prints `ERROR: no unit reviewer: <cause>` and exits 1. New review records write `arm: own`; old `arm: pool` records still count.
+- `progress_history` reports review evidence as `NoRecordedCodeReview | RecordedCodeFindings`, so no record is apart from a recorded zero.
+- `workers.py transfer-reviewers --production <slug> --session-dir <run>... [--apply]` moves leased code reviewers to unit workers. A wrong-shape destination inbox makes `_read_inbox` refuse and name the inbox; both files stay byte-identical. The pool code, the review-pool as-builts and `config/review_pool/ui.md` stay; production docs and `docs/production_format.md` carry no pool lines (old rule 16 gone, rules renumbered).
+
+**Files:**
+- `scripts/direct/review.sh` — fresh reviewer by default; ignored-flag and refused-flag paths
+- `scripts/direct/workers.py` — `review`/`review2` resolve, adoption at first use, `transfer-reviewers`
+- `scripts/agents/mesh_runs.py` — `caller_from_environment` skips adopted and ended entries
+- `scripts/agents/codex_mesh.py` — reviewer follow title, `detach_reviewer_transport`
+- `scripts/direct/progress_history.py` — named review evidence states
+
+**Binds later work:** "The review pool and the transfer code are gone" keeps the no-flag fresh reviewer, the ignored-flag stderr line, the `--pool ui` refusal and the `ERROR: no unit reviewer: <cause>` path with status `error` and exit 1. It keeps the named evidence states. It runs `transfer-reviewers` live, then deletes it. Preview lines start `preview: would migrate: …`; applied lines read `migrated:`, `deferred:` or `conflict:` with owner and thread checked. Skipped UI and unleased reviewers print `skipped: …`, then one `Archive after each completed move: …` line. `--apply` exits 1 on any deferred or conflict result. With no `pool.json` it prints `No reviewer pool for <production>; nothing to move.` and exits 0. A refusal, such as the wrong-shape inbox, prints `workers: <cause>` and exits 2. `_finish_reviewer_transfer_locked` calls `codex_mesh.detach_reviewer_transport`. The `reviewers_adopted` reader goes with the transfer code; adoption at first use stays while `--pool code` is accepted.
+
+**Gotchas:** `mesh_runs.caller_from_environment` skips entries with `status` `ended` or `adopted` or with `adopted_to`, and returns at once for a unit-ledger entry; else it matches an adopted roster entry. `codex_mesh` renames a reviewer thread (`thread/name/set`) only after the follow is accepted; a refused follow must not leave a renamed thread. `interrupt_review` does not kill the worker child.
+
+**Ruled out:** a UI review pool — the fresh Claude helper stays the one design check; a second reviewer allocator — `workers.resolve` and `open_unit_worker` are enough.
+
+### Phase 11 — The review pool and the transfer code are gone  · status: todo
+**Depends on:** Phase 10 merged to main (the showrunner says when), and Phase 12 (it renames the held design role names in the same files).
+
+#### Work Order
+
+**Goal:** no pool reviewer, pool code or transfer code is left. Each pool reviewer is a unit's `review` worker or ended.
+
+**Spec:**
+- The unit director runs `workers.py transfer-reviewers` from `~/.claude` main for each production: a dry run first, then `--apply`. A deferred result is rerun after its review ends. The run is done when each leased reviewer is migrated or ended, with destination ownership and thread id checked, and the skipped UI and unleased reviewers accounted for.
+- Then remove the scripts in Phase 10's Remove bullet (`review_pool.py`, `review_pool_report.py`, their tests, the pool code in rename, rename_unit, retire_unit, transfer_unit and restart), the pool rows in roster and send, `config/review_pool/ui.md`, the `review pool` kept contexts in `role_terms.toml`, `docs/as-built/review-pool.md` and `review-pool-probes.md`, and the transfer code with its tests (`transfer_reviewers`, the reviewer journal and the inbox receipts).
+- `review.sh` keeps `--pool`/`--lease` accepted and ignored for this release; the ignored flags select ordinary `workers.py resolve`, with no pool adoption. Kept contracts, each with its test: no-flag review keeps the fresh read-only reviewer; `--pool code`/`--lease` print the ignored line and use the unit reviewer; `--pool ui` refuses with the design-check pointer and exit 2; a resolver refusal writes lens status `error` and exits 1; `progress_history` keeps `NoRecordedCodeReview` apart from `RecordedCodeFindings(0)` across old `arm: pool` and new `arm: own` records.
+- Live retirement (before any deletion): on each machine, list every pool reviewer, template and server under `~/.local/state/review-pool/`. Each deferred or conflict result is resolved by a rerun or by ending that reviewer. Skipped UI reviewers, unleased reviewers and unused templates are ended, and unused pool app-servers stop. Record each migrated reviewer's destination unit and thread id. The archive stays on disk, unread, for one release.
+- Remove the pool adoption with the transfer: the `_adopt_unit_reviewers` hook in ordinary reviewer resolve, the `reviewers_adopted` ledger field and the reviewer-only import code. Keep the generic worker adoption and the inbox checks (`_read_inbox`, `_giving_inbox`, `_transfer_pending`, `_merge_pending`) that transfers between unit runs use. Test a new ledger and an already migrated ledger with the archive unreadable.
+- Pool archive readers go: `scripts/hierarchies/worker_owners.py` (about line 420) scans pool meshes and makes `PooledReviewerOwner`; remove that scan and type, and test with an unreadable archive that ownership still finds ordinary unit reviewers. `production_tree.py` and `mesh_runs._roster_folders` likewise.
+- Legacy rename journals: `rename.py` `_load` requires the journal's `review_pool` move and `COUNTED_APPLY_STEP_NAMES` counts `_rename_review_pool`. Keep a decoder that accepts an old journal in both counted and named completed-step forms, never reads or moves the archive, and records the old step as a named legacy state (no nullable field). This is the "migration decoder" exception in the gate below.
+- `role_terms.toml`: keep `retired = ["review pool"]`; point its `defined_in` at a surviving file that explains the retirement (`docs/as-built/long-lived-workers.md`), and remove the pool kept contexts with their uses. Remove the pool-only Template and Lease words from `docs/production_format.md`.
+
+**Files:**
+- `scripts/direct/review_pool.py`, `scripts/direct/review_pool_report.py`, `config/review_pool/ui.md`, `docs/as-built/review-pool.md`, `docs/as-built/review-pool-probes.md` — removed
+- `scripts/direct/workers.py`, `scripts/agents/codex_mesh.py`, `scripts/agents/mesh_runs.py`, `scripts/production/production_tree.py`, `scripts/production/rename.py`, `scripts/production/rename_unit.py`, `scripts/production/retire_unit.py`, `scripts/production/transfer_unit.py`, `scripts/hierarchies/worker_owners.py`, `scripts/message/roster.py`, `scripts/production/role_terms.toml`
+- `docs/production_format.md`, `docs/plans/sdlc-roles-design.md`, `docs/as-built/long-lived-workers.md`, `docs/as-built/agent-registry.md`, `docs/as-built/production-rename.md`, `docs/as-built/unit-transfer.md`, `docs/as-built/unit-progress-history.md`, `docs/as-built/merge-gate-and-test-speed.md`, `docs/as-built/build-followups-fn-length-hook.md`
+- `scripts/direct/test_review_pool.py`, `scripts/direct/test_review_pool_report.py` — removed
+- `scripts/direct/test_workers.py`, `scripts/direct/test_progress_history.py`, `scripts/direct/test_assign_launcher.py`, `scripts/direct/test_review_launcher.py`, `scripts/direct/test_review_launcher_delivery.py`, `scripts/direct/test_review_launcher_pool.py`, `scripts/direct/test_review_launcher_records.py`, `scripts/direct/test_review_launcher_trees.py`, `scripts/direct/test_review_launcher_ux.py`, `scripts/direct/review_launcher_test_support.py` — tests
+- `scripts/agents/test_codex_mesh.py`, `scripts/agents/test_mesh_runs.py`, `scripts/production/test_production_tree.py`, `scripts/production/test_rename.py`, `scripts/production/test_rename_units.py`, `scripts/production/test_rename_phase_notes.py`, `scripts/production/test_rename_unit.py`, `scripts/production/test_retire_unit.py`, `scripts/production/test_transfer_unit.py`, `scripts/production/test_stall_watch.py`, `scripts/production/test_add_unit.py`, `scripts/production/test_roles_audit.py`, `scripts/production/rename_test_support.py`, `scripts/production/rename_unit_test_support.py`, `scripts/hierarchies/test_worker_owners.py`, `scripts/message/test_roster.py`, `scripts/message/test_send.py`, `scripts/shutdown/test_restart.py` — tests
+- `scripts/message/send.py`, `scripts/shutdown/restart.py` — read only: send has no pool route left; restart keeps its legacy-option stripping
+
+**Workers:** `1 writer + 1 tester`.
+- `impl` — every production script, config and doc above, and the live retirement steps the unit director runs with it.
+- `test` — every test and test-support file above, including `review_launcher_test_support.py` and both rename support files.
+
+**Constraints from prior phases:** phase 5 role record: `Job` keeps `code reviewer`; a reviewer's shown name is `<production> · <unit> · code reviewer[ N]`. Phase 6 names config: the reviewer's shown job reads `config/names.toml`. Worker-seats Phase 7: `assign.sh` options, exit codes, the address and shown name kept apart. Reuse `workers.resolve` (it reuses idle workers, adopts prior-run workers, reopens threads and numbers new ones) and `open_unit_worker` (it makes `review` read-only); do not write a second allocator. The job key is `code_reviewer`; ordinary reviewer qualifiers are `JobSlot("review")` and `JobSlot("review2")`, not the pool's numbers. Take reviewer addresses from the worker-seats address contract; do not invent a second form. Phase 7 shipped the transfer: `python3 scripts/direct/workers.py transfer-reviewers --production <slug> --session-dir <run>... [--apply]`, dry run by default; results `ReviewerMigrated`, `ReviewerDeferred`, `ReviewerConflict(reviewer, unit, cause)` with closed `ReviewerConflictCause` (NO_DESTINATION, WRONG_UNIT, FINISHED, SAVED_DESTINATION, THREAD_MISMATCH, DIFFERENT_WORKER); a journal under `worker-transfers/<generation>/`; dry run and apply both check live turns and detached work; each unit comes from `_ledger_for_run` (plan-header fallback); addresses come from `worker_name.sh`; the destination ledger lock is held from source fence through registration; the inbox merge writes a `reviewer_inbox_sources` receipt. Validate and use these; do not rebuild them. Kept outputs: `config/review/code.md` (moved), the reviewer rows in `long-lived-workers.md`, `review_pool.standing_prompt`'s per-type defaults (`config/review_pool/ui.md` still at the old folder; `REVIEW_POOL_CONFIG` overrides both), `role_terms.toml` `retired = ["review pool"]` (its kept contexts go with their uses, per Spec), and `open_unit_worker`'s configured first title. Two pool readers still read the archive: `production_tree.py` builds reviewer edges from `pool.json` (line 231) and `mesh_runs.py` `_roster_folders` scans pool meshes; the pool part of the design doc's Role record section changes with them. Phase 10 shipped (As-built): `review.sh` with no flag keeps the fresh read-only reviewer (lens slots adversary→test, contract→impl, craft/ux→review); `--pool ui` exits 2; `transfer-reviewers` prints `preview: would migrate: …`, the skipped reviewers and the archive line, exits non-zero on deferred or conflict under `--apply`, and prints `No reviewer pool for <production>; nothing to move.` (exit 0) with no `pool.json`; `_finish_reviewer_transfer_locked` calls `codex_mesh.detach_reviewer_transport`; `mesh_runs.caller_from_environment` skips ended, adopted and `adopted_to` entries. Phase 12 renamed `scripts/guilds/roles.py` to `scripts/astra/design_roles.py`.
+
+**Acceptance gate:** the gates in Delegation Context green, with the direct, production, message, agents, hierarchies and shutdown suites; a fixture-backed check finds no operational pool reader or caller, with named exceptions for the migration decoder, compatibility flags and kept history (the retired-name check stays the separate prose gate). Live check: this unit's next review runs on its own `review` and `review2` workers, and the review after it resumes the same threads (same thread ids in the roster).
+
+
+### Phase 12 — The guilds name is gone  · status: todo
+**Depends on:** Phase 10 (it changes the same launcher and roster files). Runs before Phase 11, which waits on Phase 10 on `~/.claude` main (unit director's call, 2026-10-29).
+
+#### Work Order
+
+**Goal:** no live file, path, setting or state folder uses the name "guild". The held Astra designer and reviewer per design work as before, under the name "held design roles". The retired-name check stops the name from coming back.
+
+**Spec:**
+- Decided by the user (2026-10-29, through the showrunner): "the guilds name should go - i don't want it confusing future me". The showrunner approved this design (2026-10-29): the name "held design roles", module `scripts/astra/design_roles.py`; delete `~/rust/nate_style/guilds/`; delete the five guilds production plans; edit `sdlc-production.md`.
+- Move `scripts/guilds/roles.py` to `scripts/astra/design_roles.py`, `scripts/guilds/astra_work.py` to `scripts/astra/astra_work.py`, `test_roles.py` to `scripts/astra/test_design_roles.py`, `test_astra_work.py` to `scripts/astra/test_astra_work.py`. Use `git mv` so history follows. Delete `scripts/guilds/`. Every import `scripts.guilds` (and `from scripts.guilds import roles`) becomes `scripts.astra` (`design_roles`); `end_session.sh`'s `../guilds/roles.py` path changes with it. Local names such as `guild_roles` become `design_roles`.
+- Rename, with no old-name reader (no held role is live, no roster carries `guild_context`, no run has `guild_context.json`, and `~/.local/state/guilds/` holds only an empty `ownership/lock`; the unit director checks again at the gate):
+  - env `GUILD_ROLES_STATE` → `DESIGN_ROLES_STATE`, `GUILD_OWNERSHIP_STATE` → `DESIGN_OWNERSHIP_STATE`, `GUILD_ROLES_HOST` → `DESIGN_ROLES_HOST`, `GUILD_DESIGN_ID` → `HELD_DESIGN_ID`, `GUILD_BINDING_GENERATION` → `DESIGN_BINDING_GENERATION`, `GUILD_CONFIG_FILE` → `DESIGN_ROLES_CONFIG`;
+  - state `~/.local/state/guilds/roles` → `~/.local/state/astra/design-roles`, `~/.local/state/guilds/ownership` → `~/.local/state/astra/design-ownership` (`astra_roles.py` keeps `~/.local/state/astra/roles`; the two must not share a folder);
+  - roster key `guild_context` → `design_context` (`codex_mesh.py` `RosterEntry`, `_guild_context` → `_design_context`) and run file `guild_context.json` → `design_context.json`;
+  - `config/agents.conf` `guild=codex` and `[guild.codex]` → `design_roles=codex` and `[design_roles.codex]`, with the comment naming `scripts/astra/design_roles.py`; every reader of the family key changes with it;
+  - `config/guilds.conf` → `config/design_roles.conf`; `config/guilds/designer.md` → `config/design_roles/designer.md`;
+  - test names and fixture strings that say guild (for example `GuildRenameSweepTests`, `guild-adopt`, `guild-model`) → design-role names.
+- `scripts/production/merge_gate.py` `TEST_SUITES` drops `"guilds"` (`"astra"` already runs the moved tests); `test_merge_gate.py` `EXPECTED_SUITES` changes with it. `pyrightconfig.json` drops the `scripts/guilds` root; the `scripts/astra` environment gets the extraPaths the moved modules need.
+- `scripts/production/role_terms.toml`: add the term `held design role` (kind `role`, `defined_in = "docs/as-built/long-lived-workers.md#Why roles outlive runs"`), with `retired = ["guild", "guilds", "guild head", "guild heads"]` and its inflected forms. Kept contexts only for dated history, each with a reason. The check scans the live set (`commands/`, `docs/` except `docs/plans/`, `skills/`, `CLAUDE.md`, `scripts/` strings), so current text in that set is reworded, not kept.
+- Commands: `commands/unit/direct.md` <HeldAstraRoles/> (models from `design_roles` in `agents.conf`, `config/design_roles/designer.md`, `config/design_roles.conf`, `roles.py` → `design_roles.py`); `commands/showrunner/produce.md` <HeldProductionDesign/> (`design_roles` models). Check `commands/astra_review.md` and `codex/` for the old names too.
+- As-builts: `long-lived-workers.md` (18 uses), `agent-registry.md`, `merge-gate-and-test-speed.md`, `session-roster.md`, `unit-rename.md`, `unit-transfer.md` say what is true now.
+- Plans: delete `docs/plans/guilds-production.md`, `guilds-designers.md`, `guilds-reviewers.md`, `guilds-showrunners.md`, `guilds-units.md` (the guilds production is retired; git history keeps them). In `docs/plans/sdlc-production.md`, the "Guild heads" section becomes "Held design roles", 3 lines: what `design_roles.py` keeps, where its state is, which commands use it, linking `long-lived-workers.md`. The guilds-unit section, the G1-G10 and R2 review decisions and the retired guild-process-unit row stay as dated history. In other plans, fix only current-state lines that name a moved path (for example `build-followups-worker-seats.md` line 42, `scripts/guilds/roles.py`); done-phase and dated design records stay.
+- `~/rust/nate_style/guilds/` (separate repository): the unit director checks again that nothing loads it (`grep -rn 'nate_style/guilds'` in `~/.claude`, `~/rust/nate_style` and the hooks), then deletes it in one commit on nate_style main, fast-forward push only. The workers do not touch it.
+- The unit director removes the empty `~/.local/state/guilds/` after the merge gate, once the check above still finds no held role.
+
+**Files:**
+- `scripts/guilds/roles.py`, `scripts/guilds/astra_work.py`, `scripts/guilds/test_roles.py`, `scripts/guilds/test_astra_work.py`, `config/guilds.conf`, `config/guilds/designer.md` — moved (git mv) to the paths on the next line
+- `scripts/astra/design_roles.py`, `scripts/astra/astra_work.py`, `scripts/astra/test_design_roles.py`, `scripts/astra/test_astra_work.py`, `config/design_roles.conf`, `config/design_roles/designer.md` — new paths
+- `config/agents.conf`, `pyrightconfig.json`, `scripts/production/role_terms.toml`
+- `scripts/agents/codex_mesh.py`, `scripts/agents/mesh_runs.py`, `scripts/message/roster.py`, `scripts/direct/workers.py`, `scripts/direct/assign.py`, `scripts/direct/implement.sh`, `scripts/direct/end_session.sh`, `scripts/astra/astra_review.py`, `scripts/astra/astra_roles.py`, `scripts/hooks/pre-tool-use-berth.py`, `scripts/production/rename.py`, `scripts/production/rename_unit.py`, `scripts/production/retire_unit.py`, `scripts/production/transfer_unit.py`, `scripts/production/unit_rename_sweep.py`, `scripts/production/merge_gate.py`
+- `scripts/agents/test_codex_mesh.py`, `scripts/agents/test_mesh_runs.py`, `scripts/agents/test_agents_overlay.py`, `scripts/message/test_roster.py`, `scripts/direct/test_end_session.py`, `scripts/astra/test_astra_review.py`, `scripts/astra/test_astra_roles.py`, `scripts/hooks/test_berth_hook.py`, `scripts/production/test_rename_workers.py`, `scripts/production/test_rename_unit_state.py`, `scripts/production/test_retire_unit.py`, `scripts/production/test_transfer_unit.py`, `scripts/production/test_unit_rename_sweep.py`, `scripts/production/test_production_tree.py`, `scripts/production/test_merge_gate.py`, `scripts/production/test_roles_audit.py`, `scripts/production/rename_test_support.py`, `scripts/production/rename_unit_test_support.py`, `scripts/production/merge_gate_test_support.py`
+- `commands/unit/direct.md`, `commands/showrunner/produce.md`
+- `docs/as-built/long-lived-workers.md`, `docs/as-built/agent-registry.md`, `docs/as-built/merge-gate-and-test-speed.md`, `docs/as-built/session-roster.md`, `docs/as-built/unit-rename.md`, `docs/as-built/unit-transfer.md`
+- `docs/plans/guilds-production.md`, `docs/plans/guilds-designers.md`, `docs/plans/guilds-reviewers.md`, `docs/plans/guilds-showrunners.md`, `docs/plans/guilds-units.md` — removed; `docs/plans/sdlc-production.md`, `docs/plans/build-followups-worker-seats.md`, `docs/plans/sdlc-roles-design.md`
+
+**Workers:** `1 writer + 1 tester`.
+- `impl` — the moves of the two scripts, every production script, config, command and doc above, and `role_terms.toml`.
+- `test` — the moves of the two tests and every test and test-support file above; a test that no live module imports `scripts.guilds` or reads a `GUILD_` name; the retired-name fixture for `guild`.
+
+**Constraints from prior phases:** Phase 10 left `review.sh`, `workers.py`, `codex_mesh.py`, `mesh_runs.py` and `roster.py` as in the Phase 10 As-built; this phase changes only names in them. Roster access policy: `roster_access_policy` in `codex_mesh.py` decides a reviewer template by `instructions_file` and `held_design_id` — keep those field names (they say nothing about guilds). Phase 4: the retired-name check runs in a few seconds; adding one term must keep it so. Phase 6: shown names come from `config/names.toml`; this phase adds no shown name.
+
+**Acceptance gate:** the gates in Delegation Context green with the direct, production, message, agents, astra, hooks and shutdown suites; basedpyright 0/0/0 per slot; `roles_audit` retired-name check green with the new term; `git grep -il guild -- commands docs/as-built scripts config skills CLAUDE.md pyrightconfig.json ':!scripts/**/test_*.py'` prints only `role_terms.toml` (the retired term itself; the test files hold the retired-name fixtures). Live check: `design_roles.py` opens a held designer on a scratch design id with `DESIGN_ROLES_STATE` and `DESIGN_OWNERSHIP_STATE` in a temp folder, then resumes it (same thread id), then releases it.
