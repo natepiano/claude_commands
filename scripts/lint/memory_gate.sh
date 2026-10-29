@@ -168,7 +168,7 @@ buildlog_memory_line() {
         awk -v a="$available" -v t="$threshold" -v n="$need" -v p="$promised" -v m="$running" -v r="$reserve" \
             -v measured="${13:-0}" -v head_need="${14:-0}" -v head_label="${15:-}" -v kind="$kind" -v minutes="$(( BUILDLOG_MEM_WAIT_S / 60 ))" \
             -v since="$(TZ="$(buildlog_memory_python "$USER_ZONE_SCRIPT" 2>/dev/null)" date '+%H:%M %Z')" -v repo="${11:-}" -v step="${12:-build}" -v desc="$description" -v summary="$summary" \
-            'BEGIN { subject=(repo == "" ? step : repo " " step); if (kind == "first") printf "waiting for memory since %s: ",since > "/dev/stderr"; else printf "still waiting for memory (%d min): ",minutes > "/dev/stderr"; printf "the machine has %.1f GiB free; a build starts at %.1f (%s needs %.1f GiB",a/1073741824,t/1073741824,subject,n/1073741824 > "/dev/stderr"; if (kind == "first") printf ", %s",desc > "/dev/stderr"; if (head_need>0) printf "; head %s needs %.1f GiB",head_label,head_need/1073741824 > "/dev/stderr"; printf "; %.1f GiB promised, %.1f GiB measured across %d running steps",p/1073741824,measured/1073741824,m > "/dev/stderr"; if (m>0) printf ": %s",summary > "/dev/stderr"; if (r>0) printf "; %.1f GiB kept for earlyoom",r/1073741824 > "/dev/stderr"; print ")" > "/dev/stderr" }'
+            'BEGIN { subject=(repo == "" ? step : repo " " step); if (kind == "first") printf "waiting for memory since %s: ",since > "/dev/stderr"; else printf "still waiting for memory (%d min): ",minutes > "/dev/stderr"; printf "the machine has %.1f GiB free; a build starts at %.1f (%s needs %.1f GiB",a/1073741824,t/1073741824,subject,n/1073741824 > "/dev/stderr"; if (kind == "first") printf ", %s",desc > "/dev/stderr"; if (head_need>0) printf "; head %s needs %.1f GiB",head_label,head_need/1073741824 > "/dev/stderr"; if (m==0 && summary!="") printf "; %s",summary > "/dev/stderr"; else { printf "; %.1f GiB promised, %.1f GiB measured across %d running steps",p/1073741824,measured/1073741824,m > "/dev/stderr"; if (m>0) printf ": %s",summary > "/dev/stderr"; }; if (r>0) printf "; %.1f GiB kept for earlyoom",r/1073741824 > "/dev/stderr"; print ")" > "/dev/stderr" }'
     elif [[ "$kind" == left ]]; then
         printf 'another machine is free after %d min %d s: leaving the memory wait\n' "$(( BUILDLOG_MEM_WAIT_S / 60 ))" "$(( BUILDLOG_MEM_WAIT_S % 60 ))" >&2
     else
@@ -242,7 +242,9 @@ buildlog_wait_for_memory() {
             return 2
         fi
         available=$fresh
-        cached_repo=$repo cached_step=$step cached_worktree=$worktree cached_need=$need cached_source=$source cached_count=$count
+        # A refreshed estimate replaces the shell cache on every answer.
+        cached_repo=$repo cached_step=$step cached_worktree=$worktree
+        cached_need=$need cached_source=$source cached_count=$count
         if [[ "$state" == admit ]]; then
             BUILDLOG_MEM_RESERVATION="$reservation"
             BUILDLOG_MEM_OUTCOME=Granted

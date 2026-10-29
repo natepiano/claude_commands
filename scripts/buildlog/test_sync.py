@@ -27,6 +27,9 @@ import sync
 from test_index import point_root_at
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 def setUpModule() -> None:
     """The times these tests expect are Eastern; the user's zone setting must not change them."""
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
@@ -143,7 +146,7 @@ class SyncTests(unittest.TestCase):
         def run_ssh(args: list[str], **_: object) -> subprocess.CompletedProcess[str]:
             self.commands.append(args)
             worker.start()
-            self.assertTrue(waiting.wait(2))
+            self.assertTrue(waiting.wait(TEST_HANG_GUARD_SECS))
             self.assertFalse(returned.is_set())
             return subprocess.CompletedProcess(args, 255, stdout="", stderr="unreachable")
 
@@ -152,7 +155,7 @@ class SyncTests(unittest.TestCase):
             mock.patch.object(sync, "print", record_line, create=True),
         ):
             self.assertEqual(sync.sync(), 0)
-            worker.join(2)
+            worker.join(TEST_HANG_GUARD_SECS)
 
         self.assertFalse(worker.is_alive())
         self.assertTrue(returned.is_set())

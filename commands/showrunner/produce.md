@@ -270,8 +270,9 @@ State:
   item from `open_for_user` in that turn; it returns, in full, when the
   research reports (user, 2026-10-15).
   The user sees the count at all times in the Claude Code status line's
-  `For you: …` row, under the quota row, with the changes, proposals and
-  projects.
+  `For you: …` row, under the quota row, with changes, efficiency and
+  proposals. Proposed plan-backlog lines count as proposals; accepted lines
+  do not count. Each kind is available through `/next`.
   When the user asks for the next question, show only the current item
   (`/next question`).
   List the questions in full only when the user asks what they are: run

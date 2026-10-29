@@ -396,7 +396,7 @@ for name in ("first", "second"):
             _ = ledger.write_text("- 2026-10-16 One (one.md) — proposed\n- 2026-10-16 Two (two.md) — accepted 2026-10-16\n")
             doc = Path(folder) / "production.md"
             _ = doc.write_text(f"# Production\n\n- **Improvement queue:** {ledger}\n")
-            head = [*FOOTER_HEAD[:-1], "For you: 2 projects", ""]
+            head = [*FOOTER_HEAD[:-1], "For you: 1 proposal", ""]
             self.assertEqual(self.lines(footer("--doc", str(doc))), [*head, *AGENT_LINES, "* no dailies scheduled"])
             tail = after_timeline(self.lines(render({**report(False), "doc": str(doc)})))
             self.assertEqual(tail, ["", *head, *AGENT_LINES, "* next dailies: 11:30 PDT - nothing needed"])

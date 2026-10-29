@@ -14,6 +14,9 @@ from scripts.usage import collect
 from scripts.usage.test_collect import CollectorFixture, REPOSITORY, SNAPSHOT_COMMIT_SCRIPT
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 class CompactionReplayTests(CollectorFixture):
     @override
     def setUp(self) -> None:
@@ -44,7 +47,7 @@ class CompactionReplayTests(CollectorFixture):
                    [sys.executable, "-m", "scripts.usage.compaction_replay"])
         return subprocess.run([*command, "--db", str(self.db_path), *arguments],
                               cwd=REPOSITORY, env=environment, capture_output=True,
-                              text=True, check=False, timeout=15)
+                              text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def replay(self, *arguments: str, script: str = "") -> subprocess.CompletedProcess[str]:
         result = self.run_replay(*arguments, script=script)

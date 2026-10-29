@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, cast, final, override
 from unittest import mock
 from scripts.guilds import roles
+from scripts.direct import workers
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -87,6 +88,8 @@ class UnitRenameTests(unittest.TestCase):
             path.mkdir(parents=True)
         self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         self.env.update({
+            "UNIT_WORKERS_STATE": str(self.root / "state/unit-workers"),
+            "RETIRE_UNIT_RUN_ROOT": str(self.root / "runs"),
             "HOME": str(self.home), "CLAUDE_CONFIG_DIR": str(config),
             "XDG_CONFIG_HOME": str(self.home / ".config"), "XDG_STATE_HOME": str(self.root / "state"),
             "NOTIFIER_STATE_DIR": str(self.root / "state/notifier"),
@@ -230,6 +233,14 @@ class UnitRenameTests(unittest.TestCase):
         return {str(path.relative_to(self.root)): path.read_bytes()
                 for path in self.root.rglob("*") if path.is_file() and path != self.root / "herdr.jsonl"}
 
+    def test_worker_migration_conflict_prints_a_refusal_without_a_traceback(self) -> None:
+        result = subprocess.run([sys.executable, "-c", 'import runpy, sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[2]))\nfrom scripts.direct import workers\ndef unavailable(*args, **kwargs):\n    raise workers.WorkerUnavailable("worker ownership changed; rerun apply")\nworkers.move_unit = unavailable\nworkers.rename_unit = unavailable\nworkers.end_unit = unavailable\nsys.argv = sys.argv[1:]\nsys.path.insert(0, str(Path(sys.argv[0]).parent))\nrunpy.run_path(sys.argv[0], run_name="__main__")\n', str(SCRIPT), "apply", SLUG, "alpha", "gamma",
+            "--scratch", str(self.root / "scratch")], cwd=self.checkout, env=self.env,
+            capture_output=True, text=True, timeout=120, check=False)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("worker ownership changed; rerun apply", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_plan_writes_nothing_and_names_each_step(self) -> None:
         before = self.snapshot()
         result = self.rename("plan")
@@ -355,6 +366,31 @@ class UnitRenameTests(unittest.TestCase):
         self.assertIn(f"branch {slug}-names -> {slug}-words-names; worktree {worktree} -> "
                       + str(self.rust / f"{slug}-words-names"), result.stdout)
         self.assertEqual(self.snapshot(), before)
+
+    def test_rename_keeps_the_worker_address_and_rebinds_the_ledger_context(self) -> None:
+        run = self.root / "runs" / "carried"
+        run.mkdir(parents=True)
+        old_worktree = self.rust / "claude-demo-alpha"
+        self.write(run / "progress_history_state.json", json.dumps({"production": SLUG,
+            "unit": "alpha-unit", "working_dir": str(old_worktree)}))
+        with mock.patch.dict(os.environ, self.env):
+            store = workers.UnitWorkerLedger(workers.ledger_path(SLUG, "alpha-unit"))
+            worker = workers.UnitWorker("w7", "impl", "codex", "kept-model", "xhigh", {},
+                workers.CodexThread("original-thread", str(self.root / "codex")), workers.Paused(),
+                [workers.WorkerEvent("opened", "fixture", str(run), 1_793_188_800.0, {})])
+            with store.locked() as ledger:
+                ledger.workers[worker.name] = worker
+        self.write(run / "mesh_roster.json", json.dumps({"w7": {"thread_id": "original-thread", "role": "impl",
+            "status": "paused", "unit_ledger": str(store.path)}}))
+        result = self.rename("apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        with mock.patch.dict(os.environ, self.env):
+            target = workers.ledger_for_run(run)
+            self.assertEqual(target.path, workers.ledger_path(SLUG, "gamma-unit"))
+            with target.locked() as ledger:
+                self.assertEqual(ledger.workers["w7"], worker)
+        self.assertFalse(store.path.exists())
+        self.assertEqual(json.loads((run / "mesh_roster.json").read_text())["w7"]["unit_ledger"], str(target.path))
 
     def test_apply_moves_every_place(self) -> None:
         records = self.home / ".local/state/herdr-panes"
@@ -569,9 +605,17 @@ class UnitRenameTests(unittest.TestCase):
         _ = self.mark_live("gamma-unit", "sid-alpha")
         old = self.rust / "claude-demo-alpha"
         old.mkdir()
-        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], cwd=old)
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import sys; print('ready', flush=True); sys.stdin.read()"],
+            cwd=old, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         self.addCleanup(child.wait)
         self.addCleanup(child.kill)
+        assert child.stdin is not None
+        assert child.stdout is not None
+        self.addCleanup(child.stdin.close)
+        self.addCleanup(child.stdout.close)
+        # Python must finish startup before its cwd disappears; otherwise getpath can exit first.
+        self.assertEqual(child.stdout.readline(), "ready\n")
         # The folder is gone, but the process still has it as its working directory.
         old.rmdir()
         result = self.rename("verify")
@@ -735,7 +779,6 @@ class UnitRenameTests(unittest.TestCase):
 
         def end() -> None:
             held.close()
-            (self.root / "state/sessions" / f"{session_id}.sock").unlink()
             fake_unit_host.write(self.env, [])
         return end
 
@@ -794,7 +837,7 @@ class UnitRenameTests(unittest.TestCase):
         _ = self.mark_live("alpha-unit", "sid-alpha")
         planned = self.rename("plan")
         self.assert_ok(planned)
-        self.assertIn("1. stop alpha-unit and its Codex workers at once through the shutdown path", planned.stdout)
+        self.assertIn("1. pause alpha-unit and its Codex workers through the shutdown path", planned.stdout)
         applied = self.rename("apply")
         self.assertEqual(applied.returncode, 2, applied.stdout + applied.stderr)
         self.assertIn("alpha-unit is still stopping after 0 s; rerun apply once it has stopped", applied.stderr)
@@ -953,9 +996,12 @@ class RunProcessTests(unittest.TestCase):
                                           str(self.run_record(theirs, "lint", 301))]),
             302: FakeProcess(other, 301, ["bash", "verify.sh", "lint", "pkg"]),
         }
-        self.enterContext(mock.patch.dict(os.environ, {"RETIRE_UNIT_RUN_ROOT": str(self.root / "runs")}))
+        self.enterContext(mock.patch.dict(os.environ, {"RETIRE_UNIT_RUN_ROOT": str(self.root / "runs"),
+            "UNIT_WORKERS_STATE": str(self.root / "unit-workers")}))
         _ = self.enterContext(mock.patch.object(unit_move, "processes_inside", self.inside))
         _ = self.enterContext(mock.patch.object(retire_unit, "command_line", self.arguments))
+        from scripts.agents import mesh_runs
+        _ = self.enterContext(mock.patch.object(mesh_runs, "_process_args", self.arguments))
         _ = self.enterContext(mock.patch.object(os, "getsid", self.session))
         _ = self.enterContext(mock.patch.object(os, "kill", self.kill))
         _ = self.enterContext(mock.patch.object(shutdown_record, "all_session_records", lambda: [STOPPED_RECORD]))
@@ -1011,6 +1057,25 @@ class RunProcessTests(unittest.TestCase):
             rename_unit.stop_unit(self.rename(), lambda: None)
         return output.getvalue()
 
+    def test_rename_refuses_a_paused_workers_live_command_inside_the_worktree_without_signalling(self) -> None:
+        run = self.root / "runs" / "run-a"
+        record = run / retire_unit.DETACHED_RUNS / "lint.json"
+        _ = record.write_text(json.dumps({"status": "running", "pid": 101, "worker": "w7", "cwd": str(self.worktree)}))
+        _ = (run / "progress_history_state.json").write_text(json.dumps({"working_dir": str(self.worktree),
+            "production": SLUG, "unit": "alpha-unit"}))
+        with mock.patch.dict(os.environ, {"UNIT_WORKERS_STATE": str(self.root / "unit-workers")}):
+            store = workers.UnitWorkerLedger(workers.ledger_path(SLUG, "alpha-unit"))
+            with store.locked() as ledger:
+                ledger.workers["w7"] = workers.UnitWorker("w7", "impl", "codex", "sol", "high", {},
+                    workers.CodexThread("kept-thread", str(self.root / "codex")), workers.Paused(),
+                    [workers.WorkerEvent("opened", "fixture", str(run), 1_793_188_800.0, {})])
+            with self.assertRaisesRegex(RenameRefused, r"detached run lint of w7 works inside"):
+                _ = self.stop()
+        self.assertEqual(self.signalled, [])
+        self.assertIn(101, self.processes)
+        self.assertIn(102, self.processes)
+        self.assertTrue(record.exists())
+
     def test_the_stop_ends_the_runs_supervisor_and_watcher_and_leaves_the_rest(self) -> None:
         printed = self.stop()
         self.assertEqual(sorted(self.signalled), [101, 102, 103, 201, 202])
@@ -1059,7 +1124,7 @@ class RunProcessTests(unittest.TestCase):
         calls = self.serve(0)
         rename_unit.check_stoppable(self.rename())
         printed = self.stop()
-        self.assertEqual([call[2:] for call in calls], [["stop", "--session-dir", str(self.root / "runs" / "run-a")]])
+        self.assertEqual([call[2:] for call in calls], [["stop", "--pause", "--session-dir", str(self.root / "runs" / "run-a")]])
         self.assertIn("stopped: app-server pid 501 of run run-a", printed)
         rename_unit._check_stopped(self.rename())  # pyright: ignore[reportPrivateUsage]
 

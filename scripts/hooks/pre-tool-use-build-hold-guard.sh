@@ -3,7 +3,7 @@
 
 IFS= read -r -d '' hook_input || true
 case "$hook_input" in
-    *cargo*|*verify.sh*|*merge_gate*) ;;
+    *cargo*|*merge_gate*) ;;
     *) exit 0 ;;
 esac
 

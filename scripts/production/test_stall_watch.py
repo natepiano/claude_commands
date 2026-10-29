@@ -18,6 +18,9 @@ from pathlib import Path
 from typing import cast, override
 from zoneinfo import ZoneInfo
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 
@@ -249,7 +252,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                 _ = child.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 _ = child.kill()
-                _ = child.wait(timeout=2)
+                _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
     def record_session(self, pid: int, session_id: str, name: str, *, running: bool = True) -> Path:
         path = self.root / f"{session_id}.sock"
         record = {"pid": pid, "sessionId": session_id, "name": name,
@@ -327,10 +330,10 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         """rca.py's owner messages, once each one it started has landed.
 
         rca.py starts each owner message detached and writes "<time> <key>" to owner.log first, so the
-        stub's log is read after it has one line per started key, for at most 10 s.
+        stub's log is read after it has one line per started key, within the hang guard.
         """
         started = self.root / "state/message/rca/owner.log"
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
         while True:
             keys = [line for line in started.read_text().splitlines()
                     if line.partition(" ")[2].startswith("rca-")] if started.exists() else []

@@ -18,6 +18,9 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 SCRIPT = Path(__file__).with_name("notifier.sh")
 NOW = 1_700_000_123
 MINUTE = NOW - NOW % 60
@@ -86,7 +89,7 @@ class NotifierTests(unittest.TestCase):
                 "FAKE_SEND_RC": str(send_rc),
                 "PATH": f"{self.launcher_dir}{os.pathsep}{os.environ['PATH']}",
             },
-            capture_output=True, text=True, check=False, timeout=30,
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
 
     def successful(self, *args: str, now: int = NOW, send_rc: int = 0) -> str:
@@ -111,7 +114,7 @@ class NotifierTests(unittest.TestCase):
         return path.read_text().splitlines() if path.exists() else []
 
     def wait_for_text(self, path: Path, expected: str) -> str:
-        deadline = time.monotonic() + 4
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
         while time.monotonic() < deadline:
             if path.exists():
                 contents = path.read_text()
@@ -493,7 +496,7 @@ class NotifierTests(unittest.TestCase):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
         )
         try:
-            _, stderr = tick.communicate(timeout=3)
+            _, stderr = tick.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(tick.returncode, 0, stderr)
             _ = self.wait_for_text(started, "started")
             self.assertFalse(finished.exists())

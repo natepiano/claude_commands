@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Catch the commit forms an agent writes in ordinary use. This is not a shell
 interpreter and does not stop deliberate hiding in a script file, an alias or
-a function defined in an earlier call. Where it cannot read a command that
-holds checkpoint text, it refuses.
+a function defined in an earlier call. It acts on parsed git commit/merge
+commands and wrappers that can run them; other programs' argument text passes.
 
 Require a durable rustdoc pass for the exact tree of every Rust checkpoint.
 In every repo, a checkpoint commit must be the first command of its own Bash call.
@@ -28,7 +28,12 @@ Unknown short letters make the invocation unreadable under the same scope rules.
 Checkpoint text belongs to that invocation's message, never another program's
 quoted argument. Conditions, ordinary for loops, case arms, groups, !, time and
 function bodies are modeled and never use quote-removed fallback text.
-Opaque commands (eval, expanded command words, sh/bash/zsh -c, unmodeled env
+An expanded command word is unreadable only if its literal portion names git,
+or it has no literal portion and the same segment has a commit or merge word.
+Expanded paths such as $HOME/.../py, variables and substitutions in arguments,
+and checkpoint/commit/merge text in arguments or script names do not identify
+a git command. Commands inside substitutions are scanned independently.
+Opaque commands (eval, possible expanded git command words, sh/bash/zsh -c, unmodeled env
 options, coproc, select, [[ ]], (( )) and arithmetic for) refuse in every repo
 when their own quote-removed words hold checkpoint( and git with commit/merge;
 without checkpoint( they refuse only in a Cargo cwd with git commit/merge words.
@@ -397,7 +402,15 @@ def git_invocations(command: str) -> list[GitInvocation | UnreadableShellCommand
                 if ASSIGNMENT.match(raw):
                     position += 1
                     continue
-                if dynamic_argument(raw) or word == "eval":
+                if dynamic_argument(raw):
+                    if possible_git_command_word(raw, words[position + 1:]):
+                        invocations.append(UnreadableShellCommand(
+                            "the command word is expanded or eval-generated; use a literal git invocation",
+                            ("git", *words[position + 1:]),
+                        ))
+                    position = len(words)
+                    break
+                if word == "eval":
                     invocations.append(UnreadableShellCommand("the command word is expanded or eval-generated; use a literal git invocation", tuple(words)))
                     position = len(words)
                     break
@@ -490,6 +503,56 @@ def dynamic_argument(raw: str) -> bool:
         elif character in "$`" and not single:
             return True
     return False
+
+
+def command_word_literal(raw: str) -> str:
+    """Keep only literal command text, excluding quoted or unquoted expansions."""
+    literal: list[str] = []
+    position = 0
+    quote = ""
+    while position < len(raw):
+        character = raw[position]
+        if character == "\\" and quote != "'" and position + 1 < len(raw):
+            literal.append(raw[position + 1])
+            position += 2
+            continue
+        if character in "'\"" and (not quote or quote == character):
+            quote = "" if quote else character
+            position += 1
+            continue
+        if quote != "'":
+            if raw.startswith("$(", position) or character == "`":
+                substitution = raw.startswith("$(", position)
+                # Executable children were already returned by the outer scan.
+                position = scan_shell(raw, position + (2 if substitution else 1),
+                                      ")" if substitution else "`")[1]
+                continue
+            if raw.startswith("${", position):
+                position += 2
+                depth = 1
+                while position < len(raw) and depth:
+                    if raw.startswith("${", position):
+                        depth += 1
+                        position += 2
+                        continue
+                    if raw[position] == "}":
+                        depth -= 1
+                    position += 1
+                continue
+            variable = re.match(r"\$(?:[A-Za-z_][A-Za-z_0-9]*|[0-9]+|[@*#?$!_-])", raw[position:])
+            if variable:
+                position += variable.end()
+                continue
+        literal.append(character)
+        position += 1
+    return "".join(literal)
+
+
+def possible_git_command_word(raw: str, arguments: list[str]) -> bool:
+    literal = command_word_literal(raw)
+    if literal:
+        return literal.rsplit("/", 1)[-1] == "git"
+    return any(shell_text(argument) in {"commit", "merge"} for argument in arguments)
 
 
 def uncertain_directory_word(raw: str) -> bool:

@@ -51,7 +51,7 @@ resolver before calling `exec`.
 | `agents/agent_bg.sh` | Proves the cwd while making worker settings, passes the loaded env through settings for the long-lived background daemon, and starts the CLI through `exec`. |
 | `agents/agent_exec.sh` | Claude print runs use `exec` after changing to their requested directory. |
 | `agents/codex_mesh.py` | The shared Codex app-server calls `ensure(worktree, environment)` and starts Codex directly with the loaded env. Protected account, run, temporary-directory and guild values come from the caller. `Refused` logs the helper's line, remembers the failed shell, and falls back to the caller env so other workers keep their shared server. The recorded pid is the server's pid. |
-| `accounts/accounts.py` | `exec` calls `ensure(cwd, os.environ)` for every Claude and Codex label, puts the caller's HOME back, and exits 1 with the helper's reason on `Refused`. |
+| `accounts/accounts.py` | `exec` calls `launch_shell_environment(cwd)` for every Claude and Codex label. That guard dynamically loads `nix_env` and calls `ensure(cwd, os.environ)`, puts the caller's HOME back, and exits 1 with the helper's reason on `Refused`. |
 | `cli_agent/cli_agent.sh` | Interactive and command Claude launches use `exec` in the caller's directory. |
 | `notify/review.py` | Loads the current directory's env before the Claude reviewer starts; refusal returns an unreviewed result. |
 | `make_a_worktree/direnv_allow.sh` | Thin, silent-on-success `ensure` call; failure retains the helper's stderr and exit status. `commands/make_a_worktree.md` requires stopping on failure. |
@@ -82,6 +82,19 @@ A caller already in the nix shell takes the original path silently. An internal
 with one line instead of another re-exec, and is removed before tool setup.
 The final command's exit status passes through. This also covers Codex workers
 whose shared mesh server cannot carry each worktree's environment.
+
+Launch scan: `scripts/lib/test_claude_launch_scan.py` checks Python process calls
+whose argv starts Claude, Codex or `herdr agent start`, typed `start_agent`
+calls for either agent kind, and shell launch lines. Queries such as `--help`
+and `agents` do not count as starts. Each Python scope must call `nix_env.ensure`,
+contain a `nix_env.py` command string, or call a same-module guard by bare name.
+A top-level function is a guard when its own body calls `nix_env.ensure` or
+`loader.ensure` with `loader` assigned from an expression containing
+`import_module("...nix_env")`, including casts; calling another guard propagates
+that status until no more guards are found. Nested functions and classes are
+excluded from each body's scan, and methods and other-module attribute calls
+do not establish module guards. Shell scripts must reference the helper.
+No file is exempt.
 
 ## Existing sessions
 
@@ -155,20 +168,14 @@ A refused environment or failed recovery sends the registered STE push
 a missing, broken or unreadable process keeps it active. No restart occurs in
 check mode. The push catalog owns its title, action and text.
 
-## SessionStart and timer registration
+## Timer registration
 
-`scripts/hooks/session-start-nix-shell.py` reads its `session_id`, locates that
-session's typed registry record, and checks the process environment. Healthy
-sessions and worktrees without `.envrc` are silent. This path does not run
-direnv; metadata reads have a 140 ms alarm budget, leaving slow reads to the
-timer. A broken session receives SessionStart `additionalContext`: its nix shell
-did not load, builds will fail, and it will restart when idle with no build hold.
-The hook starts a detached `heal.py sweep --only <id> --wait-idle 1800` worker.
-It checks for idle for at most thirty minutes, then leaves later recovery to
-the timer. The director registers this hook only after the user's go.
+There is no SessionStart hook. Phase 6 built one and phase 7 removed it before
+it was registered (showrunner ruling, 2026-10-28): the five-minute sweep and the
+PATH wrappers cover a session that starts outside its shell. Revisit only if a
+failed build from such a session is seen.
 
-After merge the director registers the local five-minute sweep; implementation
-does not start a live timer:
+The local five-minute sweep is a notifier timer, registered on main on natedev:
 
 ```sh
 ~/.claude/scripts/message/notifier.sh new nix-heal --every 5 --run "$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/nix_env/heal.py sweep"
@@ -176,5 +183,5 @@ does not start a live timer:
 
 The showrunner still owns the bare `claude` and `codex` PATH wrappers in
 `/etc/nixos`; each must call this helper with the real absolute executable.
-Accounts-unit owns `accounts.py exec` and calls `nix_env.ensure` there. This
-phase does not edit those files, register the hook, or register the timer.
+Accounts-unit owns `accounts.py exec`, which calls `launch_shell_environment`;
+the scan recognizes that function as a guard.

@@ -16,6 +16,9 @@ from zoneinfo import ZoneInfo
 
 import upgrade_record
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 if TYPE_CHECKING:
     from typing import override
 else:
@@ -174,7 +177,7 @@ class CliTests(unittest.TestCase):
         if explicit_production:
             command.extend(["--production", str(self.doc)])
         result = subprocess.run(command + list(arguments), cwd=self.checkout, env=self.env,
-                                capture_output=True, text=True, timeout=20, check=False)
+                                capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
         return result
 
     def read_record(self) -> upgrade_record.Record:

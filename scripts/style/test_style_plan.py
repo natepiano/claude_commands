@@ -47,6 +47,10 @@ import style_rules
 import style_units
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
+
 @final
 class StylePlanTests(unittest.TestCase):
     root: Path = Path()
@@ -59,6 +63,31 @@ class StylePlanTests(unittest.TestCase):
     tip: str = ""
     sources: tuple[str, ...] = tuple(f"crates/{crate}/src/{name}.rs" for crate in ("alpha", "beta") for name in ("lib", "other"))
 
+    template_repo: Path = Path()
+    template_tip: str = ""
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.template_repo = Path(cls.enterClassContext(tempfile.TemporaryDirectory())) / "sample"
+        cls.template_repo.mkdir()
+        fixture = cls(methodName="runTest")
+        fixture.repo = cls.template_repo
+        # Match setUp's isolated Git configuration while building the class template.
+        with mock.patch.dict(os.environ, {"HOME": str(cls.template_repo.parent)}):
+            _ = fixture.git("init", "-q", "--initial-branch=main")
+            _ = fixture.git("config", "user.name", "Planner tests")
+            _ = fixture.git("config", "user.email", "planner@example.invalid")
+            fixture.write("Cargo.toml", '[workspace]\nmembers = ["crates/alpha", "crates/beta"]\n')
+            for crate in ("alpha", "beta"):
+                fixture.write(f"crates/{crate}/Cargo.toml",
+                           f'[package]\nname = "{crate}"\nversion = "0.1.0"\nedition = "2021"\n')
+            for path in fixture.sources:
+                fixture.write(path, "pub fn value() {}\n")
+            cls.template_tip = fixture.commit()
+
+
     @override
     def setUp(self) -> None:
         # The shipped class list, checked against the real catalog before the test catalog takes its place.
@@ -70,7 +99,7 @@ class StylePlanTests(unittest.TestCase):
         self.style = self.root / "sample-style"
         self.unit = self.root / "sample-style-names"
         self.rule_dir = self.root / "nate_style/rust"
-        self.repo.mkdir()
+        _ = shutil.copytree(self.template_repo, self.repo, symlinks=True)
         self.rule_dir.mkdir(parents=True)
         fake_fmt.install(self.root / "bin", self.root / "fmt")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
@@ -81,16 +110,7 @@ class StylePlanTests(unittest.TestCase):
             "PATH": str(self.root / "bin") + os.pathsep + os.environ.get("PATH", ""),
         })))
         _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", self.rule_dir.parent))
-        _ = self.git("init", "-q", "--initial-branch=main")
-        _ = self.git("config", "user.name", "Planner tests")
-        _ = self.git("config", "user.email", "planner@example.invalid")
-        self.write("Cargo.toml", '[workspace]\nmembers = ["crates/alpha", "crates/beta"]\n')
-        for crate in ("alpha", "beta"):
-            self.write(f"crates/{crate}/Cargo.toml",
-                       f'[package]\nname = "{crate}"\nversion = "0.1.0"\nedition = "2021"\n')
-        for path in self.sources:
-            self.write(path, "pub fn value() {}\n")
-        self.tip = self.commit()
+        self.tip = self.template_tip
         _ = self.git("worktree", "add", "-q", "-b", "style/main", str(self.style))
         _ = self.git("worktree", "add", "-q", "-b", "demo-style-names", str(self.unit))
         _ = (self.repo / ".git/info/exclude").write_text("/docs/style-production/\n/docs/*production.md\n")
@@ -306,9 +326,10 @@ class StylePlanTests(unittest.TestCase):
                 with (mock.patch.object(style_plan, "busy_files", side_effect=read_during_refill),
                       ThreadPoolExecutor(max_workers=2) as pool):
                     first = pool.submit(style_plan.next_phase, "names-unit", self.plan, self.repo)
-                    self.assertTrue(first_read.wait(5), "first refill did not read busy files")
+                    self.assertTrue(first_read.wait(TEST_HANG_GUARD_SECS), "first refill did not read busy files")
                     second = pool.submit(style_plan.next_phase, "types-unit", types_plan, self.repo)
-                    first_result, second_result = first.result(timeout=10), second.result(timeout=10)
+                    first_result = first.result(timeout=TEST_HANG_GUARD_SECS)
+                    second_result = second.result(timeout=TEST_HANG_GUARD_SECS)
                 self.assertIsInstance(first_result, style_plan.PhaseWritten)
                 self.assertIsInstance(second_result, style_plan.PhaseWritten)
                 ledger = self.ledger()
@@ -3898,15 +3919,19 @@ class StylePlanTests(unittest.TestCase):
 
         limit_seconds = 0.25
         deadline = style_plan.SplitDeadline(limit_seconds, limit_seconds / 60)
-        write_durations: list[float] = []
+        busy_budgets: list[tuple[int]] = []
         record_split = style_ledger.record_split
 
-        def timed_write(repo: Path, unit: str, split: style_ledger.RecordedSplit, *, busy_timeout_seconds: float) -> None:
-            began = time.monotonic()
-            try:
+        connect = sqlite3.connect
+
+        def observe_connect(database: str, *, uri: bool, timeout: float) -> sqlite3.Connection:
+            connection = connect(database, uri=uri, timeout=timeout)
+            busy_budgets.append(cast(tuple[int], connection.execute("PRAGMA busy_timeout").fetchone()))
+            return connection
+
+        def bounded_write(repo: Path, unit: str, split: style_ledger.RecordedSplit, *, busy_timeout_seconds: float) -> None:
+            with mock.patch.object(sqlite3, "connect", side_effect=observe_connect):
                 record_split(repo, unit, split, busy_timeout_seconds=busy_timeout_seconds)
-            finally:
-                write_durations.append(time.monotonic() - began)
 
         # Scan setup cannot spend the write budget. Without SIGALRM, SQLite itself
         # must bound the real lock wait using the remaining deadline passed by split.
@@ -3917,7 +3942,7 @@ class StylePlanTests(unittest.TestCase):
               mock.patch.object(style_plan, "busy_files", return_value=style_plan.BusyFiles(self.board(), frozenset())),
               mock.patch.object(style_plan, "classify_split", return_value=style_ledger.RecordedSplit(
                   1, 2, 3, 4, "2026-10-28T12:00:00+00:00")),
-              mock.patch.object(style_ledger, "record_split", side_effect=timed_write) as record,
+              mock.patch.object(style_ledger, "record_split", side_effect=bounded_write) as record,
               redirect_stdout(output), redirect_stderr(errors)):
             _ = writer.execute("BEGIN IMMEDIATE")
             code = style_plan.main(["split", "--unit", "names-unit", "--repo", str(self.unit),
@@ -3927,9 +3952,7 @@ class StylePlanTests(unittest.TestCase):
         self.assertRegex(errors.getvalue(), r"^split names-unit: (time limit.*|database is locked)\n$")
         record.assert_called_once()
         self.assertEqual(record.call_args.kwargs["busy_timeout_seconds"], limit_seconds)
-        elapsed, = write_durations
-        self.assertGreaterEqual(elapsed, limit_seconds * 0.9)
-        self.assertLess(elapsed, limit_seconds + 1)
+        self.assertEqual(busy_budgets, [(250,)])
         with closing(sqlite3.connect(ledger.database)) as connection:
             self.assertEqual(tuple(connection.iterdump()), before)
 

@@ -202,7 +202,7 @@ The builder's output, which the renderer consumes:
 | `counts` | The builder's, from `~/.claude/config/dailies.conf`: each `label` with its `count`, or `not_found: true` when its file is missing. Leave it to the builder; a production with no lines there has none. |
 | `children` | The builder's, when productions report to this one: each one's `name`, its saved `report`, `open` (due items for the user in its list and the lists below it), `unreadable` (lists that could not be read) and `expand`. Leave it to the builder. |
 | `reports_to` | The builder's, when this showrunner is under a root: the root's production. Leave it to the builder. |
-| `doc` | The builder's: the production doc, whose changes to review, proposals and projects the footer's counts line reads when the report renders. Leave it to the builder. |
+| `doc` | The builder's: the production doc, whose changes to review, efficiency and proposals the footer's counts line reads when the report renders. Leave it to the builder. |
 | `unit` | The Units table's unit id, never the session's current name. The builder joins on this id. |
 | `name` | The plan the unit runs, when its session name does not say it (a lane that took on another plan): `hana_organon`. Defaults to `unit`. |
 | `label` | The timeline row name, at most 8 characters. Defaults to the unit name without `-unit`. |

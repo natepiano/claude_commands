@@ -14,6 +14,9 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import fake_unit_host
@@ -85,7 +88,7 @@ raise SystemExit(1)
     def close_processes(self) -> None:
         for child in self.children:
             child.terminate()
-            _ = child.wait(timeout=2)
+            _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
 
     def record(self, name: str, session_id: str, *, running: bool = True, pid: int | None = None) -> int:
         if pid is None:

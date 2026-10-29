@@ -26,6 +26,9 @@ from unittest.mock import patch
 from scripts.whoami import agent_accounts, usage_store
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 def folder_service(folder: Path) -> str:
     """Independent vector from the service-name contract supplied by the director."""
     value = unicodedata.normalize("NFC", str(folder)).encode("utf-8")
@@ -224,13 +227,13 @@ class SharedUsageReadTests(unittest.TestCase):
         start = Barrier(2)
 
         def read_together() -> agent_accounts.Report:
-            _ = start.wait(timeout=2)
+            _ = start.wait(timeout=TEST_HANG_GUARD_SECS)
             return self.read()
 
         with patch.object(urllib.request, "urlopen", side_effect=self.response) as http:
             with ThreadPoolExecutor(max_workers=2) as pool:
                 first, second = pool.submit(read_together), pool.submit(read_together)
-                reports = [first.result(timeout=3), second.result(timeout=3)]
+                reports = [first.result(timeout=TEST_HANG_GUARD_SECS), second.result(timeout=TEST_HANG_GUARD_SECS)]
             self.assertCountEqual([report.usage_read_outcome for report in reports],
                 [agent_accounts.UsageReadOutcome.OK, agent_accounts.UsageReadOutcome.HELD])
             held = next(report for report in reports if report.usage_read_outcome == agent_accounts.UsageReadOutcome.HELD)
@@ -265,7 +268,7 @@ with (patch.object(agent_accounts, 'command_json', return_value={
                   + "claim = usage_store.claim_read\n"
                   + f"usage_store.claim_read = lambda login, now: claim(login, datetime.fromisoformat({self.now.isoformat()!r}))\n"
                   + script)
-        result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=5)
+        result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_rate_limit_holds_for_ten_minutes_even_when_the_caller_does_not_save(self) -> None:

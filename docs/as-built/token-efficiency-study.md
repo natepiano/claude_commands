@@ -8,13 +8,14 @@ The status line's `For you:` row shows how many efficiency proposals wait on the
 
 ### The For you count (`scripts/production/footer_counts.py`)
 
-- `FooterCounts(changes, proposals, projects, questions, efficiency)` is a NamedTuple, and every field defaults to 0. `efficiency` is the last field because tests and callers build the tuple by position.
+- `FooterCounts(changes, proposals, questions, efficiency)` is a NamedTuple, and every field defaults to 0.
+- `proposals(doc)` counts `proposals_table.waiting_entries(doc)`, the same own-production rows as `/next proposal`: open proposal issues waiting for approval and proposed plan-backlog lines. Accepted and deferred plan-backlog lines do not count.
 - A production doc names the ledger in a `- **Efficiency ledger:** <path>` line (field `EFFICIENCY_LEDGER_FIELD`). `efficiency_ledger(doc)` reads it through `production_field`. A missing field gives `None`. `docs/production_format.md` documents the field, and `build-followups-production.md` sets it.
 - `efficiency(doc)` counts the lines that match `EFFICIENCY_LINE`, `^- \d{4}-\d\d-\d\d .*? — (?P<status>.*)$`, when the status starts with `proposed` or `deferred` (`open_efficiency`). The status is the text after the **first** ` — `. A later ` — ` belongs to a `from Also found:` sub-item and does not count. An undated line does not count.
 - An absent field, a missing file, a directory, or a file that is not UTF-8 counts 0. The other counts stay as they are.
-- `read_counts(doc, *, questions)` fills all five counts. `total(each)` adds them by column across productions.
-- `sources(doc)` includes the ledger path even before the file exists. This makes the status line cache refresh when the ledger appears or changes.
-- `counts_line` puts the counts in the order the user set (2026-10-20): questions, changes, efficiency, proposals, projects, and leaves out zero counts: `For you: 1 question, 2 changes, 130 efficiency, 2 proposals, 3 projects`. "efficiency" has no plural.
+- `read_counts(doc, *, questions)` fills all four counts. `total(each)` adds them by column across productions.
+- `sources(doc)` includes the Efficiency ledger and Improvement queue ledger paths even before the files exist. This makes the status line cache refresh when either ledger appears or changes.
+- `counts_line` puts the counts in this order: questions, changes, efficiency, proposals, and leaves out zero counts: `For you: 1 question, 2 changes, 130 efficiency, 2 proposals`. "efficiency" has no plural. Every kind can be shown through `/next`.
 - `scripts/hooks/showrunner_footer.py`, `scripts/statusline/counts_row.py` and the dailies footer (`dailies_render.py`) pass `FooterCounts` through without change.
 - Tests: `scripts/production/test_footer_counts.py` covers the parser, missing and non-UTF-8 ledgers, sources and render order. `scripts/statusline/test_statusline.py` covers the count end to end in the status line.
 

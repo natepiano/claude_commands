@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import shutil
@@ -10,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stdout
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, cast, override
@@ -433,6 +435,68 @@ class DurableRolesTests(unittest.TestCase):
                              binding=self.binding(self.run_b))
         self.assertEqual(roles.read_design(design.placement.design_id).binding, design.binding)
         self.assertEqual(self.releases, [])
+
+    def list_output(self, *arguments: str) -> str:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(roles.main(["list", *arguments]), 0)
+        return output.getvalue()
+
+    def test_list_prints_each_role_with_its_holder_session_thread_and_document(self) -> None:
+        design = self.open_designer()
+        lines = self.list_output().splitlines()
+        self.assertEqual(len(lines), 2, lines)
+        for role in ("designer", "reviewer"):
+            instance_id = design.placement.design_id + "/" + role
+            line = next(line for line in lines if instance_id in line)
+            self.assertIn("design-unit (demo)", line)
+            self.assertIn("holder-one", line)
+            self.assertIn(design.document, line)
+            self.assertNotRegex(line, r"[{}]")
+            if role == "designer":
+                self.assertIn("RoleOpen", line)
+                self.assertIn("thread-designer", line)
+            else:
+                self.assertIn("RoleNotOpened", line)
+                self.assertNotIn("thread", line)
+
+    def test_list_names_showrunner_and_unavailable_holder_reason(self) -> None:
+        design = roles.open_role("fixture-repo", "design.md", "reviewer", roles.ShowrunnerHolder("demo"), "design")
+        with patch.object(roles, "resolve_holder", return_value=roles.HolderUnavailable("holder session is absent")):
+            lines = self.list_output().splitlines()
+        self.assertEqual(len(lines), 2)
+        for line in lines:
+            self.assertIn(design.placement.design_id, line)
+            self.assertIn("demo showrunner", line)
+            self.assertIn("holder session is absent", line)
+            self.assertNotIn("holder-one", line)
+            self.assertIn(design.document, line)
+        reviewer = next(line for line in lines if design.placement.design_id + "/reviewer" in line)
+        self.assertIn("thread-reviewer", reviewer)
+
+    def test_list_prints_empty_inventory_and_record_problems(self) -> None:
+        self.assertEqual(self.list_output(), "no held roles\n")
+        bad = self.root / "roles/00000000-0000-4000-8000-000000000001/design.json"
+        bad.parent.mkdir(parents=True)
+        _ = bad.write_text('{"schema": 999}')
+        lines = self.list_output().splitlines()
+        self.assertEqual(lines[0], "no held roles")
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[1].startswith(f"problem: {bad}: "), lines)
+        self.assertGreater(len(lines[1]), len(f"problem: {bad}: "))
+
+    def test_list_json_preserves_full_inventory_and_problems(self) -> None:
+        _ = self.open_designer()
+        bad = self.root / "roles/00000000-0000-4000-8000-000000000001/design.json"
+        bad.parent.mkdir()
+        _ = bad.write_text('{"schema": 999}')
+        report = cast(dict[str, object], json.loads(self.list_output("--json")))
+        inventory = cast(object, json.loads(json.dumps(roles.list_roles())))
+        self.assertEqual(report, inventory)
+        entries = cast(list[dict[str, object]], report["roles"])
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[0]["holder_reach"], {"kind": "HolderReach", "session_id": "holder-one"})
+        self.assertIn(str(bad), str(report["problems"]))
 
     def test_inventory_lists_bad_records_without_network_and_keeps_valid_roles(self) -> None:
         design = self.open_designer()
@@ -958,10 +1022,11 @@ class DurableRolesTests(unittest.TestCase):
 
         def request(method: str, params: object, **options: object) -> dict[str, object]:
             del params, options
+            if method == "thread/turns/list":
+                return {"result": {"data": [{"id": "still-running", "status": "inProgress"}] if active else []}}
             if method != "thread/read":
                 raise AssertionError("unexpected cleanup proof request: " + method)
-            return {"result": {"thread": {"id": "thread-designer", "status": {"type": "active" if active else "idle"},
-                "turns": [{"id": "still-running", "status": "inProgress"}] if active else []}}}
+            return {"result": {"thread": {"id": "thread-designer", "status": {"type": "active" if active else "idle"}}}}
 
         mesh = roles.mesh_directory(design.placement.design_id)
         _ = (mesh / "mesh_server.json").write_text(json.dumps({"pid": os.getpid(), "port": 32100}))

@@ -2,7 +2,7 @@
 
 > **Status: IMPLEMENTATION PLAN — phased, direct-ready; approved by the user 2026-10-28 (relayed by the showrunner).** One launcher, `assign.sh`, opens and resumes long-lived workers that belong to the unit. Tools refuse worker work that a unit director does any other way.
 
-> **As-built disposition: create** — `docs/as-built/workers.md`; it replaces `docs/as-built/long-lived-workers.md` and `docs/as-built/review-pool.md` (Phase 15).
+> **As-built disposition: create** — `docs/as-built/workers.md`; it replaces `docs/as-built/long-lived-workers.md` (Phase 15). roles-unit (sdlc) removes `docs/as-built/review-pool.md` with `review_pool.py` (showrunner, 2026-10-29).
 
 > **Production: build-followups** — unit `models-unit`; production doc `docs/plans/build-followups-production.md`
 
@@ -60,6 +60,8 @@
 - **Naming standard** (user-approved in the sdlc review, 2026-10-28; relayed by roles-unit). All remaining phases follow these rules. (1) "Seat" is retired as a name for a Codex thread; use "worker". A worker is a Codex thread that a unit director sends work to. Its full name (for example `claude-build-followups-sdlc-roles-impl`) is the worker name; `impl`, `test`, `fix2` and `review` are its roles in the unit. (2) Do not use "delegate", "seat", "helper" or "subagent" for a worker. A "small-fix helper" is a helper that a showrunner sends; it does no code work. (3) Name reviewers and designers by their job: "design reviewer", "code reviewer", "UI reviewer", "designer". (4) A session's name and its role are separate. Store the role apart from the name; never derive a role from a name. (5) In code, change prose, comments, help, printed labels and messages. Keep a stored key, flag, file name or transport field only where existing data or callers still read it, and note why next to it. A tests-only gate check fails on a new use of "seat" or "seats" as a role word. Every new name in this plan uses "worker". (6) Every name shown to a reader carries production · unit · job, for example "sdlc · roles · code reviewer 6": in reports, messages and Codex thread names. The worker address (its full name) does not change. (User decision via the sdlc showrunner, 2026-10-28.)
 
 ## Phases
+
+**Order (showrunner, 2026-10-29):** the remaining phases run in this order: 5, 7, 11, 6, 9, 10, 12, 13, 14, 15. Phase 8 is dropped. Phase numbers do not change.
 
 ### Phase 1 — Compaction hook path (WS P0)  · status: done
 
@@ -142,7 +144,7 @@
 
 **Gotchas:** the `resolve` CLI records `os.getppid()` as the reservation owner. Under Claude Code's Bash tool that is the one-call shell, so a hand-run reservation is dead when the call returns (the `--owner-pid` fix is in the worker lifecycle Work Order). A file opened `a+` reads from EOF; seek to 0 before reading an inbox. No command lists or clears a quarantined entry yet.
 
-### Phase 5 — Worker lifecycle: run end, phase end, retire, transfer, rename (WS P2, part 2)  · status: todo
+### Phase 5 — Worker lifecycle: run end, phase end, retire, transfer, rename (WS P2, part 2)  · status: done
 
 **Depends on:** Phase 4
 
@@ -151,7 +153,7 @@
 **Goal:** workers live until the unit is retired; run end, transfer and rename only pause them and keep their work, and retire alone ends them.
 
 **Spec:**
-- **Scope.** This phase covers writer workers (`impl`, `test`, `fix`) and the generic lifecycle that every ledger entry shares. Reviewer metadata, `import-pool` and reviewer rebinding belong to Phase 8. The switched-unit integration (`switched.json`) belongs to Phase 12. A unit's pool reviewers keep today's `review_pool.py` path in this phase (planner's split, from the Phase 4 review).
+- **Scope.** This phase covers writer workers (`impl`, `test`, `fix`) and the generic lifecycle that every ledger entry shares. Reviewer workers belong to roles-unit (sdlc); Phase 8 and its `import-pool` are dropped (showrunner, 2026-10-29). The switched-unit integration (`switched.json`) belongs to Phase 12. A unit's pool reviewers keep today's `review_pool.py` path in this phase (planner's split, from the Phase 4 review).
 - **Pause keeps work.** Today `codex_mesh._pause_roster()` truncates each `<name>.pending.json`, calls `_drop_queued_messages()` on the server, and `command_stop()` reaps every server the run folder records. Pause now keeps the pending file. Before it stops a server, it moves each server-queued message of a paused thread into that worker's pending file, so the message outlives the server. Pause keeps `continuation_owed`, the detached run records and their supervisors, and the reservation fields (`allocation_pending`, `allocation_id`, `allocation_owner_pid`, `allocation_expires_at`). Pause reaps only the servers that this run folder records (`mesh_server.json`, `mesh_retired.json`). It never reaps a server that another run or a production records.
 - **Retire cancels work.** `workers.end_unit` cancels pending messages, owed continuations and detached runs (it ends each supervisor by its record's `pid`), clears the reservation fields, ends each worker, prints one line for each thing it cancelled, prints one line for each quarantined entry it removes (name, reason, ledger path), and removes the ledger file.
 - **A paused worker's work moves with it on adopt.** Phase 4's `codex_mesh.worker_idle_reason()` refuses adoption when messages, an owed continuation or a detached run remain. The idle rule now depends on ledger ownership:
@@ -160,6 +162,7 @@
   - The taking run's first `follow` drains the preserved queue before its new work: it delivers each detached run result and pending message, and runs the owed continuation, in that order. It never sends a prompt again.
 - **No destructive step on pause, transfer or rename.**
   - `end_session.sh` runs `codex_mesh.py stop --pause` for each run (today it runs `stop`, which ends every worker). It leaves the workers in the ledger.
+  - **A live director keeps its workers running.** Run end pauses only the workers of a unit whose director is gone. While the unit's director is live — the same session, or a restarted director of the same unit on any account (shutdown history links the old session to the unit) — run end clears the run-active marker and changes nothing else: each worker keeps its thread, status, pending and server-queued messages, mesh routing records and server; it writes no end marker; the next run reuses the worker by name. An absent active marker or a deleted run folder alone does not prove the director is gone. No broad sweep (`cleanup`, idle-stop) undoes this. Showrunner requirement, 2026-10-28 (user rule HI9: workers live as long as their unit director), relayed by hierarchies-unit; its read-only owner report is `scripts/hierarchies/worker_owners.py` on build-followups-hierarchies.
   - `remove_run_scratch.py` keeps each checkout that is, or holds, the `cwd` of a live detached run of a paused worker. It removes the rest as today.
   - `rename_unit._stop_runs()` (used by rename, and by transfer through `rename_unit.stop_unit()`) runs `codex_mesh.py stop --pause`, not `stop`. It does not terminate the supervisor of a paused worker's detached run, nor that supervisor's command. When such a run works inside the worktree that a rename moves, the rename refuses with `RenameRefused` (`detached run <id> of <worker> works inside <worktree>; rerun apply once it ends`) and kills nothing. A transfer keeps the worktree, so it never refuses for this.
   - `retire_unit.stop_rest()` keeps `codex_mesh.py stop` (it ends workers) and calls `workers.end_unit`.
@@ -220,11 +223,11 @@
 
 ### Phase 6 — Role words `research` and `propose` (WT P2)  · status: todo
 
-**Depends on:** Phase 2, Phase 4
+**Depends on:** Phase 2, Phase 4, Phase 7, Phase 11 (runs after Phase 11; showrunner, 2026-10-29)
 
 #### Work Order
 
-**Goal:** the roster, the unit worker ledger, the hierarchy edge and the cargo handler know the roles `research` and `propose`, and both open read-only.
+**Goal:** the roster, the unit worker ledger, the hierarchy edge, `assign.sh` and the cargo handler know the roles `research` and `propose`, and both open read-only.
 
 **Spec:**
 - Three role registries take the two words. Update all three:
@@ -232,7 +235,8 @@
   - `codex_mesh.WORKER_ROLES = ("impl", "test", "fix", "review", "research", "propose")`
   - `workers.ROLES = ("impl", "test", "fix", "review", "research", "propose")`; today `workers.py resolve --role` and `workers._resolve()` refuse any other word before allocation.
 - Check every use of `WORKER_ROLES` by symbol: `_roster_role()`, `_write_roster_record()`, and the `start` and `follow` parsers in `main()`. Check every `WorkerRole` annotation (the roster `TypedDict`s, `_worker_role()`, `_set_roster_assignment()`).
-- **Access policy.** `codex_mesh.open_unit_worker()` today makes only `review` read-only (`{"kind": "ReadOnlyReviewer"}` and `READ_ONLY_SANDBOX`). `research` and `propose` open the same way: `ReadOnlyReviewer` policy and `READ_ONLY_SANDBOX`. The extra writable root for `propose` (`~/.local/state/plan-backlog`) comes with `assign.sh` in Phase 7.
+- **Access policy.** `codex_mesh.open_unit_worker()` today makes only `review` read-only (`{"kind": "ReadOnlyReviewer"}` and `READ_ONLY_SANDBOX`). `research` and `propose` open the same way: `ReadOnlyReviewer` policy and `READ_ONLY_SANDBOX`. The extra writable root for `propose` (`~/.local/state/plan-backlog`) comes with `assign.sh`.
+- **`assign.sh` takes the two roles (showrunner, 2026-10-29).** Phase 7 built four roles. This phase adds `--role research` and `--role propose` as Phase 7's spec describes them: the `--summary` report, the one proposal file, the launcher's `ledger.md` line, the read-only sandbox and the `propose` writable root. `/showrunner:assign` (Phase 11) then allows both.
 - The hierarchy edge JSON `{"manager","member","role"}` carries the word.
 - `config/agents.conf [direct.codex]`: `research=astra:xhigh`, `propose=astra:xhigh` (user, 2026-10-28; the model `/astra_review` uses for documents).
 - Cargo handler: `HierarchyRole` gains `Research` and `Propose` (serde lowercase) with their `text`; an unknown word still takes `RoleFallback`. This is a separate repository; its commit lands there, and the checkpoint body names it.
@@ -240,30 +244,34 @@
 **Files:**
 - `scripts/agents/codex_mesh.py` — `WorkerRole`, `WORKER_ROLES`, `open_unit_worker()` access policy
 - `scripts/direct/workers.py` — `ROLES`
+- `scripts/direct/assign.sh` — `--role research|propose`
+- `scripts/direct/test_assign_launcher.py` — `research` and `propose` cases
 - `config/agents.conf` — two rows
 - `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/mod.rs` — two variants
 - `scripts/agents/test_codex_mesh.py` — role cases
 - `scripts/direct/test_workers.py` — `resolve` cases for both roles
 
 **Workers:** `2 writers` — the two repositories split.
-- `impl` — `codex_mesh.py`, `workers.py`, `config/agents.conf`, `test_codex_mesh.py`, `test_workers.py`: `workers.resolve` opens a `research` and a `propose` worker, each with `ReadOnlyReviewer` and the read-only sandbox; the roster and the edge carry the word
+- `impl` — `codex_mesh.py`, `workers.py`, `assign.sh`, `config/agents.conf`, `test_codex_mesh.py`, `test_workers.py`, `test_assign_launcher.py`: `workers.resolve` opens a `research` and a `propose` worker, each with `ReadOnlyReviewer` and the read-only sandbox; the roster and the edge carry the word; `propose` writes the file and the launcher adds the ledger line once
 - `test` (opens as impl) — `census/mod.rs` and its crate tests
 
 **Constraints from prior phases:**
 - Phase 2: `[direct.codex]` rows take family words; `astra` resolves through `[codex.families]` to the newest cached release that has a `[codex.agents]` effort row (today `gpt-6-astra`, which has a `weights.py` row). `gpt-6.1-terra` and `gpt-6-luna` have no `weights.py` row: usage accounting raises `UnweightedModel` for them, so no row may name `terra` or `luna`.
 - Phase 4: `codex_mesh.open_unit_worker(session_dir, name, role)` resolves `agents_resolve direct.<role>` and refuses a non-Codex family (`WorkerUnavailable("new persistent worker requires a Codex assignment")`); it records `access_policy` in the roster, and `workers._worker_from_record()` copies it to the ledger entry. Ledger lock order: ledger, giving roster, taking roster, inbox. Fixtures block until their deadline and keep `FixtureLoopBudget`.
+- Phase 7: `assign.sh` takes `implement`, `test`, `fix` and `review`; its call form, artifacts and exit codes.
 
 **Acceptance gate:** the merge gate is green; `verify.sh test cargo-handler` and `verify.sh lint cargo-handler` pass; basedpyright on `scripts/direct scripts/agents` is 0/0; the handler shows `research` and `propose`, and an unknown word takes `RoleFallback`.
 
 ### Phase 7 — `assign.sh` core (WT P1, with WS P2's `--role`, run start and rules block)  · status: todo
 
-**Depends on:** Phase 2, Phase 4, Phase 5, Phase 6
+**Depends on:** Phase 2, Phase 4, Phase 5
 
 #### Work Order
 
-**Goal:** one launcher with named options opens or resumes the right worker for six roles; `implement.sh` and `review.sh` do not change.
+**Goal:** one launcher with named options opens or resumes the right worker for four roles; `implement.sh` and `review.sh` do not change.
 
 **Spec:**
+- **Roles in this phase (showrunner, 2026-10-29).** This phase builds `implement`, `test`, `fix` and `review`. `research` and `propose` join when Phase 6 lands; the call form and the spec lines below that name them are Phase 6 work, and until then `assign.sh` refuses both with exit 2.
 - Call form:
   ```
   assign.sh --role <implement|test|fix|review|research|propose>
@@ -287,7 +295,7 @@
 - `codex_mesh.py` uses the shown name too: every `thread/name/set` (in `open_unit_worker()`, which today builds `<production> · <unit> · <role> (<name>)` by hand, and on a replacement thread) and every follow-up message it prints. Help and diagnostics drop "seat" (for example the `reopen` help and the `command_stop()` docstring). A stored key or field that existing data still reads keeps its name, with a note next to it (naming rule 5). The tests-only gate check for "seat" belongs to Phase 12.
 - Artifacts: `${PHASE_DIR}/<role>_status`, `<role>_summary.txt`, `<role>_agent.log`, with `_<lens>` and `_<pass>` suffixes for reviews.
 - **Exit codes and outcomes.** 0 done; 1 the worker ran and failed; 2 a refused argument or claim; 3 blocked (no worker could start); 4 handed off. `follow` exits 2 for both a refusal and a `WorkerHandedOff`; after a `follow` exit 2, `assign.sh` reads the worker's roster record, and an `adopted_to` value means handed off. On handed off, `assign.sh` writes `handed_off` to `<role>_status`, records the destination run in `<role>_summary.txt`, prints `handed off: <worker> to <run>; completion unknown`, does not record the pass as done, and never sends the prompt again.
-- Review in this phase: `--role review` takes an open writer for the lens, as today without a pool. Pooled reviewers come in Phase 8.
+- Review in this phase: `--role review` takes an open writer for the lens, as today without a pool. Reviewers become ordinary unit workers (`<worktree>-review`, `-review2`), opened and resumed by `assign.sh --role review`; roles-unit (sdlc) builds that after this phase, and Phase 8 is dropped (showrunner, 2026-10-29).
 
 **Files:**
 - `scripts/direct/assign.sh` — new
@@ -299,63 +307,19 @@
 
 **Workers:** `1 writer + 1 tester`
 - `impl` — `assign.sh`, `workers.py`, `codex_mesh.py`; hub: `scripts/direct/workers.py`
-- `test` — `test_assign_launcher.py` (fake app-server; bounded real waits): each role opens with its sandbox; `--to` resumes a thread; `--model` on a roster that holds `unit_ledger` selects or opens a worker with that identity and leaves the existing worker's model unchanged; `--to` with a different `--model` exits 2; `propose` writes the file and the launcher adds the ledger line once; a missing `--role` exits 2; a writer role without `--paths` exits 2, a reviewer with `--paths` exits 2, a `..` path exits 2; each dispatch writes its `dispatch_<n>_paths.json`; every worker prompt carries the rules block; the thread name and board label read `<production> · <unit> · <job>` while `--to` takes the full address; no run starts one; a named finished run is reactivated with `start-phase` and keeps its worker's thread; the reservation owner is the launcher pid and stays live through the claim; a handoff during the turn gives exit 4, status `handed_off`, the destination run, no finished pass and no second prompt. `test_workers.py`: `resolve --model --effort` picks only an exact identity; `shown_name` follows a `move_unit` and a `rename_unit` while `resolve` prints the same address. `test_codex_mesh.py`: a replacement thread name and a follow-up message use the shown name; `--help` output has no "seat"
+- `test` — `test_assign_launcher.py` (fake app-server; bounded real waits): each role opens with its sandbox; `--to` resumes a thread; `--model` on a roster that holds `unit_ledger` selects or opens a worker with that identity and leaves the existing worker's model unchanged; `--to` with a different `--model` exits 2; `--role research` and `--role propose` exit 2; a missing `--role` exits 2; a writer role without `--paths` exits 2, a reviewer with `--paths` exits 2, a `..` path exits 2; each dispatch writes its `dispatch_<n>_paths.json`; every worker prompt carries the rules block; the thread name and board label read `<production> · <unit> · <job>` while `--to` takes the full address; no run starts one; a named finished run is reactivated with `start-phase` and keeps its worker's thread; the reservation owner is the launcher pid and stays live through the claim; a handoff during the turn gives exit 4, status `handed_off`, the destination run, no finished pass and no second prompt. `test_workers.py`: `resolve --model --effort` picks only an exact identity; `shown_name` follows a `move_unit` and a `rename_unit` while `resolve` prints the same address. `test_codex_mesh.py`: a replacement thread name and a follow-up message use the shown name; `--help` output has no "seat"
 
 **Constraints from prior phases:**
 - Phase 2: rows are family words; `agents_resolve` returns the slug or exits 1 with `no Codex model for '<word>' in ~/.codex/models_cache.json; run codex once to refresh the cache, or name the full slug`. A resolved line ends with ` word=<family word>` when the row names a family (`agents_config.sh` `_agents_print_resolved`); the slug is in `agent=`.
 - Phase 4: `workers.py resolve --session-dir <run> --role <r>` prints the worker address; `<role>2` when all are busy. Its reservation is `allocation_pending`, `allocation_id`, `allocation_owner_pid` and `allocation_expires_at` (120 s, `ALLOCATION_CLAIM_WINDOW_SECS`); `command_follow()` releases only its own `allocation_id`. `resolve` and `reopen` exit 2 on a finished run and name `progress_history.py start-phase`. `follow` exits 2 on `WorkerHandedOff` (`worker handed off to <run>; assignment completion unknown`). A quarantined ledger entry makes the first `follow` or `reopen` exit 2 naming the quarantine; later calls proceed. Ledger lock order: ledger, giving roster, taking roster, inbox.
 - Phase 5: `resolve --owner-pid <pid>`; pause keeps pending messages, owed continuations and detached runs, and adopt carries them; the taking run's first follow drains them before new work. `workers.move_unit` and `workers.rename_unit` move the ledger and rewrite each roster's `unit_ledger`; `progress_history.py set-unit` writes the run's `production` and `unit`.
-- Phase 6: `WORKER_ROLES`, `WorkerRole` and `workers.ROLES` hold `research` and `propose`; `open_unit_worker()` opens both read-only; their rows are `astra:xhigh`.
 - Phase 3: a lifecycle decision runs only after buffered notices drain; keep the `FixtureLoopBudget` guard in new fixtures.
 
 **Acceptance gate:** the merge gate is green; basedpyright on `scripts/direct scripts/agents` is 0/0.
 
-### Phase 8 — Reviewers in the worker ledger (WT P3)  · status: todo
+### Phase 8 — Reviewers in the worker ledger (WT P3)  · status: dropped
 
-**Depends on:** Phase 5, Phase 7
-
-#### Work Order
-
-**Goal:** pooled reviewers are workers in the unit ledger, with today's pool behavior; `assign.sh --role review` uses them, and a pool reviewer's authority moves to the ledger exactly once.
-
-**Spec:**
-- Keep (user, ledger 2026-10-10): one permanent read-only reviewer per owner and type; a concurrent review forks the owner's newest reviewer; a changed standing prompt re-points idle reviewers; the tree guard (`review_tree.py`) after every turn; the turn record with every field that `review.sh` `write_turn_record` writes; the owner's reviewers end at retire.
-- **Named reviewer payload.** `UnitWorker` gains `payload: WriterPayload | ReviewerPayload`. `ReviewerPayload(reviewer_type: ReviewerType, instructions_file, prime_hash, reviews, mesh_dir, lease: Unleased | UnitLease, claim: IdleReviewer | ClaimedReviewer)`. The four state types and `ReviewerType` move from `review_pool.py` to `workers.py`; `review_pool.py` imports them from there, so Phase 15 can remove `review_pool.py`. No reviewer field becomes optional on `UnitWorker`. A ledger entry with no stored payload decodes as `WriterPayload`, so Phase 4 and Phase 5 ledger files still read. Nullable legacy JSON (`ReviewerJson.lease: LeaseJson | None`, `busy_pid: int | None`) stays only in `review_pool.py` and in the `import-pool` decode.
-- `review_pool.py` `prime`, `allocate` (`_prime`, `_choose`, `_repoint`), `release`, `retire` become `workers.py` functions that act on `ReviewerPayload` entries; `migrate` and `stop` stay as `workers.py` verbs for the showrunner. The production template thread and its mesh dir live in `~/.local/state/unit-workers/<slug>/`.
-- One app-server per production for reviewers stays. The production's mesh dir records it, not any run folder, so Phase 5's pause (which reaps only the servers its run folder records) never reaps it. `workers.py` passes the entry's mesh dir to `follow --cwd <worktree> --read-only`.
-- No `--pool` flag and no `--lease`. `assign.sh --role review` reads the production doc's `**Review pool:** code|ui` line. With it, the worker is the owner's read-only code reviewer or UI reviewer. Without it, an open writer takes the lens. The unit and phase come from the run and `--phase`.
-- **`workers.py import-pool --unit <unit>` is a fenced ownership transfer, not a copy.** For each reviewer of `~/.local/state/review-pool/<slug>/pool.json` leased to the unit:
-  1. Under the ledger lock, then the pool lock (fixed order), it marks the pool reviewer `Transferred(ledger)` in `pool.json` (a third pool lease variant beside `Unleased` and `UnitLease`) and saves the pool. It keeps the thread id, prime hash and review count in the pool record.
-  2. It then writes the ledger entry (`ReviewerPayload`, same thread id) as owned by the ledger, and saves.
-  - A crash between the two writes leaves a `Transferred` pool reviewer with no ledger entry. The next `import-pool` or `resolve` on that ledger writes the entry from the pool record. A rerun after both writes changes nothing.
-  - A reviewer with a live `ClaimedReviewer` pid is not marked. `import-pool` exits 2 and names it; a rerun after its review moves it.
-  - Legacy `review_pool.py` refuses `Transferred`: `allocate` (`_choose`) never picks it, `_repoint_idle` and `migrate` skip it, `retire` and `rename_unit` skip it, and `status` prints `transferred` in the lease field, so `transfer_unit._leased()` and `retire_unit.reviewers()` do not count it.
-  - It keeps the primed threads (1,435 against 12,982 weighted tokens a turn). Phase 12's `switched` calls it. `review.sh` keeps `pool.json` for units not yet switched.
-- `review_pool_report.py` reads reviewers from the ledger and the non-`Transferred` reviewers of `pool.json` until Phase 15.
-- **Lifecycle of ledger reviewers.** `workers.move_unit` (transfer, Phase 5) rebinds each `ReviewerPayload`'s `mesh_dir` and `instructions_file` to the new production and keeps its thread id; a transfer stopped after any step completes when run again. `workers.rename_unit` keeps them (the production does not change). `workers.end_unit` (retire) ends ledger reviewers. `transfer_unit._move_state()` and `retire_unit.stop_rest()` keep their `review_pool.py retire` call for pool reviewers; it skips `Transferred` ones.
-
-**Files:**
-- `scripts/direct/workers.py` — `ReviewerPayload`, the moved state types, review functions, `import-pool`, reviewer rebind in `move_unit`, reviewers in `end_unit`
-- `scripts/direct/review_pool.py` — imports the state types; `Transferred`; legacy paths refuse or skip it
-- `scripts/direct/assign.sh` — the review path, tree guard, turn record
-- `scripts/direct/review_pool_report.py` — reads the ledger
-- `scripts/direct/test_workers_review.py` — new, ported from the `test_review_pool.py` cases
-- `scripts/direct/test_review_pool.py` — `Transferred` cases
-- `scripts/direct/test_assign_launcher.py` — review cases
-- `scripts/direct/test_review_pool_report.py` — review cases
-- `scripts/production/test_transfer_unit.py` — reviewer transfer cases
-
-**Workers:** `1 writer + 1 tester`
-- `impl` — `workers.py`, `review_pool.py`, `assign.sh`, `review_pool_report.py`; hub: `scripts/direct/workers.py`
-- `test` — `test_workers_review.py`, `test_review_pool.py`, review cases in `test_assign_launcher.py`, `test_review_pool_report.py` and `test_transfer_unit.py` (fake app-server; bounded real waits): the existing `test_review_pool.py` cases pass against `workers.py`; a second concurrent review forks the owner's reviewer; a prompt change re-points an idle reviewer; the turn record keeps every field; a ledger file written before this phase decodes with `WriterPayload`; a `ReviewerPayload` round-trips with each lease and claim variant; `import-pool` keeps thread ids; a crash after the pool mark and before the ledger write is finished by the next `import-pool` and by `resolve`; a legacy `allocate` that runs during `import-pool` never gets a `Transferred` reviewer, and the thread has exactly one owner; a claimed reviewer is not imported; a transferred reviewer keeps its thread id and points to the new mesh dir and instructions file; a transfer stopped midway completes when run again; pause of a unit run leaves the production reviewer server running
-
-**Constraints from prior phases:**
-- Phase 4: ledger types (`UnitWorker`, `CodexThread | ClaudeSession`, `HeldBy | Paused | Adopted | Retired`), `UnitWorkerLedger.locked()` and its quarantine of undecodable entries (keep quarantined entries; only retire removes them). Lock order: ledger, giving roster, taking roster, inbox; this phase puts the pool lock directly after the ledger lock. Reservation: `allocation_id`, owner pid and the 120 s window, with identity-fenced release.
-- Phase 5: `pause_unit`, `end_unit`, `move_unit`, `rename_unit` in `workers.py`; pause reaps only the servers its run folder records; a move is a journalled migration that takes both ledger locks in path order and rewrites roster `unit_ledger`, progress-state `production`/`unit` and adoption journal paths. Phase 5 covers writer workers only; reviewers are this phase.
-- Phase 7: `assign.sh` options, artifacts and exit codes (4 = handed off); `--lens` and `--pass` suffixes; `--paths` is refused for `review`; the worker address and the shown name (`workers.shown_name()`) are separate.
-- Phase 3: fixtures block until their deadline and keep `FixtureLoopBudget`.
-
-**Acceptance gate:** the merge gate is green; basedpyright on `scripts/direct scripts/production` is 0/0.
+Dropped (showrunner, 2026-10-29). Reviewers become ordinary unit workers (`<worktree>-review`, `-review2`), opened and resumed by `assign.sh --role review`. roles-unit (sdlc) owns reviewers as workers and builds them after Phase 7. This plan has no pool import, no `ReviewerPayload` and no `Transferred` pool lease.
 
 ### Phase 9 — Self-heal (WS P3)  · status: todo
 
@@ -449,17 +413,18 @@
 
 ### Phase 11 — `/unit:assign` and `/showrunner:assign` (WT P4)  · status: todo
 
-**Depends on:** Phase 7, Phase 8
+**Depends on:** Phase 7 (showrunner, 2026-10-29)
 
 #### Work Order
 
 **Goal:** a unit director and a showrunner each launch a worker with one skill.
 
 **Spec:**
-- `/unit:assign <role> [--to <worker>] [--model m[:e]] [--paths <file>] <prompt file> [...]` composes the call: `--session-dir` is the run, `--cwd` the worktree, `--phase` the open phase.
-- `/showrunner:assign`: same skill, showrunner defaults: `--session-dir ~/.local/state/unit-workers/<slug>/showrunner/`, `--cwd` the showrunner checkout. It allows `research`, `propose` and `review` of a document. `implement`, `test` and `fix` are refused with one line: a showrunner never writes code; its units do.
-- **The showrunner's ledger.** `workers.ledger_for_run()` resolves a ledger from the run's progress-state `production` and `unit` keys, then the plan header, else an adhoc key; the showrunner folder has neither. So `assign.sh`, on first use of the showrunner form, creates the folder and runs `progress_history.py set-unit --session-dir <folder> --production <slug> --unit showrunner` (Phase 5). `ledger_for_run()` then resolves `~/.local/state/unit-workers/<slug>/showrunner.json`. `resolve`, reviewer allocation and `workers.py stop` at wrap all address that one file.
-- The showrunner's ledger file gets `code` reviewers by the Phase 8 rule, for document and plan reviews. `/astra_review` keeps its held-role path. Showrunner workers end at production wrap, with the production's reviewers (user, 2026-10-28).
+- `/unit:assign <role> [--to <worker>] [--model m[:e]] [--effort <level>] [--paths <file>] <prompt file> [...]` composes the call: `--session-dir` is the run, `--cwd` the worktree, `--phase` the open phase.
+- **Per-launch model and effort (showrunner, 2026-10-29; user priority: `/showrunner:assign` with per-launch `--model` and `--effort` comes first).** Both skills take `--model m[:e]` and `--effort <level>` for one launch and pass them to `assign.sh`. Phase 7's identity rule then picks or opens a worker with that model and effort.
+- `/showrunner:assign`: same skill, showrunner defaults: `--session-dir ~/.local/state/unit-workers/<slug>/showrunner/`, `--cwd` the showrunner checkout. It allows `review` of a document; `research` and `propose` join when Phase 6 adds them to `assign.sh`. `implement`, `test` and `fix` are refused with one line: a showrunner never writes code; its units do.
+- **The showrunner's ledger.** `workers.ledger_for_run()` resolves a ledger from the run's progress-state `production` and `unit` keys, then the plan header, else an adhoc key; the showrunner folder has neither. So `assign.sh`, on first use of the showrunner form, creates the folder and runs `progress_history.py set-unit --session-dir <folder> --production <slug> --unit showrunner` (Phase 5). `ledger_for_run()` then resolves `~/.local/state/unit-workers/<slug>/showrunner.json`. `resolve` and `workers.py stop` at wrap address that one file.
+- The review role is what `assign.sh --role review` gives, with no pool (showrunner, 2026-10-29). `/astra_review` keeps its held-role path. Showrunner workers end at production wrap, with the production's reviewers (user, 2026-10-28).
 - Both skills print the worker address, its shown name (`workers.shown_name()`, Phase 7), the model and effort used, and the summary path. The address stays raw for `--to` and routing. They read no transcripts and hold no state.
 
 **Files:**
@@ -473,19 +438,18 @@
 
 **Workers:** `1 writer + 1 tester`
 - `impl` — the two commands, `produce.md`, `assign.sh`, `workers.py`
-- `test` — the showrunner form refuses `implement`; the showrunner folder gets `production` and `unit: showrunner` and `ledger_for_run()` gives `unit-workers/<slug>/showrunner.json`; `resolve`, reviewer allocation and `workers.py stop` touch that same file; both forms print address, shown name, model and summary path; `workers.py stop` ends the showrunner's workers and its reviewers
+- `test` — the showrunner form refuses `implement`; the showrunner folder gets `production` and `unit: showrunner` and `ledger_for_run()` gives `unit-workers/<slug>/showrunner.json`; `resolve` and `workers.py stop` touch that same file; `--model` and `--effort` reach `assign.sh` for one launch; both forms print address, shown name, model and summary path; `workers.py stop` ends the showrunner's workers and its reviewers
 
 **Constraints from prior phases:**
 - Phase 5: `progress_history.py set-unit` writes the keys that `ledger_for_run()` reads first.
 - Phase 7: call form, `--paths`, exit codes (4 = handed off), `workers.shown_name()` and the raw address.
-- Phase 8: reviewers in the ledger as `ReviewerPayload` and the owner rule.
 - Phase 4: lock order ledger, giving roster, taking roster, inbox; quarantined entries are kept; fixtures block until their deadline and keep `FixtureLoopBudget`.
 
 **Acceptance gate:** the merge gate is green; basedpyright on `scripts/direct` is 0/0.
 
 ### Phase 12 — The rule and the cutover (WS P1 + WT P5, merged: both change the same docs)  · status: todo
 
-**Depends on:** Phase 5, Phase 8, Phase 9, Phase 10, Phase 11
+**Depends on:** Phase 5, Phase 9, Phase 10, Phase 11
 
 #### Work Order
 
@@ -498,9 +462,9 @@
 - Pointers, no repeated text: `commands/unit/direct.md` gets a `<TagReferenceContract/>` row; `<LongLivedWorkers/>` becomes one line that points to `<WorkerRule/>`; `<CoreContract/>` keeps "does not write implementation code" and its exception "agreed doc-only/trivial post-review fixes" becomes "Markdown only". `docs/production_format.md`: the **Worker** definition and a new `<ProductionUnit/>` item 19 point to `<WorkerRule/>`. `commands/showrunner/produce.md`: one line — the showrunner never approves a flow without workers and sends an exception request to the user.
 - The design check (screenshots) moves to a UI reviewer (`assign.sh --role review --image`) when there is no `ui` pool.
 - In the same commit, call forms change to `assign.sh`: `commands/unit/direct.md` (`<LongLivedWorkers/>`, `<WorkerLaunchFailure/>`), `docs/direct/launch_implementation.md` step 5, `docs/direct/dual_review.md` step 3, `docs/direct/phase_end.md`, `commands/plan/phase_review.md`. Each writer call form passes `--paths` with the files the Work Order's **Workers** line gives that worker. Each doc names exit 4 (handed off: completion unknown, never resubmit).
-- **`workers.py switched --unit <unit>` is recoverable.** It writes the unit under `"state": "switching"` with the date into `~/.local/state/unit-workers/<slug>/switched.json`, runs `import-pool` (Phase 8) for it, then sets `"state": "switched"`. A rerun after a crash at any point finishes the switch; `import-pool` is idempotent.
+- **`workers.py switched --unit <unit>` is recoverable.** It writes the unit under `"state": "switching"` with the date into `~/.local/state/unit-workers/<slug>/switched.json`, then sets `"state": "switched"`. A rerun after a crash at any point finishes the switch. The pool import is dropped (showrunner, 2026-10-29): reviewers are ordinary unit workers that roles-unit (sdlc) builds.
 - `implement.sh` and `review.sh`: the first thing each does is check the run's unit (`SHOWRUNNER_UNIT_ID`, else `unit_runs.marker`) against `switched.json`. A unit in either state gets exit 2: `refused: <unit> switched to assign.sh on <date>; use assign.sh` (state `switched`) or `refused: <unit> is switching to assign.sh; use assign.sh` (state `switching`).
-- **Switched-unit integration.** A switched unit's transfer and rename keep every writer and reviewer thread id: Phase 5's `move_unit` moves the ledger, Phase 8 rebinds its reviewers, and the giving pool's `review_pool.py retire` skips its `Transferred` reviewers. This phase tests that path end to end.
+- **Switched-unit integration.** A switched unit's transfer and rename keep every worker thread id: Phase 5's `move_unit` moves the ledger. This phase tests that path end to end.
 - `commands/showrunner/produce.md`: the showrunner asks each unit director, one at a time, to switch, and runs `workers.py switched` on a yes. It asks first the units with a finished run or no run (style, messaging, builds), because only `assign.sh` starts or reopens their run.
 - New tag-reference test: every `<Tag/>` that `commands/unit/direct.md` and `docs/direct/*.md` name resolves to a definition.
 - New naming gate check (naming rule 5), tests-only: it fails on a new use of "seat" or "seats" as a role word in scripts, commands and docs. It allows an existing stored key, flag, file name or transport field that has a note next to it, and it does not read `docs/plans/`.
@@ -525,13 +489,12 @@
 - `scripts/production/test_transfer_unit.py` — switched-unit transfer case
 
 **Workers:** `2 writers` — docs and scripts split.
-- `impl` — `workers.py`, `implement.sh`, `review.sh`, `test_workers.py`, `test_implement_launcher.py`, `test_review_launcher.py`, `test_transfer_unit.py`: a crash after `import-pool` and before `"state": "switched"` is finished by a rerun; a legacy review allocation during the switch never gets a `Transferred` reviewer; both refusal lines; a switched unit's transfer keeps every writer and reviewer thread id
+- `impl` — `workers.py`, `implement.sh`, `review.sh`, `test_workers.py`, `test_implement_launcher.py`, `test_review_launcher.py`, `test_transfer_unit.py`: a crash after the `switching` write and before `"state": "switched"` is finished by a rerun; both refusal lines; a switched unit's transfer keeps every worker thread id
 - `test` (opens as impl) — every doc and command file, `test_tag_reference.py`, `test_worker_naming.py`; hub: `commands/unit/direct.md`
 
 **Constraints from prior phases:**
 - Phase 5: `move_unit` and `rename_unit` move the ledger as a journalled migration (both ledger locks in path order); pause keeps work and retire alone ends it.
 - Phase 7: help, diagnostics and printed names in `codex_mesh.py` no longer say "seat"; stored compatibility fields keep their names with a note. `assign.sh` exit codes 0–4; `--paths` is required for writer roles.
-- Phase 8: `workers.py import-pool --unit` marks pool reviewers `Transferred` before the ledger entry is written, and is idempotent; legacy `review_pool.py` refuses or skips `Transferred`.
 - Phase 9: `blocked:` exit 3. Phase 10: E4 lines from all three launchers; the grant attestation schema in `subagent_grants.json`. Phase 11: `/unit:assign`.
 - Phase 4: lock order ledger, giving roster, taking roster, inbox; quarantined entries are kept; fixtures block until their deadline and keep `FixtureLoopBudget`.
 
@@ -622,43 +585,32 @@
 **Goal:** `assign.sh` is the only worker launcher, and one as-built doc describes workers.
 
 **Spec:**
-- Remove `scripts/direct/implement.sh`, `review.sh`, `review_pool.py` and their tests (`test_implement_launcher.py`, `test_review_launcher.py`, `test_launcher_modes.py`, `test_review_pool.py`). Port any case still needed to `test_assign_launcher.py` first.
-- Before the removal, `commands/showrunner/produce.md` calls `workers.py` in place of `review_pool.py`: the wrap step's `review_pool.py stop` becomes `workers.py stop`, and the unit retire line's `review_pool.py retire` becomes the `workers.py` retire call. Before each delete, grep for callers of the file; every operational caller uses `assign.sh` or `workers.py`.
-- The production scripts drop their `review_pool.py` calls; every reviewer is in a ledger by now (`Transferred` in the pool): `retire_unit.reviewers()` and `stop_rest()` (`POOL` `status` and `retire`), `transfer_unit._move_state()` and `_leased()` (`POOL`), and `rename_unit._move_state()` (`import review_pool`, `review_pool.rename_unit()`).
-- `review_pool_report.py` reads only the ledger. `worker_provenance.py record` has one caller, `assign.sh`. The worker gate's E3 allow list drops `implement.sh`, `review.sh` and `review_pool.py` (hook code; no `settings.json` change).
+- Remove `scripts/direct/implement.sh`, `review.sh` and their tests (`test_implement_launcher.py`, `test_review_launcher.py`, `test_launcher_modes.py`). Port any case still needed to `test_assign_launcher.py` first.
+- **Not in this phase (showrunner, 2026-10-29).** roles-unit (sdlc) owns the removal of `review_pool.py`: the file, its tests (`test_review_pool.py`), its callers (`produce.md`, `retire_unit.py`, `transfer_unit.py`, `rename_unit.py`, `review_pool_report.py`) and `docs/as-built/review-pool.md`.
+- Before each delete, grep for callers of the file; every operational caller uses `assign.sh` or `workers.py`.
+- `worker_provenance.py record` has one caller, `assign.sh`. The worker gate's E3 allow list drops `implement.sh` and `review.sh` (hook code; no `settings.json` change).
 - The "no `implement.sh`" gate covers active scripts, commands and `docs/as-built/` only. It does not read `docs/plans/` or the grep test's own search text.
-- Write `docs/as-built/workers.md`; remove `docs/as-built/long-lived-workers.md` and `docs/as-built/review-pool.md`.
+- Write `docs/as-built/workers.md`; remove `docs/as-built/long-lived-workers.md`.
 
 **Files:**
 - `scripts/direct/implement.sh` — removed
 - `scripts/direct/review.sh` — removed
-- `scripts/direct/review_pool.py` — removed
 - `scripts/direct/test_implement_launcher.py` — removed
 - `scripts/direct/test_review_launcher.py` — removed
 - `scripts/direct/test_launcher_modes.py` — removed
-- `scripts/direct/test_review_pool.py` — removed
-- `scripts/direct/review_pool_report.py`
 - `scripts/direct/assign.sh` — the only `worker_provenance.py` caller
-- `scripts/production/retire_unit.py` — no `review_pool.py` call
-- `scripts/production/transfer_unit.py` — no `review_pool.py` call
-- `scripts/production/rename_unit.py` — no `review_pool` import
-- `commands/showrunner/produce.md` — `review_pool.py stop` and `retire` calls move to `workers.py`
 - `scripts/hooks/pre-tool-use-worker-gate.py`
 - `scripts/hooks/test_worker_gate.py`
-- `scripts/direct/test_review_pool_report.py` — ledger-only cases
 - `scripts/direct/test_assign_launcher.py` — ported launcher cases
-- `scripts/production/test_retire_unit.py`, `scripts/production/test_transfer_unit.py`, `scripts/production/test_rename_unit.py` — pool-call cases removed or moved to the ledger
 - `scripts/hooks/test_old_launchers_gone.py` — new: the "no `implement.sh`" grep test
 - `docs/as-built/workers.md` — new
 - `docs/as-built/long-lived-workers.md` — removed
-- `docs/as-built/review-pool.md` — removed
 
 **Workers:** `1 writer + 1 tester`
-- `impl` — removals, `review_pool_report.py`, `assign.sh`, `retire_unit.py`, `transfer_unit.py`, `rename_unit.py`, `produce.md`, the hook, the as-built
-- `test` — `test_worker_gate.py`, `test_review_pool_report.py`, the ported cases in `test_assign_launcher.py`, the pool-call updates in `test_retire_unit.py`, `test_transfer_unit.py` and `test_rename_unit.py`, and `test_old_launchers_gone.py`: no active script, command or `docs/as-built/` file names `implement.sh` or calls `review_pool.py`
+- `impl` — removals, `assign.sh`, the hook, the as-built
+- `test` — `test_worker_gate.py`, the ported cases in `test_assign_launcher.py`, and `test_old_launchers_gone.py`: no active script, command or `docs/as-built/` file names `implement.sh`
 
 **Constraints from prior phases:**
-- Phase 8: the reviewer state types and `ReviewerType` live in `workers.py`; `review_pool.py` only imports them, so its removal breaks no import. Every unit's pool reviewers are `Transferred` after its `switched`.
 - Phase 12: `switched.json` path, its `switching`/`switched` states and the refusal. Phase 13: the allow list.
 - Phase 4: the ledger, its lock order (ledger, giving roster, taking roster, inbox) and its quarantine stay as they are.
 
