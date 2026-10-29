@@ -24,7 +24,7 @@ from collections.abc import Callable, Iterable, Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
-from typing import Literal, TypedDict, cast, final, override
+from typing import BinaryIO, Literal, TextIO, TypedDict, cast, final, override
 from unittest.mock import call, patch
 from zoneinfo import ZoneInfo
 
@@ -881,6 +881,46 @@ class RestartTests(ShutdownTestCase):
                 self.assertNotIn("private-thread-", text)
                 persisted = next(item for item in record.session_records(LOGIN) if item["session"]["session_id"] == owner["session_id"])
                 self.assertEqual(persisted["progress"]["kind"], "restarted")
+
+    def test_restarted_unit_keeps_its_adopted_reviewer_and_queue_with_the_pool_archive_unreadable(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESUME_CODEX_WORKERS)
+        owner = unit("adopted-review-owner")
+        run = self.root / "adopted-review-run"
+        run.mkdir()
+        name = "project-review"
+        thread = "adopted-private-thread"
+        archive = self.root / "review-pool"
+        archive.mkdir()
+        roster = run / "mesh_roster.json"
+        _ = roster.write_text(json.dumps({name: {"thread_id": thread, "role": "review",
+                                               "status": "paused", "slot": "review"}}))
+        inbox = run / (name + ".pending.json")
+        _ = inbox.write_text(json.dumps({"thread_id": thread, "messages": ["finish the saved review"]}))
+        before = {path: path.read_bytes() for path in (roster, inbox)}
+        saved = entry(owner)
+        saved["codex_seats"] = [record.PausedSeat(run_dir=str(run), seat=name, role="review", thread_id=thread,
+                                                  turn_live=False, launcher_command=[])]
+        self.create([saved])
+        commands = CommandRecorder()
+        original_open = Path.open
+
+        def refuse_archive(path: Path, mode: str = "r", buffering: int = -1,
+                           encoding: str | None = None, errors: str | None = None,
+                           newline: str | None = None) -> TextIO | BinaryIO:
+            if path.is_relative_to(archive):
+                raise AssertionError(f"restart read the archive: {path}")
+            return cast(TextIO | BinaryIO, original_open(path, mode, buffering, encoding, errors, newline))
+
+        with patch.dict(os.environ, {"REVIEW_POOL_STATE": str(archive)}), \
+                patch.object(Path, "open", refuse_archive), patch.object(restart, "_run", commands):
+            restart.confirm_entry(saved, RESTARTED, True, observed_at=time.time())
+        sends = [argv for argv in commands.calls if "resume-workers-" + owner["session_id"] in argv]
+        self.assertEqual(len(sends), 1)
+        self.assertIn("Your next dispatch with --to project-review resumes it.",
+                      sends[0][sends[0].index("--text") + 1])
+        self.assertNotIn(thread, sends[0][sends[0].index("--text") + 1])
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+        self.assertEqual(self.stored_record()["progress"]["kind"], "restarted")
 
     def test_confirmed_top_level_restart_with_a_paused_seat_also_gets_the_resume_message(self) -> None:
         self.allow_leaf(ShutdownSendLeaf.RESUME_CODEX_WORKERS)

@@ -3496,10 +3496,6 @@ def _follow_worker(args: argparse.Namespace) -> int:
                                    accepting_messages=not _messages_closed(handle, thread_id))
         if record.get("unit_ledger"):
             unit_workers.note_backend(Path(session_dir), name, resumed.thread_id, home)
-            _ = _require(client.call("thread/name/set", {
-                "threadId": resumed.thread_id,
-                "name": unit_workers.shown_name(Path(session_dir), name, role=role),
-            }), "thread/name/set")
         if resumed.thread_replaced:
             thread_id = resumed.thread_id
             if not _update_roster_if_expected(session_dir, name, {
@@ -3513,6 +3509,11 @@ def _follow_worker(args: argparse.Namespace) -> int:
                 live_turn = live.turn_id
             reason = live.reason if isinstance(live, ThreadStateUnknown) else "live turn"
             raise SystemExit(f"thread {thread_id}: {reason}; follow-up failed")
+        if record.get("unit_ledger"):
+            _ = _require(client.call("thread/name/set", {
+                "threadId": thread_id,
+                "name": unit_workers.shown_name(Path(session_dir), name, role=role),
+            }), "thread/name/set")
         prompt = _message_text(args)
         timeout = _as_float(_attr(args, "timeout"), 86400.0)
         outcome = _stream_turn(args, client, port, session_dir, name, thread_id, prompt, timeout, opened, follow=True)
@@ -5017,16 +5018,17 @@ def _resume_worker_thread(
     previous_record = _lookup(session_dir, name)
     instructions_file = _as_str(previous_record.get("instructions_file"))
     held = bool(previous_record.get("held_design_id"))
+    own_reviewer = previous_record.get("role") == "review" and bool(previous_record.get("unit_ledger"))
     sandbox = _worker_sandbox(args, session_dir, name)
     resumed = client.call("thread/resume", params)
     if not resumed.get("error"):
         result = _require(resumed, "thread/resume")
-        if (held or previous_record.get("adopted_from")) and _as_str(_as_dict(result.get("thread")).get("id")) != thread_id:
+        if (held or own_reviewer or previous_record.get("adopted_from")) and _as_str(_as_dict(result.get("thread")).get("id")) != thread_id:
             raise SystemExit("RoleNeedsRecovery: resumed thread identity differs; replacement refused")
         return _WorkerThreadForHome(thread_id, False)
     if isinstance(_read_account_move(session_dir, name, thread_id), AccountMoveMarker):
         _ = _require(resumed, "thread/resume")
-    if previous_record.get("adopted_from"):
+    if own_reviewer or previous_record.get("adopted_from"):
         _ = _require(resumed, "thread/resume")
     if held:
         raise SystemExit("RoleNeedsRecovery: held thread could not resume; replacement refused")
@@ -5927,6 +5929,32 @@ def _release_adopted_writer(source: str, name: str, thread_id: str, target_port:
                     raise SystemExit(released.reason)
             finally:
                 client.close()
+
+
+def detach_reviewer_transport(source: str, name: str, thread_id: str,
+                              inbox: TextIO, pending: dict[str, object]) -> None:
+    """Carry server submissions and release the old writer before archiving it."""
+    for port in _run_servers(source):
+        client = Client(port, f"reviewer-transfer-{name}")
+        try:
+            if thread_id not in _loaded_thread_ids(client, time.monotonic() + THREAD_RELEASE_TIMEOUT_SECS):
+                continue
+            if not isinstance(_read_live_turn(client, thread_id), ThreadIdle):
+                raise unit_workers.WorkerUnavailable(f"{name}: reviewer still has a live turn")
+            def park(message: str) -> None:
+                messages = cast(list[str], pending.get("messages", []))
+                pending.update({"thread_id": thread_id, "messages": [*messages, message]})
+                _ = inbox.seek(0)
+                _ = inbox.truncate()
+                _ = inbox.write(json.dumps(pending))
+                inbox.flush()
+                os.fsync(inbox.fileno())
+            _move_queue_to_pending(client, thread_id, park)
+            released = _release_worker_thread(client, thread_id, source)
+            if isinstance(released, WorkerThreadStateUnknown):
+                raise unit_workers.WorkerUnavailable(released.reason)
+        finally:
+            client.close()
 
 
 def worker_launcher_attached(record: Mapping[str, object]) -> bool:

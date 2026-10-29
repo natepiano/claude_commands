@@ -5573,14 +5573,27 @@ def _finding_lenses(event: dict[str, object]) -> set[str]:
     return {part.strip() for part in lens.split(",") if part.strip()}
 
 
-def _raised_code_findings(session_dir: Path, instance_id: str) -> int | None:
+@dataclass(frozen=True)
+class NoRecordedCodeReview:
+    """No finished code review records this phase's raised count."""
+
+
+@dataclass(frozen=True)
+class RecordedCodeFindings:
+    count: int
+
+
+CodeReviewEvidence = NoRecordedCodeReview | RecordedCodeFindings
+
+
+def _raised_code_findings(session_dir: Path, instance_id: str) -> CodeReviewEvidence:
     """The code findings the phase's reviewers raised, from review.sh's turn records.
 
     Sums `raised` over the phase's finished (`reviewed`) code-review turns, as
-    review_pool_report.py's `Raised` does. None when the phase has no such turn:
-    a solo review writes no record.
+    historical and current review records do. No record differs from a
+    recorded review that raised zero findings.
     """
-    raised: int | None = None
+    evidence: CodeReviewEvidence = NoRecordedCodeReview()
     root = plan_history.history_root() / "review_turns" / session_dir.name
     for path in sorted(root.glob("*.json")):
         try:
@@ -5594,8 +5607,9 @@ def _raised_code_findings(session_dir: Path, instance_id: str) -> int | None:
             or _string(record.get("kind")) == "ux"
         ):
             continue
-        raised = (raised or 0) + _integer(record.get("raised"))
-    return raised
+        count = evidence.count if isinstance(evidence, RecordedCodeFindings) else 0
+        evidence = RecordedCodeFindings(count + _integer(record.get("raised")))
+    return evidence
 
 
 def _review_trial(args: argparse.Namespace) -> None:
@@ -5682,8 +5696,8 @@ def _review_trial(args: argparse.Namespace) -> None:
         if _integer(event.get("fix_pass")) in ux_rounds
     )
     raised = _raised_code_findings(session_dir, instance_id)
-    if raised is not None:
-        code_findings = raised
+    if isinstance(raised, RecordedCodeFindings):
+        code_findings = raised.count
     print(
         f"review trial: ux {ux_findings} findings, code {code_findings} findings, "
         + f"review-worker minutes {(review_seconds + 30) // 60}, "

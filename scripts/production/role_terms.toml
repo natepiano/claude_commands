@@ -133,94 +133,13 @@ reason = "Legacy SQL migration input value removed after copying rows."
 [[terms]]
 name = "review pool"
 kind = "record"
-defined_in = "docs/production_format.md#Words"
+defined_in = "docs/as-built/review-pool.md"
 other_names = []
 retired = ["review pool"]
 
-[[terms.kept_contexts]]
-path = "commands/showrunner/produce.md"
-text = "When the production doc has a **Review pool** line, no unit runs the pool:"
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
 
-[[terms.kept_contexts]]
-path = "commands/showrunner/produce.md"
-text = "   With a **Review pool** line, run"
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
 
-[[terms.kept_contexts]]
-path = "commands/unit/direct.md"
-text = "When the production doc names a review pool, send code reviews with"
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
 
-[[terms.kept_contexts]]
-path = "commands/unit/direct.md"
-text = "In a production whose doc names a review pool, review prompts use"
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "commands/unit/direct.md"
-text = "When the production doc names a review pool, on a pool review's `error` retry"
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "commands/unit/direct.md"
-text = "4. When the production doc names a review pool, select no worker. Otherwise select its worker under <TeamReview/>, save the"
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "commands/unit/direct.md"
-text = "   a review pool; otherwise with `--to` for an"
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "commands/unit/direct.md"
-text = "When the production doc names a review pool, use"
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "commands/unit/direct.md"
-text = "   Without `ui` in the production's `**Review pool:**` line, spawn a fresh"
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "docs/as-built/agent-registry.md"
-text = "`--image`, serve the review pool's reviewers and are described in"
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "docs/as-built/agent-registry.md"
-text = "  review pool (`review_pool.py`), not a second dispatcher. It resolves"
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "docs/as-built/guilds.md"
-text = "- **One store outside run roots.** A run folder ends with its run, and a `MeshWorker` hold ends with its folder. A design outlives several phases and runs, so its threads, prompts, replies and pending text live in `~/.local/state/guilds/roles/`, and the census uses a `HeldDesignRole` lifetime tied to that store. The review pool showed the pattern of lasting threads outside run roots. Copying a live roster into another run, or putting a design type inside the review pool, would give one thread two owners."
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "docs/as-built/long-lived-workers.md"
-text = "A `/unit:direct` run opens its Codex workers once and keeps them for the rest of the run. Every later phase, repair round, broad review lens, closure review and phase-review architect pass goes to a worker that is already open, with `--to <full-worker-name>`. The exception is a phase on the pool arm of a production with a review pool: its code reviews go to the production's pooled reviewers, which are not workers of the run (`docs/as-built/review-pool.md`). A worker can change role between tasks: a writer becomes a tester, a tester becomes a reviewer, or a writer takes the adversary lens against its own code. Before an open worker gets new work, the launcher compacts its thread if the recorded context is over a threshold. A turn that fills the context window gets the follow-up \"Continue where you stopped.\" When a phase finishes, its turns end but its threads stay open. The threads end only when `end_session.sh` stops the run's app-server. `scripts/whoami/worker_usage.py` checks whether this saves Codex usage. It reads the usage store (`docs/as-built/usage-ledger.md`), compares weighted Codex usage per checkpointed phase before and after the go-live time, and reports account switches per week and credits used per day alongside."
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "docs/as-built/long-lived-workers.md"
-text = "**Server environment.** `_start_server` gives the server the caller's environment with `CODEX_HOME` set to the workers home. When `--session-dir` is a child of a unit run root (`RUN_ROOTS`, `/tmp/claude/unit` and `/tmp/claude/delegate`), it also sets `UNIT_RUN_DIR` to that folder and `TMPDIR` to its `tmp/` folder, replacing any values the caller carries. Worker processes inherit it: `verify.sh` takes the cargo token on that board, and the berth hook (`scripts/hooks/pre-tool-use-berth.py`) checks that run's open phases. The caller's copy cannot be used: implement.sh exports it only after its claim step, and the claim's `compact` call starts the server when none is running. On 2026-10-17, 11 of 13 live app-servers lacked it, all three started by that `compact` call among them. A review pool's mesh directory (`mesh/<generation>/`), and any other mesh directory outside the run roots, keeps the caller's environment unchanged: one pool server serves the turns of many units, so no single run is right for it, and a reviewer edits nothing."
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "docs/as-built/long-lived-workers.md"
-text = "| `follow` | `--session-dir --to --role (required) [--lens] [--claim-pid] --message-file --summary-file [--reply-file] --log-file [--model --effort --service-tier] [--cwd] [--read-only] [--image …]` | Runs one more turn on a finished thread. If the old server is gone, it resumes the thread on a new one. `--cwd`, `--read-only` and `--image` apply to that turn only and exist for the review pool; without them the request is the worker's usual one. |"
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "docs/as-built/long-lived-workers.md"
-text = "| `prime`, `fork`, `reset` | see `docs/as-built/review-pool.md` | Create a read-only reviewer template with standing instructions, fork a named reviewer from it, and remove every turn from an idle reviewer. Only the review pool calls them. |"
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "docs/as-built/production-rename.md"
-text = "  would break the review pool and unit lookup for timer-less productions."
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
 
 [[terms.kept_contexts]]
 path = "docs/as-built/review-pool-probes.md"
@@ -230,11 +149,6 @@ reason = "Current pool compatibility; the pool removal deletes this kept context
 [[terms.kept_contexts]]
 path = "docs/as-built/review-pool.md"
 text = "# Review pool"
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "docs/as-built/review-pool.md"
-text = "| `docs/production_format.md` | Words, the `**Review pool:**` line, `retire` before a unit is marked retired, <ProductionUnit/> items 3 and 16 |"
 reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
 
 [[terms.kept_contexts]]
@@ -250,56 +164,6 @@ reason = "Current pool compatibility; the pool removal deletes this kept context
 [[terms.kept_contexts]]
 path = "docs/as-built/review-pool.md"
 text = "- With no `**Review pool:**` line in the production doc, and outside a production, every command behaves as it did without the pool. `review.sh`'s `--slot` and fresh paths are unchanged; `--to` gains only the turn record and the signal traps that mark it `canceled`."
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "docs/as-built/showrunner-automation.md"
-text = "- **Callers.** `produce.md` `<LaunchUnits/>` runs `add_unit.py --production PRODUCTION_DOC <name> --plan <unit plan>` per unit (`<name>` is the Unit value less any `-unit`; `--standby` for a unit waiting on work). When the production doc has a `- **Review pool:** ` line, the showrunner runs `review_pool.py stop --production <slug>` at wrap (`docs/as-built/review-pool.md`); the first review of each type primes the pool. `/showrunner:promote_unit` runs: find the session, check fit (normalized unit name), plan, `add_unit.py … --resume <sessionId> --cwd <cwd> --plan <plan> --check`, `/exit` the session, then the same command without `--check`, then tell the user (both names when the name changed). Typing `/compact` into a blocked unit director and **Resume** stay the showrunner's own."
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "docs/direct/dual_review.md"
-text = "When the production doc names a review pool, the launcher allocates each"
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "docs/direct/dual_review.md"
-text = "When the production doc names a review pool, every code review prompt opens"
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "docs/direct/dual_review.md"
-text = "   both otherwise. When the production doc names a review pool:"
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "docs/direct/dual_review.md"
-text = "   unless the production doc names a review pool. With a pool, read each"
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "docs/production_format.md"
-text = "  production's review pool when its doc names one."
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "docs/production_format.md"
-text = "- **Review pool** — a production's reusable reviewers, allocated by a script."
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "docs/production_format.md"
-text = "- **Review pool:** code (or `code, ui`); omit when the production has none"
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "docs/production_format.md"
-text = "anywhere else in the cell changes nothing. With a **Review pool** line, the"
-reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
-
-[[terms.kept_contexts]]
-path = "docs/production_format.md"
-text = "16. **Review pool.** With a `**Review pool:**` line in the production doc, send"
 reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
 
 [[terms.kept_contexts]]

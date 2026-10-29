@@ -1255,6 +1255,56 @@ class WorkerShownNameTests(MeshCommandFixture):
         self.assertIn(f"continues as new thread {THREAD_ID}", notice)
         self.assertEqual(len(self.methods("turn/start")), 1)
 
+    def test_a_refused_unit_reviewer_follow_keeps_the_existing_thread_title(self) -> None:
+        self.configure_context()
+        self.start_args_timeout = 0.1
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done",
+                                          "role": "review", "port": self.server.port,
+                                          "unit_ledger": str(unit_workers.ledger_for_run(self.session_dir).path)}})
+        old_title = "A title kept from the last accepted review"
+        title = old_title
+        respond = self.server.respond
+
+        @bounded_fixture
+        def remember_title(request: dict[str, object]) -> list[dict[str, object]] | None:
+            nonlocal title
+            if request.get("method") == "thread/resume":
+                self.live_turn = "another-review-turn"
+            if request.get("method") == "thread/name/set":
+                title = str(_as_test_dict(request["params"])["name"])
+            return respond(request)
+
+        self.server.respond = remember_title
+        code, errors = self.run_follow(role="review")
+        self.assertNotEqual(code, 0, errors)
+        self.assertIn("live turn", errors)
+        self.assertTrue(self.methods("thread/resume"), "follow must reach the later idle check")
+        self.assertTrue(self.methods("thread/read"))
+        self.assertEqual(self.methods("thread/name/set"), [])
+        self.assertEqual(self.methods("turn/start"), [])
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(title, old_title)
+
+    def test_an_accepted_unit_reviewer_follow_uses_the_configured_shown_name(self) -> None:
+        self.configure_context()
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done", "role": "review",
+                                          "port": self.server.port,
+                                          "unit_ledger": str(unit_workers.ledger_for_run(self.session_dir).path)}})
+        configured = fixture_names()
+        jobs = dict(configured.jobs)
+        jobs["code_reviewer"] = ("code checker",)
+        with patch.object(names, "runtime_names", return_value=names.Names(jobs, configured.audiences)):
+            code, errors = self.run_follow(role="review")
+        self.assertEqual(code, 0, errors)
+        titles = self.methods("thread/name/set")
+        self.assertTrue(titles)
+        for request in titles:
+            self.assertEqual(_as_test_dict(request["params"]), {
+                "threadId": THREAD_ID, "name": "natedev · models · code checker"})
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(self.worker_record()["role"], "review")
+        self.assertEqual(self.methods("thread/start"), [])
+
     def test_help_for_addressable_commands_uses_the_worker_vocabulary(self) -> None:
         for command in ([], ["start"], ["follow"], ["prime"], ["fork"], ["reopen"], ["adopt"]):
             with self.subTest(command=command), contextlib.redirect_stdout(io.StringIO()) as output:

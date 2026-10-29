@@ -47,7 +47,7 @@ Repair source check, 2026-10-20: Guilds HEAD is `95eb9cda042cead9f09dcdab29025f3
 | D12 | Write implementation, tests and repairs for assigned phase files | Codex worker | Small-fix helper handles separate small unowned fixes; Unit director has the stated doc-only or trivial post-review exception | duplicate | PF, Words → Worker; UD, opening and `<CoreContract>`; `docs/delegate/write_prompt_contract.md`, `<TeamFilePartition>` |
 | D13 | Run assigned checks and read their output | Codex worker | Unit director owns acceptance, live smoke and final gate; these are separate checks | duplicate | `docs/delegate/phase_checks.md`, `<PhaseChecks>`; `docs/delegate/launch_implementation.md`, `<LaunchImplementation>` item 8; UD, `<RunApplicationSmokeTest>` and `<FinalGate>` |
 | D14 | Run the main phase review, including style | Unit director | Codex worker and Pooled reviewer supply separate read-only reviews; a standalone style review stays with its invoking session | duplicate | `docs/delegate/dual_review.md`, `<DualReview>` item 4; `docs/delegate/phase_checks.md`, `<PhaseChecks>`; `commands/unit/style_review.md`, opening and `<StyleReview>` |
-| D15 | Review code in a production with a review pool | Pooled reviewer | Codex worker is the explicit fallback if the pool cannot prime | duplicate | PF, Words → Reviewer and `<ProductionUnit>` item 16; UD, `<LongLivedWorkers>` |
+| D15 | Review code in a production with a review pool | Pooled reviewer | Codex worker is the explicit fallback if the pool cannot prime | duplicate | PF, Words → Reviewer; UD, `<LongLivedWorkers>` |
 | D16 | Hold and supply the standing review prompt | Review template | None; pool scripts allocate leases and never lease the template | one owner | PF, Words → Template, Review pool and Lease |
 | D17 | Bring a user-only decision or action to the user | Top-level showrunner | Child showrunner asks in its own reply, keeps its own open item and also sends the item directly to its root; a question between productions goes to its parent; Unit director supplies the need to its showrunner | duplicate | SR, opening, `<Throughout>` → Nested showrunners, What reaches the user and Open questions; Hierarchy at `d0b07aec`, Map → Roles → Child showrunner and Channels → Open question; hana memory `unit-asks-go-through-the-showrunner.md`, body and How to apply; PF, `<ProductionUnit>` item 2 |
 | D18 | Relay the user's words to a unit | Top-level showrunner | Child showrunner relays to its own units; Unit director alone relays user words to its workers | duplicate | SR, `<Throughout>` → The user's words for a unit director and Nested showrunners; `docs/delegate/write_prompt_contract.md`, `<WritePromptContract>` item 4 and `<PhaseMesh>` |
@@ -71,7 +71,7 @@ Repair source check, 2026-10-20: Guilds HEAD is `95eb9cda042cead9f09dcdab29025f3
 | D36 | Set unit director effort and role-account selections | Top-level showrunner | Child showrunner can invoke the commands; natedev manages the shared role map, not a separate map per production | one owner | `commands/showrunner/effort.md`, opening; `commands/showrunner/accounts.md`, natedev role-map rule; config memory `ask-director-before-moving-unit.md`, How to apply bounds restarts |
 | D37 | Route a cross-unit API rename or a file restructure | Top-level showrunner | Unit director ports and tests its own branch | duplicate | SR, `<CrossUnitChange>`; PF, `<ProductionUnit>` item 8 |
 | D38 | Clear a dependency gate after a checkpoint merges | Top-level showrunner | Unit director checks the gate before dispatch | duplicate | SR, `<ClearGate>`; PF, `<ProductionUnit>` item 6 |
-| D39 | File a finished proposal and start its approved work | Unit director | Top-level showrunner records the user's verdict and returns approved work; Executive producer approves product or process scope | duplicate | PF, `<ProductionUnit>` item 17; `commands/showrunner/proposal.md`, File, Approve and Start and close |
+| D39 | File a finished proposal and start its approved work | Unit director | Top-level showrunner records the user's verdict and returns approved work; Executive producer approves product or process scope | duplicate | PF, `<ProductionUnit>` item 16; `commands/showrunner/proposal.md`, File, Approve and Start and close |
 | D40 | Record an implemented change for the user's later review | Top-level showrunner | Unit director supplies checkpoint Change-Review lines; Executive producer gives the verdict | duplicate | SR, `<ChangeReviewFeatureLog>` and `<CloseChangeReview>`; `commands/change_review.md`, add and show |
 | D41 | Give a phase briefing, phase report and ETA breakdown | Unit director | Top-level showrunner requests them and uses the result in dailies | one owner | `commands/unit/brief.md`, opening; `commands/unit/phase_report.md`, opening; `commands/unit/eta_breakdown.md`, Steps |
 | D42 | Give the unit's current status report | Unit director | Top-level showrunner requests it; reports have no timer | duplicate | PF, `<ProductionUnit>` item 11; `commands/unit/report.md`, opening and `<ProgressReport>` |
@@ -951,13 +951,21 @@ R1b and R5b, built in phase 5. A session's name and its role are separate. Every
 | Worker assignment | `role` in each `mesh_roster.json` record | `impl`, `test`, `fix`, `review`; a record with no `role` is unrecorded; any other value is unreadable | `impl`, `test`, `fix` → `worker`; `review` → `code reviewer`; unrecorded or unreadable → no job, with the reason |
 | Guild responsibility | guild records | unchanged | not shown in this phase |
 
-An Astra held role keeps its own assignment state; it is not a worker assignment. A review-pool reviewer named `<type><n>` (`code6`, `ui2`) has the job `code reviewer` or `UI reviewer` with the number `n`, and the unit of its current lease. The roster finds pool reviewers itself: each has the address `worker:review-pool/<production>/<run>/<reviewer>` and its director is the unit director that holds the lease. The name never supplies a role: a record without a role keeps its explicit state.
+An Astra held role keeps its own assignment state; it is not a worker assignment.
+A unit owns its code reviewers in the worker ledger, role `review`, job key
+`code_reviewer`, slots `review` and `review2`. The first own dispatch adopts the
+unit's leased reviewer on its existing thread before it opens any new reviewer.
+A busy lease reserves `review` while new work uses `review2`. Once moved, the
+worker's transport and history no longer read the archived pool meshes. Legacy
+pool rows remain visible only until the next phase removes their readers.
+The name never supplies a role: a record without a role keeps its explicit state.
 
 **Shown name.** Parts join with ` · `. The production part is the production slug. The unit part is the unit name without its `-unit` suffix. The job part is the job word, then the slot or the number that tells several holders apart. An absent part is left out. A session with no production, no unit and no job shows its address.
 
 | Record | Shown name |
 | --- | --- |
-| sdlc pool reviewer `code6`, leased to roles-unit | `sdlc · roles · code reviewer 6` |
+| roles-unit reviewer in slot `review` | `sdlc · roles · code reviewer` |
+| roles-unit reviewer in slot `review2` | `sdlc · roles · code reviewer 2` |
 | roles-unit director | `sdlc · roles · unit director` |
 | roles-unit worker in slot `test` | `sdlc · roles · worker test` |
 | roles-unit worker in slot `impl`, doing review | `sdlc · roles · code reviewer impl` |

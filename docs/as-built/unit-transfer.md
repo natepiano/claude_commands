@@ -1,5 +1,9 @@
 # Unit transfer (as built)
 
+Code reviews now use the unit's persistent `review` and `review2` workers
+through `assign.sh --role review`. Any pool maintenance paths described below
+remain only for the pending archive cleanup; they do not dispatch new reviews.
+
 `/showrunner:transfer_unit <unit> <to production doc>` (`commands/showrunner/transfer_unit.md`)
 moves one natedev unit director from one production to another. The giving showrunner runs it. The
 script is `scripts/production/transfer_unit.py`, with three actions: `plan`, `apply` and `verify`

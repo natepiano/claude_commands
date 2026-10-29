@@ -1,5 +1,8 @@
 # Review pool
 
+The pool no longer takes reviews. Unit directors use `assign.sh --role review`.
+The code and historical procedures below remain until the next phase removes them.
+
 ## What it is
 
 Each production has its own pool of long-lived, read-only Codex reviewers. A unit that needs a review calls a script, which hands it a reviewer at once. Each unit has a permanent reviewer per type: its first review forks one from the type's template, and every later review resumes that same thread, so the reviewer keeps building context about the unit's work across phases and plans. When every reviewer of the unit is busy, the pool forks the unit's newest reviewer, and the fork stays as the unit's second reviewer. A reviewer ends only when its unit is retired, `migrate` finds its unit gone, or the pool stops. A second reviewer type judges screenshots; it runs in shadow beside the Claude design-check helper until the user adopts it.
@@ -11,7 +14,7 @@ Each production has its own pool of long-lived, read-only Codex reviewers. A uni
 | File | Role |
 | --- | --- |
 | `scripts/direct/review_pool.py` | The pool CLI: templates, reviewers, unit leases, re-pointing, retire, migrate, stop, and the standing prompt each template is primed from |
-| `scripts/direct/review.sh` | The review launcher; its `--pool` path allocates, runs and records one review turn |
+| `scripts/direct/review.sh` | Uses unit reviewers; legacy code flags are ignored and UI flags refuse |
 | `scripts/direct/review_pool_report.py` | The cost and quality report over turn records, and `--shadow` |
 | `scripts/agents/codex_mesh.py` | The Codex mesh; `prime`, `fork`, `set-instructions` and three `follow` flags exist for the pool |
 | `config/review/code.md` | Standing instructions of the code reviewer |
@@ -19,7 +22,7 @@ Each production has its own pool of long-lived, read-only Codex reviewers. A uni
 | `commands/unit/direct.md` | The unit director's side: pool form of each review launch, <UXReview/> |
 | `docs/direct/dual_review.md` | Pool prompt opening, pool launch call, cancel through the slot file |
 | `docs/direct/phase_end.md` | States that a pooled reviewer belongs to the unit and stays at phase end |
-| `docs/production_format.md` | Words, the `**Review pool:**` line, `retire` before a unit is marked retired, <ProductionUnit/> items 3 and 16 |
+| `docs/production_format.md` | Defines unit-owned reviewers and the unit lifecycle |
 | `commands/showrunner/produce.md` | `retire` for a retired unit, `stop` at wrap |
 
 ### State

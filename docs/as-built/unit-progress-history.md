@@ -1,5 +1,9 @@
 # Unit progress history
 
+Code reviews now use the unit's persistent `review` and `review2` workers
+through `assign.sh --role review`. Any pool maintenance paths described below
+remain only for the pending archive cleanup; they do not dispatch new reviews.
+
 `scripts/direct/progress_history.py` is the shared progress recorder for
 Claude and Codex implementations of `/unit:direct`. It writes append-only
 per-run JSONL files under:
@@ -297,9 +301,10 @@ and `findings.py gate` counts passes to decide whether a phase is converging.
 The single exception is a launcher the unit director killed, whose pass stays
 open: `finish-pass --status canceled --orphaned-launcher` closes it, and only
 that status, and only while a pass is open. A review with lens `ux` records
-no pass: the unit director's `UX review` activity carries that time. A pooled
-review records its pass under the slot `pool_<reviewer>`
-(`docs/as-built/review-pool.md`).
+no pass: the unit director's `UX review` activity carries that time. Code review
+uses the unit's `review` or `review2` slot. Review evidence records `arm: own`;
+earlier `arm: pool` records remain readable. No recorded review differs from a
+recorded review with zero findings.
 
 `progress` writes the event and prints a short report under a line naming the
 worktree, and the branch when it differs: the phase heading, one ETA line, the
