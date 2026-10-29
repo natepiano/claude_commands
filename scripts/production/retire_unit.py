@@ -318,8 +318,9 @@ def run_processes(worktree: Path, inside: list[int]) -> dict[int, str]:
 
     A run's detached command (mesh_runs.py supervise) is found by its record, which holds the
     supervisor's pid and is in the supervisor's arguments; an app-server by its run's
-    mesh_server.json; an app-server's idle-stop watcher by the run folder in its arguments. Each
-    leads its own session, so its children go with it.
+    mesh_server.json; a live server's idle-stop watcher by its mesh entry point and run folder
+    arguments. A dead server's watcher needs no matching run history: its own kill -0 rule would
+    end it at its next wake. Each leads its own session, so its children go with it.
     """
     runs = runs_of(worktree)
     leaders = {item.pid: f"app-server {item.pid} of run {item.run.name}" for item in mesh_runs(runs)}
@@ -333,9 +334,19 @@ def run_processes(worktree: Path, inside: list[int]) -> dict[int, str]:
     folders = {str(folder.resolve()): folder.name for folder in runs}
     for pid in inside:
         words = command_line(pid)
-        named = [folders[word] for word in words if word in folders]
-        if words[:2] == ["sh", "-c"] and named and any("idle-stop" in word for word in words):
-            leaders[pid] = f"app-server watcher {pid} of run {named[0]}"
+        if (len(words) < 7 or Path(words[0]).name != "sh" or words[1] != "-c"
+                or "idle-stop" not in words[2] or Path(words[3]).resolve() != MESH.resolve()):
+            continue
+        try:
+            server = int(words[4])
+        except ValueError:
+            continue
+        if server <= 0:
+            continue
+        if not _alive(server):
+            leaders[pid] = f"app-server watcher {pid} of dead server {server}"
+        elif (folder := str(Path(words[6]).resolve())) in folders:
+            leaders[pid] = f"app-server watcher {pid} of run {folders[folder]}"
     return {pid: f"process {pid} ({_command_name(pid)}) of the {leaders[leader]}"
             for pid in inside if (leader := _session_of(pid)) in leaders}
 
