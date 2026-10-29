@@ -77,7 +77,7 @@ Run these in a terminal:
 
 | Command | Account |
 | --- | --- |
-| `claude` | The default `~/.claude` home, through `accounts.py exec claude` after the shell alias is updated. |
+| `claude` | The configured showrunners account, through `accounts.py exec showrunners`. `accounts.py exec claude` starts the default `~/.claude` home, which is signed out after home cutover. |
 | `claude1` | claude1 |
 | `claude2` | claude2 |
 | `claude3` | claude3 |
@@ -251,7 +251,7 @@ Run from a terminal (`CLAUDE_CODE_SESSION_ID` unset, stdout a tty), the move the
 
 Each return keeps the conversation, cwd, name, model and production resume prompt, including a unit director's ongoing run. A manual restart outcome supplies its command and place. The target is checked again at launch; its prepared environment drops inherited OAuth tokens without changing credentials or other sessions.
 
-Numbered Claude aliases through `accounts.py exec` use the terminal supervisor when stdin is a tty. Its child gets `RELAUNCH_SUPERVISED=1`; a resumed `accounts.py exec` sees that marker and execs Claude directly. Redirected and already supervised launches also exec Claude directly. Tmux respawns its existing pane. Supervised Ghostty and Terminal restarts keep the same window and scroll history; the existing fallback opens a new window if the supervisor is gone or its identity changed. Legacy Ghostty and Zed windows use the recorded desktop restart path.
+Every Claude launch through `accounts.py exec` (numbered labels, groups and `exec claude`) uses the terminal supervisor when stdin is a tty. Its child gets `RELAUNCH_SUPERVISED=1`; a resumed `accounts.py exec` sees that marker and execs Claude directly. Redirected and already supervised launches also exec Claude directly. Tmux respawns its existing pane. Supervised Ghostty and Terminal restarts keep the same window and scroll history; the existing fallback opens a new window if the supervisor is gone or its identity changed. Legacy Ghostty and Zed windows use the recorded desktop restart path.
 
 ## Picking an account
 
