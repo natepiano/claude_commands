@@ -31,7 +31,7 @@ Showrunner of build-followups, 2026-10-28 (measured by builds-unit):
 - `scripts/hooks/hook_dispatch.py` runs the Python hooks of PreToolUse, PostToolUse and Stop in one interpreter each, in the old `settings.json` order, with the same decisions, text and exit codes. The combination rules are in its docstring. `settings.json` has one dispatcher entry per event; the shell hooks (with origin's `pre-tool-use-build-hold-guard.sh`), push-gate and the other events stay as their own entries. The random-ack entry is removed; its script header says how to turn it on again.
 - Bench (N=20, same window, natedev under load): child CPU per Bash call 576.5 -> 350.7 ms (-39%), per Stop 317.4 -> 168.3 ms (-47%).
 - Gate: the full merge gate added no failure; the one red (`direct/test_progress_history`, AF_UNIX path too long) fails the same way on origin dab6cf38.
-- Open: the live check in a new session (refused heredoc, allowed Bash, Stop with a banned word) runs after promotion to main.
+- Live check on main d76569ca (2026-10-28 23:00 EDT): scratch-guard refused a Write with its usual text, PostToolUse blocked forbidden words in a tool output, the Stop dispatcher blocked a turn, and a new probe session's prose word reached the prose log (that hook logs and never blocks).
 
 ### Phase 5 — Checkpoint doc gate judges the staged tree and real git command words  · status: done
 
