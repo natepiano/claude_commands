@@ -2,6 +2,11 @@
 
 ## Items to consider
 
+- [ ] **The notes timer pass costs less than 10 s of CPU.**
+  - Target: scripts/whoami/agent_notes.py and the work it calls on a 2-minute pass that reuses the usage reading
+  - Why needed: after the usage-read cut (Phase 91, live 2026-10-28 23:05 EDT) agent_notes.py still uses 10–11 s of CPU per run (0.4–0.55 core) on natedev; the usage read is no longer its largest part
+  - Completion condition: a profile of one reused pass names its largest costs, the largest is cut, and the measured CPU per run drops (journalctl "Consumed" lines and the notes sampler, before and after)
+  - Revealed by: Phase 91 after-numbers; showrunner ruled next 2026-10-28
 - [ ] **All consumers import shared whoami modules by one name.**
   - Target: scripts/whoami, scripts/accounts, scripts/agents, scripts/message, scripts/production, scripts/herdr and scripts/shutdown
   - Why needed: sibling and package imports coexist; agent_accounts, account, note_file, session_table, run_out and usage_store register both names to preserve shared type identity and patched settings
