@@ -301,6 +301,21 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Ruled out:** a UI review pool — the fresh Claude helper stays the one design check; a second reviewer allocator — `workers.resolve` and `open_unit_worker` are enough.
 
+### Phase 10b — A unit with several old pool reviewers adopts one  · status: done
+**Depends on:** Phase 10 (on `~/.claude` main c277d568). A defect fix the showrunner asked for on 2026-10-29, reported by builds (resources-unit); it ships in one hash with Phase 12.
+
+#### Work Order
+
+**Goal:** a unit whose pool holds more than one earlier code reviewer leased to it adopts one of them, the newest, and the others no longer block it. Today `review.sh` prints `ERROR: no unit reviewer: workers: code10, code11, …: unit already has a different review worker`, because `_transfer_conflict` in `scripts/direct/workers.py` checks each candidate against the one destination name.
+
+**Spec:** adopt the newest leased reviewer; release the others from the unit's lease the way the pool already releases a lease; an adopted unit reviewer still wins over any leased one; a rerun after a crash finishes the same way; the dry run shows the same choice and writes nothing.
+
+**Files:** `scripts/direct/workers.py`, its tests, `docs/as-built/long-lived-workers.md` if it describes adoption.
+
+**Workers:** `impl` (writer and tester).
+
+**Acceptance gate:** tests for 2 and 3 earlier leased reviewers; the direct suites and the merge gate green; basedpyright 0/0/0.
+
 ### Phase 11 — The review pool and the transfer code are gone  · status: todo
 **Depends on:** Phase 10 merged to main (the showrunner says when), and Phase 12 (it renames the held design role names in the same files).
 

@@ -21,9 +21,16 @@ worker ledger. Usage reports compare checkpointed phases through the usage store
 
 ## Unit code reviewers
 
-Code reviewers use the ordinary unit worker ledger. The first own dispatch
-adopts the unit's leased code thread before opening any new reviewer. A busy
-lease holds `review`, so concurrent work uses `review2`. A later dispatch
+Code reviewers use the ordinary unit worker ledger. A reviewer already in the
+unit's destination slot wins, whether the unit opened it or adopted it from the
+pool. Ordinary resolution registers a roster-only reviewer in the ledger and
+keeps its thread. Otherwise the first own dispatch adopts the unit's most recently
+allocated leased code thread (`Reviewer.last_allocated`, with the reviewer name
+breaking ties) before opening any new reviewer. A saved transfer keeps its choice
+on recovery. Other idle leases return to the pool as `Unleased`; busy surplus
+leases are released on a later dispatch. Once no code leases remain for the unit,
+the ledger records `reviewers_adopted`, so later dispatches skip the pool. A busy chosen lease holds
+`review`, so concurrent work uses `review2`. A later dispatch
 adopts the first thread when its turn ends.
 
 | Worker slot | Role | Access | Lifetime |
@@ -58,7 +65,8 @@ python3 scripts/direct/workers.py transfer-reviewers --production <slug> \
 ```
 
 The default prints `preview: would migrate` and writes nothing. It also lists
-busy reviewers as deferred, conflicts, and each skipped UI or unleased reviewer.
+surplus leases as `preview: would release`, busy reviewers as deferred, conflicts,
+and each skipped UI or unleased reviewer.
 Use `--apply` for an explicit move. Each applied result names the destination
 owner and the checked thread id. The command exits non-zero while any leased
 code reviewer is deferred or in conflict.
