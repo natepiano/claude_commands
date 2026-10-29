@@ -57,6 +57,7 @@
 | typesafe-unit | docs/plans/build-followups-typesafe.md | `/home/natepiano/worktrees/claude-natedev-typesafe` | `natedev-typesafe` | — | — |
 | postmaster-unit | permanent | /home/natepiano/worktrees/claude-build-followups-postmaster | build-followups-postmaster | — | — |
 | ups-unit | permanent | /home/natepiano/worktrees/claude-build-followups-ups | build-followups-ups | — | — |
+| verify-unit | docs/plans/natedev-verify.md | /home/natepiano/worktrees/claude-build-followups-verify | natedev-verify | — | `scripts/direct/verify.sh`, `scripts/direct/final_pass.py`, the verify cache, lint and test scope, verify speed, the Mac test code (`scripts/mac_test/`), from builds-unit |
 
 ## Hub files
 
