@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, TypedDict, cast, override
 import update_registration as registration
 import showrunners
 import dailies_render
-from add_unit import read_production
+from production_units import read_production
 
 if TYPE_CHECKING:
     from scripts.notify import review

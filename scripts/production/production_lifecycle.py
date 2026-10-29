@@ -12,7 +12,7 @@ from typing import NamedTuple, cast
 import showrunners
 import tidy_wrapped
 import unit_lookup
-from add_unit import Production, read_production
+from production_units import Production, read_production
 from production_units import Refusal, cell_value, production_field, unit_table
 from merge_checkpoint import (CodeCheckpoint, MergeEntry, NoMerge,
                               PromotionAlreadyAtTip, PromotionOriginPushed, PromotionNotPushed,

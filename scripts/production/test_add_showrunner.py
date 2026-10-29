@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.accounts import accounts
 from scripts.production import add_showrunner
-import add_unit
+import production_units
 import showrunners
 import usage_store
 import herdr as runtime
@@ -352,7 +352,7 @@ class AddShowrunnerTests(unittest.TestCase):
         return directory
 
     def test_showrunner_shared_tab_retries_enter_with_the_selected_session_transcript(self) -> None:
-        child = add_unit.read_production(self.doc("kid"))
+        child = production_units.read_production(self.doc("kid"))
         selected = accounts.NamedAccount("claude3", self.root / "selected")
         transcript = selected.dir / "projects/fixture/resumed-id.jsonl"
         transcript.parent.mkdir(parents=True)
@@ -600,7 +600,7 @@ class AddShowrunnerTests(unittest.TestCase):
 
     def test_resume_uses_the_configured_showrunners_account(self) -> None:
         directory = self.named_account()
-        child = add_unit.read_production(self.doc("kid"))
+        child = production_units.read_production(self.doc("kid"))
         self.resume_record()
         with patch.dict(os.environ, self.env, clear=True), \
                 patch.object(accounts, "role_account", wraps=accounts.role_account) as role:
@@ -609,7 +609,7 @@ class AddShowrunnerTests(unittest.TestCase):
         role.assert_called_once_with("showrunner")
 
     def test_check_validates_the_destination_without_returning_a_binary(self) -> None:
-        child = add_unit.read_production(self.doc("kid"))
+        child = production_units.read_production(self.doc("kid"))
         with patch.dict(os.environ, self.env, clear=True), \
                 patch.object(add_showrunner, "running", return_value=False), \
                 patch.object(showrunners, "descendants_of", return_value=[]), \

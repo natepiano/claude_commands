@@ -29,7 +29,7 @@ from typing import NamedTuple, cast
 import change_review
 import scratch  # on the path once change_review has put scripts/lib there
 from showrunners import canonical_slug
-from add_unit import Production, read_production
+from production_units import Production, read_production
 from production_units import Refusal, cell_value, production_field, unit_table
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
