@@ -4,25 +4,20 @@
 Registry decoding and process identity belong to message/sessions.py. Build
 holds belong to the build-target state readers. A locked journal reserves each
 restart before invoking shutdown, including failed attempts, for one hour.
-The SessionStart worker may watch an active session for at most thirty minutes;
-the five-minute notifier sweep handles later opportunities.
+A five-minute notifier timer runs the sweep.
 """
 from __future__ import annotations
 
 import argparse
-from collections.abc import Generator
-from contextlib import contextmanager
 import fcntl
 import json
 import math
 import os
 import shlex
-import signal
 import socket
 import subprocess
 import sys
 import time
-from types import FrameType
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,7 +35,6 @@ else:
 
 STATE_DIR = Path.home() / ".local/state/nix-heal"
 RESTART_INTERVAL_SECONDS = 3600
-IDLE_WAIT_SECONDS = 1800
 # A fresh allow and export can each consume the helper's full budget, followed
 # by herdr's 90-second launch and command startup/record confirmation overhead.
 RELAUNCH_TIMEOUT_SECONDS = 2 * nix_env.TIMEOUT_SECONDS + 90 + 30
@@ -75,34 +69,6 @@ class Unavailable:
 @dataclass(frozen=True)
 class Gone:
     pass
-
-
-class IdleDeadline(Exception):
-    """The detached SessionStart worker has used its complete wall-time budget."""
-
-
-def idle_deadline(signum: int, frame: FrameType | None) -> None:
-    del signum, frame
-    raise IdleDeadline()
-
-
-@contextmanager
-def idle_budget(seconds: int) -> Generator[None]:
-    if not seconds:
-        yield
-        return
-    handler = signal.getsignal(signal.SIGALRM)
-    previous = signal.setitimer(signal.ITIMER_REAL, 0)
-    started = time.monotonic()
-    _ = signal.signal(signal.SIGALRM, idle_deadline)
-    _ = signal.setitimer(signal.ITIMER_REAL, seconds)
-    try:
-        yield
-    finally:
-        _ = signal.setitimer(signal.ITIMER_REAL, 0)
-        _ = signal.signal(signal.SIGALRM, handler)
-        if previous[0]:
-            _ = signal.setitimer(signal.ITIMER_REAL, max(0.000001, previous[0] - (time.monotonic() - started)), previous[1])
 
 
 class NoPendingRestart(TypedDict):
@@ -575,7 +541,6 @@ class SweepArguments(argparse.Namespace):
         self.command: str = ""
         self.only: str = ""
         self.check: bool = False
-        self.wait_idle: int = 0
 
 
 def main(arguments: list[str]) -> int:
@@ -583,24 +548,8 @@ def main(arguments: list[str]) -> int:
     _ = parser.add_argument("command", choices=("sweep",))
     _ = parser.add_argument("--only", default="")
     _ = parser.add_argument("--check", action="store_true")
-    _ = parser.add_argument("--wait-idle", type=int, default=0)
     parsed = parser.parse_args(arguments, namespace=SweepArguments())
-    only, check, wait_idle = parsed.only, parsed.check, parsed.wait_idle
-    if wait_idle and (not only or check or not 0 < wait_idle <= IDLE_WAIT_SECONDS):
-        parser.error("--wait-idle needs --only, no --check, and a budget from 1 to 1800 seconds")
-    deadline = time.monotonic() + wait_idle
-    try:
-        with idle_budget(wait_idle):
-            while True:
-                result = sweep(only, check)
-                if not wait_idle or time.monotonic() >= deadline or hold_reason():
-                    return result
-                current = next((item for item in list_sessions() if item.session_id == only), None)
-                if current is None or current.status in {"idle", "shell"} or not broken(current):
-                    return result
-                time.sleep(min(5, max(0, deadline - time.monotonic())))
-    except IdleDeadline:
-        return 0
+    return sweep(parsed.only, parsed.check)
 
 
 if __name__ == "__main__":

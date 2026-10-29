@@ -17,6 +17,9 @@ from typing import NamedTuple, cast, override
 from unittest.mock import patch
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 HOOKS = Path(__file__).resolve().parent
 DISPATCH = HOOKS / "hook_dispatch.py"
 ROOT = HOOKS.parents[1]
@@ -170,7 +173,7 @@ class IsolatedHookTests(unittest.TestCase):
 
     def run_python(self, arguments: list[str], payload: dict[str, object]) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, *arguments], input=json.dumps(payload),
-                              text=True, capture_output=True, check=False, timeout=8,
+                              text=True, capture_output=True, check=False, timeout=TEST_HANG_GUARD_SECS,
                               env=self.environment, cwd=self.root)
 
     def event_outcome(self, result: subprocess.CompletedProcess[str]) -> EventOutcome:

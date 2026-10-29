@@ -12,6 +12,9 @@ import unittest
 
 from scripts.lib.nix_env_test_support import NixFixture
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 VERIFY = Path(__file__).with_name("verify.sh")
 SCRIPTS = VERIFY.parent.parent
 NOTICE = "verify.sh: not in the nix shell; re-running under nix_env.py exec\n"
@@ -81,7 +84,7 @@ class VerifyNixShellTests(NixFixture):
 
     def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(["bash", str(self.verify_script), *arguments], cwd=self.work,
-                              env=self.env, text=True, capture_output=True, check=False, timeout=20)
+                              env=self.env, text=True, capture_output=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def verification_start(self) -> VerificationStart:
         return cast(VerificationStart, json.loads(self.setup_log.read_text(encoding="utf-8")))

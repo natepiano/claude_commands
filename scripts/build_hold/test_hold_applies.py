@@ -21,8 +21,8 @@ import build_targets
 
 SCRIPT = Path(__file__).with_name("hold_applies.py")
 REFUSAL = ("natedev builds are held by builder (for app test, release eta unknown). "
-           "Keep working, writes included. Run tests with verify.sh test: they go to the Mac. "
-           "Run check, lint and builds after the hold ends.")
+           "Keep working, writes included. Use verify.sh: eligible steps go to the Mac; other steps wait. "
+           "Raw cargo and merge gates must wait for the hold to end.")
 
 
 class TemporaryHoldTest(unittest.TestCase):
@@ -41,6 +41,8 @@ class TemporaryHoldTest(unittest.TestCase):
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "MAC_TEST_STATE_DIR": str(self.root / "mac"),
+            "VERIFY_STEPS_DIR": str(self.root / "steps"),
+            "VERIFY_PROC_ROOT": str(self.root / "proc"),
             "BUILD_TARGETS_CONFIG": str(targets),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "CLAUDE_CODE_SESSION_ID": "caller",

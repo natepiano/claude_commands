@@ -8,8 +8,8 @@ unit's worktree has uncommitted work or its branch has a commit the merge branch
 The `Project started` line the /unit:direct recorder adds to a plan, alone in its file's diff, is not
 uncommitted work: no person wrote it. Then it stops what the unit owns. It finds each thing by its own record, never by a name pattern:
 
-- each Claude session that works in the worktree (the unit director and its Claude workers), and the
-  director of each of the worktree's runs wherever it works, stops
+- each Claude session that works in the worktree (the unit director and its Claude workers), the
+  marked director, and the director of each of the worktree's runs wherever it works, stops
   through `shutdown.py down`, which asks it to pause and stops it at its ready mark, and its
   restore is then forgotten, so no restart brings it back;
 - each run of the worktree that has an app-server stops it and ends its Codex workers
@@ -20,7 +20,10 @@ uncommitted work: no person wrote it. Then it stops what the unit owns. It finds
 - each process that still works inside the worktree gets SIGTERM.
 
 When nothing is left running, the Units row's Plan cell gets "(retired <date>, worktree removed,
-session <id>)", committed on the merge branch, and the worktree, the local branch and the origin branch go.
+session <id>)", adding ", folder <path>" when its transcript resumes outside the worktree,
+committed on the merge branch, and the worktree, the local branch and the origin branch go.
+Shutdown completion and forgetting its restore must succeed; a final liveness and record check
+refuses marking or removal while a known session still runs or its shutdown is unfinished.
 --dry-run prints each refusal and everything it would stop and remove, and changes nothing.
 
 Exit 0 when the unit is retired; 1 on a refusal or when something still runs (a rerun resumes);
@@ -32,6 +35,7 @@ import argparse
 import itertools
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -61,8 +65,10 @@ if TYPE_CHECKING:
     from scripts.message import sessions
     from scripts.message.sessions import SessionRecord
     from scripts.shutdown import record as shutdown_record
+    from scripts.shutdown import settle as shutdown_settle
 else:
     import record as shutdown_record
+    import settle as shutdown_settle
     import sessions
     from sessions import SessionRecord
 
@@ -84,6 +90,17 @@ SESSION_NOTE = ", session {id}"
 
 
 class Refused(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class DirectorSession:
+    session_id: str
+    resume_folder: Path
+
+
+@dataclass(frozen=True)
+class NoDirectorSession:
     pass
 
 
@@ -373,6 +390,11 @@ def gather(unit: Unit) -> Found:
     runs = runs_of(unit.worktree)
     directors = frozenset(unit_runs.director(folder) for folder in runs) - {""}
     claude = claude_sessions(unit.worktree, directors)
+    marked = marked_director(unit)
+    if isinstance(marked, unit_lookup.LiveClaude) and not any(
+            item["sessionId"] == marked.session_id and item["pid"] == marked.pid for item in claude):
+        claude += (SessionRecord(pid=marked.pid, sessionId=marked.session_id, name=marked.name,
+                                 messagingSocketPath=marked.socket, updatedAt=0, tmux="", formerNames=[]),)
     claims = mac_claims(unit.worktree)
     ids = {item["sessionId"] for item in claude} | directors
     known = {item["pid"] for item in claude} | {claim.pid for claim in claims}
@@ -397,24 +419,94 @@ def _interactive(transcript: Path) -> bool:
     return False
 
 
-def last_session(unit: Unit) -> str:
-    """The unit director's session id: the live session carrying the unit's mark, else the newest
-    interactive transcript under the worktree's project folder; empty when neither."""
+def marked_director(unit: Unit) -> unit_lookup.LiveClaude | unit_lookup.ClaudeNotRunning:
     try:
         found = unit_lookup.marked_unit(unit.production.slug, unit.name)
-    except OSError:
-        found = None
-    if found is not None and isinstance(found.claude, unit_lookup.LiveClaude):
-        return found.claude.session_id
+    except OSError as error:
+        raise Refused(f"{unit.name}: cannot read unit mark: {error}") from error
+    if found is None:
+        return unit_lookup.ClaudeNotRunning()
+    if isinstance(found.claude, unit_lookup.ClaudeUnknown):
+        raise Refused(f"{unit.name}: cannot read unit mark: {found.claude.reason}")
+    return found.claude
+
+
+def transcript_locations(session_id: str) -> list[Path]:
+    """Distinct project folders holding this transcript, including shared account symlinks once."""
+    return sorted({path.resolve() for directory in unit_move.config_dirs()
+                   for path in (directory / "projects").glob(f"*/{session_id}.jsonl")})
+
+
+def transcript_resume_folder(transcript: Path) -> Path:
+    """The first recorded cwd whose project folder still holds this transcript after renames."""
+    with transcript.open(encoding="utf-8") as lines:
+        for line in lines:
+            try:
+                value = cast(object, json.loads(line))
+            except ValueError:
+                continue
+            if isinstance(value, dict):
+                cwd = cast(dict[str, object], value).get("cwd")
+                if isinstance(cwd, str) and cwd:
+                    folder = Path(cwd).expanduser()
+                    if unit_move.project_folder(str(folder)) == transcript.parent.name:
+                        return folder
+    raise Refused(f"transcript {transcript} has no cwd matching its project folder {transcript.parent.name}")
+
+
+def director_resume_folder(session_id: str) -> Path:
+    transcripts = transcript_locations(session_id)
+    if len(transcripts) != 1:
+        places = ", ".join(str(path.parent) for path in transcripts) or "none"
+        raise Refused(f"no account has the transcript of session {session_id} in exactly one project folder; found: {places}")
+    return transcript_resume_folder(transcripts[0])
+
+
+def unit_shutdowns(unit: Unit, ids: frozenset[str]) -> list[shutdown_record.SessionShutdown]:
+    """Retained requests still owned by this unit, including a director that already exited."""
+    found: list[shutdown_record.SessionShutdown] = []
+    for saved in shutdown_record.all_session_records():
+        owner = saved["session"]
+        if owner["session_id"] in ids or (owner["kind"] == "unit"
+                and owner["host"]["production"] == unit.production.slug and owner["host"]["unit"] == unit.name):
+            found.append(saved)
+    return found
+
+
+def last_session(unit: Unit) -> str:
+    """The marked director, an existing retirement's session, or the newest interactive transcript
+    under the worktree's project folder; empty when none can be found."""
+    marked = marked_director(unit)
+    if isinstance(marked, unit_lookup.LiveClaude):
+        return marked.session_id
+    if unit.retired:
+        for row in production_units.unit_table(unit.production.doc.read_text(encoding="utf-8").splitlines()):
+            if production_units.cell_value(row.get("Unit", "")) == unit.name:
+                saved = re.match(r"^\s*\(retired [^)]*, session ([0-9A-Za-z-]+)(?:, folder [^)]*)?\)", row.get("Plan", ""))
+                if saved:
+                    return saved[1]
+    retained = unit_shutdowns(unit, frozenset())
+    if retained:
+        return max(retained, key=lambda saved: saved["requested_at"])["session"]["session_id"]
     folder = unit_move.project_folder(str(unit.worktree))
     transcripts = [path for directory in unit_move.config_dirs()
                    for path in (directory / "projects" / folder).glob("*.jsonl") if _interactive(path)]
     return max(transcripts, key=lambda path: path.stat().st_mtime).stem if transcripts else ""
 
 
-def retired_note(unit: Unit, session_id: str) -> str:
+def director_session(unit: Unit) -> DirectorSession | NoDirectorSession:
+    session_id = last_session(unit)
+    return DirectorSession(session_id, director_resume_folder(session_id)) if session_id else NoDirectorSession()
+
+
+def retired_note(unit: Unit, director: DirectorSession | NoDirectorSession) -> str:
     date = datetime.now(unit.production.zone).strftime("%Y-%m-%d")
-    return RETIRED_NOTE.format(date=date, session=SESSION_NOTE.format(id=session_id) if session_id else "")
+    session = ""
+    if isinstance(director, DirectorSession):
+        session = SESSION_NOTE.format(id=director.session_id)
+        if director.resume_folder.resolve() != unit.worktree.resolve():
+            session += f", folder {director.resume_folder}"
+    return RETIRED_NOTE.format(date=date, session=session)
 
 
 def describe_session(item: SessionRecord) -> str:
@@ -449,40 +541,60 @@ def dry_run(unit: Unit) -> int:
              + [f"would stop: process {pid} ({_command_name(pid)})" for pid in found.processes])
     print("\n".join(lines or ["nothing to stop"]))
     if not unit.retired:
-        print(f"would mark: the Units row {retired_note(unit, last_session(unit))}, committed on {unit.production.merge_branch}")
+        print(f"would mark: the Units row {retired_note(unit, director_session(unit))}, committed on {unit.production.merge_branch}")
     if unit_move.exists(unit.worktree):
         print(f"would remove: worktree {unit.worktree}")
     print(f"would delete: branch {unit.branch} here and on origin")
     return 1 if refused else 0
 
 
-def stop_sessions(unit: Unit, found: Found, wait_minutes: float) -> list[str]:
+def stop_sessions(unit: Unit, found: Found, wait_minutes: float, known_ids: frozenset[str]) -> list[str]:
     """Stop the unit's Claude sessions through the shutdown path; what still runs comes back."""
-    if not found.claude:
-        return []
     try:
-        pending = {item["session"]["session_id"] for item in shutdown_record.all_session_records()}
+        saved = unit_shutdowns(unit, known_ids | {item["sessionId"] for item in found.claude})
     except (shutdown_record.InvalidRecord, OSError) as error:
-        return [f"{describe_session(item)}: shutdown records unreadable: {error}" for item in found.claude]
-    ids_found = [item["sessionId"] for item in found.claude]
+        return [f"shutdown records unreadable: {error}"]
+    pending = {item["session"]["session_id"] for item in saved}
+    targets = list(found.claude)
+    for item in saved:
+        owner = item["session"]
+        if not any(target["sessionId"] == owner["session_id"] for target in targets):
+            targets.append(SessionRecord(pid=owner["pid"], sessionId=owner["session_id"], name=owner["name"],
+                                         messagingSocketPath="", updatedAt=0, tmux="", formerNames=[]))
+    if not targets:
+        return []
+    ids_found = [item["sessionId"] for item in targets]
     ids = [session_id for session_id in ids_found if session_id not in pending]
     if ids:
-        started = run([sys.executable, str(SHUTDOWN), "down", "--here", "--only", ",".join(ids)])
+        started = run([sys.executable, str(SHUTDOWN), "down", "--here", "--only", ",".join(ids),
+                       "--why", shutdown_settle.RETIRE_REASON])
         if started.returncode:
-            return [f"{describe_session(item)}: shutdown down refused: {failure(started)}" for item in found.claude]
+            return [f"{describe_session(item)}: shutdown down refused: {failure(started)}" for item in targets]
     deadline = time.monotonic() + wait_minutes * 60
     while True:
         live = {item["sessionId"] for item in claude_sessions(unit.worktree, frozenset(ids_found))}
-        still = [item for item in found.claude if item["sessionId"] in live]
+        try:
+            records = [item for item in shutdown_record.all_session_records() if item["session"]["session_id"] in ids_found]
+        except (shutdown_record.InvalidRecord, OSError) as error:
+            return [f"shutdown records unreadable: {error}"]
+        unfinished = {item["session"]["session_id"] for item in records if not shutdown_record.shutdown_finished(item)}
+        still = [item for item in targets if item["sessionId"] in live | unfinished]
         if not still or time.monotonic() >= deadline:
             break
         time.sleep(POLL_SECONDS)
-    for item in found.claude:
+    left = [f"{describe_session(item)}: still stopping after {wait_minutes:g} minutes" for item in still]
+    failed = {item["session"]["session_id"] for item in records if shutdown_record.stop_incomplete(item)}
+    for item in targets:
         if item not in still:
+            if item["sessionId"] in failed:
+                left.append(f"{describe_session(item)}: shutdown failed; its restore stays")
+                continue
             forgot = run([sys.executable, str(SHUTDOWN), "forget", item["sessionId"]])
-            print(f"stopped: {describe_session(item)}"
-                  + ("" if forgot.returncode == 0 else f"; its restore stays: {failure(forgot)}"))
-    return [f"{describe_session(item)}: still stopping after {wait_minutes:g} minutes" for item in still]
+            if forgot.returncode:
+                left.append(f"{describe_session(item)}: its restore stays: {failure(forgot)}")
+            else:
+                print(f"stopped: {describe_session(item)}")
+    return left
 
 
 def terminate(pids: list[int], what: dict[int, str], wait: float | None = None) -> list[str]:
@@ -508,7 +620,9 @@ def terminate(pids: list[int], what: dict[int, str], wait: float | None = None) 
 
 def stop_rest(unit: Unit, found: Found) -> list[str]:
     """Stop the workers, reviewers, holds, reservations, claims and processes; what still runs comes back."""
+    from scripts.direct import workers
     left: list[str] = []
+    workers.end_unit(unit.production.slug, unit.name)
     for item in found.runs:
         result = run([sys.executable, str(MESH), "stop", "--session-dir", str(item.run)])
         if result.returncode:
@@ -544,14 +658,14 @@ def stop_rest(unit: Unit, found: Found) -> list[str]:
     return left
 
 
-def mark_retired(unit: Unit, session_id: str) -> None:
+def mark_retired(unit: Unit, director: DirectorSession | NoDirectorSession) -> None:
     """Put the retired note in front of the Units row's Plan cell and commit the doc on the merge branch."""
     doc = unit.production.doc
     lines = doc.read_text(encoding="utf-8").split("\n")
     headings = production_units.unit_headings(lines)
     _, rows = production_units.unit_rows(lines)
     plan_at = headings.index("Plan") + 1
-    note = retired_note(unit, session_id)
+    note = retired_note(unit, director)
     for index, line in enumerate(lines):
         parts = line.split("|")
         if line in rows and production_units.cell_value(parts[headings.index("Unit") + 1].strip()) == unit.name:
@@ -588,16 +702,42 @@ def remove(unit: Unit) -> list[str]:
     return failed
 
 
+def final_stop_check(unit: Unit, ids: frozenset[str]) -> list[str]:
+    left: list[str] = []
+    marked = marked_director(unit)
+    if isinstance(marked, unit_lookup.LiveClaude):
+        ids |= {marked.session_id}
+        left.append(f"marked session {marked.session_id}, pid {marked.pid}")
+    for session_id in sorted(ids):
+        observed = sessions.session_processes(session_id)
+        if isinstance(observed, sessions.SessionLivenessUnknown):
+            left.append(f"session {session_id}: {observed.reason}")
+        else:
+            left.extend(f"session {session_id}, pid {pid}" for pid in observed.pids)
+    for saved in unit_shutdowns(unit, ids):
+        if not shutdown_record.shutdown_finished(saved) or shutdown_record.stop_incomplete(saved):
+            left.append(f"session {saved['session']['session_id']}, pid {saved['session']['pid']}: shutdown {saved['progress']['kind']}")
+    return left
+
+
 def retire(unit: Unit, wait_minutes: float) -> int:
     refused = refusals(unit)
     if refused:
         print("\n".join(f"refused: {reason}" for reason in refused))
         return 1
     # Read before the stop: once stopped, the unit's mark is gone.
-    session_id = last_session(unit)
-    left = stop_sessions(unit, gather(unit), wait_minutes)
+    director = director_session(unit) if not unit.retired else NoDirectorSession()
+    session_id = director.session_id if isinstance(director, DirectorSession) else last_session(unit)
+    found = gather(unit)
+    ids = {item["sessionId"] for item in found.claude}
+    if session_id:
+        ids.add(session_id)
+    ids.update(saved["session"]["session_id"] for saved in unit_shutdowns(unit, frozenset(ids)))
+    left = stop_sessions(unit, found, wait_minutes, frozenset(ids))
     if not left:
-        left = stop_rest(unit, gather(unit))
+        remaining = gather(unit)
+        ids.update(item["sessionId"] for item in remaining.claude)
+        left = stop_rest(unit, remaining)
     if left:
         print("\n".join(f"left running: {reason}" for reason in left))
         print(f"{unit.name} is not retired: rerun once these stop")
@@ -608,14 +748,23 @@ def retire(unit: Unit, wait_minutes: float) -> int:
     except (OSError, ValueError, SystemExit) as error:
         print(f"{unit.name} is not retired: held role cleanup: {error}")
         return 1
+    try:
+        left = final_stop_check(unit, frozenset(ids))
+    except (Refused, shutdown_record.InvalidRecord, OSError) as error:
+        left = [str(error)]
+    if left:
+        print("\n".join(f"left running: {reason}" for reason in left))
+        print(f"{unit.name} is not retired: rerun once these stop")
+        return 1
     if not unit.retired:
-        mark_retired(unit, session_id)
+        mark_retired(unit, director)
     failed = remove(unit)
     print("\n".join(f"not removed: {reason}" for reason in failed) if failed else f"{unit.name} retired")
     return 1 if failed else 0
 
 
 def main(argv: list[str]) -> int:
+    from scripts.direct.workers import WorkerUnavailable
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     _ = parser.add_argument("slug")
     _ = parser.add_argument("unit")
@@ -627,7 +776,7 @@ def main(argv: list[str]) -> int:
         if cast(bool, options.dry_run):
             return dry_run(unit)
         return retire(unit, cast(float, options.wait_minutes))
-    except (Refused, production_units.Refusal, unit_names.BadName, OSError) as error:
+    except (Refused, production_units.Refusal, unit_names.BadName, WorkerUnavailable, shutdown_record.InvalidRecord, OSError) as error:
         print(f"refused: {error}")
         return 1
 

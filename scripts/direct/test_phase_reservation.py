@@ -16,6 +16,9 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.direct import phase_reservation, plan_history  # noqa: E402
 
@@ -178,7 +181,7 @@ class PhaseRepairTests(unittest.TestCase):
     def repair(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, phase_reservation.__file__, "repair", "--session-dir",
                                str(self.session), "--phase", "34h", "--repo", str(self.repo), *arguments],
-                              env=self.environment, capture_output=True, text=True, check=False, timeout=10)
+                              env=self.environment, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def state(self) -> dict[str, object]:
         return cast(dict[str, object], json.loads((self.directory / phase_reservation.STATE_FILE).read_text()))

@@ -572,6 +572,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
         blocker = "#!/bin/sh\nexit 99\n"
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.write_executable(self.bin_directory / name, blocker)
+        self.write_executable(self.bin_directory / "ssh", '#!/bin/sh\nprintf "free_gib=1000\\nhost=test-mac\\nrc=0\\n"\n')
         reader = self.root / "lint-config.sh"
         _ = reader.write_text(
             "lint_config_enabled() { return 1; }\n"
@@ -655,6 +656,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
             "XDG_RUNTIME_DIR": str(self.root / "runtime"),
             "XDG_STATE_HOME": str(self.root / "state"),
             "XDG_CACHE_HOME": str(self.root / "cache"),
+            "VERIFY_STEPS_DIR": str(self.root / "verify-steps"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILDLOG_BUILDS_CGROUP": str(self.root / "cgroup"),
             "BUILDLOG_CI_CGROUP": str(self.root / "cgroup"),
@@ -1045,7 +1047,7 @@ signal.pause()
 
     def test_alternate_target_settings_are_passed_to_runner(self) -> None:
         alternate = self.root / "alternate Mac.conf"
-        _ = alternate.write_text(f"linux_only.{self.root.name}=\n")
+        _ = alternate.write_text(f"offload=on\nlinux_only.{self.root.name}=\n")
         config = Path(self.environment["BUILD_TARGETS_CONFIG"])
         _ = config.write_text(config.read_text().replace("mac settings.conf", alternate.name))
         result = self.verify("test", "sample", "--filter", "alpha", "--no-cache",
@@ -1058,7 +1060,7 @@ signal.pause()
         self.assertEqual(self.routing_record()["target"], "mac")
 
     def test_excluded_mac_reason_is_recorded_without_calling_offload(self) -> None:
-        for settings, reason in (("", "repo"), (f"linux_only.{self.root.name}=sample\n", "linux_only")):
+        for settings, reason in (("offload=on\n", "repo"), (f"offload=on\nlinux_only.{self.root.name}=sample\n", "linux_only")):
             with self.subTest(reason=reason):
                 self.clear_observations()
                 _ = Path(self.environment["MAC_TEST_CONFIG"]).write_text(settings)

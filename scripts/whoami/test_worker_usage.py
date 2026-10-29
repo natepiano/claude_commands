@@ -19,6 +19,9 @@ from scripts.usage.test_outcomes import OutcomeFixture
 from scripts.usage.test_collect import FIXTURES as COLLECT_FIXTURES, SNAPSHOT_COMMIT_SCRIPT, SshBehavior
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 def record(record_type: str, at: str, payload: dict[str, object]) -> str:
     return json.dumps({"timestamp": at, "type": record_type, "payload": payload})
 
@@ -145,7 +148,7 @@ class StoreReadoutTests(OutcomeFixture):
         database = ["--db", str(self.db_path)] if explicit_db else []
         return subprocess.run([*command, *database, "--before", *before, "--after", *after],
                               env=self.environment(), cwd=self.root / "outside-checkout", capture_output=True,
-                              text=True, check=False, timeout=15)
+                              text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def expected(self, name: str = "expected.md") -> str:
         expected = (DAY1_FIXTURES / name).read_text(encoding="utf-8")
@@ -414,7 +417,7 @@ class StoredSwitchTests(OutcomeFixture):
         result = subprocess.run([sys.executable, str(READOUT), "--db", str(self.db_path),
                                  "--before", start, end, "--after", start, end],
                                 env=environment, cwd=self.root, capture_output=True, text=True,
-                                check=False, timeout=15)
+                                check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
         rows = [line for line in result.stdout.splitlines() if line.startswith("| Before |")]

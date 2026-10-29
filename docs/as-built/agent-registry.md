@@ -351,11 +351,11 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 - Provenance files are four lines: `task=`, `family=`, `agent=`, `effort=`.
 - The session app-server is deliberately detached, so it outlives each worker
   and a peer can still reach a thread between turns, and so the run's workers stay
-  open across phases. No launcher stops it: `end_session.sh` reaps it at run end
-  (`codex_mesh.py stop`, from the session directory recorded in the run-active
-  marker, then `sweep --stop`), and before that only the sweep and the server's
-  own idle watcher stop it, once nothing uses it. A launcher that killed it would
-  break the mesh it exists to provide.
+  open across phases. `end_session.sh` calls `codex_mesh.py stop --pause` at run
+  end. While the unit director lives, that leaves its workers and servers
+  untouched. Otherwise it preserves queued work before stopping the servers
+  recorded by that run. Ordinary idle-stop and retired-server reclamation free
+  unused servers between assignments; the next dispatch resumes the same thread.
 - A server nothing stops stays up for good: one started outside a `/unit:direct` run
   (`/ask_a_friend`, a worker launched by hand), one whose run ended without
   `end_session.sh`, and one whose run folder was deleted. `codex_mesh.py sweep`
@@ -367,7 +367,9 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   no socket open), a run-active marker naming its folder, a start or a folder
   change inside `SERVER_IDLE_SECS` (30 minutes), or a conversation that is not
   idle. The last is asked of the server itself (`thread/loaded/list`, then
-  `thread/read` on each loaded and each roster thread), so a turn left running
+  `thread/read` on each loaded and each roster thread, plus `thread/queue/list`
+  on each loaded thread). Queued submissions or an unreadable queue keep the
+  server. A turn left running
   by a launcher killed at its time limit is seen with no client and no roster.
   Anything that cannot be read counts as in use, and a server whose log names no
   run folder is `unknown`. A stale run-active marker keeps
@@ -378,10 +380,9 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   own. The second look must find the same pid still serving the same port and
   must again say unused; then `_reap` stops it and `mesh_server.json` is removed
   if it names that pid. A deleted run folder is not created again for the lock.
-  Nothing runs the sweep on a schedule. `remove_workers.py` runs `sweep --stop`
-  at phase end (after a successful Claude session listing, under the real
-  worker root only) and `end_session.sh` runs it at run end; a sweep failure
-  prints one line and never stops worker cleanup.
+  Nothing runs the sweep on a schedule. Neither `remove_workers.py` at phase
+  end nor `end_session.sh` at run end launches it. Explicit sweeps, idle-stop
+  and retired-server reclamation use the common busy check and its second look.
 - A codex app-server stops itself once nothing uses it.
   `ensure_server` starts a watcher with each server: a detached shell that wakes
   every `WATCH_WAKE_SECS` (5 minutes) and looks at the change time of
@@ -397,8 +398,9 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   (under 1 MB of their own memory against a mean 38 MB per app-server), one
   `find` per wake, and one short Python run about twice an hour while the server
   is in use. The connection count needs `ss` and the run folder needs `/proc`,
-  so on the Mac a server is kept as before and `end_session.sh` stops it.
-  `end_session.sh`, `end_friend.sh` and `stop` still stop a server at once. The
+  so on the Mac automatic reclamation keeps a server when it cannot establish
+  that the server is unused. Explicit `stop` and `end_friend.sh` can stop it;
+  run end uses `stop --pause` and preserves a live director's servers. The
   watcher is what reaps a server whose run folder no end step covers, such as
   work that went on in a run folder after its run had closed.
 - A Codex sign-in change moves every run to a new app-server. An app-server

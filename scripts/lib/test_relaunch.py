@@ -16,6 +16,9 @@ import unittest
 from unittest.mock import patch
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 sys.path.insert(0, str(Path(__file__).parents[1] / "shutdown"))
 sys.path.insert(0, str(Path(__file__).parents[2]))
 from scripts.shutdown.test_support import ShutdownTestCase
@@ -64,10 +67,10 @@ class RelaunchTests(ShutdownTestCase):
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        _ = process.communicate(timeout=5)
+        _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def wait_for_file(self, path: Path, process: subprocess.Popen[str]) -> None:
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
         while not path.exists():
             self.assertIsNone(process.poll(), "supervisor exited before its child became ready")
             if time.monotonic() >= deadline:
@@ -101,7 +104,7 @@ class RelaunchTests(ShutdownTestCase):
         return request
 
     def assert_relaunched(self, process: subprocess.Popen[str], request: Path) -> None:
-        stdout, stderr = process.communicate(timeout=8)
+        stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 11, stderr)
         observed = cast(RelaunchObservation, json.loads((self.root / "observation.json").read_text()))
         self.assertEqual(observed["parent"], process.pid)
@@ -130,7 +133,7 @@ class RelaunchTests(ShutdownTestCase):
 
     def test_no_request_preserves_the_child_exit_code(self) -> None:
         process = self.start("raise SystemExit(23)")
-        stdout, stderr = process.communicate(timeout=5)
+        stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 23, stderr)
         self.assertEqual(stdout, "")
 
@@ -151,7 +154,7 @@ class RelaunchTests(ShutdownTestCase):
         assert process.stdout is not None
         with selectors.DefaultSelector() as selector:
             _ = selector.register(process.stdout, selectors.EVENT_READ)
-            self.assertTrue(selector.select(timeout=5), "hold did not announce its wait")
+            self.assertTrue(selector.select(timeout=TEST_HANG_GUARD_SECS), "hold did not announce its wait")
             line = cast(str, process.stdout.readline())
         self.assertEqual(line, "claude stopped for a restart; waiting for it here\n")
         self.assertIsNone(process.poll())
@@ -166,7 +169,7 @@ class RelaunchTests(ShutdownTestCase):
         expires_soon = time.time() - 299
         os.utime(hold, (expires_soon, expires_soon))
         (self.root / "release").touch()
-        stdout, stderr = process.communicate(timeout=5)
+        stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 7, stderr)
         self.assertEqual(stdout.count("claude stopped for a restart; waiting for it here\n"), 1)
         self.assertIn("no restart came; this window is free\n", stdout)
@@ -200,7 +203,7 @@ class RelaunchTests(ShutdownTestCase):
                 process = self.start(child)
                 self.wait_for_file(self.root / "ready", process)
                 os.kill(process.pid, forwarded)
-                _, stderr = process.communicate(timeout=5)
+                _, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(process.returncode, 19, stderr)
                 self.assertEqual(received.read_text(), str(forwarded))
 

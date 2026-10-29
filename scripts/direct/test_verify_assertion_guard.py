@@ -34,6 +34,7 @@ class VerifyAssertionGuardTests(GitRepositoryFixture):
         script = r'''
 set -euo pipefail
 FEATURE_FLAGS=()
+HOLD_LINT=0
 RUN_LOG=""
 CHANGED_MEMBERS_PY='print("")'
 require_member() { :; }
