@@ -274,7 +274,7 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 
 **Ruled out:** sharper feature, enhancement and research criteria in `CATEGORIES` — they lowered category accuracy on the tune split (.74 -> .71).
 
-### Phase 5 — `/issue` proposes with Jev  · status: todo
+### Phase 5 — `/issue` proposes with Jev  · status: done
 
 **Depends on:** Phase 4
 
