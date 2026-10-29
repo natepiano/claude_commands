@@ -57,7 +57,8 @@ class EndSessionTests(unittest.TestCase):
         _ = shutil.copy2(UNIT_RUNS, scripts / "lib" / "unit_runs.py")
         self.script = direct_dir / "end_session.sh"
         _ = shutil.copy2(END_SESSION, self.script)
-        _ = shutil.copy2(REMOVE_RUN_SCRATCH, direct_dir / "remove_run_scratch.py")
+        # Resolve the real package and its evolving lifecycle dependencies.
+        (direct_dir / "remove_run_scratch.py").symlink_to(REMOVE_RUN_SCRATCH)
         _ = (direct_dir / "remove_workers.py").write_text("", encoding="utf-8")
         (agents / "codex_mesh.py").symlink_to(END_SESSION.parents[1] / "agents" / "codex_mesh.py")
 
@@ -89,6 +90,8 @@ class EndSessionTests(unittest.TestCase):
             "UNIT_ACTIVE_DIR": str(self.marker.parent),
             "UNIT_RUN_ROOT": str(self.runs),
             "UNIT_WORKERS_STATE": str(self.root / "unit-workers"),
+            "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
+            "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
             "SCRATCH_ROOT": str(self.root / "tracked-scratch"),
             "SCRATCH_VISIBLE_ROOT": str(self.root / "visible-scratch"),
             "SCRATCH_HOLDS": str(self.root / "scratch-holds.json"),

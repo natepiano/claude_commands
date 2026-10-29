@@ -1647,7 +1647,6 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertEqual(identity, {
             "name": worker,
             "slot": "review2",
-            "role": "review",
             "family": "codex",
             "model": "gpt-called",
             "worker_id": f"thread-{worker}",

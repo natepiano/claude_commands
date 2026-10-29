@@ -7168,9 +7168,17 @@ class MeshCommandTests(MeshCommandFixture):
         resume_ticks: list[int] = []
         ticks = 0
         offset = 0.0
+        first_reply_delivered = False
         monotonic = time.monotonic
         call = codex_mesh.Client.call
         read = codex_mesh.Client.next_frame
+        deliver = codex_mesh._deliver_reply  # pyright: ignore[reportPrivateUsage]
+
+        @bounded_fixture
+        def reply(name: str, index: int, answer: str, failure: str, summary: Path, replies: Path | None, log: TextIO) -> None:
+            nonlocal first_reply_delivered
+            deliver(name, index, answer, failure, summary, replies, log)
+            first_reply_delivered = True
 
         @bounded_fixture
         def rpc(client: codex_mesh.Client, method: str, params: dict[str, object], timeout: float = codex_mesh.CALL_TIMEOUT_SECS) -> codex_mesh.RpcMessage:
@@ -7185,7 +7193,7 @@ class MeshCommandTests(MeshCommandFixture):
         def poll(client: codex_mesh.Client, deadline: float) -> codex_mesh.RpcMessage | None:
             nonlocal ticks, offset
             frame = read(client, min(deadline, time.time() + 0.02))
-            if frame is None:
+            if frame is None and first_reply_delivered:
                 ticks += 1
                 self.assertLessEqual(ticks, 8, "resume retry exceeded its tick budget")
                 offset += 61
@@ -7195,10 +7203,12 @@ class MeshCommandTests(MeshCommandFixture):
                     _ = (self.session_dir / "worker.end").write_text("end")
             return frame
 
-        # Advance the single duration seam after real quiet reads. Scheduler
-        # delays cannot consume the simulated retry window.
+        # Finish the original turn before selecting the new account: startup
+        # file wakes do not establish an idle resident or a retry tick.
+        # Advance the duration seam after real quiet reads, independently of load.
         with (patch.object(codex_mesh.Client, "call", rpc),
               patch.object(codex_mesh.Client, "next_frame", poll),
+              patch.object(codex_mesh, "_deliver_reply", reply),
               patch.object(time, "monotonic", new=lambda: monotonic() + offset),
               patch.object(codex_mesh, "_stop_unused", return_value=False),
               contextlib.redirect_stdout(io.StringIO())):
@@ -8557,7 +8567,9 @@ class DirectorLifetimeTests(MeshCommandFixture):
         shim.parent.mkdir(parents=True)
         # Only process discovery/signalling and unrelated guild/Claude cleanup are synthetic.
         # The shell, stop, sweep, registry, shutdown history and worker ledger execute real code.
-        _ = shim.write_text("#!/usr/bin/env python3\n" + '''import os, pathlib, runpy, sys
+        _ = shim.write_text("#!/usr/bin/env python3\n" + "import sys\n"
+            + f"sys.path.insert(0, {str(Path(codex_mesh.__file__).resolve().parents[2])!r})\n"
+            + '''import os, pathlib, runpy, sys
 from unittest.mock import patch
 from scripts.agents import codex_mesh
 script, *arguments = sys.argv[1:]

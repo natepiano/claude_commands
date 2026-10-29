@@ -1248,7 +1248,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         original = cast(dict[str, object], json.loads(path.read_text()))
         name = str(original["name"])
 
-        followed = self.mesh_launch(run, to=name, kind="fix")
+        followed = self.mesh_launch(run, to=name, kind="fix", fix_cause="repair identity after implementation")
 
         self.assertEqual(followed.returncode, 0, followed.stderr)
         records = [cast(dict[str, object], json.loads(item.read_text()))
@@ -1430,6 +1430,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         first = self.claude_launch(run, "sonnet:low")
         self.assertEqual(first.returncode, 0, first.stderr)
         original = (run / "impl_worker_impl.json").read_bytes()
+        self.open_repair_round(run)
         repair = self.claude_launch(run, "sonnet:low", kind="fix")
         self.assertEqual(repair.returncode, 0, repair.stderr)
         self.assertEqual((run / "impl_worker_impl.json").read_bytes(), original)
