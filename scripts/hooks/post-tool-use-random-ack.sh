@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # After a tool call, now and then print a short random acknowledgement.
+# To enable again, put back a PostToolUse group with no matcher and command `~/.claude/scripts/hooks/post-tool-use-random-ack.sh --hook` in settings.json.
 #
 # there's a bug when we use this pre-tool use which would be better
 # that it shows the output twice which we definitely don't want

@@ -732,7 +732,9 @@ class StandaloneLaunchTests(unittest.TestCase):
                     "--config-dir", str(directory), "--prompt-file", str(prompt), "--attach")
             self.assertEqual(code, 1)
             self.assertIn("solo: opening prompt not submitted", error)
-            self.assertEqual(start.call_args.kwargs["opening"], herdr.OpeningPrompt("first prompt",
+            start.assert_called_once()
+            opening = cast(herdr.OpeningPrompt | herdr.NoOpeningPrompt, start.call_args.args[4])
+            self.assertEqual(opening, herdr.OpeningPrompt("first prompt",
                 herdr.SessionTranscript(directory, "recorded-id")))
         self.assertEqual(self.attachments, [])
 

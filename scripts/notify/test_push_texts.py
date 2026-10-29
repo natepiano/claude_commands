@@ -137,6 +137,16 @@ class PushTextTests(unittest.TestCase):
         entry = self.entry()
         self.assertEqual(push_texts.fingerprint(entry), push_texts.fingerprint(replace(entry, purpose="Other.")))
 
+    def test_agent_written_is_not_part_of_the_fingerprint(self) -> None:
+        entry = self.entry()
+        self.assertFalse(entry.agent_written)
+        self.assertEqual(push_texts.fingerprint(entry), push_texts.fingerprint(replace(entry, agent_written=True)))
+
+    def test_only_nate_adhoc_is_agent_written_and_its_approval_is_current(self) -> None:
+        self.assertEqual([entry.id for entry in push_texts.catalog() if push_texts.agent_written(entry.id)], ["nate.adhoc"])
+        self.assertFalse(push_texts.agent_written("unknown"))
+        self.assertRegex(push_texts.approval_date("nate.adhoc"), r"^\d{4}-\d{2}-\d{2}$")
+
     def test_listing_prints_one_padded_line_per_entry_sorted_by_id(self) -> None:
         entries = (replace(self.entry(), id="zeta", purpose="Last."), replace(self.entry(), id="a.long_id", purpose="First."))
         self.assertEqual(push_texts.listing(entries), "a.long_id  First.\nzeta       Last.")

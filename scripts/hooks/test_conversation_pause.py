@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 import conversation_pause
 import session_pane
 from unit_lookup import Place
+from scripts.hooks import hook_dispatch
 
 
 LIBRARY = Path(__file__).with_name("conversation_pause.py")
@@ -90,9 +91,10 @@ class ConversationPauseRegistrationTests(unittest.TestCase):
 
         stop_command = (
             '"$HOME/.claude/scripts/lib/py" '
-            '"$HOME/.claude/scripts/hooks/stop-conversation-pause.py"'
+            '"$HOME/.claude/scripts/hooks/hook_dispatch.py" stop'
         )
         self.assertEqual(registered_commands(hooks["Stop"]).count(stop_command), 1)
+        self.assertIn("stop-conversation-pause.py", [spec.filename for spec in hook_dispatch.STOP])
 
         resume_prefix = conversation_pause.RESUME_COMMAND.rsplit(" ", 1)[0]
         self.assertEqual(
