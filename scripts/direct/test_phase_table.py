@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.direct import phase_table
 from scripts.direct.recorder_fixture import invoke_recorder
+from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import fake_showrunner, fake_unit_host, showrunners
 
 
@@ -364,7 +365,7 @@ class PhaseTableTests(unittest.TestCase):
         pid = fake_unit_host.live_pid(self)
         fake_unit_host.place_process(self.environment(), pid, "w1:p1")
         self.live_record_number += 1
-        socket_path = self.root / f"live-{self.live_record_number}.sock"
+        socket_path = Path(self.enterContext(short_socket_directory())) / f"live-{self.live_record_number}.sock"
         held = socket.socket(socket.AF_UNIX)
         held.bind(str(socket_path))
         self.addCleanup(held.close)
