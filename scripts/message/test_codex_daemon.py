@@ -11,7 +11,6 @@ import os
 import socket
 import struct
 import subprocess
-import tempfile
 import threading
 import unittest
 from collections.abc import Callable
@@ -19,6 +18,7 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
 
+from scripts.lib.socket_test_support import short_socket_directory
 import codex_daemon
 
 
@@ -137,7 +137,7 @@ class CodexDaemonTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(self.enterContext(short_socket_directory()))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.root)}, clear=True)))
 
     def test_loaded_sessions_initializes_pages_and_reads_each_thread(self) -> None:

@@ -21,7 +21,7 @@ import rules
 import style_ledger
 import unit_plans
 import style_rules
-from add_unit import read_production
+from production_units import read_production
 from production_units import production_field
 from scripts.accounts.accounts import NamedAccount
 from scripts.herdr import herdr

@@ -338,12 +338,16 @@ class ReviewLauncherFixture(unittest.TestCase):
         direct_dir.mkdir(parents=True)
         agents.mkdir(parents=True)
         lib.mkdir(parents=True)
+        production = self.root / "scripts" / "production"
+        production.mkdir(parents=True)
+        _ = shutil.copy2(DIRECT_DIR.parent / "production" / "showrunners.py", production / "showrunners.py")
         # The wrapper reaches python3 through ../lib/py, resolved from its own
         # directory.
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "py", lib / "py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "user_zone.py", lib / "user_zone.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "unit_runs.py", lib / "unit_runs.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "agents_registry.py", lib / "agents_registry.py")
+        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "probe_session.py", lib / "probe_session.py")
         for name in (
             "review.sh", "implement.sh", "progress_history.py", "plan_history.py", "phase_reservation.py", "recorder_state.py",
             "findings.py", "review_tree.py", "board.sh", "worker_name.sh", "worker_state.py", "tag_inventory.py",

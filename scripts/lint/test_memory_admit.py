@@ -25,8 +25,11 @@ from unittest import mock
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import memory_admit as gate
 import nextest_budget as budget
+from memory_test_support import fake_memory_readings
 store = gate.store
 
 
@@ -55,11 +58,36 @@ HANA = gate.RepositoryIdentity("https://example.org/nate/hana", "hana", "hana")
 
 def setUpModule() -> None:
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    _ = (root / "meminfo").write_text("MemTotal: 67108864 kB\nMemAvailable: 67108864 kB\n")
+    _ = (root / "pressure").write_text(
+        "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+        + "full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+    )
     _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {
+        "BUILDLOG_MEMINFO": str(root / "meminfo"),
         "BUILDLOG_MEMORY_PRESSURE": str(root / "pressure"),
+        "BUILDLOG_LIVE_MEMORY_TRIPWIRE": os.environ.get(
+            "BUILDLOG_LIVE_MEMORY_TRIPWIRE", str(root / "live-memory-reads.jsonl")
+        ),
         "BUILDLOG_BUILD_BUDGET_GIB": "20",
         "USER_ZONE": "America/New_York",
     })))
+
+
+class MemoryTestSupportTests(unittest.TestCase):
+    def test_fake_readings_preserve_an_empty_or_set_tripwire_and_default_only_when_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            shared_record = str(root / "shared-tripwire.jsonl")
+            for setting, expected in ((None, str(root / "live-memory-reads.jsonl")),
+                                      ("", ""), (shared_record, shared_record)):
+                with self.subTest(tripwire=setting), patch.dict(os.environ):
+                    if setting is None:
+                        _ = os.environ.pop("BUILDLOG_LIVE_MEMORY_TRIPWIRE", None)
+                    else:
+                        os.environ["BUILDLOG_LIVE_MEMORY_TRIPWIRE"] = setting
+                    environment = fake_memory_readings(root)
+                    self.assertEqual(environment["BUILDLOG_LIVE_MEMORY_TRIPWIRE"], expected)
 
 
 class DecisionTests(unittest.TestCase):
@@ -1484,6 +1512,160 @@ class PressureAdmissionTests(MemoryQueueFixture):
         self.assertEqual(fields[6], "0")
 
 
+class LiveMemoryTripwireTests(MemoryQueueFixture):
+    record: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.record = self.root / "expected-live-memory-reads.jsonl"
+        (self.root / "proc").mkdir()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(self.record),
+            "BUILDLOG_MEMINFO": str(self.meminfo),
+        })))
+
+    def refusal(self, reading: str) -> str:
+        return (
+            f"live memory reading {reading} in a test; "
+            + "fake BUILDLOG_MEMINFO and BUILDLOG_MEMORY_PRESSURE (scripts/lint/memory_test_support.py)"
+        )
+
+    def assert_record(self, reading: str, *, in_process: bool = True) -> None:
+        lines = self.record.read_text().splitlines()
+        self.assertEqual(len(lines), 1)
+        row = cast(dict[str, object], json.loads(lines[0]))
+        self.assertEqual(row["reading"], reading)
+        self.assertIsInstance(row["argv"], list)
+        arguments = cast(list[object], row["argv"])
+        self.assertTrue(arguments)
+        self.assertTrue(all(isinstance(argument, str) for argument in arguments))
+        self.assertIsInstance(row["pid"], int)
+        self.assertGreater(cast(int, row["pid"]), 0)
+        if in_process:
+            self.assertEqual(row["argv"], sys.argv)
+            self.assertEqual(row["pid"], os.getpid())
+
+    def test_default_pressure_refuses_before_reading_and_records_the_process(self) -> None:
+        del os.environ["BUILDLOG_MEMORY_PRESSURE"]
+        with patch.object(Path, "read_text", side_effect=AssertionError("must refuse before reading memory")):
+            with self.assertRaises(gate.LiveMemoryReading) as raised:
+                _ = gate.read_pressure()
+        self.assertIsInstance(raised.exception, RuntimeError)
+        self.assertEqual(str(raised.exception), self.refusal("/proc/pressure/memory"))
+        self.assert_record("/proc/pressure/memory")
+
+    def test_meminfo_and_its_symlink_refuse_before_reading_and_record_the_live_path(self) -> None:
+        link = self.root / "live-meminfo"
+        link.symlink_to("/proc/meminfo")
+        for path in (Path("/proc/meminfo"), link):
+            with self.subTest(path=path):
+                self.record.unlink(missing_ok=True)
+                with patch.object(Path, "read_text", side_effect=AssertionError("must refuse before reading memory")):
+                    with self.assertRaises(gate.LiveMemoryReading) as raised:
+                        _ = gate.read_meminfo(path)
+                self.assertEqual(str(raised.exception), self.refusal("/proc/meminfo"))
+                self.assert_record("/proc/meminfo")
+
+    def test_live_readings_append_records_without_replacing_earlier_entries(self) -> None:
+        del os.environ["BUILDLOG_MEMORY_PRESSURE"]
+        with self.assertRaises(gate.LiveMemoryReading):
+            _ = gate.read_meminfo(Path("/proc/meminfo"))
+        with self.assertRaises(gate.LiveMemoryReading):
+            _ = gate.read_pressure()
+        rows = [cast(dict[str, object], json.loads(line)) for line in self.record.read_text().splitlines()]
+        self.assertEqual([row["reading"] for row in rows], ["/proc/meminfo", "/proc/pressure/memory"])
+
+    def test_fake_readings_admit_check_and_queue_without_a_record(self) -> None:
+        result = self.check(need=8, free=40)
+        self.assertEqual(result.decision.state, "admit")
+        self.assertIsInstance(result.reservation, gate.Reserved)
+        if isinstance(result.reservation, gate.Reserved):
+            result.reservation.path.unlink()
+        _ = self.head(need=8)
+        view, _ = gate.read_queue(gate.admission_dir(self.root), gate.process_table(gate.PROC), NOW.timestamp())
+        self.assertEqual(len(view.waiting), 1)
+        reason = view.waiting[0].reason
+        self.assertIsInstance(reason, gate.HeadAdmissionStatus)
+        if isinstance(reason, gate.HeadAdmissionStatus):
+            self.assertEqual(reason.decision.state, "admit")
+        self.assertFalse(self.record.exists() and self.record.read_text())
+
+    def test_queue_propagates_live_memory_refusals(self) -> None:
+        _ = self.meminfo.write_text("MemTotal: 67108864 kB\nMemAvailable: 67108864 kB\n")
+        for variable, reading in (("BUILDLOG_MEMINFO", "/proc/meminfo"),
+                                  ("BUILDLOG_MEMORY_PRESSURE", "/proc/pressure/memory")):
+            with self.subTest(variable=variable), patch.dict(os.environ):
+                del os.environ[variable]
+                self.record.unlink(missing_ok=True)
+                with self.assertRaises(gate.LiveMemoryReading) as raised:
+                    _ = gate.read_queue(gate.admission_dir(self.root), {}, NOW.timestamp())
+                self.assertEqual(str(raised.exception), self.refusal(reading))
+                self.assert_record(reading)
+
+    def test_unwritable_record_keeps_the_named_refusal_in_direct_and_queue_calls(self) -> None:
+        _ = self.meminfo.write_text("MemTotal: 67108864 kB\nMemAvailable: 67108864 kB\n")
+        record = self.root / "missing-directory" / "tripwire.jsonl"
+        for variable, reading in (("BUILDLOG_MEMINFO", "/proc/meminfo"),
+                                  ("BUILDLOG_MEMORY_PRESSURE", "/proc/pressure/memory")):
+            with patch.dict(os.environ, {"BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(record), variable: reading}):
+                with self.subTest(reading=reading, caller="direct"):
+                    with self.assertRaises(gate.LiveMemoryReading) as raised:
+                        gate.check_memory_reading(Path(reading))
+                    self.assertEqual(str(raised.exception), self.refusal(reading))
+                with self.subTest(reading=reading, caller="queue"):
+                    with self.assertRaises(gate.LiveMemoryReading) as raised:
+                        _ = gate.read_queue(gate.admission_dir(self.root), {}, NOW.timestamp())
+                    self.assertEqual(str(raised.exception), self.refusal(reading))
+
+    def test_default_pressure_still_returns_pressure_when_tripwire_is_unset_or_empty(self) -> None:
+        del os.environ["BUILDLOG_MEMORY_PRESSURE"]
+        for setting in (None, ""):
+            with self.subTest(tripwire=setting), patch.dict(os.environ):
+                if setting is None:
+                    del os.environ["BUILDLOG_LIVE_MEMORY_TRIPWIRE"]
+                else:
+                    os.environ["BUILDLOG_LIVE_MEMORY_TRIPWIRE"] = setting
+                self.assertIsInstance(gate.read_pressure(), gate.Pressure)
+
+    def test_checker_cli_exits_two_with_refusal_as_last_stderr_line(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(MEMORY_GATE.with_name("memory_admit.py")), "check", "/proc/meminfo",
+             str(os.getpid()), "", "0", "test", "check", "test", str(GIB), "fallback", "0", "/bin/true"],
+            env=dict(os.environ), capture_output=True, text=True, check=False, timeout=10,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr.splitlines()[-1], self.refusal("/proc/meminfo"))
+        self.assert_record("/proc/meminfo", in_process=False)
+
+    def test_shell_refuses_live_meminfo_or_pressure_and_records_one_reading(self) -> None:
+        _ = self.meminfo.write_text("MemTotal: 67108864 kB\nMemAvailable: 67108864 kB\n")
+        for variable, reading in (("BUILDLOG_MEMINFO", "/proc/meminfo"),
+                                  ("BUILDLOG_MEMORY_PRESSURE", "/proc/pressure/memory")):
+            with self.subTest(variable=variable):
+                self.record.unlink(missing_ok=True)
+                environment = {
+                    **os.environ, "HOME": str(self.root),
+                    "BUILD_HOLD_DIR": str(self.root / "holders"),
+                    "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
+                    "UNIT_ACTIVE_DIR": str(self.root / "active"), "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
+                    "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                    "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                    "MAC_TEST_STATE_DIR": str(self.root / "mac-state"),
+                }
+                del environment[variable]
+                result = subprocess.run(
+                    ["bash", "-c", 'source "$1"; buildlog_wait_for_memory', "test", str(MEMORY_GATE)],
+                    env=environment, capture_output=True, text=True, check=False, timeout=10,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr.strip(), f"memory admission check failed ({self.refusal(reading)}); step refused")
+                self.assertNotIn("waiting for memory", result.stderr)
+                self.assert_record(reading, in_process=False)
+
+
 class QueueApiTests(MemoryQueueFixture):
     @override
     def setUp(self) -> None:
@@ -1512,6 +1694,68 @@ class QueueApiTests(MemoryQueueFixture):
         return (self.waiter(300, NOW.timestamp() - 2400, "/tmp/clone88ci", "clone88ci"),
                 self.waiter(400, NOW.timestamp() - 300, "/tmp/warmup-tree", "warmup"),
                 self.waiter(500, NOW.timestamp() - 60, "/tmp/third", "third"))
+
+    def test_waiter_identity_keeps_the_bare_step_and_caller_identity(self) -> None:
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": "worker-id", "CLAUDE_CODE_SESSION_ID": "parent-id",
+                                     "CLAUDE_SESSION_NAME": "recorded-name"}), \
+             patch("os.getcwd", return_value="/tmp/hana-tree"):
+            for step in ("nextest", "clippy", "mend", "doc"):
+                with self.subTest(step=step):
+                    self.assertEqual(gate.waiter_identity(step, "hana-tree"), {
+                        "session_id": "worker-id", "session_name": "recorded-name",
+                        "step": step, "folder": "/tmp/hana-tree",
+                    })
+
+    def test_held_step_is_stored_and_read_without_the_repository_prefix(self) -> None:
+        _ = self.meminfo.write_text(f"MemAvailable: 0 kB\nMemTotal: {60 * GIB // 1024} kB\n")
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": "worker-id", "CLAUDE_SESSION_NAME": "recorded-name"}):
+            result = gate.check(self.meminfo, 400, "", ["cargo", "nextest"], root=self.root, now=NOW,
+                                profile=gate.StepProfile("hana", "nextest", "hana-tree",
+                                                         gate.ExpectedPeak(12 * GIB, "measured", 5), HANA))
+        self.assertEqual(result.decision.state, "hold")
+        row = cast(gate.Waiter, json.loads((self.root / "admission/400-warmup.waiting").read_text()))
+        self.assertEqual(row.get("step"), "nextest")
+        self.assertEqual(row.get("repository_name"), "hana")
+        view = gate.queue_view()
+        self.assertEqual([(step.session_id, step.step) for step in view.waiting], [("worker-id", "nextest")])
+
+    def test_queue_memory_hold_carries_threshold_and_its_parts(self) -> None:
+        _ = self.running(100, 5, age=0)
+        _ = self.waiter(300, NOW.timestamp() - 60, "/tmp/head", "head")
+        path = self.waiter(400, NOW.timestamp() - 30, "/tmp/follower", "follower")
+        row = cast(gate.Waiter, json.loads(path.read_text()))
+        row["need"] = 3 * GIB
+        _ = path.write_text(json.dumps(row))
+        _ = self.meminfo.write_text(f"MemAvailable: {8 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
+        view = gate.queue_view()
+        reason = view.waiting[1].reason
+        self.assertIsInstance(reason, gate.NeedsMemory)
+        if not isinstance(reason, gate.NeedsMemory):
+            self.fail(f"expected memory hold, got {reason}")
+        self.assertEqual((reason.need, reason.free), (3 * GIB, 8 * GIB))
+        self.assertEqual((reason.threshold, reason.growth, reason.reserve, reason.head_need),
+                         (10 * GIB, 4 * GIB, 3 * GIB, 0))
+        self.assertEqual(reason.threshold, reason.need + reason.growth + reason.reserve + reason.head_need)
+
+        # Exercise a nonzero head charge at the decision boundary; strict heads normally use BehindHead.
+        decision = gate.decide(8 * GIB, 60 * GIB, 3 * GIB, [gate.PromisedMemory(4 * GIB)], head_need=7 * GIB)
+        with patch.object(gate, "queue_decision", return_value=decision):
+            charged = gate.queue_view().waiting[1].reason
+        self.assertIsInstance(charged, gate.NeedsMemory)
+        if not isinstance(charged, gate.NeedsMemory):
+            self.fail(f"expected memory hold, got {charged}")
+        self.assertEqual((charged.threshold, charged.growth, charged.reserve, charged.head_need),
+                         (17 * GIB, 4 * GIB, 3 * GIB, 7 * GIB))
+        self.assertEqual(charged.threshold, charged.need + charged.growth + charged.reserve + charged.head_need)
+
+    def test_behind_head_carries_head_identity_and_unmatched_name(self) -> None:
+        for name, expected_name in (("clone88ci", "clone88ci"), ("", "clone88ci")):
+            with self.subTest(recorded_name=name):
+                _ = self.waiter(300, NOW.timestamp() - 2400, "/tmp/clone88ci", name)
+                _ = self.waiter(400, NOW.timestamp() - 300, "/tmp/warmup-tree", "warmup")
+                view = gate.queue_view()
+                self.assertEqual(view.waiting[1].reason, gate.BehindHead(
+                    head_name=expected_name, head_since=NOW.timestamp() - 2400, head_session_id="session-300"))
 
     def test_view_counts_measured_use_after_ramp_and_keeps_the_head(self) -> None:
         _ = self.running(100, 12)
@@ -1819,7 +2063,7 @@ class QueueApiTests(MemoryQueueFixture):
                 reason = next(step.reason for step in view.waiting if step.pid == 400)
                 if held:
                     self.assertEqual(result.decision.state, "hold")
-                    self.assertEqual(reason, gate.BehindHead("clone88ci", NOW.timestamp() - 2400))
+                    self.assertEqual(reason, gate.BehindHead("clone88ci", NOW.timestamp() - 2400, ""))
                 else:
                     self.assertEqual(result.decision.state, "admit")
                     self.assertIsInstance(reason, gate.ReadyForAdmission)

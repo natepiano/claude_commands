@@ -1,0 +1,2 @@
+goal 1 - Ship Hana · alignment ⭐⭐⭐⭐ · impact ⭐⭐⭐ · urgency ⭐ (unsure) (agent proposes) · effort ⭐⭐ (unsure) (check) (agent proposes) · category feature (unsure) (agent proposes) · area rendering (unsure) (agent proposes)
+Alternatives: urgency ⭐ / ⭐⭐ (unsure) (agent proposes) · effort ⭐⭐ / ⭐⭐⭐ (unsure) (check) (agent proposes) · category feature / enhancement (unsure) (agent proposes) · area rendering / tooling (unsure) (agent proposes)

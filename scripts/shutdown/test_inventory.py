@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import ClassVar, cast, final, override
 from unittest.mock import patch
 
+from scripts.lib.socket_test_support import short_socket_directory
 from test_support import ShutdownTestCase, linux_process_fixture
 from test_restart import entry, top_level
 import record
@@ -533,7 +534,7 @@ class InventoryTests(ShutdownTestCase):
         )
 
         self.director_pid = os.getpid()
-        socket_path = self.root / "director.sock"
+        socket_path = Path(self.enterContext(short_socket_directory())) / "director.sock"
         self.live_socket.close()
         self.live_socket = socket.socket(socket.AF_UNIX)
         self.live_socket.bind(str(socket_path))

@@ -42,7 +42,7 @@ import retire_unit
 import unit_lookup
 import unit_move
 import unit_names
-from add_unit import Production
+from production_units import Production
 from record import InvalidRecord
 
 ADD_UNIT = Path(__file__).resolve().parent / "add_unit.py"

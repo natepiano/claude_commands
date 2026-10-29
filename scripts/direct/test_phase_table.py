@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.direct import phase_table
 from scripts.direct.recorder_fixture import invoke_recorder
+from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import fake_showrunner, fake_unit_host, showrunners
 
 
@@ -364,7 +365,7 @@ class PhaseTableTests(unittest.TestCase):
         pid = fake_unit_host.live_pid(self)
         fake_unit_host.place_process(self.environment(), pid, "w1:p1")
         self.live_record_number += 1
-        socket_path = self.root / f"live-{self.live_record_number}.sock"
+        socket_path = Path(self.enterContext(short_socket_directory())) / f"live-{self.live_record_number}.sock"
         held = socket.socket(socket.AF_UNIX)
         held.bind(str(socket_path))
         self.addCleanup(held.close)
@@ -3243,6 +3244,18 @@ class PhaseTableTests(unittest.TestCase):
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
         self.assertFalse(self.vault_root.exists())
 
+    def test_show_missing_production_document_is_one_line_refusal(self) -> None:
+        production = self.working_dir / "docs" / "missing-production.md"
+
+        result = self.run_show_production(production)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertTrue(result.stderr.startswith("cannot read production doc: "))
+        self.assertIn(str(production), result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_invalid_production_document_is_one_line_refusal(self) -> None:
         self.write_production_plan()
         production = self.working_dir / "docs" / "show-production.md"
@@ -3496,6 +3509,10 @@ class PhaseTableTests(unittest.TestCase):
         )
         fake_unit_host.write(self.environment(), [fake_unit_host.HostedUnit(
             "table-host", "w1:p1", {"SHOWRUNNER_UNIT": "other", "SHOWRUNNER_UNIT_ID": "table-unit"})])
+        live_record = cast(dict[str, object], json.loads(
+            (self.sessions_dir / f"record-{self.live_record_number}.json").read_text(encoding="utf-8")
+        ))
+        fake_unit_host.place_process(self.environment(), cast(int, live_record["pid"]), "w1:p1")
         session_id = "other-showrunner"
         _ = fake_showrunner.write_timer(
             self.notifier_dir,

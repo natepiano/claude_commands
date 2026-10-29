@@ -25,8 +25,10 @@ for directory in ("production", "shutdown"):
 
 if TYPE_CHECKING:
     from scripts.production import live_units, production_units, unit_lookup
+    from scripts.herdr import herdr
     from scripts.shutdown import inventory, launch_permission, record, restart
 else:
+    herdr = import_module("herdr")
     live_units = import_module("live_units")
     production_units = import_module("production_units")
     unit_lookup = import_module("unit_lookup")
@@ -252,6 +254,7 @@ def _start_recovery(source: RecoverySource, job: RecoveryJob, timeout: float) ->
         _ = Path(job["result"]).write_text(json.dumps(failure), encoding="utf-8")
 
 
+@herdr.process_action()
 def _live_account(doc: Path, unit: str) -> str:
     for found in live_units.production_units(doc):
         if found.unit != unit or found.session is None:
@@ -348,22 +351,35 @@ def run(now: datetime, *, dry_run: bool) -> list[str]:
                     if found is None:
                         raise OSError(f"{unit}: unit liveness is unavailable")
                     claude = found.session.claude if found.session is not None else unit_lookup.ClaudeNotRunning()
+                    if not isinstance(claude, unit_lookup.LiveClaude):
+                        # A report can suggest an outage. Prove it fresh before recovery.
+                        with herdr.process_action():
+                            current = {item.unit: item for item in live_units.production_units(doc)}
+                        found = current.get(unit)
+                        if found is None:
+                            raise OSError(f"{unit}: unit liveness is unavailable")
+                        claude = found.session.claude if found.session is not None else unit_lookup.ClaudeNotRunning()
                     if isinstance(claude, unit_lookup.LiveClaude):
-                        if not dry_run:
-                            if outage_alerts.clear(claude.session_id, observed_at):
-                                for saved in record.all_session_records():
-                                    if (saved["session"]["session_id"] == claude.session_id
-                                            and "restore_alerted" in saved):
-                                        record.clear_restore_alert(saved)
                         outage = state.get(claude.session_id)
+                        restored = ""
                         if outage is not None and "job" in outage and not dry_run:
-                            Path(outage["job"]["result"]).unlink(missing_ok=True)
                             restored = _live_account(doc, unit)
-                            since = datetime.fromisoformat(outage["first_seen"]).astimezone(user_zone()).strftime("%H:%M %Z")
-                            text = f"watchdog: {unit} was down since {since}; restarted on {restored}"
-                            lines.append(text)
-                            lines.append(showrunners.tell(runner["slug"], f"unit-watchdog-{claude.session_id}-{now.isoformat()}", text))
-                        continue
+                            if not restored:
+                                claude = unit_lookup.ClaudeNotRunning()
+                        if isinstance(claude, unit_lookup.LiveClaude):
+                            if not dry_run:
+                                if outage_alerts.clear(claude.session_id, observed_at):
+                                    for saved in record.all_session_records():
+                                        if (saved["session"]["session_id"] == claude.session_id
+                                                and "restore_alerted" in saved):
+                                            record.clear_restore_alert(saved)
+                            if outage is not None and "job" in outage and not dry_run:
+                                Path(outage["job"]["result"]).unlink(missing_ok=True)
+                                since = datetime.fromisoformat(outage["first_seen"]).astimezone(user_zone()).strftime("%H:%M %Z")
+                                text = f"watchdog: {unit} was down since {since}; restarted on {restored}"
+                                lines.append(text)
+                                lines.append(showrunners.tell(runner["slug"], f"unit-watchdog-{claude.session_id}-{now.isoformat()}", text))
+                            continue
                     source = sources.get((runner["slug"], unit))
                     if source is None:
                         for key, outage in state.items():

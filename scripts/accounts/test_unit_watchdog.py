@@ -190,6 +190,120 @@ class UnitWatchdogTests(unittest.TestCase):
             self.assertEqual(self.pass_at(0, dry_run=True), [])
             reads.assert_called_once_with()
 
+    def test_recovery_rechecks_a_reported_outage_and_sees_the_new_unit_pane(self) -> None:
+        owner = self.add_unit("unit")
+        fresh = herdr.HerdrProcess(owner["pid"], herdr.HerdrPlace("agents", "new-pane"),
+            {"SHOWRUNNER_UNIT": "fixture", "SHOWRUNNER_UNIT_ID": "unit"}, "claude", str(self.home))
+        def observed() -> unit_lookup.MarkedProductions:
+            if herdr.herdr_processes():
+                return self.marked()
+            return unit_lookup.MarkedProductions({"fixture": {"unit": unit_lookup.MarkedUnit(
+                "unit", unit_lookup.ClaudeNotRunning(), unit_lookup.Place("shared", "unit"))}}, {})
+        with (patch.object(herdr, "_scan_herdr_processes", side_effect=[[], [fresh]]) as scans,
+              patch.object(unit_lookup, "every_marked_unit", side_effect=observed),
+              herdr.process_snapshot()):
+            self.assertEqual(herdr.herdr_processes(), [])
+            self.assertEqual(unit_watchdog.run(NOW, dry_run=False), [])
+        self.assertEqual(scans.call_count, 2)
+        self.assertEqual(unit_watchdog._read_state(), {})  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(self.pending, [])
+
+    def test_recovery_completion_reads_new_unit_pane_after_report_snapshot(self) -> None:
+        owner = self.add_unit("unit")
+        fresh = herdr.HerdrProcess(owner["pid"], herdr.HerdrPlace("agents", "new-pane"),
+            {"SHOWRUNNER_UNIT": "fixture", "SHOWRUNNER_UNIT_ID": "unit"}, "claude", str(self.home))
+        processes: list[herdr.HerdrProcess] = []
+
+        def observed() -> unit_lookup.MarkedProductions:
+            return self.marked() if herdr.herdr_processes() else unit_lookup.MarkedProductions({}, {})
+
+        with (patch.object(herdr, "_scan_herdr_processes", side_effect=lambda: list(processes)),
+              patch.object(unit_lookup, "every_marked_unit", side_effect=observed),
+              herdr.process_snapshot()):
+            self.assertEqual(herdr.herdr_processes(), [])
+            processes.append(fresh)
+            self.assertEqual(unit_watchdog._live_account(self.doc, "unit"), "claude4")  # pyright: ignore[reportPrivateUsage]
+
+    def test_live_unit_report_reuses_the_scan_without_starting_recovery(self) -> None:
+        owner = self.add_unit("unit")
+        fresh = herdr.HerdrProcess(owner["pid"], herdr.HerdrPlace("agents", "pane"), {}, "claude", str(self.home))
+        def observed() -> unit_lookup.MarkedProductions:
+            self.assertEqual(herdr.herdr_processes(), [fresh])
+            return self.marked()
+        with (patch.object(herdr, "_scan_herdr_processes", return_value=[fresh]) as scans,
+              patch.object(unit_lookup, "every_marked_unit", side_effect=observed),
+              herdr.process_snapshot()):
+            _ = herdr.herdr_processes()
+            self.assertEqual(unit_watchdog.run(NOW, dry_run=False), [])
+        self.assertEqual(scans.call_count, 1)
+        self.assertEqual(self.pending, [])
+
+    def test_idle_real_watcher_and_watchdog_share_the_report_scan(self) -> None:
+        owner = self.add_unit("unit", label="claude2")
+        fresh = herdr.HerdrProcess(owner["pid"], herdr.HerdrPlace("agents", "pane"),
+            {"SHOWRUNNER_UNIT": "fixture", "SHOWRUNNER_UNIT_ID": "unit"}, "claude", str(self.home))
+        def observed() -> unit_lookup.MarkedProductions:
+            _ = herdr.herdr_processes()
+            return self.marked()
+        def listing(login: str | None = None, *,
+                    registrations: inventory.ShowrunnerRegistrations | Literal["read timers"] = "read timers") -> list[inventory.ListedSession]:
+            _ = herdr.herdr_processes()
+            return self.fixture.listing(login, registrations=registrations)
+        with (patch.object(herdr, "_scan_herdr_processes", return_value=[fresh]) as scans,
+              patch.object(unit_lookup, "every_marked_unit", side_effect=observed),
+              patch.object(inventory, "listing", side_effect=listing),
+              refusal_watch.session_observation(), herdr.process_snapshot()):
+            _ = herdr.herdr_processes()  # The earlier session-table report.
+            self.assertEqual(refusal_watch.run(NOW), [])
+            self.assertEqual(scans.call_count, 1)
+        self.assertEqual(self.pending, [])
+        self.assertEqual(self.fixture.commands, [])
+
+    def test_live_report_without_fresh_confirmation_keeps_recovery_evidence(self) -> None:
+        _ = self.add_unit("unit")
+        self.finish_jobs = False
+        self.die("unit")
+        _ = self.pass_at(0)
+        _ = self.pass_at(2)
+        state = unit_watchdog._read_state()  # pyright: ignore[reportPrivateUsage]
+        outage = state["unit"]
+        assert "job" in outage
+        result = Path(outage["job"]["result"])
+        _ = result.write_text('"fixture evidence"')
+        self.revive("unit", "claude4")
+        live = self.marked()
+        self.die("unit")
+        absent = self.marked()
+        with (patch.object(unit_lookup, "every_marked_unit", side_effect=[live, absent]),
+              patch.object(unit_watchdog, "_recovery_result", return_value=unit_watchdog.RecoveryStillRunning()),
+              patch.object(outage_alerts, "clear") as cleared):
+            lines = self.pass_at(3)
+        self.assertTrue(result.exists())
+        self.assertIn("job", unit_watchdog._read_state()["unit"])  # pyright: ignore[reportPrivateUsage]
+        self.assertFalse(any("restarted on" in line for line in [*lines, *self.notices]))
+        cleared.assert_not_called()
+
+    def test_unreadable_fresh_confirmation_preserves_recovery_result_and_job(self) -> None:
+        _ = self.add_unit("unit")
+        self.finish_jobs = False
+        self.die("unit")
+        _ = self.pass_at(0)
+        _ = self.pass_at(2)
+        state = unit_watchdog._read_state()  # pyright: ignore[reportPrivateUsage]
+        outage = state["unit"]
+        assert "job" in outage
+        result = Path(outage["job"]["result"])
+        _ = result.write_text('"fixture evidence"')
+        self.revive("unit", "claude4")
+        with (patch.object(unit_watchdog, "_live_account", side_effect=OSError("fixture unreadable")),
+              patch.object(outage_alerts, "clear") as cleared):
+            lines = self.pass_at(3)
+        self.assertEqual(result.read_text(), '"fixture evidence"')
+        self.assertEqual(unit_watchdog._read_state(), state)  # pyright: ignore[reportPrivateUsage]
+        self.assertTrue(any("fixture unreadable" in line for line in lines))
+        self.assertFalse(any("restarted on" in line for line in self.notices))
+        cleared.assert_not_called()
+
     def test_10_26_auto_move_clears_a_stale_hold_and_every_unit_recovers(self) -> None:
         _ = self.fixture.groups(units="claude4")
         for name in ("alpha", "beta", "gamma"):

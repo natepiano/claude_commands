@@ -6,7 +6,7 @@ import argparse
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import fnmatch
 import hashlib
@@ -29,6 +29,36 @@ from scripts.issue_score.records import FailedIssue, RequestPayload, ScoredIssue
 
 WORKERS = 8
 
+PROJECT_NAMES = {
+    "bei": "bevy_enhanced_input", "biz": "biz", "brp": "bevy_brp_mcp",
+    "bwm": "bevy_window_manager", "cargo-berth": "cargo-berth",
+    "cargo-liner": "cargo-liner", "cargo-mend": "cargo-mend", "cargo-port": "cargo-port",
+    "conduit": "hana_conduit", "diegetic": "hana_diegetic", "fairy_dust": "fairy_dust",
+    "hana": "hana", "lading": "hana_lading", "lagrange": "bevy_lagrange",
+    "liminal": "hana_liminal", "nateroids": "nateroids", "panorbit": "bevy_panorbit_camera",
+    "rust-template": "rust-template",
+}
+
+
+@dataclass(frozen=True)
+class GoalCandidate:
+    goal: str
+    alignment: decide.FieldDecision
+
+
+@dataclass(frozen=True)
+class ResolvedGoal:
+    candidate: GoalCandidate
+
+
+@dataclass(frozen=True)
+class UnresolvedGoal:
+    first: GoalCandidate
+    second: GoalCandidate
+
+
+GoalState = ResolvedGoal | UnresolvedGoal
+
 
 class CommandArguments(argparse.Namespace):
     command: str = "score"
@@ -43,6 +73,9 @@ class CommandArguments(argparse.Namespace):
     count: int = 20
     seed: int = 0
     sheet: str = ""
+    project: str = ""
+    title: str = ""
+    body_file: str = ""
 
 
 def content_hash(issue: vault.Issue, areas: Sequence[str], definitions: Mapping[str, str]) -> str:
@@ -233,9 +266,114 @@ def score(only: str = "*", limit: int = 0, *, issues_dir: Path = vault.ISSUES_DI
     return ScoreRun(result_path, failure_count)
 
 
+def _proposal_value(field_name: str, value: str | int) -> str:
+    if field_name in vault.RATING_FIELDS:
+        return "⭐" * int(value)
+    if field_name == "backlog_goal":
+        return questions.GOAL_LABELS.get(str(value), str(value))
+    return str(value)
+
+
+def _proposal_field(field_name: str, decision: decide.FieldDecision) -> str:
+    value = _proposal_value(field_name, decision.value)
+    if decision.certainty == "unsure" and decision.origin not in ("area_fallback", "urgency_evidence"):
+        candidates = sorted(decision.probabilities, key=lambda name: (-decision.probabilities[name], name))[:2]
+        if candidates:
+            value = " / ".join(_proposal_value(field_name, candidate) for candidate in candidates)
+    flags: list[str] = []
+    if decision.certainty == "unsure":
+        flags.append("unsure")
+    if decision.split:
+        flags.append("split")
+    if decision.check:
+        flags.append("check")
+    if decision.possible_five:
+        flags.append("possible 5")
+    if decision.origin == "area_fallback":
+        flags.append(f"hint: {decision.hint}")
+    if field_name not in questions.JEV_FIELDS:
+        flags.append("agent proposes")
+    return value + "".join(f" ({flag})" for flag in flags)
+
+
+def _proposal_goal(main: Mapping[str, client.Answer], decisions: Mapping[str, decide.FieldDecision]) -> GoalState:
+    goal = decisions["backlog_goal"]
+    # Preserve the full speculative fan-out, including the runner-up goal's score.
+    candidates: dict[str, GoalCandidate] = {}
+    for name, label in questions.GOAL_LABELS.items():
+        answer = main[f"alignment_{name}"]
+        if answer["type"] != "score":
+            raise client.TypeSafeError(f"Expected Score answer: alignment_{name}")
+        alignment = replace(decide.decide_score(answer, "backlog_alignment"),
+                            structurally_eligible=goal.structurally_eligible,
+                            threshold_dependencies={"backlog_goal": goal.probabilities[name]})
+        alignment = replace(alignment, certainty="sure" if decide.is_sure("backlog_alignment", alignment) else "unsure")
+        candidates[name] = GoalCandidate(label, alignment)
+    names = sorted(goal.probabilities, key=lambda name: (-goal.probabilities[name], name))
+    if goal.certainty == "sure":
+        return ResolvedGoal(candidates[names[0]])
+    if len(names) < 2:
+        raise client.TypeSafeError("An unsure goal needs two candidates")
+    return UnresolvedGoal(candidates[names[0]], candidates[names[1]])
+
+
+def _ranking_field(field_name: str, decision: decide.FieldDecision) -> str:
+    value = decision.value
+    if decision.probabilities and decision.origin not in ("area_fallback", "urgency_evidence"):
+        value = min(decision.probabilities, key=lambda name: (-decision.probabilities[name], name))
+    return _proposal_field(field_name, replace(decision, value=value, probabilities={}))
+
+
+def propose(project: str, title: str, body: str = "", *, issues_dir: Path = vault.ISSUES_DIR,
+            state_dir: Path = STATE_DIR, model: str = questions.MODEL,
+            area_definitions_path: Path = vault.AREA_DEFINITIONS_PATH) -> str:
+    """Render a single-valued ranking and separate unsure alternatives without writing them."""
+    if project not in PROJECT_NAMES:
+        raise ValueError(f"Unknown project shorthand: {project}")
+    issue = vault.Issue(Path("__new_issue__.md"), title, PROJECT_NAMES[project], body, {})
+    # Validate context before loading the vocabulary or making either request.
+    _ = vault.build_state(issue)
+    state_dir = state_dir.expanduser().resolve()
+    if state_dir.is_relative_to(vault.VAULT_ROOT.resolve()) or state_dir.is_relative_to(issues_dir.resolve()):
+        raise ValueError("Result files must be outside the issue vault")
+    areas = vault.area_vocabulary(vault.load_open_issues(issues_dir))
+    definitions = vault.load_area_definitions(area_definitions_path)
+    record = _score_issue(issue, areas, model, state_dir, Event(), definitions)
+    main = record["answers"]["main"]["answers"]
+    area = record["answers"]["area"]["answers"]
+    decisions = decide.decide_answers(main, area)
+    goal_state = _proposal_goal(main, decisions)
+    alternatives: list[str] = []
+    if isinstance(goal_state, ResolvedGoal):
+        first_goal = goal_state.candidate
+        if first_goal.alignment.certainty == "unsure":
+            alternatives.append(f"alignment {_proposal_field('backlog_alignment', first_goal.alignment)}")
+    else:
+        first_goal = goal_state.first
+        goal_text = " / ".join(
+            f"{candidate.goal} (alignment {_proposal_field('backlog_alignment', candidate.alignment)})"
+            for candidate in (goal_state.first, goal_state.second)) + " (unsure)"
+        if "backlog_goal" not in questions.JEV_FIELDS:
+            goal_text += " (agent proposes)"
+        alternatives.append(f"goal {goal_text}")
+    parts = [f"goal {_ranking_field('backlog_goal', decisions['backlog_goal'])}",
+             f"alignment {_ranking_field('backlog_alignment', first_goal.alignment)}"]
+    for name, label in (("backlog_impact", "impact"), ("backlog_urgency", "urgency"),
+                        ("backlog_effort", "effort"), ("category", "category"), ("area", "area")):
+        parts.append(f"{label} {_ranking_field(name, decisions[name])}")
+        if decisions[name].certainty == "unsure":
+            alternatives.append(f"{label} {_proposal_field(name, decisions[name])}")
+    ranking = " · ".join(parts)
+    return ranking + ("\nAlternatives: " + " · ".join(alternatives) if alternatives else "")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    propose_command = commands.add_parser("propose", help="Propose metadata for a new issue")
+    _ = propose_command.add_argument("--project", required=True, help="Project shorthand from /issue")
+    _ = propose_command.add_argument("--title", required=True)
+    _ = propose_command.add_argument("--body-file", default="", help="UTF-8 issue body file")
     score_command = commands.add_parser("score", help="Score open non-style issues")
     _ = score_command.add_argument("--only", default="*", help="Issue filename or path glob")
     _ = score_command.add_argument("--limit", type=int, default=0, help="Maximum issues; 0 means all")
@@ -258,6 +396,10 @@ def main(argv: list[str] | None = None) -> int:
     _ = blind_score_command.add_argument("sheet")
     args = parser.parse_args(argv, namespace=CommandArguments())
     try:
+        if args.command == "propose":
+            body = Path(args.body_file).read_text(encoding="utf-8") if args.body_file else ""
+            print(propose(args.project, args.title, body))
+            return 0
         if args.command == "compare":
             print(compare(args.run_id, split=args.split, repeat_run_id=args.repeat, baseline_run_id=args.baseline))
             return 0
@@ -278,7 +420,7 @@ def main(argv: list[str] | None = None) -> int:
         run = score(args.only, args.limit, split=args.split, fresh=args.fresh)
     except (client.TypeSafeError, OSError, ValueError) as error:
         print(f"issue-score: {error}", file=sys.stderr)
-        return 1
+        return 2 if args.command == "propose" else 1
     print(run.result_path)
     if run.failure_count:
         noun = "issue" if run.failure_count == 1 else "issues"
