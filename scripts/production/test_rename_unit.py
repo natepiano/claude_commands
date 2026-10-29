@@ -771,7 +771,6 @@ class UnitRenameTests(unittest.TestCase):
 
         def end() -> None:
             held.close()
-            (self.root / "state/sessions" / f"{session_id}.sock").unlink()
             fake_unit_host.write(self.env, [])
         return end
 

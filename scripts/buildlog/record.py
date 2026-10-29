@@ -426,6 +426,15 @@ def hold_event(args: list[str]) -> None:
     store.append_line(store.host_file(host, instant.timestamp()), record)
 
 
+def queue_bump(actor: str, session: str, step: str, folder: str, old_position: int, at: float) -> None:
+    host = store.host_name()
+    store.append_line(store.host_file(host, at), {
+        "kind": "queue_bump", "v": RECORD_VERSION,
+        "id": f"{host}-{time.time_ns()}", "host": host, "at": store.utc_iso(at),
+        "actor": actor, "session": session, "step": step, "folder": folder, "old_position": old_position,
+    })
+
+
 def hold_build(args: list[str]) -> None:
     key, since, boot, pid, start, classification, session, command, cwd = args
     if classification not in {"other_session", "no_session"} or int(pid) <= 0 or not start.isdecimal():

@@ -194,6 +194,7 @@ class UnitTransferTests(unittest.TestCase):
         before = self.git("rev-parse", "demo", "other", "demo-alpha")
         result = self.transfer("plan")
         self.assert_ok(result)
+        self.assertIn("stop alpha-unit and its Codex workers through the shutdown path", result.stdout)
         self.assertIn("8. verify: alpha-unit shows under other and nowhere under demo", result.stdout)
         self.assertEqual(self.git("rev-parse", "demo", "other", "demo-alpha"), before)
 

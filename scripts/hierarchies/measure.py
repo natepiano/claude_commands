@@ -2,7 +2,8 @@
 """Read natedev's hierarchy records without changing the live process.
 
 Counts describe recorded work, not proof that commits reached Hana main. Windows
-are half open. Date bounds use the user's zone; --until includes that whole day.
+are half open. Date bounds use the user's zone; a date-only --until includes that
+whole day. A date-time --until is the excluded end.
 """
 from __future__ import annotations
 
@@ -37,6 +38,7 @@ from scripts.accounts.role_map import stored_role_map
 from scripts.lib import unit_runs
 from scripts.message import roster
 from scripts.production import showrunners, production_units, issues, change_review, dailies_render
+from scripts.production import unit_lookup
 from scripts.production.proposal_issue import proposal_progress, AwaitingApproval
 from scripts.production.proposals_table import backlog_rows, REVIEW_STATE
 from scripts.nightly_review import candidates
@@ -45,12 +47,29 @@ from scripts.usage import collect, usage_report
 JsonObject = dict[str, object]
 
 
-class Unrecorded(Enum):
-    TIME = "time not recorded"
-    DURATION = "duration not recorded"
+class TimeNotRecorded(Enum):
+    MISSING = "time not recorded"
 
 
-RecordedTime = datetime | Unrecorded
+class DurationNotRecorded(Enum):
+    MISSING = "duration not recorded"
+
+
+class ScoreNotRecorded(Enum):
+    MISSING = "score not recorded"
+
+
+class MergeHistoryNotRecorded(Enum):
+    MISSING = "merge history not recorded"
+
+
+class UnitActivity(Enum):
+    LIVE = "running phase or live session"
+    INACTIVE = "no running phase or live session"
+    UNKNOWN = "unit activity not recorded"
+
+
+RecordedTime = datetime | TimeNotRecorded
 
 
 @dataclass(frozen=True)
@@ -86,6 +105,7 @@ class Unit:
     hana: bool
     issue: str
     showrunner: str = ""
+    activity: UnitActivity = UnitActivity.INACTIVE
 
 
 @dataclass(frozen=True)
@@ -136,7 +156,7 @@ class PhaseCompletion:
     identity: str
     at: datetime
     hana: bool
-    seconds: float | Unrecorded
+    seconds: float | DurationNotRecorded
 
 
 @dataclass(frozen=True)
@@ -170,6 +190,13 @@ class AgentMessage:
 class IssueRank:
     name: str
     rank: float
+    score: float | ScoreNotRecorded = ScoreNotRecorded.MISSING
+
+
+@dataclass(frozen=True)
+class HanaMerge:
+    commit: str
+    at: datetime
 
 
 @dataclass
@@ -186,6 +213,7 @@ class BaselineSources:
     rankings: list[IssueRank]
     waiting: list[WaitingItem]
     problems: list[SourceProblem]
+    merges: list[HanaMerge] | MergeHistoryNotRecorded = MergeHistoryNotRecorded.MISSING
 
 
 def field_text(record: JsonObject, key: str) -> str:
@@ -220,7 +248,7 @@ def moment(value: object) -> RecordedTime:
             return at.replace(tzinfo=user_zone()) if at.tzinfo is None else at
     except (ValueError, OverflowError, OSError):
         pass
-    return Unrecorded.TIME
+    return TimeNotRecorded.MISSING
 
 
 def required_time(value: object) -> datetime:
@@ -265,7 +293,8 @@ def parse_push(record: JsonObject) -> PhonePush:
 
 
 def parse_rank(record: JsonObject) -> IssueRank:
-    return IssueRank(field_text(record, "name"), field_number(record, "rank"))
+    score = field_number(record, "score") if "score" in record else ScoreNotRecorded.MISSING
+    return IssueRank(field_text(record, "name"), field_number(record, "rank"), score)
 
 
 def read_failed_reviews(path: Path) -> list[FailedPushReview]:
@@ -415,7 +444,7 @@ def distribution(name: str, values: Sequence[float], window: Window, source: str
 
 def phase_flow(events: Sequence[PhaseCompletion], window: Window) -> list[MeasureRow]:
     unique = {event.identity: event for event in events if event.hana and window.contains(event.at)}
-    times = [event.seconds / 60 for event in unique.values() if not isinstance(event.seconds, Unrecorded)]
+    times = [event.seconds / 60 for event in unique.values() if not isinstance(event.seconds, DurationNotRecorded)]
     source = "progress_history run records; elapsed wall time; no merge-to-main receipt; natedev only"
     rows = [
         MeasureRow("Hana phases done", str(len(unique)), len(unique), window.label, source),
@@ -429,23 +458,100 @@ def phase_flow(events: Sequence[PhaseCompletion], window: Window) -> list[Measur
     return rows
 
 
+HANA_PROJECTS = frozenset(("hana", "hana_diegetic", "hana_conduit", "hana_liminal"))
+
+
+def closure_names_merge(issue: issues.Issue) -> bool:
+    receipt = issue.value("merge_commit")
+    if re.fullmatch(r"[0-9a-fA-F]{7,40}", receipt):
+        return True
+    return re.search(r"\bmerg(?:e|ed)\b[^\n]*\b[0-9a-fA-F]{7,40}\b", issue.value("reason"), re.IGNORECASE) is not None
+
+
+def is_declined(issue: issues.Issue) -> bool:
+    words = issue.value("reason").split()
+    return bool(words) and words[0].casefold().removesuffix(":") == "declined"
+
+
 def issue_flow(found: Sequence[issues.Issue], window: Window) -> list[MeasureRow]:
     goal = [issue for issue in found if issue.value("backlog_goal") == "1 - Ship Hana"]
     activated = [issue for issue in goal if window.contains(moment(issue.value("date_active")))]
-    closed = [issue for issue in goal if issue.value("status") == "closed" and window.contains(moment(issue.value("date_closed")))]
+    candidates = [issue for issue in goal if issue.value("status") == "closed" and window.contains(moment(issue.value("date_closed")))]
+    declined = [issue for issue in candidates if is_declined(issue)]
+    closed = [issue for issue in candidates if issue not in declined]
+    undated = [issue for issue in goal if issue.value("status") == "closed"
+               and not is_declined(issue)
+               and not isinstance(moment(issue.value("date_closed")), datetime)]
     durations: list[float] = []
     for issue in closed:
         start, finish = moment(issue.value("date_active")), moment(issue.value("date_closed"))
         if isinstance(start, datetime) and isinstance(finish, datetime) and finish >= start:
             durations.append((finish - start).total_seconds() / 60)
     active_value = str(len(activated)) if any(issue.value("date_active") for issue in goal) else "not recorded"
-    return [
+    rows = [
         MeasureRow("goal 1 issues moved to active", active_value, len(activated), window.label,
                    "Hanadocs date_active; stage/date_modified do not record a transition"),
         MeasureRow("goal 1 issues closed", str(len(closed)), len(closed), window.label,
-                   "Hanadocs date_closed; date-only precision"),
+                   "Hanadocs date_closed; date-only precision; reason declined excluded"),
         distribution("goal 1 active to closed", durations, window, "Hanadocs date_active + date_closed; date-only precision"),
     ]
+    source = "Hanadocs project + date_closed; date-only precision; reason declined excluded"
+    for project in sorted({issue.value("project") for issue in (*closed, *undated)}):
+        count = sum(issue.value("project") == project for issue in closed)
+        missing = sum(issue.value("project") == project for issue in undated)
+        scope = "Hana" if project in HANA_PROJECTS else "other"
+        value = str(count) if not missing else f"not recorded ({count} dated in window; {missing} closure dates not recorded)"
+        rows.append(MeasureRow(f"goal 1 issues closed / {project or 'project not recorded'} / {scope}",
+                               value, count, window.label, source))
+    hana = [issue for issue in closed if issue.value("project") in HANA_PROJECTS]
+    rows.append(MeasureRow("goal 1 Hana-project issues closed", str(len(hana)), len(hana), window.label, source))
+    rows.append(MeasureRow("goal 1 declined closures excluded", str(len(declined)), len(declined), window.label,
+                           "Hanadocs reason declined + date_closed; date-only precision"))
+    receipts = sum(closure_names_merge(issue) for issue in hana)
+    receipt_source = "Hanadocs reason naming a merge commit or merge_commit; text only, not checked against Git"
+    rows.append(MeasureRow("goal 1 Hana closures naming a merge commit", str(receipts), len(hana), window.label, receipt_source))
+    for issue in sorted(hana, key=lambda issue: issue.path.stem):
+        value = "yes" if closure_names_merge(issue) else "not recorded"
+        rows.append(MeasureRow(f"Hana closure merge commit / {issue.path.stem}", value, 1, window.label, receipt_source))
+    return rows
+
+
+def read_hana_merges(repo: Path) -> list[HanaMerge]:
+    result = subprocess.run(
+        ["git", "-C", str(repo), "log", "--first-parent", "--merges", "--format=%H%x09%cI", "origin/init/catalyst"],
+        check=True, capture_output=True, text=True,
+    )
+    merges: list[HanaMerge] = []
+    for line in result.stdout.splitlines():
+        commit, at = line.split("\t", 1)
+        merges.append(HanaMerge(commit, required_time(at)))
+    return merges
+
+
+def hana_repository(units: Sequence[Unit]) -> Path:
+    paths = [Path(unit.worktree) for unit in units if unit.hana and unit.worktree]
+    paths.extend(Path.home() / "rust" / name for name in ("hana_catalyst", "hana"))
+    for path in paths:
+        common = repository(str(path))
+        if common != "cwd has no repository" and is_hana(common):
+            return Path(common)
+    raise FileNotFoundError("Hana repository not found through local Git common directories")
+
+
+def merge_flow(merges: Sequence[HanaMerge] | MergeHistoryNotRecorded, window: Window) -> list[MeasureRow]:
+    source = "git log --first-parent --merges origin/init/catalyst; local ref; commit time; no fetch"
+    if isinstance(merges, MergeHistoryNotRecorded):
+        return [MeasureRow("Hana merges / origin/init/catalyst", "not recorded", 0, window.label, source)]
+    selected = {merge.commit: merge for merge in merges if window.contains(merge.at)}
+    rows = [MeasureRow("Hana merges / origin/init/catalyst", str(len(selected)), len(selected), window.label, source)]
+    days = Counter(merge.at.astimezone(user_zone()).date() for merge in selected.values())
+    day = window.since.astimezone(user_zone()).date()
+    last = (window.until - timedelta(microseconds=1)).astimezone(user_zone()).date()
+    while day <= last:
+        count = days[day]
+        rows.append(MeasureRow(f"Hana merges / {day.isoformat()}", str(count), count, window.label, source))
+        day += timedelta(days=1)
+    return rows
 
 
 def sent_after_failed_review(push: PhonePush, reviews: Sequence[FailedPushReview]) -> bool:
@@ -522,20 +628,38 @@ def rank_coverage(found: Sequence[issues.Issue], rankings: Sequence[IssueRank], 
     open_goal = {issue.path.stem: issue for issue in open_issues if issue.value("backlog_goal") == "1 - Ship Hana"}
     ranked = sorted((row for row in rankings if row.name in open_goal and row.rank > 0), key=lambda row: row.rank)
     top = list(dict.fromkeys(row.name for row in ranked))[:20]
-    covered = sum(bool(open_goal[name].value("unit")) for name in top)
+    live = [unit for unit in units if unit.activity is UnitActivity.LIVE]
+    covered_names = {name for name in top if any(unit_names_issue(unit, open_goal[name]) for unit in live)}
+    covered = len(covered_names)
     linked = 0
     for unit in units:
-        named_by_issue = any(
-            issue.value("unit") == unit.name and issue.value("showrunner") in (unit.production, unit.showrunner, "")
-            for issue in open_issues
-        )
-        linked += int(bool(unit.issue) or named_by_issue)
+        linked += int(unit.activity is UnitActivity.LIVE and any(unit_names_issue(unit, issue) for issue in open_issues))
+    by_name = {row.name: row for row in reversed(ranked)}
+    scores = [by_name[name].score for name in top]
+    weighted = "not recorded"
+    if scores and all(isinstance(score, float) and score >= 0 for score in scores):
+        total = sum(score for score in scores if isinstance(score, float))
+        covered_score = sum(score for name in covered_names if isinstance(score := by_name[name].score, float))
+        if total > 0:
+            weighted = f"{covered_score:g}/{total:g} ({covered_score / total:.1%})"
     return [
         MeasureRow("top 20 goal 1 open issues with a unit", f"{covered}/{len(top)}", len(top), snapshot,
-                   "backlog-rankings + Hanadocs unit frontmatter; assignment does not prove a running unit"),
+                   "backlog-rankings + open issue links; unit has a running phase or live session"),
         MeasureRow("live units naming an open issue", f"{linked}/{len(units)}", len(units), snapshot,
-                   "production Issue column or open issue unit + showrunner frontmatter"),
+                   "open production Issue link or open issue unit + showrunner; running phase or live session"),
+        MeasureRow("top 20 goal 1 open issues covered score", weighted, len(top), snapshot,
+                   "backlog-rankings score; covered score / all top 20 scores; running phase or live session"),
     ]
+
+
+def unit_names_issue(unit: Unit, issue: issues.Issue) -> bool:
+    if issue.value("unit") == unit.name and issue.value("showrunner") in (unit.production, unit.showrunner, ""):
+        return True
+    cell = unit.issue.strip().strip("`")
+    wiki = re.fullmatch(r"\[\[([^]|]+)(?:\|[^]]+)?\]\]", cell)
+    link = re.fullmatch(r"\[[^]]+\]\(([^)]+)\)", cell)
+    target = wiki[1] if wiki else link[1] if link else cell
+    return Path(target).name.removesuffix(".md") == issue.path.stem
 
 
 def source_problem_rows(problems: Sequence[SourceProblem], window: Window) -> list[MeasureRow]:
@@ -580,6 +704,8 @@ def read_units(problems: list[SourceProblem]) -> list[Unit]:
         runners = showrunners.registered_showrunners()
     if warnings.getvalue().strip():
         problems.append(SourceProblem("showrunners", warnings.getvalue().strip().replace("\n", "; ")))
+    marks = read_source("unit sessions", unit_lookup.every_marked_unit, unit_lookup.MarkedProductions({}, {}), problems)
+    running = read_source("unit running phases", lambda: running_phase_worktrees(unit_lookup.runs_dir(), problems), set[str](), problems)
     for runner in runners:
         doc = Path(runner["doc"])
         lines = read_source(str(doc), lambda: doc.read_text(encoding="utf-8").splitlines(), [], problems)
@@ -589,8 +715,50 @@ def read_units(problems: list[SourceProblem]) -> list[Unit]:
             tree = production_units.cell_value(row.get("Worktree", ""))
             name = production_units.cell_value(row.get("Unit", ""))
             issue = production_units.cell_value(row.get("Issue", ""))
-            result.append(Unit(runner["slug"], name, repo, tree, is_hana(tree), issue, runner["session"]))
+            marked = marks.units.get(runner["slug"], {}).get(name)
+            activity = UnitActivity.INACTIVE
+            if tree in running or (marked is not None and isinstance(marked.claude, unit_lookup.LiveClaude)):
+                activity = UnitActivity.LIVE
+            elif marks.production_fault(runner["slug"]) or (marked is not None and isinstance(marked.claude, unit_lookup.ClaudeUnknown)):
+                activity = UnitActivity.UNKNOWN
+                problems.append(SourceProblem(f"unit activity / {runner['slug']} / {name}", "running phase or live session not recorded"))
+            result.append(Unit(runner["slug"], name, repo, tree, is_hana(tree), issue, runner["session"], activity))
     return result
+
+
+def running_phase_worktrees(folder: Path, problems: list[SourceProblem]) -> set[str]:
+    newest: dict[str, tuple[datetime, bool]] = {}
+    for path in folder.iterdir():
+        if path.suffix != ".jsonl":
+            continue
+        records = read_source(str(path), lambda: json_lines(path, object_record), [], problems)
+        if not records or field_text(records[0], "event_type") != "run_started":
+            continue
+        first = records[0]
+        tree = field_text(first, "working_dir")
+        started = moment(first.get("run_started_at", first.get("timestamp")))
+        if not isinstance(started, datetime):
+            problems.append(SourceProblem(str(path), "unreadable: run start time not recorded"))
+            continue
+        phases: set[str] = set()
+        for record in records:
+            kind = field_text(record, "event_type")
+            if kind == "run_finished":
+                phases.clear()
+                continue
+            if kind not in ("phase_started", "phase_finished"):
+                continue
+            phase = field_text(record, "phase_instance_id") or field_text(record, "phase_id")
+            if not phase:
+                problems.append(SourceProblem(str(path), "unreadable: phase identity not recorded"))
+                continue
+            if kind == "phase_started":
+                phases.add(phase)
+            else:
+                phases.discard(phase)
+        if tree not in newest or started > newest[tree][0]:
+            newest[tree] = (started, bool(phases))
+    return {tree for tree, (_, running) in newest.items() if running}
 
 
 def read_workers() -> tuple[list[Worker], list[str]]:
@@ -669,7 +837,7 @@ def parse_phase(record: JsonObject, prefixes: Sequence[str]) -> tuple[PhaseCompl
     identity = field_text(record, "event_id")
     if not identity:
         identity = f"{field_text(record, 'run_id')}:{field_text(record, 'phase_instance_id')}:{at}"
-    seconds = field_number(record, "phase_elapsed_seconds") if "phase_elapsed_seconds" in record else Unrecorded.DURATION
+    seconds = field_number(record, "phase_elapsed_seconds") if "phase_elapsed_seconds" in record else DurationNotRecorded.MISSING
     return (PhaseCompletion(identity, at, hana_origin(origin, prefixes), seconds),)
 
 
@@ -783,7 +951,11 @@ def load_sources(window: Window) -> BaselineSources:
     problems.extend(worker_problems)
     problems.extend(SourceProblem("session roster", problem) for problem in roster_problems)
     problems.extend(token_problems)
-    return BaselineSources(units, workers, builds, tokens, phases, pushes, reviews, messages, found, rankings, waiting, problems)
+    def load_merges() -> list[HanaMerge] | MergeHistoryNotRecorded:
+        return read_hana_merges(hana_repository(units))
+
+    merges = read_source("Hana origin/init/catalyst merge log", load_merges, MergeHistoryNotRecorded.MISSING, problems)
+    return BaselineSources(units, workers, builds, tokens, phases, pushes, reviews, messages, found, rankings, waiting, problems, merges)
 
 
 def render(sources: BaselineSources, window: Window, now: datetime) -> str:
@@ -792,12 +964,13 @@ def render(sources: BaselineSources, window: Window, now: datetime) -> str:
     capacity_rows.extend(resource_use(sources.builds, sources.tokens, window))
     flow_rows = phase_flow(sources.phases, window)
     flow_rows.extend(issue_flow(sources.issue_records, window))
+    flow_rows.extend(merge_flow(sources.merges, window))
     attention_rows = attention(sources.pushes, sources.reviews, sources.messages, window)
     attention_rows.extend(pending_attention(sources.waiting, now, window))
     coverage_rows = rank_coverage(sources.issue_records, sources.rankings, sources.units, snapshot)
     groups = [
         table("Capacity on Hana", capacity_rows),
-        table("Flow to Hana main (recorded phase/issue completion; merges not recorded)", flow_rows),
+        table("Flow to Hana main (recorded phase/issue completion; local-ref merge commits)", flow_rows),
         table("User attention", attention_rows),
         table("Rank coverage", coverage_rows),
     ]
@@ -806,27 +979,29 @@ def render(sources: BaselineSources, window: Window, now: datetime) -> str:
     return "\n\n".join(groups)
 
 
+def window_bounds(since_text: str, until_text: str, now: datetime) -> Window:
+    until = required_time(until_text) if until_text else now
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", until_text):
+        until += timedelta(days=1)
+    since = required_time(since_text) if since_text else until - timedelta(days=7)
+    if since >= until:
+        raise ValueError("--since must precede the end of --until")
+    return Window(since, until)
+
+
 def main(arguments: Sequence[str] = ()) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("command", choices=("baseline",))
-    _ = parser.add_argument("--since", metavar="DATE")
-    _ = parser.add_argument("--until", metavar="DATE")
+    _ = parser.add_argument("--since", metavar="DATE_OR_TIME", default="")
+    _ = parser.add_argument("--until", metavar="DATE_OR_TIME", default="")
     args = parser.parse_args(arguments)
     now = datetime.now(timezone.utc)
-    since_text = cast(str | None, args.since)
-    until_text = cast(str | None, args.until)
+    since_text = cast(str, args.since)
+    until_text = cast(str, args.until)
     try:
-        until = now
-        if until_text:
-            until = datetime.strptime(until_text, "%Y-%m-%d").replace(tzinfo=user_zone()) + timedelta(days=1)
-        since = until - timedelta(days=7)
-        if since_text:
-            since = datetime.strptime(since_text, "%Y-%m-%d").replace(tzinfo=user_zone())
-        if since >= until:
-            raise ValueError("--since must precede the end of --until")
+        window = window_bounds(since_text, until_text, now)
     except ValueError as error:
         parser.error(str(error))
-    window = Window(since, until)
     print(render(load_sources(window), window, now))
     return 0
 

@@ -554,7 +554,8 @@ class QuotaAlertTests(unittest.TestCase):
             if directory == Path.home() / ".claude" and isinstance(home_state, account.LegacyHomeLogin):
                 return home_state.account
             return account.Account("claude", logins[directory], "fixture") if directory is not None else None
-        def live(directory: Path) -> Report:
+        def live(directory: Path, *, use_disk_identity: bool = False) -> Report:
+            self.assertTrue(use_disk_identity)
             return Report("Claude", email=logins[directory], quotas=[Quota("Weekly", 100,
                 datetime.now(timezone.utc) + timedelta(days=2))], source=agent_accounts.ClaudeDirectorySource(directory))
         with (mock.patch.object(sessions, "live_sessions", return_value=owners),

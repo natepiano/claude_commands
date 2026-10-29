@@ -1,6 +1,8 @@
 # Defined names are observations. This file does not approve a name change.
 # Separate several definition sources with a semicolon. Sections follow #.
 # Kept entries remove stable paths or command names before counting prose.
+# Kept contexts exempt one exact occurrence in one file from check, with a reason.
+# Inflected forms are explicit; retired forms use the term name as replacement.
 # Other-meaning files exclude known uses from definition discovery only.
 
 [[terms]]
@@ -44,6 +46,89 @@ name = "worker"
 kind = "role"
 defined_in = "docs/production_format.md#Words"
 other_names = ["seat", "Codex seat", "delegate", "Codex worker"]
+retired = ["seat", "seats", "Codex seat", "Codex seats"]
+
+[terms.inflected_forms]
+worker = ["workers"]
+seat = ["seats"]
+"Codex seat" = ["Codex seats"]
+delegate = ["delegates"]
+"Codex worker" = ["Codex workers"]
+
+[[terms.kept_contexts]]
+path = "docs/as-built/build-memory-admission.md"
+text = "Before this, a seat started one lint run three times on one tree after an interrupt (hana_catalyst-inspectors, 2026-10-21)"
+reason = "Dated 2026-10-21 incident history; preserve the recorded role wording."
+
+[[terms.kept_contexts]]
+path = "docs/as-built/shutdown-and-restart.md"
+text = "`run_dir`, `seat`, `role`, `thread_id`, `turn_live`"
+reason = "Stored shutdown record field; runtime schema stays unchanged."
+
+[[terms.kept_contexts]]
+path = "docs/as-built/shutdown-and-restart.md"
+text = "`<seat>.resume-prompt.md`"
+reason = "Filename placeholder for a stored resume prompt."
+
+[[terms.kept_contexts]]
+path = "docs/as-built/shutdown-and-restart.md"
+text = "`<run_dir>/<seat>.resume-prompt.md`"
+reason = "Filename placeholder for the per-worker resume prompt."
+
+[[terms.kept_contexts]]
+path = "docs/as-built/shutdown-and-restart.md"
+text = "`<seat>.account-move.json`"
+reason = "Filename placeholder for the account-move marker."
+
+[[terms.kept_contexts]]
+path = "docs/as-built/shutdown-and-restart.md"
+text = "`codex_mesh.py reopen --session-dir <D> --to <seat>`"
+reason = "Command placeholder for the existing transport argument."
+
+[[terms.kept_contexts]]
+path = "docs/as-built/shutdown-and-restart.md"
+text = "`reopened <seat>; send its next turn with --to <seat>`"
+reason = "Recorded command output with transport placeholders."
+
+[[terms.kept_contexts]]
+path = "docs/as-built/shutdown-and-restart.md"
+text = "`codex_mesh: <seat>: <reason>`"
+reason = "Command diagnostic placeholders; the transport contract stays unchanged."
+
+[[terms.kept_contexts]]
+path = "docs/as-built/shutdown-and-restart.md"
+text = "`<seat> (<role>, was working): <command>`"
+reason = "Resume command output placeholder."
+
+[[terms.kept_contexts]]
+path = "docs/as-built/shutdown-and-restart.md"
+text = "`<seat> (<role>, idle): paused on its thread; nothing to run now. Your next dispatch with --to <seat> resumes it.`"
+reason = "Idle resume output placeholders; preserve the transport argument."
+
+[[terms.kept_contexts]]
+path = "docs/as-built/shutdown-and-restart.md"
+text = "- Resume workers, natedev, 2026-10-16, about 21:30 EDT, on the installed `build-followups` merge `ba27d7b9`. A probe `rwprobe` (`accounts.py exec --probe`, claude2) in tmux, before herdr replaced it, held one real Codex seat, `tmp-rwseat`, in a scratch run dir under `/tmp/claude/delegate/` mapped to the probe through `active/<probe session id>`. `accounts.py move <probe id> claude3 --no-alert` finished at 21:31: the seat read `paused` (`paused_from` `done`, `paused_turn` false) on thread `01a14775-e8c5-7cd2-9d63-176e065faa06`, the probe was back on claude3, and the message log held the `resume-workers-<probe id>` message. Its `implement.sh --to tmp-rwseat` command replied `resumed` on the same thread. The run found that the message went only to unit sessions; it now goes to any session with recorded seats. The complete-command form of each seat line landed after this run and is held by `test_restart.py`. `reopen` was seen on real seats: units had returned six ended seats to `paused`."
+reason = "Dated 2026-10-16 probe history; preserve its wording and worker identity."
+
+[[terms.kept_contexts]]
+path = "docs/as-built/message-clarity.md"
+text = "- Worker agents are called \"workers\", not \"seats\". Worker naming and its migration are in `docs/as-built/long-lived-workers.md` and `docs/accounts.md`, not here."
+reason = "Retirement history at 291e1da55, dated 2026-10-16 by blame."
+
+[[terms.kept_contexts]]
+path = "docs/as-built/usage-ledger.md"
+text = "renames stored `account_role_changes` rows with role `seats` to `workers`"
+reason = "Legacy stored data value required by the role migration."
+
+[[terms.kept_contexts]]
+path = "scripts/usage/collect.py"
+text = "SELECT machine, at, 'workers', label FROM account_role_changes WHERE role = 'seats'"
+reason = "Legacy SQL migration input value; existing stores must remain readable."
+
+[[terms.kept_contexts]]
+path = "scripts/usage/collect.py"
+text = "DELETE FROM account_role_changes WHERE role = 'seats'"
+reason = "Legacy SQL migration input value removed after copying rows."
 
 [[terms]]
 name = "review pool"
@@ -177,18 +262,18 @@ name = "/unit:direct"
 kind = "step"
 defined_in = "commands/unit/direct.md#Direct"
 other_names = ["/unit:delegate"]
-kept = ["docs/direct/", "scripts/direct/"]
+kept = ["docs/delegate/", "docs/direct/", "scripts/direct/", "scripts/delegate/"]
 
 [[terms]]
 name = "astra-designer"
 kind = "role"
-defined_in = "docs/plans/sdlc-production.md#Guild heads (planned); /home/natepiano/worktrees/claude-build-followups-sdlc-guilds/docs/plans/sdlc-guilds.md#Decisions / Phase 2 Names (planned)"
+defined_in = "docs/as-built/guilds.md#Lasting roles"
 other_names = ["chief designer"]
 
 [[terms]]
 name = "astra-reviewer"
 kind = "role"
-defined_in = "docs/plans/sdlc-production.md#Guild heads (planned); /home/natepiano/worktrees/claude-build-followups-sdlc-guilds/docs/plans/sdlc-guilds.md#Decisions / Phase 2 Names (planned)"
+defined_in = "docs/as-built/guilds.md#Lasting roles"
 other_names = ["chief reviewer"]
 
 [[terms]]

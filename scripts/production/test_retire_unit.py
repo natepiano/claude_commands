@@ -218,7 +218,7 @@ class RetireUnitTests(unittest.TestCase):
         self.assertEqual(code, 0, output)
         for line in (f"would stop: Claude session alpha ({DIRECTOR}, pid 4101), through shutdown down",
                      f"would stop: Claude session alpha-seat ({SEAT}, pid 4102), through shutdown down",
-                     f"would stop: app-server pid {os.getpid()} of run run-1; seats alpha-impl",
+                     f"would stop: app-server pid {os.getpid()} of run run-1; workers alpha-impl",
                      "would retire: reviewer code-1",
                      f"would release: build hold of {DIRECTOR}",
                      f"would remove: worktree {self.worktree}",

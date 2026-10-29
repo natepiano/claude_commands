@@ -51,6 +51,7 @@ import account as account_reader
 from scripts.accounts import accounts, moves, outage_alerts
 import quota_alert
 from scripts.production import showrunners
+from scripts.nix_env import heal
 from account import Account, UnknownAccountName, UnreadableAccount
 from record import SessionShutdown, SessionProgress, TimerRestore, Where
 
@@ -345,6 +346,7 @@ class RestartTests(ShutdownTestCase):
         self.state_root = self.root / "shutdown"
         environment = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root), "SHUTDOWN_STATE_DIR": str(self.state_root),
+            "HERDR_BIN": str(self.root / "herdr-must-be-stubbed"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "CONVERSATION_PAUSE_STATE_DIR": str(self.root / "pause"),
             "AGENT_NOTES_DIR": str(self.root / "notes"),
@@ -821,7 +823,7 @@ class RestartTests(ShutdownTestCase):
                 text = argv[argv.index("--text") + 1]
                 lines = text.splitlines()
                 self.assertEqual(lines[0], "Resume your Codex workers; do not open new ones.")
-                self.assertEqual(lines[-1], "Each seat continues its own thread; after resuming, send later work with --to as usual.")
+                self.assertEqual(lines[-1], "Each worker continues its own thread; after resuming, send later work with --to as usual.")
                 work_line = next(line for line in lines if line.startswith("impl (impl, was working):"))
                 expected = list(launcher) if moved else [*launcher[:4], "--to", "impl", *launcher[4:]]
                 expected[expected.index(old_prompt)] = str(run / "impl.resume-prompt.md")
@@ -838,8 +840,9 @@ class RestartTests(ShutdownTestCase):
                 self.assertIn("project-impl (fix, idle): paused on its thread; nothing to run now. "
                               + "Your next dispatch with --to project-impl resumes it.", lines)
                 self.assertEqual(restart._resume_worker_command(seats[3], owner["cwd"]), shlex.join([  # pyright: ignore[reportPrivateUsage]
-                    "bash", str(restart.SCRIPTS / "direct" / "implement.sh"), "--to", "project-impl", str(run), owner["cwd"],
-                    str(run / "project-impl.resume-prompt.md"), "impl", "resume after a move", "impl", "resuming after a move", "0", "impl"]))
+                    "bash", str(restart.SCRIPTS / "direct" / "implement.sh"), "--to", "project-impl",
+                    "--fix-cause", "resume after a move", str(run), owner["cwd"],
+                    str(run / "project-impl.resume-prompt.md"), "fix", "resume after a move", "fix", "resuming after a move", "0", "impl"]))
                 self.assertNotIn("usual arguments", text)
                 self.assertIn(owner["cwd"], text)
                 self.assertNotIn(old_prompt, text)
@@ -2573,6 +2576,51 @@ class RestartTests(ShutdownTestCase):
         assert not isinstance(remaining, record.NoRecoverySnapshot)
         self.assertEqual(remaining["sessions"], [])
 
+    def test_codex_snapshot_proves_saved_cwd_before_opening_a_tab(self) -> None:
+        snapshot, saved, _responses, log = self.codex_recovery_fixture()
+        with (patch.object(herdr.nix_env, "ensure", return_value=herdr.nix_env.Refused("nix_env: fixture refused")) as ensure,
+              patch.object(restart, "_acknowledge_restored_snapshots") as acknowledge,
+              patch.object(herdr, "restore_server") as restored, patch.object(restart, "_open_window") as window,
+              patch.object(herdr, "open_tab") as opened, patch.object(herdr, "start_agent") as started):
+            with self.assertRaisesRegex(herdr.HerdrFailure, "^nix_env: fixture refused$"):
+                _ = restart._launch_codex_snapshot(snapshot, saved, self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        ensure.assert_called_once()
+        self.assertEqual(ensure.call_args.args[0], Path(saved["session"]["cwd"]))
+        self.assertEqual(ensure.call_args.args[1]["CODEX_HOME"], saved["codex"]["home"])
+        calls = self.herdr_calls(log) if log.exists() else []
+        self.assertFalse(any(row[2:4] in (["workspace", "create"], ["agent", "start"]) for row in calls))
+        restored.assert_not_called()
+        window.assert_not_called()
+        opened.assert_not_called()
+        started.assert_not_called()
+        acknowledge.assert_not_called()
+
+    def test_heal_waits_for_the_conductors_matching_completed_stop_record(self) -> None:
+        owner = top_level("heal-owner", cwd=str(self.root))
+        saved = entry(owner, state=record.SessionStopping(kind="stopping", at=STOPPED))
+        saved["then"] = "stop"
+        self.create([saved])
+        session = heal.HealSession(owner["session_id"], owner["pid"], owner["proc_start"], owner["name"],
+                                   Path(owner["cwd"]), "idle", self.root / ".claude2")
+        with patch("scripts.message.sessions.process_start", return_value=owner["proc_start"]) as process_start:
+            self.assertIsInstance(heal.stop_completion(session, LOGIN), heal.StopPending)
+
+            def stopped(current: SessionShutdown) -> None:
+                current["progress"] = record.SessionStopped(kind="stopped", at=STOPPED)
+
+            _ = record.update_session(LOGIN, owner["session_id"], stopped)
+            self.assertIsInstance(heal.stop_completion(session, LOGIN), heal.StopPending)
+            process_start.return_value = ""
+            self.assertIsInstance(heal.stop_completion(session, LOGIN), heal.StopComplete)
+            self.assertIsInstance(heal.stop_completion(replace(session, proc_start="reused-pid"), LOGIN), heal.StopRefused)
+
+            def failed(current: SessionShutdown) -> None:
+                current["progress"] = record.SessionStopFailed(kind="stop failed", at=STOPPED, reason="fixture failure")
+
+            _ = record.update_session(LOGIN, owner["session_id"], failed)
+            self.assertIsInstance(heal.stop_completion(session, LOGIN), heal.StopRefused)
+
+
     def test_codex_restoration_focuses_its_workspace_and_acknowledges_despite_focus_failure(self) -> None:
         snapshot, saved, responses, log = self.codex_recovery_fixture()
         name = "writing"
@@ -3212,6 +3260,30 @@ class RestartTests(ShutdownTestCase):
 
 
 
+    def test_herdr_resume_drops_conductor_variables_from_recorded_and_caller_environments(self) -> None:
+        owner, _, _ = self.herdr_restart_fixture()
+        conductor = {"REFUSAL_WATCH_INVENTORY": "read existing", "PYTHONUNBUFFERED": "1"}
+        parts = restart._resume_parts(owner, "restart")  # pyright: ignore[reportPrivateUsage]
+        parts = replace(parts, environment={**parts.environment, **conductor})
+
+        def ensure(_directory: Path, base_env: dict[str, str]) -> herdr.nix_env.Refused:
+            for variable in conductor:
+                self.assertFalse(variable in base_env, variable)
+            return herdr.nix_env.Refused("fixture ends before launch")
+
+        with (patch.dict(os.environ, conductor), patch.object(herdr.nix_env, "ensure", side_effect=ensure),
+              self.assertRaisesRegex(OSError, "fixture ends before launch")):
+            _ = restart._herdr_launch(parts, restart.RecordedHerdrPane("writing", "w1:p1"),  # pyright: ignore[reportPrivateUsage]
+                                      owner, dry_run=False)
+
+    def test_unit_launcher_drops_conductor_variables_from_caller_environment(self) -> None:
+        with (patch.dict(os.environ, {"REFUSAL_WATCH_INVENTORY": "read existing", "PYTHONUNBUFFERED": "1"}),
+              patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(["fake unit"], 0)) as launch):
+            _ = restart._run(["fake unit"], dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        environment = cast(dict[str, str], launch.call_args.kwargs["env"])
+        self.assertFalse("REFUSAL_WATCH_INVENTORY" in environment, "REFUSAL_WATCH_INVENTORY")
+        self.assertFalse("PYTHONUNBUFFERED" in environment, "PYTHONUNBUFFERED")
+
     def test_herdr_account_move_sets_prepared_variables_and_omits_removed_names(self) -> None:
         from scripts.accounts import accounts
 
@@ -3846,6 +3918,8 @@ class RestartTests(ShutdownTestCase):
     def test_restart_prompts_are_scheduled_before_showrunner_and_window_launches(self) -> None:
         self.allow_leaf(ShutdownSendLeaf.RESTART_RETIRE)
         restored_entries = [entry(showrunner('scheduled-showrunner')), entry(top_level('scheduled-window', host=inventory.WindowHost(kind='ghostty', window_shell=10, desktop=inventory.DesktopNotInSnapshot(kind='not in snapshot')))), entry(top_level('scheduled-herdr', host=inventory.HerdrHost(kind="herdr", herdr_session='writing', pane_id="w1:p1", presentation="detached")))]
+        for restored in restored_entries:
+            restored["session"]["cwd"] = str(self.root)
         saved = records_for_test(restored_entries)
         self.create(saved)
         expected_prompts: dict[str, str] = {}

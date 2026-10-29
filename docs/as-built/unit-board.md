@@ -60,7 +60,7 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 - `stage`, in order:
   - the open pass as `Build`/`Tests`/`Review`/`Repair round <n>`;
   - a `finding_batch_dispatched` not yet landed in the open phase instance, as `Repair round <dispatched batches>`;
-  - the open activity label (`units_table.open_step`);
+  - the open activity label (`unit_table_cells.open_step`);
   - `Phase <id> running` while a phase is open (`Ticket <id> running` on a standing plan);
   - otherwise `Run done`, `Waiting on G<k>` or `Standing by`.
 
@@ -207,6 +207,7 @@ It stats each source; one newer than its reference (or a failed stat) runs the g
 - Tests patch `plan_history.now_epoch` for the clock.
 - A session loads mod hooks when it starts. A session started before a mod change keeps the old hooks until `/reload-plugins`, and the command file's fallback line answers in their place; the line names `/reload-plugins` for that reason. The natedev showrunner hit this on 2026-10-18.
 - The board reads the style ledger with `sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=0)`, never through `style_ledger.Ledger`, which takes a write lock (`BEGIN IMMEDIATE`) and loads the rule catalog. SQLite's default 5 s busy timeout made a locked ledger stall each standing unit in turn; `timeout=0` gives 0 at once. `style_plan.py` writes a ticket heading as `### Phase <n> — <ticket id>`, so the phase id is the bare number; the ledger's open ticket names the ticket, and it can run one ticket ahead of the run record after refill.
+- The Units report (`style_units.py`) counts recent built findings with `built_at` on schema 25. A ledger before schema 25 has no such column; the report then uses `style_ledger.legacy_built_at_sql("h")`, the rule migration 25 uses to fill `built_at`: the merged build ticket's `updated_at`, else the finding's `updated_at`. A ledger without the `tickets` table or the `build_ticket` column uses the finding's `updated_at`, because that SQL fails there. The report stays read-only and never migrates the ledger. The totals ETA uses the same recent count.
 
 ## Why
 

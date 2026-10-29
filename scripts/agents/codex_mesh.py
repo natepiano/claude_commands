@@ -69,7 +69,6 @@ import re
 import secrets
 import select
 import shlex
-import shutil
 import signal
 import socket
 import struct
@@ -86,7 +85,7 @@ from typing import TYPE_CHECKING, Literal, NoReturn, NotRequired, NamedTuple, Pr
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.accounts.role_map import is_role_map_host, role_map_command, RoleMapUnavailable, RoleAccountUnavailable  # noqa: E402
 from scripts.direct import plan_history
-from scripts.lib import unit_runs
+from scripts.lib import nix_env, unit_runs
 from scripts.guilds.roles import PhaseBoundDesigner, ReadOnlyReviewer, ThreadAccessPolicy
 from scripts.message import sessions, process_table
 from scripts.whoami import account
@@ -270,7 +269,7 @@ MESH_RUNS_SCRIPT = Path(__file__).with_name("mesh_runs.py")
 DEAD_RUN_END_TIMEOUT_SECS = 300
 BOARD_HELPER = Path(__file__).resolve().parent.parent / "direct" / "board.sh"
 # The folders that hold unit run folders. An app-server whose session directory is one of their
-# children serves that run alone, so its seats get the run as UNIT_RUN_DIR.
+# children serves that run alone, so its workers get the run as UNIT_RUN_DIR.
 RUN_ROOTS: tuple[Path, ...] = unit_runs.run_roots()
 # Servers dropped by _retire_server, kept so `stop` can still reap them. A
 # retired server is abandoned rather than signalled: it may still be finishing a
@@ -288,7 +287,7 @@ COMPACT_IDLE_POLL_SECS = 1
 # `compact` exits with this when the thread still has a live turn, so no follow-up can be sent.
 COMPACT_TURN_STILL_LIVE = 3
 SERVER_START_TIMEOUT_SECS = 30
-# Cold direnv/Nix evaluation happens before the app-server can listen.
+# Keep the dev-shell server's startup allowance and sweep grace consistent.
 DEV_SHELL_START_TIMEOUT_SECS = 300
 # Codex compacts a thread on its own once its context passes this many tokens. Every request
 # re-reads the whole context, and threads left to Codex's default grew to 460K; a 200K cap cut a
@@ -319,6 +318,8 @@ PAUSE_INTERRUPT_SECS = 15.0
 UNSEEN_END_CHECK_SECS = 60.0
 DETACHED_RUN_CHECK_SECS = 60.0
 UNSEEN_END_CALL_SECS = 10.0
+# How many of the newest turns a read lists to find the watched or live turn.
+RECENT_TURNS = 8
 # How fast a failure has to arrive to be read as this machine's fault rather
 # than the provider's. An app-server that has wedged answers from what it
 # cached, without a round trip, so it fails in seconds; a refusal that travelled
@@ -365,19 +366,18 @@ class ServerRecord(TypedDict):
 
 @dataclass(frozen=True)
 class InheritedServerEnvironment:
-    """No allowed unit worktree dev-shell applies to this launch."""
+    """No unit worktree dev-shell applies to this launch."""
 
 
 @dataclass(frozen=True)
-class AllowedDevShell:
-    """Direnv has authorized the nearest .envrc for this unit's cwd."""
+class WorktreeDevShell:
+    """The nearest unit worktree shell to load and prove before launch."""
 
     worktree: Path
-    direnv: str
     input_revision: str
 
 
-ServerDevShell = InheritedServerEnvironment | AllowedDevShell
+ServerDevShell = InheritedServerEnvironment | WorktreeDevShell
 _INHERITED_SERVER_ENVIRONMENT = InheritedServerEnvironment()
 
 
@@ -396,7 +396,7 @@ class RememberedDevShellFailure:
     input_revision: str
     retry_at: float
 
-    def suppresses(self, dev_shell: AllowedDevShell) -> bool:
+    def suppresses(self, dev_shell: WorktreeDevShell) -> bool:
         return (self.worktree == dev_shell.worktree
                 and self.input_revision == dev_shell.input_revision
                 and time.time() < self.retry_at)
@@ -1536,7 +1536,7 @@ def _lookup_state(session_dir: str, name: str) -> RosterThread:
 
 
 def _seat_sandbox(args: argparse.Namespace, session_dir: str, name: str) -> str:
-    """Select the sandbox from the seat's resolved access policy."""
+    """Select the sandbox from the worker's resolved access policy."""
     record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
     policy = roster_access_policy(record)
     if isinstance(policy, ReadOnlyReviewer):
@@ -1638,9 +1638,7 @@ def _claim_follow(
         if not _validate_held_claim(name, entry, thread_id):
             return False
         current = _roster_thread(entry)
-        stale = isinstance(current, (ActiveThread, StartingThread)) and (
-            current.launcher_pid > 0 and not _pid_alive(current.launcher_pid)
-        )
+        stale = _launcher_died(current)
         if isinstance(current, InvalidThread) or not (
             isinstance(current, FollowableThread) or stale
         ) or current.thread_id != thread_id:
@@ -2592,66 +2590,41 @@ def held_thread_end_confirmed(session_dir: str, thread_id: str) -> bool:
 
 
 def _server_dev_shell(session_dir: str, cwd: str | None) -> DevShellProbe:
-    """Ask direnv for permission without evaluating a worktree's environment."""
+    """Select the nearest unit shell; nix_env owns approval and evaluation."""
     if not cwd or Path(session_dir).resolve().parent not in {root.resolve() for root in RUN_ROOTS}:
         return InheritedServerEnvironment()
     try:
-        directory = Path(cwd).resolve()
-        candidates = (directory, *directory.parents)
-        rc_folders = [folder for folder in candidates if (folder / ".envrc").is_file()]
-        if not rc_folders:
+        envrc = nix_env.nearest_envrc(Path(cwd))
+        if envrc is None:
             return InheritedServerEnvironment()
-        direnv = shutil.which("direnv")
-        if direnv is None:
-            return DevShellProbeUnavailable("direnv is not on PATH")
-        status = subprocess.run(
-            [direnv, "status", "--json"], cwd=directory,
-            capture_output=True, text=True, check=True, timeout=5,
+        revisions: dict[str, str] = {}
+        for name in (".envrc", "flake.nix", "flake.lock", "shell.nix", "default.nix", "devenv.nix"):
+            try:
+                info = (envrc.parent / name).stat()
+                revisions[name] = f"{info.st_mtime_ns}:{info.st_ctime_ns}:{info.st_size}"
+            except FileNotFoundError:
+                revisions[name] = "absent"
+        dev_shell = WorktreeDevShell(envrc.parent, json.dumps(revisions, sort_keys=True))
+        failed = _read_json_object(_session_path(session_dir, FAILED_DEV_SHELL_FILE))
+        failure = RememberedDevShellFailure(
+            Path(_as_str(failed.get("worktree"))), _as_str(failed.get("input_revision")),
+            _as_float(failed.get("retry_at"), 0),
         )
-        state = _as_dict(_as_dict(_loads(status.stdout)).get("state"))
-        if "foundRC" in state and state["foundRC"] is None:
-            return InheritedServerEnvironment()
-        found = _as_dict(state.get("foundRC"))
-        allowed = found.get("allowed")
-        # Direnv's AllowStatus is an integer enum: 0 allowed, 1 unapproved, 2 denied.
-        rc_path = Path(_as_str(found.get("path")))
-        if rc_path != rc_folders[0] / ".envrc":
-            return DevShellProbeUnavailable("direnv did not identify the nearest .envrc")
-        if type(allowed) is int:
-            if allowed == 0:
-                revisions: dict[str, str] = {}
-                for name in (".envrc", "flake.nix", "flake.lock", "shell.nix", "default.nix", "devenv.nix"):
-                    try:
-                        info = (rc_path.parent / name).stat()
-                        revisions[name] = f"{info.st_mtime_ns}:{info.st_ctime_ns}:{info.st_size}"
-                    except FileNotFoundError:
-                        revisions[name] = "absent"
-                dev_shell = AllowedDevShell(rc_path.parent, direnv, json.dumps(revisions, sort_keys=True))
-                failed = _read_json_object(_session_path(session_dir, FAILED_DEV_SHELL_FILE))
-                failure = RememberedDevShellFailure(
-                    Path(_as_str(failed.get("worktree"))), _as_str(failed.get("input_revision")),
-                    _as_float(failed.get("retry_at"), 0),
-                )
-                if failure.suppresses(dev_shell):
-                    return failure
-                return dev_shell
-            if allowed in (1, 2):
-                return InheritedServerEnvironment()
-        return DevShellProbeUnavailable("direnv returned an unknown allowance")
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        return failure if failure.suppresses(dev_shell) else dev_shell
+    except (OSError, ValueError) as error:
         return DevShellProbeUnavailable(str(error))
 
 
 def _remember_server_dev_shell(session_dir: str, dev_shell: ServerDevShell) -> None:
     """Keep the last successful shell across idle-stop, separately from the live record."""
     path = _session_path(session_dir, DEV_SHELL_FILE)
-    if isinstance(dev_shell, AllowedDevShell):
+    if isinstance(dev_shell, WorktreeDevShell):
         _ = path.write_text(json.dumps({"worktree": str(dev_shell.worktree)}), encoding="utf-8")
     else:
         path.unlink(missing_ok=True)
 
 
-def _remember_failed_dev_shell(session_dir: str, dev_shell: AllowedDevShell) -> None:
+def _remember_failed_dev_shell(session_dir: str, dev_shell: WorktreeDevShell) -> None:
     """Retry failed evaluations after an input change or a thirty-minute cooldown."""
     failure = RememberedDevShellFailure(dev_shell.worktree, dev_shell.input_revision, time.time() + 30 * 60)
     _ = _session_path(session_dir, FAILED_DEV_SHELL_FILE).write_text(json.dumps({
@@ -2682,7 +2655,7 @@ def ensure_server(session_dir: str, home: Path | None = None, cwd: str | None = 
         # Read failures under the same lock as launch: another caller may have
         # just fallen back for this revision while this caller was acquiring it.
         dev_shell = _server_dev_shell(session_dir, cwd)
-        dev_shell_worktree = str(dev_shell.worktree) if isinstance(dev_shell, AllowedDevShell) else ""
+        dev_shell_worktree = str(dev_shell.worktree) if isinstance(dev_shell, WorktreeDevShell) else ""
         path = _session_path(session_dir, SERVER_FILE)
         record = _read_json_object(path)
         port = record.get("port")
@@ -2697,7 +2670,7 @@ def ensure_server(session_dir: str, home: Path | None = None, cwd: str | None = 
             if matching_home and not old_sign_in and not old_limit and not old_dev_shell:
                 # The record's change time is when the server was last used; its watcher reads it.
                 os.utime(path)
-                if isinstance(dev_shell, AllowedDevShell):
+                if isinstance(dev_shell, WorktreeDevShell):
                     _remember_server_dev_shell(session_dir, dev_shell)
                 elif cwd is not None and isinstance(dev_shell, InheritedServerEnvironment):
                     _remember_server_dev_shell(session_dir, dev_shell)
@@ -2719,7 +2692,7 @@ def ensure_server(session_dir: str, home: Path | None = None, cwd: str | None = 
             dev_shell = _server_dev_shell(session_dir, remembered or None)
         if isinstance(dev_shell, DevShellProbeUnavailable):
             _log_server(session_dir, f"dev-shell probe unavailable: {dev_shell.reason}; starting with caller environment")
-        if isinstance(dev_shell, AllowedDevShell):
+        if isinstance(dev_shell, WorktreeDevShell):
             return _start_server(session_dir, selected_home, dev_shell), True
         if isinstance(dev_shell, InheritedServerEnvironment):
             _remember_server_dev_shell(session_dir, dev_shell)
@@ -2729,7 +2702,7 @@ def ensure_server(session_dir: str, home: Path | None = None, cwd: str | None = 
 def _server_environment(session_dir: str, workers_home: Path) -> dict[str, str]:
     """The app-server's environment: the caller's, with the workers home and, for a unit run, the run.
 
-    A seat's hooks and verify.sh runs read the run from UNIT_RUN_DIR. The caller's copy
+    A worker's hooks and verify.sh runs read the run from UNIT_RUN_DIR. The caller's copy
     cannot be trusted: implement.sh exports it only after its claim step, whose `compact` call may
     already have started this server. A run folder is known here, so the server names it itself. A
     review pool's mesh directory, or any other mesh directory, is not a run: one pool server
@@ -2776,14 +2749,25 @@ def _start_server(
         command = ["codex", "-c", "thread_unload_delay_secs=0", "-c", f"model_auto_compact_token_limit={AUTO_COMPACT_TOKENS}",
                    "-c", f"background_terminal_max_timeout={BACKGROUND_TERMINAL_MAX_TIMEOUT_MS}",
                    "app-server", "--listen", f"ws://127.0.0.1:{chosen}"]
-        if isinstance(dev_shell, AllowedDevShell):
-            # Apply these AFTER direnv: its .envrc and environment reversion must not choose
-            # the workers home, run, temporary folder, or held-design identity. Both direnv
-            # (syscall.Exec in cmd_exec.go) and env exec their command, retaining process.pid.
-            protected = ("CODEX_HOME", "UNIT_RUN_DIR", "TMPDIR", "CLAUDE_CODE_SESSION_ID",
-                         "GUILD_DESIGN_ID", "GUILD_BINDING_GENERATION")
-            command = [dev_shell.direnv, "exec", str(dev_shell.worktree), shutil.which("env") or "/usr/bin/env",
-                       *(f"{key}={environment[key]}" for key in protected if key in environment), *command]
+        if isinstance(dev_shell, WorktreeDevShell):
+            loaded = nix_env.ensure(dev_shell.worktree, environment)
+            if isinstance(loaded, nix_env.Loaded):
+                # A worktree can choose build flags, but cannot choose the server's
+                # account, run, temporary folder or held-design identity.
+                protected = ("CODEX_HOME", "UNIT_RUN_DIR", "TMPDIR", "CLAUDE_CODE_SESSION_ID",
+                             "GUILD_DESIGN_ID", "GUILD_BINDING_GENERATION")
+                loaded_environment = dict(loaded.env)
+                for key in protected:
+                    if key in environment:
+                        loaded_environment[key] = environment[key]
+                    elif key in loaded_environment:
+                        del loaded_environment[key]
+                environment = loaded_environment
+            else:
+                if isinstance(loaded, nix_env.Refused):
+                    _log_server(session_dir, loaded.reason)
+                    _remember_failed_dev_shell(session_dir, dev_shell)
+                dev_shell = _INHERITED_SERVER_ENVIRONMENT
         try:
             with log_path.open("ab") as log_handle:
                 process = subprocess.Popen(
@@ -2794,26 +2778,26 @@ def _start_server(
                     env=environment,
                 )
         except OSError as error:
-            if not isinstance(dev_shell, AllowedDevShell):
+            if not isinstance(dev_shell, WorktreeDevShell):
                 raise
             _remember_failed_dev_shell(session_dir, dev_shell)
-            _log_server(session_dir, f"direnv exec {dev_shell.worktree} failed: {error}; falling back to caller environment")
+            _log_server(session_dir, f"dev-shell app-server {dev_shell.worktree} failed: {error}; falling back to caller environment")
             dev_shell = _INHERITED_SERVER_ENVIRONMENT
             continue
         served: ServerRecord = {"port": chosen, "pid": process.pid, "codex_home": str(workers_home),
                                 "auto_compact_tokens": AUTO_COMPACT_TOKENS}
-        if isinstance(dev_shell, AllowedDevShell):
+        if isinstance(dev_shell, WorktreeDevShell):
             served["dev_shell_worktree"] = str(dev_shell.worktree)
         context = _guild_context(session_dir)
         if context:
             served["guild_context"] = context
         try:
-            if isinstance(dev_shell, AllowedDevShell):
+            if isinstance(dev_shell, WorktreeDevShell):
                 _ = _session_path(session_dir, SERVER_START_FILE).write_text(json.dumps({
                     "pid": process.pid, "port": chosen, "started_at": time.time(),
                     "dev_shell_worktree": str(dev_shell.worktree),
                 }), encoding="utf-8")
-            timeout = DEV_SHELL_START_TIMEOUT_SECS if isinstance(dev_shell, AllowedDevShell) else SERVER_START_TIMEOUT_SECS
+            timeout = DEV_SHELL_START_TIMEOUT_SECS if isinstance(dev_shell, WorktreeDevShell) else SERVER_START_TIMEOUT_SECS
             deadline = time.time() + timeout
             while time.time() < deadline:
                 if process.poll() is not None:
@@ -2827,7 +2811,7 @@ def _start_server(
                     continue
                 probe.close()
                 _record_started_server(session_dir, served)
-                if isinstance(dev_shell, AllowedDevShell):
+                if isinstance(dev_shell, WorktreeDevShell):
                     _remember_server_dev_shell(session_dir, dev_shell)
                     _session_path(session_dir, FAILED_DEV_SHELL_FILE).unlink(missing_ok=True)
                 if context:
@@ -2839,10 +2823,10 @@ def _start_server(
             raise SystemExit(f"codex_mesh: app-server did not accept connections on {chosen}")
         except BaseException as error:
             _discard_failed_server_start(session_dir, served, process)
-            if not isinstance(error, SystemExit) or not isinstance(dev_shell, AllowedDevShell):
+            if not isinstance(error, SystemExit) or not isinstance(dev_shell, WorktreeDevShell):
                 raise
             _remember_failed_dev_shell(session_dir, dev_shell)
-            _log_server(session_dir, f"direnv exec {dev_shell.worktree} failed: {error}; falling back to caller environment")
+            _log_server(session_dir, f"dev-shell app-server {dev_shell.worktree} failed: {error}; falling back to caller environment")
             dev_shell = _INHERITED_SERVER_ENVIRONMENT
         finally:
             pending = _session_path(session_dir, SERVER_START_FILE)
@@ -2901,11 +2885,30 @@ def _thread_has_no_active_turn(status: str) -> bool:
     return status in ("idle", "notLoaded", "systemError")
 
 
-def _ended_unseen(client: Client, thread_id: str) -> bool:
+def _recent_turns(client: Client, thread_id: str, timeout: float = CALL_TIMEOUT_SECS) -> list[dict[str, object]]:
+    """The thread's newest turns, newest first.
+
+    A full-history `thread/read` queues a deprecation notice ahead of its reply,
+    which a following launcher takes as a frame still to handle, so turns come
+    from the paged list. A refused call lists none.
+    """
+    reply = client.call("thread/turns/list", {
+        "threadId": thread_id, "limit": RECENT_TURNS, "sortDirection": "desc"}, timeout=timeout)
+    turns = _as_dict(reply.get("result")).get("data")
+    if not isinstance(turns, list):
+        return []
+    return [_as_dict(turn) for turn in cast("list[object]", turns)]
+
+
+def _ended_unseen(client: Client, thread_id: str, turn_id: str = "", *, start_seen: bool = True) -> bool:
     """True when no turn is active and nothing is queued, so no turn is left to end.
 
     A launcher that reads this while it waits for a completion notice has missed
-    the notice. The read asks for no turns, so it stays small on a long thread.
+    the notice. Given the watched turn, the thread must also list that turn,
+    either after a later turn or, once its start was seen, as ended: the server
+    can read a thread idle, and list a turn as ended, just after the turn starts.
+    A turn not yet listed has not ended. With no turn the read asks for none, so
+    it stays small on a long thread.
     A call that is refused or times out says nothing, and the launcher keeps waiting.
     """
     try:
@@ -2915,10 +2918,19 @@ def _ended_unseen(client: Client, thread_id: str) -> bool:
             return False
         reply = client.call(
             "thread/read", {"threadId": thread_id, "includeTurns": False}, UNSEEN_END_CALL_SECS)
+        thread = _as_dict(_as_dict(reply.get("result")).get("thread"))
+        if not _thread_has_no_active_turn(_as_str(_as_dict(thread.get("status")).get("type"))):
+            return False
+        if not turn_id:
+            return True
+        turns = _recent_turns(client, thread_id, UNSEEN_END_CALL_SECS)
     except SystemExit:
         return False
-    thread = _as_dict(_as_dict(reply.get("result")).get("thread"))
-    return _thread_has_no_active_turn(_as_str(_as_dict(thread.get("status")).get("type")))
+    # Newest first: a later turn proves the watched one is over.
+    for index, turn in enumerate(turns):
+        if turn.get("id") == turn_id:
+            return index > 0 or (start_seen and turn.get("status") in ("completed", "failed", "interrupted"))
+    return False
 
 
 def _more_work_coming(client: Client, thread_id: str, deadline: float) -> bool:
@@ -3672,14 +3684,18 @@ def command_compact(args: argparse.Namespace) -> int:
             client.close()
 
 
+def _launcher_died(state: RosterThread) -> bool:
+    """True when a live status names a launcher that is gone, which leaves the worker followable."""
+    return isinstance(state, (ActiveThread, StartingThread, WaitingCapacityThread)) and (
+        state.launcher_pid > 0 and not _pid_alive(state.launcher_pid))
+
+
 def _follow_refusal(session_dir: str, state: RosterThread, *, name: str) -> str:
     if isinstance(state, InvalidThread):
         return state.reason
     if isinstance(state, AdoptedThread):
         return f"worker adopted to {state.to_run}"
-    stale_launcher = isinstance(state, (ActiveThread, StartingThread)) and (
-        state.launcher_pid > 0 and not _pid_alive(state.launcher_pid)
-    )
+    stale_launcher = _launcher_died(state)
     if not isinstance(state, FollowableThread) and not stale_launcher:
         return "worker is busy or not followable"
     record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
@@ -3882,6 +3898,8 @@ class TurnStream:
     failure_serving: CodexServingState
     runs: DetachedRunWatch
     turn_id: str = ""
+    # Whether a notice for `turn_id` arrived; a turn this launcher just submitted has none yet.
+    turn_start_seen: bool = False
     # The turn a follow watches; empty between its turns.
     followed_turn: str = ""
     final_answer: str = ""
@@ -3935,18 +3953,16 @@ def _pending_after_worker_start(
 def _quota_continuation_finished(client: Client, thread_id: str, turn_id: str) -> bool:
     """An idle read-back must confirm this continuation completed successfully."""
     try:
-        reply = client.call("thread/read", {"threadId": thread_id, "includeTurns": True}, UNSEEN_END_CALL_SECS)
+        reply = client.call("thread/read", {"threadId": thread_id, "includeTurns": False}, UNSEEN_END_CALL_SECS)
+        if reply.get("error"):
+            return False
+        thread = _as_dict(_as_dict(reply.get("result")).get("thread"))
+        if _as_str(_as_dict(thread.get("status")).get("type")) != "idle":
+            return False
+        turns = _recent_turns(client, thread_id, UNSEEN_END_CALL_SECS)
     except (ConnectionError, OSError, SystemExit):
         return False
-    if reply.get("error"):
-        return False
-    thread = _as_dict(_as_dict(reply.get("result")).get("thread"))
-    if _as_str(_as_dict(thread.get("status")).get("type")) != "idle":
-        return False
-    turns = thread.get("turns")
-    return isinstance(turns, list) and any(
-        (record := _as_dict(turn)).get("id") == turn_id and record.get("status") == "completed"
-        for turn in cast("list[object]", turns))
+    return any(turn.get("id") == turn_id and turn.get("status") == "completed" for turn in turns)
 
 
 def _pending_after_completion_readback(
@@ -4130,6 +4146,7 @@ def _adopt_started_turn(stream: TurnStream, started: MovedWorker) -> None:
     stream.client, stream.port = started.client, started.port
     stream.room_wait_logged = False
     stream.thread_id, stream.turn_id = started.thread_id, started.turn_id
+    stream.turn_start_seen = False
     stream.pending_refusal = _pending_after_worker_start(stream.pending_refusal, started)
     if stream.follow:
         stream.followed_turn = stream.turn_id
@@ -4142,7 +4159,8 @@ def _adopt_moved_worker(stream: TurnStream, moved: MovedWorker) -> bool:
     stream.pending_refusal = _pending_after_worker_start(stream.pending_refusal, moved)
     if not (moved.turn_id or _continuation_is_owed(stream.session_dir, stream.name)):
         return False
-    stream.turn_id = moved.turn_id or stream.turn_id
+    if moved.turn_id:
+        stream.turn_id, stream.turn_start_seen = moved.turn_id, False
     if stream.follow:
         stream.followed_turn = stream.turn_id
     return True
@@ -4228,7 +4246,9 @@ def _on_quiet_poll(stream: TurnStream, log: TextIO) -> StreamStep | FailedWithTh
         return _resume_marked_account_move(stream, log, account_move)
     if stream.resume_owed:
         return _resume_owed_turn(stream, log, refused_for_capacity=stream.capacity_backoff_owed)
-    if not stream.resident and time.time() < stream.deadline:
+    # The frame loop bounds the run; a wall-clock jump past the deadline must
+    # not leave a one-turn launcher holding results it never checks again.
+    if not stream.resident:
         return _finish_if_ended_unseen(stream, log)
     if stream.end_marker.exists():
         return StreamStep.FINISH
@@ -4251,7 +4271,9 @@ def _finish_if_ended_unseen(stream: TurnStream, log: TextIO) -> StreamStep:
     if _waiting_on_detached_run(stream.session_dir, stream.name, stream.thread_id, stream.runs):
         return StreamStep.NEXT_FRAME
     quota_owed = _continuation_is_owed(stream.session_dir, stream.name)
-    if stream.resume_owed or not _ended_unseen(stream.client, stream.thread_id):
+    if stream.resume_owed:
+        return StreamStep.NEXT_FRAME
+    if not _ended_unseen(stream.client, stream.thread_id, stream.turn_id, start_seen=stream.turn_start_seen):
         return StreamStep.NEXT_FRAME
     # The read-back RPC may have received the completion or answer ahead of
     # its reply. Process those frames before inferring a missing notice.
@@ -4317,7 +4339,8 @@ def _keep_resident_on_selected_server(stream: TurnStream, log: TextIO) -> None:
         changed = moved.port != stream.port or moved.thread_id != stream.thread_id
         stream.client, stream.port, stream.thread_id = moved.client, moved.port, moved.thread_id
         stream.pending_refusal = _pending_after_worker_start(stream.pending_refusal, moved)
-        stream.turn_id = moved.turn_id or stream.turn_id
+        if moved.turn_id:
+            stream.turn_id, stream.turn_start_seen = moved.turn_id, False
         if changed:
             _ = log.write(f"[{_now_stamp()}] mesh: {stream.name} moved to the workers app-server on port {stream.port}\n")
             log.flush()
@@ -4329,6 +4352,9 @@ def _on_frame(stream: TurnStream, log: TextIO, frame: RpcMessage) -> StreamStep 
     params = _as_dict(frame.get("params"))
     if _as_str(params.get("threadId")) not in ("", stream.thread_id):
         return StreamStep.NEXT_FRAME
+    if stream.turn_id and stream.turn_id in (
+            _as_str(params.get("turnId")), _as_str(_as_dict(params.get("turn")).get("id"))):
+        stream.turn_start_seen = True
     if method == "turn/started":
         _on_turn_started(stream, params)
     elif method == "thread/tokenUsage/updated":
@@ -4343,7 +4369,7 @@ def _on_frame(stream: TurnStream, log: TextIO, frame: RpcMessage) -> StreamStep 
 def _on_turn_started(stream: TurnStream, params: dict[str, object]) -> None:
     live = _as_str(_as_dict(params.get("turn")).get("id"))
     if live and (not stream.follow or not stream.followed_turn or live == stream.followed_turn):
-        stream.turn_id = live
+        stream.turn_id, stream.turn_start_seen = live, True
         if stream.resume_owed:
             stream.capacity_backoff_owed = False
         if stream.follow:
@@ -5668,7 +5694,7 @@ def _drop_queued_messages(client: Client, thread_id: str) -> int:
 
 def _read_live_turn(client: Client, thread_id: str) -> ThreadState:
     """Read the active turn without sending text into the thread."""
-    reply = client.call("thread/read", {"threadId": thread_id, "includeTurns": True})
+    reply = client.call("thread/read", {"threadId": thread_id, "includeTurns": False})
     error = reply.get("error")
     if error:
         return ThreadStateUnknown(_as_str(_as_dict(error).get("message")) or "thread/read failed")
@@ -5681,14 +5707,11 @@ def _read_live_turn(client: Client, thread_id: str) -> ThreadState:
         return ThreadIdle()
     if status != "active":
         return ThreadStateUnknown(f"unrecognized status {status or '(missing)'}")
-    turns = thread.get("turns")
-    if isinstance(turns, list):
-        for turn in reversed(cast("list[object]", turns)):
-            record = _as_dict(turn)
-            if record.get("status") == "inProgress":
-                turn_id = _as_str(record.get("id"))
-                if turn_id:
-                    return ThreadLive(turn_id)
+    for turn in _recent_turns(client, thread_id):
+        if turn.get("status") == "inProgress":
+            turn_id = _as_str(turn.get("id"))
+            if turn_id:
+                return ThreadLive(turn_id)
     # Active is enough to refuse a relaunch, even if the server has not yet
     # persisted the new turn in the read response.
     return ThreadActiveWithoutTurn()

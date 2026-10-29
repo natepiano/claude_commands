@@ -513,7 +513,7 @@ class Step(NamedTuple):
 
 
 def _describe_stop(t: UnitTransfer) -> str:
-    return f"stop {t.unit} and its Codex seats through the shutdown path; its record carries the relaunch"
+    return f"stop {t.unit} and its Codex workers through the shutdown path; its record carries the relaunch"
 
 
 def _describe_plans(t: UnitTransfer) -> str:

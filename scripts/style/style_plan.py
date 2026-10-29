@@ -4,24 +4,29 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
+import math
 import os
 import posixpath
 import re
+import signal
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
-from collections import defaultdict
-from collections.abc import Mapping
-from contextlib import closing
-from dataclasses import dataclass
+from collections import Counter, defaultdict
+from collections.abc import Generator, Mapping
+from contextlib import closing, contextmanager, redirect_stdout
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from enum import Enum
 from itertools import accumulate
 from pathlib import Path, PurePosixPath
-from types import MappingProxyType
-from typing import assert_never, cast
+from types import FrameType, MappingProxyType
+from typing import Literal, assert_never, cast, override
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS / "lib"))
@@ -30,18 +35,21 @@ sys.path.insert(0, str(SCRIPTS / "production"))
 import berth_board
 import coverage_report
 import mechanical_classes
+import merge_gate
 from approved_renames import (AppliedCheck, ApprovedRename, BindingRename, Declarations, FileRename, Folder, InlineModule,
                               MissingFile, NoAppliedCheck, RenameNotApplied, UncertainScan, applied_check,
                               approved_rename, binding_rename, binding_rename_check, declaration_sites, enclosing,
                               file_rename, inline_modules)
 from add_style import StandingStyleProduction, standing_style_production
 import rules
+import showrunners
 import style_ledger
 import style_footprint
 import style_proposals
 from issues import Issue, frontmatter
-from production_units import Refusal, production_field
-from proposal_issue import ApprovedDecision, decision_answer
+from scripts.build_hold import build_hold
+from production_units import Refusal, cell_value, live_unit_table, production_field
+from proposal_issue import ApprovedDecision, decision_answer, require_generated_body
 from unit_files import changed_files, git, unit_file_holders, unit_worktrees
 from unit_plans import (AllCrates, PilotScope, crate_in_scope, delegation_context, family_plan_texts, family_pilot_scopes,
                         parse_pilot_scope, unit_plan_path)
@@ -373,7 +381,10 @@ def approved_word_swaps(
 def approved_reference_tokens(
     before: str, after: str, pairs: tuple[ApprovedRename, ...], unique: frozenset[ApprovedRename],
 ) -> bool:
-    old, new = style_footprint.token_spans(before), style_footprint.token_spans(after)
+    try:
+        old, new = style_footprint.token_spans(before), style_footprint.token_spans(after)
+    except style_footprint.UnreadableTokenSpans:
+        return False
     if (before == after or len(old) != len(new)
             or len(old) != len(style_footprint.tokens(before))
             or len(new) != len(style_footprint.tokens(after))):
@@ -738,7 +749,10 @@ class RenamedText:
 
     def matches(self, after: str) -> bool:
         """Whether the worktree text has this code and these comment lines in canonical order."""
-        spans = style_footprint.token_spans(after)
+        try:
+            spans = style_footprint.token_spans(after)
+        except style_footprint.UnreadableTokenSpans:
+            return False
         return (len(spans) == len(style_footprint.tokens(after))
                 and self.code == style_footprint.canonical_code(
                     tuple(span.token.value for span in spans),
@@ -765,7 +779,10 @@ def renamed_text(repo: Path, path: str, before: str, moves: tuple[FileRename, ..
     which reads its parent from the HEAD words. The scan reads the file's `plain_words`, and a raw site keeps its `r#`,
     so `mod r#lock;` takes `mod r#mutation_lock;`. In comments, each `crate` path to a renamed module is renamed.
     """
-    old = style_footprint.token_spans(before)
+    try:
+        old = style_footprint.token_spans(before)
+    except style_footprint.UnreadableTokenSpans:
+        return NoRenamedText()
     if len(old) != len(style_footprint.tokens(before)):
         return NoRenamedText()
     words, plain = tuple(span.token.value for span in old), plain_words(old)
@@ -798,7 +815,10 @@ def renamed_text(repo: Path, path: str, before: str, moves: tuple[FileRename, ..
 def declares_module(repo: Path, path: str, text: str, file: str) -> bool:
     """Whether the Rust file at path, read as text, declares the module file, or has a token the scan cannot read, or
     the module file is not in a crate whose modules it can name."""
-    spans = style_footprint.token_spans(text)
+    try:
+        spans = style_footprint.token_spans(text)
+    except style_footprint.UnreadableTokenSpans:
+        return True
     root = crate_root(repo, file)
     if len(spans) != len(style_footprint.tokens(text)) or isinstance(root, NoCrateRoot):
         return True
@@ -1925,6 +1945,8 @@ def _rank_waits(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord, 
     older file where a family ranked above has a unit."""
     exemptions = style_proposals.RankExemptions(ledger, tip)
     findings = ledger.named_held(ticket["finding_ids"])
+    if any(not isinstance(finding.state, style_ledger.Filed) for finding in findings):
+        return ("a queued finding is no longer filed",)
     held = tuple(f"{path} has open {waits[path].higher} work" for path in ticket["files"] if path in waits
                  and (not findings or any(f.path == path and not exemptions.allows(f, family) for f in findings)))
     if not ticket["finding_ids"] or not style_proposals.ranked_below_unit(family, ticket["crate"], scopes):
@@ -1955,28 +1977,6 @@ def _select_phase(
     scopes = family_pilot_scopes(doc, repo)
     waits = style_proposals.ranked_work(ledger, cells, scopes).waits(family)
     exemptions = style_proposals.RankExemptions(ledger, tip)
-    for index, ticket in enumerate(queued):
-        in_scope = crate_in_scope(scope, ticket["crate"])
-        # A file rename whose edit the gate cannot prove is dropped, and its finding waits on the decision path below.
-        uncertain = edits.uncertain_of_ticket(ticket) if index == 0 and in_scope else ()
-        # A ticket that the family rank holds is dropped too; its cells and findings wait on the paths below.
-        ranked = _rank_waits(ledger, ticket, family, waits, scopes, tip) if index == 0 and in_scope and not uncertain else ()
-        if (index == 0 and in_scope and not uncertain and not ranked
-                and not any(busy.contains(path) for path in edits.of_ticket(ticket))):
-            ledger.ticket_assign(ticket["id"], branch)
-            for extra in queued[1:]:
-                ledger.ticket_drop(extra["id"])
-                print(f"dropped {extra['id']}: files busy")
-            origin = ledger.ticket_origin(ticket["id"])
-            if isinstance(origin, style_ledger.ApprovedProposal):
-                style_proposals.proposal_command("start", str(origin.issue))
-            write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
-            return PhaseWritten(ticket["id"])
-        ledger.ticket_drop(ticket["id"])
-        reason = ((f"{uncertain[0]} has a path attribute the rename gate cannot read" if uncertain
-                   else ranked[0] if ranked else "files busy")
-                  if in_scope else "outside pilot scope")
-        print(f"dropped {ticket['id']}: {reason}")
     try:
         folder = Path(production_field(doc.read_text().splitlines(), "Proposals")).expanduser()
     except Refusal:
@@ -1995,10 +1995,43 @@ def _select_phase(
     # whose declaration moved tickets at its new file, a rename whose new name is declared is built, and one whose
     # declaration is gone waits for a person or is withdrawn with its file. Each refresh keeps the parent its decision
     # names, and the step renumbers after its own closes.
-    follow = (style_proposals.run_follow(style_proposals.decision_writer(ledger, next(iter(unbuilt)).parent, ""),
-                                         (finding for findings in unbuilt.values() for finding in findings), dry_run=False)
-              if any(unbuilt.values()) else style_proposals.FollowRun(style_ledger.DeclarationReading(tip, ()), (), ()))
+    following = {finding.finding_id: finding for findings in unbuilt.values() for finding in findings}
+    following.update({finding.finding_id: finding for ticket in queued
+                      for finding in ledger.named_held(ticket["finding_ids"])})
+    follow = (style_proposals.run_follow(style_proposals.decision_writer(
+                  ledger, next(finding.state.proposal.parent for finding in following.values()
+                               if isinstance(finding.state, style_ledger.Filed)), ""), following.values(), dry_run=False)
+              if any(isinstance(finding.state, style_ledger.Filed) for finding in following.values())
+              else style_proposals.FollowRun(style_ledger.DeclarationReading(tip, ()), (), ()))
     outcomes = {outcome.finding.finding_id: outcome for outcome in follow.reading.outcomes}
+    for index, ticket in enumerate(queued):
+        in_scope = crate_in_scope(scope, ticket["crate"])
+        # A file rename whose edit the gate cannot prove is dropped, and its finding waits on the decision path below.
+        uncertain = edits.uncertain_of_ticket(ticket) if index == 0 and in_scope else ()
+        # A ticket that the family rank holds is dropped too; its cells and findings wait on the paths below.
+        skipped = ticket["proposal"] and Path(ticket["proposal"]) in follow.skipped
+        ranked = (("skipped by the declaration step",) if skipped else
+                  _rank_waits(ledger, ticket, family, waits, scopes, tip)) if index == 0 and in_scope and not uncertain else ()
+        if (index == 0 and in_scope and not uncertain and not ranked
+                and not any(busy.contains(path) for path in edits.of_ticket(ticket))):
+            ledger.ticket_assign(ticket["id"], branch)
+            for extra in queued[1:]:
+                ledger.ticket_drop(extra["id"])
+                print(f"dropped {extra['id']}: files busy")
+            origin = ledger.ticket_origin(ticket["id"])
+            if isinstance(origin, style_ledger.ApprovedProposal):
+                style_proposals.proposal_command("start", str(origin.issue))
+            write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
+            return PhaseWritten(ticket["id"])
+        ledger.ticket_drop(ticket["id"])
+        reason = ((f"{uncertain[0]} has a path attribute the rename gate cannot read" if uncertain
+                   else ranked[0] if ranked else "files busy")
+                  if in_scope else "outside pilot scope")
+        print(f"dropped {ticket['id']}: {reason}")
+    # Dropping a queued ticket releases its findings for decision selection below.
+    if queued:
+        unbuilt = {issue.path: _unbuilt_findings(ledger, issue.path) for issue in decisions
+                   if issue.value("style_rule") in definitions}
     # One line for each waiting file that holds the unit's own work: a pending cell in scope or an unbuilt finding.
     own = {cell.path for cell in cells if cell.family == family and cell.state in ("open", "stale")
            and crate_in_scope(scope, cell.crate)} | {finding.path for findings in unbuilt.values() for finding in findings}
@@ -2239,9 +2272,320 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
             return WaitingForSync(len(ledger.unclassified_rules()))
 
 
+class SplitRankExemptions(style_proposals.RankExemptions):
+    def __init__(self, ledger: style_ledger.Ledger, tip: str, cache: style_ledger.GitReadCache) -> None:
+        super().__init__(ledger, tip)
+        self.cache: style_ledger.GitReadCache = cache
+
+    @override
+    def source(self, path: str) -> str:
+        if path not in self.sources:
+            self.sources[path] = self.cache.text(self.tip, path)
+        return self.sources[path]
+
+
+class SplitEditedFiles(EditedFiles):
+    def __init__(self, repo: Path, ledger: style_ledger.Ledger, base: UnitBase, cache: style_ledger.GitReadCache) -> None:
+        super().__init__(repo, ledger, base)
+        self.cache: style_ledger.GitReadCache = cache
+
+    @override
+    def read(self, named: Mapping[str, tuple[str, ...]]) -> None:
+        for commit, paths in named.items():
+            self.cache.read(commit, paths)
+            for path in paths:
+                blob = self.cache.blob(commit, path)
+                if not blob:
+                    raise style_ledger.CheckCouldNotRun(f"{commit}: no blob for {path}")
+                self.blobs[commit, path] = blob
+                self.texts[blob] = self.cache.contents[blob].decode(errors="replace")
+
+
+class SplitMovedSites(style_proposals.MovedSites):
+    def __init__(self, ledger: style_ledger.Ledger, tip: str, cache: style_ledger.GitReadCache) -> None:
+        super().__init__(ledger, tip)
+        self.cache: style_ledger.GitReadCache = cache
+
+    @override
+    def lines_at(self, commit: str, path: str) -> frozenset[str]:
+        key = (commit, path)
+        if key not in self.lines:
+            self.lines[key] = frozenset(line.strip() for line in self.cache.text(commit, path).splitlines())
+        return self.lines[key]
+
+
+SplitCategory = Literal["ready", "changed", "structure", "other"]
+
+
+def classify_split(ledger: style_ledger.Ledger, unit: str, doc: Path, base: UnitBase, scope: PilotScope,
+                   busy: BusyFiles, definitions: Mapping[str, rules.Rule], cache: style_ledger.GitReadCache,
+                   measured_at: str) -> style_ledger.RecordedSplit:
+    """Partition approved filed findings without applying any refill transition."""
+    family = rules.style_family(unit)
+    if isinstance(family, rules.NotStyleUnit):
+        raise style_ledger.LedgerError(f"{unit}: unknown style family")
+    tip = ledger.synced_commit()
+    cache.warm(tip)
+    scopes = family_pilot_scopes(doc, ledger.repo)
+    waits = style_proposals.ranked_work(ledger, ledger.cells(), scopes, reader=cache).waits(family)
+    exemptions = SplitRankExemptions(ledger, tip, cache)
+    edits = SplitEditedFiles(ledger.repo, ledger, base, cache)
+    sites = SplitMovedSites(ledger, tip, cache)
+    unsynced = unsynced_changes(ledger.repo, base, tip)
+    directories = cache.tip(tip).crate_dirs
+    try:
+        folder = Path(production_field(doc.read_text().splitlines(), "Proposals")).expanduser()
+    except Refusal:
+        selected: tuple[Issue, ...] = ()
+    else:
+        if not folder.is_absolute():
+            folder = doc.parent.parent / folder
+        selected = style_proposals.approved_decisions(folder, unit)
+    population: list[tuple[style_ledger.HeldFinding, Path]] = []
+    decisions: dict[Path, bool] = {}
+    for finding in ledger.held_findings(style_ledger.HeldFindingsInState("filed")):
+        if not isinstance(finding.state, style_ledger.Filed):
+            continue
+        path = finding.state.proposal.expanduser().resolve()
+        if path not in decisions:
+            if not path.is_file():
+                decisions[path] = False
+            else:
+                issue = Issue(path, frontmatter(path))
+                decisions[path] = (rules.style_family(issue.value("unit")) == family
+                                   and isinstance(decision_answer(issue), ApprovedDecision))
+        if decisions[path]:
+            population.append((finding, path))
+    opened = ledger.open_build_finding_ids()
+    # Match the stored proposal key exactly as refill does. A merged build still holds its findings.
+    unbuilt = {finding.finding_id: issue for issue in selected if issue.value("style_rule") in definitions
+               for finding in _unbuilt_findings(ledger, issue.path)}
+    pending = tuple(finding for finding, _path in population
+                    if finding.finding_id not in opened and finding.finding_id in unbuilt)
+    reading = (ledger.declaration_reading((finding.finding_id for finding in pending), style_proposals.approved_decision)
+               if pending else style_ledger.DeclarationReading(tip, ()))
+    outcomes = {outcome.finding.finding_id: outcome for outcome in reading.outcomes}
+    skipped: set[Path] = set()
+    for outcome in reading.outcomes:
+        if isinstance(outcome, style_ledger.DeclarationMoved | style_ledger.DeclarationRemoved):
+            if not isinstance(outcome.finding.state, style_ledger.Filed):
+                continue
+            path = outcome.finding.state.proposal
+            try:
+                require_generated_body(path)
+                _ = style_proposals.decision_parent(path)
+            except (style_ledger.LedgerError, Refusal):
+                skipped.add(path.resolve())
+    counts: Counter[SplitCategory] = Counter()
+    for finding, path in population:
+        if finding.finding_id in opened:
+            counts["ready"] += 1
+            continue
+        issue = unbuilt.get(finding.finding_id)
+        if issue is None or path in skipped or (definition := definitions.get(issue.value("style_rule"))) is None:
+            counts["other"] += 1
+            continue
+        outcome = outcomes[finding.finding_id]
+        if isinstance(outcome, style_ledger.DeclarationMoved):
+            finding = replace(finding, path=outcome.path, line=outcome.line,
+                              follow=style_ledger.FollowedDeclaration(finding.path, finding.line, tip))
+        elif not isinstance(outcome, style_ledger.DeclarationNotRead | style_ledger.DeclarationInPlace
+                            | style_ledger.KeptForOpenBuild):
+            counts["other"] += 1
+            continue
+        # Refill waives a missing file or a moved site only when the declaration step did not read it.
+        if isinstance(outcome, style_ledger.DeclarationNotRead) and (
+                not cache.blob(tip, finding.path) or sites.destinations((finding,))):
+            counts["other"] += 1
+            continue
+        crate = style_proposals.crate_for(directories, finding.path)
+        if (style_proposals.ranked_below_unit(family, crate, scopes)
+                and not style_proposals.judged_at_current_file(ledger, finding, tip)):
+            category: SplitCategory = ("other" if isinstance(ledger.judged_again_without(finding, definition),
+                                                            style_ledger.SupersedingJudgment) else "changed")
+        elif finding.path in unsynced:
+            category = "changed"
+        elif not crate_in_scope(scope, crate):
+            category = "other"
+        elif finding.path in waits and not exemptions.allows(finding, family):
+            category = "structure"
+        elif busy.contains(finding.path):
+            category = "other"
+        elif edits.uncertain(finding) or any(busy.contains(path) for path in edits.of(finding)):
+            category = "other"
+        else:
+            category = "ready"
+        counts[category] += 1
+    return style_ledger.RecordedSplit(counts["ready"], counts["changed"], counts["structure"], counts["other"], measured_at)
+
+
+@dataclass(frozen=True)
+class SplitDeadline:
+    at: float
+    timeout_minutes: float
+
+    def timeout_error(self) -> TimeoutError:
+        return TimeoutError(f"time limit of {self.timeout_minutes:g} min reached")
+
+    def remaining_seconds(self) -> float:
+        remaining = self.at - time.monotonic()
+        if remaining <= 0:
+            raise self.timeout_error()
+        return remaining
+
+
+@contextmanager
+def split_time_limit(minutes: float) -> Generator[SplitDeadline]:
+    if not math.isfinite(minutes) or minutes <= 0:
+        raise style_ledger.LedgerError("timeout-minutes must be positive and finite")
+
+    began = time.monotonic()
+    deadline = SplitDeadline(began + minutes * 60, minutes)
+
+    def expired(_signum: int, _frame: FrameType | None) -> None:
+        raise deadline.timeout_error()
+
+    previous_handler = signal.signal(signal.SIGALRM, expired)
+    previous_timer = signal.setitimer(signal.ITIMER_REAL, minutes * 60)
+    try:
+        yield deadline
+    finally:
+        _ = signal.setitimer(signal.ITIMER_REAL, 0)
+        _ = signal.signal(signal.SIGALRM, previous_handler)
+        if previous_timer[0] > 0:
+            _ = signal.setitimer(signal.ITIMER_REAL, max(0.000001, previous_timer[0] - (time.monotonic() - began)),
+                                 previous_timer[1])
+
+
+def split(unit: str, repo: Path, timeout_minutes: float = 90) -> style_ledger.RecordedSplit:
+    """Scan a backup copy, then store only a complete split on the original ledger."""
+    measured_at = datetime.now(UTC).isoformat()
+    with split_time_limit(timeout_minutes) as deadline:
+        repo = repo.expanduser().resolve()
+        style_ledger.require_split_table(repo)
+        doc = style_document(repo)
+        row = next((row for row in unit_worktrees(doc) if row.unit == unit), None)
+        if row is None:
+            raise style_ledger.LedgerError(f"{unit}: no Units row in {doc}")
+        plan = unit_plan_path(doc, unit, row.worktree)
+        scope = unit_plan_settings(plan.read_text(), repo).pilot_scope
+        board = berth_board.read_board(repo)
+        if isinstance(board, berth_board.BoardUnavailable):
+            raise style_ledger.LedgerError(f"board unavailable: {board.reason}")
+        cache = style_ledger.GitReadCache(repo)
+        with style_ledger.preview_ledger(repo, git_cache=cache) as ledger:
+            busy = busy_files(repo, doc, ledger, unit, board)
+            definitions = {rule.rule_id: rule for rule in rules.load_rules(repo)}
+            result = classify_split(ledger, unit, doc, unit_base(repo, row.branch), scope, busy, definitions, cache,
+                                    measured_at)
+        style_ledger.record_split(repo, unit, result,
+                                  busy_timeout_seconds=min(style_ledger.BUSY_TIMEOUT_SECONDS, deadline.remaining_seconds()))
+    return result
+
+
+def split_line(unit: str, result: style_ledger.RecordedSplit, minutes: float) -> str:
+    return f"{unit}: {result.ready}/{result.changed}/{result.structure}/{result.other} in {minutes:.2f} min"
+
+
+def split_all(production: Path) -> int:
+    """Run the live style units one at a time, each in a low-priority child."""
+    production = production.expanduser().resolve()
+    rows = [row for row in live_unit_table(production.read_text().splitlines(),
+                                          production.stem.removesuffix("-production"))
+            if not isinstance(rules.style_family(cell_value(row["Unit"])), rules.NotStyleUnit)]
+    if not rows:
+        print("no style units")
+        return 0
+    with redirect_stdout(io.StringIO()):
+        prefix = merge_gate.suite_scope_prefix()
+    failed = False
+    for row in rows:
+        unit = cell_value(row["Unit"])
+        try:
+            worktree = Path(cell_value(row["Worktree"])).expanduser()
+            if not worktree.is_absolute():
+                worktree = production.parent.parent / worktree
+            plan = unit_plan_path(production, unit, worktree)
+            if not plan.is_file():
+                raise style_ledger.LedgerError(f"no unit plan: {plan}")
+            child = subprocess.run([*prefix, "nice", "-n", "19", sys.executable, str(Path(__file__).resolve()),
+                                    "split", "--unit", unit, "--repo", str(worktree)],
+                                   capture_output=True, text=True, check=False)
+            if child.returncode:
+                cause = (child.stderr.strip() or child.stdout.strip() or f"exit {child.returncode}")
+                raise style_ledger.LedgerError(cause.removeprefix(f"split {unit}: "))
+            print(child.stdout.strip())
+        except Exception as error:
+            failed = True
+            print(f"{unit}: failed: {' '.join(str(error).split())}")
+    return int(failed)
+
+
+def split_all_running() -> int:
+    """Run every running style production, yielding to a natedev build hold."""
+    if build_hold.natedev_holds(build_hold.holder_directory()).in_force:
+        print("split-all: natedev build hold in force; skipped")
+        return 0
+    found = False
+    for runner in showrunners.registered_showrunners():
+        if not runner["session"]:
+            continue
+        try:
+            production = Path(runner["doc"]).expanduser()
+            lines = production.read_text().splitlines()
+            try:
+                kind = production_field(lines, "Kind")
+            except Refusal:
+                continue
+            if kind != "style":
+                continue
+            found = True
+            if build_hold.natedev_holds(build_hold.holder_directory()).in_force:
+                print("split-all: natedev build hold in force; skipped")
+                return 0
+            code = split_all(production)
+            if code:
+                print(f"split-all: {runner['slug']}: failed: exit {code}")
+        except Exception as error:
+            print(f"split-all: {runner['slug']}: failed: {' '.join(str(error).split())}")
+    if not found:
+        print("no running style productions")
+    return 0
+
+
+def refill_outcome(result: NextPhase) -> str:
+    match result:
+        case PhaseWritten():
+            return "phase written"
+        case Resumed():
+            return "resumed"
+        case RepairFirst():
+            return "repair first"
+        case WaitingForMerge():
+            return "waiting for merge"
+        case WaitingForSync():
+            return "waiting for sync"
+        case WaitingForStructure(crates):
+            return f"waiting for structure: {', '.join(crates)}"
+        case WaitingForBranchPointSync():
+            return "waiting for branch-point sync"
+        case MergeStyleBranchFirst():
+            return "merge the style branch first"
+        case berth_board.BoardUnavailable():
+            return "board unavailable"
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
+    scan = sub.add_parser("split")
+    _ = scan.add_argument("--unit", required=True)
+    _ = scan.add_argument("--repo", type=Path, required=True)
+    _ = scan.add_argument("--timeout-minutes", type=float, default=90)
+    scans = sub.add_parser("split-all")
+    targets = scans.add_mutually_exclusive_group(required=True)
+    _ = targets.add_argument("--production", type=Path)
+    _ = targets.add_argument("--all", action="store_true")
     refill = sub.add_parser("next-phase")
     _ = refill.add_argument("--unit", required=True)
     _ = refill.add_argument("--plan", type=Path, required=True)
@@ -2259,6 +2603,21 @@ def main(argv: list[str]) -> int:
     _ = ticket_widen.add_argument("--reason", required=True)
     _ = ticket_widen.add_argument("--by", required=True)
     args = cast(PlanArguments, parser.parse_args(argv))
+    if args.command == "split":
+        began = time.monotonic()
+        try:
+            result = split(args.unit, args.repo, args.timeout_minutes)
+        except Exception as error:
+            print(f"split {args.unit}: {error}", file=sys.stderr)
+            return 1
+        print(split_line(args.unit, result, (time.monotonic() - began) / 60))
+        return 0
+    if args.command == "split-all":
+        try:
+            return split_all_running() if args.all else split_all(args.production)
+        except Exception as error:
+            print(f"split-all: {error}", file=sys.stderr)
+            return 1
     try:
         if args.command == "gate":
             return gate(args.repo, args.ticket)
@@ -2287,6 +2646,7 @@ def main(argv: list[str]) -> int:
                         print(f"{unit}: {ticket.kind} {ticket.crate} {ticket.rule or ','.join(ticket.rules)} — {len(ticket.files)} files: {', '.join(ticket.files)}")
             return 0
         result = next_phase(args.unit, args.plan, args.repo)
+        style_ledger.record_refill(args.repo, args.unit, refill_outcome(result))
         match result:
             case PhaseWritten(ticket_id):
                 print(f"phase written: {ticket_id}")
@@ -2332,6 +2692,9 @@ class PlanArguments(argparse.Namespace):
     files: list[str] = []
     reason: str = ""
     by: str = ""
+    timeout_minutes: float = 90
+    production: Path = Path()
+    all: bool = False
 
 
 if __name__ == "__main__":

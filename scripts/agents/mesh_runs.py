@@ -16,10 +16,10 @@ Verbs:
              [--done-message-file F] -- command...
              Write the run record, spawn its supervisor and return at once. Exit 3 when the
              caller is not a mesh worker, so the caller runs the command attached. NAME may be
-             the seat's role, the last part of its roster name; the record keeps the roster name.
-             When the seat already has a live run of the same command in the same folder and the
+             the worker's role, the last part of its roster name; the record keeps the roster name.
+             When the worker already has a live run of the same command in the same folder and the
              files did not change since it started (same tree key), start starts nothing: it
-             names that run, whose result still arrives as the seat's next message.
+             names that run, whose result still arrives as the worker's next message.
   supervise  <record>
              Run the command, wait for it, deliver its result, then mark the record finished.
   reap       --session-dir D [--worker NAME]
@@ -117,7 +117,7 @@ class RunRecord(TypedDict):
 
 @dataclass(frozen=True)
 class MeshCaller:
-    """The worker seat a command came from."""
+    """The worker a command came from."""
 
     session_dir: str
     name: str
@@ -146,8 +146,8 @@ def _roster_folders() -> list[Path]:
 
 
 def caller_from_environment(environment: dict[str, str]) -> Caller:
-    """The seat whose thread CODEX_THREAD_ID names. The server and port are never recorded:
-    delivery looks the seat up again when the run finishes."""
+    """The worker whose thread CODEX_THREAD_ID names. The server and port are never recorded:
+    delivery looks the worker up again when the run finishes."""
     thread_id = environment.get("CODEX_THREAD_ID", "")
     if not thread_id:
         return NotMeshWorker()
@@ -184,7 +184,7 @@ def _read_record(path: Path) -> RunRecord:
 
 
 def seat_name(session_dir: str, name: str) -> str:
-    """The roster's name for the seat `--to` names. A seat may call itself by its role, the last
+    """The roster's name for the worker `--to` names. A worker may call itself by its role, the last
     part of its roster name: on 2026-10-20 tool-based-ui-trunk-box started five runs with `--to box`,
     no roster entry matched at delivery, and each result was lost. A name the roster does not hold,
     such as a reviewer that registers after its run starts, stays as given."""
@@ -275,7 +275,7 @@ def reap_orphans(session_dir: str, worker: str = "") -> list[str]:
 
 
 def live_twin(runs: Path, worker: str, command: list[str], cwd: str, tree_key: str) -> RunRecord | None:
-    """A running record of the same seat, command, folder and tree key whose supervisor lives.
+    """A running record of the same worker, command, folder and tree key whose supervisor lives.
     After an interrupt on 2026-10-21, hana_catalyst-inspectors started its lint run three times
     on one tree; each run took memory, the cargo token and build time."""
     if not tree_key:
@@ -448,13 +448,15 @@ def deliver(record: RunRecord, exit_code: int | None) -> str:
                                 text, message_id=message_id)
         return f"queued for held role {name}; its holder controls the next assignment"
     held = codex_mesh.hold_message(session_dir, name, text, without_launcher=False)
-    if isinstance(held, (codex_mesh.HeldForLauncher, codex_mesh.HeldForNextDispatch)):
+    if isinstance(held, codex_mesh.HeldForLauncher):
         return f"held for {name}'s attached launcher on thread {held.thread_id}"
+    if isinstance(held, codex_mesh.HeldForNextDispatch):
+        return f"held for {name}'s next dispatch on thread {held.thread_id}"
     state = held.reason if isinstance(held, codex_mesh.WorkerEnded) else f"{name} is {held.status or 'unknown'}"
-    note = (f"Seat {name}'s run {record['label']} finished ({_exit_words(exit_code)}); no launcher is attached "
-            + f"({state}), so the result comes to you. Dispatch the seat (implement.sh --to {name}) "
+    note = (f"Worker {name}'s run {record['label']} finished ({_exit_words(exit_code)}); no launcher is attached "
+            + f"({state}), so the result comes to you. Dispatch the worker (implement.sh --to {name}) "
             + "when it should act on it.")
-    message = "\n".join([note, f"Seat: {name}", f"Command: {' '.join(record['command'])}", "", text])
+    message = "\n".join([note, f"Worker: {name}", f"Command: {' '.join(record['command'])}", "", text])
     told = [session for session in _director_sessions(record)
             if send_to_director(session, f"{name}: run {record['label']} finished ({_exit_words(exit_code)})", message)]
     if told:

@@ -1890,6 +1890,15 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             self.assertEqual(send.send(local_options([*self.needs_go_arguments(), "--key", "go", "--repeat-minutes", "30"])).outcome,
                              "sent")
 
+    def test_nate_adhoc_uses_free_text_template_holds(self) -> None:
+        for description, expected in (("Codex workers now spend paid credits.", send.PAID_CREDITS_HELD),
+                                      ("The trunk session waits for your go.", send.NEEDS_GO_HELD)):
+            with self.subTest(description=description):
+                options = local_options(["--to", "user", "--text-id", "nate.adhoc", "--value", "sender=writer",
+                                         "--value", "title=work stopped", "--value", f"description={description}"])
+                self.assertEqual(send.wrong_template(options, description), expected)
+                self.assertIsNone(send.wrong_template(options._replace(text_id="quota.paid_credits"), description))
+
     def paid_credits_arguments(self, *extra: str) -> list[str]:
         values = {"account": "codex2", "machine": "natedev", "credits": "25,345", "refill": "Tue 10-27 02:33 EDT",
                   "next_reset": "Sat 10-24 16:40 EDT"}

@@ -52,6 +52,7 @@ fi
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
 # repo needs >= 3.10.
 PY="${HOME}/.claude/scripts/lib/py"
+NIX_ENV_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)"
 
 MESH_NAME="${1:?Usage: agent_bg.sh <mesh_name> <working_dir> <prompt_file> <summary_file> <log_file> <id_file> [model] [poll_secs]}"
 WORKING_DIR="${2:?missing working_dir}"
@@ -214,14 +215,29 @@ fi
 # through settings, empty when unset (every reader treats empty as unset), and
 # keep them off the launch below so a daemon it starts carries none.
 WORKER_ENV_NAMES=(UNIT_RUN_DIR UNIT_TEAM_ROLE AGENTS_CONFIG_FILE)
-worker_settings="$("$PY" -c '
+worker_settings="$("$PY" - "$WORKING_DIR" "$NIX_ENV_LIB" "${WORKER_ENV_NAMES[@]}" <<'PY'
 import json
 import os
 import sys
+from pathlib import Path
 
-env = {name: os.environ.get(name, "") for name in sys.argv[1:]}
+sys.path.insert(0, sys.argv[2])
+import nix_env
+
+loaded = nix_env.ensure(Path(sys.argv[1]))
+if isinstance(loaded, nix_env.Refused):
+    print(loaded.reason, file=sys.stderr)
+    raise SystemExit(1)
+# The daemon may predate this worktree. Settings carry the worktree's env to
+# the actual session too, rather than proving only the short-lived CLI env.
+env = {name: value for name, value in loaded.env.items()
+       if not name.startswith(("HERDR_", "CODEX_", "CLAUDE_CODE_MESSAGING_"))
+       and name not in {"CLAUDE_CODE_BRIDGE_SESSION_ID", "TMUX", "TMUX_PANE"}}
+env.update({name: "" for name in os.environ if name not in loaded.env})
+env.update({name: os.environ.get(name, "") for name in sys.argv[3:]})
 print(json.dumps({"sandbox": {"enabled": False}, "env": env}))
-' "${WORKER_ENV_NAMES[@]}")"
+PY
+)" || exit 1
 
 launch_args=(--bg --name "${MESH_NAME}"
              --dangerously-skip-permissions
@@ -236,7 +252,7 @@ fi
 banner="$(cd "${WORKING_DIR}" \
             && env -u UNIT_RUN_DIR -u UNIT_TEAM_ROLE -u AGENTS_CONFIG_FILE \
                    -u UNIT_RESOLVES_ROUND -u AGENT_BG_WORKERS \
-                   "${CLAUDE_BIN}" "${launch_args[@]}" \
+                   "${PY}" "$NIX_ENV_LIB/nix_env.py" exec "${CLAUDE_BIN}" "${launch_args[@]}" \
             -- "$(cat "${PROMPT_FILE}")" 2>&1 || true)"
 
 # The banner reads `backgrounded · <id> · <name>`; the separators are multibyte,

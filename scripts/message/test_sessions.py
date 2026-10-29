@@ -67,6 +67,30 @@ class SessionLookupTests(ShutdownTestCase):
             capture_output=True, text=True, check=False,
         )
 
+    def test_session_process_count_includes_every_record_for_the_id(self) -> None:
+        self.record("first.json", session_id="attached")
+        self.record("second.json", session_id="attached")
+        self.record("other.json", session_id="other")
+        self.record("dead.json", session_id="attached", pid=2**29 + os.getpid())
+        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
+            observed = sessions.session_processes("attached")
+            absent = sessions.session_processes("absent")
+        self.assertIsInstance(observed, sessions.SessionProcesses)
+        assert isinstance(observed, sessions.SessionProcesses)
+        self.assertEqual(observed.pids, (os.getpid(), os.getpid()))
+        self.assertEqual(absent, sessions.SessionProcesses(()))
+
+    def test_session_process_count_cannot_prove_uniqueness_with_unreadable_evidence(self) -> None:
+        self.record("live.json", session_id="attached")
+        _ = (self.sessions / "broken.json").write_text("{broken")
+        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
+            observed = sessions.session_processes("attached")
+            legacy = sessions.session_liveness("attached")
+        self.assertIsInstance(observed, sessions.SessionLivenessUnknown)
+        assert isinstance(observed, sessions.SessionLivenessUnknown)
+        self.assertIn("broken.json", observed.reason)
+        self.assertEqual(legacy, sessions.LiveSessionProcess(os.getpid()))
+
     def test_remote_control_reads_present_missing_empty_and_unreadable_fields(self) -> None:
         self.record(f"{os.getpid()}.json")
         path = self.sessions / f"{os.getpid()}.json"

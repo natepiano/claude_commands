@@ -323,9 +323,10 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
                          trimmed_body(action, arguments["message"], arguments["session"], header=arguments["header"]),
                          arguments["answerable"], arguments["session"])
     header, key = arguments["header"], arguments["key"]
+    registered_text = bool(arguments["text_id"]) and not push_texts.agent_written(arguments["text_id"])
     claimed = False
     try:
-        found = review.NoHold() if arguments["text_id"] else review.held_for(source)
+        found = review.NoHold() if registered_text else review.held_for(source)
         if isinstance(found, review.LiveHold):
             claimed = review.claim(source)
             if not claimed:
@@ -335,7 +336,7 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
     except OSError as error:
         found = review.UnreadableHold(review.held_path(source), str(error))
     detail = ""
-    approved = push_texts.approval_date(arguments["text_id"]) if arguments["text_id"] else ""
+    approved = push_texts.approval_date(arguments["text_id"]) if registered_text else ""
     if approved:
         # The text was reviewed and approved ahead of time: no live review, no reviewer wait.
         detail = f"registered text, approved {approved}"
@@ -347,16 +348,16 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
         detail = "review: off"
     else:
         outcome = review.review(draft, revision=claimed)
-        # A registered text without a current approval: the review is a logged check only.
-        version = draft if arguments["text_id"] else review.best_version(draft, outcome)
+        # For registered texts that are not agent-written, review is a logged check only.
+        version = draft if registered_text else review.best_version(draft, outcome)
         if isinstance(outcome, review.Unreviewed):
             detail = "unreviewed: " + outcome.why
-        elif arguments["text_id"] and isinstance(outcome, review.Rewritten):
+        elif registered_text and isinstance(outcome, review.Rewritten):
             detail = "registered text sent as rendered, rewrite not applied"
     if isinstance(outcome, review.Questions):
         outcome = review.Failed(outcome.best_version, outcome.failed_rules, outcome.metadata, outcome.failures)
     rejected = isinstance(outcome, (review.Failed, review.Withheld))
-    send_anyway = rejected and (priority == "2" or bool(arguments["text_id"]))
+    send_anyway = rejected and (priority == "2" or registered_text)
     if send_anyway:
         detail = "sent despite failed review: " + ", ".join(outcome.failed_rules if isinstance(outcome, (review.Failed, review.Withheld)) else [])
     record: ReviewedPushRecord = {**review.message_record(version)}
@@ -387,7 +388,7 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
             completion = review.post_claim(found.hold, lambda: deliver(version, keys_file, post, detail=detail, header=header,
                                                                              key=key, text_id=arguments["text_id"]))
         if isinstance(completion, review.ClaimCancelled):
-            review.log_review(draft, outcome, detail="claim cancelled before posting")
+            review.log_review(draft, outcome, detail="claim cancelled before posting", text_id=arguments["text_id"])
             print("pushover: replaced: a newer version replaced this push; nothing was sent")
             return 5
         code = completion.code if isinstance(completion, review.ClaimFailed) else 0
@@ -397,9 +398,9 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
     review.log_review(draft, outcome, delivery, detail=detail, text_id=arguments["text_id"])
     if code == 0 and send_anyway:
         print("pushover: " + detail)
-        if arguments["text_id"]:
+        if registered_text:
             request_template_fix(record)
-    if code == 0 and not arguments["text_id"] and isinstance(outcome, (review.Rewritten, review.Questions)):
+    if code == 0 and not registered_text and isinstance(outcome, (review.Rewritten, review.Questions)):
         print("pushover: sent as rewritten:")
         print(version.title)
         print(first_line(version.action, version.session))

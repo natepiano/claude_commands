@@ -144,8 +144,8 @@ codex_mesh.py send   --session-dir --to <name> (--message <text> | --message-fil
 codex_mesh.py steer  --session-dir --to <name> (--message <text> | --message-file <path>)
 codex_mesh.py end    --session-dir --to <name>
 codex_mesh.py list   --session-dir                            # roster: name, status, thread id
-codex_mesh.py stop   --session-dir [--pause]                # --pause: seats paused, not ended
-codex_mesh.py reopen --session-dir --to <name>              # ended or abandoned seat back to paused
+codex_mesh.py stop   --session-dir [--pause]                # --pause: workers paused, not ended
+codex_mesh.py reopen --session-dir --to <name>              # ended or abandoned worker back to paused
 codex_mesh.py sweep  [--root <dir>] [--stop]
 ```
 
