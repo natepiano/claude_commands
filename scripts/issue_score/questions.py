@@ -1,16 +1,49 @@
 """Auditable question wording, project context, and decision policy."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Literal, TypedDict
 
-QUESTION_SET_VERSION = "2"
+
+@dataclass(frozen=True)
+class Supported:
+    threshold: float
+
+
+@dataclass(frozen=True)
+class Unsupported:
+    reason: str = "no threshold meets the error target with nonzero coverage"
+
+
+@dataclass(frozen=True)
+class ReportOnly:
+    pass
+
+
+ThresholdOutcome = Supported | Unsupported | ReportOnly
+
+QUESTION_SET_VERSION = "3"
 MODEL = "jev-1.14.0"
 BUDGET_USD = 20.0
 INPUT_USD_PER_MILLION = 0.042
-THRESHOLDS = {field: 0.6 for field in (
-    "backlog_goal", "backlog_alignment", "backlog_impact", "backlog_urgency",
-    "backlog_effort", "category", "area",
+# Complete version-3 tuning run: 20261027T104743.153330Z-3b227095 (N=317).
+THRESHOLDS: dict[str, ThresholdOutcome] = {
+    "backlog_goal": Supported(0.40),
+    "backlog_alignment": Supported(0.40),
+    "backlog_impact": Supported(0.40),
+    "backlog_urgency": ReportOnly(),
+    "backlog_effort": ReportOnly(),
+    "category": Supported(0.90),
+    "area": Unsupported(),
+}
+# The user's per-field verdict after the Phase 3 blind test (2026-10-29):
+# Jev proposes these fields; the agent proposes every other field.
+JEV_FIELDS: frozenset[str] = frozenset({"backlog_goal", "backlog_impact", "backlog_alignment"})
+
+ERROR_TARGETS = {field: 0.1 for field in (
+    "backlog_goal", "category", "area", "backlog_impact", "backlog_alignment",
 )}
+RISK_THRESHOLDS = tuple(percent / 100 for percent in range(40, 100, 5))
 EVIDENCE_PRESENT = 0.7
 EVIDENCE_ABSENT = 0.3
 SPLIT_PROBABILITY = 0.25
@@ -48,15 +81,15 @@ GOAL_LABELS = dict(zip(GOALS, (
     "1 - Ship Hana", "2 - Find Collaborators", "3 - Seek Investors", "4 - Business Viability",
 )))
 CATEGORIES = {
-    "bug": "Something is broken and the work restores the intended behavior.",
-    "feature": "The work adds functionality that does not yet exist.",
-    "enhancement": "The work improves functionality that already exists.",
-    "docs": "The deliverable is documentation explaining the project or its use.",
-    "example": "The deliverable is a worked example or demonstration.",
-    "refactor": "The work restructures code without changing its observable behavior.",
-    "idea": "A creative concept is proposed but is not yet actionable.",
-    "research": "There is a specific question to investigate and answer before choosing an implementation.",
-    "business": "The work concerns trademarks, funding, recruiting, legal or commercial operations.",
+    "bug": "Something does not work as it was meant to: it crashes, gives a wrong result or breaks a stated behavior, and the work makes it work as intended. A look or behavior that works as designed but could be better is not a bug.",
+    "feature": "The work ships a capability that users or code cannot use at all today, such as a new tool, widget, command or integration, with a defined scope.",
+    "enhancement": "The work changes a capability that already exists so it works better, looks better or covers more cases; the issue names the existing thing it improves.",
+    "docs": "The deliverable is written documentation, such as a guide, a README or a reference page.",
+    "example": "The deliverable is a worked example or a demonstration program that shows how to use something.",
+    "refactor": "The work restructures, moves or renames code, or removes an old code path, and users see no change in behavior.",
+    "idea": "A creative concept or an inspiration is noted with no scope and no defined deliverable; nobody could start building it from the issue alone.",
+    "research": "The deliverable is a finding or a decision, not shipped code: evaluate an outside library, crate, tool or technique, or answer a stated question before an implementation is chosen. An issue that only names an outside project to look at is research.",
+    "business": "The work concerns trademarks, funding, recruiting, legal or commercial operations."
 }
 ALIGNMENT_LEVELS = [
     "The work has a weak or minimal relationship to this goal.",
@@ -73,14 +106,14 @@ IMPACT_LEVELS = [
     "The outcome transforms the product, organization or ecosystem.",
 ]
 EFFORT_LEVELS = [
-    "XS: one atomic, tightly scoped action, such as fixing the board's JSON pointer or handling one reflected enum variant index.",
-    "S: contained work with few touchpoints and a known approach, such as adding NonZeroSize or waking anchor refresh only for its panels.",
-    "M: several coordinated steps or touchpoints, such as adding gamepad camera modes to the switcher or auditing Bevy migration impact.",
-    "L: broad work with substantial coordination or integration, such as building the color picker widget or cable auto routing.",
-    "XL: a multi-phase initiative or epic needing decomposition, such as a network-aware undo system or an AI graph builder with playback.",
+    "XS: one atomic, tightly scoped action, such as coupling sccache gap start and length in one type or storing CPU usage directly in the CPU pane.",
+    "S: contained work with few touchpoints and a known approach, such as a startup phase state lifecycle enum or Cmd-D duplicate for movables.",
+    "M: several coordinated steps or touchpoints, such as generic asset loading or the Arrange Jacks widget.",
+    "L: broad work with substantial coordination or integration, such as the feature log or panel picking design proposal.",
+    "XL: a multi-phase initiative or epic needing decomposition, such as headless widgets v1 or tool graph v1.",
 ]
-# Exact open vault filenames named in the rubric, excluded from evaluation.
-EFFORT_EXAMPLE_STEMS = frozenset({
+# Historical prompt examples stay excluded even after the rubric is revised.
+HISTORICAL_EFFORT_EXAMPLE_STEMS = frozenset({
     "board prints pointer to its own json",
     "0.20.0 - handle enum variant-index reflect path (bevy PR 23137)",
     "NonZeroSize",
@@ -109,9 +142,9 @@ URGENCY_EVIDENCE = {
         "The opportunity remains available and no outside cutoff is described.",
     ),
     "current_harm": (
-        "Does `issue` describe something broken now that harms users, data or other work?",
-        "A present failure is harming users, data or work currently underway.",
-        "The work adds or improves a capability while current use continues successfully.",
+        "Does `issue` describe a failure happening now that stops people from using the product or doing their work?",
+        "A failure happens now, and people cannot use the product, finish a task or keep their data until it is fixed; no workaround is given.",
+        "The defect is a visible flaw, a wrong look, a slow step or a rare failure with a workaround; people keep using the product and doing their work while it waits.",
     ),
     "blocks_planned_work": (
         "Does `issue` describe other planned work that cannot start until this work is done?",
@@ -166,7 +199,7 @@ def _choice_pair(instructions: str, options: dict[str, str]) -> tuple[ChoiceQues
 
 def main_questions() -> dict[str, Question]:
     goal, goal_reverse = _choice_pair("Which goal does `issue` most directly advance? Choose its primary outcome.", GOALS)
-    category, category_reverse = _choice_pair("What kind of work does `issue` describe?", CATEGORIES)
+    category, category_reverse = _choice_pair("What kind of work does `issue` describe, judged by what the work delivers when it is done?", CATEGORIES)
     result: dict[str, Question] = {
         "goal": goal, "goal_reverse": goal_reverse,
         "category": category, "category_reverse": category_reverse,
