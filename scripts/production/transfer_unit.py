@@ -32,7 +32,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import add_unit  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
+from production_units import Production, read_production  # noqa: E402
 import merge_checkpoint  # noqa: E402
 import pane_record  # noqa: E402
 import production_units  # noqa: E402
@@ -147,16 +148,16 @@ def foreign_commits(transfer: UnitTransfer) -> int:
     return int(git(worktree, "rev-list", "--count", base, f"^origin/{transfer.to_merge_branch}"))
 
 
-def _production(slug: str) -> add_unit.Production:
+def _production(slug: str) -> Production:
     checked = showrunners.checked_doc(showrunners.NOTIFIER_STATE_DIR / f"showrunner-{slug}")
     if isinstance(checked, showrunners.NoCheckedDoc):
         raise RenameRefused(f"{slug} has no readable update timer: {checked.reason}")
-    return add_unit.read_production(checked.path)
+    return read_production(checked.path)
 
 
 def build(from_slug: str, given: str, to_doc: Path, scratch: Path) -> UnitTransfer:
     giving = _production(from_slug)
-    receiving = add_unit.read_production(to_doc.expanduser().resolve())
+    receiving = read_production(to_doc.expanduser().resolve())
     if receiving.slug == giving.slug:
         raise RenameRefused(f"{given} is already in {giving.slug}")
     try:

@@ -409,6 +409,51 @@ class MergeGateTests(unittest.TestCase):
         at = datetime.fromisoformat(cast(str, record["at"]))
         self.assertEqual(at.utcoffset(), UTC.utcoffset(at))
 
+    def test_tests_only_runs_types_for_each_requested_directory(self) -> None:
+        result = self.run_gate("--tests-only", "--type-dirs", "scripts/production", "scripts/hooks")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        type_call, = [call for call in self.calls() if call["tool"] == "basedpyright"]
+        python = self.state / "runner/typecheck-venv/bin/python"
+        self.assertEqual(type_call["args"], ["--pythonpath", str(python), "scripts/production", "scripts/hooks"])
+        self.assertEqual(type_call["cwd"], str(self.checkout))
+        self.assertIn("basedpyright: OK", result.stdout)
+        self.assert_all_modules_started()
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+        self.assert_not_pushed()
+
+    def test_tests_only_runs_types_with_hooks_in_the_default_scope(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "--tests-only", "--repo", str(self.checkout)],
+            cwd=self.root, env=self.environment, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, check=False, timeout=300,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        type_call, = [call for call in self.calls() if call["tool"] == "basedpyright"]
+        python = self.state / "runner/typecheck-venv/bin/python"
+        self.assertEqual(type_call["args"], ["--pythonpath", str(python), "scripts"])
+        self.assertEqual(type_call["cwd"], str(self.checkout))
+
+    def test_tests_only_fails_when_reused_tests_have_a_red_type_job(self) -> None:
+        first = self.run_gate("--tests-only")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        records = self.pass_records()
+        self.clear_gate_events()
+        self.write(self.state / "types-red", "red")
+
+        result = self.run_gate("--tests-only")
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("tests reused from", result.stdout)
+        self.assertIn("basedpyright: RED", result.stdout)
+        self.assertIn("fixture type error", result.stdout)
+        self.assertEqual(len([call for call in self.calls() if call["tool"] == "basedpyright"]), 1)
+        self.assertEqual(self.module_events(), [])
+        self.assertEqual(self.pass_records(), records)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+        self.assert_not_pushed()
+
     def test_dirty_and_failed_runs_do_not_record_a_pass(self) -> None:
         for state in ("tracked", "staged", "untracked", "failed"):
             with self.subTest(state=state):
@@ -585,7 +630,7 @@ class MergeGateTests(unittest.TestCase):
         marker = Path(self.environment["MERGE_GATE_STATE_DIR"]) / "full-required"
         for red in (True, False):
             with self.subTest(red=red):
-                def suite_run(repo: Path, memory_cap_mib: int, *, module_time_limit_s: float,
+                def suite_run(repo: Path, memory_cap_mib: int, type_dirs: list[str], *, module_time_limit_s: float,
                               full: bool) -> merge_gate.GateRun:
                     self.assertNotEqual(repo, self.checkout)
                     self.assertTrue((repo / ".git/objects/info/alternates").is_file())
@@ -594,6 +639,7 @@ class MergeGateTests(unittest.TestCase):
                     self.assertTrue(full)
                     self.assertGreater(memory_cap_mib, 0)
                     self.assertGreater(module_time_limit_s, 0)
+                    self.assertEqual(type_dirs, ["scripts"])
                     self.write(repo / "subject.txt", "only the copy changes\n")
                     copies.append(repo)
                     return merge_gate.GateRun((merge_gate.GateJobResult("hooks", "test_first.py", int(red), 0, "fixture"),), 0, 0)
@@ -982,7 +1028,8 @@ class MergeGateTests(unittest.TestCase):
         self.assertIn("sampled memory cap 268 MiB", result.stdout)
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
         self.assert_not_pushed()
-        self.assertFalse(any(call["tool"] in ("basedpyright", "ssh") for call in self.calls()))
+        self.assertEqual(len([call for call in self.calls() if call["tool"] == "basedpyright"]), 1)
+        self.assertFalse(any(call["tool"] == "ssh" for call in self.calls()))
 
     def test_running_job_limit_bounds_overlap_without_dropping_modules(self) -> None:
         self.write(self.state / "concurrency-barrier", "held")

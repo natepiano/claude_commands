@@ -25,6 +25,7 @@ from typing import Literal, TextIO, cast, final
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "buildlog"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
+import cargo_manifest
 import override_guard
 import sweep
 import treekey
@@ -1318,34 +1319,32 @@ class IneligibleMacStep:
 
 def workspace_has_linux_only(repo_root: Path, excluded: set[str]) -> bool:
     # Cargo adds in-tree path dependencies to workspace membership.
-    import audit
-
     root = repo_root.resolve()
-    manifest = audit.toml_table(root / "Cargo.toml")
-    workspace = audit.nested_table(manifest, "workspace")
-    shared = audit.nested_table(workspace, "dependencies")
-    members = set(audit.member_directories(root, manifest))
-    excluded_paths = audit.expanded_directories(root, audit.string_sequence(workspace, "exclude"))
+    manifest = cargo_manifest.toml_table(root / "Cargo.toml")
+    workspace = cargo_manifest.nested_table(manifest, "workspace")
+    shared = cargo_manifest.nested_table(workspace, "dependencies")
+    members = set(cargo_manifest.member_directories(root, manifest))
+    excluded_paths = cargo_manifest.expanded_directories(root, cargo_manifest.string_sequence(workspace, "exclude"))
     if not members:
         raise ValueError("workspace members cannot be read")
     pending = list(members)
     while pending:
         member = pending.pop()
-        values = audit.toml_table(member / "Cargo.toml")
-        package = audit.nested_table(values, "package")
+        values = cargo_manifest.toml_table(member / "Cargo.toml")
+        package = cargo_manifest.nested_table(values, "package")
         name = package.get("name")
         if not isinstance(name, str) or not name:
             raise ValueError("workspace package name cannot be read")
         if name in excluded:
             return True
         tables = [values]
-        for target in audit.nested_table(values, "target").values():
+        for target in cargo_manifest.nested_table(values, "target").values():
             if not isinstance(target, dict):
                 raise ValueError("target dependencies cannot be read")
             tables.append(cast(dict[str, object], target))
         for table in tables:
             for section in ("dependencies", "dev-dependencies", "build-dependencies"):
-                for dependency_name, dependency in audit.nested_table(table, section).items():
+                for dependency_name, dependency in cargo_manifest.nested_table(table, section).items():
                     if not isinstance(dependency, dict):
                         if not isinstance(dependency, str):
                             raise ValueError("dependency cannot be read")
@@ -1366,7 +1365,7 @@ def workspace_has_linux_only(repo_root: Path, excluded: set[str]) -> bool:
                     if not isinstance(path, str) or not path:
                         raise ValueError("dependency path cannot be read")
                     directory = (base / path).resolve()
-                    if not audit.within(root, directory) or directory in excluded_paths or directory in members:
+                    if not cargo_manifest.within(root, directory) or directory in excluded_paths or directory in members:
                         continue
                     members.add(directory)
                     pending.append(directory)
