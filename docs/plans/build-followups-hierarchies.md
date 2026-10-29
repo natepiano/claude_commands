@@ -129,7 +129,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Ruled out:** changing an approved exception without the user (nate.adhoc went to the user); limiting the `validate()` change to push review (it adds failure quotes to held-question text and breaks nothing).
 
-### Phase 4 — The measure reads wait records and merge receipts, and the 4-week experiment starts  · status: todo
+### Phase 4 — The measure reads wait records and merge receipts, and the 4-week experiment starts  · status: done
 **Depends on:** Phase 2; and sdlc gate G1, the wait records from phases-unit:
 - **Supplier:** phases-unit's HI7 phase, its Phase 6 (sdlc gate G1, 2026-10-28); its phase 7 commit 820357a2 sets the reader's schema and clears G1 when merged (sdlc, 2026-10-29).
 - **Record contract:** the shape sent to phases-unit on 2026-10-28, given under Spec below. phases-unit picks the file and the writer and sends both, with the commit, when its phase lands.

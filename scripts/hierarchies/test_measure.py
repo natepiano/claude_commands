@@ -33,6 +33,71 @@ def notification_report(
     return audit.audit(sources, window)
 
 
+def wait_fixture(
+    identity: str, kind: str, start: datetime, minutes: float = 1,
+) -> log_records.JsonObject:
+    end = start + timedelta(minutes=minutes)
+    return {
+        "schema_version": 1, "event_id": identity + "-finished", "event_type": "wait_finished",
+        "run_id": "hana-run", "phase_id": "4", "phase_instance_id": "hana-phase",
+        "working_dir": "/archive/hana_catalyst-fixture", "unit": "/archive/hana_catalyst-fixture",
+        "production": "hana", "owner_session": "hana-director", "wait_id": identity,
+        "wait_kind": kind, "wait_reason": "Admission held", "timestamp": end.isoformat(),
+        "timestamp_epoch": end.timestamp(), "wait_started_at": start.isoformat(),
+        "wait_started_epoch": start.timestamp(),
+        "wait_end": {"state": "Finished", "at": end.isoformat(), "epoch": end.timestamp()},
+        "wait_attribution": {"state": "PhaseInstance", "reason": "explicit phase attribution", "candidates": []},
+    }
+
+
+def wait_report_fixture(
+    window: log_records.Window, waits: Sequence[log_records.JsonObject],
+    phases: Sequence[log_records.JsonObject] = (), missing: Sequence[log_records.JsonObject] = (),
+) -> log_records.JsonObject:
+    return {
+        "since": window.since.isoformat(), "until": window.until.isoformat(),
+        "selection": "phase starts and wait starts in [since, until)",
+        "covered_n": sum(phase.get("state") == "Covered" for phase in phases),
+        "missing_n": sum(phase.get("state") == "HistoryNotRecorded" for phase in phases) + len(missing),
+        "missing_phase_n": sum(phase.get("state") == "HistoryNotRecorded" for phase in phases),
+        "missing_record_n": len(missing),
+        "uncertain_phase_n": sum(phase.get("state") == "UncertainCoverage" for phase in phases),
+        "attribution_miss_n": sum(
+            log_records.field_text(log_records.object_record(wait["wait_attribution"]), "state")
+            in ("UnresolvedAttribution", "UnresolvedSupplier")
+            for wait in [*waits, *missing]
+        ),
+        "production_handoff_n": sum(
+            log_records.field_text(log_records.object_record(wait["wait_attribution"]), "state")
+            == "ProductionHandoff" for wait in waits
+        ),
+        "handoffs": [wait for wait in waits if log_records.field_text(
+            log_records.object_record(wait["wait_attribution"]), "state") == "ProductionHandoff"],
+        "ignored_n": 0, "phases": list(phases), "waits": list(waits), "missing": list(missing),
+    }
+
+
+def wait_phase_fixture(state: str = "Covered", wait_n: int = 0) -> log_records.JsonObject:
+    phase: log_records.JsonObject = {
+        "run_id": "hana-run", "phase_id": "4", "phase_instance_id": "hana-phase",
+        "unit": "/archive/hana_catalyst-fixture", "state": state,
+        "reason": "wait coverage recorded" if state == "Covered" else "phase start has no wait coverage record",
+        "candidates": [],
+    }
+    if state == "Covered":
+        phase["wait_n"] = wait_n
+    return phase
+
+
+def receipt_fixture(commit: str, at: datetime) -> log_records.JsonObject:
+    return {
+        "event_type": "merge_receipt", "schema_version": 1, "project": "hana",
+        "issue": "HI7", "phase_id": "4", "merge_commit": commit,
+        "source_checkpoint": "b" * 40, "target_branch": "init/catalyst",
+        "merged_at": at.isoformat(), "timestamp_epoch": at.timestamp(),
+    }
+
+
 class MeasuresTest(unittest.TestCase):
     start: datetime = datetime(2026, 10, 13, tzinfo=timezone.utc)
     window: log_records.Window = log_records.Window(start, start + timedelta(days=7))
@@ -86,7 +151,10 @@ class MeasuresTest(unittest.TestCase):
         self.assertEqual(rows[0].n, 10)
         self.assertEqual(rows[1].value, "median 5.5 min; p90 9.0 min")
         self.assertEqual(rows[1].n, 10)
-        self.assertTrue(all(row.value == "not recorded" and "progress_history.py" in row.source for row in rows[2:]))
+        self.assertEqual([(row.value, row.n) for row in rows[2:8]],
+                         [("not recorded (HistoryNotRecorded)", 0)] * 6)
+        self.assertEqual(rows[8].measure, "Hana wait coverage / HistoryNotRecorded")
+        self.assertTrue(all("progress_history.py" in row.source for row in rows[2:]))
 
     def test_issue_flow_uses_transition_dates_and_does_not_infer_from_modified(self) -> None:
         found = [
@@ -295,6 +363,550 @@ class MeasuresTest(unittest.TestCase):
             load.assert_called_once_with(dates)
 
 
+class WaitRecordsTest(unittest.TestCase):
+    start: datetime = datetime(2026, 10, 29, tzinfo=timezone.utc)
+    window: log_records.Window = log_records.Window(start, start + timedelta(days=1))
+
+    def test_wait_share_uses_the_phase_time_population_and_only_completed_known_kinds(self) -> None:
+        done = wait_fixture("done", "WaitingForSupplier", self.start, 15)
+        unknown_cause = wait_fixture("no-cause", "", self.start, 80)
+        open_wait = wait_fixture("open", "WaitingForUser", self.start, 90)
+        open_wait["wait_end"] = {"state": "Open"}
+        history = m.parse_wait_report(wait_report_fixture(
+            self.window, [done, unknown_cause, open_wait], [wait_phase_fixture(wait_n=3)]))
+        first = m.PhaseCompletion("first", self.start, True, 3600)
+        phases = [first, first, m.PhaseCompletion("second", self.start, True, 2400),
+                  m.PhaseCompletion("other", self.start, False, 100000),
+                  m.PhaseCompletion("late", self.window.until, True, 100000),
+                  m.PhaseCompletion("undated-duration", self.start, True, m.DurationNotRecorded.MISSING)]
+        rows = {row.measure: row for row in m.phase_flow(phases, self.window, history)}
+        share = rows["Hana wait / share of phase time with a recorded kind"]
+        self.assertEqual(share.n, rows["Hana phase time"].n)
+        self.assertEqual(share.n, 2)
+        self.assertEqual(share.value, "15.0%; partial coverage: HistoryNotRecorded=0, UncertainCoverage=0, "
+                         + "WaitCauseNotRecorded=1, attribution_miss_n=0")
+        self.assertIn("progress_history.py", share.source)
+
+    def test_wait_share_distinguishes_missing_history_from_a_recorded_zero(self) -> None:
+        phases = [m.PhaseCompletion("one", self.start, True, 600)]
+        covered = m.parse_wait_report(wait_report_fixture(self.window, [], [wait_phase_fixture()]))
+        for history, expected in ((m.HistoryNotRecorded(), "not recorded (HistoryNotRecorded)"),
+                                  (covered, "0.0%")):
+            with self.subTest(history=history):
+                rows = {row.measure: row for row in m.phase_flow(phases, self.window, history)}
+                share = rows["Hana wait / share of phase time with a recorded kind"]
+                self.assertEqual((share.value, share.n), (expected, 1))
+
+    def test_wait_share_preserves_each_partial_coverage_state(self) -> None:
+        done = wait_fixture("done", "WaitingForUser", self.start, 2)
+        unresolved = wait_fixture("unresolved", "WaitingForMergeGate", self.start, 40)
+        unresolved["wait_attribution"] = {"state": "UnresolvedAttribution", "reason": "two phases", "candidates": []}
+        variants = (
+            ([wait_phase_fixture(wait_n=1)], [done], "20.0%"),
+            ([wait_phase_fixture("HistoryNotRecorded")], [done], "HistoryNotRecorded=1"),
+            ([wait_phase_fixture("UncertainCoverage")], [done], "UncertainCoverage=1"),
+            ([wait_phase_fixture(wait_n=1)], [done, unresolved], "attribution_miss_n=1"),
+        )
+        for phases, waits, expected in variants:
+            with self.subTest(expected=expected):
+                history = m.parse_wait_report(wait_report_fixture(self.window, waits, phases))
+                rows = {row.measure: row for row in m.phase_flow(
+                    [m.PhaseCompletion("one", self.start, True, 600)], self.window, history)}
+                share = rows["Hana wait / share of phase time with a recorded kind"]
+                self.assertTrue(share.value.startswith("20.0%"))
+                self.assertIn(expected, share.value)
+                kind_suffix = rows["Hana wait / WaitingForUser"].value.partition(";")[2]
+                self.assertEqual(share.value.partition(";")[2], kind_suffix)
+                self.assertEqual(share.n, 1)
+
+    def test_recorded_wait_retains_supplier_identity_and_reason_states(self) -> None:
+        named = wait_fixture("named", "WaitingForSupplier", self.start)
+        named["expected_supplier"] = {"state": "NamedSupplier", "address": "worker:run/peer"}
+        unnamed = wait_fixture("unnamed", "WaitingForUser", self.start)
+        unnamed["expected_supplier"] = {"state": "NoNamedSupplier", "reason": "no supplier address in request"}
+        historical = wait_fixture("historical", "WaitingForUser", self.start)
+        del historical["wait_reason"]
+        history = m.parse_wait_report(wait_report_fixture(self.window, [named, unnamed, historical]))
+        self.assertEqual(history.waits[0].expected_supplier, m.NamedSupplier("worker:run/peer"))
+        self.assertEqual(history.waits[0].reason, m.RecordedWaitReason("Admission held"))
+        self.assertEqual(history.waits[1].expected_supplier, m.NoNamedSupplier("no supplier address in request"))
+        self.assertEqual(history.waits[1].reason, m.RecordedWaitReason("Admission held"))
+        self.assertEqual(history.waits[2].expected_supplier, m.NoNamedSupplier("expected supplier not recorded"))
+        self.assertEqual(history.waits[2].reason, m.WaitReasonNotRecorded("wait reason not recorded"))
+
+    def test_external_wait_event_without_identity_reports_a_source_problem(self) -> None:
+        for event_type in ("wait_started", "wait_finished", "wait_unclosed", "wait_not_recorded"):
+            with self.subTest(event_type=event_type), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                runs = root / "runs"
+                runs.mkdir()
+                phase_path = runs / "hana-run.jsonl"
+                self.assertGreater(phase_path.write_text(json.dumps(self.phase_started()) + "\n"), 0)
+                event = wait_fixture("lost-id", "WaitingForUser", self.start)
+                del event["wait_id"]
+                event["event_type"] = event_type
+                external = root / "wait_attribution.jsonl"
+                self.assertGreater(external.write_text(json.dumps(event) + "\n"), 0)
+                before = external.read_bytes()
+                problems: list[log_records.SourceProblem] = []
+                history = m.read_source(str(external), lambda: m.read_wait_history(root, self.window, problems),
+                                        m.HistoryNotRecorded(), problems)
+                self.assertIsInstance(history, m.HistoryNotRecorded)
+                self.assertEqual(len(problems), 1)
+                self.assertIn("wait_id", problems[0].reason)
+                self.assertTrue(all("not recorded" in row.value for row in m.hana_wait_rows(history, self.window)))
+                self.assertEqual(external.read_bytes(), before)
+
+    def phase_started(self) -> log_records.JsonObject:
+        return {
+            "schema_version": 1, "event_type": "phase_started", "event_id": "phase-start",
+            "run_id": "hana-run", "phase_id": "4", "phase_instance_id": "hana-phase",
+            "worktree": "/archive/hana_catalyst-fixture", "production": "hana",
+            "timestamp": self.start.isoformat(), "timestamp_epoch": self.start.timestamp(),
+            "wait_coverage": {"state": "Recorded"},
+        }
+
+    def test_six_wait_kinds_report_their_own_completed_minutes_and_counts(self) -> None:
+        kinds = (
+            "WaitingForQuotaRefusal", "WaitingForMemoryOrSlot", "WaitingForMergeGate",
+            "WaitingForUser", "WaitingForSupplier", "ReadyWithoutCapacity",
+        )
+        waits = [wait_fixture(str(index), kind, self.start, index)
+                 for index, kind in enumerate(kinds, 1)]
+        report = wait_report_fixture(self.window, waits, [wait_phase_fixture(wait_n=6)])
+        history = m.parse_wait_report(report)
+        rows = {row.measure: row for row in m.hana_wait_rows(history, self.window)}
+        for kind, minutes in zip(kinds, (1, 2, 3, 4, 5, 6)):
+            with self.subTest(kind=kind):
+                row = rows["Hana wait / " + kind]
+                self.assertEqual((row.value, row.n), (f"{minutes:.1f} min", 1))
+                self.assertEqual(row.window, self.window.label)
+                self.assertIn("progress_history.py", row.source)
+
+    def test_empty_window_keeps_unrecorded_history_apart_from_a_covered_zero(self) -> None:
+        absent = m.parse_wait_report(wait_report_fixture(self.window, []))
+        covered = m.parse_wait_report(wait_report_fixture(self.window, [], [wait_phase_fixture()]))
+        absent_rows = [row for row in m.hana_wait_rows(absent, self.window) if row.measure.startswith("Hana wait / ")]
+        covered_rows = [row for row in m.hana_wait_rows(covered, self.window) if row.measure.startswith("Hana wait / ")]
+        self.assertEqual(len(absent_rows), 6)
+        self.assertTrue(all("HistoryNotRecorded" in row.value and row.n == 0 for row in absent_rows))
+        self.assertEqual(len(covered_rows), 6)
+        self.assertTrue(all(row.value == "0.0 min" and row.n == 0 for row in covered_rows))
+
+    def test_open_and_unclosed_waits_do_not_add_completed_minutes(self) -> None:
+        completed = wait_fixture("done", "WaitingForUser", self.start, 2)
+        for state, event in (("Open", "wait_started"), ("Unclosed", "wait_unclosed")):
+            with self.subTest(state=state):
+                unknown = wait_fixture("unfinished", "WaitingForUser", self.start, 50)
+                unknown.update(event_type=event, wait_end={"state": state})
+                report = wait_report_fixture(self.window, [completed, unknown], [wait_phase_fixture(wait_n=2)])
+                history = m.parse_wait_report(report)
+                rows = {row.measure: row for row in m.hana_wait_rows(history, self.window)}
+                self.assertEqual((rows["Hana wait / WaitingForUser"].value,
+                                  rows["Hana wait / WaitingForUser"].n), ("2.0 min", 1))
+                unknown_rows = [row for row in rows.values() if "unknown-ended" in row.measure]
+                self.assertEqual(sum(row.n for row in unknown_rows), 1)
+                self.assertTrue(all("not recorded" in row.value for row in unknown_rows))
+
+    def test_wait_start_selects_the_window_and_excludes_the_end(self) -> None:
+        waits = [
+            wait_fixture("earlier", "WaitingForUser", self.start - timedelta(minutes=1), 50),
+            wait_fixture("first", "WaitingForUser", self.start, 2),
+            wait_fixture("later", "WaitingForUser", self.window.until, 100),
+        ]
+        history = m.parse_wait_report(wait_report_fixture(self.window, waits, [wait_phase_fixture(wait_n=3)]))
+        rows = {row.measure: row for row in m.hana_wait_rows(history, self.window)}
+        self.assertEqual((rows["Hana wait / WaitingForUser"].value,
+                          rows["Hana wait / WaitingForUser"].n), ("2.0 min", 1))
+
+    def test_missing_cause_is_kept_apart_from_missing_phase_history(self) -> None:
+        wait = wait_fixture("cause-absent", "", self.start, 3)
+        phase = wait_phase_fixture("HistoryNotRecorded")
+        history = m.parse_wait_report(wait_report_fixture(self.window, [wait], [phase]))
+        self.assertIsInstance(history.waits[0].kind, m.WaitCauseNotRecorded)
+        self.assertIsInstance(history.phases[0].state, m.HistoryNotRecorded)
+        rows = m.hana_wait_rows(history, self.window)
+        missing_cause = [row for row in rows if "WaitCauseNotRecorded" in row.measure]
+        missing_history = [row for row in rows if "HistoryNotRecorded" in row.measure]
+        self.assertEqual([(row.value, row.n) for row in missing_cause], [("Admission held", 1)])
+        self.assertEqual(sum(row.n for row in missing_history), 1)
+        self.assertIn("phase start has no wait coverage record", missing_history[0].value)
+
+    def test_uncertain_candidates_never_become_a_covered_zero(self) -> None:
+        candidates: list[log_records.JsonObject] = [
+            {"run_id": "hana-run", "phase_id": "4", "phase_instance_id": "hana-phase"},
+            {"run_id": "hana-run", "phase_id": "5", "phase_instance_id": "hana-next-phase"},
+        ]
+        reason = "checkpoint has two matching phases"
+        missing = wait_fixture("ambiguous", "WaitingForMergeGate", self.start)
+        missing.update(event_type="wait_not_recorded", wait_end={"state": "NotRecorded"},
+                       wait_record_state={"state": "NotRecorded", "reason": reason},
+                       wait_attribution={"state": "UnresolvedAttribution", "reason": reason,
+                                         "candidates": candidates})
+        del missing["phase_id"]
+        del missing["phase_instance_id"]
+        phases: list[log_records.JsonObject] = []
+        for candidate in candidates:
+            phase = wait_phase_fixture("UncertainCoverage")
+            phase.update(candidate)
+            phase.update(reason=reason, candidates=candidates, recorded_wait_n=0,
+                         attribution_miss_ids=["ambiguous"])
+            phases.append(phase)
+        history = m.parse_wait_report(wait_report_fixture(self.window, [], phases, [missing]))
+        rows = m.hana_wait_rows(history, self.window)
+        output = log_records.table("Wait fixtures", rows)
+        self.assertIn("uncertain_phase_n", output)
+        self.assertIn("attribution_miss_n", output)
+        self.assertIn(reason, output)
+        self.assertIn("hana-next-phase", output)
+        kind_rows = [row for row in rows if row.measure in {
+            "Hana wait / WaitingForQuotaRefusal", "Hana wait / WaitingForMemoryOrSlot",
+            "Hana wait / WaitingForMergeGate", "Hana wait / WaitingForUser",
+            "Hana wait / WaitingForSupplier", "Hana wait / ReadyWithoutCapacity",
+        }]
+        self.assertEqual(len(kind_rows), 6)
+        self.assertTrue(all("not recorded" in row.value for row in kind_rows))
+        self.assertEqual([(row.value, row.n) for row in rows if row.measure == "Hana wait / uncertain_phase_n"], [("2", 2)])
+        self.assertEqual([(row.value, row.n) for row in rows if row.measure == "Hana wait / attribution_miss_n"], [("1", 1)])
+        self.assertTrue(all(isinstance(phase.state, m.UncertainWaitCoverage) for phase in history.phases))
+        self.assertNotIn("wait_n=0", output)
+
+    def test_completed_wait_with_unresolved_supplier_adds_no_hana_minutes(self) -> None:
+        reason = "supplier address is not recorded"
+        unresolved = wait_fixture("unknown-supplier", "WaitingForSupplier", self.start, 90)
+        candidates: list[log_records.JsonObject] = [
+            {"run_id": "hana-run", "phase_id": "4", "phase_instance_id": "hana-phase"},
+        ]
+        unresolved.update(expected_supplier={"state": "NoNamedSupplier", "reason": reason},
+                          wait_attribution={"state": "UnresolvedSupplier", "reason": reason,
+                                            "candidates": candidates})
+        known = wait_fixture("known-supplier", "WaitingForSupplier", self.start, 2)
+        phase = wait_phase_fixture("UncertainCoverage")
+        phase.update(reason=reason, candidates=candidates, recorded_wait_n=2,
+                     attribution_miss_ids=["unknown-supplier"])
+        history = m.parse_wait_report(wait_report_fixture(self.window, [known, unresolved], [phase]))
+        self.assertEqual([wait.identity for wait in history.waits], ["known-supplier"])
+        self.assertEqual([miss.wait_id for miss in history.attribution_misses], ["unknown-supplier"])
+        rows = {row.measure: row for row in m.hana_wait_rows(history, self.window)}
+        self.assertEqual((rows["Hana wait / WaitingForSupplier"].value.split(";", 1)[0],
+                          rows["Hana wait / WaitingForSupplier"].n), ("2.0 min", 1))
+        self.assertIn("partial coverage", rows["Hana wait / WaitingForSupplier"].value)
+        self.assertIn("not recorded", rows["Hana wait / WaitingForUser"].value)
+        self.assertEqual((rows["Hana wait / attribution_miss_n"].value,
+                          rows["Hana wait / attribution_miss_n"].n), ("1", 1))
+        output = log_records.table("Wait fixtures", list(rows.values()))
+        self.assertIn(reason, output)
+        self.assertIn("instance=hana-phase", output)
+
+    def test_missing_cause_prevents_covered_zero_and_keeps_unknown_end_count(self) -> None:
+        for state, event in (("Finished", "wait_finished"), ("Unclosed", "wait_unclosed")):
+            with self.subTest(state=state):
+                wait = wait_fixture("cause-absent", "", self.start, 5)
+                if state != "Finished":
+                    wait.update(event_type=event, wait_end={"state": state})
+                history = m.parse_wait_report(wait_report_fixture(self.window, [wait], [wait_phase_fixture(wait_n=1)]))
+                self.assertIsInstance(history.waits[0].kind, m.WaitCauseNotRecorded)
+                rows = {row.measure: row for row in m.hana_wait_rows(history, self.window)}
+                for kind in ("WaitingForQuotaRefusal", "WaitingForMemoryOrSlot", "WaitingForMergeGate",
+                             "WaitingForUser", "WaitingForSupplier", "ReadyWithoutCapacity"):
+                    row = rows["Hana wait / " + kind]
+                    self.assertIn("not recorded", row.value)
+                    self.assertIn("WaitCauseNotRecorded=1", row.value)
+                    self.assertEqual(row.n, 0)
+                self.assertEqual(rows["Hana wait / WaitCauseNotRecorded"].n, 1)
+                if state == "Unclosed":
+                    unknown = rows["Hana wait unknown-ended / WaitCauseNotRecorded"]
+                    self.assertEqual((unknown.value, unknown.n), ("duration not recorded", 1))
+
+    def test_production_handoff_wait_counts_without_borrowing_a_phase(self) -> None:
+        handoff = wait_fixture("handoff", "WaitingForMergeGate", self.start, 7)
+        for field in ("run_id", "phase_id", "phase_instance_id", "working_dir"):
+            del handoff[field]
+        handoff.update(checkpoint_commit="c" * 40,
+                       wait_attribution={"state": "ProductionHandoff",
+                                         "reason": "child production checkpoint has no owning phase", "candidates": []})
+        history = m.parse_wait_report(wait_report_fixture(self.window, [handoff]))
+        self.assertEqual(history.phases, ())
+        self.assertTrue(history.waits[0].production_handoff)
+        self.assertEqual(history.waits[0].phase, m.ProductionHandoff("hana"))
+        self.assertEqual(history.waits[0].owner, m.RecordedWaitOwner("hana-director"))
+        rows = {row.measure: row for row in m.hana_wait_rows(history, self.window)}
+        self.assertEqual((rows["Hana wait / WaitingForMergeGate"].value,
+                          rows["Hana wait / WaitingForMergeGate"].n), ("7.0 min", 1))
+        output = log_records.table("Wait fixtures", list(rows.values()))
+        self.assertEqual((rows["Hana wait / production handoff"].value,
+                          rows["Hana wait / production handoff"].n), ("no phase; owner=hana-director", 1))
+        self.assertIn("handoff", output)
+
+    def test_wait_identity_keeps_recorded_phase_and_owner_in_named_states(self) -> None:
+        wait = wait_fixture("known-owner", "WaitingForUser", self.start, 3)
+        history = m.parse_wait_report(wait_report_fixture(self.window, [wait], [wait_phase_fixture(wait_n=1)]))
+        self.assertEqual(history.waits[0].phase, m.WaitPhaseInstance("hana-run", "hana-phase"))
+        self.assertEqual(history.waits[0].owner, m.RecordedWaitOwner("hana-director"))
+        self.assertFalse(history.waits[0].production_handoff)
+        rows = {row.measure: row for row in m.hana_wait_rows(history, self.window)}
+        self.assertEqual((rows["Hana wait / WaitingForUser"].value,
+                          rows["Hana wait / WaitingForUser"].n), ("3.0 min", 1))
+
+    def test_wait_without_an_owner_has_a_named_missing_owner(self) -> None:
+        wait = wait_fixture("owner-absent", "WaitingForUser", self.start)
+        del wait["owner_session"]
+        wait.update(event_type="wait_not_recorded", wait_end={"state": "NotRecorded"},
+                    wait_record_state={"state": "NotRecorded", "reason": "wait owner session not recorded"})
+        phase = wait_phase_fixture("HistoryNotRecorded")
+        phase.update(reason="wait emission has a missing record", wait_missing_n=1, recorded_wait_n=0)
+        history = m.parse_wait_report(wait_report_fixture(self.window, [], [phase], [wait]))
+        owner = history.waits[0].owner
+        self.assertIsInstance(owner, m.WaitOwnerNotRecorded)
+        if isinstance(owner, m.WaitOwnerNotRecorded):
+            self.assertIn("owner", owner.reason)
+        self.assertEqual(history.waits[0].phase, m.WaitPhaseInstance("hana-run", "hana-phase"))
+        rows = {row.measure: row for row in m.hana_wait_rows(history, self.window)}
+        self.assertEqual((rows["Hana wait unknown-ended / WaitingForUser"].value,
+                          rows["Hana wait unknown-ended / WaitingForUser"].n), ("duration not recorded", 1))
+        self.assertEqual((rows["Hana wait / WaitOwnerNotRecorded"].value,
+                          rows["Hana wait / WaitOwnerNotRecorded"].n), ("wait owner session not recorded", 1))
+
+    def test_wait_without_phase_identity_has_a_named_missing_phase(self) -> None:
+        wait = wait_fixture("phase-absent", "WaitingForUser", self.start, 3)
+        for field in ("run_id", "phase_id", "phase_instance_id", "wait_attribution"):
+            del wait[field]
+        wait["wait_attribution"] = {}
+        history = m.parse_wait_report(wait_report_fixture(self.window, [wait]))
+        phase = history.waits[0].phase
+        self.assertIsInstance(phase, m.WaitPhaseNotRecorded)
+        if isinstance(phase, m.WaitPhaseNotRecorded):
+            self.assertIn("phase", phase.reason)
+        self.assertFalse(history.waits[0].production_handoff)
+        self.assertEqual(history.waits[0].owner, m.RecordedWaitOwner("hana-director"))
+        rows = {row.measure: row for row in m.hana_wait_rows(history, self.window)}
+        self.assertEqual((rows["Hana wait / WaitingForUser"].value,
+                          rows["Hana wait / WaitingForUser"].n), ("3.0 min", 1))
+        self.assertEqual(rows["Hana wait / WaitPhaseNotRecorded"].n, 1)
+        self.assertIn("phase", rows["Hana wait / WaitPhaseNotRecorded"].value)
+
+    def test_non_hana_waits_do_not_add_hana_minutes(self) -> None:
+        hana = wait_fixture("hana", "WaitingForQuotaRefusal", self.start, 3)
+        other = wait_fixture("other", "WaitingForQuotaRefusal", self.start, 90)
+        other.update(production="tools", working_dir="/archive/other-fixture", unit="/archive/other-fixture",
+                     run_id="tools-run", phase_instance_id="tools-phase")
+        history = m.parse_wait_report(wait_report_fixture(self.window, [hana, other]))
+        rows = {row.measure: row for row in m.hana_wait_rows(history, self.window)}
+        self.assertEqual((rows["Hana wait / WaitingForQuotaRefusal"].value,
+                          rows["Hana wait / WaitingForQuotaRefusal"].n), ("3.0 min", 1))
+
+    def test_known_unit_prefix_attributes_a_deleted_worktree_wait_to_hana(self) -> None:
+        wait = wait_fixture("deleted", "WaitingForSupplier", self.start, 4)
+        wait.update(production="tools", working_dir="/archive/widget-enhancements-unit",
+                    unit="/archive/widget-enhancements-unit")
+        report = wait_report_fixture(self.window, [wait])
+        history = m.parse_wait_report(report, prefixes=("widget-enhancements",))
+        rows = {row.measure: row for row in m.hana_wait_rows(history, self.window)}
+        self.assertEqual((rows["Hana wait / WaitingForSupplier"].value,
+                          rows["Hana wait / WaitingForSupplier"].n), ("4.0 min", 1))
+
+    def test_wait_loader_combines_run_and_external_records_without_changing_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = root / "runs"
+            runs.mkdir()
+            completed = wait_fixture("run-wait", "WaitingForMergeGate", self.start, 2)
+            opened = {**completed, "event_type": "wait_started", "wait_end": {"state": "Open"}}
+            run_file = runs / "hana-run.jsonl"
+            _ = run_file.write_text("\n".join(json.dumps(event) for event in
+                                             [self.phase_started(), opened, completed]) + "\n")
+            handoff = wait_fixture("external-wait", "WaitingForMergeGate", self.start, 7)
+            for field in ("run_id", "phase_id", "phase_instance_id", "working_dir"):
+                del handoff[field]
+            handoff.update(checkpoint_commit="c" * 40,
+                           wait_attribution={"state": "ProductionHandoff",
+                                             "reason": "child production checkpoint has no owning phase", "candidates": []})
+            external = root / "wait_attribution.jsonl"
+            _ = external.write_text(json.dumps(handoff) + "\n")
+            before = {path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+            problems: list[log_records.SourceProblem] = []
+            history = m.read_wait_history(root, self.window, problems)
+            self.assertIsInstance(history, m.HanaWaitHistory)
+            rows = {row.measure: row for row in m.hana_wait_rows(history, self.window)}
+            self.assertEqual((rows["Hana wait / WaitingForMergeGate"].value,
+                              rows["Hana wait / WaitingForMergeGate"].n), ("9.0 min", 2))
+            self.assertEqual(rows["Hana wait / production handoff"].n, 1)
+            self.assertEqual(problems, [])
+            self.assertEqual({path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()}, before)
+
+    def test_external_handoff_history_is_read_without_a_runs_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            handoff = wait_fixture("only-handoff", "WaitingForMergeGate", self.start, 7)
+            for field in ("run_id", "phase_id", "phase_instance_id", "working_dir"):
+                del handoff[field]
+            handoff.update(checkpoint_commit="c" * 40,
+                           wait_attribution={"state": "ProductionHandoff",
+                                             "reason": "child production checkpoint has no owning phase", "candidates": []})
+            path = root / "wait_attribution.jsonl"
+            _ = path.write_text(json.dumps(handoff) + "\n")
+            before = path.read_bytes()
+            problems: list[log_records.SourceProblem] = []
+            history = m.read_wait_history(root, self.window, problems)
+            rows = {row.measure: row for row in m.hana_wait_rows(history, self.window)}
+            self.assertEqual((rows["Hana wait / WaitingForMergeGate"].value,
+                              rows["Hana wait / WaitingForMergeGate"].n), ("7.0 min", 1))
+            self.assertEqual(rows["Hana wait / production handoff"].n, 1)
+            self.assertEqual(problems, [])
+            self.assertFalse((root / "runs").exists())
+            self.assertEqual(list(root.iterdir()), [path])
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_missing_wait_history_reports_a_source_problem_without_creating_a_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "absent-history"
+            problems: list[log_records.SourceProblem] = []
+            history = m.read_source(str(root), lambda: m.read_wait_history(root, self.window, problems),
+                                    m.HistoryNotRecorded(), problems)
+            self.assertIsInstance(history, m.HistoryNotRecorded)
+            self.assertFalse(root.exists())
+            self.assertEqual(len(problems), 1)
+            self.assertIn(str(root / "runs"), problems[0].reason)
+            rows = m.hana_wait_rows(history, self.window)
+            self.assertTrue(all("not recorded" in row.value for row in rows))
+
+    def test_corrupt_external_history_reports_a_problem_instead_of_a_covered_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "runs").mkdir()
+            external = root / "wait_attribution.jsonl"
+            _ = external.write_text("{not JSON}\n")
+            before = external.read_bytes()
+            problems: list[log_records.SourceProblem] = []
+            history = m.read_source(str(external), lambda: m.read_wait_history(root, self.window, problems),
+                                    m.HistoryNotRecorded(), problems)
+            self.assertIsInstance(history, m.HistoryNotRecorded)
+            self.assertEqual(len(problems), 1)
+            self.assertIn("invalid JSON or field rows", problems[0].reason)
+            self.assertIn("source unavailable", log_records.table(
+                "Source problems", log_records.source_problem_rows(problems, self.window)))
+            self.assertEqual(external.read_bytes(), before)
+
+    def test_corrupt_run_row_keeps_valid_waits_and_reports_incomplete_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = root / "runs"
+            runs.mkdir()
+            path = runs / "hana-run.jsonl"
+            _ = path.write_text("\n".join(json.dumps(record) for record in
+                                         [self.phase_started(), wait_fixture("good", "WaitingForUser", self.start, 2)])
+                                + "\n{bad JSON}\n")
+            before = path.read_bytes()
+            problems: list[log_records.SourceProblem] = []
+            history = m.read_wait_history(root, self.window, problems)
+            rows = {row.measure: row for row in m.hana_wait_rows(history, self.window)}
+            self.assertEqual((rows["Hana wait / WaitingForUser"].value,
+                              rows["Hana wait / WaitingForUser"].n), ("2.0 min", 1))
+            self.assertEqual(len(problems), 1)
+            self.assertIn("1 unreadable or unsupported history rows", problems[0].reason)
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_invalid_finished_time_and_candidate_wait_count_are_rejected(self) -> None:
+        before_start = wait_fixture("negative", "WaitingForUser", self.start, -1)
+        self.assertRaisesRegex(ValueError, "before its start", m.parse_wait_report,
+                               wait_report_fixture(self.window, [before_start]))
+        no_end_time = wait_fixture("absent-end", "WaitingForUser", self.start)
+        no_end_time["wait_end"] = {"state": "Finished"}
+        self.assertRaises(ValueError, m.parse_wait_report, wait_report_fixture(self.window, [no_end_time]))
+        candidate = wait_phase_fixture("UncertainCoverage")
+        candidate["wait_n"] = 0
+        self.assertRaisesRegex(ValueError, "cannot carry wait_n", m.parse_wait_report,
+                               wait_report_fixture(self.window, [], [candidate]))
+
+
+class MergeReceiptsTest(unittest.TestCase):
+    start: datetime = datetime(2026, 10, 29, tzinfo=timezone.utc)
+    window: log_records.Window = log_records.Window(start, start + timedelta(days=1))
+
+    def test_receipt_names_the_merge_commit_and_missing_merge_stays_visible(self) -> None:
+        receipt = m.parse_receipt(receipt_fixture("a" * 40, self.start))
+        merges = [m.HanaMerge("a" * 40, self.start), m.HanaMerge("c" * 40, self.start)]
+        rows = m.receipt_rows([receipt], merges, self.window)
+        output = log_records.table("Receipt fixtures", rows)
+        self.assertIn("ReceiptMissing", output)
+        self.assertIn("c" * 40, output)
+        self.assertEqual((receipt.commit, receipt.checkpoint), ("a" * 40, "b" * 40))
+        self.assertIsInstance(m.receipt_for_merge(merges[1], [receipt]), m.ReceiptMissing)
+        coverage = next(row for row in rows if row.measure == "Hana merge receipts / origin/init/catalyst")
+        self.assertEqual((coverage.value, coverage.n), ("1/2", 2))
+
+    def test_source_checkpoint_and_unrelated_receipts_do_not_cover_a_merge(self) -> None:
+        commit = "b" * 40
+        wrong_commit = receipt_fixture("a" * 40, self.start)
+        other_project = receipt_fixture(commit, self.start)
+        other_project["project"] = "tools"
+        other_branch = receipt_fixture(commit, self.start)
+        other_branch["target_branch"] = "sdlc"
+        receipts = [m.parse_receipt(record) for record in (wrong_commit, other_project, other_branch)]
+        rows = m.receipt_rows(receipts, [m.HanaMerge(commit, self.start)], self.window)
+        coverage = next(row for row in rows if row.measure == "Hana merge receipts / origin/init/catalyst")
+        self.assertEqual((coverage.value, coverage.n), ("0/1", 1))
+        self.assertIn("ReceiptMissing", log_records.table("Receipt fixtures", rows))
+
+    def test_receipt_at_window_end_does_not_cover_an_in_window_merge(self) -> None:
+        later = m.parse_receipt(receipt_fixture("a" * 40, self.window.until))
+        rows = m.receipt_rows([later], [m.HanaMerge("a" * 40, self.start)], self.window)
+        totals = {row.measure: (row.value, row.n) for row in rows}
+        self.assertEqual(totals["merge receipts / all projects"], ("0", 0))
+        self.assertEqual(totals["Hana merge receipts / origin/init/catalyst"], ("0/1", 1))
+
+    def test_merge_history_absence_does_not_become_receipt_coverage_zero(self) -> None:
+        receipt = m.parse_receipt(receipt_fixture("a" * 40, self.start))
+        rows = m.receipt_rows([receipt], m.MergeHistoryNotRecorded.MISSING, self.window)
+        coverage = next(row for row in rows if row.measure == "Hana merge receipts / origin/init/catalyst")
+        self.assertIn("not recorded", coverage.value)
+        self.assertEqual(coverage.n, 0)
+        self.assertEqual(coverage.window, self.window.label)
+
+    def test_receipt_loader_deduplicates_retries_and_keeps_the_file_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "merge_receipts.jsonl"
+            record = receipt_fixture("a" * 40, self.start)
+            _ = path.write_text(json.dumps(record) + "\n" + json.dumps(record) + "\n")
+            before = path.read_bytes()
+            receipts = m.read_receipts(path)
+            self.assertNotIsInstance(receipts, m.HistoryNotRecorded)
+            rows = {row.measure: row for row in m.receipt_rows(
+                receipts, [m.HanaMerge("a" * 40, self.start)], self.window)}
+            self.assertEqual((rows["merge receipts / all projects"].value,
+                              rows["merge receipts / all projects"].n), ("1", 1))
+            self.assertEqual((rows["Hana merge receipts / origin/init/catalyst"].value,
+                              rows["Hana merge receipts / origin/init/catalyst"].n), ("1/1", 1))
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_absent_receipt_file_and_a_merge_without_a_receipt_keep_distinct_states(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "missing" / "merge_receipts.jsonl"
+            receipts = m.read_receipts(path)
+            self.assertIsInstance(receipts, m.HistoryNotRecorded)
+            self.assertFalse(path.parent.exists())
+            rows = m.receipt_rows(receipts, [m.HanaMerge("c" * 40, self.start)], self.window)
+            missing = [row for row in rows if row.measure == "Hana merge / ReceiptMissing"]
+            self.assertEqual([(row.value, row.n) for row in missing], [("c" * 40, 1)])
+            self.assertIn("HistoryNotRecorded", rows[0].value)
+
+    def test_corrupt_receipt_source_never_reports_a_trusted_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "merge_receipts.jsonl"
+            _ = path.write_text(json.dumps(receipt_fixture("a" * 40, self.start)) + "\n{bad JSON}\n")
+            before = path.read_bytes()
+            problems: list[log_records.SourceProblem] = []
+            receipts = m.read_source(str(path), lambda: m.read_receipts(path),
+                                     m.HistoryNotRecorded("merge receipts not recorded"), problems)
+            self.assertIsInstance(receipts, m.HistoryNotRecorded)
+            self.assertEqual(len(problems), 1)
+            rows = m.receipt_rows(receipts, [], self.window)
+            self.assertIn("HistoryNotRecorded", rows[0].value)
+            self.assertIn(str(path), log_records.table(
+                "Source problems", log_records.source_problem_rows(problems, self.window)))
+            self.assertEqual(path.read_bytes(), before)
+
+
 class BaselineOutputTest(unittest.TestCase):
     window: log_records.Window = log_records.window_bounds("2026-10-21", "2026-10-27", datetime.now(timezone.utc))
 
@@ -360,6 +972,32 @@ class BaselineOutputTest(unittest.TestCase):
                       + f"{rows['goal 1 Hana-project issues closed']} Hana-project issues closed.", summary)
         self.assertIn(f"User attention: {rows['phone pushes sent']} pushes sent to user; "
                       + f"{rows['phone pushes after failed review']} after a failed text check.", summary)
+
+    def test_full_cli_adds_waits_and_receipts_below_the_same_five_line_summary(self) -> None:
+        sources = self.sources()
+        sources.wait_history = m.parse_wait_report(wait_report_fixture(
+            self.window, [wait_fixture("user-wait", "WaitingForUser", self.window.since, 8)],
+            [wait_phase_fixture(wait_n=1)],
+        ))
+        sources.merges = [m.HanaMerge("a" * 40, self.window.since), m.HanaMerge("c" * 40, self.window.since)]
+        sources.receipts = (m.parse_receipt(receipt_fixture("a" * 40, self.window.since)),)
+        summary = self.output(sources)
+        output = self.output(sources, full=True)
+        self.assertEqual(len(summary.splitlines()), 5)
+        self.assertTrue(output.startswith(summary + "\nCapacity on Hana\n"))
+        self.assertNotIn("Hana wait /", summary)
+        rows = {cells[0]: cells for line in output.splitlines()
+                if len(cells := re.split(r"\s{2,}", line)) == 5}
+        self.assertEqual(rows["Hana wait / WaitingForUser"][1:3], ["8.0 min", "1"])
+        expected_kinds = {
+            "Hana wait / WaitingForQuotaRefusal", "Hana wait / WaitingForMemoryOrSlot",
+            "Hana wait / WaitingForMergeGate", "Hana wait / WaitingForUser",
+            "Hana wait / WaitingForSupplier", "Hana wait / ReadyWithoutCapacity",
+            "Hana wait / share of phase time with a recorded kind",
+        }
+        self.assertEqual({name for name in rows if name.startswith("Hana wait / ")}, expected_kinds)
+        self.assertIn("ReceiptMissing", output)
+        self.assertIn("c" * 40, output)
 
     def test_missing_merge_history_prints_not_recorded_in_summary_and_table(self) -> None:
         sources = self.sources()

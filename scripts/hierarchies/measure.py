@@ -148,6 +148,173 @@ class HanaMerge:
     at: datetime
 
 
+class WaitKind(Enum):
+    QUOTA = "WaitingForQuotaRefusal"
+    CAPACITY = "WaitingForMemoryOrSlot"
+    MERGE = "WaitingForMergeGate"
+    USER = "WaitingForUser"
+    SUPPLIER = "WaitingForSupplier"
+    READY = "ReadyWithoutCapacity"
+
+
+@dataclass(frozen=True)
+class HistoryNotRecorded:
+    reason: str = "wait history not recorded"
+
+
+@dataclass(frozen=True)
+class WaitCauseNotRecorded:
+    reason: str
+
+
+@dataclass(frozen=True)
+class CompletedWait:
+    at: datetime
+
+
+@dataclass(frozen=True)
+class UnknownEndedWait:
+    state: str
+
+
+@dataclass(frozen=True)
+class WaitCandidate:
+    run: str
+    phase: str
+    instance: str
+    working_dir: str
+
+    @property
+    def label(self) -> str:
+        return f"run={self.run}; phase={self.phase}; instance={self.instance}; cwd={self.working_dir}"
+
+
+@dataclass(frozen=True)
+class CoveredWaitHistory:
+    wait_n: int
+
+
+@dataclass(frozen=True)
+class UncertainWaitCoverage:
+    reason: str
+    candidates: tuple[WaitCandidate, ...]
+
+
+@dataclass(frozen=True)
+class PhaseWaitCoverage:
+    run: str
+    instance: str
+    state: CoveredWaitHistory | HistoryNotRecorded | UncertainWaitCoverage
+
+
+@dataclass(frozen=True)
+class WaitPhaseInstance:
+    run: str
+    identity: str
+
+    def __post_init__(self) -> None:
+        if not self.run or not self.identity:
+            raise ValueError("a wait phase instance needs its run and identity")
+
+
+@dataclass(frozen=True)
+class ProductionHandoff:
+    production: str
+
+    def __post_init__(self) -> None:
+        if not self.production:
+            raise ValueError("a handoff needs its production")
+
+
+@dataclass(frozen=True)
+class WaitPhaseNotRecorded:
+    reason: str
+
+
+@dataclass(frozen=True)
+class RecordedWaitOwner:
+    session: str
+
+    def __post_init__(self) -> None:
+        if not self.session:
+            raise ValueError("a recorded wait owner needs its session")
+
+
+@dataclass(frozen=True)
+class WaitOwnerNotRecorded:
+    reason: str
+
+
+@dataclass(frozen=True)
+class NamedSupplier:
+    address: str
+
+    def __post_init__(self) -> None:
+        if not self.address:
+            raise ValueError("a named supplier needs its address or name")
+
+
+@dataclass(frozen=True)
+class NoNamedSupplier:
+    reason: str
+
+
+@dataclass(frozen=True)
+class RecordedWaitReason:
+    text: str
+
+
+@dataclass(frozen=True)
+class WaitReasonNotRecorded:
+    reason: str
+
+
+@dataclass(frozen=True)
+class HanaWait:
+    identity: str
+    kind: WaitKind | WaitCauseNotRecorded
+    started: datetime
+    end: CompletedWait | UnknownEndedWait
+    owner: RecordedWaitOwner | WaitOwnerNotRecorded
+    phase: WaitPhaseInstance | ProductionHandoff | WaitPhaseNotRecorded
+    expected_supplier: NamedSupplier | NoNamedSupplier
+    reason: RecordedWaitReason | WaitReasonNotRecorded
+
+    @property
+    def production_handoff(self) -> bool:
+        return isinstance(self.phase, ProductionHandoff)
+
+
+@dataclass(frozen=True)
+class AttributionMiss:
+    wait_id: str
+    reason: str
+    candidates: tuple[WaitCandidate, ...]
+
+
+@dataclass(frozen=True)
+class HanaWaitHistory:
+    waits: tuple[HanaWait, ...]
+    phases: tuple[PhaseWaitCoverage, ...]
+    attribution_misses: tuple[AttributionMiss, ...]
+
+
+@dataclass(frozen=True)
+class MergeReceipt:
+    project: str
+    issue: str
+    phase: str
+    commit: str
+    checkpoint: str
+    target_branch: str
+    merged_at: datetime
+
+
+@dataclass(frozen=True)
+class ReceiptMissing:
+    commit: str
+
+
 @dataclass
 class BaselineSources:
     units: list[Unit]
@@ -162,6 +329,8 @@ class BaselineSources:
     waiting: list[WaitingItem]
     problems: list[log_records.SourceProblem]
     merges: list[HanaMerge] | MergeHistoryNotRecorded = MergeHistoryNotRecorded.MISSING
+    wait_history: HanaWaitHistory | HistoryNotRecorded = HistoryNotRecorded()
+    receipts: tuple[MergeReceipt, ...] | HistoryNotRecorded = HistoryNotRecorded("merge receipts not recorded")
 
 
 def json_lines[T](path: Path, parse: Callable[[log_records.JsonObject], T]) -> list[T]:
@@ -315,7 +484,297 @@ def distribution(name: str, values: Sequence[float], window: log_records.Window,
     return log_records.MeasureRow(name, value, len(ordered), window.label, source)
 
 
-def phase_flow(events: Sequence[PhaseCompletion], window: log_records.Window) -> list[log_records.MeasureRow]:
+def object_rows(record: log_records.JsonObject, key: str) -> list[log_records.JsonObject]:
+    value = record.get(key, [])
+    if not isinstance(value, list):
+        raise ValueError(f"{key}: expected an array")
+    return [log_records.object_record(item) for item in cast(list[object], value)]
+
+
+def wait_candidates(record: log_records.JsonObject) -> tuple[WaitCandidate, ...]:
+    return tuple(WaitCandidate(log_records.field_text(item, "run_id"), log_records.field_text(item, "phase_id"),
+                               log_records.field_text(item, "phase_instance_id"), log_records.field_text(item, "working_dir"))
+                 for item in object_rows(record, "candidates"))
+
+
+def wait_origin(record: log_records.JsonObject, prefixes: Sequence[str]) -> bool:
+    return hana_origin(PhaseOrigin(
+        log_records.field_text(record, "working_dir") or log_records.field_text(record, "unit"),
+        log_records.field_text(record, "plan_doc"), log_records.field_text(record, "production"),
+        log_records.field_text(record, "repository")), prefixes)
+
+
+def parse_wait_report(record: log_records.JsonObject, prefixes: Sequence[str] = ()) -> HanaWaitHistory:
+    phases: list[PhaseWaitCoverage] = []
+    hana_phases: set[tuple[str, str]] = set()
+    for phase in object_rows(record, "phases"):
+        if not wait_origin(phase, prefixes):
+            continue
+        run, instance = log_records.field_text(phase, "run_id"), log_records.field_text(phase, "phase_instance_id")
+        hana_phases.add((run, instance))
+        state = log_records.field_text(phase, "state")
+        reason = log_records.field_text(phase, "reason")
+        coverage: CoveredWaitHistory | HistoryNotRecorded | UncertainWaitCoverage
+        if state == "Covered":
+            count = log_records.field_number(phase, "wait_n")
+            if count < 0 or not count.is_integer():
+                raise ValueError("wait_n: expected a nonnegative integer")
+            coverage = CoveredWaitHistory(int(count))
+        elif state == "HistoryNotRecorded":
+            coverage = HistoryNotRecorded(reason or "phase start has no wait coverage record")
+        elif state == "UncertainCoverage":
+            if "wait_n" in phase:
+                raise ValueError("UncertainCoverage cannot carry wait_n")
+            coverage = UncertainWaitCoverage(reason, wait_candidates(phase))
+        else:
+            raise ValueError(f"unknown phase wait coverage: {state!r}")
+        phases.append(PhaseWaitCoverage(run, instance, coverage))
+    waits: dict[str, HanaWait] = {}
+    misses: dict[str, AttributionMiss] = {}
+    for item in (*object_rows(record, "waits"), *object_rows(record, "missing")):
+        attribution = log_records.object_record(item.get("wait_attribution", {}))
+        candidates = wait_candidates(attribution)
+        owns_phase = (log_records.field_text(item, "run_id"), log_records.field_text(item, "phase_instance_id")) in hana_phases
+        candidate_hana = any(wait_origin({"working_dir": candidate.working_dir}, prefixes)
+                             or (candidate.run, candidate.instance) in hana_phases for candidate in candidates)
+        if not (owns_phase or wait_origin(item, prefixes) or candidate_hana):
+            continue
+        identity = log_records.field_text(item, "wait_id")
+        if not identity:
+            raise ValueError("wait_id not recorded")
+        if log_records.field_text(attribution, "state") in ("UnresolvedAttribution", "UnresolvedSupplier"):
+            misses[identity] = AttributionMiss(identity, log_records.field_text(attribution, "reason"), candidates)
+            # A candidate Hana phase does not establish that this was a Hana wait.
+            continue
+        kind_text = log_records.field_text(item, "wait_kind")
+        kind: WaitKind | WaitCauseNotRecorded
+        if kind_text:
+            try:
+                kind = WaitKind(kind_text)
+            except ValueError as error:
+                raise ValueError(f"unknown wait kind: {kind_text}") from error
+        else:
+            kind = WaitCauseNotRecorded(log_records.field_text(item, "wait_reason") or "wait cause not recorded")
+        started = log_records.required_time(item.get("wait_started_epoch", item.get("wait_started_at")))
+        end_record = log_records.object_record(item.get("wait_end", {}))
+        end_state = log_records.field_text(end_record, "state")
+        end: CompletedWait | UnknownEndedWait
+        if end_state == "Finished":
+            end_at = log_records.required_time(end_record.get("epoch", end_record.get("at")))
+            if end_at < started:
+                raise ValueError("wait ends before its start")
+            end = CompletedWait(end_at)
+        elif end_state in ("Open", "Unclosed", "NotRecorded"):
+            end = UnknownEndedWait(end_state)
+        else:
+            raise ValueError(f"unknown wait end state: {end_state!r}")
+        owner_session = log_records.field_text(item, "owner_session")
+        missing_record = log_records.object_record(item.get("wait_record_state", {}))
+        missing_reason = log_records.field_text(missing_record, "reason")
+        owner: RecordedWaitOwner | WaitOwnerNotRecorded = (
+            RecordedWaitOwner(owner_session) if owner_session else
+            WaitOwnerNotRecorded(missing_reason or "wait owner session not recorded")
+        )
+        phase_owner: WaitPhaseInstance | ProductionHandoff | WaitPhaseNotRecorded
+        run, instance = log_records.field_text(item, "run_id"), log_records.field_text(item, "phase_instance_id")
+        if log_records.field_text(attribution, "state") == "ProductionHandoff":
+            phase_owner = ProductionHandoff(log_records.field_text(item, "production"))
+        elif run and instance:
+            phase_owner = WaitPhaseInstance(run, instance)
+        else:
+            phase_owner = WaitPhaseNotRecorded(missing_reason or "wait phase instance not recorded")
+        supplier_record = log_records.object_record(item.get("expected_supplier", {}))
+        supplier_state = log_records.field_text(supplier_record, "state")
+        supplier: NamedSupplier | NoNamedSupplier
+        if supplier_state == "NamedSupplier":
+            supplier = NamedSupplier(log_records.field_text(supplier_record, "address"))
+        elif supplier_state in ("NoNamedSupplier", ""):
+            supplier = NoNamedSupplier(log_records.field_text(supplier_record, "reason") or "expected supplier not recorded")
+        else:
+            raise ValueError(f"unknown expected supplier state: {supplier_state!r}")
+        reason_text = log_records.field_text(item, "wait_reason")
+        wait_reason: RecordedWaitReason | WaitReasonNotRecorded = (
+            RecordedWaitReason(reason_text) if reason_text else WaitReasonNotRecorded("wait reason not recorded")
+        )
+        waits[identity] = HanaWait(identity, kind, started, end, owner, phase_owner, supplier, wait_reason)
+    return HanaWaitHistory(tuple(waits.values()), tuple(phases), tuple(misses.values()))
+
+
+def read_wait_history(
+    root: Path, window: log_records.Window, problems: list[log_records.SourceProblem], prefixes: Sequence[str] = (),
+) -> HanaWaitHistory | HistoryNotRecorded:
+    external = root / "wait_attribution.jsonl"
+    if not (root / "runs").is_dir() and not external.is_file():
+        raise FileNotFoundError(root / "runs")
+    if external.exists():
+        # The supplier reader skips corrupt external rows without a diagnostic.
+        external_records = json_lines(external, log_records.object_record)
+        if any(log_records.field_text(item, "event_type") not in
+               ("wait_started", "wait_finished", "wait_unclosed", "wait_not_recorded") for item in external_records):
+            raise ValueError("external wait history contains an unknown event type")
+        if any(not log_records.field_text(item, "wait_id") for item in external_records):
+            raise ValueError("external wait history contains a wait event without wait_id")
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS / "direct/progress_history.py"), "waits",
+         "--since", window.since.isoformat(), "--until", window.until.isoformat()],
+        env={**os.environ, "UNIT_HISTORY_DIR": str(root)}, capture_output=True, text=True, check=True, timeout=60,
+    )
+    report = log_records.object_record(cast(object, json.loads(result.stdout)))
+    ignored = log_records.field_number(report, "ignored_n")
+    if ignored:
+        problems.append(log_records.SourceProblem("progress_history waits", f"{int(ignored)} unreadable or unsupported history rows; counts can be incomplete"))
+    return parse_wait_report(report, prefixes)
+
+
+def wait_coverage_suffix(history: HanaWaitHistory | HistoryNotRecorded, window: log_records.Window) -> str:
+    if isinstance(history, HistoryNotRecorded):
+        return ""
+    missing = sum(isinstance(phase.state, HistoryNotRecorded) for phase in history.phases)
+    uncertain = sum(isinstance(phase.state, UncertainWaitCoverage) for phase in history.phases)
+    cause_missing = sum(isinstance(wait.kind, WaitCauseNotRecorded) for wait in history.waits if window.contains(wait.started))
+    attribution_missing = len(history.attribution_misses)
+    if not (missing or uncertain or cause_missing or attribution_missing):
+        return ""
+    return (f"; partial coverage: HistoryNotRecorded={missing}, UncertainCoverage={uncertain}, "
+            + f"WaitCauseNotRecorded={cause_missing}, attribution_miss_n={attribution_missing}")
+
+
+def hana_wait_rows(
+    history: HanaWaitHistory | HistoryNotRecorded, window: log_records.Window,
+) -> list[log_records.MeasureRow]:
+    source = "progress_history.py waits; phase starts and wait starts in window; completed durations only"
+    rows: list[log_records.MeasureRow] = []
+    waits = [wait for wait in history.waits if window.contains(wait.started)] if isinstance(history, HanaWaitHistory) else []
+    phases = history.phases if isinstance(history, HanaWaitHistory) else ()
+    covered = sum(isinstance(phase.state, CoveredWaitHistory) for phase in phases)
+    missing = [phase for phase in phases if isinstance(phase.state, HistoryNotRecorded)]
+    uncertain = [phase for phase in phases if isinstance(phase.state, UncertainWaitCoverage)]
+    cause_missing = sum(isinstance(wait.kind, WaitCauseNotRecorded) for wait in waits)
+    attribution_missing = len(history.attribution_misses) if isinstance(history, HanaWaitHistory) else 0
+    for kind in WaitKind:
+        completed = [wait for wait in waits if wait.kind == kind and isinstance(wait.end, CompletedWait)]
+        minutes = sum((wait.end.at - wait.started).total_seconds() / 60 for wait in completed if isinstance(wait.end, CompletedWait))
+        complete_coverage = covered and not (missing or uncertain or cause_missing or attribution_missing)
+        value = f"{minutes:.1f} min" if completed or complete_coverage else "not recorded (HistoryNotRecorded)"
+        value += wait_coverage_suffix(history, window)
+        rows.append(log_records.MeasureRow(f"Hana wait / {kind.value}", value, len(completed), window.label, source))
+        open_waits = [wait for wait in waits if wait.kind == kind and isinstance(wait.end, UnknownEndedWait)]
+        if open_waits:
+            rows.append(log_records.MeasureRow(f"Hana wait unknown-ended / {kind.value}", "duration not recorded", len(open_waits), window.label, source))
+    for wait in waits:
+        if isinstance(wait.kind, WaitCauseNotRecorded):
+            rows.append(log_records.MeasureRow("Hana wait / WaitCauseNotRecorded", wait.kind.reason, 1, window.label, wait.identity))
+            if isinstance(wait.end, UnknownEndedWait):
+                rows.append(log_records.MeasureRow("Hana wait unknown-ended / WaitCauseNotRecorded", "duration not recorded", 1, window.label, wait.identity))
+        if wait.production_handoff:
+            owner_text = wait.owner.session if isinstance(wait.owner, RecordedWaitOwner) else f"not recorded: {wait.owner.reason}"
+            rows.append(log_records.MeasureRow("Hana wait / production handoff", f"no phase; owner={owner_text}", 1, window.label, wait.identity))
+        elif isinstance(wait.phase, WaitPhaseNotRecorded):
+            rows.append(log_records.MeasureRow("Hana wait / WaitPhaseNotRecorded", wait.phase.reason, 1, window.label, wait.identity))
+        if isinstance(wait.owner, WaitOwnerNotRecorded):
+            rows.append(log_records.MeasureRow("Hana wait / WaitOwnerNotRecorded", wait.owner.reason, 1, window.label, wait.identity))
+    if isinstance(history, HistoryNotRecorded) or not phases and not waits:
+        reason = history.reason if isinstance(history, HistoryNotRecorded) else "no Hana phase or wait records in window"
+        rows.append(log_records.MeasureRow("Hana wait coverage / HistoryNotRecorded", "not recorded (HistoryNotRecorded)", 0, window.label, source + "; " + reason))
+    for phase in missing:
+        if isinstance(phase.state, HistoryNotRecorded):
+            rows.append(log_records.MeasureRow("Hana wait coverage / HistoryNotRecorded", phase.state.reason, 1, window.label, f"{phase.run}/{phase.instance}"))
+    if uncertain:
+        rows.append(log_records.MeasureRow("Hana wait / uncertain_phase_n", str(len(uncertain)), len(uncertain), window.label, source))
+    for phase in uncertain:
+        if isinstance(phase.state, UncertainWaitCoverage):
+            detail = phase.state.reason + "; candidates: " + " | ".join(candidate.label for candidate in phase.state.candidates)
+            rows.append(log_records.MeasureRow("Hana wait coverage / UncertainCoverage", detail, 1, window.label, f"{phase.run}/{phase.instance}"))
+    if isinstance(history, HanaWaitHistory) and history.attribution_misses:
+        misses = history.attribution_misses
+        rows.append(log_records.MeasureRow("Hana wait / attribution_miss_n", str(len(misses)), len(misses), window.label, source))
+        for miss in misses:
+            detail = miss.reason + "; candidates: " + " | ".join(candidate.label for candidate in miss.candidates)
+            rows.append(log_records.MeasureRow("Hana wait attribution / Unresolved", detail, 1, window.label, miss.wait_id))
+    return rows
+
+
+def parse_receipt(record: log_records.JsonObject) -> MergeReceipt:
+    if log_records.field_text(record, "event_type") != "merge_receipt":
+        raise ValueError("expected merge_receipt")
+    fields = {key: log_records.field_text(record, key) for key in
+              ("project", "issue", "phase_id", "merge_commit", "source_checkpoint", "target_branch")}
+    if not all(fields[key] for key in ("project", "merge_commit", "source_checkpoint", "target_branch")) or not (fields["issue"] or fields["phase_id"]):
+        raise ValueError("receipt must name project, phase or issue, both commits and target branch")
+    return MergeReceipt(fields["project"], fields["issue"], fields["phase_id"], fields["merge_commit"],
+                        fields["source_checkpoint"], fields["target_branch"],
+                        log_records.required_time(record.get("merged_at", record.get("timestamp_epoch"))))
+
+
+def read_receipts(path: Path) -> tuple[MergeReceipt, ...] | HistoryNotRecorded:
+    if not path.exists():
+        return HistoryNotRecorded("merge receipt history not recorded")
+    unique = {(item.project, item.target_branch, item.commit): item for item in json_lines(path, parse_receipt)}
+    return tuple(unique.values())
+
+
+def receipt_for_merge(merge: HanaMerge, receipts: Sequence[MergeReceipt]) -> MergeReceipt | ReceiptMissing:
+    for receipt in receipts:
+        if receipt.commit == merge.commit and receipt.target_branch.removeprefix("origin/") == "init/catalyst" and (
+            receipt.project in HANA_PROJECTS or Path(receipt.project).name in ("hana", "hana_catalyst")
+        ):
+            return receipt
+    return ReceiptMissing(merge.commit)
+
+
+def receipt_rows(
+    receipts: Sequence[MergeReceipt] | HistoryNotRecorded,
+    merges: Sequence[HanaMerge] | MergeHistoryNotRecorded, window: log_records.Window,
+) -> list[log_records.MeasureRow]:
+    source = "progress_history merge_receipts.jsonl; exact project, target branch and merge commit"
+    if isinstance(receipts, HistoryNotRecorded):
+        rows = [log_records.MeasureRow("merge receipts / all projects", f"not recorded (HistoryNotRecorded): {receipts.reason}", 0, window.label, source)]
+        recorded: Sequence[MergeReceipt] = ()
+    else:
+        selected = {(item.project, item.target_branch, item.commit): item for item in receipts if window.contains(item.merged_at)}
+        recorded = tuple(selected.values())
+        rows = [log_records.MeasureRow("merge receipts / all projects", str(len(selected)), len(selected), window.label, source)]
+    if isinstance(merges, MergeHistoryNotRecorded):
+        rows.append(log_records.MeasureRow("Hana merge receipts / origin/init/catalyst", "not recorded (merge history not recorded)", 0, window.label, source))
+        return rows
+    selected_merges = {merge.commit: merge for merge in merges if window.contains(merge.at)}
+    matched = 0
+    for merge in selected_merges.values():
+        result = receipt_for_merge(merge, recorded)
+        if isinstance(result, ReceiptMissing):
+            rows.append(log_records.MeasureRow("Hana merge / ReceiptMissing", result.commit, 1, window.label, source))
+        else:
+            matched += 1
+    rows.insert(1, log_records.MeasureRow("Hana merge receipts / origin/init/catalyst", f"{matched}/{len(selected_merges)}", len(selected_merges), window.label, source))
+    return rows
+
+
+WAIT_HISTORY_NOT_RECORDED = HistoryNotRecorded()
+
+
+def wait_share_row(
+    history: HanaWaitHistory | HistoryNotRecorded, window: log_records.Window, phase_minutes: Sequence[float],
+) -> log_records.MeasureRow:
+    value = "not recorded (HistoryNotRecorded)"
+    suffix = wait_coverage_suffix(history, window)
+    if isinstance(history, HanaWaitHistory):
+        completed = [wait for wait in history.waits if window.contains(wait.started)
+                     and isinstance(wait.kind, WaitKind) and isinstance(wait.end, CompletedWait)]
+        covered = any(isinstance(phase.state, CoveredWaitHistory) for phase in history.phases)
+        if completed or covered and not suffix:
+            minutes = sum((wait.end.at - wait.started).total_seconds() / 60
+                          for wait in completed if isinstance(wait.end, CompletedWait))
+            total = sum(phase_minutes)
+            value = f"{minutes / total * 100:.1f}%" if total > 0 else "not recorded (phase time unavailable)"
+    return log_records.MeasureRow("Hana wait / share of phase time with a recorded kind", value + suffix,
+                                  len(phase_minutes), window.label,
+                                  "progress_history.py waits / Hana phase time; completed known-kind wait minutes / phase minutes")
+
+
+def phase_flow(
+    events: Sequence[PhaseCompletion], window: log_records.Window,
+    wait_history: HanaWaitHistory | HistoryNotRecorded = WAIT_HISTORY_NOT_RECORDED,
+) -> list[log_records.MeasureRow]:
     unique = {event.identity: event for event in events if event.hana and window.contains(event.at)}
     times = [event.seconds / 60 for event in unique.values() if not isinstance(event.seconds, DurationNotRecorded)]
     source = "progress_history run records; elapsed wall time; no merge-to-main receipt; natedev only"
@@ -323,11 +782,8 @@ def phase_flow(events: Sequence[PhaseCompletion], window: log_records.Window) ->
         log_records.MeasureRow("Hana phases done", str(len(unique)), len(unique), window.label, source),
         distribution("Hana phase time", times, window, source),
     ]
-    for kind in ("user", "showrunner", "gate", "idle"):
-        rows.append(log_records.MeasureRow(
-            f"Hana wait / {kind}", "not recorded", 0, window.label,
-            "progress_history.py must record wait kind and start/end; activity labels do not prove waits",
-        ))
+    rows.extend(hana_wait_rows(wait_history, window))
+    rows.append(wait_share_row(wait_history, window, times))
     return rows
 
 
@@ -808,7 +1264,13 @@ def load_sources(window: log_records.Window) -> BaselineSources:
         return read_hana_merges(hana_repository(units))
 
     merges = read_source("Hana origin/init/catalyst merge log", load_merges, MergeHistoryNotRecorded.MISSING, problems)
-    return BaselineSources(units, workers, builds, tokens, phases, push_report, messages, found, rankings, waiting, problems, merges)
+    history_root = unit_runs.history_root()
+    wait_history = read_source("progress_history waits", lambda: read_wait_history(history_root, window, problems, hana_prefixes),
+                               WAIT_HISTORY_NOT_RECORDED, problems)
+    receipts = read_source("progress_history merge receipts", lambda: read_receipts(history_root / "merge_receipts.jsonl"),
+                           HistoryNotRecorded("merge receipt history not recorded"), problems)
+    return BaselineSources(units, workers, builds, tokens, phases, push_report, messages, found, rankings, waiting, problems,
+                           merges, wait_history, receipts)
 
 
 def baseline_summary(
@@ -831,9 +1293,10 @@ def baseline_summary(
 
 
 def render(sources: BaselineSources, window: log_records.Window, now: datetime, full: bool = False) -> str:
-    flow_rows = phase_flow(sources.phases, window)
+    flow_rows = phase_flow(sources.phases, window, sources.wait_history)
     flow_rows.extend(issue_flow(sources.issue_records, window))
     flow_rows.extend(merge_flow(sources.merges, window))
+    flow_rows.extend(receipt_rows(sources.receipts, sources.merges, window))
     attention_rows = attention(sources.push_report, sources.messages)
     problem_rows = log_records.source_problem_rows(sources.problems, window)
     summary = baseline_summary(window, flow_rows, attention_rows, problem_rows)
