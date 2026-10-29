@@ -2610,7 +2610,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 **Ruled out:**
 - A cut in `agent_notes.py`: its own work is not the largest cost in the profile.
 
-### Phase 95 — A failed restart shows its saved screen  · status: todo
+### Phase 95 — A failed restart shows its saved screen  · status: done
 
 **Depends on:** Phase 94 (order only)
 
