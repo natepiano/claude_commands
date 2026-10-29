@@ -15,7 +15,7 @@ import unittest
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import NamedTuple, override
+from typing import NamedTuple, cast, override
 from unittest.mock import patch
 
 import store
@@ -59,7 +59,13 @@ class WidthTrialTests(unittest.TestCase):
         self.root.mkdir()
         self.index = self.root / store.INDEX_NAME
         self.peaks = self.root / "admission" / "anon_peaks.jsonl"
-        self.enterContext(patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root)}))
+        home = Path(temporary) / "home"
+        hana = home / "rust/hana"
+        hana.mkdir(parents=True)
+        _ = subprocess.run(["git", "-C", str(hana), "init", "-q"], check=True, capture_output=True)
+        _ = subprocess.run(["git", "-C", str(hana), "remote", "add", "origin", "https://example.org/nate/hana.git"],
+                           check=True, capture_output=True)
+        self.enterContext(patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root), "HOME": str(home)}))
         with closing(sqlite3.connect(self.index)) as database, database:
             _ = database.executescript(
                 """
@@ -242,6 +248,7 @@ class WidthTrialTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
+            cwd=self.root,
             env={**os.environ, "BUILDLOG_DIR": str(self.root), "TZ": "America/Los_Angeles", "USER_ZONE": "America/Los_Angeles"},
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -346,6 +353,19 @@ class WidthTrialTests(unittest.TestCase):
             _ = output.write(json.dumps(invalid) + "\n")
 
         self.assertEqual(set(trial.anon_by_call(self.peaks, "natedev")), {"valid"})
+
+    def test_reservation_report_uses_hana_identity_from_outside_its_checkout(self) -> None:
+        self.populate_balanced()
+        rows = [cast(dict[str, object], json.loads(line)) for line in self.peaks.read_text().splitlines()]
+        for row in rows:
+            row["repo_identity"] = "https://example.org/nate/hana"
+            row["repo"] = "repo"
+        other = {**rows[0], "repo_identity": "https://example.org/nate/other", "anon_peak_bytes": 100 * GIB}
+        _ = self.peaks.write_text("".join(json.dumps(row) + "\n" for row in [*rows, *([other] * 5)]))
+
+        output = self.report()
+
+        self.assertRegex(self.metric_line(output, "R gate reservation"), r"5\.00\s+10\.00\s+—\s+—.*met$")
 
     def test_scorecard_computes_every_registered_metric(self) -> None:
         self.populate_balanced()

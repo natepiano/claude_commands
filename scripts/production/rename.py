@@ -273,7 +273,7 @@ def _load(path: Path, old: str, new: str) -> tuple[RenamePlan, int]:
         raise RenameRefused(f"{path}: rename is from {recorded_old}, not {old}")
     state = _read_moves(fields.get("state"))
     step = fields.get("step")
-    if len(state) != len(tidy_wrapped.owned_paths(new)) or type(step) is not int or not 0 <= step <= 7 or not isinstance(fields.get("done"), bool):
+    if len(state) != len(tidy_wrapped.owned_paths(new)) or type(step) is not int or not 0 <= step <= len(APPLY_STEPS) or not isinstance(fields.get("done"), bool):
         raise RenameRefused(f"{path}: invalid rename progress")
     result = RenamePlan(recorded_old, new, Path(_string(fields, "old_doc")), Path(_string(fields, "new_doc")),
                         Path(_string(fields, "checkout")), _string(fields, "merge_branch"), _string(fields, "base"),
@@ -449,6 +449,15 @@ def _rename_review_pool(plan: RenamePlan) -> None:
     unit_move.move(plan.review_pool)
 
 
+def _rename_unit_workers(plan: RenamePlan) -> None:
+    from scripts.direct import workers
+    root = workers.ledger_path(plan.old, "unused").parent
+    units = {path.name.removesuffix(".move.json") if path.name.endswith(".move.json") else path.stem
+             for path in root.glob("*.json")}
+    for unit in sorted(units):
+        workers.move_unit(plan.old, plan.new, unit)
+
+
 def _check_edits(plan: RenamePlan) -> None:
     allowed = {_relative(plan, path) for path in (plan.old_doc, plan.new_doc, *plan.plans)}
     changed = set(unit_move.git(plan.checkout, "diff", "--name-only", "-z", "HEAD").split("\0")) - {""}
@@ -488,6 +497,10 @@ def _rename_branch(plan: RenamePlan) -> None:
     _ = unit_move.git(plan.checkout, "push", "--set-upstream", "origin", f"{plan.branch}:refs/heads/{plan.branch}")
 
 
+APPLY_STEPS = (_rename_doc, _rewrite_plans, _rename_timer, _rename_showrunner_state,
+               _rename_stall_watch, _rename_review_pool, _rename_unit_workers, _rename_branch)
+
+
 def apply(old: str, new: str) -> RenamePlan:
     """Perform each atomic move and record completed steps so a refusal can be resumed."""
     result = plan(old, new)
@@ -504,9 +517,7 @@ def apply(old: str, new: str) -> RenamePlan:
             _preflight(result)
             _save(result, 0)
             completed = 0
-        steps = (_rename_doc, _rewrite_plans, _rename_timer, _rename_showrunner_state,
-                 _rename_stall_watch, _rename_review_pool, _rename_branch)
-        for number, run in enumerate(steps, start=1):
+        for number, run in enumerate(APPLY_STEPS, start=1):
             if number <= completed:
                 continue
             run(result)
@@ -523,8 +534,8 @@ def _rename_journal(new: str) -> Generator[tuple[RenamePlan, dict[str, object]]]
         raise RenameRefused(f"{new} has no rename journal")
     with unit_move.production_lock():
         result, completed = _load(path, new, new)
-        if completed != 7:
-            raise RenameRefused(f"{new}: apply must complete step 7 first")
+        if completed != len(APPLY_STEPS):
+            raise RenameRefused(f"{new}: apply must complete step {len(APPLY_STEPS)} first")
         yield result, _object(read_json(path))
 
 
@@ -709,6 +720,7 @@ def finish(new: str) -> None:
 
 
 def main(argv: list[str]) -> int:
+    from scripts.direct.workers import WorkerUnavailable
     parser = argparse.ArgumentParser(description=__doc__)
     actions = parser.add_subparsers(dest="action", required=True)
     for name in ("plan", "apply"):
@@ -739,7 +751,7 @@ def main(argv: list[str]) -> int:
                 print(line)
             if action == "apply":
                 print(f"{result.old} is now {result.new}; " + (f"keep {result.merge_branch} until finish" if result.renames_branch else f"merge branch {result.merge_branch} kept"))
-    except (RenameRefused, production_units.Refusal, tidy_wrapped.TidyRefused, OSError, UnicodeError) as error:
+    except (RenameRefused, production_units.Refusal, tidy_wrapped.TidyRefused, WorkerUnavailable, OSError, UnicodeError) as error:
         print(f"rename: {error}", file=sys.stderr)
         return 1
     return 0

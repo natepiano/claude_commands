@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-from scripts.direct import remove_workers
+from scripts.direct import remove_workers, workers
 
 SCRIPT = Path(__file__).parent / "remove_workers.py"
 
@@ -157,6 +157,17 @@ class RemoveWorkersTest(unittest.TestCase):
         result, removed = self.run_remove_workers(session_dir, caller)
         return result.returncode, sorted(removed)
 
+    def test_phase_cleanup_keeps_a_claude_session_owned_by_the_unit_ledger(self) -> None:
+        own = self.run_dir("own", ["held", "ephemeral"], orchestrator=ORCHESTRATOR)
+        self.list_rows([row("held", "persistent writer"), row("ephemeral", "temporary writer")])
+        with patch.dict(os.environ, {"UNIT_WORKERS_STATE": str(self.root / "unit-workers")}):
+            store = workers.UnitWorkerLedger(workers.ledger_path("production", "builders"))
+            with store.locked() as ledger:
+                ledger.workers["w7"] = workers.UnitWorker("w7", "impl", "claude", "opus", "high", {},
+                    workers.ClaudeSession("held-full"), workers.Paused(), [])
+            self.assertEqual(self.remove_workers(own), (0, ["ephemeral"]))
+            self.assertTrue(store.path.exists())
+
     def test_named_owner_config_dir_is_inherited_by_listing_and_removal(self) -> None:
         """F006: both commands inherit the owning session's account directory."""
         own = self.run_dir("own", ["own1"], orchestrator=ORCHESTRATOR)
@@ -273,11 +284,23 @@ class RemoveWorkersTest(unittest.TestCase):
                 patch.object(remove_workers, "DEFAULT_ROOTS", (self.root,)), \
                 patch.object(remove_workers, "claude_bin", return_value=os.fspath(self.claude)), \
                 patch.object(remove_workers, "list_sessions", return_value=None), \
-                patch.object(remove_workers, "sweep_app_servers") as sweep:
+                patch.object(subprocess, "run") as commands:
             result = remove_workers.main()
 
         self.assertEqual(result, 1)
-        sweep.assert_not_called()
+        commands.assert_not_called()
+
+    def test_successful_run_cleanup_does_not_launch_an_implicit_server_sweep(self) -> None:
+        own = self.run_dir("own", [], orchestrator=ORCHESTRATOR)
+        arguments = [str(SCRIPT), "--session-dir", str(own)]
+        held: remove_workers.HeldSessions = {"kind": "held sessions", "session_ids": set()}
+        with (patch.object(sys, "argv", arguments),
+              patch.object(remove_workers, "DEFAULT_ROOTS", (self.root,)),
+              patch.object(remove_workers, "list_sessions", return_value=[]),
+              patch.object(remove_workers, "shutdown_held_sessions", return_value=held),
+              patch.object(subprocess, "run", side_effect=AssertionError("run cleanup launched a server sweep")) as commands):
+            self.assertEqual(remove_workers.main(), 0)
+        commands.assert_not_called()
 
     def test_shutdown_query_returns_named_held_sessions(self) -> None:
         completed = subprocess.CompletedProcess[str](

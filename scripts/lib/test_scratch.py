@@ -95,6 +95,24 @@ class ScratchTests(unittest.TestCase):
         self.assertTrue(other.is_dir())
         self.assertTrue(loose.is_dir())
 
+    def test_end_keep_predicate_preserves_folders_and_holds_until_the_command_finishes(self) -> None:
+        kept = scratch.new(RUN, "live")
+        removed = scratch.new(RUN, "old")
+        held = self.base / "held-command"
+        held.mkdir()
+        _ = scratch.hold(held, RUN, "command cwd")
+        before = scratch.holds()[str(held)].copy()
+        other = scratch.new(ROW, "other")
+        self.assertEqual(scratch.end(RUN, keep=lambda path: path in (kept, held)), [removed])
+        self.assertTrue(kept.is_dir())
+        self.assertTrue(held.is_dir())
+        self.assertTrue(other.is_dir())
+        self.assertEqual(scratch.holds()[str(held)], before)
+        self.assertCountEqual(scratch.end(RUN), [kept, held])
+        self.assertEqual(scratch.holds(), {})
+        with self.assertRaises(scratch.ScratchError):
+            _ = scratch.end("invalid-task", keep=lambda path: True)
+
     def test_adopt_moves_a_loose_folder_in(self) -> None:
         loose = self.base / "rust" / "c54demo"
         (loose / "src").mkdir(parents=True)

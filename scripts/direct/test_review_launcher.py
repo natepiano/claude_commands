@@ -1622,6 +1622,30 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
             "implemented\n",
         )
 
+    def test_a_test_worker_keeps_one_identity_when_assigned_a_review(self) -> None:
+        run = self.start_implementation("test-becomes-review")
+        self.finish_implementation(run)
+        worker = "project-test"
+        identity = {"name": worker, "slot": "test", "role": "test", "family": "codex",
+                    "model": "gpt-called", "worker_id": "thread-test"}
+        path = run / "impl_worker_test.json"
+        _ = path.write_text(json.dumps(identity))
+        _ = (run / "mesh_roster.json").write_text(json.dumps({worker: {
+            "thread_id": "thread-test", "status": "done", "role": "test", "context_tokens": 0}}))
+        _ = (run / "workers").write_text(f"thread-test\t{worker}\n")
+
+        reviewed = self.run_assigned_review(run, worker)
+
+        self.assertEqual(reviewed.returncode, 0, reviewed.stderr)
+        records = [cast(dict[str, object], json.loads(item.read_text()))
+                   for item in run.glob("impl_worker_*.json")]
+        identities = [record for record in records if record.get("name") == worker]
+        self.assertEqual(len(identities), 1, records)
+        self.assertEqual(identities[0]["worker_id"], "thread-test")
+        self.assertEqual(cast(dict[str, object], json.loads(path.read_text()))["name"], worker)
+        roster = cast(dict[str, dict[str, object]], json.loads((run / "mesh_roster.json").read_text()))
+        self.assertEqual(roster[worker]["role"], "review")
+
     def test_hyphenated_new_slot_is_refused_to_keep_followup_identity_stable(self) -> None:
         session_dir = self.start_implementation("hyphenated-slot")
         self.finish_implementation(session_dir)
