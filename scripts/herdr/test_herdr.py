@@ -1959,10 +1959,12 @@ class HerdrTests(unittest.TestCase):
                 {"tab_id": "w1:t2", "label": "alpha", "pane_count": 1, "workspace_id": "w1"}]
         for arguments in (["tab", "list", "--workspace", "w1"], ["tab", "list"]):
             self.configure_herdr(arguments, json.dumps({"result": {"tabs": tabs}}))
+        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
+            {"pane_id": "w1:p1", "tab_id": "w1:t1"}, {"pane_id": "w1:p2", "tab_id": "w1:t2"}]}}))
         self.assertEqual(herdr.open_tab("fixture", "boss", "alpha", "/wt", {}), "w1:p2")
-        self.assertEqual([command[2:] for command in self.commands()[-7:]], [
+        self.assertEqual([command[2:] for command in self.commands()[-8:]], [
             tab, ["pane", "rename", "w1:p2", "alpha"], ["tab", "list", "--workspace", "w1"], ["workspace", "list"],
-            ["tab", "list", "--workspace", "w1"], ["workspace", "list"], ["tab", "list"]])
+            ["tab", "list", "--workspace", "w1"], ["pane", "list"], ["workspace", "list"], ["tab", "list"]])
         saved = herdr.saved_layout("fixture")
         self.assertEqual([(space["name"], [tab["name"] for tab in space["tabs"]]) for space in saved["workspaces"]],
                          [("boss", ["boss", "alpha"])])
@@ -2010,12 +2012,50 @@ class HerdrTests(unittest.TestCase):
     def test_order_tabs_leaves_a_tab_with_several_panes_and_an_ordered_space_alone(self) -> None:
         self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
             {"workspace_id": "w1", "label": "boss", "focused": True, "active_tab_id": "w1:t1"}]}}))
-        for tabs in ([{"tab_id": "w1:t1", "label": "boss", "pane_count": 1}, {"tab_id": "w1:t2", "label": "zed", "pane_count": 1},
-                      {"tab_id": "w1:t3", "label": "alpha", "pane_count": 2}],
-                     [{"tab_id": "w1:t1", "label": "boss", "pane_count": 1}, {"tab_id": "w1:t2", "label": "alpha", "pane_count": 1}]):
-            self.configure_herdr(["tab", "list", "--workspace", "w1"], json.dumps({"result": {"tabs": tabs}}))
-            self.assertEqual(herdr.Herdr("fixture").order_tabs("w1", herdr.SavedLayout(at=0.0, workspaces=[])), {})
-        self.assertEqual({tuple(command[2:4]) for command in self.commands()}, {("workspace", "list"), ("tab", "list")})
+        for pane, tab in (("w1:p3", "w1:t4"), ("w1:p2", "w1:t5")):
+            self.configure_herdr(["pane", "move", pane, "--new-tab", "--workspace", "w1"], json.dumps({"result": {
+                "move_result": {"created_tab": {"tab_id": tab}, "pane": {"pane_id": pane}}}}))
+        for split_first, split_last, ordered in ((True, False, False), (False, True, False), (False, False, True)):
+            with self.subTest(split_first=split_first, split_last=split_last, ordered=ordered):
+                titles = ("boss", "alpha", "zed") if ordered else ("boss", "zed", "alpha")
+                tabs = [{"tab_id": f"w1:t{index}", "label": title,
+                         "pane_count": 2 if (index == 1 and split_first) or (index == 3 and split_last) else 1}
+                        for index, title in enumerate(titles, 1)]
+                self.configure_herdr(["tab", "list", "--workspace", "w1"], json.dumps({"result": {"tabs": tabs}}))
+                panes = [{"pane_id": f"w1:p{index}", "tab_id": f"w1:t{index}"} for index in (1, 2, 3)]
+                if split_first or split_last:
+                    panes.append({"pane_id": "w1:p4", "tab_id": "w1:t1" if split_first else "w1:t3"})
+                self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": panes}}))
+                self.log.unlink(missing_ok=True)
+                moved = herdr.Herdr("fixture").order_tabs("w1", herdr.SavedLayout(at=0.0, workspaces=[]))
+                self.assertEqual(moved, {"w1:p3": "w1:p3", "w1:p2": "w1:p2"} if split_first else {})
+                acted = [command[2:] for command in self.commands() if command[3:4] in (["move"], ["rename"], ["focus"])]
+                self.assertEqual(acted, [
+                    ["pane", "move", "w1:p3", "--new-tab", "--workspace", "w1"], ["tab", "rename", "w1:t4", "alpha"],
+                    ["pane", "move", "w1:p2", "--new-tab", "--workspace", "w1"], ["tab", "rename", "w1:t5", "zed"],
+                    ["tab", "focus", "w1:t1"]] if split_first else [])
+
+    def test_order_tabs_detects_a_unit_in_any_pane_of_an_unchanged_split_tab(self) -> None:
+        self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
+            {"workspace_id": "w1", "label": "boss", "focused": True, "active_tab_id": "w1:t1"}]}}))
+        self.configure_herdr(["tab", "list", "--workspace", "w1"], json.dumps({"result": {"tabs": [
+            {"tab_id": f"w1:t{index}", "label": title, "pane_count": 2 if index == 2 else 1}
+            for index, title in enumerate(("boss", "zulu", "zebra", "apple"), 1)]}}))
+        for pane, tab in (("w1:p4", "w1:t5"), ("w1:p3", "w1:t6")):
+            self.configure_herdr(["pane", "move", pane, "--new-tab", "--workspace", "w1"], json.dumps({"result": {
+                "move_result": {"created_tab": {"tab_id": tab}, "pane": {"pane_id": pane}}}}))
+        processes = [herdr.HerdrProcess(1, herdr.HerdrPlace("fixture", "w1:p2"),
+                                       {"SHOWRUNNER_UNIT": "prod", "SHOWRUNNER_UNIT_ID": "one"}, "claude", "/repo")]
+        for split_panes in (("w1:p2", "w1:p5"), ("w1:p5", "w1:p2")):
+            with self.subTest(split_panes=split_panes), patch.object(herdr, "herdr_processes", return_value=processes):
+                panes = [{"pane_id": f"w1:p{index}", "tab_id": f"w1:t{index}"} for index in (1, 3, 4)]
+                panes.extend({"pane_id": pane, "tab_id": "w1:t2"} for pane in split_panes)
+                self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": panes}}))
+                self.log.unlink(missing_ok=True)
+                self.assertEqual(herdr.Herdr("fixture").order_tabs("w1", herdr.SavedLayout(at=0.0, workspaces=[])),
+                                 {"w1:p4": "w1:p4", "w1:p3": "w1:p3"})
+                moved_panes = [command[4] for command in self.commands() if command[2:4] == ["pane", "move"]]
+                self.assertEqual(moved_panes, ["w1:p4", "w1:p3"])
 
     def test_shared_session_is_never_stopped_and_close_agent_closes_only_the_tab(self) -> None:
         self.share()
@@ -3326,6 +3366,7 @@ class SavedLayoutTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        _ = self.enterContext(patch.object(herdr, "herdr_processes", return_value=[]))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "state"),
                                                                     "HOME": str(self.root)})))
 
@@ -3380,7 +3421,53 @@ class SavedLayoutTests(unittest.TestCase):
         self.assertEqual(saved["sdlc"], ["sdlc", "roles", "guilds"])
 
     def test_without_a_saved_layout_the_showrunner_comes_first_then_a_to_z(self) -> None:
-        self.assertEqual(herdr.tab_order("boss", ["delta", "boss", "alpha"], []), [1, 2, 0])
+        self.assertEqual(herdr.tab_order("boss", ["delta", "boss", "alpha"], [], set()), [1, 2, 0])
+
+    def test_unit_directors_sort_before_other_tabs_from_their_panes_marks(self) -> None:
+        client = LayoutHerdr()
+        client.spaces.append(("w1", "boss"))
+        for title in ("apple", "zulu", "boss", "beta", "mike", "able", "aardvark"):
+            _ = client.add_tab("w1", title)
+        marks = {"SHOWRUNNER_UNIT": "prod", "SHOWRUNNER_UNIT_ID": "one"}
+        processes = [herdr.HerdrProcess(index, herdr.HerdrPlace(session, tab["pane_id"]), environment, "claude", "/repo")
+                     for index, (tab, session, environment) in enumerate((
+                         (client.tabs[1], "fixture", marks), (client.tabs[4], "fixture", marks),
+                         (client.tabs[5], "fixture", {"SHOWRUNNER_UNIT": "prod"}),
+                         (client.tabs[6], "other", marks)))]
+        with patch.object(herdr, "herdr_processes", return_value=processes):
+            _ = client.order_tabs("w1", herdr.SavedLayout(at=0.0, workspaces=[]))
+        self.assertEqual(client.layout(), [("boss", ["boss", "mike", "zulu", "aardvark", "able", "apple", "beta"])])
+
+    def test_new_unit_environment_sorts_before_terminals_before_its_process_starts(self) -> None:
+        client = LayoutHerdr()
+        _ = client.open_tab("boss", "boss", "/repo", {})
+        _ = client.open_tab("boss", "apple", "/repo", {})
+        pane = client.open_tab("boss", "zulu", "/repo", {"SHOWRUNNER_UNIT": "prod", "SHOWRUNNER_UNIT_ID": "one"})
+        self.assertEqual(client.layout(), [("boss", ["boss", "zulu", "apple"])])
+        self.assertEqual(next(tab["label"] for tab in client.tabs if tab["pane_id"] == pane), "zulu")
+        processes = [herdr.HerdrProcess(1, herdr.HerdrPlace("fixture", pane),
+                                       {"SHOWRUNNER_UNIT": "prod", "SHOWRUNNER_UNIT_ID": "one"}, "claude", "/repo")]
+        with patch.object(herdr, "herdr_processes", return_value=processes):
+            _ = client.open_tab("boss", "banana", "/repo", {})
+            _ = client.open_tab("boss", "aardvark", "/repo", {"SHOWRUNNER_UNIT": "prod"})
+        self.assertEqual(client.layout(), [("boss", ["boss", "zulu", "aardvark", "apple", "banana"])])
+
+    def test_saved_tab_order_wins_over_unit_groups_and_alphabetical_order(self) -> None:
+        titles = ["boss", "apple", "zulu", "mike"]
+        saved = [herdr.SavedName(name=title, seen=100.0) for title in ("boss", "zulu", "apple", "mike")]
+        order = herdr.tab_order("boss", titles, saved, {"mike", "zulu"})
+        self.assertEqual([titles[index] for index in order], ["boss", "zulu", "apple", "mike"])
+
+    def test_new_units_and_terminals_take_their_places_after_the_first_saved_tab(self) -> None:
+        titles = ["performance", "zulu", "apple", "mike", "banana"]
+        saved = [herdr.SavedName(name=title, seen=100.0) for title in titles[:3]]
+        order = herdr.tab_order("fps", titles, saved, {"mike", "zulu"})
+        self.assertEqual([titles[index] for index in order], ["performance", "mike", "zulu", "apple", "banana"])
+
+    def test_sort_without_saved_order_keeps_a_first_tab_whose_title_differs_from_its_workspace(self) -> None:
+        titles = ["performance", "apple", "zulu", "mike"]
+        order = herdr.tab_order("fps", titles, [], {"mike", "zulu"})
+        self.assertEqual([titles[index] for index in order], ["performance", "mike", "zulu", "apple"])
 
     def test_a_gone_entry_keeps_its_place_until_it_is_old(self) -> None:
         saved = [herdr.SavedName(name="a", seen=100.0), herdr.SavedName(name="b", seen=100.0),

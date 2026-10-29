@@ -42,7 +42,7 @@
 #   <session_dir>/review_findings_<N>.txt  — review findings for pass N
 #   <session_dir>/review_agent_<N>.log     — full agent log for pass N; a worker's
 #                                            pass adds `-<slot>`, a pool's `-pool`, so
-#                                            two seats on one pass keep separate logs
+#                                            two workers on one pass keep separate logs
 #   <session_dir>/review_findings.txt      — symlink to the current pass's findings
 #   <session_dir>/review_agent.log         — symlink to the current pass's log
 #   <session_dir>/review_agent         — resolved task, family, agent, and effort
@@ -221,8 +221,8 @@ mkdir -p "${ARTIFACT_DIR}"
 FINDINGS_FILE="${ARTIFACT_DIR}/review_findings_${PASS_INDEX}${SUFFIX}.txt"
 STATUS_FILE="${ARTIFACT_DIR}/review_status${SUFFIX}"
 SLOT_FILE="${ARTIFACT_DIR}/review_slot${SUFFIX}"
-# Each seat logs on its own: a second seat taking the same pass and lens would
-# otherwise truncate the first one's log, and with it the reason that seat failed.
+# Each worker logs on its own: a second worker taking the same pass and lens would
+# otherwise truncate the first one's log, and with it the reason that worker failed.
 if [[ -n "${REVIEW_WORKER}" ]]; then
   SEAT_SUFFIX="-${TEAM_SLOT}"
 elif [[ -n "${POOL_TYPE}" ]]; then

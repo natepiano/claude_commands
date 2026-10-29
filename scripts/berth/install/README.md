@@ -8,8 +8,8 @@ picks the change up on its next hook invocation.
 - `hooks/berth_post_bash.sh` — `PostToolUse` drift observation.
 - `hooks/berth_session_start.sh` — `SessionStart` board read.
 
-A unit's Codex seats edit through `apply_patch`, which none of these see.
-`scripts/hooks/pre-tool-use-berth.py` is their `PreToolUse` check: for a seat
+A unit's Codex workers edit through `apply_patch`, which none of these see.
+`scripts/hooks/pre-tool-use-berth.py` is their `PreToolUse` check: for a worker
 of a running unit it gives each path to its open phase (the only one, else the
 one whose `phases/<id>/files` list covers it), runs `cargo-berth check <paths>
 --json` as that phase's berth session `<director session id>.phase-<id>`, so

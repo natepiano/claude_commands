@@ -8,11 +8,11 @@ unit's worktree has uncommitted work or its branch has a commit the merge branch
 The `Project started` line the /unit:direct recorder adds to a plan, alone in its file's diff, is not
 uncommitted work: no person wrote it. Then it stops what the unit owns. It finds each thing by its own record, never by a name pattern:
 
-- each Claude session that works in the worktree (the unit director and its Claude seats), and the
+- each Claude session that works in the worktree (the unit director and its Claude workers), and the
   director of each of the worktree's runs wherever it works, stops
   through `shutdown.py down`, which asks it to pause and stops it at its ready mark, and its
   restore is then forgotten, so no restart brings it back;
-- each run of the worktree that has an app-server stops it and ends its Codex seats
+- each run of the worktree that has an app-server stops it and ends its Codex workers
   (`codex_mesh.py stop`);
 - the unit's review-pool reviewers retire (`review_pool.py retire`); one still reviewing stays;
 - the build holds of the unit's sessions release, its berth reservations release, and the
@@ -382,7 +382,7 @@ def gather(unit: Unit) -> Found:
 
 
 def _interactive(transcript: Path) -> bool:
-    """Whether a transcript is an interactive session's; a Claude seat runs with --print."""
+    """Whether a transcript is an interactive session's; a Claude worker runs with --print."""
     try:
         with transcript.open(encoding="utf-8") as lines:
             for line in itertools.islice(lines, 50):
@@ -422,7 +422,7 @@ def describe_session(item: SessionRecord) -> str:
 
 
 def describe_run(item: MeshRun) -> str:
-    seats = f"; seats {', '.join(item.seats)}" if item.seats else "; no open seats"
+    seats = f"; workers {', '.join(item.seats)}" if item.seats else "; no open workers"
     return f"app-server pid {item.pid} of run {item.run.name}{seats}"
 
 
