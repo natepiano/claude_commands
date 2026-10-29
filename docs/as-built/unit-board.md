@@ -60,7 +60,7 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 - `stage`, in order:
   - the open pass as `Build`/`Tests`/`Review`/`Repair round <n>`;
   - a `finding_batch_dispatched` not yet landed in the open phase instance, as `Repair round <dispatched batches>`;
-  - the open activity label (`units_table.open_step`);
+  - the open activity label (`unit_table_cells.open_step`);
   - `Phase <id> running` while a phase is open (`Ticket <id> running` on a standing plan);
   - otherwise `Run done`, `Waiting on G<k>` or `Standing by`.
 
