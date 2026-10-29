@@ -42,10 +42,12 @@ from approved_renames import (AppliedCheck, ApprovedRename, BindingRename, Decla
                               file_rename, inline_modules)
 from add_style import StandingStyleProduction, standing_style_production
 import rules
+import showrunners
 import style_ledger
 import style_footprint
 import style_proposals
 from issues import Issue, frontmatter
+from scripts.build_hold import build_hold
 from production_units import Refusal, cell_value, live_unit_table, production_field
 from proposal_issue import ApprovedDecision, decision_answer, require_generated_body
 from unit_files import changed_files, git, unit_file_holders, unit_worktrees
@@ -2494,6 +2496,38 @@ def split_all(production: Path) -> int:
     return int(failed)
 
 
+def split_all_running() -> int:
+    """Run every running style production, yielding to a natedev build hold."""
+    if build_hold.natedev_holds(build_hold.holder_directory()).in_force:
+        print("split-all: natedev build hold in force; skipped")
+        return 0
+    found = False
+    for runner in showrunners.registered_showrunners():
+        if not runner["session"]:
+            continue
+        try:
+            production = Path(runner["doc"]).expanduser()
+            lines = production.read_text().splitlines()
+            try:
+                kind = production_field(lines, "Kind")
+            except Refusal:
+                continue
+            if kind != "style":
+                continue
+            found = True
+            if build_hold.natedev_holds(build_hold.holder_directory()).in_force:
+                print("split-all: natedev build hold in force; skipped")
+                return 0
+            code = split_all(production)
+            if code:
+                print(f"split-all: {runner['slug']}: failed: exit {code}")
+        except Exception as error:
+            print(f"split-all: {runner['slug']}: failed: {' '.join(str(error).split())}")
+    if not found:
+        print("no running style productions")
+    return 0
+
+
 def refill_outcome(result: NextPhase) -> str:
     match result:
         case PhaseWritten():
@@ -2524,7 +2558,9 @@ def main(argv: list[str]) -> int:
     _ = scan.add_argument("--repo", type=Path, required=True)
     _ = scan.add_argument("--timeout-minutes", type=float, default=90)
     scans = sub.add_parser("split-all")
-    _ = scans.add_argument("--production", type=Path, required=True)
+    targets = scans.add_mutually_exclusive_group(required=True)
+    _ = targets.add_argument("--production", type=Path)
+    _ = targets.add_argument("--all", action="store_true")
     refill = sub.add_parser("next-phase")
     _ = refill.add_argument("--unit", required=True)
     _ = refill.add_argument("--plan", type=Path, required=True)
@@ -2553,7 +2589,7 @@ def main(argv: list[str]) -> int:
         return 0
     if args.command == "split-all":
         try:
-            return split_all(args.production)
+            return split_all_running() if args.all else split_all(args.production)
         except Exception as error:
             print(f"split-all: {error}", file=sys.stderr)
             return 1
@@ -2633,6 +2669,7 @@ class PlanArguments(argparse.Namespace):
     by: str = ""
     timeout_minutes: float = 90
     production: Path = Path()
+    all: bool = False
 
 
 if __name__ == "__main__":

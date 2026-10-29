@@ -256,6 +256,68 @@ class StyleUnitsTests(unittest.TestCase):
                          + "ETA at that rate 2026-10-31")
         self.assertIn("| 1,234 (1,200 in 24 h) | 2,600 |", output)
 
+    def test_schema_24_uses_merged_ticket_or_finding_time_without_writing(self) -> None:
+        decision = self.decision("names", "names-unit")
+        merged = self.ticket(number="1", state="merged")
+        old_merge = self.ticket(number="2", state="merged")
+        pending = self.ticket(number="3", state="checkpointed")
+        old = "2026-10-20T11:00:00+00:00"
+        self.findings(decision, "built", 2, ticket=merged, updated_at=old)
+        self.findings(decision, "built", 3, ticket=old_merge)
+        self.findings(decision, "built", 4, ticket=pending)
+        self.findings(decision, "built", ticket="missing")
+        self.findings(decision, "built")
+        self.findings(decision, "filed", 16)
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            _ = connection.execute("UPDATE tickets SET updated_at=? WHERE id IN (?,?)", (old, old_merge, pending))
+            _ = connection.execute("ALTER TABLE held_findings DROP COLUMN built_at")
+            _ = connection.execute("DROP TABLE refill_results")
+            _ = connection.execute("CREATE TABLE schema_version(version INTEGER NOT NULL)")
+            _ = connection.execute("INSERT INTO schema_version VALUES (24)")
+        before = self.database.read_bytes()
+        with patch.object(style_ledger, "Ledger", side_effect=AssertionError("no migration")):
+            output = self.render()
+        self.assertEqual(output.splitlines()[-1],
+                         "All families: 11 built · 16 left · 8 built in the last 24 h · ETA at that rate 2026-10-30")
+        self.assertIn("| 11 (8 in 24 h) | 16 |", output)
+        self.assertEqual(self.database.read_bytes(), before)
+
+    def test_legacy_ledgers_without_ticket_metadata_use_finding_time_read_only(self) -> None:
+        decision = self.decision("names", "names-unit")
+        self.findings(decision, "built", 2)
+        self.findings(decision, "built", updated_at="2026-10-20T11:00:00+00:00")
+        self.findings(decision, "filed", 4)
+        for missing in ("tickets", "build_ticket", "both"):
+            with self.subTest(missing=missing):
+                database = self.root / f"without-{missing}.sqlite"
+                with (closing(sqlite3.connect(self.database)) as source,
+                      closing(sqlite3.connect(database)) as connection):
+                    source.backup(connection)
+                    with connection:
+                        _ = connection.execute("ALTER TABLE held_findings DROP COLUMN built_at")
+                        if missing in ("tickets", "both"):
+                            _ = connection.execute("DROP TABLE tickets")
+                        if missing in ("build_ticket", "both"):
+                            _ = connection.execute("ALTER TABLE held_findings DROP COLUMN build_ticket")
+                before = database.read_bytes()
+                output = style_units.table([live_unit("names-unit")], {}, now=NOW, zone=ZONE,
+                                           ledger_paths={"names-unit": database})
+                self.assertIn("| 3 (2 in 24 h) | 4 |", output)
+                self.assertEqual(output.splitlines()[-1],
+                                 "All families: 3 built · 4 left · 2 built in the last 24 h · ETA at that rate 2026-10-30")
+                self.assertEqual(database.read_bytes(), before)
+
+    def test_schema_25_uses_built_at_even_when_updated_at_disagrees(self) -> None:
+        decision = self.decision("names", "names-unit")
+        self.findings(decision, "built", 2, built_at="2026-10-28T11:00:00+00:00",
+                      updated_at="2026-10-20T11:00:00+00:00")
+        self.findings(decision, "built", 3, built_at="2026-10-20T11:00:00+00:00")
+        self.findings(decision, "filed", 4)
+        before = self.database.read_bytes()
+        self.assertEqual(self.render().splitlines()[-1],
+                         "All families: 5 built · 4 left · 2 built in the last 24 h · ETA at that rate 2026-10-30")
+        self.assertEqual(self.database.read_bytes(), before)
+
     def test_total_without_a_recent_build_has_no_eta(self) -> None:
         decision = self.decision("names", "names-unit")
         self.findings(decision, "built", 1234, built_at="2026-10-01T12:00:00+00:00")

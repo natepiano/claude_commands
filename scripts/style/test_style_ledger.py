@@ -292,6 +292,9 @@ class StyleLedgerTests(unittest.TestCase):
                     (finding_id, rule, self.sources[0], 1, "change", "type", "u32", "u64", self.blob(rule), "judge",
                      state, "", "created", "2026-10-21T09:00:00+00:00", ticket),
                 )
+            legacy_times = dict(cast(list[tuple[str, str]], connection.execute(
+                f"SELECT h.finding_id,{style_ledger.legacy_built_at_sql('h')} FROM held_findings h WHERE h.state='built'",
+            ).fetchall()))
         with style_ledger.Ledger(self.repo, database):
             pass
         with closing(sqlite3.connect(database)) as connection:
@@ -304,6 +307,7 @@ class StyleLedgerTests(unittest.TestCase):
                 "no-ticket": "2026-10-21T09:00:00+00:00",
                 "missing-ticket": "2026-10-21T09:00:00+00:00", "not-built": "",
             })
+            self.assertEqual({finding: at for finding, at in rows if finding != "not-built"}, legacy_times)
             self.assertEqual(connection.execute("SELECT * FROM refill_results").fetchall(), [])
 
     def refill_result(self, database: Path, unit: str = "names-unit") -> tuple[str, str, str, int, int, int, int]:

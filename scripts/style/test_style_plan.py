@@ -28,6 +28,8 @@ import approved_renames
 import declarations
 import style_footprint
 import style_plan
+import showrunners
+from scripts.build_hold import build_hold
 import live_units
 import unit_lookup
 import merge_gate
@@ -5798,6 +5800,89 @@ class UnsyncedChangeTests(unittest.TestCase):
             # A base inside the synced tip, and no unit branch, change no file.
             self.assertEqual(dict(style_plan.unsynced_changes(repo, style_plan.UnitBranchTip(tip), newest)), {})
             self.assertEqual(dict(style_plan.unsynced_changes(repo, style_plan.NoUnitBranch(), tip)), {})
+
+
+class AllStyleProductionsTests(unittest.TestCase):
+    def runner(self, root: Path, slug: str, kind: str = "style", *, running: bool = True) -> showrunners.Showrunner:
+        doc = root / f"{slug}-production.md"
+        _ = doc.write_text(f"# Production — {slug}\n\n- **Kind:** {kind}\n")
+        return {"slug": slug, "session": slug if running else "", "socket": "test" if running else "",
+                "zone": "UTC", "doc": str(doc)}
+
+    def test_all_continues_to_the_next_style_production_after_an_exception_or_failed_exit(self) -> None:
+        for failure in (OSError("cannot read ledger\ntry later"), 1):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+                root = Path(folder)
+                runners = [self.runner(root, "first"), self.runner(root, "second")]
+                output, errors = io.StringIO(), io.StringIO()
+                with (mock.patch.object(showrunners, "registered_showrunners", return_value=runners),
+                      mock.patch.object(build_hold, "natedev_holds",
+                                        return_value=build_hold.NatedevHolds(())),
+                      mock.patch.object(style_plan, "split_all", side_effect=[failure, 0]) as split,
+                      redirect_stdout(output), redirect_stderr(errors)):
+                    code = style_plan.main(["split-all", "--all"])
+                self.assertEqual(code, 0)
+                self.assertEqual(split.call_args_list,
+                                 [mock.call(Path(runner["doc"])) for runner in runners])
+                cause = "cannot read ledger try later" if isinstance(failure, OSError) else "exit 1"
+                self.assertEqual(output.getvalue(), f"split-all: first: failed: {cause}\n")
+                self.assertEqual(errors.getvalue(), "")
+
+    def test_all_without_running_style_productions_prints_one_line_and_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+            root = Path(folder)
+            runners = [self.runner(root, "product", "product"), self.runner(root, "stopped", running=False),
+                       self.runner(root, "ordinary", "")]
+            _ = Path(runners[-1]["doc"]).write_text("# Product without a Kind field\n")
+            output = io.StringIO()
+            with (mock.patch.object(showrunners, "registered_showrunners", return_value=runners),
+                  mock.patch.object(build_hold, "natedev_holds",
+                                    return_value=build_hold.NatedevHolds(())),
+                  mock.patch.object(style_plan, "split_all", side_effect=AssertionError("no style production")),
+                  redirect_stdout(output)):
+                code = style_plan.main(["split-all", "--all"])
+            self.assertEqual((code, output.getvalue()), (0, "no running style productions\n"))
+
+    def test_all_yields_to_a_build_hold_before_discovery_or_any_split(self) -> None:
+        holder = build_hold.Holder("builder", datetime(2026, 10, 28, tzinfo=UTC), "build",
+                                   build_hold.UnknownReleaseEta(), "builder")
+        output = io.StringIO()
+        with (mock.patch.object(showrunners, "registered_showrunners",
+                                side_effect=AssertionError("no discovery during hold")),
+              mock.patch.object(build_hold, "natedev_holds",
+                                return_value=build_hold.NatedevHolds((holder,))),
+              mock.patch.object(style_plan, "split_all", side_effect=AssertionError("no split during hold")),
+              redirect_stdout(output)):
+            code = style_plan.main(["split-all", "--all"])
+        self.assertEqual((code, output.getvalue()), (0, "split-all: natedev build hold in force; skipped\n"))
+
+    def test_all_stops_before_the_next_production_when_a_build_hold_starts(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+            root = Path(folder)
+            runners = [self.runner(root, "first"), self.runner(root, "second")]
+            holder = build_hold.Holder("builder", datetime(2026, 10, 28, tzinfo=UTC), "build",
+                                      build_hold.UnknownReleaseEta(), "builder")
+            clear = build_hold.NatedevHolds(())
+            held = build_hold.NatedevHolds((holder,))
+            output, errors = io.StringIO(), io.StringIO()
+            with (mock.patch.object(showrunners, "registered_showrunners", return_value=runners),
+                  mock.patch.object(build_hold, "natedev_holds", side_effect=[clear, clear, held]),
+                  mock.patch.object(style_plan, "split_all", return_value=0) as split,
+                  redirect_stdout(output), redirect_stderr(errors)):
+                code = style_plan.main(["split-all", "--all"])
+            self.assertEqual(split.call_args_list, [mock.call(Path(runners[0]["doc"]))])
+            self.assertEqual((code, output.getvalue(), errors.getvalue()),
+                             (0, "split-all: natedev build hold in force; skipped\n", ""))
+
+    def test_all_reports_a_discovery_failure_as_a_command_failure(self) -> None:
+        output, errors = io.StringIO(), io.StringIO()
+        with (mock.patch.object(showrunners, "registered_showrunners", side_effect=OSError("no timers")),
+              mock.patch.object(build_hold, "natedev_holds",
+                                return_value=build_hold.NatedevHolds(())),
+              mock.patch.object(style_plan, "split_all", side_effect=AssertionError("no discovery result")),
+              redirect_stdout(output), redirect_stderr(errors)):
+            code = style_plan.main(["split-all", "--all"])
+        self.assertEqual((code, output.getvalue(), errors.getvalue()), (1, "", "split-all: no timers\n"))
 
 
 class RefillRecordingTests(unittest.TestCase):

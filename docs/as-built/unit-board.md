@@ -207,6 +207,15 @@ It stats each source; one newer than its reference (or a failed stat) runs the g
 - Tests patch `plan_history.now_epoch` for the clock.
 - A session loads mod hooks when it starts. A session started before a mod change keeps the old hooks until `/reload-plugins`, and the command file's fallback line answers in their place; the line names `/reload-plugins` for that reason. The natedev showrunner hit this on 2026-10-18.
 - The board reads the style ledger with `sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=0)`, never through `style_ledger.Ledger`, which takes a write lock (`BEGIN IMMEDIATE`) and loads the rule catalog. SQLite's default 5 s busy timeout made a locked ledger stall each standing unit in turn; `timeout=0` gives 0 at once. `style_plan.py` writes a ticket heading as `### Phase <n> — <ticket id>`, so the phase id is the bare number; the ledger's open ticket names the ticket, and it can run one ticket ahead of the run record after refill.
+- The Units report (`style_units.py`) counts recent built findings using `built_at` on schema 25. Without that column, it uses the merged build ticket's `updated_at`, else the finding's `updated_at`. `style_ledger.legacy_built_at_sql` supplies that fallback and migration 25's backfill, keeping the same rule for both. Without the tickets table or the finding’s `build_ticket` column, the report uses the finding’s `updated_at` directly. It remains read-only, does not migrate the ledger, and uses the recent count for its totals ETA.
+
+The nightly Left split runs for every running production whose doc has `Kind: style`, using the same registry as `showrunners.py list`:
+
+```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py split-all --all
+```
+
+`--all` selects running style productions with the existing registry and production-field readers. A production failure logs its name and error and continues; per-unit output is unchanged. No running style productions or a natedev build hold prints one line and exits 0, with no new production split during a hold. The hold is checked before discovery and immediately before each production split; a hold starting during one production stops later productions from starting. Production failures also exit 0; a command-level failure exits nonzero. `--production <doc>` remains available as the mutually exclusive single-production form.
 
 ## Why
 

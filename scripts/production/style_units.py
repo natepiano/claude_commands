@@ -142,7 +142,9 @@ def read_snapshot(database: Path, now: datetime, decision_folder: Path,
             }
         if not finding_columns:
             return snapshot
-        built_at = "h.built_at" if "built_at" in finding_columns else "''"
+        built_at = "h.built_at" if "built_at" in finding_columns else "h.updated_at"
+        if "built_at" not in finding_columns and ticket_columns and "build_ticket" in finding_columns:
+            built_at = style_ledger.legacy_built_at_sql("h")
         build_ticket = "build_ticket" if "build_ticket" in finding_columns else "''"
         ticket_families: dict[str, str] = {}
         if ticket_columns:
