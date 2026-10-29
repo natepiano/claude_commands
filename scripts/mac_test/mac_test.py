@@ -21,6 +21,7 @@ import tempfile
 import time
 import threading
 from typing import Literal, NotRequired, TypeGuard, TypedDict, cast
+from urllib.parse import quote
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
@@ -1201,61 +1202,119 @@ def send_mac_free(block: ActiveMacBlock, owed: FreeMessageOwed) -> bool:
     )
 
 
+@dataclass(frozen=True)
+class CiRunForReport:
+    """A candidate run's check suite and branch details for the skipped-job report."""
+
+    check_suite_id: str
+    branch: str
+    sha: str
+
+
+def skipped_mac_suites(config: MacTestConfig, suite_ids: list[str]) -> set[str] | GhFailure:
+    if not suite_ids:
+        return set()
+    unique_ids = list(dict.fromkeys(suite_ids))
+    # Each nodes field reads at most 100 IDs; both fields share one request.
+    batches = [unique_ids[start:start + 100] for start in range(0, len(unique_ids), 100)]
+    fields = [
+        f"batch{index}: nodes(ids: {json.dumps(batch)}) {{ ... on CheckSuite {{ "
+        + "id checkRuns(first: 1, filterBy: {checkName: $job, conclusions: [SKIPPED]}) "
+        + "{ totalCount } } }"
+        for index, batch in enumerate(batches)
+    ]
+    answer = run_gh(config, "api", "graphql", "-f", "query=query($job: String!) { "
+                    + " ".join(fields) + " }", "-f", f"job={config.ci_job}")
+    if isinstance(answer, GhFailure):
+        return answer
+    try:
+        decoded = cast(object, json.loads(answer.stdout))
+    except json.JSONDecodeError:
+        return GhFailure("gh returned invalid JSON")
+    if not isinstance(decoded, dict):
+        return GhFailure("gh returned invalid JSON")
+    response = cast(dict[str, object], decoded)
+    data = response.get("data")
+    if response.get("errors") or not isinstance(data, dict):
+        return GhFailure("gh returned invalid JSON")
+    results = cast(dict[str, object], data)
+    skipped: set[str] = set()
+    for index, batch in enumerate(batches):
+        nodes = results.get(f"batch{index}")
+        if not isinstance(nodes, list) or len(cast(list[object], nodes)) != len(batch):
+            return GhFailure("gh returned invalid JSON")
+        seen: set[str] = set()
+        for raw_node in cast(list[object], nodes):
+            if not isinstance(raw_node, dict):
+                return GhFailure("gh returned invalid JSON")
+            node = cast(dict[str, object], raw_node)
+            suite_id = node.get("id")
+            checks = node.get("checkRuns")
+            if not isinstance(suite_id, str) or suite_id not in batch or suite_id in seen or not isinstance(checks, dict):
+                return GhFailure("gh returned invalid JSON")
+            count = cast(dict[str, object], checks).get("totalCount")
+            if type(count) is not int or count < 0:
+                return GhFailure("gh returned invalid JSON")
+            seen.add(suite_id)
+            if count:
+                skipped.add(suite_id)
+    return skipped
+
+
 def skipped_ci_runs(config: MacTestConfig, since: datetime) -> str:
     if not config.ci_repo:
         return ""
     answer = run_gh(
         config,
-        "run",
-        "list",
-        "--repo",
-        config.ci_repo,
-        "--workflow",
-        config.ci_workflow,
-        "--created",
-        f">={timestamp(since.replace(microsecond=0))}",
-        "--limit",
-        "200",
-        "--json",
-        "databaseId,headBranch,headSha",
+        "api",
+        f"repos/{config.ci_repo}/actions/workflows/{quote(config.ci_workflow, safe='')}/runs",
+        "--method", "GET",
+        "-f", f"created=>={timestamp(since.replace(microsecond=0))}",
+        "-F", "per_page=100",
+        "--paginate", "--slurp",
     )
     if isinstance(answer, GhFailure):
         return f"Could not list the CI runs that skipped the macOS job: {answer.line}"
-    items = json_items(answer)
-    if isinstance(items, GhFailure):
-        return f"Could not list the CI runs that skipped the macOS job: {items.line}"
-    branch_runs: dict[str, tuple[int, str]] = {}
+    pages = json_items(answer)
+    if isinstance(pages, GhFailure):
+        return f"Could not list the CI runs that skipped the macOS job: {pages.line}"
+    items: list[object] = []
+    for page in pages:
+        if not isinstance(page, dict):
+            return "Could not list the CI runs that skipped the macOS job: gh returned invalid JSON"
+        page_runs = cast(dict[str, object], page).get("workflow_runs")
+        if not isinstance(page_runs, list):
+            return "Could not list the CI runs that skipped the macOS job: gh returned invalid JSON"
+        items.extend(cast(list[object], page_runs))
+        if len(items) >= 200:
+            items = items[:200]
+            break
+    runs: list[CiRunForReport] = []
     for item in items:
         if not isinstance(item, dict):
             return "Could not list the CI runs that skipped the macOS job: gh returned invalid JSON"
         run = cast(dict[str, object], item)
-        database_id = run.get("databaseId")
-        branch = run.get("headBranch")
-        sha = run.get("headSha")
+        suite_id = run.get("check_suite_node_id")
+        branch = run.get("head_branch")
+        sha = run.get("head_sha")
         if (
-            type(database_id) is not int
+            type(run.get("id")) is not int
+            or not isinstance(suite_id, str)
+            or not suite_id
             or not isinstance(branch, str)
             or not isinstance(sha, str)
         ):
             return "Could not list the CI runs that skipped the macOS job: gh returned invalid JSON"
-        jobs = jobs_for_run(config, database_id)
-        if isinstance(jobs, GhFailure):
-            return f"Could not list the CI runs that skipped the macOS job: {jobs.line}"
-        skipped = False
-        for raw_job in jobs:
-            if not isinstance(raw_job, dict):
-                return "Could not list the CI runs that skipped the macOS job: gh returned invalid JSON"
-            job = cast(dict[str, object], raw_job)
-            if (
-                job.get("name") == config.ci_job
-                and job.get("conclusion") == "skipped"
-            ):
-                skipped = True
-                break
-        if skipped:
-            prior = branch_runs.get(branch)
-            branch_runs[branch] = (
-                (1, sha) if prior is None else (prior[0] + 1, prior[1])
+        runs.append(CiRunForReport(suite_id, branch, sha))
+    skipped = skipped_mac_suites(config, [run.check_suite_id for run in runs])
+    if isinstance(skipped, GhFailure):
+        return f"Could not list the CI runs that skipped the macOS job: {skipped.line}"
+    branch_runs: dict[str, tuple[int, str]] = {}
+    for candidate in runs:
+        if candidate.check_suite_id in skipped:
+            prior = branch_runs.get(candidate.branch)
+            branch_runs[candidate.branch] = (
+                (1, candidate.sha) if prior is None else (prior[0] + 1, prior[1])
             )
     if branch_runs:
         lines = ["CI runs that skipped the macOS job under this block:"]

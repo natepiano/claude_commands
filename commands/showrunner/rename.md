@@ -1,6 +1,6 @@
 ---
 description: Rename a production, move its units between runs, and retire its old merge branch.
-argument-hint: "plan <old> <new> | apply <old> <new> | unit <new> <unit> | finish <new> | checkout <new> [<path>]"
+argument-hint: "plan <old> <new> | apply <old> <new> | unit <new> <unit> | repair-workers <production> [--dry-run] | finish <new> | checkout <new> [<path>]"
 ---
 
 # Rename production
@@ -34,7 +34,9 @@ Show the output. On a nonzero exit, show the refusal and stop. Use this order:
    The command pushes its new branch, moves and repairs its worktree, moves
    account transcripts and copies trust entries, commits the new Worktree and
    Branch cells, then retires its old branch. It updates the stopped shutdown
-   record and prints `shutdown.py restart --only <session-id>`; relaunch the unit
+   record, run worktree and plan paths, worker launch paths and unit ledger;
+   paused workers keep their threads, Codex homes and paused state.
+   It prints `shutdown.py restart --only <session-id>`; relaunch the unit
    with that command after `unit` succeeds. With no record it reports that no
    relaunch is available. **Tell the unit director the new
    worktree path printed by the command before it resumes.** `add_unit` writes
@@ -74,6 +76,12 @@ The journal is `~/.local/state/showrunner/<new>/rename.json` (or the configured
 showrunner state root). `rename.lock` is internal coordination: leave it to the
 script. `rename-history/` holds completed journals archived by later renames;
 it is archival state, not a recovery command.
+
+For units moved before worker path repair was added, run
+`repair-workers <production> --dry-run`, then `repair-workers <production>`.
+It reads journaled moves and current Units rows with saved run or worker paths,
+including moves with no journal record. It prints each change or that a unit has nothing
+to change, and can be repeated. Dry run changes nothing.
 
 Never rewrite history: existing commit subjects, log lines and transcript
 contents keep the old name. Never force-push to carry out a rename.

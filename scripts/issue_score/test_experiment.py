@@ -45,7 +45,7 @@ class ExperimentTests(unittest.TestCase):
         response = client.parse_response(raw, expanded)
         unchanged = copy.deepcopy(response)
         area = client.parse_response(cast(object, json.loads((FIXTURES / "area_response.json").read_text())),
-                                     questions.area_questions(["rendering", "tooling"]))
+                                     questions.area_questions(["rendering", "tooling"], {}))
         for variant, replaced in (("production", ""), ("deadline_scope", "deadline_named"), ("benefit_scope", "impact")):
             with self.subTest(variant=variant):
                 projected = experiment.project_response(response, variant, variants)
@@ -64,7 +64,7 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(response, unchanged)
 
     def test_area_choice_variants_project_only_the_area_request_and_preserve_fit(self) -> None:
-        production = questions.area_questions(["rendering", "tooling"])
+        production = questions.area_questions(["rendering", "tooling"], {})
         variants = {"area_scope": {name: copy.deepcopy(production[name]) for name in ("area", "area_reverse")},
                     "deadline_scope": {"deadline_named": questions.main_questions()["deadline_named"]}}
         expanded = experiment.build_questions(production, variants)
