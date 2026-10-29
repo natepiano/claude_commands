@@ -132,6 +132,17 @@ class Waiter(TypedDict):
     step: NotRequired[str]
     folder: NotRequired[str]
     bump_order: NotRequired[int]
+    holds_younger: NotRequired[bool]
+
+
+@dataclass(frozen=True)
+class HeadPriority:
+    waiter: Waiter
+
+
+@dataclass(frozen=True)
+class NoHeadPriority:
+    pass
 
 
 @dataclass(frozen=True)
@@ -166,6 +177,11 @@ class BehindHead:
 
 
 @dataclass(frozen=True)
+class HeadWaitingForDrain:
+    running_count: int
+
+
+@dataclass(frozen=True)
 class ReadyForAdmission:
     pass
 
@@ -175,7 +191,7 @@ class ReadingUnavailable:
     pass
 
 
-WaitReason = NeedsBuildBudget | NeedsMemory | BehindHead | ReadyForAdmission | ReadingUnavailable | MemoryPressure
+WaitReason = NeedsBuildBudget | NeedsMemory | BehindHead | HeadWaitingForDrain | ReadyForAdmission | ReadingUnavailable | MemoryPressure
 
 
 @dataclass(frozen=True)
@@ -267,7 +283,7 @@ def decide(available: int, total: int | None, need: int, running: list[StepMemor
     budget = build_budget_bytes()
     reserve = total * 5 // 100 if total is not None else 0
     threshold = need + promised + reserve + head_need
-    fits_budget = charged + need + head_need <= budget or all(isinstance(row, GoneMemory) for row in running)
+    fits_budget = charged + need + head_need <= budget or (not running and not head_need)
     admit = fits_budget and available >= threshold and isinstance(pressure, NoPressureHold)
     return AdmissionDecision("admit" if admit else "hold", threshold, promised, reserve, measured,
                              pressure, charged, budget)
@@ -287,14 +303,6 @@ def growth_headroom(memory: StepMemory) -> int:
     if isinstance(memory, MeasuredMemory):
         return max(0, memory.ramp_promise - memory.bytes)
     return 0
-
-
-def _head_holds_later(available: int, total: int | None, need: int,
-                      running: list[StepMemory]) -> bool:
-    decision = decide(available, total, need, running)
-    # Leave room if the head fits now or after measured running steps end.
-    # Pending starts have no measured use to return.
-    return decision.state == "admit" or available + decision.measured >= need + decision.reserve
 
 
 def percentile(values: list[int]) -> int:
@@ -526,6 +534,33 @@ def waiter_order(row: Waiter) -> tuple[int, float, int]:
     return row.get("bump_order", 0), row["since"], row["pid"]
 
 
+def head_priority(waiters: list[Waiter], available: int, total: int | None,
+                  running: list[StepMemory], now: float) -> HeadPriority | NoHeadPriority:
+    candidates = sorted((row for row in waiters if row.get("holds_younger", False)
+                         or row.get("bump_order", 0) < 0 or now - row["since"] >= HEAD_SECONDS),
+                        key=waiter_order)
+    if candidates:
+        head = candidates[0]
+        decision = decide(available, total, head["need"], running)
+        if (head.get("holds_younger", False) or decision.state == "admit"
+                or available + decision.measured >= head["need"] + decision.reserve):
+            return HeadPriority(head)
+    return NoHeadPriority()
+
+
+def queue_decision(available: int, total: int | None, row: Waiter,
+                   running: list[StepMemory], head: HeadPriority | NoHeadPriority,
+                   pressure: Pressure) -> AdmissionDecision:
+    younger = isinstance(head, HeadPriority) and waiter_order(head.waiter) < waiter_order(row)
+    head_need = head.waiter["need"] if younger and isinstance(head, HeadPriority) else 0
+    decision = decide(available, total, row["need"], running, head_need, pressure)
+    if younger:
+        return replace(decision, state="hold")
+    if isinstance(head, HeadPriority) and waiter_order(head.waiter) == waiter_order(row) and not running:
+        return replace(decision, state="admit" if isinstance(pressure, NoPressureHold) else "hold")
+    return decision
+
+
 def git_identity(argv: list[str], cwd: str) -> tuple[str, str]:
     if not argv:
         return "", ""
@@ -572,30 +607,31 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
         mine = directory / f"{pid}-{start}.waiting"
         waiting = live_waiters(directory)
         previous = next((row for path, row in waiting if path == mine), None)
-        waiters = [row for path, row in waiting if path != mine]
-        heads = sorted((row for row in waiters
-                        if row.get("bump_order", 0) < 0 or now.timestamp() - row["since"] >= HEAD_SECONDS),
-                       key=waiter_order)
         waited_from = since or now.timestamp()
         if previous is not None:
             waited_from = min(waited_from, previous["since"])
-        own_order = (previous.get("bump_order", 0) if previous is not None else 0, waited_from, pid)
+        waiter: Waiter = {"pid": pid, "start_time": start or "", "need": peak.bytes, "since": waited_from,
+                          "label": f"{worktree or repo} {step} ({os.environ.get('BUILDLOG_CALLER') or 'caller'} pid {pid})"}
+        if previous is not None:
+            if "bump_order" in previous:
+                waiter["bump_order"] = previous["bump_order"]
+            if previous.get("holds_younger", False):
+                waiter["holds_younger"] = True
         available, total = read_meminfo(meminfo)
         pressure = read_pressure()
+        head = head_priority([row for path, row in waiting if path != mine] + ([waiter] if argv else []),
+                             available, total, running, now.timestamp())
+        if isinstance(head, HeadPriority) and not head.waiter.get("holds_younger", False):
+            head.waiter["holds_younger"] = True
+            for head_path, head_row in waiting:
+                if head_path != mine and head_row is head.waiter:
+                    _ = head_path.write_text(json.dumps(head_row, separators=(",", ":")))
         head_need, head_label = 0, ""
-        if heads and waiter_order(heads[0]) < own_order:
-            head = heads[0]
-            if _head_holds_later(available, total, head["need"], running):
-                head_need, head_label = head["need"], waiter_label(head)
-        decision = decide(available, total, peak.bytes, running, head_need, pressure)
-        if head_need and heads[0].get("bump_order", 0) < 0:
-            decision = replace(decision, state="hold")
+        if isinstance(head, HeadPriority) and waiter_order(head.waiter) < waiter_order(waiter):
+            head_need, head_label = head.waiter["need"], waiter_label(head.waiter)
+        decision = queue_decision(available, total, waiter, running, head, pressure)
         reservation: Reserved | NotReserved = NotReserved("held" if argv else "launch")
         if argv and decision.state == "hold" and start is not None:
-            waiter: Waiter = {"pid": pid, "start_time": start, "need": peak.bytes, "since": waited_from,
-                              "label": f"{worktree or repo} {step} ({os.environ.get('BUILDLOG_CALLER') or 'caller'} pid {pid})"}
-            if previous is not None and "bump_order" in previous:
-                waiter["bump_order"] = previous["bump_order"]
             identity = waiter_identity(repo, step, worktree)
             waiter["session_id"], waiter["session_name"] = identity["session_id"], identity["session_name"]
             waiter["step"], waiter["folder"] = identity["step"], identity["folder"]
@@ -715,24 +751,25 @@ def read_queue(directory: Path, processes: dict[int, ProcessIdentity], now: floa
     pressure = read_pressure()
     ordered = sorted(((path, cast(Waiter, cast(object, row))) for path, row in queue_rows(directory, "waiting", processes)),
                      key=lambda item: waiter_order(item[1]))
-    head = next((row for _, row in ordered if row.get("bump_order", 0) < 0 or now - row["since"] >= HEAD_SECONDS), None)
+    head = head_priority([row for _, row in ordered], available, total, memory, now)
     pending = sum(growth_headroom(item) for item in memory)
     waiting: list[WaitingStep] = []
     for _, row in ordered:
         identity = identities.identity(row["pid"], cast(dict[str, object], cast(object, row)))
-        own = decide(available, total, row["need"], memory, pressure=pressure)
+        own = queue_decision(available, total, row, memory, head, pressure)
         reason: WaitReason = ReadyForAdmission()
         if unavailable:
             reason = ReadingUnavailable()
+        elif isinstance(head, HeadPriority) and waiter_order(head.waiter) < waiter_order(row):
+            head_identity = identities.identity(head.waiter["pid"], cast(dict[str, object], cast(object, head.waiter)))
+            reason = BehindHead(head_identity["session_name"] or Path(head_identity["folder"]).name or str(head.waiter["pid"]), head.waiter["since"])
         elif isinstance(own.pressure, MemoryPressure):
             reason = own.pressure
+        elif own.state == "hold" and isinstance(head, HeadPriority) and row is head.waiter and memory:
+            reason = HeadWaitingForDrain(len(memory))
         elif own.state == "hold":
             reason = (NeedsMemory(row["need"], available) if available < own.threshold
                       else NeedsBuildBudget(row["need"], own.charged, own.budget))
-        elif head is not None and waiter_order(head) < waiter_order(row) and _head_holds_later(available, total, head["need"], memory):
-            if head.get("bump_order", 0) < 0 or decide(available, total, row["need"], memory, head["need"]).state == "hold":
-                head_identity = identities.identity(head["pid"], cast(dict[str, object], cast(object, head)))
-                reason = BehindHead(head_identity["session_name"] or Path(head_identity["folder"]).name or str(head["pid"]), head["since"])
         waiting.append(WaitingStep(row["pid"], identity["session_id"], identity["session_name"], identity["step"],
                                    identity["folder"], row["since"], row["need"], reason))
     return QueueView(tuple(waiting), tuple(running), available, pending, total * 5 // 100 if total else 0, now), ordered

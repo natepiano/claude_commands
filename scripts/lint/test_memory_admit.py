@@ -82,6 +82,10 @@ class DecisionTests(unittest.TestCase):
         decision = gate.decide(40 * GIB, 60 * GIB, GIB, [], pressure=gate.MemoryPressure(11))
         self.assertEqual(decision.state, "hold")
 
+    def test_empty_machine_cannot_skip_the_budget_reserved_for_a_head(self) -> None:
+        decision = gate.decide(40 * GIB, 60 * GIB, int(10.8 * GIB), [], head_need=int(19.3 * GIB))
+        self.assertEqual(decision.state, "hold")
+
 
 
 class HistoryTests(unittest.TestCase):
@@ -672,19 +676,75 @@ class QueueApiTests(MemoryQueueFixture):
         self.assertIsInstance(view.waiting[0].reason, gate.ReadyForAdmission)
         self.assertTrue(all(isinstance(row.reason, gate.BehindHead) for row in view.waiting[1:]))
 
-    def test_queue_view_names_ramp_growth_in_the_memory_floor_reason(self) -> None:
+    def test_queue_view_names_running_steps_that_hold_the_head(self) -> None:
         _ = self.running(100, 12, age=0)
         _ = self.running(200, 11.5, age=0)
         _ = self.queue()
         view = gate.queue_view()
         self.assertEqual(view.promised, int(20.5 * GIB))
         reason = view.waiting[0].reason
-        self.assertIsInstance(reason, gate.NeedsMemory)
-        assert isinstance(reason, gate.NeedsMemory)
-        self.assertEqual((reason.need, reason.free),
-                         (int(10.9 * GIB), view.available))
+        self.assertEqual(reason, gate.HeadWaitingForDrain(2))
         self.assertCountEqual([row.measured for row in view.running],
                               [gate.MeasuredMemory(GIB, 12 * GIB), gate.MeasuredMemory(2 * GIB, int(11.5 * GIB))])
+
+    def test_head_hold_survives_rising_free_memory_and_falling_measured_use(self) -> None:
+        _ = self.running(100, 12)
+        self.readings[100] = gate.MeasuredMemory(3 * GIB)
+        path = self.head(19.3)
+        first = self.check(need=1, free=20)
+        self.assertEqual(first.decision.state, "hold")
+        self.assertTrue(cast(gate.Waiter, json.loads(path.read_text())).get("holds_younger", False))
+        self.readings[100] = gate.MeasuredMemory(0)
+        second = self.check(need=1, free=21.9)
+        self.assertEqual(second.decision.state, "hold")
+        view = gate.queue_view()
+        self.assertEqual(view.waiting[0].reason, gate.HeadWaitingForDrain(1))
+        self.assertIsInstance(view.waiting[1].reason, gate.BehindHead)
+
+    def test_drained_head_starts_below_memory_floor_and_a_younger_check_cannot_take_its_place(self) -> None:
+        running = self.running(100, 12)
+        self.readings[100] = gate.MeasuredMemory(3 * GIB)
+        path = self.head(19.3)
+        self.assertEqual(self.check(need=10.8, free=20).decision.state, "hold")
+        running.unlink()
+        younger = self.check(need=10.8, free=21.9)
+        self.assertEqual(younger.decision.state, "hold")
+        view = gate.queue_view()
+        self.assertIsInstance(view.waiting[0].reason, gate.ReadyForAdmission)
+        self.assertIsInstance(view.waiting[1].reason, gate.BehindHead)
+        head = self.check(pid=300, need=19.3, free=21.9)
+        self.assertLess(head.available, head.decision.threshold)
+        self.assertIsInstance(head.reservation, gate.Reserved)
+        self.assertFalse(path.exists())
+
+    def test_head_start_removes_priority_so_younger_steps_use_normal_limits(self) -> None:
+        path = self.head(2)
+        self.assertEqual(self.check(need=1, free=40).decision.state, "hold")
+        self.readings[300] = gate.MeasuredMemory(0)
+        head = self.check(pid=300, need=2, free=40)
+        self.assertIsInstance(head.reservation, gate.Reserved)
+        self.assertFalse(path.exists())
+        younger = self.check(need=1, free=40)
+        self.assertEqual((younger.decision.state, younger.head_need), ("admit", 0))
+
+    def test_removed_head_row_releases_younger_steps_to_normal_limits(self) -> None:
+        path = self.head(19.3)
+        self.assertEqual(self.check(need=1, free=40).decision.state, "hold")
+        path.unlink()
+        younger = self.check(need=1, free=21.9)
+        self.assertEqual((younger.decision.state, younger.head_need), ("admit", 0))
+
+    def test_psi_11_holds_a_drained_head_without_releasing_younger_steps(self) -> None:
+        _ = self.head(19.3)
+        self.assertEqual(self.check(need=1, free=40).decision.state, "hold")
+        pressure = self.root / "pressure"
+        _ = pressure.write_text("full avg10=11.0 avg60=1.0 total=1\n")
+        with patch.dict(os.environ, {"BUILDLOG_MEMORY_PRESSURE": str(pressure)}):
+            head = self.check(pid=300, need=19.3, free=21.9)
+            self.assertEqual(head.decision.state, "hold")
+            view = gate.queue_view()
+        self.assertEqual(view.waiting[0].reason, gate.MemoryPressure(11))
+        self.assertIsInstance(view.waiting[1].reason, gate.BehindHead)
 
     def test_bump_by_position_session_id_session_name_and_folder_starts_the_selected_waiter_first(self) -> None:
         for selector in ("2", "session-400", "warmup", "/tmp/warmup-tree", "warmup-tree"):
