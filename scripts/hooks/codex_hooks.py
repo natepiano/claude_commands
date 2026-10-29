@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Install and trust the Codex hooks: the Rust PostToolUse checks and the berth PreToolUse check on
-`apply_patch`, and the scratch guard PreToolUse check on `Bash`."""
+`apply_patch`, and the scratch and build-hold PreToolUse checks on `Bash`."""
 
 from __future__ import annotations
 
@@ -20,15 +20,33 @@ from typing import NamedTuple, cast
 RETIRED_COMMAND = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/post-tool-use-mul-add.py"'
 
 
+class PythonHookScript(NamedTuple):
+    """A hook run through the shared Python launcher."""
+
+    script: str
+
+    def command(self) -> str:
+        return f'"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/{self.script}"'
+
+
+class ShellHookFront(NamedTuple):
+    """A hook front that starts Python only when its checks need it."""
+
+    script: str
+
+    def command(self) -> str:
+        return f'"$HOME/.claude/scripts/hooks/{self.script}"'
+
+
 class CodexHook:
     """A named handler for one hook event and tool matcher that must be installed and trusted."""
 
     __slots__: tuple[str, ...] = ("name", "command", "event", "timeout", "matcher")
 
-    def __init__(self, name: str, script: str, event: str = "PostToolUse", timeout: int = 10,
+    def __init__(self, name: str, script: PythonHookScript | ShellHookFront, event: str = "PostToolUse", timeout: int = 10,
                  matcher: str = "apply_patch") -> None:
         self.name: str = name
-        self.command: str = f'"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/{script}"'
+        self.command: str = script.command()
         self.event: str = event
         self.timeout: int = timeout
         self.matcher: str = matcher
@@ -42,11 +60,12 @@ class CodexHook:
 
 
 HOOKS: tuple[CodexHook, ...] = (
-    CodexHook("fn-length", "post-tool-use-fn-length.py"),
+    CodexHook("fn-length", PythonHookScript("post-tool-use-fn-length.py")),
     # cargo-berth's own deadline is ten seconds; the hook allows for a slow start under load.
-    CodexHook("berth", "pre-tool-use-berth.py", "PreToolUse", 30),
+    CodexHook("berth", PythonHookScript("pre-tool-use-berth.py"), "PreToolUse", 30),
     # Codex sends a shell command as tool `Bash`, as Claude Code does.
-    CodexHook("scratch-guard", "pre-tool-use-scratch-guard.py", "PreToolUse", 10, "Bash"),
+    CodexHook("scratch-guard", PythonHookScript("pre-tool-use-scratch-guard.py"), "PreToolUse", 10, "Bash"),
+    CodexHook("build-hold-guard", ShellHookFront("pre-tool-use-build-hold-guard.sh"), "PreToolUse", 10, "Bash"),
 )
 
 
