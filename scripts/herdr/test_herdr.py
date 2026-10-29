@@ -3047,6 +3047,20 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(herdr.herdr_place_of(13), herdr.HerdrPlace("fixture", "native"))
         self.assertEqual([row.pid for row in herdr.herdr_processes() if row.command == "claude"], [13])
 
+    def test_linux_deleted_cwd_preserves_the_process_marks_and_place(self) -> None:
+        server = self.process(10, 1, ["/fixture/herdr", "server"], {})
+        self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)
+        self.socket_fd(server, 100)
+        marks = {"SHOWRUNNER_UNIT": "prod", "SHOWRUNNER_UNIT_ID": "unit"}
+        process = self.process(12, 10, ["/bin/claude"], {**marks, "HERDR_PANE_ID": "pane-1"})
+        (process / "cwd").unlink()
+        (process / "cwd").symlink_to(self.root / "deleted-directory")
+        rows = herdr.herdr_processes()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0].pid, rows[0].command, rows[0].place, rows[0].marks),
+                         (12, "claude", herdr.HerdrPlace("fixture", "pane-1"), marks))
+        self.assertIsInstance(rows[0].working_directory, herdr.UnreadableCwd)
+
     def test_process_place_named_default_and_nonherdr(self) -> None:
         server = self.process(10, 1, ["/fixture/herdr", "--session", "fixture", "server"], {})
         self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)
@@ -3184,7 +3198,7 @@ class HerdrTests(unittest.TestCase):
                   "agent": "codex", "pane_id": "pane-codex", "agent_status": "idle",
               }]),
               patch.object(lookup, "_claudes", return_value=(
-                  {herdr.HerdrPlace("fixture", "pane-unit"): live}, lookup.UnreadAt({}, lookup.RecordsRead()))),
+                  {12: live}, lookup.UnreadAt({}, lookup.RecordsRead()))),
               patch.object(lookup, "_lookup_slug", side_effect=current_slug),
               patch.object(roster, "_process_account", return_value=roster.AccountLabel("codex2")),
               patch.object(herdr, "_process_sessions", wraps=PROCESS_SESSIONS) as scans):
@@ -3317,7 +3331,7 @@ class HerdrTests(unittest.TestCase):
         unreadable.joinpath("environ").mkdir()
         self.assertEqual(herdr.herdr_processes(), [herdr.HerdrProcess(12, herdr.HerdrPlace("fixture", "pane-1"), {"SHOWRUNNER_UNIT": "prod", "SHOWRUNNER_UNIT_ID": "unit"}, "claude", str(self.root))])
 
-    def test_ancestry_loop_and_vanished_cwd_are_skipped(self) -> None:
+    def test_ancestry_loop_is_skipped_and_vanished_cwd_keeps_placement(self) -> None:
         _ = self.process(10, 11, ["/bin/sh"], {"HERDR_PANE_ID": "pane-1"})
         _ = self.process(11, 10, ["/bin/sh"], {})
         self.assertEqual(herdr.herdr_place_of(10), herdr.NotInHerdr())
@@ -3326,7 +3340,10 @@ class HerdrTests(unittest.TestCase):
         self.socket_fd(server, 100)
         process = self.process(21, 20, ["/bin/sleep"], {"HERDR_PANE_ID": "pane-2"})
         process.joinpath("cwd").unlink()
-        self.assertEqual(herdr.herdr_processes(), [])
+        rows = herdr.herdr_processes()
+        self.assertEqual([(row.pid, row.place) for row in rows],
+                         [(21, herdr.HerdrPlace("default", "pane-2"))])
+        self.assertIsInstance(rows[0].working_directory, herdr.UnreadableCwd)
 
     def test_trust_ignores_inherited_git_repository_and_configuration(self) -> None:
         requested = self.root / "requested"

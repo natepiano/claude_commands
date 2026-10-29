@@ -24,7 +24,10 @@ with three actions: `plan`, `apply` and `verify`.
 
 apply works under the production lock in `unit_move`, which `rename.py` also takes. It saves the
 journal `rename_unit.json` before changing anything, and checks the showrunner checkout before
-each step. The preflight, each step's checks, and every step except stop, relaunch and verify
+each step. The journal omits the production doc and checkout paths: resume and verify resolve
+them through the current update timer, ignoring those fields in older journals. The unit's old
+and new worktree paths remain recorded because they describe the rename itself.
+The preflight, each step's checks, and every step except stop, relaunch and verify
 (`Step.locked`) run under the merge lock, `merge_checkpoint.merge_lock(checkout, slug)`: an flock
 on `<git common dir>/showrunner-merge-<slug>.lock`, which `merge_checkpoint.py` holds for a
 whole gate run, unit checkpoints and `--from-child` hand-offs alike. A rename that finds a gate
