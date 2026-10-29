@@ -24,6 +24,19 @@ FRONT = HOOK.with_suffix(".sh")
 CARGO_BUILDS = ("build", "b", "check", "c", "clippy", "test", "t", "nextest", "run", "r",
                 "bench", "doc", "d", "rustc", "rustdoc", "fix", "install", "mend", "miri")
 VERIFY_BUILDS = ("check", "lint", "build", "doc", "clippy")
+MERGE_GATE_COMMANDS = (
+    "python3 merge_gate.py --tests-only",
+    "/usr/bin/python3 scripts/production/merge_gate.py --promote-only",
+    "python3.13 -u '/work tree/merge_gate.py' --repo /repo",
+    "~/.claude/scripts/lib/py ~/.claude/scripts/production/merge_gate.py --repo /repo",
+    "scripts/lib/py scripts/production/merge_gate.py",
+    "./merge_gate.py --help",
+    "/any/path/merge_gate.py --tests-only",
+    '"/work tree/merge_gate.py" --promote-only',
+    "bash -lc 'python3 merge_gate.py --tests-only'",
+    "env CHECK=1 python3 -W ignore -X dev -- merge_gate.py --help",
+)
+MERGE_GATE_REFUSAL = REFUSAL + " The merge gate waits for the hold to end. Run it after the release."
 
 
 class TemporaryGuardTest(TemporaryHoldTest):
@@ -42,19 +55,85 @@ class TemporaryGuardTest(TemporaryHoldTest):
 
 
 class BuildHoldGuardTest(TemporaryGuardTest):
-    def run_hook(self, command: str, tool: str = "Bash", session: str = "caller") -> str:
-        payload = {"session_id": session, "tool_name": tool, "tool_input": {"command": command}}
+    def run_hook(self, command: str | list[str], tool: str = "Bash", session: str = "caller") -> str:
+        payload = {"session_id": session, "hook_event_name": "PreToolUse", "cwd": str(self.root),
+                   "tool_name": tool, "tool_input": {"command": command}}
         done = subprocess.run(["bash", str(FRONT)], input=json.dumps(payload),
                               capture_output=True, text=True, check=True,
                               env={**os.environ, "CLAUDE_PYTHON": sys.executable})
         return done.stdout
 
-    def assert_denied(self, command: str) -> None:
+    def assert_denied(self, command: str | list[str], reason: str = REFUSAL) -> None:
         response = cast(dict[str, dict[str, str]], json.loads(self.run_hook(command)))
         decision = response["hookSpecificOutput"]
         self.assertEqual(decision["hookEventName"], "PreToolUse", command)
         self.assertEqual(decision["permissionDecision"], "deny", command)
-        self.assertEqual(decision["permissionDecisionReason"], REFUSAL, command)
+        self.assertEqual(decision["permissionDecisionReason"], reason, command)
+
+    def codex_unit(self, owner: str, inherited_session: str) -> None:
+        run = self.root / "codex-run"
+        run.mkdir()
+        active = self.root / "active"
+        active.mkdir()
+        _ = (active / owner).write_text(str(run) + "\n")
+        os.environ.update({"UNIT_RUN_DIR": str(run), "UNIT_TEAM_ROLE": "impl",
+                           "CODEX_THREAD_ID": "codex-thread", "CLAUDE_CODE_SESSION_ID": inherited_session})
+
+    def test_codex_worker_of_sole_holder_uses_unit_marker(self) -> None:
+        self.hold()
+        self.codex_unit("other", "stale-session")
+        for command in (["cargo", "check"], ["/bin/bash", "-lc", "verify.sh check"],
+                        ["python3", "scripts/production/merge_gate.py", "--tests-only"]):
+            with self.subTest(command=command):
+                self.assertEqual(self.run_hook(command, session="codex-thread"), "")
+
+    def test_codex_worker_of_another_unit_is_refused(self) -> None:
+        self.hold()
+        # The marker must take priority even when the worker inherits the holder's id.
+        self.codex_unit("another-director", "other")
+        for command, reason in ((["cargo", "check"], REFUSAL),
+                                (["/bin/bash", "-lc", "verify.sh check"], REFUSAL),
+                                (["python3", "scripts/production/merge_gate.py", "--tests-only"], MERGE_GATE_REFUSAL)):
+            with self.subTest(command=command):
+                response = cast(dict[str, dict[str, str]], json.loads(self.run_hook(command, session="codex-thread")))
+                self.assertEqual(response, {"hookSpecificOutput": {
+                    "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}})
+        self.assertEqual(self.run_hook(["/bin/bash", "-lc", "verify.sh test"], session="codex-thread"), "")
+        self.assertEqual(self.run_hook(["printf", "%s", "cargo check"], session="codex-thread"), "")
+
+    def test_merge_gate_launch_forms_are_refused_during_another_hold(self) -> None:
+        self.hold()
+        for command in MERGE_GATE_COMMANDS:
+            with self.subTest(command=command):
+                self.assert_denied(command, MERGE_GATE_REFUSAL)
+
+    def test_merge_gate_launch_forms_are_allowed_without_a_hold(self) -> None:
+        for command in MERGE_GATE_COMMANDS:
+            with self.subTest(command=command):
+                self.assertEqual(self.run_hook(command), "", command)
+
+    def test_merge_gate_launch_forms_are_allowed_for_the_sole_holder(self) -> None:
+        self.hold("caller")
+        for command in MERGE_GATE_COMMANDS:
+            with self.subTest(command=command):
+                self.assertEqual(self.run_hook(command), "", command)
+
+    def test_merge_gate_mentions_are_allowed_during_a_hold(self) -> None:
+        self.hold()
+        for command in (
+            "echo 'python3 merge_gate.py --tests-only'",
+            "printf '%s' 'scripts/lib/py scripts/production/merge_gate.py'",
+            "rg 'merge_gate.py' scripts",
+            "cat <<'EOF' > notes.md\npython3 merge_gate.py --tests-only\nEOF\n",
+            "cat <<EOF > notes.md\n./merge_gate.py --promote-only\nEOF\n",
+            "python3 -c \"print('merge_gate.py')\"",
+            "python3 other.py merge_gate.py",
+            "python3 -W merge_gate.py other.py",
+            "python3 merge_gate.py.bak",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(self.run_hook(command), "", command)
+        self.assert_denied("echo 'merge_gate.py'; cargo build")
 
     def test_each_cargo_build_with_and_without_toolchain(self) -> None:
         self.hold()
@@ -104,6 +183,7 @@ class BuildHoldGuardTest(TemporaryGuardTest):
         self.assertEqual(self.run_hook("cargo build"), "")
         self.holders.mkdir()
         self.assertEqual(self.run_hook("verify.sh check"), "")
+        self.assertEqual(self.run_hook("python3 merge_gate.py --tests-only"), "")
 
     def test_holder_is_allowed(self) -> None:
         self.hold("caller")
@@ -129,6 +209,7 @@ class BuildHoldGuardTest(TemporaryGuardTest):
         self.assertFalse((self.holders / "other").exists())
         self.assertEqual(self.run_hook("cargo build"), "")
         self.assertEqual(self.run_hook("verify.sh check"), "")
+        self.assertEqual(self.run_hook("python3 merge_gate.py --tests-only"), "")
 
     def test_refusal_names_only_in_force_holders(self) -> None:
         self.hold()
@@ -143,9 +224,42 @@ class BuildHoldGuardTest(TemporaryGuardTest):
         self.releasing("released")
         self.assertEqual(self.run_hook("cargo build"), "")
 
-    def test_unreadable_state_is_allowed(self) -> None:
+    def test_unreadable_hold_directory_denies_builds_with_its_path(self) -> None:
         self.unreadable()
-        self.assertEqual(self.run_hook("cargo build"), "")
+        for command in ("cargo build", "python3 merge_gate.py --tests-only"):
+            response = cast(dict[str, dict[str, str]], json.loads(self.run_hook(command)))
+            decision = response["hookSpecificOutput"]
+            self.assertEqual(decision["permissionDecision"], "deny")
+            self.assertIn("natedev build hold decision cannot be read: NotADirectoryError:",
+                          decision["permissionDecisionReason"])
+            self.assertIn(str(self.holders), decision["permissionDecisionReason"])
+
+    def test_hold_reader_errors_and_other_decision_exceptions_deny_builds(self) -> None:
+        self.hold()
+        for exception, message, reason in (
+            ("HoldStateReadError", "holder record cannot be read\nread failed",
+             "natedev hold state cannot be read: holder record cannot be read read failed"),
+            ("RuntimeError", "cycle reader failed\nno decision",
+             "natedev build hold decision cannot be read: RuntimeError: cycle reader failed no decision"),
+        ):
+            with self.subTest(exception=exception):
+                driver = '''import runpy, sys
+from unittest import mock
+sys.path.insert(0, sys.argv[2])
+import hold_applies
+error = getattr(hold_applies, sys.argv[3]) if sys.argv[3] == "HoldStateReadError" else RuntimeError
+with mock.patch.object(hold_applies, "hold_applies", side_effect=error(sys.argv[4])):
+    runpy.run_path(sys.argv[1], run_name="__main__")
+'''
+                done = subprocess.run(
+                    [sys.executable, "-c", driver, str(HOOK), str(HOOK.parents[1] / "build_hold"), exception, message],
+                    input=json.dumps({"tool_name": "Bash", "tool_input": {"command": "cargo build"}}),
+                    capture_output=True, text=True, check=True,
+                )
+                response = cast(dict[str, dict[str, str]], json.loads(done.stdout))
+                self.assertEqual(response["hookSpecificOutput"], {
+                    "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason,
+                })
 
     def test_unreadable_release_state_is_allowed(self) -> None:
         self.hold("caller")
@@ -170,10 +284,13 @@ class BuildHoldGuardTest(TemporaryGuardTest):
             self.assertNotIn("import 'build_targets'", done.stderr)
             self.assertNotIn("import 'build_hold'", done.stderr)
 
-    def test_invalid_payload_is_allowed(self) -> None:
-        for raw in ("{", "null", '{"tool_name":"Bash","tool_input":{"command":null}}'):
+    def test_invalid_payload_denies_when_the_decision_cannot_be_read(self) -> None:
+        for raw in ("{", "null"):
             done = subprocess.run([sys.executable, str(HOOK)], input=raw, capture_output=True, text=True, check=True)
-            self.assertEqual(done.stdout, "")
+            response = cast(dict[str, dict[str, str]], json.loads(done.stdout))
+            self.assertEqual(response["hookSpecificOutput"]["permissionDecision"], "deny")
+            self.assertIn("natedev build hold decision cannot be read:",
+                          response["hookSpecificOutput"]["permissionDecisionReason"])
 
 
 class ShellFrontTest(TemporaryGuardTest):
@@ -212,10 +329,12 @@ exit "$GUARD_STATUS"
         self.assertFalse(self.calls.exists())
 
     def test_no_hold_starts_no_python(self) -> None:
-        raw = json.dumps({"tool_name": "Bash", "tool_input": {"command": "cargo build"}})
-        self.assert_no_python(raw)
-        self.holders.mkdir()
-        self.assert_no_python(raw)
+        for has_directory in (False, True):
+            if has_directory:
+                self.holders.mkdir()
+            for command in ("cargo build", "python3 merge_gate.py --tests-only"):
+                raw = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
+                self.assert_no_python(raw)
 
     def test_no_build_text_starts_no_python_during_hold(self) -> None:
         self.hold()
@@ -225,16 +344,22 @@ exit "$GUARD_STATUS"
         self.hold()
         os.environ["GUARD_OUTPUT"] = 'deny output\n'
         os.environ["GUARD_STATUS"] = "7"
-        for command in ("cargo build", "verify.sh check"):
+        for command in ("cargo build", "verify.sh check", "python3 merge_gate.py --tests-only"):
             for ending in ("", "\n\n"):
                 raw = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}}) + ending
                 done = self.run_front(raw)
                 self.assertEqual((done.returncode, done.stdout, done.stderr), (7, 'deny output\n', ""))
                 self.assertEqual(self.stdin_copy.read_text(), raw)
-        self.assertEqual(self.calls.read_text().splitlines(), ["called"] * 4)
+        self.assertEqual(self.calls.read_text().splitlines(), ["called"] * 6)
 
     def test_hidden_hold_entry_starts_python(self) -> None:
         self.hold(".holder")
+        done = self.run_front('cargo build')
+        self.assertEqual(done.returncode, 0)
+        self.assertTrue(self.calls.is_file())
+
+    def test_hold_path_that_is_not_a_directory_starts_the_decision_reader(self) -> None:
+        self.unreadable()
         done = self.run_front('cargo build')
         self.assertEqual(done.returncode, 0)
         self.assertTrue(self.calls.is_file())

@@ -1738,6 +1738,51 @@ print('two homes isolated; recorder lock retained; caller restored')
         environment.update(former or {})
         return invoke_recorder(self.valid_launch_arguments(arguments), environment, Path.cwd())
 
+    def test_starting_a_phase_reactivates_a_finished_run_without_replacing_its_workers(self) -> None:
+        for status in ("completed", "error"):
+            with self.subTest(status=status):
+                name = f"reactivate-{status}"
+                session_dir = self.start_run(name, 20_000)
+                roster = session_dir / "mesh_roster.json"
+                original = json.dumps({"unrelated-address": {
+                    "thread_id": "kept-thread", "role": "impl", "status": "paused",
+                    "model": "gpt-fixture-sol",
+                }})
+                _ = roster.write_text(original, encoding="utf-8")
+                _ = self.run_command("finish-run", "--session-dir", str(session_dir),
+                                     "--status", status, at=20_020)
+                active = self.root / "active"
+                active.mkdir(exist_ok=True)
+                marker = active / f"main-{name}"
+                with patch.dict(os.environ, {"UNIT_ACTIVE_DIR": str(active)}):
+                    _ = self.run_command(
+                        "start-phase", "--session-dir", str(session_dir),
+                        "--phase-id", "4", "--phase-title", "Resume the unit", at=20_030,
+                        claude_session=f"main-{name}",
+                    )
+                state = self.read_state(session_dir)
+                self.assertEqual(state["status"], "active")
+                self.assertNotIn("finished_at", state)
+                self.assertEqual(marker.read_text().strip(), str(session_dir))
+                self.assertEqual(roster.read_text(encoding="utf-8"), original)
+                events = self.read_events(name)
+                self.assertEqual(len([event for event in events
+                                     if event.get("event_type") == "reopened"]), 1)
+                self.assertEqual(events[-1]["event_type"], "phase_started")
+
+    def test_starting_the_same_phase_twice_records_only_one_run_reactivation(self) -> None:
+        session_dir = self.start_run("reactivate-once", 20_000)
+        _ = self.run_command("finish-run", "--session-dir", str(session_dir),
+                             "--status", "completed", at=20_020)
+        arguments = ("start-phase", "--session-dir", str(session_dir),
+                     "--phase-id", "4", "--phase-title", "Resume once")
+        with patch.dict(os.environ, {"UNIT_ACTIVE_DIR": str(self.root / "active")}):
+            _ = self.run_command(*arguments, at=20_030, claude_session="main-reactivate-once")
+            _ = self.run_command(*arguments, at=20_040, claude_session="main-reactivate-once")
+        events = self.read_events("reactivate-once")
+        self.assertEqual([event["event_type"] for event in events].count("reopened"), 1)
+        self.assertEqual([event["event_type"] for event in events].count("phase_started"), 1)
+
     def test_a_completed_phase_clears_its_enrolled_state_and_a_reopen_restores_it(self) -> None:
         session_dir = self.start_run("reopen", 20_000)
         start = ("start-phase", "--session-dir", str(session_dir), "--phase-id", "3", "--phase-title", "Retry handling")
