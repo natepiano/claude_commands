@@ -191,7 +191,9 @@ Own what a build may use and when it starts: memory admission and the memory que
 - Change-Review line: temp-clone builds and mend runs reuse the compile cache | in a terminal on natedev, `sccache --show-stats` before and after a second clone's build | the Rust hit count rises by the workspace crates of the second build.
 
 ### Phase 6 — A session can launch an app that is already built without waiting at the BRP launch gate  · status: todo
-**Depends on:** Phase 1
+**Depends on:** Phase 1. verify-unit's cancel-on-change and memory phases also change `verify.sh` and merge first. Merge `origin/builds` after they land. Before the checkpoint notice, trial-merge against `origin/natedev-verify-cancel`, `origin/natedev-verify-memory`, `origin/natedev-verify` and `origin/natedev-verify-token`. The notice names verify-unit in its also-touches line.
+
+**Ruling:** showrunner 2026-10-29 17:00 EDT: the hook decides from a build record that `verify.sh`'s build step writes.
 
 #### Work Order
 
@@ -199,18 +201,19 @@ Own what a build may use and when it starts: memory admission and the memory que
 
 **Spec:**
 
-1. **The hook decides from facts, not a claim.** For a `brp_launch_bevy_app` or `brp_launch_bevy_example` call, the hook finds the target's binary for the exact launch target and profile, and decides freshness without starting a compiler. `cargo build --offline` is still a build and is not allowed (Phase 3 architect review, F5): compare the binary's mtime with the newest input the fingerprint names. A fresh binary skips memory admission; a stale, missing or uncertain one keeps the current wait. The hook's build-hold check stays as it is.
+1. **The hook decides from a build record that the build wrote.** `scripts/direct/verify.sh`'s build step (only the build step) writes a record beside each binary it builds: the `rustc -vV` hash, profile, target, rustflags, features and the build start time. For a `brp_launch_bevy_app` or `brp_launch_bevy_example` call, the hook skips the memory wait only when the launch's inputs match the record AND every dep-info input time is older than the build start. The launch's path comes from `tool_input.path`. No path means the launch waits, because BRP searches from the MCP server's working directory. A missing record, a missing path or any difference means the launch waits. No compiler starts; `cargo build --offline` is still a build and is not allowed (Phase 3 architect review, F5). The hook's build-hold check stays as it is.
 2. **A session can also say so.** A launch call whose session set `BRP_LAUNCH_PREBUILT=1` (or the tool's own flag, if the BRP tool has one) skips admission only when item 1 confirms the binary is fresh; a stale binary still waits, and the hook prints why.
-3. **Tests** in `scripts/hooks/test_brp_launch_gate.py`: fresh binary skips the wait; stale, missing and uncertain binaries wait and start no compiler; the session flag with a stale binary waits; fake memory readings throughout (Phase 1 helper).
+3. **Tests** in `scripts/hooks/test_brp_launch_gate.py`: fresh binary skips the wait; stale, missing and uncertain binaries wait and start no compiler; the session flag with a stale binary waits; fake memory readings throughout (Phase 1 helper). Add a test of the record write in `verify.sh`'s build step with a fake cargo. Keep the suite fast: it grew to 100 s; the target is the old 55 s or less. The hook's probe stays under 1 s.
 
 **Files:**
 - `scripts/hooks/pre-tool-use-brp-launch-gate.sh` — items 1–2.
 - `scripts/hooks/test_brp_launch_gate.py` — item 3.
+- `scripts/direct/verify.sh` — the build-step record only (item 1; owner verify-unit).
+- `scripts/direct/test_verify_token_wait.py` — the record-write test (item 3); it holds the tests of `verify.sh`'s build step.
 - `docs/as-built/build-memory-admission.md` — the hook section. Phases 2 and 10 also edit this doc; the writer puts the section in the phase folder (`as_built_section.md`) and the director places it.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — items 1–2 and the doc section.
-- `test` — item 3.
+**Workers:** `1 writer`
+- `test` — items 1–3 and the doc section, this round (it holds the thread).
 
 **Acceptance gate:**
 - `test_brp_launch_gate.py` passes; the hook's added checks take under 1 s on a fresh hana binary.
@@ -294,26 +297,20 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 - Change-Review line: `/build:queue` shows the repository and the step in separate columns | in a Claude session on natedev while a build waits, type `/build:queue` | each row shows e.g. `hana` and `clippy` apart, and no row reads "hana clippy".
 
 ### Phase 9 — The floor sweep counts what a deletion really frees  · status: done
-**Depends on:** Phase 3
 
-#### Work Order
+#### As-built
 
-**Goal:** the floor sweep stops only when its deletions have covered the shortfall. Moved from Phase 3 by the hard-landing rule (closure review pass 3, 2026-10-29): it is new in repair round 3, it is not a regression that Phase 3 caused (the old locked pass had the same gap, because `ln` takes no cargo lock), it breaks nothing that worked, and no test fails. Its effect is small: one pass stops short, and the next step's sweep reads free space again.
-
-**Spec:**
-
-1. `scripts/lint/sweep.py`: `shrink_floor()` calls `freed_by()` after `remove()` has deleted the paths, but budget selection calls it before deletion through `choose()`. Separate the two: a typed reclamation estimate (before deletion, from the scan) and a confirmed deletion account (from link counts read with `lstat` just before each unlink). A file's blocks count as freed only when no other link remains. Links that the same pass removed earlier still count as removed, so the pass does not reject its own unlinks. Both callers use the same two types.
-2. Tests: after the scan, add a hard link from outside the target to one output file; the pass does not count that file's blocks and takes the next candidate until the shortfall is covered. Also: links removed earlier in the pass, a failed removal, and a dry run, through both callers. When no candidate covers the shortfall, the existing exhaustion alert still goes out; the busy-skip and exhaustion tests stay as gates.
+- `scripts/lint/sweep.py` keeps two typed counts apart. `ReclamationEstimate(bytes)` comes from the scan's link counts: `freed_by()` returns it, before any deletion. `ConfirmedDeletion(bytes, failures)` comes from the deletion: `remove()` returns it, summed from each unlink.
+- `remove_entry_at()` reads `os.lstat` just before each unlink. A file's blocks (`st_blocks * 512`) count as freed only when `st_nlink` is 1, so a file with a link outside the target frees nothing. A link that the same pass removed earlier has already lowered the count, so the last link still counts as freed. A failed or partial removal credits only the files it removed.
+- `reclaim(group, scan, remaining, dry_run)` returns the estimate on a dry run and the confirmed account on a real run. Both callers, `shrink()` (orphans and the budget pass) and `shrink_floor()`, use it and the same two types. A dry run deletes nothing and records nothing.
+- `choose()` is gone. `shrink()` and `shrink_floor()` take the next candidate in removal order and subtract the confirmed bytes, until the account covers the shortfall. When no candidate covers it, the exhaustion alert still goes out.
+- `remove_entry()` opens the parent with `O_DIRECTORY | O_NOFOLLOW`. The recursive delete walks with directory fds and checks each directory's identity with `os.path.samestat` before it opens it and again before `rmdir`. A path replaced by a symlink during the pass is not followed and not credited.
 
 **Files:**
-- `scripts/lint/sweep.py` — item 1.
-- `scripts/lint/test_sweep.py` — item 2.
+- `scripts/lint/sweep.py` — the two types, `reclaim`, `remove_entry`, `remove_entry_at`, and the loops in `shrink` and `shrink_floor`.
+- `scripts/lint/test_sweep.py` — tests for an outside link added after the scan, an earlier unlink in the same pass, a failed and a partial removal, the dry run, a directory swapped for a symlink, and the exhaustion alert when an outside link leaves the floor short.
 
-**Workers:** `1 writer`
-
-**Acceptance gate:**
-- `test_sweep.py` passes; `basedpyright` over both files reports `0 errors, 0 warnings, 0 notes`.
-- Change-Review line: the floor sweep stops only after it frees the shortfall | run the sweep tests: `python3 -m unittest discover -s scripts/lint -p test_sweep.py` | the outside-link test passes, and the pass takes the next candidate.
+**Binds later work:** Phase 4 extends this sweep; its deletions go through `reclaim` and credit only `ConfirmedDeletion` bytes. A new caller of the sweep uses the same two types and does not count from the scan on a real run.
 
 ### Phase 10 — Memory admission names the reservation a waiting step waits on  · status: done
 
@@ -334,7 +331,7 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 **Gotchas:** Releasing a measured reservation frees only its resident bytes. Its swap bytes stay part of the build charge but do not count as freed RAM.
 
 ### Phase 11 — Memory admission promises what each repository's steps really use  · status: todo
-**Depends on:** Phase 10 and Phase 12 (same file, `memory_admit.py`)
+**Depends on:** Phase 10 and Phase 12 (same file, `memory_admit.py`); verify-unit's Phase 4 (branch `natedev-verify-memory`). Start after that merge reaches `origin/builds`, and merge `origin/builds` first.
 
 **Approved:** showrunner 2026-10-29 (ETA 22:00 EDT, after Phase 12), from the widget wait study (07:09–11:43 EDT): a measured floor per repository for filtered test runs, and the promises that are 3x or more too high.
 
@@ -349,11 +346,11 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 
 **Spec:**
 
-1. Replay first: for every step in the 14-day history, compute the promise that today's `expected_peak` gives from the history before that step, and compare it to the step's measured anon peak. Report, per repository and step, the count of promises under half the measured peak and over 3x the measured peak. Save the table in the as-built doc. The replay runs again on the result: neither count rises for any repository, and each count falls in total.
+1. Replay first: for every step in the 14-day history, compute the promise that today's `expected_peak` gives from the history before that step, and compare it to the step's measured anon peak. Report, per repository and step, the count of promises under half the measured peak and over 3x the measured peak. Fresh runs (`crates_compiled` 0) and compile runs are separate rows. Save the table in the as-built doc. The replay runs again on the result: neither count rises for any repository, and each count falls in total.
 2. `expected_peak` (`scripts/lint/memory_admit.py`): when a repository has 5 or more keyed rows, use only keyed rows; old unkeyed rows count only when keyed rows are fewer than 5.
 3. A repository with 1 to 4 own runs does not take the all-repository pool p90. Use the largest of its own runs, or the pool when that is lower. A repository with no own runs keeps today's rule.
-4. Filtered runs: replace the single `FILTERED_FLOOR` with a floor per repository, from that repository's measured filtered runs that compiled (check or build work in the same step). Keep 1 GiB as the floor for a repository with no such runs. `expected_peak()` returns `min(filtered, full)` today, so a floor above the full-run estimate would not hold: the floor wins over that minimum, and a test covers a floor above the full estimate; the replay includes that case (Phase 3 architect review, F11). Comment each new constant with the measurement that set it, as the current constants are.
-5. Tests in `scripts/lint/test_memory_admit.py`: keyed rows win over unkeyed rows; 1–4 own runs do not take the pool; the per-repository filtered floor; each test fakes both memory readings.
+4. A promise does not mix compile runs and no-compile runs (showrunner 2026-10-29 17:11 EDT, from the user's rule). A compile run's promise comes only from earlier runs with `crates_compiled > 0`, in the same order as `filtered_peak` today: the exact filter set, then the package's filtered runs, then the check/build peaks. The 1 GiB floor stays only for fresh runs (`crates_compiled` 0) and for a repository with no compile history; do not raise the fresh floor. Fresh runs are verify Phase 4's: they get the p90 of earlier fresh runs of the same package and scope, at least `FILTERED_FLOOR`. `expected_peak()` returns `min(filtered, full)` today, so a compile-run promise above the full-run estimate would not hold: the compile-run promise wins over that minimum, and a test covers a promise above the full estimate; the replay includes that case (Phase 3 architect review, F11). Comment each new constant with the measurement that set it, as the current constants are.
+5. Tests in `scripts/lint/test_memory_admit.py`: keyed rows win over unkeyed rows; 1–4 own runs do not take the pool; a compile run's promise uses only compile runs; a fresh run gets the fresh-run p90, at least `FILTERED_FLOOR`; each test fakes both memory readings.
 6. Docs: `docs/as-built/build-memory-admission.md` gets the replay table before and after, and the new rules. The replay script lives in the session folder and is not committed.
 
 **Files:**
