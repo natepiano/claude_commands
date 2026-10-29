@@ -205,6 +205,7 @@ class ProductionRenameTests(unittest.TestCase):
         self.env.update({
             "UNIT_WORKERS_STATE": str(self.root / "state/unit-workers"),
             "RETIRE_UNIT_RUN_ROOT": str(self.root / "runs"),
+            "UNIT_RUN_ROOT": str(self.root / "runs"),
             "HOME": str(self.home), "CLAUDE_CONFIG_DIR": str(config),
             "XDG_CONFIG_HOME": str(self.home / ".config"),
             "XDG_STATE_HOME": str(self.root / "state"),
@@ -1068,6 +1069,107 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 self.assertFalse(workers.ledger_path(OLD, unit).exists())
                 with workers.UnitWorkerLedger(workers.ledger_path(NEW, unit)).locked() as ledger:
                     self.assertEqual(ledger.workers["w7"], worker)
+
+    def seed_paused_unit_worker(self) -> Path:
+        old = self.unit_worktree(OLD, "alpha-unit")
+        run = self.root / "runs/before-move"
+        self.write(run / workers.STATE, json.dumps({"status": "active", "working_dir": str(old),
+            "plan_doc": str(old / "docs/plans/alpha-unit.md"), "run_id": run.name}))
+        self.write(run / "working_dir", str(old))
+        with mock.patch.dict(os.environ, self.env):
+            store = workers.ledger_for_run(run)
+            worker = workers.UnitWorker("w7", "impl", "codex", "kept-model", "xhigh", {},
+                workers.CodexThread("kept-thread", str(self.root / "codex-home")), workers.Paused(),
+                [workers.WorkerEvent("opened", "before move", str(run), 1.0)])
+            with store.locked() as ledger:
+                ledger.workers["w7"] = worker
+        self.write(run / workers.ROSTER, json.dumps({"w7": {
+            "thread_id": "kept-thread", "codex_home": str(self.root / "codex-home"),
+            "role": "impl", "family": "codex", "model": "kept-model", "effort": "xhigh",
+            "status": "paused", "cwd": str(old / "subdir"), "unit_ledger": str(store.path)}}))
+        return run
+
+    def test_unit_move_repoints_paused_workers_and_the_next_run_adopts_them(self) -> None:
+        self.prepare_unit_moves()
+        run = self.seed_paused_unit_worker()
+        self.assert_success(self.run_rename("apply"))
+        self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
+        new = self.unit_worktree(NEW, "alpha-unit")
+        state = cast(dict[str, object], json.loads((run / workers.STATE).read_text()))
+        self.assertEqual((state["working_dir"], state["plan_doc"], state["production"], state["unit"]),
+                         (str(new), str(new / "docs/plans/alpha-unit.md"), NEW, "alpha-unit"))
+        roster = cast(dict[str, dict[str, object]], json.loads((run / workers.ROSTER).read_text()))
+        self.assertEqual((roster["w7"]["cwd"], roster["w7"]["status"]), (str(new / "subdir"), "paused"))
+        before = self.snapshot()
+        self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
+        self.assertEqual(self.snapshot(), before)
+        destination = self.root / "runs/after-move"
+        self.write(destination / workers.STATE, json.dumps({"status": "active", "working_dir": str(new),
+            "plan_doc": "docs/plans/alpha-unit.md", "run_id": destination.name}))
+        with mock.patch.dict(os.environ, self.env):
+            self.assertEqual(workers.adopt(run, destination, "w7"), "w7")
+            target = workers.ledger_for_run(destination)
+            self.assertEqual(target.path, workers.ledger_for_run(run).path)
+            with target.locked() as ledger:
+                self.assertEqual(ledger.workers["w7"].backend,
+                                 workers.CodexThread("kept-thread", str(self.root / "codex-home")))
+
+    def test_repair_workers_fixes_old_moves_and_dry_run_and_second_run_change_nothing(self) -> None:
+        self.prepare_unit_moves()
+        self.assert_success(self.run_rename("apply"))
+        self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
+        # Old code completed the worktree move without changing worker state.
+        run = self.seed_paused_unit_worker()
+        journal = self.journal()
+        record = cast(dict[str, dict[str, object]], journal["unit_moves"])["alpha-unit"]
+        _ = record.pop("workers_repointed")
+        self.write(self.state / "new/rename.json", json.dumps(journal))
+        before = self.snapshot()
+        preview = self.run_command("repair-workers", NEW, "--dry-run")
+        self.assert_success(preview)
+        self.assertIn("would change", preview.stdout)
+        self.assertEqual(self.snapshot(), before)
+        fixed = self.run_command("repair-workers", NEW)
+        self.assert_success(fixed)
+        self.assertIn("changed worker ledger", fixed.stdout)
+        self.assertIn("changed worker", fixed.stdout)
+        state = cast(dict[str, object], json.loads((run / workers.STATE).read_text()))
+        new = self.unit_worktree(NEW, "alpha-unit")
+        self.assertEqual((state["working_dir"], state["production"], state["unit"]),
+                         (str(new), NEW, "alpha-unit"))
+        before = self.snapshot()
+        again = self.run_command("repair-workers", NEW)
+        self.assert_success(again)
+        self.assertEqual(again.stdout, "alpha-unit: workers have nothing to change\n")
+        self.assertEqual(self.snapshot(), before)
+
+    def test_unit_retry_after_worker_writes_finishes_without_changing_workers_again(self) -> None:
+        self.prepare_unit_moves()
+        run = self.seed_paused_unit_worker()
+        self.assert_success(self.run_rename("apply"))
+        wrapper = '''import runpy, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[2]))
+from scripts.direct import workers
+repoint = workers.repoint_unit_worktree
+def interrupt(*args, **kwargs):
+    repoint(*args, **kwargs)
+    raise OSError("stop after worker writes")
+workers.repoint_unit_worktree = interrupt
+sys.argv = sys.argv[1:]
+sys.path.insert(0, str(Path(sys.argv[0]).resolve().parent))
+runpy.run_path(sys.argv[0], run_name="__main__")
+'''
+        stopped = self.run_command("unit", NEW, "alpha-unit", wrapper=wrapper)
+        self.assertNotEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertIn("stop after worker writes", stopped.stderr)
+        record = cast(dict[str, dict[str, object]], self.journal()["unit_moves"])["alpha-unit"]
+        self.assertEqual(record["step"], 2)
+        self.assertNotIn("workers_repointed", record)
+        before = {path: path.read_bytes() for path in run.rglob("*") if path.is_file()}
+        self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+        self.assert_unit_moved("alpha-unit")
 
     def test_held_roles_move_to_the_new_slug_with_the_showrunner_and_each_unit(self) -> None:
         self.prepare_unit_moves()
