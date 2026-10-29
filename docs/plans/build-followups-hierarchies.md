@@ -232,7 +232,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Binds later work:** a later push count or comparison calls `push_audit.audit()`; it never adds a second reader or rule. New session names go only in `sessions.toml`.
 
-### Phase 8 — The worker ownership report and the push audit open with what a person needs  · status: todo
+### Phase 8 — The worker ownership report and the push audit open with what a person needs  · status: done
 **Depends on:** Phases 5 and 7 (showrunner returns of C443, C446 and C447, 2026-10-29: runs next, as a small checkpoint after Phase 7).
 
 #### Work Order
