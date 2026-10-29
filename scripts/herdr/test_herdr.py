@@ -93,6 +93,7 @@ class WaitingAgentCLI:
 SCOPE_PROBE = ["--user", "--scope", "--quiet", "--collect", "--", "true"]
 REAL_SUBMIT_OPENING_PROMPT = herdr.Herdr.submit_opening_prompt
 REAL_LOAD_FACTOR = herdr.load_factor
+PROCESS_SESSIONS = herdr._process_sessions  # pyright: ignore[reportPrivateUsage]
 REQUIRE_SHARED = herdr._require_shared  # pyright: ignore[reportPrivateUsage]
 
 
@@ -3157,6 +3158,150 @@ class HerdrTests(unittest.TestCase):
         self.proc.joinpath("net", "unix").mkdir(parents=True)
         with self.assertRaisesRegex(herdr.HerdrFailure, "session fixture.*cannot read listening sockets"):
             _ = herdr.server_environment("fixture")
+
+    def test_process_snapshot_serves_roster_units_inventory_and_codex_from_one_scan(self) -> None:
+        from scripts.message import roster
+        from scripts.shutdown import inventory
+
+        server = self.process(10, 1, ["/fixture/herdr", "server"], {})
+        self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)
+        self.socket_fd(server, 100)
+        _ = self.process(12, 10, ["/bin/claude"], {
+            "HERDR_PANE_ID": "pane-unit", "SHOWRUNNER_UNIT": "production", "SHOWRUNNER_UNIT_ID": "unit",
+        })
+        _ = self.process(13, 10, ["/bin/codex"], {"HERDR_PANE_ID": "pane-codex"})
+        import unit_lookup as lookup
+
+        def current_slug(slug: str) -> str:
+            return slug
+        live = lookup.LiveClaude("Unit", "session-unit", "/fixture/socket", 12)
+        with (patch.object(herdr, "live_sessions", return_value=[{"name": "fixture"}]),
+              patch.object(herdr.Herdr, "agents", return_value=[{
+                  "agent": "codex", "pane_id": "pane-codex", "agent_status": "idle",
+              }]),
+              patch.object(lookup, "_claudes", return_value=(
+                  {herdr.HerdrPlace("fixture", "pane-unit"): live}, lookup.UnreadAt({}, lookup.RecordsRead()))),
+              patch.object(lookup, "_lookup_slug", side_effect=current_slug),
+              patch.object(roster, "_process_account", return_value=roster.AccountLabel("codex2")),
+              patch.object(herdr, "_process_sessions", wraps=PROCESS_SESSIONS) as scans):
+            def read_callers() -> tuple[object, object, object]:
+                return (roster._every_marked_unit(), inventory._unit_sessions((  # pyright: ignore[reportPrivateUsage]
+                    inventory.ShowrunnerRegistration("runner", "production", str(self.root / "production.md")),
+                )), roster._herdr_codex_panes("fixture"))  # pyright: ignore[reportPrivateUsage]
+
+            expected = read_callers()
+            self.assertEqual(scans.call_count, 3)
+            scans.reset_mock()
+            with herdr.process_snapshot():
+                observed = read_callers()
+            self.assertEqual(scans.call_count, 1)
+        self.assertEqual(observed, expected)
+        self.assertIn("session-unit", cast(dict[str, object], observed[1]))
+        self.assertEqual(cast(roster.Roster, observed[2]).entries[0].account, roster.AccountLabel("codex2"))
+
+    def test_process_reads_outside_scope_and_after_scope_exit_are_fresh(self) -> None:
+        with patch.object(herdr, "_process_sessions", wraps=PROCESS_SESSIONS) as scans:
+            self.assertEqual(herdr.herdr_processes(), [])
+            self.assertEqual(herdr.herdr_processes(), [])
+            self.assertEqual(scans.call_count, 2)
+            with herdr.process_snapshot():
+                self.assertEqual(herdr.herdr_processes(), [])
+                with herdr.process_snapshot():
+                    self.assertEqual(herdr.herdr_processes(), [])
+            self.assertEqual(scans.call_count, 3)
+            self.assertEqual(herdr.herdr_processes(), [])
+            with herdr.process_snapshot():
+                self.assertEqual(herdr.herdr_processes(), [])
+            self.assertEqual(scans.call_count, 5)
+
+    def test_process_snapshot_isolates_mutable_results_and_next_scope_sees_changes(self) -> None:
+        server = self.process(10, 1, ["/fixture/herdr", "server"], {})
+        self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)
+        self.socket_fd(server, 100)
+        process = self.process(12, 10, ["/bin/claude"], {"HERDR_PANE_ID": "pane-unit", "SHOWRUNNER_UNIT_ID": "first"})
+        with herdr.process_snapshot():
+            rows = herdr.herdr_processes()
+            expected = herdr.herdr_processes()
+            rows[0].marks["SHOWRUNNER_UNIT_ID"] = "caller change"
+            rows.clear()
+            _ = process.joinpath("environ").write_bytes(b"HERDR_PANE_ID=pane-unit\0SHOWRUNNER_UNIT_ID=second\0")
+            self.assertEqual(herdr.herdr_processes(), expected)
+        with herdr.process_snapshot():
+            self.assertEqual(herdr.herdr_processes()[0].marks["SHOWRUNNER_UNIT_ID"], "second")
+
+    def test_process_snapshot_does_not_change_scan_failure_or_retry(self) -> None:
+        with (patch.object(herdr, "_process_sessions", side_effect=[herdr.HerdrFailure("fixture scan failed"), {}]) as scans,
+              herdr.process_snapshot()):
+            with self.assertRaisesRegex(herdr.HerdrFailure, "fixture scan failed"):
+                _ = herdr.herdr_processes()
+            self.assertEqual(herdr.herdr_processes(), [])
+            self.assertEqual(herdr.herdr_processes(), [])
+            self.assertEqual(scans.call_count, 2)
+        with patch.object(herdr, "_proc_root", return_value=self.root / "missing") as roots:
+            with herdr.process_snapshot():
+                self.assertEqual(herdr.herdr_processes(), [])
+                self.assertEqual(herdr.herdr_processes(), [])
+            self.assertEqual(roots.call_count, 1)
+
+    def test_action_reads_retire_report_snapshots_and_ignore_nested_report_scopes(self) -> None:
+        with patch.object(herdr, "_process_sessions", wraps=PROCESS_SESSIONS) as scans:
+            with herdr.process_snapshot():
+                _ = herdr.herdr_processes()
+                _ = herdr.herdr_processes()
+                self.assertEqual(scans.call_count, 1)
+                with herdr.process_action():
+                    with herdr.process_snapshot():
+                        _ = herdr.herdr_processes()
+                        _ = herdr.herdr_processes()
+                self.assertEqual(scans.call_count, 3)
+                _ = herdr.herdr_processes()
+                self.assertEqual(scans.call_count, 4)
+
+    def test_action_retires_nested_snapshot_in_a_copied_context(self) -> None:
+        from contextvars import copy_context
+
+        with patch.object(herdr, "_process_sessions", wraps=PROCESS_SESSIONS) as scans:
+            with herdr.process_snapshot():
+                _ = herdr.herdr_processes()
+                copied = copy_context()
+                nested = herdr.process_snapshot()
+                copied.run(nested.__enter__)
+                try:
+                    _ = copied.run(herdr.herdr_processes)
+                    self.assertEqual(scans.call_count, 1)
+                    with herdr.process_action():
+                        _ = herdr.herdr_processes()
+                    _ = copied.run(herdr.herdr_processes)
+                    self.assertEqual(scans.call_count, 3)
+                finally:
+                    _ = copied.run(nested.__exit__, None, None, None)
+
+    def test_copied_context_scans_fresh_after_snapshot_scope_closes(self) -> None:
+        from contextvars import copy_context
+
+        with patch.object(herdr, "_process_sessions", wraps=PROCESS_SESSIONS) as scans:
+            with herdr.process_snapshot():
+                self.assertEqual(herdr.herdr_processes(), [])
+                copied = copy_context()
+                self.assertEqual(copied.run(herdr.herdr_processes), [])
+                self.assertEqual(scans.call_count, 1)
+            self.assertEqual(copied.run(herdr.herdr_processes), [])
+            self.assertEqual(scans.call_count, 2)
+
+    def test_process_snapshot_is_released_on_error_and_not_shared_with_another_thread(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with patch.object(herdr, "_process_sessions", wraps=PROCESS_SESSIONS) as scans:
+            with self.assertRaisesRegex(ValueError, "fixture scope failed"):
+                with herdr.process_snapshot():
+                    _ = herdr.herdr_processes()
+                    with ThreadPoolExecutor(max_workers=1) as pool:
+                        self.assertEqual(pool.submit(herdr.herdr_processes).result(), [])
+                    _ = herdr.herdr_processes()
+                    self.assertEqual(scans.call_count, 2)
+                    raise ValueError("fixture scope failed")
+            _ = herdr.herdr_processes()
+            self.assertEqual(scans.call_count, 3)
 
     def test_processes_skip_unreadable_and_limit_marks(self) -> None:
         server = self.process(10, 1, ["/fixture/herdr", "--session", "fixture", "server"], {})
