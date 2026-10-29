@@ -2399,6 +2399,233 @@ class StylePlanTests(unittest.TestCase):
             _ = connection.execute("INSERT OR IGNORE INTO sync_waits (unit,since,token) VALUES ('names-unit','2026-01-01T00:00:00+00:00','seed-wait')")
             connection.commit()
 
+    def waiting_ticket(self) -> tuple[style_ledger.Ledger, str, str]:
+        rule = self.rule("read")
+        self.sync()
+        ledger = self.ledger()
+        ledger.ticket_add("names-unit-1", "names-unit", "read", "names", "crates/alpha", [self.sources[0]], [rule])
+        ledger.ticket_assign("names-unit-1", "demo-style-names")
+        _ = ledger.ticket_base("names-unit-1")
+        _ = (self.unit / self.sources[0]).write_text("pub fn checkpoint_work() {}\n")
+        _ = self.git("add", self.sources[0], cwd=self.unit)
+        _ = self.git("commit", "-qm", "Waiting ticket", cwd=self.unit)
+        checkpoint = self.git("rev-parse", "HEAD", cwd=self.unit)
+        self.record(rule, self.sources[0], checkpoint, "names-unit-1")
+        ledger.ticket_checkpoint("names-unit-1", checkpoint)
+        return ledger, rule, checkpoint
+
+    def test_checkpoint_refill_disjoint_work_starts_at_the_waiting_checkpoint(self) -> None:
+        ledger, _, checkpoint = self.waiting_ticket()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-2\n", ""))
+        opened = ledger.ticket_open("names-unit")
+        self.assertEqual(len(opened), 2)
+        successor = next(ticket for ticket in opened if ticket["state"] == "assigned")
+        self.assertEqual(successor["base"], checkpoint)
+        self.assertNotIn(self.sources[0], successor["files"])
+        self.assertIn("names-unit-2", self.plan.read_text())
+        self.assertEqual(self.run_next(), (0, "resume names-unit-2\n", ""))
+        self.assertEqual(len(ledger.ticket_open("names-unit")), 2)
+
+    def test_checkpoint_refill_overlap_waits_names_files_and_keeps_the_queue(self) -> None:
+        ledger, rule, checkpoint = self.waiting_ticket()
+        ledger.ticket_add("names-unit-2", "names-unit", "read", "names", "crates/alpha", [self.sources[0]], [rule])
+        before = self.plan.read_bytes()
+        self.assertEqual(self.run_next(), (
+            5, f"waiting for merge: names-unit-1 checkpointed at {checkpoint[:7]}; overlap: {self.sources[0]}\n", ""))
+        self.assertEqual(self.plan.read_bytes(), before)
+        self.assertEqual([ticket["id"] for ticket in ledger.queued_tickets("names-unit")], ["names-unit-2"])
+
+    def test_checkpoint_refill_unknown_footprint_keeps_the_wait(self) -> None:
+        ledger, _, _ = self.waiting_ticket()
+        before = self.plan.read_bytes()
+        with mock.patch.object(style_plan.EditedFiles, "of_ticket", side_effect=style_ledger.LedgerError("unreadable")):
+            code, output, error = self.run_next()
+        self.assertEqual((code, error), (5, ""))
+        self.assertIn("footprint unknown: unreadable", output)
+        self.assertEqual(len(ledger.ticket_open("names-unit")), 1)
+        self.assertEqual(self.plan.read_bytes(), before)
+
+    def test_checkpoint_refill_unreadable_checkpoint_or_moved_branch_waits(self) -> None:
+        ledger, _, checkpoint = self.waiting_ticket()
+        for bad in ("0" * 40, self.tip):
+            with self.subTest(checkpoint=bad), closing(sqlite3.connect(ledger.database)) as connection:
+                _ = connection.execute("UPDATE tickets SET checkpoint=? WHERE id='names-unit-1'", (bad,))
+                connection.commit()
+                code, output, _ = self.run_next()
+                self.assertEqual(code, 5)
+                self.assertIn("footprint unknown:", output)
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE tickets SET checkpoint=? WHERE id='names-unit-1'", (checkpoint,))
+        self.assertEqual(len(ledger.ticket_open("names-unit")), 1)
+
+    def test_checkpoint_refill_waiting_rename_protects_reference_and_new_paths(self) -> None:
+        rule = self.rule("read")
+        old, new = "crates/alpha/src/probe.rs", "crates/alpha/src/frame_log.rs"
+        reference = "crates/alpha/src/render.rs"
+        issue = self.file_rename_decision(rule, ((old, "Rename probe.rs to frame_log.rs"),))
+        ledger = self.ledger()
+        finding = ledger.proposal_findings(issue)[0]
+        ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "crates/alpha", [old], [rule],
+                          proposal=str(issue), finding_ids=(finding.finding_id,))
+        ledger.ticket_assign("names-unit-1", "demo-style-names")
+        _ = ledger.ticket_base("names-unit-1")
+        _ = self.git("mv", old, new, cwd=self.unit)
+        for path in ("crates/alpha/src/lib.rs", reference):
+            source = self.unit / path
+            _ = source.write_text(source.read_text().replace("probe", "frame_log"))
+        _ = self.git("add", "--all", cwd=self.unit)
+        _ = self.git("commit", "-qm", "Rename waiting for merge", cwd=self.unit)
+        checkpoint = self.git("rev-parse", "HEAD", cwd=self.unit)
+        ledger.ticket_checkpoint("names-unit-1", checkpoint)
+        for number, path in enumerate((reference, new), 2):
+            with self.subTest(path=path):
+                ticket = f"names-unit-{number}"
+                ledger.ticket_add(ticket, "names-unit", "read", "names", "crates/alpha", [path], [rule])
+                code, output, error = self.run_next()
+                self.assertEqual((code, error), (5, ""))
+                self.assertIn("overlap: " + path, output)
+                self.assertEqual(len(ledger.ticket_open("names-unit")), 1)
+                ledger.ticket_drop(ticket)
+
+    def test_checkpoint_refill_stops_after_the_successor_checkpoints(self) -> None:
+        ledger, rule, _ = self.waiting_ticket()
+        self.assertEqual(self.run_next()[0], 0)
+        successor = next(ticket for ticket in ledger.ticket_open("names-unit") if ticket["state"] == "assigned")
+        checkpoint = self.git("rev-parse", "HEAD", cwd=self.unit)
+        for path in successor["files"]:
+            self.record(rule, path, checkpoint, successor["id"])
+        ledger.ticket_checkpoint(successor["id"], checkpoint)
+        code, output, error = self.run_next()
+        self.assertEqual((code, error), (5, ""))
+        self.assertIn("two open tickets", output)
+        self.assertEqual(self.count_tickets(), 2)
+
+    def test_checkpoint_refill_unknown_selected_footprint_waits_without_assignment(self) -> None:
+        ledger, _, _ = self.waiting_ticket()
+        with mock.patch.object(style_plan.WaitingCheckpoint, "check", side_effect=style_ledger.LedgerError("selected unreadable")):
+            code, output, error = self.run_next()
+        self.assertEqual((code, error), (5, ""))
+        self.assertIn("footprint unknown: selected unreadable", output)
+        self.assertEqual(len(ledger.ticket_open("names-unit")), 1)
+
+    def test_checkpoint_refill_build_inputs_and_rename_paths_block_symmetrically(self) -> None:
+        work = style_plan.WaitingCheckpoint("names-unit-1", self.tip, frozenset({self.sources[0]}),
+                                           ("crates/alpha", "crates/beta"))
+        for path in (self.sources[0], "crates/alpha/Cargo.toml", "crates/alpha/build.rs", "Cargo.toml", "Cargo.lock"):
+            with self.subTest(path=path):
+                self.assertIsInstance(work.check((path,)), style_plan.WaitingForMerge)
+                reverse = style_plan.WaitingCheckpoint("names-unit-1", self.tip, frozenset({path}), work.crates)
+                self.assertIsInstance(reverse.check((self.sources[0],)), style_plan.WaitingForMerge)
+        self.assertIsInstance(work.check((self.sources[1],)), style_plan.NoCheckpointBlock)
+        self.assertIsInstance(work.check((self.sources[2],)), style_plan.NoCheckpointBlock)
+        with self.assertRaisesRegex(style_ledger.LedgerError, "unknown crate"):
+            _ = work.check(("unknown/file.rs",))
+
+    def waiting_proposal_pair(self, kind: style_ledger.FindingKind = "type") -> tuple[style_ledger.Ledger, str, str]:
+        """A waiting proposal and a queued proposal whose approved paths are disjoint."""
+        rule = self.rule("read")
+        self.sync()
+        issue = self.approved_decision(rule, self.sources[:2], kind)
+        ledger = self.ledger()
+        findings = {finding.path: finding.finding_id for finding in ledger.proposal_findings(issue)}
+        for number, path in enumerate(self.sources[:2], 1):
+            ledger.ticket_add(f"names-unit-{number}", "names-unit", "proposal", "names", "crates/alpha", [path], [rule],
+                              proposal=str(issue), finding_ids=(findings[path],))
+        ledger.ticket_assign("names-unit-1", "demo-style-names")
+        _ = ledger.ticket_base("names-unit-1")
+        _ = (self.unit / self.sources[0]).write_text("pub fn checkpoint_work() {}\n")
+        _ = self.git("add", self.sources[0], cwd=self.unit)
+        _ = self.git("commit", "-qm", "Waiting proposal", cwd=self.unit)
+        checkpoint = self.git("rev-parse", "HEAD", cwd=self.unit)
+        ledger.ticket_checkpoint("names-unit-1", checkpoint)
+        return ledger, rule, checkpoint
+
+    def widen_for_pipeline(self, ticket: str, path: str) -> None:
+        with redirect_stdout(io.StringIO()):
+            style_plan.widen(self.repo, ticket, (path,), "reference needed", "showrunner")
+
+    def test_pipeline_growth_during_refill_rechecks_before_assignment(self) -> None:
+        ledger, _, _ = self.waiting_proposal_pair()
+        assign = style_ledger.Ledger.ticket_assign
+
+        def widen_then_assign(current: style_ledger.Ledger, ticket: str, branch: str) -> None:
+            self.widen_for_pipeline("names-unit-1", self.sources[1])
+            assign(current, ticket, branch)
+
+        before = self.plan.read_bytes()
+        with mock.patch.object(style_ledger.Ledger, "ticket_assign", new=widen_then_assign):
+            code, output, error = self.run_next()
+        self.assertEqual((code, error), (5, ""), output)
+        self.assertIn("overlap: " + self.sources[1], output)
+        self.assertEqual(self.plan.read_bytes(), before)
+        self.assertEqual([ticket["id"] for ticket in ledger.ticket_open("names-unit")], ["names-unit-1"])
+        self.assertEqual([ticket["id"] for ticket in ledger.queued_tickets("names-unit")], ["names-unit-2"])
+
+    def test_pipeline_growth_widen_on_either_ticket_is_atomic(self) -> None:
+        ledger, _, _ = self.waiting_proposal_pair()
+        ledger.ticket_assign("names-unit-2", "demo-style-names")
+        for ticket, path in (("names-unit-1", self.sources[1]), ("names-unit-2", self.sources[0])):
+            with self.subTest(ticket=ticket), self.assertRaisesRegex(style_ledger.LedgerError, "overlap: " + path):
+                self.widen_for_pipeline(ticket, path)
+            self.assertEqual(next(item for item in ledger.ticket_open("names-unit") if item["id"] == ticket)["widened"], ())
+        self.widen_for_pipeline("names-unit-2", self.sources[2])
+        self.assertEqual(self.run_next(), (0, "resume names-unit-2\n", ""))
+
+    def test_pipeline_growth_resume_refuses_legacy_overlap_and_unknown_footprints(self) -> None:
+        ledger, _, _ = self.waiting_proposal_pair()
+        ledger.ticket_assign("names-unit-2", "demo-style-names")
+        before = self.plan.read_bytes()
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("INSERT INTO ticket_widened_paths VALUES (?,?,?,?,?)",
+                                   ("names-unit-1", self.sources[1], "legacy widen", "showrunner", "now"))
+        code, output, error = self.run_next()
+        self.assertEqual((code, error), (5, ""))
+        self.assertIn("overlap: " + self.sources[1], output)
+        self.assertEqual(self.plan.read_bytes(), before)
+        with mock.patch.object(style_ledger.Ledger, "_pipeline_footprint", side_effect=style_ledger.LedgerError("unreadable")):
+            code, output, error = self.run_next()
+        self.assertEqual((code, error), (5, ""))
+        self.assertIn("unreadable", output)
+        self.assertEqual(self.plan.read_bytes(), before)
+
+    def test_pipeline_growth_checkpoint_rechecks_actual_changes(self) -> None:
+        ledger, rule, _ = self.waiting_ticket()
+        ledger.ticket_add("names-unit-2", "names-unit", "read", "names", "crates/alpha", [self.sources[1]], [rule])
+        ledger.ticket_assign("names-unit-2", "demo-style-names")
+        _ = (self.unit / self.sources[0]).write_text("pub fn overlapping_work() {}\n")
+        _ = self.git("add", self.sources[0], cwd=self.unit)
+        _ = self.git("commit", "-qm", "Unplanned overlapping edit", cwd=self.unit)
+        checkpoint = self.git("rev-parse", "HEAD", cwd=self.unit)
+        self.record(rule, self.sources[1], checkpoint, "names-unit-2")
+        with self.assertRaisesRegex(style_ledger.LedgerError, "overlap: " + self.sources[0]):
+            ledger.ticket_checkpoint("names-unit-2", checkpoint)
+        self.assertEqual(next(ticket for ticket in ledger.ticket_open("names-unit")
+                              if ticket["id"] == "names-unit-2")["state"], "assigned")
+
+    def test_pipeline_growth_new_reference_at_a_later_tip_is_rechecked(self) -> None:
+        ledger, _, _ = self.waiting_proposal_pair("rename")
+        ledger.ticket_assign("names-unit-2", "demo-style-names")
+        self.write(self.sources[1], "fn added_reference() { Outcome::Old; }\n")
+        later = self.commit()
+        previous = ledger.synced_commit()
+        with self.assertRaisesRegex(style_ledger.LedgerError, "overlap: " + self.sources[1]):
+            ledger.set_tip(later)
+        self.assertEqual(ledger.synced_commit(), previous)
+
+    def test_pipeline_growth_follow_rechecks_and_rolls_back_the_moved_finding(self) -> None:
+        ledger, _, _ = self.waiting_proposal_pair()
+        ledger.ticket_assign("names-unit-2", "demo-style-names")
+        origin = ledger.ticket_origin("names-unit-1")
+        assert isinstance(origin, style_ledger.ApprovedProposal)
+        finding = ledger.named_held(origin.finding_ids)[0]
+        tip = ledger.synced_commit()
+        reading = style_ledger.DeclarationReading(tip, (
+            style_ledger.FindingSite(finding, style_ledger.UnchangedSite(self.sources[1], 1)),))
+        with (mock.patch.object(style_ledger.Ledger, "_declaration_reading", return_value=reading),
+              self.assertRaisesRegex(style_ledger.LedgerError, "overlap: " + self.sources[1])):
+            _ = ledger.follow_declarations(origin.finding_ids, tip, lambda _: True)
+        self.assertEqual(ledger.named_held(origin.finding_ids)[0], finding)
+
     def test_refill_holds_the_selected_ticket_when_main_touches_its_file(self) -> None:
         _ = self.rule("read")
         self.sync()
@@ -2819,7 +3046,9 @@ class StylePlanTests(unittest.TestCase):
                 self.record(rule, path, self.tip, ticket["id"])
         self.ledger().ticket_checkpoint(ticket["id"], self.tip)
         self.seed_sync_wait()
-        self.assertEqual(self.run_next()[0], 5)
+        # Disjoint work now refills; block it here to retain the merge-wait preservation case.
+        with mock.patch.object(berth_board, "read_board", return_value=self.board(*self.sources)):
+            self.assertEqual(self.run_next()[0], 5)
         self.assertEqual(self.sync_wait_rows(), expected)
 
     def test_legacy_only_waits_with_action_and_mixed_catalog_selects_only_classified_rules(self) -> None:
@@ -5878,7 +6107,8 @@ class StylePlanTests(unittest.TestCase):
                         for path in ticket["files"]:
                             self.record(rule, path, self.tip, ticket["id"])
                     ledger.ticket_checkpoint("names-unit-2", self.tip)
-                with mock.patch.object(berth_board, "read_board", side_effect=AssertionError("board read")):
+                with mock.patch.object(berth_board, "read_board", return_value=self.board(*self.sources),
+                                       side_effect=AssertionError("board read on resume") if state == "assigned" else None):
                     code, output, errors = self.run_next()
                 self.assertEqual((code, errors), (0 if state == "assigned" else 5, ""))
                 self.assertIn("discarded names-unit-1: dropped\n", output)
@@ -5926,8 +6156,9 @@ class StylePlanTests(unittest.TestCase):
                 self.record(rule, path, self.tip, ticket["id"])
         ledger.ticket_checkpoint(ticket["id"], self.tip)
         before = self.plan.read_bytes()
-        with mock.patch.object(berth_board, "read_board", side_effect=AssertionError("board read")):
-            self.assertEqual(self.run_next(), (5, f"waiting for merge: names-unit-1 checkpointed at {self.tip[:7]}\n", ""))
+        with mock.patch.object(berth_board, "read_board", return_value=self.board(*self.sources)):
+            self.assertEqual(self.run_next(), (
+                5, f"waiting for merge: names-unit-1 checkpointed at {self.tip[:7]}; no disjoint ticket available\n", ""))
         self.assertEqual(self.plan.read_bytes(), before)
         _ = ledger.ticket_merge(ticket["id"])
         code, output, errors = self.run_next()
