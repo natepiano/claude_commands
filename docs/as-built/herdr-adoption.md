@@ -157,7 +157,7 @@ Marks are `SHOWRUNNER_UNIT` (production slug) and `SHOWRUNNER_UNIT_ID` (unit). T
 
 - It picks the account with `accounts.account_for_group_launch("unit", ...)`, checks it with `accounts.check`, and takes the launch barrier and permission (`RecordedSessionRestoreLaunchPurpose` for a restore). Then it runs `preflight`.
 - Every `--resume`, including restores, refuses in `preflight` before any stub, Units row, commit, worktree or tab is written when the shared session registry identifies a running session (naming its pid), or when registry or process identity is unreadable (naming the reason).
-- A plain `--resume` of a retired Units row continues its transcript without requiring a Production header in the row’s plan document, so a condensed as-built remains usable; this exception does not apply to new units, attaches or active rows.
+- A plain `--resume` of an existing Units row, active or retired, continues its transcript without requiring a Production header in the row’s own plan document, so a condensed as-built remains usable; new units and attaches still require the header, and a resume with a different plan still refuses.
 - A plain `--resume` of a retired Units row may use `--cwd` outside its worktree: the raw Plan cell supplies the retired state, the row keeps its worktree and branch, and the launch creates neither and leaves the row for resume_unit to unmark; other cwd mismatches retain their refusal.
 - On a resume of a marked unit, `ClaudeUnknown` refuses, and `ClaudeNotRunning` closes that place's tab with `close_agent` before the relaunch.
 - A restore records its prompt as scheduled (`record_scheduled_restore_prompt`). The resumed model is the transcript's last real assistant model unless `--model` is given.
