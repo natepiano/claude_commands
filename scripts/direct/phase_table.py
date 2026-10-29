@@ -12,6 +12,8 @@ import statistics
 import subprocess
 import sys
 import tempfile
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -27,9 +29,8 @@ sys.path.insert(0, str(PRODUCTION_SCRIPTS))
 from scripts.direct import plan_history
 from scripts.lib.user_zone import user_zone
 from scripts.production import showrunners, unit_lookup
-from scripts.production.add_unit import Production, read_production
-from production_units import Refusal, cell_value, live_unit_table
-from scripts.production.merge_checkpoint import PromoteTo, promotion_from_doc
+from production_units import Production, Refusal, cell_value, live_unit_table, read_production
+from scripts.production.production_doc import PromoteTo, promotion_from_doc
 
 # The finding_opened event schema uses these severities. Importing findings to
 # read its SEVERITIES also validates command-only convergence configuration.
@@ -1822,35 +1823,50 @@ def _ensure_showrunners_excluded(vault_root: Path) -> None:
         raise Refusal(f"cannot update {exclude}: {error}") from error
 
 
+@contextmanager
+def _phase_note_lock(folder: Path) -> Generator[None]:
+    """Hold the folder lock while checking and writing a phase note."""
+    descriptor = os.open(folder, os.O_RDONLY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
 def _write_note(target: Path, content: str, ownership: NoteOwnership) -> None:
-    target_existed = target.exists()
-    if target_existed and _note_ownership(target) != ownership:
-        raise Refusal(
-            "phase note target is not owned by "
-            + f"{ownership.production}/{ownership.unit}: {target}"
-        )
     temporary: Path | None = None
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=target.parent,
-            prefix=f".{target.name}.",
-            delete=False,
-        ) as handle:
-            _ = handle.write(content)
-            os.fchmod(handle.fileno(), 0o644)
-            temporary = Path(handle.name)
-        if target_existed:
-            os.replace(temporary, target)
-        else:
-            try:
-                os.link(temporary, target)
-            except FileExistsError as error:
+        with _phase_note_lock(target.parent):
+            target_existed = target.exists()
+            if target_existed and _note_ownership(target) != ownership:
                 raise Refusal(
-                    f"phase note appeared before publication: {target}"
-                ) from error
+                    "phase note target is not owned by "
+                    + f"{ownership.production}/{ownership.unit}: {target}"
+                )
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=target.parent,
+                prefix=f".{target.name}.",
+                delete=False,
+            ) as handle:
+                _ = handle.write(content)
+                os.fchmod(handle.fileno(), 0o644)
+                temporary = Path(handle.name)
+            if target_existed:
+                os.replace(temporary, target)
+            else:
+                try:
+                    os.link(temporary, target)
+                except FileExistsError as error:
+                    raise Refusal(
+                        f"phase note appeared before publication: {target}"
+                    ) from error
     except OSError as error:
         raise Refusal(f"cannot write phase note {target}: {error}") from error
     finally:
@@ -1882,6 +1898,56 @@ def _vault_root() -> Path:
         os.environ.get("PHASE_TABLE_VAULT")
         or Path.home() / "rust" / "hanadocs" / "showrunners"
     ).expanduser()
+
+
+def retarget_phase_notes(old_slug: str, new_doc: Path) -> list[Path]:
+    """Point each phase note owned by the old production at the new doc."""
+    vault_root = _vault_root()
+    if not vault_root.exists():
+        return []
+    production_file = _production_file_link(new_doc, vault_root.parent)
+    field = f"production_file: {json.dumps(production_file, ensure_ascii=False)}".encode("utf-8")
+    rewritten: list[Path] = []
+    for path in sorted(vault_root.glob("*/*.md")):
+        temporary: Path | None = None
+        try:
+            with _phase_note_lock(path.parent):
+                ownership = _note_ownership(path)
+                if not isinstance(ownership, NoteOwnership) or ownership.production != old_slug:
+                    continue
+                before = path.read_bytes()
+                lines = before.splitlines(keepends=True)
+                end = next(index for index in range(1, len(lines)) if lines[index].rstrip(b"\r\n") == b"---")
+                header: list[bytes] = [lines[0]]
+                has_link = False
+                for line in lines[1:end]:
+                    key, separator, _ = line.partition(b":")
+                    if separator and key.strip() == b"production":
+                        continue
+                    if separator and key.strip() == b"production_file":
+                        newline = line[len(line.rstrip(b"\r\n")):]
+                        line = field + newline
+                        has_link = True
+                    header.append(line)
+                if not has_link:
+                    header.append(field + lines[0][3:])
+                after = b"".join((*header, *lines[end:]))
+                if after == before:
+                    continue
+                with tempfile.NamedTemporaryFile(
+                    "wb", dir=path.parent, prefix=f".{path.name}.", delete=False
+                ) as handle:
+                    temporary = Path(handle.name)
+                    _ = handle.write(after)
+                    os.fchmod(handle.fileno(), path.stat().st_mode & 0o7777)
+                os.replace(temporary, path)
+                rewritten.append(path)
+        except OSError as error:
+            raise Refusal(f"cannot repair phase note {path}: {error}") from error
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+    return rewritten
 
 
 def _archive_note(candidate: Path, vault_root: Path, slug: str) -> Path:

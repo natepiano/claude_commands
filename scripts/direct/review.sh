@@ -189,6 +189,7 @@ BEAT_TAG="${SUBTASK}${LENS:+:${LENS}}"
 # leaving the variable unset instead would let an inherited one decide it, which
 # is how a lone reviewer ends up closing a live worker's pass.
 export UNIT_TEAM_ROLE="${TEAM_SLOT}"
+export UNIT_RUN_DIR="${SESSION_DIR}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${FOLLOW_TO}" ]]; then
@@ -201,7 +202,7 @@ fi
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
-# repo needs >= 3.10.
+# repo needs >= 3.11.
 PY="${SCRIPT_DIR}/../lib/py"
 POOL_HELPER="${SCRIPT_DIR}/review_pool.py"
 MESH_SESSION_DIR="${SESSION_DIR}"

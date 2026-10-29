@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.direct import phase_table
 from scripts.direct.recorder_fixture import invoke_recorder
+from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import fake_showrunner, fake_unit_host, showrunners
 
 
@@ -364,7 +365,7 @@ class PhaseTableTests(unittest.TestCase):
         pid = fake_unit_host.live_pid(self)
         fake_unit_host.place_process(self.environment(), pid, "w1:p1")
         self.live_record_number += 1
-        socket_path = self.root / f"live-{self.live_record_number}.sock"
+        socket_path = Path(self.enterContext(short_socket_directory())) / f"live-{self.live_record_number}.sock"
         held = socket.socket(socket.AF_UNIX)
         held.bind(str(socket_path))
         self.addCleanup(held.close)
@@ -2102,6 +2103,54 @@ class PhaseTableTests(unittest.TestCase):
         self.assertEqual(check, phase_table.CouldStart(("5",)))
         self.assertEqual(phase_table.parallel_line(check), "Parallel: Phase 5 could start")
 
+    def test_parallel_ignores_the_date_and_time_after_a_phase_reference(self) -> None:
+        self.parallel_plan(
+            "### Phase 2 — Parser  · status: todo",
+            "**Depends on:** Phase 1",
+            "### Phase 3 — Notice  · status: todo",
+            "**Depends on:** Phase 1",
+            "### Phase 4 — Resources  · status: todo",
+            "**Depends on:** Phase 1 (resources-unit waits until 2026-10-29 00:00)",
+        )
+
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "parallel", "--session-dir", str(self.session_dir)],
+            env=self.environment(1_100),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertEqual(result.stdout, "Parallel: Phase 4 could start\n")
+        self.assertEqual(result.stderr, "")
+
+    def test_parallel_waits_for_a_running_dependency_followed_by_a_period(self) -> None:
+        self.write_plan(plan_text(
+            "### Phase 7 — Parser  · status: todo",
+            "**Depends on:** none",
+            "### Phase 8 — Report  · status: todo",
+            "**Depends on:** Phase 7.",
+        ))
+        _ = self.write_run(
+            "current",
+            900,
+            self.phase_event("phase_started", "7", "seven", 1_000, phase_title="Parser"),
+        )
+        self.write_state(None)
+
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "parallel", "--session-dir", str(self.session_dir)],
+            env=self.environment(1_100),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertEqual(result.stdout, "Parallel: none — Phase 8 needs Phase 7 (running)\n")
+        self.assertEqual(result.stderr, "")
+
     def test_parallel_none_names_what_the_first_waiting_phase_needs(self) -> None:
         self.parallel_plan(
             "### Phase 2 — Parser  · status: todo",
@@ -3243,6 +3292,18 @@ class PhaseTableTests(unittest.TestCase):
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
         self.assertFalse(self.vault_root.exists())
 
+    def test_show_missing_production_document_is_one_line_refusal(self) -> None:
+        production = self.working_dir / "docs" / "missing-production.md"
+
+        result = self.run_show_production(production)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertTrue(result.stderr.startswith("cannot read production doc: "))
+        self.assertIn(str(production), result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_invalid_production_document_is_one_line_refusal(self) -> None:
         self.write_production_plan()
         production = self.working_dir / "docs" / "show-production.md"
@@ -3496,6 +3557,10 @@ class PhaseTableTests(unittest.TestCase):
         )
         fake_unit_host.write(self.environment(), [fake_unit_host.HostedUnit(
             "table-host", "w1:p1", {"SHOWRUNNER_UNIT": "other", "SHOWRUNNER_UNIT_ID": "table-unit"})])
+        live_record = cast(dict[str, object], json.loads(
+            (self.sessions_dir / f"record-{self.live_record_number}.json").read_text(encoding="utf-8")
+        ))
+        fake_unit_host.place_process(self.environment(), cast(int, live_record["pid"]), "w1:p1")
         session_id = "other-showrunner"
         _ = fake_showrunner.write_timer(
             self.notifier_dir,

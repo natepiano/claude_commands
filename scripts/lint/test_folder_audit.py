@@ -6,19 +6,23 @@ the tmp sweep owns empty temp folders."""
 from __future__ import annotations
 
 import os
-import shutil
 import socket
 import subprocess
-import tempfile
 import time
 import unittest
 from pathlib import Path
-from typing import override
+from typing import TYPE_CHECKING, override
 
 import unittest.mock
 
+if TYPE_CHECKING:
+    from ..lib.socket_test_support import short_socket_directory
+else:
+    from scripts.lib.socket_test_support import short_socket_directory
+
 import folder_audit
 import scratch
+import tmp_sweep
 
 DAY = 86_400
 
@@ -59,8 +63,7 @@ class FolderAuditTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, self.root)
+        self.root = Path(self.enterContext(short_socket_directory()))
         self.rust = self.root / "rust"
         self.temp = self.root / "tmp"
         self.rust.mkdir()
@@ -151,7 +154,7 @@ class FolderAuditTests(unittest.TestCase):
         dry = run(False)
         self.assertEqual(dry["plain"], folder_audit.WOULD_REMOVE)
         self.assertEqual(dry["fresh"], folder_audit.LISTED)
-        self.assertIn("uncommitted changes", dry["dirty"])
+        self.assertEqual(dry["dirty"], tmp_sweep.UNSAVED_WORK)
         self.assertEqual(dry["held"], folder_audit.HELD)
         self.assertEqual(dry["used"], "pid 12 works in it")
         self.assertEqual(dry["listening"], folder_audit.LIVE_SOCKET)

@@ -119,6 +119,7 @@
 #                                          emits style-lint tool boundaries for records
 #                                          --check reports mend findings and checks
 #                                          formatting without applying fixes
+#   verify.sh final-pass [<tree>]          read a matching machine-wide final pass
 #   verify.sh doc [--features <list>]      workspace rustdoc, warnings denied;
 #                                          mandatory before a Rust checkpoint,
 #                                          regardless of lint.conf; workspace
@@ -157,6 +158,12 @@
 #                                          session; same as setting
 #                                          UNIT_SESSION_DIR=<dir>
 #
+# `final` always runs the full gate. A clean, unchanged tree that passes gets
+# ~/.local/state/verify/final_pass/<tree>.json (VERIFY_STATE_DIR sets its parent).
+# `final-pass [<tree>]` reads that proof without Cargo or build admission. It
+# requires the current rustc -vV and verify.sh hash. No tree argument means
+# the current clean HEAD tree. Writes prune records older than 14 days.
+#
 # Invocation policy — canonical flags, lint.conf gating, sandbox-failure
 # detection — lives in scripts/lint/invoke.sh, the
 # single bottom layer, sourced below. This file adds only worker scope rules
@@ -167,6 +174,14 @@
 # the same command unsandboxed; anything else is the underlying tool status.
 
 set -euo pipefail
+# Read-only queries run before environment setup and build admission.
+if [[ "${1:-}" == final-pass || ( "${1:-}" == --session-dir && "${3:-}" == final-pass ) ]]; then
+    if [[ "$1" == --session-dir ]]; then shift 2; fi
+    shift
+    VERIFY_QUERY_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+    export CLAUDE_PYTHON="${CLAUDE_PYTHON:-python3}"
+    exec "$VERIFY_QUERY_DIR/../lib/py" "$VERIFY_QUERY_DIR/final_pass.py" query "$VERIFY_QUERY_DIR/verify.sh" "$@"
+fi
 if [[ -n "${TMPDIR:-}" && ! -d "$TMPDIR" ]]; then mkdir -p -- "$TMPDIR"; fi
 # Ask the shared helper which envrc applies, before tool setup or record access.
 # With no envrc, ensure returns the unchanged env without invoking direnv.
@@ -201,7 +216,7 @@ UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
-# repo needs >= 3.10.
+# repo needs >= 3.11.
 PY="${HOME}/.claude/scripts/lib/py"
 
 # The single bottom layer: run(), lint.conf gating, fmt_cargo, run_nextest,
@@ -213,7 +228,15 @@ source "$HOME/.claude/scripts/lint/invoke.sh" || {
 }
 BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_targets" && pwd)/build_targets.py}"
 LOCAL_RELEASE_WAIT_SCRIPT="${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/local_release_wait.py}"
+ASSERTION_GUARD_SCRIPT="${VERIFY_ASSERTION_GUARD_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/assertion_guard.py}"
 STEP_RECORD_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/step_record.py"
+FINAL_PASS_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/final_pass.py"
+FINAL_PASS_START=""
+final_pass_finish() {
+    [[ -n "$FINAL_PASS_START" ]] || return 0
+    env -u BUILDLOG_CALL_ID "$PY" "$FINAL_PASS_SCRIPT" finish "${BASH_SOURCE[0]}" "$FINAL_PASS_START" "$1" "${FINAL_FEATURES:-}" || true
+    FINAL_PASS_START=""
+}
 STEP_RECORD_ACTIVE=0
 STEP_RUNS_ON=natedev_only
 STEP_TARGET_TABLE=""
@@ -976,6 +999,10 @@ if [[ -z "$CMD" ]]; then
     exit 2
 fi
 shift
+if [[ "$CMD" == final ]]; then
+    FINAL_PASS_START="$("$PY" "$FINAL_PASS_SCRIPT" start "${BASH_SOURCE[0]}")"
+    trap 'final_status=$?; final_pass_finish "$final_status"; exit "$final_status"' EXIT
+fi
 
 if [[ "$CMD" == example-test ]]; then
     echo 'verify.sh: example-test is removed: examples carry no tests (user, 2026-10-04).' >&2
@@ -1039,7 +1066,63 @@ HOLD_WAITER_PID=""
 RUN_STEP_PID=""
 ROUTING_WAIT_STARTED=""
 
+# Each blocked resource interval has its own recorder id. Files carry ids from
+# step subshells to the parent cleanup, which also ends interrupted waits.
+PHASE_WAIT_SESSION="${UNIT_RUN_DIR:-${UNIT_SESSION_DIR:-}}"
+PHASE_WAIT_RECORDER="$(cd "${BASH_SOURCE[0]%/*}" && pwd)/progress_history.py"
+phase_wait_start() {
+    local key=$1 reason=$2 id file
+    [[ "${CLAUDE_PROBE_SESSION:-}" != 1 && -n "$PHASE_WAIT_SESSION" \
+        && -f "$PHASE_WAIT_SESSION/progress_history_state.json" && -n "$HOLD_WAIT_DIR" ]] || return 0
+    file="$HOLD_WAIT_DIR/phase-wait.${BASHPID:-$$}.$key"
+    [[ ! -s "$file" ]] || return 0
+    local args=(start-wait --session-dir "$PHASE_WAIT_SESSION"
+        --kind WaitingForMemoryOrSlot --reason "$reason")
+    local owner="${CODEX_THREAD_ID:-}"
+    if [[ -n "$owner" ]]; then
+        args+=(--worker-thread-id "$owner" --owner-session "$owner")
+    else
+        args+=(--director --owner-session "${CLAUDE_CODE_SESSION_ID:-}")
+    fi
+    if id="$("$PY" "$PHASE_WAIT_RECORDER" "${args[@]}")" && [[ -n "$id" ]]; then
+        printf '%s\n' "$id" > "$file"
+    else
+        printf 'verify.sh: wait history NotRecorded: %s\n' "$reason" >&2
+    fi
+}
+phase_wait_finish() {
+    local file="$HOLD_WAIT_DIR/phase-wait.${BASHPID:-$$}.$1" id
+    [[ -s "$file" ]] || return 0
+    read -r id < "$file"
+    if "$PY" "$PHASE_WAIT_RECORDER" finish-wait --session-dir "$PHASE_WAIT_SESSION" --wait-id "$id"; then
+        rm -f "$file"
+    else
+        printf 'verify.sh: wait history NotRecorded: cannot close %s\n' "$id" >&2
+    fi
+}
+phase_wait_finish_all() {
+    local file id
+    [[ -n "$HOLD_WAIT_DIR" ]] || return 0
+    for file in "$HOLD_WAIT_DIR"/phase-wait.*; do
+        [[ -s "$file" ]] || continue
+        read -r id < "$file"
+        "$PY" "$PHASE_WAIT_RECORDER" finish-wait --session-dir "$PHASE_WAIT_SESSION" --wait-id "$id" \
+            || printf 'verify.sh: wait history NotRecorded: cannot close %s\n' "$id" >&2
+    done
+}
+
+# The memory gate announces only blocked admission. A granted first check
+# emits no line and therefore creates no zero-length wait.
+buildlog_memory_line() {
+    case "$1" in
+        first) phase_wait_start memory "memory admission" ;;
+        done|left) phase_wait_finish memory ;;
+    esac
+    buildlog_memory_line_inner "$@"
+}
+
 collect_routing_wait() {
+    phase_wait_finish hold
     if [[ -n "$ROUTING_WAIT_STARTED" ]]; then
         "$PY" -c 'import sys, time
 with open(sys.argv[2], "a") as output:
@@ -1064,6 +1147,7 @@ interrupt_hold_wait() {
 }
 
 finish_hold_wait() {
+    phase_wait_finish_all
     collect_hold_wait
     if [[ -n "${TOKEN_WAIT_ENTRY:-}" ]]; then rm -f -- "$TOKEN_WAIT_ENTRY"; fi
     if [[ -n "$MAC_IDLE_MARKER" && -f "${MAC_IDLE_SCRIPT:-/nonexistent}" ]]; then
@@ -1729,6 +1813,7 @@ route_test() {
             echo "verify.sh: waiting for the Mac ($BUILDLOG_MAC_REASON) or natedev's release." >&2
             announced_reason="$BUILDLOG_MAC_REASON"
         fi
+        phase_wait_start hold "build hold"
         if [[ -z "$ROUTING_WAIT_STARTED" ]]; then
             ROUTING_WAIT_STARTED="$("$PY" -c 'import time; print(time.monotonic())')"
         fi
@@ -2061,7 +2146,7 @@ HOLD_WAIT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-hold.$$.XXXXXX")"
 export BUILDLOG_HOLD_WAIT_FILE="$HOLD_WAIT_DIR/seconds"
 export BUILDLOG_HOLD_WAITER_FILE="$HOLD_WAIT_DIR/waiter"
 export BUILDLOG_CHECK_FAILED_FILE="$HOLD_WAIT_DIR/check-failed"
-trap 'hold_status=$?; interrupt_hold_wait; finish_hold_wait; remove_step_record; exit "$hold_status"' EXIT
+trap 'hold_status=$?; interrupt_hold_wait; finish_hold_wait; remove_step_record; final_pass_finish "$hold_status"; exit "$hold_status"' EXIT
 hold_interrupted() {
     local signal_name=$1 code=$2
     trap - INT TERM HUP
@@ -2098,6 +2183,7 @@ while ! build_hold_nothing_held; do
             *) exit "$HOLD_WAIT_STATUS" ;;
         esac
     fi
+    phase_wait_start hold "build hold"
     HOLD_WAIT_ARGS=(wait-local --call-id "$BUILDLOG_CALL_ID" --pid $$)
     if [[ "$CMD" == test && -n "$MAC_LEAVE_SETTINGS" ]]; then
         HOLD_WAIT_ARGS+=(--leave-hook "$(mac_retry_hook "$MAC_LEAVE_SETTINGS" "$MAC_RETRY_AFTER")")
@@ -2107,6 +2193,7 @@ while ! build_hold_nothing_held; do
     HOLD_WAIT_STATUS=0
     wait "$HOLD_WAITER_PID" || HOLD_WAIT_STATUS=$?
     HOLD_WAITER_PID=""
+    phase_wait_finish hold
     if [[ "$HOLD_WAIT_STATUS" == "$LINT_LEFT_QUEUE_STATUS" && -n "$MAC_LEAVE_SETTINGS" ]]; then
         try_mac_test "$MAC_LEAVE_SETTINGS" "$MAC_LEAVE_REASON"
         remember_mac_retry "$MAC_LEAVE_SETTINGS" || true
@@ -2150,6 +2237,8 @@ fi
 # token is given back for each memory wait, so the two differ between steps.
 TOKEN_USED=0
 TOKEN_HELD=0
+# A step routed to the Mac skips its first token acquisition.
+TOKEN_WAITED=0
 TOKEN_WAITER_PID=""
 token_wait_clock() {
     # Tests can advance a disposable clock while acquisition still blocks on
@@ -2340,6 +2429,7 @@ acquire_token() {
         count_token_waiters_ahead
         # The line goes out before the first try when the token is not free.
         if (( noted < 0 )) && { (( TOKEN_WAITERS_AHEAD > 0 )) || [[ -d "${BOARD_DIR}/locks/cargo.d" ]]; }; then
+            phase_wait_start token "cargo token"
             token_wait_note first 0
             noted=0
         fi
@@ -2378,6 +2468,7 @@ acquire_token() {
         token_wait_clock
         waited=$(( (TOKEN_CLOCK_NOW - started) / 60 ))
         if (( noted < 0 )); then
+            phase_wait_start token "cargo token"
             token_wait_note first 0
             noted=0
         elif (( waited >= noted + TOKEN_WAIT_NOTE_MIN )); then
@@ -2386,6 +2477,7 @@ acquire_token() {
         fi
         (( TOKEN_SUPERSEDED )) || sleep "$pause"
     done
+    phase_wait_finish token
     TOKEN_WAITER_PID=""
     TOKEN_HELD=1
     TOKEN_FIRST_WAIT_DONE=1
@@ -2581,15 +2673,18 @@ build_hold_wait_local() {
         return 0
     fi
     step_state waiting_hold
+    phase_wait_start hold "build hold"
     # A step without the token (before the first take, or after a Mac trip) only waits.
     if [[ "${TOKEN_HELD:-0}" -ne 1 ]]; then
-        build_hold_wait_local_only "$@"
-        return
+        build_hold_wait_local_only "$@" || status=$?
+        phase_wait_finish hold
+        return "$status"
     fi
     if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then
         : > "${TOKEN_WAIT_FILE}.given_back"
     fi
     build_hold_wait_local_only "$@" || status=$?
+    phase_wait_finish hold
     [[ "$status" == 0 ]] || return "$status"
     acquire_token || return $?
     [[ -z "${TOKEN_WAIT_FILE:-}" ]] || rm -f "${TOKEN_WAIT_FILE}.given_back"
@@ -2680,7 +2775,7 @@ verify_cleanup() {
 }
 # EXIT alone would report success for a failed cargo run, so branch on the
 # status the trap receives; a lint failure record keeps it.
-trap 'EXIT_STATUS=$?; [[ ${EXIT_STATUS} -eq 0 ]] && verify_cleanup completed || verify_cleanup error; exit "${EXIT_STATUS}"' EXIT
+trap 'EXIT_STATUS=$?; [[ ${EXIT_STATUS} -eq 0 ]] && verify_cleanup completed || verify_cleanup error; final_pass_finish "$EXIT_STATUS"; exit "${EXIT_STATUS}"' EXIT
 verify_interrupted() {
     trap - EXIT INT TERM HUP
     EXIT_STATUS=$((128 + $1))
@@ -2692,6 +2787,7 @@ verify_interrupted() {
         RUN_STEP_PID=""
     fi
     verify_cleanup interrupted
+    final_pass_finish "$EXIT_STATUS"
     exit "$EXIT_STATUS"
 }
 trap 'verify_interrupted 2' INT
@@ -2739,6 +2835,17 @@ case "$CMD" in
             shift
         fi
         [[ $# -eq 0 ]] || { usage; exit 2; }
+        ASSERTION_REPO="${WORKSPACE_ROOT:-$(git rev-parse --show-toplevel)}"
+        ASSERTION_ARGS=(--repo "$ASSERTION_REPO")
+        if [[ -n "${UNIT_SESSION_DIR:-}" ]]; then
+            ASSERTION_ARGS+=(--rulings "$UNIT_SESSION_DIR")
+        fi
+        if [[ -n "${VERIFY_ASSERTION_BASE:-}" ]]; then
+            ASSERTION_ARGS+=(--base "$VERIFY_ASSERTION_BASE")
+        fi
+        [[ "$PKG" != --workspace ]] || echo 'style-lint: assertion guard start'
+        "$PY" "$ASSERTION_GUARD_SCRIPT" "${ASSERTION_ARGS[@]}"
+        [[ "$PKG" != --workspace ]] || echo 'style-lint: assertion guard passed'
         if [[ "$PKG" != --workspace ]]; then
             require_member "$PKG"
         fi

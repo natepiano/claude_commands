@@ -25,7 +25,7 @@ import retire_unit
 import unit_lookup
 import unit_move
 from herdr import HerdrPlace
-from add_unit import Production, read_production
+from production_units import Production, read_production
 
 if TYPE_CHECKING:
     from scripts.message import sessions

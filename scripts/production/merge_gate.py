@@ -140,7 +140,7 @@ class GateJobResult:
     seconds: float
     output: str
     killed_for: str = ""
-    build_tool_started: bool = False
+    tripwire_tripped: bool = False
 
 
 @dataclass(frozen=True)
@@ -512,7 +512,7 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
 
 
 def test_module_environment(root: Path, environment: dict[str, str]) -> dict[str, str]:
-    """Give a module a private build log and commands that record toolchain calls."""
+    """Give a module a private build log and tripwires for tools and live memory."""
     buildlog = root / "buildlog"
     buildlog.mkdir()
     tools = root / "build-tool-tripwires"
@@ -530,6 +530,7 @@ raise SystemExit(99)
         _ = executable.write_text(script)
         executable.chmod(0o755)
     return {**environment, "TMPDIR": str(root), "BUILDLOG_DIR": str(buildlog),
+            "BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(root / "live-memory-reads.jsonl"),
             "PATH": str(tools) + os.pathsep + environment.get("PATH", os.defpath)}
 
 
@@ -542,6 +543,22 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
     calls = [cast(list[str], json.loads(line)) for line in marker.read_text().splitlines()] if marker.exists() else []
     for call in calls:
         captured += f"\n{job.path.name}: a test started real {Path(call[0]).name}: {shlex.join(call[1:])}\n"
+    memory_marker = job.log.parent / "live-memory-reads.jsonl"
+    readings = memory_marker.read_text(errors="replace").splitlines() if memory_marker.exists() else []
+    for line in readings:
+        try:
+            decoded = cast(object, json.loads(line))
+            if not isinstance(decoded, dict):
+                raise ValueError("record must be an object")
+            reading = cast(dict[str, object], decoded)
+            path, argv, pid = reading.get("reading"), reading.get("argv"), reading.get("pid")
+            if (not isinstance(path, str) or not isinstance(argv, list) or type(pid) is not int
+                    or not all(isinstance(arg, str) for arg in cast(list[object], argv))):
+                raise ValueError("record fields are invalid")
+            detail = f"{path}: {shlex.join(cast(list[str], argv))}"
+        except ValueError:
+            detail = f"(unreadable record): {line}"
+        captured += f"\n{job.path.name}: a test read live memory {detail}\n"
     shutil.rmtree(job.log.parent)
     if job.killed_for:
         captured = f"{job.killed_for}\n{captured}"
@@ -550,9 +567,10 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
         status = 0
     if job.suite == "types":
         status = 0 if status in (0, 3) and re.search(r"^0 errors, 0 warnings, 0 notes\s*$", captured, re.MULTILINE) else 1
-    if calls:
+    tripwire_tripped = bool(calls or readings)
+    if tripwire_tripped:
         status = 1
-    return GateJobResult(job.suite, job.path.name, status, seconds, captured, job.killed_for, bool(calls))
+    return GateJobResult(job.suite, job.path.name, status, seconds, captured, job.killed_for, tripwire_tripped)
 
 
 @dataclass(frozen=True)
@@ -648,7 +666,7 @@ class PassedTreeLedger:
             self.report_error(error)
         return NoCertifiedBase()
 
-    def record_pass(self, kind: Literal["full", "affected"] = "full") -> None:
+    def record_pass(self, selection: AffectedSelection | FullSuite) -> None:
         if self.unavailable or isinstance(self.tree, UnrecordableTestTree):
             return
         try:
@@ -659,7 +677,10 @@ class PassedTreeLedger:
                 return
             record = {"tree": self.tree.tree, "commit": self.tree.commit,
                       "at": datetime.now(UTC).isoformat(), "host": host_name(),
-                      "checkout": str(self.repo.resolve()), "suites": sorted(TEST_SUITES), "source": self.source, "kind": kind}
+                      "checkout": str(self.repo.resolve()), "suites": sorted(TEST_SUITES), "source": self.source,
+                      "kind": "full" if isinstance(selection, FullSuite) else "affected"}
+            if isinstance(selection, FullSuite):
+                record["reason"] = selection.reason
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as ledger:
                 line = (json.dumps(record) + "\n").encode("utf-8")
@@ -734,7 +755,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     selection: AffectedSelection | FullSuite = FullSuite("passed tree reused")
     if not reused:
         selection = (required if isinstance(required, FullSuite) else FullSuite("--full") if full else
-                     select_affected(repo, ledger.certified_base(), [path for _, path in modules]))
+                     select_affected(repo, ledger.certified_base(), [path for _, path in modules], state_dir=gate_state_dir()))
         report_selection(selection, len(modules))
         if isinstance(selection, AffectedSelection):
             selected = set(selection.modules)
@@ -804,6 +825,8 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     log = root / "output.log"
                     job_environment = ({**environment, "TMPDIR": str(root)} if suite == "types"
                                        else test_module_environment(root, environment))
+                    if suite == "types":
+                        _ = job_environment.pop("BUILDLOG_LIVE_MEMORY_TRIPWIRE", None)
                     argv = ([os.environ.get("MERGE_GATE_BASEDPYRIGHT", "basedpyright"), "--pythonpath", str(types_python),
                              *type_dirs]
                             if suite == "types" else
@@ -826,7 +849,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     result = finish_gate_job(job, status)
                     running.remove(job)
                     admission.release(job.process.pid)
-                    if status < 0 and not job.killed_for and not hold.admits():
+                    if status < 0 and not job.killed_for and not result.tripwire_tripped and not hold.admits():
                         pending.appendleft((job.suite, job.path))
                         print(f"{job.suite}/{job.path.name}: stopped during a natedev hold; queued again", flush=True)
                         continue
@@ -853,7 +876,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                 if not pending and not running and not rerunning:
                     failed = [result for result in results
                               if result.suite != "types" and result.returncode and not result.killed_for
-                              and not result.build_tool_started]
+                              and not result.tripwire_tripped]
                     rerunning = True
                     if len(failed) > RERUN_LIMIT:
                         print(f"{len(failed)} modules failed; this is a real breakage, not load; no reruns", flush=True)
@@ -898,8 +921,9 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
         print(f"Slow module: {slow} ({SLOW_MODULE_FACTOR:g}x or more)", flush=True)
     if hold.seconds > 0:
         print(f"Gate hold wait: {hold.seconds:.2f}s (excluded from Gate tests)", flush=True)
+    full_reason = f"; full suite: {selection.reason}" if isinstance(selection, FullSuite) and not reused else ""
     print(f"Gate tests: {elapsed:.2f}s; at most {max_running_jobs} modules at once; "
-          + f"peak memory: {admission.peak_mib / 1024:.3f} GiB (sampled memory); cap: {memory_cap_mib / 1024:.3f} GiB", flush=True)
+          + f"peak memory: {admission.peak_mib / 1024:.3f} GiB (sampled memory); cap: {memory_cap_mib / 1024:.3f} GiB{full_reason}", flush=True)
     print(f"Largest module peak: {largest_module_peak_mib / 1024:.3f} GiB (sampled memory); module: {largest_module or '(not sampled)'}", flush=True)
     print(f"One-minute load: start={starting_load:.2f} max={maximum_load:.2f} end={ending_load:.2f}", flush=True)
     if admission.peak_mib > memory_cap_mib:
@@ -907,7 +931,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     run = GateRun(tuple(results), elapsed, admission.peak_mib, admission.peak_mib <= memory_cap_mib, reused,
                   isinstance(selection, AffectedSelection))
     if run.passed and not reused:
-        ledger.record_pass("affected" if isinstance(selection, AffectedSelection) else "full")
+        ledger.record_pass(selection)
         if isinstance(selection, FullSuite):
             (gate_state_dir() / "full-required").unlink(missing_ok=True)
     return run
@@ -1204,7 +1228,8 @@ def nightly(args: GateArguments) -> int:
         _ = nightly_git(clone, "checkout", "--detach", commit)
         tree = checked_git(clone, "rev-parse", "HEAD^{tree}")
         try:
-            run = run_suites(clone, args.memory_cap_mib, module_time_limit_s=args.module_time_limit_s, full=True)
+            run = run_suites(clone, args.memory_cap_mib, args.type_dirs,
+                             module_time_limit_s=args.module_time_limit_s, full=True)
         except (GateRefused, OSError, subprocess.SubprocessError) as error:
             print(f"Nightly suite runner failed: {error}", flush=True)
             run = GateRun((GateJobResult("runner", "suite-run", 1, 0, str(error)),), 0, 0)
@@ -1270,6 +1295,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return nightly(args)
             if args.tests_only:
                 return 0 if run_suites(Path(str(args.repo)).resolve(), int(args.memory_cap_mib),
+                                       args.type_dirs,
                                        module_time_limit_s=float(args.module_time_limit_s), full=args.full).passed else 1
             if args.promote_only:
                 promote(args)

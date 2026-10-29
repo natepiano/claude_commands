@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
 import codex_pacer
 import five_hour
@@ -571,40 +571,49 @@ def main() -> None:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.accounts import accounts
 
-    selection = accounts.claude_account_selection()
-    workers_home = resolve_workers_home()
-    updated = update_alert_pass(selection, workers_home, force_usage=bool(sys.argv[1:]))
-    for line in updated.messages:
-        print(line)
-    notes: list[AgentNote] = list(note_file.read_notes())
-    for line in (refresh(notes, current_session(), selection=selection, codex_readings=updated.codex_readings) if sys.argv[1:]
-                 else alert(notes, selection=selection, codex_readings=updated.codex_readings)):
-        print(line)
-    try:
-        mark_tier(codex_pacer.tick(notes))
-    except (OSError, ValueError, KeyError, TypeError) as error:
-        # The pacer must never cost the notes or the alerts; launches fall back to
-        # default once its decision is ten minutes old.
-        print(f"codex pacer did not run: {error!r}")
-    if not sys.argv[1:]:
-        try:
-            from scripts.accounts import refusal_watch
-            def refresh_refusal_usage() -> None:
-                if updated.usage_reused:
-                    # Refusal placement needs current usage, without another roster probe or note pass.
-                    try:
-                        reports = asyncio.run(live_reports(selection, workers_home))
-                        usage_store.save(reports, datetime.now(timezone.utc), claude_note_logins(notes))
-                    except Exception as error:
-                        # Keep placement and the watchdog running with stored readings.
-                        reason = str(error).splitlines()[0] if str(error) else type(error).__name__
-                        print(f"refusal usage refresh: {reason}", file=sys.stderr)
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
+    if TYPE_CHECKING:
+        from scripts.herdr import herdr
+    else:
+        import herdr
 
-            for line in refusal_watch.run(refresh_usage=refresh_refusal_usage):
-                print(line)
-        except Exception as error:
-            reason = str(error).splitlines()[0] if str(error) else type(error).__name__
-            print(f"refusal watcher: {reason}", file=sys.stderr)
+    from scripts.accounts import refusal_watch
+
+    with refusal_watch.session_observation(), herdr.process_snapshot():
+        selection = accounts.claude_account_selection()
+        workers_home = resolve_workers_home()
+        updated = update_alert_pass(selection, workers_home, force_usage=bool(sys.argv[1:]))
+        for line in updated.messages:
+            print(line)
+        notes: list[AgentNote] = list(note_file.read_notes())
+        for line in (refresh(notes, current_session(), selection=selection, codex_readings=updated.codex_readings) if sys.argv[1:]
+                     else alert(notes, selection=selection, codex_readings=updated.codex_readings)):
+            print(line)
+        try:
+            mark_tier(codex_pacer.tick(notes))
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            # The pacer must never cost the notes or the alerts; launches fall back to
+            # default once its decision is ten minutes old.
+            print(f"codex pacer did not run: {error!r}")
+        if not sys.argv[1:]:
+            try:
+                from scripts.accounts import refusal_watch
+                def refresh_refusal_usage() -> None:
+                    if updated.usage_reused:
+                        # Refusal placement needs current usage, without another roster probe or note pass.
+                        try:
+                            reports = asyncio.run(live_reports(selection, workers_home))
+                            usage_store.save(reports, datetime.now(timezone.utc), claude_note_logins(notes))
+                        except Exception as error:
+                            # Keep placement and the watchdog running with stored readings.
+                            reason = str(error).splitlines()[0] if str(error) else type(error).__name__
+                            print(f"refusal usage refresh: {reason}", file=sys.stderr)
+
+                for line in refusal_watch.run(refresh_usage=refresh_refusal_usage):
+                    print(line)
+            except Exception as error:
+                reason = str(error).splitlines()[0] if str(error) else type(error).__name__
+                print(f"refusal watcher: {reason}", file=sys.stderr)
 
 
 if __name__ == "__main__":

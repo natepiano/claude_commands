@@ -56,7 +56,7 @@ Loop/verbose only:
    Exit `1` means the check was refused: answer the overlap it names under
    `/unit:direct` <BerthDecisions/>, then run it again. An exit `1` that names a
    released reservation with no live one blocks the checkpoint: apply
-   <RetainDelegatedPhaseReservation/> and report the line. Then read and validate
+   <RetainPhaseReservation/> and report the line. Then read and validate
    `${PHASE_DIR}/delegated_phase_reservation_state.json`; never use a value
    remembered from conversation or the harness-session mapping.
 
@@ -227,6 +227,7 @@ Loop/verbose only:
    A hook refuses the commit without it and the merge refuses the checkpoint;
    the merge turns each visible line into a row on the change-review list.
 
+   After every successful checkpoint commit, enrolled or not, run `python3 ~/.claude/scripts/direct/progress_history.py checkpoint --session-dir "${SESSION_DIR}" --phase <phase id> --commit <full hash>`.
    A failed commit is an unsuccessful ending: do not invoke release, leave
    `Active` untouched, and apply <RetainPhaseReservation/>. After a
    successful commit from `Active`, immediately capture the full output of

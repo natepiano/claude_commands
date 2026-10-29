@@ -227,10 +227,35 @@ One ticket per phase:
 Run tier D first. Structure crates are taken in order of the other-family
 pending cells they block inside a unit's pilot scope, most first, so a crate
 blocking a pilot unit comes first. A repair phase always precedes a new ticket.
-After an interruption, resume the assigned or checkpointed ticket from
-`style_ledger.py ticket open --repo <checkout> --unit <unit>`; never take a second
-one. A checkpointed ticket waits for its merge into the style branch before
-refill. Clear the cargo-liner backlog before hana.
+After an interruption, resume the assigned ticket from
+`style_ledger.py ticket open --repo <checkout> --unit <unit>`. While exactly one
+checkpointed ticket waits for merge, refill may assign one disjoint successor
+on the same unit branch, based exactly on the waiting checkpoint. It compares
+proposal paths, rename references and new paths at the synced tip and ticket
+bases, with crate Cargo.toml/build.rs and workspace Cargo.toml/Cargo.lock as
+protected inputs. Shared protected inputs alone do not overlap: editing an
+input blocks the tickets that depend on it. An overlap keeps exit 5 and names
+the files; unknown footprints, unreadable checkpoints and a branch moved away
+from the checkpoint also keep the wait. There may be at most two open tickets,
+including two checkpointed tickets after the successor finishes; no third is
+assigned until one merges. This bound permits useful work without an unbounded
+merge backlog. The ledger records the predecessor and refuses the successor's
+merge until that predecessor is merged; reconciliation processes predecessors
+first. Clear the cargo-liner backlog before hana.
+
+The overlap snapshot is advisory: the ledger proves the pair disjoint again
+inside the assignment transaction. Widening either ticket, following or
+replacing a finding, changing a recorded base or synced tip, and checkpointing
+revalidate pending writes under that same write lock; a conflict or unreadable
+footprint rolls the write back. Resume and the gate recheck before publishing
+work. Merge checks again, including after the predecessor has merged. These
+checks include both bases and checkpoints, the live unit and style tips, and
+the tickets' actual committed paths, so later references and unplanned edits
+cannot bypass the original check. An existing overlapping pair waits for
+repair; dropping its successor permits recovery.
+The ledger guard conservatively includes all word mentions of a renamed module
+and possible path-attribute owners; a conservative overlap also waits. It uses
+the same protected build inputs as refill.
 
 Standing plans carry `> **Standing:** style_plan.py` and live under
 `docs/style-production/units/`. Git-exclude them: the ledger is their record,
@@ -244,9 +269,20 @@ only the first-launch template. Edit a launched unit's copy for changes meant
 for it. Checkpoint stages only code paths and never the plan or anything under
 `docs/style-production/`; standing plans skip shrink and every closing gate.
 Run refill at startup, after restart or compaction, and after each ticket.
-Before selecting a new ticket, refill waits for sync if the branch point's
-pushed tip is not an ancestor of the ledger's synced tip; an open ticket still
-resumes or waits for merge. The pushed tip is `origin/<branch point>`, or the
+Refill chooses the same ticket as before, then waits for sync only if new
+branch-point commits touch its files, any affected crate's `Cargo.toml` or
+`build.rs`, or workspace `Cargo.toml` or `Cargo.lock`. Otherwise it starts from
+the existing synced inputs without waiting for main. An open ticket still
+resumes or waits for merge. The ticket's final merge still takes the style branch.
+Only the selected proposal also reads its edit footprint at pushed main, so a
+new reference to a renamed or moved item holds it too. Its protected files are
+the union of the footprints at the synced tip, unit base and pushed main; an
+unreadable main footprint holds with `touched set unknown`.
+One batched name-status history read serves both selection passes, including
+edits later reverted. It reads NUL-delimited bytes and decodes paths exactly,
+preserving carriage returns; unrepresentable paths hold closed. A missing tip, a git error, a synced tip that neither
+contains main nor is its ancestor, a rename or copy anywhere in the range, or
+an unknown crate for a selected file holds refill closed. The pushed tip is `origin/<branch point>`, or the
 local branch when the repository has no `origin`. The checkouts share one
 repository, so the local branch can hold a parent merge whose gate is still
 running. Reconcile and the hand-off merge check read the same pushed tip.
@@ -283,7 +319,8 @@ Refill only the unit worktree's own plan copy:
 ```
 
 `next-phase` returns 0 after writing a phase, resuming an assigned ticket, or
-reporting `repair first`; 3 means `waiting for sync`, or
+reporting `repair first`; 3 means `waiting for sync` (with `: <kind> <crate> [<rule>]: main touched <path>`
+or `: touched set unknown: <reason>` for a main-related hold), or
 `waiting for structure: <crates>` when every pending family cell in those
 in-scope crates is blocked by a structure cell, until the
 modules unit's structure tickets merge
@@ -329,7 +366,8 @@ later rule edits cannot change an assigned ticket's Work Order. A queued ticket
 is recovered under the same id if its files, and for a proposal ticket each file
 its findings' changes edit, remain free; otherwise it is dropped
 before selecting fresh work. Merged and dropped ticket phases are discarded on
-refill; a checkpointed ticket waits for the style showrunner to merge it.
+refill; checkpointed tickets remain until the style showrunner merges them,
+while refill may issue the single disjoint successor described above.
 Refill writes plans and pinned texts atomically. Resume checks every pin's blob
 and rebuilds a damaged ticket phase from its recorded instructions. Before
 publishing a phase, it records the unit branch's starting commit once in the

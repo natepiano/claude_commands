@@ -12,6 +12,11 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+from scripts.lint.memory_test_support import fake_memory_readings
+
+
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
 
 SCRIPT = Path(__file__).with_name("dailies_render.py")
 HOLD_SCRIPT = SCRIPT.parent.parent / "build_hold" / "build_hold.py"
@@ -44,6 +49,7 @@ class DailiesHoldTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(mock.patch.dict(os.environ, fake_memory_readings(self.scratch)))
         # HOME puts the renderer's AGENTS_DIR and READINGS_LOG under this test directory.
         (self.scratch / "rust/hanadocs/agents").mkdir(parents=True)
         (self.scratch / ".local/state/agent-notes").mkdir(parents=True)
@@ -398,7 +404,7 @@ class DailiesHoldTests(unittest.TestCase):
         child = (
             "import sys, threading; sys.path.insert(0, sys.argv.pop(1)); import build_hold; "
             "status = build_hold.main(sys.argv[1:]); "
-            "[thread.join(timeout=5) for thread in threading.enumerate() if thread.name == 'hold-event-recorder']; "
+            f"[thread.join(timeout={TEST_HANG_GUARD_SECS}) for thread in threading.enumerate() if thread.name == 'hold-event-recorder']; "
             "assert not any(thread.name == 'hold-event-recorder' for thread in threading.enumerate()); "
             "sys.exit(status)"
         )

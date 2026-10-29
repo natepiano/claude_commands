@@ -16,7 +16,11 @@ from unittest import mock
 from scripts.build_hold import build_hold
 from scripts.direct import test_verify_untested_examples
 from scripts.direct.test_verify_hold_wait import read_cycle_file, release_registered_call
+from scripts.lint.memory_test_support import fake_memory_readings
 
+
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
 
 INVOKE = Path(__file__).resolve().parent.parent / "lint" / "invoke.sh"
 CYCLE_ID = "b" * 32
@@ -41,8 +45,7 @@ class VerifyReleaseAckTests(unittest.TestCase):
         _ = (release / "current").write_text(CYCLE_ID + "\n")
         self.cycle_file = release / CYCLE_ID / "cycle.json"
         self.reset_cycle()
-        meminfo = self.root / "meminfo"
-        _ = meminfo.write_text("MemAvailable: 67108864 kB\n")
+        memory_environment = fake_memory_readings(self.root)
         lint_reader = self.root / "lint-config.sh"
         _ = lint_reader.write_text('lint_config_enabled() { return 0; }\nlint_config_skip_notice() { :; }\n')
         stubs = self.root / "stubs"
@@ -77,7 +80,7 @@ PY
             "UNIT_SESSION_DIR": "",
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
-            "BUILDLOG_MEMINFO": str(meminfo),
+            **memory_environment,
             "BUILDLOG_MEM_POLL_S": "1",
             "BUILDLOG_OFF": "1",
             "BUILDLOG_SCOPE": "0",
@@ -111,7 +114,7 @@ PY
         return subprocess.run(
             ["bash", "-c", 'set -euo pipefail; source "$INVOKE_SCRIPT"; sweep_after_step() { :; }; run_once "$@"', "bash", *command],
             cwd=self.root,
-            env=self.environment, capture_output=True, text=True, check=False, timeout=10,
+            env=self.environment, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
 
     def set_owner_marker(self) -> None:
@@ -211,7 +214,7 @@ class VerifyRoutingTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(build_hold, "start_recorder", side_effect=self.record_hold_event))
 
     def record_hold_event(self, command: list[str]) -> None:
-        _ = subprocess.run(command, env=self.fixture.environment, capture_output=True, check=True, timeout=10)
+        _ = subprocess.run(command, env=self.fixture.environment, capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS)
 
     def set_owner_marker(self) -> None:
         run = self.fixture.root / "unit-run"

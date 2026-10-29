@@ -16,11 +16,142 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.direct import phase_reservation, plan_history  # noqa: E402
 
 ACTIVE: dict[str, object] = {"kind": "active", "active_phase_reservation": {
     "reservation_id": "r1", "coordination_run_id": "c1", "phase": "34h", "phase_start_head": "a" * 40}}
+
+
+@final
+class WorktreeAttributionTests(unittest.TestCase):
+    session: Path = Path()
+    first: Path = Path()
+    second: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.session = root / "run"
+        self.session.mkdir()
+        self.first = root / "worktree-x"
+        self.second = root / "worktree-y"
+        self.first.mkdir()
+        for command in (
+            ["init", "-q", "-b", "main"],
+            ["-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+             "commit", "-q", "--allow-empty", "-m", "base"],
+            ["worktree", "add", "-q", "-b", "other", str(self.second)],
+        ):
+            _ = subprocess.run(["git", "-C", str(self.first), *command], check=True, capture_output=True,
+                               timeout=TEST_HANG_GUARD_SECS)
+
+    def phases(self, worktrees: dict[str, Path]) -> list[phase_reservation.OpenPhase]:
+        records = [{"id": name, "instance_id": name, "status": "active"} for name in ("1", "2")]
+        _ = (self.session / plan_history.STATE_FILENAME).write_text(json.dumps({
+            "phase": records[-1], "open_phases": records[:-1],
+        }))
+        for name in ("1", "2"):
+            directory = phase_reservation.phase_directory(self.session, name)
+            directory.mkdir(parents=True)
+            _ = (directory / phase_reservation.FILES_FILE).write_text("scripts/direct/verify.sh\n")
+        for name, worktree in worktrees.items():
+            code, errors = self.claim(name, worktree)
+            self.assertEqual(code, 0, errors)
+        return phase_reservation.open_phases(self.session)
+
+    def claim(self, phase: str, root: Path) -> tuple[int, str]:
+        output, errors = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            code = phase_reservation.main(["claim", "--session-dir", str(self.session),
+                                           "--phase", phase, "--repo", str(root)])
+        return code, errors.getvalue()
+
+    def test_same_file_in_linked_worktrees_belongs_to_each_worktrees_phase(self) -> None:
+        for root in (self.first, self.second):
+            (root / "src").mkdir()
+        phases = self.phases({"1": self.first / "src", "2": self.second / "src"})
+        for root, owner in ((self.first, "1"), (self.second, "2")):
+            with self.subTest(root=root):
+                result = phase_reservation.attribute(phases, ["scripts/direct/verify.sh"], root)
+                if isinstance(result, phase_reservation.NoOpenPhaseHere):
+                    self.fail(f"claimed phase missing from {root}")
+                self.assertEqual(result.refused, [])
+                self.assertEqual({phase.phase: scopes for phase, scopes in result.by_phase.items()},
+                                 {owner: ["scripts/direct/verify.sh"]})
+
+    def test_only_open_phase_does_not_own_an_edit_in_another_worktree(self) -> None:
+        phase = self.phases({"1": self.first, "2": self.second})[0]
+        result = phase_reservation.attribute([phase], ["scripts/direct/verify.sh"], self.second)
+        self.assertIsInstance(result, phase_reservation.NoOpenPhaseHere)
+
+    def test_attribution_without_an_edit_root_keeps_the_single_phases_ownership(self) -> None:
+        phase = self.phases({"1": self.first, "2": self.second})[0]
+        result = phase_reservation.attribute([phase], ["unlisted.rs"])
+        if isinstance(result, phase_reservation.NoOpenPhaseHere):
+            self.fail("rootless attribution lost the claimed phase")
+        self.assertEqual(result.refused, [])
+        self.assertEqual({owner.phase: scopes for owner, scopes in result.by_phase.items()},
+                         {"1": ["unlisted.rs"]})
+
+    def test_same_worktree_overlap_keeps_the_existing_refusal(self) -> None:
+        phases = self.phases({"1": self.first, "2": self.first})
+        result = phase_reservation.attribute(phases, ["scripts/direct/verify.sh"], self.first)
+        if isinstance(result, phase_reservation.NoOpenPhaseHere):
+            self.fail("same-worktree phases were filtered out")
+        self.assertEqual(result.by_phase, {})
+        self.assertEqual(result.refused, ["scripts/direct/verify.sh"])
+        self.assertEqual(phase_reservation.refusal_reason(phases, result.refused),
+                         "scripts/direct/verify.sh is in no single open phase's files list (open phases: 1, 2); "
+                         + "add each path to exactly one phases/<phase>/files.")
+
+    def test_legacy_phase_still_matches_outside_the_known_phases_worktree(self) -> None:
+        phases = self.phases({"2": self.first})
+        overlap = phase_reservation.attribute(phases, ["scripts/direct/verify.sh"], self.first)
+        if isinstance(overlap, phase_reservation.NoOpenPhaseHere):
+            self.fail("known and legacy phases were filtered out")
+        self.assertEqual(overlap.by_phase, {})
+        self.assertEqual(overlap.refused, ["scripts/direct/verify.sh"])
+        elsewhere = phase_reservation.attribute(phases, ["scripts/direct/verify.sh"], self.second)
+        if isinstance(elsewhere, phase_reservation.NoOpenPhaseHere):
+            self.fail("legacy phase did not match another worktree")
+        self.assertEqual(elsewhere.refused, [])
+        self.assertEqual({phase.phase: scopes for phase, scopes in elsewhere.by_phase.items()},
+                         {"1": ["scripts/direct/verify.sh"]})
+
+    def test_a_second_claim_cannot_move_a_phase_to_another_live_worktree(self) -> None:
+        _ = self.phases({"1": self.first})
+        directory = phase_reservation.phase_directory(self.session, "1")
+        before = {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()}
+        code, errors = self.claim("1", self.second)
+        self.assertNotEqual(code, 0)
+        self.assertIn(str(self.first), errors)
+        self.assertIn(str(self.second), errors)
+        self.assertEqual({path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()}, before)
+
+    def test_claim_from_a_subfolder_keeps_the_root_after_the_subfolder_is_removed(self) -> None:
+        start = self.first / "temporary-start"
+        start.mkdir()
+        _ = self.phases({"1": start})
+        start.rmdir()
+        phase = phase_reservation.open_phases(self.session)[0]
+        self.assertEqual(phase.worktree, phase_reservation.KnownPhaseWorktree(self.first))
+        result = phase_reservation.attribute([phase], ["scripts/direct/verify.sh"], self.first)
+        if isinstance(result, phase_reservation.NoOpenPhaseHere):
+            self.fail("claim lost its repository root after the start folder was removed")
+        self.assertEqual(result.refused, [])
+        self.assertEqual({owner.phase: scopes for owner, scopes in result.by_phase.items()},
+                         {"1": ["scripts/direct/verify.sh"]})
+
+    def test_held_phase_reader_keeps_the_claimed_worktree(self) -> None:
+        _ = self.phases({"1": self.first})
+        _ = phase_reservation.enroll(phase_reservation.phase_directory(self.session, "1"), "1", "board_ready")
+        phases = phase_reservation.held_phases(self.session)
+        self.assertEqual([(phase.phase, phase.worktree) for phase in phases],
+                         [("1", phase_reservation.KnownPhaseWorktree(self.first))])
 
 
 @final
@@ -178,7 +309,7 @@ class PhaseRepairTests(unittest.TestCase):
     def repair(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, phase_reservation.__file__, "repair", "--session-dir",
                                str(self.session), "--phase", "34h", "--repo", str(self.repo), *arguments],
-                              env=self.environment, capture_output=True, text=True, check=False, timeout=10)
+                              env=self.environment, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def state(self) -> dict[str, object]:
         return cast(dict[str, object], json.loads((self.directory / phase_reservation.STATE_FILE).read_text()))

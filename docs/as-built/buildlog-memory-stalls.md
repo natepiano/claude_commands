@@ -38,10 +38,13 @@ The build log records how long each build step waited on memory. A machine-wide 
    - `mem_used_bytes` is MemTotal minus MemAvailable.
    - `swap_used_bytes` is SwapTotal minus SwapFree.
    - The stall fields are the raw counters since boot, in microseconds.
+   - `cpu_stall_some_us`, `cpu_stall_full_us`, `io_stall_some_us` and `io_stall_full_us` are optional PSI counters from `/proc/pressure/cpu` and `/proc/pressure/io`. Each missing or malformed counter is `null`; CPU kernels may omit `full`.
+   - `cpu_idle_ticks`, `cpu_iowait_ticks` and `cpu_total_ticks` come from the aggregate `cpu ` line in `/proc/stat`, in USER_HZ ticks. Total sums user, nice, system, idle, iowait, irq, softirq and steal; guest fields are already included in user and nice. An unavailable or malformed stat reading makes all three `null`.
    - The slice fields (`builds_anon_bytes`, `sccache_in_service`, `ci_anon_bytes`) are in `docs/as-built/build-memory-admission.md`.
    - `power_profile` is power-profiles-daemon's `Profile=` value under `[State]` (`performance`, `balanced`, `power-saver`); `power_profile_since` is the state file's mtime as `store.utc_iso`, the moment the daemon last wrote it. Both are `null` when `read_power_profile` answers `Unmeasured.VALUE`.
 2. The file sits in the host folder beside `<YYYY-MM>.jsonl`. `index.update()` already reads every `<root>/*/*.jsonl` and dispatches on `kind` through `ADDERS`, so `add_sample` picks the lines up incrementally with no special case. The hourly `buildlog sync` copies the host folder, so the Mac's index gets natedev's samples too.
 3. The `samples` table has one row per sample: `src, host, at, boot_id, mem_used_bytes, swap_used_bytes, builds_anon_bytes, sccache_in_service, ci_anon_bytes, stall_some_us, stall_full_us, power_profile, power_profile_since` (`SAMPLE_COLUMNS`; both profile columns `TEXT`). It is indexed on `(host, at)`. A line written before the profile fields existed indexes both as NULL; nothing is backfilled.
+   Schema 23 adds the seven CPU and IO fields above as `INTEGER`; rebuilding the index leaves them NULL for older records.
 
 ### The power profile: `read_power_profile(POWER_PROFILE_STATE)`
 
@@ -52,7 +55,7 @@ The build log records how long each build step waited on memory. A machine-wide 
 
 ### The report section
 
-`memory_pressure_section(connection, day, hosts)` runs after the per-kind sections and before the verify.sh calls section. `day` is the local day of the machine running the report.
+`memory_pressure_section(connection, day, hosts)` runs after the per-kind sections, followed by `cpu_disk_pressure_section(connection, day)`, then the verify.sh calls section. `day` is the local day of the machine running the report.
 
 The section always has its heading `### Memory pressure`, then `Source: 60 s machine samples and step cgroup stall counters.`, then the memory-waits line and the sccache, unsliced-step and memory-kill lines (`docs/as-built/build-memory-admission.md`), then:
   - **Stall table**, shown only when a step stalled: `| Caller | Kind | Stall | At once |`.
@@ -63,10 +66,16 @@ The section always has its heading `### Memory pressure`, then `Source: 60 s mac
     - `60 s samples: peak used memory X GiB, peak swap Y GiB; peak builds B GiB, peak CI C GiB (process memory); machine stall: some A, full B.` Each slice peak is the day's highest `builds_anon_bytes` or `ci_anon_bytes`, or `unavailable` when no sample has it., or
     - `60 s samples: none; machine stall: unavailable.` when there are no samples.
 - **How the machine stall is summed:**
+  - `sample_counter_deltas` applies the same pairing rules to memory, CPU and IO counters. A NULL at either end excludes that counter and its interval from its denominator.
   - The day's samples are taken per host, in time order. For a host's first sample of the day, the baseline is that host's latest earlier sample from any day.
   - A pair of samples counts only when the gap is between 0 and `MAX_SAMPLE_GAP_S` (300 s).
   - With the same `boot_id`, the pair adds `max(0, later − earlier)`. With a different `boot_id`, it adds the later counter.
   - The stall totals are summed over all hosts, and the peaks are the maximum over all of the day's samples.
+
+### CPU and disk pressure
+
+`### CPU and disk pressure` follows Memory pressure, with `Source: 60 s machine samples (/proc/pressure/cpu, /proc/pressure/io, /proc/stat).`
+Each host with a counted pair gets CPU some/full, IO some/full, CPU idle and iowait percentages to one decimal place. PSI divides counter deltas by wall time for that counter's counted pairs. Idle and iowait divide tick deltas by total-tick deltas from the same pairs. A share without a denominator is `—`. The sampled duration is the union of counted PSI intervals, formatted with the report's `seconds()` function; tick-only samples have zero sampled PSI time. With no counted host, the section says `CPU and IO samples: none.`
 
 ### Tests (what is pinned)
 

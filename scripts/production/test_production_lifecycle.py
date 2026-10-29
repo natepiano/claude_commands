@@ -18,7 +18,7 @@ from unittest import mock
 import fake_unit_host
 import production_lifecycle
 import showrunners
-from add_unit import read_production
+from production_units import read_production
 from fake_unit_host import HostedUnit
 
 
@@ -381,6 +381,45 @@ class LifecycleTests(unittest.TestCase):
         result = self.run_lifecycle("open")
         self.assert_step(result, "ok")
         self.assertIn("doc: ok — running", result.stdout)
+
+    def test_open_skips_missing_plan_then_commits_it_on_rerun(self) -> None:
+        _ = self.git("rm", "--cached", "docs/plans/alpha.md")
+        _ = self.git("rm", "docs/plans/beta.md")
+        _ = self.git("commit", "-m", "prepare units before their plans")
+        _ = self.git("switch", "-c", "production")
+        alpha = (self.checkout / "docs/plans/alpha.md").read_text()
+
+        first = self.run_lifecycle("open")
+
+        self.assert_step(first, "ok")
+        missing_reports = [line for line in first.stdout.splitlines() if "no plan yet" in line]
+        self.assertEqual(len(missing_reports), 1, first.stdout)
+        self.assertIn("beta-unit", missing_reports[0])
+        self.assertIn("docs/plans/beta.md", missing_reports[0])
+        self.assertFalse((self.checkout / "docs/plans/beta.md").exists())
+        self.assertEqual(set(self.git("show", "--pretty=format:", "--name-only", "HEAD").splitlines()),
+                         {"docs/plans/example-production.md", "docs/plans/alpha.md"})
+        self.assertIn("**Status: PRODUCTION — running.**",
+                      self.git("show", "HEAD:docs/plans/example-production.md"))
+        self.assertEqual(self.git("show", "HEAD:docs/plans/alpha.md"), alpha.strip())
+        self.assertEqual(self.git("log", "-1", "--format=%s"),
+                         "production(example): plans for 2 units")
+        first_tip = self.git("rev-parse", "HEAD")
+        beta = "# Beta plan\n\n## Phases\n\n1. Write the unit.\n"
+        self.write(self.checkout / "docs/plans/beta.md", beta)
+        self.write(self.checkout / "unrelated.txt", "leave this out\n")
+
+        second = self.run_lifecycle("open")
+
+        self.assert_step(second, "ok")
+        self.assertNotIn("no plan yet", second.stdout)
+        self.assertNotEqual(self.git("rev-parse", "HEAD"), first_tip)
+        self.assertEqual(self.git("show", "HEAD:docs/plans/beta.md"), beta.strip())
+        self.assertEqual(self.git("show", "--pretty=format:", "--name-only", "HEAD"), "docs/plans/beta.md")
+        self.assertEqual(self.git("log", "-1", "--format=%s"),
+                         "production(example): plans for 2 units")
+        self.assertEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin),
+                         self.git("rev-parse", "HEAD"))
 
     def test_open_rerun_does_not_commit_plans_twice_and_writes_no_session_name(self) -> None:
         first = self.run_lifecycle("open", "--session", "first-showrunner")
@@ -1006,7 +1045,7 @@ class PermanentUnitTests(unittest.TestCase):
     def test_wrap_neither_waits_on_nor_retires_a_permanent_unit(self) -> None:
         sys.path.insert(0, str(SCRIPT.parent))
         import production_lifecycle
-        from add_unit import Production
+        from production_units import Production
         from zoneinfo import ZoneInfo
 
         lines = ["## Units", "", "| Unit | Plan | Worktree | Branch | Port | Owns |", "| --- | --- | --- | --- | --- | --- |",

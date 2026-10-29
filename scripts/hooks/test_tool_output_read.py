@@ -10,6 +10,9 @@ from pathlib import Path
 from typing import TypedDict, cast
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 HOOK = Path(__file__).with_name("pre-tool-use-tool-output-read.py")
 SAVED = "/home/someone/.claude3/projects/-etc-nixos/0a1b/tool-results/b1z6o3fxk.txt"
 
@@ -26,7 +29,7 @@ class HookResponse(TypedDict):
 
 def run_hook(payload: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, str(HOOK)], input=payload, capture_output=True, text=True, check=False, timeout=10,
+        [sys.executable, str(HOOK)], input=payload, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
     )
 
 

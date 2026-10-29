@@ -22,62 +22,17 @@ review, gate and report. Every prompt sent to a worker carries them inline per
 - Free text amends or narrows the selected work.
 - `single` and `verbose` are mutually exclusive.
 
-<Guild>
-Your guild is `units`. Your head is the `units` unit director in the `guilds` production on natedev. At skill start, use the Tips lock/pull rule for `~/rust/nate_style` and load `guilds/common/` and `guilds/units/`; a Codex holder does this for its worker. Report to your head when the user corrects you, a phase needs repair round 4, a finding meets the Events repeat rule, you use a workaround for a tool fault or slow rule, or a method saves measured time. Send one report of at most 100 words, with evidence and result. Resolve the head from `message/roster.py --json` by production `guilds` and unit `units`; send with `message/send.py` or SendMessage. A Codex worker puts the report in its reply for its holder to send. Send only to the head. Never wake an idle Codex member for guild advice.
-
-Load tips: ~/.claude/scripts/lib/py ~/.claude/scripts/guilds/tips.py load --guild units
-
-Use Events in `~/.claude/docs/as-built/guilds.md` for report detection and form.
-In Synthesize / FixDispatch, send the units report when `findings.py gate` first
-returns `verdict=dispatch` with `round=4` for a phase instance; a repeated read
-sends no new report. The gate outcome does not change.
-For repeated titles in one run, normalize case and spaces. Count matching
-`finding_opened` titles across distinct `(phase_instance_id, round)` groups,
-or a `still_open`/`reopened` verdict after `finding_batch_landed` names that
-finding. Count one group once across lenses and one verdict per finding/round.
-Missing phase, round or repair order means `RepeatNotProven`; cite both event IDs.
-Send at most 100 words in six lines: Guild/event, Member/holder, Work,
-Evidence/time, Change, Result/cost/limit. Keep unsent reports with phase evidence.
-
-In LaunchImplementation, include `config/guilds/designer.md`, the expanded
-designers block and the loaded designers tip text in each Astra designer brief.
-For a designer that `roles.py` does not hold, save the brief before dispatch with:
-`~/.claude/scripts/lib/py ~/.claude/scripts/guilds/astra_work.py brief
---run-directory <SESSION_DIR> --phase <id> --member <mesh name>
---document <path> --round <N> --text-file <brief>`.
-Save the reply as `<SESSION_DIR>/design/phase<id>/round<N>_reply.md` without
-overwrite. A holder passes both `--run-directory` and `--phase` to each phase
-`astra_review.py` call. Codex holders pass the expanded block and loaded tip text
-to their worker, and relay its guild report unchanged.
-</Guild>
-
-<GuildHeadStanding>
-A plan headed `> **Standing:** guild-head` uses its event/daily loop instead
-of ticket dispatch. This branch takes precedence at startup, restart,
-compaction, phase selection in <NextPhase/>, and entry to <StandingPlanRefill/>.
-Read the plan and its production row, then process a member report or user
-feedback: check the cited evidence, publish an owned tip with
-`tips.py publish --head <guild> --from <folder>`, and reply with the tip path
-and pushed commit or a reason to decline. At a daily check-in, read only the
-uncovered interval on natedev and once on the Mac as the plan directs; record
-host coverage, and read turns only for flagged rows. Duplicate check-ins do
-no second read; cover a downtime gap once and state its length.
-
-Run no `style_plan.py` refill, ticket dispatch, phase, worker, checkpoint,
-shrink, FinalGate or RunSummary for this loop. The head writes its tips
-directly under the publish contract and routes process proposals through
-guilds to sdlc for guild-process-unit. Keep the session for its next report
-or timer. It remains a units guild member under <Guild/>; this section changes
-no other standing plan. An idle head ends each turn with
-`— holding: waiting on the next guild report or daily check-in`.
-</GuildHeadStanding>
-
 <HeldAstraRoles>
 For LongLivedWorkers and LaunchImplementation, the director briefs and accepts;
 Astra authors the assigned design. Use one `roles.py` designer and at most one
 reviewer per design, with models resolved from `guild` in `agents.conf`. Open
 once; resume the same instance across rounds, phases and runs. `roles.py` saves
 each headed prompt and reply; do not also use `astra_work.py brief` for that role.
+For a designer outside `roles.py`, include `config/guilds/designer.md` in its brief
+and save it with `astra_work.py brief --run-directory <SESSION_DIR> --phase <id>
+--member <mesh name> --document <path> --round <N> --text-file <brief>`.
+Save its reply as `<SESSION_DIR>/design/phase<id>/round<N>_reply.md` without
+overwrite. Pass both `--run-directory` and `--phase` to phase `astra_review.py` calls.
 
 For DelegatedPhaseReservationContract, prepare exact phase files, baseline and
 reservation before dispatch. Bind the designer to those output paths with explicit
@@ -369,10 +324,30 @@ an empty `write_stdin` poll. A longer command, a `verify.sh` run or any other
 started with `mesh_runs.py start`, detaches and pushes its own result to the
 worker, per <WritePromptContract/> item 3. A live run keeps the worker's
 launcher attached, so the dispatch finishes only when the worker is done.
-Records are in `${SESSION_DIR}/mesh_runs/`, each log beside its record; cancel
-a run with `kill -TERM -- -<pid>`. A message from a worker's run saying no
+Records are in `${SESSION_DIR}/mesh_runs/`, each log beside its record.
+A message from a worker's run saying no
 launcher is attached carries the result to you: dispatch that worker
 (`implement.sh --to <full worker name>`) when it should act on it.
+
+When a decision makes a running or queued test, lint or build run useless,
+cancel it in the same turn to free its memory and its place in the queue.
+This applies when a phase is parked, a round fails, a newer tree replaces the
+run's tree, or a result already in hand answers the question. No run finishes
+only to complete a report.
+
+- For a `mesh_runs.py` run, read `pid` from its record in
+  `${SESSION_DIR}/mesh_runs/` (the `.json` beside its log). Signal only while
+  its `status` is `running` and `ps -p <pid> -o args=` shows
+  `mesh_runs.py supervise` with that record's path, so a reused pid is never
+  hit; then run `kill -TERM -- -<pid>`. A start that found the same run live
+  prints no pid: read it from that run's record.
+- A detached `verify.sh` run uses the same record and command: `verify.sh`
+  detaches through `mesh_runs.py` and handles TERM to stop its step.
+- For a run in the memory queue, cancel its owning run as above. The queue
+  drops dead callers on its next read. It has no separate cancel command;
+  `memory_admit.py release` only releases a reservation. A clean queue cancel
+  and one command for all run kinds are not built yet
+  (`docs/plans/sdlc-run-cancel-design.md`); report any run you cannot cancel.
 </WorkerRuns>
 
 <WorkerLaunchFailure>
@@ -696,6 +671,7 @@ closes each at its own end. Name the phase on every launch,
 `implement.sh --phase <id>` and `review.sh --phase <id>`: the pass is stamped
 with it, and the launcher writes its files to that phase's `${PHASE_DIR}`.
 A launch without a phase is refused (the user, 2026-10-28).
+When a park makes a run useless, apply <WorkerRuns/>.
 
 Before each launch, check the prompt's phase against its active instance and title. Run start-phase and finish-phase at the real boundaries and keep parallel phases separately identified. Do not launch against a stale or absent instance. Classify planned implementation/deployment as implementation and command-only verification as an activity. A fix launch names its defect, failed gate or ledger batch. Correct active state only through supported recorder operations, preserving old evidence; never fabricate starts/finishes or rewrite historic records. Missing historic boundaries stay uncertain in analysis. (the user, 2026-10-28)
 
@@ -1221,6 +1197,11 @@ reports `No active phase to report`, continue without the progress report.
 
 <FixDispatch>
 Apply <LongLivedWorkers/>.
+When a repair round fails or its next edit replaces a run's tree, apply <WorkerRuns/>.
+
+Find a failing test's cause before you scope its repair: read the failure text
+and the fixture it runs in. A repair aimed at a cause no one has checked costs
+a full round.
 
 For a `dispatch` batch, set `${FIX_ROUND}` from the gate's `round` and create
 `${SESSION_DIR}/fix_prompt_${FIX_ROUND}.md` under
@@ -1444,6 +1425,20 @@ and limitation>`, and continue to <UXReview/> without waiting. Deferred smoke
 allows the checkpoint but is batched at <FinalGate/> and reported by
 <RunSummary/>.
 </RunApplicationSmokeTest>
+
+<UserBuildGuard>
+Before a build goes to the user's machine (an install, a binary path given to
+the user, a deploy), run in that repository:
+
+`python3 ~/.claude/scripts/direct/assertion_guard.py --base main`
+
+Exit 1 (a removed, weaker or turned-off assertion or test with no
+`Assertion-Change:` ruling) or exit 2 (it could not run) stops the hand-off:
+route the finding through <FixDispatch/>, or record its ruling, then run it
+again. The user got a build that does not work from cargo-liner-tile
+checkpoint e21d5b93, where a worker weakened an `assert_eq!` (user,
+2026-10-28).
+</UserBuildGuard>
 
 <UXReview>
 Runs when the phase changes what users see, in the app or in any example; a

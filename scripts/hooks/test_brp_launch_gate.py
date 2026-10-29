@@ -11,6 +11,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import TypedDict, cast, override
 
+from scripts.lint.memory_test_support import fake_memory_readings
+
+
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
 
 HOOK = Path(__file__).with_name("pre-tool-use-brp-launch-gate.sh")
 SETTINGS = HOOK.parent.parent.parent / "settings.json"
@@ -59,8 +64,6 @@ class BrpLaunchGateTests(unittest.TestCase):
         self.cycle_file = release / CYCLE_ID / "cycle.json"
         self.write_cycle()
         (holders / "holder").unlink(missing_ok=True)
-        meminfo = self.root / "meminfo"
-        _ = meminfo.write_text("MemAvailable: 67108864 kB\n")
         self.environment = {
             **os.environ,
             "HOME": str(self.root),
@@ -68,7 +71,7 @@ class BrpLaunchGateTests(unittest.TestCase):
             "BUILD_HOLD_RELEASE_DIR": str(release),
             "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
             "BUILD_TARGETS_SCRIPT": str(HOOK.parent.parent / "build_targets" / "build_targets.py"),
-            "BUILDLOG_MEMINFO": str(meminfo),
+            **fake_memory_readings(self.root),
             "BUILDLOG_MEM_POLL_S": "0.01",
             "UNIT_ACTIVE_DIR": str(self.root / "active"),
             "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
@@ -102,7 +105,7 @@ class BrpLaunchGateTests(unittest.TestCase):
             hook_input["session_id"] = session_id
         return subprocess.run(
             ["bash", str(self.hook)], input=json.dumps(hook_input),
-            capture_output=True, text=True, check=False, env=self.environment, timeout=10,
+            capture_output=True, text=True, check=False, env=self.environment, timeout=TEST_HANG_GUARD_SECS,
         )
 
     def use_memory_wait_stub(self, body: str) -> None:
@@ -128,6 +131,23 @@ class BrpLaunchGateTests(unittest.TestCase):
     def test_failed_memory_wait_without_output_denies_launch_with_exit_status(self) -> None:
         self.use_memory_wait_stub("return 9")
         self.assert_denied(self.run_hook(), "BRP launch memory check failed (exit 9)")
+
+    def test_live_pressure_reading_denies_launch_with_the_tripwire_reason(self) -> None:
+        record = self.root / "expected-live-memory-read.jsonl"
+        self.environment["BUILDLOG_LIVE_MEMORY_TRIPWIRE"] = str(record)
+        del self.environment["BUILDLOG_MEMORY_PRESSURE"]
+        reason = (
+            "live memory reading /proc/pressure/memory in a test; "
+            + "fake BUILDLOG_MEMINFO and BUILDLOG_MEMORY_PRESSURE (scripts/lint/memory_test_support.py)"
+        )
+        self.assert_denied(
+            self.run_hook(),
+            f"BRP launch memory check failed (exit 2): memory admission check failed ({reason}); step refused",
+        )
+        rows = record.read_text().splitlines()
+        self.assertEqual(len(rows), 1)
+        row = cast(dict[str, object], json.loads(rows[0]))
+        self.assertEqual(row["reading"], "/proc/pressure/memory")
 
     def test_allowed_memory_wait_passes_launch_without_a_deny_answer(self) -> None:
         self.use_memory_wait_stub("printf 'memory admitted\\n' >&2\nreturn 0")

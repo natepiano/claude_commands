@@ -5,24 +5,33 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import runpy
 import shutil
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 import unittest
+from types import ModuleType
 from unittest import mock
 from datetime import datetime
 from pathlib import Path
 from typing import cast, override
 from zoneinfo import ZoneInfo
 
+# load 136 on natedev, 2026-10-29
+TEST_HANG_GUARD_SECS = 300
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 
+from scripts.lib.socket_test_support import short_socket_directory
 import fake_unit_host
 from fake_unit_host import HostedUnit
+import fake_herdr
+import stall_watch
+import rca
+from cli_fixture import invoke_cli
 
 
 SCRIPT = Path(__file__).with_name("stall_watch.py")
@@ -70,7 +79,7 @@ def executable(path: Path, source: str) -> None:
 
 
 # A marked worker is python, not sleep: the Mac hides a system binary's environment from ps.
-MARKED_SLEEPER = [sys.executable, "-c", "import time; time.sleep(60)"]
+MARKED_SLEEPER = [sys.executable, "-c", f"import time; time.sleep({TEST_HANG_GUARD_SECS})"]
 
 def setUpModule() -> None:
     """The times these tests expect are Pacific; the user's zone setting must not change them."""
@@ -102,7 +111,7 @@ class StallWatchTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(self.enterContext(short_socket_directory()))
         self.bin = self.root / "bin"
         self.bin.mkdir()
         self.notifier = self.root / "notifier"
@@ -163,7 +172,7 @@ fd = os.open(os.environ['STALL_TEST_SEND_LOG'], os.O_WRONLY | os.O_APPEND | os.O
 os.write(fd, line)
 os.close(fd)
 expected = int(os.environ.get('STALL_TEST_SEND_TOGETHER', '0'))
-deadline = time.monotonic() + 30
+deadline = time.monotonic() + float(os.environ['STALL_TEST_HANG_GUARD_SECS'])
 while expected and len(open(os.environ['STALL_TEST_SEND_LOG']).readlines()) < expected:
     if time.monotonic() >= deadline:
         raise SystemExit('send barrier did not receive every concurrent delivery')
@@ -202,6 +211,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             "RCA_SEND": str(self.bin / "rca-send.py"),
             "STALL_TEST_RCA_LOG": str(self.rca_log),
             "STALL_TEST_FAIL_FILE": str(self.fail_file),
+            "STALL_TEST_HANG_GUARD_SECS": str(TEST_HANG_GUARD_SECS),
             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
             "HERDR_PROC": str(self.root / "proc"),
             "HERDR_PLATFORM": "linux",
@@ -246,10 +256,11 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         for child in self.children:
             child.terminate()
             try:
-                _ = child.wait(timeout=2)
+                _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
             except subprocess.TimeoutExpired:
                 _ = child.kill()
-                _ = child.wait(timeout=2)
+                _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
+
     def record_session(self, pid: int, session_id: str, name: str, *, running: bool = True) -> Path:
         path = self.root / f"{session_id}.sock"
         record = {"pid": pid, "sessionId": session_id, "name": name,
@@ -274,7 +285,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         return self.root / "showrunner-production.md"
 
     def unit(self, name: str) -> tuple[int, Path]:
-        child = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        child = subprocess.Popen(["sleep", str(TEST_HANG_GUARD_SECS)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.children.append(child)
         pane_pid = 10_000 + len(self.panes)
         self.process_rows += [f"{pane_pid} 1 herdr pane", f"{child.pid} {pane_pid} claude --remote-control other-name"]
@@ -294,7 +305,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         os.utime(transcript, (START - 3600, START - 3600))
         return child.pid, socket_path
 
-    def tick(self, at: int, *, together: int = 0) -> subprocess.CompletedProcess[str]:
+    def tick(self, at: int, *, together: int = 0, subprocess_cli: bool = False) -> subprocess.CompletedProcess[str]:
         _ = self.ps_file.write_text("\n".join(self.process_rows) + "\n")
         units = [
             HostedUnit(str(data["label"]), f"w{data['id']}:p1",
@@ -317,20 +328,50 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                        "working_dir": str(Path(f"/tmp/no-worktree-of-{name}").resolve())},
                       *([{"event_type": "run_finished"}] if state == "run-finished" else [])]
             _ = (runs / f"{name}.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
-        return subprocess.run(
-            [sys.executable, str(SCRIPT)],
-            env={**self.environment, "STALL_WATCH_NOW_EPOCH": str(at), "STALL_TEST_SEND_TOGETHER": str(together)},
-            capture_output=True, text=True, check=False,
-        )
+        environment = {**self.environment, "STALL_WATCH_NOW_EPOCH": str(at),
+                       "STALL_TEST_SEND_TOGETHER": str(together)}
+        if subprocess_cli:
+            return subprocess.run([sys.executable, str(SCRIPT)], env=environment,
+                                  capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        # Keep herdr.run_program, its sanitized environment, and every parser.
+        # Only the recording fake's interpreter startup is removed.
+        real_run = subprocess.run
+        session_module = ModuleType("stall_watch_fixture_sessions")
+        session_module.__file__ = str(self.sessions_script)
+
+        def sessions_main() -> int:
+            _ = runpy.run_path(str(self.sessions_script), run_name="__main__")
+            return 0
+
+        def run(command: list[str], *, capture_output: bool, text: bool, check: bool,
+                timeout: float | None = None, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            if command[0] == self.environment["HERDR_BIN"]:
+                self.assertTrue(capture_output and text)
+                self.assertFalse(check)
+                self.assertIsNotNone(env, "herdr must pass its sanitized environment")
+                assert env is not None
+                return invoke_cli(fake_herdr, lambda: fake_herdr.main(command[1:]), command[1:], env, Path.cwd())
+            if command[:2] == [sys.executable, str(self.sessions_script)]:
+                return invoke_cli(session_module, sessions_main, command[2:],
+                                  dict(os.environ) if env is None else env, Path.cwd())
+            return real_run(command, capture_output=capture_output, text=text, check=check, timeout=timeout, env=env)
+
+        with (mock.patch.object(subprocess, "run", run),
+              mock.patch.multiple(stall_watch, STATE_DIR=self.state, SESSIONS_DIR=self.sessions,
+                                  PROJECTS_DIR=self.projects, SESSIONS=self.sessions_script,
+                                  SEND=self.bin / "send.py", PS="ps"),
+              mock.patch.multiple(rca, STATE=self.root / "state/message/rca",
+                                  SEND=self.bin / "rca-send.py", PROJECTS=self.root / ".claude/projects")):
+            return invoke_cli(stall_watch, stall_watch.main, [], environment, self.root, production_state=True)
 
     def owner_messages(self) -> list[dict[str, str]]:
         """rca.py's owner messages, once each one it started has landed.
 
         rca.py starts each owner message detached and writes "<time> <key>" to owner.log first, so the
-        stub's log is read after it has one line per started key, for at most 10 s.
+        stub's log is read after it has one line per started key, within the hang guard.
         """
         started = self.root / "state/message/rca/owner.log"
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
         while True:
             keys = [line for line in started.read_text().splitlines()
                     if line.partition(" ")[2].startswith("rca-")] if started.exists() else []
@@ -374,8 +415,8 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
 
     def test_a_herdr_unit_is_watched_through_a_joined_400_line_read(self) -> None:
         self.panes["unit-one"]["label"] = "native"
-        first = self.tick(START)
-        second = self.tick(START + 300)
+        first = self.tick(START, subprocess_cli=True)
+        second = self.tick(START + 300, subprocess_cli=True)
         self.assertEqual((first.returncode, second.returncode), (0, 0), first.stderr + second.stderr)
         self.assertEqual(len(self.sent()), 2)
         calls = (self.root / "herdr.log").read_text().splitlines()
@@ -817,7 +858,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         _ = self.tick(START)
         _ = self.tick(START + 300)
         self.assertEqual(len(self.sent()), 2)
-        worker = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        worker = subprocess.Popen(["sleep", str(TEST_HANG_GUARD_SECS)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.children.append(worker)
         self.process_rows.append(f"{worker.pid} {self.children[0].pid} bash running")
         _ = self.tick(START + 360)
@@ -870,7 +911,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                     path.unlink()
                 self.send_log.unlink(missing_ok=True)
                 _ = self.tick(START)
-                worker = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                worker = subprocess.Popen(["sleep", str(TEST_HANG_GUARD_SECS)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 self.children.append(worker)
                 claude_pid = self.children[0].pid
                 self.process_rows.append(f"{worker.pid} {claude_pid} {command} running")
@@ -1112,8 +1153,9 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
 
     def test_a_showrunner_lookup_that_cannot_say_sends_nothing(self) -> None:
         self.environment["STALL_TEST_SESSION_ERRORS"] = json.dumps(["session:show-id"])
-        _ = self.tick(START)
-        result = self.tick(START + 600)
+        # The script's exception handler, outside main(), formats this failure.
+        _ = self.tick(START, subprocess_cli=True)
+        result = self.tick(START + 600, subprocess_cli=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("cannot tell whether session:show-id is running", result.stderr)
         self.assertEqual(self.sent(), [])

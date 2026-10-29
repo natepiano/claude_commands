@@ -15,7 +15,7 @@
 - **Push:** git
 - **Promote:** ~/.claude, mac ~/.claude
 - **Capacity:** natedev has 32 cores and 60 GB of memory; four units. The work is mostly documents and Python scripts, so the load is low. Its seats share natedev's build slots with build-followups.
-- **Change review:** `~/rust/hanadocs/change-review/change-review - sdlc.md` — sdlc is a top-level showrunner, so the list is its own; the file is made on its first row
+- **Change review:** `~/rust/hanadocs/change-review/change-review - natedev.md` — sdlc reports to natedev, so new rows go to the root list with Production `sdlc`; rows before 2026-10-29 stay in `change-review - sdlc.md`
 - **Review pool:** code
 - **Proposals:** `~/rust/hanadocs/issues`
 
@@ -23,7 +23,7 @@
 
 | Unit | Plan | Worktree | Branch | Port | Owns |
 | --- | --- | --- | --- | --- | --- |
-| guild-process-unit | `docs/plans/sdlc-guilds.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-guild-process` | `sdlc-guild-process` | — | `docs/plans/sdlc-guilds.md`; `docs/plans/sdlc-guilds-next.md`; `docs/as-built/guilds.md`; `scripts/astra/astra_roles.py`; `scripts/astra/test_astra_roles.py`; `scripts/guilds/`; `config/guilds/`; `commands/astra_review.md` and `scripts/astra/astra_review.py` with its test (the guild block only; natedev's enh-showrunner owns the rest); `~/rust/nate_style/guilds/` (separate repo: committed on its main by this unit after its phase gates, fast-forward only) |
+| guild-process-unit | (retired 2026-10-29, worktree removed, session 842c2149-c59b-4abd-934c-ba61d14944ad) `docs/plans/sdlc-guilds.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-guild-process` | `sdlc-guild-process` | — | `docs/plans/sdlc-guilds.md`; `docs/plans/sdlc-guilds-next.md`; `docs/as-built/guilds.md`; `scripts/astra/astra_roles.py`; `scripts/astra/test_astra_roles.py`; `scripts/guilds/`; `config/guilds/`; `commands/astra_review.md` and `scripts/astra/astra_review.py` with its test (the guild block only; natedev's enh-showrunner owns the rest); `~/rust/nate_style/guilds/` (separate repo: committed on its main by this unit after its phase gates, fast-forward only) |
 | phases-unit | `docs/plans/sdlc-phases.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-phases` | `sdlc-phases` | — | `docs/plans/sdlc-phases.md`; `docs/plans/sdlc-phases-next.md`; `docs/plans/sdlc-phases-design.md`; `scripts/direct/phase_process.py`; `scripts/direct/test_phase_process.py` |
 | fix-rounds-unit | `docs/plans/sdlc-fix-rounds.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-fix-rounds` | `sdlc-fix-rounds` | — | `docs/plans/sdlc-fix-rounds.md`; `docs/plans/sdlc-fix-rounds-next.md`; `docs/plans/sdlc-fix-rounds-study.md`; `scripts/history/`; `commands/history.md` |
 | roles-unit | `docs/plans/sdlc-roles.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-roles` | `sdlc-roles` | — | `docs/plans/sdlc-roles.md`; `docs/plans/sdlc-roles-next.md`; `docs/plans/sdlc-roles-design.md`; `scripts/production/roles_audit.py`; `scripts/production/test_roles_audit.py`; `scripts/production/role_terms.toml` |

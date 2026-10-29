@@ -19,14 +19,27 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
-from typing import TypedDict, cast, override
+from typing import TYPE_CHECKING, TypedDict, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
+
+if TYPE_CHECKING:
+    from ..lib.socket_test_support import short_socket_directory
+else:
+    from scripts.lib.socket_test_support import short_socket_directory
 
 import build_hold
 import unit_runs
 from sessions import SessionRecord
 
+if TYPE_CHECKING:
+    from ..lint.memory_test_support import fake_memory_readings
+else:
+    from scripts.lint.memory_test_support import fake_memory_readings
+
+
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
 
 SCRIPT = Path(__file__).with_name("build_hold.py")
 MEMORY_GATE = Path(__file__).resolve().parent.parent / "lint" / "memory_gate.sh"
@@ -61,7 +74,7 @@ def write_holder(folder: Path, name: str, since: str, purpose: str, release: str
 
 
 def recorded_hold_events(root: Path, expected: int) -> list[HoldEventRecord]:
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + TEST_HANG_GUARD_SECS
     while True:
         rows = [cast(HoldEventRecord, json.loads(line))
                 for path in root.rglob("[0-9][0-9][0-9][0-9]-*.jsonl") for line in path.read_text().splitlines()]
@@ -72,17 +85,17 @@ def recorded_hold_events(root: Path, expected: int) -> list[HoldEventRecord]:
 
 class IsolatedBuildHoldTest(unittest.TestCase):
     scratch: Path = Path()
+    socket_dir: Path = Path()
     lifetime_reader: int = -1
     lifetime_writer: int = -1
 
     @override
     def setUp(self) -> None:
         self.scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.socket_dir = Path(self.enterContext(short_socket_directory()))
         proc = self.scratch / "proc"
         proc.mkdir()
         _ = self.enterContext(mock.patch.object(build_hold, "PROC_ROOT", proc))
-        meminfo = self.scratch / "meminfo"
-        _ = meminfo.write_text("MemAvailable: 67108864 kB\n")
         lifetime = self.scratch / "child-lifetime"
         lifetime.mkdir()
         _ = (lifetime / "sitecustomize.py").write_text(CHILD_LIFETIME)
@@ -108,7 +121,7 @@ class IsolatedBuildHoldTest(unittest.TestCase):
             "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
             "MAC_TEST_STATE_DIR": str(self.scratch / "mac-state"),
-            "BUILDLOG_MEMINFO": str(meminfo),
+            **fake_memory_readings(self.scratch),
             # No test reads the machine's own session records, or passes for the session that runs it.
             "NOTIFIER_SESSIONS_DIR": str(self.scratch / "sessions"),
             "CLAUDE_CODE_SESSION_ID": "",
@@ -130,7 +143,7 @@ class IsolatedBuildHoldTest(unittest.TestCase):
         so wait again until a read returns EOF.
         """
         os.close(self.lifetime_writer)
-        deadline = time.monotonic() + 30
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
         try:
             while True:
                 remaining = max(deadline - time.monotonic(), 0)
@@ -652,7 +665,7 @@ class TargetCommandTests(IsolatedBuildHoldTest):
         self.assert_no_natedev_record()
 
     def session(self, name: str, *former: str) -> None:
-        path = self.scratch / "renamed-session.sock"
+        path = self.socket_dir / "renamed-session.sock"
         if not path.exists():
             connection = socket.socket(socket.AF_UNIX)
             connection.bind(str(path))
@@ -804,7 +817,7 @@ class CommandTests(IsolatedBuildHoldTest):
 
     def session(self, session_id: str, name: str, *former: str) -> None:
         """Record a live Claude session, or its rename: this test process stands in for it."""
-        path = self.scratch / f"{session_id}.sock"
+        path = self.socket_dir / f"{session_id}.sock"
         if not path.exists():
             held = socket.socket(socket.AF_UNIX)
             held.bind(str(path))
@@ -1450,7 +1463,7 @@ class HoldRecordingTests(IsolatedBuildHoldTest):
                 result = subprocess.run(
                     ["python3", str(SCRIPT), "hold", "--holder", "alice", "--for", "render checks",
                      "--proc-root", str(self.scratch / "proc")],
-                    env=dict(os.environ), capture_output=True, text=True, timeout=10, check=False)
+                    env=dict(os.environ), capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn("natedev is held for render checks.", result.stdout)
                 self.assertTrue((self.scratch / "holders" / "alice").is_file())
