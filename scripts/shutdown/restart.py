@@ -903,6 +903,14 @@ def _prompt_outcome(record: SessionShutdown) -> herdr.PromptSubmitOutcome:
         return herdr.PromptNotSubmitted("no launch submit proof")
 
 
+def saved_prompt_screen(record: SessionShutdown) -> str | herdr.PromptScreenNotRead:
+    """Read the last screen from this restart's failed submit receipt."""
+    outcome = _prompt_outcome(record)
+    if isinstance(outcome, herdr.PromptNotSubmitted) and isinstance(outcome.screen, str):
+        return outcome.screen
+    return herdr.PromptScreenNotRead()
+
+
 def _require_submitted_prompt(record: SessionShutdown, outcome: herdr.PromptSubmitOutcome | LaunchPromptProofNotRead = _LAUNCH_PROMPT_PROOF_NOT_READ) -> bool:
     if isinstance(outcome, LaunchPromptProofNotRead):
         outcome = _prompt_outcome(record)

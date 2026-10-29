@@ -613,6 +613,18 @@ def running_restart_line(saved: SessionShutdown, *, for_showrunner: bool = False
     return f"{subject} — check it, then close its record in a terminal on {saved['machine']}: {command}"
 
 
+def failed_prompt_screen_lines(saved: SessionShutdown) -> list[str]:
+    """Render a local failed restart's saved submit screen, when it was read."""
+    if saved["progress"]["kind"] != "restart failed":
+        return []
+    import restart as restart_work
+    screen = restart_work.saved_prompt_screen(saved)
+    if isinstance(screen, herdr.PromptScreenNotRead):
+        return []
+    return ["  last screen of the failed prompt submit:",
+            *("    " + line for line in screen.splitlines())]
+
+
 def _warm() -> bool:
     try:
         result = subprocess.run(
@@ -1456,6 +1468,8 @@ def report_stop(records: list[SessionShutdown]) -> None:
             lines.append(f"  {saved['session']['name']}: {progress['reason']}")
         elif progress["kind"] == "manual restart":
             lines.append(f"  {saved['session']['name']}: in a terminal on {saved['machine']}: {progress['command']}")
+        if saved["machine"].casefold() == local_machine().casefold():
+            lines.extend(failed_prompt_screen_lines(saved))
     failed = [saved for saved in records if saved["session"]["session_id"] not in running and store.stop_incomplete(saved)]
     restore_failed = [saved for saved in records
                       if saved["progress"]["kind"] in {"restart failed", "manual restart", "timers pending"}

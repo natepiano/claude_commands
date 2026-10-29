@@ -18,10 +18,18 @@ from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal, Protocol, TypedDict, cast, final, override
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast, final, override
+
+from scripts.usage import collect as collector
+
+if TYPE_CHECKING:
+    from ..production.cli_fixture import invoke_cli
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
+    from cli_fixture import invoke_cli
 
 
-# Hang guards allow for load 136 on natedev (2026-10-29).
+# load 136 on natedev, 2026-10-29
 TEST_HANG_GUARD_SECS = 300
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -150,6 +158,9 @@ class CollectorFixture(unittest.TestCase):
         self.db_path = self.state / "usage.db"
         (self.root / "fixture-repository").mkdir()
         (self.root / "production-docs").mkdir()
+        # Ordinary source/ledger cases do not exercise the waste watcher.
+        # Its CLI handoff and failure behavior retain the explicit watch test.
+        _ = (self.root / "waste_watch_noop.py").write_text("")
         self.use_fixture("basic")
 
     def use_fixture(self, name: str) -> None:
@@ -168,6 +179,7 @@ class CollectorFixture(unittest.TestCase):
         environment["USAGE_STATE_DIR"] = str(self.state)
         environment["HOME"] = str(self.root)
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        environment["USAGE_WASTE_WATCH_SCRIPT"] = str(self.root / "waste_watch_noop.py")
         environment["PATH"] = f"{self.root / 'bin'}:{environment.get('PATH', '')}"
         environment["UNIT_HISTORY_DIR"] = (
             "" if history_override == "empty" else str(self.root / ".local/state/plan-delegate"))
@@ -195,22 +207,14 @@ class CollectorFixture(unittest.TestCase):
         command, environment = self.collector_invocation(db=self.db_path)
         environment["USAGE_WASTE_WATCH_SCRIPT"] = str(stub)
         return subprocess.run(command, cwd=REPOSITORY, env=environment, capture_output=True, text=True,
-                              check=False, timeout=60)
+                              check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def cli(self, *, db: Path, machine: str = "natedev",
             history_override: Literal["configured", "empty"] = "configured",
             mac_pass: Literal["skipped", "fixture"] = "skipped") -> subprocess.CompletedProcess[str]:
         command, environment = self.collector_invocation(db=db, machine=machine,
                                                         history_override=history_override, mac_pass=mac_pass)
-        return subprocess.run(
-            command,
-            cwd=REPOSITORY,
-            env=environment,
-            capture_output=True,
-            text=True,
-            timeout=TEST_HANG_GUARD_SECS,
-            check=False,
-        )
+        return invoke_cli(collector, lambda: collector.main(command[2:]), command[2:], environment, REPOSITORY)
 
     def assert_cli_durability(self, selection: list[str], expected: str) -> None:
         command, environment = self.collector_invocation(db=self.db_path)
@@ -235,7 +239,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
 '''
         result = subprocess.run([sys.executable, "-c", program, *command[1:], *selection],
                                 env=environment, cwd=REPOSITORY, capture_output=True,
-                                text=True, check=False, timeout=300)
+                                text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         statements = [cast(str, json.loads(line)) for line in trace.read_text().splitlines()]
         self.assertEqual([sql for sql in statements if sql.startswith("PRAGMA synchronous=")], [expected])

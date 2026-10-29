@@ -374,6 +374,31 @@ class RestartTests(ShutdownTestCase):
         _ = self.enterContext(patch.object(settle, "record_time", return_value=RESTARTED))
         _ = self.enterContext(patch.object(settle, "inventory", return_value=inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])))
 
+    @patch.object(restart, "_prompt_outcome", READ_PROMPT_OUTCOME)
+    def test_saved_prompt_screen_reads_only_the_matching_failed_receipt(self) -> None:
+        saved = session_shutdown("screen-owner")
+        screen = "Claude fixture\n❯ unsent opening prompt"
+        restart._save_prompt_outcome(saved, herdr.PromptNotSubmitted("not submitted", screen))  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(restart.saved_prompt_screen(saved), screen)
+        path = restart._prompt_outcome_path(saved)  # pyright: ignore[reportPrivateUsage]
+        receipt = cast(dict[str, object], json.loads(path.read_text()))
+        for field in ("request_id", "target", "session_id"):
+            changed = {**receipt, field: "another-value"}
+            _ = path.write_text(json.dumps(changed))
+            with self.subTest(field=field):
+                self.assertIsInstance(restart.saved_prompt_screen(saved), herdr.PromptScreenNotRead)
+
+    @patch.object(restart, "_prompt_outcome", READ_PROMPT_OUTCOME)
+    def test_saved_prompt_screen_handles_missing_unreadable_and_screenless_receipts(self) -> None:
+        saved = session_shutdown("screen-owner")
+        self.assertIsInstance(restart.saved_prompt_screen(saved), herdr.PromptScreenNotRead)
+        restart._save_prompt_outcome(saved, herdr.PromptNotSubmitted("no pane read"))  # pyright: ignore[reportPrivateUsage]
+        self.assertIsInstance(restart.saved_prompt_screen(saved), herdr.PromptScreenNotRead)
+        with patch.object(Path, "read_text", side_effect=PermissionError("fixture unreadable")):
+            self.assertIsInstance(restart.saved_prompt_screen(saved), herdr.PromptScreenNotRead)
+        with patch.object(restart, "_prompt_outcome", return_value=SUBMITTED_PROMPT):
+            self.assertIsInstance(restart.saved_prompt_screen(saved), herdr.PromptScreenNotRead)
+
     def configure_groups(self, *, units: str = "claude2", showrunners: str = "claude2") -> None:
         path = accounts.groups_file()
         path.parent.mkdir(parents=True, exist_ok=True)

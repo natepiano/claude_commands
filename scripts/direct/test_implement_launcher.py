@@ -397,7 +397,7 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
                      "CLAUDE_CODE_REMOTE_MEMORY_DIR", "CODEX_HOME"):
             _ = environment.pop(name, None)
         environment["XDG_CACHE_HOME"] = str(self.root / "cache")
-        cache = self.root / "cache" / "claude" / "python3-3.10"
+        cache = self.root / "cache" / "claude" / "python3-3.11"
         cache.parent.mkdir(parents=True, exist_ok=True)
         _ = cache.write_text(sys.executable + "\n")
         _ = environment.pop("CLAUDE_PYTHON", None)
