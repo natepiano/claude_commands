@@ -32,7 +32,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import add_unit  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
+from production_units import Production, read_production  # noqa: E402
 import merge_checkpoint  # noqa: E402
 import pane_record  # noqa: E402
 import production_units  # noqa: E402
@@ -147,16 +148,16 @@ def foreign_commits(transfer: UnitTransfer) -> int:
     return int(git(worktree, "rev-list", "--count", base, f"^origin/{transfer.to_merge_branch}"))
 
 
-def _production(slug: str) -> add_unit.Production:
+def _production(slug: str) -> Production:
     checked = showrunners.checked_doc(showrunners.NOTIFIER_STATE_DIR / f"showrunner-{slug}")
     if isinstance(checked, showrunners.NoCheckedDoc):
         raise RenameRefused(f"{slug} has no readable update timer: {checked.reason}")
-    return add_unit.read_production(checked.path)
+    return read_production(checked.path)
 
 
 def build(from_slug: str, given: str, to_doc: Path, scratch: Path) -> UnitTransfer:
     giving = _production(from_slug)
-    receiving = add_unit.read_production(to_doc.expanduser().resolve())
+    receiving = read_production(to_doc.expanduser().resolve())
     if receiving.slug == giving.slug:
         raise RenameRefused(f"{given} is already in {giving.slug}")
     try:
@@ -386,6 +387,9 @@ def _move_state(transfer: UnitTransfer, _save: Callable[[], None]) -> None:
     The phase note follows on the unit's next refresh, and the giving showrunner's report state
     keeps its rows as history."""
     from scripts.guilds import roles
+    from scripts.direct import workers
+    workers.move_unit(transfer.from_slug, transfer.to_slug, transfer.unit,
+                      runs=tuple(retire_unit.runs_of(Path(transfer.worktree_dir))))
     try:
         roles.move_holder(roles.UnitHolder(transfer.from_slug, transfer.unit),
                           roles.UnitHolder(transfer.to_slug, transfer.unit), reason="unit transfer")
@@ -652,6 +656,7 @@ def verify(from_slug: str, unit: str, to_doc: Path) -> UnitTransfer:
 
 
 def main(argv: list[str]) -> int:
+    from scripts.direct.workers import WorkerUnavailable
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     _ = parser.add_argument("verb", choices=("plan", "apply", "verify"))
     _ = parser.add_argument("from_slug")
@@ -668,7 +673,7 @@ def main(argv: list[str]) -> int:
     except rename_unit.RenameWaiting as error:
         print(f"transfer_unit: {error}", file=sys.stderr)
         return 2
-    except (RenameRefused, production_units.Refusal, unit_names.BadName, OSError, UnicodeError) as error:
+    except (RenameRefused, production_units.Refusal, unit_names.BadName, WorkerUnavailable, OSError, UnicodeError) as error:
         print(f"transfer_unit: refused: {error}", file=sys.stderr)
         return 1
     print("\n".join(describe(transfer)))

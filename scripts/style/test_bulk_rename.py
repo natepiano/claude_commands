@@ -28,6 +28,9 @@ from scripts.direct.test_verify_untested_examples import rust_tool_path, workspa
 from approved_renames import AppliedInCode, BindingRename, binding_rename_check
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 class ScriptedServer:
     def __init__(self, edit: Callable[[str, int, str], tuple[bulk.SourceEdit, ...]]) -> None:
         self.edit: Callable[[str, int, str], tuple[bulk.SourceEdit, ...]] = edit
@@ -391,7 +394,7 @@ while True:
         source = (self.repo / "src/lib.rs").read_text()
         path = self.repo / "src/lib.rs"
         with mock.patch.dict(os.environ, {"PATH": str(folder) + os.pathsep + os.environ["PATH"], "BULK_LSP_LOG": str(log)}):
-            with bulk.RustAnalyzer(self.repo, timeout=10) as analyzer:
+            with bulk.RustAnalyzer(self.repo, timeout=TEST_HANG_GUARD_SECS) as analyzer:
                 analyzer.open(path, source)
                 analyzer.change(path, source)
                 with self.assertRaisesRegex(bulk.BulkRenameError, "prepareRename"):

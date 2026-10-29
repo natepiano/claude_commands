@@ -97,8 +97,8 @@ LEFT_UNMAPPED = "left_unmapped"
 # harness session id to the reservation that session holds.
 LEDGER_DIRECTORY = "cargo-berth"
 SESSION_MAP_FILE = "session-identities.json"
-# The engine's single ledger deadline is ten seconds; the rest covers a slow start under load.
-CHECK_TIMEOUT_SECONDS = 25
+# A check over a phase's whole files list took 77 s on 2026-10-29, against a ten-second ledger deadline.
+CHECK_TIMEOUT_SECONDS = 90
 PATCH_PATH_HEADERS = ("*** Add File: ", "*** Update File: ", "*** Delete File: ", "*** Move to: ")
 
 
@@ -236,6 +236,31 @@ def check(root: Path, scopes: list[str], session_id: str) -> CheckAnswer:
     except subprocess.TimeoutExpired:
         return CheckAnswer("timed_out", f"cargo-berth check did not answer within {CHECK_TIMEOUT_SECONDS} seconds", None)
     return parse_answer(result.stdout)
+
+
+def _held_acquisition(root: Path, phase: OpenPhase, phase_session: str) -> Acquisition | None:
+    """The live reservation berth's session map already names for this phase, with the phase baseline."""
+    mapped = session_reservation(root, phase_session)
+    if mapped is None or lifecycle(root, mapped[0]) != ACTIVE:
+        return None
+    try:
+        baseline = (phase.directory / BASELINE_FILE).read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return None
+    return Acquisition(*mapped, baseline) if baseline else None
+
+
+def phase_check(root: Path, scopes: list[str], session_id: str, phase: OpenPhase | None) -> CheckAnswer:
+    """`check` for an edit or claim in `phase`, as its berth session; clear at once when the phase holds a live reservation.
+
+    A held phase's reservation was claimed over its whole files list, and attribution keeps every
+    scope inside that list, so cargo-berth has nothing to add.
+    """
+    berth_session = phase_session_id(session_id, phase.phase) if phase is not None else session_id
+    held = _held_acquisition(root, phase, berth_session) if phase is not None else None
+    if held is not None:
+        return CheckAnswer(CLEAR, "the phase already holds its reservation", held)
+    return check(root, scopes, berth_session)
 
 
 def read_state(phase_dir: Path) -> dict[str, object]:
@@ -738,7 +763,7 @@ def _claim_command(args: argparse.Namespace) -> int:
         print("phase reservation: no repository or no files to claim; still awaiting first touch")
         return 0
     session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-    answer = check(root, scopes, phase_session_id(session_id, phase.phase))
+    answer = phase_check(root, scopes, session_id, phase)
     if answer.status in FAILS_OPEN:
         print(f"phase reservation: cargo-berth check answered {answer.status}; still awaiting first touch")
         return 0

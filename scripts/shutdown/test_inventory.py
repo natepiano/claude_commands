@@ -15,9 +15,10 @@ import unittest
 from datetime import datetime
 from collections.abc import Iterator
 from pathlib import Path
-from typing import cast, final, override
+from typing import ClassVar, cast, final, override
 from unittest.mock import patch
 
+from scripts.lib.socket_test_support import short_socket_directory
 from test_support import ShutdownTestCase, linux_process_fixture
 from test_restart import entry, top_level
 import record
@@ -33,6 +34,8 @@ import restart
 import shutdown
 import stop
 from fake_herdr import CommandResponse, herdr_listener
+from cli_fixture import ImmutableGitSeed, invoke_cli
+import fake_herdr
 
 
 TARGET_LOGIN = "owner@example.com"
@@ -51,6 +54,31 @@ UNKNOWN_PID = 41_006
 DIRECTOR_SHELL_PID = 51_001
 DESKTOP_SHELL_PID = 51_004
 CURRENT_PROCESS_START = "current-process-start"
+REAL_HERDR_RUN_PROGRAM = herdr.run_program
+
+
+def replay_herdr_commands(test: unittest.TestCase) -> None:
+    """Run the recording fake's real entry point without a Python process per read."""
+    fake = str(Path(__file__).parents[1] / "herdr/fake_herdr.py")
+
+    def run_herdr(argv: list[str], timeout: float = 10.0, *,
+                  environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        if argv[0] != fake:
+            return REAL_HERDR_RUN_PROGRAM(argv, timeout, environment=environment)
+
+        def execute(command: list[str], *, capture_output: bool, text: bool, check: bool,
+                    timeout: float, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+            test.assertTrue(capture_output and text)
+            test.assertFalse(check)
+            test.assertGreater(timeout, 0)
+            return invoke_cli(fake_herdr, lambda: fake_herdr.main(command[1:]), command[1:],
+                              env, Path.cwd())
+
+        # Retain herdr's environment sanitization and every inventory parser.
+        with patch.object(subprocess, "run", execute):
+            return REAL_HERDR_RUN_PROGRAM(argv, timeout, environment=environment)
+
+    _ = test.enterContext(patch.object(herdr, "run_program", run_herdr))
 
 
 class TranscriptReadCounter(io.BufferedReader):
@@ -75,6 +103,24 @@ class TranscriptReadCounter(io.BufferedReader):
 
 @final
 class InventoryTests(ShutdownTestCase):
+    seed: ClassVar[ImmutableGitSeed]
+    seed_head: ClassVar[str]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="inventory-seed-")))
+        fixture = cls()
+        fixture.root = root
+        fixture.checkout = root / "checkout"
+        fixture.checkout.mkdir()
+        fixture.origin = root / "origin.git"
+        fixture.build_git_checkout()
+        cls.seed = ImmutableGitSeed(fixture.checkout, fixture.origin)
+        cls.seed_head = fixture.head
+        fixture.live_socket.close()
+
     def test_codex_seats_records_nearest_launcher_argv_and_excludes_ended_and_other_runs(self) -> None:
         run = self.root / "paused run"
         run.mkdir()
@@ -348,8 +394,11 @@ class InventoryTests(ShutdownTestCase):
         self.assertEqual(desktops[DESKTOP_ID], "Writing")
 
     def test_desktop_snapshot_update_skips_the_agent_notes_refresh(self) -> None:
-        with (patch.object(shutil, "which", return_value="/fixture/agent-sessions-snapshot"),
+        with (patch.dict(os.environ),
+              patch.object(shutil, "which", return_value="/fixture/agent-sessions-snapshot"),
               patch.object(subprocess, "run") as updater):
+            _ = os.environ.pop("REFUSAL_WATCH_INVENTORY", None)
+            _ = os.environ.pop("PYTHONUNBUFFERED", None)
             _ = inventory._snapshot_desktops()  # pyright: ignore[reportPrivateUsage]
         updater.assert_called_once()
         environment = cast("dict[str, str]", updater.call_args.kwargs["env"])
@@ -485,7 +534,7 @@ class InventoryTests(ShutdownTestCase):
         )
 
         self.director_pid = os.getpid()
-        socket_path = self.root / "director.sock"
+        socket_path = Path(self.enterContext(short_socket_directory())) / "director.sock"
         self.live_socket.close()
         self.live_socket = socket.socket(socket.AF_UNIX)
         self.live_socket.bind(str(socket_path))
@@ -524,6 +573,7 @@ class InventoryTests(ShutdownTestCase):
         self.make_production_state()
         self.make_worker_state()
         self.make_snapshot()
+        replay_herdr_commands(self)
 
     def write_account(self, config_dir: Path, login: str) -> None:
         _ = (config_dir / ".claude.json").write_text(
@@ -570,6 +620,15 @@ class InventoryTests(ShutdownTestCase):
         return result.stdout.strip()
 
     def make_git_checkout(self) -> None:
+        # ProbeInventoryTests also constructs this fixture without a class lifecycle.
+        if not hasattr(type(self), "seed") or not self.seed.checkout.is_dir():
+            self.build_git_checkout()
+            return
+        self.checkout.rmdir()
+        self.seed.copy_to(self.checkout, self.origin)
+        self.head = self.seed_head
+
+    def build_git_checkout(self) -> None:
         _ = self.git("init", "--bare", str(self.origin), cwd=self.root)
         _ = self.git("init", "-b", "shutdown-unit", cwd=self.checkout)
         _ = self.git("config", "user.name", "Shutdown Test")
@@ -592,9 +651,9 @@ class InventoryTests(ShutdownTestCase):
         _ = (self.checkout / "dirty.txt").write_text("changed\n", encoding="utf-8")
         self.head = self.git("rev-parse", "HEAD")
 
-    def write_executable(self, name: str, body: str) -> None:
+    def write_executable(self, name: str, body: str, *, interpreter: str = sys.executable) -> None:
         path = self.bin / name
-        _ = path.write_text(f"#!{sys.executable}\n{body}", encoding="utf-8")
+        _ = path.write_text(f"#!{interpreter}\n{body}", encoding="utf-8")
         path.chmod(0o755)
 
     def make_command_stand_ins(self) -> None:
@@ -626,8 +685,8 @@ elif "comm=" in joined:
 """,
         )
         os.environ["SHUTDOWN_TEST_PARENT_ROWS"] = json.dumps(parent_rows)
-        self.write_executable("agent-sessions-snapshot", "raise SystemExit(0)\n")
-        self.write_executable("kdotool", "raise SystemExit(1)\n")
+        self.write_executable("agent-sessions-snapshot", "exit 0\n", interpreter="/bin/sh")
+        self.write_executable("kdotool", "exit 1\n", interpreter="/bin/sh")
 
     def write_session(
         self,
@@ -812,6 +871,7 @@ elif "comm=" in joined:
         )
 
     def test_inventory_is_account_scoped_and_discovers_every_owned_resource(self) -> None:
+        _ = self.enterContext(patch.object(herdr, "run_program", REAL_HERDR_RUN_PROGRAM))
         found = inventory.inventory(TARGET_LOGIN)
 
         self.assertEqual(found["login"], TARGET_LOGIN)
@@ -1502,6 +1562,7 @@ class RecoveryInventoryTests(unittest.TestCase):
             "FAKE_HERDR_RESPONSES": str(fake_responses), "FAKE_HERDR_LOG": str(self.root / "herdr-log"),
         })))
         _ = self.enterContext(patch.object(inventory, "_terminal_host", return_value=inventory.TerminalHost(kind="terminal")))
+        replay_herdr_commands(self)
 
     def process(self, pid: int, *, command: str = "claude", arguments: list[str] | None = None,
                 environment: dict[str, str] | None = None, terminal: int = 7) -> Path:

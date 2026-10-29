@@ -34,6 +34,7 @@ if command == os.environ.get("TEST_BROKEN_CHECK"):
     if mode == "error":
         raise SystemExit(12)
 if command == "eligible":
+    print("mac_allowed" if os.environ.get("TEST_ELIGIBLE_MAC") else "natedev_only test target")
     print("natedev\\teligible\\t-\\t-")
     if os.environ.get("TEST_ELIGIBLE_MAC"):
         print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"])

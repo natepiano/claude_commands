@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one nextest command on an idle Mac mirror when it is available."""
+"""Run one read-only Cargo judgment on an idle Mac mirror when it is available."""
 
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ from typing import Literal, TextIO, cast, final
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "buildlog"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
+import cargo_manifest
 import override_guard
 import sweep
 import treekey
@@ -32,6 +33,9 @@ import treekey
 
 # Version the mirrored repository's development shell exports on the Mac.
 MACOSX_DEPLOYMENT_TARGET = "14.0"
+
+
+MacVerb = Literal["nextest", "check", "clippy", "mend-check", "doc"]
 
 
 NonBusyMacDeclineReason = Literal[
@@ -242,8 +246,24 @@ class OffloadConfig:
 
 
 @dataclass(frozen=True)
+class RepositoryWorkingTree:
+    pass
+
+
+@dataclass(frozen=True)
+class StagedDocSnapshot:
+    root: Path
+
+
+MacSource = RepositoryWorkingTree | StagedDocSnapshot
+
+
+@dataclass(frozen=True)
 class OffloadRequest:
-    """One nextest invocation and the metadata sent with it."""
+    """One Mac verb, its arguments and the metadata sent with it.
+
+    nextest_words keeps the existing caller API; it holds arguments for any verb.
+    """
 
     repo_root: Path
     package: str
@@ -252,6 +272,12 @@ class OffloadRequest:
     nextest_words: tuple[str, ...]
     last_decline: LastMacDecline = NO_PRIOR_MAC_DECLINE
     copy: bool = False
+    verb: MacVerb = "nextest"
+    source: MacSource = RepositoryWorkingTree()
+
+    @property
+    def source_root(self) -> Path:
+        return self.source.root if isinstance(self.source, StagedDocSnapshot) else self.repo_root
 
 
 @dataclass(frozen=True)
@@ -482,6 +508,7 @@ class CliArguments(argparse.Namespace):
         super().__init__()
         self.command: str = ""
         self.repo_root: str = ""
+        self.source_root: str = ""
         self.package: str = ""
         self.call_id: str = ""
         self.filter_run: bool = False
@@ -490,6 +517,7 @@ class CliArguments(argparse.Namespace):
         self.last_decline: str = ""
         self.copy: bool = False
         self.nextest_words: list[str] = []
+        self.verb: MacVerb = "nextest"
 
 
 class ProcessController:
@@ -717,6 +745,7 @@ def write_result(
     result: MacOffloadResult,
     destination: ResultDestination,
     last_decline: LastMacDecline = NO_PRIOR_MAC_DECLINE,
+    verb: MacVerb = "nextest",
 ) -> int:
     """Write the wire form and return the exit status for one outcome."""
     if isinstance(result, PassedOnMac):
@@ -732,11 +761,11 @@ def write_result(
         mac = "failed"
         reason = ""
         status = result.status
-        print(
-            "mac_test: this ran on the Mac (macOS). Treat the failure as real "
-            + "and fix it; only a test that must run on Linux may rerun with "
-            + "--local to run it on natedev."
+        advice = (
+            "only a test that must run on Linux may rerun with --local to run it on natedev."
+            if verb == "nextest" else "fix the finding in the local worktree; the mirror sends no edits back."
         )
+        print("mac_test: this ran on the Mac (macOS). Treat the failure as real and fix it; " + advice)
     elif isinstance(result, LostMacRun):
         mac = "lost"
         reason = ""
@@ -856,7 +885,7 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig) -> list[str]
         "--pid",
         str(os.getpid()),
         "--what",
-        f"nextest {request.package}",
+        f"{request.verb} {request.package or 'workspace'}",
         "--worktree",
         str(request.repo_root),
         "--remote",
@@ -968,7 +997,7 @@ def copy_tree(
     request: OffloadRequest,
     repository: KnownRepository,
 ) -> bool:
-    ignored = ignored_paths(controller, request.repo_root)
+    ignored = () if isinstance(request.source, StagedDocSnapshot) else ignored_paths(controller, request.repo_root)
     if isinstance(ignored, IgnoredPathListingFailed):
         return False
     try:
@@ -989,7 +1018,7 @@ def copy_tree(
                         f"--exclude-from={exclude_path}",
                         "-e",
                         shlex.join(["ssh", *ssh_options(config)]),
-                        f"{request.repo_root}/",
+                        f"{request.source_root}/",
                         f"{config.host}:{remote_mirror(repository)}/",
                     ]
                 )
@@ -1006,10 +1035,10 @@ def copy_tree_with_key(
     request: OffloadRequest,
     repository: KnownRepository,
 ) -> CopiedTree | TreeCopyFailed:
-    before = read_tree_key(request.repo_root)
+    before = read_tree_key(request.source_root)
     if not copy_tree(controller, config, request, repository):
         return TreeCopyFailed()
-    after = read_tree_key(request.repo_root)
+    after = read_tree_key(request.source_root)
     if isinstance(before, KnownTreeKey) and isinstance(after, KnownTreeKey) and before == after:
         return CopiedTree(before)
     return CopiedTree(UNAVAILABLE_TREE_KEY)
@@ -1042,11 +1071,10 @@ def remote_test_command(
     budget = config.values.get(
         f"mac_budget_gib.{repository.name}", config.default_target_budget_gib
     )
-    words = nextest_words_with_skip(
-        request.nextest_words,
-        config.values.get(f"mac_skip.{repository.name}", ""),
-    )
-    invocation = shlex.join(["nextest", *words])
+    words = request.nextest_words
+    if request.verb == "nextest":
+        words = nextest_words_with_skip(words, config.values.get(f"mac_skip.{repository.name}", ""))
+    invocation = shlex.join([request.verb, *words])
     sent_tree = (
         f"BUILDLOG_SENT_TREE_KEY={shlex.quote(sent_tree_key.value)} "
         if isinstance(sent_tree_key, KnownTreeKey) else ""
@@ -1065,6 +1093,7 @@ def remote_test_command(
             + f'if rm -rf -- "$HOME"/{target}; then echo mac_cleanup=0; '
             + "else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi"
         )
+    forced_config = "LINT_CONFIG_FORCE=1 " if request.verb == "doc" else ""
     return (
         f"cd {shlex.quote(remote_mirror(repository))} && "
         'PATH="$HOME/.cargo/bin:$PATH" '
@@ -1073,6 +1102,7 @@ def remote_test_command(
         f"{sent_tree}"
         "BUILDLOG_SYNC=1 "
         "LINT_SKIP_SWEEP=1 "
+        f"{forced_config}"
         f"LINT_SWEEP_BUDGET_GIB={shlex.quote(budget)} "
         f"MACOSX_DEPLOYMENT_TARGET={MACOSX_DEPLOYMENT_TARGET} "
         f"~/.claude/scripts/lint/lint {invocation}; echo mac_exit=$?; {cleanup_command}"
@@ -1268,7 +1298,7 @@ def claimed_run(
             release_allowed = True
         if remote_status.status == 0:
             return PassedOnMac(seconds)
-        if remote_status.status == 4:
+        if remote_status.status == 4 and request.verb == "nextest":
             return NoTestMatchedOnMac(seconds)
         return FailedOnMac(remote_status.status, seconds)
     except OffloadInterrupted:
@@ -1282,26 +1312,108 @@ def claimed_run(
             release_claim(controller)
 
 
+@dataclass(frozen=True)
+class IneligibleMacStep:
+    reason: NonBusyMacDeclineReason
+
+
+def workspace_has_linux_only(repo_root: Path, excluded: set[str]) -> bool:
+    # Cargo adds in-tree path dependencies to workspace membership.
+    root = repo_root.resolve()
+    manifest = cargo_manifest.toml_table(root / "Cargo.toml")
+    workspace = cargo_manifest.nested_table(manifest, "workspace")
+    shared = cargo_manifest.nested_table(workspace, "dependencies")
+    members = set(cargo_manifest.member_directories(root, manifest))
+    excluded_paths = cargo_manifest.expanded_directories(root, cargo_manifest.string_sequence(workspace, "exclude"))
+    if not members:
+        raise ValueError("workspace members cannot be read")
+    pending = list(members)
+    while pending:
+        member = pending.pop()
+        values = cargo_manifest.toml_table(member / "Cargo.toml")
+        package = cargo_manifest.nested_table(values, "package")
+        name = package.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError("workspace package name cannot be read")
+        if name in excluded:
+            return True
+        tables = [values]
+        for target in cargo_manifest.nested_table(values, "target").values():
+            if not isinstance(target, dict):
+                raise ValueError("target dependencies cannot be read")
+            tables.append(cast(dict[str, object], target))
+        for table in tables:
+            for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+                for dependency_name, dependency in cargo_manifest.nested_table(table, section).items():
+                    if not isinstance(dependency, dict):
+                        if not isinstance(dependency, str):
+                            raise ValueError("dependency cannot be read")
+                        continue
+                    definition = cast(dict[str, object], dependency)
+                    base = member
+                    if definition.get("workspace") is True:
+                        inherited = shared.get(dependency_name)
+                        if not isinstance(inherited, (str, dict)):
+                            raise ValueError("workspace dependency cannot be read")
+                        if isinstance(inherited, str):
+                            continue
+                        definition = cast(dict[str, object], inherited)
+                        base = root
+                    if "path" not in definition:
+                        continue
+                    path = definition["path"]
+                    if not isinstance(path, str) or not path:
+                        raise ValueError("dependency path cannot be read")
+                    directory = (base / path).resolve()
+                    if not cargo_manifest.within(root, directory) or directory in excluded_paths or directory in members:
+                        continue
+                    members.add(directory)
+                    pending.append(directory)
+    return False
+
+
+def mac_step_eligibility(config: OffloadConfig, repo_root: Path, package: str,
+                         verb: MacVerb) -> KnownRepository | IneligibleMacStep:
+    """Share repository, package/workspace and backoff rules with eligible --kind."""
+    if not config.enabled:
+        return IneligibleMacStep("off")
+    repository = repository_identity(repo_root)
+    if isinstance(repository, UnknownRepository):
+        return IneligibleMacStep("repo")
+    key = f"linux_only.{repository.name}"
+    if key not in config.values:
+        return IneligibleMacStep("repo")
+    excluded = comma_values(config.values[key])
+    if verb == "nextest":
+        if package in excluded:
+            return IneligibleMacStep("linux_only")
+    else:
+        try:
+            if workspace_has_linux_only(repo_root, excluded):
+                return IneligibleMacStep("linux_only")
+        except (OSError, UnicodeError, ValueError):
+            return IneligibleMacStep("repo")
+    if isinstance(read_backoff(time.time()), ActiveBackoff):
+        return IneligibleMacStep("backoff")
+    return repository
+
+
 def run_offload(
     controller: ProcessController,
     config: OffloadConfig,
     request: OffloadRequest,
     started: float,
 ) -> MacOffloadResult:
-    if not config.enabled:
-        return declined("off", started)
-    repository = repository_identity(request.repo_root)
-    if isinstance(repository, UnknownRepository):
-        return declined("repo", started)
-    linux_only_key = f"linux_only.{repository.name}"
-    if linux_only_key not in config.values:
-        return declined("repo", started)
-    if request.package in comma_values(config.values[linux_only_key]):
-        return declined("linux_only", started)
-
-    backoff = read_backoff(time.time())
-    if isinstance(backoff, ActiveBackoff):
-        return declined("backoff", started)
+    eligibility = mac_step_eligibility(config, request.repo_root, request.package, request.verb)
+    if isinstance(eligibility, IneligibleMacStep):
+        return declined(eligibility.reason, started)
+    repository = eligibility
+    if isinstance(request.source, StagedDocSnapshot):
+        try:
+            if workspace_has_linux_only(request.source.root, comma_values(config.values[f"linux_only.{repository.name}"])):
+                return declined("linux_only", started)
+        except (OSError, UnicodeError, ValueError):
+            return declined("repo", started)
 
     claim = claim_for_run(controller, config, request, repository)
     if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
@@ -1360,7 +1472,9 @@ def parser() -> argparse.ArgumentParser:
     commands = root.add_subparsers(dest="command", required=True)
     run = commands.add_parser("run")
     _ = run.add_argument("--repo-root", required=True)
-    _ = run.add_argument("--package", required=True)
+    _ = run.add_argument("--source-root", default="")
+    _ = run.add_argument("--package", default="")
+    _ = run.add_argument("--verb", choices=("nextest", "check", "clippy", "mend-check", "doc"), default="nextest")
     _ = run.add_argument("--call-id", required=True)
     _ = run.add_argument("--settings", default="")
     _ = run.add_argument("--last-decline", choices=("busy", "blocked"), default="")
@@ -1382,12 +1496,14 @@ def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
         last_decline = PriorMacDecline("blocked")
     return OffloadRequest(
         repo_root=Path(arguments.repo_root).resolve(),
+        source=StagedDocSnapshot(Path(arguments.source_root).resolve()) if arguments.source_root else RepositoryWorkingTree(),
         package=arguments.package,
         call_id=arguments.call_id,
         result=result_destination(arguments.result),
         nextest_words=tuple(words),
         last_decline=last_decline,
         copy=arguments.copy,
+        verb=arguments.verb,
     )
 
 
@@ -1401,7 +1517,12 @@ def restore_ignored_interrupt_default(arguments: CliArguments) -> None:
 
 def main() -> int:
     override_guard.refuse_overrides(Path(__file__), "mac_test/offload.py")
-    arguments = parser().parse_args(namespace=CliArguments())
+    cli = parser()
+    arguments = cli.parse_args(namespace=CliArguments())
+    if arguments.verb != "nextest" and (arguments.copy or arguments.filter_run):
+        cli.error("--copy and --filter-run apply only to nextest")
+    if arguments.source_root and arguments.verb != "doc":
+        cli.error("--source-root applies only to a staged doc snapshot")
     restore_ignored_interrupt_default(arguments)
     request = request_from_arguments(arguments)
     config = read_config(Path(arguments.settings)) if arguments.settings else read_config()
@@ -1410,7 +1531,7 @@ def main() -> int:
     try:
         with interrupt_handlers(controller):
             result = run_offload(controller, config, request, started)
-        return write_result(result, request.result, request.last_decline)
+        return write_result(result, request.result, request.last_decline, request.verb)
     except OffloadInterrupted as interrupted:
         return 128 + interrupted.signal_number
     except Exception:

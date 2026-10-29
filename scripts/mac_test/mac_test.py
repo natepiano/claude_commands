@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Coordinate test use of the Mac: one claim per repository, and the Mac block."""
+"""Coordinate build-step use of the Mac: one claim per repository, and the Mac block."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ import tempfile
 import time
 import threading
 from typing import Literal, NotRequired, TypeGuard, TypedDict, cast
+from urllib.parse import quote
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
@@ -847,7 +848,7 @@ def run_is_kept(run: RunRecord) -> TypeGuard[RemoteJobClaim]:
 
 
 def copy_gives_way(run: RunRecord) -> bool:
-    """A live copy claim whose process still runs, so a new test can stop it.
+    """A live test copy whose process still runs, so a new step can stop it.
 
     A kept copy claim holds leftovers like any other kept claim and never gives way.
     """
@@ -1201,61 +1202,119 @@ def send_mac_free(block: ActiveMacBlock, owed: FreeMessageOwed) -> bool:
     )
 
 
+@dataclass(frozen=True)
+class CiRunForReport:
+    """A candidate run's check suite and branch details for the skipped-job report."""
+
+    check_suite_id: str
+    branch: str
+    sha: str
+
+
+def skipped_mac_suites(config: MacTestConfig, suite_ids: list[str]) -> set[str] | GhFailure:
+    if not suite_ids:
+        return set()
+    unique_ids = list(dict.fromkeys(suite_ids))
+    # Each nodes field reads at most 100 IDs; both fields share one request.
+    batches = [unique_ids[start:start + 100] for start in range(0, len(unique_ids), 100)]
+    fields = [
+        f"batch{index}: nodes(ids: {json.dumps(batch)}) {{ ... on CheckSuite {{ "
+        + "id checkRuns(first: 1, filterBy: {checkName: $job, conclusions: [SKIPPED]}) "
+        + "{ totalCount } } }"
+        for index, batch in enumerate(batches)
+    ]
+    answer = run_gh(config, "api", "graphql", "-f", "query=query($job: String!) { "
+                    + " ".join(fields) + " }", "-f", f"job={config.ci_job}")
+    if isinstance(answer, GhFailure):
+        return answer
+    try:
+        decoded = cast(object, json.loads(answer.stdout))
+    except json.JSONDecodeError:
+        return GhFailure("gh returned invalid JSON")
+    if not isinstance(decoded, dict):
+        return GhFailure("gh returned invalid JSON")
+    response = cast(dict[str, object], decoded)
+    data = response.get("data")
+    if response.get("errors") or not isinstance(data, dict):
+        return GhFailure("gh returned invalid JSON")
+    results = cast(dict[str, object], data)
+    skipped: set[str] = set()
+    for index, batch in enumerate(batches):
+        nodes = results.get(f"batch{index}")
+        if not isinstance(nodes, list) or len(cast(list[object], nodes)) != len(batch):
+            return GhFailure("gh returned invalid JSON")
+        seen: set[str] = set()
+        for raw_node in cast(list[object], nodes):
+            if not isinstance(raw_node, dict):
+                return GhFailure("gh returned invalid JSON")
+            node = cast(dict[str, object], raw_node)
+            suite_id = node.get("id")
+            checks = node.get("checkRuns")
+            if not isinstance(suite_id, str) or suite_id not in batch or suite_id in seen or not isinstance(checks, dict):
+                return GhFailure("gh returned invalid JSON")
+            count = cast(dict[str, object], checks).get("totalCount")
+            if type(count) is not int or count < 0:
+                return GhFailure("gh returned invalid JSON")
+            seen.add(suite_id)
+            if count:
+                skipped.add(suite_id)
+    return skipped
+
+
 def skipped_ci_runs(config: MacTestConfig, since: datetime) -> str:
     if not config.ci_repo:
         return ""
     answer = run_gh(
         config,
-        "run",
-        "list",
-        "--repo",
-        config.ci_repo,
-        "--workflow",
-        config.ci_workflow,
-        "--created",
-        f">={timestamp(since.replace(microsecond=0))}",
-        "--limit",
-        "200",
-        "--json",
-        "databaseId,headBranch,headSha",
+        "api",
+        f"repos/{config.ci_repo}/actions/workflows/{quote(config.ci_workflow, safe='')}/runs",
+        "--method", "GET",
+        "-f", f"created=>={timestamp(since.replace(microsecond=0))}",
+        "-F", "per_page=100",
+        "--paginate", "--slurp",
     )
     if isinstance(answer, GhFailure):
         return f"Could not list the CI runs that skipped the macOS job: {answer.line}"
-    items = json_items(answer)
-    if isinstance(items, GhFailure):
-        return f"Could not list the CI runs that skipped the macOS job: {items.line}"
-    branch_runs: dict[str, tuple[int, str]] = {}
+    pages = json_items(answer)
+    if isinstance(pages, GhFailure):
+        return f"Could not list the CI runs that skipped the macOS job: {pages.line}"
+    items: list[object] = []
+    for page in pages:
+        if not isinstance(page, dict):
+            return "Could not list the CI runs that skipped the macOS job: gh returned invalid JSON"
+        page_runs = cast(dict[str, object], page).get("workflow_runs")
+        if not isinstance(page_runs, list):
+            return "Could not list the CI runs that skipped the macOS job: gh returned invalid JSON"
+        items.extend(cast(list[object], page_runs))
+        if len(items) >= 200:
+            items = items[:200]
+            break
+    runs: list[CiRunForReport] = []
     for item in items:
         if not isinstance(item, dict):
             return "Could not list the CI runs that skipped the macOS job: gh returned invalid JSON"
         run = cast(dict[str, object], item)
-        database_id = run.get("databaseId")
-        branch = run.get("headBranch")
-        sha = run.get("headSha")
+        suite_id = run.get("check_suite_node_id")
+        branch = run.get("head_branch")
+        sha = run.get("head_sha")
         if (
-            type(database_id) is not int
+            type(run.get("id")) is not int
+            or not isinstance(suite_id, str)
+            or not suite_id
             or not isinstance(branch, str)
             or not isinstance(sha, str)
         ):
             return "Could not list the CI runs that skipped the macOS job: gh returned invalid JSON"
-        jobs = jobs_for_run(config, database_id)
-        if isinstance(jobs, GhFailure):
-            return f"Could not list the CI runs that skipped the macOS job: {jobs.line}"
-        skipped = False
-        for raw_job in jobs:
-            if not isinstance(raw_job, dict):
-                return "Could not list the CI runs that skipped the macOS job: gh returned invalid JSON"
-            job = cast(dict[str, object], raw_job)
-            if (
-                job.get("name") == config.ci_job
-                and job.get("conclusion") == "skipped"
-            ):
-                skipped = True
-                break
-        if skipped:
-            prior = branch_runs.get(branch)
-            branch_runs[branch] = (
-                (1, sha) if prior is None else (prior[0] + 1, prior[1])
+        runs.append(CiRunForReport(suite_id, branch, sha))
+    skipped = skipped_mac_suites(config, [run.check_suite_id for run in runs])
+    if isinstance(skipped, GhFailure):
+        return f"Could not list the CI runs that skipped the macOS job: {skipped.line}"
+    branch_runs: dict[str, tuple[int, str]] = {}
+    for candidate in runs:
+        if candidate.check_suite_id in skipped:
+            prior = branch_runs.get(candidate.branch)
+            branch_runs[candidate.branch] = (
+                (1, candidate.sha) if prior is None else (prior[0] + 1, prior[1])
             )
     if branch_runs:
         lines = ["CI runs that skipped the macOS job under this block:"]
@@ -1718,8 +1777,11 @@ def full_settle(
     if isinstance(block, PendingMacBlock):
         with locked(paths.lock):
             claims = live_claims(paths)
-        if claims:
-            block = pending_with_wait(block, WaitingOnLocalRun(claims[0].record["what"]))
+        waiting_claims = tuple(claim for claim in claims if not claim_belongs_to_block(claim.record, block))
+        # The holder's running work does not need a Mac-free message.
+        message_needed = activation_message_needed and not claims
+        if waiting_claims:
+            block = pending_with_wait(block, WaitingOnLocalRun(waiting_claims[0].record["what"]))
             with locked(paths.lock):
                 write_block(paths.block, block)
         elif config.ci_repo:
@@ -1734,11 +1796,11 @@ def full_settle(
                 with locked(paths.lock):
                     write_block(paths.block, block)
             else:
-                block = activate_block(block, now, activation_message_needed)
+                block = activate_block(block, now, message_needed)
                 with locked(paths.lock):
                     write_block(paths.block, block)
         else:
-            block = activate_block(block, now, activation_message_needed)
+            block = activate_block(block, now, message_needed)
             with locked(paths.lock):
                 write_block(paths.block, block)
 
@@ -1788,11 +1850,32 @@ def block_duration(raw: str, config: MacTestConfig) -> BlockDuration:
 
 
 def requested_delivery(holder: str) -> MessageDelivery:
-    session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    owner = build_hold.owning_session()
     return (
-        RecordedSession(session, holder)
-        if session is not None
+        RecordedSession(owner.session_id, holder)
+        if isinstance(owner, build_hold.OwningSession)
         else HolderQueue(holder)
+    )
+
+
+def block_belongs_to(
+    block: PendingMacBlock | ActiveMacBlock,
+    owner: build_hold.OwningSession | build_hold.NoOwningSession,
+) -> bool:
+    return (
+        isinstance(owner, build_hold.OwningSession)
+        and isinstance(block.delivery, RecordedSession)
+        and block.delivery.name == owner.session_id
+    )
+
+
+def claim_belongs_to_block(
+    claim: RunRecord,
+    block: PendingMacBlock | ActiveMacBlock,
+) -> bool:
+    return (
+        isinstance(block.delivery, RecordedSession)
+        and claim.get("holder_session") == block.delivery.name
     )
 
 
@@ -1834,11 +1917,12 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope) -> Clai
     except (OSError, StateReadError):
         print(f"state unreadable: {paths.block}")
         return ClaimFinished(12)
-    if not isinstance(block, NoMacBlock):
+    owner = build_hold.owning_session()
+    if not isinstance(block, NoMacBlock) and not block_belongs_to(block, owner):
         print(f"blocked by {block.holder}: {block.reason}")
         return ClaimFinished(10)
     if overlapping:
-        # A copy gives way to any new test; a copy never replaces a copy.
+        # A test copy gives way to any new step; a copy never replaces a copy.
         if not args.copy and all(copy_gives_way(claim.record) for claim in overlapping):
             return ClaimHeldByCopy(tuple(claim.record for claim in overlapping))
         return ClaimBusy(overlapping[0].record)
@@ -1858,13 +1942,8 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope) -> Clai
     if isinstance(args.remote, str):
         remote_claim: RemoteJobClaim = {**claimed, "remote_host": args.remote}
         claimed = remote_claim
-    session = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-    if session:
-        claimed["holder_session"] = session
-    else:
-        owner = build_hold.owning_session()
-        if isinstance(owner, build_hold.OwningSession):
-            claimed["holder_session"] = owner.session_id
+    if isinstance(owner, build_hold.OwningSession):
+        claimed["holder_session"] = owner.session_id
     path = claim_path(paths, scope)
     path.parent.mkdir(parents=True, exist_ok=True)
     write_json(path, claimed)
@@ -1967,7 +2046,8 @@ def free_now(
         return "backoff"
     scope = claim_scope(str(repo_root))
     try:
-        if not isinstance(read_claim_block(paths), NoMacBlock):
+        block = read_claim_block(paths)
+        if not isinstance(block, NoMacBlock) and not block_belongs_to(block, build_hold.owning_session()):
             return "blocked"
         claims = read_claims(paths)
     except (OSError, StateReadError):
@@ -2046,39 +2126,22 @@ def command_block(
             now = utc_now()
             expires = now + timedelta(hours=duration.hours)
             if isinstance(existing, NoMacBlock):
-                if claims:
-                    block: PendingMacBlock | ActiveMacBlock = PendingMacBlock(
-                        args.holder,
-                        args.reason,
-                        now,
-                        expires,
-                        requested_delivery(args.holder),
-                        requested_showrunner(args.showrunner),
-                        "still_on",
-                        WaitingOnLocalRun(claims[0].record["what"]),
-                    )
-                elif config.ci_repo:
-                    block = PendingMacBlock(
-                        args.holder,
-                        args.reason,
-                        now,
-                        expires,
-                        requested_delivery(args.holder),
-                        requested_showrunner(args.showrunner),
-                        "still_on",
-                        WAITING_ON_UNKNOWN_CI,
-                    )
-                else:
-                    block = ActiveMacBlock(
-                        args.holder,
-                        args.reason,
-                        now,
-                        expires,
-                        requested_delivery(args.holder),
-                        requested_showrunner(args.showrunner),
-                        "still_on",
-                        FREE_MESSAGE_NOT_NEEDED,
-                    )
+                pending = PendingMacBlock(
+                    args.holder,
+                    args.reason,
+                    now,
+                    expires,
+                    requested_delivery(args.holder),
+                    requested_showrunner(args.showrunner),
+                    "still_on",
+                    WAITING_ON_UNKNOWN_CI,
+                )
+                waiting_claims = tuple(claim for claim in claims if not claim_belongs_to_block(claim.record, pending))
+                block: PendingMacBlock | ActiveMacBlock = pending
+                if waiting_claims:
+                    block = pending_with_wait(pending, WaitingOnLocalRun(waiting_claims[0].record["what"]))
+                elif not config.ci_repo:
+                    block = activate_block(pending, now, False)
                 new_block = True
             elif isinstance(existing, PendingMacBlock):
                 block = PendingMacBlock(

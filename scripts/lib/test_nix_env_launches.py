@@ -13,19 +13,23 @@ from typing import TYPE_CHECKING, cast, override
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 ROOT = Path(__file__).resolve().parents[2]
 for dependency in ("lib", "herdr", "production", "message", "shutdown", "notify", "whoami", "direct"):
     sys.path.insert(0, str(ROOT / "scripts" / dependency))
 sys.path.insert(0, str(ROOT))
 if TYPE_CHECKING:
     from scripts.herdr import herdr, herdr_sessions
-    from scripts.production import add_unit, add_showrunner
+    from scripts.production import add_unit, add_showrunner, production_units
     from scripts.shutdown import restart, pane_restore, pane_record
     from scripts.notify import review
     from scripts.notify.user_action import NoActionRequired
 else:
     import herdr
     import add_unit
+    import production_units
     import add_showrunner
     import restart
     import pane_restore
@@ -73,8 +77,8 @@ class HerdrLaunchTests(NixFixture):
         started.assert_called_once()
         self.refusal(lambda: herdr.launch_agent("host", "space", "title", str(self.work), {}, "claude", [], herdr.NoOpeningPrompt(), 100, agent="fixture"))
 
-    def production(self) -> add_unit.Production:
-        return add_unit.Production(self.root / "child-production.md", "child", "merge", self.root / "checkout", self.root / "log", ZoneInfo("UTC"))
+    def production(self) -> production_units.Production:
+        return production_units.Production(self.root / "child-production.md", "child", "merge", self.root / "checkout", self.root / "log", ZoneInfo("UTC"))
 
     def test_choke_point_closes_the_new_tab_when_agent_start_fails(self) -> None:
         with (patch.object(nix_env, "ensure", return_value=nix_env.NoEnvrc(self.env)),
@@ -305,7 +309,7 @@ print('{"type":"result","result":"fixture completed"}')
 
     def run_script(self, relative: str, args: list[str], directory: Path) -> subprocess.CompletedProcess[str]:
         return subprocess.run(["bash", str(self.scripts / relative), *args], cwd=directory, env=self.env,
-                              capture_output=True, text=True, timeout=10, check=False)
+                              capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
 
     def launch_contract(self, relative: str, args: list[str], directory: Path) -> None:
         _ = self.envrc(directory)

@@ -15,7 +15,8 @@ import sys
 import tempfile
 import uuid
 from collections import defaultdict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Generator, Iterable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import cache
@@ -26,7 +27,9 @@ if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.direct import phase_reservation, plan_history, recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
+from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
 from scripts.lib import agents_registry, unit_runs  # noqa: E402
+from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 
@@ -98,6 +101,11 @@ PROGRESS_CAPS: dict[str, int] = {
     "complete": 100,
 }
 PROJECT_CAP_BEFORE_COMPLETE = 99
+
+WAIT_KINDS = (
+    "WaitingForQuotaRefusal", "WaitingForMemoryOrSlot", "WaitingForMergeGate",
+    "WaitingForUser", "WaitingForSupplier", "ReadyWithoutCapacity",
+)
 
 
 class AgentIdentity(TypedDict):
@@ -196,6 +204,70 @@ CONFIG_DIGEST_LENGTH = 12
 # one table can never be stamped with the digest of another.
 AGENTS_CONFIG_ENV = "AGENTS_CONFIG_FILE"
 DEFAULT_AGENTS_CONFIG_PATH = Path("~/.claude/config/agents.conf").expanduser()
+
+
+class ContractFileHash(TypedDict):
+    state: Literal["Recorded"]
+    sha256: str
+
+
+class ContractFileUnavailable(TypedDict):
+    state: Literal["Missing", "NotRecorded"]
+    reason: str
+
+
+class ContractMainHead(TypedDict):
+    state: Literal["Recorded"]
+    commit: str
+
+
+class ContractHeadUnavailable(TypedDict):
+    state: Literal["NotRecorded"]
+    reason: str
+
+
+class ContractRevision(TypedDict):
+    main_head: ContractMainHead | ContractHeadUnavailable
+    direct_md: ContractFileHash | ContractFileUnavailable
+    files: dict[str, ContractFileHash | ContractFileUnavailable]
+
+
+def _contract_file(path: Path) -> ContractFileHash | ContractFileUnavailable:
+    try:
+        contents = path.read_bytes()
+    except FileNotFoundError:
+        return ContractFileUnavailable(state="Missing", reason=f"Missing file: {path}")
+    except OSError as error:
+        return ContractFileUnavailable(state="NotRecorded", reason=str(error))
+    return ContractFileHash(state="Recorded", sha256=hashlib.sha256(contents).hexdigest())
+
+
+def _contract_revision() -> ContractRevision:
+    """Read the deployed main checkout afresh at each phase boundary."""
+    root = Path.home() / ".claude"
+    head: ContractMainHead | ContractHeadUnavailable
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True, timeout=5,
+        )
+        head = ContractMainHead(state="Recorded", commit=result.stdout.strip())
+    except (OSError, subprocess.SubprocessError) as error:
+        head = ContractHeadUnavailable(state="NotRecorded", reason=str(error))
+    direct = root / "commands/unit/direct.md"
+    files: dict[str, ContractFileHash | ContractFileUnavailable] = {}
+    try:
+        contents = direct.read_bytes()
+        direct_hash: ContractFileHash | ContractFileUnavailable = ContractFileHash(
+            state="Recorded", sha256=hashlib.sha256(contents).hexdigest(),
+        )
+        for path in contract_table_paths(contents.decode("utf-8")):
+            files[path] = _contract_file(root / path)
+    except FileNotFoundError:
+        direct_hash = ContractFileUnavailable(state="Missing", reason=f"Missing file: {direct}")
+    except (OSError, UnicodeError) as error:
+        direct_hash = ContractFileUnavailable(state="NotRecorded", reason=str(error))
+    return ContractRevision(main_head=head, direct_md=direct_hash, files=files)
 
 
 def _config_path() -> Path:
@@ -338,6 +410,29 @@ def _session_dir(args: argparse.Namespace) -> Path:
     if not value:
         raise SystemExit("--session-dir is required")
     return Path(value).expanduser().resolve()
+
+
+def set_unit(session_dir: Path, production: str, unit: str) -> None:
+    """Persist unit identity without changing the run's history or workers."""
+    if any(not value or value in (".", "..") or "/" in value or "\\" in value
+           for value in (production, unit)):
+        raise ValueError("invalid production or unit identity")
+    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = _read_state(session_dir)
+        state.update({"production": production, "unit": unit})
+        _write_state(session_dir, state)
+
+
+def _set_unit(args: argparse.Namespace) -> None:
+    # main already holds this lock; the public API takes it for other callers.
+    state = _read_state(_session_dir(args))
+    production, unit = _arg_string(args, "production"), _arg_string(args, "unit")
+    if any(not value or value in (".", "..") or "/" in value or "\\" in value
+           for value in (production, unit)):
+        raise SystemExit("invalid production or unit identity")
+    state.update({"production": production, "unit": unit})
+    _write_state(_session_dir(args), state)
 
 
 def _state_path(session_dir: Path) -> Path:
@@ -1381,6 +1476,8 @@ def _start_phase(args: argparse.Namespace) -> None:
     state["pending_calibration"] = None
     _write_state(session_dir, state)
     event = _event(state, "phase_started", started_at)
+    event["contract_revision"] = _contract_revision()
+    event["wait_coverage"] = {"state": "Recorded", "version": 1}
     if started_at != now:
         event["recorded_at"] = _iso_time(now)
         event["backfilled"] = True
@@ -4666,7 +4763,701 @@ def _eta(args: argparse.Namespace) -> None:
     print(f"ETA recorded: {local_eta:%H:%M %Z}")
 
 
+def _waits_by_id(events: list[dict[str, object]]) -> dict[str, dict[str, object]]:
+    waits: dict[str, dict[str, object]] = {}
+    for event in events:
+        if event.get("event_type") in ("wait_started", "wait_finished", "wait_unclosed", "wait_not_recorded"):
+            wait_id = _string(event.get("wait_id"))
+            if wait_id:
+                waits[wait_id] = event
+    return waits
+
+
+@dataclass(frozen=True)
+class WaitPhaseResolved:
+    phase: dict[str, object]
+
+
+@dataclass(frozen=True)
+class WaitPhaseNotRecorded:
+    reason: str
+
+
+@dataclass(frozen=True)
+class ResolvedWorkerPass:
+    phase: dict[str, object]
+    pass_instance_id: str
+    worker_name: str
+    team_slot: str
+
+
+@dataclass(frozen=True)
+class UnresolvedWaitAttribution:
+    reason: str
+    candidates: tuple[dict[str, object], ...]
+
+
+@dataclass(frozen=True)
+class ResolvedCheckpointPhase:
+    identity: dict[str, object]
+
+
+@dataclass(frozen=True)
+class ProductionHandoff:
+    production: str
+    checkpoint_commit: str
+
+
+@dataclass(frozen=True)
+class NamedSupplier:
+    address: str
+
+
+@dataclass(frozen=True)
+class NoNamedSupplier:
+    reason: str
+
+
+@dataclass(frozen=True)
+class ProductionUnitIdentity:
+    production: str
+    unit: str
+
+
+@dataclass(frozen=True)
+class ProductionNotRecorded:
+    reason: str
+
+
+def resolve_production_unit(state: Mapping[str, object]) -> ProductionUnitIdentity | ProductionNotRecorded:
+    """Read metadata only; never recover worker moves or take a run lock."""
+    production, unit = _string(state.get("production")), _string(state.get("unit"))
+    if not production or not unit:
+        worktree = Path(_string(state.get("working_dir")) or ".").expanduser()
+        plan = _string(state.get("project_plan_doc")) or _string(state.get("plan_doc"))
+        try:
+            content = (worktree / plan).read_text(encoding="utf-8") if plan else ""
+        except OSError:
+            content = ""
+        match = re.search(r'^> \*\*Production:(?: (.+?)\*\*|\*\* (.+?)) — unit `([^`]+)`;', content, re.MULTILINE)
+        if match:
+            production, unit = match.group(1) or match.group(2), match.group(3)
+    if not production or not unit:
+        return ProductionNotRecorded("run and plan have no production and unit identity")
+    return ProductionUnitIdentity(production, unit)
+
+
+def _phase_identity(state: dict[str, object], phase: dict[str, object]) -> dict[str, object]:
+    return {"run_id": _string(state.get("run_id")), "phase_id": _string(phase.get("id")),
+            "phase_instance_id": _string(phase.get("instance_id"))}
+
+
+def resolve_worker_pass(session_dir: Path, state: dict[str, object],
+                        thread_id: str) -> ResolvedWorkerPass | UnresolvedWaitAttribution:
+    """Use the thread's full roster name, never a server's inherited slot."""
+    phases = [*_parked_phases(state), _object_dict(state.get("phase")) or {}]
+    candidates: list[dict[str, object]] = []
+    for record in _open_passes(state).values():
+        candidates.append({"run_id": _string(state.get("run_id")),
+                           "phase_instance_id": _pass_phase_instance(record),
+                           "phase_id": _string((_object_dict(record.get("phase")) or {}).get("id")),
+                           "pass_instance_id": _string(record.get("instance_id")),
+                           "worker_name": _string(record.get("worker_name")),
+                           "team_slot": _string(record.get("team_slot"))})
+    if not candidates:
+        candidates = [_phase_identity(state, phase) for phase in phases if phase.get("status") == "active"]
+    try:
+        roster = _json_object((session_dir / "mesh_roster.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        return UnresolvedWaitAttribution(f"worker roster unavailable: {error}", tuple(candidates))
+    names = [name for name, value in (roster or {}).items()
+             if thread_id and (_object_dict(value) or {}).get("thread_id") == thread_id]
+    if len(names) != 1:
+        return UnresolvedWaitAttribution(f"worker thread has {len(names)} roster matches", tuple(candidates))
+    matching = [candidate for candidate in candidates if candidate.get("worker_name") == names[0]]
+    if len(matching) != 1:
+        return UnresolvedWaitAttribution(f"worker {names[0]} has {len(matching)} active pass matches",
+                                         tuple(matching or candidates))
+    candidate = matching[0]
+    no_phase: dict[str, object] = {}
+    phase = next((phase for phase in phases if phase.get("instance_id") == candidate["phase_instance_id"]
+                  and phase.get("status") == "active"), no_phase)
+    if not phase or not candidate["pass_instance_id"]:
+        return UnresolvedWaitAttribution("worker pass has no active phase or pass id", (candidate,))
+    return ResolvedWorkerPass(phase, _string(candidate["pass_instance_id"]), names[0],
+                              _string(candidate["team_slot"]))
+
+
+def _wait_phase(state: dict[str, object], args: argparse.Namespace) -> (
+    WaitPhaseResolved | WaitPhaseNotRecorded | ResolvedWorkerPass | UnresolvedWaitAttribution
+):
+    """Resolve the caller's pass now, or an explicitly named historical instance."""
+    slot = _optional_arg(args, "slot")
+    instance_id = _optional_arg(args, "phase_instance_id")
+    phase_id = _optional_arg(args, "phase_id")
+    if hasattr(args, "worker_thread_id"):
+        return resolve_worker_pass(_session_dir(args), state, _optional_arg(args, "worker_thread_id"))
+    if hasattr(args, "director") and cast(bool, args.director):
+        phases = [phase for phase in [*_parked_phases(state), _object_dict(state.get("phase")) or {}]
+                  if phase.get("status") == "active"]
+        if len(phases) == 1:
+            return WaitPhaseResolved(phases[0])
+        return UnresolvedWaitAttribution(f"director has {len(phases)} active phase candidates",
+                                         tuple(_phase_identity(state, phase) for phase in phases))
+    if hasattr(args, "slot"):
+        current_pass = _open_passes(state).get(slot)
+        if current_pass is None:
+            return WaitPhaseNotRecorded(f"slot {slot} has no open pass")
+        instance_id = _pass_phase_instance(current_pass)
+        if not instance_id:
+            return WaitPhaseNotRecorded(f"slot {slot} open pass has no phase instance")
+        # An open pass can only belong to an open phase. Never substitute the
+        # current phase when a reused server carries an older environment.
+        candidates = [*_parked_phases(state), _object_dict(state.get("phase")) or {}]
+        for phase in candidates:
+            if phase.get("instance_id") == instance_id and phase.get("status") == "active":
+                return WaitPhaseResolved(phase)
+        return WaitPhaseNotRecorded(f"slot {slot} open pass names no open phase")
+    if hasattr(args, "phase_instance_id"):
+        if not instance_id:
+            return WaitPhaseNotRecorded("phase instance selector is blank")
+        for event in reversed(_run_events(state)):
+            if event.get("event_type") == "phase_started" and event.get("phase_instance_id") == instance_id:
+                return WaitPhaseResolved({"instance_id": instance_id, "id": event.get("phase_id"),
+                                          "title": event.get("phase_title"),
+                                          "started_at": event.get("timestamp_epoch")})
+        return WaitPhaseNotRecorded(f"phase instance {instance_id} has no start record in this run")
+    if _optional_arg(args, "missing_reason") and not hasattr(args, "phase_id"):
+        return WaitPhaseNotRecorded("missing wait has no phase selector")
+    phase = _open_phase_named(state, phase_id) if hasattr(args, "phase_id") else _object_dict(state.get("phase"))
+    if phase is not None and phase.get("status") == "active" and state.get("status") == "active":
+        return WaitPhaseResolved(phase)
+    return WaitPhaseNotRecorded(f"phase {phase_id or '(current)'} is not open")
+
+
+def _start_wait(args: argparse.Namespace) -> None:
+    if cast(bool, args.probe) or os.environ.get(PROBE_ENV) == "1":
+        return
+    state = _read_state(_session_dir(args))
+    print(_record_wait(state, args))
+
+
+def _record_wait(state: dict[str, object], args: argparse.Namespace) -> str:
+    resolution = _wait_phase(state, args)
+    owner = _arg_string(args, "owner_session") or _string((_object_dict(state.get("main_agent")) or {}).get("session_id"))
+    missing_reason = _optional_arg(args, "missing_reason")
+    if isinstance(resolution, (WaitPhaseNotRecorded, UnresolvedWaitAttribution)):
+        missing_reason = "; ".join(part for part in (missing_reason, resolution.reason) if part)
+    if not owner:
+        missing_reason = "; ".join(part for part in (missing_reason, "wait owner session not recorded") if part)
+    now = plan_history.now_epoch()
+    # An empty explicit phase prevents _event from borrowing a reporting pass
+    # or the current phase when attribution failed.
+    event = _event(state, "wait_not_recorded" if missing_reason else "wait_started", now,
+                   phase_record=resolution.phase if isinstance(resolution, (WaitPhaseResolved, ResolvedWorkerPass)) else {})
+    wait_id = str(uuid.uuid4())
+    event.update({"wait_id": wait_id, "wait_kind": _arg_string(args, "kind"),
+                  "wait_reason": _arg_string(args, "reason"),
+                  "unit": _arg_string(args, "unit") or _string(state.get("worktree")),
+                  "owner_session": owner, "wait_started_at": _iso_time(now),
+                  "wait_started_epoch": now, "wait_end": {"state": "Open"}})
+    if hasattr(args, "expected_supplier"):
+        event["expected_supplier"] = cast(object, args.expected_supplier)
+    if isinstance(resolution, ResolvedWorkerPass):
+        event.update(pass_instance_id=resolution.pass_instance_id, worker_name=resolution.worker_name,
+                     team_slot=resolution.team_slot, wait_attribution={"state": "WorkerPass"})
+    elif isinstance(resolution, UnresolvedWaitAttribution):
+        event["wait_attribution"] = {"state": "UnresolvedAttribution", "reason": resolution.reason,
+                                     "candidates": list(resolution.candidates)}
+    else:
+        event["wait_attribution"] = {"state": "PhaseInstance" if isinstance(resolution, WaitPhaseResolved)
+                                     else "UnresolvedAttribution", "candidates": [],
+                                     "reason": resolution.reason if isinstance(resolution, WaitPhaseNotRecorded) else "explicit phase attribution"}
+    supplier = _object_dict(event.get("expected_supplier")) or {}
+    if event["wait_kind"] == "WaitingForSupplier" and supplier.get("state") == "NoNamedSupplier":
+        event["wait_attribution"] = {"state": "UnresolvedSupplier", "reason": supplier.get("reason"),
+                                     "candidates": [{key: event[key] for key in
+                                                     ("run_id", "phase_id", "phase_instance_id") if key in event}]}
+    if missing_reason:
+        event.update(wait_record_state={"state": "NotRecorded", "reason": missing_reason},
+                     wait_end={"state": "NotRecorded"},
+                     requested_slot=_optional_arg(args, "slot"),
+                     requested_phase_id=_optional_arg(args, "phase_id"),
+                     requested_phase_instance_id=_optional_arg(args, "phase_instance_id"))
+    _append_event(state, event)
+    return wait_id
+
+
+def _end_wait(state: dict[str, object], wait: dict[str, object], now: float, *, unclosed: bool) -> None:
+    event = dict(wait)
+    event.update({"event_id": str(uuid.uuid4()), "event_type": "wait_unclosed" if unclosed else "wait_finished",
+                  "timestamp": _iso_time(now), "timestamp_epoch": now,
+                  "wait_end": {"state": "Unclosed"} if unclosed else
+                  {"state": "Finished", "at": _iso_time(now), "epoch": now}})
+    _append_event(state, event)
+
+
+def _finish_wait(args: argparse.Namespace) -> None:
+    if os.environ.get(PROBE_ENV) == "1":
+        return
+    state = _read_state(_session_dir(args))
+    wait_id = _arg_string(args, "wait_id")
+    wait = _waits_by_id(_run_events(state)).get(wait_id)
+    if wait is None:
+        raise SystemExit(f"Wait {wait_id} was not recorded in this run")
+    if wait.get("event_type") != "wait_started":
+        return
+    now = plan_history.now_epoch()
+    if now < _number(wait.get("wait_started_epoch")):
+        raise SystemExit("Cannot finish a wait before its start")
+    _end_wait(state, wait, now, unclosed=False)
+
+
+def _checkpoint(args: argparse.Namespace) -> None:
+    if os.environ.get(PROBE_ENV) == "1":
+        return
+    state = _read_state(_session_dir(args))
+    commit = _arg_string(args, "commit")
+    if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit) is None:
+        raise SystemExit("checkpoint requires a full commit hash")
+    phase = _open_phase_named(state, _arg_string(args, "phase"))
+    if phase is None:
+        raise SystemExit("checkpoint requires the named open phase")
+    events = _run_events(state)
+    for event in events:
+        if (event.get("event_type") == "checkpoint" and event.get("checkpoint_commit") == commit
+                and event.get("phase_instance_id") == phase.get("instance_id")):
+            return
+    event = _event(state, "checkpoint", plan_history.now_epoch(), phase_record=phase)
+    event.update(checkpoint_commit=commit, session_dir=str(_session_dir(args)))
+    _append_event(state, event)
+
+
+def resolve_checkpoint(commit: str, working_dir: Path, phase_id: str) -> (
+    ResolvedCheckpointPhase | UnresolvedWaitAttribution
+):
+    """Match a full checkpoint, including finished instances, across durable runs."""
+    events, ignored = _load_events()
+    phases = [event for event in events if event.get("event_type") == "phase_started"
+              and _string(event.get("working_dir"))
+              and Path(_string(event.get("working_dir"))).resolve() == working_dir.resolve()
+              and event.get("phase_id") == phase_id]
+    matches = [event for event in events if event.get("event_type") == "checkpoint"
+               and event.get("checkpoint_commit") == commit]
+    valid = [event for event in matches if any(
+        (event.get("run_id"), event.get("phase_instance_id"), event.get("working_dir")) ==
+        (phase.get("run_id"), phase.get("phase_instance_id"), phase.get("working_dir")) for phase in phases)]
+    if len(matches) == len(valid) == 1 and not ignored:
+        return ResolvedCheckpointPhase(valid[0])
+    candidates = list({(_string(event.get("run_id")), _string(event.get("phase_instance_id"))): event
+                       for event in [*phases, *matches]}.values())
+    identities = tuple({key: event[key] for key in
+                        ("run_id", "phase_id", "phase_instance_id", "session_dir", "working_dir", "checkpoint_commit")
+                        if key in event} for event in candidates)
+    reason = (f"checkpoint {commit} has {len(matches)} records and {len(valid)} valid phase matches"
+              + (f"; {ignored} unreadable history rows" if ignored else ""))
+    return UnresolvedWaitAttribution(reason, identities)
+
+
+def _external_wait_file() -> Path:
+    return plan_history.history_root() / "wait_attribution.jsonl"
+
+
+def _external_wait_events() -> list[dict[str, object]]:
+    # This reader creates no file or parent directory.
+    return _run_events({"history_file": str(_external_wait_file())})
+
+
+@contextmanager
+def _external_wait_lock() -> Generator[None, None, None]:
+    path = _external_wait_file().with_suffix(".lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        yield
+
+
+def _start_external_wait(args: argparse.Namespace) -> None:
+    if os.environ.get(PROBE_ENV) == "1":
+        return
+    with _external_wait_lock():
+        _record_external_wait(args)
+
+
+def _record_external_wait(args: argparse.Namespace) -> None:
+    commit = _arg_string(args, "commit")
+    attribution = (ProductionHandoff(_arg_string(args, "production"), commit)
+                   if _arg_string(args, "command") == "start-handoff-wait" else
+                   resolve_checkpoint(commit, Path(_arg_string(args, "working_dir")), _arg_string(args, "phase_id")))
+    now = plan_history.now_epoch()
+    owner = (_arg_string(args, "owner_session") or os.environ.get("CLAUDE_CODE_SESSION_ID")
+             or os.environ.get("CODEX_THREAD_ID", ""))
+    if not owner and isinstance(attribution, ResolvedCheckpointPhase):
+        owner = _string((_object_dict(attribution.identity.get("main_agent")) or {}).get("session_id"))
+    event: dict[str, object] = {"schema_version": SCHEMA_VERSION, "event_id": str(uuid.uuid4()),
+        "event_type": "wait_started", "wait_id": str(uuid.uuid4()), "timestamp_epoch": now,
+        "timestamp": _iso_time(now), "wait_started_at": _iso_time(now), "wait_started_epoch": now,
+        "wait_kind": "WaitingForMergeGate", "wait_reason": _arg_string(args, "reason"),
+        "owner_session": owner, "unit": _arg_string(args, "unit"),
+        "checkpoint_commit": commit, "wait_end": {"state": "Open"}}
+    if isinstance(attribution, ResolvedCheckpointPhase):
+        event.update({key: attribution.identity[key] for key in
+                      ("run_id", "phase_id", "phase_instance_id", "working_dir", "session_dir")})
+        event["wait_attribution"] = {"state": "CheckpointPhase", "reason": "one checkpoint phase match",
+                                     "candidates": [attribution.identity]}
+    elif isinstance(attribution, ProductionHandoff):
+        event["production"] = attribution.production
+        event["wait_attribution"] = {"state": "ProductionHandoff", "reason": "child production checkpoint has no owning phase",
+                                     "candidates": []}
+    else:
+        event.update(event_type="wait_not_recorded", wait_end={"state": "NotRecorded"},
+                     wait_record_state={"state": "NotRecorded", "reason": attribution.reason},
+                     wait_attribution={"state": "UnresolvedAttribution", "reason": attribution.reason,
+                                       "candidates": list(attribution.candidates)})
+    _append_event({"history_file": str(_external_wait_file())}, event)
+    print(event["wait_id"])
+
+
+def _finish_external_wait(args: argparse.Namespace) -> None:
+    if os.environ.get(PROBE_ENV) == "1":
+        return
+    path = _external_wait_file()
+    with _external_wait_lock():
+        wait = _waits_by_id(_external_wait_events()).get(_arg_string(args, "wait_id"))
+        if wait is None:
+            raise SystemExit("External wait was not recorded")
+        if wait.get("event_type") == "wait_started":
+            now = plan_history.now_epoch()
+            if now < _number(wait.get("wait_started_epoch")):
+                raise SystemExit("Cannot finish a wait before its start")
+            _end_wait({"history_file": str(path)}, wait, now, unclosed=False)
+
+
+def _showrunner_supplier(state: dict[str, object]) -> NamedSupplier | NoNamedSupplier:
+    identity = resolve_production_unit(state)
+    if isinstance(identity, ProductionNotRecorded):
+        return NoNamedSupplier(identity.reason)
+    from scripts.production import showrunners
+
+    try:
+        address = showrunners.current_address(identity.production)
+    except (OSError, ValueError) as error:
+        return NoNamedSupplier(f"showrunner address unavailable: {error}")
+    # Keep the production alias, so a restart resolves its new socket on arrival.
+    return NamedSupplier("showrunner:" + identity.production) if address else NoNamedSupplier("production has no running showrunner address")
+
+
+def _supplier_fields(supplier: NamedSupplier | NoNamedSupplier) -> dict[str, object]:
+    if isinstance(supplier, NamedSupplier):
+        return {"state": "NamedSupplier", "address": supplier.address}
+    return {"state": "NoNamedSupplier", "reason": supplier.reason}
+
+
+def _turn_supplier(state: dict[str, object], reason: str) -> NamedSupplier | NoNamedSupplier:
+    if "waiting on the showrunner" in reason.lower():
+        return _showrunner_supplier(state)
+    match = re.search(r"blocked: waiting on ((?:claude-|codex-|worker:|session:|codex:|uds:)[^\s,;]+)", reason, re.IGNORECASE)
+    return NamedSupplier(match[1]) if match else NoNamedSupplier("wait names no supplier address")
+
+
+def _supplier_address(identity: str) -> NamedSupplier | NoNamedSupplier:
+    """Resolve the supplier alias at arrival, including a restarted showrunner."""
+    if identity.startswith("showrunner:"):
+        from scripts.production import showrunners
+
+        address = showrunners.current_address(identity.removeprefix("showrunner:"))
+        return NamedSupplier(address) if address else NoNamedSupplier("showrunner has no current address")
+    if identity.startswith(("uds:/", "codex:")):
+        return NamedSupplier(identity)
+    if identity.startswith("worker:"):
+        run_id, separator, name = identity.partition(":")[2].partition("/")
+        if not separator or run_id in ("", ".", "..") or "/" in name:
+            return NoNamedSupplier("worker alias has no run and worker identity")
+        threads: set[str] = set()
+        for root in unit_runs.run_roots(os.environ.get("UNIT_RUN_ROOT")):
+            try:
+                roster = _json_object((root / run_id / "mesh_roster.json").read_text(encoding="utf-8")) or {}
+                thread = _string((_object_dict(roster.get(name)) or {}).get("thread_id"))
+                if thread:
+                    threads.add(thread)
+            except (OSError, ValueError):
+                continue
+        return NamedSupplier("codex:" + next(iter(threads))) if len(threads) == 1 else NoNamedSupplier("worker alias has no unique roster thread")
+    from scripts.message import sessions
+
+    records = sessions.live_sessions()
+    matches = [record for record in records if identity in
+               (record["name"], "session:" + record["sessionId"], *record["formerNames"])]
+    # A duplicate name is not an identity, even if addressed() would pick one.
+    if len(matches) != 1:
+        return NoNamedSupplier(f"supplier alias has {len(matches)} live addresses")
+    return NamedSupplier("uds:" + matches[0]["messagingSocketPath"])
+
+
+@dataclass(frozen=True)
+class VerifiedSupplierMessage:
+    body: str
+
+
+@dataclass(frozen=True)
+class UnverifiedSupplierMessage:
+    reason: str
+
+
+def _supplier_message(identity: str, prompt: str) -> VerifiedSupplierMessage | UnverifiedSupplierMessage:
+    """Trust wrapper `from`, never `from-name` or a claimed sender in text.
+
+    send.py's separate relay inherits the supplied name, not its origin socket;
+    that alone proves nothing. Postmaster forwarding is not yet verifiable:
+    its replies log is written after delivery, so the recipient's hook can run
+    before the evidence exists. Forwarded messages leave the wait open, with or
+    without that log. Direct delivery resolves supplier aliases anew.
+    """
+    wrapper = re.fullmatch(r'\s*<cross-session-message\b([^>]*)>(.*)</cross-session-message>\s*', prompt, re.DOTALL)
+    if wrapper is None:
+        return UnverifiedSupplierMessage("message has no cross-session origin")
+    pairs = cast(list[tuple[str, str]], re.findall(r'([\w-]+)="([^"]*)"', wrapper[1]))
+    attributes = dict(pairs)
+    if len(pairs) != len(attributes):
+        return UnverifiedSupplierMessage("message has duplicate origin attributes")
+    address = _supplier_address(identity)
+    if isinstance(address, NoNamedSupplier):
+        return UnverifiedSupplierMessage(address.reason)
+    body = wrapper[2].strip()
+    origin = attributes.get("from", "")
+    if origin == address.address:
+        return VerifiedSupplierMessage(body)
+    return UnverifiedSupplierMessage("message origin is not the supplier current address")
+
+
+def record_turn_wait(session_dir: Path, owner_session: str, final_message: str) -> bool:
+    """Start a director's declared user/supplier wait once, before the stop."""
+    if os.environ.get(PROBE_ENV) == "1":
+        return False
+    lines = final_message.strip().splitlines()
+    if not lines:
+        return False
+    reason = lines[-1].strip().removeprefix("— ")
+    line = reason.lower()
+    if line.startswith(("decision:", "gate:")):
+        kind = "WaitingForUser"
+    elif line.startswith("blocked: waiting on ") and (
+        line.startswith("blocked: waiting on the showrunner")
+        or re.search(r"\bpeer\b", line) is not None
+        or re.match(r"blocked: waiting on (?:claude-|codex-|worker:|session:|codex:|uds:)", line) is not None
+    ):
+        kind = "WaitingForSupplier"
+    else:
+        return False
+    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        state = _read_state(session_dir)
+        supplier = _turn_supplier(state, reason) if kind == "WaitingForSupplier" else _showrunner_supplier(state)
+        supplier_fields = _supplier_fields(supplier)
+        marker_path = session_dir / "turn_wait.json"
+        try:
+            marker = _json_object(marker_path.read_text(encoding="utf-8")) or {}
+        except FileNotFoundError:
+            marker = {}
+        previous = _waits_by_id(_run_events(state)).get(_string(marker.get("wait_id")))
+        if previous is not None and previous.get("event_type") == "wait_started":
+            if (previous.get("owner_session") == owner_session and previous.get("wait_kind") == kind
+                    and previous.get("expected_supplier") == supplier_fields):
+                return True
+            _end_wait(state, previous, plan_history.now_epoch(), unclosed=True)
+        args = argparse.Namespace(missing_reason="", kind=kind, reason=reason,
+                                  owner_session=owner_session, unit="", expected_supplier=supplier_fields)
+        wait_id = _record_wait(state, args)
+        _ = marker_path.write_text(json.dumps({"wait_id": wait_id, "owner_session": owner_session}) + "\n",
+                                   encoding="utf-8")
+    return True
+
+
+def finish_turn_wait(session_dir: Path, owner_session: str, *, source: str, prompt: str) -> None:
+    """Finish only for typed input or a message from the recorded supplier."""
+    if os.environ.get(PROBE_ENV) == "1" or not (session_dir / "turn_wait.json").exists():
+        return
+    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        marker_path = session_dir / "turn_wait.json"
+        try:
+            marker = _json_object(marker_path.read_text(encoding="utf-8")) or {}
+        except FileNotFoundError:
+            return
+        if marker.get("owner_session") != owner_session:
+            return
+        state = _read_state(session_dir)
+        wait = _waits_by_id(_run_events(state)).get(_string(marker.get("wait_id")))
+        if wait is None or wait.get("event_type") != "wait_started":
+            return
+        supplier = _object_dict(wait.get("expected_supplier")) or {}
+        message = (_supplier_message(_string(supplier.get("address")), prompt)
+                   if source == "PEER" and supplier.get("state") == "NamedSupplier"
+                   else UnverifiedSupplierMessage("input is not a named supplier message"))
+        from_supplier = isinstance(message, VerifiedSupplierMessage)
+        user_wait = wait.get("wait_kind") == "WaitingForUser"
+        body = message.body if isinstance(message, VerifiedSupplierMessage) else ""
+        body = re.sub(r'^Message from [^\n]+ via postmaster: [^\n]* \[[a-fA-F0-9]{8}\]\r?\n\r?\n', "", body, count=1)
+        relay = from_supplier and body.lstrip().startswith("From the user (via the showrunner):")
+        if not ((user_wait and (source == "TYPED" or relay)) or (not user_wait and from_supplier)):
+            return
+        _finish_wait(argparse.Namespace(session_dir=str(session_dir), wait_id=_string(marker.get("wait_id"))))
+        marker_path.unlink()
+
+
+def write_merge_receipt(*, project: str, phase_id: str, merge_commit: str,
+                        source_checkpoint: str, target_branch: str, merged_at: float,
+                        issue: str = "") -> dict[str, object]:
+    """Record a pushed merge once; callers must not call this for a rolled-back merge."""
+    if not all((project, merge_commit, source_checkpoint, target_branch)) or not (phase_id or issue):
+        raise ValueError("A merge receipt needs its project, phase or issue, both commits, and target branch")
+    path = plan_history.history_root() / "merge_receipts.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        _ = handle.seek(0)
+        for line in handle:
+            receipt = _json_object(line)
+            if receipt is not None and (receipt.get("project"), receipt.get("target_branch"), receipt.get("merge_commit")) == (project, target_branch, merge_commit):
+                return receipt
+        record: dict[str, object] = {"event_type": "merge_receipt", "schema_version": SCHEMA_VERSION,
+                   "project": project, "issue": issue, "phase_id": phase_id,
+                   "merge_commit": merge_commit, "source_checkpoint": source_checkpoint,
+                   "target_branch": target_branch, "merged_at": _iso_time(merged_at),
+                   "timestamp_epoch": merged_at}
+        _ = handle.write(json.dumps(record, sort_keys=True) + "\n")
+        handle.flush()
+        if (os.environ.get("UNIT_SYNC_WRITES") or os.environ.get("PLAN_DELEGATE_SYNC_WRITES", "1")) != "0":
+            os.fsync(handle.fileno())
+    return record
+
+
+def _history_window(args: argparse.Namespace) -> tuple[float, float]:
+    bounds: list[float] = []
+    for name, default in (("since", 0.0), ("until", plan_history.now_epoch())):
+        text = _arg_string(args, name)
+        try:
+            parsed = datetime.fromisoformat(text) if text else None
+        except ValueError as error:
+            raise SystemExit(f"--{name} must be an ISO 8601 time") from error
+        bounds.append(default if parsed is None else
+                      (parsed if parsed.tzinfo else parsed.replace(tzinfo=user_zone())).timestamp())
+    since, until = bounds
+    if since >= until:
+        raise SystemExit("--since must be before --until")
+    return since, until
+
+
+def _attribution_candidates(wait: dict[str, object]) -> list[dict[str, object]]:
+    value = (_object_dict(wait.get("wait_attribution")) or {}).get("candidates")
+    return [record for item in cast(list[object], value) if (record := _object_dict(item)) is not None] if isinstance(value, list) else []
+
+
+def _read_waits(args: argparse.Namespace) -> None:
+    since, until = _history_window(args)
+    session = _arg_string(args, "session_dir")
+    ignored = 0
+    if session:
+        events = _run_events(_read_state(_session_dir(args)))
+        run_ids = {event.get("run_id") for event in events}
+        events.extend(wait for wait in _external_wait_events() if wait.get("run_id") in run_ids or any(
+            candidate.get("run_id") in run_ids for candidate in
+            _attribution_candidates(wait)))
+    else:
+        events, ignored = _load_events()
+        events.extend(_external_wait_events())
+    records = list(_waits_by_id(events).values())
+    selected = [wait for wait in records if since <= _number(wait.get("wait_started_epoch")) < until]
+    missing = [wait for wait in selected if wait.get("event_type") == "wait_not_recorded"]
+    waits = [wait for wait in selected if wait.get("event_type") != "wait_not_recorded"]
+    uncertain = [wait for wait in selected if (_object_dict(wait.get("wait_attribution")) or {}).get("state")
+                 in ("UnresolvedAttribution", "UnresolvedSupplier")]
+    handoffs = [wait for wait in waits if (_object_dict(wait.get("wait_attribution")) or {}).get("state") == "ProductionHandoff"]
+    phases: list[dict[str, object]] = []
+    old_phase_n = 0
+    for event in events:
+        if event.get("event_type") != "phase_started" or not since <= _number(event.get("timestamp_epoch")) < until:
+            continue
+        own = [wait for wait in waits if (wait.get("run_id"), wait.get("phase_instance_id")) ==
+               (event.get("run_id"), event.get("phase_instance_id"))]
+        own_missing = [wait for wait in missing if (wait.get("run_id"), wait.get("phase_instance_id")) ==
+                       (event.get("run_id"), event.get("phase_instance_id"))]
+        recorded = (_object_dict(event.get("wait_coverage")) or {}).get("state") == "Recorded"
+        own_uncertain = [wait for wait in uncertain if any(
+            (candidate.get("run_id"), candidate.get("phase_instance_id")) ==
+            (event.get("run_id"), event.get("phase_instance_id")) for candidate in _attribution_candidates(wait))]
+        old_phase_n += not recorded
+        phase: dict[str, object] = {"run_id": event.get("run_id"), "phase_id": event.get("phase_id"),
+                                    "phase_instance_id": event.get("phase_instance_id"),
+                                    "unit": event.get("worktree"),
+                                    "state": "Covered" if recorded and not own_missing else "HistoryNotRecorded"}
+        if own_missing:
+            phase.update(reason="wait emission has a missing record", wait_missing_n=len(own_missing),
+                         recorded_wait_n=len(own))
+        elif recorded:
+            phase["wait_n"] = len(own)
+        else:
+            phase["reason"] = "phase start has no wait coverage record"
+        phase["candidates"] = []
+        if recorded and not own_missing:
+            phase["reason"] = "wait coverage recorded"
+        if own_uncertain:
+            _ = phase.pop("wait_n", None)
+            phase.update(state="UncertainCoverage", recorded_wait_n=len(own),
+                         reason="; ".join(_string((_object_dict(wait.get("wait_attribution")) or {}).get("reason"))
+                                          for wait in own_uncertain),
+                         candidates=[candidate for wait in own_uncertain for candidate in _attribution_candidates(wait)],
+                         attribution_miss_ids=[wait["wait_id"] for wait in own_uncertain])
+        phases.append(phase)
+    print(json.dumps({"since": _iso_time(since), "until": _iso_time(until),
+                      "selection": "phase starts and wait starts in [since, until)",
+                      "covered_n": sum(phase["state"] == "Covered" for phase in phases),
+                      "missing_n": old_phase_n + len(missing),
+                      "missing_phase_n": sum(phase["state"] == "HistoryNotRecorded" for phase in phases),
+                      "missing_record_n": len(missing),
+                      "attribution_miss_n": len(uncertain),
+                      "uncertain_phase_n": sum(phase["state"] == "UncertainCoverage" for phase in phases),
+                      "production_handoff_n": len(handoffs), "handoffs": handoffs,
+                      "ignored_n": ignored, "phases": phases, "waits": waits, "missing": missing}, sort_keys=True))
+
+
+def _read_receipts(args: argparse.Namespace) -> None:
+    since, until = _history_window(args)
+    path = plan_history.history_root() / "merge_receipts.jsonl"
+    receipts: list[dict[str, object]] = []
+    problems: list[str] = []
+    try:
+        with path.open(encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+            for line in handle:
+                receipt = _json_object(line)
+                if receipt is None:
+                    problems.append("NotRecorded: invalid receipt record")
+                elif receipt.get("event_type") == "merge_receipt":
+                    receipts.append(receipt)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        problems.append(f"NotRecorded: {error}")
+    selected = [receipt for receipt in receipts if since <= _number(receipt.get("timestamp_epoch")) < until
+                and all(not _arg_string(args, option) or receipt.get(option) == _arg_string(args, option)
+                        for option in ("project", "target_branch", "merge_commit"))]
+    expected = _arg_string(args, "merge_commit")
+    missing: list[dict[str, str]] = ([{"state": "ReceiptMissing", "merge_commit": expected}]
+                                    if expected and not selected else [])
+    print(json.dumps({"since": _iso_time(since), "until": _iso_time(until),
+                      "covered_n": len(selected), "missing_n": len(missing),
+                      "receipts": selected, "missing": missing, "problems": problems}, sort_keys=True))
+
+
 def _finish_phase(args: argparse.Namespace) -> None:
+    # The run lock is already held. External starts use this same history lock,
+    # through the cleanup scan and publication of phase_finished.
+    with _external_wait_lock():
+        _finish_phase_with_wait_lock(args)
+
+
+def _finish_phase_with_wait_lock(args: argparse.Namespace) -> None:
     """Close one open phase: the one --phase-id names, else the current one.
 
     Only that phase's own passes close with it; another open phase keeps its
@@ -4697,6 +5488,13 @@ def _finish_phase(args: argparse.Namespace) -> None:
             + f"({_iso_time(started_at)})"
         )
     instance_id = _string(phase.get("instance_id"))
+    for wait in _waits_by_id(_run_events(state)).values():
+        if wait.get("phase_instance_id") == instance_id and wait.get("event_type") == "wait_started":
+            _end_wait(state, wait, now, unclosed=True)
+    for wait in _waits_by_id(_external_wait_events()).values():
+        if (wait.get("run_id") == state.get("run_id") and wait.get("phase_instance_id") == instance_id
+                and wait.get("event_type") == "wait_started"):
+            _end_wait({"history_file": str(_external_wait_file())}, wait, now, unclosed=True)
     # Every window this phase left open, one per team member: the launchers that
     # would have closed them are gone. A pass from before passes carried their
     # phase belongs to the current one.
@@ -4709,6 +5507,7 @@ def _finish_phase(args: argparse.Namespace) -> None:
         _ = _clear_armed_review(session_dir, state, "phase ended", now)
     status = _arg_string(args, "status")
     event = _event(state, "phase_finished", finished_at, phase_record=phase)
+    event["contract_revision"] = _contract_revision()
     event["status"] = status
     event["phase_elapsed_seconds"] = max(0, int(finished_at - started_at))
     if finished_at != now:
@@ -4935,6 +5734,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    identity = subparsers.add_parser("set-unit")
+    _ = identity.add_argument("--session-dir", required=True)
+    _ = identity.add_argument("--production", required=True)
+    _ = identity.add_argument("--unit", required=True)
+    identity.set_defaults(handler=_set_unit)
+
     start_run = subparsers.add_parser("start-run")
     _ = start_run.add_argument("--session-dir", required=True)
     _ = start_run.add_argument("--working-dir", required=True)
@@ -4949,6 +5754,64 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = start_phase.add_argument("--work-order-file", default="")
     _ = start_phase.add_argument("--started-at", default="")
     start_phase.set_defaults(handler=_start_phase)
+
+    start_wait = subparsers.add_parser("start-wait")
+    _ = start_wait.add_argument("--session-dir", required=True)
+    _ = start_wait.add_argument("--kind", choices=WAIT_KINDS, required=True)
+    wait_phase = start_wait.add_mutually_exclusive_group()
+    _ = wait_phase.add_argument("--phase-id", default=argparse.SUPPRESS)
+    _ = wait_phase.add_argument("--slot", default=argparse.SUPPRESS)
+    _ = wait_phase.add_argument("--worker-thread-id", default=argparse.SUPPRESS)
+    _ = wait_phase.add_argument("--director", action="store_true")
+    _ = wait_phase.add_argument("--phase-instance-id", default=argparse.SUPPRESS)
+    _ = start_wait.add_argument("--missing-reason", default="")
+    _ = start_wait.add_argument("--reason", default="")
+    _ = start_wait.add_argument("--owner-session", default="")
+    _ = start_wait.add_argument("--unit", default="")
+    _ = start_wait.add_argument("--probe", action="store_true")
+    start_wait.set_defaults(handler=_start_wait)
+
+    finish_wait = subparsers.add_parser("finish-wait")
+    _ = finish_wait.add_argument("--session-dir", required=True)
+    _ = finish_wait.add_argument("--wait-id", required=True)
+    finish_wait.set_defaults(handler=_finish_wait)
+
+    checkpoint = subparsers.add_parser("checkpoint")
+    _ = checkpoint.add_argument("--session-dir", required=True)
+    _ = checkpoint.add_argument("--phase", required=True)
+    _ = checkpoint.add_argument("--commit", required=True)
+    checkpoint.set_defaults(handler=_checkpoint)
+
+    for verb in ("start-checkpoint-wait", "start-handoff-wait"):
+        external_wait = subparsers.add_parser(verb)
+        _ = external_wait.add_argument("--commit", required=True)
+        _ = external_wait.add_argument("--owner-session", default="")
+        _ = external_wait.add_argument("--unit", default="")
+        _ = external_wait.add_argument("--reason", default="")
+        if verb == "start-checkpoint-wait":
+            _ = external_wait.add_argument("--working-dir", required=True)
+            _ = external_wait.add_argument("--phase-id", required=True)
+        else:
+            _ = external_wait.add_argument("--production", required=True)
+        external_wait.set_defaults(handler=_start_external_wait)
+
+    finish_external = subparsers.add_parser("finish-external-wait")
+    _ = finish_external.add_argument("--wait-id", required=True)
+    finish_external.set_defaults(handler=_finish_external_wait)
+
+    waits = subparsers.add_parser("waits")
+    _ = waits.add_argument("--session-dir", default="")
+    _ = waits.add_argument("--since", default="")
+    _ = waits.add_argument("--until", default="")
+    waits.set_defaults(handler=_read_waits)
+
+    receipts = subparsers.add_parser("receipts")
+    _ = receipts.add_argument("--since", default="")
+    _ = receipts.add_argument("--until", default="")
+    _ = receipts.add_argument("--merge-commit", default="")
+    _ = receipts.add_argument("--project", default="")
+    _ = receipts.add_argument("--target-branch", default="")
+    receipts.set_defaults(handler=_read_receipts)
 
     start_activity = subparsers.add_parser("start-activity")
     _ = start_activity.add_argument("--session-dir", required=True)
@@ -5123,6 +5986,9 @@ def main() -> None:
     if not callable(handler_value):
         raise SystemExit("No command handler selected")
     handler = cast(Callable[[argparse.Namespace], None], handler_value)
+    if _arg_string(args, "command") in ("waits", "receipts"):
+        handler(args)
+        return
     session_value: object = getattr(args, "session_dir", "")
     session_text = _string(session_value)
     if not session_text:

@@ -159,6 +159,9 @@ esac
         (claude / "scripts").symlink_to(VERIFY.parent.parent, target_is_directory=True)
         for name in ("tmp", "runtime", "state", "cache", "session", "target", "cgroup"):
             (self.root / name).mkdir()
+        # This workspace's memory fixture must not inherit the host's PSI.
+        pressure = self.root / "memory-pressure"
+        _ = pressure.write_text("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
         self.environment = {
             **{
                 name: value for name, value in os.environ.items()
@@ -178,11 +181,13 @@ esac
             "XDG_RUNTIME_DIR": str(self.root / "runtime"),
             "XDG_STATE_HOME": str(self.root / "state"),
             "XDG_CACHE_HOME": str(self.root / "cache"),
+            "VERIFY_STEPS_DIR": str(self.root / "verify-steps"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILDLOG_BUILDS_CGROUP": str(self.root / "cgroup"),
             "BUILDLOG_CI_CGROUP": str(self.root / "cgroup"),
             "BUILDLOG_ZRAM": str(self.root / "zram"),
             "BUILDLOG_MEMINFO": str(meminfo),
+            "BUILDLOG_MEMORY_PRESSURE": str(pressure),
             "BUILDLOG_OFF": "1",
             "BUILDLOG_SCOPE": "0",
             "BUILD_HOLD_DIR": str(self.root / "build-hold"),

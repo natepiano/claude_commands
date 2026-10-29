@@ -4,7 +4,7 @@
 - The forbidden-words list lives at `~/rust/nate_style/rust/forbidden-words.md`. `/rust_style` and `/style_eval` load it with the style guide; it is not loaded at session start. Three hooks enforce it in every session (`/banned_word_hook` turns them off and on): two PostToolUse hooks check each tool call and block on a match, and a Stop hook checks each turn's prose. Don't use those words in code, comments, or prose.
 
 ## decision criteria
-Applies to every session when coding and reviewing code. `/unit:delegate` imports the same file, where it defines `<DecisionEconomy/>`.
+Applies to every session when coding and reviewing code. `/unit:direct` imports the same file, where it defines `<DecisionEconomy/>`.
 
 @~/.claude/docs/decision_criteria.md
 

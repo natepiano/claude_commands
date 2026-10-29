@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -10,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from scripts.direct import remove_run_scratch
+from scripts.direct import remove_run_scratch, workers
 
 SCRIPT = Path(__file__).parent / "remove_run_scratch.py"
 
@@ -41,6 +43,53 @@ class RemoveRunScratchTests(unittest.TestCase):
         (outside / ".git").mkdir(parents=True)
         (run / "scratch" / "linked").symlink_to(outside)
         return run, outside
+
+    def test_cleanup_keeps_the_checkout_holding_a_paused_workers_live_command(self) -> None:
+        run, _ = self.make_run()
+        checkout = run / "phases" / "p4" / "gate"
+        command_cwd = checkout / "target"
+        _ = (run / "progress_history_state.json").write_text(json.dumps({"production": "demo", "unit": "builders"}))
+        records = run / "mesh_runs"
+        records.mkdir()
+        record = records / "verify.json"
+        child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
+                                  "mesh_runs.py", "supervise", str(record)], stdin=subprocess.PIPE)
+        self.addCleanup(lambda: child.communicate(timeout=4))
+        _ = record.write_text(json.dumps({"status": "running", "pid": child.pid, "worker": "w7", "cwd": str(command_cwd)}))
+        with mock.patch.dict(os.environ, {"UNIT_WORKERS_STATE": str(run.parent / "unit-workers")}):
+            store = workers.UnitWorkerLedger(workers.ledger_path("demo", "builders"))
+            with store.locked() as ledger:
+                ledger.workers["w7"] = workers.UnitWorker("w7", "impl", "codex", "sol", "high", {},
+                    workers.CodexThread("kept-thread", str(run.parent / "codex")), workers.Paused(),
+                    [workers.WorkerEvent("opened", "fixture", str(run), 1_793_188_800.0, {})])
+            result = subprocess.run([sys.executable, str(SCRIPT), str(run)], capture_output=True,
+                                    text=True, timeout=10, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(command_cwd.is_dir(), result.stdout)
+            self.assertFalse((run / "scratch" / "export").exists())
+            self.assertTrue(record.exists())
+            _ = record.write_text(json.dumps({"status": "finished", "pid": os.getpid(), "worker": "w7", "cwd": str(command_cwd)}))
+            result = subprocess.run([sys.executable, str(SCRIPT), str(run)], capture_output=True,
+                                    text=True, timeout=10, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(checkout.exists())
+
+    def test_old_gate_copies_beside_a_protected_branch_are_still_removed(self) -> None:
+        run, _ = self.make_run()
+        protected = run / "phases" / "p5" / "gate"
+        (protected / ".git").mkdir(parents=True)
+        cwd = protected / "build"
+        cwd.mkdir()
+        old_target = run / "phases" / "p3" / "p3_before"
+        old_target.mkdir(parents=True)
+        _ = (old_target / ".rustc_info.json").write_text("{}")
+        with (mock.patch.object(workers, "protected_working_directories", return_value=(cwd,)),
+              mock.patch.object(sys, "argv", [str(SCRIPT), str(run)])):
+            self.assertEqual(remove_run_scratch.main(), 0)
+        self.assertTrue(cwd.is_dir())
+        self.assertFalse((run / "phases" / "p4" / "gate").exists())
+        self.assertFalse(old_target.exists())
+        self.assertTrue((run / "phases" / "p4" / "review.diff").is_file())
 
     def test_checkouts_and_targets_go_at_any_depth_and_the_rest_stays(self) -> None:
         run, outside = self.make_run()

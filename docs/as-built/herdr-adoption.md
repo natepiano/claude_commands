@@ -157,6 +157,8 @@ Marks are `SHOWRUNNER_UNIT` (production slug) and `SHOWRUNNER_UNIT_ID` (unit). T
 
 - It picks the account with `accounts.account_for_group_launch("unit", ...)`, checks it with `accounts.check`, and takes the launch barrier and permission (`RecordedSessionRestoreLaunchPurpose` for a restore). Then it runs `preflight`.
 - Every `--resume`, including restores, refuses in `preflight` before any stub, Units row, commit, worktree or tab is written when the shared session registry identifies a running session (naming its pid), or when registry or process identity is unreadable (naming the reason).
+- A plain `--resume` of an existing Units row, active or retired, continues its transcript without requiring a Production header in the row’s own plan document, so a condensed as-built remains usable; new units and attaches still require the header, and a resume with a different plan still refuses.
+- A plain `--resume` of a retired Units row may use `--cwd` outside its worktree: the raw Plan cell supplies the retired state, the row keeps its worktree and branch, and the launch creates neither and leaves the row for resume_unit to unmark; other cwd mismatches retain their refusal.
 - On a resume of a marked unit, `ClaudeUnknown` refuses, and `ClaudeNotRunning` closes that place's tab with `close_agent` before the relaunch.
 - A restore records its prompt as scheduled (`record_scheduled_restore_prompt`). The resumed model is the transcript's last real assistant model unless `--model` is given.
 - A new unit waits until `read_place` shows `/remote-control is active`.
@@ -219,12 +221,12 @@ Old records and snapshots still parse. Do not remove this parsing.
 
 Use these fixture rules on Linux and macOS:
 
-- Resolve the temporary root in `test_add_unit.py` and `test_add_showrunner.py`. On macOS, `/tmp` points to `/private/tmp`. Trust keys and worktree paths must use the same resolved root as the code under test.
+- Resolve the temporary root in `add_unit_test_support.py` and `test_add_showrunner.py`. The add-unit launch, account, resume and restore suites share this fixture. On macOS, `/tmp` points to `/private/tmp`. Trust keys and worktree paths must use the same resolved root as the code under test.
 - Set `HERDR_PLATFORM=linux` in each Linux launcher fixture's environment. Do not set it for the whole run. Darwin tests must still select the Darwin path.
 - Keep `HERDR_BIN=/nonexistent/herdr` in `PromptSubmissionTests`' cleared environment. Its fake pane calls do not need herdr on `PATH`.
 - Build a herdr client only in `setUp`, never as a class attribute: the class body runs at import, before any patched environment. The run-wide `HERDR_BIN` hides such a lookup, so check a new fixture once with an empty `PATH` and no `HERDR_BIN`.
 
-Run the nine suites on the Mac with a scratch home. Run the command from the root of a copy of the tree under test, not from the Mac's live `~/.claude`, which holds main. Remove the scratch home when the run ends:
+Run these suites on the Mac with a scratch home. Run the command from the root of a copy of the tree under test, not from the Mac's live `~/.claude`, which holds main. Remove the scratch home when the run ends:
 
 ```sh
 (
@@ -236,7 +238,9 @@ Run the nine suites on the Mac with a scratch home. Run the command from the roo
     scripts.herdr.test_herdr scripts.herdr.test_herdr_sessions \
     scripts.shutdown.test_restart scripts.shutdown.test_account_move \
     scripts.shutdown.test_shutdown_cli scripts.shutdown.test_settle \
-    scripts.production.test_add_unit scripts.production.test_add_showrunner \
+    scripts.production.test_add_unit scripts.production.test_add_unit_accounts \
+    scripts.production.test_add_unit_resume scripts.production.test_add_unit_restore \
+    scripts.production.test_add_showrunner \
     scripts.notify.test_push_texts
 )
 ```

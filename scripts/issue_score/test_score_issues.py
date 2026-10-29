@@ -5,19 +5,32 @@ import contextlib
 import gzip
 import io
 import json
+import math
 import os
+import sys
 import tempfile
 import threading
 import unittest
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from email.message import Message
 from pathlib import Path
 from typing import Literal, TextIO, cast, override
 from unittest import mock
+from urllib.error import HTTPError
 from urllib.request import Request
 
-from scripts.issue_score import client, questions, score_issues
+from scripts.issue_score import client, questions, score_issues, vault
 from scripts.issue_score import records as run_records
+
+# proposals_table.py imports its production neighbors by bare name.
+PRODUCTION_DIR = str(Path(__file__).resolve().parents[1] / "production")
+if PRODUCTION_DIR not in sys.path:
+    sys.path.insert(0, PRODUCTION_DIR)
+from scripts.production.issues import Issue as ProposalIssue
+from scripts.production.proposals_table import proposal_score
+
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
 
 FIXTURES = Path(__file__).with_name("fixtures")
 
@@ -45,6 +58,21 @@ class ScoreIssuesTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": "fixture-key"})))
         _ = self.enterContext(mock.patch.object(client, "urlopen", side_effect=AssertionError("Live HTTP forbidden")))
+        definitions_path = self.root / "vault" / "conf" / "issue-areas.md"
+        definitions_path.parent.mkdir()
+        _ = definitions_path.write_text(
+            "| area | definition | issues |\n| --- | --- | --- |\n"
+            + "| unused-fixture-area | A definition outside the fixture vocabulary. | 1 |\n",
+            encoding="utf-8",
+        )
+        read_definitions = vault.load_area_definitions
+
+        def temporary_definitions(path: Path = vault.AREA_DEFINITIONS_PATH) -> dict[str, str]:
+            if path == vault.AREA_DEFINITIONS_PATH:
+                path = self.root / "vault" / "conf" / "issue-areas.md"
+            return read_definitions(path)
+
+        _ = self.enterContext(mock.patch.object(vault, "load_area_definitions", side_effect=temporary_definitions))
 
     def issue(self, name: str, *, area: str = "rendering", extra: str = "") -> Path:
         path = self.issues / (name + ".md")
@@ -69,6 +97,213 @@ class ScoreIssuesTests(unittest.TestCase):
 
     def records(self, path: Path) -> list[run_records.ScoredIssue]:
         return [cast(run_records.ScoredIssue, json.loads(line)) for line in path.read_text().splitlines()]
+
+    def proposal(self, project: str = "diegetic", title: str = "Repair graph", body: str = "") -> str:
+        return score_issues.propose(project, title, body, issues_dir=self.issues, state_dir=self.state)
+
+    def proposal_cli(self, arguments: list[str]) -> tuple[int, str, str]:
+        original_propose = score_issues.propose
+
+        def isolated_propose(project: str, title: str, body: str = "") -> str:
+            return original_propose(project, title, body, issues_dir=self.issues, state_dir=self.state)
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(score_issues, "propose", side_effect=isolated_propose), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = score_issues.main(["propose", *arguments])
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def proposal_replay(self, main: client.Response, area: client.Response) -> Callable[[Request, float], FixtureHTTPResponse]:
+        def replay(request: Request, timeout: float = 60) -> FixtureHTTPResponse:
+            _ = timeout
+            payload = cast(run_records.RequestPayload, json.loads(gzip.decompress(cast(bytes, request.data))))
+            response = area if "areas" in payload["state"] else main
+            return FixtureHTTPResponse(json.dumps(response).encode())
+        return replay
+
+    def test_propose_cli_prints_the_pinned_confirmation_line_and_leaves_vault_untouched(self) -> None:
+        _ = self.issue("Vocabulary rendering")
+        _ = self.issue("Vocabulary tooling", area="tooling")
+        definitions_path = self.root / "vault" / "conf" / "issue-areas.md"
+        _ = definitions_path.write_text(
+            "| area | definition | issues |\n| --- | --- | --- |\n"
+            + "| rendering | Drawing scenes and managing render passes. | 1 |\n", encoding="utf-8")
+        before = {path: path.read_bytes() for path in self.issues.glob("*.md")}
+        body_path = self.root / "body.md"
+        _ = body_path.write_text("Repair [[render graph|the graph]].\n", encoding="utf-8")
+        with mock.patch.object(client, "urlopen", side_effect=self.replay) as http:
+            code, stdout, stderr = self.proposal_cli([
+                "--project", "diegetic", "--title", "Repair graph", "--body-file", str(body_path)])
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(stdout, (FIXTURES / "proposal_expected.txt").read_text(encoding="utf-8"))
+        self.assertEqual(http.call_count, 2)
+        payloads = [cast(run_records.RequestPayload, json.loads(gzip.decompress(cast(bytes, call.args[0].data))))
+                    for call in http.call_args_list]
+        main_state = payloads[0]["state"]
+        self.assertEqual(set(main_state), {"issue"})
+        self.assertEqual(main_state["issue"], {
+            "title": "Repair graph", "project": "hana_diegetic",
+            "project_about": questions.PROJECT_ABOUT["hana_diegetic"], "body": "Repair the graph.\n",
+        })
+        self.assertEqual(cast(questions.AreaState, payloads[1]["state"])["areas"], ["rendering", "tooling"])
+        self.assertEqual(payloads[1]["state"]["issue"], main_state["issue"])
+        for name in ("area", "area_reverse"):
+            question = payloads[1]["questions"][name]
+            assert question["type"] == "choice"
+            self.assertEqual(question["criteria"]["rendering"],
+                             "The work concerns rendering: Drawing scenes and managing render passes.")
+            self.assertEqual(question["criteria"]["tooling"], "The work concerns the part named tooling.")
+        self.assertEqual({path: path.read_bytes() for path in self.issues.glob("*.md")}, before)
+        self.assertIn("Drawing scenes and managing render passes.", definitions_path.read_text())
+        self.assertNotIn("fixture-key", stdout + stderr)
+
+    def test_propose_unsure_goal_keeps_each_candidates_distinct_alignment_without_a_second_call(self) -> None:
+        _ = self.issue("Vocabulary rendering")
+        _ = self.issue("Vocabulary tooling", area="tooling")
+        main = cast(client.Response, json.loads((FIXTURES / "proposal_unsure_goal.json").read_text()))
+        area = cast(client.Response, json.loads((FIXTURES / "area_response.json").read_text()))
+        with mock.patch.object(client, "urlopen", side_effect=self.proposal_replay(main, area)) as http:
+            line = self.proposal()
+
+        self.assertEqual(http.call_count, 2)
+        ranking, alternatives = line.splitlines()
+        parts = ranking.split(" · ")
+        self.assertEqual(parts[0], "goal 1 - Ship Hana (unsure)")
+        self.assertEqual(parts[1], "alignment ⭐⭐⭐⭐ (unsure)")
+        self.assertIn("goal 1 - Ship Hana (alignment ⭐⭐⭐⭐ / ⭐⭐⭐ (unsure)) / "
+                      + "2 - Find Collaborators (alignment ⭐⭐ / ⭐⭐⭐ (unsure)) (unsure)", alternatives)
+
+    def test_propose_ranking_scores_only_top_values_even_when_goal_is_unsure(self) -> None:
+        _ = self.issue("Vocabulary rendering")
+        _ = self.issue("Vocabulary tooling", area="tooling")
+        area = cast(client.Response, json.loads((FIXTURES / "area_response.json").read_text()))
+        for fixture in ("main_response.json", "proposal_unsure_goal.json"):
+            with self.subTest(fixture=fixture):
+                main = cast(client.Response, json.loads((FIXTURES / fixture).read_text()))
+                with mock.patch.object(client, "urlopen", side_effect=self.proposal_replay(main, area)):
+                    output = self.proposal()
+                ranking = output.splitlines()[0]
+                path = self.root / "proposal.md"
+                _ = path.write_text("---\nstatus: open\n---\nProposed ranking: " + ranking + "\n"
+                                    + "\n".join(output.splitlines()[1:]) + "\n", encoding="utf-8")
+                score = proposal_score(ProposalIssue(path, {}))
+                self.assertTrue(math.isfinite(score))
+                # Goal 1 bonus -2, alignment 4, impact 3, urgency 1, effort 2.
+                self.assertEqual(score, 15)
+
+    def test_propose_marks_split_effort_check_and_possible_five(self) -> None:
+        _ = self.issue("Vocabulary rendering")
+        _ = self.issue("Vocabulary tooling", area="tooling")
+        main = cast(client.Response, json.loads((FIXTURES / "main_response.json").read_text()))
+        impact = main["answers"]["impact"]
+        assert impact["type"] == "score"
+        impact["probabilities"] = {"0": .45, "1": 0, "2": .1, "3": 0, "4": .45}
+        impact["score"], impact["confidence"] = 2, .45
+        main["answers"]["deadline_named"] = {"type": "noul", "noul": .95}
+        area = cast(client.Response, json.loads((FIXTURES / "area_response.json").read_text()))
+        with mock.patch.object(client, "urlopen", side_effect=self.proposal_replay(main, area)):
+            ranking, alternatives = self.proposal().splitlines()
+            parts = ranking.split(" · ")
+
+        self.assertEqual(parts[2], "impact ⭐ (unsure) (split)")
+        self.assertIn("impact ⭐ / ⭐⭐⭐⭐⭐ (unsure) (split)", alternatives)
+        self.assertEqual(parts[3], "urgency ⭐⭐⭐⭐ (unsure) (possible 5) (agent proposes)")
+        self.assertIn("(check)", parts[4])
+
+    def test_propose_reads_the_approved_jev_fields_at_call_time(self) -> None:
+        _ = self.issue("Vocabulary rendering")
+        _ = self.issue("Vocabulary tooling", area="tooling")
+        with mock.patch.object(client, "urlopen", side_effect=self.replay), \
+                mock.patch.object(questions, "JEV_FIELDS", frozenset({"category"})):
+            ranking, alternatives = self.proposal().splitlines()
+            parts = ranking.split(" · ")
+
+        self.assertEqual(parts[0], "goal 1 - Ship Hana (agent proposes)")
+        self.assertEqual(parts[1], "alignment ⭐⭐⭐⭐ (agent proposes)")
+        self.assertEqual(parts[2], "impact ⭐⭐⭐ (agent proposes)")
+        self.assertEqual(parts[5], "category feature (unsure)")
+        self.assertIn("category feature / enhancement (unsure)", alternatives)
+
+    def test_propose_normalizes_every_issue_project_shorthand_before_building_state(self) -> None:
+        expected_projects = {
+            "bei": "bevy_enhanced_input", "biz": "biz", "brp": "bevy_brp_mcp",
+            "bwm": "bevy_window_manager", "cargo-berth": "cargo-berth", "cargo-liner": "cargo-liner",
+            "cargo-mend": "cargo-mend", "cargo-port": "cargo-port", "conduit": "hana_conduit",
+            "diegetic": "hana_diegetic", "fairy_dust": "fairy_dust", "hana": "hana",
+            "lading": "hana_lading", "lagrange": "bevy_lagrange", "liminal": "hana_liminal",
+            "nateroids": "nateroids", "panorbit": "bevy_panorbit_camera", "rust-template": "rust-template",
+        }
+        _ = self.issue("Vocabulary rendering")
+        _ = self.issue("Vocabulary tooling", area="tooling")
+        for shorthand, canonical in expected_projects.items():
+            with self.subTest(project=shorthand), mock.patch.object(client, "urlopen", side_effect=self.replay) as http:
+                _ = self.proposal(shorthand)
+                self.assertEqual(http.call_count, 2)
+                for call in http.call_args_list:
+                    payload = cast(run_records.RequestPayload, json.loads(gzip.decompress(cast(bytes, call.args[0].data))))
+                    self.assertEqual(payload["state"]["issue"]["project"], canonical)
+                    self.assertEqual(payload["state"]["issue"]["project_about"], questions.PROJECT_ABOUT[canonical])
+
+    def test_propose_unknown_project_exits_two_before_any_http_request(self) -> None:
+        with mock.patch.object(client, "urlopen") as http:
+            code, stdout, stderr = self.proposal_cli(["--project", "unknown-project", "--title", "Repair graph"])
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("unknown-project", stderr)
+        http.assert_not_called()
+
+    def test_propose_distinguishes_derived_unfiled_with_hint_from_choice_picked_unfiled(self) -> None:
+        _ = self.issue("Vocabulary rendering")
+        _ = self.issue("Vocabulary unfiled", area="unfiled")
+        main = cast(client.Response, json.loads((FIXTURES / "main_response.json").read_text()))
+        for fallback in (True, False):
+            with self.subTest(fallback=fallback):
+                probabilities = {"rendering": .95, "unfiled": .05} if fallback else {"rendering": .05, "unfiled": .95}
+                winner = "rendering" if fallback else "unfiled"
+                area: client.Response = {"model": questions.MODEL, "usage": {"input_tokens": 500, "output_tokens": 100},
+                    "answers": {
+                        "area": {"type": "choice", "choice": winner, "confidence": .95, "probabilities": probabilities},
+                        "area_reverse": {"type": "choice", "choice": winner, "confidence": .95,
+                                         "probabilities": dict(reversed(list(probabilities.items())))},
+                        "area_fits": {"type": "noul", "noul": .05 if fallback else .95},
+                    }}
+                with mock.patch.object(client, "urlopen", side_effect=self.proposal_replay(main, area)):
+                    area_text = self.proposal().splitlines()[0].split(" · ")[-1]
+                expected = "area unfiled (hint: rendering) (agent proposes)" if fallback else "area unfiled (agent proposes)"
+                self.assertEqual(area_text, expected)
+
+    def test_propose_missing_or_empty_definitions_exits_two_with_path_before_http(self) -> None:
+        definitions_path = self.root / "vault" / "conf" / "issue-areas.md"
+        for missing in (True, False):
+            with self.subTest(missing=missing):
+                if missing:
+                    definitions_path.unlink()
+                else:
+                    _ = definitions_path.write_text("No definitions yet.\n", encoding="utf-8")
+                with mock.patch.object(client, "urlopen") as http:
+                    code, stdout, stderr = self.proposal_cli(["--project", "diegetic", "--title", "Repair graph"])
+                self.assertEqual((code, stdout), (2, ""))
+                self.assertIn(str(definitions_path), stderr)
+                http.assert_not_called()
+
+    def test_propose_api_failure_in_either_request_exits_two_without_a_proposal(self) -> None:
+        _ = self.issue("Vocabulary rendering")
+        _ = self.issue("Vocabulary tooling", area="tooling")
+        for failed_request in ("main", "area"):
+            def failed_replay(request: Request, timeout: float = 60) -> FixtureHTTPResponse:
+                payload = cast(run_records.RequestPayload, json.loads(gzip.decompress(cast(bytes, request.data))))
+                if ("area" if "areas" in payload["state"] else "main") == failed_request:
+                    raise HTTPError(request.full_url, 500, "fixture failure", Message(),
+                                    io.BytesIO((FIXTURES / "http_500.json").read_bytes()))
+                return self.replay(request, timeout)
+
+            with self.subTest(failed_request=failed_request), \
+                    mock.patch.object(client, "urlopen", side_effect=failed_replay) as http:
+                code, stdout, stderr = self.proposal_cli(["--project", "diegetic", "--title", "Repair graph"])
+            self.assertEqual((code, stdout), (2, ""))
+            self.assertIn("500", stderr)
+            self.assertNotIn("fixture-key", stderr)
+            self.assertEqual(http.call_count, 1 if failed_request == "main" else 2)
 
     def test_score_persists_both_payloads_all_answers_and_decisions_without_editing_vault(self) -> None:
         target = self.issue("Target graph")
@@ -117,6 +352,105 @@ class ScoreIssuesTests(unittest.TestCase):
         http.assert_not_called()
         self.assertNotEqual(first, second)
         self.assertEqual(self.records(first), self.records(second))
+        self.assertEqual((self.state / "spend.jsonl").read_bytes(), ledger_before)
+
+    def test_changed_area_definition_misses_cache_and_replays_both_requests(self) -> None:
+        _ = self.issue("Target graph")
+        _ = self.issue("Vocabulary seed", area="tooling")
+        definitions = self.root / "issue-areas.md"
+        first_definition = "Drawing scenes and managing render passes."
+        second_definition = "Drawing scenes and managing GPU render passes."
+        original = ("| area | definition | issues |\n| --- | --- | --- |\n"
+                    f"| rendering | {first_definition} | 1 |\n")
+        _ = definitions.write_text(original, encoding="utf-8")
+        with mock.patch.object(client, "urlopen", side_effect=self.replay) as http:
+            first = score_issues.score(only="Target*", issues_dir=self.issues, state_dir=self.state,
+                                       area_definitions_path=definitions)
+        self.assertEqual(http.call_count, 2)
+        with mock.patch.object(client, "urlopen", side_effect=AssertionError("Unchanged definitions must hit cache")) as http:
+            cached = score_issues.score(only="Target*", issues_dir=self.issues, state_dir=self.state,
+                                        area_definitions_path=definitions)
+        http.assert_not_called()
+        _ = definitions.write_text(original.replace(first_definition, second_definition), encoding="utf-8")
+        changed_bytes = definitions.read_bytes()
+        with mock.patch.object(client, "urlopen", side_effect=self.replay) as http:
+            changed = score_issues.score(only="Target*", issues_dir=self.issues, state_dir=self.state,
+                                         area_definitions_path=definitions)
+        self.assertEqual(http.call_count, 2)
+        before = self.records(first.result_path)[0]
+        after = self.records(changed.result_path)[0]
+        self.assertEqual(self.records(cached.result_path), [before])
+        self.assertNotEqual(before["content_hash"], after["content_hash"])
+        self.assertEqual(before["answers"], after["answers"])
+        self.assertEqual(before["payloads"]["main"], after["payloads"]["main"])
+        for entry, definition in ((before, first_definition), (after, second_definition)):
+            for name in ("area", "area_reverse"):
+                question = entry["payloads"]["area"]["questions"][name]
+                assert question["type"] == "choice"
+                self.assertEqual(question["criteria"]["rendering"], f"The work concerns rendering: {definition}")
+                self.assertEqual(question["criteria"]["tooling"], "The work concerns the part named tooling.")
+        self.assertEqual(definitions.read_bytes(), changed_bytes)
+
+    def test_experiment_area_requests_use_definitions_in_production_and_variant_questions(self) -> None:
+        _ = self.issue("Target A")
+        _ = self.issue("Vocabulary seed", area="tooling")
+        definitions = self.root / "issue-areas.md"
+        _ = definitions.write_text(
+            "| area | definition | issues |\n| --- | --- | --- |\n"
+            + "| rendering | Drawing scenes and managing render passes. | 1 |\n", encoding="utf-8")
+        replacement = questions.area_questions(["rendering", "tooling"], {})["area_fits"]
+        replacement["instructions"] = "Does `issue` concern an area in `areas`?"
+
+        def replay_variant(request: Request, timeout: float = 60) -> FixtureHTTPResponse:
+            payload = cast(run_records.RequestPayload, json.loads(gzip.decompress(cast(bytes, request.data))))
+            if "areas" not in payload["state"]:
+                return self.replay(request, timeout)
+            response = cast(client.Response, json.loads((FIXTURES / "area_response.json").read_text()))
+            response["answers"]["area_fits__fit_scope"] = {"type": "noul", "noul": .95}
+            return FixtureHTTPResponse(json.dumps(response).encode())
+
+        with mock.patch.object(client, "urlopen", side_effect=replay_variant) as http:
+            runs = score_issues.experiment({"fit_scope": {"area_fits": replacement}}, only="Target A",
+                                           issues_dir=self.issues, state_dir=self.state,
+                                           area_definitions_path=definitions)
+        self.assertEqual(http.call_count, 2)
+        self.assertEqual(set(runs), {"production", "fit_scope"})
+        for run in runs.values():
+            entry = self.records(run.result_path)[0]
+            for name in ("area", "area_reverse"):
+                question = entry["payloads"]["area"]["questions"][name]
+                assert question["type"] == "choice"
+                self.assertEqual(question["criteria"]["rendering"],
+                                 "The work concerns rendering: Drawing scenes and managing render passes.")
+            self.assertIn("area_fits__fit_scope", entry["payloads"]["area"]["questions"])
+
+    def test_cache_reuses_raw_answers_but_refreshes_stale_certainty_under_current_policy(self) -> None:
+        _ = self.issue("Target graph")
+        _ = self.issue("Vocabulary seed", area="tooling")
+        with mock.patch.object(client, "urlopen", side_effect=self.replay):
+            cached_path = self.score()
+        cached = self.records(cached_path)[0]
+        current_decisions = cached["decided_fields"]
+        stale_decisions = dict(current_decisions)
+        for field in ("area", "backlog_urgency", "backlog_effort"):
+            stale_decisions[field] = dict(cast(dict[str, object], current_decisions[field]), certainty="sure")
+        cached["decided_fields"] = stale_decisions
+        _ = cached_path.write_text(json.dumps(cached) + "\n", encoding="utf-8")
+        cached_bytes = cached_path.read_bytes()
+        ledger_before = (self.state / "spend.jsonl").read_bytes()
+
+        with mock.patch.object(client, "urlopen", side_effect=AssertionError("Cache hit must not call HTTP")) as http:
+            refreshed_path = self.score()
+
+        http.assert_not_called()
+        refreshed = self.records(refreshed_path)[0]
+        self.assertEqual(refreshed["answers"], cached["answers"])
+        self.assertEqual(refreshed["payloads"], cached["payloads"])
+        self.assertEqual(refreshed["decided_fields"], current_decisions)
+        for field in ("area", "backlog_urgency", "backlog_effort"):
+            with self.subTest(field=field):
+                self.assertEqual(cast(dict[str, object], refreshed["decided_fields"][field])["certainty"], "unsure")
+        self.assertEqual(cached_path.read_bytes(), cached_bytes)
         self.assertEqual((self.state / "spend.jsonl").read_bytes(), ledger_before)
 
     def test_tune_cli_never_sends_a_holdout_issue(self) -> None:
@@ -243,7 +577,7 @@ class ScoreIssuesTests(unittest.TestCase):
                 if active == 8:
                     released.set()
             try:
-                if not released.wait(timeout=2):
+                if not released.wait(timeout=TEST_HANG_GUARD_SECS):
                     raise AssertionError("Eight issues never reached the request boundary together")
                 fixture = "area_response.json" if "areas" in state else "main_response.json"
                 response = cast(object, json.loads((FIXTURES / fixture).read_text()))
@@ -357,7 +691,7 @@ class ScoreIssuesTests(unittest.TestCase):
             payload = cast(dict[str, object], json.loads(gzip.decompress(cast(bytes, request.data))))
             state = cast(questions.IssueState, payload["state"])
             if state["issue"]["title"] == earlier.stem:
-                if not persisted.wait(timeout=2):
+                if not persisted.wait(timeout=TEST_HANG_GUARD_SECS):
                     raise AssertionError("Completed issue was not flushed while an earlier issue was running")
                 raise client.TypeSafeError("fixture delayed failure")
             return self.replay(request, timeout)
@@ -387,16 +721,16 @@ class ScoreIssuesTests(unittest.TestCase):
             area_request = "areas" in state
             requests.append((title, area_request))
             if title == exhausted.stem:
-                if not main_started.wait(timeout=2) or not area_started.wait(timeout=2):
+                if not main_started.wait(timeout=TEST_HANG_GUARD_SECS) or not area_started.wait(timeout=TEST_HANG_GUARD_SECS):
                     raise AssertionError("Other requests did not start")
                 raise client.BudgetExceeded("fixture budget exhausted")
             if title == unfinished.stem:
                 main_started.set()
-                if not stopped.wait(timeout=2):
+                if not stopped.wait(timeout=TEST_HANG_GUARD_SECS):
                     raise AssertionError("Budget stop did not reach in-flight work")
             elif area_request:
                 area_started.set()
-                if not stopped.wait(timeout=2):
+                if not stopped.wait(timeout=TEST_HANG_GUARD_SECS):
                     raise AssertionError("Budget stop did not reach in-flight work")
             fixture = "area_response.json" if area_request else "main_response.json"
             return client.parse_response(cast(object, json.loads((FIXTURES / fixture).read_text())), request_questions)

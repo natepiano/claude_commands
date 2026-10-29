@@ -35,6 +35,8 @@ Rustdoc runs once per phase, as the unit director's last command before a Rust c
 5. On exit 0, `doc_record` computes the staged tree id again. If the staged tree changed during the run, it prints a notice and writes no record.
 6. Otherwise it writes `~/.local/state/verify/doc_pass/<tree_id>.json`.
 
+At call start, `verify.sh` reads `[workspace.metadata.dev] features = [...]` once from the repo root `Cargo.toml`. It adds that list to check, test (filtered runs included), final, doc and build without `--release`. Work Order `--features` and a build example's required features are merged without duplicates; package feature names are qualified, and names that contain `/` keep their spelling. Doc keeps workspace feature names unchanged. Release builds and lint receive no dev features. A missing or empty list keeps the existing Cargo arguments; a value other than a list of strings refuses the step with one line.
+
 The checkout and target survive exit, including a failed rustdoc run. Unchanged dependencies reuse artifacts in the repo's target directory; path-source package ids separate the checkout's workspace artifacts from the worktree's. The lock prevents concurrent runs for this repo from sharing its checkout. No checkout goes in tmpfs. Rustdoc never reads the working tree, so unstaged and untracked files do not change the result.
 
 The record has four keys: `repo_top` (the resolved path of the original repo, not the checkout), `tree_id`, `time` (UTC ISO 8601) and `call_id` (the build-log call id, `BUILDLOG_CALL_ID`). The write goes to a temporary file and is then renamed, with fsync on the file and the folder. Each write deletes records older than 14 days. The records are outside the worker session folder, so `end_session.sh` does not delete them. Workers can run `doc` too; their Work Orders do not ask for it.
@@ -80,6 +82,28 @@ A refusal is a `permissionDecision: deny` with a reason. The reason names the ca
 
 `final` runs `cargo check --workspace --all-targets`, then `run_nextest --workspace --tests`. The check type-checks every example once. `--tests` selects each target with `test = true`. By default that is each lib, bin and integration test, and no example. `final` does not pass `--lib`, so a workspace with no library works.
 
+`final` always runs these commands, even when a prior pass exists. On exit 0,
+it records a pass only when the checkout was clean at call start and remains
+clean with the same Git tree at exit. Staged changes, unstaged changes and
+untracked files prevent a record. A failed run or a changed tree prints one
+line and writes no record.
+
+The machine-wide record is `~/.local/state/verify/final_pass/<tree>.json`.
+`VERIFY_STATE_DIR` changes the `verify` folder for private state. The record
+has `tree`, `head`, `repo` (origin URL, or repo top when there is no origin),
+`rustc` (`rustc -vV`), `verify_sha256`, `features` (the merged dev feature
+list passed to Cargo), `host`, `status` (0) and `at` (UTC ISO time). The file
+and folder are synced after an atomic write. Writes prune JSON records older
+than 14 days. The record survives session cleanup and can be reused from a
+second checkout of the same tree.
+
+`verify.sh final-pass [<tree>]` reads this proof. Without a tree argument, it
+requires the current clean HEAD tree. It prints the JSON record and exits 0
+only when the tree, status, compiler text and verify.sh hash match. A missing,
+unreadable or different record exits 1 with one reason. This query runs before
+environment setup, uses no Cargo or build admission, and needs no unit session.
+It never writes state or prunes records.
+
 ### The example scan
 
 `UNTESTED_EXAMPLES_PY` reads `cargo metadata --no-deps`. It runs before the cache lookup and before any build, for `final` (the whole workspace) and for `verify.sh test <package>` with or without `--features`. It does not run for `--filter` or for a named integration test. For each example target, it scans the source for a line that starts with `#[cfg(test)]` or `#[...test]` (with optional `path::` segments). For an example at `examples/<name>/main.rs`, it scans every `.rs` file in that folder. A commented attribute does not match. Each offender gets two lines on stderr, a reason and a fix:
@@ -106,7 +130,7 @@ One example can get both refusals; the test refusal comes first. Offenders follo
 - The hook loads `SUBJECT` and `ALL` from `pre-tool-use-change-review-gate.py`. A change to those patterns changes both hooks. The hook finds git commands with its own shell parser, not with the change-review `COMMIT` pattern.
 - `final` must not link examples, and the example scan must run before any build. Together they make sure no test is lost.
 - `final` must not pass `--lib`.
-- Tests that pin this: `test_verify_doc.py`, `test_verify_lint_scope.py`, `test_checkpoint_doc_gate.py`, `test_verify_final_targets.py` and `test_verify_untested_examples.py`.
+- Tests that pin this: `test_verify_doc.py`, the `test_verify_lint_*.py` modules (shared fixture: `verify_lint_scope_test_support.py`), `test_checkpoint_doc_gate.py`, `test_verify_final_targets.py` and `test_verify_untested_examples.py`.
 - A repo with no `Cargo.toml`, such as `~/.claude`, needs no doc record, but its checkpoints still follow the own-call rule.
 
 ## Calibration / gotchas

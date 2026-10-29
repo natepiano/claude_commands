@@ -9,6 +9,9 @@ from pathlib import Path
 from typing import TypedDict, cast
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 HOOK = Path(__file__).with_name("pre-tool-use-heredoc-guard.py")
 
 
@@ -28,7 +31,7 @@ def bash_call(command: str) -> str:
 
 def run_hook(payload: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [str(HOOK)], input=payload, capture_output=True, text=True, check=False, timeout=10,
+        [str(HOOK)], input=payload, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
     )
 
 

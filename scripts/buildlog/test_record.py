@@ -20,9 +20,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 
+if TYPE_CHECKING:
+    from ..lib.socket_test_support import short_socket_directory
+else:
+    from scripts.lib.socket_test_support import short_socket_directory
+
 import record as recorder
 import sample
 import store
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 if TYPE_CHECKING:
     from ..direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
 else:
@@ -229,7 +237,7 @@ class RecordTests(unittest.TestCase):
     def test_piped_run_records_memory_wait_outside_step_duration(self) -> None:
         meminfo = self.base / "meminfo"
         _ = meminfo.write_text("MemAvailable: 11534336 kB\n")
-        runtime = self.base / "runtime" / "systemd"
+        runtime = Path(self.enterContext(short_socket_directory())) / "systemd"
         runtime.mkdir(parents=True)
         with socket.socket(socket.AF_UNIX) as manager:
             manager.bind(str(runtime / "private"))
@@ -261,13 +269,13 @@ class RecordTests(unittest.TestCase):
             )
             try:
                 assert process.stderr is not None
-                readable, _, _ = select.select([process.stderr], [], [], 5)
+                readable, _, _ = select.select([process.stderr], [], [], TEST_HANG_GUARD_SECS)
                 self.assertTrue(readable, "memory wait message did not arrive")
                 first_message = cast(str, process.stderr.readline())
                 self.assertIn("waiting for memory since ", first_message)
                 time.sleep(1.1)
                 _ = meminfo.write_text("MemAvailable: 12582912 kB\n")
-                output, remaining_errors = process.communicate(timeout=8)
+                output, remaining_errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                 errors = first_message + remaining_errors
             finally:
                 if process.poll() is None:
@@ -296,7 +304,7 @@ class RecordTests(unittest.TestCase):
         environment = self.environment(BUILDLOG_MEMINFO=str(meminfo), BUILDLOG_MEM_POLL_S="1", BUILDLOG_MEM_WAIT_LIMIT_S="1")
         result = subprocess.run(
             ["bash", "-c", command, "bash", str(SCRIPT.parent.parent / "lint" / "invoke.sh")],
-            env=environment, capture_output=True, text=True, check=False, timeout=5,
+            env=environment, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertRegex(result.stderr, r"waiting for memory since \d\d:\d\d P[DS]T: the machine has 10\.5 GiB free; a build starts at 12\.0")
@@ -326,7 +334,7 @@ class RecordTests(unittest.TestCase):
                 result = subprocess.run(
                     ["bash", "-c", command, "bash", str(SCRIPT.parent.parent / "lint" / "invoke.sh")],
                     env=self.environment(BUILDLOG_MEMINFO=str(meminfo)),
-                    capture_output=True, text=True, check=False, timeout=5,
+                    capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
                 )
                 if name in ("at floor", "above floor"):
                     self.assertEqual(result.returncode, 0, result.stderr)
@@ -352,7 +360,7 @@ class RecordTests(unittest.TestCase):
             time.sleep(1.1)
             with meminfo.open("w") as writer:
                 _ = writer.write("MemAvailable: 12582912 kB\n")
-            output, errors = process.communicate(timeout=5)
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         finally:
             if process.poll() is None:
                 process.kill()
@@ -392,7 +400,7 @@ class RecordTests(unittest.TestCase):
             env=self.environment(PATH=f"{self.base}:{os.environ['PATH']}", BUILDLOG_OFF="0", BUILDLOG_SCOPE="0",
                                  BUILDLOG_MEMINFO=str(meminfo), BUILDLOG_MEM_POLL_S="1",
                                  BUILDLOG_MEM_WAIT_LIMIT_S="0", BUILDLOG_SYNC="1"),
-            capture_output=True, text=True, check=False, timeout=5,
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(output_line, result.stdout)
@@ -421,7 +429,7 @@ class RecordTests(unittest.TestCase):
         )
         try:
             assert process.stderr is not None
-            readable, _, _ = select.select([process.stderr], [], [], 5)
+            readable, _, _ = select.select([process.stderr], [], [], TEST_HANG_GUARD_SECS)
             self.assertTrue(readable, "memory wait message did not arrive")
             first_message = cast(str, process.stderr.readline())
             self.assertIn("waiting for memory since ", first_message)
@@ -429,7 +437,7 @@ class RecordTests(unittest.TestCase):
             time.sleep(1.1)
             released_at = time.time()
             _ = meminfo.write_text("MemAvailable: 12582912 kB\n")
-            output, remaining_errors = process.communicate(timeout=8)
+            output, remaining_errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
             errors = first_message + remaining_errors
         finally:
             if process.poll() is None:

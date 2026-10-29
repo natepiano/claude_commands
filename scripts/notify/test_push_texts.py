@@ -4,6 +4,7 @@ from __future__ import annotations
 import ast
 import importlib
 import json
+import sys
 import tempfile
 import unittest
 from collections.abc import Iterator
@@ -12,6 +13,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from code_kind import is_test_code  # noqa: E402
 
 import push_texts
 from push_texts import ActionTemplate, PushExample, PushText, SessionTemplate
@@ -369,7 +373,7 @@ class PushTextTests(unittest.TestCase):
         findings: list[str] = []
         for path in (ROOT / "scripts").rglob("*.py"):
             relative = path.relative_to(ROOT).as_posix()
-            if relative in EXEMPT or path.name.startswith("test_"):
+            if relative in EXEMPT or is_test_code(path):
                 continue
             findings.extend(f"{relative}:{line}: literal phone send; use push_texts.user_send_argv" for line in literal_delivery_calls(path.read_text()))
         self.assertEqual(findings, [])
@@ -377,6 +381,6 @@ class PushTextTests(unittest.TestCase):
     def test_only_pushover_posts_to_pushover(self) -> None:
         """pushover.post_message adds the "Sent by" and "Template" lines; no other script may post round it."""
         found = [path.relative_to(ROOT).as_posix() for path in (ROOT / "scripts").rglob("*")
-                 if path.is_file() and "__pycache__" not in path.parts and not path.name.startswith("test_")
+                 if path.is_file() and "__pycache__" not in path.parts and not is_test_code(path)
                  and path.name != "pushover.py" and b"api.pushover.net" in path.read_bytes()]
         self.assertEqual(found, [])

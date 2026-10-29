@@ -17,6 +17,11 @@ from typing import override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+from scripts.lib.socket_test_support import short_socket_directory
+
+
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
 
 SCRIPT = Path(__file__).with_name("notifier.sh")
 NOW = 1_700_000_123
@@ -61,7 +66,7 @@ class NotifierTests(unittest.TestCase):
         launcher.chmod(0o755)
         self.launcher_dir = launcher_dir
         self.addCleanup(self.live_socket.close)
-        self.socket_path = self.root / "live.sock"
+        self.socket_path = Path(self.enterContext(short_socket_directory())) / "live.sock"
         self.live_socket.bind(str(self.socket_path))
         self.record("sid-1")
 
@@ -86,7 +91,7 @@ class NotifierTests(unittest.TestCase):
                 "FAKE_SEND_RC": str(send_rc),
                 "PATH": f"{self.launcher_dir}{os.pathsep}{os.environ['PATH']}",
             },
-            capture_output=True, text=True, check=False, timeout=30,
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
 
     def successful(self, *args: str, now: int = NOW, send_rc: int = 0) -> str:
@@ -111,7 +116,7 @@ class NotifierTests(unittest.TestCase):
         return path.read_text().splitlines() if path.exists() else []
 
     def wait_for_text(self, path: Path, expected: str) -> str:
-        deadline = time.monotonic() + 4
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
         while time.monotonic() < deadline:
             if path.exists():
                 contents = path.read_text()
@@ -398,7 +403,7 @@ class NotifierTests(unittest.TestCase):
         self.assertIn(" | skip hold", self.lines()[-1])
         other = socket.socket(socket.AF_UNIX)
         self.addCleanup(other.close)
-        new_path = self.root / "replacement.sock"
+        new_path = Path(self.enterContext(short_socket_directory())) / "replacement.sock"
         other.bind(str(new_path))
         self.record("sid-1", new_path, updated=2)
         _ = self.successful("tick", now=MINUTE + 360)
@@ -493,7 +498,7 @@ class NotifierTests(unittest.TestCase):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
         )
         try:
-            _, stderr = tick.communicate(timeout=3)
+            _, stderr = tick.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(tick.returncode, 0, stderr)
             _ = self.wait_for_text(started, "started")
             self.assertFalse(finished.exists())

@@ -8,16 +8,23 @@ import importlib
 import json
 import math
 import os
+import re
 import signal
 import sqlite3
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, NoReturn, NotRequired, Protocol, TypedDict, cast
+from urllib.parse import urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+
+from user_zone import user_zone
 
 
 class GitFacts(TypedDict):
@@ -54,17 +61,49 @@ store: BuildLogStore = cast(BuildLogStore, cast(object, importlib.import_module(
 
 GIB = 1 << 30
 FALLBACK = 12 * GIB
+# 111 natedev filtered single-test runs with no recompilation in the 14 days
+# to 2026-10-29 had anon p90 0.671 GiB and p95 0.784 GiB.
+FILTERED_FLOOR = GIB
 # On natedev, isolated hana nextest scopes had p90 anon / memory.peak 61%;
 # clippy had 65%, so 0.65 covers the measured p90 process-memory share.
 ANON_SHARE = 0.65
 HISTORY_DAYS = 14
 # Build anon at 16–20 GiB averaged 10.4% full PSI; at 20–24 GiB it averaged 16.4%.
-BUILD_BUDGET_BYTES = 20 * GIB
+BUILD_BUDGET_BYTES = 21 * GIB
 RAMP_SECONDS = 120
 PROC = Path("/proc")
 # A step held this long gets room first when it can start.
-HEAD_SECONDS = 900
+HEAD_SECONDS = 600
+STRICT_SECONDS = 600
+BACKFILL_SECONDS = 120
 QUEUE_LOCK_TIMEOUT_SECONDS = 10.0
+
+
+@dataclass(frozen=True)
+class RepositoryIdentity:
+    key: str
+    name: str
+    legacy_name: str = ""
+
+
+@dataclass(frozen=True)
+class UnknownRepository:
+    pass
+
+
+Repository = RepositoryIdentity | UnknownRepository
+TestScope = Literal["full", "filtered"]
+
+
+@dataclass(frozen=True)
+class PackageTestSelection:
+    package: str
+    filters: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class BroadTestSelection:
+    pass
 
 
 class Reservation(TypedDict):
@@ -78,6 +117,10 @@ class Reservation(TypedDict):
     sidecar: str
     test_threads: int | None
     call_id: str | None
+    repo_identity: NotRequired[str]
+    test_scope: NotRequired[TestScope]
+    package: NotRequired[str]
+    filters: NotRequired[list[str]]
 
 
 @dataclass(frozen=True)
@@ -132,6 +175,26 @@ class Waiter(TypedDict):
     step: NotRequired[str]
     folder: NotRequired[str]
     bump_order: NotRequired[int]
+    holds_younger: NotRequired[bool]
+    priority_since: NotRequired[float]
+    estimated_at: NotRequired[float]
+    repo_identity: NotRequired[str]
+    repository_name: NotRequired[str]
+    legacy_name: NotRequired[str]
+    test_scope: NotRequired[TestScope]
+    package: NotRequired[str]
+    filters: NotRequired[list[str]]
+
+
+@dataclass(frozen=True)
+class HeadPriority:
+    waiter: Waiter
+    window: StrictUntil | BackfillUntil
+
+
+@dataclass(frozen=True)
+class NoHeadPriority:
+    pass
 
 
 @dataclass(frozen=True)
@@ -166,6 +229,24 @@ class BehindHead:
 
 
 @dataclass(frozen=True)
+class BackfillUntil:
+    deadline: float
+
+
+@dataclass(frozen=True)
+class StrictUntil:
+    deadline: float
+
+
+@dataclass(frozen=True)
+class HeadAdmissionStatus:
+    decision: AdmissionDecision
+    need: int
+    available: int
+    backfill: BackfillUntil | StrictUntil
+
+
+@dataclass(frozen=True)
 class ReadyForAdmission:
     pass
 
@@ -175,7 +256,47 @@ class ReadingUnavailable:
     pass
 
 
-WaitReason = NeedsBuildBudget | NeedsMemory | BehindHead | ReadyForAdmission | ReadingUnavailable | MemoryPressure
+WaitReason = NeedsBuildBudget | NeedsMemory | BehindHead | HeadAdmissionStatus | ReadyForAdmission | ReadingUnavailable | MemoryPressure
+
+
+def head_wait_reason(decision: AdmissionDecision, need: int, available: int,
+                     waiter: Waiter, now: float) -> HeadAdmissionStatus:
+    return HeadAdmissionStatus(decision, need, available, head_window(waiter, now))
+
+
+def head_window(waiter: Waiter, now: float) -> BackfillUntil | StrictUntil:
+    if (not waiter.get("holds_younger", False) and waiter.get("bump_order", 0) >= 0
+            and now - waiter["since"] < HEAD_SECONDS):
+        return BackfillUntil(waiter["since"] + HEAD_SECONDS)
+    start = waiter.get("priority_since", now)
+    cycle = STRICT_SECONDS + BACKFILL_SECONDS
+    elapsed = max(0.0, now - start)
+    cycle_start = start + (elapsed // cycle) * cycle
+    if elapsed % cycle < STRICT_SECONDS:
+        return StrictUntil(cycle_start + STRICT_SECONDS)
+    return BackfillUntil(cycle_start + cycle)
+
+
+def head_wait_text(reason: HeadAdmissionStatus, zone: ZoneInfo) -> str:
+    decision = reason.decision
+    parts: list[str] = []
+    if isinstance(decision.pressure, MemoryPressure):
+        parts.append(pressure_text(decision.pressure))
+    elif decision.state == "admit":
+        parts.append("ready for the next admission check")
+    else:
+        if decision.charged + reason.need > decision.budget:
+            parts.append(f"needs {reason.need / GIB:.1f} GiB; builds use {decision.charged / GIB:.1f} "
+                         + f"of the {decision.budget / GIB:.1f} GiB budget "
+                         + f"(starts when build use falls to {(decision.budget - reason.need) / GIB:.1f} GiB)")
+        if reason.available < decision.threshold:
+            parts.append(f"needs {decision.threshold / GIB:.1f} GiB free; {reason.available / GIB:.1f} free")
+    until = datetime.fromtimestamp(reason.backfill.deadline, zone).strftime("%H:%M")
+    if isinstance(reason.backfill, BackfillUntil):
+        parts.append(f"younger steps may start until {until}")
+    else:
+        parts.append(f"younger steps wait until {until}")
+    return "head: " + "; ".join(parts)
 
 
 @dataclass(frozen=True)
@@ -232,6 +353,9 @@ class StepProfile:
     step: str
     worktree: str
     peak: ExpectedPeak
+    repository: Repository = UnknownRepository()
+    scope: TestScope = "full"
+    estimated_at: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -246,6 +370,7 @@ class CheckResult:
     profile: StepProfile
     head_need: int = 0
     head_label: str = ""
+    head_reason: HeadAdmissionStatus | ReadyForAdmission = ReadyForAdmission()
 
 
 def build_budget_bytes() -> int:
@@ -267,7 +392,7 @@ def decide(available: int, total: int | None, need: int, running: list[StepMemor
     budget = build_budget_bytes()
     reserve = total * 5 // 100 if total is not None else 0
     threshold = need + promised + reserve + head_need
-    fits_budget = charged + need + head_need <= budget or all(isinstance(row, GoneMemory) for row in running)
+    fits_budget = charged + need + head_need <= budget or (not running and not head_need)
     admit = fits_budget and available >= threshold and isinstance(pressure, NoPressureHold)
     return AdmissionDecision("admit" if admit else "hold", threshold, promised, reserve, measured,
                              pressure, charged, budget)
@@ -287,14 +412,6 @@ def growth_headroom(memory: StepMemory) -> int:
     if isinstance(memory, MeasuredMemory):
         return max(0, memory.ramp_promise - memory.bytes)
     return 0
-
-
-def _head_holds_later(available: int, total: int | None, need: int,
-                      running: list[StepMemory]) -> bool:
-    decision = decide(available, total, need, running)
-    # Leave room if the head fits now or after measured running steps end.
-    # Pending starts have no measured use to return.
-    return decision.state == "admit" or available + decision.measured >= need + decision.reserve
 
 
 def percentile(values: list[int]) -> int:
@@ -321,14 +438,23 @@ def test_threads(argv: list[str]) -> int | None:
     return None
 
 
-def expected_peak(repo: str, step: str, host: str, now: datetime, root: Path,
-                  test_threads: int | None = None) -> ExpectedPeak:
+def expected_peak(repository: Repository, step: str, host: str, now: datetime, root: Path,
+                  test_threads: int | None = None, *, scope: TestScope = "full",
+                  filters: tuple[str, ...] = (), package: str = "") -> ExpectedPeak:
     """The p90 process-memory peak of a step over HISTORY_DAYS.
 
     The gate pools every test width: one width's history is thin and rebuild-heavy, and the
     claim of a width comes only after admission. `test_threads` narrows the measured history to
     one width, for width_trial.py's report.
     """
+    if isinstance(repository, UnknownRepository):
+        return ExpectedPeak(FALLBACK, "fallback", 0)
+    if scope == "filtered" and package:
+        filtered = filtered_peak(repository, step, host, now, root, test_threads,
+                                 tuple(sorted(set(filters))), package)
+        full = expected_peak(repository, step, host, now, root, test_threads, scope="full")
+        # A filtered run builds the same targets and runs fewer tests than the full suite.
+        return ExpectedPeak(min(filtered.bytes, full.bytes), filtered.source, filtered.count)
     cutoff = store.utc_iso((now - timedelta(days=HISTORY_DAYS)).timestamp())
     before = store.utc_iso(now.timestamp())
     measured: list[int] = []
@@ -342,12 +468,16 @@ def expected_peak(repo: str, step: str, host: str, now: datetime, root: Path,
                 try:
                     item = cast(dict[str, object], json.loads(line))
                     if ((item.get("host"), item.get("step")) == (host, step)
+                            and item.get("test_scope", "full") == scope
+                            and (item.get("repo_identity") or item.get("repo") not in GENERIC_REPO_NAMES)
                             and (test_threads is None or item.get("test_threads") == test_threads)
                             and cutoff <= str(item.get("ended_at", "")) < before):
                         peak = item.get("anon_peak_bytes")
                         if isinstance(peak, int) and peak > 0:
                             pooled.append(peak)
-                            if item.get("repo") == repo:
+                            if (item.get("repo_identity") == repository.key
+                                    or (not item.get("repo_identity") and repository.legacy_name
+                                        and item.get("repo") == repository.legacy_name)):
                                 measured.append(peak)
                 except (ValueError, TypeError, AttributeError):
                     continue
@@ -360,12 +490,28 @@ def expected_peak(repo: str, step: str, host: str, now: datetime, root: Path,
     try:
         connection = sqlite3.connect(f"file:{index}?mode=ro", uri=True)
         try:
-            rows = cast(list[tuple[int]], connection.execute(
-                "SELECT peak_mem_bytes FROM steps WHERE host = ? AND repo = ? AND step = ? "
-                + "AND started_at >= ? AND started_at < ? AND peak_mem_bytes > 0",
-                (host, repo, step, cutoff, before),
-            ).fetchall())
-            peaks = [int(value) for (value,) in rows]
+            # Old index rows have no repository key. Use them only for a named
+            # checkout of that repository, and read argv to separate test scopes.
+            columns = {str(row[1]) for row in cast(list[tuple[object, ...]],
+                       connection.execute("PRAGMA table_info(steps)").fetchall())}
+            if repository.legacy_name:
+                argv_column = "argv" if "argv" in columns else "NULL"
+                rows = cast(list[tuple[int, str | None]], connection.execute(
+                    f"SELECT peak_mem_bytes, {argv_column} FROM steps WHERE host = ? AND repo = ? AND step = ? "
+                    + "AND started_at >= ? AND started_at < ? AND peak_mem_bytes > 0",
+                    (host, repository.legacy_name, step, cutoff, before),
+                ).fetchall())
+                for value, raw_argv in rows:
+                    arguments: list[str] = []
+                    if raw_argv:
+                        try:
+                            decoded = cast(object, json.loads(raw_argv))
+                            if isinstance(decoded, list):
+                                arguments = [word for word in cast(list[object], decoded) if isinstance(word, str)]
+                        except (ValueError, TypeError):
+                            continue
+                    if test_scope(arguments) == scope:
+                        peaks.append(int(value))
         finally:
             connection.close()
     except (OSError, sqlite3.Error):
@@ -375,6 +521,116 @@ def expected_peak(repo: str, step: str, host: str, now: datetime, root: Path,
     if len(pooled) >= 5:
         return ExpectedPeak(percentile(pooled), "pooled", len(pooled))
     return ExpectedPeak(FALLBACK, "fallback", 0)
+
+
+def history_arguments(raw: object) -> list[str]:
+    """Decode argv from the build-log index; absent arguments prove no selection."""
+    if not isinstance(raw, str):
+        return []
+    try:
+        decoded = cast(object, json.loads(raw))
+        if isinstance(decoded, list):
+            return [word for word in cast(list[object], decoded) if isinstance(word, str)]
+    except (ValueError, TypeError):
+        pass
+    return []
+
+
+def filtered_peak(repository: RepositoryIdentity, step: str, host: str, now: datetime,
+                  root: Path, width: int | None, filters: tuple[str, ...],
+                  package: str) -> ExpectedPeak:
+    """Prefer the exact filter set, then this package's filtered runs, at any count.
+
+    Old anon rows lack the package and cannot identify a workspace member. The
+    index's argv can, so those older measured runs remain usable there. Build
+    and check peaks cover compilation when no filtered run has been measured; no other
+    repository's test or compile peak participates in this estimate.
+    """
+    cutoff = store.utc_iso((now - timedelta(days=HISTORY_DAYS)).timestamp())
+    before = store.utc_iso(now.timestamp())
+    measured: list[int] = []
+    exact: list[int] = []
+    compile_peaks: list[int] = []
+    compile_index: list[int] = []
+    try:
+        with (root / "admission/anon_peaks.jsonl").open() as lines:
+            for line in lines:
+                try:
+                    item = cast(dict[str, object], json.loads(line))
+                    own = (item.get("repo_identity") == repository.key
+                           or (not item.get("repo_identity") and repository.legacy_name
+                               and item.get("repo") == repository.legacy_name))
+                    if (not own or item.get("host") != host
+                            or not cutoff <= str(item.get("ended_at", "")) < before):
+                        continue
+                    peak = item.get("anon_peak_bytes")
+                    if not isinstance(peak, int) or peak <= 0:
+                        continue
+                    sample_package = item.get("package", "")
+                    if (item.get("step") in ("check", "build")
+                            and (sample_package == package
+                                 or (not sample_package and package == repository.name))):
+                        compile_peaks.append(peak)
+                    if (item.get("step") != step or item.get("test_scope") != "filtered"
+                            or sample_package != package
+                            or (width is not None and item.get("test_threads") != width)):
+                        continue
+                    measured.append(peak)
+                    names = item.get("filters")
+                    if (filters and isinstance(names, list)
+                            and all(isinstance(name, str) for name in cast(list[object], names))
+                            and tuple(sorted(set(cast(list[str], names)))) == filters):
+                        exact.append(peak)
+                except (ValueError, TypeError, AttributeError):
+                    continue
+    except OSError:
+        pass
+    if exact:
+        return ExpectedPeak(percentile(exact), "measured", len(exact))
+    indexed: list[int] = []
+    indexed_exact: list[int] = []
+    if repository.legacy_name:
+        try:
+            connection = sqlite3.connect(f"file:{root / store.INDEX_NAME}?mode=ro", uri=True)
+            try:
+                columns = {str(row[1]) for row in cast(list[tuple[object, ...]],
+                           connection.execute("PRAGMA table_info(steps)").fetchall())}
+                argv_column = "argv" if "argv" in columns else "NULL"
+                rows = cast(list[tuple[int, str | None, str]], connection.execute(
+                    f"SELECT peak_mem_bytes, {argv_column}, step FROM steps "
+                    + "WHERE host = ? AND repo = ? AND step IN (?, 'check', 'build') "
+                    + "AND started_at >= ? AND started_at < ? AND peak_mem_bytes > 0",
+                    (host, repository.legacy_name, step, cutoff, before),
+                ).fetchall())
+                for value, raw_argv, sample_step in rows:
+                    arguments = history_arguments(raw_argv)
+                    sample_package = test_package(arguments)
+                    if sample_step in ("check", "build"):
+                        if (sample_package == package
+                                or (not sample_package and package == repository.name)):
+                            compile_index.append(int(value))
+                    elif (sample_package == package and test_scope(arguments) == "filtered"
+                          and (width is None or test_threads(arguments) == width)):
+                        indexed.append(int(value))
+                        if filters and test_filters(arguments) == filters:
+                            indexed_exact.append(int(value))
+            finally:
+                connection.close()
+        except (OSError, sqlite3.Error):
+            pass
+    for values, source in ((indexed_exact, "buildlog"),
+                           (measured, "measured"), (indexed, "buildlog")):
+        if values:
+            peak = percentile(values)
+            if source == "buildlog":
+                peak = int(peak * ANON_SHARE)
+            return ExpectedPeak(peak, cast(Literal["measured", "buildlog"], source), len(values))
+    if compile_peaks:
+        return ExpectedPeak(max(FILTERED_FLOOR, percentile(compile_peaks)), "measured", len(compile_peaks))
+    if compile_index:
+        return ExpectedPeak(max(FILTERED_FLOOR, int(percentile(compile_index) * ANON_SHARE)),
+                            "buildlog", len(compile_index))
+    return ExpectedPeak(FILTERED_FLOOR, "fallback", 0)
 
 
 def process_start_time(pid: int) -> str | None:
@@ -526,12 +782,169 @@ def waiter_order(row: Waiter) -> tuple[int, float, int]:
     return row.get("bump_order", 0), row["since"], row["pid"]
 
 
-def git_identity(argv: list[str], cwd: str) -> tuple[str, str]:
+def head_priority(waiters: list[Waiter], available: int, total: int | None,
+                  running: list[StepMemory], now: float) -> HeadPriority | NoHeadPriority:
+    ordered = sorted(waiters, key=waiter_order)
+    if not ordered:
+        return NoHeadPriority()
+    head = ordered[0]
+    if (head.get("holds_younger", False) or head.get("bump_order", 0) < 0
+            or now - head["since"] >= HEAD_SECONDS):
+        decision = decide(available, total, head["need"], running)
+        if (head.get("holds_younger", False) or decision.state == "admit"
+                or available + decision.measured >= head["need"] + decision.reserve):
+            return HeadPriority(head, head_window(head, now))
+    return NoHeadPriority()
+
+
+def queue_decision(available: int, total: int | None, row: Waiter,
+                   running: list[StepMemory], head: HeadPriority | NoHeadPriority,
+                   pressure: Pressure) -> AdmissionDecision:
+    younger = (isinstance(head, HeadPriority) and isinstance(head.window, StrictUntil)
+               and waiter_order(head.waiter) < waiter_order(row))
+    head_need = head.waiter["need"] if younger and isinstance(head, HeadPriority) else 0
+    decision = decide(available, total, row["need"], running, head_need, pressure)
+    if younger:
+        return replace(decision, state="hold")
+    if isinstance(head, HeadPriority) and waiter_order(head.waiter) == waiter_order(row) and not running:
+        return replace(decision, state="admit" if isinstance(pressure, NoPressureHold) else "hold")
+    return decision
+
+
+GENERIC_REPO_NAMES = frozenset({"", "repo", "c", "clone", "scratch", "tmp", "repository"})
+
+
+def git_output(directory: str, *arguments: str) -> str:
+    try:
+        result = subprocess.run(["git", "-C", directory, *arguments], capture_output=True,
+                                text=True, timeout=5, check=False)
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def remote_identity(remote: str, directory: str) -> str:
+    if "://" not in remote and ":" in remote and not remote.startswith(("/", ".")):
+        host, path = remote.split(":", 1)
+        remote = f"ssh://{host}/{path}"
+    parsed = urlsplit(remote)
+    if parsed.hostname:
+        path = parsed.path.rstrip("/").removesuffix(".git")
+        # SSH and HTTPS name the same repository; credentials are not identity.
+        port = f":{parsed.port}" if parsed.port and parsed.port not in (22, 443) else ""
+        return urlunsplit(("https", parsed.hostname.lower() + port, path, "", ""))
+    path = Path(parsed.path if parsed.scheme == "file" else remote).expanduser()
+    if not path.is_absolute():
+        path = Path(directory) / path
+    return str(path.resolve()).rstrip("/").removesuffix(".git")
+
+
+def git_identity(argv: list[str], cwd: str) -> tuple[Repository, str]:
     if not argv:
-        return "", ""
-    facts = record.git_facts(record.git_directory(argv, cwd))
-    repo_path = facts["repo_path"]
-    return (Path(repo_path).name if repo_path else "", Path(facts["worktree"] or cwd).name)
+        return UnknownRepository(), ""
+    directory = record.git_directory(argv, cwd)
+    facts = record.git_facts(directory)
+    worktree = Path(facts["worktree"] or cwd).name
+    remote = git_output(directory, "remote", "get-url", "origin")
+    if remote:
+        key = remote_identity(remote, directory)
+        name = key.rsplit("/", 1)[-1]
+        checkout_name = Path(facts["repo_path"] or cwd).name
+        legacy = name if checkout_name == name and name not in GENERIC_REPO_NAMES else ""
+        return RepositoryIdentity(key, name, legacy), worktree
+    roots = git_output(directory, "rev-list", "--max-parents=0", "--reverse", "HEAD").splitlines()
+    if roots:
+        return RepositoryIdentity("git-root:" + roots[0], Path(facts["repo_path"] or cwd).name), worktree
+    return UnknownRepository(), worktree
+
+
+def filter_expressions(argv: list[str]) -> list[str]:
+    expressions: list[str] = []
+    arguments = iter(argv)
+    for word in arguments:
+        if word in ("-E", "--filter-expr", "--filterset"):
+            expressions.append(next(arguments, ""))
+        elif word.startswith(("--filter-expr=", "--filterset=")):
+            expressions.append(word.split("=", 1)[1])
+        elif word.startswith("-E") and len(word) > 2:
+            expressions.append(word[2:].removeprefix("="))
+    return expressions
+
+
+def verify_test_selection(argv: list[str]) -> PackageTestSelection | BroadTestSelection:
+    """Recognize the whole positive expression verify emits, never its fragments."""
+    expressions = filter_expressions(argv)
+    if len(expressions) != 1:
+        return BroadTestSelection()
+    package_predicate = r"package\(([A-Za-z0-9_-]+)\)"
+    name_predicate = r"test\([A-Za-z0-9_:]+\)"
+    union = rf"\(\s*{name_predicate}(?:\s*\|\s*{name_predicate})+\s*\)"
+    match = re.fullmatch(rf"\s*{package_predicate}\s*&\s*(?:{name_predicate}|{union})\s*",
+                         expressions[0])
+    if match:
+        names = cast(list[str], re.findall(r"\btest\(([A-Za-z0-9_:]+)\)", expressions[0]))
+        return PackageTestSelection(match.group(1), tuple(sorted(set(names))))
+    # Full package runs retain their package metadata, without an exact filter set.
+    match = re.fullmatch(rf"\s*{package_predicate}\s*", expressions[0])
+    if match and test_scope(argv) == "full":
+        return PackageTestSelection(match.group(1), ())
+    return BroadTestSelection()
+
+
+def test_filters(argv: list[str]) -> tuple[str, ...]:
+    """Verify's positive filter names, sorted and deduplicated like its cache key."""
+    selection = verify_test_selection(argv)
+    return selection.filters if isinstance(selection, PackageTestSelection) else ()
+
+
+def test_package(argv: list[str]) -> str:
+    """A verify test selection or compile package; empty means broader history."""
+    if parse.step_name(argv) not in ("check", "build"):
+        selection = verify_test_selection(argv)
+        return selection.package if isinstance(selection, PackageTestSelection) else ""
+    packages: list[str] = []
+    arguments = iter(argv)
+    for word in arguments:
+        if word in ("-p", "--package"):
+            packages.append(next(arguments, ""))
+        elif word.startswith("--package="):
+            packages.append(word.split("=", 1)[1])
+        elif word.startswith("-p") and len(word) > 2:
+            packages.append(word[2:])
+    selected = set(packages)
+    return selected.pop() if len(selected) == 1 else ""
+
+
+def test_scope(argv: list[str]) -> TestScope:
+    """Keep test selection separate from package, target and execution options."""
+    step = parse.step_name(argv)
+    if step not in ("nextest", "test", "t"):
+        return "full"
+    words = argv[argv.index(step) + 1:]
+    if step == "nextest" and words and words[0] in ("run", "list"):
+        words = words[1:]
+    values = {"-p", "--package", "--manifest-path", "--target", "--target-dir", "--profile",
+              "--features", "--test-threads", "-j", "--jobs", "--config-file", "--cargo-profile",
+              "--bin", "--example", "--test", "--bench", "--status-level", "--final-status-level",
+              "--failure-output", "--success-output", "--color", "--message-format", "--retries",
+              "--archive-file", "--workspace-remap", "--partition", "-F", "--exclude", "-P",
+              "--run-ignored", "-Z", "--no-tests", "--max-fail", "--tool-config-file", "--test-group"}
+    expressions = {"-E", "--filter-expr", "--filterset"}
+    arguments = iter(words)
+    for word in arguments:
+        option = word.split("=", 1)[0]
+        if option in ("--skip", "--exact"):
+            return "filtered"
+        if option in expressions or word.startswith("-E"):
+            expression = (word[2:].removeprefix("=") if word.startswith("-E") and len(word) > 2 else
+                          word.split("=", 1)[1] if "=" in word else next(arguments, ""))
+            if re.search(r"\btest\s*\(", expression):
+                return "filtered"
+        elif word in values:
+            _ = next(arguments, "")
+        elif not word.startswith("-"):
+            return "filtered"
+    return "full"
 
 
 def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float = 0.0,
@@ -542,12 +955,20 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
     root = root if root is not None else store.root()
     now = now if now is not None else datetime.now(UTC)
     width = test_threads(argv)
+    package, filters = test_package(argv), test_filters(argv)
+    if profile is not None and profile.estimated_at and now.timestamp() - profile.estimated_at >= HEAD_SECONDS:
+        profile = None
     if profile is None:
-        repo, worktree = git_identity(argv, os.getcwd())
+        repository, worktree = git_identity(argv, os.getcwd())
+        repo = repository.name if isinstance(repository, RepositoryIdentity) else ""
+        scope = test_scope(argv)
         step = parse.step_name(argv) if argv else "build"
         host = store.host_name()
-        peak = expected_peak(repo, step, host, now, root) if repo else ExpectedPeak(FALLBACK, "fallback", 0)
-        profile = StepProfile(repo, step, worktree, peak)
+        peak = expected_peak(repository, step, host, now, root, scope=scope,
+                             package=package, filters=filters)
+        profile = StepProfile(repo, step, worktree, peak, repository, scope, now.timestamp())
+    elif not profile.estimated_at:
+        profile = replace(profile, estimated_at=now.timestamp())
     repo, step, worktree, peak = profile.repo, profile.step, profile.worktree, profile.peak
     if not argv and not (root / "admission").exists():
         available, total = read_meminfo(meminfo)
@@ -572,30 +993,45 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
         mine = directory / f"{pid}-{start}.waiting"
         waiting = live_waiters(directory)
         previous = next((row for path, row in waiting if path == mine), None)
-        waiters = [row for path, row in waiting if path != mine]
-        heads = sorted((row for row in waiters
-                        if row.get("bump_order", 0) < 0 or now.timestamp() - row["since"] >= HEAD_SECONDS),
-                       key=waiter_order)
         waited_from = since or now.timestamp()
         if previous is not None:
             waited_from = min(waited_from, previous["since"])
-        own_order = (previous.get("bump_order", 0) if previous is not None else 0, waited_from, pid)
+        waiter: Waiter = {"pid": pid, "start_time": start or "", "need": peak.bytes, "since": waited_from,
+                          "label": f"{worktree or repo} {step} ({os.environ.get('BUILDLOG_CALLER') or 'caller'} pid {pid})"}
+        waiter["test_scope"] = profile.scope
+        waiter["package"] = package
+        waiter["filters"] = list(filters)
+        waiter["estimated_at"] = profile.estimated_at
+        waiter["repo_identity"] = ""
+        if isinstance(profile.repository, RepositoryIdentity):
+            waiter["repo_identity"] = profile.repository.key
+            waiter["repository_name"] = profile.repository.name
+            waiter["legacy_name"] = profile.repository.legacy_name
+        if previous is not None:
+            if "bump_order" in previous:
+                waiter["bump_order"] = previous["bump_order"]
+            if previous.get("holds_younger", False):
+                waiter["holds_younger"] = True
+            if "priority_since" in previous:
+                waiter["priority_since"] = previous["priority_since"]
         available, total = read_meminfo(meminfo)
         pressure = read_pressure()
+        candidates = sorted([row for path, row in waiting if path != mine] + ([waiter] if argv else []),
+                            key=waiter_order)
+        head = head_priority(candidates, available, total, running, now.timestamp())
+        if isinstance(head, HeadPriority) and "priority_since" not in head.waiter:
+            head.waiter["holds_younger"] = True
+            head.waiter["priority_since"] = now.timestamp()
+            for head_path, head_row in waiting:
+                if head_path != mine and head_row is head.waiter:
+                    _ = head_path.write_text(json.dumps(head_row, separators=(",", ":")))
         head_need, head_label = 0, ""
-        if heads and waiter_order(heads[0]) < own_order:
-            head = heads[0]
-            if _head_holds_later(available, total, head["need"], running):
-                head_need, head_label = head["need"], waiter_label(head)
-        decision = decide(available, total, peak.bytes, running, head_need, pressure)
-        if head_need and heads[0].get("bump_order", 0) < 0:
-            decision = replace(decision, state="hold")
+        if (isinstance(head, HeadPriority) and isinstance(head.window, StrictUntil)
+                and waiter_order(head.waiter) < waiter_order(waiter)):
+            head_need, head_label = head.waiter["need"], waiter_label(head.waiter)
+        decision = queue_decision(available, total, waiter, running, head, pressure)
         reservation: Reserved | NotReserved = NotReserved("held" if argv else "launch")
         if argv and decision.state == "hold" and start is not None:
-            waiter: Waiter = {"pid": pid, "start_time": start, "need": peak.bytes, "since": waited_from,
-                              "label": f"{worktree or repo} {step} ({os.environ.get('BUILDLOG_CALLER') or 'caller'} pid {pid})"}
-            if previous is not None and "bump_order" in previous:
-                waiter["bump_order"] = previous["bump_order"]
             identity = waiter_identity(repo, step, worktree)
             waiter["session_id"], waiter["session_name"] = identity["session_id"], identity["session_name"]
             waiter["step"], waiter["folder"] = identity["step"], identity["folder"]
@@ -609,11 +1045,19 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                                     "admitted_at": store.utc_iso(now.timestamp()), "sidecar": sidecar,
                                     "test_threads": width,
                                     "call_id": os.environ.get("BUILDLOG_CALL_ID") or None}
+                row["test_scope"] = profile.scope
+                row["package"] = package
+                row["filters"] = list(filters)
+                if isinstance(profile.repository, RepositoryIdentity):
+                    row["repo_identity"] = profile.repository.key
                 _ = path.write_text(json.dumps(row, separators=(",", ":")))
                 reservation = Reserved(path)
             else:
                 reservation = NotReserved("untracked")
-        return CheckResult(decision, peak, [row for _, row in live], reservation, repo, step, available, profile, head_need, head_label)
+        head_reason = (head_wait_reason(decision, peak.bytes, available, waiter, now.timestamp())
+                       if candidates and candidates[0] is waiter else ReadyForAdmission())
+        return CheckResult(decision, peak, [row for _, row in live], reservation, repo, step, available, profile,
+                           head_need, head_label, head_reason)
 
 
 def waiter_identity(repo: str, step: str, worktree: str) -> WaiterIdentity:
@@ -715,24 +1159,26 @@ def read_queue(directory: Path, processes: dict[int, ProcessIdentity], now: floa
     pressure = read_pressure()
     ordered = sorted(((path, cast(Waiter, cast(object, row))) for path, row in queue_rows(directory, "waiting", processes)),
                      key=lambda item: waiter_order(item[1]))
-    head = next((row for _, row in ordered if row.get("bump_order", 0) < 0 or now - row["since"] >= HEAD_SECONDS), None)
+    head = head_priority([row for _, row in ordered], available, total, memory, now)
     pending = sum(growth_headroom(item) for item in memory)
     waiting: list[WaitingStep] = []
     for _, row in ordered:
         identity = identities.identity(row["pid"], cast(dict[str, object], cast(object, row)))
-        own = decide(available, total, row["need"], memory, pressure=pressure)
+        own = queue_decision(available, total, row, memory, head, pressure)
         reason: WaitReason = ReadyForAdmission()
         if unavailable:
             reason = ReadingUnavailable()
+        elif (isinstance(head, HeadPriority) and isinstance(head.window, StrictUntil)
+              and waiter_order(head.waiter) < waiter_order(row)):
+            head_identity = identities.identity(head.waiter["pid"], cast(dict[str, object], cast(object, head.waiter)))
+            reason = BehindHead(head_identity["session_name"] or Path(head_identity["folder"]).name or str(head.waiter["pid"]), head.waiter["since"])
+        elif row is ordered[0][1]:
+            reason = head_wait_reason(own, row["need"], available, row, now)
         elif isinstance(own.pressure, MemoryPressure):
             reason = own.pressure
         elif own.state == "hold":
             reason = (NeedsMemory(row["need"], available) if available < own.threshold
                       else NeedsBuildBudget(row["need"], own.charged, own.budget))
-        elif head is not None and waiter_order(head) < waiter_order(row) and _head_holds_later(available, total, head["need"], memory):
-            if head.get("bump_order", 0) < 0 or decide(available, total, row["need"], memory, head["need"]).state == "hold":
-                head_identity = identities.identity(head["pid"], cast(dict[str, object], cast(object, head)))
-                reason = BehindHead(head_identity["session_name"] or Path(head_identity["folder"]).name or str(head["pid"]), head["since"])
         waiting.append(WaitingStep(row["pid"], identity["session_id"], identity["session_name"], identity["step"],
                                    identity["folder"], row["since"], row["need"], reason))
     return QueueView(tuple(waiting), tuple(running), available, pending, total * 5 // 100 if total else 0, now), ordered
@@ -781,6 +1227,8 @@ def bump_waiter(selector: str, actor: str) -> WaitingStep:
         path, row = ordered[position]
         # Each move gets an order before all current waiters. Keep the wait time.
         row["bump_order"] = min(0, *(item.get("bump_order", 0) for _, item in ordered)) - 1
+        row["holds_younger"] = True
+        row["priority_since"] = time.time()
         temporary = path.with_suffix(".bump")
         _ = temporary.write_text(json.dumps(row, separators=(",", ":")))
         os.replace(temporary, path)
@@ -807,6 +1255,8 @@ def release(path: Path, status: int, root: Path | None = None) -> None:
                     "host": store.host_name(), "repo": row["repo"], "step": row["step"],
                     "worktree": row["worktree"], "anon_peak_bytes": peak, "status": status,
                     "test_threads": row.get("test_threads"), "call_id": row.get("call_id"),
+                    "repo_identity": row.get("repo_identity"), "test_scope": row.get("test_scope", "full"),
+                    "package": row.get("package", ""), "filters": row.get("filters", []),
                     "ended_at": store.utc_iso(time.time()),
                 })
         except (OSError, ValueError):
@@ -852,12 +1302,29 @@ def main() -> None:
     _, _, meminfo, pid, sidecar, since, cached_repo, cached_step, cached_worktree, cached_need, cached_source, cached_count, *argv = sys.argv
     profile = None
     if cached_need != "-":
-        profile = StepProfile(cached_repo, cached_step, cached_worktree,
-                              ExpectedPeak(int(cached_need), cast(Literal["measured", "buildlog", "fallback"], cached_source), int(cached_count)))
+        start = process_start_time(int(pid))
+        try:
+            row = cast(Waiter, json.loads((store.root() / "admission" / f"{pid}-{start}.waiting").read_text()))
+            # An empty key is the explicit unknown identity. Old rows must refresh.
+            if ("repo_identity" in row and "test_scope" in row and "estimated_at" in row
+                    and (row["test_scope"] == "full"
+                         or (row.get("package") == test_package(argv)
+                             and row.get("filters") == list(test_filters(argv))))
+                    and 0 <= time.time() - row["estimated_at"] < HEAD_SECONDS):
+                key = row["repo_identity"]
+                repository: Repository = (RepositoryIdentity(key, row.get("repository_name", cached_repo), row.get("legacy_name", ""))
+                                          if key else UnknownRepository())
+                profile = StepProfile(cached_repo, cached_step, cached_worktree,
+                                      ExpectedPeak(int(cached_need), cast(Literal["measured", "buildlog", "pooled", "fallback"], cached_source), int(cached_count)),
+                                      repository, row["test_scope"], row["estimated_at"])
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
     result = check(Path(meminfo), int(pid), sidecar, argv, float(since or 0), profile=profile)
     decision, peak, live = result.decision, result.peak, result.live
     summary = ", ".join(f"{row['repo']} {row['step']} in {row['worktree']}" for row in live)
-    if isinstance(decision.pressure, MemoryPressure):
+    if isinstance(result.head_reason, HeadAdmissionStatus):
+        summary = f"{head_wait_text(result.head_reason, user_zone())}; {summary}".rstrip("; ")
+    elif isinstance(decision.pressure, MemoryPressure):
         summary = f"{pressure_text(decision.pressure)}; {summary}".rstrip("; ")
     reservation = result.reservation
     path = str(reservation.path) if isinstance(reservation, Reserved) else ""

@@ -11,7 +11,6 @@ import os
 import socket
 import struct
 import subprocess
-import tempfile
 import threading
 import unittest
 from collections.abc import Callable
@@ -19,8 +18,12 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
 
+from scripts.lib.socket_test_support import short_socket_directory
 import codex_daemon
 
+
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
 
 RpcMessage = dict[str, object]
 
@@ -90,12 +93,12 @@ class FakeDaemon:
 
     def __enter__(self) -> FakeDaemon:
         self.thread.start()
-        if not self.ready.wait(2):
+        if not self.ready.wait(TEST_HANG_GUARD_SECS):
             raise AssertionError("fake daemon did not start")
         return self
 
     def __exit__(self, *_details: object) -> None:
-        self.thread.join(2)
+        self.thread.join(TEST_HANG_GUARD_SECS)
         self.server.close()
         if self.thread.is_alive():
             raise AssertionError("fake daemon did not finish")
@@ -134,7 +137,7 @@ class CodexDaemonTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(self.enterContext(short_socket_directory()))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.root)}, clear=True)))
 
     def test_loaded_sessions_initializes_pages_and_reads_each_thread(self) -> None:

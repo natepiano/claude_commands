@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import os
+import select
 import shlex
 import sqlite3
 import subprocess
@@ -20,6 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, cast, final, override
 from unittest import mock
 from scripts.guilds import roles
+from scripts.direct import workers
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -42,6 +44,9 @@ else:
 
 SCRIPT = Path(__file__).with_name("rename_unit.py")
 SLUG = "demo"
+
+# load 136 on natedev, 2026-10-29
+TEST_HANG_GUARD_SECS = 300
 
 # Fail one git call by its arguments, so a rerun proves the journal resumes there.
 REFUSE_GIT = '''import os, runpy, subprocess, sys
@@ -87,6 +92,8 @@ class UnitRenameTests(unittest.TestCase):
             path.mkdir(parents=True)
         self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         self.env.update({
+            "UNIT_WORKERS_STATE": str(self.root / "state/unit-workers"),
+            "RETIRE_UNIT_RUN_ROOT": str(self.root / "runs"),
             "HOME": str(self.home), "CLAUDE_CONFIG_DIR": str(config),
             "XDG_CONFIG_HOME": str(self.home / ".config"), "XDG_STATE_HOME": str(self.root / "state"),
             "NOTIFIER_STATE_DIR": str(self.root / "state/notifier"),
@@ -200,7 +207,7 @@ class UnitRenameTests(unittest.TestCase):
         command = [sys.executable, *(["-c", REFUSE_GIT] if refuse else []), str(SCRIPT), action, SLUG, old, new,
                    "--scratch", str(self.root / "scratch")]
         return subprocess.run(command, cwd=self.checkout, env={**self.env, "RENAME_TEST_REFUSE": refuse},
-                              capture_output=True, text=True, check=False, timeout=120)
+                              capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def start_apply(self) -> subprocess.Popen[str]:
         """apply in the background, so the test can act as the shutdown path while it waits."""
@@ -211,10 +218,27 @@ class UnitRenameTests(unittest.TestCase):
         return process
 
     def wait_for(self, ready: Callable[[], bool]) -> None:
-        deadline = time.monotonic() + 60
+        """Wait for a stand-in's file event; elapsed time is only a hang guard."""
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
         while not ready():
             self.assertLess(time.monotonic(), deadline, "timed out")
             time.sleep(0.1)
+
+    def wait_for_output(self, process: subprocess.Popen[str], expected: str) -> str:
+        """Read through an event without buffering output needed by communicate()."""
+        assert process.stdout is not None
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+        output = bytearray()
+        while True:
+            remaining = deadline - time.monotonic()
+            self.assertGreater(remaining, 0, f"timed out waiting for {expected!r}")
+            readable, _, _ = select.select([process.stdout], [], [], remaining)
+            self.assertTrue(readable, f"timed out waiting for {expected!r}")
+            chunk = os.read(process.stdout.fileno(), 1)
+            self.assertTrue(chunk, f"stdout closed before {expected!r}: {output!r}")
+            output.extend(chunk)
+            if chunk == b"\n" and expected in output.decode():
+                return output.decode()
 
     def assert_ok(self, result: subprocess.CompletedProcess[str]) -> None:
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -229,6 +253,14 @@ class UnitRenameTests(unittest.TestCase):
     def snapshot(self) -> dict[str, bytes]:
         return {str(path.relative_to(self.root)): path.read_bytes()
                 for path in self.root.rglob("*") if path.is_file() and path != self.root / "herdr.jsonl"}
+
+    def test_worker_migration_conflict_prints_a_refusal_without_a_traceback(self) -> None:
+        result = subprocess.run([sys.executable, "-c", 'import runpy, sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[2]))\nfrom scripts.direct import workers\ndef unavailable(*args, **kwargs):\n    raise workers.WorkerUnavailable("worker ownership changed; rerun apply")\nworkers.move_unit = unavailable\nworkers.rename_unit = unavailable\nworkers.end_unit = unavailable\nsys.argv = sys.argv[1:]\nsys.path.insert(0, str(Path(sys.argv[0]).parent))\nrunpy.run_path(sys.argv[0], run_name="__main__")\n', str(SCRIPT), "apply", SLUG, "alpha", "gamma",
+            "--scratch", str(self.root / "scratch")], cwd=self.checkout, env=self.env,
+            capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("worker ownership changed; rerun apply", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_plan_writes_nothing_and_names_each_step(self) -> None:
         before = self.snapshot()
@@ -349,12 +381,37 @@ class UnitRenameTests(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, str(SCRIPT), "plan", slug, f"{slug}-names-unit", f"{slug}-words-names-unit",
              "--scratch", str(self.root / "scratch")], cwd=checkout, env=self.env,
-            capture_output=True, text=True, check=False, timeout=120)
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
         self.assert_ok(result)
         self.assertIn(f"branch {slug}-names -> {slug}-words-names; worktree {worktree} -> "
                       + str(self.rust / f"{slug}-words-names"), result.stdout)
         self.assertEqual(self.snapshot(), before)
+
+    def test_rename_keeps_the_worker_address_and_rebinds_the_ledger_context(self) -> None:
+        run = self.root / "runs" / "carried"
+        run.mkdir(parents=True)
+        old_worktree = self.rust / "claude-demo-alpha"
+        self.write(run / "progress_history_state.json", json.dumps({"production": SLUG,
+            "unit": "alpha-unit", "working_dir": str(old_worktree)}))
+        with mock.patch.dict(os.environ, self.env):
+            store = workers.UnitWorkerLedger(workers.ledger_path(SLUG, "alpha-unit"))
+            worker = workers.UnitWorker("w7", "impl", "codex", "kept-model", "xhigh", {},
+                workers.CodexThread("original-thread", str(self.root / "codex")), workers.Paused(),
+                [workers.WorkerEvent("opened", "fixture", str(run), 1_793_188_800.0, {})])
+            with store.locked() as ledger:
+                ledger.workers[worker.name] = worker
+        self.write(run / "mesh_roster.json", json.dumps({"w7": {"thread_id": "original-thread", "role": "impl",
+            "status": "paused", "unit_ledger": str(store.path)}}))
+        result = self.rename("apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        with mock.patch.dict(os.environ, self.env):
+            target = workers.ledger_for_run(run)
+            self.assertEqual(target.path, workers.ledger_path(SLUG, "gamma-unit"))
+            with target.locked() as ledger:
+                self.assertEqual(ledger.workers["w7"], worker)
+        self.assertFalse(store.path.exists())
+        self.assertEqual(json.loads((run / "mesh_roster.json").read_text())["w7"]["unit_ledger"], str(target.path))
 
     def test_apply_moves_every_place(self) -> None:
         records = self.home / ".local/state/herdr-panes"
@@ -436,7 +493,7 @@ class UnitRenameTests(unittest.TestCase):
                   + "assert record.create_session(json.loads(sys.stdin.read()))")
         created = subprocess.run([sys.executable, "-c", script, str(SCRIPT.parents[1] / "shutdown")],
                                  input=json.dumps(saved), env=self.env, capture_output=True, text=True,
-                                 check=False, timeout=60)
+                                 check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(created.returncode, 0, created.stderr)
         log = self.root / "shutdown-calls.jsonl"
         stub = self.root / "fake_shutdown.py"
@@ -569,15 +626,23 @@ class UnitRenameTests(unittest.TestCase):
         _ = self.mark_live("gamma-unit", "sid-alpha")
         old = self.rust / "claude-demo-alpha"
         old.mkdir()
-        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], cwd=old)
-        self.addCleanup(child.wait)
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import sys; print('ready', flush=True); sys.stdin.read()"],
+            cwd=old, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(child.wait, timeout=TEST_HANG_GUARD_SECS)
         self.addCleanup(child.kill)
+        assert child.stdin is not None
+        assert child.stdout is not None
+        self.addCleanup(child.stdin.close)
+        self.addCleanup(child.stdout.close)
+        # Python must finish startup before its cwd disappears; otherwise getpath can exit first.
+        self.assertEqual(self.wait_for_output(child, "ready"), "ready\n")
         # The folder is gone, but the process still has it as its working directory.
         old.rmdir()
         result = self.rename("verify")
         self.assert_refused(result, f"processes {child.pid} still work in {old}")
         child.kill()
-        _ = child.wait()
+        _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
         self.assert_ok(self.rename("verify"))
 
     def test_verify_fails_on_an_unclassified_stale_reference(self) -> None:
@@ -706,7 +771,7 @@ class UnitRenameTests(unittest.TestCase):
         self.assert_refused(self.rename("apply", refuse="push origin demo:refs/heads/demo"), "simulated failure")
         claim = subprocess.run(
             [sys.executable, "-c", "import rename_state; print(' '.join(sorted(rename_state.rename_claim('demo'))))"],
-            cwd=SCRIPT.parent, env=self.env, capture_output=True, text=True, check=False, timeout=60)
+            cwd=SCRIPT.parent, env=self.env, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(claim.stdout.strip(), "alpha-unit gamma-unit", claim.stderr)
 
     def test_refusals(self) -> None:
@@ -743,27 +808,40 @@ class UnitRenameTests(unittest.TestCase):
         record = self.home / ".local/state/shutdown/owner@example.com/sessions/sid-alpha.json"
         stopped = cast(dict[str, object], json.loads(record.read_text()))
         record.unlink()
+        # Write the stopping record before down returns. Otherwise apply can print the
+        # same stopping event for a missing record, before it has read our state.
+        stopping = {**stopped, "progress": {"kind": "stopping", "at": "2026-10-09T21:49:30+00:00"}}
+        stub = Path(self.env["RENAME_UNIT_SHUTDOWN"])
+        self.write(stub, stub.read_text() + "from pathlib import Path\n"
+                   + "if sys.argv[1] == 'down':\n"
+                   + f"    _ = Path({str(record)!r}).write_text({json.dumps(stopping)!r})\n"
+                   + "if sys.argv[1] == 'restart':\n"
+                   + "    with open(os.environ['RENAME_UNIT_SHUTDOWN_LOG'], 'a') as log:\n"
+                   + "        _ = log.write(json.dumps(['restart exiting']) + '\\n')\n")
         end = self.mark_live("alpha-unit", "sid-alpha")
-        self.env.update({"RENAME_UNIT_STOP_WAIT": "60", "RENAME_UNIT_LIVE_WAIT": "60"})
+        self.env.update({"RENAME_UNIT_STOP_WAIT": str(TEST_HANG_GUARD_SECS),
+                         "RENAME_UNIT_LIVE_WAIT": str(TEST_HANG_GUARD_SECS)})
         process = self.start_apply()
         calls: Callable[[], list[list[str]]] = lambda: ([cast(list[str], json.loads(line)) for line in
                                                          log.read_text().splitlines()] if log.exists() else [])
-        self.wait_for(lambda: ["down", "--only", "sid-alpha", "--here"] in calls())
-        # The shutdown path ends the unit; its record reads stopping, and stopped a moment later.
+        waited = self.wait_for_output(process, "stop: waiting — alpha-unit is stopping")
         end()
-        _ = record.write_text(json.dumps({**stopped, "progress": {"kind": "stopping", "at": "2026-10-09T21:49:30+00:00"}}))
-        time.sleep(1.5)
         self.assertIsNone(process.poll())
-        _ = record.write_text(json.dumps(stopped))
-        self.wait_for(lambda: ["restart", "--only", "sid-alpha", "--here"] in calls())
-        # The relaunched unit comes up under its new id after the restart returns.
-        time.sleep(1.5)
+        # Publish stopped atomically so apply cannot read a partially written record.
+        next_record = record.with_suffix(".next")
+        self.write(next_record, json.dumps(stopped))
+        _ = next_record.replace(record)
+        # The restart stand-in logs its exit after recording the command.
+        self.wait_for(lambda: ["restart exiting"] in calls())
         _ = self.mark_live("gamma-unit", "sid-alpha")
-        stdout, stderr = process.communicate(timeout=120)
+        stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        stdout = waited + stdout
         self.assertEqual(process.returncode, 0, stdout + stderr)
         self.assertIn("stop: waiting — alpha-unit is stopping", stdout)
         self.assertIn("alpha-unit is now gamma-unit, relaunched in", stdout)
         self.assertEqual((self.journal()["done"], self.journal()["claimed"]), (True, False))
+        self.assertEqual(calls(), [["down", "--only", "sid-alpha", "--here"],
+                                   ["restart", "--only", "sid-alpha", "--here"], ["restart exiting"]])
 
     def test_apply_waits_for_a_merge_gate_before_it_writes_the_merge_branch(self) -> None:
         _ = self.seed_record()
@@ -775,12 +853,12 @@ class UnitRenameTests(unittest.TestCase):
             # Hold the gate until apply says it waits: a fixed sleep let a slow start under
             # load reach the lock after it was released, so it never waited.
             assert process.stdout is not None
-            waited = str(process.stdout.readline())  # pyright: ignore[reportAny]
+            waited = self.wait_for_output(process, "merge lock: waiting —")
             # The gate holds the merge branch: the rename has not even checked the checkout yet.
             self.assertIsNone(process.poll())
             self.assertFalse((self.state / SLUG / "rename_unit.json").exists())
             fcntl.flock(gate, fcntl.LOCK_UN)
-        stdout, stderr = process.communicate(timeout=120)
+        stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertIn("merge lock: waiting — a merge gate or a unit rename is writing demo's merge branch",
                       waited + stdout)
         # The fake restart starts nothing; every step before verify ran once the gate was done.
@@ -793,7 +871,7 @@ class UnitRenameTests(unittest.TestCase):
         _ = self.mark_live("alpha-unit", "sid-alpha")
         planned = self.rename("plan")
         self.assert_ok(planned)
-        self.assertIn("1. stop alpha-unit and its Codex workers at once through the shutdown path", planned.stdout)
+        self.assertIn("1. pause alpha-unit and its Codex workers through the shutdown path", planned.stdout)
         applied = self.rename("apply")
         self.assertEqual(applied.returncode, 2, applied.stdout + applied.stderr)
         self.assertIn("alpha-unit is still stopping after 0 s; rerun apply once it has stopped", applied.stderr)
@@ -952,9 +1030,12 @@ class RunProcessTests(unittest.TestCase):
                                           str(self.run_record(theirs, "lint", 301))]),
             302: FakeProcess(other, 301, ["bash", "verify.sh", "lint", "pkg"]),
         }
-        self.enterContext(mock.patch.dict(os.environ, {"RETIRE_UNIT_RUN_ROOT": str(self.root / "runs")}))
+        self.enterContext(mock.patch.dict(os.environ, {"RETIRE_UNIT_RUN_ROOT": str(self.root / "runs"),
+            "UNIT_WORKERS_STATE": str(self.root / "unit-workers")}))
         _ = self.enterContext(mock.patch.object(unit_move, "processes_inside", self.inside))
         _ = self.enterContext(mock.patch.object(retire_unit, "command_line", self.arguments))
+        from scripts.agents import mesh_runs
+        _ = self.enterContext(mock.patch.object(mesh_runs, "_process_args", self.arguments))
         _ = self.enterContext(mock.patch.object(os, "getsid", self.session))
         _ = self.enterContext(mock.patch.object(os, "kill", self.kill))
         _ = self.enterContext(mock.patch.object(shutdown_record, "all_session_records", lambda: [STOPPED_RECORD]))
@@ -1010,6 +1091,25 @@ class RunProcessTests(unittest.TestCase):
             rename_unit.stop_unit(self.rename(), lambda: None)
         return output.getvalue()
 
+    def test_rename_refuses_a_paused_workers_live_command_inside_the_worktree_without_signalling(self) -> None:
+        run = self.root / "runs" / "run-a"
+        record = run / retire_unit.DETACHED_RUNS / "lint.json"
+        _ = record.write_text(json.dumps({"status": "running", "pid": 101, "worker": "w7", "cwd": str(self.worktree)}))
+        _ = (run / "progress_history_state.json").write_text(json.dumps({"working_dir": str(self.worktree),
+            "production": SLUG, "unit": "alpha-unit"}))
+        with mock.patch.dict(os.environ, {"UNIT_WORKERS_STATE": str(self.root / "unit-workers")}):
+            store = workers.UnitWorkerLedger(workers.ledger_path(SLUG, "alpha-unit"))
+            with store.locked() as ledger:
+                ledger.workers["w7"] = workers.UnitWorker("w7", "impl", "codex", "sol", "high", {},
+                    workers.CodexThread("kept-thread", str(self.root / "codex")), workers.Paused(),
+                    [workers.WorkerEvent("opened", "fixture", str(run), 1_793_188_800.0, {})])
+            with self.assertRaisesRegex(RenameRefused, r"detached run lint of w7 works inside"):
+                _ = self.stop()
+        self.assertEqual(self.signalled, [])
+        self.assertIn(101, self.processes)
+        self.assertIn(102, self.processes)
+        self.assertTrue(record.exists())
+
     def test_the_stop_ends_the_runs_supervisor_and_watcher_and_leaves_the_rest(self) -> None:
         printed = self.stop()
         self.assertEqual(sorted(self.signalled), [101, 102, 103, 201, 202])
@@ -1058,7 +1158,7 @@ class RunProcessTests(unittest.TestCase):
         calls = self.serve(0)
         rename_unit.check_stoppable(self.rename())
         printed = self.stop()
-        self.assertEqual([call[2:] for call in calls], [["stop", "--session-dir", str(self.root / "runs" / "run-a")]])
+        self.assertEqual([call[2:] for call in calls], [["stop", "--pause", "--session-dir", str(self.root / "runs" / "run-a")]])
         self.assertIn("stopped: app-server pid 501 of run run-a", printed)
         rename_unit._check_stopped(self.rename())  # pyright: ignore[reportPrivateUsage]
 

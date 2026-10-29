@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import cast, override
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 SCRIPT = Path(__file__).with_name("history.py")
 BASE = 1_792_454_400
 
@@ -57,7 +60,7 @@ class RoutedHistoryTests(unittest.TestCase):
         environment = {**os.environ, "SKILL_HISTORY_STATE_ROOT": str(self.root), "USER_ZONE": "UTC"}
         result = subprocess.run(
             [sys.executable, str(SCRIPT), "routed", "--format", format_name, *arguments],
-            capture_output=True, text=True, check=False, env=environment, timeout=30,
+            capture_output=True, text=True, check=False, env=environment, timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout

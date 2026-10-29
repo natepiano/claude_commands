@@ -12,8 +12,12 @@ from pathlib import Path
 from typing import override
 from unittest import mock
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from scripts.lib.socket_test_support import short_socket_directory
 import fake_unit_host
 import showrunners
 import unit_lookup
@@ -88,7 +92,7 @@ class UnitLookupTests(unittest.TestCase):
         """Record a live Claude in `pane`: this test process stands in for it."""
         if pane:
             fake_unit_host.place_process(self.environment, os.getpid(), pane)
-        path = self.root / f"{name}-{updated}.sock"
+        path = Path(self.enterContext(short_socket_directory())) / f"{name}-{updated}.sock"
         held = socket.socket(socket.AF_UNIX)
         held.bind(str(path))
         self.addCleanup(held.close)
@@ -249,7 +253,7 @@ class UnitLookupTests(unittest.TestCase):
         # During an account move many sessions exit at once; their records are not evidence about other panes.
         self.hosts({"$1": marked("trunk", "w4:p1", "trunk-unit")})
         exited = subprocess.Popen(["true"])
-        _ = exited.wait(timeout=30)
+        _ = exited.wait(timeout=TEST_HANG_GUARD_SECS)
         _ = (self.records / f"{exited.pid}.json").write_text("{")
         self.assertIsInstance(unit_lookup.marked_units("show")["trunk-unit"].claude, ClaudeNotRunning)
 
