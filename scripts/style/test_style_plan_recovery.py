@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import io
+import sqlite3
 import sys
 import unittest
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from pathlib import Path
 from typing import final
 from unittest import mock
@@ -24,6 +25,37 @@ from style_plan_test_support import StylePlanFixture
 
 @final
 class StylePlanTests(StylePlanFixture):
+    def test_sync_wait_names_one_needed_main_path(self) -> None:
+        path = "crates/alpha/src/a.rs"
+        changes = style_plan.MainChanges(self.tip, frozenset((path, self.sources[2])), ("crates/alpha", "crates/beta"))
+        result = style_plan.ticket_sync_wait(self.ledger(), changes, "listed", "crates/alpha", "rule-x", (path,))
+        reason = f"listed crates/alpha rule-x: main touched {path}"
+        self.assertEqual(result, style_plan.WaitingForSync(0, reason))
+        assert isinstance(result, style_plan.WaitingForSync)
+        self.assertEqual(style_plan.refill_outcome(result), f"waiting for sync: {reason}")
+
+    def test_sync_wait_names_first_three_of_five_needed_main_paths(self) -> None:
+        paths = tuple(f"crates/alpha/src/{name}.rs" for name in "edcba")
+        changes = style_plan.MainChanges(self.tip, frozenset((*paths, self.sources[2])), ("crates/alpha", "crates/beta"))
+        result = style_plan.ticket_sync_wait(self.ledger(), changes, "listed", "crates/alpha", "rule-x", paths)
+        reason = "listed crates/alpha rule-x: main touched crates/alpha/src/a.rs, crates/alpha/src/b.rs, crates/alpha/src/c.rs +2"
+        self.assertEqual(result, style_plan.WaitingForSync(0, reason))
+        assert isinstance(result, style_plan.WaitingForSync)
+        self.assertEqual(style_plan.refill_outcome(result), f"waiting for sync: {reason}")
+
+    def test_refill_records_sync_wait_reason_in_ledger(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        self.write(self.sources[0], "pub fn changed_on_main() {}\n")
+        _ = self.commit()
+        outcome = f"waiting for sync: read crates/alpha: main touched {self.sources[0]}"
+        self.assertEqual(self.run_next(), (3, outcome + "\n", ""))
+        with closing(sqlite3.connect(self.ledger().database)) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT outcome FROM refill_results WHERE unit='names-unit'",
+            ).fetchone(), (outcome,))
+
+
     def test_sync_wait_is_recorded_until_structure_finishes_and_refill_writes_a_phase(self) -> None:
         structure = self.rule("structure", "tier: D\nfamily: modules\n")
         _ = self.rule("read")
