@@ -352,7 +352,8 @@ def _describe(plan: RenamePlan) -> list[str]:
             (f"7. merge branch {plan.merge_branch} -> {plan.new}; commit {plan.message!r}; push origin {plan.new}; "
              + f"keep {plan.merge_branch} until finish" if plan.renames_branch else
              f"7. merge branch {plan.merge_branch} kept (not named for the production); commit {plan.message!r}; "
-             + f"push origin {plan.merge_branch}")]
+             + f"push origin {plan.merge_branch}"),
+            f"8. phase notes: {plan.old} -> {plan.new_doc}"]
 
 
 def _dirty(plan: RenamePlan) -> list[str]:
@@ -533,8 +534,15 @@ def _rename_branch(plan: RenamePlan) -> None:
     _ = unit_move.git(plan.checkout, "push", "--set-upstream", "origin", f"{plan.branch}:refs/heads/{plan.branch}")
 
 
+def _retarget_phase_notes(plan: RenamePlan) -> None:
+    from scripts.direct import phase_table
+
+    _ = phase_table.retarget_phase_notes(plan.old, plan.new_doc)
+
+
 APPLY_STEPS = (_rename_doc, _rewrite_plans, _rename_timer, _rename_showrunner_state,
-               _rename_stall_watch, _rename_review_pool, _rename_unit_workers, _rename_branch)
+               _rename_stall_watch, _rename_review_pool, _rename_unit_workers, _rename_branch,
+               _retarget_phase_notes)
 APPLY_STEP_NAMES = tuple(step.__name__ for step in APPLY_STEPS)
 # The step list of journals that recorded a count; its order maps a count to step names.
 COUNTED_APPLY_STEP_NAMES = ("_rename_doc", "_rewrite_plans", "_rename_timer", "_rename_showrunner_state",
@@ -760,6 +768,7 @@ def unit(new: str, name: str) -> None:
         completed = record.get("step")
         if type(completed) is not int or not 0 <= completed <= 5:
             raise RenameRefused(f"{name}: invalid unit rename progress")
+        _retarget_phase_notes(result)
         if completed < 5:
             _stopped_unit(result, name)
             _check_unit_tip(result, record)
@@ -829,11 +838,24 @@ def finish(new: str) -> None:
                                                    else f"kept merge branch {result.merge_branch}"))
 
 
+def repair_notes(old: str, new: str) -> list[Path]:
+    """Repair phase notes without changing the production or its rename journal."""
+    from scripts.direct import phase_table
+
+    _validate_slug(old)
+    new = showrunners.canonical_slug(new)
+    _validate_slug(new)
+    doc = showrunners.timer_docs().get(new)
+    if doc is None:
+        raise RenameRefused(f"{new} has no production doc")
+    return phase_table.retarget_phase_notes(old, doc)
+
+
 def main(argv: list[str]) -> int:
     from scripts.direct.workers import WorkerUnavailable
     parser = argparse.ArgumentParser(description=__doc__)
     actions = parser.add_subparsers(dest="action", required=True)
-    for name in ("plan", "apply"):
+    for name in ("plan", "apply", "repair-notes"):
         command = actions.add_parser(name)
         _ = command.add_argument("old")
         _ = command.add_argument("new")
@@ -848,7 +870,13 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     action, new = cast(str, args.action), cast(str, args.new)
     try:
-        if action == "unit":
+        if action == "repair-notes":
+            paths = repair_notes(cast(str, args.old), new)
+            for path in paths:
+                print(path)
+            if not paths:
+                print("no phase notes to repair")
+        elif action == "unit":
             unit(new, cast(str, args.unit))
         elif action == "finish":
             finish(new)
