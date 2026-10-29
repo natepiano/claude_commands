@@ -2538,14 +2538,27 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Depends on:** Phase 91
 
-#### Work Order
+#### As-built
 
-User, via the showrunner, 2026-10-28: "i need to be able to run claude, claude1,...claude4 and have it work everywhere same for codex, codex1, codex2."
+- `accounts.py exec <label>` loads the nix shell of the launch folder before it starts Claude, Codex or the `relaunch.py` supervisor, for every label: `claude`, `claudeN`, `codexN`, `units`, `workers`, `showrunners`, `unit`. One call site, `launch_shell_environment(Path.cwd())`, feeds the Claude and the Codex branch of `exec_account`. It calls `scripts/lib/nix_env.ensure(directory, os.environ)`, imported lazily through `import_module("scripts.lib.nix_env")`. There is no second loader.
+- A refused folder, a missing helper or an unknown result raises `LaunchShellError`. `main` prints the helper's line (for example the `direnv allow` command) and exits 1; no agent starts. Other exec errors stay exit 2, which `renew_login` reads as "program not found".
+- After the load, the caller's `HOME` is put back (or removed when the caller had none), and then the account variables are applied. A folder `.envrc` cannot change the account.
+- `exec claude` uses the default `~/.claude` home: `PreparedAccount({}, remove={CLAUDE_CONFIG_DIR, CLAUDE_CODE_REMOTE_MEMORY_DIR, CLAUDE_CODE_OAUTH_TOKEN})`, with no readiness check and no group selection. `--probe` works.
+- `resolve_program(tool, *, environment)` searches the loaded `PATH`, then `~/.local/bin`. It skips a `#!` script that names `nix_env.py` or `lib.nix_env`, so a `PATH` wrapper cannot load the shell two times. An executable it cannot read is still used. A `PATH` with only wrappers gives `accounts: could not start ...` and exit 2.
+- The `claude-unit` alias is gone from the docs and the plan; `exec unit` stays.
+- Live check: a folder whose `.envrc` was not allowed yet loaded 27 nix `PATH` entries and kept `HOME`; a folder with no `.envrc` loaded none; `exec claude --version` printed the version in both.
 
-- `accounts.py exec` loads the nix shell of the launch folder before it execs Claude or Codex, for every label (`claudeN`, `codexN`, `units`, `workers`, `showrunners`) on Linux and the Mac. Use efficiency-unit's helper (it allows the nearest `.envrc`, returns the direnv environment, and refuses without `IN_NIX_SHELL`); its name and contract come from efficiency-unit. Do not write a second loader.
-- Add `exec claude` for the default `~/.claude` home, so a bare `claude` alias can use the same path. The showrunner adds the aliases in /etc/nixos on both machines after this merges.
-- Tests: a launch folder whose `.envrc` is not allowed yet, and a folder with no `.envrc`; the helper and the exec leaf are fakes. The live check is the director's, after the build hold ends.
+#### Files
 
-**Files:** `scripts/accounts/accounts.py`, `scripts/accounts/test_accounts.py`, `scripts/accounts/test_launch_accounts.py`, `docs/accounts.md`.
+`scripts/accounts/accounts.py` (`LaunchShellEnvironment`, `LaunchShellRefusal`, `NixShellLoader` protocols, `LaunchShellError`, `launch_shell_environment`, `resolve_program`, `exec_account`, `_exec_codex_account`, `main`); `scripts/accounts/nix_env_fake.py` (a fake helper with no side effects, and `imports_with_nix_loader`); tests `test_launch_accounts.py`, `test_accounts.py`, `test_cutover_home.py`, `test_role_map.py`; `docs/accounts.md`, `commands/showrunner/accounts.md`.
 
-**Verification:** `scripts.accounts.test_accounts scripts.accounts.test_launch_accounts scripts.lib.test_user_zone`, basedpyright on `scripts/accounts scripts/whoami`, then the full merge gate, after the build hold ends.
+#### Gotchas
+
+- Tests patch `accounts.import_module` with `nix_env_fake.imports_with_nix_loader`, and each exec test sets the fake in `setUp`. Never patch `sys.modules`: it changed the imports of other modules' tests.
+- On natedev `~/.claude` holds no login (home cutover, `home_cutovers` in `config/accounts.json`), so `exec claude` starts signed out there; `docs/accounts.md` states this. The bare `claude` alias (`/etc/nixos/modules/common/shell.nix`) runs `exec showrunners --remote-control ...`, which loads the shell too. Do not point it at `exec claude` while `~/.claude` has no login.
+- `scripts/lib/test_claude_launch_scan.py` exempts `accounts/accounts.py`. Its guard check finds only a literal `nix_env.ensure` call, not `launch_shell_environment`.
+- The Mac has explicit `claude1`-`claude4`, `codex`, `codex1` and `codex2` aliases in `modules/darwin/shell.nix`. `new_account.alias_step` still returns None on darwin and reads only `modules/linux/shell.nix`.
+
+#### Ruled out
+
+- Patching `sys.modules` in test fixtures: it changed other modules' tests.
