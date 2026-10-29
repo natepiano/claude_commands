@@ -49,6 +49,10 @@ class WorkerArguments(argparse.Namespace):
     session_dir: Path = Path()
     role: str = ""
     owner_pid: int = 0
+    model: str = ""
+    effort: str = ""
+    name: str = ""
+    command: str = ""
 
 
 @dataclass(frozen=True)
@@ -796,6 +800,8 @@ def note_backend(run: Path, name: str, thread_id: str, home: Path) -> None:
                 if isinstance(backend, CodexThread) and backend.thread_id != thread_id:
                     worker.events.append(_event("replaced", "resume refused old thread", run,
                                                 old_thread_id=backend.thread_id, thread_id=thread_id))
+                worker.role = _text(record.get("role")) or worker.role
+                worker.access_policy = _object(record.get("access_policy")) or worker.access_policy
                 worker.backend = CodexThread(thread_id, str(home.resolve()))
                 worker.ownership = HeldBy(str(run))
                 # The first exact-thread resume completes the incoming handoff.
@@ -837,12 +843,13 @@ def _reserve(run: Path, name: str, store: UnitWorkerLedger, owner_pid: int, *, p
             _write_roster(handle, roster)
 
 
-def resolve(run: Path, role: str) -> str:
+def resolve(run: Path, role: str, *, model: str = "", effort: str = "") -> str:
     """Return an idle worker, carry one over, reopen one, or open the next name."""
-    return _resolve(run, role, os.getpid())
+    return _resolve(run, role, os.getpid(), model=model, effort=effort)
 
 
-def _resolve(run: Path, role: str, owner_pid: int) -> str:
+def _resolve(run: Path, role: str, owner_pid: int, *, model: str = "", effort: str = "",
+             new_name: str = "") -> str:
     from scripts.agents import codex_mesh
     if role not in ROLES:
         raise WorkerUnavailable(f"unsupported worker role: {role}")
@@ -854,9 +861,12 @@ def _resolve(run: Path, role: str, owner_pid: int) -> str:
             raise WorkerUnavailable("run is finished; use progress_history.py start-phase to reactivate it, " +
                                     "or workers.py resolve --session-dir <new-run> to carry the worker forward")
         roster = _read_roster(run)
+        def matches(record: Mapping[str, object]) -> bool:
+            return (not new_name and (not model or record.get("model") == model)
+                    and (not effort or record.get("effort") == effort))
         for name, value in roster.items():
             record = _object(value)
-            if record.get("role") != role or record.get("adopted_to"):
+            if record.get("role") != role or record.get("adopted_to") or not matches(record):
                 continue
             registered = ledger.workers.get(name)
             if registered is not None and isinstance(registered.ownership, Retired):
@@ -874,7 +884,8 @@ def _resolve(run: Path, role: str, owner_pid: int) -> str:
                 ledger.workers[name].ownership = HeldBy(str(run))
                 return name
         for name, worker in list(ledger.workers.items()):
-            if worker.role != role or isinstance(worker.ownership, Retired):
+            if (new_name or worker.role != role or isinstance(worker.ownership, Retired)
+                    or model and worker.model != model or effort and worker.effort != effort):
                 continue
             owner = worker.ownership
             previous_runs: list[str] = []
@@ -893,7 +904,8 @@ def _resolve(run: Path, role: str, owner_pid: int) -> str:
                     continue
         for name, value in roster.items():
             record = _object(value)
-            if record.get("role") != role or record.get("status") not in ("ended", "running", "starting"):
+            if (record.get("role") != role or not matches(record)
+                    or record.get("status") not in ("ended", "running", "starting")):
                 continue
             if codex_mesh.worker_idle_reason(str(run), name, record,
                                              prior_runs=codex_mesh.worker_run_history(str(run), name)[1:]):
@@ -914,7 +926,11 @@ def _resolve(run: Path, role: str, owner_pid: int) -> str:
         while name in ledger.workers or name in roster:
             ordinal += 1
             name = f"{role}{ordinal}"
-        record = codex_mesh.open_unit_worker(str(run), name, role)
+        if new_name:
+            if new_name in ledger.workers or new_name in roster:
+                raise WorkerUnavailable(f"{new_name}: worker name already exists")
+            name = new_name
+        record = codex_mesh.open_unit_worker(str(run), name, role, model=model, effort=effort)
         ledger.workers[name] = _worker_from_record(name, run, record)
         ledger.workers[name].events = [_event("opened", "no idle worker for role", run)]
         _reserve(run, name, store, owner_pid)
@@ -1279,6 +1295,28 @@ def rename_unit(production: str, old: str, new: str, *, runs: tuple[Path, ...] =
     _move_ledger(ledger_path(production, old), ledger_path(production, new), runs)
 
 
+def shown_name(run: Path, address: str, *, role: str = "") -> str:
+    """Render current unit context and stored assignment without changing the address."""
+    # Notices can render while holding an inbox lock. Recover ownership at
+    # command entry, never while rendering: ledger_for_run can finish a move
+    # and take ledger/roster locks. Ledger saves are atomic snapshots.
+    store = _ledger_for_run(run)
+    roster = _read_roster(run)
+    record = _object(roster.get(address))
+    role = _text(record.get("role")) or role
+    if not role:
+        saved = _object(_object(_read(store.path).get("workers")).get(address))
+        role = _text(saved.get("role"))
+    role = role or "worker"
+    jobs = {"impl": "implementer", "test": "tester", "fix": "repair worker", "review": "code reviewer"}
+    peers = [name for name, value in roster.items() if _object(value).get("role") == role]
+    ordinal = peers.index(address) + 1 if address in peers else len(peers) + 1
+    job = jobs.get(role, role)
+    if ordinal > 1:
+        job += f" {ordinal}"
+    return f"{store.path.parent.name} · {store.path.stem} · {job}"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1286,11 +1324,21 @@ def main() -> int:
     _ = command.add_argument("--session-dir", type=Path, required=True)
     _ = command.add_argument("--role", choices=ROLES, required=True)
     _ = command.add_argument("--owner-pid", type=int, default=0)
+    _ = command.add_argument("--model", default="")
+    _ = command.add_argument("--effort", default="")
+    _ = command.add_argument("--new-worker", dest="name", default="")
+    display = commands.add_parser("shown-name")
+    _ = display.add_argument("--session-dir", type=Path, required=True)
+    _ = display.add_argument("--name", required=True)
     args = parser.parse_args(namespace=WorkerArguments())
     run = args.session_dir
     role = args.role
     try:
-        print(_resolve(run, role, args.owner_pid or director_pid(run)))
+        if args.command == "shown-name":
+            print(shown_name(run, args.name))
+        else:
+            print(_resolve(run, role, args.owner_pid or director_pid(run),
+                           model=args.model, effort=args.effort, new_name=args.name))
         return 0
     except (WorkerUnavailable, OSError, ValueError) as error:
         print(f"workers: {error}", file=sys.stderr)

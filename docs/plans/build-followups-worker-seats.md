@@ -230,7 +230,7 @@
 
 **Acceptance gate:** the merge gate is green; `verify.sh test cargo-handler` and `verify.sh lint cargo-handler` pass; basedpyright on `scripts/direct scripts/agents scripts/production scripts/guilds` is 0/0; the handler shows `research` and `propose`, and an unknown word takes `RoleFallback`.
 
-### Phase 7 — `assign.sh` core (WT P1, with WS P2's `--role`, run start and rules block)  · status: todo
+### Phase 7 — `assign.sh` core (WT P1, with WS P2's `--role`, run start and rules block)  · status: done
 
 **Depends on:** Phase 2, Phase 4, Phase 5
 

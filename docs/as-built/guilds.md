@@ -147,7 +147,7 @@ Other public functions: `queue_message`, `pending_messages`, `held_document`, `e
 
 **Prompts.** A designer prompt is `config/guilds/designer.md` + `tips.load("designers")` + `Use apply_patch for all repository edits. Edit only the bound output paths.` A reviewer prompt is `astra_review.review_prompt(document, "")`. `_prompt` writes the `astra_work.header_line` first (`PhaseWork` from the binding, else `StandaloneWork`), then the instructions, the holder's text and each pending message as `Pending message <id> from <source>: <text>`.
 
-**Access.** The roster entry's `access_policy` decides the sandbox (`codex_mesh.py` `_seat_sandbox`, `_resume_params`): `ReadOnlyReviewer` gives `read-only`; `PhaseBoundDesigner` gives its `launch_sandbox` (`danger-full-access`). A legacy entry with `instructions_file` and no policy refuses with "recovery required". A designer must be bound; `_validate_binding` checks the phase resolves, the output paths stay inside the repository and are listed in the open phase's `files`, and the reservation ledger reads.
+**Access.** The roster entry's `access_policy` decides the sandbox (`codex_mesh.py` `_worker_sandbox`, `_resume_params`): `ReadOnlyReviewer` gives `read-only`; `PhaseBoundDesigner` gives its `launch_sandbox` (`danger-full-access`). A legacy entry with `instructions_file` and no policy refuses with "recovery required". A designer must be bound; `_validate_binding` checks the phase resolves, the output paths stay inside the repository and are listed in the open phase's `files`, and the reservation ledger reads.
 
 **Lifecycle as built.**
 
