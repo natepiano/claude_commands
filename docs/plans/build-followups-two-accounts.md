@@ -2616,37 +2616,31 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Also touches:** shutdown-unit (`scripts/shutdown`).
 
-#### Work Order
+#### As-built
 
-**Goal:** A `restart failed` record whose opening-prompt submit failed shows the last screen that submit saw. Phase 69 saves the screen in the receipt `<SHUTDOWN_STATE_DIR>/<login>/restart-note-<session id>.prompt-outcome.json` (`restart._prompt_outcome_path`), but no user surface shows it, so to diagnose `restart prompt not submitted` the user opens the receipt by hand.
-
-**Spec:**
-- One reader in `scripts/shutdown/restart.py`: `saved_prompt_screen(record) -> str | herdr.PromptScreenNotRead`. It reads the receipt through `_prompt_outcome(record)` (the request id, session id and target checks stay) and returns `outcome.screen` for a `herdr.PromptNotSubmitted` with a read screen, else `herdr.PromptScreenNotRead()`. The screen is ANSI-stripped, the last 40 lines (Phase 69).
-- Every surface that prints a `restart failed` record prints the screen under that record's line, when the reader returns one: a header line `  last screen of the failed prompt submit:`, then each screen line indented 4 spaces.
-  - `shutdown status`: `shutdown._shutdown_record_lines`, in both forms: the live-session line `settle.running_restart_line` and the lines of `settle.status_record_lines`. A screen added only to `status_record_lines` never shows for a live `restart failed` record.
-  - `shutdown follow`: `shutdown._follow_action` for a `restart failed` record, live or not.
-  - The stop report: `settle.report_stop`, after the `running_restart_line` line or the `<name>: <reason>` line of a `restart failed` record.
-- The receipt is in the record machine's `SHUTDOWN_STATE_DIR`. A peer record that `shutdown status` reads from `records --json` has no receipt here: it prints no screen.
-- The phone push stays the same (`restart.send_failure_pushes`, `settle.alert_user`), because a push carries only what the user must do. `settle.tell_showrunners_outcome` stays the same.
-- No other behavior changes.
+- A `restart failed` record whose opening-prompt submit failed shows the last screen that submit saw. The screen comes from the Phase 69 receipt `<SHUTDOWN_STATE_DIR>/<login>/restart-note-<session id>.prompt-outcome.json` (ANSI-stripped, last 40 lines).
+- `restart.saved_prompt_screen(record) -> str | herdr.PromptScreenNotRead` reads the receipt through `_prompt_outcome(record)`, with its request id, session id and target checks. It returns the screen of a `herdr.PromptNotSubmitted` that read one, else `herdr.PromptScreenNotRead()`.
+- `settle.failed_prompt_screen_lines(saved)` is the one render function: the header `  last screen of the failed prompt submit:`, then each screen line indented 4 spaces. It gives lines only for a `restart failed` record with a screen.
+- Three surfaces put these lines under the record line:
+  - `shutdown status`: `shutdown._shutdown_record_lines`, for the live form (`settle.running_restart_line`) and for `settle.status_record_lines`, only when `local_observation` is true. A peer record read from `records --json` has no local receipt and prints no screen.
+  - `shutdown follow`: `shutdown._follow_action`, for a live and a not-live `restart failed` record, with no machine check (follow reads only local records).
+  - The stop report: `settle.report_stop`, after the `running_restart_line` line or the `<name>: <reason>` line, when `saved["machine"].casefold() == local_machine().casefold()`.
+- Phone pushes (`restart.send_failure_pushes`, `settle.alert_user`) and `settle.tell_showrunners_outcome` do not change.
 
 **Files:**
 - `scripts/shutdown/restart.py` — `saved_prompt_screen`.
+- `scripts/shutdown/settle.py` — `failed_prompt_screen_lines`, `report_stop`.
 - `scripts/shutdown/shutdown.py` — `_shutdown_record_lines`, `_follow_action`.
-- `scripts/shutdown/settle.py` — `report_stop`, and one shared function that renders the screen lines.
 - `scripts/shutdown/test_restart.py` — the reader: a matching receipt with a screen, one with no screen, one of another request, a missing or unreadable file.
-- `scripts/shutdown/test_shutdown_cli.py`, `scripts/shutdown/test_settle.py` — status (live and not live), follow and the stop report print the screen; a peer record and a record without a screen print none; the push text is unchanged.
+- `scripts/shutdown/test_settle.py`, `scripts/shutdown/test_shutdown_cli.py` — the stop report (live, absent, mixed-case machine), status (live and not live), follow, a peer record, a receipt with no screen, unchanged push text.
 - `docs/as-built/shutdown-and-restart.md` — where the saved screen shows.
 
-**Workers:** 1 writer, no split (three modules in one directory share one render function).
-- `impl` — all files.
-
-**Constraints from prior phases:** Phase 70: a `restart failed` record can belong to a live session; the liveness reads (`_restart_failed_liveness`, `restart_failed_liveness`) and the printed commands stay as they are. Phase 71/72: `settle.running_restart_line` stays the one source of the live-session line, and its text does not change. Tests set `HOME` and `SHUTDOWN_STATE_DIR` to scratch folders and write fixture receipts; they never touch `~/.local/state/shutdown`, live dirs, ssh or real sessions.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py'` passes; `basedpyright scripts/shutdown/restart.py scripts/shutdown/shutdown.py scripts/shutdown/settle.py` and the three test files read `0 errors, 0 warnings, 0 notes`.
+**Binds later work:** `settle.failed_prompt_screen_lines` holds a function-local `import restart as restart_work`. It is a sibling shutdown import, the same as the other function-local ones in `settle.py`, and is not a shared whoami module import ("All consumers import shared whoami modules by one name").
 
 **Gotchas:**
-- A receipt holds a screen when the submit read the pane at least once. `herdr.wait_for_prompt_input` keeps the last screen it read, so a failure before any typing can hold one too (`destination never became ready for input` after a `destination has no empty composer` read). A receipt has `PromptScreenNotRead` when no pane read happened (the agent never became interactive-ready) or when `restart.py` saved its own reason (`launch has no submit proof`, `restart launcher supplied no submit proof`). The surfaces print nothing for it.
+- Compare machine names with `casefold()`: a record can name `Mac` on a host that reports `mac` (`test_stop_report_shows_saved_screen_when_local_machine_case_differs`).
+- A receipt holds a screen when the submit read the pane at least once. `herdr.wait_for_prompt_input` keeps the last screen it read, so a failure before any typing can hold one too (`destination never became ready for input` after a `destination has no empty composer` read). A receipt has `PromptScreenNotRead` when no pane read happened, or when `restart.py` saved its own reason (`launch has no submit proof`, `restart launcher supplied no submit proof`). The surfaces print nothing for it.
+- `scripts/accounts/test_unit_watchdog.py` calls `settle.report_stop`. A gate for a change to `report_stop` runs the accounts suite too, not only `scripts/shutdown`.
 
 ### Phase 94b — Cut the top live cost of the notes timer pass  · status: todo
 
@@ -2662,8 +2656,9 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - Before and after numbers come from the same method: the profile script, then the timer runs (`notes_cpu` sampler and the service `Consumed` lines).
 
 **Files:**
-- `scripts/whoami/profile_notes_pass.py` (new) and its test `scripts/whoami/test_profile_notes_pass.py`: the patch list covers each side-effect call; a pass under the script writes nothing outside the scratch folder.
-- The module that holds the top live cost, and the test module beside it.
+- `scripts/whoami/profile_notes_pass.py` — new: the profile script.
+- `scripts/whoami/test_profile_notes_pass.py` — new: the patch list covers each side-effect call; a pass under the script writes nothing outside the scratch folder.
+- `scripts/whoami/`, `scripts/accounts/` — the module that holds the top live cost, and the test module beside it. The profile names the module; it can be in another directory.
 
 **Workers:** 1 writer, no split.
 - `impl` — the profile script, then the cut.
@@ -2702,7 +2697,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - No other behavior changes.
 
 **Files:**
-- `scripts/whoami/agent_accounts.py`, `account.py`, `note_file.py`, `session_table.py`, `run_out.py`, `usage_store.py` — the registration blocks.
+- `scripts/whoami/agent_accounts.py`, `scripts/whoami/account.py`, `scripts/whoami/note_file.py`, `scripts/whoami/session_table.py`, `scripts/whoami/run_out.py`, `scripts/whoami/usage_store.py` — the registration blocks.
 - `scripts/whoami/five_hour.py`, `scripts/whoami/quota_alert.py`, `scripts/whoami/codex_pacer.py`, `scripts/whoami/agent_notes.py`, `scripts/whoami/whoami.py` — consumers.
 - `scripts/accounts/accounts.py`, `scripts/accounts/new_account.py`, `scripts/accounts/refusal_watch.py`, `scripts/accounts/refusals.py`, `scripts/accounts/unit_watchdog.py` — consumers.
 - `scripts/shutdown/inventory.py`, `scripts/shutdown/pane_record.py`, `scripts/shutdown/pane_restore.py`, `scripts/shutdown/record.py`, `scripts/shutdown/restart.py`, `scripts/shutdown/settle.py`, `scripts/shutdown/shutdown.py` — consumers.
