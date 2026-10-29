@@ -843,6 +843,69 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         self.assertEqual(worker["model"], "gpt-kept-sol")
         self.assertEqual(self.methods("thread/start"), [])
 
+    def resolve_identity(self, model: str, effort: str) -> str:
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "resolve", "--session-dir", str(self.session_dir),
+             "--role", "impl", "--owner-pid", str(os.getpid()),
+             "--model", model, "--effort", effort],
+            cwd=self.session_dir.parent / "repository", capture_output=True, text=True,
+            env=os.environ.copy(), timeout=15, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(result.stdout.strip().splitlines()), 1, result.stdout)
+        return result.stdout.strip()
+
+    def test_explicit_model_and_effort_select_an_exact_idle_identity(self) -> None:
+        self.open_worker("keep-first")
+        roster = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
+        original = cast(dict[str, object], roster["keep-first"])
+        other = {**original, "thread_id": "other-thread", "model": "gpt-other-sol", "effort": "high"}
+        roster["select-this"] = other
+        self.write_pool_roster(roster)
+
+        self.assertEqual(self.resolve_identity("gpt-other-sol", "high"), "select-this")
+
+        after = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
+        self.assertEqual(cast(dict[str, object], after["keep-first"]), original)
+        self.assertEqual(self.methods("thread/start"), [])
+        with workers.ledger_for_run(self.session_dir).locked() as ledger:
+            self.assertEqual((ledger.workers["select-this"].model, ledger.workers["select-this"].effort),
+                             ("gpt-other-sol", "high"))
+
+    def test_an_effort_override_opens_another_worker_without_mutating_the_unit_identity(self) -> None:
+        self.configure_new_worker()
+        store = self.lifecycle_worker("impl")
+        original = json_object(self.session_dir / codex_mesh.ROSTER_FILE)["impl"]
+
+        chosen = self.resolve_identity("gpt-kept-sol", "high")
+
+        self.assertEqual(chosen, "impl2")
+        self.assertEqual(json_object(self.session_dir / codex_mesh.ROSTER_FILE)["impl"], original)
+        with store.locked() as ledger:
+            self.assertEqual(ledger.workers["impl"].effort, "xhigh")
+            self.assertEqual(ledger.workers[chosen].effort, "high")
+            self.assertEqual(ledger.workers[chosen].model, "gpt-kept-sol")
+        params = cast(dict[str, object], self.methods("thread/start")[0]["params"])
+        self.assertEqual(params["model"], "gpt-kept-sol")
+
+    def test_shown_context_follows_transfer_and_rename_while_the_address_stays_stable(self) -> None:
+        _ = self.lifecycle_worker("w7")
+
+        def shown() -> str:
+            result = subprocess.run([sys.executable, str(SCRIPT), "shown-name", "--session-dir",
+                                     str(self.session_dir), "--name", "w7"],
+                                    capture_output=True, text=True, timeout=15, check=False)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return result.stdout.strip()
+
+        before = shown()
+        self.assertTrue(before.startswith("before · builders · "), before)
+        self.assertNotIn("w7", before)
+        workers.move_unit("before", "after", "builders", runs=(self.session_dir,))
+        self.assertEqual(shown(), before.replace("before ·", "after ·", 1))
+        workers.rename_unit("after", "builders", "renamed", runs=(self.session_dir,))
+        self.assertEqual(shown(), before.replace("before · builders ·", "after · renamed ·", 1))
+        self.assertEqual(self.resolve(self.session_dir), "w7")
+
     def test_the_unit_ledger_retains_backend_access_model_and_a_caused_open_event(self) -> None:
         self.open_worker()
         name = self.resolve(self.session_dir)
