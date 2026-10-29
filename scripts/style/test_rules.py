@@ -93,9 +93,9 @@ class RuleTests(unittest.TestCase):
         with self.assertRaises(rules.RuleValidationError) as raised:
             _ = rules.load_rules(None)
         self.assertIn(str(path), str(raised.exception))
-        self.assertIn("requires candidates or pre_filter", str(raised.exception))
+        self.assertIn("unsupported frontmatter block", str(raised.exception))
 
-        _ = self.write_rule("listed", metadata + "pre_filter: 'Some<'\n")
+        _ = self.write_rule("listed", "tier: B\nfamily: names\npre_filter: 'Some<'\n")
         rule, = rules.load_rules(None)
         self.assertEqual(rule.pre_filter, "Some<")
 
@@ -561,6 +561,322 @@ class RuleTests(unittest.TestCase):
         self.assertEqual(error.returncode, 2)
         self.assertIn(str(invalid), error.stderr)
         self.assertNotIn("Traceback", error.stderr)
+
+
+class JudgedRuleTextTests(unittest.TestCase):
+    def assert_snapshot_comparison(self, before: bytes, after: bytes, *, unchanged: bool) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            _ = subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            path = repo / "rule.md"
+            old = subprocess.run(["git", "-C", str(repo), "hash-object", "-w", "--stdin"],
+                                 input=before, check=True, capture_output=True).stdout.decode().strip()
+            _ = path.write_bytes(after)
+            current = rules._load_rule(path, "local", repo, rules.RepoReach())  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(rules.judged_text_unchanged(old, current), unchanged)
+            self.assertEqual(rules.judged_text_unchanged(current.blob, current, compared_blob=old), unchanged)
+
+    def test_unicode_line_separator_cannot_hide_scope_change(self) -> None:
+        before = "---\ntier: C\nfamily: names\ntags: [one] # comment\u2028input_scope: file\n---\n# Body\n".encode()
+        self.assert_snapshot_comparison(before, before.replace(b"file", b"crate"), unchanged=False)
+
+    def test_other_unicode_line_frames_cannot_hide_scope_change(self) -> None:
+        for separator in ("\u2029", "\u0085", "\u001c", "\u001d", "\u001e", "\v", "\f"):
+            with self.subTest(separator=repr(separator)):
+                before = f"---\ntier: C\nfamily: names\ntags: [one] # comment{separator}input_scope: file\n---\n# Body\n".encode()
+                self.assert_snapshot_comparison(before, before.replace(b"file", b"crate"), unchanged=False)
+
+    def test_framing_mismatch_is_stale_even_for_equal_blobs_and_unchanged_bodies(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            _ = subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            path = repo / "rule.md"
+            for content in (
+                "---\ntier: C\nfamily: names\ntags: [one] # comment\u2028input_scope: file\n---\n# Body\n",
+                "---\ntier: C\nfamily: names\n---\n# Body\u2028Unchanged\n",
+            ):
+                with self.subTest(content=content):
+                    original = content.encode()
+                    self.assert_snapshot_comparison(original, original, unchanged=False)
+                    old = subprocess.run(["git", "-C", str(repo), "hash-object", "-w", "--stdin"],
+                                         input=original, check=True, capture_output=True).stdout.decode().strip()
+                    _ = path.write_bytes(b"---\ntier: C\nfamily: names\n---\n# Today\n")
+                    current = rules._load_rule(path, "local", repo, rules.RepoReach())  # pyright: ignore[reportPrivateUsage]
+                    self.assertFalse(rules.judged_text_unchanged(old, current, compared_blob=old))
+
+    def test_tags_header_cannot_take_ownership_of_retained_list_items(self) -> None:
+        for gap in (b"", b"# comment\n", b"\n  # comment\n\n"):
+            for items in (b"- '[[related]]'\n", b"- one\n" + gap + b"- '[[related]]'\n"):
+                with self.subTest(gap=gap, items=items):
+                    before = b"---\ntier: C\nfamily: names\nsee_also:\n" + gap + items + b"---\n# Body\n"
+                    after = before.replace(b"see_also:\n", b"see_also:\ntags:\n")
+                    self.assert_snapshot_comparison(before, after, unchanged=False)
+                    self.assert_snapshot_comparison(after, before, unchanged=False)
+
+    def test_admin_edits_preserve_crlf_trailing_newlines_and_block_trivia(self) -> None:
+        for newline in (b"\n", b"\r\n", b"\r"):
+            for trailing in (b"", newline):
+                for before, after in (
+                    (b"tags: [one] # old\n", b"tags: [two] # new\n"),
+                    (b"date_modified: '[[2026-01-01]]' # old\n", b"date_modified: '[[2026-02-02]]' # new\n"),
+                    (b"tags:\n# comment\n\n- one\n", b"tags:\n# comment\n\n- two\n"),
+                ):
+                    with self.subTest(newline=newline, trailing=trailing, before=before):
+                        original = (b"---\ntier: C\nfamily: names\n" + before + b"---\n# Body").replace(b"\n", newline) + trailing
+                        edited = original.replace(before.replace(b"\n", newline), after.replace(b"\n", newline))
+                        self.assert_snapshot_comparison(original, edited, unchanged=True)
+
+    def test_noncanonical_admin_and_other_frontmatter_changes_are_stale(self) -> None:
+        changes = (
+            (b"tags: one:\n", b"tags: [one]\n"),
+            (b"tags: [one{two}]\n", b"tags: [one]\n"),
+            (b"tags: [one}two]\n", b"tags: [one]\n"),
+            (b"other: one\n", b"other: 'one'\n"),
+            (b"other: one\n", b"other: one # comment\n"),
+            (b"other: one\nnext: two\n", b"next: two\nother: one\n"),
+            (b"input_scope: crate\n", b"input_scope: file\n"),
+            (b"see_also: '[[one]]'\n", b"see_also: '[[two]]'\n"),
+            (b"mode: propose\n", b"mode: check\n"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            _ = subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            path = repo / "rule.md"
+            for before, after in changes:
+                with self.subTest(before=before, after=after):
+                    original = b"---\ntier: C\nfamily: names\n" + before + b"---\n# Body\n"
+                    old = subprocess.run(["git", "-C", str(repo), "hash-object", "-w", "--stdin"],
+                                         input=original, check=True, capture_output=True).stdout.decode().strip()
+                    _ = path.write_bytes(original.replace(before, after))
+                    current = rules._load_rule(path, "local", repo, rules.RepoReach())  # pyright: ignore[reportPrivateUsage]
+                    self.assertFalse(rules.judged_text_unchanged(old, current))
+                    self.assertFalse(rules.judged_text_unchanged(current.blob, current, compared_blob=old))
+
+    def test_canonical_admin_edits_preserve_identical_remaining_lines(self) -> None:
+        changes = (
+            (b"tags: one:\n", b"tags: one:\napproval: always\n"),
+            (b"tags: [one{two}]\n", b"tags: [one{two}]\napproval: always # execution gate\n"),
+            (b"tags:\n- one\n", b"tags:\n- two\n- three\n"),
+            (b"tags:\n  - one\n", b"tags:\n  - two # item\n"),
+            (b"tags: [one]\n", b"tags: [two, three] # comment\n"),
+            (b"date_created: '[[2026-01-01]]'\n", b'date_created: "[[2026-02-02]]" # date\n'),
+            (b'date_modified: "[[2026-01-01]]"\n', b"date_modified: '[[2026-02-02]]'\n"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            _ = subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            path = repo / "rule.md"
+            for before, after in changes:
+                with self.subTest(before=before, after=after):
+                    original = b"---\ntier: C\nfamily: names\n" + before + b"---\n# Body\n"
+                    old = subprocess.run(["git", "-C", str(repo), "hash-object", "-w", "--stdin"],
+                                         input=original, check=True, capture_output=True).stdout.decode().strip()
+                    _ = path.write_bytes(original.replace(before, after))
+                    current = rules._load_rule(path, "local", repo, rules.RepoReach())  # pyright: ignore[reportPrivateUsage]
+                    self.assertTrue(rules.judged_text_unchanged(old, current))
+
+    def test_scope_changes_preserve_body_bytes_but_invalidate_judgment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            _ = subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            path = repo / "rule.md"
+            _ = path.write_bytes(b"---\ntier: C\nfamily: names\ninput_scope: crate\n---\n# Rule\nKeep bytes.\n")
+            old = subprocess.run(["git", "-C", str(repo), "hash-object", "-w", str(path)],
+                                 check=True, capture_output=True, text=True).stdout.strip()
+            before = rules._load_rule(path, "local", repo, rules.RepoReach())  # pyright: ignore[reportPrivateUsage]
+            _ = path.write_bytes(path.read_bytes().replace(b"input_scope: crate", b"input_scope: file\napproval: always"))
+            current = rules._load_rule(path, "local", repo, rules.RepoReach())  # pyright: ignore[reportPrivateUsage]
+            self.assertNotEqual(current.blob, old)
+            self.assertEqual(current.body_identity, before.body_identity)
+            self.assertFalse(rules.judged_text_unchanged(old, current))
+            self.assertTrue(rules.judged_text_unchanged(current.blob, current))
+
+    def test_closed_grammar_validates_both_operands_even_when_equal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            _ = subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            path = repo / "rule.md"
+            valid = b"---\ntier: C\nfamily: names\n---\n# Body\n"
+            _ = path.write_bytes(valid)
+            current = rules._load_rule(path, "local", repo, rules.RepoReach())  # pyright: ignore[reportPrivateUsage]
+            good = subprocess.run(["git", "-C", str(repo), "hash-object", "-w", "--stdin"], input=valid,
+                                  check=True, capture_output=True).stdout.decode().strip()
+            for extra in (b"other: - orphan", b"other: ? orphan", b"tags: [", b"tags: 'unclosed",
+                          b"tags: [one]\ntags: [two]", b"tags:\n\t- one", b"approval: never",
+                          b"input_scope: invalid", b"candidates:\n  surface: whole"):
+                with self.subTest(extra=extra):
+                    content = valid.replace(b"---\n# Body", extra + b"\n---\n# Body")
+                    bad = subprocess.run(["git", "-C", str(repo), "hash-object", "-w", "--stdin"], input=content,
+                                         check=True, capture_output=True).stdout.decode().strip()
+                    self.assertFalse(rules.judged_text_unchanged(bad, current))
+                    self.assertFalse(rules.judged_text_unchanged(good, current, compared_blob=bad))
+                    self.assertFalse(rules.judged_text_unchanged(bad, current, compared_blob=bad))
+                    _ = path.write_bytes(content)
+                    with self.assertRaises(rules.RuleValidationError):
+                        _ = rules._load_rule(path, "local", repo, rules.RepoReach())  # pyright: ignore[reportPrivateUsage]
+            self.assertFalse(rules.judged_text_unchanged("0" * 40, current, compared_blob="0" * 40))
+
+    def test_only_administrative_metadata_preserves_judgments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            _ = subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            path = repo / "rule.md"
+            valid = "---\ntier: C\nfamily: names\n---\n# Body\n"
+            _ = path.write_text(valid)
+            old = subprocess.run(["git", "-C", str(repo), "hash-object", "-w", str(path)],
+                                 check=True, capture_output=True, text=True).stdout.strip()
+            changes = (("tags: [one] # comment", True), ("tags:\n- one", True),
+                       ("approval: always", True),
+                       ("date_created: '[[2026-01-01]]'\ndate_modified: '[[2026-01-02]]'", True),
+                       ("input_scope: file", False), ('see_also: "[[binding]]"', False),
+                       ("mode: propose", False), ("unknown: value", False),
+                       ("pre_filter: value", False), ("candidates:\n  kind: regex\n  surface: whole", False))
+            for extra, expected in changes:
+                with self.subTest(extra=extra):
+                    _ = path.write_text(valid.replace("---\n# Body", extra + "\n---\n# Body"))
+                    current = rules._load_rule(path, "local", repo, rules.RepoReach())  # pyright: ignore[reportPrivateUsage]
+                    self.assertEqual(rules.judged_text_unchanged(old, current), expected)
+
+    def test_historical_equivalence_is_independent_of_todays_body(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            _ = subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            path = repo / "rule.md"
+            pins: list[str] = []
+            for extra in ("", "tags: [one]\n", "other: changed\n"):
+                content = f"---\ntier: C\nfamily: names\n{extra}---\n# Old\n".encode()
+                pins.append(subprocess.run(["git", "-C", str(repo), "hash-object", "-w", "--stdin"], input=content,
+                                           check=True, capture_output=True).stdout.decode().strip())
+            _ = path.write_text("---\ntier: C\nfamily: names\n---\n# New\n")
+            current = rules._load_rule(path, "local", repo, rules.RepoReach())  # pyright: ignore[reportPrivateUsage]
+            self.assertTrue(rules.judged_text_unchanged(pins[0], current, compared_blob=pins[1]))
+            self.assertFalse(rules.judged_text_unchanged(pins[0], current, compared_blob=pins[2]))
+
+    def test_frontmatter_and_body_bytes_both_control_equivalence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            _ = subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            path = repo / "rule.md"
+            original = b"---\ntier: C\nfamily: names\npre_filter: value\nother: value\n---\n# Body\n"
+            old = subprocess.run(["git", "-C", str(repo), "hash-object", "-w", "--stdin"], input=original,
+                                 check=True, capture_output=True).stdout.decode().strip()
+            for content, expected in (
+                (b"---\nother: 'value' # comment\nfamily: names\ntier: C\n---\n# Body\n", False),
+                (original.replace(b"other: value", b"other: [value]"), False),
+                (original.replace(b"# Body\n", b"# Body\r\n"), False),
+                (original.replace(b"# Body", b"# Changed"), False),
+                (original.replace(b"family: names", b"family: values"), False),
+                (original.replace(b"tier: C", b"tier: B"), False),
+                (original.replace(b"other: value", b"other: changed"), False),
+            ):
+                with self.subTest(content=content):
+                    _ = path.write_bytes(content)
+                    current = rules._load_rule(path, "local", repo, rules.RepoReach())  # pyright: ignore[reportPrivateUsage]
+                    self.assertEqual(rules.judged_text_unchanged(old, current), expected)
+
+    def test_body_edit_missing_blob_and_unterminated_frontmatter_are_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            _ = subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            path = repo / "rule.md"
+            _ = path.write_bytes(b"---\ntier: C\nfamily: names\n---\n# Body\n")
+            current = rules._load_rule(path, "local", repo, rules.RepoReach())  # pyright: ignore[reportPrivateUsage]
+            for content in (b"---\ntier: C\n---\n# Changed\n", b"---\n# Body\n",
+                            b"---\n---\n# Body\r\n", b"---\n---\n\xff"):
+                blob = subprocess.run(["git", "-C", str(repo), "hash-object", "-w", "--stdin"], input=content,
+                                      check=True, capture_output=True).stdout.decode().strip()
+                self.assertFalse(rules.judged_text_unchanged(blob, current), repr(content))
+            self.assertFalse(rules.judged_text_unchanged("0" * 40, current))
+
+    def test_malformed_historical_frontmatter_is_stale_under_the_rule_loaders_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            _ = subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            path = repo / "rule.md"
+            valid = b"---\ntier: C\nfamily: names\n---\n# Body\n"
+            _ = path.write_bytes(valid)
+            current = rules._load_rule(path, "global", repo, rules.RepoReach())  # pyright: ignore[reportPrivateUsage]
+            for metadata in (b"tags: [", b"tags: 'unterminated", b"tier: unknown", b"tier: C\nfamily: wrong",
+                             b"tier: C\nfamily: names\n- orphan", b"tier: C\nfamily: names\nother: [",
+                             b"tier: C\nfamily: names\ncandidates:\n  kind: [",
+                             b"candidates:\n  surface: whole"):
+                with self.subTest(metadata=metadata):
+                    content = b"---\n" + metadata + b"\n---\n# Body\n"
+                    blob = subprocess.run(["git", "-C", str(repo), "hash-object", "-w", "--stdin"], input=content,
+                                          check=True, capture_output=True).stdout.decode().strip()
+                    self.assertFalse(rules.judged_text_unchanged(blob, current))
+                    _ = path.write_bytes(content)
+                    with self.assertRaises(rules.RuleValidationError):
+                        _ = rules._load_rule(path, "global", repo, rules.RepoReach())  # pyright: ignore[reportPrivateUsage]
+                    _ = path.write_bytes(valid)
+
+    def test_inline_list_comment_loads_and_keeps_judgment_current(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            _ = subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            path = repo / "rule.md"
+            _ = path.write_text("---\ntier: C\nfamily: names\n---\n# Body\n")
+            current = rules._load_rule(path, "local", repo, rules.RepoReach())  # pyright: ignore[reportPrivateUsage]
+            _ = path.write_text("---\ntier: C\nfamily: names\ntags: [one] # comment\n---\n# Body\n")
+            old = subprocess.run(["git", "-C", str(repo), "hash-object", "-w", str(path)],
+                                 check=True, capture_output=True, text=True).stdout.strip()
+            self.assertTrue(rules.judged_text_unchanged(old, current))
+            edited = rules._load_rule(path, "local", repo, rules.RepoReach())  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(edited.body_identity, current.body_identity)
+
+    def test_index_activity_keeps_one_cat_file_process(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            _ = subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            path = repo / "rule.md"
+            _ = path.write_text("---\ntier: C\nfamily: names\n---\n# Body\n")
+            old = subprocess.run(["git", "-C", str(repo), "hash-object", "-w", str(path)],
+                                 check=True, capture_output=True, text=True).stdout.strip()
+            _ = path.write_text("---\ntier: C\nfamily: names\napproval: always\n---\n# Body\n")
+            current = rules._load_rule(path, "local", repo, rules.RepoReach())  # pyright: ignore[reportPrivateUsage]
+            with mock.patch("rules.subprocess.Popen", wraps=subprocess.Popen) as popen:
+                self.assertTrue(rules.judged_text_unchanged(old, current))
+                _ = subprocess.run(["git", "-C", str(repo), "read-tree", "--empty"], check=True)
+                self.assertTrue(rules.judged_text_unchanged(old, current))
+            batch_calls = [call for call in popen.call_args_list if "cat-file" in call.args[0]]
+            self.assertEqual(len(batch_calls), 1)
+
+    def test_replaced_rule_repository_cannot_reuse_the_previous_repositories_blob_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "rules"
+            _ = subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            path = repo / "rule.md"
+            _ = path.write_bytes(b"---\ntier: C\nfamily: names\n---\n# Body\n")
+            old = subprocess.run(["git", "-C", str(repo), "hash-object", "-w", str(path)],
+                                 check=True, capture_output=True, text=True).stdout.strip()
+            valid = b"---\ntier: C\nfamily: names\napproval: always\n---\n# Body\n"
+            _ = path.write_bytes(valid)
+            current = rules._load_rule(path, "local", repo, rules.RepoReach())  # pyright: ignore[reportPrivateUsage]
+            self.assertTrue(rules.judged_text_unchanged(old, current))
+            _ = repo.rename(root / "previous-repository")
+            _ = subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            _ = path.write_bytes(valid)
+            current = rules._load_rule(path, "local", repo, rules.RepoReach())  # pyright: ignore[reportPrivateUsage]
+            absent = subprocess.run(["git", "-C", str(repo), "cat-file", "-e", old], capture_output=True)
+            self.assertNotEqual(absent.returncode, 0)
+            self.assertFalse(rules.judged_text_unchanged(old, current))
+
+    def test_many_judged_blobs_share_one_cat_file_process_and_cached_bodies(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            _ = subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            path = repo / "rule.md"
+            _ = path.write_bytes(b"---\ntier: C\nfamily: names\n---\n# Body\n")
+            current = rules._load_rule(path, "local", repo, rules.RepoReach())  # pyright: ignore[reportPrivateUsage]
+            blobs = [subprocess.run(["git", "-C", str(repo), "hash-object", "-w", "--stdin"],
+                                    input=f"---\ntier: C\nfamily: names\ndate_modified: '[[2026-01-{index + 1:02}]]'\n---\n# Body\n".encode(),
+                                    check=True, capture_output=True).stdout.decode().strip() for index in range(20)]
+            with mock.patch("rules.subprocess.Popen", wraps=subprocess.Popen) as popen:
+                for blob in blobs * 3:
+                    self.assertTrue(rules.judged_text_unchanged(blob, current))
+            self.assertEqual(popen.call_count, 1)
+            self.assertIn("--batch", cast(list[str], popen.call_args.args[0]))
 
 
 if __name__ == "__main__":
