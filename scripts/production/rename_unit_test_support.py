@@ -265,6 +265,38 @@ class UnitRenameFixture(unittest.TestCase):
         self.addCleanup(process.kill)
         return process
 
+    def dead_server_watcher(self, worktree: Path, folder: Path) -> subprocess.Popen[str]:
+        """A literal sh watcher of another worktree's run, blocked until signalled after its server dies."""
+        server = subprocess.Popen([sys.executable, "-c", "import sys; print('ready', flush=True); sys.stdin.read()"],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(server.wait, timeout=TEST_HANG_GUARD_SECS)
+        self.addCleanup(server.kill)
+        assert server.stdin is not None and server.stdout is not None
+        self.addCleanup(server.stdin.close)
+        self.addCleanup(server.stdout.close)
+        _ = self.wait_for_output(server, "ready")
+        folder.mkdir(parents=True)
+        self.write(folder / "progress_history_state.json", json.dumps({"working_dir": str(worktree.parent / "another-worktree")}))
+        self.write(folder / "mesh_server.json", json.dumps({"pid": server.pid, "port": 51101}))
+        # The sleep stand-in reports entry and blocks on a pipe. No elapsed time decides when
+        # the server dies or whether the watcher releases the worktree.
+        script = ('sleep() { printf "sleeping\\n"; read -r wake; }; '
+                  'while kill -0 "$1" 2>/dev/null; do sleep "$5"; '
+                  '"$4" "$0" idle-stop --session-dir "$3" --pid "$1" --port "$2" && exit 0; done')
+        watcher = subprocess.Popen(["sh", "-c", script,
+            str(SCRIPT.parents[1] / "agents/codex_mesh.py"), str(server.pid), "51101", str(folder),
+            sys.executable, "300"], cwd=worktree, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            text=True, start_new_session=True)
+        self.addCleanup(watcher.wait, timeout=TEST_HANG_GUARD_SECS)
+        self.addCleanup(watcher.kill)
+        assert watcher.stdin is not None and watcher.stdout is not None
+        self.addCleanup(watcher.stdin.close)
+        self.addCleanup(watcher.stdout.close)
+        _ = self.wait_for_output(watcher, "sleeping")
+        server.kill()
+        _ = server.wait(timeout=TEST_HANG_GUARD_SECS)
+        return watcher
+
     def wait_for(self, ready: Callable[[], bool]) -> None:
         """Wait for a stand-in's file event; elapsed time is only a hang guard."""
         wait_until(ready, self.root, timeout=TEST_HANG_GUARD_SECS)
