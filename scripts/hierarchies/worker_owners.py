@@ -4,6 +4,7 @@
 Report is read-only. Recovery stores evidence without rebuilding deleted run
 folders. Dry runs write nothing. The first applied end only records a report.
 Missing sources prevent all applied ends.
+Text reports end with Totals. Use --full to list each timer registration.
 """
 from __future__ import annotations
 
@@ -665,6 +666,7 @@ def main(arguments: Sequence[str] = ()) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     command_option = parser.add_argument("command", choices=("report", "recover", "end"))
     json_option = parser.add_argument("--json", action="store_true")
+    full_option = parser.add_argument("--full", action="store_true", help="list each timer registration")
     class_option = parser.add_argument("--class", dest="selected_class", choices=("DirectorGone", "OwnerUnknown"))
     mode = parser.add_mutually_exclusive_group()
     dry_run_option = mode.add_argument("--dry-run", action="store_false", dest="apply")
@@ -675,9 +677,11 @@ def main(arguments: Sequence[str] = ()) -> int:
     selected_class = cast(str, getattr(args, class_option.dest))
     apply = cast(bool, getattr(args, apply_option.dest))
     as_json = cast(bool, getattr(args, json_option.dest))
+    full = cast(bool, getattr(args, full_option.dest))
     if command == "end" and not selected_class:
         parser.error("end requires --class DirectorGone|OwnerUnknown")
     sources = collect_sources()
+    timers = timer_registrations(Path(os.environ.get("NOTIFIER_STATE_DIR", str(Path.home() / ".local/state/notifier"))), sources.problems)
     notes: tuple[str, ...] = ()
     end_failed = False
     if command == "recover":
@@ -688,7 +692,6 @@ def main(arguments: Sequence[str] = ()) -> int:
         sources = replace(sources, workers=result.workers)
         notes = result.evidence
         end_failed = bool(result.failed)
-    timers = timer_registrations(Path(os.environ.get("NOTIFIER_STATE_DIR", str(Path.home() / ".local/state/notifier"))), sources.problems)
     totals = {kind.value: sum(item.classification == kind for item in sources.workers) for kind in WorkerClass}
     if as_json:
         print(json.dumps({"workers": [worker_record(item) for item in sources.workers], "totals": totals,
@@ -701,14 +704,19 @@ def main(arguments: Sequence[str] = ()) -> int:
                     print(f"  candidate owner: {candidate.director.session_id}; unit={candidate.director.unit}; live={isinstance(candidate, LiveDirectorOwner)}")
             for evidence in worker.evidence:
                 print(f"  evidence: {evidence}")
-        print("Totals: " + ", ".join(f"{kind}={count}" for kind, count in totals.items()))
-        for timer in timers:
-            print(f"timer {timer.name}\ttarget={timer.target}\trequested_by={timer.requested_by or 'unknown'}\t{timer.evidence}")
-        for problem in sources.problems:
-            print(f"source problem: {problem}")
         for note in notes:
             print(note)
-    return 1 if sources.problems or end_failed else 0
+        for problem in sources.problems:
+            print(f"source problem: {problem}")
+        if full:
+            for timer in timers:
+                print(f"timer {timer.name}\ttarget={timer.target}\trequested_by={timer.requested_by or 'unknown'}\t{timer.evidence}")
+        else:
+            missing_requests = sum(not timer.requested_by for timer in timers)
+            print(f"Timers: {len(timers)} registered, {missing_requests} with no recorded request (the showrunner checks these; --full lists each)")
+        print("Totals: " + ", ".join(f"{kind}={count}" for kind, count in totals.items()) +
+              f", source_problems={len(sources.problems)}")
+    return 1 if command == "end" and (sources.problems or end_failed) else 0
 
 
 if __name__ == "__main__":

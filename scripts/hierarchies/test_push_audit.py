@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextlib import redirect_stdout
 import ast
+import io
 import json
 import os
 from pathlib import Path
@@ -15,6 +17,7 @@ from unittest.mock import patch
 
 from scripts.hierarchies import push_audit as audit
 from scripts.hierarchies import log_records
+from scripts.production import showrunners
 
 
 JsonRecord = dict[str, object]
@@ -26,7 +29,7 @@ REGISTERED_TEXT = "shutdown.stop_failed"
 
 
 def detail_section(output: str) -> str:
-    return output.split("\n\nTotals per showrunner", 1)[0]
+    return output[output.index("Sends after failed text checks"):].split("\n\nTotals per showrunner", 1)[0]
 
 
 def total_cells(output: str) -> dict[str, list[str]]:
@@ -99,7 +102,7 @@ class PushAuditTest(unittest.TestCase):
             "NOTIFIER_STATE_DIR": str(self.home / ".local/state/notifier"),
         }
         result = subprocess.run(
-            [sys.executable, str(AUDIT_SCRIPT), "report", "--since", since, "--until", until],
+            [sys.executable, str(AUDIT_SCRIPT), "report", "--full", "--since", since, "--until", until],
             cwd=AUDIT_SCRIPT.parents[2], env=environment, capture_output=True, text=True,
             check=False, timeout=15,
         )
@@ -115,6 +118,52 @@ class PushAuditTest(unittest.TestCase):
         self.assertIn("hana", output)
         self.assertIn("Emergency fixture", output)
         self.assertNotIn("Unapproved", detail_section(output))
+
+    def test_default_summary_matches_full_totals_and_has_no_table_rows(self) -> None:
+        self.save(self.pushes, [
+            self.push("Priority fixture", priority="2"),
+            self.push("Registered fixture", text_id=REGISTERED_TEXT),
+            self.push("Unapproved fixture"),
+            self.push("Passed fixture"),
+        ])
+        self.save(self.reviews, [
+            self.failed_review("Priority fixture", priority="2"),
+            self.failed_review("Registered fixture", text_id=REGISTERED_TEXT),
+            self.failed_review("Unapproved fixture"),
+        ])
+        output = io.StringIO()
+        with patch.object(audit, "STATE_DIR", self.logs), \
+                patch.object(showrunners, "NOTIFIER_STATE_DIR", self.home / "notifiers"), \
+                patch.dict(os.environ, {"USER_ZONE": "America/New_York"}), redirect_stdout(output):
+            result = audit.main(["report", "--since", SINCE, "--until", UNTIL])
+        self.assertEqual(result, 0)
+        summary = output.getvalue()
+        full = self.report()
+        self.assertEqual(full.split("\n\n", 1)[0] + "\n", summary)
+        self.assertEqual(len(summary.splitlines()), 4)
+        self.assertIn("Window: 2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded).", summary)
+        self.assertIn("Pushes: 4 delivered; 3 after a failed text check.", summary)
+        self.assertIn("ApprovedPriorityTwo: 1; ApprovedRegisteredText: 1; Unapproved: 1.", summary)
+        self.assertIn("Source problems: 0. Use --full to print the tables.", summary)
+        self.assertNotIn("Sends after failed text checks", summary)
+        self.assertNotIn("Priority fixture", summary)
+        self.assertNotIn("Totals per showrunner", summary)
+        self.assertEqual(total_cells(full)["all senders"][:2], [
+            "after failed check 3; ApprovedPriorityTwo 1; ApprovedRegisteredText 1; Unapproved 1", "4",
+        ])
+
+    def test_summary_reports_missing_source_without_printing_tables(self) -> None:
+        self.reviews.unlink()
+        self.save(self.pushes, [self.push("Annotated fixture", priority="2",
+                                        outcome="sent, sent despite failed review: context")])
+        output = io.StringIO()
+        with patch.object(audit, "STATE_DIR", self.logs), \
+                patch.object(showrunners, "NOTIFIER_STATE_DIR", self.home / "notifiers"), redirect_stdout(output):
+            result = audit.main(["report", "--since", SINCE, "--until", UNTIL])
+        self.assertEqual(result, 0)
+        self.assertIn("Pushes: 1 delivered; 1 after a failed text check.", output.getvalue())
+        self.assertIn("Source problems: 1. Use --full to print the tables.", output.getvalue())
+        self.assertNotIn("review.jsonl", output.getvalue())
 
     def test_registered_text_names_its_exception_and_id(self) -> None:
         self.save(self.pushes, [self.push("Registered fixture", text_id=REGISTERED_TEXT,
