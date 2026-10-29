@@ -24,6 +24,16 @@ Own what the build log records and what its reports show: the build log, /build:
 
 Add to `buildlog sample` and its samples table the /proc/pressure/cpu and /proc/pressure/io totals (some, and full where present), and the /proc/stat idle and iowait counters. Show them in /build:report's Memory pressure section, or in a section next to it, as share of time. Tests fake every reading, as in phase 1. Reason: the build log records memory only, so history cannot say whether natedev was CPU or disk bound.
 
+2026-10-29 14:00 EDT (the user, relayed by the showrunner; it replaces the user's earlier "builds-report or hana-lfo" message)
+
+i don't mind columns in reports showing a showerunner and a unit as long as they are using the short name - it's the file path that iwas discusing as being hyphenated - both situations should use the short names
+
+The showrunner: keep the separate Showrunner and Unit columns, and fill each with the short name the user uses: Showrunner "builds" or "hana", Unit "report" or "lfo", never "report-unit" or a long session name. Only file paths join them with a hyphen (builds-report). Take the name from the one place that names sessions, never a second copy of that logic. Put it in Phase 2 if it fits, or in a small phase right after.
+
+2026-10-29 14:12 EDT (the showrunner, approving verify-unit's Work Order for the copy folder name)
+
+verify-unit's Work Order for the copy folder name (roster.py join `<showrunner>-<unit>`, drop a leading showrunner name from the unit name, drop a missing part, callers pass the director's session from owning_session(), 4 tests) is approved. Add it as the phase after your Phase 3, because it builds on Phase 3's unit_labels.
+
 ## Delegation Context
 
 - **Project:** `~/.claude` — the build system scripts; this plan changes the `/build:queue` tables.
@@ -54,111 +64,117 @@ Add to `buildlog sample` and its samples table the /proc/pressure/cpu and /proc/
 
 ### Phase 1 — Queue tables name who runs each step  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `/build:queue` shows each step's showrunner, unit director and session; the Step column is the bare step name (`nextest`, `clippy`) in both tables; and Waiting has a separate Free column, so its Reason no longer repeats the needs and free amounts.
-
-**Spec:**
-
-1. **Identity columns.** Both tables get `Showrunner` and `Unit director` columns before `Session`:
-   - Running: `# | Showrunner | Unit director | Session | Step | Folder | Promised | Using | Delta | State`
-   - Waiting: `# | Showrunner | Unit director | Session | Step | Folder | Waiting since | Needs | Free | Reason`
-
-   `build_queue.py` reads `roster.roster(os.environ, roster.ThisMachine())` once per run (the queue is natedev-local, so the other machine is not read). It runs that read in a thread at the same time as `memory_admit.queue_view()`, so the wall time is the slower of the two reads, not their sum. Import `roster` the way `scripts/hierarchies/measure.py` does (`from scripts.message import roster`). Do not change `roster.py`; read its public state classes.
-
-   Match a step's `session_id` to one entry: a Claude entry when `entry.session` is `ClaudeSession` and its `session_id` is equal; a Codex entry when `entry.thread` is `CodexThread` and its `thread_id` is equal. The labels for a matched entry:
-   - **Session** — `entry.name`.
-   - **Showrunner** — `UnderShowrunner.name`; for `RunsProduction` (the session is a showrunner), `entry.name`; else `—`.
-   - **Unit director** — `UnderDirector.name`; for `DirectsUnit` (the session is a unit director), `entry.name`; else `—`.
-
-   A step with no match keeps today's Session text (the recorded session name, else the folder basename) and shows `—` in both new columns. When the roster read raises, or returns problems, the tables still print; one line after the Totals line says `Roster: <first problem or error>; Showrunner and Unit director show — for unmatched steps`. A clean read adds no line.
-
-   Live readings at 10:18 EDT on 2026-10-29, to check against: `clone88ci` is Codex worker `organon-ci88`, unit director `organon`, showrunner `hana`; `merge-gate` is unit director `merge-gate`, showrunner `hana`; `lfo` is unit director `lfo`, showrunner `hana`; every one of the 21 steps read then matched a roster entry.
-
-2. **Behind-head name.** The waiting Reason `behind <name> (waiting N min)` names the head by its Session label from item 1, not by its recorded session name or folder. `BehindHead` today carries `head_name` (`memory_admit.py` `read_queue`, line ~976). Add the head's `session_id` to `BehindHead` so that `build_queue.py` can resolve it, and keep `head_name` as the label for an unmatched head.
-
-3. **Bare step name.** The waiter row stores `"<repo> <step>"` (`waiter_identity`, `memory_admit.py` line ~867: `"step": f"{repo} {step}".strip()`), while the reservation row stores the bare step. Fix it where the step is stored: `waiter_identity` writes the bare `step`. Then both tables show `nextest`, `clippy`, `mend`, `doc`. The `queue_bump` build-log row takes `moved.step`, so from now on it also records the bare step; its `folder` field still names the tree. Check that no other reader of a waiter's `step` field needs the repo prefix (`grep -n '"step"\|\.step\b' scripts/lint/memory_admit.py scripts/buildlog/*.py`); the waiter's `repository_name` field keeps the repo.
-
-4. **Free column; shorter Reason.** Waiting gets a `Free` column with `view.available` in GiB (`12.1 GiB`), on each row. The table's Reason text drops the amounts that are now in Needs and Free:
-   - `BehindHead`: `behind <name> (waiting N min)`
-   - `NeedsMemory`: `<reserve> GiB kept for earlyoom`
-   - `NeedsBuildBudget`: `builds use <charged> of the <budget> GiB budget`
-   - `ReadyForAdmission`: `ready for the next admission check`
-   - `ReadingUnavailable`: `memory reading unavailable`
-   - `MemoryPressure`: unchanged (`memory_admit.pressure_text`)
-   - `HeadAdmissionStatus`: the head text without its first `needs <need> GiB` and its `<available> free` amounts: for example `head: builds use 16.1 of the 21.0 GiB budget (starts when build use falls to 10.1 GiB); needs 13.9 GiB free; younger steps wait until 10:27`. The `needs <threshold> GiB free` part stays: it is the free memory the head must see (need plus reserve), a different number from Needs. Build this text in `build_queue.py` from the `HeadAdmissionStatus` fields; `head_wait_text` stays as it is (Invariants).
-
-5. **Bump by the shown name.** `bump <selector>` also takes the Session label the table shows (for example `bump organon-ci88`). `build_queue.py` resolves a selector that equals exactly one shown Session label to that step's full `session_id`, then calls `memory_admit.bump_waiter` with it. Every other selector goes to `bump_waiter` unchanged. Two waiting rows that share the label are ambiguous: print the existing ambiguous error and move nothing. The result line names the step by its Session label.
-
-6. **Command and as-built text.** `commands/build/queue.md`: name the new columns, say Showrunner and Unit director come from the session roster with `—` when no roster entry matches, say Step is the bare step, add the Free column, and add the shown Session name to the bump selectors. `docs/as-built/build-memory-admission.md`: in the Queue API bullet (line ~36) add the roster read and the bare waiter step; in the Queue order bullet (line ~37) add the shown Session label as a selector.
+- `/build:queue` prints two tables with identity columns before `Session`:
+  - Running: `# | Showrunner | Unit director | Session | Step | Folder | Promised | Using | Delta | State`
+  - Waiting: `# | Showrunner | Unit director | Session | Step | Folder | Waiting since | Needs | Free | Reason`
+- `build_queue.py` reads `roster.roster(os.environ, roster.ThisMachine())` in a worker thread while `memory_admit.queue_view()` runs on the main thread (its lock timeout uses a signal). `session_labels` maps each roster entry to its labels: Session is `entry.name`; Showrunner is `UnderShowrunner.name`, or `entry.name` for `RunsProduction`; Unit director is `UnderDirector.name`, or `entry.name` for `DirectsUnit`; else `—`. A step matches by `session_id` (Claude) or `thread_id` (Codex). An unmatched step keeps its recorded session name, else the folder basename, with `—` in both new columns.
+- When the roster read raises or returns problems, the tables still print, and one line after Totals says `Roster: <first problem>; Showrunner and Unit director show — for unmatched steps`.
+- `waiter_identity(step, worktree)` stores the bare step, so the Step column is one word (`nextest`, `clippy`), and the `queue_bump` build-log row records the bare step. `BehindHead` carries `head_session_id`; `behind <label> (waiting N min)` uses the head's Session label, and `head_name` is the label for an unmatched head.
+- The Free column shows `view.available` in GiB, or `—` when any waiter has `ReadingUnavailable`. Reason text omits the amounts in Needs and Free. `NeedsMemory` carries `need`, `free`, `threshold`, `growth`, `reserve` and `head_need`, and its Reason names the threshold and its parts: `needs <threshold> GiB free: this step <need>, running steps may grow <growth>, head <head_need>, earlyoom <reserve>` (a part that rounds to 0.0 is left out). `build_queue.py` builds the head Reason from the `HeadAdmissionStatus` fields; `head_wait_text` is unchanged.
+- `bump <selector>` also takes a shown Session label. A label that matches one waiting row resolves to that row's position; a label on two rows prints the ambiguous error and moves nothing.
 
 **Files:**
-- `scripts/build_queue/build_queue.py` — roster read in parallel with the queue view, identity columns, Free column, table reason text, bump by Session label
-- `scripts/lint/memory_admit.py` — `waiter_identity` writes the bare step; `BehindHead` carries the head's `session_id`
-- `scripts/build_queue/test_build_queue.py` — tests for items 1–5 with a faked roster
-- `scripts/lint/test_memory_admit.py` — waiter step and `BehindHead` field tests
-- `commands/build/queue.md` — the command text
-- `docs/as-built/build-memory-admission.md` — the Queue API and Queue order bullets
+- `scripts/build_queue/build_queue.py` — roster read, `session_labels`, identity and Free columns, Reason text, bump by Session label
+- `scripts/lint/memory_admit.py` — bare waiter step; `BehindHead.head_session_id`; `NeedsMemory` threshold parts
+- `scripts/build_queue/test_build_queue.py`, `scripts/lint/test_memory_admit.py` — tests with a faked roster (no test reads the live roster)
+- `commands/build/queue.md` — the columns, the roster source, the bare step, the Session-label selector
+- `docs/as-built/build-memory-admission.md` — Queue API and Queue order bullets
 
-**Workers:** `2 writers` — no test lane (tests sit beside the code), so `test` opens as impl.
-- `impl` — `scripts/build_queue/build_queue.py`, `scripts/lint/memory_admit.py`, `commands/build/queue.md`, `docs/as-built/build-memory-admission.md`
-- `test` (opens as impl) — `scripts/build_queue/test_build_queue.py`, `scripts/lint/test_memory_admit.py`. Fake the roster with `mock.patch` on the roster function `build_queue.py` calls; never read the live roster. Cases: a Codex worker under a director and a showrunner; a unit director; a showrunner; an unmatched session (`—` and today's Session text); a roster that raises and one with problems (tables still print, one `Roster:` line); both tables show the bare step; the Free column and each reason text in item 4; `behind <label>` uses the head's Session label; bump by a unique Session label moves that step, and by a shared label moves nothing.
+**Binds later work:** `session_labels` lives in `build_queue.py`; the phase that moves it into `roster.py` changes its tests on purpose.
 
-**Constraints from prior phases:** none (Phase 1).
+**Gotchas:**
+- Waiter rows written by an older installed copy of `memory_admit.py` still store `"<repo> <step>"`, so Waiting shows prefixed steps until this branch is the installed copy.
+- The checkpoint assertion guard refuses `::*` wildcards: each changed test expectation needs its own `Assertion-Change: <path>::<test> — <why>` line.
 
-**Acceptance gate:**
-- `python3 -m unittest scripts.build_queue.test_build_queue scripts.lint.test_memory_admit` green, and the production Merge tests (`env HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only` and the production basedpyright line) green.
-- `basedpyright scripts/build_queue scripts/lint/memory_admit.py scripts/lint/test_memory_admit.py`: `0 errors, 0 warnings`.
-- Live check on natedev from the worktree: `python3 scripts/build_queue/build_queue.py`. Each step whose session the roster lists (`~/.claude/scripts/lib/py ~/.claude/scripts/message/roster.py --here`) shows that entry's showrunner, unit director and session name; every Step cell in both tables is one bare word; Waiting has a Free column, and no Reason cell starts with `needs <amount> GiB; <amount> free`.
-- Speed: run `build_queue.py` and `roster.py --here --json` back to back three times. The median `build_queue.py` wall time is at most the median roster wall time plus 0.5 s (before this phase: queue 2.2 s, roster 3.3 s on 2026-10-29 10:30 EDT).
+**Ruled out:** a read-side strip of the `<repository_name> ` prefix from waiter steps — the write-side fix is enough once installed.
 
-### Phase 2 — Samples record CPU and disk pressure  · status: todo
+### Phase 2 — Samples record CPU and disk pressure  · status: done
+
+#### As-built
+
+- `buildlog sample` reads `/proc/pressure/cpu`, `/proc/pressure/io` and `/proc/stat` once per 60 s sample and records seven fields: `cpu_stall_some_us`, `cpu_stall_full_us`, `io_stall_some_us`, `io_stall_full_us` (PSI totals, microseconds) and `cpu_idle_ticks`, `cpu_iowait_ticks`, `cpu_total_ticks` (USER_HZ). A missing file or a parse error makes only that reading `null`; the memory readings stay required, and the sample is still written.
+- `sample.py` holds the paths `CPU_PRESSURE`, `IO_PRESSURE`, `STAT`; `CpuTicks(idle, iowait, total)` from `parse_cpu_ticks(text)`, which sums the first eight fields of the `cpu ` line (guest time is already inside user and nice) and raises `ValueError` on a missing or short line; `read_cpu_ticks(path) -> CpuTicks | Unmeasured`; and `read_pressure(path) -> PartialStallTotals`. The PSI result types are `StallTotals` and `PartialStallTotals`, shared by memory, CPU and IO.
+- The `samples` table has the seven fields as `INTEGER` columns at `SCHEMA_VERSION` 23; older rows read NULL.
+- `report.py` `sample_counter_deltas(connection, day, columns) -> list[SampleCounterInterval]` holds the one pairing rule for memory, CPU and IO counters: same host, gap at most `MAX_SAMPLE_GAP_S`, the host's latest earlier sample as the day's baseline, and a new `boot_id` counts the later counter from zero. `SampleCounterInterval.deltas` is keyed by counter name; a NULL at either end gives `CounterNotRecorded.VALUE`, which adds nothing to that counter or its denominator. `memory_pressure_section` uses it, with unchanged text and numbers.
+- `cpu_disk_pressure_section(connection, day)` prints `### CPU and disk pressure` after Memory pressure, with `Source: 60 s machine samples (/proc/pressure/cpu, /proc/pressure/io, /proc/stat).` Each host with a counted pair gets `<host>: CPU some X%, full Y%; IO some X%, full Y%; CPU idle X%, iowait Y% (of <duration> sampled)`. A PSI share divides by the wall time of that counter's counted pairs; idle and iowait divide by the `cpu_total_ticks` delta of the same pairs. A share with no denominator is `—`; with no counted host the section says `CPU and IO samples: none.`
+- One sample costs about 0.11 ms more (20-run median 0.234 ms → 0.347 ms).
+
+**Files:**
+- `scripts/buildlog/sample.py` — the three paths, `CpuTicks`, `parse_cpu_ticks`, `read_cpu_ticks`, `read_pressure`, `StallTotals`, `PartialStallTotals`, the seven record fields
+- `scripts/buildlog/index.py` — seven sample columns, schema 23
+- `scripts/buildlog/report.py` — `sample_counter_deltas`, `SampleCounterInterval`, `CounterNotRecorded`, `cpu_disk_pressure_section`
+- `scripts/buildlog/test_sample.py`, `scripts/buildlog/test_index.py`, `scripts/buildlog/test_report.py` — faked readings, schema rebuild, section cases
+- `scripts/buildlog/test_memory_records.py` — its subprocess fixture points the three new paths at scratch files
+- `commands/build/report.md`, `docs/as-built/buildlog-memory-stalls.md` — the new section and fields
+
+**Gotchas:**
+- A test that runs `sample()` in a subprocess must point `CPU_PRESSURE`, `IO_PRESSURE` and `STAT` at scratch paths, as `test_memory_records.py` does, or it reads live `/proc`.
+- The `(of …)` duration is the union of pairs where any PSI counter counted, so a host with only tick readings shows `0.0 s` sampled beside valid idle and iowait shares.
+- A `SCHEMA_VERSION` raise changes `test_index.py`'s schema expectation, which needs its own `Assertion-Change:` line.
+
+**Ruled out:** wall time times CPU count as the tick denominator — it goes wrong when CPUs go offline; picking counters by tuple position in `report.py` — they are keyed by name.
+
+### Phase 3 — Build views name the showrunner and unit by short name  · status: todo
+
+**Depends on:** Phase 1
 
 #### Work Order
 
-**Goal:** each 60 s machine sample records CPU and IO stall totals and the CPU idle and iowait counters, and `/build:report` shows them as share of time beside Memory pressure, so the build history says whether natedev was CPU bound, disk bound or neither.
+**Goal:** `/build:queue` and `/build:status` name the showrunner and the unit of each build step by the short names the user uses in sessions (Showrunner `builds`, `hana`; Unit `report`, `lfo`), from one shared label function.
 
 **Spec:**
 
-1. **New readings in `buildlog sample`** (`scripts/buildlog/sample.py`, `sample()` line ~150). Add module paths beside `PRESSURE`: `CPU_PRESSURE = Path("/proc/pressure/cpu")`, `IO_PRESSURE = Path("/proc/pressure/io")`, `STAT = Path("/proc/stat")`. Read each once per sample:
-   - CPU and IO PSI: `parse_pressure(text, require_both=False)`. `some` and `full` totals in microseconds. The kernel may omit the `full` line for CPU; that value is `None`.
-   - `/proc/stat`: the first line that starts with `cpu ` (all CPUs). Record field 4 `idle` and field 5 `iowait` (USER_HZ ticks since boot), and the sum of fields 1–8 (user, nice, system, idle, iowait, irq, softirq, steal) as the total. Guest time is already inside user and nice, so it is not added. Add a parser `parse_cpu_ticks(text) -> CpuTicks` (NamedTuple: `idle`, `iowait`, `total`) beside `parse_meminfo`; it raises `ValueError` on a missing or short `cpu ` line.
-   - A missing file or a parse error makes only that reading `None`. The memory readings stay required (the Linux-only check at line ~150 does not change): a sample with no CPU or IO reading is still written.
-   - Record fields: `cpu_stall_some_us`, `cpu_stall_full_us`, `io_stall_some_us`, `io_stall_full_us`, `cpu_idle_ticks`, `cpu_iowait_ticks`, `cpu_total_ticks`.
-
-   **Director's call:** the total ticks are recorded too. A share of time needs a denominator; wall time times CPU count goes wrong when CPUs go offline, the tick total does not. One field; a one-line revert if not wanted.
-
-2. **Samples table** (`scripts/buildlog/index.py` `SAMPLE_COLUMNS`, line ~245). Add the seven columns as `INTEGER`, NULL when not recorded, each with a one-line description in the existing style (`"machine CPU some stall counter since boot, microseconds; NULL when not recorded"`, `"CPU idle ticks since boot from /proc/stat, USER_HZ"`, and so on). Raise `SCHEMA_VERSION` (22 → 23) so the index rebuilds from the JSONL files, the way earlier sample columns were added. Older sample rows load with NULL in the new columns.
-
-3. **Shared counter deltas** (`scripts/buildlog/report.py`). `memory_pressure_section` sums counter deltas between samples inside its loop (line ~846): same host, gap at most `MAX_SAMPLE_GAP_S`, same boot id (a new boot counts the counter from zero). Move that rule into one function that the memory stall and the new section both use, so the boot and gap rules live in one place. A pair where either value is NULL adds nothing to that counter, and adds nothing to its time denominator. The memory stall line keeps its current text and numbers.
-
-4. **New report section** `### CPU and disk pressure`, right after `### Memory pressure` (line ~1796), from the same day's samples. Per host that has at least one counted pair, one line:
-
-   `natedev: CPU some 41.2%, full —; IO some 3.1%, full 1.0%; CPU idle 52.0%, iowait 0.4% (of 14 h 20 min sampled)`
-
-   - PSI share = summed stall delta in microseconds / summed wall-time delta of the same counted pairs in microseconds.
-   - Idle and iowait share = summed tick delta / summed total-tick delta of the same pairs.
-   - A value with no counted pair shows `—`. A host with no counted pair for any of the seven is left out. When no host has one, the section says `CPU and IO samples: none.`
-   - One decimal place, like the report's other percentages. The `(of …)` part is the sampled wall time counted for the PSI shares, written the way the report writes other durations.
-   - The section's Source line: `Source: 60 s machine samples (/proc/pressure/cpu, /proc/pressure/io, /proc/stat).`
-
-5. **Docs.** `commands/build/report.md`: name the new section in one sentence. `docs/as-built/buildlog-memory-stalls.md`: the sample record's new fields and the new section.
+1. **One label function** (`scripts/message/roster.py`). The roster already holds the names: a showrunner's name is its registered session name (`UnderShowrunner.name`, `RunsProduction` → the entry's `name`), and a unit's name is its director's Claude session name (`DirectsUnit` → the entry's `name`, `UnderDirector.name`). These are the names herdr shows as workspace and tab. Move `SessionLabels` and `session_labels` from `scripts/build_queue/build_queue.py` (line ~36) into `roster.py` as `UnitLabels(session, showrunner, unit)` and `unit_labels(entries) -> dict[str, UnitLabels]`, keyed by Claude session id and Codex thread id, with the same rules; `—` where a relationship is missing. Add `unit_labels_for(session_ids, environment) -> dict[str, UnitLabels]` for a caller that knows Claude session ids and must stay fast: it reads only the session records, the showrunner registry and the production unit marks the roster already reads (`_newest_sessions`, `_registered_showrunners`, `_production_places`), never the process table, Codex meshes or accounts. For the same live Claude session both functions return the same labels; a test pins it. No other file composes a showrunner or unit name.
+2. **`/build:queue`** (`build_queue.py`). The `Unit director` column is renamed `Unit` in both tables. Cells come from `roster.unit_labels`. Nothing else in the tables changes.
+3. **`/build:status`** (`scripts/build_targets/build_targets.py`, `running` text line ~89). A running claim or hold whose record names a holder session gets ` (showrunner <name>, unit <name>)` after its `since <time>`, from `roster.unit_labels_for`: `mac: running nextest hana since 12:46 EDT (showrunner hana, unit inspectors)`. A holder the lookup cannot name, or a record with no holder session, keeps today's text. A failed lookup never fails the command: it keeps today's text.
+4. **`/build:report`**: no change. It has no Showrunner or Unit cell; its Waiting cells name worktree folders, which are file paths.
+5. **Docs.** `commands/build/queue.md`: `Unit` in place of `Unit director`. `commands/build/status.md`: the showrunner and unit after a running claim. `docs/as-built/build-memory-admission.md`: the Queue API bullet names `roster.unit_labels`.
 
 **Files:**
-- `scripts/buildlog/sample.py` — paths, `parse_cpu_ticks`, the seven record fields
-- `scripts/buildlog/index.py` — seven `SAMPLE_COLUMNS`, `SCHEMA_VERSION` 23
-- `scripts/buildlog/report.py` — shared counter delta function, the new section
-- `scripts/buildlog/test_sample.py`, `scripts/buildlog/test_report.py`, and `scripts/buildlog/test_index.py` when it pins the schema
-- `commands/build/report.md`, `docs/as-built/buildlog-memory-stalls.md`
+- `scripts/message/roster.py` — `UnitLabels`, `unit_labels`, `unit_labels_for`
+- `scripts/build_queue/build_queue.py` — uses `roster.unit_labels`; `Unit` header
+- `scripts/build_targets/build_targets.py` — showrunner and unit after a running claim or hold
+- `scripts/message/test_roster.py`, `scripts/build_queue/test_build_queue.py`, `scripts/build_targets/test_build_targets.py`
+- `commands/build/queue.md`, `commands/build/status.md`, `docs/as-built/build-memory-admission.md`
 
-**Workers:** `2 writers` — the open phase 1 workers, `test` still opened as impl.
-- `impl` — `sample.py`, `index.py`, `report.py`, `commands/build/report.md`, `docs/as-built/buildlog-memory-stalls.md`
-- `test` — `test_sample.py`, `test_report.py`, `test_index.py`. Fake every reading with `patch.object(sample, …)` on the module paths, as `test_sample.py` fakes `MEMINFO` and `PRESSURE` now; never read live `/proc`. Cases: all readings present; CPU without a `full` line; a missing CPU, IO or stat file (sample still written, that field `None`); a malformed `/proc/stat`; the report shares for two hosts with known deltas; a reboot between samples; a gap over `MAX_SAMPLE_GAP_S`; old rows with NULL columns next to new rows; no samples; the memory stall line unchanged.
+**Workers:** `2 writers` — open workers, or new ones when Phase 2's are still busy.
+- `impl` — `roster.py`, `build_queue.py`, `build_targets.py`, `commands/build/queue.md`, `commands/build/status.md`, `docs/as-built/build-memory-admission.md`
+- `test` — `test_roster.py`, `test_build_queue.py`, `test_build_targets.py`. Fake the session records, the showrunner registry and the unit marks; never read the live roster or live sessions. Cases: a unit director, a Codex worker under it, a showrunner, an unmatched session, a style unit whose session name already leads with its showrunner's (`cargo-liner-style-types`); `unit_labels` and `unit_labels_for` agree on one session; the `Unit` header in both queue tables; a status claim with a named holder, with an unknown holder, with no holder session, and with a lookup that raises.
 
-**Constraints from prior phases:** Phase 1 changed only `/build:queue`; nothing here depends on it.
+**Constraints from prior phases:** Phase 1 added the queue's identity columns and `session_labels`; this phase moves that function, so every expectation it changes on purpose needs its own `Assertion-Change: <path>::<test> — <why>` line (no `::*`). `roster.py` serves every production's messaging; its owner is named in the checkpoint notice's also-touches line. No file here overlaps Phase 2, so the two phases can run side by side.
 
 **Acceptance gate:**
-- `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` green, and the production Merge tests (`env HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only`) green.
-- `basedpyright scripts/buildlog`: `0 errors, 0 warnings`.
-- Live check on natedev from the worktree: run the sampler once with `BUILDLOG_DIR` set to a scratch folder and read the JSONL line: all seven fields hold integers (`cpu_stall_full_us` may be `null` if the kernel omits it). Then build a report from a scratch log with two such samples a minute apart and see the new section with shares between 0% and 100%.
-- Speed: one sample reads three more small `/proc` files. Time 20 runs of `sample()` before and after with live readings: the median grows by at most 2 ms.
+- `python3 -m unittest scripts.message.test_roster scripts.build_queue.test_build_queue scripts.build_targets.test_build_targets` green, and the production Merge tests green.
+- `basedpyright` on the six Python files: `0 errors, 0 warnings`.
+- Live check on natedev from the worktree: `/build:queue` shows `Unit` with short unit names; `/build:status` shows `(showrunner <name>, unit <name>)` after each running Mac claim whose holder runs.
+- Speed: `/build:status` median of 10 runs grows by at most 0.2 s (now about 0.3 s); `/build:queue` does not get slower.
+
+### Phase 4 — Copy folders take one showrunner-unit name  · status: todo
+
+**Depends on:** Phase 3
+
+#### Work Order
+
+**Goal:** One function in `roster.py` gives the `<showrunner>-<unit>` folder name that verify-unit's copies helper puts in `/tmp/claude/copies/<showrunner>-<unit>/<phase>-<purpose>`, from Phase 3's `UnitLabels`, so no caller joins names itself.
+
+**Spec:**
+
+1. **`UnitLabels.folder_name() -> str`** (`scripts/message/roster.py`). It joins the showrunner and unit names with `-`: showrunner `hana`, unit `lfo` gives `hana-lfo`.
+2. **No doubled showrunner.** When the unit name is the showrunner name, or starts with the showrunner name and `-`, the unit name alone is the folder name: showrunner `cargo-liner-style`, unit `cargo-liner-style-types` gives `cargo-liner-style-types`.
+3. **A missing part is dropped.** A `—` part is left out with its hyphen: showrunner `builds` and no unit gives `builds`; no showrunner and unit `lfo` gives `lfo`. With both missing, the session name is the folder name.
+4. **Callers pass the director's session.** The docstring says: look up labels with `unit_labels_for([<session id from build_hold.owning_session()>], environment)`, so a Codex worker resolves to its unit director. This phase changes no caller; verify-unit's copies helper is the first.
+
+**Files:**
+- `scripts/message/roster.py` — `UnitLabels.folder_name`
+- `scripts/message/test_roster.py` — four tests
+
+**Workers:** `1 writer` — `impl2` (it wrote Phase 3's `UnitLabels`): both files. Tests build `UnitLabels` values directly; they read no live roster or session. Cases: plain join; unit that leads with its showrunner's name; one part missing (each side); both missing.
+
+**Constraints from prior phases:** Phase 3 put `UnitLabels`, `unit_labels` and `unit_labels_for` in `roster.py`; `—` marks a missing relationship. `roster.py` belongs to natedev's `scripts/message/` owner (shutdown-unit), so the checkpoint notice carries its also-touches line, trial-merged against origin/natedev and origin/natedev-shutdown. A changed existing expectation needs its own `Assertion-Change: <path>::<test> — <why>` line.
+
+**Acceptance gate:**
+- `python3 -m unittest scripts.message.test_roster` green, and the production Merge tests green.
+- `basedpyright scripts/message/roster.py scripts/message/test_roster.py`: `0 errors, 0 warnings, 0 notes`.
+- Live check on natedev from the worktree: `unit_labels_for` for this session's id, then `folder_name()`, prints `builds-report`.
