@@ -1146,6 +1146,12 @@ def _heal_folder_trust(session: Session, folder: Path, config_dir: Path, *, dry_
         raise FolderNotTrusted(reason, accounts.trust_command(folder, accounts.NamedAccount(target, config_dir)))
 
 
+def _prepare_resume_environment(session_id: str, cwd: str, environment: dict[str, str],
+                                unset_variables: frozenset[str]) -> herdr.PreparedAgentEnvironment | herdr.nix_env.Refused:
+    """Consume a healer's scoped proof, or load before any window is restored."""
+    return herdr.prepare_session_environment(session_id, cwd, environment, unset_variables)
+
+
 def _herdr_launch(
     parts: ResumeParts, destination: HerdrDestination, session: Session, *, dry_run: bool,
     session_kind: herdr.SecuritySession | herdr.SessionKindNotRead = _SESSION_KIND_NOT_READ,
@@ -1174,6 +1180,10 @@ def _herdr_launch(
         print(f"herdr {name}: resume {session['session_id']} in {location}")
         return HerdrLaunch(herdr.ServerAdopted(), herdr.PromptNotSubmitted("dry run"))
     try:
+        prepared_environment = _prepare_resume_environment(session["session_id"], parts.cwd, environment,
+                                                          frozenset(unset_variables))
+        if isinstance(prepared_environment, herdr.nix_env.Refused):
+            raise herdr.HerdrFailure(prepared_environment.reason)
         server = herdr.restore_server(name, 90_000,
             session_kind=herdr.security_session() if isinstance(session_kind, herdr.SessionKindNotRead) else session_kind)
         server_environment = herdr.server_environment(name)
@@ -1183,8 +1193,11 @@ def _herdr_launch(
                     f"herdr server {name} carries {variable} from where it started; "
                     + f"start the {name} server again from a shell without it, then restart"
                 )
-        if isinstance(server, (herdr.ServerCreated, herdr.WindowServerCreated)) and herdr.keeps_restored_layout(name):
+        if (isinstance(server, (herdr.ServerCreated, herdr.WindowServerCreated)) and herdr.keeps_restored_layout(name)
+                and not os.environ.get(herdr.nix_env.HEAL_SESSION_ENV)):
             # The restored panes no shutdown record owns come back on their own accounts.
+            # A heal is scoped to its prepared session; unrelated panes could
+            # otherwise load direnv after the healer's final hold check.
             import pane_restore
 
             try:
@@ -1211,14 +1224,11 @@ def _herdr_launch(
                 # The session resumes in its own new tab, so a busy old pane is left as it is.
                 print(f"herdr {name}:{destination.pane_id}: pane runs {', '.join(activity.commands)}; left open")
         _record_scheduled_restart_prompt(session["session_id"], parts.opening_prompt, dry_run=False)
-        pane = herdr.open_tab(name, herdr_space(session), session["name"], parts.cwd, environment)
-        try:
-            outcome = client.start_agent(session["name"], pane, kind="claude", agent_arguments=list(parts.claude_arguments),
-                opening=herdr.OpeningPrompt(parts.opening_prompt,
-                    herdr.SessionTranscript(config_dir, session["session_id"])), timeout_ms=90_000)
-        except herdr.AgentExited:
-            herdr.close_agent(name, pane)
-            raise
+        launched = herdr.launch_prepared_agent(name, herdr_space(session), session["name"], prepared_environment,
+            kind="claude", agent=session["name"], agent_arguments=list(parts.claude_arguments),
+            opening=herdr.OpeningPrompt(parts.opening_prompt,
+                herdr.SessionTranscript(config_dir, session["session_id"])), timeout_ms=90_000)
+        pane, outcome = launched.pane, launched.outcome
         if isinstance(server, (herdr.ServerAdopted, herdr.WindowServerCreated)):
             focused = _focus_restored_pane(client, pane, session["name"])
             if focused and isinstance(server, herdr.WindowServerCreated):
@@ -2681,14 +2691,14 @@ def _launch_codex_snapshot(
     if dry_run:
         print(f"herdr {name}: CODEX_HOME={launch['home']} codex {shlex.join(arguments)} in a new tab in {herdr_space(owner)}")
         return SessionLaunched()
+    prepared_environment = _prepare_resume_environment(owner["session_id"], owner["cwd"],
+        {"CODEX_HOME": launch["home"]}, herdr.NO_ENVIRONMENT_REMOVALS)
+    if isinstance(prepared_environment, herdr.nix_env.Refused):
+        raise herdr.HerdrFailure(prepared_environment.reason)
     server = herdr.restore_server(name, 90_000, session_kind=state.session_kind)
-    pane = herdr.open_tab(name, herdr_space(owner), title, owner["cwd"], {"CODEX_HOME": launch["home"]})
-    try:
-        _ = herdr.start_agent(name, pane, kind="codex", agent=title, agent_arguments=arguments,
-                          opening=herdr.NoOpeningPrompt(), timeout_ms=90_000)
-    except (herdr.HerdrFailure, OSError, subprocess.SubprocessError):
-        herdr.close_agent(name, pane)
-        raise
+    launched = herdr.launch_prepared_agent(name, herdr_space(owner), title, prepared_environment,
+        kind="codex", agent=title, agent_arguments=arguments, opening=herdr.NoOpeningPrompt(), timeout_ms=90_000)
+    pane = launched.pane
     focused = _focus_restored_pane(herdr.Herdr(name), pane, owner["name"])
     if focused and isinstance(server, herdr.WindowServerCreated):
         _close_startup_workspaces(herdr.Herdr(name), pane)

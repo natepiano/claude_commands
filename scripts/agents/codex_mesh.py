@@ -66,7 +66,6 @@ import os
 import re
 import secrets
 import shlex
-import shutil
 import signal
 import socket
 import struct
@@ -83,7 +82,7 @@ from typing import TYPE_CHECKING, Literal, NoReturn, NotRequired, NamedTuple, Te
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.accounts.role_map import role_map_command, RoleMapUnavailable, RoleAccountUnavailable  # noqa: E402
 from scripts.direct import plan_history
-from scripts.lib import unit_runs
+from scripts.lib import nix_env, unit_runs
 from scripts.guilds.roles import PhaseBoundDesigner, ReadOnlyReviewer, ThreadAccessPolicy
 from scripts.message import sessions, process_table
 from scripts.whoami import account
@@ -258,7 +257,7 @@ COMPACT_IDLE_POLL_SECS = 1
 # `compact` exits with this when the thread still has a live turn, so no follow-up can be sent.
 COMPACT_TURN_STILL_LIVE = 3
 SERVER_START_TIMEOUT_SECS = 30
-# Cold direnv/Nix evaluation happens before the app-server can listen.
+# Keep the dev-shell server's startup allowance and sweep grace consistent.
 DEV_SHELL_START_TIMEOUT_SECS = 300
 # Codex compacts a thread on its own once its context passes this many tokens. Every request
 # re-reads the whole context, and threads left to Codex's default grew to 460K; a 200K cap cut a
@@ -334,19 +333,18 @@ class ServerRecord(TypedDict):
 
 @dataclass(frozen=True)
 class InheritedServerEnvironment:
-    """No allowed unit worktree dev-shell applies to this launch."""
+    """No unit worktree dev-shell applies to this launch."""
 
 
 @dataclass(frozen=True)
-class AllowedDevShell:
-    """Direnv has authorized the nearest .envrc for this unit's cwd."""
+class WorktreeDevShell:
+    """The nearest unit worktree shell to load and prove before launch."""
 
     worktree: Path
-    direnv: str
     input_revision: str
 
 
-ServerDevShell = InheritedServerEnvironment | AllowedDevShell
+ServerDevShell = InheritedServerEnvironment | WorktreeDevShell
 _INHERITED_SERVER_ENVIRONMENT = InheritedServerEnvironment()
 
 
@@ -365,7 +363,7 @@ class RememberedDevShellFailure:
     input_revision: str
     retry_at: float
 
-    def suppresses(self, dev_shell: AllowedDevShell) -> bool:
+    def suppresses(self, dev_shell: WorktreeDevShell) -> bool:
         return (self.worktree == dev_shell.worktree
                 and self.input_revision == dev_shell.input_revision
                 and time.time() < self.retry_at)
@@ -2096,66 +2094,41 @@ def held_thread_end_confirmed(session_dir: str, thread_id: str) -> bool:
 
 
 def _server_dev_shell(session_dir: str, cwd: str | None) -> DevShellProbe:
-    """Ask direnv for permission without evaluating a worktree's environment."""
+    """Select the nearest unit shell; nix_env owns approval and evaluation."""
     if not cwd or Path(session_dir).resolve().parent not in {root.resolve() for root in RUN_ROOTS}:
         return InheritedServerEnvironment()
     try:
-        directory = Path(cwd).resolve()
-        candidates = (directory, *directory.parents)
-        rc_folders = [folder for folder in candidates if (folder / ".envrc").is_file()]
-        if not rc_folders:
+        envrc = nix_env.nearest_envrc(Path(cwd))
+        if envrc is None:
             return InheritedServerEnvironment()
-        direnv = shutil.which("direnv")
-        if direnv is None:
-            return DevShellProbeUnavailable("direnv is not on PATH")
-        status = subprocess.run(
-            [direnv, "status", "--json"], cwd=directory,
-            capture_output=True, text=True, check=True, timeout=5,
+        revisions: dict[str, str] = {}
+        for name in (".envrc", "flake.nix", "flake.lock", "shell.nix", "default.nix", "devenv.nix"):
+            try:
+                info = (envrc.parent / name).stat()
+                revisions[name] = f"{info.st_mtime_ns}:{info.st_ctime_ns}:{info.st_size}"
+            except FileNotFoundError:
+                revisions[name] = "absent"
+        dev_shell = WorktreeDevShell(envrc.parent, json.dumps(revisions, sort_keys=True))
+        failed = _read_json_object(_session_path(session_dir, FAILED_DEV_SHELL_FILE))
+        failure = RememberedDevShellFailure(
+            Path(_as_str(failed.get("worktree"))), _as_str(failed.get("input_revision")),
+            _as_float(failed.get("retry_at"), 0),
         )
-        state = _as_dict(_as_dict(_loads(status.stdout)).get("state"))
-        if "foundRC" in state and state["foundRC"] is None:
-            return InheritedServerEnvironment()
-        found = _as_dict(state.get("foundRC"))
-        allowed = found.get("allowed")
-        # Direnv's AllowStatus is an integer enum: 0 allowed, 1 unapproved, 2 denied.
-        rc_path = Path(_as_str(found.get("path")))
-        if rc_path != rc_folders[0] / ".envrc":
-            return DevShellProbeUnavailable("direnv did not identify the nearest .envrc")
-        if type(allowed) is int:
-            if allowed == 0:
-                revisions: dict[str, str] = {}
-                for name in (".envrc", "flake.nix", "flake.lock", "shell.nix", "default.nix", "devenv.nix"):
-                    try:
-                        info = (rc_path.parent / name).stat()
-                        revisions[name] = f"{info.st_mtime_ns}:{info.st_ctime_ns}:{info.st_size}"
-                    except FileNotFoundError:
-                        revisions[name] = "absent"
-                dev_shell = AllowedDevShell(rc_path.parent, direnv, json.dumps(revisions, sort_keys=True))
-                failed = _read_json_object(_session_path(session_dir, FAILED_DEV_SHELL_FILE))
-                failure = RememberedDevShellFailure(
-                    Path(_as_str(failed.get("worktree"))), _as_str(failed.get("input_revision")),
-                    _as_float(failed.get("retry_at"), 0),
-                )
-                if failure.suppresses(dev_shell):
-                    return failure
-                return dev_shell
-            if allowed in (1, 2):
-                return InheritedServerEnvironment()
-        return DevShellProbeUnavailable("direnv returned an unknown allowance")
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        return failure if failure.suppresses(dev_shell) else dev_shell
+    except (OSError, ValueError) as error:
         return DevShellProbeUnavailable(str(error))
 
 
 def _remember_server_dev_shell(session_dir: str, dev_shell: ServerDevShell) -> None:
     """Keep the last successful shell across idle-stop, separately from the live record."""
     path = _session_path(session_dir, DEV_SHELL_FILE)
-    if isinstance(dev_shell, AllowedDevShell):
+    if isinstance(dev_shell, WorktreeDevShell):
         _ = path.write_text(json.dumps({"worktree": str(dev_shell.worktree)}), encoding="utf-8")
     else:
         path.unlink(missing_ok=True)
 
 
-def _remember_failed_dev_shell(session_dir: str, dev_shell: AllowedDevShell) -> None:
+def _remember_failed_dev_shell(session_dir: str, dev_shell: WorktreeDevShell) -> None:
     """Retry failed evaluations after an input change or a thirty-minute cooldown."""
     failure = RememberedDevShellFailure(dev_shell.worktree, dev_shell.input_revision, time.time() + 30 * 60)
     _ = _session_path(session_dir, FAILED_DEV_SHELL_FILE).write_text(json.dumps({
@@ -2186,7 +2159,7 @@ def ensure_server(session_dir: str, home: Path | None = None, cwd: str | None = 
         # Read failures under the same lock as launch: another caller may have
         # just fallen back for this revision while this caller was acquiring it.
         dev_shell = _server_dev_shell(session_dir, cwd)
-        dev_shell_worktree = str(dev_shell.worktree) if isinstance(dev_shell, AllowedDevShell) else ""
+        dev_shell_worktree = str(dev_shell.worktree) if isinstance(dev_shell, WorktreeDevShell) else ""
         path = _session_path(session_dir, SERVER_FILE)
         record = _read_json_object(path)
         port = record.get("port")
@@ -2201,7 +2174,7 @@ def ensure_server(session_dir: str, home: Path | None = None, cwd: str | None = 
             if matching_home and not old_sign_in and not old_limit and not old_dev_shell:
                 # The record's change time is when the server was last used; its watcher reads it.
                 os.utime(path)
-                if isinstance(dev_shell, AllowedDevShell):
+                if isinstance(dev_shell, WorktreeDevShell):
                     _remember_server_dev_shell(session_dir, dev_shell)
                 elif cwd is not None and isinstance(dev_shell, InheritedServerEnvironment):
                     _remember_server_dev_shell(session_dir, dev_shell)
@@ -2223,7 +2196,7 @@ def ensure_server(session_dir: str, home: Path | None = None, cwd: str | None = 
             dev_shell = _server_dev_shell(session_dir, remembered or None)
         if isinstance(dev_shell, DevShellProbeUnavailable):
             _log_server(session_dir, f"dev-shell probe unavailable: {dev_shell.reason}; starting with caller environment")
-        if isinstance(dev_shell, AllowedDevShell):
+        if isinstance(dev_shell, WorktreeDevShell):
             return _start_server(session_dir, selected_home, dev_shell), True
         if isinstance(dev_shell, InheritedServerEnvironment):
             _remember_server_dev_shell(session_dir, dev_shell)
@@ -2280,14 +2253,25 @@ def _start_server(
         command = ["codex", "-c", "thread_unload_delay_secs=0", "-c", f"model_auto_compact_token_limit={AUTO_COMPACT_TOKENS}",
                    "-c", f"background_terminal_max_timeout={BACKGROUND_TERMINAL_MAX_TIMEOUT_MS}",
                    "app-server", "--listen", f"ws://127.0.0.1:{chosen}"]
-        if isinstance(dev_shell, AllowedDevShell):
-            # Apply these AFTER direnv: its .envrc and environment reversion must not choose
-            # the workers home, run, temporary folder, or held-design identity. Both direnv
-            # (syscall.Exec in cmd_exec.go) and env exec their command, retaining process.pid.
-            protected = ("CODEX_HOME", "UNIT_RUN_DIR", "TMPDIR", "CLAUDE_CODE_SESSION_ID",
-                         "GUILD_DESIGN_ID", "GUILD_BINDING_GENERATION")
-            command = [dev_shell.direnv, "exec", str(dev_shell.worktree), shutil.which("env") or "/usr/bin/env",
-                       *(f"{key}={environment[key]}" for key in protected if key in environment), *command]
+        if isinstance(dev_shell, WorktreeDevShell):
+            loaded = nix_env.ensure(dev_shell.worktree, environment)
+            if isinstance(loaded, nix_env.Loaded):
+                # A worktree can choose build flags, but cannot choose the server's
+                # account, run, temporary folder or held-design identity.
+                protected = ("CODEX_HOME", "UNIT_RUN_DIR", "TMPDIR", "CLAUDE_CODE_SESSION_ID",
+                             "GUILD_DESIGN_ID", "GUILD_BINDING_GENERATION")
+                loaded_environment = dict(loaded.env)
+                for key in protected:
+                    if key in environment:
+                        loaded_environment[key] = environment[key]
+                    elif key in loaded_environment:
+                        del loaded_environment[key]
+                environment = loaded_environment
+            else:
+                if isinstance(loaded, nix_env.Refused):
+                    _log_server(session_dir, loaded.reason)
+                    _remember_failed_dev_shell(session_dir, dev_shell)
+                dev_shell = _INHERITED_SERVER_ENVIRONMENT
         try:
             with log_path.open("ab") as log_handle:
                 process = subprocess.Popen(
@@ -2298,26 +2282,26 @@ def _start_server(
                     env=environment,
                 )
         except OSError as error:
-            if not isinstance(dev_shell, AllowedDevShell):
+            if not isinstance(dev_shell, WorktreeDevShell):
                 raise
             _remember_failed_dev_shell(session_dir, dev_shell)
-            _log_server(session_dir, f"direnv exec {dev_shell.worktree} failed: {error}; falling back to caller environment")
+            _log_server(session_dir, f"dev-shell app-server {dev_shell.worktree} failed: {error}; falling back to caller environment")
             dev_shell = _INHERITED_SERVER_ENVIRONMENT
             continue
         served: ServerRecord = {"port": chosen, "pid": process.pid, "codex_home": str(workers_home),
                                 "auto_compact_tokens": AUTO_COMPACT_TOKENS}
-        if isinstance(dev_shell, AllowedDevShell):
+        if isinstance(dev_shell, WorktreeDevShell):
             served["dev_shell_worktree"] = str(dev_shell.worktree)
         context = _guild_context(session_dir)
         if context:
             served["guild_context"] = context
         try:
-            if isinstance(dev_shell, AllowedDevShell):
+            if isinstance(dev_shell, WorktreeDevShell):
                 _ = _session_path(session_dir, SERVER_START_FILE).write_text(json.dumps({
                     "pid": process.pid, "port": chosen, "started_at": time.time(),
                     "dev_shell_worktree": str(dev_shell.worktree),
                 }), encoding="utf-8")
-            timeout = DEV_SHELL_START_TIMEOUT_SECS if isinstance(dev_shell, AllowedDevShell) else SERVER_START_TIMEOUT_SECS
+            timeout = DEV_SHELL_START_TIMEOUT_SECS if isinstance(dev_shell, WorktreeDevShell) else SERVER_START_TIMEOUT_SECS
             deadline = time.time() + timeout
             while time.time() < deadline:
                 if process.poll() is not None:
@@ -2331,7 +2315,7 @@ def _start_server(
                     continue
                 probe.close()
                 _record_started_server(session_dir, served)
-                if isinstance(dev_shell, AllowedDevShell):
+                if isinstance(dev_shell, WorktreeDevShell):
                     _remember_server_dev_shell(session_dir, dev_shell)
                     _session_path(session_dir, FAILED_DEV_SHELL_FILE).unlink(missing_ok=True)
                 if context:
@@ -2343,10 +2327,10 @@ def _start_server(
             raise SystemExit(f"codex_mesh: app-server did not accept connections on {chosen}")
         except BaseException as error:
             _discard_failed_server_start(session_dir, served, process)
-            if not isinstance(error, SystemExit) or not isinstance(dev_shell, AllowedDevShell):
+            if not isinstance(error, SystemExit) or not isinstance(dev_shell, WorktreeDevShell):
                 raise
             _remember_failed_dev_shell(session_dir, dev_shell)
-            _log_server(session_dir, f"direnv exec {dev_shell.worktree} failed: {error}; falling back to caller environment")
+            _log_server(session_dir, f"dev-shell app-server {dev_shell.worktree} failed: {error}; falling back to caller environment")
             dev_shell = _INHERITED_SERVER_ENVIRONMENT
         finally:
             pending = _session_path(session_dir, SERVER_START_FILE)

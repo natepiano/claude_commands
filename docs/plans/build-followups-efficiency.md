@@ -59,7 +59,7 @@ Showrunner of build-followups, 2026-10-28 (measured by builds-unit):
 
 **Acceptance:** both test modules pass; basedpyright clean; the full merge gate `--tests-only` adds no failure to the origin tip.
 
-### Phase 6 — Every Claude and Codex session starts inside its worktree's nix shell  · status: in review
+### Phase 6 — Every Claude and Codex session starts inside its worktree's nix shell  · status: done
 
 **Source:** the user, via the showrunner, 2026-10-28: "it has to be rock solid reliable - never fail again"; "bare claude should be forced to use this also".
 
