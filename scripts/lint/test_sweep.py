@@ -150,6 +150,14 @@ def run_sweep(target: Target, budget: int, dry_run: bool) -> tuple[int, str]:
 
 
 class SweepCase(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            sweep.FLOOR_STATE_ENV: str(state / "sweep"),
+            sweep.BUILDLOG_DIR_ENV: str(state / "buildlog"),
+        })))
+
     def target(self) -> Target:
         return Target(Path(self.enterContext(tempfile.TemporaryDirectory())).resolve())
 
@@ -478,8 +486,63 @@ class FloorTests(SweepCase):
             sweep.floor_record_path(),
             sweep.FloorRecord(time.time() - age, free, caches,
                               sweep.DeliveredAlert(alert_at) if alert_at is not None else sweep.NoDeliveredAlert(),
-                              sweep.DeliveredAlert(push_at) if push_at is not None else sweep.NoDeliveredAlert()),
+                              sweep.DeliveredAlert(push_at) if push_at is not None else sweep.NoDeliveredAlert(),
+                              sweep.KnownHeldRoots(frozenset())),
         )
+
+    def test_a_changed_held_root_set_does_not_report_its_missing_bytes_as_growth(self) -> None:
+        base = self.base()
+        tree, output = cargo_target(base, "idle", APP, time.time() - DAY)
+        held_tree, _ = cargo_target(base, "held", DEMO, time.time() - DAY)
+        caches = sweep.directory_blocks(str(tree.parent))
+        self.prior(int(10.2 * GIB), caches + 35 * GIB)
+        protected = {str(held_tree.parent): sweep.BuildHoldTarget("build-speed")}
+        with (mock.patch.object(sweep, "build_hold_targets", return_value=protected),
+              mock.patch.object(sweep, "send_floor_alert") as send):
+            status, _ = self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB])
+        self.assertEqual(status, 0)
+        self.assertFalse(output.exists())
+        send.assert_not_called()
+        record = sweep.read_floor_record(sweep.floor_record_path())
+        assert isinstance(record, sweep.FloorRecord)
+        self.assertEqual(record.held_roots, sweep.KnownHeldRoots(frozenset(protected)))
+        data = cast(dict[str, object], json.loads(sweep.floor_record_path().read_text()))
+        self.assertEqual(data["held_roots"], [str(held_tree.parent)])
+
+    def test_the_same_held_roots_still_report_an_unexplained_free_space_fall(self) -> None:
+        base = self.base()
+        tree, output = cargo_target(base, "idle", APP, time.time() - DAY)
+        held_tree, _ = cargo_target(base, "held", DEMO, time.time() - DAY)
+        protected = {str(held_tree.parent): sweep.BuildHoldTarget("build-speed")}
+        sweep.write_floor_record(sweep.floor_record_path(), sweep.FloorRecord(
+            time.time() - 60, 30 * GIB, sweep.directory_blocks(str(tree.parent)),
+            sweep.NoDeliveredAlert(), sweep.NoDeliveredAlert(), sweep.KnownHeldRoots(frozenset(protected))))
+        with (mock.patch.object(sweep, "build_hold_targets", return_value=protected),
+              mock.patch.object(sweep, "send_floor_alert", return_value=True) as send):
+            status, _ = self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB])
+        self.assertEqual(status, 0)
+        self.assertFalse(output.exists())
+        send.assert_called_once()
+        self.assertIn("free space fell more than 10 GiB beyond build-cache growth", cast(str, send.call_args.args[0]))
+
+    def test_an_old_record_without_held_roots_does_not_fire_a_growth_alert(self) -> None:
+        base = self.base()
+        tree, output = cargo_target(base, "idle", APP, time.time() - DAY)
+        path = sweep.floor_record_path()
+        path.parent.mkdir()
+        _ = path.write_text(json.dumps({
+            "measured_at": time.time() - 60, "free_bytes": 30 * GIB,
+            "build_cache_bytes": sweep.directory_blocks(str(tree.parent)),
+            "last_alert_at": None, "last_push_at": None,
+        }))
+        previous = sweep.read_floor_record(path)
+        assert isinstance(previous, sweep.FloorRecord)
+        self.assertIsInstance(previous.held_roots, sweep.UnknownHeldRoots)
+        with mock.patch.object(sweep, "send_floor_alert") as send:
+            status, _ = self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB])
+        self.assertEqual(status, 0)
+        self.assertFalse(output.exists())
+        send.assert_not_called()
 
     def test_cache_growth_explains_free_space_fall(self) -> None:
         base = self.base()
@@ -1475,6 +1538,54 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
             "for": "timed builds", "release_eta": "unknown",
         }))
 
+    def test_own_deletes_do_not_hold_a_target_but_a_later_build_write_does(self) -> None:
+        base = self.base()
+        now = time.time()
+        tree, removed = cargo_target(base, "external", APP, now - DAY)
+        remaining = unit(tree, "deps", "remaining", DEMO, now - DAY)
+        for path in tree.parent.rglob("*"):
+            os.utime(path, (now - DAY, now - DAY))
+        self.write_build_hold(base, now - 60)
+        with mock.patch.object(time, "time", return_value=now):
+            self.assertEqual(sweep.remove([sweep.Group("unit", str(tree), [str(removed)])]), 0)
+            # A coarse filesystem can date the delete up to two seconds after the clock reading.
+            os.utime(tree / "deps", (now + 2, now + 2))
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(sweep.build_hold_targets([str(tree.parent)], {}), {})
+            recorded = cast(dict[str, object], json.loads(sweep.target_deletes_path().read_text()))
+            self.assertEqual(recorded[str(tree.parent)], now)
+            self.assertFalse(removed.exists())
+            self.assertTrue(remaining.exists())
+            os.utime(tree / "deps", (now + 3, now + 3))
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(sweep.build_hold_targets([str(tree.parent)], {}),
+                                 {str(tree.parent): sweep.BuildHoldTarget("build-speed")})
+
+    def test_delete_records_drop_missing_roots_and_roots_older_than_a_day(self) -> None:
+        base = self.base()
+        now = time.time()
+        tree, removed = cargo_target(base, "current", APP, now - DAY)
+        old_tree, _ = cargo_target(base, "old", DEMO, now - 2 * DAY)
+        path = sweep.target_deletes_path()
+        path.parent.mkdir()
+        _ = path.write_text(json.dumps({str(old_tree.parent): now - DAY - 1,
+                                        str(base / "missing"): now - 60}))
+        with mock.patch.object(time, "time", return_value=now):
+            self.assertEqual(sweep.remove([sweep.Group("unit", str(tree), [str(removed)])]), 0)
+        self.assertEqual(json.loads(path.read_text()), {str(tree.parent): now})
+        self.assertFalse(removed.exists())
+
+    def test_doc_index_removal_records_the_target_delete(self) -> None:
+        base = self.base()
+        now = time.time()
+        tree, _ = cargo_target(base, "docs", APP, now - DAY)
+        doc = tree.parent / "doc"
+        _ = write(doc / "search.index" / "index")
+        with mock.patch.object(time, "time", return_value=now), redirect_stdout(io.StringIO()):
+            self.assertEqual(sweep.prune_doc_index([str(tree.parent)], 0, False), 0)
+        self.assertFalse(doc.exists())
+        self.assertEqual(json.loads(sweep.target_deletes_path().read_text()), {str(tree.parent): now})
+
     def test_a_holders_idle_workspace_target_is_never_locked_or_scanned(self) -> None:
         base = self.base()
         since = time.time()
@@ -1487,6 +1598,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         before = {path.relative_to(tree.parent): path.read_bytes()
                   for path in tree.parent.rglob("*") if path.is_file()}
         self.write_build_hold(base, since)
+        sweep.record_target_deletes([str(tree.parent)])
         record = cast(sessions.SessionRecord, cast(object, {
             "sessionId": "holder-session", "pid": 4242, "name": "build-speed",
         }))

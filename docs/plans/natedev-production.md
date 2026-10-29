@@ -4,12 +4,13 @@
 
 ## Production Context
 
+- **Formerly:** `build-followups`
 - **Source plans:** `docs/plans/build-followups.md` (now `docs/as-built/build-followups.md`), `docs/plans/build-followups-stalls.md` (now `docs/as-built/buildlog-memory-stalls.md`), `docs/plans/build-followups-ratio.md` (now `docs/as-built/buildlog-tests-per-edit-rust-release.md`), `docs/plans/build-followups-memory.md` (the user, 2026-10-04 11:46 PDT; now `docs/as-built/build-memory-admission.md`), `docs/plans/build-followups-notifier.md` (now `docs/as-built/validate-and-push-cancel-prior.md`), `docs/plans/build-followups-screen-record.md` (the user, 2026-10-06; now `docs/as-built/screen-record.md`), `docs/as-built/build-followups-fn-length-hook.md (run done; as-built 4ab5e4c)` (the user, 2026-10-06), `docs/plans/build-followups-mul-add.md` (now `docs/as-built/build-followups-mul-add.md`) (the user, 2026-10-06 08:2x PDT), `docs/plans/build-followups-screenshot.md` and `docs/plans/build-followups-enh-showrunner.md` (the user, 2026-10-06; now `docs/as-built/showrunner-automation.md`), and `docs/plans/build-followups-kill-order.md` (natedev, 2026-10-06, after earlyoom killed CI compilers before a hung 15 GB test; now `docs/as-built/build-memory-admission.md`), and `docs/plans/build-followups-test-speed.md` (the user, 2026-10-13; now `docs/as-built/merge-gate-and-test-speed.md`) — written 2026-10-04 by natedev from the adhoc review's five follow-up tasks (user: "launch it as a plan for a unit director to execute"; "you must use /showrunner:produce for this and start running dailies")
 - **Repository:** `/home/natepiano/.claude`
-- **Merge branch:** `build-followups` — every unit merges here; only the showrunner pushes it
+- **Merge branch:** `natedev` — every unit merges here; only the showrunner pushes it
 - **Showrunner checkout:** `/home/natepiano/worktrees/claude-build-followups-trunk`
 - **Showrunner session:** natedev
-- **Log:** `docs/plans/build-followups-log.md` — git-excluded; one line per event
+- **Log:** `docs/plans/natedev-log.md` — git-excluded; one line per event
 - **Change review:** `~/rust/hanadocs/change-review/change-review - natedev.md` — changes for the user to check, read only when the user asks; never open questions
 - **User zone:** America/Curacao (AST) — every time the showrunner reports is in this zone only (user, 2026-10-21: "My time zone is Curacao- I think that's ast. Please adjust"; EDT from 2026-10-12, PDT from 2026-10-04). user_zone.conf is the setting; this line only records it
 - **Updates:** on demand (user, 2026-10-10: dailies only when the user asks); each dailies lists every unit; a simple dailies gives each waiting, idle unit one line
@@ -46,11 +47,11 @@
 | messaging-unit | `docs/as-built/message-clarity.md` (run done; as-built) | /home/natepiano/worktrees/claude-build-followups-messaging | build-followups-messaging | — | scripts/notify/ |
 | herdr-trial-unit | (retired 2026-10-18, worktree removed) done, as-built `docs/as-built/herdr-adoption.md` (trial: `docs/as-built/herdr-trial.md`) | /home/natepiano/worktrees/claude-build-followups-herdr-trial | build-followups-herdr-trial | — | scripts/herdr/; docs/plans/build-followups-herdr-*.md; docs/as-built/herdr-*.md |
 | herdr-trust-unit | (retired 2026-10-18, worktree removed) `docs/as-built/herdr-adoption.md` (run done; as-built) | /home/natepiano/worktrees/claude-build-followups-herdr-trust | build-followups-herdr-trust | — | — |
-| herdr-unit | docs/as-built/herdr-adoption.md | /home/natepiano/worktrees/claude-build-followups-herdr | build-followups-herdr | — | — |
+| herdr-unit | (retired 2026-10-28, worktree removed, session da928300-b33f-49a3-9898-9380eaaca881) docs/as-built/herdr-adoption.md | /home/natepiano/worktrees/claude-build-followups-herdr | build-followups-herdr | — | — |
 | nightly-review-unit | (retired 2026-10-19, worktree removed) permanent | /home/natepiano/worktrees/claude-build-followups-nightly-review | build-followups-nightly-review | — | — |
 | style-unit | `docs/as-built/style-showrunner.md` (run done; as-built) | /home/natepiano/worktrees/claude-build-followups-style | build-followups-style | — | — |
 | unit-board-unit | docs/as-built/unit-board.md | /home/natepiano/worktrees/claude-build-followups-unit-board | build-followups-unit-board | — | — |
-| hanadocs-unit | standby | /home/natepiano/worktrees/claude-build-followups-hanadocs | build-followups-hanadocs | — | the hanadocs vault (~/rust/hanadocs); commits to its main |
+| hanadocs-unit | (retired 2026-10-28, worktree removed, session 6eaf058b-3fef-41bc-98d3-3c54e63a242a) standby | /home/natepiano/worktrees/claude-build-followups-hanadocs | build-followups-hanadocs | — | the hanadocs vault (~/rust/hanadocs); commits to its main |
 | review-unit | (retired 2026-10-18, worktree removed) docs/plans/build-followups-review.md | /home/natepiano/worktrees/claude-build-followups-review | build-followups-review | — | — |
 | efficiency-unit | docs/as-built/token-efficiency-study.md | /home/natepiano/worktrees/claude-build-followups-efficiency | build-followups-efficiency | — | the efficiency proposals ledger (~/.local/state/nightly-review/ledger.md and its night reports); the token-efficiency investigation |
 | typesafe-unit | docs/plans/build-followups-typesafe.md | /home/natepiano/worktrees/claude-build-followups-typesafe | build-followups-typesafe | — | — |

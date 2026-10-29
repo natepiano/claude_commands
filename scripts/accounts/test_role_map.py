@@ -16,6 +16,7 @@ from typing import Self, cast, override
 from unittest.mock import Mock, patch
 
 from scripts.accounts import accounts, role_map
+from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader
 from scripts.agents import codex_mesh
 from scripts.whoami import agent_accounts
 
@@ -36,6 +37,7 @@ class RoleMapTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        _ = cast(object, self.enterContext(patch.object(accounts, "import_module", side_effect=imports_with_nix_loader(fake_nix_loader()))))
         self.home, self.server_home = root / "mac home", root / "natedev home"
         for home in (self.home, self.server_home):
             (home / ".claude").mkdir(parents=True)

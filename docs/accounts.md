@@ -77,18 +77,19 @@ Run these in a terminal:
 
 | Command | Account |
 | --- | --- |
-| `claude` | The configured showrunners account, through `accounts.py exec showrunners` after the shell alias is updated. |
-| `claude-unit` | The configured units account. |
+| `claude` | The configured showrunners account, through `accounts.py exec showrunners`. `accounts.py exec claude` starts the default `~/.claude` home, which is signed out after home cutover. |
 | `claude1` | claude1 |
 | `claude2` | claude2 |
 | `claude3` | claude3 |
+| `claude4` | claude4 |
 | `codex` | The configured workers account, through `accounts.py exec workers` after the shell alias is updated. |
 | `codex1` | codex1 |
 | `codex2` | codex2 |
 
-These aliases come from natedev's shell configuration after a rebuild; the Mac has none. In a shell without them, run:
+The showrunner installs these aliases in the shell configuration on Linux and the Mac after this change merges. In a shell without them, run:
 
 ```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec claude
 ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec claude3
 ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec showrunners
 ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec codex1
@@ -96,7 +97,9 @@ These aliases come from natedev's shell configuration after a rebuild; the Mac h
 ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec workers
 ```
 
-For Claude labels and groups, arguments pass through to `claude`. Every Claude launch sets `CLAUDE_CONFIG_DIR` to a numbered folder; claude2 uses `~/.claude2` just like the other accounts. `--probe` goes before the label: `accounts.py exec --probe claude3 -n check-idle` sets `CLAUDE_PROBE_SESSION=1` for a throwaway session. Its shutdown record always has `probe: true` and `alerts: "none"`; restart and move preserve the marker. Even a direct `send.py --to user` from that session sends no phone push.
+Every `accounts.py exec` loads the launch folder's shell through the shared `scripts/lib/nix_env.py` helper before it starts Claude, Codex or the terminal supervisor. This applies to numbered labels and `units`, `workers` and `showrunners` on Linux and the Mac. The helper finds the nearest `.envrc` at or above the current directory. It allows that file under `~/rust`, `~/worktrees` or `~/.claude*`; elsewhere, a file that is not allowed refuses the launch and names the `direnv allow` command. A loaded shell must set `IN_NIX_SHELL`. With no `.envrc`, the caller's environment stays in use. A refusal prints the helper's reason and exits 1 without launching an agent. If the shared helper is missing, only the exec command fails with an update message.
+
+The executable is found on the loaded shell's PATH, then in `~/.local/bin`. The search skips executable scripts that invoke `nix_env.py` or `lib.nix_env`, so a plain `claude` or `codex` wrapper cannot load the shell again. If only wrappers are found, the launch fails. After the shell loads, the caller's `HOME` is restored and account variables are applied, so the folder cannot change the selected account or home. For Claude labels and groups, arguments pass through to `claude`. Numbered labels set `CLAUDE_CONFIG_DIR` to their numbered folder; claude2 uses `~/.claude2` just like the other accounts. `exec claude` uses `~/.claude` and removes inherited account, remote-memory and OAuth-token overrides; after home cutover it starts signed out until that home has its own login. It does not select a group. `--probe` goes before the label: `accounts.py exec --probe claude3 -n check-idle` sets `CLAUDE_PROBE_SESSION=1` for a throwaway session. Its shutdown record always has `probe: true` and `alerts: "none"`; restart and move preserve the marker. Even a direct `send.py --to user` from that session sends no phone push.
 
 `scripts/accounts/hello.sh <claudeN>` starts a throwaway probe session on that account, sends hello, prints the reply and exits. It needs no prompt; an allow rule covers it.
 
@@ -248,7 +251,7 @@ Run from a terminal (`CLAUDE_CODE_SESSION_ID` unset, stdout a tty), the move the
 
 Each return keeps the conversation, cwd, name, model and production resume prompt, including a unit director's ongoing run. A manual restart outcome supplies its command and place. The target is checked again at launch; its prepared environment drops inherited OAuth tokens without changing credentials or other sessions.
 
-Numbered Claude aliases through `accounts.py exec` use the terminal supervisor when stdin is a tty. Its child gets `RELAUNCH_SUPERVISED=1`; a resumed `accounts.py exec` sees that marker and execs Claude directly. Redirected and already supervised launches also exec Claude directly. Tmux respawns its existing pane. Supervised Ghostty and Terminal restarts keep the same window and scroll history; the existing fallback opens a new window if the supervisor is gone or its identity changed. Legacy Ghostty and Zed windows use the recorded desktop restart path.
+Every Claude launch through `accounts.py exec` (numbered labels, groups and `exec claude`) uses the terminal supervisor when stdin is a tty. Its child gets `RELAUNCH_SUPERVISED=1`; a resumed `accounts.py exec` sees that marker and execs Claude directly. Redirected and already supervised launches also exec Claude directly. Tmux respawns its existing pane. Supervised Ghostty and Terminal restarts keep the same window and scroll history; the existing fallback opens a new window if the supervisor is gone or its identity changed. Legacy Ghostty and Zed windows use the recorded desktop restart path.
 
 ## Picking an account
 
@@ -262,7 +265,7 @@ A role mapped to an account missing on this machine refuses with `accounts: <rol
 
 `groups.json` stores explicitly selected group accounts. A manual group move, a refusal move or an account move entry writes it; selecting one group leaves the other unconfigured. Both groups may use the same account. Changes append `{at, group, label, why}` to `roles.jsonl`; historical burn skips these group entries. Launches, status, `accounts.py placement --explain` and the refusal watcher never initialize missing selections. Status and previews print `not configured`, and the watcher moves no member of an unconfigured group.
 
-`claude-unit`, `exec unit`, `env unit` and `role unit` use the units account; `role showrunner` and new showrunner launches use the showrunners account. The legacy `unit` configuration key is ignored; `set-role unit` and `swap unit` refuse. Codex workers retain their own role.
+`exec unit`, `env unit` and `role unit` use the units account; `role showrunner` and new showrunner launches use the showrunners account. The legacy `unit` configuration key is ignored; `set-role unit` and `swap unit` refuse. Codex workers retain their own role.
 
 New units and showrunners save `@claude_config_dir` and `@claude_model` on tmux. A resume uses its group's configured account, and accepts `--account` or `--config-dir` only when it names that account. Promoting a unit uses the configured showrunners account; recovery as a unit uses the configured units account.
 

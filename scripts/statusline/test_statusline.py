@@ -216,19 +216,18 @@ class ColorTests(unittest.TestCase):
         ])
 
     def test_the_counts_row_colors_each_part_by_its_type_and_keeps_the_number_bold(self) -> None:
-        row = "sid For you: 1 question, 2 changes, 130 efficiency, 2 proposals, 3 projects"
+        row = "sid For you: 1 question, 2 changes, 130 efficiency, 2 proposals"
         line = status_lines({"session_id": "sid"}, colors=SHIPPED_COLORS, counts=row)[-1]
         self.assertEqual(line, "For you: \x1b[91m\x1b[1m1\x1b[22m question\x1b[0m, "
                          + "\x1b[96m\x1b[1m2\x1b[22m changes\x1b[0m, "
                          + "\x1b[92m\x1b[1m130\x1b[22m efficiency\x1b[0m, "
-                         + "\x1b[38;5;141m\x1b[1m2\x1b[22m proposals\x1b[0m, "
-                         + "\x1b[38;5;208m\x1b[1m3\x1b[22m projects\x1b[0m")
+                         + "\x1b[38;5;141m\x1b[1m2\x1b[22m proposals\x1b[0m")
 
     def test_a_counts_type_without_a_color_key_keeps_only_its_bold_number(self) -> None:
-        row = "sid For you: 2 questions, 1 change, 1 project"
+        row = "sid For you: 2 questions, 1 change, 1 proposal"
         line = status_lines({"session_id": "sid"}, colors="counts.questions=bright-red\n", counts=row)[-1]
         self.assertEqual(line, "For you: \x1b[91m\x1b[1m2\x1b[22m questions\x1b[0m, "
-                         + "\x1b[1m1\x1b[22m change, \x1b[1m1\x1b[22m project")
+                         + "\x1b[1m1\x1b[22m change, \x1b[1m1\x1b[22m proposal")
 
 
 def limits(five_hour: dict[str, float | None], seven_day: dict[str, float | None]) -> dict[str, object]:
@@ -673,8 +672,9 @@ class CountsRowTests(unittest.TestCase):
             with self.subTest(shell=shell):
                 lines = self.lines(shell=shell)
                 self.assertTrue(lines[0].startswith("showrunner | "), lines)
-                self.assertEqual(lines[-1], "For you: 1 question, 1 project")
-                self.assertNotIn("For you: 1 question, 1 project", self.lines("bbbb-2222", shell=shell))
+                self.assertEqual(lines[-1], "For you: 1 question, 1 proposal")
+                self.assertNotIn("project", lines[-1])
+                self.assertNotIn("For you: 1 question, 1 proposal", self.lines("bbbb-2222", shell=shell))
 
     def test_each_count_in_the_row_is_bold_inside_its_shipped_color(self) -> None:
         _ = self.ledger.write_text("- 2026-10-16 Idea (idea.md) — proposed\n", encoding="utf-8")
@@ -684,14 +684,14 @@ class CountsRowTests(unittest.TestCase):
                                 capture_output=True, text=True, check=True, env=env, cwd=self.home)
         self.assertEqual(result.stdout.splitlines()[-1],
                          "For you: \x1b[91m\x1b[1m12\x1b[22m questions\x1b[0m, "
-                         + "\x1b[38;5;208m\x1b[1m1\x1b[22m project\x1b[0m")
+                         + "\x1b[38;5;141m\x1b[1m1\x1b[22m proposal\x1b[0m")
 
     def test_the_row_counts_efficiency_and_refreshes_when_the_ledger_changes(self) -> None:
         ledger = self.home / "efficiency.md"
         doc = self.home / "docs/plans/show-production.md"
         _ = doc.write_text(doc.read_text(encoding="utf-8") + f"- **Efficiency ledger:** {ledger}\n",
                            encoding="utf-8")
-        _ = self.ledger.write_text("- 2026-10-19 Project (project.md) — proposed\n", encoding="utf-8")
+        _ = self.ledger.write_text("- 2026-10-19 Faster tests (tests.md) — proposed\n", encoding="utf-8")
         self.questions({"since": "2026-10-19T04:00", "text": "Review the study"})
         for shell in SHELLS:
             with self.subTest(shell=shell):
@@ -699,11 +699,11 @@ class CountsRowTests(unittest.TestCase):
                                       + "- 2026-10-19 messages: Second — deferred\n"
                                       + "- 2026-10-19 rust: Done — accepted, applied\n", encoding="utf-8")
                 self.assertEqual(self.lines(shell=shell)[-1],
-                                 "For you: 1 question, 2 efficiency, 1 project")
+                                 "For you: 1 question, 2 efficiency, 1 proposal")
                 _ = ledger.write_text("- 2026-10-19 config: First — accepted, applied\n"
                                       + "- 2026-10-19 messages: Second — deferred\n", encoding="utf-8")
                 self.assertEqual(self.lines(shell=shell)[-1],
-                                 "For you: 1 question, 1 efficiency, 1 project")
+                                 "For you: 1 question, 1 efficiency, 1 proposal")
 
     def test_nothing_counted_shows_no_row(self) -> None:
         self.assertEqual(len(self.lines()), 1)
@@ -721,7 +721,7 @@ class CountsRowTests(unittest.TestCase):
                 self.assertEqual(self.lines(shell=shell)[-1], "For you: 2 questions")
                 # The ledger did not exist, so its folder stands in until it appears.
                 _ = self.ledger.write_text("- 2026-10-16 Idea (idea.md) — proposed\n", encoding="utf-8")
-                self.assertEqual(self.lines(shell=shell)[-1], "For you: 2 questions, 1 project")
+                self.assertEqual(self.lines(shell=shell)[-1], "For you: 2 questions, 1 proposal")
                 self.ledger.unlink()
                 self.questions({"since": "2026-10-16T19:00", "text": "A"})
 
