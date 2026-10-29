@@ -67,6 +67,7 @@ class PhaseRounds(TypedDict):
     rounds: list[Round]
     causes: dict[str, int]
     findings: int
+    reviews: int
     fix_seconds: float
     check: Literal["ok", "mixed"]
     past_landing: int
@@ -279,6 +280,12 @@ def load_phases(events: list[dict[str, object]]) -> list[PhaseRounds]:
             status=_string(finish.get("status"), "open"), rounds=rounds,
             causes={cause: sum(repair["cause"] == cause for repair in rounds) for cause in CAUSES},
             findings=sum(_string(event.get("event_type")) == "finding_opened" for event in phase_events),
+            reviews=sum(
+                _string(event.get("event_type")) == "pass_started"
+                and _string(event.get("pass_kind")) == "review"
+                and _string(event.get("run_id")) == run_id
+                for event in phase_events
+            ),
             fix_seconds=sum(repair["fix_seconds"] for repair in rounds),
             check="mixed" if wrong_phase or last - first > 72 * 3600
             or (bool(merges) and max(merges) - min(merges) > MERGE_SEPARATION_SECONDS) else "ok",
@@ -311,28 +318,33 @@ def run(args: argparse.Namespace) -> None:
     top_value: object = getattr(args, "top", 25)
     top = max(0, top_value) if isinstance(top_value, int) else 25
     shown = phases[:top]
-    headers = ["run", "phase", "title", "plan", "rounds", *CAUSES, "findings", "fix-time", "span", "check"]
+    headers = ["run", "phase", "title", "plan", "reviewed", "rounds", *CAUSES, "findings", "fix-time", "span", "check"]
     table = [
         [phase["run_id"][:8], phase["phase_id"], phase["title"][:40], phase["plan"],
+         "yes" if phase["reviews"] else "no",
          str(len(phase["rounds"])), *(str(phase["causes"][cause]) for cause in CAUSES),
          str(phase["findings"]), _duration(phase["fix_seconds"]), _duration(phase["span_seconds"]), phase["check"]]
         for phase in shown
     ]
     count = len(phases)
-    heavy = [phase for phase in phases if len(phase["rounds"]) >= 3]
+    reviewed = [phase for phase in phases if phase["reviews"] > 0]
+    reviewed_count = len(reviewed)
+    heavy = [phase for phase in reviewed if len(phase["rounds"]) >= 3]
     fix_seconds = sum(phase["fix_seconds"] for phase in phases)
+    reviewed_fix_seconds = sum(phase["fix_seconds"] for phase in reviewed)
     heavy_seconds = sum(phase["fix_seconds"] for phase in heavy)
     cause_counts = {cause: sum(phase["causes"][cause] for phase in phases) for cause in CAUSES}
     total_rounds = sum(cause_counts.values())
     shares = {cause: 100.0 * cause_counts[cause] / total_rounds if total_rounds else 0.0 for cause in CAUSES}
-    median = statistics.median([len(phase["rounds"]) for phase in phases]) if phases else 0.0
-    heavy_share = 100.0 * len(heavy) / count if count else 0.0
-    fix_share = 100.0 * heavy_seconds / fix_seconds if fix_seconds else 0.0
+    median = statistics.median([len(phase["rounds"]) for phase in reviewed]) if reviewed else 0.0
+    heavy_share = 100.0 * len(heavy) / reviewed_count if reviewed_count else 0.0
+    fix_share = 100.0 * heavy_seconds / reviewed_fix_seconds if reviewed_fix_seconds else 0.0
     mixed = sum(phase["check"] == "mixed" for phase in phases)
     meta = _meta(tally)
-    meta.update(phases=count, median_rounds=median, heavy_phases=len(heavy),
+    meta.update(phases=count, reviewed_phases=reviewed_count, unreviewed_phases=count - reviewed_count,
+                median_rounds=median, heavy_phases=len(heavy),
                 heavy_phase_share=heavy_share, heavy_fix_seconds=heavy_seconds,
-                heavy_fix_share=fix_share, fix_seconds=fix_seconds,
+                heavy_fix_share=fix_share, fix_seconds=fix_seconds, reviewed_fix_seconds=reviewed_fix_seconds,
                 rounds=total_rounds, causes=cause_counts, cause_shares=shares, mixed=mixed)
     form = _arg(args, "format", "table")
     if form == "json":
@@ -341,6 +353,7 @@ def run(args: argparse.Namespace) -> None:
         for phase, cells in zip(shown, table, strict=True):
             row: dict[str, object] = dict(zip(headers, cells, strict=True))
             row.update(phase)
+            row["reviewed"] = phase["reviews"] > 0
             row["title"] = phase["title"][:40]
             row["round_details"] = phase["rounds"]
             row["rounds"] = len(phase["rounds"])
@@ -349,8 +362,9 @@ def run(args: argparse.Namespace) -> None:
     else:
         _emit(table, headers, form, meta)
         if form == "table":
-            print(f"\n{count} phases counted; median {median:g} rounds")
-            print(f"{len(heavy)} phases with >=3 rounds ({heavy_share:.1f}%) hold {fix_share:.1f}% of fix time")
+            print(f"\n{count} phases counted; {reviewed_count} reviewed; median {median:g} rounds over reviewed phases")
+            print(f"{count - reviewed_count} phases with no review recorded (not in the median or shares)")
+            print(f"{len(heavy)} reviewed phases with >=3 rounds ({heavy_share:.1f}%) hold {fix_share:.1f}% of reviewed fix time")
             print("Rounds by cause: " + ", ".join(f"{cause} {shares[cause]:.1f}%" for cause in CAUSES))
             print(f"{mixed} mixed records")
     _warn(tally)

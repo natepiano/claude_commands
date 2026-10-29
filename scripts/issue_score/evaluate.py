@@ -46,8 +46,7 @@ class FieldObservation:
     issue: vault.Issue
     actual: FieldValue
     predicted: FieldValue
-    confidence: float
-    can_be_sure: bool
+    decision: decide.FieldDecision
     probabilities: dict[str, float] | ExactMatchOnly
 
 
@@ -165,7 +164,7 @@ def _object(value: object) -> dict[str, object]:
     return cast(dict[str, object], value)
 
 
-def _load_run(path: Path) -> RunJudgments:
+def load_run(path: Path) -> RunJudgments:
     scored: dict[str, ScoredIssue] = {}
     failed: dict[str, str] = {}
     for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
@@ -200,22 +199,6 @@ def _score(answers: Mapping[str, client.Answer], name: str) -> client.ScoreAnswe
     return answer
 
 
-def _noul(answers: Mapping[str, client.Answer], name: str) -> float:
-    answer = answers[name]
-    if answer["type"] != "noul":
-        raise ValueError(f"Expected Noul answer {name}")
-    return answer["noul"]
-
-
-def _agree(answers: Mapping[str, client.Answer], name: str) -> bool:
-    first, reverse = _choice(answers, name), _choice(answers, name + "_reverse")
-
-    def winner(distribution: Mapping[str, float]) -> str:
-        return min(distribution, key=lambda key: (-distribution[key], key))
-
-    return winner(first["probabilities"]) == winner(reverse["probabilities"])
-
-
 def _observation(issue: vault.Issue, record: ScoredIssue, field: str) -> FieldObservation:
     decision = _object(record["decided_fields"][field])
     predicted = decision["value"]
@@ -226,8 +209,8 @@ def _observation(issue: vault.Issue, record: ScoredIssue, field: str) -> FieldOb
         raise ValueError(f"Invalid confidence for {field}")
     main = record["answers"]["main"]["answers"]
     area = record["answers"]["area"]["answers"]
+    current_decision = decide.decide_answers(main, area)[field]
     actual: FieldValue = issue.labels.get(field, "")
-    can_be_sure = not decision.get("split", False)
     probabilities: dict[str, float] | ExactMatchOnly
     if field in ORDINAL_FIELDS:
         actual = str(actual).count("⭐")
@@ -242,17 +225,10 @@ def _observation(issue: vault.Issue, record: ScoredIssue, field: str) -> FieldOb
                 raise ValueError(f"Invalid backlog_goal value: {goal_value!r}")
             goal_name = goal_names[goal_value]
             name = "alignment_" + goal_name
-            goal_confidence = goal_decision["confidence"]
-            if not isinstance(goal_confidence, (float, int)):
-                raise ValueError("Invalid goal confidence")
-            confidence = min(confidence, goal_confidence)
-            can_be_sure = can_be_sure and _agree(main, "goal")
         if field == "backlog_urgency":
-            evidence = [_noul(main, name) for name in questions.URGENCY_EVIDENCE]
-            can_be_sure = can_be_sure and not any(questions.EVIDENCE_ABSENT <= p <= questions.EVIDENCE_PRESENT for p in evidence)
-            if predicted >= 4:
+            if current_decision.origin == "urgency_evidence":
                 probabilities = ExactMatchOnly("urgency from evidence")
-                return FieldObservation(issue, actual, predicted, confidence, can_be_sure, probabilities)
+                return FieldObservation(issue, actual, predicted, current_decision, probabilities)
             name = "pressure"
         answer = _score(main, name)
         probabilities = {str(int(level) + 1): p for level, p in answer["probabilities"].items()}
@@ -260,14 +236,12 @@ def _observation(issue: vault.Issue, record: ScoredIssue, field: str) -> FieldOb
         answers, name = (area, "area") if field == "area" else (main, "goal" if field == "backlog_goal" else field)
         if field == "area":
             actual = vault.normalize_area(str(actual))
-            if predicted == "unfiled" and _noul(area, "area_fits") < questions.EVIDENCE_ABSENT:
-                return FieldObservation(issue, actual, predicted, confidence, True, ExactMatchOnly("unfiled area"))
-            can_be_sure = can_be_sure and _noul(area, "area_fits") > questions.EVIDENCE_PRESENT
-        can_be_sure = can_be_sure and _agree(answers, name)
+            if current_decision.origin == "area_fallback":
+                return FieldObservation(issue, actual, predicted, current_decision, ExactMatchOnly("unfiled area"))
         probabilities = decide.average_choice(_choice(answers, name), _choice(answers, name + "_reverse"))
         if field == "backlog_goal":
             probabilities = {questions.GOAL_LABELS[name]: p for name, p in probabilities.items()}
-    return FieldObservation(issue, actual, predicted, confidence, can_be_sure, probabilities)
+    return FieldObservation(issue, actual, predicted, current_decision, probabilities)
 
 
 def _mean(values: Sequence[float]) -> Metric:
@@ -328,11 +302,67 @@ def _field_report(field: str, observations: list[FieldObservation]) -> list[str]
     return lines
 
 
-def _risk_report(field: str, observations: list[FieldObservation]) -> list[str]:
+def _covered(field: str, observations: list[FieldObservation], threshold: float) -> list[FieldObservation]:
+    thresholds = dict(questions.THRESHOLDS)
+    # Sweep this field even when production currently leaves it agent-only.
+    thresholds[field] = decide.Supported(threshold)
+    return [item for item in observations if decide.is_sure(field, item.decision, thresholds)]
+
+
+def _threshold_outcome(field: str, observations: list[FieldObservation], *, complete: bool) -> decide.ThresholdOutcome:
+    points: list[decide.RiskPoint] = []
+    for threshold in questions.RISK_THRESHOLDS:
+        covered = _covered(field, observations, threshold)
+        if not covered:
+            continue
+        if field in ("backlog_impact", "backlog_alignment"):
+            error = sum(abs(int(item.actual) - int(item.predicted)) > 1 for item in covered) / len(covered)
+        else:
+            error = sum(item.actual != item.predicted for item in covered) / len(covered)
+        points.append(decide.RiskPoint(threshold, len(covered) / len(observations), error))
+    return decide.select_threshold(field, points, complete=complete)
+
+
+def _outcome_text(outcome: decide.ThresholdOutcome) -> str:
+    if isinstance(outcome, decide.Supported):
+        return f"supported({outcome.threshold:.2f}); Jev proposes, pending held-out validation and user verdict"
+    if isinstance(outcome, decide.Unsupported):
+        return f"unsupported ({outcome.reason}); agent-only"
+    return "report-only; agent proposes pending user verdict"
+
+
+def _heldout_validation(field: str, observations: list[FieldObservation], *, complete: bool) -> str:
+    policy = questions.THRESHOLDS[field]
+    if not isinstance(policy, decide.Supported):
+        return _outcome_text(policy)
+    threshold = policy.threshold
+    covered = _covered(field, observations, threshold)
+    if field in ("backlog_impact", "backlog_alignment"):
+        errors = [float(abs(int(item.actual) - int(item.predicted)) > 1) for item in covered]
+        measure = "beyond-one error"
+    else:
+        errors = [float(item.actual != item.predicted) for item in covered]
+        measure = "exact error"
+    error = _mean(errors)
+    target = questions.ERROR_TARGETS[field]
+    passed = bool(covered) and isinstance(error, float) and error <= target + 1e-12
+    status = "partial" if not complete else "pass" if passed else "fail"
+    coverage = float(len(covered) / len(observations)) if observations else 0.0
+    recommendation = "Jev proposes, pending user verdict" if status == "pass" else "agent-only"
+    return (f"{status} at configured threshold {threshold:.2f}; Sure N: {len(covered)}; "
+            f"coverage: {coverage:.4f}; {measure}: {_metric(error)}; target: ≤ {target:.4f}; {recommendation}")
+
+
+def _judgment_text(field: str, observations: list[FieldObservation], *, split: Split, complete: bool) -> str:
+    if split == "holdout":
+        return _heldout_validation(field, observations, complete=complete)
+    return _outcome_text(_threshold_outcome(field, observations, complete=complete and split == "tune"))
+
+
+def _risk_report(field: str, observations: list[FieldObservation], *, complete: bool, split: Split) -> list[str]:
     rows: list[list[object]] = []
-    for percent in range(40, 100, 5):
-        threshold = percent / 100
-        covered = [item for item in observations if item.can_be_sure and item.confidence >= threshold]
+    for threshold in questions.RISK_THRESHOLDS:
+        covered = _covered(field, observations, threshold)
         row: list[object] = [f"{threshold:.2f}", len(covered), _metric(float(len(covered) / len(observations))
                                                                    if observations else UndefinedMetric("no observations")),
                              _metric(_mean([float(item.actual != item.predicted) for item in covered]))]
@@ -343,7 +373,9 @@ def _risk_report(field: str, observations: list[FieldObservation]) -> list[str]:
     headers = ["Threshold", "Sure N", "Coverage", "Exact error"]
     if field in ORDINAL_FIELDS:
         headers.append("Beyond-one error")
-    return [f"### {field}", "", *_table(headers, rows)]
+    recommendation = _judgment_text(field, observations, split=split, complete=complete)
+    label = "Held-out validation" if split == "holdout" else "Threshold outcome"
+    return [f"### {field}", "", f"{label}: {recommendation}.", "", *_table(headers, rows)]
 
 
 def _goals(path: Path) -> dict[str, renumber.Goal]:
@@ -384,53 +416,103 @@ def _run_path(run_id: str, state_dir: Path) -> Path:
     return state_dir / "runs" / (name + ".jsonl")
 
 
+def _same_questions(first: ScoredIssue, second: ScoredIssue) -> bool:
+    first_variant = first.get("variant_set", "production")
+    second_variant = second.get("variant_set", "production")
+    if first_variant != second_variant:
+        return False
+    # Choice criteria order is part of the request, including in nested objects.
+    return json.dumps(first.get("variant_definitions", {})) == json.dumps(second.get("variant_definitions", {}))
+
+
+def _high_priority(issues: Sequence[vault.Issue]) -> list[vault.Issue]:
+    result: list[vault.Issue] = []
+    for issue in issues:
+        try:
+            if float(issue.labels.get("backlog_score", "")) >= 20:
+                result.append(issue)
+        except ValueError:
+            continue
+    return result
+
+
+def _recommendations(observations: Mapping[str, list[FieldObservation]], high: Sequence[vault.Issue], *, complete: bool, split: Split) -> list[str]:
+    paths = {issue.path for issue in high}
+    rows: list[list[object]] = []
+    for field, items in observations.items():
+        band = [item for item in items if item.issue.path in paths]
+        exact = _mean([float(item.actual == item.predicted) for item in band])
+        ordinal = [item for item in band if isinstance(item.probabilities, dict)] if field in ORDINAL_FIELDS else []
+        within = _mean([float(abs(int(item.actual) - int(item.predicted)) <= 1) for item in ordinal])
+        rows.append([field, len(band), _metric(exact), _metric(within) if field in ORDINAL_FIELDS else "N/A",
+                     _judgment_text(field, items, split=split, complete=complete)])
+    urgency = observations["backlog_urgency"]
+    rows_45 = [item for item in urgency if item.actual in (4, 5)]
+    return ["## Per-field recommendations and score ≥ 20 results", "",
+            "These are measured candidates for review. A global pass supplies no evidence for the high-priority group; its results below must be assessed separately.", "",
+            *_table(["Field", "Score ≥ 20 N", "Exact", "Within one", "Recommendation"], rows),
+            "Category review must inspect feature/enhancement/research confusion, shown in each group's confusion matrix.", "",
+            f"Urgency 4–5 current-label rows: N={len(rows_45)}, exact={_metric(_mean([float(item.actual == item.predicted) for item in rows_45]))}. Judge urgency by kappa and these rows, not majority-class accuracy.", ""]
+
+
 def compare(run_id: str, *, split: Split = "all", repeat_run_id: str = "",
             issues_dir: Path = vault.ISSUES_DIR, state_dir: Path = STATE_DIR,
-            goals_path: Path = vault.VAULT_ROOT / "prioritization goals.md") -> Path:
+            goals_path: Path = vault.VAULT_ROOT / "prioritization goals.md", baseline_run_id: str = "") -> Path:
     """Write a report from saved answers; this function never contacts the API."""
     state_dir = state_dir.expanduser().resolve()
     if state_dir.is_relative_to(vault.VAULT_ROOT.resolve()) or state_dir.is_relative_to(issues_dir.resolve()):
         raise ValueError("Reports must be outside the issue vault")
     run_path = _run_path(run_id, state_dir)
-    run = _load_run(run_path)
+    run = load_run(run_path)
     rated = vault.load_rated_issues(issues_dir)
     in_scope = [issue for issue in rated.issues if in_split(issue.path, split)]
     styles = [issue for issue in in_scope if issue.is_style]
-    examples = [issue for issue in in_scope if not issue.is_style and issue.path.stem in questions.EFFORT_EXAMPLE_STEMS]
-    eligible = [issue for issue in in_scope if not issue.is_style and issue.path.stem not in questions.EFFORT_EXAMPLE_STEMS]
+    examples = [issue for issue in in_scope if not issue.is_style and issue.path.stem in questions.HISTORICAL_EFFORT_EXAMPLE_STEMS]
+    eligible = [issue for issue in in_scope if not issue.is_style and issue.path.stem not in questions.HISTORICAL_EFFORT_EXAMPLE_STEMS]
     scored = [issue for issue in eligible if str(issue.path) in run.scored]
     failed = [issue for issue in eligible if str(issue.path) in run.failed]
     unscored = [issue for issue in eligible if str(issue.path) not in run.scored and str(issue.path) not in run.failed]
     partial = bool(failed or unscored)
+    candidate_count = len(scored)
+    baseline = RunJudgments({}, {})
+    if baseline_run_id:
+        baseline = load_run(_run_path(baseline_run_id, state_dir))
+        partial = partial or any(str(issue.path) not in baseline.scored for issue in eligible)
+        scored = [issue for issue in scored if str(issue.path) in baseline.scored]
     skipped = [item for item in rated.skipped if in_split(item.path, split)]
     observations = {field: [_observation(issue, run.scored[str(issue.path)], field) for issue in scored
                              if issue.labels.get(field, "")] for field in FIELDS}
     lines = [f"# Issue score comparison{' — partial' if partial else ''}: {run_path.stem} ({split})", "",
-             f"Scored: {len(scored)}; failed: {len(failed)}; unscored: {len(unscored)}; eligible rated issues: {len(eligible)}.", "",
+             f"Scored: {candidate_count}; failed: {len(failed)}; unscored: {len(unscored)}; eligible rated issues: {len(eligible)}.", "",
              f"Excluded effort examples: {len(examples)}; admitted style issues excluded: {len(styles)}; loader skips: {len(skipped)}.", "",
              "Labels and backlog_score are read from the current vault, never from the run. All metrics exclude effort examples and style issues.", "",
              "RPS is normalized by K−1 on the five-star rubric. Pressure mass is zero at stars 4 and 5. Evidence-based urgency 4 and derived unfiled fallback areas receive exact-match metrics only. Brier is the sum over classes.", ""]
     models = sorted({run.scored[str(issue.path)]["model"] for issue in scored})
     versions = sorted({run.scored[str(issue.path)]["question_set_version"] for issue in scored})
     lines += [f"Models: {', '.join(models) or 'none'}; question versions: {', '.join(versions) or 'none'}.", ""]
+    variants = sorted({run.scored[str(issue.path)].get("variant_set", "production") for issue in scored})
+    lines += [f"Variant sets: {', '.join(variants) or 'none'}.", ""]
     goals = _goals(goals_path)
+    if baseline_run_id:
+        baseline_failed = [issue for issue in eligible if str(issue.path) in baseline.failed]
+        baseline_unscored = [issue for issue in eligible if str(issue.path) not in baseline.failed and str(issue.path) not in baseline.scored]
+        changed_content = sum(run.scored[str(issue.path)]["content_hash"] != baseline.scored[str(issue.path)]["content_hash"] for issue in scored)
+        lines += [f"Shared cohort with baseline {baseline_run_id}: {len(scored)} issues. Both runs use these same current labels, read once.", "",
+                  f"Shared issues whose content/state hash changed between runs: {changed_content}. Interpret wording effects separately from state changes.", "",
+                  f"Baseline scored: {sum(str(issue.path) in baseline.scored for issue in eligible)}; failed: {len(baseline_failed)}; unscored: {len(baseline_unscored)}.", "",
+                  *(f"- Baseline missing: {_cell(issue.path)}" for issue in [*baseline_failed, *baseline_unscored]), ""]
     groups = [("all", scored), ("title-only", [issue for issue in scored if len(vault.clean_body(issue.body)) < 200])]
-    high: list[vault.Issue] = []
-    for issue in scored:
-        try:
-            if float(issue.labels.get("backlog_score", "")) >= 20:
-                high.append(issue)
-        except ValueError:
-            continue
+    high = _high_priority(scored)
     groups.append(("score ≥ 20", high))
     for name, issues in groups:
         lines += [f"## Group: {name} (N={len(issues)})", "", *_ordering(issues, run, goals)]
         paths = {issue.path for issue in issues}
         for field in FIELDS:
             lines += _field_report(field, [item for item in observations[field] if item.issue.path in paths])
-    lines += ["## Risk-coverage", "", "Structural uncertainty (split answers, order disagreement, ambiguous evidence) remains unsure at every threshold. Alignment also requires the chosen goal's confidence to meet the threshold.", ""]
+    lines += ["## Risk-coverage", "", "The production sure rule sweeps only this field's threshold; every other field keeps its configured threshold. Structural uncertainty remains unsure. Threshold selection requires a complete tuning run.", ""]
     for field in FIELDS:
-        lines += _risk_report(field, observations[field])
+        lines += _risk_report(field, observations[field], complete=not partial, split=split)
+    lines += _recommendations(observations, high, complete=not partial, split=split)
     lines += ["## Largest disagreements (up to 20 per field)", ""]
     for field in FIELDS:
         def gap(item: FieldObservation) -> float:
@@ -444,17 +526,32 @@ def compare(run_id: str, *, split: Split = "all", repeat_run_id: str = "",
                             key=lambda item: (-gap(item), str(item.issue.path)))[:20]
         lines += [f"### {field}", "", *_table(["Issue", "Current", "Jev", "Gap"],
                   [[item.issue.title, item.actual, item.predicted, f"{gap(item):.4f}"] for item in mismatches])]
+    if baseline_run_id:
+        lines += [f"## Baseline: {baseline_run_id}", "", "All baseline metrics use the identical shared cohort above.", ""]
+        baseline_observations = {field: [_observation(issue, baseline.scored[str(issue.path)], field) for issue in scored
+                                        if issue.labels.get(field, "")] for field in FIELDS}
+        for name, issues in groups:
+            lines += [f"## Baseline group: {name} (N={len(issues)})", "", *_ordering(issues, baseline, goals)]
+            paths = {issue.path for issue in issues}
+            for field in FIELDS:
+                lines += _field_report(field, [item for item in baseline_observations[field] if item.issue.path in paths])
+        lines += ["## Baseline risk-coverage", ""]
+        for field in FIELDS:
+            lines += _risk_report(field, baseline_observations[field], complete=not partial, split=split)
+        lines += _recommendations(baseline_observations, high, complete=not partial, split=split)
     if repeat_run_id:
-        second = _load_run(_run_path(repeat_run_id, state_dir))
+        second = load_run(_run_path(repeat_run_id, state_dir))
         common = [issue for issue in scored if str(issue.path) in second.scored]
-        matched = [issue for issue in common if all(run.scored[str(issue.path)][key] == second.scored[str(issue.path)][key]
-                                                   for key in ("content_hash", "question_set_version", "model"))]
+        unchanged = [issue for issue in common if all(run.scored[str(issue.path)][key] == second.scored[str(issue.path)][key]
+                                                     for key in ("content_hash", "question_set_version", "model"))]
+        matched = [issue for issue in unchanged
+                   if _same_questions(run.scored[str(issue.path)], second.scored[str(issue.path)])]
         rows: list[list[object]] = []
         for field in FIELDS:
             changed = sum(_object(run.scored[str(issue.path)]["decided_fields"][field])["value"]
                           != _object(second.scored[str(issue.path)]["decided_fields"][field])["value"] for issue in matched)
             rows.append([field, len(matched), changed, _metric(float(changed / len(matched)) if matched else UndefinedMetric("no comparable pairs"))])
-        lines += ["## Repeat check", "", f"Second run: {repeat_run_id}. Comparable issues: {len(matched)}; changed content/model/version: {len(common) - len(matched)}; missing second successes: {len(scored) - len(common)}.", "",
+        lines += ["## Repeat check", "", f"Second run: {repeat_run_id}. Comparable issues: {len(matched)}; changed content/model/version: {len(common) - len(unchanged)}; missing second successes: {len(scored) - len(common)}; changed question definitions: {len(unchanged) - len(matched)}; not comparable: {len(common) - len(matched)}.", "",
                   "Use score --fresh for each repeat so cached responses do not masquerade as independent judgments.", "",
                   *_table(["Field", "N", "Changed", "Change rate"], rows)]
     lines += ["## Exclusions and incomplete coverage", "", "### Effort examples", "",
