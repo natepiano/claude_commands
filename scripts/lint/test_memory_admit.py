@@ -1052,7 +1052,44 @@ class ShellTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(len(result.stderr.splitlines()), 1)
                 self.assertIn("head clone88ci nextest (verify pid 300) needs 10.9 GiB", result.stderr)
-                self.assertIn("0.0 GiB promised, 3.0 GiB measured", result.stderr)
+                self.assertTrue(result.stderr.endswith(
+                    "0.0 GiB promised, 3.0 GiB measured across 2 running steps: test steps; "
+                    + "2.8 GiB kept for earlyoom)\n"))
+
+    def test_wait_line_shows_reason_in_place_of_zero_running_steps(self) -> None:
+        command = ('source "$1"; BUILDLOG_MEM_WAIT_S=120; buildlog_memory_python() { echo UTC; }; '
+                   + 'buildlog_memory_line "$2" 19327352832 19434727014 16213501542 measured 5 0 0 '
+                   + '3221225472 "$3" test nextest 0')
+        reasons = ("memory pressure: full avg10 11.0",
+                   "head: needs 18.1 GiB free; 18.0 free; younger steps may start until 18:10")
+        with tempfile.TemporaryDirectory() as folder:
+            for kind in ("first", "periodic"):
+                for reason in reasons:
+                    with self.subTest(kind=kind, reason=reason):
+                        result = subprocess.run(
+                            ["bash", "-c", command, "test", str(MEMORY_GATE), kind, reason],
+                            env={**os.environ, "BUILDLOG_DIR": folder}, capture_output=True,
+                            text=True, check=False, timeout=300)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(len(result.stderr.splitlines()), 1)
+                        self.assertTrue(result.stderr.endswith(f"; {reason}; 3.0 GiB kept for earlyoom)\n"))
+                        self.assertNotIn("0 running steps", result.stderr)
+                        self.assertNotIn("GiB promised", result.stderr)
+                        self.assertNotIn("GiB measured", result.stderr)
+
+    def test_wait_line_keeps_zero_running_text_when_reason_is_empty(self) -> None:
+        command = ('source "$1"; BUILDLOG_MEM_WAIT_S=120; buildlog_memory_python() { echo UTC; }; '
+                   + 'buildlog_memory_line "$2" 0 0 0 fallback 0 0 0 0 "" test check 0')
+        with tempfile.TemporaryDirectory() as folder:
+            for kind in ("first", "periodic"):
+                with self.subTest(kind=kind):
+                    result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE), kind],
+                                            env={**os.environ, "BUILDLOG_DIR": folder}, capture_output=True,
+                                            text=True, check=False, timeout=300)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(len(result.stderr.splitlines()), 1)
+                    self.assertTrue(result.stderr.endswith(
+                        "; 0.0 GiB promised, 0.0 GiB measured across 0 running steps)\n"))
 
     def test_old_shell_keeps_its_field_count_and_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
