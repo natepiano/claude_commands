@@ -4,7 +4,7 @@ export const POLL_MS = 500;
 export const BATCH = 20;
 export const VERSION = "0.1.0";
 export const REPLY_WINDOW_MS = 30 * 60 * 1000;
-export const PATHS = { outbox: "outbox", claimed: "claimed", results: "results", heartbeat: "heartbeat.json", errors: "errors", delivered: "delivered", replies: "replies" } as const;
+export const PATHS = { outbox: "outbox", claimed: "claimed", results: "results", heartbeat: "heartbeat.json", errors: "errors", delivered: "delivered", replies: "replies", forwards: "forwards" } as const;
 
 export type OutboxEntry = {
   id: string;
@@ -63,9 +63,8 @@ export type ReplyLog = {
   senders: string[];
   body: string;
   targets: string[];
-  forward: "pending" | "done";
-  forwarded: string[];
 };
+export type ForwardLog = { forwarded: string[] };
 export type Replies = {
   sending(entry: OutboxEntry, atMs: number): Promise<RouteToken>;
   notDelivered(token: RouteToken): Promise<void>;
@@ -119,5 +118,8 @@ export function isReplyLog(value: unknown): value is ReplyLog {
     && typeof value.session_id === "string" && value.session_id !== ""
     && Array.isArray(value.senders) && value.senders.length > 0
     && value.senders.every((sender: unknown) => typeof sender === "string" && sender !== "") && typeof value.body === "string"
-    && sessionIds(value.targets) && (value.forward === "pending" || value.forward === "done") && sessionIds(value.forwarded);
+    && sessionIds(value.targets);
+}
+export function isForwardLog(value: unknown): value is ForwardLog {
+  return record(value) && sessionIds(value.forwarded);
 }
