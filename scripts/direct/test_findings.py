@@ -31,6 +31,8 @@ MAX_REOPENS=2
 STALLED_ROUNDS=2
 MAX_CONSECUTIVE_SAME_KIND_PASSES=3
 MAX_REVIEW_CANCELLATIONS=1
+ROUTING_FROM_ROUND=4
+ASTRA_AFTER_FAILED_FIXES=2
 """
 
 
@@ -95,7 +97,15 @@ class FindingsLedgerTests(unittest.TestCase):
         """Write `text` as the whole file, standard limits omitted."""
         _ = self.config_file.write_text(text, encoding="utf-8")
 
+    @staticmethod
+    def dispatch_arguments(arguments: tuple[str, ...]) -> tuple[str, ...]:
+        # Older ledger cases exercise other rules with a valid accepted-check list.
+        if arguments and arguments[0] == "dispatch" and "--accepted-checks" not in arguments:
+            return (*arguments, "--accepted-checks", "none: fixture edits reach no accepted behavior")
+        return arguments
+
     def run_command(self, *arguments: str, at: int = 1_000) -> str:
+        arguments = self.dispatch_arguments(arguments)
         result = subprocess.run(
             ["python3", str(SCRIPT), *arguments, "--session-dir", str(self.session_dir)],
             check=True,
@@ -105,7 +115,11 @@ class FindingsLedgerTests(unittest.TestCase):
         )
         return result.stdout.strip()
 
-    def run_failing_command(self, *arguments: str, at: int = 1_000) -> subprocess.CompletedProcess[str]:
+    def run_failing_command(
+        self, *arguments: str, at: int = 1_000, complete_dispatch: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        if complete_dispatch:
+            arguments = self.dispatch_arguments(arguments)
         return subprocess.run(
             ["python3", str(SCRIPT), *arguments, "--session-dir", str(self.session_dir)],
             check=False,
@@ -453,6 +467,7 @@ class FindingsLedgerTests(unittest.TestCase):
         payload = self.gate()
         self.assertEqual(payload["verdict"], "dispatch")
         self.assertIn("F001 failed to close after 2 repair attempts", str(payload["advisory"]))
+        _ = self.record_astra("F001")
         self.assertEqual(self.run_command("dispatch", "--covers", "F001"), "round 3 covering F001")
 
     def test_a_finding_that_reopens_twice_is_advised_not_blocked(self) -> None:
@@ -736,6 +751,267 @@ class FindingsLedgerTests(unittest.TestCase):
         )
         for event in self.events():
             self.assertEqual(event["phase_instance_id"], "instance-a")
+
+    def record_astra(self, finding_id: str, *, unavailable: str = "") -> Path:
+        note = self.root / f"{finding_id}-astra.md"
+        _ = note.write_text("Finding: retry fails. Try 1 reused the stale handle; try 2 kept its owner.\n")
+        decision = ("--unavailable", unavailable) if unavailable else ("--approach", "Replace the handle owner")
+        _ = self.run_command("astra", "--id", finding_id, "--note", str(note), *decision)
+        return note
+
+    def write_repair_intervals(self, count: int, *, instance: str = "instance-a") -> None:
+        """Unledgered fixes use distinct intervals even when fix_pass restarts at one."""
+        path = self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        records: list[dict[str, object]] = []
+        for index in range(count):
+            start: dict[str, object] = {
+                "event_type": "pass_started", "phase_instance_id": instance,
+                "pass_instance_id": f"repair-{instance}-{index}", "pass_kind": "fix",
+                "fix_pass": 1, "pass_started_at": 100 + index * 20,
+                "timestamp_epoch": 100 + index * 20, "pass_activity": "repair failing tests",
+            }
+            records.extend([start, {**start, "event_type": "pass_finished",
+                                    "timestamp_epoch": 110 + index * 20,
+                                    "pass_elapsed_seconds": 10, "status": "completed"}])
+        with path.open("a", encoding="utf-8") as stream:
+            for record in records:
+                _ = stream.write(json.dumps(record) + "\n")
+
+    def route_finding(self, finding_id: str, *, reason: str = "spec-gap") -> str:
+        return self.run_command(
+            "route", "--id", finding_id, "--reason", reason, "--owner", "receiving-unit",
+            "--work-order", "docs/follow-up.md — Phase 6 — Specify retry ownership",
+            "--due", "Phase 6 checkpoint", "--evidence", "The Work Order has no owner rule",
+        )
+
+    def test_a_mixed_batch_routes_the_gap_and_dispatches_the_kept_regression(self) -> None:
+        self.write_progress_state("instance-a")
+        self.write_repair_intervals(3)
+        _ = self.open_finding("blocker", "accepted retry regressed")
+        _ = self.open_finding("blocker", "owner rule is missing")
+        _ = self.record_astra("F001")
+        _ = self.record_astra("F002")
+        _ = self.route_finding("F002")
+        gate = self.gate()
+        self.assertEqual((gate["round"], gate["repair_round"]), (1, 4))
+        self.assertEqual([row["id"] for row in cast(list[dict[str, object]], gate["batch"])], ["F001"])
+        result = self.run_failing_command(
+            "dispatch", "--covers", "F001", "--keep", "F001=regression:accepted retry now loses data",
+            "--accepted-checks", "Retry preserves the queued data",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        status = self.status()
+        self.assertEqual(status["in_flight"], ["F001"])
+        routed = cast(list[dict[str, object]], status["routed"])
+        self.assertEqual([row["id"] for row in routed], ["F002"])
+        self.assertEqual(routed[0]["state"], "routed")
+        event, = [row for row in self.events() if row["event_type"] == "finding_routed"]
+        self.assertEqual({key: event[key] for key in (
+            "finding_id", "reason", "owner", "work_order", "due", "evidence", "repair_round",
+            "round", "fix_attempts", "astra_approach",
+        )}, {
+            "finding_id": "F002", "reason": "spec-gap", "owner": "receiving-unit",
+            "work_order": "docs/follow-up.md — Phase 6 — Specify retry ownership",
+            "due": "Phase 6 checkpoint", "evidence": "The Work Order has no owner rule",
+            "repair_round": 4, "round": 1, "fix_attempts": 0,
+            "astra_approach": "Replace the handle owner",
+        })
+        self.assertIn("timestamp", event)
+        self.assertIn("timestamp_epoch", event)
+        dispatched, = [row for row in self.events() if row["event_type"] == "finding_batch_dispatched"]
+        self.assertEqual((dispatched["round"], dispatched["repair_round"]), (1, 4))
+        self.assertEqual(dispatched["accepted_checks"], "Retry preserves the queued data")
+        self.assertEqual(dispatched["kept"], {
+            "F001": {"category": "regression", "evidence": "accepted retry now loses data"},
+        })
+        gate_event, = [row for row in self.events() if row["event_type"] == "finding_gate"]
+        self.assertEqual((gate_event["round"], gate_event["repair_round"]), (1, 4))
+        self.assertFalse(any(row["event_type"] == "trial_exposure" and row["proposal"] == "P3"
+                             for row in self.events()))
+
+    def test_routing_before_round_four_keeps_the_work_open_but_out_of_the_gate(self) -> None:
+        self.write_progress_state("instance-a")
+        _ = self.open_finding("blocker", "missing ownership rule")
+        _ = self.route_finding("F001", reason="outside-kept")
+        payload = self.gate()
+        self.assertEqual(payload["verdict"], "converged")
+        self.assertEqual(payload["open_counts"], {"blocker": 0, "minor": 0, "nit": 0})
+        self.assertEqual(payload["batch"], [])
+        status = self.status()
+        self.assertEqual([row["id"] for row in cast(list[dict[str, object]], status["routed"])], ["F001"])
+        event, = [row for row in self.events() if row["event_type"] == "finding_routed"]
+        self.assertEqual((event["repair_round"], event["round"], event["astra_approach"]), (1, 1, ""))
+        self.assertEqual(event["reason"], "outside-kept")
+
+    def test_round_four_requires_keep_for_each_finding_using_the_history_counter(self) -> None:
+        self.write_progress_state("instance-a")
+        self.write_repair_intervals(3)
+        self.write_repair_intervals(5, instance="another-phase")
+        for title in ("first regression", "second regression"):
+            _ = self.open_finding("blocker", title)
+        self.assertEqual((self.gate()["round"], self.gate()["repair_round"]), (1, 4))
+        for finding_id in ("F001", "F002"):
+            _ = self.record_astra(finding_id)
+        result = self.run_failing_command("dispatch", "--covers", "F001,F002")
+        self.assertNotEqual(result.returncode, 0)
+        for finding_id in ("F001", "F002"):
+            self.assertIn(finding_id, result.stderr)
+        self.assertIn("route it with", result.stderr)
+        self.assertIn("findings.py route", result.stderr)
+        self.assertIn("kept category and its evidence", result.stderr)
+        self.assertEqual(self.status()["in_flight"], [])
+        partial = self.run_failing_command(
+            "dispatch", "--covers", "F001,F002", "--keep", "F001=broken:retry raises",
+        )
+        self.assertNotEqual(partial.returncode, 0)
+        self.assertIn("F002", partial.stderr)
+
+    def test_no_history_uses_the_ledger_round_and_respects_configured_routing_limit(self) -> None:
+        self.write_config("ROUTING_FROM_ROUND=2\n")
+        _ = self.open_finding("blocker", "first")
+        self.close_round(["F001"])
+        _ = self.open_finding("blocker", "second")
+        payload = self.gate()
+        self.assertEqual((payload["round"], payload["repair_round"]), (2, 2))
+        self.assertEqual(payload["astra_review_due"], ["F002"])
+        _ = self.record_astra("F002")
+        missing = self.run_failing_command("dispatch", "--covers", "F002")
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("--keep", missing.stderr)
+
+    def test_astra_is_due_at_each_new_failed_attempt_and_clears_with_a_record(self) -> None:
+        self.write_progress_state("instance-a")
+        _ = self.open_finding("blocker", "retry never closes")
+        self.assertEqual(self.gate()["astra_review_due"], [])
+        for attempt in range(2):
+            self.close_round(["F001"], verdict="still_open")
+            if attempt == 0:
+                self.assertEqual(self.gate()["astra_review_due"], [])
+        self.assertEqual(self.gate()["astra_review_due"], ["F001"])
+        denied = self.run_failing_command("dispatch", "--covers", "F001")
+        self.assertNotEqual(denied.returncode, 0)
+        self.assertIn("F001", denied.stderr)
+        self.assertIn("astra", denied.stderr.lower())
+        note = self.record_astra("F001")
+        self.assertEqual(self.gate()["astra_review_due"], [])
+        review, = [row for row in self.events() if row["event_type"] == "finding_astra_review"]
+        self.assertEqual({key: review[key] for key in (
+            "finding_id", "note", "approach", "unavailable", "fix_attempts", "repair_round",
+        )}, {"finding_id": "F001", "note": str(note), "approach": "Replace the handle owner",
+             "unavailable": "", "fix_attempts": 2, "repair_round": 3})
+        self.close_round(["F001"], verdict="still_open")
+        self.assertEqual(self.gate()["astra_review_due"], ["F001"])
+        _ = self.record_astra("F001", unavailable="Astra is busy")
+        self.assertEqual(self.gate()["astra_review_due"], [])
+        latest = [row for row in self.events() if row["event_type"] == "finding_astra_review"][-1]
+        self.assertEqual((latest["unavailable"], latest["approach"], latest["fix_attempts"]),
+                         ("Astra is busy", "", 3))
+
+    def test_round_four_also_requires_astra_before_routing_a_never_tried_finding(self) -> None:
+        self.write_progress_state("instance-a")
+        self.write_repair_intervals(3)
+        _ = self.open_finding("blocker", "missing rule")
+        self.assertEqual(self.gate()["astra_review_due"], ["F001"])
+        denied = self.run_failing_command(
+            "route", "--id", "F001", "--reason", "outside-kept", "--owner", "unit-b",
+            "--work-order", "plan.md — Phase 6 — Define the rule", "--due", "Phase 6 checkpoint",
+        )
+        self.assertNotEqual(denied.returncode, 0)
+        self.assertIn("astra", denied.stderr.lower())
+        _ = self.record_astra("F001")
+        _ = self.route_finding("F001")
+        self.assertEqual(self.gate()["verdict"], "converged")
+
+    def test_astra_refuses_a_missing_note_without_clearing_the_due_review(self) -> None:
+        self.write_progress_state("instance-a")
+        self.write_repair_intervals(3)
+        _ = self.open_finding("blocker", "retry")
+        result = self.run_failing_command(
+            "astra", "--id", "F001", "--note", str(self.root / "missing.md"),
+            "--approach", "Replace the owner",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.gate()["astra_review_due"], ["F001"])
+        self.assertFalse(any(row["event_type"] == "finding_astra_review" for row in self.events()))
+
+    def test_the_failed_fix_trigger_uses_the_configured_limit(self) -> None:
+        self.write_config("ASTRA_AFTER_FAILED_FIXES=1\n")
+        _ = self.open_finding("blocker", "retry")
+        self.close_round(["F001"], verdict="still_open")
+        self.assertEqual(self.gate()["astra_review_due"], ["F001"])
+
+    def test_route_refuses_empty_handoff_fields_and_non_open_states(self) -> None:
+        _ = self.open_finding("blocker", "retry")
+        options = {"--owner": "unit-b", "--work-order": "plan.md — Phase 6 — Retry", "--due": "checkpoint"}
+        for empty in options:
+            with self.subTest(empty=empty):
+                arguments = ["route", "--id", "F001", "--reason", "spec-gap"]
+                for name, value in options.items():
+                    arguments.extend([name, " " if name == empty else value])
+                denied = self.run_failing_command(*arguments)
+                self.assertNotEqual(denied.returncode, 0)
+                self.assertEqual(self.gate()["verdict"], "dispatch")
+        for state in ("repair_in_flight", "fixed_pending_review", "accepted"):
+            if state == "repair_in_flight":
+                _ = self.run_command("dispatch", "--covers", "F001")
+            elif state == "fixed_pending_review":
+                _ = self.run_command("landed")
+            else:
+                _ = self.run_command("verdict", "--id", "F001", "--state", "accepted")
+            denied = self.run_failing_command(
+                "route", "--id", "F001", "--reason", "spec-gap", "--owner", "unit-b",
+                "--work-order", "plan.md — Phase 6 — Retry", "--due", "checkpoint",
+            )
+            self.assertNotEqual(denied.returncode, 0, state)
+            rows = cast(list[dict[str, object]], self.status()["findings"])
+            self.assertEqual(rows[0]["state"], state)
+
+    def test_dispatch_requires_nonempty_accepted_checks(self) -> None:
+        self.write_progress_state("instance-a")
+        _ = self.open_finding("blocker", "retry")
+        for extra in ((), ("--accepted-checks", ""), ("--accepted-checks", "   ")):
+            denied = self.run_failing_command("dispatch", "--covers", "F001", *extra,
+                                              complete_dispatch=False)
+            self.assertNotEqual(denied.returncode, 0)
+            self.assertIn("--accepted-checks", denied.stderr)
+        self.assertFalse(any(row["event_type"] == "finding_batch_dispatched" for row in self.events()))
+        _ = self.run_command("dispatch", "--covers", "F001", "--accepted-checks", "none: no accepted caller")
+        dispatched, = [row for row in self.events() if row["event_type"] == "finding_batch_dispatched"]
+        self.assertEqual(dispatched["accepted_checks"], "none: no accepted caller")
+
+    def test_trial_exposures_keep_the_basis_decision_and_repair_round(self) -> None:
+        self.write_progress_state("instance-a")
+        for proposal, basis, decision in (
+            ("P2", "Work Order changes retry lifecycle", ""),
+            ("P1", "Verification names the retry tests", "director ran the commands"),
+        ):
+            options = ("--decision", decision) if decision else ()
+            _ = self.run_command("exposure", "--proposal", proposal, "--basis", basis, *options)
+        exposures = [row for row in self.events() if row["event_type"] == "trial_exposure"]
+        self.assertEqual([{key: row[key] for key in ("proposal", "basis", "decision", "repair_round")}
+                          for row in exposures], [
+            {"proposal": "P2", "basis": "Work Order changes retry lifecycle", "decision": "", "repair_round": 1},
+            {"proposal": "P1", "basis": "Verification names the retry tests",
+             "decision": "director ran the commands", "repair_round": 1},
+        ])
+        _ = self.open_finding("blocker", "retry")
+        self.close_round(["F001"], verdict="still_open")
+        self.write_repair_intervals(3)
+        _ = self.gate()
+        p3 = [row for row in self.events() if row["event_type"] == "trial_exposure" and row["proposal"] == "P3"]
+        self.assertTrue(p3)
+        self.assertEqual(p3[-1]["repair_round"], 4)
+        self.assertTrue(p3[-1]["basis"])
+
+    def test_close_route_records_the_origin_and_closure_evidence(self) -> None:
+        self.write_progress_state("receiving-instance", "6")
+        _ = self.run_command("close-route", "--from", "origin-run:origin-instance:F003",
+                             "--evidence", "abc123; retry tests pass; review accepted")
+        closed, = [row for row in self.events() if row["event_type"] == "finding_route_closed"]
+        self.assertEqual(closed["from"], "origin-run:origin-instance:F003")
+        self.assertEqual(closed["evidence"], "abc123; retry tests pass; review accepted")
+        self.assertEqual(closed["phase_instance_id"], "receiving-instance")
 
     def test_a_run_without_progress_state_records_no_events(self) -> None:
         _ = self.open_finding("blocker", "null deref")

@@ -19,7 +19,7 @@
 - **Pending until idle.** A block is pending while any claim is live (it waits on the oldest one's `what`), or while `ci_activity` reads busy: a queued or in-progress run of `ci_workflow` is busy until it lists a job named `ci_job` with status `completed`. A pending block says `a CI run may still use the Mac`; the stored `waiting_on` kind is `ci_job`.
 - **The message.** Sent once per block, keyed `mac-free-<since>`, through `send.py` to the session's socket (from `sessions.py socket session:<id>`) or the holder's name: `Message from mac-test: the Mac is free. <what> ended at <HH:MM zone>; your block (<for>) is active, and nothing is built or tested there until you run unblock.` For CI the ended work reads `CI's hold on the Mac`. send.py exit 0 or 1 counts as delivered.
 - Every `gh` call is bounded by `gh_timeout_s`; the send and the session lookup by 30 s (`MAC_TEST_MESSAGE_TIMEOUT_S`). An empty `ci_repo` turns every `gh` call off.
-- `commands/build/mac.md` is `/build:mac block <why>`, `unblock`, `status`, and `audit`; `/build:hold hold <why> target mac` runs the same block command with its default duration. `/build:targets [--probe]` only reads coordination state, with a reach check when requested. `mac_test.py status` calls `full_settle`, which can lift expiry, restore CI and send pending messages.
+- `commands/build/mac.md` is `/build:mac block <why>`, `unblock`, `status`, and `audit`; `/build:hold hold <why> target mac` runs the same block command with its default duration. `/build:status [--probe]` only reads coordination state, with a reach check when requested. `mac_test.py status` calls `full_settle`, which can lift expiry, restore CI and send pending messages.
 
 ### The idle claim — `mac_test.py watch-claim`
 
@@ -33,6 +33,47 @@ A claim from any caller (offload, `mac_run.sh`, a session following `/build:mac`
   - `ActivityCheckFailed`: print `Mac claim activity check failed: <reason>` and change nothing. An unreachable Mac never releases a claim.
 - The message: `Your Mac claim "<what>" (since <HH:MM>) was released at <HH:MM>: nothing ran on the Mac for 15 minutes, so tests waiting for it can run. Claim it again before your next Mac command: python3 ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ --what '<what>' --worktree '<worktree>' [--remote '<host>'] (see /build:mac).` The `--worktree` is the claim's own, so the repeated claim keeps its scope; the `--remote` word appears for a remote claim.
 - `mac_activity_script()` runs over one ssh call (`BatchMode=yes`, `ConnectTimeout=connect_timeout_s`, 10 s total) and prints `active=<n>` and `rc=0`; any other answer is `ActivityCheckFailed`. A Mac process is one of the user's processes that `offload.mirror_selector_script(ALL_MIRRORS)` selects (a command line or working directory under `.local/state/mac-test/mirror/`), or whose executable is named `cargo`, `rustc` or `cargo-nextest`, or whose executable path contains `/target/` (test and app binaries). The check sends no signal. The text runs under the Mac's `sh` and `zsh -f`.
+
+### The idle Mac watch — `scripts/buildlog/mac_idle.py`
+
+The existing `buildlog-sample.timer` runs `buildlog sample` on natedev every
+60 seconds. That command also runs the idle Mac check. It needs no new unit.
+The check starts a three-minute idle interval when it sees no claim. A claim
+in `claims/`, a legacy `run.json`, a Mac block, or a future `unreachable_until`
+stops it. A change to the claims folder resets the interval. The check reads
+these files and never changes a claim or a build hold.
+
+An eligible test registers its call id, PID, process start time, repository,
+package, session temp path, retry deadline and wait paths under
+`~/.local/state/mac-idle/calls/`. The check verifies that the process still
+runs `verify.sh test`. It then requires a live memory admission `.waiting`
+record, a hold waiter record or `wait-local` child with the same call id, a
+token waiter file for that PID, or a routing wait child with that call id.
+Process names alone do not count. `build_targets.py eligible` checks the
+package again. Permanent declines stay excluded for that call.
+
+For a missing session temp folder, the check requires a session record whose
+PID and start time still match a live process. It then creates the folder
+under `/tmp/claude/session/`. For a missing leave hook or a pending retry
+deadline, it writes the call's `.retry` marker. The normal leave check reads
+that marker and bypasses the deadline, then checks `free-now`. Hold and
+memory waits also accept the call's exported marker hook when their normal
+hook is empty. Cargo-token waits use the same retry check. The original call
+removes the marker before its Mac attempt and keeps its own result and
+buildlog row. The watch starts no test process.
+
+An unknown cause sends one message per cause per call to the `builds-unit`
+director in production `build-followups`. The check resolves that address
+with `scripts/message/roster.py --json` and sends through `send.py`. A call
+started before marker support gets this message too. It sends no message to
+the user. A failed send stays pending for another pass; a queued send counts
+as accepted.
+
+Buildlog index schema 21 includes `mac_idle`: one row per cause per call, with the
+wait, cause and action. The `.cases` record prevents one row on every pass.
+A pending send is retried without another row. `buildlog schema` lists the
+fields. `MAC_IDLE_STATE_DIR` and `SESSION_TEMP_ROOT` select private roots for
+tests; test claim, session, process and buildlog roots are private too.
 
 ### Footer and dailies — `scripts/production/dailies_render.py`
 
@@ -79,7 +120,7 @@ After any temporary Mac result at the start of a `verify.sh test` call, the call
 
 ### Build log and report — `scripts/buildlog/`
 
-- The index is at schema 17. `calls` carries `mac` (`passed_full`, `passed_filter`, `failed`, `lost`, `declined`; `passed` before 2026-10-16 meant natedev confirmed the pass), `mac_reason`, `local_reason`, `mac_s`, `mac_holder`, `target` and `hold_wait_s`, and for a Mac copy of a still-compiling natedev test `copy` (the last copy's outcome: `won`, `natedev_won`, `gave_way`, `declined` or `lost`, plus `passed_full` before 2026-10-16; empty when no copy started), `copy_s` (seconds copies held the Mac, summed), `copy_count` (copies started) and `copy_natedev_s` (seconds the natedev nextest step had run, from its first cargo line, when the result was decided). verify.sh passes them as `BUILDLOG_MAC_COPY`, `BUILDLOG_MAC_COPY_S`, `BUILDLOG_MAC_COPY_COUNT` and `BUILDLOG_MAC_COPY_NATEDEV_S`; `record.py call` stores them, and rows from before schema 17 read NULL. Mac steps have `caller = verify-mac` and the natedev call's id from `BUILDLOG_CALL_ID`; they reach natedev through `buildlog sync`. NULL `mac_holder` reads `holder not recorded`; known jobs, lost-run leftovers and unreadable holders are counted separately below the busy cause without changing the usable share.
+- The index is at schema 21. `calls` carries `mac` (`passed_full`, `passed_filter`, `failed`, `lost`, `declined`; `passed` before 2026-10-16 meant natedev confirmed the pass), `mac_reason`, `local_reason`, `mac_s`, `mac_holder`, `target` and `hold_wait_s`, and for a Mac copy of a still-compiling natedev test `copy` (the last copy's outcome: `won`, `natedev_won`, `gave_way`, `declined` or `lost`, plus `passed_full` before 2026-10-16; empty when no copy started), `copy_s` (seconds copies held the Mac, summed), `copy_count` (copies started) and `copy_natedev_s` (seconds the natedev nextest step had run, from its first cargo line, when the result was decided). verify.sh passes them as `BUILDLOG_MAC_COPY`, `BUILDLOG_MAC_COPY_S`, `BUILDLOG_MAC_COPY_COUNT` and `BUILDLOG_MAC_COPY_NATEDEV_S`; `record.py call` stores them, and rows from before schema 17 read NULL. Mac steps have `caller = verify-mac` and the natedev call's id from `BUILDLOG_CALL_ID`; they reach natedev through `buildlog sync`. NULL `mac_holder` reads `holder not recorded`; known jobs, lost-run leftovers and unreadable holders are counted separately below the busy cause without changing the usable share.
 - `COUNTED_FAILURE` (`status != 0 AND NOT (caller IS 'verify-mac' AND step IS 'nextest' AND status = 4) AND NOT (host IS 'natedev' AND step IS 'nextest' AND call_id IN (SELECT id FROM calls WHERE copy = 'won'))`) drives `step_days.failed`, the `failures` view, the Mac table's Failed, each step table's Failed and the lead block's `Failed steps`. A Mac "no tests to run" keeps raw status 4 without counting as a failure, and a natedev nextest step stopped because its call's Mac copy finished first keeps its raw status (usually 143) without counting either: the stop is the copy's win, not a test result, and the Mac's own step carries the call's real result. The Summary's successes and failures split stays on raw status.
 - `report.py`'s step tables, Rebuilds, Memory pressure, Power profile, lead counts and Summary count `host = 'natedev'` through `mac_outcome.natedev_step_predicate(step)`, so callers there carry no host suffix. `mac_section(connection, day)` follows `Tests by target` as `### Mac`: `Caller | Kind | Runs | Failed | Avg | p95 | Range | Build | Tests | Tests failed`, one row per caller and kind over every step with `host <> 'natedev'`, offloaded or started on the Mac directly, busiest first. `verify-mac` reads `verify.sh offload`; other callers keep their `caller_label` text. Failed uses `COUNTED_FAILURE`; Build is the mean `finished_s`; a missing test fact shows `—`. A `Mac total: <n> steps, <time>; <n> failed.` line and a Source line close it; a day with no Mac steps prints `No steps recorded on the Mac.` `report.py` excludes Mac-only calls through `natedev_call_predicate`, and shares the result rules in `mac_outcome.offload_record` with `mac_report.py`. Its lead block gives the Mac usable share and current holds. `tests_by_target_lines` prints `Tests by target`: `Package | Mac ran | Mac passed | Mac failed | Mac p50 | natedev ran | natedev p50 | Did not reach the Mac`. The Waiting table has `Held target`, apart from memory admission. `/build:mac_report` gives windows, decline causes and busy holders, local reasons, usable share and the same-tree failure count.
 - `### Mac copies` follows `### Mac`: `Package | Copies | Mac won | natedev won | Gave way | Other | Est. saved | Mac time on copies that did not win`, over the day's test calls with a `copy` word. Copies sums `copy_count`; the outcome columns count calls by their last copy's outcome; Other is `declined`, `lost` and the older `passed_full`; the last column sums `copy_s` of calls whose copy did not win. The lead block ends with `Mac copies: <won> of <started> finished first, about <time> saved (estimated).` A day with no copy prints `Mac copies: none started.` in the section's place and no lead line. A copy-won call counts as Mac ran in `Tests by target` but not as a natedev run (its natedev step was stopped, so its wall time is no natedev run's) and not in `natedev runs avoided`, so a win is counted once, in Mac copies.

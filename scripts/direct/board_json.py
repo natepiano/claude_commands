@@ -22,9 +22,11 @@ if not __package__:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 sys.path.insert(0, str(REPOSITORY_ROOT / "scripts" / "production"))
 
+import unit_table_cells
+
 from scripts.direct import phase_table, plan_history
 from scripts.lib import unit_runs
-from scripts.production import production_units, showrunners, unit_run, units_table
+from scripts.production import production_units, showrunners, unit_run
 
 
 def text(value: object) -> str:
@@ -253,8 +255,8 @@ def stage(events: list[dict[str, object]], state: str, rows: list[phase_table.Do
             repairing = False
     if repairing:
         return f"Repair round {dispatched}"
-    step = units_table.open_step(events)
-    if isinstance(step, units_table.OpenStep):
+    step = unit_table_cells.open_step(events)
+    if isinstance(step, unit_table_cells.OpenStep):
         return step.label
     if isinstance(current, phase_table.OpenPhase):
         return f"Ticket {ticket.id} running" if isinstance(ticket, TicketInProgress) else f"Phase {current.phase} running"
@@ -317,7 +319,7 @@ def unit(cells: dict[str, str], clock: BoardClock, sources: set[Path]) -> dict[s
     if isinstance(found, unit_run.RunFound):
         path = plan_history.history_root() / "runs" / f"{found.run_id}.jsonl"
         sources.add(path)
-        events = units_table.run_events(path)
+        events = unit_table_cells.run_events(path)
         worker_rows = workers(session_directory(found.run_id), sources,
                               re.sub(r"[^a-zA-Z0-9._-]", "-", worktree.name)[:40])
     header = events[0] if events else {}

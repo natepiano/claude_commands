@@ -130,7 +130,7 @@ ensure_worktree() {
         git -C "$repository" worktree add "$worktree" -b "$branch" || return 1
     fi
     bash "$HOME/.claude/scripts/make_a_worktree/copy_settings_local.sh" "$worktree" >/dev/null 2>&1 || true
-    bash "$HOME/.claude/scripts/make_a_worktree/direnv_allow.sh" "$worktree" >/dev/null 2>&1 || true
+    bash "$HOME/.claude/scripts/make_a_worktree/direnv_allow.sh" "$worktree" || return 1
 }
 
 # CLAUDE_CODE_MESSAGING_SOCKET, its token, and the bridge session id name the
@@ -206,13 +206,18 @@ claude_launch_environment || exit 1
 mkdir -p "$state/inbox"
 ensure_worktree || { printf 'worktree preparation failed\n' >&2; exit 1; }
 set_resume_flags "$mode" || exit 1
+nix_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)"
+nix_helper="$nix_lib/nix_env.py"
+nix_python="$nix_lib/py"
+claude_binary="$(command -v claude)"
+"$nix_python" "$nix_helper" ensure "$worktree" >/dev/null || exit 1
 
 if [ "$mode" = here ]; then
     cd "$worktree" || exit 1
     exec env -u CLAUDE_CODE_MESSAGING_SOCKET \
         -u CLAUDE_CODE_MESSAGING_TOKEN \
         -u CLAUDE_CODE_BRIDGE_SESSION_ID \
-        claude -n "$session_name" "${resume_flags[@]}" --permission-mode auto "/berth_fix --fixer"
+        "$nix_python" "$nix_helper" exec "$claude_binary" -n "$session_name" "${resume_flags[@]}" --permission-mode auto "/berth_fix --fixer"
 fi
 
 # An existing Ghostty process may have a different account environment.
@@ -221,6 +226,6 @@ resolver_config_dir=${CLAUDE_CONFIG_DIR:-}
 if [[ -n "$resolver_config_dir" ]]; then
     window_environment+=("CLAUDE_CONFIG_DIR=$resolver_config_dir" "CLAUDE_CODE_REMOTE_MEMORY_DIR=$HOME/.claude")
 fi
-open_window "${window_environment[@]}" claude -n "$session_name" "${resume_flags[@]}" --permission-mode auto "/berth_fix --fixer" \
+open_window "${window_environment[@]}" "$nix_python" "$nix_helper" exec "$claude_binary" -n "$session_name" "${resume_flags[@]}" --permission-mode auto "/berth_fix --fixer" \
     || { printf 'window launch failed\n' >&2; exit 1; }
 printf 'opened %s in a Ghostty window\n' "$session_name"

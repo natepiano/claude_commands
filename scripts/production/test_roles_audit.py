@@ -6,9 +6,10 @@ from contextlib import redirect_stdout
 from io import StringIO
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import roles_audit as audit
 import showrunners
@@ -267,6 +268,107 @@ kept = ["docs/seat/"]
 
 
 class SourceCheckTests(unittest.TestCase):
+    def write_check_root(self, root: Path, sources: dict[str, str]) -> None:
+        inventory = root / "scripts/production/role_terms.toml"
+        inventory.parent.mkdir(parents=True)
+        _ = inventory.write_text(WORKER_TERMS, encoding="utf-8")
+        for name, source in sources.items():
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _ = path.write_text(source, encoding="utf-8")
+
+    def test_check_selects_python_literal_joins_and_decoded_escapes(self) -> None:
+        control = 'print("Dispatch a worker.")\n'
+        cases = (
+            ('print("se" "at")\n', 1),
+            ('print(\n    "se"\n    "at"\n)\n', 2),
+            (r'print("\x73eat")' + "\n", 1),
+            (r'print("\N{LATIN SMALL LETTER S}eat")' + "\n", 1),
+        )
+        for source, line in cases:
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.write_check_root(root, {"scripts/joined.py": source,
+                                             "scripts/control.py": control})
+                with patch.object(audit, "python_prose", wraps=audit.python_prose) as extract:
+                    issues = audit.check_sources(root)
+                self.assertEqual(issues, (f"scripts/joined.py:{line}: retired 'seat'; use 'worker'",))
+                self.assertNotIn(call(control), extract.call_args_list,
+                                 "plain control must skip full prose extraction")
+
+    def test_check_preserves_shell_quotes_and_tab_stripped_heredocs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            control = 'echo "Dispatch a worker."\n'
+            self.write_check_root(root, {
+                "scripts/quoted.sh": 'echo "seat"\n',
+                "scripts/prompt.sh": "cat <<-'PROMPT'\n\tCodex seats\n\tPROMPT\n",
+                "scripts/control.sh": control,
+            })
+            with patch.object(audit, "shell_prose", wraps=audit.shell_prose) as extract:
+                issues = audit.check_sources(root)
+            self.assertEqual(issues, (
+                "scripts/prompt.sh:2: retired 'Codex seats'; use 'worker'",
+                "scripts/quoted.sh:1: retired 'seat'; use 'worker'",
+            ))
+            self.assertNotIn(call(control), extract.call_args_list,
+                             "plain control must skip full prose extraction")
+
+    def test_check_reports_read_and_syntax_errors_without_a_raw_retired_form(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_check_root(root, {
+                "scripts/broken.py": 'print("Dispatch a worker."\n',
+                "scripts/control.py": 'print("Dispatch a worker.")\n',
+            })
+            _ = (root / "scripts/undecodable.py").write_bytes(b"\xff\n")
+            issues = audit.check_sources(root)
+            output = StringIO()
+            with redirect_stdout(output):
+                status = audit.main(["check", "--root", str(root)])
+            self.assertEqual(len(issues), 2)
+            self.assertTrue(any(issue.startswith("scripts/broken.py:") for issue in issues), issues)
+            self.assertTrue(any(issue.startswith("scripts/undecodable.py:") for issue in issues), issues)
+            self.assertEqual(status, 1)
+            self.assertIn("scripts/broken.py:", output.getvalue())
+            self.assertIn("scripts/undecodable.py:", output.getvalue())
+
+    def test_check_covers_non_git_roots_and_untracked_git_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_check_root(root, {
+                "scripts/untracked.py": 'print("Dispatch a seat.")\n',
+                "scripts/control.py": 'print("Dispatch a worker.")\n',
+            })
+            expected = ("scripts/untracked.py:1: retired 'seat'; use 'worker'",)
+            self.assertEqual(audit.check_sources(root), expected)
+            _ = subprocess.run(["git", "init", "--quiet", str(root)], check=True, capture_output=True)
+            self.assertEqual(audit.check_sources(root), expected)
+
+    def test_repository_candidate_check_matches_full_extraction(self) -> None:
+        repository = Path(__file__).resolve().parents[2]
+        # The full-tree reference found no findings or read issues. Keep its
+        # protocol/history files and each source format in this bounded sample;
+        # the separate repository check still covers every live source.
+        paths = (
+            "scripts/production/role_terms.toml",
+            "docs/as-built/shutdown-and-restart.md",
+            "docs/as-built/message-clarity.md",
+            "docs/as-built/usage-ledger.md",
+            "docs/as-built/build-memory-admission.md",
+            "docs/production_format.md",
+            "scripts/production/rename_unit.py",
+            "scripts/direct/implement.sh",
+            "scripts/usage/collect.py",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in paths:
+                destination = root / name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                _ = destination.write_bytes((repository / name).read_bytes())
+            self.assertEqual(audit.check_sources(root), audit.check_sources(root, full_extraction=True))
+
     def test_formatted_string_fragments_keep_prose_when_they_cannot_tokenize(self) -> None:
         sources = {
             "scripts/apostrophe.py": 'print(f"Dispatch a seat\'s work to {name}.")\n',

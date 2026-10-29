@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Generator
 import json
 import contextlib
 import io
 import os
+import fcntl
 from pathlib import Path
 import re
 import signal
@@ -13,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 from typing import TypedDict, cast, final, override
 import unittest
 from contextlib import redirect_stdout
@@ -20,12 +23,14 @@ from unittest import mock
 
 from scripts.production import change_review, merge_gate
 from scripts.direct.wait_for_test_state import wait_for_file
+from scripts.direct.local_release_wait import IntervalReleasePolling
+from scripts.build_hold.test_hold_applies import TemporaryHoldTest
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("merge_gate.py")
 EXPECTED_SUITES = (
-    "lib", "hooks", "message", "accounts", "whoami", "agents", "build_hold",
+    "lib", "hooks", "message", "accounts", "whoami", "agents", "build_hold", "build_queue",
     "mac_test", "usage", "bevy_upgrade", "bevy_migration_plan", "production", "direct", "buildlog",
     "lint", "nightly_review", "build_targets", "shutdown", "feature_log",
     "model_study", "herdr", "notify", "statusline", "astra", "style", "history", "guilds", "issue_score",
@@ -80,10 +85,6 @@ if name == "ssh":
     answer = (state / "mac-answer").read_text() if (state / "mac-answer").exists() else "ff_rc=0\\nfixture-head\\n"
     print(answer, end="")
     raise SystemExit(0)
-if name == "ps":
-    if (state / "release-running").exists():
-        print("12345 " + (state / "release-running").read_text())
-    raise SystemExit(0)
 if name == "suite-python":
     os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
 if name == "style_sync.py":
@@ -122,6 +123,13 @@ class FixtureTest(unittest.TestCase):
         tmp = Path(os.environ["TMPDIR"])
         self.assertTrue(tmp.is_dir())
         self.assertTrue(str(tmp).startswith("/dev/shm/"), tmp)
+        buildlog = Path(os.environ["BUILDLOG_DIR"])
+        self.assertTrue(buildlog.is_dir())
+        self.assertTrue(buildlog.is_relative_to(tmp), buildlog)
+        (buildlog / "fixture-log").write_text("private log")
+        with (state / "buildlogs.jsonl").open("a") as output:
+            fcntl.flock(output, fcntl.LOCK_EX)
+            output.write(json.dumps({"tmpdir": str(tmp), "buildlog": str(buildlog)}) + "\\n")
         self.assertEqual(sys.stdin.read(), "")
         self.assertEqual(signal.getsignal(signal.SIGINT), signal.default_int_handler)
         self.assertEqual(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
@@ -131,6 +139,25 @@ class FixtureTest(unittest.TestCase):
             self.assertEqual(os.environ.get("PYTHONPATH"), os.environ.get("MERGE_GATE_TEST_PYTHONPATH"))
         record({"suite": suite, "module": module.name, "pid": os.getpid(),
                 "event": "start", "tmpdir": str(tmp)})
+        death = state / ("signal-" + suite)
+        if death.exists():
+            if death.read_text() == "once":
+                death.unlink()
+            os.kill(os.getpid(), signal.SIGTERM)
+        if suite == "hooks" and (state / "tool-commands.json").exists():
+            import subprocess
+            commands = json.loads((state / "tool-commands.json").read_text())
+            environment = dict(os.environ)
+            if (state / "own-tool-stubs").exists():
+                tools = tmp / "own-tools"
+                tools.mkdir()
+                for command in commands:
+                    stub = tools / command[0]
+                    stub.write_text("#!/bin/sh\\nexit 0\\n")
+                    stub.chmod(0o755)
+                environment["PATH"] = str(tools) + os.pathsep + environment["PATH"]
+            statuses = [subprocess.run(command, env=environment, check=False).returncode for command in commands]
+            (state / "tool-statuses.json").write_text(json.dumps(statuses))
         if (state / "concurrency-barrier").exists():
             (state / (str(os.getpid()) + ".started")).touch()
             deadline = time.monotonic() + 300
@@ -242,6 +269,11 @@ class MergeGateTests(unittest.TestCase):
             "MERGE_GATE_STATE_DIR": str(self.state / "runner"),
             "MERGE_GATE_STYLE_SYNC": str(self.bin / "style_sync.py"),
             "BUILDLOG_SCOPE": "0",
+            "BUILD_HOLD_DIR": str(self.root / "holders"),
+            "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
+            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
+            "PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": "",
             # The calling showrunner is found from these update timers, never the live ones.
             "NOTIFIER_STATE_DIR": str(home / "notifier"), "CLAUDE_CODE_SESSION_ID": "fixture-showrunner",
         }
@@ -271,7 +303,7 @@ class MergeGateTests(unittest.TestCase):
         self.write(self.unit / "unit.txt", "checkpoint\n")
         self.checkpoint = self.commit(self.unit, "unit checkpoint")
         _ = self.git(self.unit, "push", "-u", "origin", "unit-phase")
-        for name in ("basedpyright", "uv", "ssh", "ps", "suite-python", "style_sync.py", "systemd-run"):
+        for name in ("basedpyright", "uv", "ssh", "suite-python", "style_sync.py", "systemd-run"):
             self.write(self.bin / name, TOOL_STUB.replace("#!/usr/bin/env python3", "#!" + sys.executable, 1))
             (self.bin / name).chmod(0o755)
 
@@ -539,8 +571,8 @@ class MergeGateTests(unittest.TestCase):
         self.assertCountEqual([(row["suite"], row["module"]) for row in starts],
                               [(suite, "test_first.py") for suite in EXPECTED_SUITES] + [("lib", "test_second.py")])
         self.assertEqual(len({row["pid"] for row in starts}), MODULES)
-        self.assertEqual(len({row["tmpdir"] for row in starts}), 1)
-        self.assertFalse(Path(starts[0]["tmpdir"]).exists())
+        self.assertEqual(len({row["tmpdir"] for row in starts}), MODULES)
+        self.assertTrue(all(not Path(row["tmpdir"]).exists() for row in starts))
         type_calls = [call for call in self.calls() if call["tool"] == "basedpyright"]
         self.assertEqual(len(type_calls), 1)
         venv = self.state / "runner" / "typecheck-venv"
@@ -701,6 +733,43 @@ class MergeGateTests(unittest.TestCase):
                                  "MERGE_GATE_TEST_ISOLATION": "1"})
         result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_module_tool_calls_fail_even_when_its_tests_pass(self) -> None:
+        commands = [["cargo", "check"], ["cargo", "metadata"], ["rustc", "--version"],
+                    ["rustdoc", "--version"], ["rustup", "show"], ["cargo-nextest", "--version"]]
+        self.write(self.state / "tool-commands.json", json.dumps(commands))
+        result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(json.loads((self.state / "tool-statuses.json").read_text()), [99] * len(commands))
+        for tool, argument in commands:
+            self.assertIn(f"test_first.py: a test started real {tool}: {argument}", result.stdout)
+        events = [event for event in self.module_events() if event["suite"] == "hooks"]
+        self.assertEqual([event["event"] for event in events], ["start", "finish"])
+        self.assertNotIn("Rerun alone:", result.stdout)
+
+    def test_module_can_put_its_own_build_tool_stub_first(self) -> None:
+        self.write(self.state / "tool-commands.json", json.dumps([["cargo", "check"]]))
+        self.write(self.state / "own-tool-stubs", "stub cargo")
+        result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads((self.state / "tool-statuses.json").read_text()), [0])
+        self.assertNotIn("a test started real", result.stdout)
+
+    def test_modules_use_private_build_logs_and_remove_them(self) -> None:
+        caller_log = self.root / "caller-buildlog"
+        self.write(caller_log / "keep", "caller log")
+        self.environment["BUILDLOG_DIR"] = str(caller_log)
+        result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rows = [cast(dict[str, str], json.loads(line))
+                for line in (self.state / "buildlogs.jsonl").read_text().splitlines()]
+        self.assertEqual(len(rows), MODULES)
+        self.assertEqual(len({row["buildlog"] for row in rows}), MODULES)
+        for row in rows:
+            self.assertTrue(Path(row["buildlog"]).is_relative_to(row["tmpdir"]))
+            self.assertFalse(Path(row["tmpdir"]).exists())
+        self.assertEqual(list(caller_log.iterdir()), [caller_log / "keep"])
+        self.assertEqual((caller_log / "keep").read_text(), "caller log")
 
     def test_red_modules_fail_again_print_both_outputs_and_reset(self) -> None:
         self.write(self.state / "red-lib", "red")
@@ -1040,15 +1109,6 @@ class MergeGateTests(unittest.TestCase):
                 except ProcessLookupError:
                     pass
 
-    def test_relative_release_arguments_are_detected_but_own_process_is_excluded(self) -> None:
-        for arguments in ("build_hold.py release", "python3 build_hold.py release", "python3 /fixture/build_hold.py release"):
-            with self.subTest(arguments=arguments), mock.patch.object(subprocess, "run", return_value=
-                    subprocess.CompletedProcess([], 0, f"999999 {arguments}\n{os.getpid()} {arguments}\n", "")):
-                self.assertTrue(merge_gate.release_running())
-        with mock.patch.object(subprocess, "run", return_value=
-                subprocess.CompletedProcess([], 0, f"{os.getpid()} python3 /fixture/build_hold.py release\n", "")):
-            self.assertFalse(merge_gate.release_running())
-
     def test_sampled_admission_learns_headroom_and_reserves_between_scans(self) -> None:
         admission = merge_gate.SampledRSSAdmission(512)
         admission.observe(100.0, 300.0, {1: 100.0, 2: 30.0})
@@ -1160,7 +1220,7 @@ class MergeGateTests(unittest.TestCase):
         args = merge_gate.GateArguments(main_repo=str(self.main), merge_branch="integration", settings_blob=self.settings_blob,
                                        ssh="fake-ssh", mac_repo="~/fixture", mac_host="fixture")
         for failure in (subprocess.TimeoutExpired("fake-ssh", 25), merge_gate.GateRefused("interrupted by SIGTERM"), KeyboardInterrupt()):
-            with self.subTest(failure=type(failure).__name__), mock.patch.object(merge_gate, "release_running", return_value=False), mock.patch.object(
+            with self.subTest(failure=type(failure).__name__), mock.patch.dict(os.environ, self.environment), mock.patch.object(merge_gate, "wait_for_release_lock"), mock.patch.object(
                     merge_gate, "checked_git", side_effect=["main", "", self.base, self.base, self.settings_blob, "", "", self.base]) as checked, mock.patch.object(
                     merge_gate, "git", return_value=subprocess.CompletedProcess([], 0, "", "")), mock.patch.object(
                     subprocess, "run", side_effect=failure):
@@ -1196,14 +1256,114 @@ class MergeGateTests(unittest.TestCase):
         self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.git(self.origin, "rev-parse", "main"))
         self.assertEqual(len([call for call in self.calls() if call["tool"] == "ssh"]), 2)
 
-    def test_promote_refuses_during_release(self) -> None:
-        self.write(self.state / "release-running", "python3 build_hold.py release")
-        result = self.run_gate("--promote")
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("release", (result.stdout + result.stderr).lower())
+    def publish_for_promotion(self) -> merge_gate.GateArguments:
+        _ = self.git(self.checkout, "merge", "--ff-only", "unit-phase")
+        _ = self.git(self.checkout, "push", "origin", "integration")
+        return merge_gate.GateArguments(
+            main_repo=str(self.main), merge_branch="integration", settings_blob=self.settings_blob,
+            ssh=str(self.bin / "ssh"), mac_repo="~/fixture", mac_host="fixture")
+
+    @contextlib.contextmanager
+    def release_lock_held_by_child(self) -> Generator[subprocess.Popen[str], None, None]:
+        lock = Path(self.environment["BUILD_HOLD_RELEASE_DIR"]) / "release.lock"
+        self.write(lock, "")
+        ready = self.state / "release-lock-held"
+        source = """import fcntl, signal, sys
+from pathlib import Path
+signal.signal(signal.SIGTERM, signal.SIG_DFL)
+with Path(sys.argv[1]).open("r+") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    Path(sys.argv[2]).touch()
+    sys.stdin.readline()
+    fcntl.flock(lock, fcntl.LOCK_UN)
+"""
+        process = subprocess.Popen(
+            [sys.executable, "-c", source, str(lock), str(ready)], env=self.environment,
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        try:
+            wait_for_file(ready)
+            yield process
+        finally:
+            if process.poll() is None:
+                process.kill()
+            _ = process.communicate(timeout=300)
+
+    def test_finished_release_and_live_command_text_do_not_block_promotion(self) -> None:
+        args = self.publish_for_promotion()
+        release = Path(self.environment["BUILD_HOLD_RELEASE_DIR"])
+        holders = Path(self.environment["BUILD_HOLD_DIR"])
+        holders.mkdir()
+        cycle_id = "a" * 32
+        instant = "2026-10-28T14:50:00-04:00"
+        self.write(release / cycle_id / "cycle.json", json.dumps({
+            "id": cycle_id, "opened_at": instant, "release_started_at": instant,
+            "holders": {"fixture": {"since": instant, "released_at": instant}},
+            "recipients": {}, "entries": []}))
+        self.write(release / "current", cycle_id)
+        self.write(release / "release.lock", "")
+        ready = self.state / "command-text-ready"
+        source = ("import pathlib, signal, sys; signal.signal(signal.SIGTERM, signal.SIG_DFL); "
+                  "pathlib.Path(sys.argv[1]).touch(); sys.stdin.readline()")
+        process = subprocess.Popen(
+            [sys.executable, "-c", source, str(ready), "build_hold.py", "release"],
+            env=self.environment, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE, text=True)
+        try:
+            wait_for_file(ready)
+            with mock.patch.dict(os.environ, self.environment), redirect_stdout(io.StringIO()):
+                merge_gate.promote(args)
+            self.assertIsNone(process.poll())
+            self.assertEqual(list(holders.iterdir()), [])
+            self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.checkpoint)
+            self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.checkpoint)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            _ = process.communicate(timeout=300)
+
+    def test_promotion_waits_for_another_process_to_free_the_release_lock(self) -> None:
+        args = self.publish_for_promotion()
+        with self.release_lock_held_by_child() as process:
+            def release_during_wait(_seconds: float) -> None:
+                self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.base)
+                self.assertFalse(any(call["tool"] == "ssh" for call in self.calls()))
+                _, errors = process.communicate(input="release\n", timeout=300)
+                self.assertEqual(process.returncode, 0, errors)
+
+            pause = mock.Mock(side_effect=release_during_wait)
+            clock = SimpleNamespace(monotonic=mock.Mock(side_effect=[10.0, 10.0, 11.0]), sleep=pause)
+            with mock.patch.dict(os.environ, self.environment), \
+                    mock.patch.object(merge_gate, "time", clock), redirect_stdout(io.StringIO()):
+                merge_gate.promote(args, release_lock_wait_s=0.5, release_lock_poll_s=0.01)
+            pause.assert_called_once_with(0.01)
+        self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.checkpoint)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.checkpoint)
+
+    def test_promotion_refuses_when_the_release_lock_stays_held_for_the_whole_wait(self) -> None:
+        args = self.publish_for_promotion()
+        pause = mock.Mock()
+        clock = SimpleNamespace(monotonic=mock.Mock(side_effect=[10.0, 10.0, 70.0]), sleep=pause)
+        with self.release_lock_held_by_child(), mock.patch.dict(os.environ, self.environment), \
+                mock.patch.object(merge_gate, "time", clock):
+            with self.assertRaisesRegex(merge_gate.GateRefused,
+                    "^build-hold state stayed locked for 60 s; main promotion refused$"):
+                merge_gate.promote(args)
+            pause.assert_called_once_with(0.2)
         self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.base)
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
         self.assertFalse(any(call["tool"] == "ssh" for call in self.calls()))
+
+    def test_promotion_does_not_create_a_missing_release_directory_or_lock(self) -> None:
+        args = self.publish_for_promotion()
+        release = Path(self.environment["BUILD_HOLD_RELEASE_DIR"])
+        with mock.patch.dict(os.environ, self.environment), redirect_stdout(io.StringIO()):
+            merge_gate.promote(args)
+            self.assertFalse(release.exists())
+            release.mkdir()
+            merge_gate.promote(args)
+            self.assertEqual(list(release.iterdir()), [])
+        self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.checkpoint)
+        self.assertEqual(len([call for call in self.calls() if call["tool"] == "ssh"]), 2)
 
     def test_promote_preserves_unrelated_local_edits_and_untracked_files(self) -> None:
         self.write(self.main / "subject.txt", "uncommitted main\n")
@@ -1272,6 +1432,225 @@ class MergeGateTests(unittest.TestCase):
         result = self.run_gate("--promote")
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len([call for call in self.calls() if call["tool"] == "ssh"]), 1)
+
+
+@final
+class MergeGateHoldTests(TemporaryHoldTest):
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.gate = MergeGateTests()
+        self.environment: dict[str, str] = {}
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.addCleanup(self.gate.doCleanups)
+        self.gate.setUp()
+        # Keep the hold helper's roots and owner, and the gate helper's tools and repos.
+        self.environment = {**self.gate.environment, **{
+            name: os.environ[name] for name in (
+                "BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR", "BUILD_TARGETS_CONFIG",
+                "MAC_TEST_STATE_DIR", "NOTIFIER_SESSIONS_DIR", "CLAUDE_CODE_SESSION_ID",
+                "UNIT_ACTIVE_DIR", "UNIT_RUN_DIR", "UNIT_SESSION_DIR",
+                "PLAN_DELEGATE_BOARD_DIR", "PLAN_DELEGATE_SESSION_DIR",
+            )
+        }}
+        self.enterContext(mock.patch.dict(os.environ, self.environment))
+
+    def record(self, event: str) -> None:
+        with (self.gate.state / "modules.jsonl").open("a") as output:
+            fcntl.flock(output, fcntl.LOCK_EX)
+            _ = output.write(json.dumps({"suite": "", "module": "", "pid": os.getpid(),
+                                         "event": event, "tmpdir": ""}) + "\n")
+
+    def test_each_mode_waits_before_tests_types_or_promotion(self) -> None:
+        arguments = ["--repo", str(self.gate.checkout), "--merge-branch", "integration",
+                     "--unit-branch", "unit-phase", "--checkpoint", self.gate.checkpoint,
+                     "--previous-checkpoint", self.gate.base, "--unit", "fixture-unit",
+                     "--phase", "hold", "--type-dirs", "scripts/production",
+                     "--production", str(self.gate.quiet_production),
+                     "--settings-blob", self.gate.settings_blob,
+                     "--main-repo", str(self.gate.main), "--ssh", str(self.gate.bin / "ssh")]
+        for mode in ([], ["--tests-only"], ["--promote-only"]):
+            with self.subTest(mode=mode):
+                (self.gate.state / "modules.jsonl").unlink(missing_ok=True)
+                (self.gate.state / "tools.jsonl").unlink(missing_ok=True)
+                self.hold()
+                before_merge = self.gate.git(self.gate.checkout, "rev-parse", "HEAD")
+                before_main = self.gate.git(self.gate.main, "rev-parse", "HEAD")
+
+                def release(_seconds: float) -> None:
+                    self.assertEqual(self.gate.module_events(), [])
+                    self.assertEqual(self.gate.calls(), [])
+                    self.assertEqual(self.gate.git(self.gate.checkout, "rev-parse", "HEAD"), before_merge)
+                    self.assertEqual(self.gate.git(self.gate.main, "rev-parse", "HEAD"), before_main)
+                    self.record("release")
+                    (self.holders / "other").unlink()
+
+                events = IntervalReleasePolling()
+                output = io.StringIO()
+                with mock.patch.object(merge_gate, "local_release_waiter", return_value=events), \
+                        mock.patch.object(events, "wait", side_effect=release), \
+                        redirect_stdout(output):
+                    code = merge_gate.main([*arguments, *mode])
+                self.assertEqual(code, 0, output.getvalue())
+                self.assertEqual(output.getvalue().count("natedev is held by builder; waiting"), 1)
+                self.assertEqual(output.getvalue().count("Gate hold: released after"), 1)
+                recorded = self.gate.module_events()
+                self.assertEqual(recorded[0]["event"], "release")
+                if mode == ["--promote-only"]:
+                    self.assertEqual(len(recorded), 1)
+                    self.assertEqual(len([call for call in self.gate.calls() if call["tool"] == "ssh"]), 1)
+                else:
+                    self.assertEqual(len([event for event in recorded if event["event"] == "finish"]), MODULES)
+
+    def test_sole_holder_runs_all_modules_and_types_without_waiting(self) -> None:
+        self.hold("caller", "builder")
+        output = io.StringIO()
+        with mock.patch.object(merge_gate, "local_release_waiter",
+                               side_effect=AssertionError("the sole holder must run")), redirect_stdout(output):
+            run = merge_gate.run_suites(self.gate.checkout, type_dirs=("scripts/production",))
+        self.assertTrue(run.passed, output.getvalue())
+        self.assertEqual(len(run.jobs), MODULES + 1)
+        self.assertTrue((self.holders / "caller").exists())
+        self.assertTrue((self.gate.state / "types-ran").exists())
+        self.assertNotIn("Gate hold:", output.getvalue())
+        self.assertNotIn("Gate hold wait:", output.getvalue())
+
+    def test_mid_gate_hold_stops_new_starts_and_excludes_wait_time(self) -> None:
+        self.gate.write(self.gate.state / "concurrency-barrier", "held")
+        start = merge_gate.start_gate_job
+        finish = merge_gate.finish_gate_job
+        started: list[merge_gate.RunningGateJob] = []
+        now = [0.0]
+        clock = SimpleNamespace(monotonic=lambda: now[0], sleep=time.sleep)
+
+        def start_module(suite: str, path: Path, argv: list[str], repo: Path,
+                         environment: dict[str, str], log: Path) -> merge_gate.RunningGateJob:
+            self.assertFalse((self.holders / "other").exists(), self.gate.module_events())
+            job = start(suite, path, argv, repo, environment, log)
+            started.append(job)
+            wait_for_file(self.gate.state / f"{job.process.pid}.started")
+            if len(started) == 1:
+                self.hold()
+                self.record("hold")
+            (self.gate.state / f"{job.process.pid}.released").touch()
+            return job
+
+        def finish_module(job: merge_gate.RunningGateJob, status: int) -> merge_gate.GateJobResult:
+            result = finish(job, status)
+            if job is started[0]:
+                recorded = self.gate.module_events()
+                self.assertEqual([event["event"] for event in recorded], ["start", "hold", "finish"])
+                now[0] += 37.0
+                self.record("release")
+                (self.holders / "other").unlink()
+            return result
+
+        output = io.StringIO()
+        with mock.patch.object(merge_gate, "start_gate_job", side_effect=start_module), \
+                mock.patch.object(merge_gate, "finish_gate_job", side_effect=finish_module), \
+                mock.patch.object(merge_gate, "time", clock), redirect_stdout(output):
+            run = merge_gate.run_suites(self.gate.checkout, max_running_jobs=2)
+        self.assertTrue(run.passed, output.getvalue())
+        self.assertEqual(len(run.jobs), MODULES)
+        self.assertEqual(len([event for event in self.gate.module_events() if event["event"] == "finish"]), MODULES)
+        self.assertEqual(run.seconds, 0.0)
+        self.assertIn("Gate hold wait: 37.00s (excluded from Gate tests)", output.getvalue())
+        self.assertIn("Gate tests: 0.00s;", output.getvalue())
+
+    def test_final_hold_read_error_undoes_the_merge_without_pushing(self) -> None:
+        check_settings = merge_gate.check_settings
+
+        def fail_final_hold_read(repo: Path, revision: str, approved: str) -> None:
+            check_settings(repo, revision, approved)
+            self.assertNotEqual(self.gate.git(repo, "rev-parse", "HEAD"), self.gate.base)
+            self.unreadable()
+
+        output = io.StringIO()
+        with mock.patch.object(merge_gate, "check_settings", side_effect=fail_final_hold_read), \
+                contextlib.redirect_stderr(output), redirect_stdout(output):
+            code = merge_gate.main([
+                "--repo", str(self.gate.checkout), "--merge-branch", "integration",
+                "--unit-branch", "unit-phase", "--checkpoint", self.gate.checkpoint,
+                "--previous-checkpoint", self.gate.base, "--unit", "fixture-unit", "--phase", "hold",
+                "--production", str(self.gate.quiet_production), "--type-dirs", "scripts/production",
+                "--settings-blob", self.gate.settings_blob,
+            ])
+        self.assertNotEqual(code, 0, output.getvalue())
+        self.assertIn("natedev hold state cannot be read", output.getvalue())
+        self.assertIn("merge undone, not pushed", output.getvalue())
+        self.assertEqual(self.gate.git(self.gate.checkout, "rev-parse", "HEAD"), self.gate.base)
+        self.gate.assert_not_pushed()
+        self.assertFalse((self.gate.checkout / "unit.txt").exists())
+
+    def test_signalled_module_and_types_jobs_resume_after_hold_release(self) -> None:
+        for suite in ("hooks", "types"):
+            with self.subTest(suite=suite):
+                (self.gate.state / "modules.jsonl").unlink(missing_ok=True)
+                self.gate.write(self.gate.state / "signal-hooks", "once")
+                if suite == "types":
+                    self.gate.write(self.gate.bin / "basedpyright", "#!" + sys.executable + "\n"
+                                    + "import os, pathlib, signal\n"
+                                    + "marker = pathlib.Path(os.environ['MERGE_GATE_TEST_STATE']) / 'signal-types'\n"
+                                    + "if marker.exists():\n"
+                                    + "    marker.unlink()\n"
+                                    + "    os.kill(os.getpid(), signal.SIGTERM)\n"
+                                    + "print('0 errors, 0 warnings, 0 notes')\n")
+                    self.gate.write(self.gate.state / "signal-types", "once")
+                    (self.gate.state / "signal-hooks").unlink()
+                start = merge_gate.start_gate_job
+                starts: list[str] = []
+
+                def start_job(name: str, path: Path, argv: list[str], repo: Path,
+                              environment: dict[str, str], log: Path) -> merge_gate.RunningGateJob:
+                    self.assertFalse((self.holders / "other").exists())
+                    if not starts:
+                        self.hold()
+                        self.record("hold")
+                    starts.append(name)
+                    return start(name, path, argv, repo, environment, log)
+
+                def release(_seconds: float) -> None:
+                    self.assertEqual(starts, [suite])
+                    self.record("release")
+                    (self.holders / "other").unlink()
+
+                events = IntervalReleasePolling()
+                output = io.StringIO()
+                with mock.patch.object(merge_gate, "TEST_SUITES", ("hooks",)), \
+                        mock.patch.object(merge_gate, "RERUN_LIMIT", 0), \
+                        mock.patch.object(merge_gate, "start_gate_job", side_effect=start_job), \
+                        mock.patch.object(merge_gate, "local_release_waiter", return_value=events), \
+                        mock.patch.object(events, "wait", side_effect=release), redirect_stdout(output):
+                    run = merge_gate.run_suites(self.gate.checkout, max_running_jobs=1,
+                                               type_dirs=("scripts/production",) if suite == "types" else ())
+                self.assertTrue(run.passed, output.getvalue())
+                self.assertEqual(starts[:2], [suite, suite])
+                self.assertEqual(len(run.jobs), 2 if suite == "types" else 1)
+                self.assertIn("stopped during a natedev hold; queued again", output.getvalue())
+                self.assertNotIn("Rerun alone:", output.getvalue())
+                events_recorded = [event["event"] for event in self.gate.module_events()]
+                self.assertLess(events_recorded.index("hold"), events_recorded.index("release"))
+                self.assertLess(events_recorded.index("release"), events_recorded.index("finish"))
+
+    def test_a_signal_without_a_hold_keeps_the_module_red(self) -> None:
+        self.gate.write(self.gate.state / "signal-hooks", "always")
+        output = io.StringIO()
+        with mock.patch.object(merge_gate, "TEST_SUITES", ("hooks",)), redirect_stdout(output):
+            run = merge_gate.run_suites(self.gate.checkout)
+        self.assertFalse(run.passed, output.getvalue())
+        self.assertEqual(len(run.jobs), 1)
+        self.assertEqual(run.jobs[0].returncode, -signal.SIGTERM)
+        self.assertEqual([event["event"] for event in self.gate.module_events()], ["start", "start"])
+        self.assertNotIn("queued again", output.getvalue())
+
+    def test_unreadable_hold_state_refuses_before_any_job(self) -> None:
+        self.unreadable()
+        with self.assertRaisesRegex(merge_gate.GateRefused, "natedev hold state cannot be read"):
+            _ = merge_gate.run_suites(self.gate.checkout, type_dirs=("scripts/production",))
+        self.assertEqual(self.gate.calls(), [])
+        self.assertEqual(self.gate.module_events(), [])
 
 
 if __name__ == "__main__":

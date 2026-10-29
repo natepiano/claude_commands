@@ -23,7 +23,7 @@ review, gate and report. Every prompt sent to a worker carries them inline per
 - `single` and `verbose` are mutually exclusive.
 
 <Guild>
-Your guild is `units`. Your head is the `units` unit director in the top-level `guilds` production on natedev. At skill start, use the Tips lock/pull rule for `~/rust/nate_style` and load `guilds/common/` and `guilds/units/`; a Codex holder does this for its worker. Report to your head when the user corrects you, a phase needs repair round 4, a finding meets the Events repeat rule, you use a workaround for a tool fault or slow rule, or a method saves measured time. Send one report of at most 100 words, with evidence and result. Resolve the head from `message/roster.py --json` by production `guilds` and unit `units`; send with `message/send.py` or SendMessage. A Codex worker puts the report in its reply for its holder to send. Send only to the head. Never wake an idle Codex member for guild advice.
+Your guild is `units`. Your head is the `units` unit director in the `guilds` production on natedev. At skill start, use the Tips lock/pull rule for `~/rust/nate_style` and load `guilds/common/` and `guilds/units/`; a Codex holder does this for its worker. Report to your head when the user corrects you, a phase needs repair round 4, a finding meets the Events repeat rule, you use a workaround for a tool fault or slow rule, or a method saves measured time. Send one report of at most 100 words, with evidence and result. Resolve the head from `message/roster.py --json` by production `guilds` and unit `units`; send with `message/send.py` or SendMessage. A Codex worker puts the report in its reply for its holder to send. Send only to the head. Never wake an idle Codex member for guild advice.
 
 Load tips: ~/.claude/scripts/lib/py ~/.claude/scripts/guilds/tips.py load --guild units
 
@@ -630,13 +630,21 @@ launcher's own `landed` and `abandon` reach that phase's ledger.
 | `open --severity <blocker\|minor\|nit> --title <t> --file <p> [--line N] --caught-by <worker\|main\|both> [--lens <adversary\|contract\|craft\|ux>[,…]] [--detail <d>]` | create an id; `--lens` names every lens that raised it, comma-separated; legacy `both` means `adversary,contract` |
 | `status` | read the ledger for closure review |
 | `gate` | get `converged` or `dispatch`, plus batch and any advisory |
-| `dispatch --covers F001,F002,...` | record one complete repair batch |
+| `dispatch --covers F001,F002,... --accepted-checks "<checks or none: reason>" [--keep F001=<regression\|broken\|gate\|ruling>:<evidence>]` | record the complete kept batch; repeat `--keep` per id from repair round 4 (the user, 2026-10-28) |
+| `route --id F003 --reason <spec-gap\|outside-kept> --owner <unit> --work-order "<plan path> — Phase <N> — <title>" --due "<checkpoint>" [--evidence <why>]` | leave work open in an owned follow-up; refuses in-flight, pending or accepted findings and a missing due Astra record (the user, 2026-10-28) |
+| `close-route --from <run id>:<phase instance id>:<finding id> --evidence "<commit, test result, review>"` | the receiving director records closure at its checkpoint (the user, 2026-10-28) |
+| `astra --id F003 --note <path> --approach "<one line>"` or `--unavailable "<reason>"` | record the approach or busy/unavailable result at the current fix-attempt count; note must exist (the user, 2026-10-28) |
+| `exposure --proposal <P1\|P2> --basis "<text>" [--decision "<text>"]` | record trial exposure before the decision (the user, 2026-10-28) |
 | `abandon --reason <r> [--edits-landed]` | a dispatched repair died; reopen its batch |
 | `verdict --id F001 --state <accepted\|still_open\|reopened> [--evidence <e>]` | record closure evidence |
 
 `findings.py` owns batching and gating: the first round gates blockers and
 minors, later rounds gate blockers, nits never gate. It rejects a partial batch,
-so a round closes everything on the ledger; `start-phase` resets it.
+so a round covers every gating open finding; `start-phase` resets it.
+A `routed` finding remains unresolved in `status` under `routed`, outside the
+batch and open counts. `history.py routed --open` shows its owner, Work Order
+and due checkpoint until the receiving director records `close-route`
+(the user, 2026-10-28).
 
 **The gate never stops the run.** It answers `converged` or `dispatch` and
 nothing else. Where it once stopped, it now returns that sentence in `advisory`
@@ -686,8 +694,30 @@ counts all describe the wrong phase. A phase opened beside one still running
 leaves that one open: `start-phase` parks it, and `finish-phase --phase-id <id>`
 closes each at its own end. Name the phase on every launch,
 `implement.sh --phase <id>` and `review.sh --phase <id>`: the pass is stamped
-with it, where a launch without one takes the newest open phase, and the
-launcher writes its files to that phase's `${PHASE_DIR}`.
+with it, and the launcher writes its files to that phase's `${PHASE_DIR}`.
+A launch without a phase is refused (the user, 2026-10-28).
+
+Before each launch, check the prompt's phase against its active instance and title. Run start-phase and finish-phase at the real boundaries and keep parallel phases separately identified. Do not launch against a stale or absent instance. Classify planned implementation/deployment as implementation and command-only verification as an activity. A fix launch names its defect, failed gate or ledger batch. Correct active state only through supported recorder operations, preserving old evidence; never fabricate starts/finishes or rewrite historic records. Missing historic boundaries stay uncertain in analysis. (the user, 2026-10-28)
+
+For the 30-phase accuracy trial, launchers check before any worker starts.
+`review.sh` runs `check-launch` in every mode, including UX and early reviews;
+`implement.sh` runs `start-pass` first. Both commands share the launch check:
+they refuse a missing or closed phase, a first identity line
+`Phase <id> — <title>` that differs from the open phase, and a fix without an
+authorized ledger round unless `implement.sh --fix-cause "<failed gate or defect>"`
+names its cause. The newest round authorizes its workers while in flight and,
+after its resolver lands, while covered findings await closure verdicts; its
+companion can still launch. A prompt with no identity line passes; later phase
+lines are content. Refusals record `launch_refused`; each `pass_started` holds
+`launch_check`, and UX records `launch_checked` without opening a pass. Early
+reviews check again at deferred `start-pass`; a refusal reports error. Stop on
+the recorder message and correct state through supported operations
+(the user, 2026-10-28).
+
+For the 30-exposed-phase P2 trial, after `start-phase` and before the first
+dispatch, record `findings.py exposure --proposal P2 --basis "<Work Order behavior>"`
+when the Work Order changes visible layout, lifecycle or integration behavior,
+or rule or acceptance criteria (the user, 2026-10-28).
 </PassOwnership>
 
 <ProgressContract>
@@ -1199,6 +1229,13 @@ file/line findings and intended behavior. Verification contains only implicated
 `verify.sh` lines—usually check and test, plus lint after the worker's last
 edit when the phase has a lint run, per <PhaseChecks/>.
 
+Put known fixture/setup updates, lint, tests and merge follow-through in the original repair prompt. After handoff, inspect the remaining action. If it only runs unchanged commands and no edit or judgment is pending, the director runs the existing detached verification workflow; do not dispatch a repair worker. Preserve the commands, output, tree identity and review result. A failing command reopens or retains its finding and goes to the owning worker if an edit is needed. Fixture expectations, source edits and conflict choices remain owner work; a green command does not replace closure review. (the user, 2026-10-28)
+
+At each repair handoff whose Verification list holds lint or test commands,
+record `findings.py exposure --proposal P1 --basis "<handoff and commands>"`
+before choosing the runner. Give `--decision "director ran the commands"` or
+`--decision "worker: <the edit or judgment still pending>"` (the user, 2026-10-28).
+
 A repair runs **one worker per file set no other worker touches**: when the failing
 tests or findings split that way, always run as many workers as you can reasonably
 manage; otherwise one. User, 2026-10-04. Use the open `impl` and `test` slots
@@ -1216,15 +1253,55 @@ it. <ClosureReview/> is the cold read, so no worker is spent
 on one here. A worker's file set is its findings' files plus their test targets;
 its prompt names every other worker's files as read only.
 
+Before editing, list accepted behaviors and checks reached by the repair's planned paths, using earlier verdicts, real callers and the current suite. Carry their commands/live views into Verification beside the new regression check. Preserve assertions unless a cited approved goal change or evidence shows an expectation is wrong. Run the new and affected accepted checks on the same tree. Compare a suspected old defect against the prior accepted tree. Reopen lost accepted behavior with failing evidence. Keep cold closure review for public contracts, registration and cross-batch invariants; route unrelated old defects under item 7. (the user, 2026-10-28)
+
+For the 30-phase P5 trial on all repairs, carry those checks in
+`dispatch --accepted-checks "<accepted checks the edits can break>"`; use
+`--accepted-checks "none: <why no accepted behavior is reached>"` only with that
+evidence. Dispatch refuses an empty value; its event records the list. A value
+without `none:` records P5 exposure (the user, 2026-10-28).
+
 Dispatch every open worker with `implement.sh --to <full-worker-name>` before the
 usual positional arguments; the prompt file is the follow-up message. Omit
 `--to` only for a new worker allowed by <LongLivedWorkers/>. Messages without the
 launcher are for questions only.
 
-Run `findings.py dispatch --covers <all batch ids>` before launching, then:
+Count repair rounds as `history.py rounds` numbers its repair intervals, not as ledger batches. From repair round 4 onward, do not dispatch a missing target, rule interpretation or acceptance case in this phase unless evidence establishes a phase-caused regression, broken working behavior or test/gate failure. A broad original permission to fix pilot defects does not override this check. A later explicit user or showrunner ruling may keep named work; cite it. Route every other missing criterion to a follow-up Work Order in the owning unit, with its target decision, implementation, tests and acceptance evidence. Do not dispatch a batch until every finding is either retained with evidence or assigned to that follow-up. Split mixed batches; keep their eligible defects here. Never mark an unmet pilot acceptance bar passed because its work was routed.
+
+Work Orders state the acceptance observation, unit or comparison, and named real-path test or live check for changed behavior. Reuse established targets. Resolve choices through the showrunner before dependent work; do not invent a number to fill the form. A later changed goal updates the order explicitly. (the user, 2026-10-28)
+
+Count repair rounds as `history.py rounds` numbers its repair intervals, not as ledger batches. Before any round 4-or-later dispatch on a repeated finding, require evidence that it is a phase-caused regression, broken working behavior or test/gate failure. Earlier attempts and an open verdict alone are not that evidence. Broad original permission for pilot fixes does not override landing. Cite any later explicit user/showrunner ruling that keeps the named work. Route a repeated finding outside these categories to its owning unit's follow-up Work Order before another repair starts. Keep the finding open and link its checks, previous attempts, due checkpoint and final acceptance result. Split mixed batches and retain all eligible work. If eligibility is unknown, diagnose it rather than silently route or count it as a certain saving.
+
+For retained work after two completed failed fixes, record the failure, approaches tried, cause diagnosis and next distinguishing test before another approach. Interrupted workers and account moves remain continuations, not completed rejected patches. (the user, 2026-10-28)
+
+At each fix limit, try something different. When a phase reaches repair round 4 with a finding still open, or a kept finding has failed two fixes, the director writes a short note: the finding, the tries so far and why each failed. It runs `/astra_review` on the note. Astra's approach goes into the next try, or into the follow-up Work Order when the finding moves out (the user, 2026-10-28).
+
+Before forming the batch, use the gate's `repair_round`, which counts
+`history.py rounds` repair intervals, for the round-4 checks; keep `round` for
+`${FIX_ROUND}` and ledger dispatches. P2 is a 30-exposed-phase trial from
+round 4; P3 is a 30-phase trial. For every `astra_review_due` id, write the note
+and run `/astra_review --run-directory "${SESSION_DIR}" --phase <id> <note>`.
+Record `findings.py astra --id <id> --note <note> --approach "<one line>"`,
+or `--unavailable "<reason>"` when the review reports busy or unavailable.
+Put its approach into the next prompt or receiving Work Order. A new failed
+fix makes the review due again (the user, 2026-10-28).
+
+Route each outgoing id with `findings.py route`, naming its owner, receiving
+Work Order and due checkpoint, before dispatch. Routing is allowed in any
+round, including item 7's landing rule. From repair round 4, give one
+`--keep F003=<regression|broken|gate|ruling>:<evidence>` per covered id.
+The tools refuse a missing due Astra record, kept evidence or accepted checks.
+Every gating open id still belongs in `--covers`; a routed id leaves that
+batch but stays unresolved until its receiving checkpoint records `close-route`
+(the user, 2026-10-28).
+
+Apply <PassOwnership/>'s phase and cause check before each launch
+(the user, 2026-10-28). Run
+`findings.py dispatch --covers <all kept batch ids> --accepted-checks "<checks or none: reason>" [--keep <id>=<category>:<evidence> ...]`
+before launching, then:
 
 ```sh
-UNIT_RESOLVES_ROUND=1 implement.sh --to "<full-worker-name>" \
+UNIT_RESOLVES_ROUND=1 implement.sh --to "<full-worker-name>" --phase "<phase id>" \
   "${SESSION_DIR}" "${WORKING_DIR}" \
   "${SESSION_DIR}/fix_prompt_${FIX_ROUND}.md" fix \
   "<responsibility>" fix "<activity>" "${FIX_ROUND}" <slot>
@@ -1309,7 +1386,11 @@ reporting anything about the round.
    Otherwise the whole batch follows steps 4–5.
 4. Apply <DecisionRouting/> before opening findings.
 5. Open every confirmed remaining issue that has no ledger id yet, then obey
-   `findings.py gate`:
+   `findings.py gate`. Use its `repair_round` for the round-4 routing and kept
+   evidence checks; use `round` for the ledger batch. For each `astra_review_due`
+   id, run and record the Astra step in <FixDispatch/> before dispatch or routing.
+   The gate records P3 exposure when a round-4-or-later decision has a gating
+   open finding with a previous repair (the user, 2026-10-28):
    - `converged`: retain nits for retrospective; continue to smoke, then
      <UXReview/>.
    - `dispatch`: apply <FixDispatch/> to the complete batch, then return here.
@@ -1413,7 +1494,7 @@ instructions name; with none, skip and say so in one line.
      pass index in this session. Write the helper prompt to
      `${SESSION_DIR}/ux_prompt_${PASS_INDEX}_helper.md` and the pool prompt to
      `${SESSION_DIR}/ux_prompt_${PASS_INDEX}_pool.md`, then launch
-     `review.sh --pool ui --lease <slug>/<unit>/<phase> "${SESSION_DIR}" <worktree> "${SESSION_DIR}/ux_prompt_${PASS_INDEX}_pool.md" review "UI design check" "judging the shots" "${PASS_INDEX}" ux`
+     `review.sh --phase "<phase id>" --pool ui --lease <slug>/<unit>/<phase> "${SESSION_DIR}" <worktree> "${SESSION_DIR}/ux_prompt_${PASS_INDEX}_pool.md" review "UI design check" "judging the shots" "${PASS_INDEX}" ux`
      in the background. The launcher resumes the unit's UI reviewer and sends
      every listed image; its thread carries what it learned from earlier reviews.
    - Test `~/.local/state/review-pool/<slug>/ui_adopted`. While it is absent,

@@ -37,6 +37,40 @@ class UsageStoreTests(unittest.TestCase):
         environment: object = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.home)})))
         del environment
 
+    def test_timer_reuse_keeps_original_time_windows_and_failed_read(self) -> None:
+        reports = [Report("Codex", email="timer@example.invalid",
+            source=agent_accounts.CodexHomeSource(self.home / ".codex"),
+            quotas=[Quota("Weekly", 20, RESETS)], five_hour=Quota("5-hour", 30, RESETS), credit_balance="25"),
+            Report("Claude", problem="identity unavailable")]
+        usage_store.save_timer_usage("selection", reports, READ)
+        recent = usage_store.recent_timer_usage("selection", READ + timedelta(minutes=2))
+        self.assertIsInstance(recent, usage_store.RecentTimerUsage)
+        assert isinstance(recent, usage_store.RecentTimerUsage)
+        self.assertEqual(recent.observed_at, READ)
+        self.assertEqual(recent.reports[0].weekly_remaining, 80)
+        self.assertEqual(recent.reports[0].credit_balance, "25")
+        self.assertEqual(recent.reports[0].source, reports[0].source)
+        self.assertEqual(recent.reports[0].five_hour, reports[0].five_hour)
+        self.assertEqual(recent.reports[1].problem, "identity unavailable")
+        self.assertEqual(usage_store.timer_file().stat().st_mode & 0o777, 0o600)
+
+    def test_timer_cache_rejects_expiry_clock_reversal_selection_change_and_damage(self) -> None:
+        usage_store.save_timer_usage("selection", [], READ)
+        for signature, at in (("other", READ), ("selection", READ - timedelta(seconds=1)),
+                              ("selection", READ + timedelta(minutes=10))):
+            self.assertIsInstance(usage_store.recent_timer_usage(signature, at), usage_store.TimerUsageDue)
+        for text in ("bad json", "[]", '{}', '{"signature":"selection","at":42}',
+                     json.dumps({"signature": "selection", "at": READ.isoformat(), "reports": [None]})):
+            _ = usage_store.timer_file().write_text(text)
+            self.assertIsInstance(usage_store.recent_timer_usage("selection", READ), usage_store.TimerUsageDue)
+
+    def test_timer_cache_cannot_hide_a_reset(self) -> None:
+        usage_store.save_timer_usage("selection", [Report("Codex",
+            quotas=[Quota("Weekly", 20, RESETS)],
+            five_hour=Quota("5-hour", 25, READ + timedelta(minutes=1)))], READ)
+        self.assertIsInstance(usage_store.recent_timer_usage("selection", READ + timedelta(minutes=2)),
+                              usage_store.TimerUsageDue)
+
     def test_save_keeps_both_windows_under_the_login_in_lower_case(self) -> None:
         usage_store.save([Report(
             "Claude", email="Main@Example.invalid",

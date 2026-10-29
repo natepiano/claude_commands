@@ -15,7 +15,10 @@ from pathlib import Path
 from typing import Callable, cast, override
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import fn_length_lib
+from scripts.hooks import hook_dispatch
 
 
 HOOK = Path(__file__).with_name("post-tool-use-fn-length.py")
@@ -500,15 +503,19 @@ class FunctionHookTests(SyntheticPackageTests):
     def test_settings_registers_hook_after_basedpyright(self) -> None:
         settings = cast(dict[str, object], json.loads(SETTINGS.read_text()))
         hooks = cast(dict[str, list[dict[str, object]]], settings["hooks"])
+        dispatcher = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/hook_dispatch.py" post_tool_use'
         groups = [group for group in hooks["PostToolUse"]
-                  if group.get("matcher") == "Edit|MultiEdit|Write"]
+                  if any(handler.get("command") == dispatcher
+                         for handler in cast(list[dict[str, object]], group["hooks"]))]
         self.assertEqual(len(groups), 1)
+        self.assertFalse(groups[0].get("matcher"))
         commands = cast(list[dict[str, object]], groups[0]["hooks"])
+        self.assertEqual([handler["command"] for handler in commands], [dispatcher])
         self.assertEqual(
-            [cast(str, handler["command"]) for handler in commands[:2]],
+            [(spec.filename, spec.matcher) for spec in hook_dispatch.POST_TOOL_USE[:2]],
             [
-                '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/post-tool-use-basedpyright.py"',
-                '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/post-tool-use-fn-length.py"',
+                ("post-tool-use-basedpyright.py", "Edit|MultiEdit|Write"),
+                ("post-tool-use-fn-length.py", "Edit|MultiEdit|Write"),
             ],
         )
 
