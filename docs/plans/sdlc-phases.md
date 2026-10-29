@@ -314,7 +314,7 @@ The showrunner sent this work on 2026-10-29 for the user, through hana (the tool
 
 **Acceptance gate:** `tag_inventory.py` passes with the same tag list; `python3 scripts/production/roles_audit.py check --root .` prints no issue; each cancel command the rule names exists in the code it cites; the checkpoint is verified and mergeable.
 
-### Phase 10 — Findings and a design: checkable cancel criteria and one stop command  · status: todo
+### Phase 10 — Findings and a design: checkable cancel criteria and one stop command  · status: done
 **Depends on:** none
 
 The same showrunner request (2026-10-29), Ask 2: research and a design, no build. The showrunner passes the design to hana.
