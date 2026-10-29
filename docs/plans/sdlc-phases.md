@@ -135,16 +135,16 @@ For active process redesigns, as we are currently undergoing with promotions and
 **Ruled out:** a retrospective before sample — the design's Steps need a prospective one; start-time selection inside `phase_boundaries` — it breaks `daily_read.py`; deploy time as exposure — it does not prove which contract a phase read.
 
 ### Phase 4 — `direct.md` becomes a short route, and each step reads only its own rule file  · status: todo
-**Depends on:** Phase 3, Phase 6, Phase 7
+**Depends on:** Phase 3, Phase 6, Phase 7, Phase 8
 
-**Waits for:** Phase 3, Phase 6 and Phase 7 on main (the showrunner names each hash and time); then at least twenty eligible `BeforeChange` phases (`--before-at` main HEAD) from at least two units after the latest of the three times, so both samples run with the same recorder and launchers. fix-rounds-unit's `<FixDispatch/>` edits to `commands/unit/direct.md` are on the sdlc merge branch since c79e5d12.
+**Waits for:** Phase 3, Phase 6, Phase 7 and Phase 8 on main (the showrunner names each hash and time); then at least twenty eligible `BeforeChange` phases (`--before-at` main HEAD) from at least two units after the latest of the four times, so both samples run with the same recorder and launchers. fix-rounds-unit's `<FixDispatch/>` edits to `commands/unit/direct.md` are on the sdlc merge branch since c79e5d12.
 
 #### Work Order
 
 **Goal:** the before sample is frozen in the Step log, then `commands/unit/direct.md` is a short route and each step's rules live in one file that the director reads at that step.
 
 **Spec:**
-- First, before any edit to a contract file, freeze the before sample. Fix both bounds: `--since` is the latest of the three main times, and `--until` is the freeze time, written as UTC stamps in the Step log. Run one invocation per unit: `phase_process.py baseline --exposure before --before-at <~/.claude main HEAD at the freeze> --units <one unit> --since <the latest main time> --until <the freeze time>`. `render_trial` pools the primary measures across all selected units, so a run with several units gives no per-unit result. Run each unit again with `--detail trial` to list its eligible rows. Record in the design doc's **Step log** the `phase_process.py` commit, the before anchor, the filter, each unit, the window, n for each measure, each excluded state with n, median and p90 phase time per unit over the trial's eligible phases (the trial section's phase-time line), and the selected phase instances.
+- First, before any edit to a contract file, freeze the before sample. Fix both bounds: `--since` is the latest of the four main times (Phases 3, 6, 7 and 8), and `--until` is the freeze time, written as UTC stamps in the Step log. Run one invocation per unit: `phase_process.py baseline --exposure before --before-at <~/.claude main HEAD at the freeze> --units <one unit> --since <the latest main time> --until <the freeze time>`. `render_trial` pools the primary measures across all selected units, so a run with several units gives no per-unit result. Run each unit again with `--detail trial` to list its eligible rows. Record in the design doc's **Step log** the `phase_process.py` commit, the before anchor, the filter, each unit, the window, n for each measure, each excluded state with n, median and p90 phase time per unit over the trial's eligible phases (the trial section's phase-time line), and the selected phase instances.
 - Phase instances and matching metadata: the detail table prints only run and display phase id. For each detail row, read its phase start event in `~/.local/state/plan-delegate/runs/<run>.jsonl` (read-only) and record the run id, display phase id, `phase_instance_id`, start time, mode, scope class, worker model and gates. When one display id has more than one instance in the run, the start time inside the window selects the instance; when that does not select exactly one, the Step log names the row ambiguous. A field that the run file does not hold is `NotRecorded` for that row, never a blank. Phase 5 matches on these recorded values.
 - Merge the sdlc merge branch. Build every move on its text (fix-rounds-unit's phase 5 and roles-unit's renames).
 - The route: `direct.md` keeps the tags that can apply at any step after a compaction — state, `<TagReferenceContract>`, `<LongLivedWorkers>`, `<CoreContract>`, `<ProductionUnit>`, `<TurnEndGate>`, `<ToolingContract>`, `<DispatchContract>`, `<WorkerRuns>`, `<PauseForMove>`, `<CompactionContract>`, `<UserFacingText>`, `<ProgressContract>`, `<AuthorizationContract>`, `<DecisionRouting>`, `<Guild>`, `<GuildHeadStanding>`, `<HeldAstraRoles>` and the `**Standing:**` startup line — and one table row per moved tag: tag, file, the moment to read it. Moved tags go to files under `docs/direct/` beside `phase_end.md` and `run_phase_review.md`, grouped by step. Each step file starts with the list of contracts it depends on. A rule body moves byte-for-byte; only the route rows and each step file's header are new text.
@@ -161,7 +161,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 - `impl` — `commands/unit/direct.md`, `docs/direct/*.md` (new files only), `docs/plans/sdlc-phases-design.md`: the before sample, then the move
 - `test` — opens as test — runs `tag_inventory.py` and `roles_audit.py check`, and checks that each moved body is byte-identical to its source; writes no doc text
 
-**Constraints from prior phases:** Deployed revisions: Phase 3 is merged as b5187294, and ~/.claude main has been bc9e8ad9 since 05:29 EDT 2026-10-29. Phase 6 and Phase 7 are pending: the showrunner names hash and time for each, and the Step log records them. Phase 3's recorder records the `direct.md` hash at each phase start and finish, and `phase_process.py` reads exposure from it with `--before-at` (before the route exists) and `--route-revision`. Cheap A's guards (design doc, Recommendation): it does not rely on the 20k restore after compaction, the core rules are always read, each tag is found by its name, the tag inventory stays complete, and no `/unit:delegate` alias copies the text. Move each rule body as it is: repair rules stay fix-rounds-unit's text, `<Guild>` text stays guild-process-unit's (user, 2026-10-28). `direct.md` is a build-followups hub file: the checkpoint notice names each build-followups owner of a touched file, trial-merged against its tip. roles-unit renamed 9 "seat" words to "worker" in `direct.md`; keep them.
+**Constraints from prior phases:** Deployed revisions: Phase 3 is merged as b5187294, and ~/.claude main has been bc9e8ad9 since 05:29 EDT 2026-10-29. Phase 6, Phase 7 and Phase 8 are pending: the showrunner names hash and time for each, and the Step log records them. Phase 8 changes which waits close, so a before sample that starts before Phase 8 is on main mixes two wait recorders. Phase 3's recorder records the `direct.md` hash at each phase start and finish, and `phase_process.py` reads exposure from it with `--before-at` (before the route exists) and `--route-revision`. Cheap A's guards (design doc, Recommendation): it does not rely on the 20k restore after compaction, the core rules are always read, each tag is found by its name, the tag inventory stays complete, and no `/unit:delegate` alias copies the text. Move each rule body as it is: repair rules stay fix-rounds-unit's text, `<Guild>` text stays guild-process-unit's (user, 2026-10-28). `direct.md` is a build-followups hub file: the checkpoint notice names each build-followups owner of a touched file, trial-merged against its tip. roles-unit renamed 9 "seat" words to "worker" in `direct.md`; keep them. Phase 9 adds the run-cancel rule to `<WorkerRuns/>` and a worker sentence to `write_prompt_contract.md` item 3; move them with their tags.
 
 **Acceptance gate:** the gates in Delegation Context green; the Step log holds the frozen before sample; `tag_inventory.py` passes before and after with the same tag list; `roles_audit.py check` prints no issue; each moved body is byte-identical to its source; the checkpoint is verified and mergeable.
 
@@ -191,7 +191,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 - `impl` — `docs/plans/sdlc-phases-design.md`
 - `test` — opens as test — independently re-runs the frozen measure and checks the Step log; it writes no doc text
 
-**Constraints from prior phases:** Deployed revisions: Phase 3 is merged as b5187294, and ~/.claude main has been bc9e8ad9 since 05:29 EDT 2026-10-29. Phase 6, Phase 7 and Phase 4's route are pending: the showrunner names hash and time for each, and the Step log records them. The Step log before measure (version, filter, units, n, fixed window, phase instances with matching metadata), the deploy hash and time from the showrunner, and the change Phase 3 shipped. Step 1's target: weighted director tokens 3–7% lower per phase plus gap; gap 0–3 s. Exposure comes from the `direct.md` hash the recorder records at each phase start and finish (Phase 3), never from a deploy time; Phase 4 froze the before sample before the route. The next step is chosen from B, full A, G and I (design doc, Recommendation); C waits until dispatch time comes first. Phase 6 is on main before the before sample starts, so both samples use the same recorder and launchers. `test_phase_process.py` holds three tests that read the design doc's Recommendation, Comparison and Steps; every Step log or Recommendation edit keeps them green.
+**Constraints from prior phases:** Deployed revisions: Phase 3 is merged as b5187294, and ~/.claude main has been bc9e8ad9 since 05:29 EDT 2026-10-29. Phase 6, Phase 7, Phase 8 and Phase 4's route are pending: the showrunner names hash and time for each, and the Step log records them. The Step log before measure (version, filter, units, n, fixed window, phase instances with matching metadata), the deploy hash and time from the showrunner, and the change Phase 3 shipped. Step 1's target: weighted director tokens 3–7% lower per phase plus gap; gap 0–3 s. Exposure comes from the `direct.md` hash the recorder records at each phase start and finish (Phase 3), never from a deploy time; Phase 4 froze the before sample before the route. The next step is chosen from B, full A, G and I (design doc, Recommendation); C waits until dispatch time comes first. Phases 6, 7 and 8 are on main before the before sample starts, so both samples use the same recorder, wait records and launchers. `test_phase_process.py` holds three tests that read the design doc's Recommendation, Comparison and Steps; every Step log or Recommendation edit keeps them green.
 
 **Acceptance gate:** the Step log has before and after numbers with n and window, the matching result and the phase-time check; `python3 -m unittest discover -s scripts/direct -p 'test_phase_process.py'` passes, its design-doc tests included; the question is sent.
 
@@ -270,6 +270,77 @@ Phase 7's closure review found F007: the recorder checked a postmaster-forwarded
 
 **Tests:** verification runs while the forward is still pending and ends the wait; a missing, duplicate or mismatched record leaves it open; a direct reply still ends it.
 
-**Files:** `scripts/direct/progress_history.py`, `scripts/direct/test_progress_history.py`, `scripts/hooks/test_direct_turn_wait_hooks.py`.
+**Files:**
+- `scripts/direct/progress_history.py` — the forwarded-reply match
+- `scripts/direct/test_progress_history.py` — the regression and rejection tests
+- `scripts/hooks/test_direct_turn_wait_hooks.py` — the hook-level wait tests
 
-**Acceptance gate:** the gates in Delegation Context green; `basedpyright` on the changed files; each new test fails on the Phase 7 tree and passes after.
+Read-only references: `mods/postmaster/hooks/replies.ts`, `mods/postmaster/hooks/protocol.ts`, `mods/postmaster/hooks/outbox.ts` (record directory under `XDG_STATE_HOME`/`HOME`).
+
+**Workers:** `1 writer + 1 tester`
+- `fix3` — `scripts/direct/progress_history.py`: reply verification and the `finish_turn_wait` call boundary; sole hub owner.
+- `merge` — opens as test — `scripts/direct/test_progress_history.py`, `scripts/hooks/test_direct_turn_wait_hooks.py`: record fixtures, the pending-forward regression, rejection and direct-delivery cases.
+
+**Constraints from prior phases:** check that the outer wrapper `from` resolves to the postmaster's verified session or socket before reading any record; keep the direct-supplier path separate. Match the forward's `at_ms` to `record.at_ms`, the exact original body and the receiving `owner_session` in `targets`, to exactly one valid record; the record file counter is not the forward's suffix counter. A pending record proves origin and intended receiver, not confirmed forwarding. `finish_turn_wait` passes `owner_session` to `_supplier_message`. A verified reply alone never ends `WaitingForUser`; that still needs the expected showrunner's relay. Reuse `resolve_production_unit` and `_supplier_address`, keep the run lock and the exact wait-id and owner checks, and keep `VerifiedSupplierMessage | UnverifiedSupplierMessage`. Keep the legacy containment test's rejection and add new-schema pending and done cases. The record schema (abc8344f) is already in HEAD. Use `fix3` and `merge` until models-unit's reopen fix frees `impl` and `test`.
+
+**Acceptance gate:** the gates in Delegation Context green; `basedpyright` on the changed files; the valid pending-forward regression fails on the Phase 7 tree and passes after; direct delivery and every rejection case stay green on both trees. Run `scripts.direct.test_progress_history` and `scripts.hooks.test_direct_turn_wait_hooks`. The full gate also needs unit-board's `rename.py:771` fix on sdlc; Phase 8 does not repair it.
+
+### Phase 9 — A decision that makes a run useless cancels that run in the same turn  · status: done
+**Depends on:** none
+
+The showrunner sent this work on 2026-10-29 for the user, through hana (the tool-based-ui showrunner). At about 12:50 EDT hana parked cables-unit's phase 54b after its third repair round failed. The round's gate run (cargo nextest, started 11:39) kept running until about 13:03 only to finish a report, and it held memory that other runs waited for. No rule told anyone to cancel it.
+
+#### Work Order
+
+**Goal:** every director, showrunner and worker that starts runs reads one rule: when a decision makes a running or queued test, lint or build run useless, cancel that run in the same turn, and give back its memory and its place in the queue.
+
+**Spec:**
+- The rule names the cases: the phase is parked, the round failed, a newer tree replaces the run's tree, or a result already in hand answers the question. No run finishes only to complete a report.
+- The rule names the cancel command for each kind of run that exists today, read from the code, not invented: a `mesh_runs.py` run (`kill -TERM -- -<pid>` on the pid in its record under `${SESSION_DIR}/mesh_runs/`), a detached `verify.sh` run, and a run waiting in the memory queue. Where no clean cancel exists today, the rule says so and points to the Phase 10 design; it does not invent a command.
+- `/showrunner:produce`: a showrunner ruling that parks, stops or replaces work names the runs to cancel.
+- `/unit:direct`: the rule sits in `<WorkerRuns/>`, and the repair-round and park paths point to it.
+- Worker prompts that start runs: `<WritePromptContract/>` item 3's verbatim `## Builds and tests` section carries a one-sentence form of the rule for workers (cancel a run of your own that a later edit or result makes useless).
+- Simplified Technical English. No other text moves; Phase 4 later moves `direct.md` bodies byte-for-byte and keeps this text.
+
+**Files:**
+- `commands/unit/direct.md` — `<WorkerRuns/>` rule and its pointers
+- `commands/showrunner/produce.md` — the ruling rule
+- `docs/direct/write_prompt_contract.md` — the worker sentence in item 3
+
+**Workers:** `1 writer` — three short doc edits; no test lane.
+- `rule` — opens as impl — all three files; it reads `scripts/agents/mesh_runs.py`, `scripts/direct/verify.sh` and the memory queue code read-only to name each cancel command.
+
+**Constraints from prior phases:** `direct.md` is a build-followups hub file: the checkpoint notice names each build-followups owner of a touched file, trial-merged against its tip. Keep roles-unit's "worker" wording. verify-unit (builds production) owns `verify.sh` and the memory queue; this phase changes no code there.
+
+**Acceptance gate:** `tag_inventory.py` passes with the same tag list; `python3 scripts/production/roles_audit.py check --root .` prints no issue; each cancel command the rule names exists in the code it cites; the checkpoint is verified and mergeable.
+
+### Phase 10 — Findings and a design: checkable cancel criteria and one stop command  · status: todo
+**Depends on:** none
+
+The same showrunner request (2026-10-29), Ask 2: research and a design, no build. The showrunner passes the design to hana.
+
+#### Work Order
+
+**Goal:** a design doc says which cancel criteria a tool can check without judgment, with evidence for each, and designs one command that marks a phase or round stopped and cancels every run tied to it.
+
+**Spec:**
+- (a) Criteria. Test each against the live code and records, and state for each: the source a tool reads, whether it is reliable today, and the gap if not.
+  - The run's phase or reservation is released, parked or marked failed.
+  - Its tree or clone is no longer the tip of any live branch or phase.
+  - Its unit recorded a stop or park.
+  - The session that owns it is gone.
+  - A newer run for the same phase and step is queued.
+- (b) One command for the moment work is found faulty (a failed round, a park, a stop rule). It marks the phase or round stopped and cancels every run tied to it: `verify.sh` runs, `mesh_runs` runs and the memory queue. Exit 77 means cancelled, not failed. The design names the run-to-phase link each kind of run carries today, the link it must gain, the record the stop writes, and who calls the command (director, showrunner, repair round).
+- builds is planning verify-made build copies with provenance paths; a copy path that names its phase serves criterion (a). The design states what path shape it needs from builds.
+- verify-unit (builds production) owns `verify.sh` and the queue. The design marks every change there as builds' to agree; the unit director sends builds that part before the design goes to the showrunner.
+- No code changes.
+
+**Files:**
+- `docs/plans/sdlc-run-cancel-design.md` — findings and design (new)
+
+**Workers:** `1 designer` — an Astra designer under `<HeldAstraRoles/>`, with one reviewer.
+- `designer` — `docs/plans/sdlc-run-cancel-design.md`; reads the code read-only.
+
+**Constraints from prior phases:** Phase 6 and Phase 7 wait records name the worker pass, checkpoint and sender that own each wait (`progress_history.py`); the stop record should reuse those identities. `mesh_runs.py` records live in `${SESSION_DIR}/mesh_runs/`, each log beside its record. Reservation states are in `phase_reservation.py`.
+
+**Acceptance gate:** each criterion has its source, reliability and gap with a file reference; the command design names its links, records, exit codes and callers; builds' part is marked and sent; the reviewer's findings are answered; the design is sent to the showrunner.
