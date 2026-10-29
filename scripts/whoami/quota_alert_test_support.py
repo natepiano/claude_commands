@@ -9,6 +9,7 @@ import base64
 import json
 import os
 import subprocess
+import shutil
 import sys
 import tempfile
 import unittest
@@ -16,7 +17,7 @@ from collections.abc import Callable
 from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import cast, override
+from typing import ClassVar, cast, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -112,29 +113,17 @@ class QuotaReminderFixture(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.root = Path(directory.name).resolve()
+        self.root = self.fixture_root()
         _ = self.enterContext(mock.patch.object(session_table, "live_sessions", return_value=session_table.ReadSessions({}, frozenset())))
         environment_context = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root),
         })))
         del environment_context
-        (self.root / ".claude/config").mkdir(parents=True)
-        _ = (self.root / ".claude/config/accounts.json").write_text(
-            json.dumps({"workers": "codex1"}))
-        _ = (self.root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "someone@example.com"}}))
-        codex_home = self.root / ".codex"
-        codex_home.mkdir()
-        claims = base64.urlsafe_b64encode(json.dumps({"email": "someone@example.com"}).encode()).decode().rstrip("=")
-        _ = (codex_home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
+        self.prepare_files()
         _ = self.enterContext(mock.patch.object(note_file, "AGENTS_DIR", self.root))
         _ = self.enterContext(mock.patch.object(agent_notes, "READINGS_LOG", self.root / "readings.jsonl"))
         config = self.root / "showrunners.json"
-        _ = config.write_text(json.dumps({"threshold_percent": 1, "repeat_minutes": 30,
-                                          "stall_minutes": 5, "faults_to": "natedev", "always": ["natedev"]}))
         registry = self.root / "agents.conf"
-        _ = registry.write_text(REGISTRY)
         for name, value in (("CONFIG", config), ("STATE", self.root / "state.json"), ("relay", self.relay),
                             ("tell_user", self.tell_user), ("REGISTRY", registry)):
             patcher = mock.patch.object(quota_alert, name, value)
@@ -145,11 +134,31 @@ class QuotaReminderFixture(unittest.TestCase):
         self.addCleanup(recipients_patch.stop)
         # A fresh sync stamp and no Codex config keep agents_config.sh from syncing the catalog into the fixture.
         synced = self.root / "catalog synced"
-        synced.touch()
         for key, value in (("CODEX_CATALOG_SYNC_STATE_FILE", synced), ("CODEX_CONFIG_FILE", self.root / "absent"),
                            ("CODEX_MODELS_CACHE_FILE", self.root / "absent")):
             self.addCleanup(self.restore_environment, key, os.environ.get(key))
             os.environ[key] = str(value)
+
+    def fixture_root(self) -> Path:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        return Path(directory.name).resolve()
+
+    def prepare_files(self) -> None:
+        """Write the immutable starting account and registry documents."""
+        (self.root / ".claude/config").mkdir(parents=True)
+        _ = (self.root / ".claude/config/accounts.json").write_text(
+            json.dumps({"workers": "codex1"}))
+        _ = (self.root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "someone@example.com"}}))
+        codex_home = self.root / ".codex"
+        codex_home.mkdir()
+        claims = base64.urlsafe_b64encode(json.dumps({"email": "someone@example.com"}).encode()).decode().rstrip("=")
+        _ = (codex_home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
+        _ = (self.root / "showrunners.json").write_text(json.dumps({
+            "threshold_percent": 1, "repeat_minutes": 30, "stall_minutes": 5,
+            "faults_to": "natedev", "always": ["natedev"]}))
+        _ = (self.root / "agents.conf").write_text(REGISTRY)
+        (self.root / "catalog synced").touch()
 
     @staticmethod
     def restore_environment(key: str, value: str | None) -> None:
@@ -310,6 +319,41 @@ class QuotaReminderFixture(unittest.TestCase):
         entries = [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()]
         return [entry for entry in entries if entry.get("kind") in
                 ("routed to claude", "routed back", "routing not restored")]
+
+class SeededQuotaReminderFixture(QuotaReminderFixture):
+    """Copy a class's account and registry seed to the same private path per test.
+
+    Python alert logic and the real Bash registry editor remain unchanged. Other
+    users of QuotaReminderFixture keep their original per-test construction.
+    """
+
+    seed: ClassVar[Path]
+    case: ClassVar[Path]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        directory = tempfile.TemporaryDirectory(prefix="quota-reminder-test-")
+        cls.addClassCleanup(directory.cleanup)
+        root = Path(directory.name).resolve()
+        cls.seed, cls.case = root / "seed", root / "case"
+        cls.seed.mkdir()
+        builder = cls()
+        builder.root = cls.seed
+        QuotaReminderFixture.prepare_files(builder)
+
+    @override
+    def fixture_root(self) -> Path:
+        _ = shutil.copytree(self.seed, self.case)
+        self.addCleanup(shutil.rmtree, self.case)
+        return self.case
+
+    @override
+    def prepare_files(self) -> None:
+        # fixture_root has restored the class seed, including its sync stamp.
+        pass
+
 
 class CodexZeroEpisodeFixture(unittest.TestCase):
     root: Path = Path()

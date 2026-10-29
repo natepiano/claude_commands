@@ -82,6 +82,22 @@ class WorkspaceRunTests(CargoProjectTests):
         self.runner = FakeRunner()
         self.server = ScriptedServer(lambda text, offset, new: word_edits(text, "old", new))
 
+    def test_metadata_only_rule_edit_selects_approved_findings_but_body_edit_is_stale(self) -> None:
+        ledger, definition, findings = self.setup_findings()
+        self.addCleanup(ledger.close)
+        _ = subprocess.run(["git", "init", "-q", str(definition.path.parent.parent)], check=True)
+        _ = subprocess.run(["git", "-C", str(definition.path.parent.parent), "hash-object", "-w", str(definition.path)],
+                           check=True, capture_output=True)
+        text = definition.path.read_text()
+        _ = definition.path.write_text(text.replace("---\n", "---\napproval: always\n", 1))
+        current = next(rule for rule in rules.load_rules(self.repo) if rule.rule_id == definition.rule_id)
+        self.assertEqual({f.finding_id for f in run.select(ledger, current).findings}, {f.finding_id for f in findings})
+        _ = definition.path.write_text(definition.path.read_text() + "Changed requirement\n")
+        changed = next(rule for rule in rules.load_rules(self.repo) if rule.rule_id == definition.rule_id)
+        selected = run.select(ledger, changed)
+        self.assertFalse(selected.findings)
+        self.assertEqual({item.reason for item in selected.skipped}, {"rule changed since judged"})
+
     def setup_findings(self) -> tuple[ledger_api.Ledger, rules.Rule, tuple[ledger_api.HeldFinding, ...]]:
         ledger = self.ledger()
         ledger.set_tip(self.base)
