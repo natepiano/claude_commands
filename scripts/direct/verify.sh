@@ -33,8 +33,9 @@
 # director's last command before a Rust checkpoint. Workers may run it too.
 # Unlike lint stages, this phase check cannot be switched off in lint.conf.
 # A pass is stored in ~/.local/state/verify/doc_pass/<tree>.json, keyed by a
-# temporary index of all tracked and untracked, non-ignored working files.
-# The real index is unchanged. A tree changed during the run records nothing.
+# staged index in a stable, locked checkout under the repo's target directory.
+# Unstaged and untracked files are excluded. The real index is unchanged. A staged tree
+# changed during the run records nothing.
 # Records outlive worker sessions and are pruned after 14 days on each write.
 #
 # The lint stages — mend, fmt, clippy fix, fmt, clippy judgment — use
@@ -1017,8 +1018,8 @@ tree_key() {
         <<< "${GATE_METADATA}" 2>/dev/null || true
 }
 
-# Git's own tree identity, including every non-ignored working file. Initialize
-# from the real index to retain tracked files even when they are now ignored.
+# Git's staged tree identity. A private copy avoids updating the real index's
+# cache-tree extension when write-tree runs.
 doc_tree() {
     "$PY" - <<'PYDOC'
 import os
@@ -1036,8 +1037,47 @@ with tempfile.TemporaryDirectory(prefix="verify-doc-", dir="/tmp") as temporary:
     environment = {**os.environ, "GIT_INDEX_FILE": str(private_index)}
     def git(*arguments: str) -> str:
         return subprocess.check_output(["git", "-C", top, *arguments], env=environment, text=True).strip()
-    git("add", "-A", "--", ".")
     print(git("write-tree"))
+PYDOC
+}
+
+# The caller holds DOC_CHECKOUT/lock until rustdoc and its record are complete.
+# The private index and persistent path preserve unchanged source mtimes.
+doc_checkout() {
+    "$PY" - "$DOC_REPO_TOP" "$DOC_TREE" "$DOC_CHECKOUT" <<'PYDOC'
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+top, judged, checkout = sys.argv[1], sys.argv[2], Path(sys.argv[3])
+tree, index, previous = checkout / "tree", checkout / "index", checkout / "tree-id"
+git_dir = subprocess.check_output(["git", "-C", top, "rev-parse", "--absolute-git-dir"], text=True).strip()
+environment = {**os.environ, "GIT_DIR": git_dir, "GIT_WORK_TREE": str(tree), "GIT_INDEX_FILE": str(index)}
+
+def git(*arguments):
+    subprocess.run(["git", "-C", str(tree), *arguments], env=environment, check=True)
+
+try:
+    old = previous.read_text().strip()
+    if not index.is_file() or not tree.is_dir() or not old:
+        raise ValueError("checkout metadata missing")
+    # A timestamp-only change is clean after rehashing; a content change
+    # instead triggers the one full recovery below.
+    git("update-index", "--refresh")
+    git("clean", "-ffdqx")
+    git("read-tree", "-m", "-u", old, judged)
+except (OSError, ValueError, subprocess.CalledProcessError):
+    # A failed update or missing private index gets exactly one full recovery.
+    if tree.exists():
+        shutil.rmtree(tree)
+    index.unlink(missing_ok=True)
+    index.with_name(index.name + ".lock").unlink(missing_ok=True)
+    tree.mkdir()
+    git("read-tree", judged)
+    git("checkout-index", "--all", "--index")
+previous.write_text(judged + "\n")
 PYDOC
 }
 
@@ -1045,7 +1085,7 @@ doc_record() {
     local current_tree
     current_tree="$(doc_tree)" || return
     if [[ "$current_tree" != "$DOC_TREE" ]]; then
-        echo 'verify.sh: the tree changed while doc ran; no doc pass record was written.'
+        echo 'verify.sh: the staged tree changed while doc ran; no doc pass record was written.'
         return 0
     fi
     "$PY" - "$DOC_REPO_TOP" "$DOC_TREE" "$BUILDLOG_CALL_ID" <<'PYDOC'
@@ -2555,11 +2595,28 @@ case "$CMD" in
             exit 2
         fi
         DOC_REPO_TOP="$(git rev-parse --show-toplevel)"
+        # Cargo resolves its configured target at the original repo, never at
+        # the isolated source checkout. Relative env overrides use that top.
+        if [[ -z "${CARGO_TARGET_DIR:-}" ]]; then
+            CARGO_TARGET_DIR="$(cd "$DOC_REPO_TOP" && cargo metadata --no-deps --format-version 1 \
+                | "$PY" -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
+        fi
+        CARGO_TARGET_DIR="$("$PY" -c 'from pathlib import Path; import sys; print((Path(sys.argv[1]) / sys.argv[2]).resolve())' "$DOC_REPO_TOP" "$CARGO_TARGET_DIR")"
+        export CARGO_TARGET_DIR
+        DOC_CHECKOUT="$CARGO_TARGET_DIR/verify-doc/$("$PY" -c 'import hashlib, sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:24])' "$DOC_REPO_TOP")"
+        mkdir -p "$DOC_CHECKOUT"
+        # fd 8 holds the doc checkout lock; fd 9 belongs to nextest sharing.
+        exec 8>"$DOC_CHECKOUT/lock"
+        flock 8
         DOC_TREE="$(doc_tree)"
+        doc_checkout
         if ! lint_config_enabled doc; then
             echo 'verify.sh: the phase rustdoc check cannot be switched off; ignoring doc=off.'
         fi
-        LINT_CONFIG_FORCE=1 invoke_doc --workspace "${DOC_FEATURE_FLAGS[@]}"
+        (
+            cd "$DOC_CHECKOUT/tree"
+            LINT_CONFIG_FORCE=1 invoke_doc --workspace "${DOC_FEATURE_FLAGS[@]}"
+        )
         doc_record
         ;;
     example)

@@ -5,11 +5,11 @@ Usage: rename_unit.py plan|apply|verify <slug> <old> <new> [--scratch <showrunne
 
 `<old>` is the unit's Units id, or its stem; `<new>` takes an id or a stem and becomes
 `<stem>-unit`, as add_unit names a unit. apply saves the request before it changes anything, stops
-the unit and its Codex seats at once through the shutdown path (`down`, then `now`), sends SIGTERM to
-what its runs leave in its worktree (an app-server and its seats, a detached run's supervisor, an app-server's watcher), merges the merge branch into the unit, moves the branch and
+the unit and its Codex workers at once through the shutdown path (`down`, then `now`), sends SIGTERM to
+what its runs leave in its worktree (an app-server and its workers, a detached run's supervisor, an app-server's watcher), merges the merge branch into the unit, moves the branch and
 worktree (unit_move), commits `chore(<slug>): rename unit <old> to <new>` on the merge branch, which
 merge_branch_history follows, merges that commit into the unit, moves the unit's state, retires the
-old branch, points the unit's shutdown record at the new names (each paused Codex seat's launcher
+old branch, points the unit's shutdown record at the new names (each paused Codex worker's launcher
 folder and resume prompt included), relaunches the unit from it and verifies; verify also fails
 while a process works in the old worktree path. One apply does all of it: it waits for the stop (STOP_WAIT_SECONDS) and for the relaunched
 unit to come up live (LIVE_WAIT_SECONDS), and exits 2 only when the stop outlasts its wait; a rerun
@@ -77,7 +77,7 @@ PROGRESS = ("merged", "doc_commit", "unit_tip", "account", "session_id", "kept",
 SHUTDOWN = Path(os.environ.get("RENAME_UNIT_SHUTDOWN") or Path(__file__).resolve().parent.parent / "shutdown/shutdown.py")
 STOPPED = frozenset({"stopped", "already gone", "process identity lost"})
 STOPPING = frozenset({"waiting", "reaping", "ready", "stopping", "held by usage limit", "passive worker ready"})
-# The kinds `shutdown.py now` forces: a rename stops the unit and its Codex seats at once, not at
+# The kinds `shutdown.py now` forces: a rename stops the unit and its Codex workers at once, not at
 # their next idle (user, 2026-10-20).
 FORCEABLE = frozenset({"waiting", "reaping", "ready", "held by usage limit"})
 # How long apply waits for the unit to stop, and for the relaunched unit to come up live.
@@ -621,7 +621,7 @@ def stop_unit(rename: StopTarget, _save: Callable[[], None]) -> None:
 
 def _stop_runs(rename: StopTarget) -> None:
     """End what the unit's runs leave in its worktree once the unit has stopped: each run's
-    app-server with its seats (`codex_mesh.py stop`, as retire_unit does), then by SIGTERM a
+    app-server with its workers (`codex_mesh.py stop`, as retire_unit does), then by SIGTERM a
     detached run's supervisor with its command, an app-server's idle-stop watcher, and an
     app-server that did not stop. Each leads its own session, so the shutdown path does not end
     it, and nothing starts it again."""
@@ -685,19 +685,19 @@ def renamed_note(rename: UnitRename) -> str:
             + f"{rename.new_worktree} on branch {rename.new_branch}"
             + (f", and your plan is at {plans}" if plans else "") + ". Use these names from now on."
             + (f" Your work was in progress ({rename.kept}), so your branch kept its commits and took no merge: "
-               + f"the rename commit comes with your next merge of {rename.merge_branch}. Your paused Codex seats "
+               + f"the rename commit comes with your next merge of {rename.merge_branch}. Your paused Codex workers "
                + f"now work in {rename.new_worktree}; say so in your next message to each." if rename.kept else ""))
 
 
 def seat_note(rename: UnitRename) -> str:
-    """The line a paused Codex seat reads in its resume prompt when its worktree moved."""
+    """The line a paused Codex worker reads in its resume prompt when its worktree moved."""
     return (f"While you were paused the showrunner renamed your unit: your worktree is now {rename.new_worktree} "
             + f"on branch {rename.new_branch}. {rename.old_worktree} no longer exists; wherever your instructions "
             + f"name it, use {rename.new_worktree}.")
 
 
 def _move_seats(rename: UnitRename, saved: SessionShutdown) -> None:
-    """Point each paused Codex seat at the new worktree: its launcher's cwd, and a line in its resume prompt."""
+    """Point each paused Codex worker at the new worktree: its launcher's cwd, and a line in its resume prompt."""
     if rename.old_worktree == rename.new_worktree:
         return
     note = seat_note(rename)
@@ -949,7 +949,7 @@ class Step(NamedTuple):
 
 
 def _describe_stop(r: UnitRename) -> str:
-    return (f"stop {r.old} and its Codex seats at once through the shutdown path; its record carries the relaunch; "
+    return (f"stop {r.old} and its Codex workers at once through the shutdown path; its record carries the relaunch; "
             + "then stop its runs' app-servers and SIGTERM their supervisors and app-server watchers left in the worktree")
 
 
@@ -993,7 +993,7 @@ def _describe_record(r: UnitRename) -> str:
     if r.id_matches:
         return f"shutdown record: {session}"
     return (f"shutdown record: unit {r.old} -> {r.new}, {session}, and the paths under its worktree, "
-            + "each paused Codex seat's included, whose resume prompt names the new worktree")
+            + "each paused Codex worker's included, whose resume prompt names the new worktree")
 
 
 def _describe_relaunch(r: UnitRename) -> str:

@@ -118,6 +118,7 @@ class CargoWrapperTest(unittest.TestCase):
             "OSTYPE": "linux-gnu",
             "XDG_RUNTIME_DIR": str(self.runtime),
             "BUILD_HOLD_DIR": str(self.hold),
+            "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "CARGO_WRAPPER_CGROUP_FILE": str(self.cgroup),
             "CARGO_LOG": str(self.cargo_log),
             "SCOPE_LOG": str(self.scope_log),

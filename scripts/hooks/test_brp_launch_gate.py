@@ -257,10 +257,15 @@ printf "MemAvailable: 67108864 kB\n" > "$BUILDLOG_MEMINFO"
     def test_unreadable_release_record_denies_launch_without_repairing_it(self) -> None:
         self.prepare_hold_before_release()
         _ = self.cycle_file.write_text("{broken")
+        release = Path(self.environment["BUILD_HOLD_RELEASE_DIR"])
+        holder = Path(self.environment["BUILD_HOLD_DIR"]) / "holder"
+        before = (holder.read_bytes(), (release / "current").read_bytes())
         result = self.run_hook()
         response = cast(HookResponse, json.loads(result.stdout))
         self.assertEqual(response["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertEqual(self.cycle_file.read_text(), "{broken")
+        self.assertEqual((holder.read_bytes(), (release / "current").read_bytes()), before)
+        self.assertEqual(list(release.rglob("*.damaged-*")), [])
         self.assertNotIn("waiting for memory", result.stderr)
 
     def test_failed_hold_check_without_output_denies_with_a_reason(self) -> None:
