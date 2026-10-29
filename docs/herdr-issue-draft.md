@@ -27,7 +27,7 @@ The rule's `not` clauses (`esc to cancel`, `enter to select`, …) do not help, 
 3. Ask Claude to run a Bash command that needs approval, so that the permission dialog opens at the bottom of the screen.
 4. Run `herdr pane get <pane>` and `herdr agent explain <pane>`.
 
-Steps 1-3 are the shape of the screen we saw; we found the cause from a saved screen, not from these exact steps. To test without a live session, save the screen to a file and run `herdr agent explain --file <screen> --agent claude`.
+We have not run these exact steps. We found the cause from a saved copy of the pane's screen. You can check a saved screen without a live session: `herdr agent explain --file <screen> --agent claude`.
 
 ## Expected
 
@@ -45,7 +45,7 @@ The pane is **idle**. The rule is `live_prompt_box`.
 
 ## Suggested fix
 
-We use a local override with two edits, and it has worked since 2026-10-21:
+We use a local override with two edits:
 
 1. `live_prompt_box` matches only a box whose body **opens** with the `❯` line, not any body that has a `❯` line somewhere:
 
