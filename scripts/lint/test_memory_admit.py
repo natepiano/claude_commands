@@ -39,7 +39,6 @@ def setUpModule() -> None:
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
     _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {
         "BUILDLOG_MEMORY_PRESSURE": str(root / "pressure"),
-        "BUILDLOG_SWAPINFO": str(root / "swap"),
     })))
 
 
@@ -508,14 +507,13 @@ class MeasuredAdmissionTests(MemoryQueueFixture):
 
 class PressureAdmissionTests(MemoryQueueFixture):
     pressure: Path = Path()
-    swap: Path = Path()
 
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.pressure, self.swap = self.root / "pressure", self.root / "swap"
+        self.pressure = self.root / "pressure"
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "BUILDLOG_MEMORY_PRESSURE": str(self.pressure), "BUILDLOG_SWAPINFO": str(self.swap),
+            "BUILDLOG_MEMORY_PRESSURE": str(self.pressure),
             "BUILDLOG_MEMINFO": str(self.meminfo), "BUILDLOG_PROC": str(self.root / "proc"),
         })))
 
@@ -535,11 +533,16 @@ class PressureAdmissionTests(MemoryQueueFixture):
                 _ = self.pressure.write_text(f"some avg10=71.0 avg60=1.0 total=1\nfull avg10={full} avg60=1.0 total=1\n")
                 self.assert_admission(full > 10)
 
-    def test_swap_holds_only_above_ninety_percent_and_no_swap_passes(self) -> None:
-        for total, free, held in ((100, 5, True), (100, 15, False), (100, 10, False), (0, 0, False)):
-            with self.subTest(total=total, free=free):
-                _ = self.swap.write_text(f"SwapTotal: {total} kB\nSwapFree: {free} kB\n")
-                self.assert_admission(held)
+    def test_idle_swap_at_ninety_nine_percent_does_not_hold_low_pressure_admission(self) -> None:
+        _ = self.pressure.write_text("full avg10=4.0 avg60=1.0 total=1\n")
+        _ = self.meminfo.write_text(
+            f"MemAvailable: {40 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n"
+            + "SwapTotal: 100 kB\nSwapFree: 1 kB\n")
+        profile = gate.StepProfile("test", "nextest", "test", gate.ExpectedPeak(8 * GIB, "measured", 5))
+        result = gate.check(self.meminfo, 400, "", ["cargo", "nextest"], root=self.root, now=NOW, profile=profile)
+        self.assertEqual(result.decision.state, "admit")
+        self.assertIsInstance(result.reservation, gate.Reserved)
+        self.assertIsInstance(result.decision.pressure, gate.NoPressureHold)
 
     def test_unreadable_pressure_does_not_hold_but_memory_still_does(self) -> None:
         self.pressure.mkdir()
@@ -558,7 +561,8 @@ class PressureAdmissionTests(MemoryQueueFixture):
             gate.main()
         fields = output.getvalue().strip().split("|")
         self.assertEqual(fields[0], "hold")
-        self.assertIn("memory pressure: full avg10 23.4, swap 0%", fields[8])
+        self.assertEqual(fields[8], "memory pressure: full avg10 23.4")
+        self.assertNotIn("swap", fields[8])
         self.assertEqual(fields[6], "0")
 
 

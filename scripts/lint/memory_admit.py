@@ -113,7 +113,6 @@ class NoPressureHold:
 @dataclass(frozen=True)
 class MemoryPressure:
     full_avg10: float
-    swap_percent: float
 
 
 Pressure = NoPressureHold | MemoryPressure
@@ -422,9 +421,9 @@ def read_meminfo(path: Path) -> tuple[int, int | None]:
     return available, total
 
 
-def read_pressure(meminfo: Path) -> Pressure:
-    """Unreadable pressure or swap files do not block; the memory rule still applies."""
-    full, swap = 0.0, 0.0
+def read_pressure() -> Pressure:
+    """An unreadable pressure file does not block; the memory rule still applies."""
+    full = 0.0
     try:
         path = Path(os.environ.get("BUILDLOG_MEMORY_PRESSURE", "/proc/pressure/memory"))
         for line in path.read_text().splitlines():
@@ -433,19 +432,11 @@ def read_pressure(meminfo: Path) -> Pressure:
                 full = next(float(part.removeprefix("avg10=")) for part in parts[1:] if part.startswith("avg10="))
     except (OSError, ValueError, StopIteration):
         pass
-    try:
-        path = Path(os.environ.get("BUILDLOG_SWAPINFO", str(meminfo)))
-        values = {parts[0]: int(parts[1]) for line in path.read_text().splitlines()
-                  if len(parts := line.split()) == 3 and parts[0] in ("SwapTotal:", "SwapFree:")}
-        if values.get("SwapTotal:", 0) > 0 and "SwapFree:" in values:
-            swap = 100 * (values["SwapTotal:"] - values["SwapFree:"]) / values["SwapTotal:"]
-    except (OSError, ValueError):
-        pass
-    return MemoryPressure(full, swap) if full > 10.0 or swap > 90.0 else NO_PRESSURE_HOLD
+    return MemoryPressure(full) if full > 10.0 else NO_PRESSURE_HOLD
 
 
 def pressure_text(pressure: MemoryPressure) -> str:
-    return f"memory pressure: full avg10 {pressure.full_avg10:.1f}, swap {pressure.swap_percent:.0f}%"
+    return f"memory pressure: full avg10 {pressure.full_avg10:.1f}"
 
 
 def admission_dir(root: Path) -> Path:
@@ -527,7 +518,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
     repo, step, worktree, peak = profile.repo, profile.step, profile.worktree, profile.peak
     if not argv and not (root / "admission").exists():
         available, total = read_meminfo(meminfo)
-        pressure = read_pressure(meminfo)
+        pressure = read_pressure()
         return CheckResult(decide(available, total, peak.bytes, [], pressure=pressure), peak, [], NotReserved("launch"), repo, step, available, profile)
     directory = admission_dir(root)
     with (directory / "lock").open("a+") as lock:
@@ -557,7 +548,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
             waited_from = min(waited_from, previous["since"])
         own_order = (previous.get("bump_order", 0) if previous is not None else 0, waited_from, pid)
         available, total = read_meminfo(meminfo)
-        pressure = read_pressure(meminfo)
+        pressure = read_pressure()
         head_need, head_label = 0, ""
         if heads and waiter_order(heads[0]) < own_order:
             head = heads[0]
@@ -688,7 +679,7 @@ def read_queue(directory: Path, processes: dict[int, ProcessIdentity], now: floa
         available, total = read_meminfo(Path(os.environ.get("BUILDLOG_MEMINFO", "/proc/meminfo")))
     except (OSError, ValueError):
         unavailable = True
-    pressure = read_pressure(Path(os.environ.get("BUILDLOG_MEMINFO", "/proc/meminfo")))
+    pressure = read_pressure()
     ordered = sorted(((path, cast(Waiter, cast(object, row))) for path, row in queue_rows(directory, "waiting", processes)),
                      key=lambda item: waiter_order(item[1]))
     head = next((row for _, row in ordered if row.get("bump_order", 0) < 0 or now - row["since"] >= HEAD_SECONDS), None)
