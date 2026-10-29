@@ -4,7 +4,7 @@
 
 > **As-built disposition: create**
 
-> **Production: build-followups** — unit `accounts-unit`; production doc `docs/plans/build-followups-production.md`
+> **Production: natedev** — unit `accounts-unit`; production doc `docs/plans/natedev-production.md`
 
 ## Source
 
@@ -2585,7 +2585,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 **Gotchas:**
 - The Phase 92 gotcha that `new_account.alias_step` "still returns None on darwin" and reads only `modules/linux/shell.nix` is no longer true. `alias_step` reads this machine's module on both machines.
 
-### Phase 94 — The notes timer pass costs less than 10 s of CPU  · status: todo
+### Phase 94 — The notes timer pass costs less than 10 s of CPU  · status: done
 
 **Depends on:** Phase 91
 

@@ -472,7 +472,8 @@ def record(state: State, tier: str, now: datetime) -> None:
 def prune(state: State, now: datetime, retained_rollouts: Iterable[Path]) -> None:
     oldest = hour_key(now - timedelta(days=FIT_DAYS + 1))
     state["buckets"] = {k: b for k, b in state["buckets"].items() if k >= oldest}
-    keep = {str(p) for p in retained_rollouts}
+    # A rollout deleted during ingestion must not leave an offset for its replacement.
+    keep = {str(p) for p in retained_rollouts if p.exists()}
     state["files"] = {k: f for k, f in state["files"].items() if k in keep}
     hour = now.timestamp() / 3600
     state["windows"] = {k: v for k, v in state["windows"].items() if float(k) > hour - 24}

@@ -565,7 +565,14 @@ def session_refusals(session_ids: list[str]) -> dict[str, TranscriptRefusal | Pr
                             if transcript.name in wanted:
                                 paths[wanted[transcript.name]].append(Path(transcript.path))
                 except OSError:
-                    continue
+                    # A project may permit known-file reads without directory listing.
+                    for name, session_id in wanted.items():
+                        candidate = Path(project.path) / name
+                        try:
+                            if candidate.exists():
+                                paths[session_id].append(candidate)
+                        except OSError:
+                            continue
     except OSError:
         pass
     for session_id, candidates in paths.items():

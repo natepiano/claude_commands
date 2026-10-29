@@ -4,7 +4,7 @@ import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import override
 from unittest.mock import patch
@@ -155,6 +155,35 @@ class MeasurementTests(unittest.TestCase):
             self.assertEqual(updated["buckets"][pacer.hour_key(NOW)]["tokens"], {"default ?": 3000})
             self.assertEqual(updated["files"][str(path)]["offset"], path.stat().st_size)
             self.assertEqual(updated["files"][str(added)]["offset"], added.stat().st_size)
+
+    def test_tick_forgets_deleted_rollout_before_reading_its_replacement(self) -> None:
+        sessions = self.root / "sessions"
+        folder = sessions / NOW.astimezone().strftime("%Y/%m/%d")
+        folder.mkdir(parents=True)
+        path = folder / "rollout-current.jsonl"
+        tokens = rollout_line("token_usage_record", NOW,
+                              {"usage": {"input_tokens": 1000, "output_tokens": 0}}) + "\n"
+        _ = path.write_text(tokens)
+        ingest = pacer.ingest
+
+        def ingest_then_delete(state: pacer.State, files: Iterator[Path]) -> None:
+            ingest(state, files)
+            path.unlink()
+
+        with (patch.object(pacer, "SESSIONS", sessions),
+              patch.object(pacer, "STATE_FILE", self.root / "state.json"),
+              patch.object(pacer, "PLAN_FILE", self.root / "plan.json"),
+              patch.object(pacer, "TIER_FILE", self.root / "tier"),
+              patch.object(pacer, "registry_tier", return_value="pace")):
+            with patch.object(pacer, "ingest", side_effect=ingest_then_delete):
+                _ = pacer.tick([], NOW)
+            deleted = pacer.load_state()
+            _ = path.write_text(tokens * 2)
+            _ = pacer.tick([], NOW)
+            updated = pacer.load_state()
+            self.assertEqual(updated["buckets"][pacer.hour_key(NOW)]["tokens"], {"default ?": 3000})
+            self.assertNotIn(str(path), deleted["files"])
+            self.assertEqual(updated["files"][str(path)]["offset"], path.stat().st_size)
 
     def test_tokens_take_the_tier_in_force_at_thread_start(self) -> None:
         state = pacer.empty_state()

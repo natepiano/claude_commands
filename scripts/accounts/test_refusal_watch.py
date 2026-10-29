@@ -12,8 +12,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
-from collections.abc import Generator, Mapping
+from contextlib import AbstractContextManager, contextmanager, nullcontext, redirect_stderr, redirect_stdout
+from collections.abc import Generator, Iterator, Mapping
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
@@ -3302,6 +3302,23 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.transcript("continued", entry_id="new-refusal")
         _, next_output, _ = self.cli("--dry-run")
         self.assertIn("owner continued: refused; move", next_output)
+
+    def test_refusal_pass_reads_known_transcripts_in_an_unlistable_project(self) -> None:
+        _ = self.owner("refused")
+        transcript = self.transcript("refused")
+        scan = os.scandir
+
+        def project_entries(path: str | Path) -> AbstractContextManager[Iterator[os.DirEntry[str]]]:
+            if Path(path) == transcript.parent:
+                raise PermissionError("project permits traversal only")
+            return scan(path)
+
+        with patch.object(os, "scandir", side_effect=project_entries):
+            code, output, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("owner refused: refused; move", output)
+        self.assertEqual(len(self.commands), 1)
+        self.assertEqual([entry["kind"] for entry in moves.read_moves()], ["requested"])
 
     def assert_five_hour_moves(self, reset: datetime) -> None:
         _ = self.owner("refused")
