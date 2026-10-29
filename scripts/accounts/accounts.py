@@ -1240,14 +1240,69 @@ def _prepared_account(label: str, *, resume: bool, repair: bool) -> PreparedAcco
     return PreparedAccount(account.named_account_environment(selected.dir), remove)
 
 
-def resolve_program(tool: Literal["claude", "codex"]) -> str:
-    """Find an executable on PATH, then in the installer directory on both machines."""
-    found = shutil.which(tool)
-    if found:
-        return str(Path(found).absolute())
+class LaunchShellEnvironment(Protocol):
+    @property
+    def env(self) -> Mapping[str, str]: ...
+
+
+class LaunchShellRefusal(Protocol):
+    @property
+    def reason(self) -> str: ...
+
+
+class NixShellLoader(Protocol):
+    Loaded: type[LaunchShellEnvironment]
+    NoEnvrc: type[LaunchShellEnvironment]
+    Refused: type[LaunchShellRefusal]
+
+    def ensure(self, directory: Path, base_env: Mapping[str, str]) -> LaunchShellEnvironment | LaunchShellRefusal: ...
+
+
+class LaunchShellError(AccountsError):
+    """The folder's shell could not be loaded for this launch."""
+
+
+def launch_shell_environment(directory: Path) -> dict[str, str]:
+    """Load the shared helper only when an account is about to launch."""
+    try:
+        loader = cast(NixShellLoader, cast(object, import_module("scripts.lib.nix_env")))
+    except ImportError as error:
+        raise LaunchShellError("accounts: nix shell helper unavailable (scripts/lib/nix_env.py); update the shared scripts") from error
+    base_env = dict(os.environ)
+    result = loader.ensure(directory, base_env)
+    if isinstance(result, loader.Refused):
+        raise LaunchShellError(result.reason)
+    if isinstance(result, (loader.Loaded, loader.NoEnvrc)):
+        environment = dict(result.env)
+        # The folder's shell must not change the launcher's account home.
+        if "HOME" in base_env:
+            environment["HOME"] = base_env["HOME"]
+        else:
+            _ = environment.pop("HOME", None)
+        return environment
+    raise LaunchShellError("accounts: nix shell helper returned an unsupported result")
+
+
+def resolve_program(tool: Literal["claude", "codex"], *, environment: Mapping[str, str] = os.environ) -> str:
+    """Find the agent itself, without loading the launch shell a second time."""
     installed = accounts_home() / ".local" / "bin" / tool
-    if installed.is_file() and os.access(installed, os.X_OK):
-        return str(installed.absolute())
+    directories = environment.get("PATH", os.defpath).split(os.pathsep)
+    for directory in [*directories, str(installed.parent)]:
+        found = shutil.which(tool, path=directory or os.curdir)
+        if not found:
+            continue
+        program = Path(found)
+        # Shell launchers invoke the shared helper. Agent scripts must still work.
+        try:
+            with program.open("rb") as source:
+                if source.read(2) == b"#!":
+                    script = source.read()
+                    if b"nix_env.py" in script or b"lib.nix_env" in script:
+                        continue
+        except OSError:
+            # An executable does not need read permission to run.
+            pass
+        return str(program.absolute())
     raise FileNotFoundError(f"{tool} program not found (looked in PATH and {installed})")
 
 
@@ -1255,9 +1310,10 @@ def _exec_codex_account(label: str, arguments: list[str]) -> None:
     """Launch Codex on a checked account, including the stored workers selection."""
     selected_label = role_account("workers").label if label == "workers" else label
     target = check_codex_target(selected_label, accounts_home() / ".codex")
-    environment = {**os.environ, "CODEX_HOME": str(target.home)}
+    environment = launch_shell_environment(Path.cwd())
+    environment["CODEX_HOME"] = str(target.home)
     try:
-        program = resolve_program("codex")
+        program = resolve_program("codex", environment=environment)
         os.execvpe(program, [program, *arguments], environment)
     except OSError as error:
         raise AccountsError(f"accounts: could not start codex: {error}") from error
@@ -1345,10 +1401,15 @@ def exec_account(label: str, arguments: list[str], *, probe: bool = False) -> No
             raise AccountsError("accounts: --probe is only supported for Claude accounts")
         _exec_codex_account(label, arguments)
         return
-    prepared = prepared_account(label, resume="--resume" in arguments)
+    if label == "claude":
+        prepared = PreparedAccount({}, frozenset({
+            "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_REMOTE_MEMORY_DIR", "CLAUDE_CODE_OAUTH_TOKEN",
+        }))
+    else:
+        prepared = prepared_account(label, resume="--resume" in arguments)
     if isinstance(prepared, AccountRefused):
         raise AccountsError(prepared.reason)
-    environment = dict(os.environ)
+    environment = launch_shell_environment(Path.cwd())
     for name in prepared.remove:
         _ = environment.pop(name, None)
     environment.update(prepared.variables)
@@ -1359,7 +1420,7 @@ def exec_account(label: str, arguments: list[str], *, probe: bool = False) -> No
         for name in UNIT_MARKS:
             _ = environment.pop(name, None)
     try:
-        program = resolve_program("claude")
+        program = resolve_program("claude", environment=environment)
         if sys.stdin.isatty() and "RELAUNCH_SUPERVISED" not in environment:
             os.execvpe(sys.executable, [sys.executable, str(SCRIPTS / "lib" / "relaunch.py"),
                                       "run", "--", program, *arguments], environment)
@@ -4566,6 +4627,9 @@ def main(argv: list[str]) -> int:
                 print("No paired quota readings in this window.")
             return 0
         raise AccountsError(f"accounts: unknown action {options.action}")
+    except LaunchShellError as error:
+        print(error, file=sys.stderr)
+        return 1
     except (AccountsError, next_moves.NextMoveError, role_map.RoleMapUnavailable, role_map.RoleMapWriteRefused) as error:
         print(error, file=sys.stderr)
         return 2 if options.action == "exec" else 1

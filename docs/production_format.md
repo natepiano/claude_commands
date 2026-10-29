@@ -23,7 +23,7 @@ must not drift from it:
 <GuildHeads>
 For Words and <ProductionUnit/> below, production `guilds` has four unit
 directors with the exact IDs `designers`, `reviewers`, `showrunners`, `units`,
-without `-unit`. The guilds showrunner is top-level on natedev; these heads
+without `-unit`. The guilds showrunner runs on natedev under sdlc; these heads
 are its units, not showrunners, and belong to the units guild. Other unit
 names and worker IDs keep their current rules.
 
