@@ -497,4 +497,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
     `Change-Review:` line in its checkpoint (`/unit:checkpoint`). A change
     outside a checkpoint goes on the list through `/change_review add`. Never
     ask the user to check something directly.
+19. **Builds for the user.** Before a build goes to the user's machine, run
+    `assertion_guard.py --base main` in that repository (`/unit:direct`
+    <UserBuildGuard/>). Exit 1 or 2 stops the hand-off.
 </ProductionUnit>
