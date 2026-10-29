@@ -1,8 +1,8 @@
 # efficiency
 
-> **Status: IMPLEMENTATION PLAN — phased, delegate-ready.** Phase 4: one Python dispatcher per hook event runs the event's Python hooks in one interpreter, so a Bash call starts 2 Python processes instead of 8, and a Stop starts 1 instead of 4. Phase 5: the checkpoint doc gate judges the staged tree and real git command words. Phase 6: every Claude and Codex session starts inside its worktree's nix shell.
+> **Status: IMPLEMENTATION PLAN — phased, delegate-ready.** Phase 4: one Python dispatcher per hook event runs the event's Python hooks in one interpreter, so a Bash call starts 2 Python processes instead of 8, and a Stop starts 1 instead of 4. Phase 5: the checkpoint doc gate judges the staged tree and real git command words. Phase 6: every Claude and Codex session starts inside its worktree's nix shell. Phase 7: the launch scan sees accounts.py's guard with no exemption, and the unused SessionStart nix-shell hook is removed.
 
-> **Production: build-followups** — unit `efficiency-unit`; production doc `docs/plans/build-followups-production.md`
+> **Production: natedev** — unit `efficiency-unit`; production doc `docs/plans/natedev-production.md`
 
 ## Source
 
@@ -61,6 +61,21 @@ Showrunner of build-followups, 2026-10-28 (measured by builds-unit):
 - `verify.sh` re-runs itself under `nix_env.py exec` when it starts outside the shell, with one line.
 - `scripts/nix_env/heal.py sweep` restarts a session outside its shell, after the build-hold check, on its own account; when the restart cannot fix it, it pushes `nix_heal.failed` (texts reviewed and approved).
 - Live check: `ensure` in `~/rust/bevy_brp` loaded the shell in 0.4 s; `exec` ran a program inside it.
-- Open: the SessionStart hook `scripts/hooks/session-start-nix-shell.py` is in the tree, but its `settings.json` registration waits for the user's typed go. The `nix-heal` notifier timer (every 5 minutes) is registered after the merge.
+- The `nix-heal` notifier timer (every 5 minutes) is registered on main. A SessionStart hook was built and then dropped in phase 7 (showrunner ruling): the timer and the PATH wrappers cover the case.
 
 **After the merge:** the showrunner adds PATH wrappers for bare `claude`, `claude1`-`claude4`, `codex`, `codex1` and `codex2` in /etc/nixos on both machines; accounts-unit wires `accounts.py exec`. Both get the merge commit.
+
+### Phase 7 — Launch scan sees accounts.py's nix shell guard  · status: in progress
+
+**Source:** accounts-unit, 2026-10-28; the showrunner ruled "next". accounts phase 92 (adfb9f38) is on origin/build-followups.
+
+**Goal:** `scripts/lib/test_claude_launch_scan.py` has no exemption: `accounts/accounts.py` passes because the scan sees its guard, and a new unguarded start in accounts.py fails the test.
+
+**Scope:**
+- The scan counts a scope as guarded when it calls a guard function of the same module (by name, followed transitively), and a function is a guard when it calls `ensure` on `nix_env` or on a value from `import_module("<...>nix_env")`. Today the scan sees only a literal `nix_env.ensure` call or a `nix_env.py` string in the same function, so accounts.py's `_exec_codex_account` and its Claude exec (lines 1317, 1425, 1428) fail without the exemption.
+- Remove `ACCOUNT_EXEC_OWNER`, its comment, its skip in `unguarded_launches`, and the "Account exec is owned by accounts-unit" docstring sentence. Replace the exemption test with tests for the helper rule: a start after a call to a same-module guard function passes; a start after a call to a function that only imports nix_env, or to a name from another module, fails.
+- `docs/as-built/nix-shell-launch.md`: the scan section states the helper rule and that no file is exempt.
+
+- **Drop the SessionStart nix-shell hook** (showrunner ruling, 2026-10-28: the 5-minute nix-heal timer and the PATH wrappers cover the case; revisit only if a failed build from such a session is seen). Remove `scripts/hooks/session-start-nix-shell.py`, its test, its load in `scripts/lib/test_nix_env_integration.py`, and the code in `scripts/nix_env/heal.py` that only it used (`--wait-idle`, `idle_budget`, `IdleDeadline`, `IDLE_WAIT_SECONDS`). The as-built and the phase 6 record drop the hook.
+
+**Acceptance:** `python3 -m unittest scripts.lib.test_claude_launch_scan` passes from the repo root; basedpyright clean on the test file; the full merge gate `--tests-only` adds no failure to the origin tip.
