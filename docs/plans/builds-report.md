@@ -118,38 +118,34 @@ verify-unit's Work Order for the copy folder name (roster.py join `<showrunner>-
 
 ### Phase 3 — Build views name the showrunner and unit by short name  · status: done
 
-**Depends on:** Phase 1
+#### As-built
 
-#### Work Order
-
-**Goal:** `/build:queue` and `/build:status` name the showrunner and the unit of each build step by the short names the user uses in sessions (Showrunner `builds`, `hana`; Unit `report`, `lfo`), from one shared label function.
-
-**Spec:**
-
-1. **One label function** (`scripts/message/roster.py`). The roster already holds the names: a showrunner's name is its registered session name (`UnderShowrunner.name`, `RunsProduction` → the entry's `name`), and a unit's name is its director's Claude session name (`DirectsUnit` → the entry's `name`, `UnderDirector.name`). These are the names herdr shows as workspace and tab. Move `SessionLabels` and `session_labels` from `scripts/build_queue/build_queue.py` (line ~36) into `roster.py` as `UnitLabels(session, showrunner, unit)` and `unit_labels(entries) -> dict[str, UnitLabels]`, keyed by Claude session id and Codex thread id, with the same rules; `—` where a relationship is missing. Add `unit_labels_for(session_ids, environment) -> dict[str, UnitLabels]` for a caller that knows Claude session ids and must stay fast: it reads only the session records, the showrunner registry and the production unit marks the roster already reads (`_newest_sessions`, `_registered_showrunners`, `_production_places`), never the process table, Codex meshes or accounts. For the same live Claude session both functions return the same labels; a test pins it. No other file composes a showrunner or unit name.
-2. **`/build:queue`** (`build_queue.py`). The `Unit director` column is renamed `Unit` in both tables. Cells come from `roster.unit_labels`. Nothing else in the tables changes.
-3. **`/build:status`** (`scripts/build_targets/build_targets.py`, `running` text line ~89). A running claim or hold whose record names a holder session gets ` (showrunner <name>, unit <name>)` after its `since <time>`, from `roster.unit_labels_for`: `mac: running nextest hana since 12:46 EDT (showrunner hana, unit inspectors)`. A holder the lookup cannot name, or a record with no holder session, keeps today's text. A failed lookup never fails the command: it keeps today's text.
-4. **`/build:report`**: no change. It has no Showrunner or Unit cell; its Waiting cells name worktree folders, which are file paths.
-5. **Docs.** `commands/build/queue.md`: `Unit` in place of `Unit director`. `commands/build/status.md`: the showrunner and unit after a running claim. `docs/as-built/build-memory-admission.md`: the Queue API bullet names `roster.unit_labels`.
+- `roster.py` holds the one label rule. `UnitLabels(session, showrunner="—", unit="—")` is frozen and its fields are whitespace-collapsed. Showrunner is `UnderShowrunner.name`, or the entry's name for `RunsProduction`; unit is `UnderDirector.name`, or the entry's name for `DirectsUnit`; else `—`. These are the short names herdr shows (`builds`, `report`).
+- `unit_labels(entries) -> dict[str, UnitLabels]` keys the full roster by Claude session id and Codex thread id. `unit_labels_for(session_ids, environment) -> dict[str, UnitLabels]` is the fast path: it reads session records, the showrunner registry through `showrunners.registered_showrunners(known_sessions=...)` and unit marks through `unit_lookup.session_unit_marks` (each record's PID environ only), never the process table, Codex meshes or accounts. A session whose `CLAUDE_CODE_SESSION_ID` names another known session resolves under that director. Unknown ids are left out; any error returns `{}`. `unit_lookup.group_marked_units` holds the slug-rename and duplicate-mark rule for both paths, and a test pins that both paths agree.
+- `/build:queue` names the column `Unit` in both tables, from `roster.unit_labels`; the roster problem line ends `Showrunner and Unit show — for unmatched steps`.
+- `/build:status`: `targets.py` carries `HolderSession(session_id) | NoHolderSession` as `holder_session` on `RunningJob` (the claim record's `holder_session`) and `Held` (the local hold key, or a Mac block's `RecordedSession` name). `build_targets.main` collects the holders, calls `unit_labels_for` once, and `format_state` / `running_job_text` add ` (showrunner <name>, unit <name>)` after `since <time>`. No holder session, an unknown holder or a lookup that raises keeps the old line. A status run costs about 0.10 s more (median 0.204 → 0.307 s).
+- `roster.py` imports `scripts.shutdown.remote` by package and does not put `scripts/shutdown` on `sys.path`; `account`, `agent_accounts` and `note_file` load lazily. `scripts/shutdown/inventory.py` appends its own folder after existing `sys.path` entries for its sibling imports.
 
 **Files:**
-- `scripts/message/roster.py` — `UnitLabels`, `unit_labels`, `unit_labels_for`
-- `scripts/build_queue/build_queue.py` — uses `roster.unit_labels`; `Unit` header
-- `scripts/build_targets/build_targets.py` — showrunner and unit after a running claim or hold
-- `scripts/message/test_roster.py`, `scripts/build_queue/test_build_queue.py`, `scripts/build_targets/test_build_targets.py`
-- `commands/build/queue.md`, `commands/build/status.md`, `docs/as-built/build-memory-admission.md`
+- `scripts/message/roster.py` — `UnitLabels`, `unit_labels`, `unit_labels_for`, package import of `scripts.shutdown.remote`
+- `scripts/production/unit_lookup.py` — `group_marked_units`, `session_unit_marks`
+- `scripts/production/showrunners.py` — `registered_showrunners(known_sessions=...)`, `DiscoverSessions`
+- `scripts/build_queue/build_queue.py` — `roster.unit_labels`, `Unit` header
+- `scripts/build_targets/targets.py` — `HolderSession`, `NoHolderSession` on `RunningJob` and `Held`
+- `scripts/build_targets/build_targets.py` — `unit_label_suffix`, one `unit_labels_for` call per run
+- `scripts/shutdown/inventory.py` — appends its own folder for sibling imports
+- `scripts/message/test_roster.py`, `scripts/build_queue/test_build_queue.py`, `scripts/build_targets/test_build_targets.py`, `scripts/build_targets/test_targets.py`, `scripts/production/test_unit_lookup.py`, `scripts/production/test_showrunners.py`, `scripts/shutdown/test_inventory.py` — faked records, registry and marks; fast-path parity; holder cases; fresh-process import regressions
+- `commands/build/queue.md`, `commands/build/status.md`, `docs/as-built/build-memory-admission.md` — the `Unit` column, the status suffix, `roster.unit_labels`
 
-**Workers:** `2 writers` — open workers, or new ones when Phase 2's are still busy.
-- `impl` — `roster.py`, `build_queue.py`, `build_targets.py`, `commands/build/queue.md`, `commands/build/status.md`, `docs/as-built/build-memory-admission.md`
-- `test` — `test_roster.py`, `test_build_queue.py`, `test_build_targets.py`. Fake the session records, the showrunner registry and the unit marks; never read the live roster or live sessions. Cases: a unit director, a Codex worker under it, a showrunner, an unmatched session, a style unit whose session name already leads with its showrunner's (`cargo-liner-style-types`); `unit_labels` and `unit_labels_for` agree on one session; the `Unit` header in both queue tables; a status claim with a named holder, with an unknown holder, with no holder session, and with a lookup that raises.
+**Binds later work:** `UnitLabels`, `unit_labels` and `unit_labels_for` live in `roster.py`; `—` marks a missing relationship. Copy folder names build on `UnitLabels`.
 
-**Constraints from prior phases:** Phase 1 added the queue's identity columns and `session_labels`; this phase moves that function, so every expectation it changes on purpose needs its own `Assertion-Change: <path>::<test> — <why>` line (no `::*`). `roster.py` serves every production's messaging; its owner is named in the checkpoint notice's also-touches line. No file here overlaps Phase 2, so the two phases can run side by side.
+**Gotchas:**
+- `roster.py`'s module-level `sys.path` edits reach every importer: a change there must also run the herdr and shutdown folder suites.
+- buildlog and shutdown each have a `record.py`; with `scripts/shutdown` ahead on `sys.path`, `import record` loads the wrong one.
+- A status line joins a claim to its holder by the recorded holder session; `what` and `since` can match a stale claim.
+- Status timings under machine load vary from 0.3 to 2 s; measure on a quiet machine.
 
-**Acceptance gate:**
-- `python3 -m unittest scripts.message.test_roster scripts.build_queue.test_build_queue scripts.build_targets.test_build_targets` green, and the production Merge tests green.
-- `basedpyright` on the six Python files: `0 errors, 0 warnings`.
-- Live check on natedev from the worktree: `/build:queue` shows `Unit` with short unit names; `/build:status` shows `(showrunner <name>, unit <name>)` after each running Mac claim whose holder runs.
-- Speed: `/build:status` median of 10 runs grows by at most 0.2 s (now about 0.3 s); `/build:queue` does not get slower.
+**Ruled out:** a label fast path with its own copy of the slug and mark rules — it drifts from `unit_lookup` and `showrunners`; a package-import migration of the other shutdown modules — the record name clash belongs to shutdown-unit.
 
 ### Phase 4 — Copy folders take one showrunner-unit name  · status: todo
 
