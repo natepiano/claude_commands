@@ -248,6 +248,8 @@ def command_register_local(_call_id: str, *, pid: int) -> int:
 def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", caller: str = "") -> int:
     """Wait until no hold applies. An empty caller is verify.sh; any other caller is a lint step."""
     _ = pid
+    if not leave_hook and not caller:
+        leave_hook = os.environ.get("BUILDLOG_MAC_IDLE_HOOK", "")
     name = speaker(caller)
     # verify.sh runs a test on the Mac when it can; a lint step only waits.
     waiting = "; waiting (tests that can run on the Mac keep running there)." if not caller else "; waiting for the release."

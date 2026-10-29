@@ -317,6 +317,9 @@ PAUSE_INTERRUPT_SECS = 15.0
 UNSEEN_END_CHECK_SECS = 60.0
 DETACHED_RUN_CHECK_SECS = 60.0
 UNSEEN_END_CALL_SECS = 10.0
+# The server can still read a thread idle just after its turn starts. An idle read
+# counts as a lost completion notice only after the stream has been this quiet.
+UNSEEN_END_QUIET_SECS = 2.0
 # How fast a failure has to arrive to be read as this machine's fault rather
 # than the provider's. An app-server that has wedged answers from what it
 # cached, without a round trip, so it fails in seconds; a refusal that travelled
@@ -3864,6 +3867,7 @@ class TurnStream:
     room_wait_logged: bool = False
     events: FollowEvents | SocketOnlyWait = SOCKET_ONLY_WAIT
     state_change_owed: bool = False
+    last_frame_at: float = field(default_factory=time.monotonic)
 
 
 class StreamStep(Enum):
@@ -4040,6 +4044,8 @@ def _stream_frames(stream: TurnStream, log: TextIO) -> FailedWithThread | None:
         stream.client.wake = stream.events
         read_until = min(expires, next_check, run_watch.next_check, next_role_check)
         frame = stream.client.next_frame(time.time() + max(0.0, read_until - time.monotonic()))
+        if frame is not None:
+            stream.last_frame_at = time.monotonic()
         if frame is None:
             if time.monotonic() >= next_role_check:
                 # A remote role tick performs no thread/read or run scan.
@@ -4183,7 +4189,9 @@ def _finish_if_ended_unseen(stream: TurnStream, log: TextIO) -> StreamStep:
     if _waiting_on_detached_run(stream.session_dir, stream.name, stream.thread_id, stream.runs):
         return StreamStep.NEXT_FRAME
     quota_owed = _continuation_is_owed(stream.session_dir, stream.name)
-    if stream.resume_owed or not _ended_unseen(stream.client, stream.thread_id):
+    if stream.resume_owed or time.monotonic() - stream.last_frame_at < UNSEEN_END_QUIET_SECS:
+        return StreamStep.NEXT_FRAME
+    if not _ended_unseen(stream.client, stream.thread_id):
         return StreamStep.NEXT_FRAME
     # The read-back RPC may have received the completion or answer ahead of
     # its reply. Process those frames before inferring a missing notice.

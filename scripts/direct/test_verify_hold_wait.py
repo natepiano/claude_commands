@@ -135,6 +135,7 @@ class VerifyHoldWaitTests(unittest.TestCase):
         self.cycle_file = root / "release" / CYCLE_ID / "cycle.json"
         self.fixture.environment.update({
             "CLAUDE_PYTHON": sys.executable,
+            "BUILDLOG_DIR": str(root / "buildlog"),
             "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
             "UNIT_ACTIVE_DIR": str(root / "active"),
             "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
@@ -364,6 +365,7 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
         starts = self.count_python_starts()
         for state in ("missing", "empty"):
             with self.subTest(holders=state):
+                starts.unlink(missing_ok=True)
                 if state == "empty":
                     holders.mkdir()
                 code, output = self.finish(self.start_lint_step("cargo-port"))
