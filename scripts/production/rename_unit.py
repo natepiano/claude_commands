@@ -696,15 +696,26 @@ def seat_note(rename: UnitRename) -> str:
             + f"name it, use {rename.new_worktree}.")
 
 
-def _move_seats(rename: UnitRename, saved: SessionShutdown) -> None:
-    """Point each paused Codex worker at the new worktree: its launcher's cwd, and a line in its resume prompt."""
-    if rename.old_worktree == rename.new_worktree:
+def repoint_shutdown_worktree(saved: SessionShutdown, old: str, new: str,
+                              host_names: dict[str, str], note: str) -> None:
+    """Move restore paths and worker launchers without changing the unit's identity."""
+    session = saved["session"]
+    host = session["host"]
+    if host["kind"] != "unit":
+        raise RenameRefused("shutdown record is not a unit's")
+    if saved["progress"]["kind"] not in STOPPED:
+        raise RenameRefused(f"shutdown record reads {saved['progress']['kind']}; settle it first")
+    host["session_name"] = host_names.get(host["session_name"], host["session_name"])
+    if host["plan"]["kind"] == "plan":
+        host["plan"]["path"] = _moved(host["plan"]["path"], old, new)
+    session["cwd"] = _moved(session["cwd"], old, new)
+    for worker in saved["workers"]:
+        worker["cwd"] = _moved(worker["cwd"], old, new)
+    if old == new:
         return
-    note = seat_note(rename)
-    for seat in saved.get("codex_seats", []):
-        seat["launcher_command"] = [_moved(argument, rename.old_worktree, rename.new_worktree)
-                                    for argument in seat["launcher_command"]]
-        prompt = Path(seat["run_dir"]) / f"{seat['seat']}.resume-prompt.md"
+    for worker in saved.get("codex_seats", []):
+        worker["launcher_command"] = [_moved(argument, old, new) for argument in worker["launcher_command"]]
+        prompt = Path(worker["run_dir"]) / f"{worker['seat']}.resume-prompt.md"
         text = prompt.read_text(encoding="utf-8") if prompt.exists() else ""
         if note not in text:
             _ = prompt.write_text(f"{text}{note}\n", encoding="utf-8")
@@ -743,14 +754,8 @@ def _restart_record(rename: UnitRename, save: Callable[[], None]) -> None:
         if saved["progress"]["kind"] not in STOPPED:
             raise RenameRefused(f"{rename.old}'s shutdown record reads {saved['progress']['kind']}; settle it first")
         host["unit"] = rename.new
-        host["session_name"] = host_names.get(host["session_name"], host["session_name"])
-        if host["plan"]["kind"] == "plan":
-            host["plan"]["path"] = _moved(host["plan"]["path"], rename.old_worktree, rename.new_worktree)
+        repoint_shutdown_worktree(saved, rename.old_worktree, rename.new_worktree, host_names, seat_note(rename))
         session["name"] = new_stem
-        session["cwd"] = _moved(session["cwd"], rename.old_worktree, rename.new_worktree)
-        for worker in saved["workers"]:
-            worker["cwd"] = _moved(worker["cwd"], rename.old_worktree, rename.new_worktree)
-        _move_seats(rename, saved)
         saved["renamed"] = renamed_note(rename)
 
     try:
