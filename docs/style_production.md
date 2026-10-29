@@ -244,9 +244,20 @@ only the first-launch template. Edit a launched unit's copy for changes meant
 for it. Checkpoint stages only code paths and never the plan or anything under
 `docs/style-production/`; standing plans skip shrink and every closing gate.
 Run refill at startup, after restart or compaction, and after each ticket.
-Before selecting a new ticket, refill waits for sync if the branch point's
-pushed tip is not an ancestor of the ledger's synced tip; an open ticket still
-resumes or waits for merge. The pushed tip is `origin/<branch point>`, or the
+Refill chooses the same ticket as before, then waits for sync only if new
+branch-point commits touch its files, any affected crate's `Cargo.toml` or
+`build.rs`, or workspace `Cargo.toml` or `Cargo.lock`. Otherwise it starts from
+the existing synced inputs without waiting for main. An open ticket still
+resumes or waits for merge. The ticket's final merge still takes the style branch.
+Only the selected proposal also reads its edit footprint at pushed main, so a
+new reference to a renamed or moved item holds it too. Its protected files are
+the union of the footprints at the synced tip, unit base and pushed main; an
+unreadable main footprint holds with `touched set unknown`.
+One batched name-status history read serves both selection passes, including
+edits later reverted. It reads NUL-delimited bytes and decodes paths exactly,
+preserving carriage returns; unrepresentable paths hold closed. A missing tip, a git error, a synced tip that neither
+contains main nor is its ancestor, a rename or copy anywhere in the range, or
+an unknown crate for a selected file holds refill closed. The pushed tip is `origin/<branch point>`, or the
 local branch when the repository has no `origin`. The checkouts share one
 repository, so the local branch can hold a parent merge whose gate is still
 running. Reconcile and the hand-off merge check read the same pushed tip.
@@ -283,7 +294,8 @@ Refill only the unit worktree's own plan copy:
 ```
 
 `next-phase` returns 0 after writing a phase, resuming an assigned ticket, or
-reporting `repair first`; 3 means `waiting for sync`, or
+reporting `repair first`; 3 means `waiting for sync` (with `: <kind> <crate> [<rule>]: main touched <path>`
+or `: touched set unknown: <reason>` for a main-related hold), or
 `waiting for structure: <crates>` when every pending family cell in those
 in-scope crates is blocked by a structure cell, until the
 modules unit's structure tickets merge
