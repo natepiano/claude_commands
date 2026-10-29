@@ -496,6 +496,14 @@ class MeshCommandFixture(unittest.TestCase):
     hide_live_turn_id: bool  # pyright: ignore[reportUninitializedInstanceVariable]
     stale_read_turn: str  # pyright: ignore[reportUninitializedInstanceVariable]
     stale_reads: int  # pyright: ignore[reportUninitializedInstanceVariable]
+    # Every turn this server started, with the status it ends in; a read that
+    # asks for turns lists each one that is not live.
+    started_turns: dict[str, str]  # pyright: ignore[reportUninitializedInstanceVariable]
+    # More turn records such a read lists.
+    silent_ended: list[dict[str, object]]  # pyright: ignore[reportUninitializedInstanceVariable]
+    # A started turn the server reads idle but does not list yet.
+    unlisted_turn: str  # pyright: ignore[reportUninitializedInstanceVariable]
+    unlisted_reads: int  # pyright: ignore[reportUninitializedInstanceVariable]
     next_thread_id: str  # pyright: ignore[reportUninitializedInstanceVariable]
     fork_thread_id: str  # pyright: ignore[reportUninitializedInstanceVariable]
     history_turns: list[dict[str, object]]  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -534,6 +542,10 @@ class MeshCommandFixture(unittest.TestCase):
         self.hide_live_turn_id = False
         self.stale_read_turn = ""
         self.stale_reads = 0
+        self.started_turns = {}
+        self.silent_ended = []
+        self.unlisted_turn = ""
+        self.unlisted_reads = 0
         self.next_thread_id = THREAD_ID
         self.fork_thread_id = "thread-review-fork"
         self.history_turns = []
@@ -624,6 +636,11 @@ class MeshCommandFixture(unittest.TestCase):
                 }),
             ]
             outcome = self.outcomes.pop(0) if self.outcomes else "completed"
+            self.started_turns[turn_id] = "failed" if outcome in {
+                "capacity", "capacity_final_queued", "capacity_queued", "capacity_structured",
+                "capacity_completed", "overflow", "progress_overflow", "failed",
+                "failed_with_queued", "capacity_with_peer",
+            } else "completed"
             if outcome in {
                 "capacity", "capacity_final_queued", "capacity_queued",
                 "capacity_structured", "capacity_completed", "failed",
@@ -675,6 +692,9 @@ class MeshCommandFixture(unittest.TestCase):
                         "threadId": THREAD_ID, "item": {"type": "agentMessage", "text": "late answer"}
                     }),
                 ]
+            if outcome == "idle_before_listed":
+                self.unlisted_turn = turn_id
+                return turn_submission_frames
             if outcome == "completed_then_peer":
                 self.live_turn = "peer-turn"
                 self.announce_live_completion = True
@@ -891,7 +911,23 @@ class MeshCommandFixture(unittest.TestCase):
                     }))
                     self.stale_read_turn = self.live_turn = ""
                 return frames
-            turns: list[dict[str, object]] = []
+            turns: list[dict[str, object]] = [
+                *({"id": turn, "status": status} for turn, status in self.started_turns.items()
+                  if turn not in (self.live_turn, self.unlisted_turn)),
+                *self.silent_ended,
+            ] if params.get("includeTurns") else []
+            unlisted_ends: list[dict[str, object]] = []
+            if self.unlisted_turn:
+                self.unlisted_reads += 1
+                # The turn completes after the second read, with its notice.
+                if self.unlisted_reads == 2:
+                    unlisted_ends = [
+                        _notice("item/completed", {
+                            "threadId": THREAD_ID, "item": {"type": "agentMessage", "text": "listed late"}
+                        }),
+                        _notice("turn/completed", {"threadId": THREAD_ID, "turn": {"id": self.unlisted_turn}}),
+                    ]
+                    self.unlisted_turn = ""
             if self.live_turn and not self.hide_live_turn_id:
                 turns.append({"id": self.live_turn, "status": "inProgress"})
             frames = [_reply(request, {"thread": {
@@ -901,7 +937,7 @@ class MeshCommandFixture(unittest.TestCase):
                     "systemError" if thread_id in self.error_threads else "idle"
                 )},
                 "turns": turns,
-            }})]
+            }}), *unlisted_ends]
             if self.live_turn and self.announce_live_completion:
                 frames.append(_notice("turn/completed", {
                     "threadId": THREAD_ID, "turn": {"id": self.live_turn}
@@ -3639,6 +3675,7 @@ class MeshCommandTests(MeshCommandFixture):
 
     def quota_completion(self, request: dict[str, object]) -> list[dict[str, object]]:
         params = cast(dict[str, object], request["params"])
+        self.started_turns["quota-turn"] = "failed"
         return [_reply(request, {"turn": {"id": "quota-turn"}}),
                 _notice("turn/completed", {"threadId": params["threadId"],
                     "turn": {"id": "quota-turn", "error": {"message": USAGE_LIMIT}}})]
@@ -5483,7 +5520,7 @@ class MeshCommandTests(MeshCommandFixture):
                 director=codex_mesh.UnknownWorkerDirector(), client=client, port=self.server.port,
                 thread_id=THREAD_ID, failure_serving=client.serving,
                 runs=codex_mesh.DetachedRunWatch(str(self.session_dir), "worker"),
-                turn_started_at=time.monotonic(), turn_id="capacity-turn", resume_owed=True)
+                turn_id="capacity-turn", resume_owed=True)
             log = io.StringIO()
             step = codex_mesh._resume_owed_turn(stream, log, refused_for_capacity=False)  # pyright: ignore[reportPrivateUsage]
             self.assertIs(step, codex_mesh.StreamStep.NEXT_FRAME)
@@ -5772,22 +5809,20 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertIn("thread is idle and no completion notice arrived",
                       (self.session_dir / "worker.log").read_text(encoding="utf-8"))
 
-    def test_an_idle_read_just_after_the_turn_starts_does_not_end_the_turn(self) -> None:
-        # The server can read a thread idle for a moment after its turn starts.
-        # The launcher waits a moment after the turn starts before it calls the notice lost.
+    def test_an_idle_read_that_does_not_list_the_turn_as_ended_does_not_end_it(self) -> None:
+        # The server can read a thread idle just after its turn starts, before it lists the turn.
         self.assertEqual(self.run_start()[0], 0)
-        self.outcomes = ["answered_without_completion"]
+        self.outcomes = ["idle_before_listed"]
         self.start_args_timeout = 5
 
-        started = time.monotonic()
-        with (patch.object(codex_mesh, "UNSEEN_END_CHECK_SECS", 0.05),
-              patch.object(codex_mesh, "UNSEEN_END_QUIET_SECS", 1.0)):
+        with patch.object(codex_mesh, "UNSEEN_END_CHECK_SECS", 0.05):
             code, errors = self.run_follow()
 
         self.assertEqual((code, errors), (0, ""))
-        self.assertGreaterEqual(time.monotonic() - started, 1.0)
+        self.assertEqual(self.unlisted_reads, 2)
         self.assertEqual(self.methods("turn/interrupt"), [])
         self.assertEqual(self.worker_record()["status"], "done")
+        self.assertIn("listed late", (self.session_dir / "summary.txt").read_text(encoding="utf-8"))
 
     def test_an_idle_thread_with_no_notice_and_no_answer_finishes_as_failed(self) -> None:
         self.assertEqual(self.run_start()[0], 0)
@@ -5912,6 +5947,13 @@ class MeshCommandTests(MeshCommandFixture):
         try:
             ended = codex_mesh._ended_unseen  # pyright: ignore[reportPrivateUsage]
             self.assertTrue(ended(client, THREAD_ID))
+            # Given the watched turn, an idle thread must also list that turn as ended.
+            self.assertFalse(ended(client, THREAD_ID, "turn-9"))
+            self.silent_ended = [{"id": "turn-9", "status": "inProgress"}]
+            self.assertFalse(ended(client, THREAD_ID, "turn-9"))
+            self.silent_ended = [{"id": "turn-9", "status": "interrupted"}]
+            self.assertTrue(ended(client, THREAD_ID, "turn-9"))
+            self.silent_ended = []
             self.queued = [{"id": "queued-1", "input": [], "clientUserMessageId": "m1"}]
             self.assertFalse(ended(client, THREAD_ID))
             self.queued = []
@@ -7272,9 +7314,9 @@ class MeshCommandTests(MeshCommandFixture):
         self.server.respond = no_answer
         ended = codex_mesh._ended_unseen  # pyright: ignore[reportPrivateUsage]
 
-        def check(client: codex_mesh.Client, thread: str) -> bool:
+        def check(client: codex_mesh.Client, thread: str, turn: str = "") -> bool:
             change()
-            return ended(client, thread)
+            return ended(client, thread, turn)
 
         with patch.object(codex_mesh, "_post_board_status") as board, patch.object(codex_mesh, "_ended_unseen", side_effect=check):
             code, errors = self.run_follow()
@@ -7493,14 +7535,6 @@ class FollowEventRegressionTests(MeshCommandFixture):
     """Real socket/file waits: no next_frame substitution or fabricated quiet wakes."""
 
     guard_frame_reads: bool = False
-
-    @override
-    def setUp(self) -> None:
-        super().setUp()
-        # These stand-in servers end the turn at once; the start-lag wait is pinned elsewhere.
-        quiet = patch.object(codex_mesh, "UNSEEN_END_QUIET_SECS", 0.0)
-        _ = quiet.start()
-        self.addCleanup(quiet.stop)
 
     def test_adopted_worker_wakes_a_real_file_wait_and_refuses_old_follow(self) -> None:
         self.write_pool_roster({"worker": {
@@ -7755,6 +7789,8 @@ class FollowEventRegressionTests(MeshCommandFixture):
         client.session_dir = str(self.session_dir)
         args = self.start_args()
         args.resident = resident
+        # The stand-in server started the watched turn; a turn read lists it unless it is live.
+        self.started_turns["buffered-turn"] = "completed"
         return codex_mesh.TurnStream(
             args=args, session_dir=str(self.session_dir), name="worker", follow=True, resident=resident,
             timeout=3, opened=time.time(), deadline=time.time() + 3,
@@ -7763,7 +7799,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
             director=codex_mesh.UnknownWorkerDirector(), client=client, port=self.server.port,
             thread_id=THREAD_ID, failure_serving=client.serving,
             runs=codex_mesh.DetachedRunWatch(str(self.session_dir), "worker"),
-            turn_started_at=time.monotonic(), turn_id="buffered-turn", followed_turn="buffered-turn",
+            turn_id="buffered-turn", followed_turn="buffered-turn",
         )
 
     def test_due_run_scan_drains_raw_buffered_completion_before_its_next_wait(self) -> None:

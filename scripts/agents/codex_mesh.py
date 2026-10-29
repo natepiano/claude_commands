@@ -317,9 +317,6 @@ PAUSE_INTERRUPT_SECS = 15.0
 UNSEEN_END_CHECK_SECS = 60.0
 DETACHED_RUN_CHECK_SECS = 60.0
 UNSEEN_END_CALL_SECS = 10.0
-# The server can still read a thread idle just after its turn starts. An idle read
-# counts as a lost completion notice only this long after the watched turn started.
-UNSEEN_END_QUIET_SECS = 2.0
 # How fast a failure has to arrive to be read as this machine's fault rather
 # than the provider's. An app-server that has wedged answers from what it
 # cached, without a round trip, so it fails in seconds; a refusal that travelled
@@ -2871,11 +2868,13 @@ def _thread_has_no_active_turn(status: str) -> bool:
     return status in ("idle", "notLoaded", "systemError")
 
 
-def _ended_unseen(client: Client, thread_id: str) -> bool:
+def _ended_unseen(client: Client, thread_id: str, turn_id: str = "") -> bool:
     """True when no turn is active and nothing is queued, so no turn is left to end.
 
     A launcher that reads this while it waits for a completion notice has missed
-    the notice. The read asks for no turns, so it stays small on a long thread.
+    the notice. Given the watched turn, the thread must also list that turn as
+    ended: the server can read a thread idle just after its turn starts. With
+    no turn the read asks for none, so it stays small on a long thread.
     A call that is refused or times out says nothing, and the launcher keeps waiting.
     """
     try:
@@ -2884,11 +2883,19 @@ def _ended_unseen(client: Client, thread_id: str) -> bool:
         if isinstance(items, list) and items:
             return False
         reply = client.call(
-            "thread/read", {"threadId": thread_id, "includeTurns": False}, UNSEEN_END_CALL_SECS)
+            "thread/read", {"threadId": thread_id, "includeTurns": bool(turn_id)}, UNSEEN_END_CALL_SECS)
     except SystemExit:
         return False
     thread = _as_dict(_as_dict(reply.get("result")).get("thread"))
-    return _thread_has_no_active_turn(_as_str(_as_dict(thread.get("status")).get("type")))
+    if not _thread_has_no_active_turn(_as_str(_as_dict(thread.get("status")).get("type"))):
+        return False
+    if not turn_id:
+        return True
+    turns = thread.get("turns")
+    return isinstance(turns, list) and any(
+        (record := _as_dict(turn)).get("id") == turn_id
+        and record.get("status") in ("completed", "failed", "interrupted")
+        for turn in cast("list[object]", turns))
 
 
 def _more_work_coming(client: Client, thread_id: str, deadline: float) -> bool:
@@ -3846,8 +3853,6 @@ class TurnStream:
     thread_id: str
     failure_serving: CodexServingState
     runs: DetachedRunWatch
-    # When the watched turn started, on the monotonic clock.
-    turn_started_at: float
     turn_id: str = ""
     # The turn a follow watches; empty between its turns.
     followed_turn: str = ""
@@ -3956,7 +3961,7 @@ def _stream_turn(
         reply_path=Path(reply_file) if reply_file else None,
         end_marker=end_marker, director=director,
         client=client, port=initial_port, thread_id=initial_thread_id, failure_serving=failure_serving,
-        runs=DetachedRunWatch(session_dir, name), turn_started_at=time.monotonic(),
+        runs=DetachedRunWatch(session_dir, name),
     )
     with _pending_file(session_dir, name) as handle:
         _write_pending(handle, initial_thread_id, _pending_for_thread(handle, initial_thread_id))
@@ -4011,17 +4016,6 @@ def _start_streamed_turn(stream: TurnStream, prompt: str, log: TextIO) -> Stream
     return StreamStep.NEXT_FRAME
 
 
-def _next_unseen_check(stream: TurnStream) -> float:
-    """Return when to check next for a lost completion notice.
-
-    The check is skipped until the watched turn is UNSEEN_END_QUIET_SECS old, so
-    the first check after that wait comes when the wait ends, not a minute later.
-    """
-    now = time.monotonic()
-    quiet_ends = stream.turn_started_at + UNSEEN_END_QUIET_SECS
-    return min(quiet_ends, now + UNSEEN_END_CHECK_SECS) if now < quiet_ends else now + UNSEEN_END_CHECK_SECS
-
-
 def _stream_frames(stream: TurnStream, log: TextIO) -> FailedWithThread | None:
     """Handle frames until the run finishes or its deadline passes.
 
@@ -4029,7 +4023,7 @@ def _stream_frames(stream: TurnStream, log: TextIO) -> FailedWithThread | None:
     """
     run_watch = stream.runs
     run_watch.refresh()
-    next_check = _next_unseen_check(stream)
+    next_check = time.monotonic() + UNSEEN_END_CHECK_SECS
     expires = time.monotonic() + max(0.0, stream.deadline - time.time())
     next_role_check = (time.monotonic() + REMOTE_ROLE_CHECK_SECS
                        if stream.resident and not is_role_map_host() else expires)
@@ -4048,7 +4042,7 @@ def _stream_frames(stream: TurnStream, log: TextIO) -> FailedWithThread | None:
         if (time.monotonic() >= next_check or runs_due
                 or (stream.state_change_owed and not stream.client.has_pending_frames)):
             step = _on_quiet_poll(stream, log)
-            next_check = _next_unseen_check(stream)
+            next_check = time.monotonic() + UNSEEN_END_CHECK_SECS
             if isinstance(step, FailedWithThread):
                 return step
             if step is StreamStep.FINISH:
@@ -4063,7 +4057,7 @@ def _stream_frames(stream: TurnStream, log: TextIO) -> FailedWithThread | None:
             stream.state_change_owed = True
         step = _on_quiet_poll(stream, log) if frame is None else _on_frame(stream, log, frame)
         if frame is None and time.monotonic() >= next_check:
-            next_check = _next_unseen_check(stream)
+            next_check = time.monotonic() + UNSEEN_END_CHECK_SECS
         if isinstance(step, FailedWithThread):
             return step
         if step is StreamStep.FINISH:
@@ -4199,9 +4193,9 @@ def _finish_if_ended_unseen(stream: TurnStream, log: TextIO) -> StreamStep:
     if _waiting_on_detached_run(stream.session_dir, stream.name, stream.thread_id, stream.runs):
         return StreamStep.NEXT_FRAME
     quota_owed = _continuation_is_owed(stream.session_dir, stream.name)
-    if stream.resume_owed or time.monotonic() - stream.turn_started_at < UNSEEN_END_QUIET_SECS:
+    if stream.resume_owed:
         return StreamStep.NEXT_FRAME
-    if not _ended_unseen(stream.client, stream.thread_id):
+    if not _ended_unseen(stream.client, stream.thread_id, stream.turn_id):
         return StreamStep.NEXT_FRAME
     # The read-back RPC may have received the completion or answer ahead of
     # its reply. Process those frames before inferring a missing notice.
@@ -4294,7 +4288,6 @@ def _on_turn_started(stream: TurnStream, params: dict[str, object]) -> None:
     live = _as_str(_as_dict(params.get("turn")).get("id"))
     if live and (not stream.follow or not stream.followed_turn or live == stream.followed_turn):
         stream.turn_id = live
-        stream.turn_started_at = time.monotonic()
         if stream.resume_owed:
             stream.capacity_backoff_owed = False
         if stream.follow:
