@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from collections.abc import Mapping
 from pathlib import Path
 from typing import override
+from unittest.mock import patch
 
 import codex_pacer as pacer
 import note_file
@@ -99,6 +100,61 @@ class MeasurementTests(unittest.TestCase):
         path = self.root / name
         _ = path.write_text("\n".join(lines) + "\n" + tail, encoding="utf-8")
         return path
+
+    def test_rollout_order_uses_filenames_without_comparing_paths(self) -> None:
+        sessions = self.root / "sessions"
+        today = NOW.astimezone()
+        expected: list[Path] = []
+        for back in (1, 0):
+            folder = sessions / (today - timedelta(days=back)).strftime("%Y/%m/%d")
+            folder.mkdir(parents=True)
+            for name in ("rollout-z.jsonl", "rollout-a-2.jsonl", "rollout-a.jsonl"):
+                _ = (folder / name).write_text("")
+            expected.extend(folder / name for name in ("rollout-a-2.jsonl", "rollout-a.jsonl", "rollout-z.jsonl"))
+        with (patch.object(pacer, "SESSIONS", sessions),
+              patch.object(Path, "__lt__", side_effect=AssertionError("compared complete paths"))):
+            self.assertEqual(list(pacer.rollout_files(NOW, 1)), expected)
+
+    def test_tick_discovers_rollouts_once_and_keeps_the_reused_plan_and_state(self) -> None:
+        sessions = self.root / "sessions"
+        folder = sessions / NOW.astimezone().strftime("%Y/%m/%d")
+        folder.mkdir(parents=True)
+        path = folder / "rollout-current.jsonl"
+        tokens = rollout_line("token_usage_record", NOW,
+                              {"usage": {"input_tokens": 1000, "output_tokens": 0}}) + "\n"
+        _ = path.write_text(tokens)
+        stale = self.root / "rollout-stale.jsonl"
+        state = pacer.empty_state()
+        state["files"][str(stale)] = {"offset": 50, "tier": "default", "model": "old"}
+        with (patch.object(pacer, "SESSIONS", sessions),
+              patch.object(pacer, "STATE_FILE", self.root / "state.json"),
+              patch.object(pacer, "PLAN_FILE", self.root / "plan.json"),
+              patch.object(pacer, "TIER_FILE", self.root / "tier"),
+              patch.object(pacer, "registry_tier", return_value="pace"),
+              patch.object(pacer, "rollout_files", wraps=pacer.rollout_files) as discover):
+            pacer.write_atomic(pacer.STATE_FILE, json.dumps(state))
+            first_plan = pacer.tick([], NOW)
+            first_state = pacer.load_state()
+            before = {p: p.read_bytes() for p in (pacer.STATE_FILE, pacer.PLAN_FILE, pacer.TIER_FILE)}
+            original_open = Path.open
+            with patch.object(Path, "open", autospec=True, side_effect=original_open) as opened:
+                self.assertEqual(pacer.tick([], NOW), first_plan)
+            self.assertEqual(pacer.load_state(), first_state)
+            self.assertEqual({p: p.read_bytes() for p in before}, before)
+            self.assertNotIn(str(stale), first_state["files"])
+            self.assertEqual(first_state["files"][str(path)]["offset"], path.stat().st_size)
+            self.assertEqual(first_state["buckets"][pacer.hour_key(NOW)]["tokens"], {"default ?": 1000})
+            self.assertFalse(any(call.args[0] == path for call in opened.call_args_list))
+            self.assertEqual(discover.call_count, 2)
+            # New files and appended tokens are still read on the next tick.
+            _ = path.write_text(tokens * 2)
+            added = folder / "rollout-new.jsonl"
+            _ = added.write_text(tokens)
+            _ = pacer.tick([], NOW)
+            updated = pacer.load_state()
+            self.assertEqual(updated["buckets"][pacer.hour_key(NOW)]["tokens"], {"default ?": 3000})
+            self.assertEqual(updated["files"][str(path)]["offset"], path.stat().st_size)
+            self.assertEqual(updated["files"][str(added)]["offset"], added.stat().st_size)
 
     def test_tokens_take_the_tier_in_force_at_thread_start(self) -> None:
         state = pacer.empty_state()

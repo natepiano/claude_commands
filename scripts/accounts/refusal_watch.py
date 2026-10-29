@@ -462,6 +462,13 @@ def transcript_refusal(session_id: str, *, config_dir: Path | None = None) -> Tr
     root = config_dir if config_dir is not None else Path.home() / ".claude"
     try:
         paths = list((root / "projects").glob("*/" + session_id + ".jsonl"))
+    except OSError:
+        return NoSessionRefusal()
+    return _transcript_refusal(paths)
+
+
+def _transcript_refusal(paths: list[Path]) -> TranscriptRefusal | NoSessionRefusal:
+    try:
         if not paths:
             return NoSessionRefusal()
         transcript = max(paths, key=lambda path: path.stat().st_mtime)
@@ -535,6 +542,35 @@ def assumed_refusal(session_id: str) -> ProofRefusal | NoSessionRefusal:
 def session_refusal(session_id: str) -> TranscriptRefusal | ProofRefusal | NoSessionRefusal:
     assumed = assumed_refusal(session_id)
     return transcript_refusal(session_id) if isinstance(assumed, NoSessionRefusal) else assumed
+
+
+def session_refusals(session_ids: list[str]) -> dict[str, TranscriptRefusal | ProofRefusal | NoSessionRefusal]:
+    """Find this pass's transcripts with one directory scan per project."""
+    detected: dict[str, TranscriptRefusal | ProofRefusal | NoSessionRefusal] = {
+        session_id: assumed_refusal(session_id) for session_id in session_ids}
+    wanted = {session_id + ".jsonl": session_id for session_id, refusal in detected.items()
+              if isinstance(refusal, NoSessionRefusal)}
+    if not wanted:
+        return detected
+    paths: dict[str, list[Path]] = {session_id: [] for session_id in wanted.values()}
+    # Keep the index within this pass. New transcripts and exchanges are read next pass.
+    try:
+        with os.scandir(Path.home() / ".claude/projects") as projects:
+            for project in projects:
+                try:
+                    if not project.is_dir():
+                        continue
+                    with os.scandir(project.path) as transcripts:
+                        for transcript in transcripts:
+                            if transcript.name in wanted:
+                                paths[wanted[transcript.name]].append(Path(transcript.path))
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    for session_id, candidates in paths.items():
+        detected[session_id] = _transcript_refusal(candidates)
+    return detected
 
 
 def clear_assumed(session_id: str) -> None:
@@ -731,8 +767,8 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
     selected_groups = accounts.GroupAccounts() if proof_group else accounts.group_accounts()
     unconfigured = {group for group in (() if proof_group else accounts.CLAUDE_GROUPS) if isinstance(accounts.group_label(selected_groups, group), accounts.GroupNotConfigured)}
     reported_unconfigured: set[accounts.ClaudeGroup] = set()
-    detected = {session["sessionId"]: session_refusal(session["sessionId"]) for session in sessions.live_sessions()
-        if session["sessionId"] not in open_ids and (not proof_group or session["sessionId"] in proof_group)}
+    detected = session_refusals([session["sessionId"] for session in sessions.live_sessions()
+        if session["sessionId"] not in open_ids and (not proof_group or session["sessionId"] in proof_group)])
     refused_ids = frozenset(session_id for session_id, refusal in detected.items()
         if isinstance(refusal, (TranscriptRefusal, ProofRefusal))
         and not ((previous := state["sessions"].get(session_id)) and previous["entry_id"] == refusal.entry_id
