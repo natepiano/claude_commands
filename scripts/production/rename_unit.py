@@ -155,6 +155,7 @@ class UnitRename:
 
 
 REQUIRED = tuple(field.name for field in dataclasses.fields(UnitRename) if field.name not in ("step", "id_matches", *PROGRESS))
+LOCATION_FIELDS = ("doc", "checkout")
 
 
 def _swap(value: str, old_stem: str, new_stem: str, what: str) -> str:
@@ -1098,9 +1099,12 @@ def _load(path: Path) -> UnitRename:
     id_matches = fields.get("id_matches", False)
     if type(id_matches) is not bool:
         raise RenameRefused(f"{path}: invalid unit rename journal")
-    if (not all(isinstance(fields.get(name), str) and fields.get(name) for name in REQUIRED)
+    if (not all(isinstance(fields.get(name), str) and fields.get(name) for name in REQUIRED if name not in LOCATION_FIELDS)
             or type(step) is not int or not all(isinstance(fields.get(name, ""), str) for name in PROGRESS)):
         raise RenameRefused(f"{path}: invalid unit rename journal")
+    # A showrunner checkout can move while the rename is open. Ignore legacy locations.
+    production = _production(cast(str, fields["slug"]))
+    fields.update(doc=str(production.doc), checkout=str(production.checkout))
     merged, doc_commit, unit_tip, account, session_id, kept, old_session = (cast(str, fields.get(name, ""))
                                                                             for name in PROGRESS)
     return UnitRename(*(cast(str, fields[name]) for name in REQUIRED), step=step, merged=merged,
@@ -1111,7 +1115,10 @@ def _load(path: Path) -> UnitRename:
 def _save(path: Path, rename: UnitRename) -> None:
     # The claim holds until the record names the new unit: from then on the relaunch, and any
     # later launch, finds every name moved.
-    write_json(path, {**asdict(rename), "done": rename.step == len(STEPS),
+    saved = cast(dict[str, object], asdict(rename))
+    for name in LOCATION_FIELDS:
+        del saved[name]
+    write_json(path, {**saved, "done": rename.step == len(STEPS),
                       "claimed": rename.step < step_number(_restart_record)})
 
 

@@ -202,6 +202,74 @@ class UnitTransferTests(unittest.TestCase):
         self.assert_refused(self.transfer("verify"),
                             f"a session still carries the marks demo alpha-unit: pid {pid} (claude) in herdr:old:w3:p3Y")
 
+    def pause_before_source_commit(self) -> Path:
+        script = '''import sys
+sys.path.insert(0, sys.argv[1])
+import transfer_unit
+def pause(transfer, save):
+    raise transfer_unit.RenameRefused("fixture pause before source commit")
+transfer_unit.STEPS = tuple(step._replace(run=pause) if step.run == transfer_unit._commit_from else step
+                            for step in transfer_unit.STEPS)
+raise SystemExit(transfer_unit.main(sys.argv[2:]))
+'''
+        result = subprocess.run([sys.executable, "-c", script, str(SCRIPT.parent), "apply", "demo", "alpha-unit",
+                                 str(self.receiving / "docs/plans/other-production.md"),
+                                 "--scratch", str(self.root / "scratch")],
+                                cwd=self.giving, env=self.env, capture_output=True, text=True, check=False, timeout=120)
+        self.assert_refused(result, "fixture pause before source commit")
+        path = self.root / "state/showrunner/demo/transfer_unit.json"
+        saved = cast(dict[str, object], json.loads(path.read_text()))
+        self.assertEqual((saved["step"], saved["done"]), (3, False))
+        for name in ("from_doc", "to_doc", "from_checkout", "to_checkout"):
+            self.assertNotIn(name, saved)
+        return path
+
+    def move_giving_checkout(self) -> None:
+        old = self.giving
+        self.giving = old.with_name("claude-demo-relocated")
+        _ = old.rename(self.giving)
+        _ = self.git("worktree", "repair")
+        doc = self.giving / "docs/plans/demo-production.md"
+        self.write(doc, doc.read_text().replace(str(old), str(self.giving)))
+        _ = self.git("add", str(doc))
+        _ = self.git("commit", "-m", "relocate giving checkout")
+        conf = self.root / "state/notifier/showrunner-demo/conf"
+        self.write(conf, conf.read_text().replace(str(old), str(self.giving)))
+        self.assertFalse(old.exists())
+
+    def assert_transfer_resumed(self, path: Path) -> None:
+        self.assert_ok(self.transfer("apply"))
+        saved = cast(dict[str, object], json.loads(path.read_text()))
+        self.assertIs(saved["done"], True)
+        self.assertNotIn("alpha-unit", (self.giving / "docs/plans/demo-production.md").read_text())
+        self.assertIn("alpha-unit", (self.receiving / "docs/plans/other-production.md").read_text())
+        self.assert_ok(self.transfer("verify"))
+
+    def test_resume_looks_up_the_moved_giving_checkout(self) -> None:
+        path = self.pause_before_source_commit()
+        self.move_giving_checkout()
+        self.assert_transfer_resumed(path)
+
+    def test_old_journal_ignores_stale_locations_for_both_productions(self) -> None:
+        path = self.pause_before_source_commit()
+        saved = cast(dict[str, object], json.loads(path.read_text()))
+        saved.update(from_doc=str(self.giving / "docs/plans/demo-production.md"), from_checkout=str(self.giving),
+                     to_doc=str(self.receiving / "docs/plans/other-production.md"), to_checkout=str(self.receiving))
+        self.write(path, json.dumps(saved))
+        self.move_giving_checkout()
+        old = self.receiving
+        self.receiving = old.with_name("claude-other-relocated")
+        _ = self.git("worktree", "move", str(old), str(self.receiving))
+        doc = self.receiving / "docs/plans/other-production.md"
+        self.write(doc, doc.read_text().replace(str(old), str(self.receiving)))
+        _ = self.git("add", str(doc), cwd=self.receiving)
+        _ = self.git("commit", "-m", "relocate receiving checkout", cwd=self.receiving)
+        self.assertFalse(old.exists())
+        self.assert_transfer_resumed(path)
+        saved = cast(dict[str, object], json.loads(path.read_text()))
+        for name in ("from_doc", "to_doc", "from_checkout", "to_checkout"):
+            self.assertNotIn(name, saved)
+
     def test_a_stopped_unit_relaunches_from_a_record_that_names_the_receiving_production(self) -> None:
         log = self.seed_record()
         result = self.transfer("apply")
