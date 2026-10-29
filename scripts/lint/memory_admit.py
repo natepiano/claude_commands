@@ -220,6 +220,10 @@ class NeedsBuildBudget:
 class NeedsMemory:
     need: int = 0
     free: int = 0
+    threshold: int = 0
+    growth: int = 0
+    reserve: int = 0
+    head_need: int = 0
 
 
 @dataclass(frozen=True)
@@ -1179,7 +1183,9 @@ def read_queue(directory: Path, processes: dict[int, ProcessIdentity], now: floa
         elif isinstance(own.pressure, MemoryPressure):
             reason = own.pressure
         elif own.state == "hold":
-            reason = (NeedsMemory(row["need"], available) if available < own.threshold
+            reason = (NeedsMemory(row["need"], available, own.threshold, own.promised, own.reserve,
+                                  own.threshold - row["need"] - own.promised - own.reserve)
+                      if available < own.threshold
                       else NeedsBuildBudget(row["need"], own.charged, own.budget))
         waiting.append(WaitingStep(row["pid"], identity["session_id"], identity["session_name"], identity["step"],
                                    identity["folder"], row["since"], row["need"], reason))

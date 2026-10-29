@@ -199,7 +199,7 @@ class QueueTests(unittest.TestCase):
         line = next(line for line in build_queue.render_queue(view, ZoneInfo("UTC")) if "head:" in line)
         self.assertTrue(line.endswith(
             "10.9 GiB | 12.0 GiB | head: builds use 16.1 of the 21.0 GiB budget "
-            + "(starts when build use falls to 10.1 GiB); needs 13.9 GiB free; younger steps wait until 19:10 |"))
+            + "(starts when build use falls to 10.1 GiB); needs 13.9 GiB free: this step 10.9, earlyoom 3.0; younger steps wait until 19:10 |"))
 
     def test_bump_by_unique_shown_label_moves_and_logs_the_actual_waiter(self) -> None:
         _ = self.write_waiter(100, "head-id", "head")
@@ -289,7 +289,9 @@ class QueueTests(unittest.TestCase):
         pending = int(23.5 * GIB)
         waiting = memory_admit.WaitingStep(
             10, "waiting-id", "unit", "check", "/tmp/tree", NOW - 2400,
-            int(11.6 * GIB), memory_admit.NeedsMemory(int(11.6 * GIB), int(23.1 * GIB)),
+            int(11.6 * GIB), memory_admit.NeedsMemory(
+                int(11.6 * GIB), int(23.1 * GIB), threshold=int(11.6 * GIB) + pending + 3 * GIB,
+                growth=pending, reserve=3 * GIB),
         )
         running = (
             memory_admit.RunningStep("one", "", "test", "/one", 12 * GIB, memory_admit.PromisedMemory(12 * GIB)),
@@ -299,7 +301,52 @@ class QueueTests(unittest.TestCase):
         view = memory_admit.QueueView((waiting,), running, int(23.1 * GIB), pending, 3 * GIB, NOW)
         line = next(line for line in build_queue.render_queue(view, ZoneInfo("UTC")) if "earlyoom" in line)
         self.assertTrue(line.endswith(
-            "11.6 GiB | 23.1 GiB | 3.0 GiB kept for earlyoom |"))
+            "11.6 GiB | 23.1 GiB | needs 38.1 GiB free: this step 11.6, "
+            + "running steps may grow 23.5, earlyoom 3.0 |"))
+
+    def test_memory_hold_above_step_need_names_every_threshold_part(self) -> None:
+        waiting = memory_admit.WaitingStep(
+            10, "waiting-id", "unit", "clippy", "/tmp/tree", NOW, 3 * GIB,
+            memory_admit.NeedsMemory(
+                3 * GIB, int(11.5 * GIB), threshold=6 * GIB + int(13.4 * GIB) + int(6.7 * GIB),
+                growth=int(13.4 * GIB), reserve=3 * GIB, head_need=int(6.7 * GIB)),
+        )
+        view = memory_admit.QueueView((waiting,), (), int(11.5 * GIB), int(13.4 * GIB), 3 * GIB, NOW)
+        line = next(line for line in build_queue.render_queue(view, ZoneInfo("UTC")) if "| clippy |" in line)
+        self.assertTrue(line.endswith(
+            "3.0 GiB | 11.5 GiB | needs 26.1 GiB free: this step 3.0, "
+            + "running steps may grow 13.4, head 6.7, earlyoom 3.0 |"), line)
+
+    def test_memory_reason_omits_parts_that_round_to_zero(self) -> None:
+        for growth, reserve, head_need, expected in (
+            (0, 3 * GIB, 0, "needs 6.0 GiB free: this step 3.0, earlyoom 3.0"),
+            (1, 1, 1, "needs 3.0 GiB free: this step 3.0"),
+            (0, 0, 0, "needs 0.0 GiB free: this step 0.0"),
+        ):
+            with self.subTest(growth=growth, reserve=reserve, head_need=head_need):
+                need = 0 if (growth, reserve, head_need) == (0, 0, 0) else 3 * GIB
+                waiting = memory_admit.WaitingStep(
+                    10, "waiting-id", "unit", "clippy", "/tmp/tree", NOW, need,
+                    memory_admit.NeedsMemory(need, 0, threshold=need + growth + reserve + head_need,
+                                            growth=growth, reserve=reserve, head_need=head_need),
+                )
+                view = memory_admit.QueueView((waiting,), (), 0, growth, reserve, NOW)
+                line = next(line for line in build_queue.render_queue(view, ZoneInfo("UTC")) if "| clippy |" in line)
+                self.assertEqual(line.split("|")[-2].strip(), expected)
+
+    def test_head_free_threshold_names_step_growth_and_reserve(self) -> None:
+        decision = memory_admit.decide(5 * GIB, 60 * GIB, 3 * GIB,
+                                       [memory_admit.PromisedMemory(4 * GIB)])
+        waiting = memory_admit.WaitingStep(
+            10, "head-id", "unit", "clippy", "/tmp/tree", NOW - 2400, 3 * GIB,
+            memory_admit.head_wait_reason(decision, 3 * GIB, 5 * GIB,
+                {"pid": 10, "start_time": "10", "need": 3 * GIB, "since": NOW - 2400}, NOW),
+        )
+        view = memory_admit.QueueView((waiting,), (), 5 * GIB, 4 * GIB, 3 * GIB, NOW)
+        line = next(line for line in build_queue.render_queue(view, ZoneInfo("UTC")) if "head:" in line)
+        self.assertTrue(line.endswith(
+            "head: needs 10.0 GiB free: this step 3.0, running steps may grow 4.0, earlyoom 3.0; "
+            + "younger steps wait until 19:10 |"), line)
 
     def test_budget_reason_names_charged_builds_and_the_limit(self) -> None:
         waiting = memory_admit.WaitingStep(
@@ -335,7 +382,7 @@ class QueueTests(unittest.TestCase):
         )
         view = memory_admit.QueueView((waiting,), (), available, 0, 3 * GIB, NOW)
         line = next(line for line in build_queue.render_queue(view, ZoneInfo("UTC")) if "head:" in line)
-        self.assertTrue(line.endswith("head: needs 18.1 GiB free; younger steps wait until 19:10 |"))
+        self.assertTrue(line.endswith("head: needs 18.1 GiB free: this step 15.1, earlyoom 3.0; younger steps wait until 19:10 |"))
 
     def test_head_backfill_label_uses_the_since_zone_and_becomes_strict_at_ten_minutes(self) -> None:
         need, available = int(15.1 * GIB), 18 * GIB
@@ -351,7 +398,7 @@ class QueueTests(unittest.TestCase):
                     memory_admit.head_wait_reason(decision, need, available, row, NOW))
                 view = memory_admit.QueueView((waiting,), (), available, 0, 3 * GIB, NOW)
                 line = next(line for line in build_queue.render_queue(view, ZoneInfo("America/New_York")) if "head:" in line)
-                self.assertTrue(line.endswith("head: needs 18.1 GiB free; " + suffix + " |"))
+                self.assertTrue(line.endswith("head: needs 18.1 GiB free: this step 15.1, earlyoom 3.0; " + suffix + " |"))
 
     def test_live_queue_pressure_reason_reaches_the_cli(self) -> None:
         process = self.root / "proc/100"

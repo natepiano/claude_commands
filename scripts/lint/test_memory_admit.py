@@ -1148,6 +1148,35 @@ class QueueApiTests(MemoryQueueFixture):
         view = gate.queue_view()
         self.assertEqual([(step.session_id, step.step) for step in view.waiting], [("worker-id", "nextest")])
 
+    def test_queue_memory_hold_carries_threshold_and_its_parts(self) -> None:
+        _ = self.running(100, 5, age=0)
+        _ = self.waiter(300, NOW.timestamp() - 60, "/tmp/head", "head")
+        path = self.waiter(400, NOW.timestamp() - 30, "/tmp/follower", "follower")
+        row = cast(gate.Waiter, json.loads(path.read_text()))
+        row["need"] = 3 * GIB
+        _ = path.write_text(json.dumps(row))
+        _ = self.meminfo.write_text(f"MemAvailable: {8 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
+        view = gate.queue_view()
+        reason = view.waiting[1].reason
+        self.assertIsInstance(reason, gate.NeedsMemory)
+        if not isinstance(reason, gate.NeedsMemory):
+            self.fail(f"expected memory hold, got {reason}")
+        self.assertEqual((reason.need, reason.free), (3 * GIB, 8 * GIB))
+        self.assertEqual((reason.threshold, reason.growth, reason.reserve, reason.head_need),
+                         (10 * GIB, 4 * GIB, 3 * GIB, 0))
+        self.assertEqual(reason.threshold, reason.need + reason.growth + reason.reserve + reason.head_need)
+
+        # Exercise a nonzero head charge at the decision boundary; strict heads normally use BehindHead.
+        decision = gate.decide(8 * GIB, 60 * GIB, 3 * GIB, [gate.PromisedMemory(4 * GIB)], head_need=7 * GIB)
+        with patch.object(gate, "queue_decision", return_value=decision):
+            charged = gate.queue_view().waiting[1].reason
+        self.assertIsInstance(charged, gate.NeedsMemory)
+        if not isinstance(charged, gate.NeedsMemory):
+            self.fail(f"expected memory hold, got {charged}")
+        self.assertEqual((charged.threshold, charged.growth, charged.reserve, charged.head_need),
+                         (17 * GIB, 4 * GIB, 3 * GIB, 7 * GIB))
+        self.assertEqual(charged.threshold, charged.need + charged.growth + charged.reserve + charged.head_need)
+
     def test_behind_head_carries_head_identity_and_unmatched_name(self) -> None:
         for name, expected_name in (("clone88ci", "clone88ci"), ("", "clone88ci")):
             with self.subTest(recorded_name=name):

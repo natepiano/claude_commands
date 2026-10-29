@@ -85,6 +85,15 @@ def age(since: float, now: float) -> int:
     return max(0, int((now - since) // 60))
 
 
+def free_memory_text(threshold: int, need: int, growth: int, reserve: int, head_need: int = 0) -> str:
+    parts = [f"this step {need / memory_admit.GIB:.1f}"]
+    for name, value in (("running steps may grow", growth), ("head", head_need), ("earlyoom", reserve)):
+        amount = f"{value / memory_admit.GIB:.1f}"
+        if amount != "0.0":
+            parts.append(f"{name} {amount}")
+    return f"needs {threshold / memory_admit.GIB:.1f} GiB free: " + ", ".join(parts)
+
+
 def head_reason_text(reason: memory_admit.HeadAdmissionStatus, zone: ZoneInfo) -> str:
     decision = reason.decision
     parts: list[str] = []
@@ -98,7 +107,7 @@ def head_reason_text(reason: memory_admit.HeadAdmissionStatus, zone: ZoneInfo) -
                          + f"of the {decision.budget / memory_admit.GIB:.1f} GiB budget "
                          + f"(starts when build use falls to {(decision.budget - reason.need) / memory_admit.GIB:.1f} GiB)")
         if reason.available < decision.threshold:
-            parts.append(f"needs {decision.threshold / memory_admit.GIB:.1f} GiB free")
+            parts.append(free_memory_text(decision.threshold, reason.need, decision.promised, decision.reserve))
     until = local_minute(int(reason.backfill.deadline // 60), zone)
     if isinstance(reason.backfill, memory_admit.BackfillUntil):
         parts.append(f"younger steps may start until {until}")
@@ -119,7 +128,7 @@ def reason_text(step: memory_admit.WaitingStep, view: memory_admit.QueueView, zo
             return (f"builds use {reason.charged / memory_admit.GIB:.1f} of the "
                     + f"{reason.budget / memory_admit.GIB:.1f} GiB budget")
         case memory_admit.NeedsMemory():
-            return f"{view.reserve / memory_admit.GIB:.1f} GiB kept for earlyoom"
+            return free_memory_text(reason.threshold, reason.need, reason.growth, reason.reserve, reason.head_need)
         case memory_admit.BehindHead():
             head = labels.get(reason.head_session_id, SessionLabels(field(reason.head_name)))
             return (f"behind {head.session} "
