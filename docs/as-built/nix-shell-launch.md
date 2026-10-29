@@ -51,6 +51,7 @@ resolver before calling `exec`.
 | `agents/agent_bg.sh` | Proves the cwd while making worker settings, passes the loaded env through settings for the long-lived background daemon, and starts the CLI through `exec`. |
 | `agents/agent_exec.sh` | Claude print runs use `exec` after changing to their requested directory. |
 | `agents/codex_mesh.py` | The shared Codex app-server calls `ensure(worktree, environment)` and starts Codex directly with the loaded env. Protected account, run, temporary-directory and guild values come from the caller. `Refused` logs the helper's line, remembers the failed shell, and falls back to the caller env so other workers keep their shared server. The recorded pid is the server's pid. |
+| `accounts/accounts.py` | `exec` calls `ensure(cwd, os.environ)` for every Claude and Codex label, puts the caller's HOME back, and exits 1 with the helper's reason on `Refused`. |
 | `cli_agent/cli_agent.sh` | Interactive and command Claude launches use `exec` in the caller's directory. |
 | `notify/review.py` | Loads the current directory's env before the Claude reviewer starts; refusal returns an unreviewed result. |
 | `make_a_worktree/direnv_allow.sh` | Thin, silent-on-success `ensure` call; failure retains the helper's stderr and exit status. `commands/make_a_worktree.md` requires stopping on failure. |
