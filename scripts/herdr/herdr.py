@@ -29,11 +29,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime, timezone
 from pathlib import Path
-from collections.abc import Sequence
+from collections.abc import Sequence, Set
 from typing import NamedTuple, NotRequired, TypedDict, cast, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
+
+import nix_env as nix_env
 
 # Herdr requires agent-start timeouts strictly above this boundary.
 _AGENT_START_TIMEOUT_MINIMUM_MS = 3000
@@ -44,6 +46,8 @@ _PLATFORM = sys.platform
 # The marks that name a production unit. Only a unit's own launch sets them; a probe, or a herdr
 # server started from inside a unit, drops them so that the unit's lookup never finds a second session.
 UNIT_MARKS = ("SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID")
+NO_ENVIRONMENT_REMOVALS: frozenset[str] = frozenset()
+_NO_NEW_UNIT_DIRECTOR_TITLES: frozenset[str] = frozenset()
 SHARED_SESSION = "agents"
 # The slice of the pane scopes. A pane shell in its own scope keeps the agent load out of the server's cgroup.
 PANE_SLICE = "app-agents.slice"
@@ -818,16 +822,22 @@ def json_items(value: object, context: str) -> list[object]:
     return cast(list[object], value)
 
 
+def child_environment(environment: dict[str, str]) -> dict[str, str]:
+    """Keep the one-launch heal proof in its consuming process, never its children."""
+    return {key: value for key, value in environment.items()
+            if key not in (nix_env.HEAL_SESSION_ENV, nix_env.HEAL_DIRECTORY_ENV)}
+
+
 def unmarked_environment() -> dict[str, str]:
-    """This process's environment without a unit's marks, so that no server it starts carries them."""
-    return {key: value for key, value in os.environ.items() if key not in UNIT_MARKS}
+    """Exclude unit identity and one-launch heal proof from inherited child environments."""
+    return child_environment({key: value for key, value in os.environ.items() if key not in UNIT_MARKS})
 
 
 def run_program(argv: list[str], timeout: float = 10.0, *,
                 environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=timeout,
-                              env=unmarked_environment() if environment is None else environment)
+                              env=unmarked_environment() if environment is None else child_environment(environment))
     except OSError as error:
         raise HerdrFailure(f"{argv[0]}: {error}") from error
 
@@ -883,6 +893,10 @@ class SavedSpace(TypedDict):
 class SavedLayout(TypedDict):
     at: float
     workspaces: list[SavedSpace]
+
+
+class WorkspacesKeptForSplitTabs(NamedTuple):
+    labels: list[str]
 
 
 class _LiveSpace(NamedTuple):
@@ -957,14 +971,18 @@ def merged_layout(saved: SavedLayout, live: list[_LiveSpace], now: float) -> Sav
         for entry in order])
 
 
-def tab_order(space: str, titles: list[str], saved: list[SavedName]) -> list[int]:
+def tab_order(space: str, titles: list[str], saved: list[SavedName], unit_director_titles: Set[str]) -> list[int]:
     """The indexes of `titles` in the order the workspace `space` shows them.
 
-    Saved tabs keep their saved order. A tab not saved goes by the A-Z rule: the showrunner's tab,
-    titled with the workspace's own name, first, else before the first saved tab that sorts after it.
+    Saved tabs keep their saved order. For other tabs, the showrunner comes first, then unit
+    directors A-Z, then other tabs A-Z. The first tab stays first. `sort-tabs` ignores saved order.
     """
-    def rule(title: str) -> tuple[bool, str]:
-        return (title != space, title)
+    showrunner_title = space
+    if titles and not saved and space not in titles:
+        showrunner_title = titles[0]
+
+    def rule(title: str) -> tuple[bool, bool, str]:
+        return (title != showrunner_title, title not in unit_director_titles, title)
 
     places = {entry["name"]: place for place, entry in enumerate(saved)}
     order = sorted((index for index, title in enumerate(titles) if title in places), key=lambda index: places[titles[index]])
@@ -1064,7 +1082,7 @@ class Herdr:
         each holding a placeholder tab until its first session's tab arrives.
         """
         options = ["--label", title, "--cwd", cwd]
-        for key, value in {**environment, "HERDR_AGENT_PANE": "1"}.items():
+        for key, value in {**child_environment(environment), "HERDR_AGENT_PANE": "1"}.items():
             options.extend(["--env", f"{key}={value}"])
         with _LayoutLock(self.session):
             saved = saved_layout(self.session)
@@ -1083,7 +1101,8 @@ class Herdr:
             _ = self.run("pane", "rename", pane, title)
             if workspace is not None:
                 self._close_placeholders(workspace)
-                pane = self.order_tabs(workspace, saved).get(pane, pane)
+                unit_director_titles = {title} if has_unit_marks(environment) else _NO_NEW_UNIT_DIRECTOR_TITLES
+                pane = self.order_tabs(workspace, saved, unit_director_titles).get(pane, pane)
             self.save_layout()
             return pane
 
@@ -1177,37 +1196,47 @@ class Herdr:
                 self.save_layout()
         return True
 
-    def order_tabs(self, workspace: str, saved: SavedLayout) -> dict[str, str]:
-        """Put the workspace's tabs in their saved order, and each tab not saved in its A-Z place (`tab_order`).
+    def order_tabs(self, workspace: str, saved: SavedLayout,
+                   new_unit_director_titles: Set[str] = _NO_NEW_UNIT_DIRECTOR_TITLES) -> dict[str, str]:
+        """Keep saved order; sort other tabs by showrunner, unit directors A-Z, then other tabs A-Z.
 
+        `sort-tabs` passes an empty saved layout to sort all tabs. The first tab stays first.
         herdr 0.9.5 cannot move a tab, but a
         pane moved into a new tab puts that tab last: so every tab from the first one out of place
         moves, in order. Each pane keeps its process, and focus goes back where it was. A tab with
-        several panes leaves the order as it is. Returns each moved pane's new id by its old one.
+        several panes stops the sort only when it must move. Returns each moved pane's new id by its old one.
         """
         spaces = [json_object(item, "herdr workspace") for item in json_items(
             self.result("workspace", "list").get("workspaces"), "herdr workspace list")]
         name = next((item.get("label") for item in spaces if item.get("workspace_id") == workspace), None)
         tabs = [json_object(item, "herdr tab") for item in json_items(
             self.result("tab", "list", "--workspace", workspace).get("tabs"), "herdr tab list")]
-        titles = [json_text(tab.get("label"), "herdr tab label") for tab in tabs]
-        unsaved: list[SavedName] = []
-        kept = next((space["tabs"] for space in saved["workspaces"] if space["name"] == name), unsaved)
-        order = tab_order(name if isinstance(name, str) else "", titles, kept)
-        start = next((place for place, index in enumerate(order) if index != place), len(tabs))
-        if start == len(tabs) or any(tabs[index].get("pane_count") != 1 for index in order[start:]):
+        if len(tabs) < 2:
             return {}
         rows = [json_object(item, "herdr pane") for item in json_items(
             self.result("pane", "list").get("panes"), "herdr pane list")]
-        pane_of = {json_text(row.get("tab_id"), "herdr pane tab id"): json_text(row.get("pane_id"), "herdr pane id")
-                   for row in rows}
+        panes_of: dict[str, list[str]] = {}
+        for row in rows:
+            tab = json_text(row.get("tab_id"), "herdr pane tab id")
+            panes_of.setdefault(tab, []).append(json_text(row.get("pane_id"), "herdr pane id"))
+        unit_panes = unit_director_panes(self.session, herdr_processes())
+        unit_director_titles = new_unit_director_titles | {
+            json_text(tab.get("label"), "herdr tab label") for tab in tabs
+            if any(pane in unit_panes for pane in panes_of.get(json_text(tab.get("tab_id"), "herdr tab id"), []))}
+        titles = [json_text(tab.get("label"), "herdr tab label") for tab in tabs]
+        unsaved: list[SavedName] = []
+        kept = next((space["tabs"] for space in saved["workspaces"] if space["name"] == name), unsaved)
+        order = tab_order(name if isinstance(name, str) else "", titles, kept, unit_director_titles)
+        start = next((place for place, index in enumerate(order) if index != place), len(tabs))
+        if start == len(tabs) or any(tabs[index].get("pane_count") != 1 for index in order[start:]):
+            return {}
         focused = next((item for item in spaces if item.get("focused") is True), None)
         active = next((item.get("active_tab_id") for item in spaces if item.get("workspace_id") == workspace), None)
         moved: dict[str, str] = {}
         active_tab = active
         for index in order[start:]:
             tab = json_text(tabs[index].get("tab_id"), "herdr tab id")
-            pane = pane_of[tab]
+            pane = panes_of[tab][0]
             result = json_object(self.result("pane", "move", pane, "--new-tab", "--workspace", workspace)
                                  .get("move_result"), "herdr pane move")
             created = json_text(json_object(result.get("created_tab"), "herdr moved tab").get("tab_id"), "herdr tab id")
@@ -1220,6 +1249,20 @@ class Herdr:
         if focused is not None and focused.get("workspace_id") != workspace:
             self.focus_workspace(json_text(focused.get("workspace_id"), "herdr workspace id"))
         return moved
+
+    def sort_tabs(self) -> WorkspacesKeptForSplitTabs:
+        """Sort each workspace by showrunner, units A-Z, then other tabs A-Z; save and return split workspaces kept."""
+        kept: list[str] = []
+        with _LayoutLock(self.session):
+            for space in self.live_layout():
+                tabs = [json_object(item, "herdr tab") for item in json_items(
+                    self.result("tab", "list", "--workspace", space.workspace_id).get("tabs"), "herdr tab list")]
+                if any(tab.get("pane_count") != 1 for tab in tabs):
+                    kept.append(space.label)
+                    continue
+                _ = self.order_tabs(space.workspace_id, SavedLayout(at=0.0, workspaces=[]))
+            self.save_layout()
+        return WorkspacesKeptForSplitTabs(kept)
 
     def close_tab_of(self, pane: str) -> None:
         """Close the tab holding `pane`; a pane already gone leaves nothing to close."""
@@ -1322,7 +1365,8 @@ class Herdr:
             pass
         next_observation = time.monotonic() + 0.5
         try:
-            process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                       env=unmarked_environment())
         except OSError as error:
             raise HerdrFailure(f"{argv[0]}: {error}") from error
         with process:
@@ -2891,6 +2935,16 @@ def _darwin_herdr_processes() -> list[HerdrProcess]:
     return processes
 
 
+def has_unit_marks(environment: dict[str, str]) -> bool:
+    return all(environment.get(mark) for mark in UNIT_MARKS)
+
+
+def unit_director_panes(session: str, processes: Sequence[HerdrProcess]) -> set[str]:
+    """The session's pane ids whose processes carry both unit marks."""
+    return {process.place.pane for process in processes
+            if process.place.session == session and has_unit_marks(process.marks)}
+
+
 def herdr_processes() -> list[HerdrProcess]:
     if _platform() == "darwin":
         return _darwin_herdr_processes()
@@ -2932,6 +2986,96 @@ def _agent_name(name: str) -> str:
     return mapped[:32]
 
 
+@dataclass(frozen=True)
+class AgentLaunched:
+    pane: str
+    outcome: PromptSubmitOutcome | PromptSubmissionNotRequired
+
+
+@dataclass(frozen=True)
+class PreparedAgentEnvironment:
+    """An environment already proved for the exact directory to be opened."""
+
+    directory: Path
+    env: dict[str, str]
+
+
+def launch_agent(name: str, space: str, title: str, cwd: str, environment: dict[str, str],
+                 kind: str, agent_arguments: list[str], opening: OpeningPrompt | NoOpeningPrompt,
+                 timeout_ms: int, *, agent: str, unset_environment: frozenset[str] = NO_ENVIRONMENT_REMOVALS) -> AgentLaunched | nix_env.Refused:
+    """Prove the start environment before creating a pane or starting an agent.
+
+    herdr owns the executable selected by --kind. The pane carries the loaded
+    environment, so its canonical executable inherits it, including on resume.
+    Caller account choices and unit marks take precedence over inherited ones.
+    """
+    _check_agent_arguments(kind, agent_arguments)
+    if os.environ.get(nix_env.HEAL_SESSION_ENV) or os.environ.get(nix_env.HEAL_DIRECTORY_ENV):
+        # Unit restores reach this choke point through add_unit in a child
+        # process rather than restart's direct Claude/Codex restoration paths.
+        session_id = next((agent_arguments[index + 1] for index, argument in enumerate(agent_arguments[:-1])
+                           if argument in {"--resume", "--session-id", "resume"}), "")
+        prepared = prepare_session_environment(session_id, cwd, environment, unset_environment)
+    else:
+        prepared = prepare_agent_environment(cwd, environment, unset_environment)
+    if isinstance(prepared, nix_env.Refused):
+        return prepared
+    return launch_prepared_agent(name, space, title, prepared, kind, agent_arguments, opening, timeout_ms, agent=agent)
+
+
+def agent_base_environment(environment: dict[str, str], unset_environment: frozenset[str]) -> dict[str, str]:
+    """Keep the target account's choices while dropping the launcher's identity."""
+    base_env = dict(os.environ)
+    for key in tuple(base_env):
+        # scripts/lib/unit_env.sh and unit_runs.environ map every PLAN_DELEGATE_ alias to UNIT_.
+        if (key.startswith(("HERDR_", "CODEX_", "UNIT_", "PLAN_DELEGATE_", "SHOWRUNNER_", "CLAUDE_", "NIX_HEAL_"))
+                or key in {"ANTHROPIC_API_KEY", "SHELL", "TMUX", "TMUX_PANE"}):
+            del base_env[key]
+    base_env.update(environment)
+    for key in unset_environment:
+        _ = base_env.pop(key, None)
+    return child_environment(base_env)
+
+
+def prepare_agent_environment(cwd: str, environment: dict[str, str],
+                              unset_environment: frozenset[str] = NO_ENVIRONMENT_REMOVALS) -> PreparedAgentEnvironment | nix_env.Refused:
+    """Load before a server restore can create a desktop window."""
+    loaded = nix_env.ensure(Path(cwd), agent_base_environment(environment, unset_environment))
+    if isinstance(loaded, nix_env.Refused):
+        return loaded
+    launch_environment = {key: value for key, value in loaded.env.items() if key not in unset_environment}
+    return PreparedAgentEnvironment(Path(cwd).resolve(), launch_environment)
+
+
+def prepare_session_environment(session_id: str, cwd: str, environment: dict[str, str],
+                                unset_variables: frozenset[str]) -> PreparedAgentEnvironment | nix_env.Refused:
+    """Consume the healer's one-session proof without loading after its hold check."""
+    ready_session = os.environ.get(nix_env.HEAL_SESSION_ENV, "")
+    ready_directory = os.environ.get(nix_env.HEAL_DIRECTORY_ENV, "")
+    directory = Path(cwd).resolve()
+    if ready_session or ready_directory:
+        if ready_session != session_id or ready_directory != str(directory):
+            return nix_env.Refused("nix_env: prepared restart environment belongs to another session or directory")
+        if nix_env.nearest_envrc(directory) is not None and not os.environ.get("IN_NIX_SHELL"):
+            return nix_env.Refused(f"nix_env: {directory}: prepared restart environment has no nix shell")
+        return PreparedAgentEnvironment(directory, agent_base_environment(environment, unset_variables))
+    return prepare_agent_environment(cwd, environment, unset_variables)
+
+
+def launch_prepared_agent(name: str, space: str, title: str, prepared: PreparedAgentEnvironment,
+                          kind: str, agent_arguments: list[str], opening: OpeningPrompt | NoOpeningPrompt,
+                          timeout_ms: int, *, agent: str) -> AgentLaunched:
+    """Launch an already proved environment without another potentially slow load."""
+    _check_agent_arguments(kind, agent_arguments)
+    pane = open_tab(name, space, title, str(prepared.directory), prepared.env)
+    try:
+        outcome = start_agent(name, pane, kind, agent_arguments, opening, timeout_ms, agent=agent)
+    except (HerdrFailure, OSError, subprocess.SubprocessError):
+        close_agent(name, pane)
+        raise
+    return AgentLaunched(pane, outcome)
+
+
 def start_agent(name: str, pane: str, kind: str, agent_arguments: list[str],
                 opening: OpeningPrompt | NoOpeningPrompt, timeout_ms: int, *, agent: str) -> PromptSubmitOutcome | PromptSubmissionNotRequired:
     """Start the agent named `agent` in the named session.
@@ -2939,4 +3083,5 @@ def start_agent(name: str, pane: str, kind: str, agent_arguments: list[str],
     `agent` is the full session name: a pane carries only the short tab title.
     """
     _check_agent_arguments(kind, agent_arguments)
-    return Herdr(name).start_agent(agent, pane, kind, agent_arguments, opening, timeout_ms)
+    return Herdr(name).start_agent(agent, pane, kind=kind, agent_arguments=agent_arguments,
+                                  opening=opening, timeout_ms=timeout_ms)

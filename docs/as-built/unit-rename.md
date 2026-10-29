@@ -43,7 +43,7 @@ steps:
    rerun resumes there, so a rename never waits for a person (user: "it is unacceptable that it
    require my intervention"). Once the unit is stopped (or was not running),
    `_stop_runs` ends what its runs leave in the worktree. First each run's live app-server (found
-   by the run's `mesh_server.json`) stops with its seats through `codex_mesh.py stop`, as
+   by the run's `mesh_server.json`) stops with its workers through `codex_mesh.py stop`, as
    retire_unit does; a failed stop is printed and SIGTERM ends the server. Then SIGTERM goes to a
    detached run's supervisor (`mesh_runs.py supervise`, found by its run record) with every process
    of its session, an app-server's idle-stop watcher (found by the run folder in its arguments), and
@@ -105,8 +105,8 @@ steps:
    - the cwd, plan path and worker cwds under the worktree;
    - the Claude and herdr names, while they are still the defaults;
    - `renamed`, which `restart.restart_note` puts first in the resumed prompt. With `kept` set it
-     also says the branch took no merge and the paused Codex seats now work in the new worktree.
-     `implement.sh` passes `--cwd <working dir>` on every follow-up, so a resumed seat's turns run
+     also says the branch took no merge and the paused Codex workers now work in the new worktree.
+     `implement.sh` passes `--cwd <working dir>` on every follow-up, so a resumed worker's turns run
      there and not in the path its thread started in.
 
    `restart._unit_argv` still reads the plan from the Units row.

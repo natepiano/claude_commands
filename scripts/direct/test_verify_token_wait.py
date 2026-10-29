@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import cast, override
 
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.direct.test_verify_mac_offload import RUSTC_STUB, stub_build_tool_path
 
 VERIFY = Path(__file__).with_name("verify.sh")
 BOARD = VERIFY.with_name("board.sh")
@@ -97,6 +98,9 @@ fi
 exit 97
 ''')
         cargo.chmod(0o755)
+        rustc = stubs / "rustc"
+        _ = rustc.write_text(RUSTC_STUB)
+        rustc.chmod(0o755)
         git = stubs / "git"
         _ = git.write_text(r'''#!/bin/sh
 case " $* " in
@@ -123,10 +127,11 @@ esac
         self.environment = {
             **{name: value for name, value in os.environ.items()
                if name not in {"UNIT_RUN_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID",
-                               "CODEX_SESSION_ID", "UNIT_DETACHED_RUN"} and not name.startswith("PLAN_DELEGATE_")},
-            "PATH": f"{stubs}:{os.environ['PATH']}",
+                               "CODEX_SESSION_ID", "UNIT_DETACHED_RUN", "BASH_ENV", "ENV"}
+               and not name.startswith(("PLAN_DELEGATE_", "BASH_FUNC_"))},
+            "PATH": stub_build_tool_path(stubs),
             "HOME": str(home),
-            "RUSTUP_HOME": str(Path.home() / ".rustup"),
+            "RUSTUP_HOME": str(self.root / "rustup"),
             "PACKAGE_ROOT": str(self.root),
             "CARGO_CALLS": str(self.root / "cargo-calls"),
             "METADATA_CALLS": str(self.root / "metadata-calls"),
@@ -153,6 +158,7 @@ esac
             "BUILDLOG_HOLD_REGISTRATION_FILE": str(self.root / "registration"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "MAC_TEST_STATE_DIR": str(self.root / "mac-state"),
+            "MAC_IDLE_STATE_DIR": str(self.root / "mac-idle"),
             "VERIFY_MAC_RUNNER": str(self.root / "no-mac-runner"),
             "LINT_CONFIG_READER": str(reader),
             "LINT_CONFIG_FILE": str(reader),

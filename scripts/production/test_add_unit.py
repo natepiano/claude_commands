@@ -30,6 +30,10 @@ import conversation_pause
 import launch_permission
 import unit_lookup
 import session_pane
+import sessions
+import inventory
+import record as shutdown_store
+import restart
 from herdr import HerdrPlace
 from production_units import Refusal, cell_value, live_unit_table, plan_cell_is_retired, retired_units
 from scripts.accounts import accounts
@@ -148,6 +152,8 @@ class AddUnitTests(ShutdownTestCase):
             "---\nlogin: owner@example.com\nsessions: 1\n---\n",
             encoding="utf-8",
         )
+        registry = home / ".claude/sessions"
+        registry.mkdir()
         self.state = self.root / "stub-state"
         _ = self.state.mkdir()
         _ = (self.state / "ready").touch()
@@ -166,6 +172,7 @@ class AddUnitTests(ShutdownTestCase):
         _ = sync_state.touch()
         self.env = {**os.environ, "HOME": str(self.root / "home"),
                     "HERDR_PLATFORM": "linux",
+                    "NOTIFIER_SESSIONS_DIR": str(registry),
                     "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
                     "STUB_STATE": str(self.state),
                     "SHOWRUNNERS_CONFIG": str(self.config), "CLAUDE_TEST_SECRET": "must-not-leak",
@@ -441,7 +448,7 @@ class AddUnitTests(ShutdownTestCase):
     def prepare_herdr_launch(self, *args: str) -> None:
         parser = argparse.ArgumentParser()
         _ = parser.add_argument("name")
-        for flag in ("plan", "brief", "port", "owns", "resume", "cwd", "restart-note", "session-name", "host-session", "account", "config-dir", "model", "autocompact"):
+        for flag in ("plan", "brief", "port", "owns", "resume", "attach", "cwd", "restart-note", "session-name", "host-session", "account", "config-dir", "model", "autocompact"):
             _ = parser.add_argument("--" + flag, type=int if flag == "port" else str)
         _ = parser.add_argument("--standby", action="store_true")
         _ = parser.add_argument("--permanent", action="store_true")
@@ -950,7 +957,7 @@ class AddUnitTests(ShutdownTestCase):
             result = self.successful("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(result.returncode, 0)
         start.assert_called_once()
-        opening = cast(object, start.call_args.kwargs["opening"])
+        opening = cast(object, start.call_args.args[4])
         self.assertIsInstance(opening, herdr.OpeningPrompt)
         assert isinstance(opening, herdr.OpeningPrompt)
         self.assertEqual(opening.text, "/unit:direct docs/plans/given.md")
@@ -1018,6 +1025,273 @@ class AddUnitTests(ShutdownTestCase):
         self.assertIn("account logged out", errors.getvalue())
         prepared.assert_called_once_with("claude3", resume=True)
         self.assertEqual(self.herdr_calls(), [])
+
+    def write_resume_registry_record(self, proc_start: str) -> None:
+        registry = Path(self.env["NOTIFIER_SESSIONS_DIR"])
+        _ = (registry / f"{os.getpid()}.json").write_text(json.dumps({
+            "pid": os.getpid(), "sessionId": "session-123", "name": "postmaster",
+            "messagingSocketPath": "", "updatedAt": 1, "procStart": proc_start,
+        }))
+
+    def test_running_resume_refuses_before_any_launch_write(self) -> None:
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        started = sessions.process_start(os.getpid())
+        assert started is not None
+        self.write_resume_registry_record(started)
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+        for mode in ([], ["--check"]):
+            with self.subTest(mode=mode):
+                result = self.cli("alpha", "--permanent", "--resume", "session-123", "--cwd", str(prior), *mode)
+                self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+                self.assertEqual(result.stderr, f"add_unit: session session-123 already runs as pid {os.getpid()}; "
+                                 + "to make it this unit, run add_unit with --attach session-123\n")
+                self.assert_no_launch_change(document, head)
+                self.assertEqual([row for row in self.herdr_calls() if row[2:4] != ["session", "list"]], [])
+                self.assertNotIn("build-followups-alpha", self.git("branch", "--list"))
+        # Brief launches must refuse before their stub is written too.
+        result = self.cli("alpha", "--brief", "Repair the unit", "--resume", "session-123", "--cwd", str(prior))
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertFalse((self.checkout / "docs/plans/build-followups-alpha.md").exists())
+        self.assert_no_launch_change(document, head)
+        self.assertEqual([row for row in self.herdr_calls() if row[2:4] != ["session", "list"]], [])
+
+    def test_running_restore_refuses_even_without_herdr_marks(self) -> None:
+        self.commit_prepared_row(self.unit_row())
+        self.write_shutdown_record(self.shutdown_record("restarting"))
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        started = sessions.process_start(os.getpid())
+        assert started is not None
+        self.write_resume_registry_record(started)
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+        result = self.restore("alpha", prior)
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertIn(f"session session-123 already runs as pid {os.getpid()}", result.stderr)
+        self.assert_no_launch_change(document, head)
+        self.assertEqual([row for row in self.herdr_calls() if row[2:4] != ["session", "list"]], [])
+        self.assertEqual(self.recorded_prompts("session-123"), ())
+
+    def test_resume_with_unreadable_registry_refuses_with_the_reason(self) -> None:
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        registry = Path(self.env["NOTIFIER_SESSIONS_DIR"])
+        _ = (registry / "broken.json").write_text("{broken")
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+        result = self.cli("alpha", "--permanent", "--resume", "session-123", "--cwd", str(prior))
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertEqual(result.stderr, "add_unit: cannot tell whether session session-123 runs: "
+                         + "unreadable session registry record: broken.json\n")
+        self.assert_no_launch_change(document, head)
+        self.assertEqual([row for row in self.herdr_calls() if row[2:4] != ["session", "list"]], [])
+
+    def test_resume_with_unreadable_process_identity_refuses_with_the_reason(self) -> None:
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        self.write_resume_registry_record("recorded-start")
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+        with patch.object(sessions, "process_start", return_value=None):
+            result = self.cli("alpha", "--permanent", "--resume", "session-123", "--cwd", str(prior))
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertEqual(result.stderr, "add_unit: cannot tell whether session session-123 runs: "
+                         + f"process identity unreadable for pid {os.getpid()}\n")
+        self.assert_no_launch_change(document, head)
+        self.assertEqual([row for row in self.herdr_calls() if row[2:4] != ["session", "list"]], [])
+
+    def test_resume_with_stale_registry_identity_still_launches(self) -> None:
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        self.write_resume_registry_record("a-previous-process-start")
+        result = self.successful("alpha", "--permanent", "--resume", "session-123", "--cwd", str(prior))
+        self.assertIn("alpha-unit started:", result.stdout)
+        arguments = self.agent_arguments()
+        self.assertEqual(arguments[arguments.index("--resume") + 1], "session-123")
+        self.assertIn(str(prior), self.opened())
+        starts = [row for row in self.herdr_calls() if row[2:4] == ["agent", "start"]]
+        self.assertEqual(len(starts), 1)
+
+    def prepare_attach(self, *, after_stop: tuple[int, ...] = (), after_launch: tuple[int, ...] = (202,),
+                       stop_progress: str = "stopped", timeout: bool = False) -> tuple[Path, list[str]]:
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        started = sessions.process_start(os.getpid())
+        assert started is not None
+        self.write_resume_registry_record(started)
+        source = inventory.ListedSession("session-123", os.getpid(), started, "postmaster", "top-level",
+                                         self.root / "home/.claude", "owner@example.com", "", "")
+        _ = self.enterContext(patch.object(inventory, "listing", return_value=[source]))
+        document, head = self.doc.read_text(), self.git("rev-parse", "HEAD")
+        trace: list[str] = []
+        stopped = False
+        launched = False
+        launch_session = add_unit.launch_session
+
+        def launch(request: add_unit.UnitLaunch, director: add_unit.DirectorAgent, prompt: str,
+                   selected: accounts.ClaudeLaunchAccount, *, target: str = "", model: str = "",
+                   autocompact_window: str = "") -> herdr.PromptSubmitOutcome:
+            nonlocal launched
+            trace.append("launch")
+            launched = True
+            return launch_session(request, director, prompt, selected, target=target, model=model,
+                                  autocompact_window=autocompact_window)
+
+        def shutdown(arguments: list[str], within: float) -> subprocess.CompletedProcess[str]:
+            nonlocal stopped
+            self.assertGreater(within, 0)
+            self.assert_no_launch_change(document, head)
+            self.assertEqual([row for row in self.herdr_calls() if row[2:4] == ["agent", "start"]], [])
+            trace.append(arguments[0])
+            if arguments[0] == "down":
+                self.assertEqual(arguments[:6], ["down", "owner@example.com", "--here", "--only", "session-123", "--request-id"])
+                self.write_shutdown_record(self.shutdown_record("down", progress={"kind": stop_progress,
+                                                                                 "at": "2026-10-28T20:00:00+00:00"}))
+                _ = shutdown_store.migrate("owner@example.com")
+                def select_request(saved: shutdown_store.SessionShutdown) -> None:
+                    saved["request_id"] = arguments[6]
+                    saved["hold"] = "session"
+                _ = shutdown_store.update_session("owner@example.com", "session-123", select_request)
+                (Path(self.env["NOTIFIER_SESSIONS_DIR"]) / f"{os.getpid()}.json").unlink()
+                stopped = True
+            else:
+                self.assertEqual(arguments[:3], ["follow", "owner@example.com", "--request"])
+                if timeout:
+                    raise subprocess.TimeoutExpired(arguments, within)
+            return subprocess.CompletedProcess(arguments, 0, "", "")
+
+        def processes(_identity: str) -> sessions.SessionProcesses:
+            return sessions.SessionProcesses(after_launch if launched else after_stop if stopped else (os.getpid(),))
+
+        def finish(records: list[shutdown_store.SessionShutdown]) -> restart.TargetCheck:
+            trace.append("finish")
+            self.assertTrue(launched)
+            return restart.TargetCheck([], records)
+
+        _ = self.enterContext(patch.object(add_unit, "run_attach_shutdown", side_effect=shutdown))
+        _ = self.enterContext(patch.object(add_unit, "launch_session", side_effect=launch))
+        _ = self.enterContext(patch.object(sessions, "session_processes", side_effect=processes))
+        _ = self.enterContext(patch.object(sessions, "process_liveness", return_value=sessions.SessionNotLive()))
+        _ = self.enterContext(patch.object(restart, "wait_for_confirmation", return_value=restart.RegistryConfirmation()))
+        _ = self.enterContext(patch.object(restart, "clear_running_on_target", side_effect=finish))
+        return prior, trace
+
+    def test_attach_stops_then_launches_once_with_unit_marks_and_finishes(self) -> None:
+        prior, trace = self.prepare_attach()
+        result = self.successful("alpha", "--permanent", "--attach", "session-123", "--cwd", str(prior))
+        self.assertEqual(trace, ["down", "follow", "launch", "finish"])
+        starts = [row for row in self.herdr_calls() if row[2:4] == ["agent", "start"]]
+        self.assertEqual(len(starts), 1)
+        arguments = self.agent_arguments()
+        self.assertEqual(arguments[arguments.index("--resume") + 1], "session-123")
+        self.assertEqual(self.pane_environment()[unit_lookup.PRODUCTION_MARK], "build-followups")
+        self.assertEqual(self.pane_environment()[unit_lookup.UNIT_MARK], "alpha-unit")
+        self.assertIn(str(prior), self.opened())
+        self.assertIn("attached session-123 as alpha-unit: one process, pid 202", result.stdout)
+
+    def test_attach_requires_cwd_supported_mode_and_exclusive_session_flag(self) -> None:
+        document, head = self.doc.read_text(), self.git("rev-parse", "HEAD")
+        cases = ((["--permanent", "--attach", "session-123"], "--attach and --cwd"),
+                 (["--brief", "repair", "--attach", "session-123", "--cwd", str(self.root)], "--attach requires"),
+                 (["--permanent", "--attach", "session-123", "--resume", "other", "--cwd", str(self.root)], "not allowed"))
+        for arguments, message in cases:
+            with self.subTest(arguments=arguments):
+                result = self.cli("alpha", *arguments)
+                self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+                self.assertIn(message, result.stderr)
+                self.assert_no_launch_change(document, head)
+
+    def test_attach_check_validates_without_stopping(self) -> None:
+        prior, trace = self.prepare_attach()
+        _ = self.successful("alpha", "--standby", "--attach", "session-123", "--cwd", str(prior), "--check")
+        self.assertEqual(trace, [])
+
+    def test_attach_refuses_absent_and_unknown_sessions_before_writes(self) -> None:
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        document, head = self.doc.read_text(), self.git("rev-parse", "HEAD")
+        for liveness, reason in ((sessions.SessionNotLive(), "session session-123 does not run; use --resume"),
+                                 (sessions.SessionLivenessUnknown("registry permission denied"), "registry permission denied")):
+            with (self.subTest(reason=reason), patch.object(sessions, "session_liveness", return_value=liveness),
+                  patch.object(add_unit, "run_attach_shutdown") as shutdown):
+                result = self.cli("alpha", "--standby", "--attach", "session-123", "--cwd", str(prior))
+                self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+                self.assertIn(reason, result.stderr)
+                shutdown.assert_not_called()
+                self.assert_no_launch_change(document, head)
+
+    def test_attach_checks_launch_hold_before_requesting_shutdown(self) -> None:
+        prior, trace = self.prepare_attach()
+        with patch.object(launch_permission, "launch_permission", return_value=launch_permission.BlockedByShutdown("units account is held")):
+            result = self.cli("alpha", "--permanent", "--attach", "session-123", "--cwd", str(prior))
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertIn("units account is held", result.stderr)
+        self.assertEqual(trace, [])
+
+    def test_attach_refuses_unclear_source_account_before_stopping(self) -> None:
+        prior, trace = self.prepare_attach()
+        with patch.object(inventory, "listing", return_value=[]):
+            result = self.cli("alpha", "--permanent", "--attach", "session-123", "--cwd", str(prior))
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertIn("source account is unclear", result.stderr)
+        self.assertEqual(trace, [])
+
+    def test_attach_timeout_leaves_shutdown_state_and_prints_cancel(self) -> None:
+        prior, trace = self.prepare_attach(stop_progress="waiting", timeout=True)
+        result = self.cli("alpha", "--permanent", "--attach", "session-123", "--cwd", str(prior))
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertEqual(trace, ["down", "follow"])
+        self.assertIn("cancel owner@example.com --here --only session-123", result.stderr)
+        with patch.dict(os.environ, self.env):
+            self.assertEqual(shutdown_store.session_records("owner@example.com")[0]["progress"]["kind"], "waiting")
+
+    def test_attach_requires_stopped_record_even_when_follower_returns_success(self) -> None:
+        prior, trace = self.prepare_attach(stop_progress="waiting")
+        result = self.cli("alpha", "--permanent", "--attach", "session-123", "--cwd", str(prior))
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertIn("record does not confirm a completed stop", result.stderr)
+        self.assertIn("cancel owner@example.com --here --only session-123", result.stderr)
+        self.assertEqual(trace, ["down", "follow"])
+
+    def test_attach_refuses_process_still_registered_after_stop(self) -> None:
+        prior, trace = self.prepare_attach(after_stop=(303,))
+        result = self.cli("alpha", "--permanent", "--attach", "session-123", "--cwd", str(prior))
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertIn("processes still run after shutdown; pids found: [303]", result.stderr)
+        self.assertEqual(trace, ["down", "follow"])
+
+    def test_attach_checks_old_pid_even_after_registry_record_disappears(self) -> None:
+        prior, trace = self.prepare_attach()
+        with patch.object(sessions, "process_liveness", return_value=sessions.LiveSessionProcess(os.getpid())):
+            result = self.cli("alpha", "--permanent", "--attach", "session-123", "--cwd", str(prior))
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertIn(f"pids found: [{os.getpid()}]", result.stderr)
+        self.assertEqual(trace, ["down", "follow"])
+
+    def test_attach_refuses_unfinished_shutdown_record_after_launch(self) -> None:
+        prior, trace = self.prepare_attach()
+        def unfinished(records: list[shutdown_store.SessionShutdown]) -> restart.TargetCheck:
+            return restart.TargetCheck(records, [])
+
+        with patch.object(restart, "clear_running_on_target", side_effect=unfinished):
+            result = self.cli("alpha", "--permanent", "--attach", "session-123", "--cwd", str(prior))
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertEqual(trace, ["down", "follow", "launch"])
+        self.assertIn("shutdown record did not finish", result.stderr)
+        self.assertNotIn("attached session-123 as", result.stdout)
+
+    def test_attach_reports_duplicate_processes_after_launch_without_touching_them(self) -> None:
+        prior, trace = self.prepare_attach(after_launch=(202, 303))
+        result = self.cli("alpha", "--plan", "docs/plans/given.md", "--attach", "session-123", "--cwd", str(prior))
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertEqual(trace, ["down", "follow", "launch", "finish"])
+        self.assertIn("ATTACH UNPROVEN", result.stderr)
+        self.assertIn("pids found: [202, 303]", result.stderr)
+        self.assertNotIn("attached session-123 as", result.stdout)
+        self.assertEqual(len([row for row in self.herdr_calls() if row[2:4] == ["agent", "start"]]), 1)
+        self.assertEqual([row for row in self.herdr_calls() if row[2:4] in (["agent", "stop"], ["server", "stop"])], [])
 
     def test_herdr_resume_uses_group_account_and_last_real_transcript_model(self) -> None:
         self.write_agent_config(director="sonnet:high")
@@ -1708,7 +1982,9 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(self.opened()[:8], ["--session", SHARED, "workspace", "create", "--label", "director",
                                              "--cwd", str(worktree)])
         self.assertIn(["--session", SHARED, "tab", "rename", "w1:t1", "alpha"], self.herdr_calls())
-        self.assertEqual(self.pane_environment(), {"SHOWRUNNER_UNIT": "build-followups",
+        self.assertEqual({key: value for key, value in self.pane_environment().items()
+                          if key.startswith(("SHOWRUNNER_", "CLAUDE_", "HERDR_")) or key == "ENABLE_TOOL_SEARCH"},
+                         {"SHOWRUNNER_UNIT": "build-followups",
             "SHOWRUNNER_UNIT_ID": "alpha-unit", "ENABLE_TOOL_SEARCH": "true", "HERDR_AGENT_PANE": "1",
             "CLAUDE_CONFIG_DIR": str(Path(self.env["HOME"]) / ".claude2"),
             "CLAUDE_CODE_REMOTE_MEMORY_DIR": str(Path(self.env["HOME"]) / ".claude")})

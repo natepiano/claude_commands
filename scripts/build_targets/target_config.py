@@ -11,7 +11,7 @@ from typing import Literal
 
 SCRIPTS = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS / "lint"))
-from sweep import config_values
+from config_values import config_values
 
 
 Platform = Literal["linux", "macos"]

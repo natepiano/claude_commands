@@ -120,9 +120,7 @@ class BuildScopeTests(unittest.TestCase):
                      "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
                      "UNIT_ACTIVE_DIR": str(root / "active"),
                      "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-                     "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-                     "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
-                     "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                     "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                      "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": directory, "LINT_CONFIG_READER": str(root / "missing-config")},
             )
             sampler_pid = 0
@@ -185,9 +183,7 @@ class BuildScopeTests(unittest.TestCase):
                      "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
                      "UNIT_ACTIVE_DIR": str(root / "active"),
                      "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-                     "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-                     "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
-                     "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                     "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                      "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": directory, "TMPDIR": directory,
                      "LINT_CONFIG_READER": str(root / "missing-config")},
             )
@@ -257,9 +253,7 @@ class BuildAdmissionTests(unittest.TestCase):
                  "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
                  "UNIT_ACTIVE_DIR": str(root / "active"),
                  "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-                 "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-                 "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
-                 "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                 "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                  "MAC_TEST_STATE_DIR": str(root / "mac-state"),
                  "LINT_CONFIG_READER": str(root / "missing-config")},
         )
@@ -286,9 +280,7 @@ buildlog_wait_for_memory() {
     echo memory >> "$events"
     BUILDLOG_MEM_WAIT_S=0 BUILDLOG_MEM_OUTCOME=Granted
 }
-build_hold_step_started() { :; }
-build_hold_check_admission() { return 0; }
-build_hold_mark() { :; }
+build_hold_check_local() { return 0; }
 buildlog_begin() {
     printf 'begin %s\n' "$*" >> "$events"
     BUILDLOG_START="" BUILDLOG_PEAK="" BUILDLOG_MEM_RESERVATION=""

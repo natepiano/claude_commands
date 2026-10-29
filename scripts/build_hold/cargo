@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Keep lookup and non-building commands in Bash: metadata calls are frequent.
+search_path=${PATH-}
+while :; do
+    path_entry=${search_path%%:*}
+    real_cargo=${path_entry:-.}/cargo
+    if [[ -f "$real_cargo" && -x "$real_cargo" && ! "$real_cargo" -ef "${BASH_SOURCE[0]}" ]]; then
+        break
+    fi
+    if [[ "$search_path" != *:* ]]; then
+        printf 'cargo: no other cargo executable on PATH\n' >&2
+        exit 127
+    fi
+    search_path=${search_path#*:}
+done
+
+subcommand=
+skip_value=0
+for arg in "$@"; do
+    if (( skip_value )); then
+        skip_value=0
+        continue
+    fi
+    case "$arg" in
+        +*) ;;
+        -C|--config|-Z|--color|--manifest-path|--lockfile-path|--target-dir|--target|\
+        -j|--jobs|-p|--package|--exclude|-F|--features|--profile|--message-format|\
+        --artifact-dir|--out-dir) skip_value=1 ;;
+        -*) ;;
+        *) subcommand=$arg; break ;;
+    esac
+done
+case "$subcommand" in
+    build|b|check|c|clippy|test|t|nextest|run|r|bench|doc|d|rustc|rustdoc|fix|install|miri|mend) ;;
+    *) exec "$real_cargo" "$@" ;;
+esac
+
+[[ "$OSTYPE" == linux* ]] || exec "$real_cargo" "$@"
+
+# The caller's scope has already passed hold admission. The override lets
+# checks use a saved cgroup record without reading the host's process state.
+cgroup_file=${CARGO_WRAPPER_CGROUP_FILE:-/proc/self/cgroup}
+in_build_scope=0
+if [[ -r "$cgroup_file" ]]; then
+    while IFS= read -r cgroup || [[ -n "$cgroup" ]]; do
+        if [[ "$cgroup" == */builds.slice/* ]]; then
+            in_build_scope=1
+            break
+        fi
+    done < "$cgroup_file"
+fi
+(( in_build_scope )) && exec "$real_cargo" "$@"
+
+hold_dir=${BUILD_HOLD_DIR:-$HOME/.local/state/build-hold}
+shopt -s nullglob dotglob
+hold_entries=("$hold_dir"/*)
+if (( ${#hold_entries[@]} )); then
+    wrapper_path=$(readlink -f -- "${BASH_SOURCE[0]}")
+    if hold_message=$(python3 "${wrapper_path%/*}/hold_applies.py" 2>&1); then
+        printf '%s\n' "$hold_message" >&2
+        exit 1
+    else
+        hold_status=$?
+        if (( hold_status != 1 )); then
+            printf 'cargo: note: %s\n' "${hold_message//$'\n'/ }" >&2
+        fi
+    fi
+fi
+
+if [[ -S "${XDG_RUNTIME_DIR:-/nonexistent}/bus" ]] && command -v systemd-run >/dev/null 2>&1; then
+    exec systemd-run --user --scope --quiet --collect --expand-environment=no --slice=builds.slice -- "$real_cargo" "$@"
+fi
+exec "$real_cargo" "$@"

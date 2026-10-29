@@ -130,7 +130,7 @@ PY
             claude_launch_environment workers || return 1
             family_args_line="$(agents_claude_args)"
             read -r -a family_args <<< "$family_args_line"
-            command=(claude --print)
+            command=("$PY" "$script_dir/../lib/nix_env.py" exec "$(command -v claude)" --print)
             if [[ "$mode" == "write" ]]; then
                 command+=(--dangerously-skip-permissions)
             else

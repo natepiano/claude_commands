@@ -85,7 +85,7 @@ class DailiesHoldTests(unittest.TestCase):
         return path
 
     def write_cycle(
-        self, states: list[tuple[str, str]], *, outcomes: dict[str, str] | None = None,
+        self, states: list[tuple[str, str]], *,
         names: dict[str, str] | None = None, release_started_at: str = "2026-10-04T10:57:00-07:00",
     ) -> None:
         release = self.scratch / "release"
@@ -93,21 +93,10 @@ class DailiesHoldTests(unittest.TestCase):
         directory.mkdir(parents=True)
         _ = (release / "current").write_text(CYCLE_ID + "\n")
         entries: list[dict[str, str]] = []
-        for index, (session_id, state) in enumerate(states):
-            entry = {
-                "session_id": session_id, "name": (names or {}).get(session_id, f"session {index + 1}"),
-                "state": state,
-            }
-            if state in {"DeliveryQueued", "DeliveryFailed"}:
-                entry["attempted_at"] = "2026-10-04T10:57:00-07:00"
-            elif state in {"ReleasedAwaitingAdmission", "NoAdmissionAck", "WaitingForMemory"}:
-                entry["released_at"] = "2026-10-04T10:57:00-07:00"
-            if state == "WaitingForMemory":
-                entry["wait_started_at"] = "2026-10-04T10:58:00-07:00"
-            if state == "MemoryGateReturned":
-                entry["wait_ended_at"] = "2026-10-04T10:59:30-07:00"
-                entry["outcome"] = (outcomes or {}).get(session_id, "Granted")
-            entries.append(entry)
+        for index, (session_id, delivery) in enumerate(states):
+            entries.append({"session_id": session_id,
+                            "name": (names or {}).get(session_id, f"session {index + 1}"),
+                            "delivery": delivery})
         cycle: dict[str, object] = {
             "id": CYCLE_ID,
             "opened_at": "2026-10-04T10:55:00-07:00",
@@ -247,11 +236,11 @@ class DailiesHoldTests(unittest.TestCase):
                     )
 
     def test_release_directory_alone_is_not_a_holder(self) -> None:
-        self.write_cycle([("first", "DeliveryQueued")])
+        self.write_cycle([("first", "QueuedUnconfirmed")])
         report = self.assert_ok(self.report(False))
         footer = self.assert_ok(self.footer())
-        self.assertFalse(any("build hold" in line or "DeliveryQueued" in line for line in report))
-        self.assertFalse(any("build hold" in line or "DeliveryQueued" in line for line in footer))
+        self.assertFalse(any("build hold" in line or "QueuedUnconfirmed" in line for line in report))
+        self.assertFalse(any("build hold" in line or "QueuedUnconfirmed" in line for line in footer))
         status = self.run_script(HOLD_SCRIPT, "status")
         self.assertEqual(status.stdout.strip(), "no build hold")
         buildlog = SCRIPT.parent.parent / "buildlog"
@@ -267,43 +256,32 @@ class DailiesHoldTests(unittest.TestCase):
 
     def test_a_release_shows_its_progress_and_names_only_sessions_to_act_on(self) -> None:
         _ = self.write_holder("worker", "2026-10-04T10:56:00-07:00", "the focused test")
-        states = [
-            ("first", "MemoryGateReturned"), ("second", "AwaitingRelease"),
-            ("third", "DeliveryQueued"), ("fourth", "DeliveryFailed"),
-            ("fifth", "RecipientGone"), ("sixth", "ReleasedAwaitingAdmission"),
-            ("seventh", "WaitingForMemory"), ("eighth", "MemoryGateReturned"),
-            ("ninth", "MemoryGateReturned"), ("tenth", "NoAdmissionAck"),
-            ("eleventh", "NoRegistration"),
-        ]
-        outcomes = {"first": "Granted", "eighth": "TimedOut", "ninth": "MeminfoUnavailable"}
-        self.write_cycle(states, outcomes=outcomes)
+        states = [("first", "Delivered"), ("second", "NotAttempted"),
+                  ("third", "QueuedUnconfirmed"), ("fourth", "DeliveryFailed"), ("fifth", "RecipientGone")]
+        self.write_cycle(states)
         for lines in (self.assert_ok(self.report(True)), self.assert_ok(self.footer())):
-            # The session that has gone is not counted; the three back from the memory wait are free.
             self.assertIn("* build hold: worker holds builds since 10:56 PDT for the focused test; "
-                          + "released 10:57 PDT; 3 of 10 sessions free to build again", lines)
+                          + "released 10:57 PDT; the memory gate orders builds", lines)
             hold_index = next(index for index, line in enumerate(lines) if line.startswith("* build hold:"))
-            self.assertEqual(lines[hold_index + 1:hold_index + 3], [
-                "  * session 4 could not be told builds are released; tell it",
-                "  * session 10 has not answered the release for 15 minutes; check it",
+            self.assertEqual(lines[hold_index + 1:hold_index + 4], [
+                f"  * session {number} could not be told builds are released; tell it" for number in (3, 4, 5)
             ])
-            self.assertFalse(lines[hold_index + 3].startswith("  * "))
             text = "\n".join(lines)
-            for session_id, state in states:
+            for session_id, delivery in states:
                 self.assertNotIn(f"[{session_id}]", text)
-                self.assertNotIn(state, text)
-            self.assertNotIn("next session", text)
+                self.assertNotIn(delivery, text)
 
     def test_a_session_whose_name_is_its_id_is_never_shown_by_that_id(self) -> None:
         _ = self.write_holder("worker", "2026-10-04T10:56:00-07:00", "the focused test")
         session_id = "450ac99b-caed-49ba-8c6f-29016df421ab"
-        self.write_cycle([(session_id, "NoAdmissionAck")], names={session_id: session_id})
+        self.write_cycle([(session_id, "DeliveryFailed")], names={session_id: session_id})
         lines = self.assert_ok(self.footer())
-        self.assertIn("  * an unnamed session has not answered the release for 15 minutes; check it", lines)
+        self.assertIn("  * an unnamed session could not be told builds are released; tell it", lines)
         self.assertNotIn(session_id, "\n".join(lines))
 
     def test_a_hold_not_yet_released_keeps_its_expected_release(self) -> None:
         _ = self.write_holder("worker", "2026-10-04T10:56:00-07:00", "the focused test", "2026-10-04T11:15:00-07:00")
-        self.write_cycle([("first", "AwaitingRelease")], release_started_at="")
+        self.write_cycle([("first", "NotAttempted")], release_started_at="")
         lines = self.assert_ok(self.footer())
         self.assertIn("* build hold: worker holds builds since 10:56 PDT for the focused test; "
                       + "expected to release 11:15 PDT (in 15 minutes)", lines)
@@ -320,18 +298,18 @@ class DailiesHoldTests(unittest.TestCase):
             "TZ": ZONE, "USER_ZONE": ZONE,
         }))
         _ = self.write_holder("worker", "2026-10-04T10:56:00-07:00", "the focused test")
-        self.write_cycle([("first", "ReleasedAwaitingAdmission")])
+        self.write_cycle([("first", "Delivered")])
         path = self.scratch / "release" / CYCLE_ID / "cycle.json"
         cycle = cast(dict[str, object], json.loads(path.read_text()))
         entries = cast(list[dict[str, str]], cycle["entries"])
-        entries[0]["released_at"] = "broken"
+        entries[0]["delivery"] = "broken"
         _ = path.write_text(json.dumps(cycle) + "\n")
         before = path.read_bytes()
         report = self.assert_ok(self.report(True))
         footer = self.assert_ok(self.footer())
         for lines in (report, footer):
             hold_index = next(index for index, line in enumerate(lines) if line.startswith("* build hold:"))
-            error_line = "release record could not be read: invalid released_at for first; /build:hold release sets it aside and ends the hold"
+            error_line = "release record could not be read: invalid delivery for entry 0; /build:hold release sets it aside and ends the hold"
             self.assertIn("  * " + error_line, lines)
             self.assertLess(hold_index, next(index for index, line in enumerate(lines) if error_line in line))
         self.assertLess(next(index for index, line in enumerate(report) if error_line in line), report.index("* none active"))
@@ -348,7 +326,7 @@ class DailiesHoldTests(unittest.TestCase):
             "TZ": ZONE, "USER_ZONE": ZONE,
         }))
         _ = self.write_holder("worker", "2026-10-04T10:56:00-07:00", "the focused test")
-        self.write_cycle([("first", "AwaitingRelease")])
+        self.write_cycle([("first", "NotAttempted")])
         path = self.scratch / "release" / "current"
         content = b"invalid-current\n"
         _ = path.write_bytes(content)

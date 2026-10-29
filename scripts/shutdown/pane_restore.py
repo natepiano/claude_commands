@@ -97,13 +97,10 @@ def _resume(session: str, client: herdr.Herdr, pane: RestoredPane, entry: pane_r
         raise herdr.HerdrFailure("the pane runs a program")
     environment = {**entry["environment"], **named_account_environment(Path(entry["config_dir"]))}
     title = pane.label or entry["name"]
-    opened = herdr.open_tab(session, pane.space, title, entry["cwd"], environment)
-    try:
-        _ = client.start_agent(title, opened, "claude", claude_arguments(entry), herdr.NoOpeningPrompt(),
-                               START_TIMEOUT_MS)
-    except herdr.HerdrFailure:
-        client.close_tab_of(opened)
-        raise
+    launched = herdr.launch_agent(session, pane.space, title, entry["cwd"], environment, "claude",
+        claude_arguments(entry), herdr.NoOpeningPrompt(), START_TIMEOUT_MS, agent=title)
+    if isinstance(launched, herdr.nix_env.Refused):
+        raise herdr.HerdrFailure(launched.reason)
     # Ordering the tabs keeps each pane's id (herdr review, 2026-10-19).
     client.close_tab_of(pane.pane_id)
 

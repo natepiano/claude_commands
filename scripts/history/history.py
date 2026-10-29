@@ -43,6 +43,7 @@ from scripts.lib.user_zone import user_zone  # noqa: E402
 __all__ = [
     "_arg", "_duration", "_emit", "_events", "_integer", "_meta", "_number",
     "_require_rows", "_since_epoch", "_skills", "_status_filter", "_string", "_warn",
+    "_object", "_stores",
 ]
 
 
@@ -1118,6 +1119,11 @@ def _cmd_rounds(args: argparse.Namespace) -> None:
     rounds.run(args)
 
 
+def _cmd_routed(args: argparse.Namespace) -> None:
+    routed = cast(RoundReporter, cast(object, import_module("scripts.history.routed")))
+    routed.run(args)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Query stage timings across skill run histories.",
@@ -1178,6 +1184,12 @@ def main() -> None:
     _ = rounds.add_argument("--top", type=int, default=25, help="maximum rows (default: 25)")
     _ = rounds.add_argument("--plan", default="", help="plan basename substring")
     rounds.set_defaults(handler=_cmd_rounds)
+
+    routed = subparsers.add_parser("routed", help="routed findings and their receiving checkpoints")
+    _ = routed.add_argument("--open", action="store_true", help="only work with no recorded closure")
+    _ = routed.add_argument("--since", default="", help="30d, 12h, 3M, or an ISO date")
+    _ = routed.add_argument("--format", choices=("text", "json"), default="text")
+    routed.set_defaults(handler=_cmd_routed)
 
     compare = subparsers.add_parser("compare", help="before and after one change")
     _ = compare.add_argument("--on", default="", help="the date the change landed")

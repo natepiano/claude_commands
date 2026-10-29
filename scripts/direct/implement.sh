@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # implement.sh — Invoke the configured worker agent to implement code changes.
 #
-# Usage: implement.sh [--to <worker>] [--phase <id>] <session_dir> [working_dir] [prompt_file] [task]
+# Usage: implement.sh [--to <worker>] [--phase <id>] [--fix-cause <text>] <session_dir> [working_dir] [prompt_file] [task]
 #                     [role_description] [pass_kind] [pass_activity] [fix_pass]
 #                     <team_role> [mesh_prefix]
 #   role_description — 1-2 lines describing this dispatch's responsibility,
@@ -57,10 +57,12 @@ FOLLOW_TO=""
 # A phase running beside another names itself: start-pass stamps its pass with it, and its
 # per-role files go to <session_dir>/phases/<id>/.
 PHASE_ID=""
+FIX_CAUSE=""
 while [[ "${1:-}" == --* ]]; do
   case "$1" in
     --to) FOLLOW_TO="${2:?Usage: implement.sh --to <worker> <session_dir> ...}" ;;
     --phase) PHASE_ID="${2:?--phase requires a phase id}" ;;
+    --fix-cause) FIX_CAUSE="${2:?--fix-cause requires a failed gate or defect}" ;;
     *) echo "ERROR: unknown implement option '$1'." >&2; exit 2 ;;
   esac
   shift 2
@@ -286,7 +288,7 @@ with worker_claim_lock(root):
         identity = read(identity_file)
         expected = {"name": name, "slot": slot, "family": family, "model": model, "worker_id": worker_id}
         # A run from before the repair worker had its own record lost the fix worker's identity
-        # to the impl worker's, and a reopened seat keeps only its roster thread: record it from there.
+        # to the impl worker's, and a reopened worker keeps only its roster thread: record it from there.
         # A worker recorded under another slot is followed in the wrong role and stays refused.
         if not identity and worker_id and worker_slot(root, name) is None:
             identity_file.write_text(json.dumps(expected))
@@ -401,14 +403,14 @@ if [[ -n "${FOLLOW_TO}" ]]; then
   trap 'worker_record release' EXIT
 fi
 
-# A phase claims its files before any seat edits them, wherever the seat runs
+# A phase claims its files before any worker edits them, wherever the worker runs
 # (phase_reservation.py claim): an unclaimed edit drifts to another reservation.
 if [[ -n "${PHASE_ID}" ]] && ! "$PY" "${SCRIPT_DIR}/phase_reservation.py" claim \
   --session-dir "${SESSION_DIR}" --phase "${PHASE_ID}" --repo "${WORKING_DIR}" >>"${LOG_FILE}" 2>&1; then
-  echo "ERROR: phase ${PHASE_ID} could not claim its files before its seat opens; see ${LOG_FILE}." >&2
+  echo "ERROR: phase ${PHASE_ID} could not claim its files before its worker opens; see ${LOG_FILE}." >&2
   echo "error" > "${STATUS_FILE}"
   bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" blocked \
-    "launcher: phase ${PHASE_ID} could not claim its files; its seat did not open" || true
+    "launcher: phase ${PHASE_ID} could not claim its files; its worker did not open" || true
   exit 1
 fi
 
@@ -423,9 +425,12 @@ if [[ -f "${PROGRESS_STATE}" ]]; then
   if ! UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" start-pass \
     --session-dir "${SESSION_DIR}" \
     --pass-kind "${PASS_KIND}" \
+    --prompt-file "${PROMPT_FILE}" \
+    --fix-cause "${FIX_CAUSE}" \
     --fix-pass "${FIX_PASS}" \
     --activity "${PASS_ACTIVITY}" \
     --called-task "${TASK}" \
+    --worker-name "${MESH_NAME}" \
     --called-family "${AGENT_FAMILY}" \
     --called-model "${AGENT_MODEL}" \
     --called-effort "${AGENT_EFFORT:-unset}" \

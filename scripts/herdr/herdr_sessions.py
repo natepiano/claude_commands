@@ -30,7 +30,7 @@ from scripts.shutdown import launch_permission  # noqa: E402
 from scripts.accounts import accounts  # noqa: E402
 from scripts.whoami import account  # noqa: E402
 
-USAGE = "usage: herdr_sessions.py list [--on <host>] | attach <name> | focus <name> | attach-remote <host> <name> | start [--name N] [--cwd D] [-- <claude args>] | resume <name> --session-id ID --cwd D [--config-dir D] [--restore] [--prompt-file P] [--attach] [-- <claude args>]"
+USAGE = "usage: herdr_sessions.py list [--on <host>] | sort-tabs | attach <name> | focus <name> | attach-remote <host> <name> | start [--name N] [--cwd D] [-- <claude args>] | resume <name> --session-id ID --cwd D [--config-dir D] [--restore] [--prompt-file P] [--attach] [-- <claude args>]"
 REMOTE_LIST_TIMEOUT = 15
 ADHOC_SPACE = "ad-hoc"
 
@@ -213,12 +213,14 @@ def _launch(verb: str, arguments: list[str]) -> int:
         name = options.name or next(candidate for candidate in (
             herdr.generated_session_name(folder.name, str(suffix)) for suffix in itertools.count(1))
             if candidate not in taken)
-        pane = herdr.open_tab(shared, ADHOC_SPACE, name, str(folder), pane_environment)
         if verb == "resume":
             claude_arguments.extend(["--resume", options.session_id])
         claude_arguments.extend(["-n", name])
-        outcome = herdr.start_agent(shared, pane, kind="claude", agent=name, agent_arguments=claude_arguments,
-                                    opening=opening, timeout_ms=90_000)
+        launched = herdr.launch_agent(shared, ADHOC_SPACE, name, str(folder), pane_environment,
+            kind="claude", agent=name, agent_arguments=claude_arguments, opening=opening, timeout_ms=90_000)
+        if isinstance(launched, herdr.nix_env.Refused):
+            raise herdr.HerdrFailure(launched.reason)
+        pane, outcome = launched.pane, launched.outcome
         if isinstance(opening, herdr.OpeningPrompt) and not isinstance(outcome, herdr.PromptSubmitted):
             reason = outcome.reason if isinstance(outcome, herdr.PromptNotSubmitted) else "launcher supplied no submit proof"
             print(f"herdr_sessions: {name}: opening prompt not submitted: {reason}", file=sys.stderr)
@@ -258,7 +260,7 @@ def unit_roles() -> dict[str, str]:
     for process in herdr.herdr_processes():
         slug = process.marks.get("SHOWRUNNER_UNIT", "")
         unit = process.marks.get("SHOWRUNNER_UNIT_ID", "")
-        if slug and unit and process.place.session == shared:
+        if process.place.session == shared and herdr.has_unit_marks(process.marks):
             _ = roles.setdefault(process.place.pane, f"unit {slug}/{unit}")
     return roles
 
@@ -290,7 +292,7 @@ def _main(argv: list[str]) -> int:
         except (herdr.HerdrFailure, OSError, ValueError) as error:
             print(f"herdr_sessions: {error}", file=sys.stderr)
             return 1
-    if argv[1:] != ["list"] and not (len(argv) == 3 and argv[1] in ("attach", "focus") and argv[2]):
+    if argv[1:] not in (["list"], ["sort-tabs"]) and not (len(argv) == 3 and argv[1] in ("attach", "focus") and argv[2]):
         print(USAGE, file=sys.stderr)
         return 2
     try:
@@ -300,6 +302,10 @@ def _main(argv: list[str]) -> int:
                 return 0
             print(f"herdr_sessions: herdr session {shared} is not running", file=sys.stderr)
             return 1
+        if argv[1] == "sort-tabs":
+            for label in herdr.Herdr(shared).sort_tabs().labels:
+                print(f"herdr_sessions: {label}: tab with several panes; order kept")
+            return 0
         panes = herdr.Herdr(shared).panes()
         if argv[1] in ("attach", "focus"):
             name = argv[2]

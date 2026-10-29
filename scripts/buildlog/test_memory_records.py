@@ -11,8 +11,12 @@ import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 
+if TYPE_CHECKING:
+    from ..direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
+else:
+    from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
 from test_index import Record, call, encode, point_root_at, sample, step
 
 HERE = Path(__file__).parent
@@ -33,6 +37,8 @@ class MemoryRecordTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        tools = rust_tool_path(self.base / "tools")
+        self.enterContext(mock.patch.dict(os.environ, {"PATH": tools}))
         self.root = self.base / "buildlog"
         point_root_at(self, self.root)
 
@@ -115,6 +121,7 @@ class MemoryRecordTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         records = self.records()
         self.assertEqual([row["slice"] for row in records if row["kind"] == "step"], ["builds", "fallback", "none"])
+        self.assertEqual([row["rustc"] for row in records if row["kind"] == "step"], [FIXED_RUSTC] * 3)
         self.assertEqual([row["mem_kills"] for row in records if row["kind"] == "call"], [1, 2, 0])
         self.assertEqual([row["mem_kill_stopped"] for row in records if row["kind"] == "call"], [False, True, False])
         query = self.run_script(CLI, "query", "--json", "SELECT slice FROM steps ORDER BY rowid")

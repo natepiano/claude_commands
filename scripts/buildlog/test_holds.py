@@ -244,28 +244,33 @@ class HoldsTests(unittest.TestCase):
         self.assertIsInstance(missing.ended, holds.HoldEndNotRecorded)
         self.assertFalse(holds.key_is_present(holds.read_current_holds(), missing.host, missing.target, missing.key))
 
-    def test_a_releasing_holder_is_open_and_prints_releasing_instead_of_held(self) -> None:
+    def test_present_holder_stays_held_and_open_despite_recorded_release(self) -> None:
         since = datetime(2026, 10, 12, 12, tzinfo=UTC)
         write_holder("session", since)
         cycle = build_hold.open_cycle(since)
         cycle["holders"] = {"session": {"since": since.isoformat(), "released_at": since.isoformat()}}
+        cycle["release_started_at"] = since.isoformat()
         build_hold.save_cycle(cycle)
         self.add(hold_event("began", "session", since.isoformat(), host=store.host_name()))
         current = holds.read_current_holds()
-        self.assertEqual(holds.now_lines(current), ["Now: natedev releasing (held by hana for render since 2026-10-12 12:00 UTC)"])
+        self.assertEqual(holds.now_lines(current), ["Now: natedev held by hana for render since 2026-10-12 12:00 UTC"])
         history = holds.read_hold_history(self.connection, current, NOW)
         self.assertEqual(history.intervals[0].ended, holds.OpenHold(NOW))
         self.assertEqual(holds.hold_duration(history, "natedev", since.isoformat(), NOW.isoformat()).seconds, 14400)
+        (Path(os.environ["BUILD_HOLD_DIR"]) / "session").unlink()
+        current = holds.read_current_holds()
+        self.assertEqual(holds.now_lines(current), [])
+        self.assertFalse(holds.key_is_present(current, store.host_name(), "natedev", "session"))
 
-    def test_a_damaged_release_record_prints_the_shared_error_and_no_holder_line(self) -> None:
+    def test_damaged_release_record_cannot_hide_a_present_holder(self) -> None:
         write_holder("session", NOW)
         directory = Path(os.environ["BUILD_HOLD_RELEASE_DIR"])
         directory.mkdir(parents=True)
         _ = (directory / "current").write_text("bad cycle id")
         lines = holds.now_lines(holds.read_current_holds())
-        self.assertEqual(len(lines), 1)
-        self.assertIn("Now: natedev state unreadable: release record could not be read:", lines[0])
-        self.assertNotIn("held by", lines[0])
+        self.assertEqual(lines, ["Now: natedev held by hana for render since 2026-10-12 16:00 UTC"])
+        (Path(os.environ["BUILD_HOLD_DIR"]) / "session").unlink()
+        self.assertEqual(holds.now_lines(holds.read_current_holds()), [])
 
     def test_a_pending_mac_block_is_open_by_its_since_key_and_survives_its_planned_expiry(self) -> None:
         since = NOW - timedelta(days=3)

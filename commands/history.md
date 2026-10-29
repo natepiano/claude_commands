@@ -5,7 +5,7 @@ description: Query stage, phase, and run timings across skill run history
 # history
 
 `$ARGUMENTS` — a subcommand (`summary`, `compare`, `stages`, `phases`, `rounds`, `runs`,
-`tests`, `versions`) and its flags.
+`routed`, `tests`, `versions`) and its flags.
 
 Run:
 
@@ -13,7 +13,7 @@ Run:
 python3 ~/.claude/scripts/history/history.py $ARGUMENTS
 ```
 
-Empty `$ARGUMENTS` → run `summary`. A first word that is not one of the eight
+Empty `$ARGUMENTS` → run `summary`. A first word that is not one of the nine
 subcommands → show `history.py --help` and stop.
 
 **Runs sandboxed — never pass `dangerouslyDisableSandbox`.** The script reads
@@ -34,7 +34,7 @@ Relay stderr `note:` lines exactly.
 
 ## Output
 
-Every subcommand prints a wide fixed-width table — header row, dashed rule, data
+Except `routed` (text rows), every subcommand prints a wide fixed-width table — header row, dashed rule, data
 rows.
 
 **Always render it as a markdown table** — never relay the fixed-width form raw. Use
@@ -56,11 +56,12 @@ unconverted.
 - `phases` — review and fix rounds per phase, grouped by `(run, phase)`; columns
   `run  phase  reviews  fixes  impl  fix  total`
 - `rounds` — repair rounds and causes per phase instance; `--top N` (default 25), `--plan <substring>`, `--status`, `--until` (same forms as `--since`); marks mixed phase records
+- `routed [--open] [--since <time>] [--format text|json]` — routed findings, owners, Work Orders, due checkpoints, age and closure; read-only (the user, 2026-10-28)
 - `runs` — one row per run
 - `tests` — verification and smoke history
 - `versions` — which spine and schema versions each store holds
 
-Every subcommand takes `--skill`, `--since` (`30d`, `12h`, `3M`, or an ISO date;
+Except `routed` (flags above), every subcommand takes `--skill`, `--since` (`30d`, `12h`, `3M`, or an ISO date;
 units are case-sensitive, `m` minutes and `M` months), and `--format
 table|json|csv`. Beyond those:
 

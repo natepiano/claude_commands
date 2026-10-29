@@ -1,4 +1,4 @@
-"""Local verification admission uses temporary holds and command stand-ins."""
+"""Local verification hold waits uses temporary holds and command stand-ins."""
 
 from __future__ import annotations
 
@@ -67,13 +67,10 @@ def grant_call(path: Path) -> None:
         "UNIT_ACTIVE_DIR": str(release.parent / "active"),
     }), mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test/socket")), \
          mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()):
-        with build_hold.release_lock():
-            cycle = build_hold.read_cycle()
-            assert cycle is not None
-            now = datetime.now().astimezone()
-            cycle["release_started_at"] = now.isoformat()
-            build_hold.save_cycle(cycle)
-            _ = build_hold.advance_release(cycle, now, clock=lambda: now)
+        holders = build_hold.read_holders(build_hold.holder_directory())
+        assert isinstance(holders, build_hold.ActiveHolders)
+        for holder in holders.holders:
+            _ = build_hold.release_cycle(build_hold.holder_directory(), holder.key)
 
 
 def change_cycle(path: Path, change: Callable[[build_hold.HoldCycle], None]) -> None:
@@ -100,8 +97,7 @@ def release_registered_call(path: Path) -> Generator[None, None, None]:
             while not stop.wait(0.01) and time.monotonic() < deadline:
                 if not path.exists():
                     continue
-                cycle = read_cycle_file(path)
-                if any(entry.get("calls", []) for entry in cycle["entries"]):
+                if any(path.parents[2].glob("**/verify-hold.*/waiter")):
                     grant_call(path)
                     return
         except BaseException as error:
@@ -139,6 +135,7 @@ class VerifyHoldWaitTests(unittest.TestCase):
         self.cycle_file = root / "release" / CYCLE_ID / "cycle.json"
         self.fixture.environment.update({
             "CLAUDE_PYTHON": sys.executable,
+            "BUILDLOG_DIR": str(root / "buildlog"),
             "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
             "UNIT_ACTIVE_DIR": str(root / "active"),
             "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
@@ -147,10 +144,8 @@ class VerifyHoldWaitTests(unittest.TestCase):
             "MAC_TEST_STATE_DIR": str(root / "mac-state"),
             "BUILD_TARGETS_POLL_S": "0.01", "BUILD_TARGETS_NOW": "",
             "TEST_RUNNER_MAC": "declined", "TEST_RUNNER_STATUS": "75",
-            "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-            "BUILDLOG_HOLD_STARTED_FILE": "",
+            "BUILDLOG_HOLD_WAIT_FILE": "",
             "BUILDLOG_HOLD_WAITER_FILE": "",
-            "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
         })
 
     def hold(self, key: str = "hana") -> None:
@@ -180,21 +175,8 @@ class VerifyHoldWaitTests(unittest.TestCase):
     def stop_process(self, process: subprocess.Popen[str]) -> None:
         self.fixture.stop_verify(process)
 
-    def wait_for_call(self, process: subprocess.Popen[str],
-                      announcement: str = VERIFY_WAITING) -> build_hold.ReleaseEntry:
-        deadline = time.monotonic() + HANG_GUARD_S
-        while time.monotonic() < deadline:
-            if self.cycle_file.exists():
-                cycle = read_cycle_file(self.cycle_file)
-                for entry in cycle["entries"]:
-                    if entry.get("calls", []):
-                        self.wait_for_waiting_diagnostic(process, announcement)
-                        return entry
-            if process.poll() is not None:
-                code, output = self.finish(process)
-                self.fail(f"Verification exited {code} without registering its call: {output}")
-            time.sleep(0.01)
-        self.fail("Verification did not register its call")
+    def wait_for_call(self, process: subprocess.Popen[str], announcement: str = VERIFY_WAITING) -> None:
+        self.wait_for_waiting_diagnostic(process, announcement)
 
     def wait_for_waiting_diagnostic(self, process: subprocess.Popen[str],
                                     announcement: str = VERIFY_WAITING) -> None:
@@ -289,54 +271,29 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
         code, output = self.finish(process)
         self.assertEqual(code, 0, output)
         self.assertIn("held by hana for render checks; waiting", output)
-        self.assertEqual(output.count("natedev is held by"), 1)
+        self.assertEqual(output.count("; waiting (tests that can run on the Mac"), 1)
         self.assertEqual(len(self.fixture.local_runs()), 1)
         observed = cast(WaitObservation, json.loads(observation.read_text()))
         self.assertGreater(float(observed["total"]), 0)
         self.assertAlmostEqual(float(observed["total"]), sum(float(value) for value in observed["waits"]), places=5)
         self.assertAlmostEqual(self.recorded_hold_wait(), float(observed["total"]), places=5)
-        # Ordered commands recorded from the unchanged scripts at 8b3178f8.
-        expected = [
-            ["build_targets.py", "check-admission", "--call-id", "c1"],
-            ["build_targets.py", "wait-local", "--call-id", "c1", "--pid", "<pid>"],
-            ["build_targets.py", "wait-local", "--call-id", "c1", "--pid", "<pid>"],
-            ["build_targets.py", "wait-local", "--call-id", "c1", "--pid", "<pid>"],
-            ["build_targets.py", "check-admission", "--call-id", "c1"],
-            ["build_hold.py", "mark", "--state", "MemoryGateReturned", "--outcome", "Granted",
-             "--call-id", "c1", "--cycle-id", "cccccccccccccccccccccccccccccccc", "--generation", "1"],
-            ["build_targets.py", "finish-local", "--call-id", "c1"],
-        ]
-        self.assertEqual(self.hold_commands(starts), expected)
+        commands = self.hold_commands(starts)
+        self.assertTrue(any(command[1] == "wait-local" for command in commands))
+        self.assertFalse(any(command[1] in {"mark", "check-admission", "finish-local"} for command in commands))
 
-    def test_held_call_registers_before_compiling_then_runs_on_release(self) -> None:
+    def test_held_call_waits_before_compiling_then_runs_on_release(self) -> None:
         self.hold()
         self.fixture.environment["BUILD_TARGETS_POLL_S"] = "3600"
         process = self.start("test", "sample", "--local", "local admission test", "--filter", "smoke")
-        entry = self.wait_for_call(process)
-        self.assertTrue(entry["session_id"].startswith("verify:"))
+        _ = self.wait_for_call(process)
         self.assertEqual(self.fixture.local_runs(), [])
         grant_call(self.cycle_file)
         code, output = self.finish(process)
         self.assertEqual(code, 0, output)
         self.assertIn("held by hana for render checks; waiting", output)
         self.assertEqual(len(self.fixture.local_runs()), 1)
-        self.assertTrue((Path(self.fixture.environment["BUILD_HOLD_DIR"]) / "hana").exists())
+        self.assertFalse((Path(self.fixture.environment["BUILD_HOLD_DIR"]) / "hana").exists())
 
-    def test_worker_registers_and_marks_the_marker_owner(self) -> None:
-        self.hold()
-        active = self.fixture.root / "active"
-        active.mkdir()
-        run = self.fixture.root / "unit-run"
-        run.mkdir()
-        _ = (active / "owner").write_text(str(run))
-        self.fixture.environment.update({"UNIT_RUN_DIR": str(run), "CLAUDE_CODE_SESSION_ID": "stale-session"})
-        process = self.start("test", "sample", "--local", "local admission test", "--filter", "smoke")
-        entry = self.wait_for_call(process)
-        self.assertEqual(entry["session_id"], "owner")
-        grant_call(self.cycle_file)
-        code, output = self.finish(process)
-        self.assertEqual(code, 0, output)
-        self.assertEqual(read_cycle_file(self.cycle_file)["entries"][0]["state"], "MemoryGateReturned")
 
     def test_mac_filter_pass_during_local_hold_needs_no_local_admission(self) -> None:
         self.hold()
@@ -356,30 +313,6 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
         self.assertIn("hold state cannot be read", result.stdout + result.stderr)
         self.assertEqual(self.fixture.local_runs(), [])
 
-    def test_waiter_signals_remove_only_the_cancelled_call(self) -> None:
-        for signal_number, expected in ((signal.SIGINT, 130), (signal.SIGTERM, 143)):
-            with self.subTest(signal=signal_number):
-                self.hold()
-                process = subprocess.Popen(
-                    [sys.executable, str(TARGETS), "wait-local", "--call-id", "cancelled"],
-                    env={**self.fixture.environment, "CLAUDE_CODE_SESSION_ID": "owner"},
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
-                )
-                self.addCleanup(self.stop_process, process)
-                _ = self.wait_for_call(process)
-                def add_peer(cycle: build_hold.HoldCycle) -> None:
-                    cycle["entries"][0]["calls"].append({
-                        "call_id": "peer", "pid": os.getpid(),
-                        "proc_start": Path(f"/proc/{os.getpid()}/stat").read_text().rsplit(")", 1)[1].split()[19],
-                        "started": False, "admitted_generation": 0,
-                    })
-
-                change_cycle(self.cycle_file, add_peer)
-                process.send_signal(signal_number)
-                code, output = self.finish(process)
-                self.assertEqual(code, expected, output)
-                remaining = [call["call_id"] for entry in read_cycle_file(self.cycle_file)["entries"] for call in entry.get("calls", [])]
-                self.assertEqual(remaining, ["peer"])
 
     def test_mac_runner_does_not_register_a_local_waiter(self) -> None:
         self.hold()
@@ -415,9 +348,7 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
                 self.fixture.cargo_events_path.unlink(missing_ok=True)
                 self.hold()
                 process = self.start_lint_step(caller, probe=probe)
-                entry = self.wait_for_call(process, f"{speaker}: natedev is held by hana for render checks; waiting")
-                self.assertTrue(entry["session_id"].startswith("verify:v"), entry["session_id"])
-                self.assertRegex(entry["calls"][0]["call_id"], r"^v[0-9]{8}T[0-9]{6}-[0-9]+-[0-9]+$")
+                _ = self.wait_for_call(process, f"{speaker}: natedev is held by hana for render checks; waiting")
                 self.assertEqual(self.fixture.cargo_events(), [])
                 grant_call(self.cycle_file)
                 code, output = self.finish(process)
@@ -425,8 +356,7 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
                 self.assertNotIn("verify.sh", output)
                 self.assertNotIn("Mac", output)
                 self.assertEqual([event["args"][0] for event in self.fixture.cargo_events()], ["check"])
-                # The gate's mark ends the call's turn under the id lint made for it.
-                self.assertEqual(read_cycle_file(self.cycle_file)["entries"][0]["state"], "MemoryGateReturned")
+                self.assertEqual(read_cycle_file(self.cycle_file)["entries"], [])
                 # Lint keeps that id out of the build log: the caller has no call record.
                 self.assertEqual(probe.read_text(), "|")
 
@@ -435,6 +365,7 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
         starts = self.count_python_starts()
         for state in ("missing", "empty"):
             with self.subTest(holders=state):
+                starts.unlink(missing_ok=True)
                 if state == "empty":
                     holders.mkdir()
                 code, output = self.finish(self.start_lint_step("cargo-port"))
@@ -456,8 +387,7 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
         holders = Path(self.fixture.environment["BUILD_HOLD_DIR"])
         _ = (holders / "holder-session").write_text((holders / "hana").read_text())
         process = self.start_lint_step("cargo-port", {"CLAUDE_CODE_SESSION_ID": "holder-session"})
-        entry = self.wait_for_call(process, "lint (cargo-port): natedev is held by hana")
-        self.assertEqual(entry["session_id"], "holder-session")
+        _ = self.wait_for_call(process, "lint (cargo-port): natedev is held by hana")
         self.assertEqual(self.fixture.cargo_events(), [])
         grant_call(self.cycle_file)
         code, output = self.finish(process)
@@ -520,7 +450,7 @@ if arguments[:1] == ["metadata"]:''',
         self.assertEqual(len(self.fixture.local_runs()), 1)
 
 
-    def test_one_admission_covers_all_steps_in_the_same_holder_generation(self) -> None:
+    def test_release_frees_every_step(self) -> None:
         self.hold()
         process = self.start("final")
         _ = self.wait_for_call(process)
@@ -531,7 +461,7 @@ if arguments[:1] == ["metadata"]:''',
         commands = [event["args"][0] for event in self.fixture.cargo_events()]
         self.assertIn("check", commands)
         self.assertIn("nextest", commands)
-        self.assertEqual(output.count("natedev is held by"), 1)
+        self.assertEqual(output.count("; waiting (tests that can run on the Mac"), 1)
 
     def test_interrupted_verification_removes_its_registered_call(self) -> None:
         self.hold()
@@ -542,7 +472,7 @@ if arguments[:1] == ["metadata"]:''',
         code, output = self.finish(process)
         self.assertEqual(code, 143, output)
         self.assertEqual(self.fixture.local_runs(), [])
-        self.assertEqual([call for entry in read_cycle_file(self.cycle_file)["entries"] for call in entry.get("calls", [])], [])
+        self.assertEqual(read_cycle_file(self.cycle_file)["entries"], [])
         observed = cast(WaitObservation, json.loads(observation.read_text()))
         self.assertGreater(float(observed["total"]), 0)
         self.assertAlmostEqual(float(observed["total"]), sum(float(value) for value in observed["waits"]), places=5)
@@ -569,8 +499,7 @@ if arguments[:1] == ["metadata"]:''',
             _ = build_targets.command_wait_local("announcement-call")
         self.assertEqual(interrupted.exception.code, 143)
         self.assertEqual(wait_file.read_text(), "7.000000\n")
-        self.assertEqual([call for entry in read_cycle_file(self.cycle_file)["entries"]
-                          for call in entry.get("calls", [])], [])
+        self.assertEqual(read_cycle_file(self.cycle_file)["entries"], [])
 
     def test_local_admission_waits_for_release_notifications_instead_of_sleeping(self) -> None:
         from scripts.build_targets import build_targets
@@ -598,11 +527,7 @@ if arguments[:1] == ["metadata"]:''',
                  mock.patch.object(time, "sleep", side_effect=release_on_poll) as polling:
                 self.assertEqual(build_targets.command_wait_local("polling-call"), 0)
             polling.assert_called_once_with(0.01)
-            key = build_hold.waiter_key("polling-call")
-            self.assertIsInstance(build_hold.read_admission(key, "polling-call"), build_hold.AdmittedTurn)
-            build_hold.remove_call(key, "polling-call")
-        self.assertEqual([call for entry in read_cycle_file(self.cycle_file)["entries"]
-                          for call in entry.get("calls", [])], [])
+        self.assertEqual(read_cycle_file(self.cycle_file)["entries"], [])
 
     def test_local_release_waiter_keeps_linux_notifications(self) -> None:
         from scripts.direct import local_release_wait
@@ -648,10 +573,7 @@ if arguments[:1] == ["metadata"]:''',
         environment = {
             **self.fixture.environment, "BUILDLOG_CALLER": "verify", "BUILDLOG_CALL_ID": "width-call",
             "BUILDLOG_HOLD_WAIT_FILE": str(self.fixture.root / "width-wait"),
-            "BUILDLOG_HOLD_ADMISSION_FILE": str(self.fixture.root / "width-admission"),
-            "BUILDLOG_HOLD_STARTED_FILE": str(self.fixture.root / "width-started"),
             "BUILDLOG_HOLD_WAITER_FILE": str(self.fixture.root / "width-waiter"),
-            "BUILDLOG_HOLD_REGISTRATION_FILE": str(self.fixture.root / "width-registration"),
             "TEST_WIDTH_CLOCK": str(clock),
         }
         script = '''set -euo pipefail
@@ -686,8 +608,7 @@ run_nextest --package sample
         process = self.start("final")
         _ = self.wait_for_call(process)
         grant_call(self.cycle_file)
-        entry = read_cycle_file(self.cycle_file)["entries"][0]
-        release = datetime.fromisoformat(entry.get("released_at", "")).timestamp()
+        release = datetime.fromisoformat(read_cycle_file(self.cycle_file)["release_started_at"]).timestamp()
         code, output = self.finish(process)
         self.assertEqual(code, 0, output)
         records = [cast(StepObservation, json.loads(line)) for line in (self.fixture.root / "step-observations").read_text().splitlines()]
@@ -712,7 +633,7 @@ run_nextest --package sample
         self.assertGreater(float(observed["total"]), 0)
         self.assertAlmostEqual(float(observed["total"]), sum(float(value) for value in observed["waits"]), places=5)
         self.assertFalse(Path(observed["directory"]).exists())
-        self.assertEqual([call for entry in read_cycle_file(self.cycle_file)["entries"] for call in entry.get("calls", [])], [])
+        self.assertEqual(read_cycle_file(self.cycle_file)["entries"], [])
 
     def test_holder_joining_during_memory_admission_delays_step_and_records_separate_waits(self) -> None:
         invoke = VERIFY.parent.parent / "lint" / "invoke.sh"
@@ -725,8 +646,6 @@ run_nextest --package sample
             **self.fixture.environment,
             "BUILDLOG_CALLER": "verify", "BUILDLOG_CALL_ID": "memory-call",
             "BUILDLOG_HOLD_WAIT_FILE": str(waits),
-            "BUILDLOG_HOLD_ADMISSION_FILE": str(self.fixture.root / "memory-admission"),
-            "BUILDLOG_HOLD_STARTED_FILE": str(self.fixture.root / "memory-started"),
             "BUILDLOG_HOLD_WAITER_FILE": str(self.fixture.root / "memory-waiter"),
             "TEST_MEMORY_CLOCK": str(memory_clock), "TEST_COMPILED": str(compiled),
             "TEST_MEMORY_STEP": str(observation), "TEST_CYCLE_FILE": str(self.cycle_file),
@@ -809,7 +728,7 @@ os.execv(os.environ["TEST_REAL_PYTHON"],''',
         _ = self.wait_for_call(process)
         self.assertEqual(self.fixture.local_runs(), [])
         grant_call(self.cycle_file)
-        release = datetime.fromisoformat(read_cycle_file(self.cycle_file)["entries"][0].get("released_at", "")).timestamp()
+        release = datetime.fromisoformat(read_cycle_file(self.cycle_file)["release_started_at"]).timestamp()
         code, output = self.finish(process)
         self.assertEqual(code, 0, output)
         self.assertEqual(len(self.fixture.local_runs()), 1)

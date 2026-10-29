@@ -181,7 +181,7 @@ the new id. Then it relaunches the unit and verifies that nothing live still hol
 
 To retire a unit, run `/showrunner:retire_unit <unit>` from the showrunner session. It refuses
 while the unit has uncommitted work or a checkpoint not merged. It stops everything the unit owns
-(its sessions, Codex seats, reviewers, holds, reservations, Mac claims and processes), marks the row
+(its sessions, Codex workers, reviewers, holds, reservations, Mac claims and processes), marks the row
 retired, and removes the worktree and branch. `--dry-run` lists all of it and changes nothing.
 The retired note names the director's last session. `/showrunner:resume_unit <unit>` makes the
 worktree again at the same path from the merge branch, resumes that session and makes the row live.
@@ -385,6 +385,18 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
      phase only when it is a regression the phase caused, breaks something
      that worked, or fails a test or gate. Every other finding moves to the
      follow-up phase, however visible, open since round 1 or found this round.
+   Count repair rounds as `history.py rounds` numbers its repair intervals, not as ledger batches. From repair round 4 onward, do not dispatch a missing target, rule interpretation or acceptance case in this phase unless evidence establishes a phase-caused regression, broken working behavior or test/gate failure. A broad original permission to fix pilot defects does not override this check. A later explicit user or showrunner ruling may keep named work; cite it. Route every other missing criterion to a follow-up Work Order in the owning unit, with its target decision, implementation, tests and acceptance evidence. Do not dispatch a batch until every finding is either retained with evidence or assigned to that follow-up. Split mixed batches; keep their eligible defects here. Never mark an unmet pilot acceptance bar passed because its work was routed.
+
+   Work Orders state the acceptance observation, unit or comparison, and named real-path test or live check for changed behavior. Reuse established targets. Resolve choices through the showrunner before dependent work; do not invent a number to fill the form. A later changed goal updates the order explicitly. (the user, 2026-10-28)
+
+   Count repair rounds as `history.py rounds` numbers its repair intervals, not as ledger batches. Before any round 4-or-later dispatch on a repeated finding, require evidence that it is a phase-caused regression, broken working behavior or test/gate failure. Earlier attempts and an open verdict alone are not that evidence. Broad original permission for pilot fixes does not override landing. Cite any later explicit user/showrunner ruling that keeps the named work. Route a repeated finding outside these categories to its owning unit's follow-up Work Order before another repair starts. Keep the finding open and link its checks, previous attempts, due checkpoint and final acceptance result. Split mixed batches and retain all eligible work. If eligibility is unknown, diagnose it rather than silently route or count it as a certain saving.
+
+   For retained work after two completed failed fixes, record the failure, approaches tried, cause diagnosis and next distinguishing test before another approach. Interrupted workers and account moves remain continuations, not completed rejected patches. (the user, 2026-10-28)
+
+   At each fix limit, try something different. When a phase reaches repair round 4 with a finding still open, or a kept finding has failed two fixes, the director writes a short note: the finding, the tries so far and why each failed. It runs `/astra_review` on the note. Astra's approach goes into the next try, or into the follow-up Work Order when the finding moves out (the user, 2026-10-28).
+
+   Use `findings.py route` to move a finding out of the batch and `dispatch --keep F003=<regression|broken|gate|ruling>:<evidence>` for each kept finding from repair round 4. Record Astra's result with `findings.py astra`; it is due at round 4 or two failed fixes, again at each new fix-attempt count. Record `--unavailable` if Astra reports busy or unavailable (the user, 2026-10-28).
+
    - **One batch per check** (2026-10-01, measured: late repair rounds came
      mostly from one visual defect found live after each fix). Every live
      check or set of shots after a fix covers every view the phase changes,
@@ -395,7 +407,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
      is still open after two fixes, send no third worker pass with the same
      approach. First find why the fixes did not hold, write it in the
      attempts log, then dispatch once with an approach that addresses that
-     cause.
+     cause. Apply the Astra step above before that next approach (the user, 2026-10-28).
 
    Before the hard landing, everything else is fixed before the checkpoint. This is packaging under
    `<DecisionEconomy/>`, so it never goes to the user as a question. State it

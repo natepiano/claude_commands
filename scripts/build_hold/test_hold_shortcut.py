@@ -2,20 +2,14 @@
 
 from __future__ import annotations
 
-import io
 import os
 import shutil
 import subprocess
-import time
 from collections.abc import Mapping
-from contextlib import redirect_stdout
-from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
 from typing import override
-from unittest import mock
 
-import build_hold
 import test_build_hold
 
 
@@ -40,7 +34,12 @@ class HoldShortcutTests(test_build_hold.IsolatedBuildHoldTest):
         bin_dir = self.scratch / "bin"
         bin_dir.mkdir()
         python = bin_dir / "python3"
-        _ = python.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$TEST_STARTS"\nexit "$TEST_STATUS"\n')
+        _ = python.write_text(
+            '#!/bin/bash\nprintf "%s\\n" "$*" >> "$TEST_STARTS"\n'
+            + 'if [[ "$2" == wait-local && ( "$TEST_STATUS" == 10 || "$TEST_STATUS" == 12 ) ]]; then\n'
+            + '    printf "hold refused (exit %s)\\n" "$TEST_STATUS" >&2\nfi\n'
+            + 'exit "$TEST_STATUS"\n'
+        )
         python.chmod(0o755)
         self.environment = {
             **os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
@@ -56,7 +55,7 @@ source "$1"
 '''+ setting + '''
 shortcut=0; build_hold_nothing_held || shortcut=$?
 wait_status=0; build_hold_wait_local || wait_status=$?
-admission=0; build_hold_check_admission || admission=$?
+admission=0; build_hold_check_local || admission=$?
 printf '%s %s %s\\n' "$shortcut" "$wait_status" "$admission"
 '''
         return subprocess.run([BASH, "-c", script, "bash", str(MEMORY_GATE)],
@@ -68,11 +67,14 @@ printf '%s %s %s\\n' "$shortcut" "$wait_status" "$admission"
         result = self.run_checks(setting, extra={"TEST_STATUS": str(status), **extra})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), f"{shortcut} {status} {status}")
-        self.assertEqual(result.stderr, "")
+        errors = f"hold refused (exit {status})\n" if status in (10, 12) else ""
+        if status == 12:
+            errors += "build hold check check-local failed (exit 12); step refused\n"
+        self.assertEqual(result.stderr, errors)
         commands = self.starts.read_text().splitlines() if self.starts.exists() else []
         script = MEMORY_GATE.parent.parent / "build_targets" / "build_targets.py"
         self.assertEqual(commands, [f"{script} wait-local --call-id c1 --pid 12345",
-                                    f"{script} check-admission --call-id c1"] if starts else [])
+                                    f"{script} check-local --caller verify"] if starts else [])
 
     def release_record(self) -> None:
         release = self.scratch / "release"
@@ -101,7 +103,7 @@ printf '%s %s %s\\n' "$shortcut" "$wait_status" "$admission"
         self.assert_checks(shortcut=0, starts=False)
 
     def test_any_doubt_starts_the_check(self) -> None:
-        for kind in ("subdirectory", "dot", "two dots", "link", "missing", "file", "no read", "no search", "empty variable", "holder"):
+        for kind in ("subdirectory", "dot", "two dots", "link", "file", "no read", "no search", "empty variable", "holder"):
             with self.subTest(kind=kind):
                 if kind in ("no read", "no search") and os.getuid() == 0:
                     self.skipTest("Root can read directories without permission")
@@ -109,7 +111,7 @@ printf '%s %s %s\\n' "$shortcut" "$wait_status" "$admission"
                 extra = {"BUILD_HOLD_DIR": str(folder)}
                 if kind == "file":
                     _ = folder.write_text("file")
-                elif kind != "missing":
+                else:
                     folder.mkdir()
                     if kind == "subdirectory":
                         (folder / "child").mkdir()
@@ -160,11 +162,14 @@ printf '%s %s %s\\n' "$shortcut" "$wait_status" "$admission"
                 call_id = wait.split()[3]
                 self.assertRegex(call_id, r"^v[0-9]{8}T[0-9]{6}-[0-9]+-[0-9]+$")
                 self.assertEqual(wait, f"{script} wait-local --call-id {call_id} --pid 12345 --caller {name}")
-                self.assertEqual(admission, f"{script} check-admission --call-id {call_id} --caller {name}")
+                self.assertEqual(admission, f"{script} check-local --caller {name}")
 
     def test_caller_without_a_holder_directory_starts_no_check(self) -> None:
-        extra = {"BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "cargo-port", "BUILD_HOLD_DIR": str(self.scratch / "missing")}
-        self.assert_checks(shortcut=1, extra=extra, starts=False)
+        for call_id, caller in (("", "cargo-port"), ("c1", "verify")):
+            with self.subTest(caller=caller):
+                extra = {"BUILDLOG_CALL_ID": call_id, "BUILDLOG_CALLER": caller,
+                         "BUILD_HOLD_DIR": str(self.scratch / "missing")}
+                self.assert_checks(shortcut=0, extra=extra, starts=False)
 
     def test_nothing_held_starts_no_process(self) -> None:
         empty_path = self.scratch / "empty-path"
@@ -184,31 +189,3 @@ for ((n=0; n<2000; n++)); do build_hold_nothing_held; done
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
         self.assertEqual(forks.read_text(), "", "the shortcut must not fork subshells")
-
-    def test_holder_file_stays_until_the_release_completes(self) -> None:
-        now = datetime.now(timezone.utc)
-        _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder", "holder"),
-                                  "release test", build_hold.NoReleaseEta(), now)
-        build_hold.record_recipients([("first", "first"), ("second", "second")])
-        # Waits keep both sessions in the release; a session only told would hold nothing.
-        for key in ("first", "second"):
-            _ = build_hold.register_wait(key)
-        sleeps: list[float] = []
-
-        def finish_turn(seconds: float) -> None:
-            self.assertTrue((self.holders / "holder").is_file())
-            sleeps.append(seconds)
-            cycle = build_hold.read_cycle()
-            assert cycle is not None
-            for entry in cycle["entries"]:
-                if entry["state"] == "ReleasedAwaitingAdmission":
-                    _ = build_hold.answer_nothing_to_build(entry["session_id"])
-
-        with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test/socket")), \
-             mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()), \
-             mock.patch.object(time, "sleep", side_effect=finish_turn), redirect_stdout(io.StringIO()):
-            line = build_hold.release_cycle(self.holders, "holder")
-        self.assertTrue(sleeps)
-        self.assertIn("released, builds may resume", line)
-        self.assertFalse((self.holders / "holder").exists())
-        self.reap_recorders()

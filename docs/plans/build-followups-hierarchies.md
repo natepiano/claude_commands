@@ -2,7 +2,7 @@
 
 > **Status: IMPLEMENTATION PLAN — phased, delegate-ready; long-running.** Find the agent hierarchy that delivers Hana fastest under the user's constraints: measure today's hierarchy, collect the constraints, propose the best hierarchy with a step-by-step change to it, then build and measure one approved step at a time.
 
-> **Production: build-followups** — unit `hierarchies-unit`; production doc `docs/plans/build-followups-production.md`
+> **Production: sdlc** — unit `hierarchies-unit`; production doc `docs/plans/sdlc-production.md`
 
 ## Source
 
@@ -86,98 +86,134 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - 51 of 187 workers record no cwd. They count as unclassified, not as Hana or other.
 - The merge gate test `accounts/test_cutover_home` checks access times. It fails under heavy load and passes when run alone.
 
-### Phase 2 — The design doc recommends the best hierarchy and the steps to reach it  · status: todo
-**Depends on:** Phase 1
+### Phase 2 — The design doc recommends the best hierarchy and the steps to reach it  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** the design doc compares at least three hierarchies against the constraints and the baseline, recommends one, and splits the change into small steps, each with the measure it moves.
-
-**Spec:**
-- Section **Candidates.** At least three, each described by its roles, who decides priority, how work is admitted, how the user is reached, and how capacity (build slots, accounts, workers) is shared. Seeds, not limits:
-  - **Today's tree, repaired:** same roles; fix the measured friction (finished units that keep sessions, leaked workers, timers on on-demand productions, queues that grow faster than the user drains them).
-  - **Product-led, flat:** showrunners stay peers, but the ranked Hana backlog decides what every production admits; each non-Hana production supplies Hana, and each of its units names the Hana issue or the measured Hana cost (build minutes, screenshot minutes, review time) it cuts.
-  - **Capacity-led:** productions stay as they are; one owner shares build slots, accounts and workers by issue rank across all productions.
-- Every candidate places sdlc and guilds as top-level showrunners, with the four guild heads as units of guilds, and keeps the organization flat (Decisions). A candidate that puts a showrunner above another breaks a `user` constraint.
-- Section **Comparison.** One table: each candidate scored on each Phase 1 measure (expected direction and size, with the reason) and each constraint (kept or broken). A candidate that breaks a `user` constraint is out.
-- Section **Recommendation.** The best candidate and why, in at most ten lines.
-- Section **Steps.** The change from today to the recommendation as numbered steps. Each step: what changes (files and roles), the measure it should move and by how much, how to undo it, and whether it needs the user (every role, promotion, rename or responsibility change does). Step 1 is the one with the largest expected effect on Hana delivery per unit of work.
-- Before the gate, the unit director runs `/adversarial` on the recommendation against the runner-up and `/astra_review` on the doc, and folds their findings into the doc.
+- The design doc holds Candidates, Comparison, Recommendation and Steps. The user's review decisions HI1-HI11 are folded in.
+- Candidate A (today's tree, repaired) runs as an experiment. Candidate B does not start. Candidate C is dropped.
+- The user approves Steps 1, 2 and 4. Each step has a Hana link, a measure and a review point. Constraints C53-C57 record the new rules.
+- sdlc is a top-level showrunner. guilds is its child, and the four guild heads are units of guilds.
+- `measure.py baseline` splits closures by project and leaves out declines. It also reports Hana merges per week, rank coverage of open issues, date-time window flags and one missing-value type per domain.
 
 **Files:**
-- `docs/plans/build-followups-hierarchies-design.md` — new sections above
+- `docs/plans/build-followups-hierarchies-design.md` — Constraints, Map, Baseline, Questions, Candidates, Comparison, Recommendation, Steps.
+- `scripts/hierarchies/measure.py` — Baseline measures. Missing-value types: `TimeNotRecorded`, `DurationNotRecorded`, `ScoreNotRecorded`, `MergeHistoryNotRecorded`. Re-run with `~/.claude/scripts/lib/py scripts/hierarchies/measure.py baseline` from the worktree root (about 23 s).
+- `scripts/hierarchies/test_measure.py` — tests for those measures.
 
-**Workers:** `2 writers` — nothing splits: one doc. `impl` takes it; `test` has no test lane, so it opens as impl and only checks numbers.
-- `impl` — `docs/plans/build-followups-hierarchies-design.md`
-- `test` — opens as impl — re-runs `measure.py baseline` for the doc's Comparison window and checks each number the doc cites against it; it writes no doc text
+**Binds later work:** The unit director writes each step's result into the design doc. The Step 2 work waits on phases-unit's HI7 phase, and must check that the wait record has a holder field. The four-week review counts a Hana wait as non-Hana-caused only when a record names the holder. The four-week review waits on the two-week re-runs of Steps 1 and 4. The Step 4 keep rule goes to models-unit as a requirement.
 
-**Constraints from prior phases:**
-- The design doc holds Constraints C01–C50 (each marked `user` or `derived`, with its source), the Map, the Baseline (run 2026-10-20 17:24 EDT, 7 days, natedev) and Questions Q1–Q5. Rank 1 of the user's goals is `1 - Ship Hana`.
-- Baseline facts the candidates answer: Hana has 11 of 41 live units (27%) and 66 of 187 workers, but 80% of build and check minutes, 82% of test minutes and 41% of tokens; 51 workers record no cwd and have no running director; 598 items wait on the user (315 changes, 161 proposals, 121 efficiency items, 1 question).
-- No source records phase wait kinds, issue activation times or question answer times; those rows print `not recorded`. A candidate that needs one of them to show its effect names the record it adds.
-- Q1–Q5 went to the user through the showrunner on 2026-10-20 at 17:43 EDT. Write the user's answers into the doc's Questions section as they arrive. While an answer is open, each candidate states its result under the recommended answer and under the other answer, and the Recommendation names which answers it rests on.
-- Re-run the baseline with `~/.claude/scripts/lib/py scripts/hierarchies/measure.py baseline` from the worktree root (about 23 s).
+**Gotchas:** The closure count treats any reason whose first word is "declined" as a decline. The run recorder writes `phase_instance_id` and `phase_id`, never `phase`. Each missing value has its own type, and all of them print "not recorded".
 
-**Acceptance gate:** the doc has the four sections; each candidate has a score on every measure and constraint; each step names its measure, its size and how to undo it; the adversarial and astra findings are folded in. At phase end the unit director sends the showrunner the Recommendation and Step 1 as one question for the user.
+**Ruled out:** candidate B, a shared rank order with a Hana-cost test (HI10); candidate C, capacity-led with natedev allocating workers (HI11); a fixed Hana share or measured Hana cost (HI2); a daily review budget (HI3); a size threshold for the four-week review's proposal (HI10).
 
-### Phase 3 — Build the first approved step  · status: todo
+### Phase 3 — Each user push after a failed text check names its approved exception, and unapproved paths are fixed  · status: todo
 **Depends on:** Phase 2
 
 #### Work Order
 
-**Pending decision: which step the user approves first**
+**Goal:** design Step 1 (HI6, approved 2026-10-28) is live: every send to the user that passes a failed text check is classified as an approved exception or an unapproved path, and each unapproved path is fixed.
 
-Actual problem:
-Phase 2 ends with a recommendation and numbered steps in `docs/plans/build-followups-hierarchies-design.md`; role and responsibility changes are the user's (memory `process-redesigns-are-questions`).
+**Hana link:** indirect. Each unapproved push takes the user's attention from Hana decisions.
 
-What exists now:
-- No step is approved. The files a step changes (for example `commands/showrunner/produce.md`, `commands/unit/direct.md`, `docs/production_format.md`, `scripts/production/`) have owners in the production doc's Units and Hub files tables.
-
-What should change:
-- Phase 2's Step 1, as the user approves or changes it, becomes this Work Order's Spec, Files, Workers and Acceptance gate, with the measure it must move.
-
-Recommendation:
-Step 1 from the design doc's Steps section.
-
-**Goal:** the approved step is live on `~/.claude` main.
-
-**Spec:** set by the decision above.
+**Spec:**
+- `scripts/hierarchies/push_audit.py report [--since DATE|DATETIME] [--until DATE|DATETIME]`: read `~/.local/state/notify/pushover.jsonl` and `review.jsonl` read-only; for each user push after a failed text check, print the sender, the text id or key, and the class: `ApprovedPriorityTwo`, `ApprovedRegisteredText` (the exceptions in `scripts/notify/pushover.py:316-319`), or `Unapproved` with the code path that sent it. Totals per showrunner, with window and n.
+- Trace each `Unapproved` class to its sending path (`scripts/notify/review.py`, `scripts/notify/pushover.py`, `scripts/message/send.py`, `commands/showrunner/add_unit.md`, `scripts/production/add_unit.py`). Fix only paths confirmed as not approved, where the defect lives. Do not change an exception: a change to one is its own question for the user.
+- The showrunner duty (run the report, record which exception each send uses) goes to roles-unit through the sdlc showrunner as a text proposal; this phase does not edit `commands/showrunner/produce.md`.
 
 **Files:**
-- `docs/plans/build-followups-hierarchies-design.md` — mark the approved step as built in Steps. The step's own files are set by the decision above; a file another unit owns is edited after the showrunner settles it.
+- `scripts/hierarchies/push_audit.py`, `scripts/hierarchies/test_push_audit.py` — new
+- `scripts/notify/` fixes — messaging-unit's files; this unit edits them (showrunner ruling 2026-10-28); the notice carries an also-touches line per build-followups owner
+- `scripts/message/send.py` fixes — shutdown-unit's file; `scripts/production/add_unit.py` and `commands/showrunner/add_unit.md` fixes — enh-showrunner-unit's files (build-followups production doc). Same rule as `scripts/notify/` (unit director's call, 2026-10-28, extending ruling 1 to every owner a confirmed fix reaches): this unit edits the file where the defect lives, tells the sdlc showrunner which owner's file before the edit, and the notice carries an also-touches line for each owner, trial-merged against its tip. Only files with a confirmed `Unapproved` path are edited.
+- `docs/plans/build-followups-hierarchies-design.md` — Step 1 result, written by the unit director at the checkpoint (Phase 5 runs in parallel and its result goes in the same doc, so no worker edits it)
 
-**Workers:** set by the decision above.
+**Workers:** `1 writer + 1 tester`
+- `impl` — `push_audit.py`, the confirmed fixes
+- `test` — `test_push_audit.py`: fixtures for each class, a priority-2 send, a registered text, an unapproved send, a missing log
 
-**Constraints from prior phases:** the design doc's Steps section; the Phase 1 baseline.
+**Constraints from prior phases:** Baseline **User attention**: 64 pushes, 16 after a failed review, n=64 (2026-10-13 17:24 to 2026-10-20 17:24 EDT). The 16 are not 16 faults. The audit reads only; it sends nothing (C49).
 
-**Acceptance gate:** set by the decision above, and the merge gate (Delegation Context → Test) green.
+**Acceptance gate:** unit tests green; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; the report on the Baseline window and on the last 7 days shows each send's class; zero `Unapproved` sends after the fixes, or each one left names its open question. **Measure:** unapproved sends per week, from 16 after-failed-review pushes in the Baseline (n=64). **Review point (C53):** re-run the report 2 weeks after the merge; Phase 6 keeps or drops the duty on it.
 
-### Phase 4 — Measure the first step and propose the next  · status: todo
-**Depends on:** Phase 3
+### Phase 4 — The measure reads wait records and merge receipts, and the 4-week experiment starts  · status: todo
+**Depends on:** Phase 2; and a wait on sdlc phases-unit (approved by the sdlc showrunner 2026-10-28; the row for the sdlc production doc's Gates table goes to the sdlc showrunner with the Phase 2 notice):
+- **Supplier:** phases-unit's HI7 phase, the phase it plans right after its phase 3 (phases-unit, 2026-10-28).
+- **Record contract:** the shape sent to phases-unit on 2026-10-28, given under Spec below. phases-unit picks the file and the writer and sends both, with the commit, when its phase lands.
+- **Clears when:** that phase's checkpoint is merged to `origin/sdlc` and on `~/.claude` main, its message names the record file and commit, and the file holds at least one wait record and one merge receipt written by a real phase. Until then this phase does not start.
 
 #### Work Order
 
-**Goal:** the design doc shows whether the first step moved its measure, and the next step goes to the user.
+**Goal:** design Step 2 (HI7, approved as a 4-week experiment): `measure.py` reads the wait records and merge receipts that phases-unit builds, and the doc names the experiment's start and review date.
+
+**Hana link:** direct. The records show which waits slow Hana phases.
 
 **Spec:**
-- `measure.py compare --before <baseline window> --after <window from the step's merge>`: the same tables as `baseline`, each row with before, after and the change. The after window is at least 3 days, or the step's own window if the doc names one.
-- Design doc section **Results**: per step, the expected and the measured change, and keep or undo. A step whose measure did not move gets an undo recommendation.
-- Update **Steps**: re-rank the remaining steps by what the results show.
-- After this phase the unit stays as the hierarchy consultant: each next step becomes a new phase after the user approves it, built and measured the same way.
+- The record shape went to phases-unit on 2026-10-28 (showrunner ruling 3) the design needs: per wait, phase, owner, UTC start and end, and one kind (`WaitingForQuotaRefusal`, `WaitingForMemoryOrSlot`, `WaitingForMergeGate`, `WaitingForUser`, `WaitingForSupplier`, `ReadyWithoutCapacity`); per merge, a receipt (project, issue or plan phase, commit, target branch, merge time). The duty text goes to roles-unit. phases-unit picks the file and writer; this phase adapts to it.
+- `measure.py baseline` fills the four `Hana wait /` rows and a receipts row from those records: minutes by kind with n, `HistoryNotRecorded` for a window with no records (never zero), and `ReceiptMissing` per merge with no receipt. Readers are read-only typed loaders; a corrupt source prints a source-problem row.
+- Design doc: the experiment's start (first records on `~/.claude` main) and its review date, four weeks later.
+- Phase 6 counts a Hana wait as non-Hana-caused only when a record names the non-Hana holder of the account, slot or memory. Check that phases-unit's record shape carries that holder; if it does not, ask phases-unit (through the sdlc showrunner) to add it before the experiment starts.
+
+**Files:**
+- `scripts/hierarchies/measure.py`, `scripts/hierarchies/test_measure.py`
+- `docs/plans/build-followups-hierarchies-design.md` — Step 2 start and review date
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — `measure.py` and the doc
+- `test` — `test_measure.py`: fixtures for each wait kind, a window with no records, a merge with and without a receipt
+
+**Constraints from prior phases:** the Baseline rows print `not recorded` today; `--since` and `--until` take dates and date-times.
+
+**Acceptance gate:** unit tests green; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; `measure.py baseline` over the first records prints real wait and receipt rows. **Measure:** share of Hana phase time with a recorded wait kind, and share of merges with a receipt. **Review point (C53):** four weeks after the first records land; Phase 6 keeps or drops the step on it.
+
+### Phase 5 — A run end ends only workers whose unit director is gone or whose owner cannot be found  · status: todo
+**Depends on:** Phase 2
+
+#### Work Order
+
+**Goal:** design Step 4 (HI9, approved with the user's rule): workers live as long as their unit director, across runs, and are reused by name; a check ends only workers with no live director or no known owner, and each showrunner removes timers nobody asked for.
+
+**Hana link:** indirect. Workers with no owner hold quota and memory on the accounts and the machine Hana shares.
+
+**Spec:**
+- `scripts/hierarchies/worker_owners.py report`: list each Codex worker with its recorded run, unit and director session, and one class: `OwnedLive`, `PooledReviewer`, `DirectorGone`, `OwnerUnknown`. Read-only.
+- `worker_owners.py recover`: for each `OwnerUnknown` worker, try provenance recovery first (shutdown history records, the message log, launcher records naming its thread id); a recovered worker moves to its real class. The 2026-10-28 run-folder deletions made live units' workers look ownerless, this unit's included.
+- `worker_owners.py end --class DirectorGone|OwnerUnknown [--dry-run]`: end only those, through `codex_mesh.py end`, and log each one with its evidence. `OwnerUnknown` is ended only after recovery failed for that worker. Never an `OwnedLive` worker, a pooled reviewer, or a named worker of a live unit director. **The first run reports and ends nothing** (showrunner, 2026-10-28).
+- A worker survives its run's end: the keep rule in `end_session.sh` and `codex_mesh.py` belongs to build-followups models-unit, which lands it in its own phase 5 (worker lifecycle). This phase sends models-unit the requirement (a live director's workers are kept at run end) with a test case (build-followups showrunner, 2026-10-28). The <LongLivedWorkers/> text change ("run-scoped", "`end_session.sh` ends them") goes to phases-unit; the duty goes to roles-unit.
+- Timers: list notifier registrations (`scripts/message/notifier.sh`) with whether a user or showrunner asked for each; the showrunner removes the rest.
+
+**Files:**
+- `scripts/hierarchies/worker_owners.py`, `scripts/hierarchies/test_worker_owners.py` — new
+- The keep rule in `scripts/agents/codex_mesh.py` and `scripts/direct/end_session.sh` — models-unit lands it in its own phase 5 (worker lifecycle); this phase sends it the requirement and a test case (build-followups showrunner, 2026-10-28, which replaces the earlier ruling that this unit edits them)
+- `docs/plans/build-followups-hierarchies-design.md` — Step 4 result, written by the unit director at the checkpoint (Phase 3 runs in parallel and its result goes in the same doc, so no worker edits it)
+
+**Workers:** `1 writer + 1 tester`
+- `impl2` — `worker_owners.py`, and the keep-rule requirement with its test case for models-unit (a second writer slot: Phase 3 holds `impl` and `test` in parallel)
+- `test2` — `test_worker_owners.py`: fixtures for each class, a pooled reviewer, a director that restarted on another account
+
+**Constraints from prior phases:** Baseline **Capacity on Hana**: 51 workers with no recorded cwd and no running director, n=51. A paused worker of a live director is `OwnedLive`. The 2026-10-28 run-folder loss (a paused run's roster deleted) is one case the report must name, not hide.
+
+**Acceptance gate:** unit tests green; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; `report` on the live roster names an owner or a class for every worker; the first run ends no worker. **Measure:** Baseline 51 workers with no known owner; target zero after recovery. **Review point (C53):** re-run 2 weeks after the merge; Phase 6 keeps or drops the step on it.
+
+### Phase 6 — The four-week review: which waits slow Hana, which links helped, and which trial steps stay  · status: todo
+**Depends on:** the checkpoints of Phases 3, 4 and 5, and the three review records: the Phase 3 and Phase 5 re-runs 2 weeks after each merge, recorded in the design doc under Steps 1 and 4, and four weeks of Phase 4 records. The phase starts on the latest of these dates, never before.
+
+#### Work Order
+
+**Goal:** design Step 5: the doc reports which waits slow Hana (HI7), which Hana links helped (HI2), and keep or drop for each trial step (HI1).
+
+**Hana link:** direct. The review keeps a step only by its effect on Hana.
+
+**Spec:**
+- `measure.py compare --before <Baseline window> --after <the four-week window>`: the same rows for both windows, each with before, after and the change; `not recorded` rows stay `not recorded`. The windows differ in length (7 days and 28 days), so each count row (merges, closures, pushes, waits) prints a rate per week, never a raw total, and the change is between the two rates. A row whose source covers only part of a window prints its covered days beside the rate and is marked partial.
+- Set quota and memory waits beside same-hour non-Hana tokens on the same role account and non-Hana build memory on natedev. If the records show non-Hana work slowing Hana, bring a new proposal (HI10); there is no size threshold. Records show it only when a record names a non-Hana cause for a Hana wait: a `WaitingForSupplier` wait whose record names non-Hana work, or a quota or memory wait whose record, or the slot or hold record that covers the whole wait, names a non-Hana holder of that account, slot or memory. Load in the same hour is context, never proof. A wait with no named cause is reported as cause not recorded, with its minutes and n, and does not count. Report each wait with a named non-Hana cause with its minutes and n. If the Phase 4 record shape has no field for the holder, Phase 4 asks phases-unit to add one.
+- Design doc section **Results**: per step, the measure, its change, keep or drop. The link records (Step 3) set beside Hana merges and closures.
 
 **Files:**
 - `scripts/hierarchies/measure.py`, `scripts/hierarchies/test_measure.py` — `compare`
-- `docs/plans/build-followups-hierarchies-design.md` — Results, Steps
+- `docs/plans/build-followups-hierarchies-design.md` — Results
 
 **Workers:** `1 writer + 1 tester`
-- `impl` — `scripts/hierarchies/measure.py` and the design doc
-- `test` — `scripts/hierarchies/test_measure.py`: `compare` on fixtures with known before and after values
+- `impl` — `measure.py` and the doc
+- `test` — `test_measure.py`: `compare` on fixtures with known before and after values
 
-**Constraints from prior phases:**
-- `measure.py baseline [--since DATE] [--until DATE]` exists: default window the 7 days to now, end excluded. Each measure is a function over typed domain records built by read-only loaders; `compare` runs the same functions on both windows and does not add new loaders.
-- A missing or corrupt source prints a source-problem row instead of failing; `compare` keeps that row in each window and shows no change for it.
-- Rows with no recording source (phase wait kinds, issue activation times, question answer times) print `not recorded`; `compare` prints them the same way, unless the Phase 3 step added the record.
-- Items waiting on the user come from showrunner/outstanding through `dailies_render.read_outstanding`.
-- The step built in Phase 3 and the measure it should move.
-
-**Acceptance gate:** unit tests green; `basedpyright scripts/hierarchies` ends `0 errors, 0 warnings, 0 notes`; the merge gate (Delegation Context → Test) green; the doc's Results row for Step 1 holds real before and after numbers. At phase end the unit director sends the showrunner the Results and the next step as one question for the user.
+**Acceptance gate:** unit tests green; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; Results holds real numbers for each step, judged on the measure and review point each of Phases 3–5 names. **Measure and review point:** this phase is the review point for Steps 1, 2 and 4. At phase end the unit director sends the showrunner the Results and the keep-or-drop list as one question for the user.
