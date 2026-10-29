@@ -2,7 +2,7 @@
 
 > **Status: IMPLEMENTATION PLAN — phased, delegate-ready; long-running.** A regime, run every hour, that measures how long any agent takes to get a usable framed screenshot, shows that shots taken by hand cost far more than `/hana_shot`, measures each `/hana_shot` change, and proposes the next change by measured minutes saved. The user approves each proposal before it is built.
 
-> **Production: build-followups** — unit `screenshot-unit`; production doc `docs/plans/build-followups-production.md`
+> **Production: natedev** — unit `screenshot-unit`; production doc `docs/plans/natedev-production.md`
 
 ## Source
 
