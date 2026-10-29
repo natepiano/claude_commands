@@ -21,7 +21,7 @@ Showrunner of build-followups, 2026-10-28 (measured by builds-unit):
 
 ## Phases
 
-### Phase 4 — One Python dispatcher per hook event  · status: pending
+### Phase 4 — One Python dispatcher per hook event  · status: done
 
 **Goal:** a Bash call runs its PreToolUse Python hooks in one Python process and its PostToolUse Python hooks in one more, and a Stop runs its Python hooks in one process, with the same decisions, the same text to Claude and the user, and the same exit codes as today.
 
