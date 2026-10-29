@@ -10,6 +10,8 @@ remain only for the pending archive cleanup; they do not dispatch new reviews.
 
 **Build-hold guard tests.** `scripts/hooks/test_build_hold_guard.py` calls the real Python hook entry point in-process for command parsing and hold decisions, restoring stdin, environment and import paths for each call. `build_hold_guard_test_support.py` copies the existing hold fixture's class seed into a private case directory at the same path for each test. Real subprocess tests retain the shell front's no-Python fast paths, byte-for-byte stdin/output/status relay, lazy imports, malformed input, and shell-to-reader integration. No production hook or hold decision is replaced, and no clock or wait budget is shortened.
 
+**Build-hold tests.** `scripts/build_hold/test_build_hold.py` uses a class fixture seed copied into the same private path for each test. `build_hold_test_support.py` invokes the real argument parser and command handlers in-process for holder-state checks, while shell wait status, detached recording, lock ownership and child reaping retain real processes. Record assertions wait for recorder threads and the child-lifetime FIFO to finish instead of polling log files. Real recorder output and every original assertion remain covered.
+
 ## How it works
 
 ### The gate: `scripts/production/merge_gate.py`
