@@ -23,7 +23,7 @@ The session notifier sends a message to a live Claude session on a schedule: the
 
 | `scripts/direct/prepare_session.sh` | Run start: writes the run-active marker, then creates the instance. |
 
-| `scripts/direct/end_session.sh` | Run end: removes the instance, then the marker. |
+| `scripts/direct/end_session.sh` | Run end: removes the instance, then the session's own marker. |
 
 | `scripts/hooks/direct_run.py` | `check` CLI: the unit instance's check. Also a library the worker hooks import. |
 
@@ -241,3 +241,26 @@ For each unit with a live Claude, `unit_status.sh` takes its session id from `un
 Production registration creates the showrunner update and the run-only
 stall-watch job. Session names come from herdr; there is no name-refresh job.
 Existing retired jobs are removed by their production's showrunner.
+
+### Other sessions' run markers (2026-10-29)
+
+`unit_runs.marker_must_stay(path)` protects another session's marker. It uses the
+marker filename as the session id and delegates to
+`scripts/message/sessions.py:session_liveness`, which reads the session registry
+and checks the saved process identity (or an older record's socket). A live
+session or unknown liveness keeps the marker, regardless of its age or whether
+its run folder still exists. Tests redirect that registry with
+`NOTIFIER_SESSIONS_DIR` or patch the shared liveness observation.
+
+`unit_runs.py removal-check` does not offer the former `delegate` folder for
+removal while any marker has a live or unknown owner, including owners absent
+from the initial running-session listing. Confirmed-gone owners retain the
+previous behavior. The automatic temp sweep already retains both `active/`
+directories and every marker in them; the folder audit excludes the run roots.
+
+A session's own lifecycle is separate: `end_session.sh` removes its own marker
+when ending its run, and `prepare_session.sh` removes its own former `delegate`
+marker after writing its new `unit` marker. This prevents an obsolete former
+marker from pointing the mover at an old run. `direct_run.active_run` still uses
+its unchanged 12-hour run-content age rule for the hook's own session; that rule
+controls turn continuation and does not authorize deletion.

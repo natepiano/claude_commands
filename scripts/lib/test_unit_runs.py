@@ -9,10 +9,16 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import unit_runs  # noqa: E402
+if TYPE_CHECKING:
+    from scripts.message import sessions
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
+    import sessions
 
 
 class UnitRunsTest(unittest.TestCase):
@@ -35,6 +41,37 @@ class UnitRunsTest(unittest.TestCase):
                 (new / "active").mkdir(parents=True)
                 _ = (new / "active/s1").write_text("run\n")
                 self.assertEqual(unit_runs.marker("s1"), new / "active/s1")
+
+    def test_live_marker_is_kept_and_never_offered_for_former_folder_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            former = Path(folder) / "delegate"
+            marker = former / "active" / "fixture-live"
+            marker.parent.mkdir(parents=True)
+            _ = marker.write_text("/missing/run\n")
+            with (patch.object(unit_runs, "FORMER_RUN_ROOT", former),
+                  patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(123)) as check,
+                  contextlib.redirect_stdout(io.StringIO()) as shown):
+                self.assertEqual(unit_runs.removal_check({}), 1)
+            self.assertEqual(marker.read_text(), "/missing/run\n")
+            self.assertNotIn("can go", shown.getvalue())
+            self.assertEqual(check.call_args.args, ("fixture-live",))
+
+    def test_gone_marker_can_be_offered_but_unknown_is_kept(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            former = Path(folder) / "delegate"
+            marker = former / "active" / "fixture-gone"
+            marker.parent.mkdir(parents=True)
+            _ = marker.write_text("/missing/run\n")
+            with (patch.object(unit_runs, "FORMER_RUN_ROOT", former),
+                  patch.object(sessions, "session_liveness", return_value=sessions.SessionLivenessUnknown("unreadable")),
+                  contextlib.redirect_stdout(io.StringIO())):
+                self.assertEqual(unit_runs.removal_check({}), 1)
+            with (patch.object(unit_runs, "FORMER_RUN_ROOT", former),
+                  patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
+                  contextlib.redirect_stdout(io.StringIO()) as shown):
+                self.assertEqual(unit_runs.removal_check({}), 0)
+            self.assertIn("can go", shown.getvalue())
+            self.assertTrue(marker.exists(), "removal-check only judges; it never unlinks")
 
     def test_the_recorded_director_wins_over_the_session_that_started_the_run(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -127,7 +164,8 @@ class UnitRunsTest(unittest.TestCase):
             _ = (former / "active/sid-open").write_text(f"{former / 'run-open'}\n")
             _ = (former / "active/sid-ended").write_text(f"{former / 'run-ended'}\n")
             with patch.object(unit_runs, "FORMER_RUN_ROOT", former), \
-                    contextlib.redirect_stdout(io.StringIO()) as shown:
+                    contextlib.redirect_stdout(io.StringIO()) as shown, \
+                    patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()):
                 self.assertEqual(unit_runs.removal_check({"sid-open": "two-accounts", "sid-other": "elsewhere"}), 1)
                 self.assertEqual(unit_runs.removal_check({"sid-other": "elsewhere"}), 0)
             self.assertIn(f"two-accounts (sid-open): {former / 'run-open'}", shown.getvalue())

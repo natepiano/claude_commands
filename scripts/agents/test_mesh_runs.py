@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
 from scripts.agents import codex_mesh, mesh_runs
 from scripts.buildlog import treekey
 from scripts.guilds import roles
+from scripts.lib.socket_test_support import short_socket_directory
 
 WORKER = "unit-impl"
 DEAD_PID = 2 ** 22 + 12345
@@ -323,7 +324,7 @@ class MeshRunsTests(unittest.TestCase):
         self.assertEqual(self.sent, [])
 
     def test_scope_prefix_needs_a_user_manager_and_honours_the_off_switch(self) -> None:
-        runtime = self.root / "runtime"
+        runtime = Path(self.stack.enter_context(short_socket_directory())) / "runtime"
         (runtime / "systemd").mkdir(parents=True)
         marker = self.root / "r1.scope"
         on = {"XDG_RUNTIME_DIR": str(runtime)}
