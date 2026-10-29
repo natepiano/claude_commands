@@ -46,11 +46,11 @@
 | messaging-unit | `docs/as-built/message-clarity.md` (run done; as-built) | /home/natepiano/worktrees/claude-build-followups-messaging | build-followups-messaging | — | scripts/notify/ |
 | herdr-trial-unit | (retired 2026-10-18, worktree removed) done, as-built `docs/as-built/herdr-adoption.md` (trial: `docs/as-built/herdr-trial.md`) | /home/natepiano/worktrees/claude-build-followups-herdr-trial | build-followups-herdr-trial | — | scripts/herdr/; docs/plans/build-followups-herdr-*.md; docs/as-built/herdr-*.md |
 | herdr-trust-unit | (retired 2026-10-18, worktree removed) `docs/as-built/herdr-adoption.md` (run done; as-built) | /home/natepiano/worktrees/claude-build-followups-herdr-trust | build-followups-herdr-trust | — | — |
-| herdr-unit | docs/as-built/herdr-adoption.md | /home/natepiano/worktrees/claude-build-followups-herdr | build-followups-herdr | — | — |
+| herdr-unit | (retired 2026-10-28, worktree removed, session da928300-b33f-49a3-9898-9380eaaca881) docs/as-built/herdr-adoption.md | /home/natepiano/worktrees/claude-build-followups-herdr | build-followups-herdr | — | — |
 | nightly-review-unit | (retired 2026-10-19, worktree removed) permanent | /home/natepiano/worktrees/claude-build-followups-nightly-review | build-followups-nightly-review | — | — |
 | style-unit | `docs/as-built/style-showrunner.md` (run done; as-built) | /home/natepiano/worktrees/claude-build-followups-style | build-followups-style | — | — |
 | unit-board-unit | docs/as-built/unit-board.md | /home/natepiano/worktrees/claude-build-followups-unit-board | build-followups-unit-board | — | — |
-| hanadocs-unit | standby | /home/natepiano/worktrees/claude-build-followups-hanadocs | build-followups-hanadocs | — | the hanadocs vault (~/rust/hanadocs); commits to its main |
+| hanadocs-unit | (retired 2026-10-28, worktree removed, session 6eaf058b-3fef-41bc-98d3-3c54e63a242a) standby | /home/natepiano/worktrees/claude-build-followups-hanadocs | build-followups-hanadocs | — | the hanadocs vault (~/rust/hanadocs); commits to its main |
 | review-unit | (retired 2026-10-18, worktree removed) docs/plans/build-followups-review.md | /home/natepiano/worktrees/claude-build-followups-review | build-followups-review | — | — |
 | efficiency-unit | docs/as-built/token-efficiency-study.md | /home/natepiano/worktrees/claude-build-followups-efficiency | build-followups-efficiency | — | the efficiency proposals ledger (~/.local/state/nightly-review/ledger.md and its night reports); the token-efficiency investigation |
 | typesafe-unit | docs/plans/build-followups-typesafe.md | /home/natepiano/worktrees/claude-build-followups-typesafe | build-followups-typesafe | — | — |
