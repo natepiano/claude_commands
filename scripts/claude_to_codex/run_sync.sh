@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
-# repo needs >= 3.10.
+# repo needs >= 3.11.
 PY="$SCRIPT_DIR/../lib/py"
 SOURCE_DIR="$HOME/.claude/commands"
 LOG_DIR="/tmp/claude-to-codex-sync"

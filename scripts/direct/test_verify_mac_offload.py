@@ -688,7 +688,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
             "TEST_REAL_RECORD": str(VERIFY.parent.parent / "buildlog" / "record.py"),
         }
 
-        cache = self.root / "cache/claude/python3-3.10"
+        cache = self.root / "cache/claude/python3-3.11"
         cache.parent.mkdir(parents=True, exist_ok=True)
         _ = cache.write_text(sys.executable + "\n")
         _ = self.environment.pop("CLAUDE_PYTHON", None)

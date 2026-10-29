@@ -129,7 +129,7 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 
 - **Project:** `~/.claude` — the user's Claude Code configuration; this unit adds `scripts/issue_score/`, a TypeSafe-backed scorer for hanadocs issue fields.
 - **Project started:** 2026-10-27T00:44:08.723+00:00
-- **Stack:** Python ≥ 3.10, standard library only, run through `~/.claude/scripts/lib/py`; TypeSafe HTTP API `POST https://api.typesafe.ai/v1/systemone`, model `jev-1.14.0`; schemas at `https://api.typesafe.ai/openapi.json` and `https://docs.typesafe.ai/api/system-one.md`.
+- **Stack:** Python ≥ 3.11, standard library only, run through `~/.claude/scripts/lib/py`; TypeSafe HTTP API `POST https://api.typesafe.ai/v1/systemone`, model `jev-1.14.0`; schemas at `https://api.typesafe.ai/openapi.json` and `https://docs.typesafe.ai/api/system-one.md`.
 - **Layout:**
   - `scripts/issue_score/` — new: `client.py`, `vault.py`, `questions.py`, `decide.py`, `evaluate.py`, `score_issues.py` (CLI), `test_*.py`, `fixtures/`
   - `commands/issue.md` — `/issue`; step 4 gains the `propose` call (Phase 4)

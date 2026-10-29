@@ -389,7 +389,7 @@ Numbers:
 
 The script:
 
-- The scripts run under Python 3.10 on the Mac (`scripts/lib/py`); the tests run only on natedev's 3.13 and use 3.12 names.
+- The scripts run under Python 3.11 or later on the Mac (`scripts/lib/py`); the tests run only on natedev's 3.13 and use 3.12 names.
 - A tool or test run off natedev without `FEATURE_LOG_VAULT` reaches natedev's live vault. An empty `FEATURE_LOG_VAULT` stops forwarding and selects the local `~/rust/hanadocs`.
 - A forwarded call runs natedev's deployed `~/.claude` copy, not the caller's checkout.
 - `date_created` and `date_modified` use the vault host's local date (natedev is America/New_York); a defaulted `completed_date` and event times are in the user's zone.
