@@ -29,11 +29,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime, timezone
 from pathlib import Path
-from collections.abc import Sequence, Set
+from collections.abc import Mapping, Sequence, Set
 from typing import NamedTuple, NotRequired, TypedDict, cast, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import nix_env as nix_env
 
@@ -68,6 +69,29 @@ exec @SYSTEMD_RUN@ --user --scope --quiet --collect --slice={PANE_SLICE} -- "$re
 def _platform() -> str:
     """The platform herdr reads processes as: HERDR_PLATFORM names the one a test's fake process tree was built for."""
     return os.environ.get("HERDR_PLATFORM", _PLATFORM)
+
+
+def _tab_identity(tab: Mapping[str, object], panes: Sequence[Mapping[str, object]]) -> str:
+    labels = [row.get("label") for row in panes if row.get("tab_id") == tab.get("tab_id")]
+    if len(labels) == 1 and isinstance(labels[0], str) and labels[0]:
+        return labels[0]
+    return json_text(tab.get("label"), "herdr tab label")
+
+
+def session_title(name: str, production: str = "", unit: str = "") -> str:
+    """Render a director or showrunner tab without reading the live roster or processes."""
+    if not production:
+        return name
+    from scripts.lib import names
+
+    loaded = names.runtime_names()
+    if not isinstance(loaded, names.Names):
+        return name
+    parts = [production]
+    if unit:
+        parts.append(unit.removesuffix("-unit"))
+    parts.append(loaded.job("unit_director" if unit else "showrunner"))
+    return " · ".join(parts)
 
 
 class HerdrFailure(Exception):
@@ -1075,12 +1099,13 @@ class Herdr:
             raise HerdrFailure(f"several panes ({found.count}) for label {label!r}")
         return found.pane_id
 
-    def open_tab(self, space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
-        """Open a tab and its pane, both named `title`, in the workspace named `space`, creating the workspace first.
+    def open_tab(self, space: str, title: str, cwd: str, environment: dict[str, str], *, label: str = "") -> str:
+        """Open a tab named `title` and a pane named `label`, in the workspace named `space`, creating the workspace first.
 
         A server that holds none of the saved workspaces gets them all first, in their saved order,
         each holding a placeholder tab until its first session's tab arrives.
         """
+        label = label or title
         options = ["--label", title, "--cwd", cwd]
         for key, value in {**child_environment(environment), "HERDR_AGENT_PANE": "1"}.items():
             options.extend(["--env", f"{key}={value}"])
@@ -1098,10 +1123,10 @@ class Herdr:
                 _ = self.run("tab", "rename", tab, title)
             root_pane = json_object(result.get("root_pane"), "herdr tab root pane")
             pane = json_text(root_pane.get("pane_id"), "herdr tab root pane id")
-            _ = self.run("pane", "rename", pane, title)
+            _ = self.run("pane", "rename", pane, label)
             if workspace is not None:
                 self._close_placeholders(workspace)
-                unit_director_titles = {title} if has_unit_marks(environment) else _NO_NEW_UNIT_DIRECTOR_TITLES
+                unit_director_titles = {label} if has_unit_marks(environment) else _NO_NEW_UNIT_DIRECTOR_TITLES
                 pane = self.order_tabs(workspace, saved, unit_director_titles).get(pane, pane)
             self.save_layout()
             return pane
@@ -1140,11 +1165,13 @@ class Herdr:
             self.result("workspace", "list").get("workspaces"), "herdr workspace list")]
         tabs = [json_object(item, "herdr tab") for item in json_items(
             self.result("tab", "list").get("tabs"), "herdr tab list")]
+        panes = [json_object(item, "herdr pane") for item in json_items(
+            self.result("pane", "list").get("panes"), "herdr pane list")]
         spaces: list[_LiveSpace] = []
         for workspace in workspaces:
             ident = json_text(workspace.get("workspace_id"), "herdr workspace id")
             label = workspace.get("label")
-            titles = [json_text(tab.get("label"), "herdr tab label") for tab in tabs if tab.get("workspace_id") == ident]
+            titles = [_tab_identity(tab, panes) for tab in tabs if tab.get("workspace_id") == ident]
             if isinstance(label, str) and label:
                 spaces.append(_LiveSpace(ident, label, titles))
         return spaces
@@ -1170,11 +1197,12 @@ class Herdr:
                               encoding="utf-8")
         _ = staged.replace(path)
 
-    def retitle(self, pane: str, title: str) -> bool:
-        """Give the pane and its tab the name `title`, then order the workspace's tabs again.
+    def retitle(self, pane: str, title: str, *, label: str = "") -> bool:
+        """Keep the pane's identity separate from its shown tab title.
 
         False when both already carry it, after two reads and no change.
         """
+        label = label or title
         rows = [json_object(item, "herdr pane") for item in json_items(
             self.result("pane", "list").get("panes"), "herdr pane list")]
         row = next((row for row in rows if row.get("pane_id") == pane), None)
@@ -1185,15 +1213,15 @@ class Herdr:
         tabs = [json_object(item, "herdr tab") for item in json_items(
             self.result("tab", "list", "--workspace", workspace).get("tabs"), "herdr tab list")]
         shown = next((item.get("label") for item in tabs if item.get("tab_id") == tab), None)
-        if shown == title and row.get("label") == title:
+        if shown == title and row.get("label") == label:
             return False
-        if row.get("label") != title:
-            _ = self.run("pane", "rename", pane, title)
+        if row.get("label") != label:
+            _ = self.run("pane", "rename", pane, label)
         if shown != title:
             _ = self.run("tab", "rename", tab, title)
-            with _LayoutLock(self.session):
-                _ = self.order_tabs(workspace, saved_layout(self.session))
-                self.save_layout()
+        with _LayoutLock(self.session):
+            _ = self.order_tabs(workspace, saved_layout(self.session))
+            self.save_layout()
         return True
 
     def order_tabs(self, workspace: str, saved: SavedLayout,
@@ -1221,9 +1249,10 @@ class Herdr:
             panes_of.setdefault(tab, []).append(json_text(row.get("pane_id"), "herdr pane id"))
         unit_panes = unit_director_panes(self.session, herdr_processes())
         unit_director_titles = new_unit_director_titles | {
-            json_text(tab.get("label"), "herdr tab label") for tab in tabs
+            _tab_identity(tab, rows) for tab in tabs
             if any(pane in unit_panes for pane in panes_of.get(json_text(tab.get("tab_id"), "herdr tab id"), []))}
-        titles = [json_text(tab.get("label"), "herdr tab label") for tab in tabs]
+        display_titles = [json_text(tab.get("label"), "herdr tab label") for tab in tabs]
+        titles = [_tab_identity(tab, rows) for tab in tabs]
         unsaved: list[SavedName] = []
         kept = next((space["tabs"] for space in saved["workspaces"] if space["name"] == name), unsaved)
         order = tab_order(name if isinstance(name, str) else "", titles, kept, unit_director_titles)
@@ -1241,7 +1270,7 @@ class Herdr:
                                  .get("move_result"), "herdr pane move")
             created = json_text(json_object(result.get("created_tab"), "herdr moved tab").get("tab_id"), "herdr tab id")
             moved[pane] = json_text(json_object(result.get("pane"), "herdr moved pane").get("pane_id"), "herdr pane id")
-            _ = self.run("tab", "rename", created, titles[index])
+            _ = self.run("tab", "rename", created, display_titles[index])
             if tab == active:
                 active_tab = created
         if isinstance(active_tab, str):
@@ -2223,8 +2252,8 @@ def _require_shared(name: str) -> None:
                            + f"{shared}; open a tab there instead of starting another session")
 
 
-def open_tab(name: str, space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
-    return Herdr(name).open_tab(space, title, cwd, environment)
+def open_tab(name: str, space: str, title: str, cwd: str, environment: dict[str, str], *, label: str = "") -> str:
+    return Herdr(name).open_tab(space, title, cwd, environment, label=label)
 
 
 def save_shared_layout(running: set[str]) -> None:
@@ -3002,7 +3031,7 @@ class PreparedAgentEnvironment:
 
 def launch_agent(name: str, space: str, title: str, cwd: str, environment: dict[str, str],
                  kind: str, agent_arguments: list[str], opening: OpeningPrompt | NoOpeningPrompt,
-                 timeout_ms: int, *, agent: str, unset_environment: frozenset[str] = NO_ENVIRONMENT_REMOVALS) -> AgentLaunched | nix_env.Refused:
+                 timeout_ms: int, *, agent: str, label: str = "", unset_environment: frozenset[str] = NO_ENVIRONMENT_REMOVALS) -> AgentLaunched | nix_env.Refused:
     """Prove the start environment before creating a pane or starting an agent.
 
     herdr owns the executable selected by --kind. The pane carries the loaded
@@ -3020,7 +3049,8 @@ def launch_agent(name: str, space: str, title: str, cwd: str, environment: dict[
         prepared = prepare_agent_environment(cwd, environment, unset_environment)
     if isinstance(prepared, nix_env.Refused):
         return prepared
-    return launch_prepared_agent(name, space, title, prepared, kind, agent_arguments, opening, timeout_ms, agent=agent)
+    return launch_prepared_agent(name, space, title, prepared, kind, agent_arguments, opening, timeout_ms,
+                                 agent=agent, label=label)
 
 
 def agent_base_environment(environment: dict[str, str], unset_environment: frozenset[str]) -> dict[str, str]:
@@ -3064,10 +3094,10 @@ def prepare_session_environment(session_id: str, cwd: str, environment: dict[str
 
 def launch_prepared_agent(name: str, space: str, title: str, prepared: PreparedAgentEnvironment,
                           kind: str, agent_arguments: list[str], opening: OpeningPrompt | NoOpeningPrompt,
-                          timeout_ms: int, *, agent: str) -> AgentLaunched:
+                          timeout_ms: int, *, agent: str, label: str = "") -> AgentLaunched:
     """Launch an already proved environment without another potentially slow load."""
     _check_agent_arguments(kind, agent_arguments)
-    pane = open_tab(name, space, title, str(prepared.directory), prepared.env)
+    pane = open_tab(name, space, title, str(prepared.directory), prepared.env, label=label)
     try:
         outcome = start_agent(name, pane, kind, agent_arguments, opening, timeout_ms, agent=agent)
     except (HerdrFailure, OSError, subprocess.SubprocessError):

@@ -22,7 +22,10 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import send
+from scripts.lib import names
+from scripts.lib.test_names import fixture_names
 import rca
 import review
 import push_texts
@@ -158,6 +161,7 @@ class SendTests(ShutdownTestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(mock.patch.object(names, "load_names", return_value=fixture_names()))
         super().setUp()
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -327,14 +331,39 @@ class SendTests(ShutdownTestCase):
             session=roster.ClaudeSession("sender"),
         )
 
+    def test_name_config_rename_changes_new_senders_but_keeps_queued_and_forwarded_display(self) -> None:
+        options = local_options(["--to", "session:absent", "--from", "sender-address", "--text", "before rename"])
+        with mock.patch.object(roster, "roster", return_value=roster.Roster([self.sender_entry()], [])):
+            self.assertEqual(send.send(options).outcome, "queued")
+            with mock.patch.object(names, "runtime_names", return_value=fixture_names(worker="builder")):
+                newer = local_options(["--to", "session:absent", "--from", "sender-address", "--text", "after rename"])
+                self.assertEqual(send.send(newer).outcome, "queued")
+        queued = send.read_queue(send.queue_for("session:absent"))
+        self.assertEqual([row.get("shown_sender") for row in queued],
+                         ["sdlc · roles · worker test", "sdlc · roles · builder test"])
+        self.assertEqual([row["from"] for row in queued], ["sender-address", "sender-address"])
+        self.session("absent", "Returned recipient")
+        with mock.patch.object(names, "runtime_names", side_effect=AssertionError("replay must keep the captured display")):
+            replay = send.pending("session:absent")
+        self.assertIn("Shown sender: sdlc · roles · worker test", replay)
+        self.assertIn("Shown sender: sdlc · roles · builder test", replay)
+        received = send.parse(["--here", "--to", "codex:remote-thread", "--from", "sender-address",
+                               "--forwarded-shown-sender", "sdlc · roles · worker test", "--summary", "Preview", "--text", "body"])
+        with mock.patch.object(names, "runtime_names", side_effect=AssertionError("receiver must not apply its names")), \
+                mock.patch.object(codex_daemon, "queue", return_value=codex_daemon.Queued()) as queue:
+            self.assertEqual(send.send(received).outcome, "sent")
+        queue.assert_called_once_with("remote-thread", "body\nShown sender: sdlc · roles · worker test", timeout=send.TIMEOUT)
+
     def test_queued_sender_display_survives_roster_changes_and_legacy_records_use_raw_sender(self) -> None:
+        queued_at = datetime(2026, 10, 20, tzinfo=timezone.utc)
         with mock.patch.object(roster, "roster", return_value=roster.Roster([self.sender_entry()], [])) as read_roster:
             for keyed in (False, True):
                 options = local_options([
                     "--to", "session:absent", "--from", "sender-address", "--text", "Preview\nbody",
                     *(["--key", "message-key"] if keyed else []),
                 ])
-                self.assertEqual(send.send(options).outcome, "queued")
+                with mock.patch.object(send, "now", return_value=queued_at + timedelta(seconds=int(keyed))):
+                    self.assertEqual(send.send(options).outcome, "queued")
             self.assertEqual(read_roster.call_count, 2)
         path = send.queue_for("session:absent")
         queued = send.read_queue(path)
@@ -349,8 +378,8 @@ class SendTests(ShutdownTestCase):
         with mock.patch.object(roster, "roster", side_effect=AssertionError("replay must not resolve the sender")):
             replay = send.pending("session:absent")
         self.assertEqual(replay.count("Shown sender: sdlc · roles · worker test"), 2)
-        self.assertIn("from sender-address at ", replay)
-        self.assertTrue(replay.endswith(":\nlegacy body"))
+        self.assertRegex(replay, r"(?:\A|\n\n)Queued message \d+ of 3, from sender-address at "
+                         + r"[^\n]+:\nlegacy body(?:\n\n|\Z)")
         self.assertEqual([entry["from"] for entry in self.log()], ["sender-address", "sender-address"])
 
     def test_mesh_and_daemon_payloads_show_sender_without_changing_address_thread_or_log(self) -> None:
@@ -1115,6 +1144,8 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             + "import sys\n"
             + f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
             + "import roster, send\n"
+            + "from scripts.lib import names\nfrom scripts.lib.test_names import fixture_names\n"
+            + "names.load_names = lambda: fixture_names()\n"
             + "roster.roster = lambda environment, scope: roster.Roster([], [])\n"
             + "roster.peer_roster = lambda environment: roster.Roster([], [])\n"
             + "raise SystemExit(send.main(sys.argv[1:]))\n",

@@ -925,6 +925,20 @@ All other aliases and related terms stay proposed under the N-A treatment table,
 
 After each approved numbered phase, run `~/.claude/scripts/lib/py scripts/production/roles_audit.py baseline`. Record its term-set version, file set, count and window beside the before result. Keep any contact comparison on one fixed window. Run the new source-only check through the unit's tests-only gate after its policy is approved. A step is complete only when its stated measure moves and the functional checks pass. Source-only tests must not read real home-state records or send messages.
 
+## Name config
+
+`config/names.toml` holds changeable display names. Each stable key has one ordered list. The first name is current. Later names are retired. Put a new name first and keep the earlier names. This one edit changes future displays and adds every earlier name to the source check. Captured shown senders keep their original text on replay and remote delivery.
+
+The `jobs` group uses `JobKey`: `showrunner`, `unit_director`, `worker`, `code_reviewer`, `ui_reviewer`, `designer`, `design_reviewer`. The `audiences` group holds broadcast labels: `showrunners`, `unit_directors`, `agents`, `workers`, `top_level`, `all_roles`. These are display keys. Organizational roles, worker assignments, session names and routing addresses keep their existing values.
+
+`scripts/lib/names.py` provides `load_names(path)`. It returns `Names` or an explicit error: `UnknownKey`, `MissingKey`, `MissingDisplayName`, `DuplicateDisplayName`, `UnreadableNames`, or `InvalidNames`. `Names.job` and `Names.audience` take their group's typed key. `Names.retired()` returns all earlier names. A renderer reports a config error once on stderr and uses the address instead of inventing a job name. Fixtures supply a config path or replace the loader; they do not read the live config to render a fixture.
+
+Herdr keeps two separate values. The tab title is the shown name. The pane label is the session name. Unit launch and restart pass both. Lookup, saved layout, tab order and attach hints use pane labels. Moving a tab keeps its display title. A config edit does not retitle a live tab; launch or restart sets its next title.
+
+The fixed-display check rejects labels in script output: a whole printed literal that equals a display name, or a complete job or status column in a shown name. Embedded job segments such as `f"{unit} · unit director"` count. Role words inside help, error and report sentences do not fail this check. Each run prints their count. `--prose` lists each as `<path>:<line>: '<name>'`. The classification keeps labels and sentence uses as separate types. Stored keys, including account group keys, are not hits.
+
+Prose is covered by the retired-name check. A changed display name joins the retired list by itself. A rename has two steps: change `config/names.toml`, then fix the lines the retired-name check lists in docs and script output. Captured sender text and stored keys keep their recorded values. Guild heads are out of scope, as directed by the showrunner on 2026-10-28. No head table or type is added. Guild ownership remains in `config/guilds.conf`.
+
 ## Role record
 
 R1b and R5b, built in phase 5. A session's name and its role are separate. Every roster record carries its role in its own fields, apart from its name. Each shown name has the form production · unit · job. The address does not change.
@@ -953,7 +967,9 @@ An Astra held role keeps its own assignment state; it is not a worker assignment
 
 **Where it shows.** Codex thread titles (set again at each turn, so a lease move or role change shows at the next turn), the roster's own output, broadcast recipient lines and the sender a reader sees. A broadcast recipient line reads `<shown name> [<address>] - <outcome>`; the address shows only when it differs from the shown name, and there is no separate role column. `send.py` reads the shown sender once, on the sending machine, from the same roster read that finds the recipient. Relay, Codex and daemon deliveries then carry a `Shown sender: <name>` line after the first line of the body. A user push does not change. Cost: a send to a socket or a named machine reads the roster once more, about 1 s (319 entries). `roster.py --json` adds the shown name and keeps every existing field and value. Addresses, `--to` and `--from` values, sockets, thread ids and the stored fields `seat` and `codex_seats` stay as they are.
 
-**Column owners.** The unit board's owner and cargo-liner show the session name and the shown job as two columns. They read both from `roster.py --json`. Sending them this definition does not count as their change landing.
+**Job field and column owners.** `roster.py --json` adds `job` beside every existing field. An assigned job is `{"state":"assigned","key":"unit_director","display":"unit director","qualifier":""}`. An unassigned job is `{"state":"unassigned","reason":"assignment not recorded: <record>"}` or carries the unreadable record and its error. The human table shows this reason instead of the legacy slot label. The job key is a `JobKey`; organizational role and worker assignment remain separate.
+
+The unit board's owner and cargo-liner must show session identity and job in separate columns. Each reads `job.display` when assigned. Each leaves the job cell empty and shows `job.reason` when unassigned. Their acceptance test changes one fixture display name, checks the new job column, keeps the session identity, and checks the unreadable/unrecorded reason. Landing evidence: pending for the unit board; pending for cargo-liner. Sending this definition does not count as either change landing.
 
 ## Next steps
 
@@ -1242,3 +1258,7 @@ The check now selects candidate files before full extraction, splits each Python
 | `python3 -m unittest discover -s scripts/production -p 'test_roles_audit.py'` (31 tests) | not measured alone (about 38 s for the check inside it) | 4.1 s, 22.7; 8.4 s, 38–44 | 1.68 s, 1.50 s, 1.69 s at 67 |
 
 Times depend on load. With candidate selection only, one suite run took 8.4 s at load 38–44, so the review asked for more margin. With 8 processes, runs at load 87–102 took 2.5–4.4 s for the check and 3.7–5.6 s for the suite. The merge gate cost is measured in real gates later.
+
+### Phase 6 extraction change
+
+Shell output extraction now includes `cat >&2 <<EOF` bodies and keeps their physical source lines. Non-output heredocs remain excluded. This extends the extractor; it does not change the frozen Phase 3 lexical measure or earn rename count credit.

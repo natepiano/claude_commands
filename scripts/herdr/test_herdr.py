@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from scripts.lib import names
+from scripts.lib.test_names import fixture_names
+
 import json
 import io
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
@@ -2051,9 +2054,10 @@ class HerdrTests(unittest.TestCase):
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
             {"pane_id": "w1:p1", "tab_id": "w1:t1"}, {"pane_id": "w1:p2", "tab_id": "w1:t2"}]}}))
         self.assertEqual(herdr.open_tab("fixture", "boss", "alpha", "/wt", {}), "w1:p2")
-        self.assertEqual([command[2:] for command in self.commands()[-8:]], [
+        self.assertEqual([command[2:] for command in self.commands()[-9:]], [
             tab, ["pane", "rename", "w1:p2", "alpha"], ["tab", "list", "--workspace", "w1"], ["workspace", "list"],
-            ["tab", "list", "--workspace", "w1"], ["pane", "list"], ["workspace", "list"], ["tab", "list"]])
+            ["tab", "list", "--workspace", "w1"], ["pane", "list"], ["workspace", "list"], ["tab", "list"],
+            ["pane", "list"]])
         saved = herdr.saved_layout("fixture")
         self.assertEqual([(space["name"], [tab["name"] for tab in space["tabs"]]) for space in saved["workspaces"]],
                          [("boss", ["boss", "alpha"])])
@@ -3434,6 +3438,27 @@ class LayoutHerdr(herdr.Herdr):
         return "{}"
 
 
+class TitledLayoutHerdr(LayoutHerdr):
+    """Model distinct tab titles and pane labels through the real layout code."""
+
+    @override
+    def result(self, *arguments: str) -> dict[str, object]:
+        if arguments[:2] == ("agent", "list"):
+            return {"agents": []}
+        if arguments[:2] == ("pane", "list"):
+            return {"panes": [{"pane_id": tab["pane_id"], "tab_id": tab["tab_id"],
+                               "workspace_id": tab["workspace_id"],
+                               "label": tab.get("pane_label", tab["label"])} for tab in self.tabs]}
+        return super().result(*arguments)
+
+    @override
+    def run(self, *arguments: str) -> str:
+        if arguments[:2] == ("pane", "rename"):
+            next(tab for tab in self.tabs if tab["pane_id"] == arguments[2])["pane_label"] = arguments[3]
+            return "{}"
+        return super().run(*arguments)
+
+
 @final
 class SavedLayoutTests(unittest.TestCase):
     """A restart puts every session back in its saved workspace and tab, in the saved order (user, 2026-10-21)."""
@@ -3465,6 +3490,32 @@ class SavedLayoutTests(unittest.TestCase):
             for title in titles:
                 _ = client.open_tab(space, title, "/repo", {})
         return client
+
+    def test_display_rename_restores_saved_tab_order_and_resolves_each_pane_by_key(self) -> None:
+        from scripts.message import roster
+
+        def title(key: str) -> str:
+            return roster.ShownName(roster.ProductionPart("sdlc"), roster.UnitPart(key + "-unit"),
+                                    roster.ShownJob("unit_director", roster.Unqualified()), key).render()
+
+        old = TitledLayoutHerdr()
+        with patch.object(names, "runtime_names", return_value=fixture_names()):
+            for key in ("sdlc", "zulu", "alpha"):
+                _ = old.open_tab("sdlc", title(key), "/repo", {}, label=key)
+        order = [tab["pane_label"] for tab in old.tabs]
+        self.assertEqual([tab["name"] for tab in herdr.saved_layout("fixture")["workspaces"][0]["tabs"]], order)
+        fresh = TitledLayoutHerdr()
+        with patch.object(names, "runtime_names", return_value=fixture_names(director="coordinator")):
+            for key in reversed(order):
+                _ = fresh.open_tab("sdlc", title(key), "/repo", {}, label=key)
+        self.assertEqual([tab["pane_label"] for tab in fresh.tabs], order)
+        for tab in fresh.tabs:
+            key = tab["pane_label"]
+            self.assertEqual(fresh.lookup(key), herdr.PaneFound(tab["pane_id"]))
+            self.assertIsInstance(fresh.lookup(tab["label"]), herdr.NoPane)
+            self.assertIn("coordinator", tab["label"])
+            self.assertTrue(herdr.attach_hint("sdlc", key).endswith("tab " + key))
+        self.assertEqual([tab["name"] for tab in herdr.saved_layout("fixture")["workspaces"][0]["tabs"]], order)
 
     def test_a_reboot_restart_in_any_order_brings_back_every_workspace_and_tab_in_place(self) -> None:
         self.assertEqual(self.running().layout(), self.BEFORE)

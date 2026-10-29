@@ -36,6 +36,8 @@ import herdr  # noqa: E402
 import codex_daemon  # noqa: E402
 import process_table  # noqa: E402
 from scripts.guilds import roles  # noqa: E402
+from scripts.lib import names  # noqa: E402
+from scripts.lib.names import JobKey  # noqa: E402
 if TYPE_CHECKING:
     from ..accounts.role_map import role_map_command
     from ..whoami import account, agent_accounts, note_file
@@ -249,9 +251,6 @@ class RosterEntry:
     account: AccountAttribution = AccountUnread("not read")
 
 
-Job = Literal["showrunner", "unit director", "worker", "code reviewer", "UI reviewer", "designer", "design reviewer"]
-
-
 @dataclass(frozen=True)
 class JobNumber:
     number: int
@@ -272,7 +271,7 @@ JobQualifier = JobNumber | JobSlot | Unqualified
 
 @dataclass(frozen=True)
 class ShownJob:
-    job: Job
+    job: JobKey
     qualifier: JobQualifier
 
 
@@ -315,7 +314,10 @@ class ShownName:
         if isinstance(self.unit, UnitPart) and self.unit.unit:
             parts.append(self.unit.unit.removesuffix("-unit"))
         if isinstance(self.job, ShownJob):
-            label = self.job.job
+            loaded = names.runtime_names()
+            if not isinstance(loaded, names.Names):
+                return self.address
+            label = loaded.job(self.job.job)
             qualifier = self.job.qualifier
             if isinstance(qualifier, JobNumber):
                 label += f" {qualifier.number}"
@@ -332,23 +334,24 @@ def shown_name(entry: RosterEntry) -> ShownName:
         job = ShownJob("showrunner", Unqualified())
         unit = ""
     elif entry.role == "unit director":
-        job = ShownJob("unit director", Unqualified())
+        job = ShownJob("unit_director", Unqualified())
     elif entry.role in ("astra-designer", "astra-reviewer"):
-        job = ShownJob("designer" if entry.role == "astra-designer" else "design reviewer", Unqualified())
+        job = ShownJob("designer" if entry.role == "astra-designer" else "design_reviewer", Unqualified())
     elif entry.role == "worker" and isinstance(entry.assignment, WorkerAssignment):
         assignment = entry.assignment
+        record = str(Path(assignment.session_dir) / ("mesh_roster.json" if entry.kind == "codex" else "board.log")) if assignment.session_dir else entry.name
         if isinstance(assignment.role, AssignmentUnrecorded):
-            job = JobUnassigned("assignment unrecorded")
+            job = JobUnassigned(f"assignment not recorded: {record}")
         elif isinstance(assignment.role, AssignmentUnreadable):
-            job = JobUnassigned(f"assignment unreadable: {assignment.role.value}")
+            job = JobUnassigned(f"assignment record not readable: {record}: {assignment.role.value}")
         else:
             slot = assignment.slot
             pool = re.fullmatch(r"(code|ui)([0-9]+)", slot)
             if assignment.role == "review" and pool:
-                job = ShownJob("UI reviewer" if assignment.reviewer_type == "ui" else "code reviewer",
+                job = ShownJob("ui_reviewer" if assignment.reviewer_type == "ui" else "code_reviewer",
                                JobNumber(int(pool[2])))
             else:
-                job = ShownJob("code reviewer" if assignment.role == "review" else "worker",
+                job = ShownJob("code_reviewer" if assignment.role == "review" else "worker",
                                JobSlot(slot) if slot else Unqualified())
     address = _address(entry) or _session_address(entry)
     return ShownName(ProductionPart(production) if production else NoProduction(),
@@ -638,6 +641,19 @@ class SerializedRosterEntry(TypedDict):
     session_dir: str
     thread: str | None
     shown_name: str
+    job: dict[str, str]
+
+
+def serialized_job(job: ShownJob | JobUnassigned) -> dict[str, str]:
+    if isinstance(job, JobUnassigned):
+        return {"state": "unassigned", "reason": job.reason}
+    loaded = names.runtime_names()
+    if not isinstance(loaded, names.Names):
+        return {"state": "unassigned", "reason": names.error_text(loaded)}
+    qualifier = job.qualifier
+    text = (str(qualifier.number) if isinstance(qualifier, JobNumber)
+            else qualifier.slot if isinstance(qualifier, JobSlot) else "")
+    return {"state": "assigned", "key": job.job, "display": loaded.job(job.job), "qualifier": text}
 
 
 def _serialized_entry(entry: RosterEntry) -> SerializedRosterEntry:
@@ -660,6 +676,7 @@ def _serialized_entry(entry: RosterEntry) -> SerializedRosterEntry:
         "session_dir": _session_dir(entry),
         "thread": entry.thread.thread_id if isinstance(entry.thread, CodexThread) else None,
         "shown_name": shown_name(entry).render(),
+        "job": serialized_job(shown_name(entry).job),
     }
 
 
@@ -1775,14 +1792,16 @@ def _home_shortened(path: str) -> str:
 
 
 def _entry_line(entry: RosterEntry, *, you: bool, context: bool) -> str:
-    name = f"{shown_name(entry).render()} [{shown_name(entry).address}]"
+    shown = shown_name(entry)
+    rendered = shown.render()
+    name = f"{rendered} [{shown.address}]" if rendered != shown.address else rendered
     if you:
         name += " (you)"
     if context:
         name += " (context)"
     details = [entry.kind, entry.status]
-    if entry.role == "worker":
-        details.append(_slot_role_for(entry))
+    if isinstance(shown.job, JobUnassigned):
+        details.append(shown.job.reason)
     unit = _unit(entry)
     if unit:
         details.append(unit)

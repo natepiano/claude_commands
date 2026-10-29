@@ -906,8 +906,9 @@ def launch_session(
     host = herdr.shared_session()
     _ = herdr.start_server(host, timeout_ms)
     production = request.production
+    title = herdr.session_title(session_name, production.slug, request.identity.unit)
     launched = herdr.launch_agent(host, showrunners.herdr_space(production.slug, str(production.doc)),
-        session_name, str(request.session_cwd), environment, kind="claude", agent=host_session_name(request),
+        title, str(request.session_cwd), environment, kind="claude", agent=host_session_name(request), label=session_name,
         agent_arguments=arguments, opening=herdr.OpeningPrompt(prompt, herdr.SessionTranscript(selected.dir, session_id)),
         timeout_ms=timeout_ms)
     if isinstance(launched, herdr.nix_env.Refused):

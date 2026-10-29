@@ -1,6 +1,9 @@
 """Prove group membership, sender identity, and one concurrent delivery per address."""
 from __future__ import annotations
 
+from scripts.lib import names
+from scripts.lib.test_names import fixture_names
+
 import io
 import json
 import os
@@ -68,6 +71,7 @@ class BroadcastTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(patch.object(names, "load_names", return_value=fixture_names()))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = (self.root / "send.py").write_text(SEND_STUB, encoding="utf-8")
         _ = (self.root / "ps").write_text("", encoding="utf-8")
@@ -90,6 +94,8 @@ class BroadcastTests(unittest.TestCase):
             + "os.environ['LOG'] = os.environ['PEER_LOG']; os.environ['TOGETHER'] = '1'\n"
             + f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
             + "import broadcast, roster\n"
+            + "from scripts.lib import names\nfrom scripts.lib.test_names import fixture_names\n"
+            + "names.load_names = lambda: fixture_names()\n"
             + "broadcast.SEND = Path(os.environ.get('BROADCAST_SEND') or os.environ['SAFE_PEER_SEND'])\n"
             + "roster.machine_name = lambda: 'mac'\n"
             + "roster.roster = lambda environment, scope: roster.RosterSnapshot.decode(os.environ['SSH_SNAPSHOT']).result\n"
@@ -191,6 +197,24 @@ class BroadcastTests(unittest.TestCase):
             self.assertIn("showrunner", text)
             self.assertIn("unit director", text)
             self.assertIn("agent", text)
+
+    def test_configured_director_display_changes_report_without_changing_recipients(self) -> None:
+        with patch.object(names, "runtime_names", return_value=fixture_names(director="coordinator")):
+            result, output, errors = self.run_main("--units", "fixture update")
+        self.assertEqual((result, errors), (0, ""), output)
+        self.assertIn("show · trunk · coordinator [session:id-trunk] - sent", output)
+        self.assertEqual(set(self.sent_texts()), {"session:id-trunk"})
+        self.assertEqual(self.rows[2].role, "unit director")
+
+    def test_audience_display_rename_changes_empty_report_without_changing_selection(self) -> None:
+        self.rows = []
+        original = fixture_names()
+        configured = names.Names(original.jobs, {**original.audiences, "showrunners": ("production leads", "showrunners")})
+        with patch.object(names, "runtime_names", return_value=configured):
+            result, output, errors = self.run_main("--showrunners", "fixture update")
+        self.assertEqual((result, errors), (0, ""), output)
+        self.assertIn("production leads - none on this machine", output)
+        self.assertEqual(self.sent_texts(), {})
 
     def test_report_shows_each_job_and_address_once(self) -> None:
         result, output, errors = self.run_main("--all", "stop")

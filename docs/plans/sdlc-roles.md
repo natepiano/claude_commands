@@ -177,7 +177,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Ruled out:** a second lexical baseline run — the file set is not the same after the role and names changes.
 
-### Phase 6 — Names that can change live in one config file  · status: todo
+### Phase 6 — Names that can change live in one config file  · status: done
 **Depends on:** Phase 5
 
 #### Work Order
@@ -221,7 +221,44 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Acceptance gate:** the gates in Delegation Context green, with `python3 -m unittest discover -s scripts/message -p 'test_*.py'` and the tests of each tab title writer; a one-line display-name edit in a fixture config changes every printed place and nothing else; two successive renames retire both earlier names; the check fails on a planted fixed display name, in a stderr heredoc too; after a rename, restart finds each pane by its key and keeps the tab order; `roster.py` on the live tree shows a missing job's reason, and `roster.py --json` carries the job field (smoke: `python3 ~/.claude/scripts/message/roster.py` and `--json` on natedev).
 
-### Phase 7 — The retired-name baseline reads at a glance  · status: todo
+### Phase 7 — Each unit director owns its reviewers  · status: todo
+**Depends on:** Phase 6, and models-unit's worker-seats Phase 7 (`assign.sh`) on main; the showrunner says when. Start no code before that message.
+
+#### Work Order
+
+**Goal:** a unit director owns its code reviewers as it owns its writers, testers and fixers. It resumes the same reviewers across phases and plans, so their context builds up. The review pool is gone.
+
+**Spec:**
+- Decided by the user (2026-10-28, through the showrunner): "unit directors own their own reviews just as they have their own implementers and testers and fixers and they should restart sessions rather than start new ones so context builds up"; the pool "feels unnecessarily complex"; the roles unit director owns the retirement.
+- Reviewers are ordinary unit workers in the unit worker ledger (worker-seats Phase 4), role `review`: addresses `<worktree>-review` and `<worktree>-review2`. `assign.sh --role review` resumes `review`; when `review` is busy (the two lenses of one review run at once), `workers.py resolve` gives `review2`. They are read-only and persist, pause, move and end exactly as writers do (`docs/as-built/long-lived-workers.md`). Never a fresh reviewer while its thread exists.
+- Context carries over (unit director's call): a one-time step makes each unit's leased pool code reviewer (`~/.local/state/review-pool/<slug>/pool.json`) its `review` worker on the same thread. A unit with no leased reviewer opens `review` at its next review. A reviewer still reviewing is not moved; a rerun moves it. A rerun after the move changes nothing.
+- Standing instructions: `config/review_pool/code.md` moves to `config/review/code.md`. Every review prompt carries one line that names that file; the reviewer reads it at its first review and again when the file changes (`<ReviewPromptContract/>` keeps its standing-instructions line).
+- Remove: `scripts/direct/review_pool.py`, `test_review_pool.py`, `review_pool_report.py` and its test; the pool paths in `review.sh` (`--pool` and `--lease` are accepted and ignored for one release: one stderr line, then the unit's own `review` worker takes the review); the pool code in `rename.py`, `rename_unit.py`, `retire_unit.py`, `transfer_unit.py`, `restart.py`; the pool reviewer rows and `worker:review-pool/...` addresses in `roster.py` and `send.py` (phase 5); the `**Review pool:**` lines in the production docs; `docs/production_format.md` rule 16 (later rules renumbered, with every reference); the pool text in `commands/unit/direct.md`, `docs/direct/dual_review.md`, `commands/showrunner/produce.md`. `scripts/feature_log/inventory.py --pool` is a different thing and stays.
+- UI design checks (unit director's call): no `ui_adopted` marker exists, so the UI pool only ran in shadow. Its shadow trial ends; the fresh Claude helper, which already governs, stays the one design check. `config/review_pool/ui.md` is removed.
+- `progress_history.py` keeps reading old review records that carry `arm: pool`; new records write `own`.
+- Pool state on disk: after the one-time step, `~/.local/state/review-pool/` stays as an archive for one release and nothing reads it; the step prints its path. The production reviewer app-servers end when no reviewer uses them.
+- `role_terms.toml` gains `review pool` as a retired term, so the retired-name check lists every doc and script that still says it.
+- Docs match: `docs/as-built/review-pool.md` and `review-pool-probes.md` are removed; `long-lived-workers.md` gains the reviewer rows; every other as-built that names the pool (Files at phase start list each) says what is true now.
+
+**Files:**
+- `scripts/direct/review.sh` — pool paths removed; `--pool`/`--lease` accepted and ignored
+- `scripts/direct/assign.sh`, `scripts/direct/workers.py` — the `review`/`review2` resolve and the one-time reviewer step (models-unit dropped worker-seats Phase 8, its Phase 12 import-pool call and its Phase 15 `review_pool.py` removal, 2026-10-29: all reviewer work is in this phase)
+- `scripts/direct/review_pool.py`, `scripts/direct/test_review_pool.py`, `scripts/direct/review_pool_report.py`, `scripts/direct/test_review_pool_report.py` — removed
+- `scripts/production/rename.py`, `scripts/production/rename_unit.py`, `scripts/production/retire_unit.py`, `scripts/production/transfer_unit.py`, `scripts/shutdown/restart.py` — pool code removed
+- `scripts/message/roster.py`, `scripts/message/send.py` — pool reviewer rows and addresses removed
+- `scripts/production/role_terms.toml` — `review pool` retired
+- `config/review/code.md` — moved from `config/review_pool/code.md`; `config/review_pool/ui.md` removed
+- `docs/production_format.md`, `commands/unit/direct.md`, `docs/direct/dual_review.md`, `commands/showrunner/produce.md`, `docs/plans/sdlc-production.md`, `docs/plans/build-followups-production.md` — pool text and Review pool lines
+- `docs/as-built/review-pool.md`, `docs/as-built/review-pool-probes.md` — removed; `docs/as-built/long-lived-workers.md` and each other as-built that names the pool
+- `scripts/direct/test_review_launcher.py`, `scripts/direct/test_workers.py`, `scripts/production/test_retire_unit.py`, `scripts/production/test_transfer_unit.py`, `scripts/production/test_stall_watch.py`, `scripts/production/test_add_unit.py`, `scripts/message/test_roster.py`, `scripts/message/test_send.py` — pool cases removed, reviewer cases added
+
+**Workers:** `1 writer + 1 tester`. `impl` holds the scripts, config and docs above; `test` holds the test files. Files owned by build-followups units (`review.sh`, `assign.sh`, `workers.py`, `codex_mesh.py`, `docs/production_format.md`, the commands) go on the checkpoint notice's also-touches lines, trial-merged against each owner's tip.
+
+**Constraints from prior phases:** phase 5 role record: `Job` keeps `code reviewer`; a reviewer's shown name is `<production> · <unit> · code reviewer[ N]`. Phase 6 names config: the reviewer's shown job reads `config/names.toml`. Worker-seats Phase 7: `assign.sh` options, exit codes, the address and shown name kept apart.
+
+**Acceptance gate:** the gates in Delegation Context green, with the direct, production and message suites; `rg -n 'review_pool|review-pool|--pool code|Review pool' scripts commands docs config` lists only the retirement note, the archive path and `feature_log --pool`; the retired-name check exit 0. Live check: this unit's next review runs on its own `review` and `review2` workers, and the review after it resumes the same threads (same thread ids in the roster).
+
+### Phase 8 — The retired-name baseline reads at a glance  · status: todo
 **Depends on:** Phase 6
 
 #### Work Order
@@ -244,8 +281,8 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Acceptance gate:** the gates in Delegation Context green; the baseline on the live tree prints the summary first, in plain words.
 
-### Phase 8 — Measure the first step and propose the next  · status: todo
-**Depends on:** Phase 5 (it needs only the Phase 3 merge window, so it may run beside Phases 6 and 7)
+### Phase 9 — Measure the first step and propose the next  · status: todo
+**Depends on:** Phase 5 (it needs only the Phase 3 merge window, so it may run beside Phases 6, 7 and 8)
 
 #### Work Order
 
@@ -255,7 +292,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 - The lexical after measure is done: the Step log's Phase 3 after measure (n=596 live files) reads 15 singular and 7 plural kept uses, 0 eligible. On the comparable merged set the reduction is 104 to 22 (n=82); this supersedes the earlier expected reduction of n=66. Do not mix the n=563 and n=596 snapshots.
 - The windowed measure names the merge timestamp of f8f5b962 into sdlc and a complete observation interval of at least 3 days after it. Sent-contact counts are descriptive and have no Step 1 reduction target. Keep unknown roles unknown: a current role record gives no historical roles or request intent, so never infer a role from a shown name.
 - Add the merge-gate cost of the retired-name check (Phase 4 budget) as measured in real gates over the window.
-- Do not run the lexical baseline again: the recorded 104-to-22 reduction (n=82) is the lexical result, and a new run on the current tree has no same file set, because Phases 5–7 change sources, config and output. The lexical half-size decision is closed by that result.
+- Do not run the lexical baseline again: the recorded 104-to-22 reduction (n=82) is the lexical result, and a new run on the current tree has no same file set, because Phases 5–8 change sources, config and output. The lexical half-size decision is closed by that result.
 - For the windowed measure (sent contacts per recipient), the after window is at least 3 days from the merge. Wrong-party asks are not measurable until message records carry roles; do not report them. Add each number to the Step log with its n or window and its source.
 - Update Steps with what the measure taught, and propose the next step; that proposal is the question.
 - At phase end, the unit director sends the showrunner the result and the next step as one question for the user. The next approved step becomes a new phase after this one, with the Work Order of Phase 3 and the step's own Spec.

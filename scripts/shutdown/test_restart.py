@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+from scripts.lib import names
+from scripts.lib.test_names import fixture_names
+
 import copy
 import io
 from types import SimpleNamespace
@@ -323,6 +326,7 @@ class RestartTests(ShutdownTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = self.enterContext(patch.object(names, "load_names", return_value=fixture_names()))
         _ = self.enterContext(patch.object(quota_alert, "tell_user",
             side_effect=AssertionError("restart test must fake the fallback push")))
         # Mac cases override the shared Linux fixture locally.
@@ -2353,18 +2357,49 @@ class RestartTests(ShutdownTestCase):
         _ = cast(object, self.enterContext(patch.object(herdr, "server_environment", return_value={})))
         _ = cast(object, self.enterContext(patch.object(herdr.Herdr, "pane_activity", return_value=herdr.PaneAtShell())))
         # The fake server records a tab as a workspace it creates; workspace layout is herdr's own test.
-        def open_tab(name: str, _space: str, _title: str, cwd: str, environment: dict[str, str]) -> str:
+        def open_tab(name: str, _space: str, _title: str, cwd: str, environment: dict[str, str], *, label: str = "") -> str:
             client = herdr.Herdr(name)
             arguments = ["workspace", "create", "--label", name, "--cwd", cwd]
             for key, value in {**environment, "HERDR_AGENT_PANE": "1"}.items():
                 arguments.extend(["--env", f"{key}={value}"])
             root_pane = herdr.json_object(client.result(*arguments, "--no-focus").get("root_pane"), "fake root pane")
             pane = herdr.json_text(root_pane.get("pane_id"), "fake root pane id")
-            _ = client.run("pane", "rename", pane, name)
+            _ = client.run("pane", "rename", pane, label or name)
             return pane
 
         _ = cast(object, self.enterContext(patch.object(herdr, "open_tab", open_tab)))
         return owner, responses, log
+
+    def test_restart_display_rename_keeps_saved_layout_pane_keys_and_attach_hint(self) -> None:
+        from scripts.herdr.test_herdr import TitledLayoutHerdr
+        owner = self.herdr_restart_fixture()[0]
+        _ = self.enterContext(patch.object(herdr, "herdr_processes", return_value=[]))
+        old = TitledLayoutHerdr()
+        _ = old.open_tab("ad-hoc", "sdlc · roles · unit director", owner["cwd"], {}, label=owner["name"])
+        _ = old.open_tab("ad-hoc", "another tab", owner["cwd"], {}, label="other-key")
+        fresh = TitledLayoutHerdr()
+        _ = fresh.open_tab("ad-hoc", "another tab", owner["cwd"], {}, label="other-key")
+
+        def open_tab(host: str, space: str, title: str, cwd: str, environment: dict[str, str], *, label: str = "") -> str:
+            self.assertEqual(host, "fixture")
+            return fresh.open_tab(space, title, cwd, environment, label=label)
+
+        parts = restart._resume_parts(owner, "restart")  # pyright: ignore[reportPrivateUsage]
+        parts = replace(parts, environment={**parts.environment, "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "roles-unit"})
+        with patch.object(names, "runtime_names", return_value=fixture_names(director="coordinator")), \
+                patch.object(herdr, "restore_server", return_value=herdr.ServerAdopted()), \
+                patch.object(herdr, "Herdr", return_value=fresh), \
+                patch.object(herdr, "open_tab", side_effect=open_tab), \
+                patch.object(herdr, "start_agent", return_value=SUBMITTED_PROMPT):
+            launched = restart._herdr_launch(parts,  # pyright: ignore[reportPrivateUsage]
+                restart.SharedHerdrTab("fixture"), owner, dry_run=False)
+        self.assertEqual(launched.prompt_outcome, SUBMITTED_PROMPT)
+        self.assertEqual([tab["pane_label"] for tab in fresh.tabs], [owner["name"], "other-key"])
+        found = fresh.lookup(owner["name"])
+        self.assertIsInstance(found, herdr.PaneFound)
+        self.assertIn("coordinator", fresh.tabs[0]["label"])
+        self.assertIsInstance(fresh.lookup(fresh.tabs[0]["label"]), herdr.NoPane)
+        self.assertTrue(herdr.attach_hint("ad-hoc", owner["name"]).endswith("tab " + owner["name"]))
 
     def test_shared_tab_restart_carries_its_destination_transcript_and_failed_submit_outcome(self) -> None:
         owner, _responses, _log = self.herdr_restart_fixture()

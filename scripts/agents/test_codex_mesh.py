@@ -12,6 +12,9 @@ file replaced by its last chat reply.
 
 from __future__ import annotations
 
+from scripts.lib import names
+from scripts.lib.test_names import fixture_names
+
 from scripts.whoami.note_file import note_name
 
 import argparse
@@ -518,6 +521,7 @@ class MeshCommandFixture(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(patch.object(names, "load_names", return_value=fixture_names()))
         self.loop_budget = FixtureLoopBudget(self.id())
         self.temporary = tempfile.TemporaryDirectory()
         # resolve(): macOS /tmp is a link to /private/tmp, and the mesh records resolved paths.
@@ -3163,6 +3167,21 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(set(self.roster()), {"worker"})
         self.assertEqual([_as_test_dict(request["params"]).get("threadId")
                           for request in self.methods("turn/start")], [THREAD_ID])
+
+    def test_display_rename_reaches_the_next_thread_title_without_changing_record_identity(self) -> None:
+        roster = message_roster
+        place = (roster.ProductionWithoutRunningShowrunner("sdlc"),
+                 roster.UnderDirector("roles-unit", "director", "session:director"), "")
+        with patch.object(roster, "_pool_context", return_value=place):
+            self.assertEqual(self.run_start(), (0, ""))
+            before = dict(self.worker_record())
+            with patch.object(names, "runtime_names", return_value=fixture_names(worker="builder")):
+                self.assertEqual(self.run_follow(), (0, ""))
+        self.assertEqual(self.methods("thread/name/set")[-1]["params"], {
+            "threadId": THREAD_ID, "name": "sdlc · roles · builder worker"})
+        after = self.worker_record()
+        self.assertEqual((after["role"], after["thread_id"]), (before["role"], before["thread_id"]))
+        self.assertEqual(set(self.roster()), {"worker"})
 
     def test_unplaced_thread_keeps_its_address_as_title(self) -> None:
         roster = message_roster

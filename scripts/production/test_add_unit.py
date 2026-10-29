@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from scripts.lib import names
+from scripts.lib.test_names import fixture_names
+
 import argparse
 import dataclasses
 import fcntl
@@ -108,6 +111,7 @@ class AddUnitTests(ShutdownTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = self.enterContext(patch.object(names, "load_names", return_value=fixture_names()))
         # These CLI fixtures prove launcher plumbing; transcript proof is exercised
         # through the real submit method in PromptSubmissionTests.
         def submitted(client: herdr.Herdr, pane: str, opening: herdr.OpeningPrompt,
@@ -951,6 +955,18 @@ class AddUnitTests(ShutdownTestCase):
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertTrue(result.stderr.rstrip().endswith(ending), result.stderr)
                 self.assertEqual(closed.call_args_list, [] if typed else [call(SHARED, "w1:p1")])
+
+    def test_configured_tab_title_keeps_pane_session_and_attach_keys(self) -> None:
+        with patch.object(names, "runtime_names", return_value=fixture_names(director="coordinator")):
+            result = self.successful("alpha", "--plan", "docs/plans/given.md")
+        calls = self.herdr_calls()
+        self.assertIn(["--session", SHARED, "tab", "rename", "w1:t1", "build-followups · alpha · coordinator"], calls)
+        self.assertIn(["--session", SHARED, "pane", "rename", "w1:p1", "alpha"], calls)
+        start = next(row for row in calls if row[2:4] == ["agent", "start"])
+        arguments = start[start.index("--") + 1:]
+        self.assertEqual(arguments[arguments.index("-n") + 1], "alpha")
+        self.assertIn("tab alpha", result.stdout)
+        self.assertNotIn("tab build-followups ·", result.stdout)
 
     def test_unit_launch_passes_a_typed_opening_prompt_once(self) -> None:
         with patch.object(herdr, "start_agent", wraps=herdr.start_agent) as start:
@@ -1981,7 +1997,9 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(self.servers_started(), [["--user", "start", "herdr-agents.service"]])
         self.assertEqual(self.opened()[:8], ["--session", SHARED, "workspace", "create", "--label", "director",
                                              "--cwd", str(worktree)])
-        self.assertIn(["--session", SHARED, "tab", "rename", "w1:t1", "alpha"], self.herdr_calls())
+        self.assertIn(["--session", SHARED, "tab", "rename", "w1:t1",
+                       "build-followups · alpha · unit director"], self.herdr_calls())
+        self.assertIn(["--session", SHARED, "pane", "rename", "w1:p1", "alpha"], self.herdr_calls())
         self.assertEqual({key: value for key, value in self.pane_environment().items()
                           if key.startswith(("SHOWRUNNER_", "CLAUDE_", "HERDR_")) or key == "ENABLE_TOOL_SEARCH"},
                          {"SHOWRUNNER_UNIT": "build-followups",
@@ -2973,7 +2991,9 @@ class AddUnitTests(ShutdownTestCase):
 
         self.assertEqual(self.opened()[1], SHARED)
         self.assertEqual(self.opened()[7], str(prior))
-        self.assertIn(["--session", SHARED, "tab", "rename", "w1:t1", recorded_session], self.herdr_calls())
+        self.assertIn(["--session", SHARED, "tab", "rename", "w1:t1",
+                       "build-followups · alpha · unit director"], self.herdr_calls())
+        self.assertIn(["--session", SHARED, "pane", "rename", "w1:p1", recorded_session], self.herdr_calls())
         claude = self.agent_arguments()
         prompt = self.opening_prompt()
         self.assertEqual(claude[claude.index("--remote-control") + 1], recorded_session)
