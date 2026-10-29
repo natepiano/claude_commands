@@ -45,6 +45,7 @@ from unittest.mock import MagicMock, patch
 
 from scripts.agents import codex_mesh
 from scripts.direct import plan_history, workers as unit_workers
+from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.lib import nix_env
 from scripts.message import process_table, sessions
 from scripts.usage import agents_log
@@ -573,6 +574,7 @@ class MeshCommandFixture(unittest.TestCase):
         _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {
             "GUILD_ROLES_STATE": str(self.session_dir / "guild-roles"),
             "GUILD_OWNERSHIP_STATE": str(self.session_dir / "guild-ownership"),
+            "UNIT_RUN_DIR": "", "PLAN_DELEGATE_RUN_DIR": "", "PLAN_DELEGATE_BOARD_DIR": "",
         })))
         _ = self.patches.callback(set_environment("USAGE_STATE_DIR", str(self.session_dir / "usage-state")))
         _ = self.patches.enter_context(patch.object(codex_mesh, "QUEUE_GRACE_SECS", 0.0))
@@ -3743,6 +3745,84 @@ class MeshCommandTests(MeshCommandFixture):
         self.server.respond = lambda request: (self.quota_completion(request)
             if request.get("method") == "turn/start" else original(request))
         return source
+
+    def record_worker_phase(self) -> Path:
+        history = self.session_dir.parent / "wait-history"
+        _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {
+            "UNIT_RUN_DIR": str(self.session_dir), "UNIT_HISTORY_DIR": str(history),
+            "UNIT_TEAM_ROLE": "impl", "UNIT_PHASE_ID": "6", "UNIT_PASS_OWNER": "launcher",
+            "UNIT_SYNC_WRITES": "0", "CLAUDE_PROBE_SESSION": "",
+        })))
+        for arguments in (
+            ["start-run", "--session-dir", str(self.session_dir), "--working-dir", str(self.session_dir),
+             "--main-family", "codex", "--main-model", "fixture", "--main-session-id", "director"],
+            ["start-phase", "--session-dir", str(self.session_dir), "--phase-id", "6", "--phase-title", "Old"],
+            ["finish-phase", "--session-dir", str(self.session_dir), "--phase-id", "6", "--status", "completed"],
+            ["start-phase", "--session-dir", str(self.session_dir), "--phase-id", "7", "--phase-title", "Current"],
+            ["start-pass", "--session-dir", str(self.session_dir), "--phase-id", "7", "--pass-kind", "impl",
+             "--activity", "worker", "--called-task", "direct.impl", "--called-family", "codex",
+             "--called-model", "fixture", "--worker-name", "worker"],
+        ):
+            result = invoke_recorder(arguments, dict(os.environ), self.session_dir)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        return history / "runs" / f"{self.session_dir.name}.jsonl"
+
+    def test_provider_refusal_wait_ends_when_the_worker_runs_again(self) -> None:
+        _ = self.prepare_refusing_account()
+        history = self.record_worker_phase()
+        reporter = self.session_dir / "quota-report.py"
+        _ = reporter.write_text("raise SystemExit(0)\n")
+        respond = self.respond
+        self.server.respond = lambda request: (self.quota_completion(request)
+            if request.get("method") == "turn/start" else respond(request))
+        with (patch.object(codex_mesh, "QUOTA_REPORT", reporter),
+              patch.object(codex_mesh, "_quota_continuation_ready", return_value=False)):
+            code, errors = self.run_start()
+        self.assertEqual(code, 1, errors)
+        rows = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
+        quota, = [row for row in rows if row["event_type"] == "wait_started"
+                  and row["wait_kind"] == "WaitingForQuotaRefusal"]
+        self.assertEqual((quota["phase_id"], quota["owner_session"]), ("7", THREAD_ID))
+        self.assertFalse(any(row["event_type"] == "wait_finished" for row in rows))
+        self.server.respond = respond
+        with patch.object(codex_mesh, "_quota_continuation_ready", return_value=True):
+            code, errors = self.run_follow()
+        self.assertEqual(code, 0, errors)
+        rows = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
+        ended, = [row for row in rows if row["event_type"] == "wait_finished" and row["wait_id"] == quota["wait_id"]]
+        self.assertEqual(cast(dict[str, object], ended["wait_end"])["state"], "Finished")
+
+    def test_account_room_wait_closes_on_dispatch_without_recording_a_quota_refusal(self) -> None:
+        _ = self.prepare_refusing_account()
+        history = self.record_worker_phase()
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "failed",
+                                          "continuation_owed": True, "port": self.server.port}})
+        with patch.object(codex_mesh, "_quota_continuation_ready", return_value=False):
+            code, errors = self.run_follow()
+        self.assertEqual(code, 1, errors)
+        rows = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
+        wait, = [row for row in rows if row["event_type"] == "wait_started"]
+        phase, = [row for row in rows if row["event_type"] == "phase_started" and row["phase_id"] == "7"]
+        self.assertEqual((wait["wait_kind"], wait["phase_instance_id"]),
+                         ("ReadyWithoutCapacity", phase["phase_instance_id"]))
+        with patch.object(codex_mesh, "_quota_continuation_ready", return_value=True):
+            code, errors = self.run_follow()
+        self.assertEqual(code, 0, errors)
+        rows = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
+        finished, = [row for row in rows if row["event_type"] == "wait_finished"]
+        self.assertEqual(finished["wait_id"], wait["wait_id"])
+
+    def test_probe_account_room_wait_writes_no_phase_wait(self) -> None:
+        _ = self.prepare_refusing_account()
+        history = self.record_worker_phase()
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "failed",
+                                          "continuation_owed": True, "port": self.server.port}})
+        with (patch.dict(os.environ, {"CLAUDE_PROBE_SESSION": "1"}),
+              patch.object(codex_mesh, "_quota_continuation_ready", return_value=False)):
+            code, errors = self.run_follow()
+        self.assertEqual(code, 1, errors)
+        rows = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
+        self.assertFalse(any(str(row["event_type"]).startswith("wait_") for row in rows))
 
     def save_unresolved_refusal(self, source: agent_accounts.KnownCodexAccount) -> None:
         now = datetime.now(timezone.utc)

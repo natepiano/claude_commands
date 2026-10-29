@@ -28,6 +28,7 @@ from scripts.direct import phase_reservation, plan_history, recorder_state  # no
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
 from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
 from scripts.lib import agents_registry, unit_runs  # noqa: E402
+from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 
@@ -99,6 +100,11 @@ PROGRESS_CAPS: dict[str, int] = {
     "complete": 100,
 }
 PROJECT_CAP_BEFORE_COMPLETE = 99
+
+WAIT_KINDS = (
+    "WaitingForQuotaRefusal", "WaitingForMemoryOrSlot", "WaitingForMergeGate",
+    "WaitingForUser", "WaitingForSupplier", "ReadyWithoutCapacity",
+)
 
 
 class AgentIdentity(TypedDict):
@@ -1447,6 +1453,7 @@ def _start_phase(args: argparse.Namespace) -> None:
     _write_state(session_dir, state)
     event = _event(state, "phase_started", started_at)
     event["contract_revision"] = _contract_revision()
+    event["wait_coverage"] = {"state": "Recorded", "version": 1}
     if started_at != now:
         event["recorded_at"] = _iso_time(now)
         event["backfilled"] = True
@@ -4732,6 +4739,296 @@ def _eta(args: argparse.Namespace) -> None:
     print(f"ETA recorded: {local_eta:%H:%M %Z}")
 
 
+def _waits_by_id(events: list[dict[str, object]]) -> dict[str, dict[str, object]]:
+    waits: dict[str, dict[str, object]] = {}
+    for event in events:
+        if event.get("event_type") in ("wait_started", "wait_finished", "wait_unclosed", "wait_not_recorded"):
+            wait_id = _string(event.get("wait_id"))
+            if wait_id:
+                waits[wait_id] = event
+    return waits
+
+
+@dataclass(frozen=True)
+class WaitPhaseResolved:
+    phase: dict[str, object]
+
+
+@dataclass(frozen=True)
+class WaitPhaseNotRecorded:
+    reason: str
+
+
+def _wait_phase(state: dict[str, object], args: argparse.Namespace) -> WaitPhaseResolved | WaitPhaseNotRecorded:
+    """Resolve the caller's pass now, or an explicitly named historical instance."""
+    slot = _optional_arg(args, "slot")
+    instance_id = _optional_arg(args, "phase_instance_id")
+    phase_id = _optional_arg(args, "phase_id")
+    if hasattr(args, "slot"):
+        current_pass = _open_passes(state).get(slot)
+        if current_pass is None:
+            return WaitPhaseNotRecorded(f"slot {slot} has no open pass")
+        instance_id = _pass_phase_instance(current_pass)
+        if not instance_id:
+            return WaitPhaseNotRecorded(f"slot {slot} open pass has no phase instance")
+        # An open pass can only belong to an open phase. Never substitute the
+        # current phase when a reused server carries an older environment.
+        candidates = [*_parked_phases(state), _object_dict(state.get("phase")) or {}]
+        for phase in candidates:
+            if phase.get("instance_id") == instance_id and phase.get("status") == "active":
+                return WaitPhaseResolved(phase)
+        return WaitPhaseNotRecorded(f"slot {slot} open pass names no open phase")
+    if hasattr(args, "phase_instance_id"):
+        if not instance_id:
+            return WaitPhaseNotRecorded("phase instance selector is blank")
+        for event in reversed(_run_events(state)):
+            if event.get("event_type") == "phase_started" and event.get("phase_instance_id") == instance_id:
+                return WaitPhaseResolved({"instance_id": instance_id, "id": event.get("phase_id"),
+                                          "title": event.get("phase_title"),
+                                          "started_at": event.get("timestamp_epoch")})
+        return WaitPhaseNotRecorded(f"phase instance {instance_id} has no start record in this run")
+    if _optional_arg(args, "missing_reason") and not hasattr(args, "phase_id"):
+        return WaitPhaseNotRecorded("missing wait has no phase selector")
+    phase = _open_phase_named(state, phase_id) if hasattr(args, "phase_id") else _object_dict(state.get("phase"))
+    if phase is not None and phase.get("status") == "active" and state.get("status") == "active":
+        return WaitPhaseResolved(phase)
+    return WaitPhaseNotRecorded(f"phase {phase_id or '(current)'} is not open")
+
+
+def _start_wait(args: argparse.Namespace) -> None:
+    if cast(bool, args.probe) or os.environ.get(PROBE_ENV) == "1":
+        return
+    state = _read_state(_session_dir(args))
+    print(_record_wait(state, args))
+
+
+def _record_wait(state: dict[str, object], args: argparse.Namespace) -> str:
+    resolution = _wait_phase(state, args)
+    owner = _arg_string(args, "owner_session") or _string((_object_dict(state.get("main_agent")) or {}).get("session_id"))
+    missing_reason = _optional_arg(args, "missing_reason")
+    if isinstance(resolution, WaitPhaseNotRecorded):
+        missing_reason = "; ".join(part for part in (missing_reason, resolution.reason) if part)
+    if not owner:
+        missing_reason = "; ".join(part for part in (missing_reason, "wait owner session not recorded") if part)
+    now = plan_history.now_epoch()
+    # An empty explicit phase prevents _event from borrowing a reporting pass
+    # or the current phase when attribution failed.
+    event = _event(state, "wait_not_recorded" if missing_reason else "wait_started", now,
+                   phase_record=resolution.phase if isinstance(resolution, WaitPhaseResolved) else {})
+    wait_id = str(uuid.uuid4())
+    event.update({"wait_id": wait_id, "wait_kind": _arg_string(args, "kind"),
+                  "wait_reason": _arg_string(args, "reason"),
+                  "unit": _arg_string(args, "unit") or _string(state.get("worktree")),
+                  "owner_session": owner, "wait_started_at": _iso_time(now),
+                  "wait_started_epoch": now, "wait_end": {"state": "Open"}})
+    if missing_reason:
+        event.update(wait_record_state={"state": "NotRecorded", "reason": missing_reason},
+                     wait_end={"state": "NotRecorded"},
+                     requested_slot=_optional_arg(args, "slot"),
+                     requested_phase_id=_optional_arg(args, "phase_id"),
+                     requested_phase_instance_id=_optional_arg(args, "phase_instance_id"))
+    _append_event(state, event)
+    return wait_id
+
+
+def _end_wait(state: dict[str, object], wait: dict[str, object], now: float, *, unclosed: bool) -> None:
+    event = dict(wait)
+    event.update({"event_id": str(uuid.uuid4()), "event_type": "wait_unclosed" if unclosed else "wait_finished",
+                  "timestamp": _iso_time(now), "timestamp_epoch": now,
+                  "wait_end": {"state": "Unclosed"} if unclosed else
+                  {"state": "Finished", "at": _iso_time(now), "epoch": now}})
+    _append_event(state, event)
+
+
+def _finish_wait(args: argparse.Namespace) -> None:
+    if os.environ.get(PROBE_ENV) == "1":
+        return
+    state = _read_state(_session_dir(args))
+    wait_id = _arg_string(args, "wait_id")
+    wait = _waits_by_id(_run_events(state)).get(wait_id)
+    if wait is None:
+        raise SystemExit(f"Wait {wait_id} was not recorded in this run")
+    if wait.get("event_type") != "wait_started":
+        return
+    now = plan_history.now_epoch()
+    if now < _number(wait.get("wait_started_epoch")):
+        raise SystemExit("Cannot finish a wait before its start")
+    _end_wait(state, wait, now, unclosed=False)
+
+
+def record_turn_wait(session_dir: Path, owner_session: str, final_message: str) -> bool:
+    """Start a director's declared user/supplier wait once, before the stop."""
+    if os.environ.get(PROBE_ENV) == "1":
+        return False
+    lines = final_message.strip().splitlines()
+    if not lines:
+        return False
+    reason = lines[-1].strip().removeprefix("— ")
+    line = reason.lower()
+    if line.startswith(("decision:", "gate:")):
+        kind = "WaitingForUser"
+    elif line.startswith("blocked: waiting on ") and (
+        line.startswith("blocked: waiting on the showrunner")
+        or re.search(r"\bpeer\b", line) is not None
+        or re.match(r"blocked: waiting on (?:claude-|codex-|seat:)", line) is not None
+    ):
+        kind = "WaitingForSupplier"
+    else:
+        return False
+    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        state = _read_state(session_dir)
+        marker_path = session_dir / "turn_wait.json"
+        try:
+            marker = _json_object(marker_path.read_text(encoding="utf-8")) or {}
+        except FileNotFoundError:
+            marker = {}
+        previous = _waits_by_id(_run_events(state)).get(_string(marker.get("wait_id")))
+        if previous is not None and previous.get("event_type") == "wait_started":
+            if previous.get("owner_session") == owner_session and previous.get("wait_kind") == kind:
+                return True
+            _end_wait(state, previous, plan_history.now_epoch(), unclosed=False)
+        args = argparse.Namespace(missing_reason="", kind=kind, reason=reason,
+                                  owner_session=owner_session, unit="")
+        wait_id = _record_wait(state, args)
+        _ = marker_path.write_text(json.dumps({"wait_id": wait_id, "owner_session": owner_session}) + "\n",
+                                   encoding="utf-8")
+    return True
+
+
+def finish_turn_wait(session_dir: Path, owner_session: str) -> None:
+    """The next prompt ends this director's declared wait, regardless of sender."""
+    if os.environ.get(PROBE_ENV) == "1" or not (session_dir / "turn_wait.json").exists():
+        return
+    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        marker_path = session_dir / "turn_wait.json"
+        try:
+            marker = _json_object(marker_path.read_text(encoding="utf-8")) or {}
+        except FileNotFoundError:
+            return
+        if marker.get("owner_session") != owner_session:
+            return
+        _finish_wait(argparse.Namespace(session_dir=str(session_dir), wait_id=_string(marker.get("wait_id"))))
+        marker_path.unlink()
+
+
+def write_merge_receipt(*, project: str, phase_id: str, merge_commit: str,
+                        source_checkpoint: str, target_branch: str, merged_at: float,
+                        issue: str = "") -> dict[str, object]:
+    """Record a pushed merge once; callers must not call this for a rolled-back merge."""
+    if not all((project, merge_commit, source_checkpoint, target_branch)) or not (phase_id or issue):
+        raise ValueError("A merge receipt needs its project, phase or issue, both commits, and target branch")
+    path = plan_history.history_root() / "merge_receipts.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        _ = handle.seek(0)
+        for line in handle:
+            receipt = _json_object(line)
+            if receipt is not None and (receipt.get("project"), receipt.get("target_branch"), receipt.get("merge_commit")) == (project, target_branch, merge_commit):
+                return receipt
+        record: dict[str, object] = {"event_type": "merge_receipt", "schema_version": SCHEMA_VERSION,
+                   "project": project, "issue": issue, "phase_id": phase_id,
+                   "merge_commit": merge_commit, "source_checkpoint": source_checkpoint,
+                   "target_branch": target_branch, "merged_at": _iso_time(merged_at),
+                   "timestamp_epoch": merged_at}
+        _ = handle.write(json.dumps(record, sort_keys=True) + "\n")
+        handle.flush()
+        if (os.environ.get("UNIT_SYNC_WRITES") or os.environ.get("PLAN_DELEGATE_SYNC_WRITES", "1")) != "0":
+            os.fsync(handle.fileno())
+    return record
+
+
+def _history_window(args: argparse.Namespace) -> tuple[float, float]:
+    bounds: list[float] = []
+    for name, default in (("since", 0.0), ("until", plan_history.now_epoch())):
+        text = _arg_string(args, name)
+        try:
+            parsed = datetime.fromisoformat(text) if text else None
+        except ValueError as error:
+            raise SystemExit(f"--{name} must be an ISO 8601 time") from error
+        bounds.append(default if parsed is None else
+                      (parsed if parsed.tzinfo else parsed.replace(tzinfo=user_zone())).timestamp())
+    since, until = bounds
+    if since >= until:
+        raise SystemExit("--since must be before --until")
+    return since, until
+
+
+def _read_waits(args: argparse.Namespace) -> None:
+    since, until = _history_window(args)
+    session = _arg_string(args, "session_dir")
+    ignored = 0
+    if session:
+        events = _run_events(_read_state(_session_dir(args)))
+    else:
+        events, ignored = _load_events()
+    records = list(_waits_by_id(events).values())
+    selected = [wait for wait in records if since <= _number(wait.get("wait_started_epoch")) < until]
+    missing = [wait for wait in selected if wait.get("event_type") == "wait_not_recorded"]
+    waits = [wait for wait in selected if wait.get("event_type") != "wait_not_recorded"]
+    phases: list[dict[str, object]] = []
+    old_phase_n = 0
+    for event in events:
+        if event.get("event_type") != "phase_started" or not since <= _number(event.get("timestamp_epoch")) < until:
+            continue
+        own = [wait for wait in waits if (wait.get("run_id"), wait.get("phase_instance_id")) ==
+               (event.get("run_id"), event.get("phase_instance_id"))]
+        own_missing = [wait for wait in missing if (wait.get("run_id"), wait.get("phase_instance_id")) ==
+                       (event.get("run_id"), event.get("phase_instance_id"))]
+        recorded = (_object_dict(event.get("wait_coverage")) or {}).get("state") == "Recorded"
+        old_phase_n += not recorded
+        phase: dict[str, object] = {"run_id": event.get("run_id"), "phase_id": event.get("phase_id"),
+                                    "phase_instance_id": event.get("phase_instance_id"),
+                                    "unit": event.get("worktree"),
+                                    "state": "Covered" if recorded and not own_missing else "HistoryNotRecorded"}
+        if own_missing:
+            phase.update(reason="wait emission has a missing record", wait_missing_n=len(own_missing),
+                         recorded_wait_n=len(own))
+        elif recorded:
+            phase["wait_n"] = len(own)
+        else:
+            phase["reason"] = "phase start has no wait coverage record"
+        phases.append(phase)
+    print(json.dumps({"since": _iso_time(since), "until": _iso_time(until),
+                      "selection": "phase starts and wait starts in [since, until)",
+                      "covered_n": sum(phase["state"] == "Covered" for phase in phases),
+                      "missing_n": old_phase_n + len(missing),
+                      "missing_phase_n": sum(phase["state"] == "HistoryNotRecorded" for phase in phases),
+                      "missing_record_n": len(missing),
+                      "ignored_n": ignored, "phases": phases, "waits": waits, "missing": missing}, sort_keys=True))
+
+
+def _read_receipts(args: argparse.Namespace) -> None:
+    since, until = _history_window(args)
+    path = plan_history.history_root() / "merge_receipts.jsonl"
+    receipts: list[dict[str, object]] = []
+    problems: list[str] = []
+    try:
+        with path.open(encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+            for line in handle:
+                receipt = _json_object(line)
+                if receipt is None:
+                    problems.append("NotRecorded: invalid receipt record")
+                elif receipt.get("event_type") == "merge_receipt":
+                    receipts.append(receipt)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        problems.append(f"NotRecorded: {error}")
+    selected = [receipt for receipt in receipts if since <= _number(receipt.get("timestamp_epoch")) < until
+                and all(not _arg_string(args, option) or receipt.get(option) == _arg_string(args, option)
+                        for option in ("project", "target_branch", "merge_commit"))]
+    expected = _arg_string(args, "merge_commit")
+    missing: list[dict[str, str]] = ([{"state": "ReceiptMissing", "merge_commit": expected}]
+                                    if expected and not selected else [])
+    print(json.dumps({"since": _iso_time(since), "until": _iso_time(until),
+                      "covered_n": len(selected), "missing_n": len(missing),
+                      "receipts": selected, "missing": missing, "problems": problems}, sort_keys=True))
+
+
 def _finish_phase(args: argparse.Namespace) -> None:
     """Close one open phase: the one --phase-id names, else the current one.
 
@@ -4763,6 +5060,9 @@ def _finish_phase(args: argparse.Namespace) -> None:
             + f"({_iso_time(started_at)})"
         )
     instance_id = _string(phase.get("instance_id"))
+    for wait in _waits_by_id(_run_events(state)).values():
+        if wait.get("phase_instance_id") == instance_id and wait.get("event_type") == "wait_started":
+            _end_wait(state, wait, now, unclosed=True)
     # Every window this phase left open, one per team member: the launchers that
     # would have closed them are gone. A pass from before passes carried their
     # phase belongs to the current one.
@@ -5017,6 +5317,39 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = start_phase.add_argument("--started-at", default="")
     start_phase.set_defaults(handler=_start_phase)
 
+    start_wait = subparsers.add_parser("start-wait")
+    _ = start_wait.add_argument("--session-dir", required=True)
+    _ = start_wait.add_argument("--kind", choices=WAIT_KINDS, required=True)
+    wait_phase = start_wait.add_mutually_exclusive_group()
+    _ = wait_phase.add_argument("--phase-id", default=argparse.SUPPRESS)
+    _ = wait_phase.add_argument("--slot", default=argparse.SUPPRESS)
+    _ = wait_phase.add_argument("--phase-instance-id", default=argparse.SUPPRESS)
+    _ = start_wait.add_argument("--missing-reason", default="")
+    _ = start_wait.add_argument("--reason", default="")
+    _ = start_wait.add_argument("--owner-session", default="")
+    _ = start_wait.add_argument("--unit", default="")
+    _ = start_wait.add_argument("--probe", action="store_true")
+    start_wait.set_defaults(handler=_start_wait)
+
+    finish_wait = subparsers.add_parser("finish-wait")
+    _ = finish_wait.add_argument("--session-dir", required=True)
+    _ = finish_wait.add_argument("--wait-id", required=True)
+    finish_wait.set_defaults(handler=_finish_wait)
+
+    waits = subparsers.add_parser("waits")
+    _ = waits.add_argument("--session-dir", default="")
+    _ = waits.add_argument("--since", default="")
+    _ = waits.add_argument("--until", default="")
+    waits.set_defaults(handler=_read_waits)
+
+    receipts = subparsers.add_parser("receipts")
+    _ = receipts.add_argument("--since", default="")
+    _ = receipts.add_argument("--until", default="")
+    _ = receipts.add_argument("--merge-commit", default="")
+    _ = receipts.add_argument("--project", default="")
+    _ = receipts.add_argument("--target-branch", default="")
+    receipts.set_defaults(handler=_read_receipts)
+
     start_activity = subparsers.add_parser("start-activity")
     _ = start_activity.add_argument("--session-dir", required=True)
     _ = start_activity.add_argument("--label", required=True)
@@ -5190,6 +5523,9 @@ def main() -> None:
     if not callable(handler_value):
         raise SystemExit("No command handler selected")
     handler = cast(Callable[[argparse.Namespace], None], handler_value)
+    if _arg_string(args, "command") in ("waits", "receipts"):
+        handler(args)
+        return
     session_value: object = getattr(args, "session_dir", "")
     session_text = _string(session_value)
     if not session_text:

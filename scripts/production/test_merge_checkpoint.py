@@ -141,7 +141,7 @@ class MergeCheckpointTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.origin = self.root / "origin.git"
-        self.checkout = self.root / "merge"
+        self.checkout = self.root / "hana"
         self.unit = self.root / "alpha"
         self.other = self.root / "beta"
         self.promote = self.root / "installed"
@@ -193,7 +193,11 @@ class MergeCheckpointTests(unittest.TestCase):
                     "CHECKPOINT_TEST_STATE": str(self.state),
                     "MERGE_CHECKPOINT_SCRATCH": str(self.state),
                     "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
-                    "SHOWRUNNER_STATE_DIR": str(self.root / "showrunners")}
+                    "SHOWRUNNER_STATE_DIR": str(self.root / "showrunners"),
+                    "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "", "PLAN_DELEGATE_BOARD_DIR": "",
+                    "MERGE_CHECKPOINT_RUN_ROOT": str(self.root / "unit-runs"),
+                    "UNIT_HISTORY_DIR": str(self.root / "history"), "UNIT_SYNC_WRITES": "0",
+                    "CLAUDE_PROBE_SESSION": ""}
         self.production_doc()
 
     def git(self, *args: str, cwd: Path | None = None) -> str:
@@ -217,6 +221,7 @@ class MergeCheckpointTests(unittest.TestCase):
                        hub_files: bool = True, change_review: Path | None = None) -> None:
         rows = [
             "# Production — example", "", "## Production Context", "",
+            f"- **Repository:** `{self.checkout}`",
             "- **Merge branch:** `production`",
             *([f"- **Change review:** `{change_review}`"] if change_review else []),
             f"- **Showrunner checkout:** `{self.checkout}`",
@@ -300,6 +305,120 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertEqual(self.events("checkpoint-test"), [])
         self.assertEqual(self.events("review_regime.py"), [])
         self.assertIn("send alpha-unit:", result.process.stdout)
+
+    def receipts(self) -> list[dict[str, object]]:
+        path = self.root / "history" / "merge_receipts.jsonl"
+        return [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_checkpoint_receipt_names_pushed_merge_and_source_once_on_retry(self) -> None:
+        checkpoint = self.checkpoint()
+        first = self.run_checkpoint(checkpoint)
+        self.assertEqual(first.process.returncode, 0, first.process.stdout + first.process.stderr)
+        merge = self.git("rev-parse", "HEAD")
+        receipt, = self.receipts()
+        self.assertEqual((receipt["project"], receipt["phase_id"], receipt["merge_commit"],
+                          receipt["source_checkpoint"], receipt["target_branch"]),
+                         ("hana", "2", merge, checkpoint, "production"))
+        self.assertEqual(receipt["timestamp_epoch"], float(self.git("show", "-s", "--format=%ct", merge)))
+        self.assertTrue(str(receipt["merged_at"]).endswith("+00:00"))
+        retried = self.run_checkpoint(checkpoint)
+        self.assertEqual(retried.process.returncode, 0, retried.process.stdout + retried.process.stderr)
+        self.assertEqual(self.receipts(), [receipt])
+        readback = subprocess.run([sys.executable, str(SCRIPT.parent.parent / "direct" / "progress_history.py"),
+                                   "receipts", "--project", "hana", "--merge-commit", merge], cwd=self.checkout, env=self.env,
+                                  capture_output=True, text=True, check=False, timeout=300)
+        self.assertEqual(readback.returncode, 0, readback.stderr)
+        report = cast(dict[str, object], json.loads(readback.stdout))
+        self.assertEqual((report["covered_n"], report["missing_n"], report["receipts"]), (1, 0, [receipt]))
+
+    def test_rolled_back_checkpoint_writes_no_receipt(self) -> None:
+        checkpoint = self.checkpoint()
+        _ = (self.state / "fail-checkpoint-test").touch()
+        failed = self.run_checkpoint(checkpoint)
+        self.assertNotEqual(failed.process.returncode, 0)
+        self.assertEqual(self.git("rev-parse", "HEAD"), failed.before)
+        self.assertEqual(self.receipts(), [])
+
+    def test_child_receipt_survives_retry_and_rebuilds_a_missed_write(self) -> None:
+        _ = self.child_production()
+        checkpoint = self.checkpoint()
+        first = self.run_handoff(checkpoint)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        merge = self.git("rev-parse", "HEAD")
+        receipt, = self.receipts()
+        self.assertEqual((receipt["merge_commit"], receipt["source_checkpoint"], receipt["issue"]),
+                         (merge, checkpoint, "example-style hand-off"))
+        retried = self.run_handoff(checkpoint)
+        self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+        self.assertEqual(self.receipts(), [receipt])
+        (self.root / "history" / "merge_receipts.jsonl").unlink()
+        recovered = self.run_handoff(checkpoint)
+        self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+        self.assertEqual(self.receipts(), [receipt])
+
+    def test_receipt_reader_names_a_merge_that_has_no_receipt(self) -> None:
+        checkpoint = self.checkpoint()
+        _ = self.git("merge", "--no-ff", "-m", "fixture merge without recording", checkpoint)
+        merge = self.git("rev-parse", "HEAD")
+        result = subprocess.run([sys.executable, str(SCRIPT.parent.parent / "direct" / "progress_history.py"),
+                                 "receipts", "--merge-commit", merge], cwd=self.checkout, env=self.env,
+                                capture_output=True, text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = cast(dict[str, object], json.loads(result.stdout))
+        self.assertEqual((report["covered_n"], report["missing_n"], report["missing"]),
+                         (0, 1, [{"state": "ReceiptMissing", "merge_commit": merge}]))
+
+    def test_gate_wait_uses_the_units_named_phase_and_closes_on_red(self) -> None:
+        checkpoint = self.checkpoint()
+        session = self.root / "unit-runs" / "alpha-run"
+        recorder = SCRIPT.parent.parent / "direct" / "progress_history.py"
+        for arguments in (
+            ["start-run", "--session-dir", str(session), "--working-dir", str(self.unit),
+             "--main-family", "codex", "--main-model", "fixture", "--main-effort", "high",
+             "--main-session-id", "unit-director"],
+            ["start-phase", "--session-dir", str(session), "--phase-id", "2", "--phase-title", "Gate"],
+            ["start-phase", "--session-dir", str(session), "--phase-id", "3", "--phase-title", "Parallel"],
+        ):
+            result = subprocess.run([sys.executable, str(recorder), *arguments], cwd=self.unit, env=self.env,
+                                    capture_output=True, text=True, check=False, timeout=300)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        _ = (self.state / "fail-checkpoint-test").touch()
+        failed = self.run_checkpoint(checkpoint)
+        self.assertNotEqual(failed.process.returncode, 0)
+        rows = [cast(dict[str, object], json.loads(line)) for line in
+                (self.root / "history" / "runs" / "alpha-run.jsonl").read_text().splitlines()]
+        started, = [row for row in rows if row["event_type"] == "wait_started"]
+        finished, = [row for row in rows if row["event_type"] == "wait_finished"]
+        phase, = [row for row in rows if row["event_type"] == "phase_started" and row["phase_id"] == "2"]
+        self.assertEqual((started["wait_kind"], started["phase_instance_id"], started["unit"], started["owner_session"]),
+                         ("WaitingForMergeGate", phase["phase_instance_id"], "alpha-unit", "unit-director"))
+        self.assertEqual(started["wait_id"], finished["wait_id"])
+        self.assertEqual(cast(dict[str, object], finished["wait_end"])["state"], "Finished")
+
+    def test_merge_after_phase_finish_records_the_checkpoint_instances_gate_wait(self) -> None:
+        checkpoint = self.checkpoint()
+        session = self.root / "unit-runs" / "finished-alpha"
+        recorder = SCRIPT.parent.parent / "direct" / "progress_history.py"
+        for arguments in (
+            ["start-run", "--session-dir", str(session), "--working-dir", str(self.unit),
+             "--main-family", "codex", "--main-model", "fixture", "--main-session-id", "unit-director"],
+            ["start-phase", "--session-dir", str(session), "--phase-id", "2", "--phase-title", "Finished"],
+            ["finish-phase", "--session-dir", str(session), "--phase-id", "2", "--status", "completed"],
+        ):
+            recorded = subprocess.run([sys.executable, str(recorder), *arguments], env=self.env, cwd=self.unit,
+                                      capture_output=True, text=True, check=False, timeout=300)
+            self.assertEqual(recorded.returncode, 0, recorded.stderr)
+        merged = self.run_checkpoint(checkpoint)
+        self.assertEqual(merged.process.returncode, 0, merged.process.stdout + merged.process.stderr)
+        read = subprocess.run([sys.executable, str(recorder), "waits", "--session-dir", str(session)],
+                              env=self.env, cwd=self.unit, capture_output=True, text=True, check=False, timeout=300)
+        self.assertEqual(read.returncode, 0, read.stderr)
+        report = cast(dict[str, object], json.loads(read.stdout))
+        wait, = cast(list[dict[str, object]], report["waits"])
+        phase, = cast(list[dict[str, object]], report["phases"])
+        self.assertEqual((wait["wait_kind"], wait["phase_instance_id"], phase["wait_n"]),
+                         ("WaitingForMergeGate", phase["phase_instance_id"], 1))
+        self.assertEqual(cast(dict[str, object], wait["wait_end"])["state"], "Finished")
 
     def test_missing_hash_and_unpushed_checkpoint_stop_at_ancestry(self) -> None:
         missing = self.run_checkpoint("0" * 40)
@@ -911,6 +1030,11 @@ class MergeCheckpointTests(unittest.TestCase):
                       result.process.stdout)
         self.assertEqual(self.git("merge-base", "--is-ancestor", sha, tip), "")
         self.assertIn("main-only.txt", self.git("ls-tree", "-r", "--name-only", tip))
+        receipts = self.receipts()
+        self.assertEqual({row["merge_commit"] for row in receipts},
+                         set(self.git("rev-list", "--first-parent", "--merges", "HEAD").splitlines()))
+        integration, = [row for row in receipts if row["merge_commit"] == tip]
+        self.assertEqual(integration["source_checkpoint"], self.git("rev-parse", "HEAD^2"))
         self.assertRegex(result.process.stdout, re.escape(f"into: {self.checkout} (production) — ") + ".*unblocks: G1: beta-unit Phase 4")
         self.assertRegex(result.process.stdout, re.escape(f"into: {self.promote} (main) — ") + ".*unblocks: the live gate of alpha-unit phase 2")
         self.assertIn("the merge branch collects every unit's checkpoints", result.process.stdout)
@@ -1493,6 +1617,7 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), before)
         self.assertEqual(self.events("send.py"), [])
         self.assertEqual(self.events("style_sync.py"), [])
+        self.assertEqual(self.receipts(), [])
         retried = self.run_handoff(checkpoint)
         self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
         merge = self.git("rev-parse", "HEAD")

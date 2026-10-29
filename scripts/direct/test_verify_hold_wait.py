@@ -22,6 +22,7 @@ from unittest import mock
 
 from scripts.build_hold import build_hold
 from scripts.direct import test_verify_mac_offload
+from scripts.direct.recorder_fixture import invoke_recorder
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
@@ -213,6 +214,84 @@ class VerifyHoldWaitTests(unittest.TestCase):
         output, errors = process.communicate(timeout=HANG_GUARD_S)
         return process.returncode, self.wait_output.pop(process.pid, "") + output + self.wait_diagnostics.pop(process.pid, "") + errors
 
+    def record_phase(self) -> Path:
+        session = self.fixture.root / "unit-run"
+        self.fixture.environment.update({"UNIT_RUN_DIR": str(session), "UNIT_PHASE_ID": "closed-server-phase",
+                                         "UNIT_TEAM_ROLE": "impl",
+                                         "UNIT_PASS_OWNER": "launcher",
+                                         "UNIT_HISTORY_DIR": str(self.fixture.root / "history"),
+                                         "UNIT_SYNC_WRITES": "0", "CLAUDE_PROBE_SESSION": ""})
+        for arguments in (
+            ["start-run", "--session-dir", str(session), "--working-dir", str(self.fixture.root),
+             "--main-family", "codex", "--main-model", "fixture", "--main-effort", "high",
+             "--main-session-id", "fixture-director"],
+            ["start-phase", "--session-dir", str(session), "--phase-id", "6", "--phase-title", "Hold"],
+            ["start-pass", "--session-dir", str(session), "--phase-id", "6", "--pass-kind", "impl",
+             "--activity", "verify", "--called-task", "direct.impl", "--called-family", "codex",
+             "--called-model", "fixture"],
+        ):
+            result = invoke_recorder(arguments, self.fixture.environment, self.fixture.root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        return self.fixture.root / "history" / "runs" / f"{session.name}.jsonl"
+
+    def test_reused_server_wait_uses_the_slots_open_phase_after_its_old_phase_closed(self) -> None:
+        history = self.record_phase()
+        session = Path(self.fixture.environment["UNIT_RUN_DIR"])
+        for arguments in (
+            ["finish-pass", "--session-dir", str(session), "--status", "completed"],
+            ["finish-phase", "--session-dir", str(session), "--phase-id", "6", "--status", "completed"],
+            ["start-phase", "--session-dir", str(session), "--phase-id", "7", "--phase-title", "Next"],
+            ["start-pass", "--session-dir", str(session), "--phase-id", "7", "--pass-kind", "impl",
+             "--activity", "verify", "--called-task", "direct.impl", "--called-family", "codex",
+             "--called-model", "fixture"],
+        ):
+            result = invoke_recorder(arguments, self.fixture.environment, self.fixture.root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.fixture.environment["UNIT_PHASE_ID"] = "6"
+        self.hold()
+        process = self.start("check", "sample")
+        self.wait_for_call(process)
+        grant_call(self.cycle_file)
+        code, output = self.finish(process)
+        self.assertEqual(code, 0, output)
+        rows = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
+        phase, = [row for row in rows if row["event_type"] == "phase_started" and row["phase_id"] == "7"]
+        wait, = [row for row in rows if row["event_type"] == "wait_started"]
+        self.assertEqual((wait["phase_id"], wait["phase_instance_id"]), ("7", phase["phase_instance_id"]))
+
+    def test_review_with_an_empty_slot_records_its_active_pass_wait(self) -> None:
+        history = self.record_phase()
+        self.fixture.environment["UNIT_TEAM_ROLE"] = ""
+        session = self.fixture.environment["UNIT_RUN_DIR"]
+        result = invoke_recorder([
+            "start-pass", "--session-dir", session, "--phase-id", "6", "--pass-kind", "review",
+            "--activity", "verify", "--called-task", "direct.review", "--called-family", "codex",
+            "--called-model", "fixture",
+        ], self.fixture.environment, self.fixture.root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.hold()
+        process = self.start("check", "sample")
+        self.wait_for_call(process)
+        grant_call(self.cycle_file)
+        code, output = self.finish(process)
+        self.assertEqual(code, 0, output)
+        rows = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
+        phase, = [row for row in rows if row["event_type"] == "phase_started"]
+        wait, = [row for row in rows if row["event_type"] == "wait_started"]
+        self.assertEqual(wait["phase_instance_id"], phase["phase_instance_id"])
+
+    def test_probe_verification_waits_without_phase_wait_events(self) -> None:
+        history = self.record_phase()
+        self.fixture.environment["CLAUDE_PROBE_SESSION"] = "1"
+        self.hold()
+        process = self.start("check", "sample")
+        self.wait_for_call(process)
+        grant_call(self.cycle_file)
+        code, output = self.finish(process)
+        self.assertEqual(code, 0, output)
+        rows = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
+        self.assertEqual([row for row in rows if str(row["event_type"]).startswith("wait_")], [])
+
     def test_unheld_local_call_needs_no_release(self) -> None:
         result = self.fixture.verify("test", "sample", "--local", "local admission test", "--filter", "smoke")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -282,6 +361,7 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
         self.assertFalse(any(command[1] in {"mark", "check-admission", "finish-local"} for command in commands))
 
     def test_held_call_waits_before_compiling_then_runs_on_release(self) -> None:
+        history = self.record_phase()
         self.hold()
         self.fixture.environment["BUILD_TARGETS_POLL_S"] = "3600"
         process = self.start("test", "sample", "--local", "local admission test", "--filter", "smoke")
@@ -293,6 +373,13 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
         self.assertIn("held by hana for render checks; waiting", output)
         self.assertEqual(len(self.fixture.local_runs()), 1)
         self.assertFalse((Path(self.fixture.environment["BUILD_HOLD_DIR"]) / "hana").exists())
+        rows = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
+        started, = [row for row in rows if row["event_type"] == "wait_started"]
+        finished, = [row for row in rows if row["event_type"] == "wait_finished"]
+        self.assertEqual((started["wait_kind"], started["wait_reason"], started["owner_session"]),
+                         ("WaitingForMemoryOrSlot", "build hold", "fixture-director"))
+        self.assertEqual(started["wait_id"], finished["wait_id"])
+        self.assertEqual(cast(dict[str, object], finished["wait_end"])["state"], "Finished")
 
 
     def test_mac_filter_pass_during_local_hold_needs_no_local_admission(self) -> None:
@@ -621,6 +708,7 @@ run_nextest --package sample
         self.assertAlmostEqual(float(observed["total"]), sum(float(value) for value in observed["waits"]), places=5)
 
     def test_interrupt_during_a_step_wait_records_seconds_and_removes_the_call(self) -> None:
+        history = self.record_phase()
         self.hold_after_first_step()
         observation = self.observe_waits()
         process = self.start("final")
@@ -634,6 +722,12 @@ run_nextest --package sample
         self.assertAlmostEqual(float(observed["total"]), sum(float(value) for value in observed["waits"]), places=5)
         self.assertFalse(Path(observed["directory"]).exists())
         self.assertEqual(read_cycle_file(self.cycle_file)["entries"], [])
+        rows = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
+        started = [row for row in rows if row["event_type"] == "wait_started"]
+        finished = [row for row in rows if row["event_type"] == "wait_finished"]
+        self.assertTrue(started)
+        self.assertEqual({row["wait_id"] for row in started}, {row["wait_id"] for row in finished})
+        self.assertTrue(all(cast(dict[str, object], row["wait_end"])["state"] == "Finished" for row in finished))
 
     def test_holder_joining_during_memory_admission_delays_step_and_records_separate_waits(self) -> None:
         invoke = VERIFY.parent.parent / "lint" / "invoke.sh"

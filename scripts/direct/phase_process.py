@@ -1657,6 +1657,19 @@ def render_trial(trials: Sequence[TrialPhase], measures: Sequence[TrialMeasures]
                 str(row.reloads.contexts) if isinstance(row.reloads, PhaseReloads) else "—") for row in rows], window)
 
 
+def render_trial_phase_time(events: Sequence[Event], trials: Sequence[TrialPhase], window: Window) -> None:
+    """Use the eligible trial sample even when its usage or transcript is missing."""
+    units = {event.run: str(event.record.get("unit") or event.record.get("worktree") or
+                            event.branch or event.run) for event in events if event.kind == "run_started"}
+    seconds: dict[str, list[float]] = defaultdict(list)
+    for trial in trials:
+        if isinstance(trial.interval, PhaseWithGap):
+            seconds[units.get(trial.phase.run, trial.phase.run)].append(trial.phase.end - trial.phase.start)
+    table("Trial phase time per unit — eligible start-selected phases, natedev only",
+          ("unit", "n phases", "median", "p90", "total", "not recorded"),
+          [distribution_row(unit, values, 0, duration) for unit, values in sorted(seconds.items())], window)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("command", choices=("baseline",))
@@ -1708,9 +1721,11 @@ def main() -> int:
         render_baseline(events, window, usage, contract, plans, problems)
         render_trial_phase_exclusions(events, window)
         render_trial(trials, measures, window, exposure_filter)
+        render_trial_phase_time(events, eligible, window)
     elif detail == "trial":
         render_trial_phase_exclusions(events, window)
         render_trial(trials, measures, window, exposure_filter, True)
+        render_trial_phase_time(events, eligible, window)
     else:
         render_detail(detail, events, window, usage, contract, plans)
     return 0

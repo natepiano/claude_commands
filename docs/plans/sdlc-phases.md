@@ -135,9 +135,9 @@ For active process redesigns, as we are currently undergoing with promotions and
 **Ruled out:** a retrospective before sample — the design's Steps need a prospective one; start-time selection inside `phase_boundaries` — it breaks `daily_read.py`; deploy time as exposure — it does not prove which contract a phase read.
 
 ### Phase 4 — `direct.md` becomes a short route, and each step reads only its own rule file  · status: todo
-**Depends on:** Phase 3, Phase 6
+**Depends on:** Phase 3, Phase 6, Phase 7
 
-**Waits for:** Phase 3 and Phase 6 on main (the showrunner names each hash and time); then at least twenty eligible `BeforeChange` phases (`--before-at` main HEAD) from at least two units after the later of the two times, so both samples run with the same recorder and launchers. fix-rounds-unit's `<FixDispatch/>` edits to `commands/unit/direct.md` are on the sdlc merge branch since c79e5d12.
+**Waits for:** Phase 3, Phase 6 and Phase 7 on main (the showrunner names each hash and time); then at least twenty eligible `BeforeChange` phases (`--before-at` main HEAD) from at least two units after the latest of the three times, so both samples run with the same recorder and launchers. fix-rounds-unit's `<FixDispatch/>` edits to `commands/unit/direct.md` are on the sdlc merge branch since c79e5d12.
 
 #### Work Order
 
@@ -194,7 +194,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Acceptance gate:** the Step log has before and after numbers with n and window, the matching result and the phase-time check; `python3 -m unittest discover -s scripts/direct -p 'test_phase_process.py'` passes, its design-doc tests included; the question is sent.
 
-### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: todo
+### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
 It needs only the recorder changes of Phase 3. It does not wait for the before sample, so it runs while the route phase waits; its number keeps the accepted route and measure phase names stable.
@@ -226,3 +226,38 @@ It needs only the recorder changes of Phase 3. It does not wait for the before s
 **Constraints from prior phases:** Phase 3 added the contract hashes to `start-phase`/`finish-phase`; keep that event shape. `progress_history.py`, `merge_checkpoint.py` and the launchers belong to build-followups owners as well: the checkpoint notice names each owner of a touched file, trial-merged against its tip. hierarchies-unit adds its own read-only readers to `scripts/hierarchies/measure.py`; this phase does not edit it. roles-unit writes the duties; this phase changes no contract text. `scripts/agents/test_codex_mesh.py` FollowEventRegressionTests were red on origin/sdlc 535426d3 and are fixed on 025a8b55 (models' d2180907), which this branch has merged.
 
 **Acceptance gate:** the gates in Delegation Context green, `basedpyright` on each slot's files; a live scratch run records a wait of each kind that has an emit point and reads it back; a scratch merge writes a receipt and the read verb names a merge without one `ReceiptMissing`; the checkpoint notice names the file and commit for hierarchies-unit.
+
+### Phase 7 — Each wait names the worker, checkpoint and sender that own it  · status: todo
+**Depends on:** Phase 6
+
+Phase 6's repair round 4 left three wait-attribution findings open. The landing rule moved them here: each is a wrong result in behavior Phase 6 added, not a regression and not a red gate. Astra's review (`/tmp/claude/astra/20261029T084546Z-3976557/review.md`) gives the approach for each. One rule covers all three: record explicit identity where the wait is seen, keep it through completion, and name the wait unresolved when identity cannot be resolved. Phase 4 waits for this phase as well, so both trial samples run with the same recorder.
+
+#### Work Order
+
+**Goal:** every wait record names the worker pass, checkpoint phase instance or message sender that owns it, or it is a named unresolved state. Wait counts are never certain when identity is unknown.
+
+**Spec:**
+- Worker waits (Phase 6 F001): `verify.sh` and the `codex_mesh.py` emit points select the pass from `CODEX_THREAD_ID`, never from `UNIT_TEAM_ROLE` or another variable fixed at app-server start. One server serves every slot of a run. Resolve the thread id to exactly one `mesh_roster.json` entry, then match that entry's full worker name to exactly one active pass (`worker_name` and `team_slot` in the pass record). Do not decode the slot from the name: a `…-fix` worker can hold `impl`. A missing or ambiguous match records a named attribution miss, with no fallback to a slot.
+- Merge-gate waits (Phase 6 F002): checkpoint creation records its run and phase instance, and the merge request carries that association to `merge_checkpoint.py`. When the association is absent or ambiguous, every candidate instance reads as uncertain coverage, never covered zero. The miss is counted once, and no candidate gets an invented wait. Choosing the newest instance hides the defect, so it is not allowed. This covers both merge paths.
+- User and supplier waits (Phase 6 F004): the UserPromptSubmit hook classifies the prompt before it ends a wait. `WaitingForUser` ends only on typed user input. `WaitingForSupplier` stores the expected supplier when it starts and ends only on a message from that sender. Timers, task notifications, scheduled notices and unrelated peers leave both waits open. A supplier wait with no named supplier is an explicit unresolved state. The duplicate-wait check in `record_turn_wait` compares the supplier as well as the owner and kind.
+- `verify.sh` wraps `buildlog_memory_line` with a plain wrapper that calls an inner function, not an `eval` of an edited `declare -f` (Phase 6 F007, nit).
+- Regression tests, each failing on the Phase 6 tree:
+  - `UNIT_TEAM_ROLE=impl` held constant, impl and test passes open in different phase instances, and verification run with the test worker's thread id: the wait belongs to the test phase and keeps that thread as owner. The same check for a `…-fix` worker.
+  - Two finished instances with one display id, merging the first one's checkpoint: with the association, exactly the first gets the wait; without it, neither reads covered zero. The same check across two runs, and with the second instance still active.
+  - A user wait survives a timer, a task notification and a peer message, and ends on typed input. A showrunner wait survives an unrelated peer and ends once, at the showrunner's message. The Phase 6 supplier test that closes on a generic peer is corrected.
+
+**Files:**
+- `scripts/direct/progress_history.py`, `scripts/direct/test_progress_history.py` — pass resolution by worker, supplier identity, uncertain coverage
+- `scripts/direct/verify.sh`, `scripts/direct/test_verify_hold_wait.py`, `scripts/direct/test_verify_token_wait.py` — thread-based attribution and the wrapper
+- `scripts/agents/codex_mesh.py`, `scripts/agents/test_codex_mesh.py` — thread-based attribution (models-unit also owns these)
+- `scripts/production/merge_checkpoint.py`, `scripts/production/test_merge_checkpoint.py` — the checkpoint association
+- `scripts/hooks/user-prompt-submit-conversation-pause.py`, `scripts/hooks/stop-direct-continue.py`, `scripts/hooks/test_direct_turn_wait_hooks.py` — sender-matched completion
+- Research at phase start names where checkpoint creation writes the association (the checkpoint notice or the merge request).
+
+**Workers:** `2 writers` — the recorder and hooks, and the emit points with the merge association.
+- `impl` — `progress_history.py`, its test, and the three hook files
+- `test` — opens as impl — `verify.sh`, `codex_mesh.py`, `merge_checkpoint.py` and their tests
+
+**Constraints from prior phases:** keep Phase 6's event shape and wait ids, and reuse the recorder. Old run files stay readable. Probe sessions write nothing. The checkpoint notice names models-unit for `codex_mesh.py` and each build-followups owner of a touched file, trial-merged against its tip.
+
+**Acceptance gate:** the gates in Delegation Context green, `basedpyright` on each slot's files; each regression test above fails on the Phase 6 tree and passes here; a live scratch run with two slots on one server records each worker's wait on its own pass.

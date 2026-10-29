@@ -384,6 +384,7 @@ class ReviewLauncherPassTests(unittest.TestCase):
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "user_zone.py", lib / "user_zone.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "unit_runs.py", lib / "unit_runs.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "agents_registry.py", lib / "agents_registry.py")
+        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "probe_session.py", lib / "probe_session.py")
         for name in (
             "review.sh", "implement.sh", "progress_history.py", "plan_history.py", "phase_reservation.py", "recorder_state.py",
             "findings.py", "review_tree.py", "board.sh", "worker_name.sh", "worker_state.py", "tag_inventory.py",
@@ -534,6 +535,17 @@ else:
              str(self.prompt_file), "review", "blind review", "reviewing the diff", "1", lens, early],
             check=False, capture_output=True, text=True, env=environment, timeout=300,
         )
+
+    def test_named_review_phase_reaches_verification_environment(self) -> None:
+        session = self.start_implementation("review-phase-environment")
+        self.finish_implementation(session)
+        _ = self.prompt_file.write_text("Phase 3 — Retry handling\nReview the diff.\n")
+        stub = self.root / "scripts" / "agents" / "agent_exec.sh"
+        with stub.open("a") as output:
+            _ = output.write('printf "%s|%s" "$UNIT_RUN_DIR" "$UNIT_TEAM_ROLE" > "$UNIT_RUN_DIR/wait-context"\n')
+        result = self.checked_review(session, "--phase", "3")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((session / "wait-context").read_text(), f"{session}|")
 
     def test_ux_launch_checks_identity_before_the_worker_and_records_valid_checks(self) -> None:
         stale = self.start_implementation("ux-stale-identity")

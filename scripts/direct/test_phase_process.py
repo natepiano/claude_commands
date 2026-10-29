@@ -436,6 +436,53 @@ class TrialProcessTests(unittest.TestCase):
             self.assertRegex(text, r"weighted director tokens, phase plus gap\s+1\s+45\s+45\s+45\s+0")
             self.assertRegex(text, r"first request after contract Read result\s+1\s+150\s+150\s+150\s+0")
 
+    def test_trial_phase_time_uses_start_selected_eligible_phases_and_recorded_units(self) -> None:
+        events = trial_events()
+        window = process.Window(10, 11)
+        selected = process.select_trial_phases(events, window, ROUTE)
+        self.assertEqual(process.phase_boundaries(events, window), ())
+        self.assertEqual(len(selected), 1)
+        other = replace(selected[0], phase=replace(selected[0].phase, run="second-run", end=40))
+        missing_next = replace(selected[0], phase=replace(selected[0].phase, end=999), interval=process.NoFollowingPhase())
+        second_start = replace(events[0], run="second-run", record={"worktree": "unit-a"})
+        first_start = replace(events[0], record={"worktree": "unit-a"})
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            process.render_trial_phase_time((first_start, second_start), (*selected, other, missing_next), window)
+        self.assertIn(window.label(), output.getvalue())
+        self.assertRegex(output.getvalue(), r"unit-a\s+2\s+60\.0s\s+90\.0s\s+120\.0s\s+0")
+        self.assertNotIn("999", output.getvalue())
+
+    def test_baseline_trial_phase_time_matches_exposure_filter_in_both_report_modes(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+            root = Path(folder)
+            commit_fixture_documents(root / ".claude", {"commands/unit/direct.md": "old contract\n"}, "Before")
+            anchor = process.git_output(root / ".claude", ["rev-parse", "HEAD"]).strip()
+            runs = root / "history/runs"
+            runs.mkdir(parents=True)
+            records = [entry.record for entry in trial_events()]
+            other_director = process.DirectorSession("claude", "other")
+            records.extend(contract_event(kind, at, run="other", direct_hash=NEW_HASH, director=other_director).record
+                           for kind, at in (("run_started", 1), ("phase_started", 10), ("phase_finished", 500)))
+            records.append(contract_event("phase_started", 510, run="other", phase="next", direct_hash=NEW_HASH,
+                                          director=other_director).record)
+            _ = (runs / "fixture.jsonl").write_text("\n".join(json.dumps(record) for record in records))
+            for detail in ((), ("--detail", "trial")):
+                with self.subTest(detail=detail):
+                    args = ["phase_process.py", "baseline", "--exposure", "before", "--before-at", anchor,
+                            "--since", "1970-01-01T00:00:10Z", "--until", "1970-01-01T00:00:11Z", *detail]
+                    output = io.StringIO()
+                    with patch.object(Path, "home", return_value=root), \
+                            patch.object(plan_history, "history_root", return_value=root / "history"), \
+                            patch.object(collect, "store_path", return_value=root / "absent.db"), \
+                            patch.object(process, "__file__", str(root / "scripts/direct/phase_process.py")), \
+                            patch.object(sys, "argv", args), contextlib.redirect_stdout(output):
+                        self.assertEqual(process.main(), 0)
+                    time_table = output.getvalue().split("Trial phase time per unit", 1)[1]
+                    self.assertRegex(time_table, r"run\s+1\s+90\.0s\s+90\.0s\s+90\.0s\s+0")
+                    self.assertNotIn("other", time_table)
+                    self.assertIn("ExposureNotRecorded n=1", output.getvalue())
+
     def test_local_date_window_uses_the_user_zone(self) -> None:
         with patch.dict(os.environ, {"USER_ZONE": "America/New_York", "USER_ZONE_CONF": "/nonexistent"}):
             self.assertEqual(process.date_epoch("2026-10-28T09:00:00"), process.date_epoch("2026-10-28T13:00:00+00:00"))

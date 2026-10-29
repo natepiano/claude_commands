@@ -17,6 +17,7 @@ import unittest
 from pathlib import Path
 from typing import cast, override
 
+from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.direct.test_verify_mac_offload import RUSTC_STUB, stub_build_tool_path
 
@@ -248,6 +249,38 @@ esac
         wait_until(lambda: path.exists() or process.poll() is not None, path.parent, processes=(process,))
         self.assertTrue(path.exists(), "verify never reached its expected state")
 
+    def record_phase(self, session: Path) -> None:
+        self.environment.update({"UNIT_HISTORY_DIR": str(self.root / "history"),
+                                 "UNIT_PHASE_ID": "6", "UNIT_SYNC_WRITES": "0",
+                                 "UNIT_PASS_OWNER": "launcher",
+                                 "CLAUDE_PROBE_SESSION": ""})
+        for arguments in (
+            ["start-run", "--session-dir", str(session), "--working-dir", str(self.root),
+             "--main-family", "codex", "--main-model", "fixture", "--main-effort", "high",
+             "--main-session-id", "fixture-director"],
+            ["start-phase", "--session-dir", str(session), "--phase-id", "6", "--phase-title", "Resources"],
+        ):
+            result = invoke_recorder(arguments, self.environment, self.root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        for slot in ("impl", "first", "second"):
+            arguments = ["start-pass", "--session-dir", str(session), "--phase-id", "6", "--pass-kind", "impl",
+                         "--activity", "verify", "--called-task", "direct.impl", "--called-family", "codex",
+                         "--called-model", "fixture"]
+            result = invoke_recorder(arguments, {**self.environment, "UNIT_TEAM_ROLE": slot}, self.root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def phase_waits(self, session: Path) -> list[dict[str, object]]:
+        return [row for row in (cast(dict[str, object], json.loads(line)) for line in
+                (self.root / "history" / "runs" / f"{session.name}.jsonl").read_text().splitlines())
+                if str(row["event_type"]).startswith("wait_")]
+
+    def test_unblocked_verification_records_no_resource_wait(self) -> None:
+        session = Path(self.environment["UNIT_SESSION_DIR"])
+        self.record_phase(session)
+        result = self.verify(self.environment)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.phase_waits(session), [])
+
     def test_group_cleanup_ends_without_pidfd_support(self) -> None:
         child = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
                                  start_new_session=True)
@@ -361,6 +394,7 @@ esac
 
     def test_waiting_for_peer_call_records_token_seconds(self) -> None:
         board = self.root / "board"
+        self.record_phase(board)
         waiting = self.root / "waiting-for-token"
         resume = self.root / "resume-acquisition"
         first_clock = self.root / "first-clock"
@@ -431,6 +465,11 @@ exec "$TEST_REAL_SLEEP" "$@"
         self.assertEqual(first_wait, 0)
         self.assertEqual(second_wait, 20)
         self.assertGreater(second_wait, first_wait)
+        started, = [row for row in self.phase_waits(board) if row["event_type"] == "wait_started"]
+        finished, = [row for row in self.phase_waits(board) if row["event_type"] == "wait_finished"]
+        self.assertEqual((started["wait_kind"], started["wait_reason"], started["phase_id"]),
+                         ("WaitingForMemoryOrSlot", "cargo token", "6"))
+        self.assertEqual(started["wait_id"], finished["wait_id"])
 
     def test_killed_verify_holder_is_reclaimed_promptly(self) -> None:
         sleep = self.root / "stubs" / "sleep"
@@ -666,6 +705,7 @@ exec "$TEST_REAL_SLEEP" "$@"
         # builds meanwhile. Phase 16's step then waits for the token, and phase
         # 15's launcher ending cannot free it.
         board = self.root / "board"
+        self.record_phase(board)
         lock = board / "locks" / "cargo.d"
         meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
         _ = meminfo.write_text("MemAvailable: 0 kB\n")
@@ -705,6 +745,10 @@ exec "$TEST_REAL_SLEEP" "$@"
             self.assertNotIn("Traceback", phase_16_errors.read_text())
             self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 2)
             self.assertFalse(lock.exists())
+            starts = [row for row in self.phase_waits(board) if row["event_type"] == "wait_started"]
+            ends = [row for row in self.phase_waits(board) if row["event_type"] == "wait_finished"]
+            self.assertIn("memory admission", {row["wait_reason"] for row in starts})
+            self.assertEqual({row["wait_id"] for row in starts}, {row["wait_id"] for row in ends})
         finally:
             _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
             _ = (self.root / "release").touch()

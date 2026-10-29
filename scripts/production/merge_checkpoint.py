@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import json
 import os
 import re
 import shlex
@@ -30,6 +31,11 @@ import scratch  # on the path once change_review has put scripts/lib there
 from showrunners import canonical_slug
 from add_unit import Production, read_production
 from production_units import Refusal, cell_value, production_field, unit_table
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.direct import progress_history  # noqa: E402
+from scripts.lib import unit_runs  # noqa: E402
+from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 
 # /zone queues a change for the Mac while it is offline; a promotion's Mac pull sends it.
 ZONE_SCRIPT = Path(__file__).resolve().parents[1] / "lib/zone.py"
@@ -1043,6 +1049,122 @@ def notify_style(checkout: Path, branch: str, tip: str) -> None:
         print("style sync: " + str(error).replace("\n", "; "), flush=True)
 
 
+class PhaseWaitTarget(NamedTuple):
+    session_dir: Path
+    phase_id: str
+    phase_instance_id: str
+
+
+class WaitHistoryUnavailable(NamedTuple):
+    reason: str
+    runs: tuple[Path, ...] = ()
+
+
+def merge_wait_target(worktree: Path, phase_id: str) -> PhaseWaitTarget | WaitHistoryUnavailable:
+    """Find the checkpoint's phase instance, including a finished phase."""
+    explicit = unit_runs.environ("RUN_DIR") or os.environ.get("UNIT_SESSION_DIR", "")
+    candidates: set[Path] = {Path(explicit)} if explicit else set()
+    for root in unit_runs.run_roots(os.environ.get("MERGE_CHECKPOINT_RUN_ROOT")):
+        candidates.update(path.parent for path in root.glob("*/progress_history_state.json"))
+    targets: list[PhaseWaitTarget] = []
+    matching_runs: list[Path] = []
+    for directory in sorted(candidates):
+        try:
+            value = cast(object, json.loads((directory / "progress_history_state.json").read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        state = cast(dict[str, object], value)
+        working_dir = state.get("working_dir")
+        if not isinstance(working_dir, str) or Path(working_dir).resolve() != worktree.resolve():
+            continue
+        matching_runs.append(directory)
+        history = state.get("history_file")
+        if not isinstance(history, str):
+            continue
+        try:
+            records = [cast(object, json.loads(line)) for line in Path(history).read_text(encoding="utf-8").splitlines()]
+        except (OSError, ValueError):
+            continue
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            phase = cast(dict[str, object], record)
+            identifier, instance = phase.get("phase_id"), phase.get("phase_instance_id")
+            if (phase.get("event_type") == "phase_started" and isinstance(identifier, str)
+                    and isinstance(instance, str) and instance and (not phase_id or phase_id == identifier)):
+                targets.append(PhaseWaitTarget(directory, identifier, instance))
+    return targets[0] if len(targets) == 1 else WaitHistoryUnavailable(
+        f"{len(targets)} matching checkpoint phase instances", tuple(matching_runs))
+
+
+@contextmanager
+def merge_gate_wait(worktree: Path, phase_id: str, unit: str) -> Generator[None, None, None]:
+    if os.environ.get(PROBE_ENV) == "1":
+        yield
+        return
+    target = merge_wait_target(worktree, phase_id)
+    if isinstance(target, WaitHistoryUnavailable):
+        report("wait", "HistoryNotRecorded", target.reason)
+        for directory in target.runs:
+            try:
+                missing = subprocess.run([sys.executable, str(Path(progress_history.__file__)), "start-wait",
+                    "--session-dir", str(directory), "--phase-id", phase_id,
+                    "--kind", "WaitingForMergeGate", "--unit", unit, "--missing-reason", target.reason],
+                    capture_output=True, text=True, check=False)
+                if missing.returncode:
+                    report("wait", "NotRecorded", missing.stderr.strip() or "cannot record missing merge wait")
+            except OSError as error:
+                report("wait", "NotRecorded", str(error))
+        yield
+        return
+    command = [sys.executable, str(Path(progress_history.__file__)), "start-wait",
+               "--session-dir", str(target.session_dir), "--phase-instance-id", target.phase_instance_id,
+               "--unit", unit, "--kind", "WaitingForMergeGate", "--reason", "checkpoint merge tests"]
+    wait_id = ""
+    try:
+        started = subprocess.run(command, capture_output=True, text=True, check=False)
+        wait_id = started.stdout.strip() if started.returncode == 0 else ""
+        if not wait_id:
+            report("wait", "NotRecorded", started.stderr.strip() or "recorder returned no wait id")
+    except OSError as error:
+        report("wait", "NotRecorded", str(error))
+    try:
+        yield
+    finally:
+        if wait_id:
+            try:
+                finished = subprocess.run([sys.executable, str(Path(progress_history.__file__)), "finish-wait",
+                                           "--session-dir", str(target.session_dir), "--wait-id", wait_id],
+                                          capture_output=True, text=True, check=False)
+                if finished.returncode:
+                    report("wait", "NotRecorded", finished.stderr.strip() or "cannot close merge gate wait")
+            except OSError as error:
+                report("wait", "NotRecorded", str(error))
+
+
+def record_pushed_merges(production: Production, merge_head: str, source_checkpoint: str,
+                         tip: str, *, phase_id: str, issue: str = "") -> None:
+    """Receipts survive promotion failures and include origin/main integration merges."""
+    repository = production_field(production.doc.read_text(encoding="utf-8").splitlines(), "Repository")
+    project = Path(repository).expanduser().name
+    merges = good(git(production.checkout, "rev-list", "--first-parent", "--merges", "--reverse",
+                      f"{merge_head}^1..{tip}"), "receipt").splitlines()
+    for commit in merges:
+        if commit != merge_head and good(git(production.checkout, "show", "-s", "--format=%s", commit), "receipt") != (
+            "Merge origin/main into " + production.merge_branch
+        ):
+            break  # A retry can see later units' merges; their own call records them.
+        source = source_checkpoint if commit == merge_head else good(
+            git(production.checkout, "rev-parse", f"{commit}^2"), "receipt")
+        stamp = float(good(git(production.checkout, "show", "-s", "--format=%ct", commit), "receipt"))
+        _ = progress_history.write_merge_receipt(
+            project=project, phase_id=phase_id, issue=issue, merge_commit=commit,
+            source_checkpoint=source, target_branch=production.merge_branch, merged_at=stamp,
+        )
+
+
 def run(request: MergeRequest) -> int:
     try:
         already = ancestry(request)
@@ -1066,7 +1188,11 @@ def run(request: MergeRequest) -> int:
             paths = changed_paths(request, f"{merge_head}^1")
         if isinstance(pushed, NotYetPushed):
             try:
-                tests_green = tests(request, paths, merge_head)
+                if isinstance(request.kind, CodeCheckpoint):
+                    with merge_gate_wait(request.unit.worktree, request.phase, request.unit.name):
+                        tests_green = tests(request, paths, merge_head)
+                else:
+                    tests_green = tests(request, paths, merge_head)
             except (OSError, ValueError) as error:
                 undo_unpushed_merge(request.production, merge_head)
                 raise Stop("red", "failed", str(error),
@@ -1081,6 +1207,8 @@ def run(request: MergeRequest) -> int:
             tip = push_validate(request.production,
                                 f"ci({request.production.slug}): format fixes after {request.unit.name} phase {request.phase}",
                                 not already, request.cancel_prior)
+        record_pushed_merges(request.production, merge_head, request.commit, tip, phase_id=request.phase,
+                             issue=str(request.unit.plan))
         notify_style(request.production.checkout, request.production.merge_branch, tip)
         if isinstance(pushed, NotYetPushed):
             record_changes(request, commits, merge_head)
@@ -1260,6 +1388,10 @@ def run_handoff(request: ChildHandoffRequest) -> int:
     delivery = request.delivery
     if isinstance(delivery, MergedAndPushed):
         print(f"hand-off {checkpoint[:7]} already merged as {delivery.merge_head[:7]}", flush=True)
+        pushed = pushed_state(request.production, checkpoint)
+        tip = pushed.tip if isinstance(pushed, PushedTip) else delivery.merge_head
+        record_pushed_merges(request.production, delivery.merge_head, checkpoint, tip,
+                             phase_id="", issue=f"{request.child.slug} hand-off")
         finish_handoff(request, delivery.merge_head)
         return 0
     current = good(git(checkout, "branch", "--show-current"), "merge")
@@ -1275,8 +1407,9 @@ def run_handoff(request: ChildHandoffRequest) -> int:
         _ = good(git(checkout, "merge", "--no-ff", "-m", subject, checkpoint), "merge")
         merge_head = good(git(checkout, "rev-parse", "HEAD"), "merge")
         try:
-            _ = checkpoint_tests(request.production, paths, checkpoint, request.merge_tests,
-                                 request.flakes, request.scratch, merge_head, request.flaky_tests)
+            with merge_gate_wait(request.child.checkout, "", request.child.slug):
+                _ = checkpoint_tests(request.production, paths, checkpoint, request.merge_tests,
+                                     request.flakes, request.scratch, merge_head, request.flaky_tests)
         except (OSError, ValueError) as error:
             undo_unpushed_merge(request.production, merge_head)
             raise Stop("red", "failed", str(error), "repair the test logging failure and send a new checkpoint") from error
@@ -1288,6 +1421,8 @@ def run_handoff(request: ChildHandoffRequest) -> int:
         tip = push_validate(request.production,
                             f"ci({request.production.slug}): format fixes after {request.child.slug} style hand-off",
                             isinstance(delivery, NotMerged))
+    record_pushed_merges(request.production, merge_head, checkpoint, tip,
+                         phase_id="", issue=f"{request.child.slug} hand-off")
     notify_style(checkout, branch, tip)
     promote(request, tip)
     finish_handoff(request, merge_head)

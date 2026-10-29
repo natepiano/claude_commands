@@ -470,6 +470,16 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
         return [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()
                 if cast(dict[str, object], json.loads(line)).get("event_type") == kind]
 
+    def test_named_phase_reaches_worker_verification_environment(self) -> None:
+        session = self.start_phase("phase-environment")
+        _ = self.prompt_file.write_text("Phase 3 — Retry handling\nWrite the retry path.\n")
+        stub = self.root / "scripts" / "agents" / "agent_exec.sh"
+        with stub.open("a") as output:
+            _ = output.write('printf "%s|%s" "$UNIT_RUN_DIR" "$UNIT_TEAM_ROLE" > "$UNIT_RUN_DIR/wait-context"\n')
+        result = self.checked_launch(session, "--phase", "3")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((session / "wait-context").read_text(), f"{session}|impl")
+
     def test_a_companion_fix_starts_after_the_resolver_lands_its_round(self) -> None:
         session = self.start_phase("landed-companion")
         self.open_repair_round(session)
