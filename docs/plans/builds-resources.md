@@ -42,7 +42,7 @@ Own what a build may use and when it starts: memory admission and the memory que
 
 ## Phases
 
-### Phase 1 — A tripwire for live memory readings, and the BRP launch tests fake both  · status: todo
+### Phase 1 — A tripwire for live memory readings, and the BRP launch tests fake both  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -73,7 +73,7 @@ Own what a build may use and when it starts: memory admission and the memory que
 **Files:**
 - `scripts/lint/memory_admit.py` — the path check, `LiveMemoryReading`, `main`.
 - `scripts/lint/memory_gate.sh` — the shell check before the `MemAvailable` read.
-- `scripts/lint/memory_test_support.py` (new) — `fake_memory_readings`.
+- `scripts/lint/memory_test_support.py` — new: `fake_memory_readings`.
 - `scripts/lint/test_memory_admit.py` — the tripwire tests and the tripwire in its environments.
 - `scripts/hooks/test_brp_launch_gate.py` — the helper in `setUp`, the denial test.
 - `scripts/build_hold/test_build_hold.py` — the helper.
@@ -81,8 +81,8 @@ Own what a build may use and when it starts: memory admission and the memory que
 - `docs/as-built/build-memory-admission.md` — item 8.
 
 **Workers:** `1 writer + 1 tester`
-- `impl` — `memory_admit.py`, `memory_gate.sh`, `memory_test_support.py`, the `setUp` changes in `test_brp_launch_gate.py` and `test_build_hold.py`, `affected_modules.py`, the as-built doc.
-- `test` — the tests of item 7, written from this Spec alone.
+- `impl` — `memory_admit.py`, `memory_gate.sh`, `memory_test_support.py`, `affected_modules.py`, the as-built doc.
+- `test` — every test file: the helper in `test_brp_launch_gate.py` and `test_build_hold.py` (items 5–6), the tripwire in `test_memory_admit.py`'s environments (item 6), and the tests of item 7, written from this Spec alone. (Unit director, 2026-10-29: the test slot owns all three test files so no file has two writers.)
 
 **Constraints from prior phases:** none.
 
@@ -112,7 +112,15 @@ Own what a build may use and when it starts: memory admission and the memory que
 **Files:**
 - `scripts/production/merge_gate.py` — items 1–2 (owner: natedev showrunner).
 - `scripts/production/test_merge_gate.py` — item 6 (owner: natedev showrunner).
-- Each module item 3 lists, and the modules of item 5: verify-unit (`scripts/direct/test_verify_*.py`, `scripts/buildlog/test_mac_idle.py`, `scripts/lint/test_invoke_scope.py`), report-unit (`scripts/buildlog/test_record.py` and any `scripts/buildlog/` or `scripts/build_queue/` module listed), natedev showrunner (`scripts/production/test_dailies_render_holds.py` and any other `scripts/production/` module listed), this unit (`scripts/hooks/`, `scripts/build_hold/`, `scripts/build_targets/`, `scripts/lint/` modules it owns).
+- `scripts/direct/` — verify-unit test modules item 3 lists, and the `test_verify_*.py` modules of item 5 (owner verify-unit).
+- `scripts/buildlog/test_mac_idle.py` — item 5 (owner verify-unit).
+- `scripts/buildlog/test_record.py` — item 5 (owner report-unit).
+- `scripts/build_queue/` — any module item 3 lists (owner report-unit).
+- `scripts/production/test_dailies_render_holds.py` — item 5 (owner natedev showrunner).
+- `scripts/hooks/` — any module item 3 lists (this unit, or the owner the survey names).
+- `scripts/build_hold/` — any module item 3 lists (this unit).
+- `scripts/build_targets/` — any module item 3 lists (this unit).
+- `scripts/lint/` — any module item 3 lists (this unit, or verify-unit for `test_invoke_scope.py`, `test_nextest_*.py`).
 - `docs/as-built/merge-gate-and-test-speed.md`, `docs/as-built/build-memory-admission.md` — item 7.
 
 **Workers:** `1 writer + 1 tester`

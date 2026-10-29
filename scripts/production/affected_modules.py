@@ -18,6 +18,7 @@ import sys
 # Shared fixture providers, including test modules imported by other modules.
 # Changing their setup/patch boundaries requires a full isolation check.
 SHARED_TEST_HELPERS = frozenset({
+    "scripts/lint/memory_test_support.py",
     "scripts/shutdown/test_support.py", "scripts/shutdown/test_account_move.py",
     "scripts/shutdown/test_inventory.py", "scripts/production/cli_fixture.py",
     "scripts/direct/recorder_fixture.py", "scripts/direct/wait_for_test_state.py",

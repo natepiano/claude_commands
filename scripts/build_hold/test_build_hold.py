@@ -19,13 +19,18 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
-from typing import TypedDict, cast, override
+from typing import TYPE_CHECKING, TypedDict, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
 import build_hold
 import unit_runs
 from sessions import SessionRecord
+
+if TYPE_CHECKING:
+    from ..lint.memory_test_support import fake_memory_readings
+else:
+    from scripts.lint.memory_test_support import fake_memory_readings
 
 
 SCRIPT = Path(__file__).with_name("build_hold.py")
@@ -81,8 +86,6 @@ class IsolatedBuildHoldTest(unittest.TestCase):
         proc = self.scratch / "proc"
         proc.mkdir()
         _ = self.enterContext(mock.patch.object(build_hold, "PROC_ROOT", proc))
-        meminfo = self.scratch / "meminfo"
-        _ = meminfo.write_text("MemAvailable: 67108864 kB\n")
         lifetime = self.scratch / "child-lifetime"
         lifetime.mkdir()
         _ = (lifetime / "sitecustomize.py").write_text(CHILD_LIFETIME)
@@ -108,7 +111,7 @@ class IsolatedBuildHoldTest(unittest.TestCase):
             "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
             "MAC_TEST_STATE_DIR": str(self.scratch / "mac-state"),
-            "BUILDLOG_MEMINFO": str(meminfo),
+            **fake_memory_readings(self.scratch),
             # No test reads the machine's own session records, or passes for the session that runs it.
             "NOTIFIER_SESSIONS_DIR": str(self.scratch / "sessions"),
             "CLAUDE_CODE_SESSION_ID": "",

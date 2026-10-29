@@ -183,7 +183,7 @@ buildlog_wait_for_memory() {
         BUILDLOG_MEM_OUTCOME=Granted
         return 0
     fi
-    local meminfo="${BUILDLOG_MEMINFO:-/proc/meminfo}" line available_kb available result error_line
+    local meminfo="${BUILDLOG_MEMINFO:-/proc/meminfo}" live_path line available_kb available result error_line
     local started=0 announced=0 next_notice=60 interval="${BUILDLOG_MEM_POLL_S:-5}" limit="${BUILDLOG_MEM_WAIT_LIMIT_S:-900}"
     local state threshold need source count promised running reserve summary reservation repo step fresh reason worktree measured head_need head_label fields numeric noticed=0 caller_pid=$BASHPID
     local cached_repo="" cached_step="" cached_worktree="" cached_need=- cached_source="" cached_count=0
@@ -191,6 +191,18 @@ buildlog_wait_for_memory() {
     [[ "$limit" =~ ^[0-9]+$ && "$limit" -ge 0 ]] || limit=900
     BUILDLOG_MEM_WAIT_FROM="${BUILDLOG_MEM_WAIT_SINCE:-${EPOCHSECONDS:-$(date +%s)}}"
     while [[ -r "$meminfo" ]]; do
+        if [[ -n "${BUILDLOG_LIVE_MEMORY_TRIPWIRE:-}" ]]; then
+            if ! live_path=$(realpath -m -- "$meminfo"); then
+                buildlog_memory_refuse 'cannot resolve memory reading path'
+                return 2
+            fi
+            if [[ "$live_path" == /proc/meminfo || "$live_path" == /proc/pressure/memory ]]; then
+                result=$(buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" tripwire "$live_path" 2>&1) || true
+                error_line=${result##*$'\n'}
+                buildlog_memory_refuse "${error_line:-live memory tripwire failed}"
+                return 2
+            fi
+        fi
         available_kb=""
         while IFS= read -r line || [[ -n "$line" ]]; do
             if [[ "$line" =~ ^MemAvailable:[[:space:]]+([0-9]+)[[:space:]]+kB[[:space:]]*$ ]]; then
