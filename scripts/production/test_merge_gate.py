@@ -24,7 +24,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 from scripts.production import change_review, merge_gate
-from scripts.production.affected_modules import CertifiedBase
+from scripts.production.affected_modules import CertifiedBase, FullSuite
 from scripts.direct.wait_for_test_state import wait_for_file
 from scripts.direct.local_release_wait import IntervalReleasePolling
 from scripts.build_hold.test_hold_applies import TemporaryHoldTest
@@ -586,17 +586,22 @@ class MergeGateTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assert_all_modules_started()
                 self.assertNotIn("tests reused from", result.stdout)
-                self.assertIn("full suite: " + ("--full" if trigger == "--full" else
-                              "last nightly run was red (red-tree, 2026-10-29T00:00:00+00:00)"), result.stdout)
+                reason = ("--full" if trigger == "--full" else
+                          "last nightly run was red (red-tree, 2026-10-29T00:00:00+00:00)")
+                self.assertIn("full suite: " + reason, result.stdout)
+                summary = next(line for line in result.stdout.splitlines() if line.startswith("Gate tests:"))
+                self.assertIn("full suite: " + reason, summary)
+                self.assertEqual(self.pass_records()[-1]["reason"], reason)
                 self.assertFalse(marker.exists())
                 self.assertEqual(self.pass_records()[-1]["kind"], "full")
 
     def test_base_search_uses_only_newest_full_same_host_suite_ancestor_and_accepts_legacy_records(self) -> None:
         ledger = merge_gate.PassedTreeLedger(self.checkout, "tests-only", merge_gate.clean_test_tree(self.checkout))
         with mock.patch.dict(os.environ, self.environment):
-            ledger.record_pass()
+            ledger.record_pass(FullSuite("no certified base"))
             original = self.pass_records()[0]
             _ = original.pop("kind")  # Older full certifications remain usable.
+            _ = original.pop("reason")
             self.write(self.checkout / "subject.txt", "a descendant\n")
             head = self.commit(self.checkout, "descendant")
             detached = self.git(self.checkout, "commit-tree", self.git(self.checkout, "rev-parse", "HEAD^{tree}"),

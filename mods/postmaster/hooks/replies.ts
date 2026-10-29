@@ -110,20 +110,25 @@ export async function startReplies(calls: PostmasterCalls): Promise<Replies> {
       const senders = [...new Set(matching.map(route => route.sender))];
       const targets = new Set<string>();
       for (const route of matching) if (route.destination.kind === "session") targets.add(route.destination.sessionId);
+      const replying = matching[matching.length - 1];
+      if (replying === undefined) return { kind: "pass" };
       const answerTo = senders.length === 1 ? senders.join(", ") : `one of ${senders.join(", ")}`;
-      const key = `${at_ms}-${++replyCount}`;
-      const forwarded: string[] = [];
+      const logPath = path(PATHS.replies, `${at_ms}-${++replyCount}`);
+      const log: ReplyLog = {
+        at_ms, socket: reply.socket, name: reply.name, session_id: replying.sessionId, senders, body: reply.body,
+        targets: [...targets], forward: "pending", forwarded: [],
+      };
+      // The record exists before any forward, so a recipient's hook can check where the reply came from.
+      await calls.fs.write(logPath, JSON.stringify(log));
       for (const sessionId of targets) {
         const text = `Message from ${reply.name} (their answer to ${answerTo}, passed on by postmaster) [${at_ms}-${++forwardCount}]:\n\n${reply.body}`;
         try {
           const answer = await calls.session.send({ to: { sessionId }, text });
-          if (answer.isDelivered) forwarded.push(sessionId);
+          if (answer.isDelivered) log.forwarded.push(sessionId);
         } catch { /* The answer is still logged and consumed when forwarding fails. */ }
       }
-      const replying = matching[matching.length - 1];
-      if (replying === undefined) return { kind: "pass" };
-      const log: ReplyLog = { at_ms, socket: reply.socket, name: reply.name, session_id: replying.sessionId, senders, body: reply.body, forwarded };
-      await calls.fs.write(path(PATHS.replies, key), JSON.stringify(log));
+      log.forward = "done";
+      await calls.fs.write(logPath, JSON.stringify(log));
       return { kind: "consumed", reason: "postmaster reply" };
     },
   };

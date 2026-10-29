@@ -800,17 +800,17 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.assertIsInstance(ordinary_resume.launch_kind, add_unit.NewWorkLaunch)
         self.assertIsInstance(new_work.launch_kind, add_unit.NewWorkLaunch)
 
-    def test_guilds_designer_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
-        self.assert_guild_head_launch_and_restart("designers")
+    def test_named_designer_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
+        self.assert_named_unit_launch_and_restart("designers")
 
-    def test_guilds_reviewer_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
-        self.assert_guild_head_launch_and_restart("reviewers")
+    def test_named_reviewer_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
+        self.assert_named_unit_launch_and_restart("reviewers")
 
-    def test_guilds_showrunner_head_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
-        self.assert_guild_head_launch_and_restart("showrunners")
+    def test_named_showrunner_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
+        self.assert_named_unit_launch_and_restart("showrunners")
 
-    def test_guilds_unit_head_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
-        self.assert_guild_head_launch_and_restart("units")
+    def test_named_unit_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
+        self.assert_named_unit_launch_and_restart("units")
 
     def test_restore_flags_are_atomic_and_require_resume(self) -> None:
         note = self.root / "restart-note.txt"

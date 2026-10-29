@@ -16,7 +16,7 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS / "production"))
 
 import showrunners
-from add_showrunner import herdr_tab_open
+from add_showrunner import NoEndingTab, herdr_tab_open
 import herdr
 from production_units import Production, read_production
 from production_units import Refusal, cell_value, production_field, unit_table
@@ -404,7 +404,7 @@ def main(argv: list[str]) -> int:
         if existing:
             _attach(style)
             return 0
-        if style.slug not in showrunners.timer_slugs() and herdr_tab_open(style.slug):
+        if style.slug not in showrunners.timer_slugs() and herdr_tab_open(style.slug, NoEndingTab()):
             raise Refusal(_open_session_guidance(style, "live session without an update timer"))
         if not (style.checkout / ".git").exists():
             present = subprocess.run(

@@ -96,7 +96,7 @@ branch is renamed, and no unfinished prior rename journal for the old slug.
 | 1 | Add or extend Formerly as the first bullet of Production Context, write the new doc, point CHECK at it, and `git mv` the doc. |
 | 2 | Rewrite unit-plan Production headers (both header forms) and their production-doc references; add a header where a plan has none. |
 | 3 | Rename `showrunner-<old>` to `showrunner-<new>` and keep the updated CHECK. |
-| 4 | Move `footers-off/<slug>`, `review-paused/<slug>.json`, `outstanding/<slug>.json`, `counts/<slug>`, `reports/<slug>.json`, then each entry of `<slug>/` into the new directory; rewrite matching `*/parent` contents; each guild design the showrunner holds takes `ShowrunnerHolder(<new>)` (`roles.move_holder`). Then `rename_outside.apply`: move the `next-`, `proposal-` and `question-<slug>` pins (and their `-all-below` forms) and rename their `<old>: ` item keys; rewrite Production cells naming `<old>` on the change-review list; point each child doc's Parent production line at the new doc; move the bevy upgrade record and notifier job (`RUN` names the new doc, `FROM` the new instance) and drop its lock; remove the derived `unit-board/<old>.json`; a Log line naming `<old>-log.md` takes `<new>-log.md`, the log and its `-recovered` copy move, and an info/exclude line naming an old one gains one for the new. The production's own log and its `-recovered` copy, by either name, may stand untracked: every clean-checkout check (`_dirty`, `_check_edits`) skips them, since a log is never committed. Every part repeats safely. |
+| 4 | Move `footers-off/<slug>`, `review-paused/<slug>.json`, `outstanding/<slug>.json`, `counts/<slug>`, `reports/<slug>.json`, then each entry of `<slug>/` into the new directory; rewrite matching `*/parent` contents; each held design the showrunner holds takes `ShowrunnerHolder(<new>)` (`roles.move_holder`). Then `rename_outside.apply`: move the `next-`, `proposal-` and `question-<slug>` pins (and their `-all-below` forms) and rename their `<old>: ` item keys; rewrite Production cells naming `<old>` on the change-review list; point each child doc's Parent production line at the new doc; move the bevy upgrade record and notifier job (`RUN` names the new doc, `FROM` the new instance) and drop its lock; remove the derived `unit-board/<old>.json`; a Log line naming `<old>-log.md` takes `<new>-log.md`, the log and its `-recovered` copy move, and an info/exclude line naming an old one gains one for the new. The production's own log and its `-recovered` copy, by either name, may stand untracked: every clean-checkout check (`_dirty`, `_check_edits`) skips them, since a log is never committed. Every part repeats safely. |
 | 5 | Move each Units row's stall-watch file from `sha256(old\0unit).json` to `sha256(new\0unit).json`. |
 | 6 | Move the production's review-pool directory, including leases. |
 | 7 | Renamed merge branch: create and switch to `<new>` at the saved tip and update Merge branch. Kept merge branch: stay on it. Then commit documents and push with upstream. |
@@ -148,7 +148,7 @@ exists, must stay at the recorded tip before each later change.
 | 0 | Saved old and new branch names, worktree paths and tips. |
 | 1 | Created `<new>-<stem>` at the old tip and pushed it. |
 | 2 | Ran `git worktree move`, `git worktree repair` and switched the moved worktree to its new branch. |
-| 3 | Moved account project directories and copied trust entries; each guild design the unit holds took `UnitHolder(<new>, <unit>)` and the new worktree paths (`roles.move_holder`). |
+| 3 | Moved account project directories and copied trust entries; each held design the unit holds took `UnitHolder(<new>, <unit>)` and the new worktree paths (`roles.move_holder`). |
 | 4 | Committed the Units row's Worktree and Branch cells and pushed the merge branch. |
 | 5 | Verified the new remote tip and deleted the old remote and local unit branch. |
 
@@ -161,12 +161,18 @@ Threads, Codex homes and paused state stay the same. The journal records
 `workers_repointed` after these writes; a retry repeats partial writes safely
 and skips a completed worker step.
 
-`rename.py repair-workers <production> [--dry-run]` applies the same repair
-to each journaled unit that reached step 2, including completed moves made
-before this repair existed. It prints one line per change and one line for
-each unit with nothing to change. Dry run writes nothing. A second repair
-changes nothing. Units without a journaled worktree move are outside this
-command's scope.
+`rename.py repair-workers <production> [--dry-run]` reads journaled moves
+at step 2 or later and the current production doc's Units rows. It also works
+without a rename journal, using the doc named by the update timer. Missing
+old worktrees in run state or worker roster paths are matched by saved unit
+identity, a plan header, then the old folder name. Former production names
+come from the journal and the doc's Formerly line. A run that matches two
+units is named and skipped. Each change and each unit with nothing to change
+gets one line; no matches prints the reason. Dry run writes no file or lock.
+A second repair changes nothing.
+
+Apply updates its own journal fields and retains all other keys, including
+`unit_moves`, later step names and the completed `done` value on a rerun.
 
 The destination is a sibling named `<repository>-<new>-<stem>`. The repository
 prefix comes from the conventional old basename, or the showrunner checkout's
@@ -284,7 +290,7 @@ and 2 for invalid arguments.
   slug: `outstanding/<slug>.history.jsonl` and the `review-health-<slug>`
   notifier instance. Step 4 moves the `bevy-upgrade-<slug>` instance and the
   `BEVY_UPGRADE_STATE_DIR/<slug>.json` record, and each held design role
-  through `roles.move_holder` (`docs/as-built/guilds.md`).
+  through `roles.move_holder` (`docs/as-built/long-lived-workers.md#lasting-roles`).
 
 ## Why
 

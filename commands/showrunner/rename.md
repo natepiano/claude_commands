@@ -79,7 +79,8 @@ it is archival state, not a recovery command.
 
 For units moved before worker path repair was added, run
 `repair-workers <production> --dry-run`, then `repair-workers <production>`.
-It uses the journal's moved units, prints each change or that a unit has nothing
+It reads journaled moves and current Units rows with saved run or worker paths,
+including moves with no journal record. It prints each change or that a unit has nothing
 to change, and can be repeated. Dry run changes nothing.
 
 Never rewrite history: existing commit subjects, log lines and transcript
