@@ -60,6 +60,20 @@ In `invoke.sh`, `run_once` checks natedev holds before memory admission, runs th
 
 `BUILDLOG_SCOPE_SH` also writes the scope's cgroup directory to `"$BUILDLOG_PEAK.cgroup"`. `run_once` passes the step's argv to the gate and runs one `buildlog_sample_anon` sampler, which reads the scope's `anon` every second, keeps the maximum in the `.max` file beside the reservation, and exits when its parent is gone. `buildlog_finish_memory` stops the sampler, releases the reservation and removes the sidecar on every path; the release appends the maximum to `anon_peaks.jsonl` (host, repo, step, worktree, anon peak, exit status, UTC end time, `test_threads`, `call_id`), and nothing for an unscoped step. `scripts/lint/test_memory_admit.py` covers the rule, the ledger and the shell gate over a fake meminfo, index and cgroup tree; its shell tests run the gate under `set -e`, as `invoke.sh` does.
 
+### Name the reservation that blocks a waiter
+
+`python3 scripts/lint/memory_admit.py blocker --waiter <waiter file>` reads the admission ledger under a shared lock. It does not create the lock, prune stale records, or change state files. It prints one JSON line and exits 0:
+
+- `{"session_id":"…","session_name":"…","pool":"memory"}` when one reservation blocks admission and its session is known.
+- `{"unit":"…"}` when that reservation's session is unknown but its cgroup sidecar names a systemd scope or service.
+- `{}` when no single reservation can be named. This includes a ready step, a pressure hold, queue priority, several possible blocking reservations, and unknown ownership.
+
+A gone waiter file gives exit 2. A stale waiter that is still on disk gives `{}` and exit 0.
+
+The lookup uses the same queue and admission rules as `check`. It reports a reservation only when removing that reservation would admit the waiter and no other single reservation would do so. Releasing a measured reservation returns only its resident bytes to available memory. Swap bytes stay part of the build charge but do not count as freed RAM. The lookup removes the reservation's full build charge and growth promise, then applies the same admission rule. The lookup does not assign a pressure hold to a reservation.
+
+`CheckResult.blocker` carries the same typed result from the snapshot used for admission. New poll callers set `BUILDLOG_MEM_BLOCKER=1` to append one JSON blocker field to the existing pipe-separated `check` output. It is field 16 normally, or field 19 with `BUILDLOG_MEM_DETAIL=1`. JSON escapes any pipe in a name as `\u007c`. The prior fields keep their positions and values. Without the opt-in, the 15-field and 18-field forms stay unchanged so existing shell callers continue to work. A caller that accepts the new field can detect a holder change on its existing check poll, with no separate Python start.
+
 ### Cargo wrapper (natedev only)
 
 `scripts/build_hold/cargo` puts building cargo commands from shells, scripts and TUIs in a `builds.slice` scope. This includes `cargo mend`, which builds the workspace. It finds the first other cargo on PATH, keeps its arguments and exit status, and passes non-building commands such as `metadata`, `fmt` and `tree` through at once. A call already in `builds.slice` skips the hold check and a second scope. Other building calls check `hold_applies.py` when the hold directory has an entry: an applicable hold refuses the command; unreadable state prints a note and allows it. An empty hold directory starts no Python. Without a user bus or `systemd-run`, cargo runs directly.

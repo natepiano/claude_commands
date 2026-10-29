@@ -44,6 +44,56 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertIn("send alpha-unit: push your branch to origin and resend the checkpoint",
                       never_pushed.process.stdout)
         self.assertEqual(never_pushed.process.stdout, unpushed.process.stdout)
+    def test_checkpoint_on_second_origin_branch_merges_the_checkpoint_and_names_branch(self) -> None:
+        _ = self.git("checkout", "-b", "alpha-phase", cwd=self.unit)
+        sha = self.checkpoint(push=False)
+        _ = self.git("push", "origin", "alpha-phase", cwd=self.unit)
+        # The accepted checkpoint need not be the containing branch's tip.
+        later = self.checkpoint("outside.txt", "later work\n", push=False)
+        _ = self.git("push", "origin", "alpha-phase", cwd=self.unit)
+        _ = self.git("config", "remote.origin.fetch",
+                     "+refs/heads/alpha-branch:refs/remotes/origin/alpha-branch")
+        result = self.run_checkpoint(sha)
+        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+        self.assertIn("ancestry: ok — checkpoint exists, follows history, and is on origin/alpha-phase\n",
+                      result.process.stdout)
+        self.assertEqual(self.git("rev-parse", "HEAD^2"), sha)
+        self.assertNotEqual(self.git("rev-parse", "HEAD^2"), later)
+        self.assertFalse((self.checkout / "outside.txt").exists())
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), self.git("rev-parse", "HEAD"))
+
+    def test_checkpoint_on_no_origin_branch_checks_all_heads_and_still_holds(self) -> None:
+        sha = self.checkpoint(push=False)
+        # Simulate a deleted alternate branch with a stale local tracking ref.
+        _ = self.git("push", "origin", f"{sha}:refs/heads/alpha-phase", cwd=self.unit)
+        _ = self.git("update-ref", "refs/remotes/origin/alpha-phase", sha)
+        _ = self.git("update-ref", "-d", "refs/heads/alpha-phase", cwd=self.origin)
+        with mock.patch.object(merge_checkpoint, "git", wraps=merge_checkpoint.git) as commands:
+            result = self.run_checkpoint(sha)
+        self.assert_stopped_before_merge(result, "held", "ancestry: held — commit is not on origin")
+        self.assertIn("send alpha-unit: push your branch to origin and resend the checkpoint", result.process.stdout)
+        commands.assert_any_call(self.checkout, "fetch", "--prune", "origin",
+                                 "+refs/heads/*:refs/remotes/origin/*")
+        self.assertEqual(self.git("for-each-ref", "refs/remotes/origin/alpha-phase"), "")
+
+    def test_second_origin_branch_is_accepted_when_units_row_branch_was_deleted(self) -> None:
+        _ = self.git("checkout", "-b", "alpha-phase", cwd=self.unit)
+        sha = self.checkpoint(push=False)
+        _ = self.git("push", "origin", "alpha-phase", cwd=self.unit)
+        _ = self.git("push", "origin", "--delete", "alpha-branch", cwd=self.unit)
+        result = self.run_checkpoint(sha)
+        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+        self.assertIn("is on origin/alpha-phase", result.process.stdout)
+        self.assertEqual(self.git("rev-parse", "HEAD^2"), sha)
+
+    def test_units_row_origin_branch_uses_the_fast_path(self) -> None:
+        sha = self.checkpoint()
+        with mock.patch.object(merge_checkpoint, "git", wraps=merge_checkpoint.git) as commands:
+            result = self.run_checkpoint(sha)
+        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+        self.assertIn("is on origin/alpha-branch", result.process.stdout)
+        self.assertFalse(any(call.args[1:3] == ("fetch", "--prune") for call in commands.call_args_list))
+
     def test_unreachable_origin_still_fails_at_ancestry(self) -> None:
         sha = self.checkpoint()
         _ = self.git("remote", "set-url", "origin", str(self.root / "absent.git"))
