@@ -21,6 +21,7 @@ class WorkerLaunchRecord(TypedDict, total=False):
     turn_id: str
     seat_id: str
     seat: str
+    role: str
 
 
 def _move_old_name(previous: Path, current: Path) -> Path:
@@ -74,14 +75,30 @@ def _convert_record(path: Path) -> None:
         _ = scratch.replace(path)
 
 
-def worker_record_path(run: Path, name: str, slot: str) -> Path:
-    """The worker's durable identity file: its slot's, except the repair worker's own.
-
-    A repair worker runs in slot impl as `<project>-fix` (worker_name.sh). Keyed by its slot,
-    its record would replace the impl worker's, and the impl worker could not be followed again.
-    """
-    key = "fix" if name.endswith("-fix") else slot
-    return run / f"impl_worker_{key}.json"
+def worker_record_path(run: Path, name: str, slot: str, *, role: str = "") -> Path:
+    """Find a worker by its address; a later assignment never changes its identity path."""
+    for path in sorted(run.glob("impl_worker_*.json")):
+        try:
+            value = cast(object, json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            continue
+        if isinstance(value, dict) and cast(dict[str, object], value).get("name") == name:
+            return path
+    try:
+        roster = cast(dict[str, object], json.loads((run / "mesh_roster.json").read_text(encoding="utf-8")))
+        record = roster.get(name)
+        if not role and isinstance(record, dict):
+            stored_role = cast(dict[str, object], record).get("role")
+            role = stored_role if isinstance(stored_role, str) else ""
+    except (OSError, ValueError):
+        pass
+    key = "fix" if role == "fix" else slot
+    candidate = run / f"impl_worker_{key}.json"
+    if candidate.exists():
+        # Slot paths are retained for earlier callers. An occupied slot belongs
+        # to another address, so give the new worker a separate stable key.
+        return run / f"impl_worker_name_{name.encode().hex()}.json"
+    return candidate
 
 
 def worker_slot(run: Path, name: str) -> str | None:
@@ -100,19 +117,6 @@ def worker_slot(run: Path, name: str) -> str | None:
     return None
 
 
-def _rekey_record(run: Path, path: Path) -> None:
-    """Move a repair worker's record out of the slot file an earlier launcher wrote it to."""
-    try:
-        value = cast(object, json.loads(path.read_text(encoding="utf-8")))
-    except (OSError, ValueError):
-        return
-    if not isinstance(value, dict):
-        return
-    name = cast(WorkerLaunchRecord, cast(object, value)).get("name")
-    if isinstance(name, str) and name:
-        _ = _move_old_name(path, worker_record_path(run, name, path.stem.removeprefix("impl_worker_")))
-
-
 def migrate_worker_records(run: Path) -> None:
     """Convert durable identity names and claim fields under the launch lock."""
     _ = worker_ledger(run)
@@ -121,8 +125,6 @@ def migrate_worker_records(run: Path) -> None:
     for pattern in ("impl_worker_*.json", "impl_claim_*.json"):
         for path in run.glob(pattern):
             _convert_record(path)
-    for path in run.glob("impl_worker_*.json"):
-        _rekey_record(run, path)
 
 
 @contextmanager

@@ -18,6 +18,7 @@ from typing import cast, final, override
 from unittest import mock
 
 from scripts.guilds import roles
+from scripts.direct import workers
 
 SCRIPT = Path(__file__).with_name("rename.py")
 OLD = "old"
@@ -202,6 +203,8 @@ class ProductionRenameTests(unittest.TestCase):
         config.mkdir()
         self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         self.env.update({
+            "UNIT_WORKERS_STATE": str(self.root / "state/unit-workers"),
+            "RETIRE_UNIT_RUN_ROOT": str(self.root / "runs"),
             "HOME": str(self.home), "CLAUDE_CONFIG_DIR": str(config),
             "XDG_CONFIG_HOME": str(self.home / ".config"),
             "XDG_STATE_HOME": str(self.root / "state"),
@@ -426,7 +429,7 @@ class ProductionRenameTests(unittest.TestCase):
         self.assertEqual(self.git("ls-remote", "origin", "refs/heads/new"), f"{new_tip}\trefs/heads/new")
         self.assertEqual(self.git("ls-remote", "origin", "refs/heads/old"), f"{self.old_tip}\trefs/heads/old")
         self.assertEqual(self.git("status", "--porcelain"), "")
-        self.assertEqual(self.journal()["step"], 7)
+        self.assertEqual(self.journal()["step"], 8)
         self.assertIs(self.journal()["done"], False)
 
     def test_plan_ignores_as_built_paths_and_prose_in_plan_cells(self) -> None:
@@ -625,7 +628,7 @@ class ProductionRenameTests(unittest.TestCase):
         self.assertTrue((self.notifier / "showrunner-old/conf").exists())
         self.assertFalse((self.notifier / "showrunner-new").exists())
         self.assert_success(self.run_rename("apply", source="ancient"))
-        self.assertEqual(self.journal()["step"], 7)
+        self.assertEqual(self.journal()["step"], 8)
         self.assertEqual(self.git("rev-parse", "new^"), base)
         self.assertEqual(self.git("status", "--porcelain"), "")
 
@@ -715,6 +718,16 @@ class ProductionRenameTests(unittest.TestCase):
         before = self.snapshot()
         self.assert_success(self.run_rename("apply"))
         self.assertEqual(self.snapshot(), before)
+
+    def test_worker_migration_conflict_prints_a_refusal_without_a_traceback(self) -> None:
+        with mock.patch.dict(os.environ, self.env):
+            ledger = workers.UnitWorkerLedger(workers.ledger_path(OLD, "alpha-unit"))
+            with ledger.locked():
+                pass
+        result = self.run_command("apply", OLD, NEW, wrapper='import runpy, sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[2]))\nfrom scripts.direct import workers\ndef unavailable(*args, **kwargs):\n    raise workers.WorkerUnavailable("worker ownership changed; rerun apply")\nworkers.move_unit = unavailable\nworkers.rename_unit = unavailable\nworkers.end_unit = unavailable\nsys.argv = sys.argv[1:]\nsys.path.insert(0, str(Path(sys.argv[0]).parent))\nrunpy.run_path(sys.argv[0], run_name="__main__")\n')
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("worker ownership changed; rerun apply", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_invalid_and_reserved_destinations_refuse_without_writes(self) -> None:
         for destination in ("../escape", "bad.slug", "footers-off", "review-paused", "outstanding"):
@@ -903,6 +916,23 @@ class ProductionRenameTests(unittest.TestCase):
                 (roles.mesh_directory(design.placement.design_id) / "mesh_roster.json").read_text()))
         return current, roster[design.roles[0].name]["cwd"]
 
+    def test_production_rename_moves_every_unit_worker_ledger_with_its_backend(self) -> None:
+        originals: dict[str, workers.UnitWorker] = {}
+        with mock.patch.dict(os.environ, self.env):
+            for unit in ("alpha-unit", "beta-unit", "showrunner"):
+                store = workers.UnitWorkerLedger(workers.ledger_path(OLD, unit))
+                worker = workers.UnitWorker("w7", "impl", "codex", "kept-model", "xhigh", {},
+                    workers.CodexThread("thread-" + unit, str(self.home / "codex")), workers.Paused(), [])
+                with store.locked() as ledger:
+                    ledger.workers[worker.name] = worker
+                originals[unit] = worker
+        self.assert_success(self.run_rename("apply"))
+        with mock.patch.dict(os.environ, self.env):
+            for unit, worker in originals.items():
+                self.assertFalse(workers.ledger_path(OLD, unit).exists())
+                with workers.UnitWorkerLedger(workers.ledger_path(NEW, unit)).locked() as ledger:
+                    self.assertEqual(ledger.workers["w7"], worker)
+
     def test_held_roles_move_to_the_new_slug_with_the_showrunner_and_each_unit(self) -> None:
         self.prepare_unit_moves()
         config = self.root / "guilds.conf"
@@ -934,7 +964,7 @@ class ProductionRenameTests(unittest.TestCase):
                 before = self.snapshot()
                 refused = self.run_command(*arguments)
                 self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
-                self.assertIn("step 7", refused.stderr)
+                self.assertIn("step 8", refused.stderr)
                 self.assertEqual(self.snapshot(), before)
 
     def test_unit_retry_repairs_a_worktree_already_moved_before_interruption(self) -> None:
@@ -1039,7 +1069,7 @@ class ProductionRenameTests(unittest.TestCase):
         self.assertEqual((archived["old"], archived["new"]), (OLD, NEW))
         current = cast(dict[str, object], json.loads((self.state / "next/rename.json").read_text()))
         self.assertIs(current["done"], False)
-        self.assertEqual(current["step"], 7)
+        self.assertEqual(current["step"], 8)
 
     def test_a_merge_branch_not_named_for_the_production_is_kept(self) -> None:
         self.prepare_unit_moves()

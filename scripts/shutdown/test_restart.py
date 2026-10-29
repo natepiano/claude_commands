@@ -60,6 +60,9 @@ from record import SessionShutdown, SessionProgress, TimerRestore, Where
 
 LOGIN = "owner@example.com"
 LABEL = "claude2"
+# Hang guard: natedev reached load 136 on 2026-10-29; scheduling delays are not failures.
+HANG_GUARD_SECONDS = 300
+
 STOPPED = "2026-10-09T21:49:10+00:00"
 RESTARTED = "2026-10-10T01:02:03+00:00"
 SUBMITTED_PROMPT = herdr.PromptSubmitted(datetime.fromisoformat(RESTARTED))
@@ -5407,7 +5410,7 @@ class RestartTests(ShutdownTestCase):
         self.create(saved)
         threads: set[int] = set()
         lock = threading.Lock()
-        launches_in_flight = threading.Barrier(6, timeout=10)
+        launches_in_flight = threading.Barrier(6, timeout=HANG_GUARD_SECONDS)
         launches: list[str] = []
 
         def launch(parts: restart.ResumeParts, destination: restart.HerdrDestination,
@@ -5875,20 +5878,20 @@ class RestartTests(ShutdownTestCase):
         def launch(_record: SessionShutdown, _note: str, _state: restart.DesktopLaunchState, *, dry_run: bool) -> restart.SessionLaunched:
             del dry_run
             entered.set()
-            self.assertTrue(release.wait(0.8))
+            self.assertTrue(release.wait(HANG_GUARD_SECONDS))
             return restart.SessionLaunched(SUBMITTED_PROMPT)
 
         with patch.object(restart, "_retire"), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "_launch_session", launch), patch.object(restart, "wait_for_confirmation") as wait:
             worker = threading.Thread(target=lambda: results.append(restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state)))
             worker.start()
             try:
-                self.assertTrue(entered.wait(0.8))
+                self.assertTrue(entered.wait(HANG_GUARD_SECONDS))
                 losing = restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state)
                 self.assertEqual(losing["progress"], saved["progress"])
                 wait.assert_not_called()
             finally:
                 release.set()
-                worker.join(0.8)
+                worker.join(HANG_GUARD_SECONDS)
         self.assertFalse(worker.is_alive())
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["progress"]["kind"], "restarting")
@@ -6311,7 +6314,7 @@ class RestartTests(ShutdownTestCase):
                     def launch(_saved: SessionShutdown, _note: str, _desktop: restart.DesktopLaunchState, *, dry_run: bool) -> restart.SessionLaunched:
                         del dry_run
                         entered.set()
-                        self.assertTrue(release.wait(0.8))
+                        self.assertTrue(release.wait(HANG_GUARD_SECONDS))
                         return restart.SessionLaunched(SUBMITTED_PROMPT)
 
                     def owner() -> None:
@@ -6330,7 +6333,7 @@ class RestartTests(ShutdownTestCase):
                         worker = threading.Thread(target=owner)
                         worker.start()
                         try:
-                            self.assertTrue(entered.wait(0.8))
+                            self.assertTrue(entered.wait(HANG_GUARD_SECONDS))
                             with patch.object(restart, "session_records", read_snapshot), patch.object(restart, "wait_for_confirmation", return_value=registry_confirmation(frozenset())) as wait, redirect_stdout(io.StringIO()):
                                 self.assertEqual(restart.up(LOGIN), 0)
                             wait.assert_not_called()
@@ -6342,7 +6345,7 @@ class RestartTests(ShutdownTestCase):
                             })
                         finally:
                             release.set()
-                            worker.join(0.8)
+                            worker.join(HANG_GUARD_SECONDS)
                     self.assertFalse(worker.is_alive())
                     self.assertEqual(failures, [])
 
