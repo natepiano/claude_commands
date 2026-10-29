@@ -1,6 +1,6 @@
 # Production — builds
 
-> **Status: PRODUCTION — planned.** The build system every session uses on natedev and the Mac: memory admission, the build queue, build holds, slots and disk sweeps; `verify.sh`, its pass records and the Mac test offload; and the build log with its reports (the user, 2026-10-29, via natedev).
+> **Status: PRODUCTION — running.** The build system every session uses on natedev and the Mac: memory admission, the build queue, build holds, slots and disk sweeps; `verify.sh`, its pass records and the Mac test offload; and the build log with its reports (the user, 2026-10-29, via natedev).
 
 ## Production Context
 
