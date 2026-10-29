@@ -219,7 +219,7 @@ Own what a build may use and when it starts: memory admission and the memory que
 - `test_brp_launch_gate.py` passes; the hook's added checks take under 1 s on a fresh hana binary.
 - Change-Review line: launching an already-built Bevy app through BRP starts at once | in a Claude session on natedev with a built hana, launch it with the BRP launch tool | it starts without a `waiting for memory` line.
 
-### Phase 7 — A one-line command summarizes the machine's working set, and the disk-floor sweep uses less memory  · status: todo
+### Phase 7 — A one-line command summarizes the machine's working set, and the disk-floor sweep uses less memory  · status: done
 **Depends on:** Phase 3
 
 #### Work Order
