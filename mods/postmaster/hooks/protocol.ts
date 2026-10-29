@@ -62,6 +62,8 @@ export type ReplyLog = {
   session_id: string;
   senders: string[];
   body: string;
+  targets: string[];
+  forward: "pending" | "done";
   forwarded: string[];
 };
 export type Replies = {
@@ -107,6 +109,9 @@ export function isDeliveryRouteFile(value: unknown): value is DeliveryRouteFile 
     && typeof value.reply_to_session_id === "string"
     && typeof value.session_id === "string" && value.session_id !== "" && timestamp(value.at_ms);
 }
+function sessionIds(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((id: unknown) => typeof id === "string" && id !== "");
+}
 export function isReplyLog(value: unknown): value is ReplyLog {
   return record(value) && timestamp(value.at_ms)
     && typeof value.socket === "string" && value.socket.startsWith("uds:/")
@@ -114,5 +119,5 @@ export function isReplyLog(value: unknown): value is ReplyLog {
     && typeof value.session_id === "string" && value.session_id !== ""
     && Array.isArray(value.senders) && value.senders.length > 0
     && value.senders.every((sender: unknown) => typeof sender === "string" && sender !== "") && typeof value.body === "string"
-    && Array.isArray(value.forwarded) && value.forwarded.every((id: unknown) => typeof id === "string" && id !== "");
+    && sessionIds(value.targets) && (value.forward === "pending" || value.forward === "done") && sessionIds(value.forwarded);
 }
