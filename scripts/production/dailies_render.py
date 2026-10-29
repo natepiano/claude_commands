@@ -48,7 +48,7 @@ production's own plumbing words (PLUMBING).
 --reports-to  With --footer, for a showrunner under a root: adds the bullet
          `reports to <root slug>`.
 --doc    With --footer, the production doc: the line after the header counts
-         its changes, efficiency, proposals and projects (footer_counts.py). A
+         its changes, efficiency and proposals (footer_counts.py). A
          report reads the doc from its input's `doc`.
 
 The input format is in ~/.claude/commands/showrunner/dailies.md.
@@ -2046,7 +2046,7 @@ def main(arguments: list[str]) -> int:
     _ = parser.add_argument("--below", type=Path, action="append", default=[],
                             help="with --footer, once per lower production: its list, counted with --outstanding; one that cannot be read is named")
     _ = parser.add_argument("--reports-to", default="", help="with --footer: the root production a lower showrunner is under")
-    _ = parser.add_argument("--doc", type=Path, help="with --footer: the production doc whose changes, proposals and projects are counted")
+    _ = parser.add_argument("--doc", type=Path, help="with --footer: the production doc whose changes, efficiency and proposals are counted")
     options = parser.parse_args(arguments)
     input_path = cast(Path | None, options.input)
     chart = cast(str | None, options.chart)

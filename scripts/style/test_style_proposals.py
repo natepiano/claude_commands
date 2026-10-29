@@ -809,6 +809,23 @@ class StyleProposalsTests(unittest.TestCase):
         ledger.ticket_drop(ticket)
         return finding
 
+    def test_current_file_gate_uses_shared_site_proof_without_certifying_changed_rule(self) -> None:
+        source = "fn work() {\n    consume(791);\n}\n"
+        with self.ledger() as ledger:
+            _ = self.commit_tip(ledger, {"alpha/src/lib.rs": source})
+            ticket = self.assign_ticket(ledger, "names-unit")
+            _ = ledger.ticket_base(ticket)
+            blob = next(rule.blob for rule in rules.load_rules(self.repo) if rule.rule_id == self.rename)
+            finding = ledger.hold(self.rename, "alpha/src/lib.rs", 2, source.splitlines()[1], "restructure",
+                                  "791", "LIMIT", blob, ticket)
+            ledger.ticket_drop(ticket)
+            _ = (self.catalog / "names.md").write_text((self.catalog / "names.md").read_text() + "A changed requirement\n")
+            tip = self.commit_tip(ledger, {finding.path: "fn sibling() {}\n" + source})
+            self.assertTrue(style_proposals.judged_at_current_file(ledger, finding, tip))
+            self.assertTrue(style_ledger.rule_changed_since_judged(finding, {rule.rule_id: rule for rule in rules.load_rules(self.repo)}))
+            changed = self.commit_tip(ledger, {finding.path: source.replace("791", "792")})
+            self.assertFalse(style_proposals.judged_at_current_file(ledger, finding, changed))
+
     def test_decision_b_files_only_local_bindings_while_types_work_is_open(self) -> None:
         with self.ledger() as ledger:
             _ = (self.catalog / "types.md").write_text("---\ntier: C\nfamily: types\ninput_scope: file\n---\n# Types\n")

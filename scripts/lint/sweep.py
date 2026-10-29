@@ -283,12 +283,26 @@ class Scan:
 
 
 @dataclass(frozen=True)
+class UnknownHeldRoots:
+    pass
+
+
+@dataclass(frozen=True)
+class KnownHeldRoots:
+    roots: frozenset[str]
+
+
+UNKNOWN_HELD_ROOTS = UnknownHeldRoots()
+
+
+@dataclass(frozen=True)
 class FloorRecord:
     measured_at: float
     free_bytes: int
     build_cache_bytes: int
     alert_history: NoDeliveredAlert | DeliveredAlert
     push_history: NoDeliveredAlert | DeliveredAlert
+    held_roots: UnknownHeldRoots | KnownHeldRoots = UNKNOWN_HELD_ROOTS
 
 
 @dataclass(frozen=True)
@@ -868,6 +882,7 @@ def choose(
 
 def remove(groups: list[Group]) -> int:
     failures = 0
+    changed_trees: set[str] = set()
     for group in groups:
         for path in group.entries:
             try:
@@ -875,11 +890,15 @@ def remove(groups: list[Group]) -> int:
                     shutil.rmtree(path)
                 else:
                     os.unlink(path)
+                changed_trees.add(group.build_tree)
             except FileNotFoundError:
                 continue
             except OSError as error:
+                # A failed recursive removal may already have deleted some files.
+                changed_trees.add(group.build_tree)
                 failures += 1
                 print(f"lint sweep: could not remove {path}: {error}", file=sys.stderr)
+    record_target_deletes(sorted(changed_trees))
     return failures
 
 
@@ -952,6 +971,8 @@ def prune_doc_index(roots: list[str], budget: int, dry_run: bool) -> int:
                     print(f"lint sweep: could not remove {doc}: {error}", file=sys.stderr)
                     failures += 1
                     continue
+                finally:
+                    record_target_deletes([root])
             verb = "would remove" if dry_run else "removed"
             print(
                 f"lint sweep: {doc} index is {mib(index)}, over the {mib(budget)} budget;"
@@ -1110,6 +1131,47 @@ def _finite_number(value: object) -> TypeGuard[int | float]:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
+def target_deletes_path() -> Path:
+    return floor_record_path().with_name("target-deletes.json")
+
+
+def read_target_deletes(path: Path, now: float) -> dict[str, float]:
+    try:
+        raw = cast(object, json.loads(path.read_text()))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {root: float(at) for root, at in cast(dict[str, object], raw).items()
+            if _finite_number(at) and now - DAY_SECONDS <= at <= now and os.path.isdir(root)}
+
+
+def record_target_deletes(paths: Sequence[str]) -> None:
+    roots: set[str] = set()
+    for path in paths:
+        directory = Path(path).resolve()
+        for ancestor in (directory, *directory.parents):
+            if is_cargo_target(str(ancestor)):
+                roots.add(str(ancestor))
+                break
+    if not roots:
+        return
+    path = target_deletes_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.with_suffix(".lock").open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            now = time.time()
+            deleted = read_target_deletes(path, now)
+            deleted.update(dict.fromkeys(roots, now))
+            partial = path.with_suffix(".tmp")
+            _ = partial.write_text(json.dumps(deleted) + "\n")
+            _ = partial.replace(path)
+    except OSError:
+        # State writes must not change a removal's result.
+        pass
+
+
 def read_floor_record(path: Path) -> NoFloorRecord | FloorRecord:
     try:
         value = cast(object, json.loads(path.read_text()))
@@ -1131,7 +1193,11 @@ def read_floor_record(path: Path) -> NoFloorRecord | FloorRecord:
         return NoFloorRecord()
     history = DeliveredAlert(float(alert)) if alert is not None else NoDeliveredAlert()
     push_history = DeliveredAlert(float(push)) if push is not None else NoDeliveredAlert()
-    return FloorRecord(float(measured), int(free), int(caches), history, push_history)
+    roots = data.get("held_roots")
+    held_roots: UnknownHeldRoots | KnownHeldRoots = UNKNOWN_HELD_ROOTS
+    if isinstance(roots, list) and all(isinstance(root, str) for root in cast(list[object], roots)):
+        held_roots = KnownHeldRoots(frozenset(cast(list[str], roots)))
+    return FloorRecord(float(measured), int(free), int(caches), history, push_history, held_roots)
 
 
 def write_floor_record(path: Path, record: FloorRecord) -> None:
@@ -1139,13 +1205,16 @@ def write_floor_record(path: Path, record: FloorRecord) -> None:
     partial = path.with_name(path.name + ".tmp")
     alert_at = record.alert_history.at if isinstance(record.alert_history, DeliveredAlert) else None
     push_at = record.push_history.at if isinstance(record.push_history, DeliveredAlert) else None
-    _ = partial.write_text(json.dumps({
+    data: dict[str, object] = {
         "measured_at": record.measured_at,
         "free_bytes": record.free_bytes,
         "build_cache_bytes": record.build_cache_bytes,
         "last_alert_at": alert_at,
         "last_push_at": push_at,
-    }) + "\n")
+    }
+    if isinstance(record.held_roots, KnownHeldRoots):
+        data["held_roots"] = sorted(record.held_roots.roots)
+    _ = partial.write_text(json.dumps(data) + "\n")
     _ = partial.replace(path)
 
 
@@ -1464,6 +1533,7 @@ def build_hold_targets(targets: Sequence[str], known_trees: dict[str, list[str]]
     if isinstance(state, build_hold.NoHolders):
         return {}
     records = sessions.live_sessions()
+    own_deletes = read_target_deletes(target_deletes_path(), time.time())
     protected: dict[str, BuildHoldTarget] = {}
     for holder in state.holders:
         folders: list[Path] = []
@@ -1488,6 +1558,7 @@ def build_hold_targets(targets: Sequence[str], known_trees: dict[str, list[str]]
                 continue
             if root not in known_trees:
                 known_trees[root] = build_trees(root)
+            own_delete = own_deletes.get(str(Path(root).resolve()), float("-inf"))
             paths = [os.path.join(root, USE_STAMP)]
             for tree in known_trees[root]:
                 paths.extend([tree, *(os.path.join(tree, name) for name in (*HASHED_DIRS, INCREMENTAL_DIR))])
@@ -1496,7 +1567,8 @@ def build_hold_targets(targets: Sequence[str], known_trees: dict[str, list[str]]
                     changed = os.stat(path).st_mtime
                 except OSError:
                     continue
-                if changed >= changed_since:
+                # A delete changes its parent directory's mtime; allow two seconds for coarse timestamps.
+                if changed >= changed_since and changed > own_delete + 2:
                     protected[root] = BuildHoldTarget(holder.name)
                     break
     return protected
@@ -1640,7 +1712,10 @@ def hold_floor(
                 free_fall = previous.free_bytes - scanned_free if isinstance(previous, FloorRecord) else 0
                 cache_growth = before_caches - previous.build_cache_bytes if isinstance(previous, FloorRecord) else 0
                 recent = isinstance(previous, FloorRecord) and 0 <= now - previous.measured_at <= GROWTH_WINDOW_SECONDS
-                growth_fired = recent and free_fall - cache_growth > UNEXPLAINED_FALL_BYTES
+                same_held_roots = (isinstance(previous, FloorRecord)
+                                   and isinstance(previous.held_roots, KnownHeldRoots)
+                                   and previous.held_roots.roots == frozenset(hold_targets))
+                growth_fired = recent and same_held_roots and free_fall - cache_growth > UNEXPLAINED_FALL_BYTES
                 removal_fired = removed > LARGE_REMOVAL_BYTES
                 if growth_fired or removal_fired:
                     reasons: list[str] = []
@@ -1652,7 +1727,8 @@ def hold_floor(
                                                reasons, read_disk_measurement())
                     if send_floor_alert(message, FloorAlertChannels.NATEDEV):
                         history = DeliveredAlert(time.time())
-            write_floor_record(record_path, FloorRecord(now, after_free, after_caches, history, push_history))
+            write_floor_record(record_path, FloorRecord(now, after_free, after_caches, history, push_history,
+                                                       KnownHeldRoots(frozenset(hold_targets))))
         return 1 if failures else 0
     finally:
         release(held)

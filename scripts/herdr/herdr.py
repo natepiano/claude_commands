@@ -35,6 +35,8 @@ from typing import NamedTuple, NotRequired, TypedDict, cast, override
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 
+import nix_env as nix_env
+
 # Herdr requires agent-start timeouts strictly above this boundary.
 _AGENT_START_TIMEOUT_MINIMUM_MS = 3000
 # herdr refuses a longer `agent start --timeout`.
@@ -44,6 +46,7 @@ _PLATFORM = sys.platform
 # The marks that name a production unit. Only a unit's own launch sets them; a probe, or a herdr
 # server started from inside a unit, drops them so that the unit's lookup never finds a second session.
 UNIT_MARKS = ("SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID")
+NO_ENVIRONMENT_REMOVALS: frozenset[str] = frozenset()
 _NO_NEW_UNIT_DIRECTOR_TITLES: frozenset[str] = frozenset()
 SHARED_SESSION = "agents"
 # The slice of the pane scopes. A pane shell in its own scope keeps the agent load out of the server's cgroup.
@@ -819,16 +822,22 @@ def json_items(value: object, context: str) -> list[object]:
     return cast(list[object], value)
 
 
+def child_environment(environment: dict[str, str]) -> dict[str, str]:
+    """Keep the one-launch heal proof in its consuming process, never its children."""
+    return {key: value for key, value in environment.items()
+            if key not in (nix_env.HEAL_SESSION_ENV, nix_env.HEAL_DIRECTORY_ENV)}
+
+
 def unmarked_environment() -> dict[str, str]:
-    """This process's environment without a unit's marks, so that no server it starts carries them."""
-    return {key: value for key, value in os.environ.items() if key not in UNIT_MARKS}
+    """Exclude unit identity and one-launch heal proof from inherited child environments."""
+    return child_environment({key: value for key, value in os.environ.items() if key not in UNIT_MARKS})
 
 
 def run_program(argv: list[str], timeout: float = 10.0, *,
                 environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=timeout,
-                              env=unmarked_environment() if environment is None else environment)
+                              env=unmarked_environment() if environment is None else child_environment(environment))
     except OSError as error:
         raise HerdrFailure(f"{argv[0]}: {error}") from error
 
@@ -1073,7 +1082,7 @@ class Herdr:
         each holding a placeholder tab until its first session's tab arrives.
         """
         options = ["--label", title, "--cwd", cwd]
-        for key, value in {**environment, "HERDR_AGENT_PANE": "1"}.items():
+        for key, value in {**child_environment(environment), "HERDR_AGENT_PANE": "1"}.items():
             options.extend(["--env", f"{key}={value}"])
         with _LayoutLock(self.session):
             saved = saved_layout(self.session)
@@ -1356,7 +1365,8 @@ class Herdr:
             pass
         next_observation = time.monotonic() + 0.5
         try:
-            process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                       env=unmarked_environment())
         except OSError as error:
             raise HerdrFailure(f"{argv[0]}: {error}") from error
         with process:
@@ -2976,6 +2986,96 @@ def _agent_name(name: str) -> str:
     return mapped[:32]
 
 
+@dataclass(frozen=True)
+class AgentLaunched:
+    pane: str
+    outcome: PromptSubmitOutcome | PromptSubmissionNotRequired
+
+
+@dataclass(frozen=True)
+class PreparedAgentEnvironment:
+    """An environment already proved for the exact directory to be opened."""
+
+    directory: Path
+    env: dict[str, str]
+
+
+def launch_agent(name: str, space: str, title: str, cwd: str, environment: dict[str, str],
+                 kind: str, agent_arguments: list[str], opening: OpeningPrompt | NoOpeningPrompt,
+                 timeout_ms: int, *, agent: str, unset_environment: frozenset[str] = NO_ENVIRONMENT_REMOVALS) -> AgentLaunched | nix_env.Refused:
+    """Prove the start environment before creating a pane or starting an agent.
+
+    herdr owns the executable selected by --kind. The pane carries the loaded
+    environment, so its canonical executable inherits it, including on resume.
+    Caller account choices and unit marks take precedence over inherited ones.
+    """
+    _check_agent_arguments(kind, agent_arguments)
+    if os.environ.get(nix_env.HEAL_SESSION_ENV) or os.environ.get(nix_env.HEAL_DIRECTORY_ENV):
+        # Unit restores reach this choke point through add_unit in a child
+        # process rather than restart's direct Claude/Codex restoration paths.
+        session_id = next((agent_arguments[index + 1] for index, argument in enumerate(agent_arguments[:-1])
+                           if argument in {"--resume", "--session-id", "resume"}), "")
+        prepared = prepare_session_environment(session_id, cwd, environment, unset_environment)
+    else:
+        prepared = prepare_agent_environment(cwd, environment, unset_environment)
+    if isinstance(prepared, nix_env.Refused):
+        return prepared
+    return launch_prepared_agent(name, space, title, prepared, kind, agent_arguments, opening, timeout_ms, agent=agent)
+
+
+def agent_base_environment(environment: dict[str, str], unset_environment: frozenset[str]) -> dict[str, str]:
+    """Keep the target account's choices while dropping the launcher's identity."""
+    base_env = dict(os.environ)
+    for key in tuple(base_env):
+        # scripts/lib/unit_env.sh and unit_runs.environ map every PLAN_DELEGATE_ alias to UNIT_.
+        if (key.startswith(("HERDR_", "CODEX_", "UNIT_", "PLAN_DELEGATE_", "SHOWRUNNER_", "CLAUDE_", "NIX_HEAL_"))
+                or key in {"ANTHROPIC_API_KEY", "SHELL", "TMUX", "TMUX_PANE"}):
+            del base_env[key]
+    base_env.update(environment)
+    for key in unset_environment:
+        _ = base_env.pop(key, None)
+    return child_environment(base_env)
+
+
+def prepare_agent_environment(cwd: str, environment: dict[str, str],
+                              unset_environment: frozenset[str] = NO_ENVIRONMENT_REMOVALS) -> PreparedAgentEnvironment | nix_env.Refused:
+    """Load before a server restore can create a desktop window."""
+    loaded = nix_env.ensure(Path(cwd), agent_base_environment(environment, unset_environment))
+    if isinstance(loaded, nix_env.Refused):
+        return loaded
+    launch_environment = {key: value for key, value in loaded.env.items() if key not in unset_environment}
+    return PreparedAgentEnvironment(Path(cwd).resolve(), launch_environment)
+
+
+def prepare_session_environment(session_id: str, cwd: str, environment: dict[str, str],
+                                unset_variables: frozenset[str]) -> PreparedAgentEnvironment | nix_env.Refused:
+    """Consume the healer's one-session proof without loading after its hold check."""
+    ready_session = os.environ.get(nix_env.HEAL_SESSION_ENV, "")
+    ready_directory = os.environ.get(nix_env.HEAL_DIRECTORY_ENV, "")
+    directory = Path(cwd).resolve()
+    if ready_session or ready_directory:
+        if ready_session != session_id or ready_directory != str(directory):
+            return nix_env.Refused("nix_env: prepared restart environment belongs to another session or directory")
+        if nix_env.nearest_envrc(directory) is not None and not os.environ.get("IN_NIX_SHELL"):
+            return nix_env.Refused(f"nix_env: {directory}: prepared restart environment has no nix shell")
+        return PreparedAgentEnvironment(directory, agent_base_environment(environment, unset_variables))
+    return prepare_agent_environment(cwd, environment, unset_variables)
+
+
+def launch_prepared_agent(name: str, space: str, title: str, prepared: PreparedAgentEnvironment,
+                          kind: str, agent_arguments: list[str], opening: OpeningPrompt | NoOpeningPrompt,
+                          timeout_ms: int, *, agent: str) -> AgentLaunched:
+    """Launch an already proved environment without another potentially slow load."""
+    _check_agent_arguments(kind, agent_arguments)
+    pane = open_tab(name, space, title, str(prepared.directory), prepared.env)
+    try:
+        outcome = start_agent(name, pane, kind, agent_arguments, opening, timeout_ms, agent=agent)
+    except (HerdrFailure, OSError, subprocess.SubprocessError):
+        close_agent(name, pane)
+        raise
+    return AgentLaunched(pane, outcome)
+
+
 def start_agent(name: str, pane: str, kind: str, agent_arguments: list[str],
                 opening: OpeningPrompt | NoOpeningPrompt, timeout_ms: int, *, agent: str) -> PromptSubmitOutcome | PromptSubmissionNotRequired:
     """Start the agent named `agent` in the named session.
@@ -2983,4 +3083,5 @@ def start_agent(name: str, pane: str, kind: str, agent_arguments: list[str],
     `agent` is the full session name: a pane carries only the short tab title.
     """
     _check_agent_arguments(kind, agent_arguments)
-    return Herdr(name).start_agent(agent, pane, kind, agent_arguments, opening, timeout_ms)
+    return Herdr(name).start_agent(agent, pane, kind=kind, agent_arguments=agent_arguments,
+                                  opening=opening, timeout_ms=timeout_ms)

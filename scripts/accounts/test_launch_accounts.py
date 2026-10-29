@@ -2,9 +2,20 @@
 from __future__ import annotations
 
 import ast
+import io
+import os
 import re
+import subprocess
+import sys
+import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from typing import cast, final, override
+from unittest.mock import patch
+
+from scripts.accounts import accounts, nix_env_fake as fixtures
+from scripts.shutdown import launch_permission
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -163,6 +174,184 @@ def shell_launch_account_violations(source: str, path: str) -> list[str]:
                 and not re.search(r"resolver|record|account_for_group_launch", line)):
             problems.append(f"{path}:{number}: shell launcher sets an account without a resolved account or record")
     return problems
+
+
+@final
+class ExecLaunchShellTests(unittest.TestCase):
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.root = Path()
+        self.folder = Path()
+        self.home = Path()
+        self.loader = fixtures.fake_nix_loader()
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.folder = self.root / "launch folder" / "nested"
+        self.folder.mkdir(parents=True)
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.loader = fixtures.fake_nix_loader()
+        _ = cast(object, self.enterContext(patch.object(accounts, "import_module", side_effect=fixtures.imports_with_nix_loader(self.loader))))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.home), "PATH": os.defpath,
+            "KEEP": "base", "UNSET_BY_SHELL": "old", "AGENT_NOTES_DIR": str(self.home / "notes"),
+            "SHUTDOWN_STATE_DIR": str(self.home / "shutdown"),
+            "NOTIFIER_SESSIONS_DIR": str(self.home / "sessions")}, clear=True)))
+        _ = self.enterContext(patch.object(launch_permission, "launch_permission",
+            return_value=launch_permission.AllowedByShutdownState()))
+        _ = self.enterContext(patch.object(Path, "cwd", return_value=self.folder))
+        _ = self.enterContext(patch.object(sys.stdin, "isatty", return_value=False))
+        prepared = accounts.PreparedAccount({"CLAUDE_CONFIG_DIR": str(self.home / ".claude4")},
+                                            frozenset({"CLAUDE_CODE_OAUTH_TOKEN"}))
+        _ = self.enterContext(patch.object(accounts, "prepared_account", return_value=prepared))
+        _ = self.enterContext(patch.object(accounts, "check_codex_target", return_value=accounts.SelectableCodexAccount(
+            self.home / ".codex2", "fixture@example.invalid", "codex2")))
+        _ = self.enterContext(patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount(
+            "codex2", self.home / ".codex2")))
+        # No test may start a shell, agent, probe, or remote command.
+        _ = self.enterContext(patch.object(subprocess, "run", side_effect=AssertionError("unexpected subprocess")))
+        _ = self.enterContext(patch.object(subprocess, "Popen", side_effect=AssertionError("unexpected subprocess")))
+
+    def run_exec(self, label: str) -> tuple[int, str, str]:
+        output, error = io.StringIO(), io.StringIO()
+        with redirect_stdout(output), redirect_stderr(error):
+            code = accounts.main(["exec", label, "--", "argument with spaces"])
+        return code, output.getvalue(), error.getvalue()
+
+    def test_every_label_loads_the_launch_folder_before_exec_on_both_platforms(self) -> None:
+        envrc = self.folder.parent / ".envrc"
+        _ = envrc.write_text("use flake\n")
+        # The helper owns allowing this file and returns the resulting shell.
+        shell = {"HOME": str(self.home), "PATH": str(self.root / "shell-bin"), "KEEP": "base",
+                 "IN_NIX_SHELL": "impure", "FROM_SHELL": "yes", "CLAUDE_CONFIG_DIR": "wrong",
+                 "CODEX_HOME": "wrong", "CLAUDE_CODE_OAUTH_TOKEN": "fixture-token"}
+        arguments = ["argument with spaces"]
+        for platform in ("linux", "darwin"):
+            for label in ("claude", "claude1", "claude2", "claude3", "claude4", "units", "showrunners",
+                          "codex1", "codex2", "workers"):
+                with (self.subTest(platform=platform, label=label), patch.object(sys, "platform", platform),
+                      patch.object(self.loader, "ensure", return_value=fixtures.FakeLoadedShell(shell, envrc)) as ensure,
+                      patch.object(accounts, "resolve_program", return_value="/fixture/agent") as resolve,
+                      patch.object(os, "execvpe") as launch):
+                    self.assertEqual(self.run_exec(label), (0, "", ""))
+                    ensure.assert_called_once_with(self.folder, os.environ)
+                    launch.assert_called_once()
+                    program, argv, environment = cast(tuple[str, list[str], dict[str, str]], launch.call_args.args)
+                    self.assertEqual((program, argv), ("/fixture/agent", ["/fixture/agent", *arguments]))
+                    self.assertEqual(environment["FROM_SHELL"], "yes")
+                    self.assertNotIn("UNSET_BY_SHELL", environment)
+                    if label.startswith("codex") or label == "workers":
+                        self.assertEqual(environment["CODEX_HOME"], str(self.home / ".codex2"))
+                        tool = "codex"
+                    else:
+                        if label == "claude":
+                            self.assertNotIn("CLAUDE_CONFIG_DIR", environment)
+                        else:
+                            self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str(self.home / ".claude4"))
+                        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", environment)
+                        tool = "claude"
+                    resolve.assert_called_once_with(tool, environment=environment)
+                    self.assertEqual(shell["CLAUDE_CONFIG_DIR"], "wrong")
+                    self.assertNotIn("FROM_SHELL", os.environ)
+
+    def test_loaded_shell_cannot_change_the_callers_home(self) -> None:
+        shell = {**os.environ, "HOME": str(self.root / "project-home"), "IN_NIX_SHELL": "impure"}
+        for label in ("claude", "claude4", "codex2", "workers"):
+            with (self.subTest(label=label),
+                  patch.object(self.loader, "ensure", return_value=fixtures.FakeLoadedShell(shell, self.folder / ".envrc")),
+                  patch.object(accounts, "resolve_program", return_value="/fixture/agent"),
+                  patch.object(os, "execvpe") as launch):
+                self.assertEqual(self.run_exec(label), (0, "", ""))
+                environment = cast(dict[str, str], launch.call_args.args[2])
+                self.assertEqual(environment["HOME"], str(self.home))
+                if label == "claude":
+                    self.assertNotIn("CLAUDE_CONFIG_DIR", environment)
+                self.assertEqual(shell["HOME"], str(self.root / "project-home"))
+
+    def test_execute_only_program_is_returned_when_wrapper_check_cannot_read_it(self) -> None:
+        for tool in ("claude", "codex"):
+            program = fixtures.installed_program(self.root / "execute-only", tool)
+            with (self.subTest(tool=tool), patch.object(Path, "open", side_effect=PermissionError("execute only"))):
+                self.assertEqual(accounts.resolve_program(tool, environment={"PATH": str(Path(program).parent)}), program)
+
+    def test_folder_without_envrc_execs_with_the_unchanged_base_environment(self) -> None:
+        for label in ("claude", "claude4", "codex2", "workers"):
+            with (self.subTest(label=label),
+                  patch.object(self.loader, "ensure", return_value=fixtures.FakeNoEnvrc(dict(os.environ))) as ensure,
+                  patch.object(accounts, "resolve_program", return_value="/fixture/agent"),
+                  patch.object(os, "execvpe") as launch):
+                self.assertEqual(self.run_exec(label), (0, "", ""))
+                ensure.assert_called_once_with(self.folder, os.environ)
+                environment = cast(dict[str, str], launch.call_args.args[2])
+                self.assertEqual(environment["KEEP"], "base")
+                self.assertEqual(environment["UNSET_BY_SHELL"], "old")
+                self.assertNotIn("IN_NIX_SHELL", environment)
+                self.assertFalse((self.folder / ".envrc").exists())
+
+    def test_refused_envrc_exits_one_without_starting_an_agent_or_supervisor(self) -> None:
+        envrc = self.folder.parent / ".envrc"
+        _ = envrc.write_text("use flake\n")
+        for label in ("claude", "claude4", "units", "showrunners", "codex2", "workers"):
+            for reason in (f"nix_env: run direnv allow {envrc}", "nix_env: IN_NIX_SHELL is not set",
+                           "nix_env: direnv timed out"):
+                with (self.subTest(label=label, reason=reason), patch.object(sys.stdin, "isatty", return_value=True),
+                      patch.object(self.loader, "ensure", return_value=fixtures.FakeShellRefusal(reason)),
+                      patch.object(accounts, "resolve_program") as resolve, patch.object(os, "execvpe") as launch):
+                    self.assertEqual(self.run_exec(label), (1, "", reason + "\n"))
+                    resolve.assert_not_called()
+                    launch.assert_not_called()
+
+    def test_missing_helper_fails_only_exec_with_a_clear_error(self) -> None:
+        with (patch.object(accounts, "import_module", side_effect=ImportError("fixture helper missing")), patch.object(os, "execvpe") as launch,
+              patch.object(accounts, "status_report", return_value="fixture status")):
+            self.assertEqual(self.run_exec("claude"), (1, "",
+                "accounts: nix shell helper unavailable (scripts/lib/nix_env.py); update the shared scripts\n"))
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(accounts.main(["status"]), 0)
+            self.assertEqual(output.getvalue(), "fixture status\n")
+            launch.assert_not_called()
+
+    def test_program_is_resolved_from_the_loaded_shell_path(self) -> None:
+        for label, tool in (("claude", "claude"), ("codex2", "codex")):
+            program = fixtures.installed_program(self.root / "shell", tool)
+            shell = {**os.environ, "PATH": str(Path(program).parent), "IN_NIX_SHELL": "impure"}
+            with (self.subTest(label=label),
+                  patch.object(self.loader, "ensure", return_value=fixtures.FakeLoadedShell(shell, self.folder / ".envrc")),
+                  patch.object(os, "execvpe") as launch):
+                self.assertEqual(self.run_exec(label), (0, "", ""))
+                self.assertEqual(launch.call_args.args[:2], (program, [program, "argument with spaces"]))
+
+    def test_exec_skips_nix_shell_wrappers_before_the_real_program(self) -> None:
+        for label, tool in (("claude", "claude"), ("codex2", "codex")):
+            wrapper = Path(fixtures.installed_program(self.root / "wrappers", tool))
+            _ = wrapper.write_text('#!/bin/sh\nexec python3 /fixture/nix_env.py exec "$@"\n')
+            program = fixtures.installed_program(self.root / "real", tool)
+            shell = {**os.environ, "PATH": os.pathsep.join((str(wrapper.parent), str(Path(program).parent))),
+                     "IN_NIX_SHELL": "impure"}
+            with (self.subTest(label=label),
+                  patch.object(self.loader, "ensure", return_value=fixtures.FakeLoadedShell(shell, self.folder / ".envrc")) as ensure,
+                  patch.object(os, "execvpe") as launch):
+                self.assertEqual(self.run_exec(label), (0, "", ""))
+                ensure.assert_called_once_with(self.folder, os.environ)
+                self.assertEqual(launch.call_args.args[:2], (program, [program, "argument with spaces"]))
+
+    def test_wrapper_path_falls_back_to_installed_program_and_refuses_wrapper_only(self) -> None:
+        wrapper = Path(fixtures.installed_program(self.root / "wrappers", "claude"))
+        _ = wrapper.write_text('#!/bin/sh\nexec python3 -m lib.nix_env exec "$@"\n')
+        program = Path(fixtures.installed_program(self.home, "claude"))
+        shell = {**os.environ, "PATH": str(wrapper.parent)}
+        with (patch.object(self.loader, "ensure", return_value=fixtures.FakeNoEnvrc(shell)),
+              patch.object(os, "execvpe") as launch):
+            self.assertEqual(self.run_exec("claude"), (0, "", ""))
+            self.assertEqual(launch.call_args.args[0], str(program))
+            launch.reset_mock()
+            _ = program.write_text(wrapper.read_text())
+            code, output, error = self.run_exec("claude")
+            self.assertEqual((code, output), (2, ""))
+            self.assertIn("claude program not found", error)
+            launch.assert_not_called()
 
 
 class LaunchAccountTests(unittest.TestCase):

@@ -309,7 +309,10 @@ class DeclaredFile:
         if not isinstance(body, _Body):
             return UnreadableBody()
         text = "\n".join(self.source_lines)
-        spans = style_footprint.token_spans(text)
+        try:
+            spans = style_footprint.token_spans(text)
+        except style_footprint.UnreadableTokenSpans:
+            return UnreadableBody()
         if body.close >= len(spans):
             return UnreadableBody()
         source = text[spans[body.open].end:spans[body.close].start]
@@ -522,7 +525,11 @@ def statement_site(new: DeclaredFile, new_item: DeclaredItem, text: str) -> int 
     source = "\n".join(new.source_lines)
     offsets = tuple(accumulate((len(line) + 1 for line in new.source_lines), initial=0))
     by_line: dict[int, list[style_footprint.Token]] = {}
-    for span in style_footprint.token_spans(source):
+    try:
+        spans = style_footprint.token_spans(source)
+    except style_footprint.UnreadableTokenSpans:
+        return StatementRefusal.TEXT_NOT_FOUND
+    for span in spans:
         by_line.setdefault(bisect_right(offsets, span.start), []).append(span.token)
     matches = [number for number in range(new_item.first_line, min(new_item.last_line, len(new.source_lines)) + 1)
                if new.site_kind(new_item, number) == DeclarationSite.STATEMENT
@@ -697,7 +704,10 @@ def item_body(file: DeclaredFile, item: DeclaredItem) -> ReadableBody | Unreadab
 def preserved_body(old: ReadableBody, new: ReadableBody, before: str, after: str) -> int:
     """Count equal lines once, in order, after replacing only the renamed identifier."""
     source = "\n".join(old.lines)
-    spans = style_footprint.token_spans(source)
+    try:
+        spans = style_footprint.token_spans(source)
+    except style_footprint.UnreadableTokenSpans:
+        return 0
     # A comment-only body needs no replacements; unreadable code supplies no proof.
     if not spans and style_footprint.tokens(source):
         return 0

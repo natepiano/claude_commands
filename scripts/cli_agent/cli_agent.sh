@@ -60,9 +60,9 @@ cli_agent_run() {
             claude_launch_environment workers || return 1
             read -r -a agent_args <<< "$(agents_claude_args)"
             if [[ -z "$invocation" ]]; then
-                exec claude "${agent_args[@]}"
+                exec "$CLI_AGENT_DIR/../lib/py" "$CLI_AGENT_DIR/../lib/nix_env.py" exec "$(command -v claude)" "${agent_args[@]}"
             fi
-            exec claude "${agent_args[@]}" -- "/$invocation"
+            exec "$CLI_AGENT_DIR/../lib/py" "$CLI_AGENT_DIR/../lib/nix_env.py" exec "$(command -v claude)" "${agent_args[@]}" -- "/$invocation"
             ;;
     esac
 }

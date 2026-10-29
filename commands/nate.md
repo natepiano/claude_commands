@@ -53,14 +53,17 @@ The send.py arguments:
 Now: `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/message/send.py" <arguments>`. Report the
 result in one line; a delayed one names the send time in the user's zone, with its label.
 
-The user receives:
+The push is reviewed before it is sent; the user may receive the reviewer's rewrite. If review holds
+it (pushover exit 6, `pushover: not sent: …`), report in one line that it was not sent, with the reason.
+
+The user receives the reviewed title and description, which start as:
 
 ```text
 Title: <sender> <title>
-Description: <description>
+<description>
 
 Sent by: <sender>
-Template: nate.<template>
+Template: nate.adhoc
 ```
 
 Every push ends with these `Sent by` and `Template` lines; a push with no text id shows `Template: none (free text)`.

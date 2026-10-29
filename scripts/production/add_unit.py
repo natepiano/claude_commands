@@ -929,16 +929,14 @@ def launch_session(
     host = herdr.shared_session()
     _ = herdr.start_server(host, timeout_ms)
     production = request.production
-    pane = herdr.open_tab(host, showrunners.herdr_space(production.slug, str(production.doc)),
-                          session_name, str(request.session_cwd), environment)
-    try:
-        outcome = herdr.start_agent(host, pane, kind="claude", agent=host_session_name(request), agent_arguments=arguments,
-            opening=herdr.OpeningPrompt(prompt, herdr.SessionTranscript(selected.dir, session_id)),
-            timeout_ms=timeout_ms)
-        return outcome if isinstance(outcome, (herdr.PromptSubmitted, herdr.PromptNotSubmitted)) else herdr.PromptNotSubmitted("launcher returned no submit proof")
-    except herdr.AgentExited:
-        herdr.close_agent(host, pane)
-        raise
+    launched = herdr.launch_agent(host, showrunners.herdr_space(production.slug, str(production.doc)),
+        session_name, str(request.session_cwd), environment, kind="claude", agent=host_session_name(request),
+        agent_arguments=arguments, opening=herdr.OpeningPrompt(prompt, herdr.SessionTranscript(selected.dir, session_id)),
+        timeout_ms=timeout_ms)
+    if isinstance(launched, herdr.nix_env.Refused):
+        raise Refusal(launched.reason)
+    outcome = launched.outcome
+    return outcome if isinstance(outcome, (herdr.PromptSubmitted, herdr.PromptNotSubmitted)) else herdr.PromptNotSubmitted("launcher returned no submit proof")
 
 
 def close_untyped_session(request: UnitLaunch, outcome: herdr.PromptNotSubmitted) -> str:

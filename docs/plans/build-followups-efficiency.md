@@ -1,8 +1,8 @@
 # efficiency
 
-> **Status: IMPLEMENTATION PLAN — phased, delegate-ready.** Phase 4: one Python dispatcher per hook event runs the event's Python hooks in one interpreter, so a Bash call starts 2 Python processes instead of 8, and a Stop starts 1 instead of 4. Phase 5: the checkpoint doc gate judges the staged tree and real git command words. Phase 6: every Claude and Codex session starts inside its worktree's nix shell.
+> **Status: IMPLEMENTATION PLAN — phased, delegate-ready.** Phase 4: one Python dispatcher per hook event runs the event's Python hooks in one interpreter, so a Bash call starts 2 Python processes instead of 8, and a Stop starts 1 instead of 4. Phase 5: the checkpoint doc gate judges the staged tree and real git command words. Phase 6: every Claude and Codex session starts inside its worktree's nix shell. Phase 7: the launch scan sees accounts.py's guard with no exemption, and the unused SessionStart nix-shell hook is removed.
 
-> **Production: build-followups** — unit `efficiency-unit`; production doc `docs/plans/build-followups-production.md`
+> **Production: natedev** — unit `efficiency-unit`; production doc `docs/plans/natedev-production.md`
 
 ## Source
 
@@ -21,28 +21,17 @@ Showrunner of build-followups, 2026-10-28 (measured by builds-unit):
 
 ## Phases
 
-### Phase 4 — One Python dispatcher per hook event  · status: pending
+### Phase 4 — One Python dispatcher per hook event  · status: done
 
 **Goal:** a Bash call runs its PreToolUse Python hooks in one Python process and its PostToolUse Python hooks in one more, and a Stop runs its Python hooks in one process, with the same decisions, the same text to Claude and the user, and the same exit codes as today.
 
-**Scope:**
-- New `scripts/hooks/hook_dispatch.py <event>` (`pre_tool_use`, `post_tool_use`, `stop`). It reads stdin once and holds one ordered table per event: each row is a hook file in `scripts/hooks/`, the tool-name matcher it has in `settings.json` today, and its timeout. Order is the `settings.json` order of today.
-- It loads each hook file as a module (by path, under a unique module name), and runs its existing entry point with that payload as stdin and with stdout and stderr captured, and maps `SystemExit` to the exit code. A hook file stays runnable as a script, so its tests and any caller that runs it by path keep working. Where a hook needs a small change to run this way (a `main()` that reads `sys.stdin`, module-level side effects, an output a subprocess writes straight to file descriptor 1), change the hook in the smallest form and keep its script behavior.
-- One hook's crash, exception or timeout never stops the hooks after it; the result for that hook is what Claude Code gives a failed or timed-out hook today (no decision from it). A per-hook timeout keeps today's value (scratch-guard 10 s; the others the 600 s default).
-- Combine the hook results into one result with the effect that separate hooks have today:
-  - any exit 2 → exit 2, and stderr is the exit-2 hooks' stderr texts in table order, joined by a blank line;
-  - else, JSON from the hooks that exit 0 is merged: PreToolUse `permissionDecision` by the documented precedence, with the reasons of the hooks that gave the winning decision joined in table order; every `additionalContext` joined in table order; `systemMessage` texts joined; `continue:false` from any hook wins with its `stopReason`; PostToolUse and Stop `decision:block` from any hook wins with the reasons joined;
-  - a hook that exits with another code, or prints invalid JSON, adds a line to `systemMessage` that names the hook and its stderr, the same notice a user sees today.
-  - Write the exact rules, and each case where the docs state no rule, in the module docstring.
-- `settings.json` (user's typed go: "go", 2026-10-28 11:50 EDT, in the efficiency-unit pane): the Python hooks for these three events move behind the dispatcher. PreToolUse: heredoc-guard, tool-output-read, showrunner-move-guard, change-review-gate, checkpoint-doc-gate (Bash) and scratch-guard (Bash|Write|NotebookEdit) become one entry with matcher `Bash|Write|NotebookEdit`. PostToolUse: basedpyright and fn-length (Edit|MultiEdit|Write), context-usage and banned-words (all tools) become one entry with no matcher. Stop: direct-continue, conversation-pause, prose-banned-words and herdr_tab_title become one entry. The PostToolUse random-ack entry is removed and not added to the dispatcher (user's typed go, 2026-10-28 11:59 EDT); `post-tool-use-random-ack.sh` and `config/acknowledgements.txt` stay, and the script header gains one line naming the `settings.json` entry that turns it on again. The other shell hooks (berth_post_bash.sh, berth_pre_edit.sh, brp-launch-gate.sh), push-gate (PushNotification, 120 s), SessionStart, SubagentStart, PreCompact and UserPromptSubmit stay as they are.
-- Tests in `scripts/hooks/test_hook_dispatch.py`: for each event, a table of payloads (allow, deny from each blocking hook, ask, two hooks blocking at once, additionalContext from two hooks, a crashing hook, a timed-out hook, a non-matching tool) where the dispatcher's exit code, stdout JSON and stderr equal the combination rule applied to the separate hook processes' results. A test pins that the dispatcher table equals the hook files and matchers that `settings.json` no longer lists.
+#### As-built
 
-**Out of scope:** porting the shell hooks to Python; SessionStart and other events; changing what any hook checks.
-
-**Acceptance:**
-- Bench: child CPU per Bash call and per Stop, N=20 before and after on natedev, recorded in the as-built doc.
-- The full merge gate `--tests-only` passes; basedpyright 0 errors and 0 warnings on `scripts/hooks/`.
-- A live check in a new session: a Bash call that a gate refuses is refused with the same text; an allowed call runs; a Stop with a banned word in prose still blocks.
+- Checkpoint fad3a1f3. The full record is `docs/as-built/hook-dispatch.md`.
+- `scripts/hooks/hook_dispatch.py` runs the Python hooks of PreToolUse, PostToolUse and Stop in one interpreter each, in the old `settings.json` order, with the same decisions, text and exit codes. The combination rules are in its docstring. `settings.json` has one dispatcher entry per event; the shell hooks (with origin's `pre-tool-use-build-hold-guard.sh`), push-gate and the other events stay as their own entries. The random-ack entry is removed; its script header says how to turn it on again.
+- Bench (N=20, same window, natedev under load): child CPU per Bash call 576.5 -> 350.7 ms (-39%), per Stop 317.4 -> 168.3 ms (-47%).
+- Gate: the full merge gate added no failure; the one red (`direct/test_progress_history`, AF_UNIX path too long) fails the same way on origin dab6cf38.
+- Live check on main d76569ca (2026-10-28 23:00 EDT): scratch-guard refused a Write with its usual text, PostToolUse blocked forbidden words in a tool output, the Stop dispatcher blocked a turn, and a new probe session's prose word reached the prose log (that hook logs and never blocks).
 
 ### Phase 5 — Checkpoint doc gate judges the staged tree and real git command words  · status: done
 
@@ -59,18 +48,30 @@ Showrunner of build-followups, 2026-10-28 (measured by builds-unit):
 
 **Acceptance:** both test modules pass; basedpyright clean; the full merge gate `--tests-only` adds no failure to the origin tip.
 
-### Phase 6 — Every Claude and Codex session starts inside its worktree's nix shell  · status: in review
+### Phase 6 — Every Claude and Codex session starts inside its worktree's nix shell  · status: done
 
 **Source:** the user, via the showrunner, 2026-10-28: "it has to be rock solid reliable - never fail again"; "bare claude should be forced to use this also".
 
 **Goal:** every start path for a Claude or Codex session loads the worktree's `.envrc` nix shell first, or refuses with one line; a session that started outside it is healed.
 
-**Scope:**
-- One launch helper `scripts/lib/nix_env.py` (`ensure(directory, base_env) -> Loaded | NoEnvrc | Refused`; auto-allow only under `~/rust`, `~/worktrees` and `~/.claude*`; the proof is `IN_NIX_SHELL`; 600 s budget; CLI `ensure` and `exec`). Every start path goes through it: herdr's `launch_agent` choke point, restart and pane restore, add_unit, add_showrunner, berth_fix, agent_bg, agent_exec, cli_agent, codex_mesh, review, make_a_worktree. A scan test fails on any start site outside the helper.
-- A SessionStart self-heal hook `scripts/hooks/session-start-nix-shell.py` (its `settings.json` registration waits for the user's typed go).
-- `scripts/nix_env/heal.py sweep`, run every 5 minutes by a notifier timer registered after the merge: it finds a session outside its shell and restarts it in place, after the build-hold check, with the session's own account, and keeps the pending record until a healthy replacement runs.
-- `verify.sh` re-runs itself under `nix_env.py exec` and prints one line; it refuses only when `ensure` refuses.
-- Regression tests per launch path, including an `.envrc` allowed after the launch.
-- The as-built `docs/as-built/nix-shell-launch.md`.
+#### As-built
+
+- Checkpoint 187c88b9. The full record is `docs/as-built/nix-shell-launch.md`.
+- `scripts/lib/nix_env.py` (`ensure`, `exec`) is the one way a session starts: herdr's `launch_agent`, restart and pane restore, add_unit, add_showrunner, berth_fix, agent_bg, agent_exec, cli_agent, codex_mesh, review and make_a_worktree all go through it, and `scripts/lib/test_claude_launch_scan.py` fails on a start site outside it. herdr gives a new session a clean base environment (launcher variables and the parent's nix shell removed).
+- `verify.sh` re-runs itself under `nix_env.py exec` when it starts outside the shell, with one line.
+- `scripts/nix_env/heal.py sweep` restarts a session outside its shell, after the build-hold check, on its own account; when the restart cannot fix it, it pushes `nix_heal.failed` (texts reviewed and approved).
+- Live check: `ensure` in `~/rust/bevy_brp` loaded the shell in 0.4 s; `exec` ran a program inside it.
+- The `nix-heal` notifier timer (every 5 minutes) is registered on main. A SessionStart hook was built and then dropped in phase 7 (showrunner ruling): the timer and the PATH wrappers cover the case.
 
 **After the merge:** the showrunner adds PATH wrappers for bare `claude`, `claude1`-`claude4`, `codex`, `codex1` and `codex2` in /etc/nixos on both machines; accounts-unit wires `accounts.py exec`. Both get the merge commit.
+
+### Phase 7 — Launch scan sees accounts.py's nix shell guard  · status: done
+
+**Goal:** `scripts/lib/test_claude_launch_scan.py` has no exemption, and the unused SessionStart nix-shell hook is gone.
+
+#### As-built
+
+- Checkpoint 4c174618. The full record is `docs/as-built/nix-shell-launch.md` (Launch scan, Timer registration).
+- The scan counts a same-module guard function as a guard: a top-level function that calls `ensure` on `nix_env` or on a value from `import_module("...nix_env")`, or that calls another guard by bare name (fixed point). Nested functions, methods and other-module attribute calls do not count. The `accounts/accounts.py` exemption is removed; its `launch_shell_environment` is seen as a guard.
+- The unregistered SessionStart hook `scripts/hooks/session-start-nix-shell.py`, its test, and the `heal.py --wait-idle` path only it used are removed (showrunner ruling, 2026-10-28: the five-minute nix-heal timer and the PATH wrappers cover the case; revisit only if a failed build from such a session is seen). `heal.py sweep --only <id> --check` stays for the `nix_heal.failed` push.
+- Checks: 41 tests pass, basedpyright clean. The full merge gate was stopped by a natedev build hold; the showrunner gates at merge.
