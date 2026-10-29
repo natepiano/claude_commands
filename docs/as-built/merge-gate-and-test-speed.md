@@ -1,5 +1,9 @@
 # Merge gate and test speed
 
+Code reviews now use the unit's persistent `review` and `review2` workers
+through `assign.sh --role review`. Any pool maintenance paths described below
+remain only for the pending archive cleanup; they do not dispatch new reviews.
+
 ## What it is
 
 `scripts/production/merge_gate.py` is the committed command that merges a checkpoint into a `~/.claude` production's merge branch and tests the result. It refuses unsafe starting states, merges the checkpoint `--no-ff`, then selects affected test modules of the `~/.claude` Python suites in `TEST_SUITES` plus basedpyright in parallel under a sampled-memory cap. A clean tree with a recorded full pass on this host reuses its test modules; basedpyright still runs. Test modules use `builds.slice` scopes when available. After the parallel pass, up to eight failed modules run once more, alone. The final results decide the gate. On green it pushes, and with `--promote` it fast-forwards `~/.claude` main and the Mac. On red it undoes the merge and prints each red suite's failures. Earlier parallel runs took 75–195 s; by 2026-10-29 the 312-module full-gate estimate was about 11,800 module-seconds, or 740 s at 16 jobs. Affected selection reduces the modules run when a certified base is available and no full-suite rule applies. A set of test rules keeps them at that speed and keeps load from turning them red: no live state, no wall-clock thresholds, no fixed waits in the code under test, few process launches, no trivial tests.

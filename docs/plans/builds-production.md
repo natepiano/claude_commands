@@ -16,7 +16,6 @@
 - **Promote:** ~/.claude, mac ~/.claude
 - **Capacity:** natedev has 32 cores and 60 GB of memory; three units. The work is Python and shell scripts and docs. The tests run under the merge gate's memory cap. Its workers share natedev's build slots with natedev and sdlc.
 - **Change review:** `~/rust/hanadocs/change-review/change-review - natedev.md` — builds is a child of natedev, so it names its root's list
-- **Review pool:** code
 - **Proposals:** `~/rust/hanadocs/issues`
 
 ## Units
