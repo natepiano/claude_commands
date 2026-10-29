@@ -7436,27 +7436,36 @@ class MeshCommandTests(MeshCommandFixture):
         new, _change, release = self.prepare_post_turn_home_change((message,))
         release()
         self.assertNotEqual(self.server.port, new.port)
-        failed = [False]
+        events: list[str] = []
         closed_ports: list[int] = []
+        start_turn = codex_mesh._start_turn  # pyright: ignore[reportPrivateUsage]
         write_pending = codex_mesh._write_pending  # pyright: ignore[reportPrivateUsage]
         update_roster = codex_mesh._update_roster  # pyright: ignore[reportPrivateUsage]
         close = codex_mesh.Client.close
         detail = f"local {write_site} write failed after target accepted turn"
 
-        def target_accepted() -> bool:
-            return any(request.get("method") == "turn/start" for request in new.requests)
+        def accepted(
+            client: codex_mesh.Client, args: argparse.Namespace, thread: str, sandbox: str,
+            message: str, pending: tuple[str, ...] = (),
+        ) -> str:
+            turn = start_turn(client, args, thread, sandbox, message, pending)
+            if client.port == new.port:
+                self.assertTrue(turn, "the target must accept the turn before the write fails")
+                events.append("accepted")
+            return turn
 
         def pending(handle: TextIO, thread: str, messages: list[str], *, accepting_messages: bool = True) -> None:
-            if write_site == "pending" and target_accepted() and not failed[0]:
+            if write_site == "pending" and events == ["accepted"]:
                 self.assertEqual(messages, [])
-                failed[0] = True
+                events.append("write failed")
                 raise OSError(detail)
             write_pending(handle, thread, messages, accepting_messages=accepting_messages)
 
         def roster(session: str, name: str, fields: codex_mesh.ThreadRecord) -> None:
-            if (write_site == "roster" and target_accepted() and not failed[0]
-                    and fields.get("status") == "running" and fields.get("port") == new.port):
-                failed[0] = True
+            if write_site == "roster" and events == ["accepted"]:
+                self.assertEqual(fields.get("status"), "running")
+                self.assertEqual(fields.get("port"), new.port)
+                events.append("write failed")
                 raise OSError(detail)
             update_roster(session, name, fields)
 
@@ -7465,6 +7474,9 @@ class MeshCommandTests(MeshCommandFixture):
             close(client)
 
         with (
+            # This fixture already released the old writer; its confirmation only needs a hang guard.
+            patch.object(codex_mesh, "THREAD_RELEASE_TIMEOUT_SECS", TEST_HANG_GUARD_SECS),
+            patch.object(codex_mesh, "_start_turn", wraps=accepted),
             patch.object(codex_mesh, "_write_pending", side_effect=pending),
             patch.object(codex_mesh, "_update_roster", side_effect=roster),
             patch.object(codex_mesh.Client, "close", closed),
@@ -7473,7 +7485,8 @@ class MeshCommandTests(MeshCommandFixture):
             patch.object(codex_mesh, "_end_unwatched_turn", return_value=codex_mesh.RelaunchAllowed()) as cleanup,
         ):
             code, errors = self.run_start()
-        self.assertTrue(failed[0], "the injected failure must follow target turn acceptance")
+        self.assertEqual(events, ["accepted", "write failed"],
+                         "exactly one write must fail, after target turn acceptance")
         self.assertEqual(code, 1)
         self.assertIn(f"state unknown ({detail})", errors)
         self.assertEqual(self.worker_record()["status"], "failed")
@@ -7775,16 +7788,29 @@ class FollowEventRegressionTests(MeshCommandFixture):
         self.server.respond = queued_peer
         self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "running"}})
         attempts = 0
-        second_wait = 0.0
         wake_marker = self.session_dir / "worker.pending.json"
-        timer = threading.Timer(0.2, lambda: wake_marker.touch())
-        with contextlib.closing(codex_mesh.Client(self.server.port, "worker", deadline=time.time() + 4)) as client:
+        activity_wait = codex_mesh.FollowEvents.wait
+        wakes: list[codex_mesh.FileWaitResult] = []
+
+        def wake_submission(events: codex_mesh.FollowEvents, connection: socket.socket,
+                            deadline: float) -> codex_mesh.FileWaitResult:
+            self.assertEqual(attempts, 2)
+            wake_marker.touch()
+            result = activity_wait(events, connection, deadline)
+            wakes.append(result)
+            self.assertIsInstance(result, codex_mesh.StateFilesChanged)
+            assert isinstance(result, codex_mesh.StateFilesChanged)
+            self.assertIn(wake_marker, result.paths)
+            return result
+
+        with contextlib.closing(codex_mesh.Client(
+                self.server.port, "worker", deadline=time.time() + TEST_HANG_GUARD_SECS)) as client:
             @bounded_fixture
             def move(
                 _args: argparse.Namespace, _session: str, _name: str, _thread: str, moving: codex_mesh.Client,
                 *, message: str,
             ) -> codex_mesh.WorkerMoveResult:
-                nonlocal attempts, second_wait
+                nonlocal attempts
                 self.assertEqual(message, "resume after overflow")
                 self.assertIs(moving, client)
                 attempts += 1
@@ -7793,31 +7819,26 @@ class FollowEventRegressionTests(MeshCommandFixture):
                     return codex_mesh.WorkerWaitingOnLiveTurn()
                 if attempts == 2:
                     _ = client.call("test/drain-peer", {})
-                    second_wait = time.perf_counter()
-                    timer.start()
                     return codex_mesh.WorkerWaitingOnLiveTurn()
                 self.assertEqual(attempts, 3, "retained notices caused a busy submission retry")
-                self.assertGreater(time.perf_counter() - second_wait, 0.1,
-                                   "pending notices woke a wait for new activity")
+                self.assertEqual(len(wakes), 1, "pending notices bypassed the wait for new activity")
                 return codex_mesh.MovedWorker(client, self.server.port, "queued-peer", THREAD_ID, False)
 
             args = self.start_args()
-            args.timeout = 3
-            try:
-                with patch.object(codex_mesh, "_move_resident", new=move):
-                    _ = codex_mesh._start_workers_turn(  # pyright: ignore[reportPrivateUsage]
-                        args, str(self.session_dir), "worker", THREAD_ID, client, "resume after overflow")
-            finally:
-                timer.cancel()
-                if timer.ident is not None:
-                    timer.join(timeout=1)
+            args.timeout = TEST_HANG_GUARD_SECS
+            with (patch.object(codex_mesh, "_move_resident", new=move),
+                  patch.object(codex_mesh.FollowEvents, "wait", new=wake_submission)):
+                _ = codex_mesh._start_workers_turn(  # pyright: ignore[reportPrivateUsage]
+                    args, str(self.session_dir), "worker", THREAD_ID, client, "resume after overflow")
+            self.assertEqual(attempts, 3)
+            self.assertEqual(len(wakes), 1)
             stream = self.stream_for(client)
             stream.follow = False
             stream.followed_turn = ""
             log = io.StringIO()
             with patch.object(codex_mesh, "_after_turn_end", return_value=codex_mesh.StreamStep.FINISH):
                 for expected in notices:
-                    frame = client.next_frame(time.time() + 1)
+                    frame = client.next_frame(time.time() + TEST_HANG_GUARD_SECS)
                     self.assertEqual(frame, expected, "submission wait lost or reordered a peer notice")
                     assert frame is not None
                     _ = codex_mesh._on_frame(stream, log, frame)  # pyright: ignore[reportPrivateUsage]
@@ -7849,17 +7870,30 @@ class FollowEventRegressionTests(MeshCommandFixture):
 
         self.server.respond = rate_notice_before_idle_reply
         self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done" if resident else "running"}})
-        with contextlib.closing(codex_mesh.Client(self.server.port, "worker", deadline=time.time() + 3)) as client:
+        with contextlib.closing(codex_mesh.Client(
+                self.server.port, "worker", deadline=time.time() + TEST_HANG_GUARD_SECS)) as client:
             stream = self.stream_for(client, resident=resident)
+            stream.timeout = TEST_HANG_GUARD_SECS
+            stream.deadline = time.time() + TEST_HANG_GUARD_SECS
             stream.final_answer = "answer without completion"
             # The answer arrived, so the turn's notices did too.
             stream.turn_start_seen = True
             stream.state_change_owed = True
-            started = time.perf_counter()
-            _ = codex_mesh._stream_frames(stream, io.StringIO())  # pyright: ignore[reportPrivateUsage]
+            next_frame = client.next_frame
+
+            def drain_notice(deadline: float) -> codex_mesh.RpcMessage | None:
+                self.assertTrue(client.has_pending_frames,
+                                "draining the rate notice postponed the idle check until another read")
+                frame = next_frame(deadline)
+                self.assertIsNotNone(frame)
+                assert frame is not None
+                self.assertEqual(frame.get("method"), "account/rateLimits/updated")
+                return frame
+
+            with patch.object(client, "next_frame", wraps=drain_notice) as reads:
+                _ = codex_mesh._stream_frames(stream, io.StringIO())  # pyright: ignore[reportPrivateUsage]
+            reads.assert_called_once()
             self.assertTrue(buffered)
-            self.assertLess(time.perf_counter() - started, 1,
-                            "draining the rate notice postponed the idle check until the next timeout")
             self.assertEqual(stream.failure, "")
 
     def stream_for(self, client: codex_mesh.Client, *, resident: bool = False) -> codex_mesh.TurnStream:
@@ -13750,15 +13784,28 @@ class ServerRecordTests(unittest.TestCase):
             },
         }), encoding="utf-8")
 
-        started = time.monotonic()
-        with patch.object(codex_mesh, "PAUSE_INTERRUPT_SECS", 0.5), \
-                contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+        connect = socket.create_connection
+        read = MagicMock(side_effect=TimeoutError("app-server handshake timed out"))
+
+        def silent_connection(address: tuple[str, int], *, timeout: float) -> socket.socket:
+            self.assertLessEqual(timeout, TEST_HANG_GUARD_SECS,
+                                 "pause omitted its deadline before a blocking handshake")
+            connection = connect(address, timeout=timeout)
+            self.addCleanup(connection.close)
+            # Keep real connect/send/timeout handling; deliver the hung read's timeout as an event.
+            return cast(socket.socket, MagicMock(wraps=connection, recv=read))
+
+        with (patch.object(codex_mesh, "PAUSE_INTERRUPT_SECS", TEST_HANG_GUARD_SECS),
+              patch.object(codex_mesh, "CONNECT_TIMEOUT_SECS", 2 * TEST_HANG_GUARD_SECS),
+              patch.object(socket, "create_connection", wraps=silent_connection) as connections,
+              contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO())):
             with self.assertRaisesRegex(SystemExit, "servers kept alive"):
                 _ = codex_mesh.command_stop(
                     argparse.Namespace(session_dir=str(self.session_dir), pause=True)
                 )
 
-        self.assertLess(time.monotonic() - started, 10)
+        connections.assert_called_once()
+        read.assert_called_once_with(4096)
         self.assertIsNone(self.spawned[0].poll(), "pause destroyed an unconfirmed queue")
         self.assertTrue((self.session_dir / codex_mesh.SERVER_FILE).exists())
         roster = cast("dict[str, dict[str, object]]", json.loads(
