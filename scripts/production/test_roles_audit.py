@@ -491,7 +491,7 @@ class SourceCheckTests(unittest.TestCase):
             with redirect_stdout(detailed):
                 status = audit.main(["check", "--root", str(root), "--prose"])
             self.assertEqual(status, 0)
-            self.assertEqual(detailed.getvalue().splitlines()[0], count_line)
+            self.assertEqual(detailed.getvalue().splitlines()[0], "role words in sentences: 2")
             self.assertCountEqual(detailed.getvalue().splitlines()[1:], [
                 "scripts/messages.py:2: 'unit director'",
                 "scripts/messages.py:3: 'worker'",
@@ -507,7 +507,7 @@ class SourceCheckTests(unittest.TestCase):
                 status = audit.main(["check", "--root", str(root), "--prose"])
             self.assertEqual(status, 0)
             self.assertEqual(output.getvalue().splitlines(), [
-                "role words in sentences: 0 (list with --prose)",
+                "role words in sentences: 0",
             ])
             self.assertEqual(audit.check_sources(root), audit.check_sources(root, full_extraction=True))
 
@@ -521,7 +521,7 @@ class SourceCheckTests(unittest.TestCase):
                 status = audit.main(["check", "--root", str(root), "--prose"])
             self.assertEqual(status, 0)
             self.assertEqual(output.getvalue().splitlines(), [
-                "role words in sentences: 1 (list with --prose)",
+                "role words in sentences: 1",
                 "scripts/error.py:1: 'showrunner'",
             ])
             self.assertEqual(audit.check_sources(root), audit.check_sources(root, full_extraction=True))

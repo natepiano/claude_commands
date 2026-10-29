@@ -1142,6 +1142,38 @@ class RosterTests(unittest.TestCase):
         by_name = {cast(str, row["name"]): row for row in rows}
         self.assertEqual(by_name["orphan-fix"]["address"], "")
 
+    def test_workers_keep_their_unit_title_after_the_director_stops(self) -> None:
+        _ = (self.director_run / "progress_history_state.json").write_text(json.dumps({
+            "production": "alpha", "unit": "unit-one",
+            "working_dir": str(self.home / "projects" / "unit-one"),
+        }))
+        _ = (self.director_run / "mesh_roster.json").write_text(json.dumps({
+            "alpha-impl": {"thread_id": "thread-shared", "status": "running", "role": "impl",
+                           "launcher_pid": os.getpid()},
+            "alpha-fix": {"thread_id": "thread-fix", "status": "done", "role": "fix"},
+        }))
+        _ = (self.director_run / "board.log").write_text("2026-10-29T12:00:00Z [test] handoff: role=impl fixture\n")
+        before = self._entries()
+        (self.sessions / "director.json").unlink()
+        (self.director_run / "heartbeat.log").touch()
+        entries = self._entries()
+        for name in ("alpha-impl", "claude-worker"):
+            with self.subTest(worker=name):
+                entry = entries[name]
+                self.assertEqual(roster.shown_name(entry), roster.shown_name(before[name]))
+                self.assertEqual(entry.director, roster.UnitWithoutRunningDirector("unit-one"))
+                restored = roster.RosterSnapshot.decode(
+                    roster.RosterSnapshot(roster.Roster([entry], [])).encode()).result.entries[0]
+                self.assertEqual(restored, entry)
+        self.assertEqual(entries["alpha-fix"].reach, roster.CannotReceiveMessages(
+            "between turns; no unit director is running"))
+        result, lines, errors = self._run_main()
+        self.assertEqual((result, errors), (0, []))
+        worker = next(line.strip() for line in lines if "[worker:director-run/alpha-impl]" in line)
+        self.assertTrue(worker.startswith("alpha · unit-one · worker impl [worker:director-run/alpha-impl]"), worker)
+        self.assertNotIn("worker worker", worker)
+        self.assertTrue(any("director not running:" in line for line in lines))
+
     def test_same_worker_name_in_two_live_runs_has_two_unique_addresses(self) -> None:
         second_run = self.runs / "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         self._write_mesh(second_run, {

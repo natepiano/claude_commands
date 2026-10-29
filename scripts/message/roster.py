@@ -167,7 +167,12 @@ class NoDirector:
     """This session has no unit-director link."""
 
 
-DirectorRelationship = DirectsUnit | UnderDirector | NoDirector
+@dataclass(frozen=True)
+class UnitWithoutRunningDirector:
+    unit: str
+
+
+DirectorRelationship = DirectsUnit | UnderDirector | UnitWithoutRunningDirector | NoDirector
 
 
 @dataclass(frozen=True)
@@ -370,7 +375,7 @@ SnapshotState = TaggedSnapshotState | WorkerAssignment | HeldDesignRole
 _SNAPSHOT_STATES: tuple[type[TaggedSnapshotState], ...] = (
     Messageable, CannotReceiveMessages, UnderShowrunner, RunsProduction,
     ProductionWithoutRunningShowrunner, NoShowrunner, UnderDirector, DirectsUnit,
-    NoDirector, NotAWorker, CodexThread, NoCodexThread,
+    UnitWithoutRunningDirector, NoDirector, NotAWorker, CodexThread, NoCodexThread,
     ClaudeSession, NoClaudeSession, AccountLabel, AccountUnread, AccountAttributionUnavailable,
 )
 
@@ -598,7 +603,7 @@ def _showrunner_address(entry: RosterEntry) -> str:
 
 
 def _unit(entry: RosterEntry) -> str:
-    if isinstance(entry.director, (DirectsUnit, UnderDirector)):
+    if isinstance(entry.director, (DirectsUnit, UnderDirector, UnitWithoutRunningDirector)):
         return entry.director.unit
     return ""
 
@@ -1177,16 +1182,32 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _stopped_run_place(run: Path) -> _RunPlace:
+    """Keep a worker's recorded unit without claiming that its director is live."""
+    from scripts.direct.progress_history import ProductionUnitIdentity, resolve_production_unit
+
+    try:
+        state = _read_object(run / unit_runs.STATE_FILE)
+    except (OSError, UnicodeError, ValueError):
+        return _RunPlace(NoDirector(), NoShowrunner(), "")
+    identity = resolve_production_unit(state)
+    cwd = _as_string(state.get("working_dir"))
+    if isinstance(identity, ProductionUnitIdentity):
+        return _RunPlace(UnitWithoutRunningDirector(identity.unit),
+                         ProductionWithoutRunningShowrunner(identity.production), cwd)
+    return _RunPlace(NoDirector(), NoShowrunner(), cwd)
+
+
 def _run_place(
     run: _LiveRun,
     claude_entries: Mapping[str, RosterEntry],
     production_places: Mapping[str, _ProductionPlace],
 ) -> _RunPlace:
     if isinstance(run.director, _NoRunningDirector):
-        return _RunPlace(NoDirector(), NoShowrunner(), "")
+        return _stopped_run_place(run.path)
     director = claude_entries.get(run.director.session_id)
     if director is None:
-        return _RunPlace(NoDirector(), NoShowrunner(), "")
+        return _stopped_run_place(run.path)
     place = production_places.get(run.director.session_id)
     unit = place.director.unit if place is not None else ""
     director_link = UnderDirector(unit, director.name, _session_address(director))
@@ -1355,6 +1376,9 @@ def _claude_entries(
             worker = workers[session_id]
             assignment = _claude_assignment(worker.run.path, worker.worker_name or record["name"], problems)
             run_director = worker.run.director
+            if isinstance(run_director, _NoRunningDirector):
+                place = _stopped_run_place(worker.run.path)
+                showrunner, director = place.showrunner, place.director
             director_entry = (
                 records_by_id.get(run_director.session_id)
                 if isinstance(run_director, _DirectorSession) else None
@@ -1818,7 +1842,8 @@ def _entry_line(entry: RosterEntry, *, you: bool, context: bool) -> str:
     cwd = _home_shortened(entry.cwd)
     if cwd:
         details.append(cwd)
-    return f"{entry.role} {name} — {', '.join(details)}"
+    prefix = "" if entry.role == "worker" and isinstance(shown.job, ShownJob) else f"{entry.role} "
+    return f"{prefix}{name} — {', '.join(details)}"
 
 
 def _chosen_entries(

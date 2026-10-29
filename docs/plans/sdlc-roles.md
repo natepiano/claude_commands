@@ -315,6 +315,24 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Gotchas:** `UnitLease.ordinal` counts reviews, not recency.
 
+### Phase 10c — Small fixes from the phase 10 vet  · status: done
+**Depends on:** Phase 10b. The showrunner's vet of the phase 10 change-review rows (2026-10-29); it ships in one hash with Phase 12 and Phase 10b.
+
+#### Work Order
+
+**Goal:** three small output and doc defects are gone.
+
+**Spec:**
+- `scripts/production/roles_audit.py check --prose` prints its count line without the hint `(list with --prose)`, because the list is already shown (about line 1082). The hint stays when `--prose` is not given.
+- `scripts/message/roster.py` prints a worker under a stopped director with the word `worker` once and with its production and unit, as it does under a live director.
+- `docs/as-built/herdr-adoption.md` (Shared session layout paragraph) says what is true now about a pane's name and its tab's name, from `scripts/herdr/herdr.py`.
+
+**Files:** `scripts/production/roles_audit.py`, `scripts/production/test_roles_audit.py`, `scripts/message/roster.py`, `scripts/message/test_roster.py`, `docs/as-built/herdr-adoption.md`
+
+**Workers:** `impl` (writer and tester).
+
+**Acceptance gate:** a test for each output; the production and message suites and the merge gate green; basedpyright 0/0/0.
+
 ### Phase 11 — The review pool and the transfer code are gone  · status: todo
 **Depends on:** Phase 10 merged to main (the showrunner says when), and Phase 12 (it renames the held design role names in the same files).
 
