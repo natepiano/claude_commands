@@ -8025,102 +8025,75 @@ class FollowEventRegressionTests(MeshCommandFixture):
                 _notice("account/rateLimits/updated", {"rateLimits": {}})]
 
         self.server.respond = trailing_status
-        more_work = codex_mesh._more_work_coming  # pyright: ignore[reportPrivateUsage]
-        on_frame = codex_mesh._on_frame  # pyright: ignore[reportPrivateUsage]
+        check_more_work = codex_mesh._more_work_coming  # pyright: ignore[reportPrivateUsage]
         finish_stream = codex_mesh._finish_stream  # pyright: ignore[reportPrivateUsage]
         next_frame = codex_mesh.Client.next_frame
         read = codex_mesh.Client._read  # pyright: ignore[reportPrivateUsage]
-        rpc = codex_mesh.Client.call
-        completed = False
-        grace_reads: list[list[str]] = []
-        replayed_notices: list[str] = []
-        finished = 0
-
-        def observed_frame(
-            stream: codex_mesh.TurnStream, log: TextIO, frame: codex_mesh.RpcMessage,
-        ) -> codex_mesh.StreamStep | codex_mesh.FailedWithThread:
-            nonlocal completed
-            if frame.get("method") == "turn/completed":
-                completed = True
-            return on_frame(stream, log, frame)
-
-        def stream_read(client: codex_mesh.Client, deadline: float) -> codex_mesh.RpcMessage | None:
-            if completed:
-                self.assertTrue(client.has_pending_frames, "stream waited again after turn/completed")
-            frame = next_frame(client, deadline)
-            if completed:
-                assert frame is not None
-                replayed_notices.append(str(frame.get("method")))
-                self.assertLessEqual(len(replayed_notices), 2, "trailing notices were replayed repeatedly")
-            return frame
+        grace_active = False
+        grace_checked = False
+        frame_read_active = False
+        grace_run_deadline = 0.0
+        opened_windows = 0
+        test = self
+        # Adding the real interval opens a grace window; notices must not open
+        # another. Counting additions tolerates rounding and early file wakes.
+        class SingleGraceWindow(float):
+            @override
+            def __radd__(self, opened: float, /) -> float:
+                nonlocal opened_windows
+                opened_windows += 1
+                test.assertEqual(opened_windows, 1, "a notice opened another grace window")
+                return opened + float(self)
 
         def observed_more_work(client: codex_mesh.Client, thread_id: str, deadline: float) -> bool:
-            self.assertTrue(completed)
-            self.assertEqual(grace_reads, [], "trailing notices opened another grace window")
-            reads: list[str] = []
-            grace_reads.append(reads)
-            elapsed = 0.0
-
-            def real_rpc(
-                client: codex_mesh.Client, method: str, params: dict[str, object],
-                timeout: float = codex_mesh.CALL_TIMEOUT_SECS,
-            ) -> codex_mesh.RpcMessage:
-                with patch.object(codex_mesh, "time", time), patch.object(codex_mesh.Client, "_read", read):
-                    return rpc(client, method, params, timeout)
-
-            def grace_read(client: codex_mesh.Client, read_until: float) -> codex_mesh.RpcMessage | None:
-                nonlocal elapsed
-                self.assertLess(len(reads), 3, "grace window was re-armed after a notice")
-                self.assertLess(read_until, deadline, "grace read waited until the run deadline")
-                # Logical time starts at zero: every read must name the same
-                # single grace deadline, regardless of real scheduling delays.
-                self.assertEqual(read_until, codex_mesh.QUEUE_GRACE_SECS,
-                                 "a notice extended the grace deadline")
-                if client.has_pending_frames:
-                    # Read the actual buffered notices, with real I/O time isolated
-                    # from the logical grace clock so scheduler load cannot expire it.
-                    with patch.object(codex_mesh, "time", time), patch.object(codex_mesh.Client, "_read", read):
-                        frame = next_frame(client, time.time() + TEST_HANG_GUARD_SECS)
-                    assert frame is not None
-                    reads.append(str(frame.get("method")))
-                    elapsed += codex_mesh.QUEUE_GRACE_SECS / 3
-                    return frame
-                reads.append("grace expired")
-                elapsed = read_until
-                return None
-
-            # Two notices precede one empty read that expires the logical grace
-            # window. Keep real socket waits out of this count-based proof.
-            with (
-                patch.object(codex_mesh, "time", SimpleNamespace(
-                    time=lambda: elapsed, monotonic=lambda: elapsed, sleep=fixture_no_sleep)),
-                patch.object(codex_mesh.Client, "call", real_rpc),
-                patch.object(codex_mesh.Client, "next_frame", grace_read),
-                patch.object(codex_mesh.Client, "_read",
-                             side_effect=AssertionError("grace bypassed next_frame for a blocking read")),
-            ):
-                result = more_work(client, thread_id, deadline)
+            nonlocal grace_active, grace_checked, grace_run_deadline
+            grace_run_deadline = deadline
+            grace_active = True
+            try:
+                result = check_more_work(client, thread_id, deadline)
+            finally:
+                grace_active = False
+            grace_checked = True
             self.assertFalse(result, "trailing notices were counted as another turn")
             return result
 
+        def observed_next_frame(client: codex_mesh.Client, read_until: float) -> codex_mesh.RpcMessage | None:
+            nonlocal frame_read_active
+            if grace_active:
+                self.assertEqual(opened_windows, 1, "grace skipped its window and waited until the run deadline")
+                self.assertLess(read_until, grace_run_deadline, "grace waited until the run deadline")
+            elif grace_checked:
+                self.assertTrue(client.has_pending_frames, "stream waited again after the notices drained")
+            frame_read_active = True
+            try:
+                return next_frame(client, read_until)
+            finally:
+                frame_read_active = False
+
+        def observed_read(
+            client: codex_mesh.Client, deadline: float,
+            wake: codex_mesh.FollowEvents | codex_mesh.SocketOnlyWait = codex_mesh.SOCKET_ONLY_WAIT,
+        ) -> codex_mesh.RpcMessage | None:
+            frame = read(client, deadline, wake)
+            if grace_active and frame is None:
+                self.assertTrue(frame_read_active, "grace bypassed next_frame for a blocking read")
+            return frame
+
         def observed_finish(stream: codex_mesh.TurnStream) -> codex_mesh.RunOutcome:
-            nonlocal finished
-            finished += 1
             self.assertLess(time.time(), stream.deadline, "run finished at its hang guard")
             return finish_stream(stream)
 
         with (
-            patch.object(codex_mesh, "QUEUE_GRACE_SECS", 0.05),
-            patch.object(codex_mesh, "_more_work_coming", observed_more_work),
-            patch.object(codex_mesh, "_on_frame", observed_frame),
-            patch.object(codex_mesh, "_finish_stream", observed_finish),
-            patch.object(codex_mesh.Client, "next_frame", stream_read),
+            patch.object(codex_mesh, "QUEUE_GRACE_SECS", SingleGraceWindow(0.05)),
+            patch.object(codex_mesh, "_more_work_coming", wraps=observed_more_work) as more_work,
+            patch.object(codex_mesh.Client, "next_frame", new=observed_next_frame),
+            patch.object(codex_mesh.Client, "_read", new=observed_read),
+            patch.object(codex_mesh, "_finish_stream", wraps=observed_finish) as finish,
         ):
             code, errors = self.run_start()
-        notices = ["thread/status/changed", "account/rateLimits/updated"]
-        self.assertEqual(grace_reads, [[*notices, "grace expired"]])
-        self.assertEqual(replayed_notices, notices)
-        self.assertEqual(finished, 1)
+        more_work.assert_called_once()
+        self.assertEqual(opened_windows, 1)
+        finish.assert_called_once()
         self.assertEqual(code, 1 if failed else 0, errors)
         self.assertEqual(self.worker_record()["status"], "failed" if failed else "done")
         if failed:
