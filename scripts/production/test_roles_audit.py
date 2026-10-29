@@ -10,6 +10,8 @@ import subprocess
 import tempfile
 import unittest
 from unittest.mock import call, patch
+from collections.abc import Callable
+from typing import cast
 
 import roles_audit as audit
 import showrunners
@@ -430,7 +432,7 @@ class SourceCheckTests(unittest.TestCase):
             self.write_check_root(root, {"scripts/keys.py":
                 'label = "worker"\nprint(record[label])\nprint({label: value})\nprint(label == record.role)\n'
                 + 'print(record.get(label))\n'})
-            self.assertEqual(audit.source_check(root), audit.SourceCheck((), ()))
+            self.assertEqual(audit.source_check(root), audit.SourceCheck((), (), (), ()))
 
     def test_concatenated_output_keeps_sentence_context_and_detects_whole_labels(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -738,7 +740,7 @@ class MessageTests(unittest.TestCase):
                  message(start, outcome="skipped", **director),
                  message(end, **director), message(start - timedelta(seconds=1), **director)]
         source = audit.parse_messages("\n".join(lines))
-        counts = audit.measure_wrong_party(source.records, audit.AuditWindow(start, end))
+        counts = audit.measure_sent_contacts(source.records, audit.AuditWindow(start, end))
         self.assertEqual(counts.senders, (audit.SenderContacts("alpha", 1, 1, 0, 1, 4),
                                          audit.SenderContacts("named-unit", 0, 0, 1, 0, 1)))
         self.assertEqual((counts.window_records, counts.sent_records, counts.other_machine_records, counts.machine_unknown),
@@ -763,15 +765,16 @@ class MessageTests(unittest.TestCase):
         start = datetime(2026, 10, 1, tzinfo=timezone.utc)
         source = audit.parse_messages(message(start))
         result = audit.report((term("worker", "seat"),), (audit.LiveFile("commands/a.md", "worker seat seat"),),
-                              (), source, audit.AuditWindow(start, start + timedelta(days=1)), ())
+                              (), source, audit.AuditWindow(start, start + timedelta(days=1)), (),
+                              source_result=audit.SourceCheck((), (), (), ()), unread_production_docs=())
         self.assertIn("2 / 3", result)
         self.assertIn("66.7%", result)
-        self.assertIn("not recorded: 1", result)
-        self.assertIn(audit.ROLE_SOURCE, result)
+        self.assertIn("role unknown (n=1)", result)
+        self.assertIn("Request intent is not recorded.", result)
         self.assertIn("natedev only", result)
         self.assertIn("2026-09-30", result)
         self.assertIn("live: n=1 files", result)
-        self.assertIn("helper call arguments are not followed into parameters", result)
+        self.assertNotIn("\nNames\n", result)
 
     def test_baseline_reads_fixture_productions_and_reports_unavailable_log(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -794,11 +797,222 @@ other_names = ["seat"]
                     patch.object(Path, "home", return_value=root), \
                     patch.dict("os.environ", {"USER_ZONE": "America/New_York"}):
                 result = audit.baseline(root, audit.AuditWindow(at, at + timedelta(days=1)))
-            self.assertIn("unit format", result)
+            self.assertIn("invalid unit format", result)
             self.assertIn("bad", result)
-            self.assertIn("no defined_in", result)
+            self.assertIn("has no declared definition", result)
             self.assertIn("unavailable:", result)
-            self.assertIn("natedev sent n=0", result)
+            self.assertIn("Sent contacts: unknown (n=0)", result)
+            self.assertIn(f"Warning: {root / '.local/state/message/log.jsonl'}:", result)
+
+
+class BaselineReportTests(unittest.TestCase):
+    def write_fixture(self, root: Path) -> audit.AuditWindow:
+        paths = {
+            "config/names.toml": NAMES_TOML,
+            "scripts/production/role_terms.toml": '''[[terms]]
+name = "worker"
+kind = "role"
+defined_in = "docs/words.md#Words"
+other_names = ["seat", "delegate"]
+[[terms]]
+name = "gate"
+kind = "step"
+defined_in = "none"
+other_names = []
+''',
+            "docs/words.md": "# Words\nworker seat seat delegate\n",
+            "scripts/output.py": 'print("worker")\n',
+            "fixture-production.md": "## Units\n| Unit | Plan |\n| --- | --- |\n| bad | a.md |\n",
+        }
+        at = datetime(2026, 10, 1, tzinfo=timezone.utc)
+        paths[".local/state/message/log.jsonl"] = message(at)
+        for relative, text in paths.items():
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _ = path.write_text(text, encoding="utf-8")
+        return audit.AuditWindow(at, at + timedelta(days=1))
+
+    def test_report_rejects_omitted_source_check_evidence(self) -> None:
+        at = datetime(2026, 10, 1, tzinfo=timezone.utc)
+        # Exercise runtime callers that bypass the required keyword's type check.
+        unchecked_report = cast(Callable[..., str], audit.report)
+        with self.assertRaisesRegex(TypeError, "source_result"):
+            _ = unchecked_report((), (), (), audit.parse_messages(""),
+                                 audit.AuditWindow(at, at + timedelta(days=1)), ())
+
+    def test_report_shows_zero_labels_after_a_successful_source_check(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            window = self.write_fixture(root)
+            _ = (root / "scripts/output.py").write_text('print("Ready.")\n', encoding="utf-8")
+            checked = audit.source_check(root)
+            self.assertEqual(checked.labels, ())
+            self.assertEqual(checked.unread_sources, ())
+            result = audit.report((), (), (), audit.parse_messages(""), window, (),
+                                  source_result=checked, unread_production_docs=())
+            self.assertIn("Fixed display labels: n=0 to fix;", result)
+            self.assertNotIn("sources not read", result)
+
+    def test_unread_sources_make_zero_label_and_production_counts_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            window = self.write_fixture(root)
+            _ = (root / "scripts/output.py").write_text('print("Ready.")\n', encoding="utf-8")
+            _ = (root / "scripts/bad.py").write_bytes(b"\xff")
+            unreadable_doc = root / "unreadable-production.md"
+            _ = unreadable_doc.write_bytes(b"\xff")
+            missing_doc = root / "missing-production.md"
+            checked = audit.source_check(root)
+            self.assertEqual([source.path for source in checked.unread_sources], ["scripts/bad.py"])
+            with patch.object(Path, "home", return_value=root), \
+                    patch.object(showrunners, "timer_docs", return_value={"unreadable": unreadable_doc, "missing": missing_doc}):
+                result = audit.baseline(root, window)
+            label_line = next(line for line in result.splitlines() if line.startswith("Fixed display labels:"))
+            production_line = next(line for line in result.splitlines() if line.startswith("Unit and session names:"))
+            self.assertEqual(label_line, "Fixed display labels: n=0 to fix; n=1 sources not read; "
+                             + "role words in sentences: n=0 (information only; live: n=2 files; n=1 sources not read).")
+            self.assertEqual(production_line, "Unit and session names: n=0 findings across n=0 production docs "
+                             + "(including retired units); n=2 sources not read.")
+            for prefix in ("Other names:", "Most used other names:", "Definitions:", "Files:"):
+                line = next(line for line in result.splitlines() if line.startswith(prefix))
+                self.assertIn("n=1 sources not read", line)
+            for path in ("scripts/bad.py", str(unreadable_doc), str(missing_doc)):
+                self.assertTrue(any(line.startswith("Warning:") and path in line for line in result.splitlines()), result)
+
+    def test_baseline_keeps_first_read_failure_in_name_and_label_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            window = self.write_fixture(root)
+            output = root / "scripts/output.py"
+            original_read = Path.read_text
+            output_reads = 0
+
+            def read_fixture(path: Path, encoding: str = "utf-8") -> str:
+                nonlocal output_reads
+                if path == output:
+                    output_reads += 1
+                    if output_reads == 1:
+                        raise OSError("fixture source temporarily unavailable")
+                return original_read(path, encoding=encoding)
+
+            with patch.object(Path, "read_text", new=read_fixture), \
+                    patch.object(Path, "home", return_value=root), \
+                    patch.object(showrunners, "timer_docs", return_value={}):
+                result = audit.baseline(root, window)
+            lines = result.splitlines()
+            self.assertIn("Other names: 3 / 4 (75.0%; live: n=1 files; n=1 sources not read).", lines)
+            self.assertIn("Fixed display labels: n=0 to fix; n=1 sources not read; "
+                          + "role words in sentences: n=0 (information only; live: n=1 files; n=1 sources not read).", lines)
+            self.assertIn("Warning: scripts/output.py: fixture source temporarily unavailable", lines)
+            self.assertFalse(any(line.startswith("Fix: scripts/output.py:") for line in lines), result)
+            self.assertEqual(output_reads, 1)
+
+    def test_fixture_baseline_starts_with_share_worst_names_and_actionable_findings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            window = self.write_fixture(root)
+            with patch.object(Path, "home", return_value=root), \
+                    patch.object(showrunners, "timer_docs", return_value={"fixture": root / "fixture-production.md"}):
+                result = audit.baseline(root, window)
+            self.assertEqual(result.splitlines()[:2], [
+                "Other names: 3 / 5 (60.0%; live: n=2 files).",
+                "Most used other names: 'seat' n=2 (worker); 'delegate' n=1 (worker) (live: n=2 files).",
+            ])
+            self.assertIn("Definition: 'gate' has no declared definition.", result)
+            self.assertIn("Name: 'bad' has an invalid unit format in fixture.", result)
+            self.assertIn("Fixed display labels: n=1 to fix; role words in sentences: n=0", result)
+            self.assertIn("Fix: scripts/output.py:1: fixed display name 'worker'; read config/names.toml", result)
+            self.assertIn(f"Message window: {window.label()} (natedev only).", result)
+            self.assertIn("role unknown (n=1)", result)
+            self.assertIn("Request intent is not recorded.", result)
+
+    def test_baseline_cli_prints_full_tables_only_when_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _ = self.write_fixture(root)
+            arguments = ["baseline", "--root", str(root), "--since", "2026-10-01", "--until", "2026-10-01"]
+            with patch.object(Path, "home", return_value=root), \
+                    patch.object(showrunners, "timer_docs", return_value={"fixture": root / "fixture-production.md"}):
+                short, detailed = StringIO(), StringIO()
+                with redirect_stdout(short):
+                    self.assertEqual(audit.main(arguments), 0)
+                with redirect_stdout(detailed):
+                    self.assertEqual(audit.main([*arguments, "--tables"]), 0)
+            self.assertTrue(detailed.getvalue().startswith(short.getvalue().rstrip() + "\n\n"))
+            for heading in ("Roles baseline", "Names", "Source issues"):
+                self.assertNotIn(heading, short.getvalue().splitlines())
+                self.assertIn(heading, detailed.getvalue().splitlines())
+            self.assertIn("Definitions (declared sources", detailed.getvalue())
+            self.assertIn("Unit and session names — natedev only", detailed.getvalue())
+            self.assertIn("Sent contacts — natedev only; request intent not recorded", detailed.getvalue())
+            self.assertNotIn("Wrong-party asks", detailed.getvalue())
+            self.assertIn(audit.ROLE_SOURCE, detailed.getvalue())
+            self.assertIn("helper call arguments are not followed into parameters", detailed.getvalue())
+
+    def test_sent_contact_tables_drop_zero_and_unknown_only_rows_without_hiding_coverage(self) -> None:
+        at = datetime(2026, 10, 1, tzinfo=timezone.utc)
+        source = audit.parse_messages("\n".join([
+            message(at, sender="zero-only", from_role="worker", from_production="one"),
+            message(at, sender="unknown-only"),
+            message(at, sender="known-director", from_role="unit director", from_production="one"),
+            message(at, sender="known-other-production", recipient="runner", from_role="unit director",
+                    from_production="one", to_role="showrunner", to_production="two"),
+            message(at, sender="unknown-production", recipient="runner", from_role="unit director", to_role="showrunner"),
+            message(at, sender="unknown-machine", machine=""),
+        ]))
+        window = audit.AuditWindow(at, at + timedelta(days=1))
+        coverage = audit.measure_sent_contacts(source.records, window)
+        self.assertIsInstance(coverage, audit.SentContactCoverage)
+        result = audit.report((), (), (), source, window, (), tables=True,
+                              source_result=audit.SourceCheck((), (), (), ()), unread_production_docs=())
+        contacts = result.split("Sent contacts — natedev only; request intent not recorded\n", 1)[1].split("\n\n", 1)[0]
+        self.assertIn("known-director", contacts)
+        self.assertIn("known-other-production", contacts)
+        for dropped in ("zero-only", "unknown-only", "unknown-production"):
+            self.assertNotIn(dropped, contacts)
+        self.assertIn("role unknown (n=1)", result)
+        self.assertIn("production unknown (n=1)", result)
+        self.assertIn("machine unknown (n=1)", result)
+        self.assertIn("n=5 sent / n=6 window records", result)
+
+    def test_short_summary_names_each_conflicting_definition_and_shared_unit(self) -> None:
+        at = datetime(2026, 10, 1, tzinfo=timezone.utc)
+        result = audit.report(
+            (term("worker", defined_in=("docs/a.md#Words", "docs/b.md#Words")),), (),
+            (audit.ProductionNames("one", "one.md", "runner-one", ("shared-unit",)),
+             audit.ProductionNames("two", "two.md", "runner-two", ("shared-unit",))),
+            audit.parse_messages(""), audit.AuditWindow(at, at + timedelta(days=1)), (),
+            source_result=audit.SourceCheck((), (), (), ()), unread_production_docs=())
+        self.assertIn("Definitions: n=1 findings across n=1 terms.", result)
+        self.assertIn("Definition: 'worker' has definitions in docs/a.md, docs/b.md.", result)
+        self.assertIn("Unit and session names: n=1 findings across n=2 production docs", result)
+        self.assertIn("Name: 'shared-unit' is shared by one, two.", result)
+
+    def test_unreadable_sources_have_individual_warnings_in_the_short_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            window = self.write_fixture(root)
+            (root / ".local/state/message/log.jsonl").unlink()
+            _ = (root / "scripts/bad.py").write_bytes(b"\xff")
+            missing_doc = root / "missing-production.md"
+            with patch.object(Path, "home", return_value=root), \
+                    patch.object(showrunners, "timer_docs", return_value={"missing": missing_doc}):
+                result = audit.baseline(root, window)
+            for path in ("scripts/bad.py", str(missing_doc), str(root / ".local/state/message/log.jsonl")):
+                self.assertTrue(any(line.startswith("Warning:") and path in line for line in result.splitlines()), result)
+            self.assertIn("Sent contacts: unknown (n=0); message log unavailable:", result)
+            self.assertNotIn("Sent contacts: n=0 sent", result)
+
+    def test_sentence_only_baseline_reports_information_without_label_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            window = self.write_fixture(root)
+            _ = (root / "scripts/output.py").write_text('print("Ask the worker for help.")\n', encoding="utf-8")
+            with patch.object(Path, "home", return_value=root), \
+                    patch.object(showrunners, "timer_docs", return_value={}):
+                result = audit.baseline(root, window)
+            self.assertIn("Fixed display labels: n=0 to fix; role words in sentences: n=1 (information only; live: n=2 files).", result)
+            self.assertFalse(any(line.startswith("Fix:") for line in result.splitlines()), result)
 
 
 if __name__ == "__main__":

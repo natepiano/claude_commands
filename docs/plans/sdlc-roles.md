@@ -243,7 +243,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Acceptance gate:** the gates in Delegation Context green, with the direct, production and message suites; a fixture-backed check finds no operational pool reader or caller, with named exceptions for the migration decoder, compatibility flags and kept history (the retired-name check stays the separate prose gate). Live check: this unit's next review runs on its own `review` and `review2` workers, and the review after it resumes the same threads (same thread ids in the roster).
 
-### Phase 8 — The retired-name baseline reads at a glance  · status: todo
+### Phase 8 — The retired-name baseline reads at a glance  · status: done
 **Depends on:** Phase 6
 
 #### Work Order
