@@ -74,11 +74,12 @@ class CountTests(unittest.TestCase):
     def test_announcement_reaches_showrunners_and_directors_on_both_machines_through_fake_ssh(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         commands: list[list[str]] = []
+        holders: tuple[tuple[str, roster.Role], ...] = (("runner", "showrunner"), ("director", "unit director"))
         rows = [roster.RosterEntry(
             "fixture", "claude", role, name, "working", roster.Messageable(f"session:{name}"),
             "/fixture", roster.NoShowrunner(), roster.NoDirector(), roster.NotAWorker(),
             session=roster.ClaudeSession(name),
-        ) for name, role in (("runner", "showrunner"), ("director", "unit director"))]
+        ) for name, role in holders]
 
         def run(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
             commands.append(command)
@@ -300,7 +301,10 @@ class MessageTests(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         lines = done.stdout.splitlines()
         self.assertEqual(lines[-1], "hana: counting every 2 minutes")
-        self.assertCountEqual(lines[:-1], ["hana - showrunner - sent", "trunk - unit director - sent"])
+        self.assertCountEqual(lines[:-1], [
+            "show · showrunner [session:id-hana] - sent",
+            "show · trunk · unit director [session:id-trunk] - sent",
+        ])
         log = (self.root / "log").read_text(encoding="utf-8")
         for session in ("hana", "trunk"):
             self.assertIn(f"send --to session:id-{session} --from natedev --here --text Codex wind-down, from the user", log)
@@ -317,7 +321,10 @@ class MessageTests(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         lines = done.stdout.splitlines()
         self.assertEqual(lines[0], "hana: count stopped")
-        self.assertCountEqual(lines[1:], ["hana - showrunner - sent", "trunk - unit director - sent"])
+        self.assertCountEqual(lines[1:], [
+            "show · showrunner [session:id-hana] - sent",
+            "show · trunk · unit director [session:id-trunk] - sent",
+        ])
         # Only the showrunners' own update timers are left: every count is gone.
         self.assertEqual(sorted(path.name for path in (self.root / "notifier").iterdir()),
                          ["showrunner-show", "showrunner-zz-gone"])
@@ -329,7 +336,10 @@ class MessageTests(unittest.TestCase):
         self.assertEqual(self.run_script("triage", "--from", "natedev").returncode, 1)
         _ = self.run_script("start", "--from", "natedev")
         done = self.run_script("triage", "--from", "natedev")
-        self.assertCountEqual(done.stdout.splitlines(), ["hana - showrunner - sent", "trunk - unit director - sent"])
+        self.assertCountEqual(done.stdout.splitlines(), [
+            "show · showrunner [session:id-hana] - sent",
+            "show · trunk · unit director [session:id-trunk] - sent",
+        ])
         self.assertIn("which ones can be stopped now and added to a resume list",
                       (self.root / "log").read_text(encoding="utf-8"))
 

@@ -81,7 +81,7 @@ FLAGS: dict[str, BroadcastGroup] = {
 
 class Recipient(NamedTuple):
     session: str
-    role: str
+    address: str = ""
 
 
 @dataclass(frozen=True)
@@ -190,7 +190,8 @@ def _broadcast(
 
     def deliver(chosen_entry: tuple[roster.RosterEntry, str]) -> Delivery:
         entry, text = chosen_entry
-        recipient = Recipient(entry.name, entry.role)
+        shown = roster.shown_name(entry)
+        recipient = Recipient(shown.render(), shown.address)
         match entry.reach:
             case roster.CannotReceiveMessages():
                 return Delivery(recipient, "no live session", _unreachable(entry, entry.reach))
@@ -221,8 +222,9 @@ def report(deliveries: list[Delivery]) -> bool:
                 print(f"{host}: {line}")
             case GroupWithoutMembers(group):
                 print(f"{_group_name(group)} - none on this machine")
-            case Recipient(session, role):
-                print(f"{session} - {role} - {outcome}" + (f": {detail}" if detail else ""))
+            case Recipient(session, address):
+                label = f"{session} [{address}]" if address and address != session else session
+                print(f"{label} - {outcome}" + (f": {detail}" if detail else ""))
     return all(delivery.outcome != "NOT sent" for delivery in deliveries)
 
 

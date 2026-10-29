@@ -85,7 +85,7 @@ from scripts.accounts.role_map import role_map_command, RoleMapUnavailable, Role
 from scripts.direct import plan_history
 from scripts.lib import unit_runs
 from scripts.guilds.roles import PhaseBoundDesigner, ReadOnlyReviewer, ThreadAccessPolicy
-from scripts.message import sessions, process_table
+from scripts.message import sessions, process_table, roster as message_roster
 from scripts.whoami import account
 from scripts.usage import agents_log
 from scripts.whoami.agent_accounts import (
@@ -3451,12 +3451,17 @@ def _stream_turn(
         stream.client.close()
 
 
+def _thread_shown_name(session_dir: str, name: str) -> str:
+    record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+    return message_roster.mesh_shown_name(session_dir, name, record).render()
+
+
 def _start_streamed_turn(stream: TurnStream, prompt: str, log: TextIO) -> StreamStep:
     """Name the thread, submit its first turn and mark it running on the roster."""
     # The roster is written before this call: a disconnect after thread
     # creation must still leave its id reachable.
-    if not stream.follow:
-        _ = stream.client.call("thread/name/set", {"threadId": stream.thread_id, "name": stream.name})
+    title = _thread_shown_name(stream.session_dir, stream.name)
+    _ = stream.client.call("thread/name/set", {"threadId": stream.thread_id, "name": title})
     initial_move = (_read_account_move(stream.session_dir, stream.name, stream.thread_id)
                     if _attr(stream.args, "account_move") is True else NoAccountMove())
     started = _start_workers_turn(
@@ -4266,7 +4271,7 @@ def _resume_worker_thread(
         record["instructions_file"] = instructions_file
     if not _update_roster_if_expected(session_dir, name, record, RosterOnThread(thread_id)):
         _refuse_taken_follow_up(client, replacement, session_dir)
-    _ = client.call("thread/name/set", {"threadId": replacement, "name": name})
+    _ = client.call("thread/name/set", {"threadId": replacement, "name": _thread_shown_name(session_dir, name)})
     _post_board_status(
         session_dir, name,
         f"{codex_home_display(workers_home)} refused to resume {thread_id}; worker continues as new thread {replacement}",
@@ -7098,7 +7103,11 @@ def command_prime(args: argparse.Namespace) -> int:
         thread_id = _as_str(_as_dict(result.get("thread")).get("id"))
         if not thread_id:
             raise SystemExit("thread/start returned no thread id")
-        _ = _require(client.call("thread/name/set", {"threadId": thread_id, "name": name}), "thread/name/set")
+        title_record: dict[str, object] = {"role": "review"}
+        if held_design:
+            title_record.update({"held_design_id": held_design, "held_role": held_role})
+        title = message_roster.mesh_shown_name(session_dir, name, title_record).render()
+        _ = _require(client.call("thread/name/set", {"threadId": thread_id, "name": title}), "thread/name/set")
         record: FollowableRecord = {
             "thread_id": thread_id, "status": "done", "role": "review",
             "context_tokens": 0, "instructions_file": str(instructions_path),
@@ -7164,7 +7173,8 @@ def command_fork(args: argparse.Namespace) -> int:
         thread_id = _as_str(_as_dict(result.get("thread")).get("id"))
         if not thread_id:
             raise SystemExit("thread/fork returned no thread id")
-        _ = _require(client.call("thread/name/set", {"threadId": thread_id, "name": name}), "thread/name/set")
+        title = message_roster.mesh_shown_name(session_dir, name, {"role": "review"}).render()
+        _ = _require(client.call("thread/name/set", {"threadId": thread_id, "name": title}), "thread/name/set")
         record: FollowableRecord = {
             "thread_id": thread_id, "status": "done", "role": "review", "context_tokens": 0,
             "access_policy": {"kind": "ReadOnlyReviewer"},

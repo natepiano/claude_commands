@@ -44,7 +44,7 @@ from unittest.mock import MagicMock, patch
 
 from scripts.agents import codex_mesh
 from scripts.direct import plan_history
-from scripts.message import process_table, sessions
+from scripts.message import process_table, sessions, roster as message_roster
 from scripts.usage import agents_log
 from scripts.accounts import accounts, moves, refusals, role_map
 from scripts.guilds import astra_work, roles
@@ -421,6 +421,11 @@ class MeshCommandTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.patches = contextlib.ExitStack()
+        # Title lookup reads fixture context only, never the machine's sessions.
+        _ = self.patches.enter_context(patch.object(message_roster, "_newest_sessions", return_value=[]))
+        _ = self.patches.enter_context(patch.object(message_roster, "_raw_session_details", return_value={}))
+        _ = self.patches.enter_context(patch.object(message_roster, "_registered_showrunners", return_value=[]))
+        _ = self.patches.enter_context(patch.object(message_roster, "_production_places", return_value={}))
         _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {
             "GUILD_ROLES_STATE": str(self.session_dir / "guild-roles"),
             "GUILD_OWNERSHIP_STATE": str(self.session_dir / "guild-ownership"),
@@ -1101,6 +1106,11 @@ class MeshCommandTests(unittest.TestCase):
                     self.assertEqual([_as_test_dict(request["params"])["threadId"]
                                       for request in self.methods("thread/resume")], [THREAD_ID])
                     self.assertEqual(self.methods("thread/start"), [])
+                    titles = self.methods("thread/name/set")
+                    self.assertTrue(titles)
+                    for request in titles:
+                        self.assertEqual(request["params"], {
+                            "threadId": THREAD_ID, "name": "demo · design · designer"})
                     turn = _as_test_dict(self.methods("turn/start")[0]["params"])
                     self.assertIn("Keep this pending design correction.", json.dumps(turn["input"]))
                     self.assertEqual(turn["sandboxPolicy"], {"type": "dangerFullAccess"})
@@ -1713,6 +1723,10 @@ class MeshCommandTests(unittest.TestCase):
             "sandbox": "read-only", "approvalPolicy": "never",
         }])
         self.assertEqual(self.worker_record().get("instructions_file"), str(path))
+
+        self.assertEqual(self.worker_record()["role"], "review")
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(set(self.roster()), {"worker"})
 
     def test_replacement_worker_keeps_standing_instructions_and_read_only_policy(self) -> None:
         path = self.standing_instructions()
@@ -2649,6 +2663,8 @@ class MeshCommandTests(unittest.TestCase):
             code, errors = self.run_follow()
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(self.worker_record()["role"], "impl")
+        self.assertEqual(set(self.roster()), {"worker"})
         self.assertEqual(self.methods("thread/start"), [])
         self.assertEqual(len(self.methods("thread/resume")), 1)
 
@@ -2880,7 +2896,7 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(self.worker_record()["status"], "done")
         self.assertEqual(self.worker_record()["context_tokens"], 123)
         self.assertEqual([_as_test_dict(request["params"]).get("threadId")
-                          for request in self.methods("thread/name/set")], [THREAD_ID])
+                          for request in self.methods("thread/name/set")], [THREAD_ID, THREAD_ID])
         self.assertEqual([_as_test_dict(request["params"]).get("threadId")
                           for request in self.methods("turn/start")], [THREAD_ID])
         self.assertEqual([record["id"] for record in self.usage_records()], ["old-follow-thread", THREAD_ID])
@@ -2910,6 +2926,96 @@ class MeshCommandTests(unittest.TestCase):
 
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(self.worker_record()["role"], "impl")
+
+    def test_thread_titles_follow_assignment_at_each_turn_without_renaming_the_worker(self) -> None:
+        roster = message_roster
+        place = (roster.ProductionWithoutRunningShowrunner("sdlc"),
+                 roster.UnderDirector("roles-unit", "director", "session:director"), "")
+        with patch.object(roster, "_pool_context", return_value=place):
+            self.assertEqual(self.run_start(), (0, ""))
+            self.assertEqual(self.methods("thread/name/set")[-1]["params"], {
+                "threadId": THREAD_ID, "name": "sdlc · roles · worker worker"})
+            self.server.requests.clear()
+            self.assertEqual(self.run_follow(role="review"), (0, ""))
+        self.assertEqual(self.methods("thread/name/set")[-1]["params"], {
+            "threadId": THREAD_ID, "name": "sdlc · roles · code reviewer worker"})
+        self.assertEqual(self.worker_record()["role"], "review")
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(set(self.roster()), {"worker"})
+        self.assertEqual([_as_test_dict(request["params"]).get("threadId")
+                          for request in self.methods("turn/start")], [THREAD_ID])
+
+    def test_unplaced_thread_keeps_its_address_as_title(self) -> None:
+        roster = message_roster
+        with patch.object(roster, "_pool_context", return_value=(roster.NoShowrunner(), roster.NoDirector(), "")):
+            self.assertEqual(self.run_start(), (0, ""))
+        self.assertEqual(self.methods("thread/name/set")[-1]["params"], {"threadId": THREAD_ID, "name": "worker"})
+        self.assertEqual(self.worker_record()["role"], "impl")
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+
+    def test_prime_and_fork_send_shown_titles_and_keep_mesh_addresses(self) -> None:
+        roster = message_roster
+        place = (roster.ProductionWithoutRunningShowrunner("sdlc"),
+                 roster.UnderDirector("roles-unit", "director", "session:director"), "")
+        with patch.object(roster, "_pool_context", return_value=place):
+            result, output, errors = self.run_mesh(self.prime_cli())
+            self.assertEqual((result, output, errors), (0, f"{THREAD_ID}\n", ""))
+            self.assertEqual(self.methods("thread/name/set")[-1]["params"], {
+                "threadId": THREAD_ID, "name": "sdlc · roles · code reviewer template"})
+            result, output, errors = self.run_mesh(["fork", "--from", "template", "--name", "reviewer"])
+        self.assertEqual((result, output, errors), (0, f"{self.fork_thread_id}\n", ""))
+        self.assertEqual(self.methods("thread/name/set")[-1]["params"], {
+            "threadId": self.fork_thread_id, "name": "sdlc · roles · code reviewer reviewer"})
+        self.assert_review_record("template", THREAD_ID)
+        self.assert_review_record("reviewer", self.fork_thread_id)
+        self.assertEqual(set(self.roster()), {"template", "reviewer"})
+
+    def test_prime_held_titles_use_the_design_holder_before_the_mesh_record_exists(self) -> None:
+        for index, (holder, prefix) in enumerate((
+                (roles.UnitHolder("sdlc", "roles-unit"), "sdlc · roles"),
+                (roles.ShowrunnerHolder("sdlc"), "sdlc"))):
+            for role, job in (("designer", "designer"), ("reviewer", "design reviewer")):
+                with self.subTest(holder=holder, role=role):
+                    design_id = f"00000000-0000-4000-8000-00000000009{index}"
+                    directory = roles.design_directory(design_id)
+                    claim = directory / f"{role}.creation-claimed"
+                    claim.unlink(missing_ok=True)
+                    design = roles.HeldDesign(roles.DesignPlacement(design_id, "fixture-host", 1),
+                        "fixture-repo", str(self.session_dir), str(self.session_dir / "design.md"), "design",
+                        "2026-10-21T12:00:00+00:00", holder, roles.DesignUnbound(),
+                        (roles.RoleInstance("designer", "template" if role == "designer" else "other-designer",
+                                            roles.RoleNotOpened("claim")),
+                         roles.RoleInstance("reviewer", "template" if role == "reviewer" else "other-reviewer",
+                                            roles.RoleNotOpened("claim"))))
+                    roles._save(design)  # pyright: ignore[reportPrivateUsage]
+                    self.write_pool_roster({})
+                    self.server.requests.clear()
+                    with patch.object(roles, "resolve_holder", return_value=roles.HolderReach("fixture-holder")), \
+                            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "fixture-holder"}):
+                        result, output, errors = self.run_mesh(self.prime_cli(
+                            "--held-design", design_id, "--held-role", role))
+                    self.assertEqual((result, output, errors), (0, f"{THREAD_ID}\n", ""))
+                    self.assertEqual(self.methods("thread/name/set")[-1]["params"], {
+                        "threadId": THREAD_ID, "name": f"{prefix} · {job}"})
+                    record = _as_test_dict(self.roster()["template"])
+                    self.assertEqual((record["held_design_id"], record["held_role"], record["thread_id"]),
+                                     (design_id, role, THREAD_ID))
+
+    def test_resume_fallback_sets_shown_title_and_retains_assignment(self) -> None:
+        roster = message_roster
+        self.write_pool_roster({"worker": {"thread_id": "old-thread", "status": "done", "role": "impl"}})
+        self.failing_method = "thread/resume"
+        place = (roster.ProductionWithoutRunningShowrunner("sdlc"),
+                 roster.UnderDirector("roles-unit", "director", "session:director"), "")
+        with patch.object(roster, "_pool_context", return_value=place):
+            self.assertEqual(self.run_follow(), (0, ""))
+        titles = self.methods("thread/name/set")
+        self.assertTrue(titles)
+        for request in titles:
+            self.assertEqual(request["params"], {"threadId": THREAD_ID, "name": "sdlc · roles · worker worker"})
+        self.assertEqual(self.worker_record()["role"], "impl")
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(set(self.roster()), {"worker"})
 
     def test_start_appends_usage_without_a_lens(self) -> None:
         code, errors = self.run_start()

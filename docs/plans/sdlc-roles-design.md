@@ -62,8 +62,8 @@ Repair source check, 2026-10-20: Guilds HEAD is `95eb9cda042cead9f09dcdab29025f3
 | D27 | Review remaining Work Orders, then shrink the completed phase | Unit director | Codex worker supplies an architect review only when a listed trigger fires | duplicate | UD, `<RunPhaseReview>`; `docs/delegate/run_phase_review.md`, `<RunPhaseReview>` and `<RunPhaseShrink>`; `docs/delegate/phase_end.md`, `<PhaseEnd>` items 3 and 7 |
 | D28 | Close the run with as-built documentation | Unit director | None; its scope choice is not a product scope change | duplicate | SR, `<Throughout>` → As-built close-out; UD, `<RunAsBuilt>`; `docs/delegate/final_gate_commit.md`, `<RunAsBuilt>`; `commands/plan/to_as_built.md`, Purpose |
 | D29 | Write a small unowned fix in the showrunner checkout | Small-fix helper | Top-level showrunner dispatches, commits, pushes and promotes; existing unit work stays with its unit | one owner | nixos memory `small-fixes-by-subagent-in-main.md`, body and How to apply; PF, Words → Showrunner writes no implementation code |
-| D30 | Head the designer guild | `designers` guild head, a unit director in the top-level `guilds` production | None; contract in Guilds, Guilds and heads | one owner | SDLC, Guild heads; Guilds, Guilds and heads |
-| D31 | Head the reviewer guild | `reviewers` guild head, a unit director in the top-level `guilds` production | None; contract in Guilds, Guilds and heads | one owner | SDLC, Guild heads; Guilds, Guilds and heads |
+| D30 | Head the designer guild | `designers` guild head, a unit director in the `guilds` production, which runs under sdlc (G1c) | None; contract in Guilds, Guilds and heads | one owner | SDLC, Guild heads; Guilds, Guilds and heads |
+| D31 | Head the reviewer guild | `reviewers` guild head, a unit director in the `guilds` production, which runs under sdlc (G1c) | None; contract in Guilds, Guilds and heads | one owner | SDLC, Guild heads; Guilds, Guilds and heads |
 | D32 | Maintain and distribute each guild's shared tips | Each guild head, for its own guild (`tips.py publish` to `~/rust/nate_style/guilds/`) | Members report set events to their head (Guilds, Events); starting skills load tips | one owner | Guilds, Guilds and heads and Tips; SDLC, Scope of each unit → guilds-unit |
 | D33 | Launch a unit director or resume a retired unit | Top-level showrunner | Child showrunner for its own units | duplicate | SR, `<LaunchUnits>`; `commands/showrunner/add_unit.md`, opening; `commands/showrunner/resume_unit.md`, opening and steps 1–3 |
 | D34 | Launch or attach a child showrunner | Top-level showrunner | Child showrunner may hold a lower production under the existing contract; Executive producer keeps the flat-organization redesign choice | duplicate | SR, `<Throughout>` → Nested showrunners; `commands/showrunner/add_showrunner.md`, opening; `commands/showrunner/attach.md`, opening; SDLC, Production rules → A flat organization |
@@ -118,8 +118,8 @@ The machine-readable inventory is `scripts/production/role_terms.toml`. The tabl
 | child showrunner | role | Showrunner with its own production that reports to a parent; PF, Words | lower showrunner: `commands/showrunner/add_showrunner.md`, opening | child showrunner |
 | root showrunner | role | Top of an attached production tree; PF, Words | root: SR, `<Throughout>` → Nested showrunners; top-level showrunner: Hierarchy, Map → Roles | root showrunner for a tree; top-level showrunner for a peer without a parent |
 | small-fix helper | role | Approved name: a showrunner helper that does no code work; user, sdlc review, relayed in phase 3 Work Order (2026-10-28) | Earlier code-writing helper wording remains in the D29 source inventory pending a separately approved duty correction | small-fix helper; no source duty change in this phase |
-| astra-designer | role | Two planned uses: the per-design Codex role writes and revises a design in the same thread (D51; Guilds, Phase 2 → Spec and Roles); the temporary top-level designer guild-head ID names D30 (SDLC, Guild heads) | chief designer: SDLC, Guild heads; Guilds, Decisions → edge role ids and Phase 2 → Names require the head and per-design uses to be named apart | Astra designer for the per-design role; chief designer for the head until cargo-liner settles its name with the user |
-| astra-reviewer | role | Two planned uses: the per-design Codex role reviews the design and returns findings (D52; Guilds, Phase 2 → Spec and Roles); the temporary top-level reviewer guild-head ID names D31 (SDLC, Guild heads) | chief reviewer: SDLC, Guild heads; Guilds, Phase 2 → Roles distinguishes the per-design role from pooled code and UI reviewers and one-turn `/astra_review` | Astra reviewer for the per-design role; chief reviewer for the head until cargo-liner settles its name with the user; pooled reviewer for D15 |
+| astra-designer | role | Two planned uses: the per-design Codex role writes and revises a design in the same thread (D51; Guilds, Phase 2 → Spec and Roles); the temporary designer guild-head ID names D30 (SDLC, Guild heads) | chief designer: SDLC, Guild heads; Guilds, Decisions → edge role ids and Phase 2 → Names require the head and per-design uses to be named apart | Astra designer for the per-design role; chief designer for the head until cargo-liner settles its name with the user |
+| astra-reviewer | role | Two planned uses: the per-design Codex role reviews the design and returns findings (D52; Guilds, Phase 2 → Spec and Roles); the temporary reviewer guild-head ID names D31 (SDLC, Guild heads) | chief reviewer: SDLC, Guild heads; Guilds, Phase 2 → Roles distinguishes the per-design role from pooled code and UI reviewers and one-turn `/astra_review` | Astra reviewer for the per-design role; chief reviewer for the head until cargo-liner settles its name with the user; pooled reviewer for D15 |
 | Work Order | document | Self-contained dispatch specification against named files and Delegation Context; Format, Document structure and Rules 2–3 | work order: `docs/delegate/compose_work_order.md`, title; case variants count together | Work Order |
 | production doc | document | Source of a production's units, branches, gates and rules; PF, Production doc structure | production document is listed in the term inventory; its measured live files are indexed below, including a zero if none use that phrase | production doc for the file |
 | unit plan | document | Phased plan for one unit; PF, Words → Unit; `commands/producer/to_production.md`, `<WriteUnitPlans>` | delegate-ready plan: Format, introduction; that term also covers a standalone run | unit plan in a production; phased plan for the general format |
@@ -924,6 +924,36 @@ For lease, first correct PF's phase-only definition against `scripts/direct/revi
 All other aliases and related terms stay proposed under the N-A treatment table, with their Other-name file index as one input, not a sufficient source set. Add defined-name and plural matches whenever those spellings would change. Include zero-hit policy entries only with a measured definition task or keep them unbuilt. Every later rename needs a frozen eligible size, kept contexts and an undo of that term's prose/policy together. Meaning IDs and inventory versions must stay beside before/after Definitions; adding a meaning or changing a parser is not source cleanup by itself. No aggregate promise of fewer production names or contacts is made.
 
 After each approved numbered phase, run `~/.claude/scripts/lib/py scripts/production/roles_audit.py baseline`. Record its term-set version, file set, count and window beside the before result. Keep any contact comparison on one fixed window. Run the new source-only check through the unit's tests-only gate after its policy is approved. A step is complete only when its stated measure moves and the functional checks pass. Source-only tests must not read real home-state records or send messages.
+
+## Role record
+
+R1b and R5b, built in phase 5. A session's name and its role are separate. Every roster record carries its role in its own fields, apart from its name. Each shown name has the form production · unit · job. The address does not change.
+
+**Three meanings of role.** They stay apart, and each keeps its routing and permission meaning.
+
+| Meaning | Where it lives | Values | Shown job |
+| --- | --- | --- | --- |
+| Organizational role | `RosterEntry.role` in `scripts/message/roster.py` | `showrunner`, `unit director`, `worker`, `freestanding`, `astra-designer`, `astra-reviewer` | `showrunner`, `unit director`; `astra-designer` → `designer`; `astra-reviewer` → `design reviewer`; a worker takes its job from its assignment; `freestanding` has no job |
+| Worker assignment | `role` in each `mesh_roster.json` record | `impl`, `test`, `fix`, `review`; a record with no `role` is unrecorded; any other value is unreadable | `impl`, `test`, `fix` → `worker`; `review` → `code reviewer`; unrecorded or unreadable → no job, with the reason |
+| Guild responsibility | guild records | unchanged | not shown in this phase |
+
+An Astra held role keeps its own assignment state; it is not a worker assignment. A review-pool reviewer named `<type><n>` (`code6`, `ui2`) has the job `code reviewer` or `UI reviewer` with the number `n`, and the unit of its current lease. The roster finds pool reviewers itself: each has the address `worker:review-pool/<production>/<run>/<reviewer>` and its director is the unit director that holds the lease. The name never supplies a role: a record without a role keeps its explicit state.
+
+**Shown name.** Parts join with ` · `. The production part is the production slug. The unit part is the unit name without its `-unit` suffix. The job part is the job word, then the slot or the number that tells several holders apart. An absent part is left out. A session with no production, no unit and no job shows its address.
+
+| Record | Shown name |
+| --- | --- |
+| sdlc pool reviewer `code6`, leased to roles-unit | `sdlc · roles · code reviewer 6` |
+| roles-unit director | `sdlc · roles · unit director` |
+| roles-unit worker in slot `test` | `sdlc · roles · worker test` |
+| roles-unit worker in slot `impl`, doing review | `sdlc · roles · code reviewer impl` |
+| sdlc showrunner | `sdlc · showrunner` |
+| Astra designer held for a roles-unit design | `sdlc · roles · designer` |
+| freestanding session | its address, such as `session:<session id>` |
+
+**Where it shows.** Codex thread titles (set again at each turn, so a lease move or role change shows at the next turn), the roster's own output, broadcast recipient lines and the sender a reader sees. A broadcast recipient line reads `<shown name> [<address>] - <outcome>`; the address shows only when it differs from the shown name, and there is no separate role column. `send.py` reads the shown sender once, on the sending machine, from the same roster read that finds the recipient. Relay, Codex and daemon deliveries then carry a `Shown sender: <name>` line after the first line of the body. A user push does not change. Cost: a send to a socket or a named machine reads the roster once more, about 1 s (319 entries). `roster.py --json` adds the shown name and keeps every existing field and value. Addresses, `--to` and `--from` values, sockets, thread ids and the stored fields `seat` and `codex_seats` stay as they are.
+
+**Column owners.** The unit board's owner and cargo-liner show the session name and the shown job as two columns. They read both from `roster.py --json`. Sending them this definition does not count as their change landing.
 
 ## Next steps
 

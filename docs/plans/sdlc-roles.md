@@ -155,7 +155,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Ruled out:** a literal `git grep` prefilter, because it misses joined literals and escapes that Python extraction decodes; candidate selection alone, because it reached 8.4 s at load 38-44.
 
-### Phase 5 — Each session records its role apart from its name  · status: todo
+### Phase 5 — Each session records its role apart from its name  · status: done
 **Depends on:** Phase 4
 
 #### Work Order
@@ -187,8 +187,62 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Acceptance gate:** the gates in Delegation Context green; each role-holding record type has a role field apart from its name; shown names follow R5b; the record definition is in the design doc and sent to the showrunner for the column owners.
 
-### Phase 6 — Measure the first step and propose the next  · status: todo
+### Phase 6 — Names that can change live in one config file  · status: todo
 **Depends on:** Phase 5
+
+#### Work Order
+
+**Goal:** a name the user may change later (a guild head, a shown job) is one line in one config file, so a rename never spreads through scripts and docs again, as `seat` and `delegate` did.
+
+**Spec:**
+- Decided by the user (2026-10-28, via the showrunner): names go through config indirection. One config file holds each changeable name as a stable key and a display name. Scripts use the key; printed text reads the display name. A rename is a one-line config edit.
+- The file: `config/names.toml` (unit director's call: one file for every changeable name, beside the other `config/` files; `config/guilds.conf` keeps the guild ownership settings).
+- Guild heads, agreed with the guilds showrunner 2026-10-28: keys `designers`, `reviewers`, `showrunners`, `units` (the guilds-production Units IDs; timers `guilds-<key>-daily`), display names `<key> head`. No head display text is printed today; the first printed head name reads the config.
+- Shown jobs (phase 5's `Job` values: showrunner, unit director, worker, code reviewer, UI reviewer, designer, design reviewer): each gets a key and a display name; `roster.ShownName.render()` reads the display name. The key stays the value in records and code.
+- The herdr session name keeps the key (it works as an address). The herdr tab label shows the display name, set at `add_unit` and at restart; there is no live retitle (agreed with the guilds showrunner).
+- The retired-name check (`roles_audit.py check`) fails when a script holds a display name from `config/names.toml` as fixed printed text outside that file. Docs prose is out of scope: a rename still updates docs through the normal retired-name flow.
+- A rename stays one edit (the showrunner, 2026-10-28): each name in `config/names.toml` keeps a history of its earlier display names, and the loader adds each one to the retired-name list on its own. The fast retired-name check then finds every doc and script that still uses the old display name. Test: change a display name in a fixture config, and the check reports a fixture doc that still uses the old one.
+- Types: a key type per name group and one loader that refuses an unknown key, a missing display name and a duplicate display name, each with its own explicit error; no bare string lookups with a default.
+- Tests: rename one display name in a fixture config and every renderer (shown name, Codex thread title, broadcast line, tab label) shows the new name while addresses, session names and records keep the key; the check fails on a planted fixed display name in a fixture script and passes on the live tree.
+- Files at phase start name every place a head or job display text is printed or set as a tab label.
+
+**Files:**
+- `config/names.toml` — keys and display names
+- `scripts/message/roster.py` — shown job reads the display name
+- `scripts/production/roles_audit.py`, `scripts/production/role_terms.toml` — fixed display-name check
+- tab label writers named at phase start (`scripts/production/add_unit.py`, `scripts/shutdown/restart.py` or their callees)
+- `docs/plans/sdlc-roles-design.md` — the name config section
+- tests beside each changed script
+
+**Workers:** `1 writer + 1 tester`.
+
+**Constraints from prior phases:** R5b shown names; the stored fields `seat` and `codex_seats` stay as they are.
+
+**Acceptance gate:** the gates in Delegation Context green; a one-line display-name edit in a fixture config changes every printed place and nothing else; the check fails on a planted fixed display name.
+
+### Phase 7 — The retired-name baseline reads at a glance  · status: todo
+**Depends on:** Phase 6
+
+#### Work Order
+
+**Goal:** a person reads `roles_audit.py baseline` in a few lines (user verdict on change review row C1, 2026-10-28: "pretty much something you can read but not me really").
+
+**Spec:**
+- The output starts with a short summary: the share of other names, the worst names with their counts, and each finding in plain words.
+- The full tables print only behind a flag.
+- Drop wrong-party rows that are all zero or "not recorded".
+- The change comes back to the user as a new change review row.
+- Tests pin the summary lines on a fixture and that the flag prints the full tables.
+
+**Files:**
+- `scripts/production/roles_audit.py`, `scripts/production/test_roles_audit.py`
+
+**Workers:** `1 writer + 1 tester`.
+
+**Acceptance gate:** the gates in Delegation Context green; the baseline on the live tree prints the summary first, in plain words.
+
+### Phase 8 — Measure the first step and propose the next  · status: todo
+**Depends on:** Phase 5 (it needs only the Phase 3 merge window, so it may run beside Phases 6 and 7)
 
 #### Work Order
 
