@@ -22,6 +22,7 @@ from unittest.mock import patch
 
 from scripts.direct import phase_reservation, phase_table, plan_history, progress_history, recorder_state
 from scripts.direct.recorder_fixture import invoke_recorder
+from scripts.history.rounds import load_phases
 
 
 SCRIPT = Path(__file__).with_name("progress_history.py")
@@ -1684,6 +1685,96 @@ print('two homes isolated; recorder lock retained; caller restored')
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--cap-stage is required", result.stderr)
+
+    def contract_fixture(self) -> tuple[Path, Path, str]:
+        deployed = self.root / ".claude"
+        direct = deployed / "commands/unit/direct.md"
+        direct.parent.mkdir(parents=True)
+        step = deployed / "docs/direct/phase_end.md"
+        step.parent.mkdir(parents=True)
+        _ = direct.write_text(
+            "<TagReferenceContract>\n| Contract | File | Moment |\n| --- | --- | --- |\n"
+            + "| <PhaseEnd/> | `docs/direct/phase_end.md` | end |\n</TagReferenceContract>\n",
+            encoding="utf-8",
+        )
+        _ = step.write_text("<PhaseEnd>\nFinish the phase.\n</PhaseEnd>\n", encoding="utf-8")
+        for arguments in (
+            ["git", "init", "-b", "main"],
+            ["git", "add", "."],
+            ["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+             "-c", "commit.gpgsign=false", "commit", "-m", "Contract fixture"],
+        ):
+            _ = subprocess.run(arguments, cwd=deployed, check=True, capture_output=True, text=True)
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=deployed, check=True,
+                              capture_output=True, text=True).stdout.strip()
+        return direct, step, head
+
+    def recorded_contracts(self, name: str) -> list[dict[str, object]]:
+        events: list[dict[str, object]] = [json.loads(line) for line in
+                                          (self.history_dir / "runs" / f"{name}.jsonl").read_text().splitlines()]
+        return [cast(dict[str, object], event["contract_revision"]) for event in events
+                if event["event_type"] in {"phase_started", "phase_finished"}]
+
+    def test_phase_boundaries_record_main_head_and_clean_contract_bytes(self) -> None:
+        direct, step, head = self.contract_fixture()
+        session = self.start_run("exposure-clean", 1000)
+        _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "3",
+                             "--phase-title", "Clean contract", at=1010)
+        _ = self.run_command("finish-phase", "--session-dir", str(session), "--status", "completed", at=1060)
+        records = self.recorded_contracts("exposure-clean")
+        self.assertEqual(len(records), 2)
+        for record in records:
+            self.assertEqual(record["main_head"], {"state": "Recorded", "commit": head})
+            self.assertEqual(record["direct_md"], {"state": "Recorded", "sha256": hashlib.sha256(direct.read_bytes()).hexdigest()})
+            self.assertEqual(record["files"], {"docs/direct/phase_end.md":
+                             {"state": "Recorded", "sha256": hashlib.sha256(step.read_bytes()).hexdigest()}})
+
+    def test_finish_records_dirty_bytes_instead_of_reusing_start_or_git(self) -> None:
+        direct, step, head = self.contract_fixture()
+        old_direct = hashlib.sha256(direct.read_bytes()).hexdigest()
+        old_step = hashlib.sha256(step.read_bytes()).hexdigest()
+        session = self.start_run("exposure-dirty", 1000)
+        _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "3",
+                             "--phase-title", "Dirty contract", at=1010)
+        _ = direct.write_bytes(direct.read_bytes() + b"\nDirty route.\n")
+        _ = step.write_bytes(b"<PhaseEnd>\nChanged on disk.\n</PhaseEnd>\n")
+        _ = self.run_command("finish-phase", "--session-dir", str(session), "--status", "completed", at=1060)
+        started, finished = self.recorded_contracts("exposure-dirty")
+        self.assertEqual(started["direct_md"], {"state": "Recorded", "sha256": old_direct})
+        self.assertEqual(started["files"], {"docs/direct/phase_end.md": {"state": "Recorded", "sha256": old_step}})
+        self.assertEqual(finished["direct_md"], {"state": "Recorded", "sha256": hashlib.sha256(direct.read_bytes()).hexdigest()})
+        self.assertEqual(finished["files"], {"docs/direct/phase_end.md":
+                         {"state": "Recorded", "sha256": hashlib.sha256(step.read_bytes()).hexdigest()}})
+        self.assertEqual(finished["main_head"], {"state": "Recorded", "commit": head})
+
+    def test_missing_contract_file_is_a_named_state_at_each_boundary(self) -> None:
+        direct, step, _ = self.contract_fixture()
+        step.unlink()
+        session = self.start_run("exposure-missing", 1000)
+        _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "3",
+                             "--phase-title", "Missing contract", at=1010)
+        direct.unlink()
+        _ = self.run_command("finish-phase", "--session-dir", str(session), "--status", "completed", at=1060)
+        started, finished = self.recorded_contracts("exposure-missing")
+        files = cast(dict[str, dict[str, str]], started["files"])
+        self.assertEqual(files["docs/direct/phase_end.md"]["state"], "Missing")
+        self.assertIn("phase_end.md", files["docs/direct/phase_end.md"]["reason"])
+        missing_direct = cast(dict[str, str], finished["direct_md"])
+        self.assertEqual(missing_direct["state"], "Missing")
+        self.assertIn("commands/unit/direct.md", missing_direct["reason"])
+        self.assertNotIn("sha256", missing_direct)
+
+    def test_old_phase_events_and_new_exposure_events_have_the_same_reader_boundaries(self) -> None:
+        session = self.start_run("exposure-reader", 1000)
+        _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "3",
+                             "--phase-title", "Reader compatibility", at=1010)
+        _ = self.run_command("finish-phase", "--session-dir", str(session), "--status", "completed", at=1060)
+        events: list[dict[str, object]] = [json.loads(line) for line in
+                                          (self.history_dir / "runs" / "exposure-reader.jsonl").read_text().splitlines()]
+        phases = load_phases(events)
+        old = [{key: value for key, value in event.items() if key != "contract_revision"} for event in events]
+        self.assertEqual(load_phases(old), phases)
+        self.assertEqual((phases[0]["started_at"], phases[0]["finished_at"]), (1010, 1060))
 
     def test_start_phase_records_work_order_size(self) -> None:
         started_at = 60_000
