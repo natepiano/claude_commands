@@ -19,6 +19,9 @@ from urllib.request import Request
 from scripts.issue_score import client, questions, score_issues
 from scripts.issue_score import records as run_records
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 FIXTURES = Path(__file__).with_name("fixtures")
 
 
@@ -243,7 +246,7 @@ class ScoreIssuesTests(unittest.TestCase):
                 if active == 8:
                     released.set()
             try:
-                if not released.wait(timeout=2):
+                if not released.wait(timeout=TEST_HANG_GUARD_SECS):
                     raise AssertionError("Eight issues never reached the request boundary together")
                 fixture = "area_response.json" if "areas" in state else "main_response.json"
                 response = cast(object, json.loads((FIXTURES / fixture).read_text()))
@@ -357,7 +360,7 @@ class ScoreIssuesTests(unittest.TestCase):
             payload = cast(dict[str, object], json.loads(gzip.decompress(cast(bytes, request.data))))
             state = cast(questions.IssueState, payload["state"])
             if state["issue"]["title"] == earlier.stem:
-                if not persisted.wait(timeout=2):
+                if not persisted.wait(timeout=TEST_HANG_GUARD_SECS):
                     raise AssertionError("Completed issue was not flushed while an earlier issue was running")
                 raise client.TypeSafeError("fixture delayed failure")
             return self.replay(request, timeout)
@@ -387,16 +390,16 @@ class ScoreIssuesTests(unittest.TestCase):
             area_request = "areas" in state
             requests.append((title, area_request))
             if title == exhausted.stem:
-                if not main_started.wait(timeout=2) or not area_started.wait(timeout=2):
+                if not main_started.wait(timeout=TEST_HANG_GUARD_SECS) or not area_started.wait(timeout=TEST_HANG_GUARD_SECS):
                     raise AssertionError("Other requests did not start")
                 raise client.BudgetExceeded("fixture budget exhausted")
             if title == unfinished.stem:
                 main_started.set()
-                if not stopped.wait(timeout=2):
+                if not stopped.wait(timeout=TEST_HANG_GUARD_SECS):
                     raise AssertionError("Budget stop did not reach in-flight work")
             elif area_request:
                 area_started.set()
-                if not stopped.wait(timeout=2):
+                if not stopped.wait(timeout=TEST_HANG_GUARD_SECS):
                     raise AssertionError("Budget stop did not reach in-flight work")
             fixture = "area_response.json" if area_request else "main_response.json"
             return client.parse_response(cast(object, json.loads((FIXTURES / fixture).read_text())), request_questions)

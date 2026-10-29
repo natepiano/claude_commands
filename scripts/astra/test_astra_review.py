@@ -14,6 +14,9 @@ from pathlib import Path
 from typing import TypedDict, cast, override
 from unittest.mock import patch
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_review  # noqa: E402
 from scripts.guilds import astra_work, roles, tips  # noqa: E402
@@ -111,7 +114,7 @@ class AstraReviewTests(unittest.TestCase):
 
     def git(self, directory: Path, *arguments: str) -> None:
         result = subprocess.run(["git", "-C", str(directory), *arguments], env=self.environment,
-                                capture_output=True, text=True, check=False, timeout=10)
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def run_script(self, *arguments: str) -> subprocess.CompletedProcess[str]:

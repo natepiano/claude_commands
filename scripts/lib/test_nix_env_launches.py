@@ -13,6 +13,9 @@ from typing import TYPE_CHECKING, cast, override
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 ROOT = Path(__file__).resolve().parents[2]
 for dependency in ("lib", "herdr", "production", "message", "shutdown", "notify", "whoami", "direct"):
     sys.path.insert(0, str(ROOT / "scripts" / dependency))
@@ -305,7 +308,7 @@ print('{"type":"result","result":"fixture completed"}')
 
     def run_script(self, relative: str, args: list[str], directory: Path) -> subprocess.CompletedProcess[str]:
         return subprocess.run(["bash", str(self.scripts / relative), *args], cwd=directory, env=self.env,
-                              capture_output=True, text=True, timeout=10, check=False)
+                              capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
 
     def launch_contract(self, relative: str, args: list[str], directory: Path) -> None:
         _ = self.envrc(directory)

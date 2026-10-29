@@ -8,6 +8,7 @@ import fcntl
 from io import StringIO
 import json
 import os
+import select
 import shlex
 import socket
 import subprocess
@@ -21,6 +22,9 @@ from unittest.mock import patch
 import feature_log
 from feature_log import locked, state_dir, vault_dir
 
+
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
 
 TODAY = "2026-10-10"
 EVENT_TIME = "2026-10-10T12:34:56-07:00"
@@ -3136,29 +3140,45 @@ class FeatureLogTests(unittest.TestCase):
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with lock_path.open("a+", encoding="utf-8") as held_lock:
             fcntl.flock(held_lock.fileno(), fcntl.LOCK_EX)
+            attempted_read, attempted_write = os.pipe()
+            self.addCleanup(os.close, attempted_read)
+            self.addCleanup(os.close, attempted_write)
+            driver = "\n".join([
+                "import fcntl, os, runpy",
+                "real_flock = fcntl.flock",
+                "def observe(fd, operation):",
+                "    if operation == fcntl.LOCK_EX:",
+                "        try: real_flock(fd, operation | fcntl.LOCK_NB)",
+                "        except BlockingIOError:",
+                f"            os.write({attempted_write}, b'B')",
+                "        else: return",
+                "    real_flock(fd, operation)",
+                "fcntl.flock = observe",
+                "runpy.run_path('scripts/feature_log/feature_log.py', run_name='__main__')",
+            ])
             process: subprocess.Popen[str] = subprocess.Popen(
-                [
-                    sys.executable,
-                    "scripts/feature_log/feature_log.py",
-                    "digest",
-                ],
+                [sys.executable, "-c", driver, "digest"],
                 cwd=Path(__file__).resolve().parents[2],
                 env=os.environ.copy(),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
+                text=True, pass_fds=(attempted_write,),
             )
+            self.addCleanup(process.communicate, timeout=TEST_HANG_GUARD_SECS)
+            self.addCleanup(process.kill)
             try:
-                with self.assertRaises(subprocess.TimeoutExpired):
-                    _ = process.wait(timeout=0.5)
+                ready, _, _ = select.select([attempted_read], [], [], TEST_HANG_GUARD_SECS)
+                self.assertEqual(ready, [attempted_read], "digest never attempted its held cursor lock")
+                self.assertEqual(os.read(attempted_read, 1), b"B")
+                self.assertIsNone(process.poll())
             finally:
                 fcntl.flock(held_lock.fileno(), fcntl.LOCK_UN)
 
         try:
-            stdout, stderr = process.communicate(timeout=5)
+            stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         except subprocess.TimeoutExpired:
             process.kill()
-            _ = process.communicate(timeout=5)
+            _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
             raise
         self.assertEqual(process.returncode, 0, stderr)
         self.assertIn("+ locked digest result", stdout)
