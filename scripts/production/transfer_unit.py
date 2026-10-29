@@ -386,6 +386,9 @@ def _move_state(transfer: UnitTransfer, _save: Callable[[], None]) -> None:
     The phase note follows on the unit's next refresh, and the giving showrunner's report state
     keeps its rows as history."""
     from scripts.guilds import roles
+    from scripts.direct import workers
+    workers.move_unit(transfer.from_slug, transfer.to_slug, transfer.unit,
+                      runs=tuple(retire_unit.runs_of(Path(transfer.worktree_dir))))
     try:
         roles.move_holder(roles.UnitHolder(transfer.from_slug, transfer.unit),
                           roles.UnitHolder(transfer.to_slug, transfer.unit), reason="unit transfer")
@@ -652,6 +655,7 @@ def verify(from_slug: str, unit: str, to_doc: Path) -> UnitTransfer:
 
 
 def main(argv: list[str]) -> int:
+    from scripts.direct.workers import WorkerUnavailable
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     _ = parser.add_argument("verb", choices=("plan", "apply", "verify"))
     _ = parser.add_argument("from_slug")
@@ -668,7 +672,7 @@ def main(argv: list[str]) -> int:
     except rename_unit.RenameWaiting as error:
         print(f"transfer_unit: {error}", file=sys.stderr)
         return 2
-    except (RenameRefused, production_units.Refusal, unit_names.BadName, OSError, UnicodeError) as error:
+    except (RenameRefused, production_units.Refusal, unit_names.BadName, WorkerUnavailable, OSError, UnicodeError) as error:
         print(f"transfer_unit: refused: {error}", file=sys.stderr)
         return 1
     print("\n".join(describe(transfer)))

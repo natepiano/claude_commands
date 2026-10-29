@@ -99,6 +99,17 @@ class ProgressHistoryTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_set_unit_rebinds_ledger_identity_without_changing_run_history(self) -> None:
+        run = self.start_run("identity", 1760658000)
+        state = run / "progress_history_state.json"
+        before = cast(dict[str, object], json.loads(state.read_text()))
+        _ = self.run_command("set-unit", "--session-dir", str(run), "--production", "receiving",
+                             "--unit", "builders", at=1760658001)
+        after = cast(dict[str, object], json.loads(state.read_text()))
+        self.assertEqual(after.pop("production"), "receiving")
+        self.assertEqual(after.pop("unit"), "builders")
+        self.assertEqual(after, before)
+
     def test_event_write_syncs_by_default_and_flushes_without_sync_for_disposable_state(self) -> None:
         append = cast(Callable[[dict[str, object], dict[str, object]], None], vars(progress_history)["_append_event"])
         history = self.root / "sync-event.jsonl"

@@ -340,6 +340,29 @@ def _session_dir(args: argparse.Namespace) -> Path:
     return Path(value).expanduser().resolve()
 
 
+def set_unit(session_dir: Path, production: str, unit: str) -> None:
+    """Persist unit identity without changing the run's history or workers."""
+    if any(not value or value in (".", "..") or "/" in value or "\\" in value
+           for value in (production, unit)):
+        raise ValueError("invalid production or unit identity")
+    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = _read_state(session_dir)
+        state.update({"production": production, "unit": unit})
+        _write_state(session_dir, state)
+
+
+def _set_unit(args: argparse.Namespace) -> None:
+    # main already holds this lock; the public API takes it for other callers.
+    state = _read_state(_session_dir(args))
+    production, unit = _arg_string(args, "production"), _arg_string(args, "unit")
+    if any(not value or value in (".", "..") or "/" in value or "\\" in value
+           for value in (production, unit)):
+        raise SystemExit("invalid production or unit identity")
+    state.update({"production": production, "unit": unit})
+    _write_state(_session_dir(args), state)
+
+
 def _state_path(session_dir: Path) -> Path:
     return session_dir / plan_history.STATE_FILENAME
 
@@ -4832,6 +4855,12 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Record and aggregate durable unit progress events."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    identity = subparsers.add_parser("set-unit")
+    _ = identity.add_argument("--session-dir", required=True)
+    _ = identity.add_argument("--production", required=True)
+    _ = identity.add_argument("--unit", required=True)
+    identity.set_defaults(handler=_set_unit)
 
     start_run = subparsers.add_parser("start-run")
     _ = start_run.add_argument("--session-dir", required=True)

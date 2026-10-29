@@ -206,12 +206,15 @@ def _process_args(pid: int) -> list[str]:
     return shown.stdout.split()
 
 
-def _supervises(pid: int, record_path: Path) -> bool:
+def supervises(pid: int, record_path: Path) -> bool:
     """Whether pid is the `supervise` process of this record, so a reused pid does not match."""
     if pid <= 0:
         return False
     parts = _process_args(pid)
-    return "supervise" in parts and str(record_path) in parts and any(part.endswith("mesh_runs.py") for part in parts)
+    if "supervise" not in parts or not any(part.endswith("mesh_runs.py") for part in parts):
+        return False
+    expected = record_path.resolve()
+    return any(Path(part).resolve() == expected for part in parts if part)
 
 
 def _orphaned(path: Path, raw: dict[str, object], now: float) -> bool:
@@ -221,7 +224,7 @@ def _orphaned(path: Path, raw: dict[str, object], now: float) -> bool:
         return False
     pid = codex_mesh._as_int(raw.get("pid"))  # pyright: ignore[reportPrivateUsage]
     if pid > 0:
-        return not _supervises(pid, path)
+        return not supervises(pid, path)
     started = codex_mesh._as_float(raw.get("started_at"), now)  # pyright: ignore[reportPrivateUsage]
     return now - started >= codex_mesh.DETACHED_RUN_START_GRACE_SECS
 
@@ -281,7 +284,7 @@ def live_twin(runs: Path, worker: str, command: list[str], cwd: str, tree_key: s
         raw = codex_mesh._read_json_object(path)  # pyright: ignore[reportPrivateUsage]
         if (raw.get("status") == "running" and raw.get("worker") == worker and raw.get("command") == command
                 and raw.get("cwd") == cwd and raw.get("tree_key") == tree_key
-                and _supervises(codex_mesh._as_int(raw.get("pid")), path)):  # pyright: ignore[reportPrivateUsage]
+                and supervises(codex_mesh._as_int(raw.get("pid")), path)):  # pyright: ignore[reportPrivateUsage]
             return cast(RunRecord, cast(object, raw))
     return None
 

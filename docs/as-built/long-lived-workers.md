@@ -95,7 +95,7 @@ The flag is cleared by any `item/completed` from the worker's own work, but not 
   - The name must match `^[A-Za-z][A-Za-z0-9_]{0,31}$`, so it cannot contain a hyphen.
   - It runs `codex_mesh.py start --role review` with the default `danger-full-access` sandbox.
   - After the turn it writes `impl_worker_<slot>.json` with the configured implementation model of the family (`worker.<family>` `implementation`, or `impl` if that is not set), not the review model. A later `implement.sh --to` can then give the worker writing or repair work.
-  - The worker stays open until `end_session.sh`.
+  - The unit keeps the worker across run ends until the unit is retired.
 - **Neither flag**: runs the fresh blind reviewer through `agent_exec.sh … readonly`, with no address (`mesh=none`). The skills use this form only for a review outside a run.
 
 **Tree guard (assigned and pooled reviews).** Before the turn, `review.sh` runs `review_tree.py baseline`, which records HEAD and, for each path `git status` names (untracked, non-ignored files included), its HEAD, index and worktree entries: mode and blob id, a symlink's target standing for its content.
@@ -108,7 +108,7 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/direct/
 
 - Each lens gets a different open worker, and an idle open worker, a writer included, takes a lens before a new worker opens. Idle workers that did not write the files under review go first; then a writer takes one, arguing against its own choices on the `adversary` lens.
 - Roles move between workers; slots do not. Any open worker may take any role, including in the middle of a phase. Before dispatching, post a board `handoff` that names the slot, the role it leaves and the role it takes. The new prompt has the worker run `board.sh role` before its first tool call.
-- If every open worker is busy, open an extra worker named for its role with `--slot` (`review`, then `review2`; `fix2` for repair) and keep it until `end_session.sh`. Never name an extra worker with a bare number.
+- If every open worker is busy, open an extra worker named for its role with `--slot` (`review`, then `review2`; `fix2` for repair) and keep it with the unit across run ends. Never name an extra worker with a bare number.
 - Only the adversary lens starts early, and the director records its worker in `EARLY_REVIEW_SLOT`. The closure review and the phase-review architect go to an open worker with `--to`.
 - Every review prompt opens with a role switch: "You are slot <slot>, now working as a reviewer. Edit nothing. Read the diff cold as if someone else wrote it. If you wrote any of the code, argue against your own choices as an adversary would." The prompt also gives the concrete `board.sh role … review` command for the worker's first tool call.
 - Every prompt carries the Three Gods sentence written out in full: opening, later-phase, repair, review and follow-up prompts alike. It also carries the Type Design Contract, verbatim for a new worker or as the allowed pointer for a follow-up. Compaction can erase earlier prompt text, which is why each prompt repeats them.
@@ -118,24 +118,23 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/direct/
 
 ### Cleanup
 
-- **Phase end.** `<PhaseCleanup/>` runs `remove_workers.py --session-dir`. That removes Claude workers only and leaves Codex threads open. After a successful Claude session listing, and only under the real worker root, it runs `codex_mesh.py sweep --stop` (best-effort). A sweep failure prints one line and worker cleanup continues.
+- **Phase end.** `<PhaseCleanup/>` runs `remove_workers.py --session-dir`. It leaves Codex threads open and preserves Claude workers held by the unit ledger or a live unit director. It does not launch server reclamation.
 - **Run end.** `scripts/direct/end_session.sh` acts on every run folder the ending director holds, not only the one its marker names: a director runs independent phases side by side, each in its own run folder. `unit_runs.py held <session id>` lists them, the marker's run first, then every folder under the run roots whose `unit_runs.director(run)` is the session. It is a plain scan: reading the director of all 224 live folders took about 25 ms (2026-10-17). The marker's run is kept even when the scan fails. A run of another director is never touched. The steps, in order:
   1. `roles.py unbind-run <run>` for each held run, which unbinds every held design role bound to it and leaves its thread, prompts and replies (`docs/as-built/guilds.md`); a failure stops the script before any other step
   2. one `remove_workers.py` call with a `--session-dir` per held run
-  3. `codex_mesh.py stop` for each held run with `mesh_roster.json`, `mesh_server.json` or `mesh_retired.json`
-  4. one `sweep --root <root of the first held run> --stop`
-  5. one `remove_run_scratch.py` call for every held run: it removes `verify_cache/` and every git checkout (a folder holding `.git`, a folder or a file) and cargo target (a folder holding `.rustc_info.json` or `CACHEDIR.TAG`) at any depth, without descending into what it removes or following a link; a linked worktree goes through `git worktree remove --force --force` in its source repo, or is deleted and its source pruned, so no stale entry keeps its branch "already checked out"; ledgers, logs, diffs, json and the run folder stay (2026-10-21: gate copies under `phases/`, exports under `scratch/` and builds such as `p62_bin` had filled run folders)
-  6. removal of the run-active marker
+  3. `codex_mesh.py stop --pause` for each held run with `mesh_roster.json`, `mesh_server.json` or `mesh_retired.json`. A live unit director's workers, queues and servers remain untouched. Otherwise pause preserves pending messages, owed continuations, reservations and detached commands before stopping only that run's recorded servers.
+  4. one `remove_run_scratch.py --tracked` call for every held run: it removes `verify_cache/` and git checkouts and cargo targets at any depth, without descending into what it removes or following a link. It keeps any checkout or tracked scratch folder containing the working directory of a live detached command belonging to a worker that is not retired. A linked worktree goes through `git worktree remove --force --force` in its source repo, or is deleted and its source pruned; ledgers, logs, diffs, json and the run folder stay.
+  5. removal of the run-active marker
 
-  Steps 1 to 5 run even with no marker, for runs the session still holds. Steps 2 to 5 each continue after a failure. Tests point the scan at a temp folder with `UNIT_RUN_ROOT` and the marker with `UNIT_ACTIVE_DIR`.
+  Steps 1 to 4 run even with no marker, for runs the session still holds. Steps 2 to 4 each continue after a failure. Run end does not launch a sweep. Tests point the scan at a temp folder with `UNIT_RUN_ROOT` and the marker with `UNIT_ACTIVE_DIR`.
 - **Sweep.** It first decides who owns each `ws://` app-server: the current server of a run, the current server of a held design role, a retired server of a run, an unowned server whose log names its run, or an unowned server with no log. Alongside the run folders selected by `--root`, it reads the durable design mesh folders returned by `roles.durable_meshes()` (folders with `mesh_roster.json`). A matching current server record belongs to a held design role only while its roster has an entry with `held_design_id`; a released role or deleted folder gets the usual ownership rules. It then judges whether anything still needs the server:
   - Any connected client means in use.
   - For a current run server, a run-active marker or a running worker means in use.
-  - A retired server is unused unless a conversation is mid-turn.
-  - An unowned server is in use during the record-start window, or while a conversation is mid-turn.
+  - A retired server is unused unless a conversation is mid-turn or a loaded thread has queued or unreadable work.
+  - An unowned server is in use during the record-start window, while a conversation is mid-turn, or when a loaded thread has queued or unreadable work.
   - Current run servers and held design servers share the 30-minute quiet window (`SERVER_IDLE_SECS`): a live worker launcher, a server under 30 minutes old, a mesh folder changed in the last 30 minutes, or a conversation mid-turn means in use.
 
-  It prints `pid  port  verdict  reason  owner` with verdict `in use`, `unused`, `stopped` or `kept`. With `--stop`, it judges a second time under the owner's mesh folder server lock before stopping a server. Servers listening on `--listen unix://` are never touched. Each server also has its own watcher, which wakes every 300 s and runs `idle-stop` once the server record has gone 30 minutes untouched. If a server fails to start, its process is terminated and its record dropped.
+  It reads `thread/queue/list` for loaded threads; queued submissions or unreadable queue state keep the server. It prints `pid  port  verdict  reason  owner` with verdict `in use`, `unused`, `stopped` or `kept`. With `--stop`, it judges a second time under the owner's mesh folder server lock before stopping a server. Ordinary idle-stop and retired-server reclamation can free an unused server while the director lives; the next dispatch resumes the same worker name and thread. Servers listening on `--listen unix://` are never touched. Each server also has its own watcher, which wakes every 300 s and runs `idle-stop` once the server record has gone 30 minutes untouched. If a server fails to start, its process is terminated and its record dropped.
 
 ### Measurement: `scripts/whoami/worker_usage.py`
 
@@ -173,9 +172,9 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/direct/
 | `scripts/agents/codex_mesh.py` | Worker threads, roster, compaction, overflow press-on, role claim and restore, sweep |
 | `scripts/direct/implement.sh` | Writer, tester and repair dispatch; `--to` reuse with identity check, claim and compaction |
 | `scripts/direct/review.sh` | Reviews: `--to` reuse, `--slot` new worker, `--pool` pooled reviewer, tree guard, fresh read-only fallback |
-| `scripts/direct/end_session.sh` | Unbinds held design roles from every run the director holds, ends that run's workers (`stop`) and sweeps |
-| `scripts/direct/remove_run_scratch.py` | Removes `verify_cache/`, checkouts and cargo targets from each ended run folder |
-| `scripts/direct/remove_workers.py` | Removes Claude workers at phase end (`--session-dir`, repeatable); sweeps after a successful listing |
+| `scripts/direct/end_session.sh` | Unbinds held design roles, preserves a live director's workers and servers, otherwise pauses recorded runs; no sweep |
+| `scripts/direct/remove_run_scratch.py` | Removes run and tracked scratch while preserving live detached commands' working directories |
+| `scripts/direct/remove_workers.py` | Removes unheld Claude workers at phase end (`--session-dir`, repeatable); preserves unit workers; no sweep |
 | `scripts/lib/unit_runs.py` | `held`: every run folder a director holds |
 | `scripts/direct/progress_history.py` | Agent columns for extra workers |
 | `scripts/whoami/worker_usage.py` | Before/after usage report over the usage store |
