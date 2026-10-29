@@ -26,6 +26,7 @@ if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.direct import phase_reservation, plan_history, recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
+from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
 from scripts.lib import agents_registry, unit_runs  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
@@ -196,6 +197,70 @@ CONFIG_DIGEST_LENGTH = 12
 # one table can never be stamped with the digest of another.
 AGENTS_CONFIG_ENV = "AGENTS_CONFIG_FILE"
 DEFAULT_AGENTS_CONFIG_PATH = Path("~/.claude/config/agents.conf").expanduser()
+
+
+class ContractFileHash(TypedDict):
+    state: Literal["Recorded"]
+    sha256: str
+
+
+class ContractFileUnavailable(TypedDict):
+    state: Literal["Missing", "NotRecorded"]
+    reason: str
+
+
+class ContractMainHead(TypedDict):
+    state: Literal["Recorded"]
+    commit: str
+
+
+class ContractHeadUnavailable(TypedDict):
+    state: Literal["NotRecorded"]
+    reason: str
+
+
+class ContractRevision(TypedDict):
+    main_head: ContractMainHead | ContractHeadUnavailable
+    direct_md: ContractFileHash | ContractFileUnavailable
+    files: dict[str, ContractFileHash | ContractFileUnavailable]
+
+
+def _contract_file(path: Path) -> ContractFileHash | ContractFileUnavailable:
+    try:
+        contents = path.read_bytes()
+    except FileNotFoundError:
+        return ContractFileUnavailable(state="Missing", reason=f"Missing file: {path}")
+    except OSError as error:
+        return ContractFileUnavailable(state="NotRecorded", reason=str(error))
+    return ContractFileHash(state="Recorded", sha256=hashlib.sha256(contents).hexdigest())
+
+
+def _contract_revision() -> ContractRevision:
+    """Read the deployed main checkout afresh at each phase boundary."""
+    root = Path.home() / ".claude"
+    head: ContractMainHead | ContractHeadUnavailable
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True, timeout=5,
+        )
+        head = ContractMainHead(state="Recorded", commit=result.stdout.strip())
+    except (OSError, subprocess.SubprocessError) as error:
+        head = ContractHeadUnavailable(state="NotRecorded", reason=str(error))
+    direct = root / "commands/unit/direct.md"
+    files: dict[str, ContractFileHash | ContractFileUnavailable] = {}
+    try:
+        contents = direct.read_bytes()
+        direct_hash: ContractFileHash | ContractFileUnavailable = ContractFileHash(
+            state="Recorded", sha256=hashlib.sha256(contents).hexdigest(),
+        )
+        for path in contract_table_paths(contents.decode("utf-8")):
+            files[path] = _contract_file(root / path)
+    except FileNotFoundError:
+        direct_hash = ContractFileUnavailable(state="Missing", reason=f"Missing file: {direct}")
+    except (OSError, UnicodeError) as error:
+        direct_hash = ContractFileUnavailable(state="NotRecorded", reason=str(error))
+    return ContractRevision(main_head=head, direct_md=direct_hash, files=files)
 
 
 def _config_path() -> Path:
@@ -1404,6 +1469,7 @@ def _start_phase(args: argparse.Namespace) -> None:
     state["pending_calibration"] = None
     _write_state(session_dir, state)
     event = _event(state, "phase_started", started_at)
+    event["contract_revision"] = _contract_revision()
     if started_at != now:
         event["recorded_at"] = _iso_time(now)
         event["backfilled"] = True
@@ -4732,6 +4798,7 @@ def _finish_phase(args: argparse.Namespace) -> None:
         _ = _clear_armed_review(session_dir, state, "phase ended", now)
     status = _arg_string(args, "status")
     event = _event(state, "phase_finished", finished_at, phase_record=phase)
+    event["contract_revision"] = _contract_revision()
     event["status"] = status
     event["phase_elapsed_seconds"] = max(0, int(finished_at - started_at))
     if finished_at != now:

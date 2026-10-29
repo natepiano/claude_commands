@@ -13,11 +13,18 @@ import sys
 import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import store
 
 SCRIPTS = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SCRIPTS.parent))
+
+if TYPE_CHECKING:
+    from ..direct import step_record
+else:
+    from scripts.direct import step_record
+
 IDLE_SECONDS = 180
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
@@ -38,6 +45,7 @@ def watch_paths() -> MacIdlePaths:
         Path(os.environ.get("MAC_TEST_STATE_DIR", "~/.local/state/mac-test")).expanduser(),
         Path(os.environ.get("SESSION_TEMP_ROOT", "/tmp/claude/session")),
         store.root() / "admission",
+        proc=Path(os.environ.get("VERIFY_PROC_ROOT", "/proc")),
         sessions=Path(os.environ.get("NOTIFIER_SESSIONS_DIR", str(Path.home() / ".claude/sessions"))),
     )
 
@@ -53,7 +61,7 @@ class LiveProcess:
 
 
 @dataclass(frozen=True)
-class VerifyTestCall:
+class VerifyCall:
     call_id: str
     pid: int
     start: str
@@ -67,6 +75,8 @@ class VerifyTestCall:
     retry_after: float
     marker_hook: bool
     local_reason: str = ""
+    kind: str = "test"
+    wait_state: step_record.StepState = step_record.StepState.WAITING_MAC
 
 
 def read_record(path: Path) -> dict[str, object]:
@@ -114,7 +124,7 @@ def processes(proc: Path) -> dict[int, LiveProcess]:
     return found
 
 
-def belongs_to(process: LiveProcess, call: VerifyTestCall, live: dict[int, LiveProcess]) -> bool:
+def belongs_to(process: LiveProcess, call: VerifyCall, live: dict[int, LiveProcess]) -> bool:
     seen: set[int] = set()
     while process.pid not in seen:
         if process.pid == call.pid:
@@ -126,47 +136,7 @@ def belongs_to(process: LiveProcess, call: VerifyTestCall, live: dict[int, LiveP
     return False
 
 
-@dataclass(frozen=True)
-class VerifyTestRequest:
-    package: str
-    local_reason: str
-
-
-@dataclass(frozen=True)
-class NotVerifyTest:
-    pass
-
-
-def verify_test_request(process: LiveProcess) -> VerifyTestRequest | NotVerifyTest:
-    for index, word in enumerate(process.argv):
-        if Path(word).name != "verify.sh":
-            continue
-        args = process.argv[index + 1:]
-        if args[:1] == ("--session-dir",):
-            args = args[2:] if len(args) >= 2 else ()
-        if args[:1] != ("test",):
-            return NotVerifyTest()
-        args = args[1:]
-        operands: list[str] = []
-        local_reason = ""
-        while args:
-            if args[0] == "--no-cache":
-                args = args[1:]
-            elif args[0] == "--local":
-                if len(args) < 2 or not args[1].strip() or args[1].startswith("--"):
-                    return NotVerifyTest()
-                local_reason = "local_flag"
-                args = args[2:]
-            else:
-                operands.append(args[0])
-                args = args[1:]
-        if operands:
-            return VerifyTestRequest(operands[0], local_reason)
-        return NotVerifyTest()
-    return NotVerifyTest()
-
-
-def waiting_evidence(call: VerifyTestCall, paths: MacIdlePaths, live: dict[int, LiveProcess]) -> str:
+def waiting_evidence(call: VerifyCall, paths: MacIdlePaths, live: dict[int, LiveProcess]) -> str:
     """Read wait records and match their process lifetimes to the call."""
     children = {pid: child for pid, child in live.items() if belongs_to(child, call, live)}
     for path in paths.admission.glob("*.waiting"):
@@ -189,10 +159,10 @@ def waiting_evidence(call: VerifyTestCall, paths: MacIdlePaths, live: dict[int, 
             return "build_hold"
         if (call.call_id in child.argv and any(Path(word).name == "local_release_wait.py" for word in child.argv)):
             return "routing"
-    return ""
+    return call.wait_state.value
 
 
-def registered_call(row: dict[str, object]) -> VerifyTestCall:
+def registered_call(row: dict[str, object]) -> VerifyCall:
     """Validate the stored call at the JSON boundary."""
     text_fields = ("call_id", "start", "repo", "package", "session", "temp_dir", "hold_waiter", "token_dir", "settings")
     if not all(isinstance(row.get(name), str) for name in text_fields):
@@ -200,59 +170,44 @@ def registered_call(row: dict[str, object]) -> VerifyTestCall:
     pid, retry_after = row.get("pid"), row.get("retry_after")
     if not isinstance(pid, int) or pid <= 0 or not isinstance(retry_after, (float, int)) or not math.isfinite(retry_after):
         raise ValueError("invalid Mac wait call identity or deadline")
-    return VerifyTestCall(cast(str, row["call_id"]), pid, cast(str, row["start"]), cast(str, row["repo"]),
+    return VerifyCall(cast(str, row["call_id"]), pid, cast(str, row["start"]), cast(str, row["repo"]),
                        cast(str, row["package"]), cast(str, row["session"]), cast(str, row["temp_dir"]),
                        cast(str, row["hold_waiter"]), cast(str, row["token_dir"]), cast(str, row["settings"]),
                        float(retry_after), row.get("marker_hook") is True, str(row.get("local_reason", "")))
 
 
-def waiting_calls(paths: MacIdlePaths, live: dict[int, LiveProcess]) -> tuple[VerifyTestCall, ...]:
-    calls: dict[int, VerifyTestCall] = {}
-    for path in (paths.state / "calls").glob("*.json"):
+def waiting_calls(paths: MacIdlePaths, live: dict[int, LiveProcess]) -> tuple[VerifyCall, ...]:
+    calls: list[VerifyCall] = []
+    for path in sorted(step_record.record_directory().glob("*.json")):
+        record = step_record.read(path.stem)
+        if isinstance(record, step_record.StaleRecord):
+            print(f"Mac idle watch: ignored stale step record {record.call_id}", file=sys.stderr)
+            continue
+        if isinstance(record, step_record.UnreadableRecord):
+            print(f"Mac idle watch: ignored unreadable step record {record.call_id}: {record.reason}", file=sys.stderr)
+            continue
+        if not isinstance(record, step_record.StepRecord):
+            continue
+        if (not isinstance(record.runs_on, step_record.MacAllowed)
+                or record.state not in (step_record.StepState.WAITING_HOLD, step_record.StepState.WAITING_MAC)):
+            continue
+        process = live.get(record.pid)
+        if process is None or process.start != record.proc_start:
+            continue
         try:
-            call = registered_call(read_record(path))
+            call = registered_call(read_record(call_path(paths, record.call_id)))
         except ValueError:
-            continue
-        process = live.get(call.pid)
-        if process and process.start == call.start and isinstance(verify_test_request(process), VerifyTestRequest):
-            calls[call.pid] = call
-    # Calls started before marker support still need a report. Wait records,
-    # not the verify process name, decide whether a call is waiting.
-    for process in live.values():
-        request = verify_test_request(process)
-        if process.pid in calls or isinstance(request, NotVerifyTest):
-            continue
-        if process.environment.get("BUILDLOG_DIR", str(Path.home() / ".local/state/buildlog")) != str(store.root()):
-            continue
-        env = process.environment
-        call_id = env.get("BUILDLOG_CALL_ID", "")
-        for child in live.values():
-            candidate = child.environment.get("BUILDLOG_CALL_ID", "")
-            if candidate and belongs_to(child, VerifyTestCall("", process.pid, process.start, "", "", "", "", "", "", "", 0, False), live):
-                call_id = candidate
-                env = child.environment
-                break
-        if not call_id:
-            continue
-        calls[process.pid] = VerifyTestCall(call_id, process.pid, process.start, process.cwd, request.package,
-            env.get("CLAUDE_CODE_SESSION_ID", ""), env.get("TMPDIR", ""), env.get("BUILDLOG_HOLD_WAITER_FILE", ""),
-            str(Path(env["UNIT_RUN_DIR"]) / "token_waiters") if env.get("UNIT_RUN_DIR") else "", "", 0, False,
-            request.local_reason)
-    return tuple(call for call in calls.values() if waiting_evidence(call, paths, live))
+            call = VerifyCall(record.call_id, record.pid, record.proc_start, str(record.repo), record.package or "",
+                "", "", "", "", "", 0, False)
+        if call.pid != record.pid or call.start != record.proc_start:
+            call = replace(call, pid=record.pid, start=record.proc_start, marker_hook=False,
+                           session="", temp_dir="", hold_waiter="", token_dir="")
+        calls.append(replace(call, repo=str(record.repo), package=record.package or "", kind=record.kind,
+                             wait_state=record.state))
+    return tuple(calls)
 
 
-def eligible(call: VerifyTestCall) -> bool:
-    command = [sys.executable, str(SCRIPTS / "build_targets/build_targets.py"), "eligible", "--repo-root", call.repo,
-               "--package", call.package]
-    if call.local_reason:
-        command += ["--local", call.local_reason]
-    result = subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
-    return result.returncode == 0 and any(
-        len(fields := line.split("\t")) == 4 and fields[1] == "eligible" and fields[3] != "-"
-        for line in result.stdout.splitlines())
-
-
-def session_is_live(call: VerifyTestCall, paths: MacIdlePaths, live: dict[int, LiveProcess]) -> bool:
+def session_is_live(call: VerifyCall, paths: MacIdlePaths, live: dict[int, LiveProcess]) -> bool:
     for path in paths.sessions.glob("*.json"):
         row = read_record(path)
         pid = row.get("pid")
@@ -262,7 +217,7 @@ def session_is_live(call: VerifyTestCall, paths: MacIdlePaths, live: dict[int, L
     return False
 
 
-def notify_director(call: VerifyTestCall, cause: str) -> bool:
+def notify_director(call: VerifyCall, cause: str) -> bool:
     try:
         result = subprocess.run([sys.executable, str(SCRIPTS / "message/roster.py"), "--json"],
                                 capture_output=True, text=True, timeout=45, check=False)
@@ -282,7 +237,7 @@ def notify_director(call: VerifyTestCall, cause: str) -> bool:
             try:
                 sent = subprocess.run([sys.executable, str(SCRIPTS / "message/send.py"), "--to", address,
                     "--from", "Mac idle watch", "--text", f"Mac idle watch: {cause}\nRepo {call.repo}; call {call.call_id}; "
-                    + f"verify.sh test {call.package}, pid {call.pid}. The Mac has no claim for at least 3 minutes. "
+                    + f"verify.sh {call.kind} {call.package}, pid {call.pid}. The Mac has no claim for at least 3 minutes. "
                     + "The call is still waiting on natedev. Check its wait and Mac result."],
                     capture_output=True, text=True, timeout=45, check=False)
             except (OSError, subprocess.SubprocessError):
@@ -291,7 +246,7 @@ def notify_director(call: VerifyTestCall, cause: str) -> bool:
     return False
 
 
-def record_case(call: VerifyTestCall, cause: str, action: str, wait: str, now: float) -> None:
+def record_case(call: VerifyCall, cause: str, action: str, wait: str, now: float) -> None:
     host = store.host_name()
     identity = hashlib.sha256(f"{host}:{call.call_id}:{cause}".encode()).hexdigest()
     store.append_line(store.host_file(host, now), {"kind": "mac_idle", "id": identity, "host": host,
@@ -343,8 +298,6 @@ def watch_once(paths: MacIdlePaths, now: float, monotonic: float) -> None:
             return
         live = processes(paths.proc)
         for call in waiting_calls(paths, live):
-            if not eligible(call):
-                continue
             case_file = call_path(paths, call.call_id).with_suffix(".cases")
             cases = read_record(case_file)
             wait = waiting_evidence(call, paths, live)
@@ -390,7 +343,7 @@ def main(args: list[str]) -> int:
         _, call_id, pid_text, repo, package, settings, retry, hold_waiter, token_dir, session, temp_dir, marker = args
         pid = int(pid_text)
         process = read_process(paths.proc / pid_text)
-        call = VerifyTestCall(call_id, pid, process.start, repo, package, session, temp_dir, hold_waiter, token_dir,
+        call = VerifyCall(call_id, pid, process.start, repo, package, session, temp_dir, hold_waiter, token_dir,
                            settings, float(retry), marker == "1")
         write_record(call_path(paths, call_id), asdict(call))
         print(marker_path(paths, call_id))

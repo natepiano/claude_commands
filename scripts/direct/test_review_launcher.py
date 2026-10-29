@@ -386,7 +386,7 @@ class ReviewLauncherPassTests(unittest.TestCase):
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "agents_registry.py", lib / "agents_registry.py")
         for name in (
             "review.sh", "implement.sh", "progress_history.py", "plan_history.py", "phase_reservation.py", "recorder_state.py",
-            "findings.py", "review_tree.py", "board.sh", "worker_name.sh", "worker_state.py",
+            "findings.py", "review_tree.py", "board.sh", "worker_name.sh", "worker_state.py", "tag_inventory.py",
         ):
             _ = shutil.copy2(DIRECT_DIR / name, direct_dir / name)
         recorder = direct_dir / "progress_history.py"

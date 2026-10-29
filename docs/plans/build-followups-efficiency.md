@@ -75,3 +75,19 @@ Showrunner of build-followups, 2026-10-28 (measured by builds-unit):
 - The scan counts a same-module guard function as a guard: a top-level function that calls `ensure` on `nix_env` or on a value from `import_module("...nix_env")`, or that calls another guard by bare name (fixed point). Nested functions, methods and other-module attribute calls do not count. The `accounts/accounts.py` exemption is removed; its `launch_shell_environment` is seen as a guard.
 - The unregistered SessionStart hook `scripts/hooks/session-start-nix-shell.py`, its test, and the `heal.py --wait-idle` path only it used are removed (showrunner ruling, 2026-10-28: the five-minute nix-heal timer and the PATH wrappers cover the case; revisit only if a failed build from such a session is seen). `heal.py sweep --only <id> --check` stays for the `nix_heal.failed` push.
 - Checks: 41 tests pass, basedpyright clean. The full merge gate was stopped by a natedev build hold; the showrunner gates at merge.
+
+### Phase 8 — Checkpoint doc gate acts only on a real git commit or merge  · status: done
+
+**Source:** showrunner of natedev, 2026-10-29 (defect report from cargo-liner's showrunner).
+
+**Goal:** `scripts/hooks/pre-tool-use-checkpoint-doc-gate.py` acts only when a parsed command runs git commit or git merge (or a wrapper that runs one). Any other command passes, whatever its arguments hold.
+
+**Defects:**
+- It refused `cd ... && S=...; $HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/merge_checkpoint.py ... --started "$(git log -1 --format=%cI 719c9b28)"` with "the command word is expanded or eval-generated; use a literal git invocation" (line ~401). That command runs no git commit.
+- It refuses Bash text that holds the words checkpoint and commit, for example an `echo` of a message.
+
+**Fix:** treat a command word that is a variable or `$(...)` as unreadable only when it could be git: its literal text names git, or it holds no readable text at all and the same segment has a `commit` or `merge` word. A variable in an argument, a `$(...)` in an argument (a command inside `$(...)` is still parsed on its own), a path such as `$HOME/.../py`, and the words checkpoint, commit or merge in arguments, strings or script names never trigger the gate.
+
+**Tests** (`scripts/hooks/test_checkpoint_doc_gate.py`): the cargo-liner command above passes; `echo "checkpoint(x): commit message"` passes; a `$HOME/...py` command word with checkpoint text in its arguments passes; a real `git commit -F msg` with a checkpoint subject and no doc record is still refused; `$GIT commit` and `eval "git commit ..."` with checkpoint text are still refused.
+
+**Acceptance:** `python3 -m unittest scripts.hooks.test_checkpoint_doc_gate` passes from the repo root; basedpyright clean on both files.
