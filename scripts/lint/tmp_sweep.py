@@ -38,7 +38,9 @@ both are true:
   * no process has its working folder, an open file or a mapped file inside it
     (one /proc scan per run; where no /proc exists, one lsof scan).
 
-These stay too: the roots and their active/ run-marker folders; a unit run
+These stay too: runs named by active markers, runs with any worker seat not ended (including
+paused seats), and runs using a live or paused session worktree. Unreadable ownership records
+keep runs too, including their temp entries. The roots and their active/ run-marker folders stay; a unit run
 folder whose own record names a running session: that session's marker in an
 active/ folder, else the folder's `director` file, else the `run_started` event
 that opens its history (unit_runs.director), so an idle run that no worker has
@@ -72,6 +74,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast
 
@@ -544,20 +547,171 @@ def delete_tree(path: str) -> None:
         shutil.rmtree(path)
 
 
+class RunKeepReason(Enum):
+    ACTIVE_MARKER = "an active-run marker names it"
+    UNENDED_SEAT = "a worker has not ended"
+    SESSION_WORKTREE = "a live or paused session uses its worktree"
+    UNREADABLE_RECORD = "a run ownership record cannot be read"
+
+
+class MissingRecord(Enum):
+    ABSENT = "record absent"
+
+
+def record_object(path: Path) -> dict[str, object] | MissingRecord:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        if path.is_symlink():
+            raise ValueError(f"{path}: broken record link") from None
+        return MissingRecord.ABSENT
+    raw = cast(object, json.loads(text))
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path}: expected an object")
+    return cast(dict[str, object], raw)
+
+
+def record_entries(directory: Path) -> list[Path]:
+    try:
+        return list(directory.iterdir())
+    except FileNotFoundError:
+        if directory.is_symlink():
+            raise ValueError(f"{directory}: broken record link") from None
+        return []
+
+
 def marked_runs(roots: Roots) -> dict[str, str]:
-    """Each run folder a run marker names, by its real path, to the marker's session. A marker
-    holds the run folder's path on its first line."""
+    """Markers protect their run even when the director is paused. Read errors reach the guard."""
     marked: dict[str, str] = {}
     for root in roots.runs:
-        for marker in listing(os.path.join(root, RUN_MARKERS)):
-            try:
-                with open(marker.path, encoding="utf-8") as handle:
-                    run = handle.readline().strip()
-            except (OSError, UnicodeError):
-                continue
-            if run:
-                marked[os.path.realpath(run)] = marker.name
+        for marker in record_entries(Path(root) / RUN_MARKERS):
+            with marker.open(encoding="utf-8") as handle:
+                run = handle.readline().strip()
+            if not run or not os.path.isabs(run):
+                raise ValueError(f"{marker}: expected a run path")
+            marked[os.path.realpath(run)] = marker.name
     return marked
+
+
+@dataclass(frozen=True)
+class SessionRunUse:
+    worktrees: frozenset[str]
+    runs: frozenset[str]
+
+
+def session_run_use(live: frozenset[str]) -> SessionRunUse:
+    """Read registry cwd and the mover's shutdown session/legacy pause records without writing."""
+    registry = sessions.read_registry()
+    if registry.unreadable:
+        raise ValueError("session registry unreadable")
+    worktrees: set[str] = set()
+    for item in registry.entries:
+        cwd = cast(object, item.details.get("cwd", ""))
+        if not isinstance(cwd, str) or (cwd and not os.path.isabs(cwd)):
+            raise ValueError("session cwd unreadable")
+        if item.record["sessionId"] in live and cwd:
+            worktrees.add(os.path.realpath(cwd))
+    runs: set[str] = set()
+
+    def add_session(value: object) -> None:
+        if not isinstance(value, dict):
+            raise ValueError("shutdown session unreadable")
+        session = cast(dict[str, object], value)
+        cwd, run_dirs = session.get("cwd"), session.get("run_dirs")
+        if not isinstance(cwd, str) or not isinstance(run_dirs, list):
+            raise ValueError("shutdown session has no cwd or run_dirs")
+        if cwd:
+            if not os.path.isabs(cwd):
+                raise ValueError("shutdown session cwd unreadable")
+            worktrees.add(os.path.realpath(cwd))
+        for run in cast(list[object], run_dirs):
+            if not isinstance(run, str) or not os.path.isabs(run):
+                raise ValueError("shutdown session has an invalid run path")
+            runs.add(os.path.realpath(run))
+
+    def add_pause(record: dict[str, object]) -> None:
+        progress = record.get("progress")
+        if not isinstance(progress, dict) or not isinstance(cast(dict[str, object], progress).get("kind"), str):
+            raise ValueError("shutdown progress unreadable")
+        if cast(dict[str, object], progress)["kind"] not in ("restarted", "timers pending"):
+            add_session(record.get("session"))
+
+    state = Path(os.environ.get("SHUTDOWN_STATE_DIR", str(Path.home() / ".local/state/shutdown")))
+    for account in record_entries(state):
+        if not account.is_dir():
+            continue
+        for path in record_entries(account / "sessions"):
+            if path.suffix == ".json":
+                record = record_object(path)
+                if isinstance(record, MissingRecord):
+                    raise ValueError(f"{path}: record disappeared")
+                add_pause(record)
+        # The mover still reads pre-session account records and partial shutdowns.
+        legacy = [account / "record.json"] + [path for path in record_entries(account / "partial")
+                                             if path.suffix == ".json"]
+        for path in legacy:
+            record = record_object(path)
+            if isinstance(record, MissingRecord):
+                continue
+            if record.get("state") in ("up", "cancelled"):
+                continue
+            entries = record.get("entries")
+            if not isinstance(entries, list):
+                raise ValueError(f"{path}: shutdown entries unreadable")
+            for entry in cast(list[object], entries):
+                if not isinstance(entry, dict):
+                    raise ValueError(f"{path}: shutdown entry unreadable")
+                add_pause(cast(dict[str, object], entry))
+    return SessionRunUse(frozenset(worktrees), frozenset(runs))
+
+
+def run_folder_guards(roots: Roots, live: frozenset[str] | None,
+                      marked: dict[str, str]) -> dict[str, RunKeepReason]:
+    folders = [entry.path for root in roots.runs for entry in listing(root)
+               if entry.name != RUN_MARKERS and entry.is_dir(follow_symlinks=False)]
+    try:
+        if live is None:
+            raise ValueError("session registry unreadable")
+        use = session_run_use(live)
+    except (OSError, UnicodeError, ValueError):
+        return dict.fromkeys(folders, RunKeepReason.UNREADABLE_RECORD)
+    kept: dict[str, RunKeepReason] = {}
+    for folder in folders:
+        try:
+            roster = record_object(Path(folder) / "mesh_roster.json")
+            if not isinstance(roster, MissingRecord):
+                for seat in roster.values():
+                    if not isinstance(seat, dict) or not isinstance(cast(dict[str, object], seat).get("status"), str):
+                        raise ValueError("worker roster entry unreadable")
+                    if cast(dict[str, object], seat)["status"] != "ended":
+                        kept[folder] = RunKeepReason.UNENDED_SEAT
+            # Read even when another reason keeps the folder, so errors are visible.
+            state = record_object(Path(folder) / unit_runs.STATE_FILE)
+            if not isinstance(state, MissingRecord):
+                working = state.get("working_dir", "")
+                if not isinstance(working, str):
+                    raise ValueError("run worktree unreadable")
+                if working and os.path.realpath(working) in use.worktrees:
+                    kept[folder] = RunKeepReason.SESSION_WORKTREE
+            if os.path.realpath(folder) in use.runs:
+                kept[folder] = RunKeepReason.SESSION_WORKTREE
+            if os.path.realpath(folder) in marked:
+                kept[folder] = RunKeepReason.ACTIVE_MARKER
+            # director() handles the history fallback; check its inputs before that permissive reader.
+            director = Path(folder) / unit_runs.DIRECTOR_FILE
+            if os.path.lexists(director) and not director.read_text(encoding="utf-8").strip():
+                raise ValueError("run director unreadable")
+            if not isinstance(state, MissingRecord) and state.get("history_file"):
+                history = state["history_file"]
+                if not isinstance(history, str):
+                    raise ValueError("run history path unreadable")
+                with Path(history).open(encoding="utf-8") as handle:
+                    event = cast(object, json.loads(handle.readline()))
+                if not isinstance(event, dict):
+                    raise ValueError("run history unreadable")
+        except (OSError, UnicodeError, ValueError):
+            kept[folder] = RunKeepReason.UNREADABLE_RECORD
+    return kept
 
 
 def when(timestamp: float) -> str:
@@ -626,13 +780,27 @@ def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR) -> Swee
         return result
     live = running_session_ids()
     inner = session_folders(roots, live)
-    marked = marked_runs(roots)
+    try:
+        marked = marked_runs(roots)
+        guarded = run_folder_guards(roots, live, marked)
+    except (OSError, UnicodeError, ValueError):
+        marked = {}
+        guarded = {entry.path: RunKeepReason.UNREADABLE_RECORD for root in roots.runs
+                   for entry in listing(root) if entry.name != RUN_MARKERS}
     judged = roots.all() + inner + temp_parents(roots, live)
     uses = entry_uses(paths, judged)
     for root in judged:
         emptied = False
         for entry in roots.entries(root):
             reason = owner_reason(entry, root, roots, live, marked)
+            # Apply to every deletion path, including entries inside a protected run's tmp/.
+            if reason != ROOT:
+                # Resolve only the parents: a link inside a protected run is judged where it lies.
+                path = os.path.join(os.path.realpath(os.path.dirname(entry.path)), entry.name)
+                for folder, guard in guarded.items():
+                    if path == folder or path.startswith(folder + os.sep) or folder.startswith(path + os.sep):
+                        reason = NO_SESSIONS if live is None else guard.value
+                        break
             if reason is None and entry.path in uses:
                 result.keep(f"{entry.path}: {uses[entry.path]}", IN_USE)
                 continue

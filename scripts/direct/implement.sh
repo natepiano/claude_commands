@@ -286,7 +286,7 @@ with worker_claim_lock(root):
         identity = read(identity_file)
         expected = {"name": name, "slot": slot, "family": family, "model": model, "worker_id": worker_id}
         # A run from before the repair worker had its own record lost the fix worker's identity
-        # to the impl worker's, and a reopened seat keeps only its roster thread: record it from there.
+        # to the impl worker's, and a reopened worker keeps only its roster thread: record it from there.
         # A worker recorded under another slot is followed in the wrong role and stays refused.
         if not identity and worker_id and worker_slot(root, name) is None:
             identity_file.write_text(json.dumps(expected))
@@ -401,14 +401,14 @@ if [[ -n "${FOLLOW_TO}" ]]; then
   trap 'worker_record release' EXIT
 fi
 
-# A phase claims its files before any seat edits them, wherever the seat runs
+# A phase claims its files before any worker edits them, wherever the worker runs
 # (phase_reservation.py claim): an unclaimed edit drifts to another reservation.
 if [[ -n "${PHASE_ID}" ]] && ! "$PY" "${SCRIPT_DIR}/phase_reservation.py" claim \
   --session-dir "${SESSION_DIR}" --phase "${PHASE_ID}" --repo "${WORKING_DIR}" >>"${LOG_FILE}" 2>&1; then
-  echo "ERROR: phase ${PHASE_ID} could not claim its files before its seat opens; see ${LOG_FILE}." >&2
+  echo "ERROR: phase ${PHASE_ID} could not claim its files before its worker opens; see ${LOG_FILE}." >&2
   echo "error" > "${STATUS_FILE}"
   bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" blocked \
-    "launcher: phase ${PHASE_ID} could not claim its files; its seat did not open" || true
+    "launcher: phase ${PHASE_ID} could not claim its files; its worker did not open" || true
   exit 1
 fi
 

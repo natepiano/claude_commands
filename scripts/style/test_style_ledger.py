@@ -550,6 +550,265 @@ class StyleLedgerTests(unittest.TestCase):
             identities.append(finding.finding_id)
         return rule, issue, tuple(identities)
 
+    def built_time(self, ledger: style_ledger.Ledger, finding_id: str) -> str:
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            row = cast(tuple[str], connection.execute(
+                "SELECT built_at FROM held_findings WHERE finding_id=?", (finding_id,),
+            ).fetchone())
+        return row[0]
+
+    def assert_build_time_survives_reading(self, ledger: style_ledger.Ledger, finding_id: str) -> None:
+        self.assertEqual(self.built_time(ledger, finding_id), "2026-10-27T10:00:00+00:00")
+        with mock.patch.object(style_ledger, "_now", return_value="2026-10-28T11:00:00+00:00"):
+            ledger.record_person_applied({finding_id: style_ledger.ReadByPerson("reader")})
+        self.assertEqual(self.built_time(ledger, finding_id), "2026-10-27T10:00:00+00:00")
+
+    def test_migration_25_backfills_from_merged_build_ticket_else_the_finding(self) -> None:
+        database = self.root / "version-24.sqlite"
+        rule = self.rule("backfill")
+        with closing(sqlite3.connect(database)) as connection, connection:
+            for number, migration in sorted(style_ledger.MIGRATIONS.items()):
+                if number <= 24:
+                    _ = connection.executescript(migration)
+            _ = connection.execute("CREATE TABLE schema_version(version INTEGER NOT NULL)")
+            _ = connection.execute("INSERT INTO schema_version VALUES (24)")
+            for ticket, state in (("merged", "merged"), ("pending", "checkpointed")):
+                _ = connection.execute(
+                    "INSERT INTO tickets(id,unit,kind,family,rule,crate,files,sites,rules,rule_blobs,state,branch,"
+                    + "checkpoint,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (ticket, ticket, "proposal", "names", rule, "crates/alpha", "[]", "[]", "[]", "{}", state,
+                     "main", "", "created", "2026-10-20T08:00:00+00:00"),
+                )
+            for finding_id, state, ticket in (("merged-build", "built", "merged"), ("pending-build", "built", "pending"),
+                                               ("no-ticket", "built", ""), ("missing-ticket", "built", "missing"),
+                                               ("not-built", "filed", "merged")):
+                _ = connection.execute(
+                    "INSERT INTO held_findings(finding_id,rule,path,line,text,kind,before,after,rule_blob,ticket,state,"
+                    + "proposal,created_at,updated_at,build_ticket) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (finding_id, rule, self.sources[0], 1, "change", "type", "u32", "u64", self.blob(rule), "judge",
+                     state, "", "created", "2026-10-21T09:00:00+00:00", ticket),
+                )
+        with style_ledger.Ledger(self.repo, database):
+            pass
+        with closing(sqlite3.connect(database)) as connection:
+            rows = cast(list[tuple[str, str]], connection.execute(
+                "SELECT finding_id,built_at FROM held_findings ORDER BY finding_id",
+            ).fetchall())
+            self.assertEqual(dict(rows), {
+                "merged-build": "2026-10-20T08:00:00+00:00",
+                "pending-build": "2026-10-21T09:00:00+00:00",
+                "no-ticket": "2026-10-21T09:00:00+00:00",
+                "missing-ticket": "2026-10-21T09:00:00+00:00", "not-built": "",
+            })
+            self.assertEqual(connection.execute("SELECT * FROM refill_results").fetchall(), [])
+
+    def refill_result(self, database: Path, unit: str = "names-unit") -> tuple[str, str, str, int, int, int, int]:
+        with closing(sqlite3.connect(database)) as connection:
+            return cast(tuple[str, str, str, int, int, int, int], connection.execute(
+                "SELECT at,outcome,split_at,ready,changed,structure,other FROM refill_results WHERE unit=?", (unit,),
+            ).fetchone())
+
+    def test_record_refill_upserts_only_the_outcome_and_leaves_reserved_columns_alone(self) -> None:
+        ledger = self.ledger()
+        first = "2026-10-27T08:15:00+00:00"
+        later = "2026-10-28T09:30:00+00:00"
+        with (mock.patch.object(rules, "load_rules", side_effect=AssertionError("record_refill loads no catalog")),
+              mock.patch.object(style_ledger, "open_ledger", side_effect=AssertionError("record_refill runs no migration"))):
+            with mock.patch.object(style_ledger, "_now", return_value=first):
+                style_ledger.record_refill(self.repo, "names-unit", "phase written")
+            self.assertEqual(self.refill_result(ledger.database), (first, "phase written", "", 0, 0, 0, 0))
+            with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                _ = connection.execute("UPDATE refill_results SET split_at=?,ready=1,changed=2,structure=3,other=4", (first,))
+            with mock.patch.object(style_ledger, "_now", return_value=later):
+                style_ledger.record_refill(self.repo, "names-unit", "repair first")
+                style_ledger.record_refill(self.repo, "types-unit", "board unavailable")
+            self.assertEqual(self.refill_result(ledger.database), (later, "repair first", first, 1, 2, 3, 4))
+            self.assertEqual(self.refill_result(ledger.database, "types-unit"), (later, "board unavailable", "", 0, 0, 0, 0))
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM refill_results").fetchone(), (2,))
+
+    def test_record_refill_does_nothing_without_a_database_or_table(self) -> None:
+        database = style_ledger.ledger_location(self.repo).database
+        style_ledger.record_refill(self.repo, "names-unit", "repair first")
+        self.assertFalse(database.exists())
+        database.parent.mkdir(parents=True)
+        with closing(sqlite3.connect(database)) as connection, connection:
+            _ = connection.execute("CREATE TABLE existing(value TEXT)")
+            _ = connection.execute("INSERT INTO existing VALUES ('kept')")
+        before = database.read_bytes()
+        style_ledger.record_refill(self.repo, "names-unit", "no work")
+        self.assertEqual(database.read_bytes(), before)
+        with closing(sqlite3.connect(database)) as connection:
+            self.assertEqual(connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall(), [("existing",)])
+
+    def test_a_first_split_inserts_counts_without_inventing_a_refill(self) -> None:
+        ledger = self.ledger()
+        measured_at = "2026-10-28T10:01:02+00:00"
+        split = style_ledger.RecordedSplit(7, 6, 5, 4, measured_at)
+        with (mock.patch.object(rules, "load_rules", side_effect=AssertionError("no catalog write")),
+              mock.patch.object(style_ledger, "open_ledger", side_effect=AssertionError("no migration"))):
+            style_ledger.record_split(self.repo, "names-unit", split)
+        self.assertEqual(self.refill_result(ledger.database), ("", "", measured_at, 7, 6, 5, 4))
+
+    def test_the_split_blob_cache_reads_each_tree_once_and_keeps_versions_distinct(self) -> None:
+        path = self.sources[0]
+        old = (self.repo / path).read_text()
+        self.write(path, "pub fn changed() -> u64 { 2 }\n")
+        current = self.commit("Change one source")
+        read = style_ledger._git  # pyright: ignore[reportPrivateUsage]
+        trees: list[tuple[str, ...]] = []
+
+        def git(repo: Path, *arguments: str) -> str:
+            if arguments[0] == "ls-tree":
+                trees.append(arguments)
+            return read(repo, *arguments)
+
+        with mock.patch.object(style_ledger, "_git", side_effect=git):
+            cache = style_ledger.GitReadCache(self.repo)
+            for _ in range(2):
+                self.assertEqual(cache.text(self.initial_tip, path), old)
+                self.assertEqual(cache.text(current, path), "pub fn changed() -> u64 { 2 }\n")
+                self.assertEqual(cache.blob(current, self.sources[1]), cache.blob(self.initial_tip, self.sources[1]))
+        self.assertEqual(len(trees), 2)
+        self.assertEqual({arguments[-1] for arguments in trees}, {self.initial_tip, current})
+        self.assertTrue(all(any(option.startswith("-") and "r" in option for option in arguments[1:-1])
+                            for arguments in trees))
+
+    def test_git_read_cache_and_ledgers_resolve_a_branch_again_after_it_moves(self) -> None:
+        cache = style_ledger.GitReadCache(self.repo)
+        ledger = self.ledger()
+        with style_ledger.Ledger(self.repo, ledger.database, git_cache=cache) as cached_ledger:
+            self.assertEqual(cache.tip("main").commit, self.initial_tip)
+            self.assertEqual(cached_ledger._tip("main").commit, self.initial_tip)  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(ledger._tip("main").commit, self.initial_tip)  # pyright: ignore[reportPrivateUsage]
+            self.write(self.sources[0], "pub fn advanced() {}\n")
+            current = self.commit("Advance main after caching its tip")
+            with self.subTest(reader="cache"):
+                self.assertEqual(cache.tip("main").commit, current)
+            with self.subTest(reader="cached ledger"):
+                self.assertEqual(cached_ledger._tip("main").commit, current)  # pyright: ignore[reportPrivateUsage]
+            with self.subTest(reader="ledger"):
+                self.assertEqual(ledger._tip("main").commit, current)  # pyright: ignore[reportPrivateUsage]
+            self.assertNotIn("main", cache.tips)
+            self.assertEqual(cache.tip(self.initial_tip).commit, self.initial_tip)
+
+    def test_site_proof_shares_blob_reads_with_the_split_cache(self) -> None:
+        source = "fn work() {\n    let old = 791;\n}\n"
+        ledger, _, finding = self.site_fixture(source=source)
+        base = ledger.synced_commit()
+        tip = self.commit_tip(ledger, {PARENT_FILE: "// header\n" + source})
+        cache = style_ledger.GitReadCache(self.repo)
+        with mock.patch.object(style_ledger, "blob_contents", wraps=style_ledger.blob_contents) as reads:
+            self.assertEqual(cache.file(base, PARENT_FILE), source.encode())
+            self.assertEqual(cache.file(tip, PARENT_FILE), ("// header\n" + source).encode())
+            # The direct site read and the declaration step's batched preparation share those bytes.
+            with style_ledger.Ledger(self.repo, ledger.database, git_cache=cache) as cached_ledger:
+                self.assertIsInstance(self.strict_site(cached_ledger, finding, tip), style_ledger.UnchangedSite)
+            with style_ledger.Ledger(self.repo, ledger.database, git_cache=cache) as cached_ledger:
+                self.assertIsInstance(cached_ledger.finding_site(finding, tip), style_ledger.UnchangedSite)
+        requested = [blob for call in reads.call_args_list for blob in cast(dict[str, str], call.args[1]).values()]
+        for commit in (base, tip):
+            with self.subTest(commit=commit):
+                self.assertEqual(requested.count(cache.blob(commit, PARENT_FILE)), 1)
+
+    def test_split_write_uses_a_small_busy_timeout_on_a_locked_ledger(self) -> None:
+        ledger = self.ledger()
+        previous = style_ledger.RecordedSplit(9, 8, 7, 6, "2026-10-27T12:00:00+00:00")
+        style_ledger.record_split(self.repo, "names-unit", previous)
+        before = self.refill_result(ledger.database)
+        with closing(sqlite3.connect(ledger.database)) as writer:
+            _ = writer.execute("BEGIN IMMEDIATE")
+            began = time.monotonic()
+            with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
+                style_ledger.record_split(self.repo, "names-unit",
+                                          style_ledger.RecordedSplit(1, 2, 3, 4, "2026-10-28T12:00:00+00:00"),
+                                          busy_timeout_seconds=0.05)
+            elapsed = time.monotonic() - began
+            writer.rollback()
+        self.assertLess(elapsed, 0.75)
+        self.assertEqual(self.refill_result(ledger.database), before)
+
+    def test_a_later_split_preserves_the_refill_and_a_refill_preserves_the_split(self) -> None:
+        ledger = self.ledger()
+        first_at = "2026-10-27T12:00:00+00:00"
+        later_at = "2026-10-28T10:00:00+00:00"
+        with mock.patch.object(style_ledger, "_now", return_value=first_at):
+            style_ledger.record_refill(self.repo, "names-unit", "phase written")
+        style_ledger.record_split(self.repo, "names-unit", style_ledger.RecordedSplit(1, 2, 3, 4, first_at))
+        style_ledger.record_split(self.repo, "names-unit", style_ledger.RecordedSplit(0, 0, 0, 0, later_at))
+        self.assertEqual(self.refill_result(ledger.database), (first_at, "phase written", later_at, 0, 0, 0, 0))
+        with mock.patch.object(style_ledger, "_now", return_value=later_at):
+            style_ledger.record_refill(self.repo, "names-unit", "waiting for sync")
+        self.assertEqual(self.refill_result(ledger.database), (later_at, "waiting for sync", later_at, 0, 0, 0, 0))
+
+    def test_proposal_merge_sets_built_at_once(self) -> None:
+        rule, issue, ids = self.decision_findings()
+        ledger = self.ledger()
+        ledger.ticket_add("names-1", "names", "proposal", "names", "crates/alpha", [self.sources[0]], [rule],
+                          proposal=str(issue), finding_ids=ids[:1])
+        ledger.ticket_assign("names-1", "main")
+        self.write(self.sources[0], "pub enum Outcome { New }\n")
+        tip = self.commit("Apply approved rename")
+        ledger.set_tip(tip, "main")
+        ledger.ticket_checkpoint("names-1", tip)
+        with mock.patch.object(style_ledger, "_now", return_value="2026-10-27T10:00:00+00:00"):
+            self.assertEqual(ledger.ticket_merge("names-1"), ())
+        self.assert_build_time_survives_reading(ledger, ids[0])
+        with mock.patch.object(style_ledger, "_now", return_value="2026-10-29T12:00:00+00:00"):
+            _ = ledger.ticket_merge("names-1")
+        self.assertEqual(self.built_time(ledger, ids[0]), "2026-10-27T10:00:00+00:00")
+
+    def test_declaration_follow_sets_built_at_once(self) -> None:
+        ledger = self.ledger()
+        finding_id = self.renamed_parent(ledger)
+        _ = self.commit_tip(ledger, {PARENT_FILE: PARENT.replace("Parent", "Renamed")})
+        with mock.patch.object(style_ledger, "_now", return_value="2026-10-27T10:00:00+00:00"):
+            outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.DeclarationRenamed)
+        self.assert_build_time_survives_reading(ledger, finding_id)
+        with mock.patch.object(style_ledger, "_now", return_value="2026-10-29T12:00:00+00:00"):
+            _ = self.follow_approved(ledger, [finding_id])
+        self.assertEqual(self.built_time(ledger, finding_id), "2026-10-27T10:00:00+00:00")
+
+    def test_held_built_sets_built_at_once_and_reopening_clears_it(self) -> None:
+        ledger, finding_id, _, _ = self.checkpointed_type_findings()
+        with mock.patch.object(style_ledger, "_now", return_value="2026-10-27T10:00:00+00:00"):
+            ledger.mark_built(finding_id)
+        self.assert_build_time_survives_reading(ledger, finding_id)
+        with mock.patch.object(style_ledger, "_now", return_value="2026-10-29T12:00:00+00:00"):
+            ledger.mark_built(finding_id)
+        self.assertEqual(self.built_time(ledger, finding_id), "2026-10-27T10:00:00+00:00")
+        ledger.return_to_filed({finding_id: style_ledger.ReadByPerson("reader")})
+        self.assertEqual(self.built_time(ledger, finding_id), "")
+
+    def test_mark_built_at_merge_sets_built_at_once(self) -> None:
+        _, _, ids = self.decision_findings()
+        self.write(self.sources[0], "pub enum Outcome { New }\n")
+        tip = self.commit("Apply rename at merge")
+        ledger = self.ledger()
+        ledger.set_tip(tip, "main")
+        with mock.patch.object(style_ledger, "_now", return_value="2026-10-27T10:00:00+00:00"):
+            _ = ledger.mark_built_at_merge(ids[:1], tip, style_ledger.NotReadByPerson())
+        self.assert_build_time_survives_reading(ledger, ids[0])
+        with mock.patch.object(style_ledger, "_now", return_value="2026-10-29T12:00:00+00:00"):
+            with self.assertRaisesRegex(style_ledger.LedgerError, "cannot mark a built finding built"):
+                _ = ledger.mark_built_at_merge(ids[:1], tip, style_ledger.ReadByPerson("other"))
+        self.assertEqual(self.built_time(ledger, ids[0]), "2026-10-27T10:00:00+00:00")
+
+    def test_withdrawing_a_built_duplicate_clears_its_built_at(self) -> None:
+        _, issue, ids = self.decision_findings()
+        self.write(self.sources[0], "pub enum Outcome { New }\n")
+        tip = self.commit("Apply rename at merge")
+        ledger = self.ledger()
+        ledger.set_tip(tip, "main")
+        with mock.patch.object(style_ledger, "_now", return_value="2026-10-27T10:00:00+00:00"):
+            _ = ledger.mark_built_at_merge(ids[:1], tip, style_ledger.NotReadByPerson())
+        self.assertEqual(self.built_time(ledger, ids[0]), "2026-10-27T10:00:00+00:00")
+        ledger.withdraw_duplicates((style_ledger.BareDuplicate(ids[0], ids[1], issue),))
+        self.assertEqual(self.built_time(ledger, ids[0]), "")
+        states = {finding.finding_id: finding.state for finding in ledger.proposal_findings(issue)}
+        self.assertEqual(states[ids[0]], style_ledger.Withdrawn(issue, style_ledger.DuplicateOf(ids[1])))
+
     def test_record_held_refuses_a_cell_with_no_findings(self) -> None:
         rule = self.rule("read")
         self.set_tip(self.initial_tip)
@@ -1289,6 +1548,8 @@ class StyleLedgerTests(unittest.TestCase):
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_session_dir")
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_phase")
             _ = connection.execute("ALTER TABLE processed_tips DROP COLUMN reason")
+            _ = connection.execute("DROP TABLE refill_results")
+            _ = connection.execute("ALTER TABLE held_findings DROP COLUMN built_at")
             _ = connection.execute("UPDATE schema_version SET version=18")
         migrated = self.ledger()
         finding, = migrated.named_held((finding_id,))
@@ -1698,7 +1959,7 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(ledger.database)) as connection, connection:
             _ = connection.execute("INSERT INTO held_findings SELECT ?,rule,path,line,text,kind,before,after,rule_blob,ticket,"
                                    + "state,proposal,created_at,updated_at,build_ticket,moved_from,withdrawn_by,person_read_by,"
-                                   + "duplicate_of,unwaived_by,followed_from,followed_from_line,followed_at,declaration_gone_at,waive_provenance,waived_by FROM held_findings "
+                                   + "duplicate_of,unwaived_by,followed_from,followed_from_line,followed_at,declaration_gone_at,waive_provenance,waived_by,built_at FROM held_findings "
                                    + "WHERE finding_id=?", (twin, ids[1]))
         before = self.held_rows(ledger.database)
         for name, error in (
@@ -5138,6 +5399,8 @@ class StyleLedgerTests(unittest.TestCase):
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_session_dir")
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_phase")
             _ = connection.execute("ALTER TABLE processed_tips DROP COLUMN reason")
+            _ = connection.execute("DROP TABLE refill_results")
+            _ = connection.execute("ALTER TABLE held_findings DROP COLUMN built_at")
             _ = connection.execute("UPDATE schema_version SET version=8")
             connection.commit()
         migrated = self.ledger()
@@ -8330,6 +8593,8 @@ class StyleLedgerTests(unittest.TestCase):
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_session_dir")
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_phase")
             _ = connection.execute("ALTER TABLE processed_tips DROP COLUMN reason")
+            _ = connection.execute("DROP TABLE refill_results")
+            _ = connection.execute("ALTER TABLE held_findings DROP COLUMN built_at")
             _ = connection.execute("UPDATE schema_version SET version=6")
             connection.commit()
         with style_ledger.open_ledger(self.repo) as migrated:

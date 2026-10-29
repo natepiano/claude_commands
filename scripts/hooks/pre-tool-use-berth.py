@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-"""Check a unit's Codex seat edits against cargo-berth before `apply_patch` writes them.
+"""Check a unit's Codex worker edits against cargo-berth before `apply_patch` writes them.
 
 Claude Code edits reach `cargo-berth hook pre-tool-use` through `berth_pre_edit.sh`; a Codex
-seat's `apply_patch` had no berth check at all, so its first touch never turned the phase's
+worker's `apply_patch` had no berth check at all, so its first touch never turned the phase's
 `enrolled_awaiting_first_touch` state `Active`, and an `Active` record never followed a new
 reservation of its phase. This hook runs for Codex `PreToolUse` on
-`apply_patch`. It acts only for a seat of a running unit: the app-server a unit director starts
+`apply_patch`. It acts only for a worker of a running unit: the app-server a unit director starts
 carries the director's `CLAUDE_CODE_SESSION_ID` and, when codex_mesh started it for a run, that run
 as `UNIT_RUN_DIR`. The run named there is the session directory; when it is unset or
 names a folder that is gone, the director's run marker names it. Any other Codex session is left
 alone.
 
-Seats persist across phases and the mesh knows no phase, so each edited path goes to the open
+Workers persist across phases and the mesh knows no phase, so each edited path goes to the open
 phase that owns it (`phase_reservation.attribute`): the only open phase, else the one whose
 `files` list covers it. A path no single open phase owns refuses the edit. A recorder-open phase
 with no state file and no berth mapping of its own was never enrolled (FinalGate's `final`) and owns
 nothing; an unreadable recorder state leaves the phases whose directories hold a state file.
 
-For a seat it runs `cargo-berth check <paths> --json` from the repository root once per owning
+For a worker it runs `cargo-berth check <paths> --json` from the repository root once per owning
 phase, as that phase's berth session `<director session id>.phase-<phase>`, so two open phases
 hold separate reservations. A path a sibling phase already holds is allowed and records nothing:
 the engine leaves the session unmapped and names the sibling's reservation. A clear answer allows the edit and, when it carries the acquired reservation,
@@ -25,7 +25,7 @@ writes `Active` into that phase's state file. An unenrolled repository is allowe
 ledger the engine cannot read (`ledger_unreadable`, as in a scratch clone with no ledger): the
 engine's own edit hook lets those edits through, because ledger loss fails open. Every other
 answer, a missing engine or a timeout refuses the edit with the engine's reason: an unchecked
-edit can collide with a foreign reservation, where a refused one only costs the seat a retry.
+edit can collide with a foreign reservation, where a refused one only costs the worker a retry.
 
 Codex accepts only a refusal from a PreToolUse hook: an allow is an exit 0 with no output.
 """
@@ -46,9 +46,9 @@ from scripts.guilds import roles  # noqa: E402
 
 
 def _seat_session_dir() -> Path | None:
-    """The unit's session directory when this Codex process is one of its seats.
+    """The unit's session directory when this Codex process is one of its workers.
 
-    The seat's own run comes first: codex_mesh names it as UNIT_RUN_DIR in the
+    The worker's own run comes first: codex_mesh names it as UNIT_RUN_DIR in the
     environment of every app-server it starts for a run, and a director running phases side by
     side marks just one of their runs. The marker is read when that variable is unset or names a
     folder that is gone, so a stale variable never lets an edit through unchecked.

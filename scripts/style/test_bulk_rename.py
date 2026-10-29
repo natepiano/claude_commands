@@ -526,7 +526,8 @@ class LedgerTests(CargoProjectTests):
         _ = ledger.bulk_release("names-1", {kept: "all refused"})
         self.assertEqual(ledger.bulk_findings("names-1"), ())
         with closing(sqlite3.connect(ledger.database)) as connection:
-            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_version").fetchone()[0], 24)
+            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_version").fetchone()[0],
+                             max(style_ledger.MIGRATIONS))
 
     def test_release_requires_assigned_proposal_and_nonempty_reason(self) -> None:
         ledger = self.ledger()
@@ -579,12 +580,16 @@ class LedgerTests(CargoProjectTests):
         ledger = self.ledger()
         with closing(sqlite3.connect(ledger.database)) as connection:
             _ = connection.execute("DROP TABLE bulk_refusals")
+            _ = connection.execute("DROP TABLE refill_results")
+            _ = connection.execute("ALTER TABLE held_findings DROP COLUMN built_at")
             _ = connection.execute("UPDATE schema_version SET version=23")
             connection.commit()
         with style_ledger.Ledger(self.repo, ledger.database) as upgraded:
             self.assertEqual(upgraded.bulk_refusals("names-1"), ())
-        # Older migration tests replay from a historical version without dropping tables added afterwards.
+        # The refusal migration also accepts an existing refusal table.
         with closing(sqlite3.connect(ledger.database)) as connection:
+            _ = connection.execute("DROP TABLE refill_results")
+            _ = connection.execute("ALTER TABLE held_findings DROP COLUMN built_at")
             _ = connection.execute("UPDATE schema_version SET version=23")
             connection.commit()
         with style_ledger.Ledger(self.repo, ledger.database) as replayed:

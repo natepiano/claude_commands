@@ -181,7 +181,7 @@ the new id. Then it relaunches the unit and verifies that nothing live still hol
 
 To retire a unit, run `/showrunner:retire_unit <unit>` from the showrunner session. It refuses
 while the unit has uncommitted work or a checkpoint not merged. It stops everything the unit owns
-(its sessions, Codex seats, reviewers, holds, reservations, Mac claims and processes), marks the row
+(its sessions, Codex workers, reviewers, holds, reservations, Mac claims and processes), marks the row
 retired, and removes the worktree and branch. `--dry-run` lists all of it and changes nothing.
 The retired note names the director's last session. `/showrunner:resume_unit <unit>` makes the
 worktree again at the same path from the merge branch, resumes that session and makes the row live.

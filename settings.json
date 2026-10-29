@@ -258,6 +258,15 @@
         "hooks": [
           {
             "type": "command",
+            "command": "\"$HOME/.claude/scripts/hooks/pre-tool-use-build-hold-guard.sh\""
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/pre-tool-use-change-review-gate.py\""
           }
         ]

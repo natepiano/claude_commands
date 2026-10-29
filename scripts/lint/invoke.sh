@@ -12,6 +12,8 @@
 # invoke_clippy_fix applies fixes; fmt_cargo formats them before invoke_clippy
 # judges the result. Worker verdict keys include this policy file.
 
+if [[ -n "${TMPDIR:-}" && ! -d "$TMPDIR" ]]; then mkdir -p -- "$TMPDIR" || return; fi
+
 [[ -n "${LINT_INVOKE_SOURCED:-}" ]] && return 0
 LINT_INVOKE_SOURCED=1
 
@@ -201,7 +203,7 @@ buildlog_finish_memory() {
 
 # run() returns this when LINT_QUEUE_LEAVE_HOOK (memory_gate.sh) ended the
 # memory wait or natedev's hold wait: the step never started, holds no reservation, leaves no build
-# log row and takes back build_hold_step_started's mark, and BUILDLOG_MEM_WAIT_S
+# log row, and BUILDLOG_MEM_WAIT_S
 # keeps the time it waited. run_nextest passes it through. 75 is EX_TEMPFAIL;
 # neither cargo nor nextest exits with it.
 LINT_LEFT_QUEUE_STATUS=75
@@ -214,17 +216,15 @@ run_once() {
     buildlog_begin "$@" || true
     local sampler_pid="" parent_pid=$BASHPID status=0 memory_wait=0
     if buildlog_step_compiles "$@"; then
-        build_hold_step_started
         while :; do
             buildlog_wait_for_memory "$@"
             memory_wait=$(( memory_wait + BUILDLOG_MEM_WAIT_S ))
             if [[ "$BUILDLOG_MEM_OUTCOME" == LeftQueue ]]; then
                 buildlog_release_memory 0
-                [[ -z "${BUILDLOG_HOLD_STARTED_FILE:-}" ]] || rm -f "$BUILDLOG_HOLD_STARTED_FILE"
                 BUILDLOG_MEM_WAIT_S=$memory_wait BUILDLOG_START="" BUILDLOG_TREE=""
                 return "$LINT_LEFT_QUEUE_STATUS"
             fi
-            if build_hold_check_admission; then
+            if build_hold_check_local; then
                 break
             else
                 status=$?
@@ -238,14 +238,12 @@ run_once() {
                 status=$?
                 BUILDLOG_MEM_WAIT_S=$memory_wait
                 if [[ "$status" == "$LINT_LEFT_QUEUE_STATUS" ]]; then
-                    [[ -z "${BUILDLOG_HOLD_STARTED_FILE:-}" ]] || rm -f "$BUILDLOG_HOLD_STARTED_FILE"
                     BUILDLOG_START="" BUILDLOG_TREE=""
                 fi
                 return "$status"
             }
         done
         BUILDLOG_MEM_WAIT_S=$memory_wait
-        build_hold_mark MemoryGateReturned "$BUILDLOG_MEM_OUTCOME"
     fi
     if [[ -n "${LINT_NEXTEST_SHARE:-}" ]]; then
         nextest_share_claim "$@"

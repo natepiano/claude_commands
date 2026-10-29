@@ -1649,13 +1649,15 @@ def _tip(repo: Path, commit: str) -> RepositoryTip:
         mode, kind, name = metadata.split()
         entries[path] = TreeEntry(mode, kind, name)
     blobs = {path: entry.object for path, entry in entries.items() if entry.kind == "blob"}
-    manifests = {path: content.decode() for path, content in blob_contents(
-        repo, {path: blob for path, blob in blobs.items() if PurePosixPath(path).name == "Cargo.toml"})}
+    configs = (".claude/config/berth.toml", "rustfmt.toml", ".rustfmt.toml")
+    inputs = {path: blob for path, blob in blobs.items() if PurePosixPath(path).name == "Cargo.toml" or path in configs}
+    contents = {path: content.decode(errors="replace") for path, content in blob_contents(repo, inputs)}
+    manifests = {path: text for path, text in contents.items() if PurePosixPath(path).name == "Cargo.toml"}
     directories = tuple(member.directory for member in rule_catalog.workspace_members(manifests))
     ignored: list[str] = []
-    for config in (".claude/config/berth.toml", "rustfmt.toml", ".rustfmt.toml"):
+    for config in configs:
         if config in blobs:
-            ignored.extend(_ignored_paths(_table(tomllib.loads(_git(repo, "show", f"{commit}:{config}")))))
+            ignored.extend(_ignored_paths(_table(tomllib.loads(contents[config]))))
     files = tuple(sorted(path for path in blobs if path.endswith(".rs") and not _is_ignored(path, tuple(ignored))))
     return RepositoryTip(commit, tree, blobs, directories, files, entries)
 
@@ -1957,13 +1959,89 @@ MIGRATIONS = {
             PRIMARY KEY(finding_id, ticket)
         );
     """,
+    25: """
+        CREATE TABLE refill_results (
+            unit TEXT PRIMARY KEY, at TEXT NOT NULL, outcome TEXT NOT NULL,
+            split_at TEXT NOT NULL DEFAULT '', ready INTEGER NOT NULL DEFAULT 0,
+            changed INTEGER NOT NULL DEFAULT 0, structure INTEGER NOT NULL DEFAULT 0,
+            other INTEGER NOT NULL DEFAULT 0
+        );
+        ALTER TABLE held_findings ADD COLUMN built_at TEXT NOT NULL DEFAULT '';
+        UPDATE held_findings SET built_at=COALESCE(
+            (SELECT updated_at FROM tickets WHERE id=held_findings.build_ticket AND state='merged'), updated_at
+        ) WHERE state='built';
+    """,
 }
 
 
+class GitReadCache:
+    """The trees and blob bytes read by one split scan."""
+
+    def __init__(self, repo: Path) -> None:
+        self.repo: Path = repo
+        self.tips: dict[str, RepositoryTip] = {}
+        self.contents: dict[str, bytes] = {}
+        self.warmed: set[str] = set()
+
+    def tip(self, commit: str) -> RepositoryTip:
+        if not re.fullmatch(r"[0-9a-f]{40}", commit):
+            commit = _git(self.repo, "rev-parse", "--verify", f"{commit}^{{commit}}")
+        if commit not in self.tips:
+            self.tips[commit] = _tip(self.repo, commit)
+        return self.tips[commit]
+
+    def read(self, commit: str, paths: Iterable[str]) -> None:
+        tip = self.tip(commit)
+        self.read_blobs(blob for path in paths if (blob := tip.blobs.get(path, "")))
+
+    def read_blobs(self, blobs: Iterable[str]) -> None:
+        """Read each immutable blob once, shared by file and site-proof reads."""
+        unread = {blob: blob for blob in blobs if blob not in self.contents}
+        if unread:
+            self.contents.update(blob_contents(self.repo, unread))
+
+    def warm(self, commit: str) -> None:
+        """Read source and manifest bytes in one batch for the whole tree."""
+        commit = self.tip(commit).commit
+        if commit not in self.warmed:
+            self.read(commit, (path for path in self.tip(commit).blobs if path.endswith((".rs", ".md", ".toml"))))
+            self.warmed.add(commit)
+
+    def blob(self, commit: str, path: str) -> str:
+        try:
+            return self.tip(commit).blobs.get(path, "")
+        except LedgerError:
+            return ""
+
+    def crate_directories(self, commit: str) -> tuple[str, ...]:
+        return self.tip(commit).crate_dirs
+
+    def file(self, commit: str, path: str) -> bytes | Folder | MissingFile:
+        tip = self.tip(commit)
+        if path not in tip.blobs:
+            return Folder() if any(name.startswith(path.rstrip("/") + "/") for name in tip.entries) else MissingFile()
+        self.warm(tip.commit)
+        self.read(tip.commit, (path,))
+        return self.contents[tip.blobs[path]]
+
+    def text(self, commit: str, path: str) -> str:
+        content = self.file(commit, path)
+        return content.decode(errors="replace") if isinstance(content, bytes) else ""
+
+
+@dataclass(frozen=True)
+class NoGitReadCache:
+    """Ordinary ledger operations use their existing read paths."""
+
+
+_NO_GIT_READ_CACHE = NoGitReadCache()
+
+
 class Ledger:
-    def __init__(self, repo: Path, database: Path) -> None:
+    def __init__(self, repo: Path, database: Path, *, git_cache: GitReadCache | NoGitReadCache = _NO_GIT_READ_CACHE) -> None:
         self.repo: Path = repo
         self.database: Path = database
+        self.git_cache: GitReadCache | NoGitReadCache = git_cache
         self._catalog: tuple[Rule, ...] = rule_catalog.load_rules(repo)
         self._tips: dict[str, RepositoryTip] = {}
         self._fingerprints: dict[tuple[str, CellInputScope, str], str] = {}
@@ -2036,10 +2114,11 @@ class Ledger:
         return self._tip(self.synced_commit())
 
     def _tip(self, commit: str) -> RepositoryTip:
-        # Only a full object name is immutable; branch names must resolve afresh.
-        if re.fullmatch(r"[0-9a-f]{40}", commit) and commit in self._tips:
-            return self._tips[commit]
-        commit = _git(self.repo, "rev-parse", "--verify", f"{commit}^{{commit}}")
+        # Only full object names are immutable; resolve branch names before either cache.
+        if not re.fullmatch(r"[0-9a-f]{40}", commit):
+            commit = _git(self.repo, "rev-parse", "--verify", f"{commit}^{{commit}}")
+        if isinstance(self.git_cache, GitReadCache):
+            return self.git_cache.tip(commit)
         if commit not in self._tips:
             self._tips[commit] = _tip(self.repo, commit)
         return self._tips[commit]
@@ -2060,6 +2139,10 @@ class Ledger:
     def _rust_code(self, blob: str) -> RustCode | NotTokenized:
         """What _rust_code reads in a blob, read once."""
         if blob not in self._rust_codes:
+            if isinstance(self.git_cache, GitReadCache):
+                self.git_cache.read_blobs((blob,))
+                self._rust_codes[blob] = _rust_code(self.git_cache.contents[blob])
+                return self._rust_codes[blob]
             result = subprocess.run(["git", "-C", str(self.repo), "cat-file", "blob", blob], capture_output=True, check=False)
             if result.returncode:
                 raise CheckCouldNotRun(result.stderr.decode(errors="replace").strip() or f"git cat-file blob {blob} failed")
@@ -2626,6 +2709,8 @@ class Ledger:
 
     def _file_at(self, commit: str, path: str) -> bytes | Folder | MissingFile:
         """What is at path in commit: a file's bytes, a folder or nothing. A git error raises, so it never reads as nothing."""
+        if isinstance(self.git_cache, GitReadCache):
+            return self.git_cache.file(commit, path)
         entry = _git(self.repo, "ls-tree", commit, "--", path)
         if not entry:
             return MissingFile()
@@ -2717,7 +2802,7 @@ class Ledger:
                         if isinstance(check, AppliedInCode):
                             # A person's reading was of the old build, so a new build clears it.
                             _ = self._connection.execute(
-                                "UPDATE held_findings SET state='built',person_read_by='',updated_at=? WHERE finding_id=?", (now, finding_id),
+                                "UPDATE held_findings SET state='built',person_read_by='',built_at=CASE WHEN built_at='' THEN ? ELSE built_at END,updated_at=? WHERE finding_id=?", (now, now, finding_id),
                             )
                             continue
                         if isinstance(check, RenameNotApplied):
@@ -3310,6 +3395,14 @@ class Ledger:
         ).fetchall())
         return tuple(Path(row[0]) for row in rows)
 
+    def open_build_finding_ids(self) -> frozenset[str]:
+        """Filed findings that a ticket which is not final holds."""
+        rows = cast(list[tuple[str]], self._connection.execute(
+            "SELECT h.finding_id FROM held_findings h JOIN tickets t ON t.id=h.build_ticket "
+            + "WHERE h.state='filed' AND t.state NOT IN ('merged','dropped')",
+        ).fetchall())
+        return frozenset(row[0] for row in rows)
+
     def moved_findings(self, source: Path) -> dict[str, Path]:
         """The decision of each finding that a migration moved from source."""
         rows = cast(list[tuple[str, str]], self._connection.execute(
@@ -3364,7 +3457,7 @@ class Ledger:
                         raise LedgerError(f"{duplicate.finding_id}: build ticket {ticket['id']} still holds the finding")
                 source = finding.state.proposal
                 _ = self._connection.execute(
-                    "UPDATE held_findings SET state='withdrawn',duplicate_of=?,withdrawn_by=0,proposal=?,"
+                    "UPDATE held_findings SET state='withdrawn',built_at='',duplicate_of=?,withdrawn_by=0,proposal=?,"
                     + "moved_from=CASE WHEN ?=proposal THEN moved_from ELSE ? END,updated_at=? WHERE finding_id=?",
                     (duplicate.qualified, str(duplicate.decision), str(duplicate.decision), str(source), now, duplicate.finding_id),
                 )
@@ -3453,7 +3546,7 @@ class Ledger:
                         or any(self.newest_held_judgment(*cell) != read for cell, read in reads.items())):
                     raise ChangedBeforeLock("the findings or their judgments changed while they were declined; rerun")
                 now = _now()
-                _ = self._connection.executemany("UPDATE held_findings SET state='waived',waive_provenance=?,waived_by=?,updated_at=? WHERE finding_id=?",
+                _ = self._connection.executemany("UPDATE held_findings SET state='waived',built_at='',waive_provenance=?,waived_by=?,updated_at=? WHERE finding_id=?",
                                                  [(provenance, by, now, finding.finding_id) for finding in findings])
                 for cell, read in reads.items():
                     if isinstance(read, NewestHeldJudgment) and isinstance(decisions[cell], CellWaived):
@@ -4389,7 +4482,13 @@ class Ledger:
                 blob = tree.blobs.get(finding.path, "")
                 if blob and blob not in self._site_sources:
                     wanted[blob] = blob
-        for blob, content in blob_contents(self.repo, wanted):
+        if isinstance(self.git_cache, GitReadCache):
+            self.git_cache.read_blobs(wanted)
+            cached = self.git_cache.contents
+            contents = ((blob, cached[blob]) for blob in wanted)
+        else:
+            contents = blob_contents(self.repo, wanted)
+        for blob, content in contents:
             try:
                 self._site_sources[blob] = finding_sites.SourceSites(content.decode())
             except UnicodeDecodeError:
@@ -4401,8 +4500,12 @@ class Ledger:
         if not blob:
             return finding_sites.SourceSites("")
         if blob not in self._site_sources:
-            for _, content in blob_contents(self.repo, {path: blob}):
-                self._site_sources[blob] = finding_sites.SourceSites(content.decode())
+            if isinstance(self.git_cache, GitReadCache):
+                self.git_cache.read_blobs((blob,))
+                content = self.git_cache.contents[blob]
+            else:
+                content = next(blob_contents(self.repo, {path: blob}))[1]
+            self._site_sources[blob] = finding_sites.SourceSites(content.decode())
         return self._site_sources[blob]
 
     def _original_site_inputs(self, finding: HeldFinding, read: RepositoryTip, tip: RepositoryTip,
@@ -4999,8 +5102,8 @@ class Ledger:
                 # declaration, in its own file too, so reopen checks that site and its line reads at the tip.
                 _ = self._connection.executemany(
                     "UPDATE held_findings SET state='built',person_read_by='',path=?,line=?,followed_from=?,followed_from_line=?,"
-                    + "followed_at=?,updated_at=? WHERE finding_id=?",
-                    [(item.path, item.line, item.finding.path, item.finding.line, tip.commit, now, item.finding.finding_id)
+                    + "followed_at=?,built_at=CASE WHEN built_at='' THEN ? ELSE built_at END,updated_at=? WHERE finding_id=?",
+                    [(item.path, item.line, item.finding.path, item.finding.line, tip.commit, now, now, item.finding.finding_id)
                      for item in renames],
                 )
                 _ = self._connection.executemany(
@@ -5047,8 +5150,9 @@ class Ledger:
                 if current != finding or merged_build_ticket(current) != ticket:
                     raise ChangedBeforeLock(f"{finding_id}: the finding changed while it was marked built; rerun")
                 # A person's reading was of the old build, so a new build clears it.
-                _ = self._connection.execute("UPDATE held_findings SET state='built',person_read_by='',updated_at=? WHERE finding_id=?",
-                                             (_now(), finding_id))
+                now = _now()
+                _ = self._connection.execute("UPDATE held_findings SET state='built',person_read_by='',built_at=CASE WHEN built_at='' THEN ? ELSE built_at END,updated_at=? WHERE finding_id=?",
+                                             (now, now, finding_id))
 
         return retry_on_change(attempt)
 
@@ -5109,8 +5213,8 @@ class Ledger:
                 for item in built:
                     by = item.reading.by if isinstance(item.reading, ReadByPerson) else ""
                     _ = self._connection.execute(
-                        "UPDATE held_findings SET state='built',person_read_by=?,updated_at=? WHERE finding_id=?",
-                        (by, now, item.finding_id),
+                        "UPDATE held_findings SET state='built',person_read_by=?,built_at=CASE WHEN built_at='' THEN ? ELSE built_at END,updated_at=? WHERE finding_id=?",
+                        (by, now, now, item.finding_id),
                     )
             return tuple(built)
 
@@ -5169,7 +5273,7 @@ class Ledger:
         cells = {(finding.rule, _finding_cell(self._component_rule(finding.rule), finding.path, tip)) for finding in findings}
         now = _now()
         _ = self._connection.executemany(
-            "UPDATE held_findings SET state='unfiled',proposal='',build_ticket='',moved_from='',updated_at=? WHERE finding_id=?",
+            "UPDATE held_findings SET state='unfiled',proposal='',build_ticket='',moved_from='',built_at='',updated_at=? WHERE finding_id=?",
             [(now, finding.finding_id) for finding in findings],
         )
         for rule, path in sorted(cells):
@@ -5250,7 +5354,7 @@ class Ledger:
                 if not isinstance(self._held(finding_id).state, Built):
                     raise LedgerError(f"{finding_id}: finding is not built")
                 _ = self._connection.execute(
-                    "UPDATE held_findings SET state='filed',build_ticket='',updated_at=? WHERE finding_id=?", (now, finding_id),
+                    "UPDATE held_findings SET state='filed',build_ticket='',built_at='',updated_at=? WHERE finding_id=?", (now, finding_id),
                 )
                 reading = refilings[finding_id]
                 if isinstance(reading, ReadByPerson):
@@ -5281,7 +5385,7 @@ class Ledger:
             # A unit cannot relabel an existing waive. A person's explicit waive protects it from replacement.
             if isinstance(finding.state, Withdrawn) or isinstance(finding.state, Waived) and isinstance(actor, WaiveByUnit):
                 return
-            _ = self._connection.execute("UPDATE held_findings SET state='waived',waive_provenance=?,waived_by=?,updated_at=? WHERE finding_id=?",
+            _ = self._connection.execute("UPDATE held_findings SET state='waived',built_at='',waive_provenance=?,waived_by=?,updated_at=? WHERE finding_id=?",
                                          (provenance, by, _now(), finding_id))
 
     def reconcile(self, branch_point: str, style_branch: str) -> tuple[str, ...]:
@@ -5955,6 +6059,61 @@ def open_ledger(repo: Path) -> Ledger:
     return Ledger(location.repo, location.database)
 
 
+def record_refill(repo: Path, unit: str, outcome: str) -> None:
+    """Save a refill result without loading rules or changing the schema."""
+    database = ledger_location(repo).database
+    if not database.is_file():
+        return
+    with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=rw", uri=True,
+                                timeout=BUSY_TIMEOUT_SECONDS)) as connection, connection:
+        if not connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='refill_results'").fetchone():
+            return
+        now = _now()
+        _ = connection.execute(
+            "INSERT INTO refill_results(unit,at,outcome) VALUES (?,?,?) "
+            + "ON CONFLICT(unit) DO UPDATE SET at=excluded.at,outcome=excluded.outcome",
+            (unit, now, outcome),
+        )
+
+
+@dataclass(frozen=True)
+class RecordedSplit:
+    ready: int
+    changed: int
+    structure: int
+    other: int
+    measured_at: str
+
+
+@dataclass(frozen=True)
+class NoSplitRecorded:
+    """The unit has no completed split scan."""
+
+
+def require_split_table(repo: Path) -> None:
+    """Refuse an old stored schema before a split scans its backup."""
+    database = ledger_location(repo).database
+    with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True,
+                                timeout=BUSY_TIMEOUT_SECONDS)) as connection:
+        if not connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='refill_results'").fetchone():
+            raise LedgerError("ledger has no refill_results (schema below 25)")
+
+
+def record_split(repo: Path, unit: str, split: RecordedSplit, *,
+                 busy_timeout_seconds: float = BUSY_TIMEOUT_SECONDS) -> None:
+    """Save a complete split without changing the last refill result."""
+    database = ledger_location(repo).database
+    with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=rw", uri=True,
+                                timeout=busy_timeout_seconds)) as connection, connection:
+        _ = connection.execute(
+            "INSERT INTO refill_results(unit,at,outcome,split_at,ready,changed,structure,other) "
+            + "VALUES (?,'','',?,?,?,?,?) ON CONFLICT(unit) DO UPDATE SET "
+            + "split_at=excluded.split_at,ready=excluded.ready,changed=excluded.changed,"
+            + "structure=excluded.structure,other=excluded.other",
+            (unit, split.measured_at, split.ready, split.changed, split.structure, split.other),
+        )
+
+
 @contextmanager
 def refill_lock(repo: Path) -> Generator[None]:
     """Serialize refill selection for units that share a ledger."""
@@ -5966,7 +6125,7 @@ def refill_lock(repo: Path) -> Generator[None]:
 
 
 @contextmanager
-def preview_ledger(repo: Path) -> Generator[Ledger]:
+def preview_ledger(repo: Path, *, git_cache: GitReadCache | NoGitReadCache = _NO_GIT_READ_CACHE) -> Generator[Ledger]:
     """Read and migrate a temporary copy without changing the stored ledger."""
     location = ledger_location(repo)
     with tempfile.TemporaryDirectory(prefix="style-ledger-preview-") as directory:
@@ -5976,7 +6135,7 @@ def preview_ledger(repo: Path) -> Generator[Ledger]:
                                           timeout=BUSY_TIMEOUT_SECONDS)) as source,
                   closing(sqlite3.connect(database, timeout=BUSY_TIMEOUT_SECONDS)) as destination):
                 source.backup(destination)
-        with Ledger(location.repo, database) as ledger:
+        with Ledger(location.repo, database, git_cache=git_cache) as ledger:
             yield ledger
 
 

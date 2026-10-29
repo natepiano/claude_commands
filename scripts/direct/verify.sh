@@ -162,6 +162,7 @@
 # the same command unsandboxed; anything else is the underlying tool status.
 
 set -euo pipefail
+if [[ -n "${TMPDIR:-}" && ! -d "$TMPDIR" ]]; then mkdir -p -- "$TMPDIR"; fi
 BUILD_OVERRIDE_GUARD_DIR="${BASH_SOURCE[0]%/*}"
 [[ "$BUILD_OVERRIDE_GUARD_DIR" != "${BASH_SOURCE[0]}" ]] || BUILD_OVERRIDE_GUARD_DIR=.
 source "$BUILD_OVERRIDE_GUARD_DIR/../build_hold/override_guard.sh" || exit 2
@@ -929,9 +930,6 @@ interrupt_hold_wait() {
 finish_hold_wait() {
     collect_hold_wait
     if [[ -n "$HOLD_WAIT_DIR" ]]; then
-        if [[ -n "${BUILDLOG_HOLD_REGISTRATION_FILE:-}" && -f "$BUILDLOG_HOLD_REGISTRATION_FILE" ]]; then
-            python3 "$BUILD_TARGETS_SCRIPT" finish-local --call-id "$BUILDLOG_CALL_ID" >/dev/null 2>&1 || true
-        fi
         rm -rf "$HOLD_WAIT_DIR"
         HOLD_WAIT_DIR=""
     fi
@@ -1125,11 +1123,12 @@ COPY_WORD="" COPY_MAC="" COPY_REASON="" COPY_SECONDS="" COPY_RUNNER_STATUS="" CO
 MAC_RESULT_FILE=""
 MAC_LOG_FILE=""
 MAC_RUNNER_PID=""
-# The Mac settings a local test may still leave for (run_local_test): a Mac
-# that declined busy or blocked. MAC_LEAVE_REASON is that decline, passed back
-# as --last-decline.
+# A waiting local test can still leave for this eligible Mac. Non-busy
+# declines set a retry deadline; busy and blocked use the normal poll.
 MAC_LEAVE_SETTINGS=""
 MAC_LEAVE_REASON=""
+MAC_RETRY_AFTER=0
+MAC_RETRY_NOTICE_SHOWN=0
 
 forward_mac_runner_signal() {
     local signal_name=$1 exit_status=$2
@@ -1162,7 +1161,7 @@ try_mac_test() {
     local result_seconds="" result_holder="" mac_words=0 line
     local runner_args=(run --repo-root "$(git rev-parse --show-toplevel)"
         --package "$PKG" --call-id "$BUILDLOG_CALL_ID" --settings "$1")
-    if [[ $# -gt 1 ]]; then
+    if [[ "${2:-}" == busy || "${2:-}" == blocked ]]; then
         runner_args+=(--last-decline "$2")
     fi
     MAC_RESULT_FILE="$(mktemp)"
@@ -1266,20 +1265,9 @@ finish_mac_pass() {
     exit 0
 }
 
-# Registration is local demand, not a reservation to retain while another
-# target runs. A successful withdrawal also discards the old admission stamp.
-withdraw_local_demand() {
-    if [[ -f "$BUILDLOG_HOLD_REGISTRATION_FILE" ]]; then
-        local status=0
-        python3 "$BUILD_TARGETS_SCRIPT" finish-local --call-id "$BUILDLOG_CALL_ID" || status=$?
-        if [[ "$status" != 0 ]]; then exit "$status"; fi
-        rm -f "$BUILDLOG_HOLD_REGISTRATION_FILE" "$BUILDLOG_HOLD_ADMISSION_FILE"
-    fi
-}
-
-# The helper still diagnoses every registration. Show its stderr again only
+# The helper checks the hold on every poll. Show its stderr again only
 # when the holder, reason or escalation message changes during this wait.
-register_routing_demand() {
+check_routing_hold() {
     local admission=0
     if build_hold_nothing_held; then return 0; fi
     python3 "$BUILD_TARGETS_SCRIPT" register-local --call-id "$BUILDLOG_CALL_ID" --pid $$ \
@@ -1291,15 +1279,39 @@ register_routing_demand() {
     return "$admission"
 }
 
-# Status 0 when mac_test.py says a claim for this repository made now could
-# start a run on the Mac these settings name: local records only, no SSH.
-mac_free_now() {
-    "$PY" "$MAC_TEST_SCRIPT" free-now --settings "$1" --repo-root "$(git rev-parse --show-toplevel)" >/dev/null 2>&1
+# Keep one retry rule for routing and local memory or hold waits.
+remember_mac_retry() {
+    case "$BUILDLOG_MAC:$BUILDLOG_MAC_REASON" in
+        declined:no_tests|declined:off|declined:repo|declined:linux_only|declined:local_flag)
+            if [[ "$MAC_LEAVE_SETTINGS" == "$1" ]]; then
+                MAC_LEAVE_SETTINGS="" MAC_LEAVE_REASON="" MAC_RETRY_AFTER=0
+            fi
+            return 1 ;;
+    esac
+    MAC_LEAVE_SETTINGS="$1" MAC_LEAVE_REASON="$BUILDLOG_MAC_REASON" MAC_RETRY_AFTER=0
+    if [[ "$BUILDLOG_MAC" != declined || ( "$BUILDLOG_MAC_REASON" != busy && "$BUILDLOG_MAC_REASON" != blocked ) ]]; then
+        MAC_RETRY_AFTER="$("$PY" -c 'import time; print(time.monotonic() + 180)')"
+        if [[ "$MAC_RETRY_NOTICE_SHOWN" == 0 ]]; then
+            echo "verify.sh: Mac attempt ended ($BUILDLOG_MAC${BUILDLOG_MAC_REASON:+: $BUILDLOG_MAC_REASON}); waiting 180 s before each retry while natedev waits." >&2
+            MAC_RETRY_NOTICE_SHOWN=1
+        fi
+    fi
+}
+
+# The same command gates routing retries and both local wait hooks. The
+# deadline uses the call's monotonic clock. free-now reads local state only.
+mac_retry_hook() {
+    if [[ "$2" != 0 ]]; then
+        printf '%q ' "$PY" -c 'import sys, time; sys.exit(time.monotonic() < float(sys.argv[1]))' "$2"
+        printf '&& '
+    fi
+    printf '%q ' "$PY" "$MAC_TEST_SCRIPT" free-now --settings "$1" \
+        --repo-root "$(git rev-parse --show-toplevel)"
 }
 
 route_test() {
     local table name eligibility reason settings admission=0 announced_reason="" retry_index
-    local retry_settings=() retry_reasons=()
+    local retry_settings=() retry_reasons=() retry_after=()
     local eligible_args=(eligible --repo-root "$(git rev-parse --show-toplevel)" --package "$PKG")
     if [[ "$LOCAL_ONLY" -eq 1 ]]; then
         eligible_args+=(--local "$LOCAL_REASON")
@@ -1322,7 +1334,7 @@ route_test() {
         [[ "$eligibility" == eligible ]] || continue
         if [[ "$settings" == - ]]; then
             admission=0
-            build_hold_check_admission || admission=$?
+            check_routing_hold || admission=$?
             case "$admission" in
                 0) return 0 ;;
                 10|12) continue ;;
@@ -1331,24 +1343,17 @@ route_test() {
         fi
         [[ -f "$MAC_RUNNER" ]] || continue
         try_mac_test "$settings"
-        if [[ "$BUILDLOG_MAC" == declined && ( "$BUILDLOG_MAC_REASON" == busy || "$BUILDLOG_MAC_REASON" == blocked ) ]]; then
+        if remember_mac_retry "$settings"; then
             retry_settings+=("$settings")
-            retry_reasons+=("$BUILDLOG_MAC_REASON")
-            if [[ -z "$MAC_LEAVE_SETTINGS" ]]; then
-                MAC_LEAVE_SETTINGS="$settings" MAC_LEAVE_REASON="$BUILDLOG_MAC_REASON"
-            fi
-        else
-            # A lost attempt or another decline needs the existing local
-            # wait, without more Mac tries.
-            MAC_LEAVE_SETTINGS="" MAC_LEAVE_REASON=""
-            return 0
+            retry_reasons+=("$MAC_LEAVE_REASON")
+            retry_after+=("$MAC_RETRY_AFTER")
         fi
     done <<< "$table"
 
     [[ ${#retry_settings[@]} -gt 0 ]] || return 0
     while true; do
         admission=0
-        register_routing_demand || admission=$?
+        check_routing_hold || admission=$?
         case "$admission" in
             0) collect_routing_wait; return 0 ;;
             10) ;;
@@ -1366,31 +1371,29 @@ route_test() {
         wait "$HOLD_WAITER_PID"
         HOLD_WAITER_PID=""
 
-        # A Mac that freed wins over a release turn: try it before renewing
-        # demand, which a release may already have admitted. The demand is
-        # withdrawn before a Mac attempt (see withdraw_local_demand), so
-        # free-now gates the attempt: a busy Mac must not cost a held turn.
+        # Try a free Mac before checking natedev again.
         for ((retry_index=0; retry_index<${#retry_settings[@]}; retry_index++)); do
-            mac_free_now "${retry_settings[$retry_index]}" || continue
+            [[ -n "${retry_settings[$retry_index]}" ]] || continue
+            eval "$(mac_retry_hook "${retry_settings[$retry_index]}" "${retry_after[$retry_index]}")" >/dev/null 2>&1 || continue
             collect_routing_wait
-            withdraw_local_demand
             try_mac_test "${retry_settings[$retry_index]}" "${retry_reasons[$retry_index]}"
-            if [[ "$BUILDLOG_MAC" != declined || ( "$BUILDLOG_MAC_REASON" != busy && "$BUILDLOG_MAC_REASON" != blocked ) ]]; then
-                MAC_LEAVE_SETTINGS="" MAC_LEAVE_REASON=""
-                return 0
+            if ! remember_mac_retry "${retry_settings[$retry_index]}"; then
+                retry_settings[$retry_index]=""
+                continue
             fi
-            # A declined claim is more hold wait; a runner that executes tests
-            # returns or exits above, so its runtime is never added here.
-            printf '%s\n' "${BUILDLOG_MAC_S:-0}" >> "$BUILDLOG_HOLD_WAIT_FILE"
-            retry_reasons[$retry_index]="$BUILDLOG_MAC_REASON"
-            if [[ "${retry_settings[$retry_index]}" == "$MAC_LEAVE_SETTINGS" ]]; then
-                MAC_LEAVE_REASON="$BUILDLOG_MAC_REASON"
+            # Count declined claims as hold wait. A lost run may have run
+            # tests, so its runtime does not count as hold wait.
+            if [[ "$BUILDLOG_MAC" == declined ]]; then
+                printf '%s\n' "${BUILDLOG_MAC_S:-0}" >> "$BUILDLOG_HOLD_WAIT_FILE"
             fi
+            retry_reasons[$retry_index]="$MAC_LEAVE_REASON"
+            retry_after[$retry_index]="$MAC_RETRY_AFTER"
             if [[ "$announced_reason" != "$BUILDLOG_MAC_REASON" ]]; then
                 echo "verify.sh: waiting for the Mac ($BUILDLOG_MAC_REASON) or natedev's release." >&2
                 announced_reason="$BUILDLOG_MAC_REASON"
             fi
         done
+        [[ -n "$(printf '%s' "${retry_settings[@]}")" ]] || return 0
     done
 }
 
@@ -1477,8 +1480,8 @@ finish_copy_win() {
 # Runs the tests on natedev. While MAC_LEAVE_SETTINGS names a Mac, a run held
 # in the memory wait leaves once mac_test.py free-now says that Mac is free,
 # and its Mac result counts as one from route_test: a failure or a pass ends
-# the call; busy or blocked waits here again, still free to leave; a lost run
-# or another decline runs here with no way out. Once the step compiles,
+# the call. Other results keep the hook unless the Mac excludes this test.
+# Non-busy declines wait for the retry deadline. Once the step compiles,
 # copy_watch.py may run a copy on the Mac; a copy result that finishes first
 # ends the call (finish_copy_win).
 run_local_test() {
@@ -1487,8 +1490,7 @@ run_local_test() {
         hook=""
         copy_watch=0
         if [[ -n "$MAC_LEAVE_SETTINGS" ]]; then
-            hook="$(printf '%q ' "$PY" "$MAC_TEST_SCRIPT" free-now --settings "$MAC_LEAVE_SETTINGS" \
-                --repo-root "$(git rev-parse --show-toplevel)")"
+            hook="$(mac_retry_hook "$MAC_LEAVE_SETTINGS" "$MAC_RETRY_AFTER")"
             if [[ -f "$MAC_COPY_WATCH" && -f "$MAC_RUNNER" ]]; then
                 copy_watch=1
             fi
@@ -1514,14 +1516,9 @@ run_local_test() {
         if [[ -z "$hook" || "$status" -ne "$LINT_LEFT_QUEUE_STATUS" ]]; then
             return "$status"
         fi
-        # The step never started; its hold turn goes to the next session.
-        withdraw_local_demand
+        # The step never started and has no memory reservation.
         try_mac_test "$MAC_LEAVE_SETTINGS" "$MAC_LEAVE_REASON"
-        if [[ "$BUILDLOG_MAC" == declined && ( "$BUILDLOG_MAC_REASON" == busy || "$BUILDLOG_MAC_REASON" == blocked ) ]]; then
-            MAC_LEAVE_REASON="$BUILDLOG_MAC_REASON"
-        else
-            MAC_LEAVE_SETTINGS="" MAC_LEAVE_REASON=""
-        fi
+        remember_mac_retry "$MAC_LEAVE_SETTINGS" || true
     done
 }
 
@@ -1694,10 +1691,7 @@ fi
 
 HOLD_WAIT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-hold.$$.XXXXXX")"
 export BUILDLOG_HOLD_WAIT_FILE="$HOLD_WAIT_DIR/seconds"
-export BUILDLOG_HOLD_ADMISSION_FILE="$HOLD_WAIT_DIR/admission"
-export BUILDLOG_HOLD_STARTED_FILE="$HOLD_WAIT_DIR/started"
 export BUILDLOG_HOLD_WAITER_FILE="$HOLD_WAIT_DIR/waiter"
-export BUILDLOG_HOLD_REGISTRATION_FILE="$HOLD_WAIT_DIR/registration"
 trap 'hold_status=$?; interrupt_hold_wait; finish_hold_wait; exit "$hold_status"' EXIT
 hold_interrupted() {
     local signal_name=$1 code=$2
@@ -1717,14 +1711,24 @@ if [[ "$CMD" == test ]]; then
     compose_nextest_args
     route_test
 fi
-if ! build_hold_nothing_held; then
-    python3 "$BUILD_TARGETS_SCRIPT" wait-local --call-id "$BUILDLOG_CALL_ID" --pid $$ &
+while ! build_hold_nothing_held; do
+    HOLD_WAIT_ARGS=(wait-local --call-id "$BUILDLOG_CALL_ID" --pid $$)
+    if [[ "$CMD" == test && -n "$MAC_LEAVE_SETTINGS" ]]; then
+        HOLD_WAIT_ARGS+=(--leave-hook "$(mac_retry_hook "$MAC_LEAVE_SETTINGS" "$MAC_RETRY_AFTER")")
+    fi
+    python3 "$BUILD_TARGETS_SCRIPT" "${HOLD_WAIT_ARGS[@]}" &
     HOLD_WAITER_PID=$!
     HOLD_WAIT_STATUS=0
     wait "$HOLD_WAITER_PID" || HOLD_WAIT_STATUS=$?
     HOLD_WAITER_PID=""
+    if [[ "$HOLD_WAIT_STATUS" == "$LINT_LEFT_QUEUE_STATUS" && -n "$MAC_LEAVE_SETTINGS" ]]; then
+        try_mac_test "$MAC_LEAVE_SETTINGS" "$MAC_LEAVE_REASON"
+        remember_mac_retry "$MAC_LEAVE_SETTINGS" || true
+        continue
+    fi
     if [[ "$HOLD_WAIT_STATUS" != 0 ]]; then exit "$HOLD_WAIT_STATUS"; fi
-fi
+    break
+done
 trap - INT TERM HUP
 
 # Open a progress window for the duration of this run when a worker session is
