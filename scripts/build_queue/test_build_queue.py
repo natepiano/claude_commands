@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
+import fcntl
 import io
 import json
 import os
@@ -31,6 +32,7 @@ class QueueTests(unittest.TestCase):
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILDLOG_PROC": str(self.root / "proc"),
             "BUILDLOG_MEMINFO": str(self.root / "meminfo"),
+            "BUILDLOG_MEMORY_PRESSURE": str(self.root / "pressure"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "USER_ZONE": "America/New_York",
         })))
@@ -59,11 +61,11 @@ class QueueTests(unittest.TestCase):
         self.assertTrue(lines[0].endswith("needs 10.9 GiB; 23.1 free; ready for the next admission check"))
         self.assertNotIn("promised", lines[1])
 
-    def test_memory_reason_charges_only_pending_starts_and_names_earlyoom_reserve(self) -> None:
+    def test_memory_reason_names_free_memory_and_earlyoom_reserve(self) -> None:
         pending = int(23.5 * GIB)
         waiting = memory_admit.WaitingStep(
             10, "waiting-id", "unit", "check", "/tmp/tree", NOW - 2400,
-            int(11.6 * GIB), memory_admit.NeedsMemory(int(11.6 * GIB), int(23.1 * GIB), 2, pending),
+            int(11.6 * GIB), memory_admit.NeedsMemory(int(11.6 * GIB), int(23.1 * GIB)),
         )
         running = (
             memory_admit.RunningStep("one", "", "test", "/one", 12 * GIB, memory_admit.PromisedMemory(12 * GIB)),
@@ -73,7 +75,36 @@ class QueueTests(unittest.TestCase):
         view = memory_admit.QueueView((waiting,), running, int(23.1 * GIB), pending, 3 * GIB, NOW)
         line = build_queue.render_queue(view, ZoneInfo("UTC"))[0]
         self.assertTrue(line.endswith(
-            "needs 11.6 GiB; 23.1 free; 3.0 kept for earlyoom; 23.5 promised to 2 starting steps"))
+            "needs 11.6 GiB; 23.1 free; 3.0 kept for earlyoom"))
+
+    def test_budget_reason_names_charged_builds_and_the_limit(self) -> None:
+        waiting = memory_admit.WaitingStep(
+            10, "waiting-id", "unit", "check", "/tmp/tree", NOW - 300,
+            int(10.8 * GIB), memory_admit.NeedsBuildBudget(int(10.8 * GIB), int(17.6 * GIB), 20 * GIB),
+        )
+        view = memory_admit.QueueView((waiting,), (), 30 * GIB, 0, 3 * GIB, NOW)
+        line = build_queue.render_queue(view, ZoneInfo("UTC"))[0]
+        self.assertTrue(line.endswith("needs 10.8 GiB; builds 17.6 of 20.0 GiB budget"))
+
+    def test_live_queue_pressure_reason_reaches_the_cli(self) -> None:
+        process = self.root / "proc/100"
+        process.mkdir()
+        fields = ["S", "1", *(["0"] * 17), "100"]
+        _ = (process / "stat").write_text(f"100 (verify) {' '.join(fields)}\n")
+        directory = self.root / "buildlog/admission"
+        directory.mkdir(parents=True)
+        _ = (directory / "100.waiting").write_text(json.dumps({
+            "pid": 100, "start_time": "100", "need": 8 * GIB, "since": NOW,
+            "session_name": "unit", "step": "check", "folder": "/tree",
+        }))
+        _ = (self.root / "pressure").write_text("full avg10=23.4 avg60=1.0 total=1\n")
+        output = io.StringIO()
+        with mock.patch("sys.argv", ["build_queue.py"]), redirect_stdout(output):
+            self.assertEqual(build_queue.main(), 0)
+        self.assertIn("unit: check in /tree", output.getvalue())
+        self.assertIn("memory pressure: full avg10 23.4", output.getvalue())
+        self.assertNotIn("swap", output.getvalue())
+        self.assertNotIn("ready", output.getvalue())
 
     def test_unavailable_reading_does_not_claim_zero_free_memory(self) -> None:
         step = memory_admit.WaitingStep(
@@ -114,10 +145,24 @@ class QueueTests(unittest.TestCase):
         read.assert_called_once_with()
         self.assertEqual(output.getvalue(), "memory queue: empty\n")
 
+    def test_cli_reports_admission_lock_timeout_with_status_two(self) -> None:
+        directory = self.root / "buildlog/admission"
+        directory.mkdir(parents=True)
+        errors = io.StringIO()
+        output = io.StringIO()
+        with (directory / "lock").open("a+") as lock, \
+             mock.patch.object(memory_admit, "QUEUE_LOCK_TIMEOUT_SECONDS", 0.03), \
+             mock.patch("sys.argv", ["build_queue.py"]), \
+             redirect_stderr(errors), redirect_stdout(output):
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.assertEqual(build_queue.main(), 2)
+        self.assertEqual(errors.getvalue(), "build queue: admission lock busy for 0.03 s; try again\n")
+        self.assertEqual(output.getvalue(), "")
+
     def test_ten_thousand_waiting_and_running_rows_render_in_under_one_second(self) -> None:
         waiting = tuple(memory_admit.WaitingStep(
             pid, f"session-{pid}", "", "check", f"/tmp/tree-{pid}", NOW - pid,
-            12 * GIB, memory_admit.NeedsMemory(12 * GIB, 20 * GIB, 2, 10 * GIB),
+            12 * GIB, memory_admit.NeedsMemory(12 * GIB, 20 * GIB),
         ) for pid in range(10000))
         running = tuple(memory_admit.RunningStep(
             f"session-{pid}", "", "test", f"/tmp/tree-{pid}", 8 * GIB, memory_admit.MeasuredMemory(GIB),

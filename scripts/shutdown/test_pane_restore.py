@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from collections.abc import Mapping
 from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
@@ -79,7 +80,12 @@ class PaneRestoreTests(unittest.TestCase):
         self.config = self.root / ".claude3"
         (self.config / "projects/work").mkdir(parents=True)
         _ = (self.config / "projects/work/sid-alpha.jsonl").write_text("{}\n")
-        for patcher in (mock.patch.object(pane_record, "RECORD_DIR", self.root / "herdr-panes"),
+        def no_envrc(directory: Path, environment: Mapping[str, str]) -> herdr.nix_env.NoEnvrc:
+            _ = directory
+            return herdr.nix_env.NoEnvrc(dict(environment))
+
+        for patcher in (mock.patch.object(herdr.nix_env, "ensure", side_effect=no_envrc),
+                        mock.patch.object(pane_record, "RECORD_DIR", self.root / "herdr-panes"),
                         mock.patch.object(pane_record, "PROC", self.root / "proc"),
                         mock.patch.dict(os.environ, {"HOME": str(self.root)}),
                         mock.patch.object(pane_restore, "all_session_records", self.records),

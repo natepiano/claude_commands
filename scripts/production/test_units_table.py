@@ -260,8 +260,8 @@ class UnitsTableTests(unittest.TestCase):
                   "types-unit": {"unavailable": "worktree cannot be read"}})),
               contextlib.redirect_stdout(output)):
             self.assertEqual(units_table.main(["--production", str(doc)]), 0)
-        self.assertIn("| names | #12 · read · alpha · 1 finding | — | 0 (0 in 24 h) | 1 |", output.getvalue())
-        self.assertIn("| types | idle | — | 0 (0 in 24 h) | 0 |", output.getvalue())
+        self.assertIn("| names | #12 · read · alpha · 1 finding | starting 1 finding | — | 0 (0) | 1 |", output.getvalue())
+        self.assertIn("| types | idle | idle | — | 0 (0) | 0 |", output.getvalue())
         self.assertFalse((self.root / "retained").exists())
 
     def test_production_of_reads_the_timer_addressed_to_the_session(self) -> None:

@@ -45,10 +45,15 @@ class Refill(NamedTuple):
     outcome: str
 
 
+class NoTicket(NamedTuple):
+    """The unit has no assigned or checkpointed ticket."""
+
+
 class FamilyCounts(NamedTuple):
     built: int = 0
     left: int = 0
     recent: int = 0
+    filed: int = 0
 
 
 class FindingGroup(NamedTuple):
@@ -78,6 +83,7 @@ class LedgerSnapshot:
     refills: dict[str, Refill] = field(default_factory=dict)
     counts: dict[str, FamilyCounts] = field(default_factory=dict)
     splits: dict[str, style_ledger.RecordedSplit] = field(default_factory=dict)
+    total_filed: int = 0
 
 
 def parsed_time(value: str) -> datetime | TimeUnavailable:
@@ -142,7 +148,9 @@ def read_snapshot(database: Path, now: datetime, decision_folder: Path,
             }
         if not finding_columns:
             return snapshot
-        built_at = "h.built_at" if "built_at" in finding_columns else "''"
+        built_at = "h.built_at" if "built_at" in finding_columns else "h.updated_at"
+        if "built_at" not in finding_columns and ticket_columns and "build_ticket" in finding_columns:
+            built_at = style_ledger.legacy_built_at_sql("h")
         build_ticket = "build_ticket" if "build_ticket" in finding_columns else "''"
         ticket_families: dict[str, str] = {}
         if ticket_columns:
@@ -154,6 +162,8 @@ def read_snapshot(database: Path, now: datetime, decision_folder: Path,
         ).fetchall())
         for row in grouped:
             finding = FindingGroup(*row)
+            if finding.state == "filed":
+                snapshot.total_filed += finding.findings
             path = (decision_folder / Path(finding.proposal).expanduser()).resolve()
             if path not in decisions:
                 decisions[path] = decision_family(path)
@@ -173,6 +183,7 @@ def read_snapshot(database: Path, now: datetime, decision_folder: Path,
                 counts.built + (finding.findings if finding.state == "built" else 0),
                 counts.left + (finding.findings if finding.state == "filed" and approved else 0),
                 counts.recent + (finding.findings if recent else 0),
+                counts.filed + (finding.findings if finding.state == "filed" else 0),
             )
     return snapshot
 
@@ -185,19 +196,23 @@ def json_items(value: str) -> list[object]:
     return cast(list[object], decoded) if isinstance(decoded, list) else []
 
 
-def ticket_cell(ticket: Ticket) -> str:
-    rule = Path(ticket.rule).stem
-    if not rule:
-        stems = [Path(value).stem for value in json_items(ticket.rules) if isinstance(value, str)]
-        rule = stems[0] + (f"+{len(stems) - 1}" if len(stems) > 1 else "") if stems else unit_table_cells.NONE
+def ticket_work(ticket: Ticket) -> str:
     if ticket.kind == "proposal":
         count, noun = len(json_items(ticket.finding_ids)), "finding"
     elif ticket.kind == "listed":
         count, noun = len(json_items(ticket.sites)), "site"
     else:
         count, noun = len(json_items(ticket.files)), "file"
+    return f"{count:,} {noun}{'' if count == 1 else 's'}"
+
+
+def ticket_cell(ticket: Ticket) -> str:
+    rule = Path(ticket.rule).stem
+    if not rule:
+        stems = [Path(value).stem for value in json_items(ticket.rules) if isinstance(value, str)]
+        rule = stems[0] + (f"+{len(stems) - 1}" if len(stems) > 1 else "") if stems else unit_table_cells.NONE
     number = ticket.id.removeprefix(ticket.unit + "-")
-    return f"#{number} · {rule} · {ticket.crate} · {count:,} {noun}{'' if count == 1 else 's'}"
+    return f"#{number} · {rule} · {ticket.crate} · {ticket_work(ticket)}"
 
 
 def record_fields(record: object) -> dict[str, object]:
@@ -211,19 +226,29 @@ def newest_step(record: object) -> unit_table_cells.OpenStep | unit_table_cells.
     return unit_table_cells.open_step(unit_table_cells.run_events(runs[-1])) if runs else unit_table_cells.NoOpenStep()
 
 
-def format_step(record: object, checkpointed: bool, zone: tzinfo,
-                step: unit_table_cells.OpenStep | unit_table_cells.NoOpenStep) -> str:
-    label = step.label if isinstance(step, unit_table_cells.OpenStep) and step.label else (
-        "checkpoint sent" if checkpointed else unit_table_cells.NONE)
+def format_step(step: unit_table_cells.OpenStep | unit_table_cells.NoOpenStep,
+                ticket: Ticket | NoTicket, idle: str) -> str:
+    wording = {
+        "impl": f"writing {ticket_work(ticket)}" if isinstance(ticket, Ticket) else "writing",
+        "fix": "fixing review findings",
+        "review": "reviewing",
+        "test": "testing",
+        "checkpoint sent": "waiting for the showrunner to merge",
+    }
+    if isinstance(step, unit_table_cells.OpenStep):
+        label, activity = step.label.strip(), step.text.strip()
+        generic = {*wording, *wording.values(), "writing"}
+        if activity and activity.casefold() not in generic:
+            return activity
+        return wording.get(label.casefold(), label or unit_table_cells.NONE)
+    if isinstance(ticket, Ticket):
+        return wording["checkpoint sent"] if ticket.state == "checkpointed" else f"starting {ticket_work(ticket)}"
+    return idle
+
+
+def eta_cell(record: object, zone: tzinfo) -> str:
     eta = record_fields(record_fields(record_fields(record).get("current")).get("eta")).get("time")
-    if isinstance(eta, str):
-        eta_text = f"ETA {clock(eta, zone)}"
-        label = eta_text if label == unit_table_cells.NONE else f"{label} · {eta_text}"
-    return label
-
-
-def step_cell(record: object, checkpointed: bool, zone: tzinfo) -> str:
-    return format_step(record, checkpointed, zone, newest_step(record))
+    return clock(eta, zone) if isinstance(eta, str) else unit_table_cells.NONE
 
 
 def unit_steps(units: list[live_units.LiveUnit], records: dict[str, object]
@@ -231,10 +256,10 @@ def unit_steps(units: list[live_units.LiveUnit], records: dict[str, object]
     return {unit.unit: newest_step(records.get(unit.unit)) for unit in units}
 
 
-def left_cell(total: int, split: style_ledger.RecordedSplit | style_ledger.NoSplitRecorded,
+def left_cell(approved: int, filed: int, split: style_ledger.RecordedSplit | style_ledger.NoSplitRecorded,
               now: datetime) -> str:
     """Show the last measured split and its whole-minute age."""
-    text = f"{total:,}"
+    text = f"{approved:,}" if approved == filed else f"{approved:,} approved of {filed:,} filed"
     if isinstance(split, style_ledger.NoSplitRecorded):
         return text
     at = parsed_time(split.measured_at)
@@ -264,24 +289,28 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
             if path not in snapshots:
                 snapshots[path] = read_snapshot(path, now, decision_folder, decisions)
         open_steps = steps.result()
-    lines = ["| Unit | Ticket | Step | Built | Left |", "| --- | --- | --- | --- | --- |"]
+    lines = ["| Unit | Ticket | Step | ETA | Findings built (24 h) | Findings left |",
+             "| --- | --- | --- | --- | --- | --- |"]
     for unit in units:
         snapshot = snapshots[paths[unit.unit].resolve()] if unit.unit in paths else LedgerSnapshot()
         family = rules.style_family(unit.unit)
         counts = snapshot.counts.get(family, FamilyCounts()) if isinstance(family, str) else FamilyCounts()
-        ticket = snapshot.tickets.get(unit.unit)
+        ticket = snapshot.tickets.get(unit.unit, NoTicket())
         refill = snapshot.refills.get(unit.unit)
         idle = f"idle — {refill.outcome} ({clock(refill.at, zone)})" if refill else "idle"
-        left = left_cell(counts.left, snapshot.splits.get(unit.unit, style_ledger.NoSplitRecorded()), now)
-        cells = (unit_table_cells.session_cell(unit), ticket_cell(ticket) if ticket else idle,
-                 format_step(records.get(unit.unit), bool(ticket and ticket.state == "checkpointed"), zone,
-                             open_steps[unit.unit]),
-                 f"{counts.built:,} ({counts.recent:,} in 24 h)", left)
+        idle_step = f"idle — {refill.outcome}" if refill else "idle"
+        left = left_cell(counts.left, counts.filed, snapshot.splits.get(unit.unit, style_ledger.NoSplitRecorded()), now)
+        cells = (unit_table_cells.session_cell(unit), ticket_cell(ticket) if isinstance(ticket, Ticket) else idle,
+                 format_step(open_steps[unit.unit], ticket, idle_step), eta_cell(records.get(unit.unit), zone),
+                 f"{counts.built:,} ({counts.recent:,})", left)
         lines.append("| " + " | ".join(unit_table_cells.escaped(cell) for cell in cells) + " |")
     all_counts = [counts for snapshot in snapshots.values() for counts in snapshot.counts.values()]
     totals = FamilyCounts(sum(counts.built for counts in all_counts), sum(counts.left for counts in all_counts),
-                          sum(counts.recent for counts in all_counts))
-    total = f"All families: {totals.built:,} built · {totals.left:,} left · {totals.recent:,} built in the last 24 h · "
+                          sum(counts.recent for counts in all_counts),
+                          sum(snapshot.total_filed for snapshot in snapshots.values()))
+    filed = f" of {totals.filed:,} filed" if totals.left != totals.filed else ""
+    total = (f"All families: {totals.built:,} findings built · {totals.left:,} approved findings left{filed} · "
+             + f"{totals.recent:,} built in the last 24 h · ")
     if totals.recent:
         finish = (now + timedelta(days=totals.left / totals.recent)).astimezone(zone).strftime("%Y-%m-%d")
         total += f"ETA at that rate {finish}"
