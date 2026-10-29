@@ -609,7 +609,7 @@ class MeshCommandFixture(unittest.TestCase):
         if method == "thread/fork":
             return [_reply(request, {"thread": {"id": self.fork_thread_id}})]
         if method == "thread/turns/list":
-            turns = self.history_turns.copy()
+            turns = [*self.history_turns, *self.listed_turns()]
             if params.get("sortDirection") != "asc":
                 turns.reverse()
             limit = params.get("limit")
@@ -696,6 +696,10 @@ class MeshCommandFixture(unittest.TestCase):
             if outcome == "idle_before_listed":
                 self.unlisted_turn = turn_id
                 return turn_submission_frames
+            if outcome == "listed_before_notices":
+                # The server reads the thread idle and lists the new turn as
+                # ended before it sends any notice for it.
+                return turn_submission_frames[:1]
             if outcome == "completed_then_peer":
                 self.live_turn = "peer-turn"
                 self.announce_live_completion = True
@@ -912,11 +916,7 @@ class MeshCommandFixture(unittest.TestCase):
                     }))
                     self.stale_read_turn = self.live_turn = ""
                 return frames
-            turns: list[dict[str, object]] = [
-                *({"id": turn, "status": status} for turn, status in self.started_turns.items()
-                  if turn not in (self.live_turn, self.unlisted_turn)),
-                *self.silent_ended,
-            ] if params.get("includeTurns") else []
+            turns = self.listed_turns() if params.get("includeTurns") else []
             unlisted_ends: list[dict[str, object]] = []
             if self.unlisted_turn:
                 self.unlisted_reads += 1
@@ -929,9 +929,10 @@ class MeshCommandFixture(unittest.TestCase):
                         _notice("turn/completed", {"threadId": THREAD_ID, "turn": {"id": self.unlisted_turn}}),
                     ]
                     self.unlisted_turn = ""
-            if self.live_turn and not self.hide_live_turn_id:
-                turns.append({"id": self.live_turn, "status": "inProgress"})
-            frames = [_reply(request, {"thread": {
+            # Codex 0.163 queues this notice ahead of every full-history read.
+            frames = [_notice("deprecationNotice", {
+                "summary": "Full-history hydration is deprecated"})] if params.get("includeTurns") else []
+            frames += [_reply(request, {"thread": {
                 "id": thread_id,
                 "status": {"type": self.thread_statuses.get(thread_id) or (
                     "active" if self.live_turn else
@@ -996,6 +997,19 @@ class MeshCommandFixture(unittest.TestCase):
             return []
         return [cast("dict[str, object]", json.loads(line))
                 for line in self.usage_path().read_text(encoding="utf-8").splitlines()]
+
+    def listed_turns(self) -> list[dict[str, object]]:
+        """Turns the server lists, oldest first: ended ones, then any in progress."""
+        turns: list[dict[str, object]] = [
+            *({"id": turn, "status": status} for turn, status in self.started_turns.items()
+              if turn not in (self.live_turn, self.unlisted_turn, self.stale_read_turn)),
+            *self.silent_ended,
+        ]
+        if self.stale_read_turn:
+            turns.append({"id": self.stale_read_turn, "status": "inProgress"})
+        elif self.live_turn and not self.hide_live_turn_id:
+            turns.append({"id": self.live_turn, "status": "inProgress"})
+        return turns
 
     def methods(self, method: str) -> list[dict[str, object]]:
         return [request for request in self.server.requests if request.get("method") == method]
@@ -1959,8 +1973,9 @@ class MeshCommandTests(MeshCommandFixture):
             if request.get("method") == "thread/loaded/list":
                 return [_reply(request, {"data": [THREAD_ID], "nextCursor": None})]
             if request.get("method") == "thread/read":
-                return [_reply(request, {"thread": {"status": {"type": "active"},
-                    "turns": [{"id": "outgoing-turn", "status": "inProgress"}]}})]
+                return [_reply(request, {"thread": {"status": {"type": "active"}, "turns": []}})]
+            if request.get("method") == "thread/turns/list":
+                return [_reply(request, {"data": [{"id": "outgoing-turn", "status": "inProgress"}], "nextCursor": None})]
             return respond(request)
         self.server.respond = held_thread
         for arguments in (["reset", "--to", "worker"], ["fork", "--from", "worker", "--name", "reviewer"]):
@@ -3887,7 +3902,8 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(self.worker_record()["status"], "failed")
         self.assertIs(self.worker_record().get("continuation_owed"), False)
         if continuation_completed:
-            self.assertTrue(any(read.get("includeTurns") is True for read in recovery_reads))
+            self.assertFalse(any(read.get("includeTurns") is True for read in recovery_reads))
+            self.assertTrue(self.methods("thread/turns/list"))
             self.assertIn("recovered task finished without notification",
                           (self.session_dir / "worker.log").read_text())
         else:
@@ -4615,7 +4631,9 @@ class MeshCommandTests(MeshCommandFixture):
     def test_quiet_poll_resumes_a_marked_account_move_after_a_system_error(self) -> None:
         _target, destination = self.prepare_workers_move()
         self.outcomes = ["disconnect", "completed"]
-        self.start_args_timeout = 5
+        # The run ends on the resumed turn's completion; the budget only bounds
+        # a failure, so it sits far above full-suite load.
+        self.start_args_timeout = 120
         marker_injected = False
         on_frame = codex_mesh._on_frame  # pyright: ignore[reportPrivateUsage]
 
@@ -4780,8 +4798,9 @@ class MeshCommandTests(MeshCommandFixture):
             params = _as_test_dict(request.get("params"))
             thread_id = str(params.get("threadId", ""))
             if request.get("method") == "thread/read":
-                return [_reply(request, {"thread": {"id": thread_id, "status": {"type": "active"},
-                    "turns": [{"id": "live-turn", "status": "inProgress"}]}})]
+                return [_reply(request, {"thread": {"id": thread_id, "status": {"type": "active"}, "turns": []}})]
+            if request.get("method") == "thread/turns/list":
+                return [_reply(request, {"data": [{"id": "live-turn", "status": "inProgress"}], "nextCursor": None})]
             if request.get("method") == "turn/interrupt":
                 folder, name = locations[thread_id]
                 marker = _as_test_dict(cast(object, json.loads((folder / f"{name}.account-move.json").read_text())))
@@ -5888,7 +5907,7 @@ class MeshCommandTests(MeshCommandFixture):
                 if quiet_polls == 2:
                     # The first quiet poll must keep the launcher for the live run.
                     self.assertEqual(self.methods("thread/read")[-1]["params"], {
-                        "threadId": THREAD_ID, "includeTurns": True,
+                        "threadId": THREAD_ID, "includeTurns": False,
                     })
                     _ = run.write_text(json.dumps({"worker": "worker", "status": "finished", "pid": os.getpid()}))
                     if room_wait:
@@ -6148,6 +6167,18 @@ class MeshCommandTests(MeshCommandFixture):
         refused, _errors = self.run_follow()
         self.assertEqual(refused, 2)
         self.live_turn = ""
+
+        code, errors = self.run_follow()
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.worker_record()["status"], "done")
+
+    def test_follow_recovers_a_capacity_wait_whose_launcher_died(self) -> None:
+        self.assertEqual(self.run_start()[0], 0)
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            "worker": {"thread_id": THREAD_ID, "status": codex_mesh.WAITING_CAPACITY,
+                     "launcher_pid": 99999999}
+        }), encoding="utf-8")
 
         code, errors = self.run_follow()
 
@@ -7315,9 +7346,9 @@ class MeshCommandTests(MeshCommandFixture):
         self.server.respond = no_answer
         ended = codex_mesh._ended_unseen  # pyright: ignore[reportPrivateUsage]
 
-        def check(client: codex_mesh.Client, thread: str, turn: str = "") -> bool:
+        def check(client: codex_mesh.Client, thread: str, turn: str = "", *, start_seen: bool = True) -> bool:
             change()
-            return ended(client, thread, turn)
+            return ended(client, thread, turn, start_seen=start_seen)
 
         with patch.object(codex_mesh, "_post_board_status") as board, patch.object(codex_mesh, "_ended_unseen", side_effect=check):
             code, errors = self.run_follow()
@@ -7778,6 +7809,8 @@ class FollowEventRegressionTests(MeshCommandFixture):
         with contextlib.closing(codex_mesh.Client(self.server.port, "worker", deadline=time.time() + 3)) as client:
             stream = self.stream_for(client, resident=resident)
             stream.final_answer = "answer without completion"
+            # The answer arrived, so the turn's notices did too.
+            stream.turn_start_seen = True
             stream.state_change_owed = True
             started = time.perf_counter()
             _ = codex_mesh._stream_frames(stream, io.StringIO())  # pyright: ignore[reportPrivateUsage]
@@ -8027,9 +8060,114 @@ class FollowEventRegressionTests(MeshCommandFixture):
                             to="worker", message="detached run result", message_file=""))
             code, errors = future.result(timeout=3)
         self.assertEqual((code, errors), (0, ""))
+        # A full-history read queues a notice that kept the idle check from
+        # ever reaching delivery.
+        self.assertFalse([read for read in self.methods("thread/read")
+                          if _as_test_dict(read["params"]).get("includeTurns")])
         if not resident:
             self.assertEqual(self.turn_inputs[-1], "detached run result")
         self.assertTrue(run.exists(), "run discovery removed a lookup record")
+
+    def test_last_detached_run_result_turn_is_watched_not_interrupted(self) -> None:
+        self.start_args_timeout = 60
+        self.assertEqual(self.run_start(), (0, ""))
+        self.outcomes = ["completed", "listed_before_notices"]
+        run = self.session_dir / codex_mesh.DETACHED_RUNS_DIR / "last.json"
+        run.parent.mkdir()
+        _ = run.write_text(json.dumps({"worker": "worker", "status": "running", "pid": os.getpid()}))
+        held_on_run = threading.Event()
+        polled_result_turn = threading.Event()
+        steps: list[codex_mesh.StreamStep | codex_mesh.FailedWithThread] = []
+        waiting = codex_mesh._waiting_on_detached_run  # pyright: ignore[reportPrivateUsage]
+        quiet = codex_mesh._on_quiet_poll  # pyright: ignore[reportPrivateUsage]
+        budget = FixtureLoopBudget("last run result turn", seconds=20, max_calls=200)
+
+        def note_wait(session_dir: str, name: str, thread_id: str, runs: codex_mesh.DetachedRunWatch) -> bool:
+            held = waiting(session_dir, name, thread_id, runs)
+            if held:
+                held_on_run.set()
+            return held
+
+        def note_result_turn_poll(
+            stream: codex_mesh.TurnStream, log: TextIO,
+        ) -> codex_mesh.StreamStep | codex_mesh.FailedWithThread:
+            _ = budget.check()
+            watched = stream.turn_id
+            step = quiet(stream, log)
+            if self.server.held_turn_ready.is_set() and watched == f"turn-{self.turn_starts}":
+                steps.append(step)
+                polled_result_turn.set()
+            return step
+
+        with (patch.object(codex_mesh, "_waiting_on_detached_run", note_wait),
+              patch.object(codex_mesh, "_on_quiet_poll", note_result_turn_poll),
+              ThreadPoolExecutor(max_workers=1) as executor):
+            future = executor.submit(self.run_follow)
+            try:
+                self.assertTrue(held_on_run.wait(timeout=5), "launcher never waited on the live run")
+                self.server.hold_turn_completion = True
+                self.server.answer_requests_during_held_turn = True
+                self.server.held_turn_completes_successfully = True
+                _ = run.write_text(json.dumps({"worker": "worker", "status": "finished", "pid": os.getpid()}))
+                held = codex_mesh.hold_message(str(self.session_dir), "worker", "detached run result",
+                                               without_launcher=False)
+                self.assertIsInstance(held, codex_mesh.HeldForLauncher)
+                self.assertTrue(self.server.held_turn_ready.wait(timeout=5), "the held result opened no turn")
+                self.assertTrue(polled_result_turn.wait(timeout=5), "no lifecycle check ran on the result turn")
+                self.assertNotIn(codex_mesh.StreamStep.FINISH, steps)
+                self.assertFalse(future.done(), "launcher left the result turn before its completion")
+            finally:
+                self.server.release_held_turn.set()
+            code, errors = future.result(timeout=10)
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.methods("turn/interrupt"), [])
+        self.assertEqual(self.turn_inputs[-1], "detached run result")
+        log = (self.session_dir / "worker.log").read_text() if (self.session_dir / "worker.log").exists() else ""
+        self.assertNotIn("no completion notice arrived", log)
+
+    def test_a_result_held_past_the_wall_clock_deadline_opens_the_next_turn(self) -> None:
+        self.start_args_timeout = 60
+        self.assertEqual(self.run_start(), (0, ""))
+        self.outcomes = ["completed", "completed"]
+        run = self.session_dir / codex_mesh.DETACHED_RUNS_DIR / "late.json"
+        run.parent.mkdir()
+        _ = run.write_text(json.dumps({"worker": "worker", "status": "running", "pid": os.getpid()}))
+        held_on_run = threading.Event()
+        clock_jumped = threading.Event()
+        waiting = codex_mesh._waiting_on_detached_run  # pyright: ignore[reportPrivateUsage]
+        quiet = codex_mesh._on_quiet_poll  # pyright: ignore[reportPrivateUsage]
+        budget = FixtureLoopBudget("held result past the deadline", seconds=20, max_calls=200)
+
+        def note_wait(session_dir: str, name: str, thread_id: str, runs: codex_mesh.DetachedRunWatch) -> bool:
+            held = waiting(session_dir, name, thread_id, runs)
+            if held:
+                held_on_run.set()
+            return held
+
+        def jump_wall_clock(
+            stream: codex_mesh.TurnStream, log: TextIO,
+        ) -> codex_mesh.StreamStep | codex_mesh.FailedWithThread:
+            _ = budget.check()
+            if held_on_run.is_set():
+                # A suspended machine moves wall time past the deadline while
+                # the frame loop's monotonic clock keeps it running.
+                stream.deadline = time.time() - 1
+                clock_jumped.set()
+            return quiet(stream, log)
+
+        with (patch.object(codex_mesh, "_waiting_on_detached_run", note_wait),
+              patch.object(codex_mesh, "_on_quiet_poll", jump_wall_clock),
+              ThreadPoolExecutor(max_workers=1) as executor):
+            future = executor.submit(self.run_follow)
+            self.assertTrue(held_on_run.wait(timeout=5), "launcher never waited on the live run")
+            _ = run.write_text(json.dumps({"worker": "worker", "status": "finished", "pid": os.getpid()}))
+            held = codex_mesh.hold_message(str(self.session_dir), "worker", "detached run result",
+                                           without_launcher=False)
+            self.assertIsInstance(held, codex_mesh.HeldForLauncher)
+            code, errors = future.result(timeout=10)
+        self.assertTrue(clock_jumped.is_set())
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.turn_inputs[-1], "detached run result")
 
     def test_missing_completion_keeps_the_inbox_open_for_a_new_detached_run(self) -> None:
         self.assert_inbox_stays_open_for_late_run(resident=False)
@@ -10515,11 +10653,13 @@ class SweepTests(unittest.TestCase):
                 pass
 
             @bounded_fixture
-            def call(self, method: str, params: dict[str, object]) -> dict[str, object]:
+            def call(self, method: str, params: dict[str, object], **_options: object) -> dict[str, object]:
                 if method == "thread/loaded/list":
                     return loaded
+                if method == "thread/turns/list":
+                    return {"result": {"data": [{"id": "u", "status": "inProgress"}]}}
                 status = statuses[cast("str", params["threadId"])]
-                return {"result": {"thread": {"status": {"type": status}, "turns": [{"id": "u", "status": "inProgress"}]}}}
+                return {"result": {"thread": {"status": {"type": status}, "turns": []}}}
 
             def close(self) -> None:
                 pass
@@ -11225,8 +11365,10 @@ class SignInChangeTests(unittest.TestCase):
     def test_a_resident_worker_mid_turn_stays_until_its_turn_ends(self) -> None:
         class BusyClient:
             @bounded_fixture
-            def call(self, _method: str, _params: dict[str, object]) -> dict[str, object]:
-                return {"result": {"thread": {"status": {"type": "active"}, "turns": [{"id": "t", "status": "inProgress"}]}}}
+            def call(self, method: str, _params: dict[str, object], **_options: object) -> dict[str, object]:
+                if method == "thread/turns/list":
+                    return {"result": {"data": [{"id": "t", "status": "inProgress"}]}}
+                return {"result": {"thread": {"status": {"type": "active"}, "turns": []}}}
 
             def close(self) -> None:
                 raise AssertionError("a worker mid-turn keeps its connection")
@@ -11742,7 +11884,9 @@ class WorkersHomeTests(unittest.TestCase):
                 if method == "thread/loaded/list":
                     return {"result": {"data": ["thread-1"]}}
                 if method == "thread/read":
-                    return {"result": {"thread": {"status": {"type": "active"}, "turns": [{"id": "turn-1", "status": "inProgress"}]}}}
+                    return {"result": {"thread": {"status": {"type": "active"}, "turns": []}}}
+                if method == "thread/turns/list":
+                    return {"result": {"data": [{"id": "turn-1", "status": "inProgress"}]}}
                 raise AssertionError(f"Live writer must not receive {method}")
             def close(self) -> None:
                 pass
