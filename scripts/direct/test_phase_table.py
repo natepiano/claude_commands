@@ -48,6 +48,7 @@ class PhaseTableTests(unittest.TestCase):
     sessions_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     notifier_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     live_record_number: int = 0
+    live_unit_pid: int = 0
     showrunner_record_number: int = 0
 
     @override
@@ -67,6 +68,7 @@ class PhaseTableTests(unittest.TestCase):
         self.sessions_dir.mkdir()
         self.notifier_dir = self.root / "notifier"
         self.live_record_number = 0
+        self.live_unit_pid = 0
         self.showrunner_record_number = 0
         _ = subprocess.run(
             ["git", "init", "-q", str(self.working_dir)],
@@ -385,7 +387,9 @@ class PhaseTableTests(unittest.TestCase):
             "table-host", "w1:p1", {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "table-unit"})])
         if not live_name:
             return
-        pid = fake_unit_host.live_pid(self)
+        if not self.live_unit_pid:
+            self.live_unit_pid = fake_unit_host.live_pid(self)
+        pid = self.live_unit_pid
         fake_unit_host.place_process(self.environment(), pid, "w1:p1")
         self.live_record_number += 1
         socket_path = Path(self.enterContext(short_socket_directory())) / f"live-{self.live_record_number}.sock"
