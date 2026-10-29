@@ -124,11 +124,11 @@ Hold length: 3 h. Count: about 17 hana builds — A 2, B 4, C 4, D 5 (one pair a
 
 **Goal:** names and cleanup support exist where they live.
 
-**Spec:** report-unit lands `unit_labels` / `unit_labels_for` (its Phase 3) plus the join function and dropped-part rule (Naming). resources-unit adds the copies root to `scratch.py` (two-level name, provenance fields), `tmp_sweep.py` and the scratch guard; its Phase 3 in-use marking covers `/tmp/claude/copies`. If Phase 1 picks the shared build-dir, resources-unit owns its budget and hold.
+**Spec:** report-unit lands `unit_labels` / `unit_labels_for` (its Phase 3) plus the join function and dropped-part rule (Naming). resources-unit adds the copies root to `scratch.py` (two-level name, provenance fields), `tmp_sweep.py` and the scratch guard; its Phase 3 in-use marking covers `/tmp/claude/copies`. If Phase 1 picks the shared build-dir, resources-unit owns its budget and hold. efficiency-unit changes `scripts/lib/nix_env.py` to trust a copy's `.envrc` only when the copy's copies.py/scratch.py record names a source repo under `~/rust`, `~/worktrees` or `~/.claude*`, and the copy's `.envrc` equals the source's `.envrc` blob at the copy commit (approved by builds). Today it refuses (`direnv: .envrc is blocked`), so verify.sh and style_sync lint fail in a copy. verify-unit sends efficiency the record's path and fields (source path, source commit, copy commit) when Phase 3 fixes them. Due before Phase 4.
 
-**Files:** owned by report-unit and resources-unit; verify-unit sends the requests.
+**Files:** owned by report-unit, resources-unit and efficiency-unit; verify-unit sends the requests.
 
-**Acceptance gate:** both merged on builds.
+**Acceptance gate:** all three merged on builds.
 
 Rough duration: half a day each, in parallel with Phase 1.
 
