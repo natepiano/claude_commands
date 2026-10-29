@@ -321,12 +321,18 @@ Each subcommand takes `--production`; `main` catches `merge_checkpoint.Stop`, so
 ## Session hosting
 
 Unit lookup reads only herdr. `Place` is `HerdrPlace(session, pane)`;
-`MarkedUnit(unit, claude, place)` exposes the server name as `place.session`.
+`MarkedUnit(unit, claude, place, pid, command)` exposes the server name as `place.session`.
 `every_marked_unit()` raises `OSError` when herdr cannot be read, and
-`marked_units(slug)` selects one production. Duplicate marks refuse that
-production. Registry records join by pid through `herdr_processes` and
+`marked_units(slug)` selects one production. A live Claude joins only marks on
+its exact PID. A marked shell or other non-Claude process retains its stopped
+pane as `ClaudeNotRunning`, for recovery, resume and status. Live or unknown
+Claude holders take precedence over stopped panes; only those holders count
+toward duplicate faults. With only stopped holders, the first pane is retained.
+Duplicate live or unknown marks refuse that production and name each holder's
+PID, command and pane. Transfer and rename verification reject former marks
+only for live or unknown holders, ignoring leftover non-Claude processes. Registry records join by pid through `herdr_processes` and
 `herdr_place_of`; unreadable cwd preserves placement. An unreadable registry
-keeps an unresolved Claude as `ClaudeUnknown(reason)`.
+keeps an unresolved Claude as `ClaudeUnknown(reason)`; a registered running Claude without its messaging socket is also unknown, never absent.
 
 Units launch exclusively in herdr and restore through `add_unit.py --host-session`.
 Resume models come from transcripts. Existing Units rows can be reused;

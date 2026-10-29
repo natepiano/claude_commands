@@ -135,12 +135,14 @@ These all use this path: effort changes (`unit_effort.py`), promotion, relays an
 
 ### Unit lookup and marks
 
-`unit_lookup.py` has one source, herdr. `Place = HerdrPlace`. `MarkedUnit(unit, claude, place)` is frozen, and its session name is `place.session`. `Claude = LiveClaude(name, session_id, socket, pid) | ClaudeNotRunning | ClaudeUnknown(reason)`.
+`unit_lookup.py` has one source, herdr. `Place = HerdrPlace`. `MarkedUnit(unit, claude, place, pid, command)` is frozen, and its session name is `place.session`. `Claude = LiveClaude(name, session_id, socket, pid) | ClaudeNotRunning | ClaudeUnknown(reason)`.
 
-- `_claudes(processes)` joins every live session record to a place by pid through `herdr_processes()`. A live pid missing from that list (a deleted cwd) falls back to `herdr_place_of(pid)`. It returns `RecordsRead | RecordsPartlyUnread(reason)`, and a partial read makes unplaced units `ClaudeUnknown`.
-- `_herdr_marked` yields each running pane carrying both marks, once per place.
-- `every_marked_unit() -> MarkedProductions(units, faults)` reads all units once and raises `OSError` when herdr cannot be read. Two sessions carrying one unit's mark is a fault, and that production is left out. `marked_units(slug)` raises the fault as `OSError`. Slugs resolve through `canonical_slug`.
+- `_claudes(processes)` keeps the newest live session record for each pid, joined to a place through `herdr_processes()`. An unreadable cwd preserves the process's PID, command, marks and placement, on Linux as on Darwin. A live pid missing from the snapshot falls back to `herdr_place_of(pid)` for placement. It returns `RecordsRead | RecordsPartlyUnread(reason)`, and a partial read makes unplaced units `ClaudeUnknown`.
+- `_herdr_marked` identifies a live Claude only from the marked process's exact PID (`sessions.live_session`, the same check as `LiveClaude`). A marked shell or other non-Claude process retains its pane as `ClaudeNotRunning`; it cannot borrow a live Claude in the same pane. This preserves stopped-unit recovery, resume and status. Only `LiveClaude` and `ClaudeUnknown` holders count toward duplicate faults; a live or unknown holder takes precedence over stopped panes. With only stopped holders, discovery retains the first pane without a duplicate fault. Unknown registry evidence, including a registered running Claude whose messaging socket is absent, remains `ClaudeUnknown` and blocks ambiguous ownership; a readable registry with no live Claude leaves the marked pane stopped.
+- `every_marked_unit() -> MarkedProductions(units, faults)` reads all units once and raises `OSError` when herdr cannot be read. Two live or unknown Claude holders carrying one unit's mark are a fault; each holder is identified by PID, command and herdr pane, and that unit is left out. `marked_units(slug)` raises the fault as `OSError`. Slugs resolve through `canonical_slug`.
 - CLI: `list <slug>` prints `unit, herdr:<session>:<pane>, session, live|unknown|stopped, name, session id, socket`. `pane <slug> <unit>` prints `place_text(place)`. Exit 0, 1 no such unit, 2 usage, 3 cannot tell.
+
+Transfer and rename verification ignore leftover non-Claude processes carrying former marks. A refusal for a remaining mark identifies its holder by PID, command and pane.
 
 Marks are `SHOWRUNNER_UNIT` (production slug) and `SHOWRUNNER_UNIT_ID` (unit). They are set in the pane environment when a unit launches; adopting an existing conversation requires a safe stop and marked relaunch with `add_unit.py --attach`.
 
