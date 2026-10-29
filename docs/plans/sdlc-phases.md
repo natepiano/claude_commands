@@ -433,7 +433,7 @@ Assertion-Change: `test_invalid_reply_record_schema_leaves_the_supplier_wait_ope
 
 **Acceptance gate:** a forwarded reply whose record has the write-once fields ends the wait, with and without a `forwards/` file; an old-form record still ends it; a missing, mismatched or duplicate record still leaves it open. Tests pass on a trial merge with natedev-postmaster dfb1ef64 (not merged into this branch), and postmaster's own tests pass there too.
 
-### Phase 13 — The trial measures table fits a phone  · status: todo
+### Phase 13 — The trial measures table fits a phone  · status: done
 **Depends on:** Phase 11
 
 The showrunner returned change-review row C454 (2026-10-29): `phase_process.py baseline --exposure before --before-at HEAD --detail trial` prints its trial measures table 95-106 characters wide, which wraps on a phone, and the row stated a fixed n that has since moved.

@@ -45,6 +45,7 @@ class QueueTests(unittest.TestCase):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILDLOG_PROC": str(self.root / "proc"),
+            "BUILDLOG_BUILDS_CGROUP": str(self.root / "builds.slice"),
             "BUILDLOG_MEMINFO": str(self.root / "meminfo"),
             "BUILDLOG_MEMORY_PRESSURE": str(self.root / "pressure"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
