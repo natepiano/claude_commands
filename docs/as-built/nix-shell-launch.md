@@ -20,7 +20,11 @@ of three frozen dataclasses:
 
 It searches the start directory and then its parents. Resolved `.envrc` files
 under `~/rust`, `~/worktrees`, and `~/.claude*` are approved with
-`direnv allow <envrc>`. Files elsewhere require existing explicit approval;
+`direnv allow <envrc>`. Linked worktrees outside those roots are also approved
+when their `.git`, `commondir`, and `gitdir` back pointer prove registration by
+a repository under a trusted root, using file reads alone. This covers
+style-sync lint snapshots made with `git worktree add` under `/tmp/claude/session`;
+clones and forged links still require explicit approval. Files elsewhere require existing explicit approval;
 a blocked-file refusal names the `direnv allow <path>` command. Each direnv
 command has a 600-second timeout. `direnv export json` runs in the requested
 directory with the supplied base environment. Strings replace variables;
