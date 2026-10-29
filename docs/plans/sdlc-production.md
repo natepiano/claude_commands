@@ -40,7 +40,7 @@ Scope of each unit:
 
 As built (`docs/as-built/guilds.md`; the user's G1b and G7 in Review decisions):
 
-- Each guild head is a unit director with the guild's exact ID, `designers`, `reviewers`, `showrunners` or `units`, under the top-level `guilds` production on natedev (`docs/plans/guilds-production.md`). The heads are not units of sdlc.
+- Each guild head is a unit director with the guild's exact ID, `designers`, `reviewers`, `showrunners` or `units`, under the `guilds` production on natedev (`docs/plans/guilds-production.md`). The heads are not units of sdlc. The guilds showrunner reports to sdlc in the showrunner tree (attached 2026-10-28); its herdr space stays top-level.
 - Goddess names are on hold. `astra-designer` and `astra-reviewer` name only the per-design Astra roles and their census edges, not the heads.
 - guild-process-unit owns process changes, not head operations. A head sends a process proposal through the guilds showrunner to sdlc for guild-process-unit.
 
@@ -90,7 +90,7 @@ Model, in the user's words (2026-10-21): the goal of a guild is to help guild me
 | # | Item | Decision |
 | --- | --- | --- |
 | G1 | Which jobs get a guild (showrunners, unit directors, designers, reviewers; workers?) | Four guilds: showrunners, unit directors, designers, reviewers. Workers have no guild; they get better guidance through their unit director's work orders. |
-| G1b | The head's form | Each head is a unit director, one per guild, under one lasting top-level guilds showrunner (not sdlc). In herdr: a top-level guilds space, the guilds showrunner as the first tab, then the four head unit directors in alphabetical order. This replaces the brief's "each head is a top-level showrunner". |
+| G1b | The head's form | Each head is a unit director, one per guild, under one lasting guilds showrunner, not under sdlc. The guilds showrunner reports to sdlc in the showrunner tree (the user, 2026-10-28: "seems almost as if it should be"). In herdr: a top-level guilds space, the guilds showrunner as the first tab, then the four head unit directors in alphabetical order. This replaces the brief's "each head is a top-level showrunner". |
 | G2 | What heads watch, since they do not read every turn | Events plus records: a head reads turns when an event fires (G3), and once a day reads the records already kept (repair rounds, time per phase step, review findings); it reads turns only where a record looks bad. |
 | G3 | The events that make a member write to its guild or head | The member sends one short message to its head only, never to the whole guild, when: the user corrects it; a phase reaches repair round 4; the same review finding comes back twice; it works around a tool fault or a rule that slowed it; it finds a way that saved real time. The head decides what goes to the whole guild. |
 | G3b | Where the heads keep the guild tips | In ~/rust/nate_style: one folder per guild plus one shared folder, one tip per markdown file like the rust rules, and a base folder per guild with Obsidian views by tag like rust_base. The head adds and edits tip files. A member loads its guild's tips when its skill starts. Tips reach both machines through git; the design's copy step and receipts go. Replaces docs/guilds in ~/.claude. |
