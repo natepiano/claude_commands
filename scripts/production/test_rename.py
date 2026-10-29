@@ -1137,8 +1137,115 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         before = self.snapshot()
         again = self.run_command("repair-workers", NEW)
         self.assert_success(again)
-        self.assertEqual(again.stdout, "alpha-unit: workers have nothing to change\n")
+        self.assertIn("alpha-unit: workers have nothing to change\n", again.stdout)
         self.assertEqual(self.snapshot(), before)
+
+    def test_apply_rerun_keeps_unit_moves_and_other_journal_keys(self) -> None:
+        self.prepare_unit_moves()
+        self.assert_success(self.run_rename("apply"))
+        self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
+        journal = self.journal()
+        moves = journal["unit_moves"]
+        journal["future_record"] = {"keep": [1, "two"]}
+        journal["done"] = True
+        completed = cast(list[str], journal["completed"])
+        completed.remove("_rename_unit_workers")
+        completed.append("_later_apply_step")
+        self.write(self.state / "new/rename.json", json.dumps(journal))
+        self.assert_success(self.run_rename("apply"))
+        saved = self.journal()
+        self.assertEqual(saved["unit_moves"], moves)
+        self.assertEqual(saved["future_record"], {"keep": [1, "two"]})
+        self.assertIs(saved["done"], True)
+        self.assertIn("_later_apply_step", cast(list[str], saved["completed"]))
+
+    def test_repair_without_unit_moves_finds_old_run_and_allows_adoption(self) -> None:
+        self.prepare_unit_moves()
+        self.assert_success(self.run_rename("apply"))
+        self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
+        run = self.seed_paused_unit_worker()
+        journal = self.journal()
+        del journal["unit_moves"]
+        self.write(self.state / "new/rename.json", json.dumps(journal))
+        before = self.snapshot()
+        preview = self.run_command("repair-workers", NEW, "--dry-run")
+        self.assert_success(preview)
+        self.assertIn(f"would change run {run}", preview.stdout)
+        self.assertIn(f"would change worker {run}/w7", preview.stdout)
+        self.assertEqual(self.snapshot(), before)
+        self.assert_success(self.run_command("repair-workers", NEW))
+        new = self.unit_worktree(NEW, "alpha-unit")
+        destination = self.root / "runs/after-repair"
+        self.write(destination / workers.STATE, json.dumps({"status": "active", "working_dir": str(new),
+            "production": NEW, "unit": "alpha-unit", "run_id": destination.name}))
+        with mock.patch.dict(os.environ, self.env):
+            self.assertEqual(workers.adopt(run, destination, "w7"), "w7")
+        before = self.snapshot()
+        repeated = self.run_command("repair-workers", NEW)
+        self.assert_success(repeated)
+        self.assertIn("workers have nothing to change", repeated.stdout)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_repair_uses_worker_cwd_when_run_worktree_is_already_current(self) -> None:
+        self.prepare_unit_moves()
+        self.assert_success(self.run_rename("apply"))
+        self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
+        run = self.seed_paused_unit_worker()
+        journal = self.journal()
+        del journal["unit_moves"]
+        self.write(self.state / "new/rename.json", json.dumps(journal))
+        new = self.unit_worktree(NEW, "alpha-unit")
+        state = cast(dict[str, object], json.loads((run / workers.STATE).read_text()))
+        state["working_dir"] = str(new)
+        state["plan_doc"] = "docs/plans/alpha-unit.md"
+        self.write(run / workers.STATE, json.dumps(state))
+        # Both rows name the same folder. The plan header selects alpha-unit.
+        self.write(self.new_doc, self.new_doc.read_text().replace(
+            str(self.unit_worktree(OLD, "beta-unit")), str(new)))
+        fixed = self.run_command("repair-workers", NEW)
+        self.assert_success(fixed)
+        self.assertNotIn("ambiguous unit", fixed.stdout)
+        roster = cast(dict[str, dict[str, object]], json.loads((run / workers.ROSTER).read_text()))
+        self.assertEqual(roster["w7"]["cwd"], str(new / "subdir"))
+        self.assertEqual(roster["w7"]["unit_ledger"], str(self.root / "state/unit-workers/new/alpha-unit.json"))
+
+    def test_repair_without_a_rename_journal_uses_the_timer_doc(self) -> None:
+        self.prepare_unit_moves()
+        self.assert_success(self.run_rename("apply"))
+        self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
+        run = self.seed_paused_unit_worker()
+        (self.state / "new/rename.json").unlink()
+        fixed = self.run_command("repair-workers", NEW)
+        self.assert_success(fixed)
+        self.assertIn(f"changed worker {run}/w7", fixed.stdout)
+        state = cast(dict[str, object], json.loads((run / workers.STATE).read_text()))
+        self.assertEqual(state["working_dir"], str(self.unit_worktree(NEW, "alpha-unit")))
+
+    def test_repair_skips_a_run_that_matches_two_units(self) -> None:
+        self.prepare_unit_moves()
+        self.assert_success(self.run_rename("apply"))
+        self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
+        run = self.seed_paused_unit_worker()
+        state = cast(dict[str, object], json.loads((run / workers.STATE).read_text()))
+        state["plan_doc"] = ""
+        self.write(run / workers.STATE, json.dumps(state))
+        journal = self.journal()
+        del journal["unit_moves"]
+        self.write(self.state / "new/rename.json", json.dumps(journal))
+        self.write(self.new_doc, self.new_doc.read_text().replace(
+            str(self.unit_worktree(OLD, "beta-unit")), str(self.unit_worktree(NEW, "alpha-unit"))))
+        before = self.snapshot()
+        fixed = self.run_command("repair-workers", NEW)
+        self.assert_success(fixed)
+        self.assertIn(f"run {run}: ambiguous unit", fixed.stdout)
+        self.assertIn("skipped", fixed.stdout)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_repair_reports_why_no_move_was_found(self) -> None:
+        self.assert_success(self.run_rename("apply"))
+        result = self.run_command("repair-workers", NEW)
+        self.assert_success(result)
+        self.assertIn("no moved unit was found: no unit run names an old worktree", result.stdout)
 
     def test_unit_retry_after_worker_writes_finishes_without_changing_workers_again(self) -> None:
         self.prepare_unit_moves()
