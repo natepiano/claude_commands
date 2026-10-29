@@ -13,6 +13,7 @@ from .questions import BODY_CHARACTER_LIMIT, GOAL_LABELS, IssueState, PROJECT_AB
 
 VAULT_ROOT = Path.home() / "rust/hanadocs"
 ISSUES_DIR = VAULT_ROOT / "issues"
+AREA_DEFINITIONS_PATH = VAULT_ROOT / "conf/issue-areas.md"
 RATING_FIELDS = ("backlog_alignment", "backlog_impact", "backlog_urgency", "backlog_effort")
 LABEL_FIELDS = ("backlog_goal", *RATING_FIELDS, "category", "area", "backlog_score")
 WIKILINK = re.compile(r"\[\[([^\]\n]+)\]\]")
@@ -92,6 +93,34 @@ def clean_body(body: str) -> str:
 
 def normalize_area(area: str) -> str:
     return plain(area).strip("\"'").strip().casefold()
+
+
+def load_area_definitions(path: Path = AREA_DEFINITIONS_PATH) -> dict[str, str]:
+    """Require a readable area table; missing area rows retain name-only criteria."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        raise ValueError(f"{path}: area definitions file not found") from None
+    definitions: dict[str, str] = {}
+    in_table = False
+    for line in lines:
+        cells = [cell.strip().replace(r"\|", "|")
+                 for cell in re.split(r"(?<!\\)\|", line.strip().strip("|"))]
+        if [cell.casefold() for cell in cells] == ["area", "definition", "issues"]:
+            in_table = True
+            continue
+        if not in_table:
+            continue
+        if len(cells) != 3:
+            break
+        if all(re.fullmatch(r":?-+:?", cell) for cell in cells):
+            continue
+        area = normalize_area(cells[0])
+        if area and cells[1]:
+            definitions[area] = cells[1]
+    if not definitions:
+        raise ValueError(f"{path}: no area definitions found in area | definition | issues table")
+    return definitions
 
 
 def _frontmatter(path: Path) -> VaultDocument:

@@ -157,7 +157,7 @@ codex_mesh.py sweep  [--root <dir>] [--stop]
 `review-pool.md`. `prime --held-design --held-role` starts a held design role's
 thread for `scripts/guilds/roles.py`; held roles, their access policy and the
 verbs that refuse them (`start`, `fork`, `reopen`, `set-instructions`, raw `stop`
-and `stop --pause`) are described in `guilds.md`.
+and `stop --pause`) are described in `long-lived-workers.md#lasting-roles`.
 
 `serve` spawns `codex app-server --listen ws://127.0.0.1:<free port>` detached
 (`start_new_session=True`) and records `{port, pid}` in

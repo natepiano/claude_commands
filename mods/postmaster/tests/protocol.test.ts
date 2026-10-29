@@ -49,22 +49,25 @@ describe("postmaster protocol validators", () => {
     for (const value of [null, undefined, [], "route"]) expect(isDeliveryRouteFile(value)).toBe(false);
   });
 
-  test("reply logs require the replying identity original sender body and confirmed destinations", () => {
-    const log = { at_ms: 1000, socket: "uds:/test-sockets/recipient.sock", name: "Recipient",
-      session_id: "recipient", senders: ["Original sender"], body: "answer", forwarded: ["original-session"] };
+  test("reply logs require the replying identity original sender body targets forward state and confirmed destinations", () => {
+    const log = { at_ms: 1000, socket: "uds:/test-sockets/recipient.sock", name: "Recipient", session_id: "recipient",
+      senders: ["Original sender"], body: "answer", targets: ["original-session"], forward: "done", forwarded: ["original-session"] };
     expect(isReplyLog(log)).toBe(true);
-    expect(isReplyLog({ ...log, forwarded: [] })).toBe(true);
+    expect(isReplyLog({ ...log, forward: "pending", forwarded: [] })).toBe(true);
+    expect(isReplyLog({ ...log, targets: [], forwarded: [] })).toBe(true);
     for (const field of Object.keys(log)) {
       const missing: Record<string, unknown> = { ...log };
       delete missing[field];
       expect(isReplyLog(missing)).toBe(false);
     }
     for (const forwarded of ["original-session", [17], [""], null]) expect(isReplyLog({ ...log, forwarded })).toBe(false);
+    for (const targets of ["original-session", [17], [""], null]) expect(isReplyLog({ ...log, targets })).toBe(false);
+    for (const forward of ["", "open", "DONE", null]) expect(isReplyLog({ ...log, forward })).toBe(false);
   });
 
   test("reply logs require a nonempty list of nonempty sender names", () => {
     const log = { at_ms: 1000, socket: "uds:/test-sockets/recipient.sock", name: "Recipient",
-      session_id: "recipient", senders: ["Alice", "Bob"], body: "answer", forwarded: [] };
+      session_id: "recipient", senders: ["Alice", "Bob"], body: "answer", targets: [], forward: "done", forwarded: [] };
     expect(isReplyLog(log)).toBe(true);
     for (const senders of [[], [""], ["Alice", ""], [17], "Alice", null]) {
       expect(isReplyLog({ ...log, senders })).toBe(false);

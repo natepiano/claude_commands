@@ -103,6 +103,8 @@ opening in <ReviewPromptContract/>; one to a Codex reviewer also carries item
 
 5. `## Project Context`.
 6. `## Work Specification`.
+   Every implementation, test and repair prompt carries verbatim: "Do not weaken, delete or turn off an existing assertion or test to make a test pass. If one must change, post blocked with the test, the old assertion, the new assertion and why." The unit director answers a blocked post in the next work order: it rejects the change, or it adds the ruling line `Assertion-Change: <path>::<test> — <why>`, which `assertion_guard.py` reads from the run's work orders and from the commit message. Without that line, `verify.sh lint` and the checkpoint commit refuse a removed, weaker or turned-off assertion or test. In cargo-liner-tile checkpoint e21d5b93 a worker changed an `assert_eq!` to a bound `assert!` to make its change pass, and no review saw it (user, 2026-10-28).
+
    For workers writing tests, carry: "Do not write trivial tests that cannot fail for a real defect: assertions of a constant, literal or default against itself, implementation repetition, tests of the standard library or a mock they configure, name-existence or import-only checks, or duplicates of another test; a test that pins behaviour a user or another script depends on is not trivial."
 
    Every repair prompt's Work Specification also carries these fixing rules inline:

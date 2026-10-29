@@ -3,13 +3,28 @@
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
+from typing import NamedTuple
+from zoneinfo import ZoneInfo
 
 import unit_lookup
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from user_zone import user_zone  # noqa: E402
 
 
 class Refusal(Exception):
     """An invalid request that must leave the production unchanged."""
+
+
+class Production(NamedTuple):
+    doc: Path
+    slug: str
+    merge_branch: str
+    checkout: Path
+    log: Path
+    zone: ZoneInfo
 
 
 def cell_value(value: str) -> str:
@@ -120,3 +135,24 @@ def production_field(lines: list[str], field: str) -> str:
             if result:
                 return result
     raise Refusal(f"production doc lacks {field}")
+
+
+def read_production(path: Path) -> Production:
+    """Read the production fields shared with merge_checkpoint.py."""
+    try:
+        doc = path.resolve(strict=True)
+        lines = doc.read_text(encoding="utf-8").splitlines()
+        merge_branch = production_field(lines, "Merge branch")
+        checkout = Path(production_field(lines, "Showrunner checkout")).expanduser().resolve()
+        log = Path(production_field(lines, "Log"))
+        zone = user_zone()
+        slug = doc.name.removesuffix("-production.md")
+        if slug == doc.name:
+            raise Refusal("production doc name must end in -production.md")
+        if log.is_absolute():
+            raise Refusal("production Log must be relative to Showrunner checkout")
+        if "## Units" not in lines:
+            raise Refusal("production doc lacks Units table")
+        return Production(doc, slug, merge_branch, checkout, checkout / log, zone)
+    except (OSError, UnicodeError, KeyError, ValueError) as error:
+        raise Refusal(f"cannot read production doc: {error}") from error

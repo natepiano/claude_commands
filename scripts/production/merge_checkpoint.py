@@ -28,8 +28,13 @@ from typing import NamedTuple, cast
 import change_review
 import scratch  # on the path once change_review has put scripts/lib there
 from showrunners import canonical_slug
-from add_unit import Production, read_production
+from production_units import Production, read_production
 from production_units import Refusal, cell_value, production_field, unit_table
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.direct import progress_history  # noqa: E402
+from scripts.production import production_doc  # noqa: E402
+from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 
 # /zone queues a change for the Mac while it is offline; a promotion's Mac pull sends it.
 ZONE_SCRIPT = Path(__file__).resolve().parents[1] / "lib/zone.py"
@@ -50,32 +55,6 @@ class PushedTip(NamedTuple):
 
 class NotYetPushed(NamedTuple):
     pass
-
-
-class FieldPresent(NamedTuple):
-    text: str
-
-
-class FieldAbsent(NamedTuple):
-    pass
-
-
-class NoPromotion(NamedTuple):
-    pass
-
-
-class NoMac(NamedTuple):
-    pass
-
-
-class MacCheckout(NamedTuple):
-    path: PurePosixPath
-    """As written in the doc; a leading ~ is the Mac's home, so the Mac's shell expands it."""
-
-
-class PromoteTo(NamedTuple):
-    checkouts: tuple[Path, ...]
-    mac: NoMac | MacCheckout
 
 
 class PromotionAlreadyAtTip(NamedTuple):
@@ -188,7 +167,7 @@ class MergeRequest(NamedTuple):
     also: tuple[str, ...]
     kind: CodeCheckpoint | ShrinkCommit | AsBuiltCommit
     push: ValidateAndPush | GitPush
-    promotion: NoPromotion | PromoteTo
+    promotion: production_doc.NoPromotion | production_doc.PromoteTo
     merge_tests: tuple[tuple[str, ...], ...]
     flakes: frozenset[str]
     flaky_tests: frozenset[str]
@@ -246,41 +225,14 @@ def good(result: subprocess.CompletedProcess[str], step: str) -> str:
     return result.stdout.strip()
 
 
-def optional_field(lines: list[str], field: str) -> FieldPresent | FieldAbsent:
-    prefix = f"- **{field}:**"
-    for line in lines:
-        if line.startswith(prefix):
-            return FieldPresent(line[len(prefix):].removeprefix(" "))
-    return FieldAbsent()
-
-
 def listed_names(lines: list[str], field: str) -> frozenset[str]:
     """A doc field's names: the backtick-quoted ones, else a comma list before " — "."""
-    present = optional_field(lines, field)
-    if isinstance(present, FieldAbsent):
+    present = production_doc.optional_field(lines, field)
+    if isinstance(present, production_doc.FieldAbsent):
         return frozenset()
     quoted = re.findall(r"`([^`]+)`", present.text)
     names = quoted if quoted else present.text.split(" — ", 1)[0].split(",")
     return frozenset(name.strip() for name in names if name.strip())
-
-
-def promotion_from_doc(lines: list[str]) -> NoPromotion | PromoteTo:
-    """Read the production's promotion destinations in their declared order."""
-    field = optional_field(lines, "Promote")
-    if isinstance(field, FieldAbsent):
-        return NoPromotion()
-    promote_raw = field.text.split(" — ", 1)[0].replace("`", "")
-    if promote_raw.strip().casefold() == "none":
-        return NoPromotion()
-    local: list[Path] = []
-    mac: NoMac | MacCheckout = NoMac()
-    for item in promote_raw.split(","):
-        item = item.strip()
-        if item.startswith("mac "):
-            mac = MacCheckout(PurePosixPath(item[4:].strip()))
-        elif item:
-            local.append(Path(item).expanduser())
-    return PromoteTo(tuple(local), mac) if local or isinstance(mac, MacCheckout) else NoPromotion()
 
 
 def parse_units(lines: list[str]) -> tuple[Unit, ...]:
@@ -317,8 +269,8 @@ def parse_merge_tests(lines: list[str], checkout: Path) -> tuple[tuple[str, ...]
     program on PATH or an executable file in the showrunner checkout: a package name or a directory
     written there by mistake is refused by name.
     """
-    field = optional_field(lines, "Merge tests")
-    if isinstance(field, FieldAbsent):
+    field = production_doc.optional_field(lines, "Merge tests")
+    if isinstance(field, production_doc.FieldAbsent):
         raise Refusal("production doc lacks Merge tests")
     first_comment = len(field.text)
     in_backticks = False
@@ -357,16 +309,16 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
     unit = next((candidate for candidate in units if candidate.name == name), None)
     if unit is None:
         raise Refusal(f"unit {name} not in production doc")
-    push_field = optional_field(lines, "Push")
-    push_raw = cell_value(push_field.text) if isinstance(push_field, FieldPresent) else "validate_and_push"
+    push_field = production_doc.optional_field(lines, "Push")
+    push_raw = cell_value(push_field.text) if isinstance(push_field, production_doc.FieldPresent) else "validate_and_push"
     if push_raw not in ("git", "validate_and_push"):
         raise Refusal(f"unknown Push mode: {push_raw}")
     push: ValidateAndPush | GitPush = GitPush() if push_raw == "git" else ValidateAndPush()
     if cast(bool, args.cancel_prior) and isinstance(push, GitPush):
         raise Refusal("--cancel-prior applies only to Push: validate_and_push")
-    promotion = promotion_from_doc(lines)
+    promotion = production_doc.promotion_from_doc(lines)
     # Checked at load, so a bad destination stops the checkpoint before anything is pushed.
-    if isinstance(promotion, PromoteTo):
+    if isinstance(promotion, production_doc.PromoteTo):
         for checkout in promotion.checkouts:
             if not checkout.is_dir():
                 raise Refusal(f"Promote checkout {checkout} does not exist; name an existing checkout, or none")
@@ -463,9 +415,6 @@ def on_origin(request: MergeRequest) -> bool:
 
 def ancestry(request: MergeRequest) -> bool:
     checkout = request.production.checkout
-    if git(checkout, "cat-file", "-e", f"{request.commit}^{{commit}}").returncode:
-        raise Stop("ancestry", "failed", f"commit {request.commit} is absent",
-                   "push the checkpoint and send its hash again")
     history = merge_history(request)
     if isinstance(history, LastMerged) and git(checkout, "merge-base", "--is-ancestor", history.hash,
                                                request.commit).returncode:
@@ -939,7 +888,7 @@ def send_queued_zone() -> None:
 
 
 def promote(request: MergeRequest | ChildHandoffRequest, tip: str) -> None:
-    if isinstance(request.promotion, NoPromotion):
+    if isinstance(request.promotion, production_doc.NoPromotion):
         report("promote", "ok", "no promotion configured")
         return
     label = (f"{request.unit.name} phase {request.phase}" if isinstance(request, MergeRequest)
@@ -954,7 +903,7 @@ def promote(request: MergeRequest | ChildHandoffRequest, tip: str) -> None:
         report("promote", "ok", detail)
         into(checkout, "main", f"sessions on {os.uname().nodename} run the installed commands from it",
              f"the live gate of {label}")
-    if isinstance(request.promotion.mac, MacCheckout):
+    if isinstance(request.promotion.mac, production_doc.MacCheckout):
         mac = request.promotion.mac.path
         source = request.promotion.checkouts[0] if request.promotion.checkouts else request.production.checkout
         pull_mac_checkout(mac, source)
@@ -1014,7 +963,7 @@ def record(request: MergeRequest, merge_head: str, tests_green: str) -> None:
                        "the showrunner will repair the review record and rerun")
     request.production.log.parent.mkdir(parents=True, exist_ok=True)
     with request.production.log.open("a", encoding="utf-8") as log:
-        suffix = "; promoted" if isinstance(request.promotion, PromoteTo) else ""
+        suffix = "; promoted" if isinstance(request.promotion, production_doc.PromoteTo) else ""
         _ = log.write(f"- {datetime.now(request.production.zone):%H:%M %Z}: {request.unit.name} phase {request.phase} "
                       + f"({request.commit}) merged as {merge_head}; {tests_green} green; pushed{suffix}\n")
     report("record", "ok", "review ledger and production log updated" if isinstance(request.kind, CodeCheckpoint)
@@ -1052,8 +1001,79 @@ def notify_style(checkout: Path, branch: str, tip: str) -> None:
         print("style sync: " + str(error).replace("\n", "; "), flush=True)
 
 
+@contextmanager
+def _external_merge_wait(arguments: list[str]) -> Generator[None, None, None]:
+    if os.environ.get(PROBE_ENV) == "1":
+        yield
+        return
+    recorder = [sys.executable, str(Path(progress_history.__file__))]
+    wait_id = ""
+    try:
+        started = subprocess.run([*recorder, *arguments], capture_output=True, text=True, check=False)
+        wait_id = started.stdout.strip() if started.returncode == 0 else ""
+        if not wait_id:
+            report("wait", "NotRecorded", started.stderr.strip() or "recorder returned no wait id")
+    except OSError as error:
+        report("wait", "NotRecorded", str(error))
+    try:
+        yield
+    finally:
+        if wait_id:
+            try:
+                finished = subprocess.run([*recorder, "finish-external-wait", "--wait-id", wait_id],
+                                          capture_output=True, text=True, check=False)
+                if finished.returncode:
+                    report("wait", "NotRecorded", finished.stderr.strip() or "cannot close merge gate wait")
+            except OSError as error:
+                report("wait", "NotRecorded", str(error))
+
+
+@contextmanager
+def merge_gate_wait(worktree: Path, phase_id: str, unit: str, checkpoint: str) -> Generator[None, None, None]:
+    """Resolve the full checkpoint in durable history, including finished runs."""
+    with _external_merge_wait(["start-checkpoint-wait", "--commit", checkpoint,
+        "--working-dir", str(worktree), "--phase-id", phase_id, "--unit", unit,
+        "--reason", "checkpoint merge tests"]):
+        yield
+
+
+@contextmanager
+def child_handoff_wait(production: str, checkpoint: str) -> Generator[None, None, None]:
+    """A child branch checkpoint belongs to its production, with no phase."""
+    owner = os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID", "")
+    with _external_merge_wait(["start-handoff-wait", "--production", production,
+        "--commit", checkpoint, "--owner-session", owner, "--reason", "child production merge tests"]):
+        yield
+
+
+def record_pushed_merges(production: Production, merge_head: str, source_checkpoint: str,
+                         tip: str, *, phase_id: str, issue: str = "") -> None:
+    """Receipts survive promotion failures and include origin/main integration merges."""
+    repository = production_field(production.doc.read_text(encoding="utf-8").splitlines(), "Repository")
+    project = Path(repository).expanduser().name
+    merges = good(git(production.checkout, "rev-list", "--first-parent", "--merges", "--reverse",
+                      f"{merge_head}^1..{tip}"), "receipt").splitlines()
+    for commit in merges:
+        if commit != merge_head and good(git(production.checkout, "show", "-s", "--format=%s", commit), "receipt") != (
+            "Merge origin/main into " + production.merge_branch
+        ):
+            break  # A retry can see later units' merges; their own call records them.
+        source = source_checkpoint if commit == merge_head else good(
+            git(production.checkout, "rev-parse", f"{commit}^2"), "receipt")
+        stamp = float(good(git(production.checkout, "show", "-s", "--format=%ct", commit), "receipt"))
+        _ = progress_history.write_merge_receipt(
+            project=project, phase_id=phase_id, issue=issue, merge_commit=commit,
+            source_checkpoint=source, target_branch=production.merge_branch, merged_at=stamp,
+        )
+
+
 def run(request: MergeRequest) -> int:
     try:
+        checkpoint = git(request.unit.worktree, "rev-parse", "--verify", f"{request.commit}^{{commit}}")
+        if checkpoint.returncode:
+            raise Stop("ancestry", "failed", f"commit {request.commit} is absent",
+                       "push the checkpoint and send its hash again")
+        request = request._replace(commit=checkpoint.stdout.strip())
         already = ancestry(request)
         tests_green = "merge tests" if isinstance(request.kind, CodeCheckpoint) else "no tests"
         pushed = pushed_state(request.production, request.commit) if already else NotYetPushed()
@@ -1075,7 +1095,11 @@ def run(request: MergeRequest) -> int:
             paths = changed_paths(request, f"{merge_head}^1")
         if isinstance(pushed, NotYetPushed):
             try:
-                tests_green = tests(request, paths, merge_head)
+                if isinstance(request.kind, CodeCheckpoint):
+                    with merge_gate_wait(request.unit.worktree, request.phase, request.unit.name, request.commit):
+                        tests_green = tests(request, paths, merge_head)
+                else:
+                    tests_green = tests(request, paths, merge_head)
             except (OSError, ValueError) as error:
                 undo_unpushed_merge(request.production, merge_head)
                 raise Stop("red", "failed", str(error),
@@ -1090,6 +1114,8 @@ def run(request: MergeRequest) -> int:
             tip = push_validate(request.production,
                                 f"ci({request.production.slug}): format fixes after {request.unit.name} phase {request.phase}",
                                 not already, request.cancel_prior)
+        record_pushed_merges(request.production, merge_head, request.commit, tip, phase_id=request.phase,
+                             issue=str(request.unit.plan))
         notify_style(request.production.checkout, request.production.merge_branch, tip)
         if isinstance(pushed, NotYetPushed):
             record_changes(request, commits, merge_head)
@@ -1130,7 +1156,7 @@ class ChildHandoffRequest(NamedTuple):
     merge_tests: tuple[tuple[str, ...], ...]
     started: str
     delivery: NotMerged | MergedNotPushed | MergedAndPushed
-    promotion: NoPromotion | PromoteTo
+    promotion: production_doc.NoPromotion | production_doc.PromoteTo
     root_self: bool
     flakes: frozenset[str]
     flaky_tests: frozenset[str]
@@ -1186,8 +1212,8 @@ def child_request(args: argparse.Namespace) -> ChildHandoffRequest:
         if git(checkout, "merge-base", "--is-ancestor", previous, checkpoint).returncode:
             raise Refusal(f"checkpoint {checkpoint[:7]} does not descend from {slug}'s last merged hand-off {last.short}")
     parent_lines = production.doc.read_text().splitlines()
-    mode = optional_field(parent_lines, "Push")
-    raw = cell_value(mode.text) if isinstance(mode, FieldPresent) else "validate_and_push"
+    mode = production_doc.optional_field(parent_lines, "Push")
+    raw = cell_value(mode.text) if isinstance(mode, production_doc.FieldPresent) else "validate_and_push"
     if raw not in ("git", "validate_and_push"):
         raise Refusal(f"unknown Push mode: {raw}")
     delivery: NotMerged | MergedNotPushed | MergedAndPushed = NotMerged()
@@ -1195,8 +1221,8 @@ def child_request(args: argparse.Namespace) -> ChildHandoffRequest:
         merge_head = handoff_merge_evidence(production, slug, checkpoint)
         pushed = pushed_state(production, checkpoint)
         delivery = MergedAndPushed(merge_head) if isinstance(pushed, PushedTip) else MergedNotPushed(merge_head)
-    promotion = promotion_from_doc(parent_lines)
-    if isinstance(promotion, PromoteTo):
+    promotion = production_doc.promotion_from_doc(parent_lines)
+    if isinstance(promotion, production_doc.PromoteTo):
         for destination in promotion.checkouts:
             if not destination.is_dir():
                 raise Refusal(f"Promote checkout {destination} does not exist; name an existing checkout, or none")
@@ -1275,6 +1301,10 @@ def run_handoff(request: ChildHandoffRequest) -> int:
     delivery = request.delivery
     if isinstance(delivery, MergedAndPushed):
         print(f"hand-off {checkpoint[:7]} already merged as {delivery.merge_head[:7]}", flush=True)
+        pushed = pushed_state(request.production, checkpoint)
+        tip = pushed.tip if isinstance(pushed, PushedTip) else delivery.merge_head
+        record_pushed_merges(request.production, delivery.merge_head, checkpoint, tip,
+                             phase_id="", issue=f"{request.child.slug} hand-off")
         finish_handoff(request, delivery.merge_head)
         return 0
     current = good(git(checkout, "branch", "--show-current"), "merge")
@@ -1299,8 +1329,9 @@ def run_handoff(request: ChildHandoffRequest) -> int:
             paths = merge_paths(checkout, f"{merge_head}^1", checkpoint)
     if isinstance(delivery, NotMerged) or pending_tests.exists():
         try:
-            _ = checkpoint_tests(request.production, paths, checkpoint, request.merge_tests,
-                                 request.flakes, request.scratch, merge_head, request.flaky_tests)
+            with child_handoff_wait(request.child.slug, checkpoint):
+                _ = checkpoint_tests(request.production, paths, checkpoint, request.merge_tests,
+                                     request.flakes, request.scratch, merge_head, request.flaky_tests)
         except (OSError, ValueError) as error:
             undo_unpushed_merge(request.production, merge_head)
             raise Stop("red", "failed", str(error), "repair the test logging failure and send a new checkpoint") from error
@@ -1311,6 +1342,8 @@ def run_handoff(request: ChildHandoffRequest) -> int:
         tip = push_validate(request.production,
                             f"ci({request.production.slug}): format fixes after {request.child.slug} style hand-off",
                             isinstance(delivery, NotMerged))
+    record_pushed_merges(request.production, merge_head, checkpoint, tip,
+                         phase_id="", issue=f"{request.child.slug} hand-off")
     notify_style(checkout, branch, tip)
     promote(request, tip)
     finish_handoff(request, merge_head)

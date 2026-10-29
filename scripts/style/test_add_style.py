@@ -21,7 +21,7 @@ import rules
 import style_ledger
 import unit_plans
 import style_rules
-from add_unit import read_production
+from production_units import read_production
 from production_units import production_field
 from scripts.accounts.accounts import NamedAccount
 from scripts.herdr import herdr
@@ -86,7 +86,7 @@ def run_script(script, *arguments):
     return real_run_script(script, *arguments)
 
 with mock.patch.object(add_style, "_run_script", side_effect=run_script), mock.patch.object(
-    add_style, "herdr_tab_open", side_effect=lambda name:
+    add_style, "herdr_tab_open", side_effect=lambda name, ending:
     (Path(os.environ["TEST_LIVE_SESSIONS"]) / name).exists()
 ):
     raise SystemExit(add_style.main(sys.argv[2:]))
@@ -707,3 +707,7 @@ class AddStyleTests(unittest.TestCase):
         self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
         self.assertEqual((self.calls(), self.sync()), (calls, sync))
         self.assertEqual(production_field(self.doc.read_text().splitlines(), "Parent production"), str(self.parent))
+
+
+if __name__ == "__main__":
+    _ = unittest.main()

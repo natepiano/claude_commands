@@ -22,7 +22,7 @@ from typing import ClassVar, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from add_unit import read_production
+from production_units import read_production
 from dailies_render import LENGTHS
 from dailies_input import (Activity, BevyUpgradeUnavailable, Block, ClaudeNotRunning, Decision, FormWaiting,
                            Running, SessionGone, StillWaiting, TicksFailing, UnitRow,

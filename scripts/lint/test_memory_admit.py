@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 
 import memory_admit as gate
 import nextest_budget as budget
+from memory_test_support import fake_memory_readings
 store = gate.store
 
 GIB = gate.GIB
@@ -39,11 +40,36 @@ HANA = gate.RepositoryIdentity("https://example.org/nate/hana", "hana", "hana")
 
 def setUpModule() -> None:
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    _ = (root / "meminfo").write_text("MemTotal: 67108864 kB\nMemAvailable: 67108864 kB\n")
+    _ = (root / "pressure").write_text(
+        "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+        + "full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+    )
     _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {
+        "BUILDLOG_MEMINFO": str(root / "meminfo"),
         "BUILDLOG_MEMORY_PRESSURE": str(root / "pressure"),
+        "BUILDLOG_LIVE_MEMORY_TRIPWIRE": os.environ.get(
+            "BUILDLOG_LIVE_MEMORY_TRIPWIRE", str(root / "live-memory-reads.jsonl")
+        ),
         "BUILDLOG_BUILD_BUDGET_GIB": "20",
         "USER_ZONE": "America/New_York",
     })))
+
+
+class MemoryTestSupportTests(unittest.TestCase):
+    def test_fake_readings_preserve_an_empty_or_set_tripwire_and_default_only_when_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            shared_record = str(root / "shared-tripwire.jsonl")
+            for setting, expected in ((None, str(root / "live-memory-reads.jsonl")),
+                                      ("", ""), (shared_record, shared_record)):
+                with self.subTest(tripwire=setting), patch.dict(os.environ):
+                    if setting is None:
+                        _ = os.environ.pop("BUILDLOG_LIVE_MEMORY_TRIPWIRE", None)
+                    else:
+                        os.environ["BUILDLOG_LIVE_MEMORY_TRIPWIRE"] = setting
+                    environment = fake_memory_readings(root)
+                    self.assertEqual(environment["BUILDLOG_LIVE_MEMORY_TRIPWIRE"], expected)
 
 
 class DecisionTests(unittest.TestCase):
@@ -198,6 +224,279 @@ class HistoryTests(unittest.TestCase):
         scratch = gate.RepositoryIdentity(HANA.key, HANA.name)
         self.assertEqual(gate.expected_peak(scratch, "nextest", self.host, NOW, self.root).source,
                          "fallback")
+
+
+class FilteredPromiseTests(unittest.TestCase):
+    root: Path = Path()
+    host: str = "test-host"
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (self.root / "admission").mkdir()
+
+    def samples(self, peaks: list[int], *, package: str = "hana", filters: tuple[str, ...] = (),
+                scope: gate.TestScope = "filtered", step: str = "nextest",
+                repository: gate.RepositoryIdentity = HANA, host: str = "test-host",
+                at: datetime = HISTORY_AT) -> None:
+        with (self.root / "admission/anon_peaks.jsonl").open("a") as output:
+            for peak in peaks:
+                _ = output.write(json.dumps({
+                    "host": host, "repo": repository.name, "repo_identity": repository.key,
+                    "step": step, "test_scope": scope, "package": package,
+                    "filters": list(filters), "anon_peak_bytes": peak,
+                    "ended_at": store.utc_iso(at.timestamp()),
+                }) + "\n")
+
+    def promise(self, filters: tuple[str, ...] = ("native_rate",)) -> gate.ExpectedPeak:
+        return gate.expected_peak(HANA, "nextest", self.host, NOW, self.root,
+                                  scope="filtered", package="hana", filters=filters)
+
+    def test_exact_filter_set_uses_its_p90_regardless_of_name_order(self) -> None:
+        self.samples([number * GIB for number in range(1, 11)], filters=("render", "native_rate"))
+        self.samples([14 * GIB] * 10, filters=("other",))
+        self.samples([19 * GIB] * 10, scope="full")
+        for filters in (("native_rate", "render"), ("render", "native_rate")):
+            with self.subTest(filters=filters):
+                self.assertEqual(self.promise(filters), gate.ExpectedPeak(9 * GIB, "measured", 10))
+
+    def test_one_exact_native_rate_sample_precedes_other_filtered_history(self) -> None:
+        self.samples([2 * GIB], filters=("native_rate",))
+        self.samples([9 * GIB] * 10, filters=("render",))
+        self.assertEqual(self.promise(), gate.ExpectedPeak(2 * GIB, "measured", 1))
+
+    def test_unseen_filter_set_uses_all_filtered_runs_of_the_same_package(self) -> None:
+        self.samples([number * GIB for number in range(1, 6)], filters=("render",))
+        self.samples([number * GIB for number in range(6, 11)], filters=("audio",))
+        self.samples([17 * GIB] * 10, filters=("native_rate",), package="hana-ui")
+        other = gate.RepositoryIdentity("https://example.org/nate/other", "other", "other")
+        self.samples([18 * GIB] * 10, filters=("native_rate",), repository=other)
+        self.samples([19 * GIB] * 10, scope="full")
+        self.assertEqual(self.promise(), gate.ExpectedPeak(9 * GIB, "measured", 10))
+
+    def test_no_filtered_history_uses_floor_when_compile_peak_is_lower(self) -> None:
+        self.samples([gate.FILTERED_FLOOR // 2] * 5, step="check", scope="full")
+        self.samples([19 * GIB] * 5, scope="full")
+        self.assertEqual(self.promise().bytes, gate.FILTERED_FLOOR)
+
+    def test_no_filtered_history_keeps_compile_peak_above_the_floor(self) -> None:
+        compile_peak = 2 * gate.FILTERED_FLOOR
+        self.samples([compile_peak] * 5, step="check", scope="full")
+        self.samples([4 * compile_peak] * 5, step="check", scope="full", package="hana-ui")
+        self.samples([5 * compile_peak] * 5, scope="full")
+        self.assertEqual(self.promise().bytes, compile_peak)
+
+    def test_no_compile_or_filtered_history_uses_floor_instead_of_full_suite(self) -> None:
+        self.samples([19 * GIB] * 5, scope="full")
+        self.samples([18 * GIB] * 5, package="hana-ui", filters=("native_rate",))
+        self.assertEqual(self.promise().bytes, gate.FILTERED_FLOOR)
+
+    def test_compile_fallback_can_use_same_package_buildlog_history(self) -> None:
+        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+            _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
+                           + "peak_mem_bytes INTEGER, argv TEXT)")
+            for package, peak in (("hana", 8 * GIB), ("hana-ui", 20 * GIB)):
+                _ = db.executemany("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?)", [
+                    (self.host, "hana", "check", store.utc_iso(HISTORY_AT.timestamp()), peak,
+                     json.dumps(["cargo", "check", "-p", package]))
+                ] * 5)
+        self.assertEqual(self.promise().bytes, max(gate.FILTERED_FLOOR, int(8 * GIB * gate.ANON_SHARE)))
+
+    def test_exact_buildlog_filters_precede_broader_filtered_anon_history(self) -> None:
+        self.samples([19 * GIB] * 10, filters=("other",))
+        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+            _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
+                           + "peak_mem_bytes INTEGER, argv TEXT)")
+            for package, names, peaks in (
+                ("hana", "test(render) | test(native_rate)", list(range(1, 11))),
+                ("hana-ui", "test(render) | test(native_rate)", [20] * 10),
+                ("hana", "test(other)", [21] * 10),
+            ):
+                argv = ["cargo", "nextest", "run", "-E", f"package({package}) & ({names})"]
+                _ = db.executemany("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?)", [
+                    (self.host, "hana", "nextest", store.utc_iso(HISTORY_AT.timestamp()), peak * GIB,
+                     json.dumps(argv)) for peak in peaks
+                ])
+        self.assertEqual(self.promise(("native_rate", "render")),
+                         gate.ExpectedPeak(int(9 * GIB * gate.ANON_SHARE), "buildlog", 10))
+
+    def test_verify_nextest_expression_supplies_package_and_canonical_filter_set(self) -> None:
+        cases = (
+            ("package(hana) & test(native_rate)", ("native_rate",)),
+            ("package(hana) & (test(render) | test(native_rate))", ("native_rate", "render")),
+            ("package(hana) & (test(render) | test(native_rate) | test(render))", ("native_rate", "render")),
+            ("package(hana)", ()),
+        )
+        for expression, filters in cases:
+            for arguments in (["-E", expression], ["--filterset=" + expression]):
+                with self.subTest(arguments=arguments):
+                    argv = ["cargo", "nextest", "run", "--workspace", "--test-threads", "16", *arguments]
+                    self.assertEqual(gate.test_package(argv), "hana")
+                    self.assertEqual(gate.test_filters(argv), filters)
+
+    def test_filtered_history_respects_host_and_time_window(self) -> None:
+        self.samples([19 * GIB] * 5, filters=("native_rate",), host="other-host")
+        self.samples([19 * GIB] * 5, filters=("native_rate",), at=NOW - timedelta(days=15))
+        self.samples([19 * GIB] * 5, filters=("native_rate",), at=NOW + timedelta(seconds=1))
+        self.assertEqual(self.promise().bytes, gate.FILTERED_FLOOR)
+
+    def test_unfiltered_p90_is_unchanged_by_filtered_and_compile_history(self) -> None:
+        self.samples([number * GIB for number in range(1, 11)], scope="full")
+        self.samples([19 * GIB] * 10, filters=("native_rate",))
+        self.samples([20 * GIB] * 10, step="check", scope="full")
+        self.assertEqual(gate.expected_peak(HANA, "nextest", self.host, NOW, self.root),
+                         gate.ExpectedPeak(9 * GIB, "measured", 10))
+
+    def test_non_verify_expressions_have_no_exact_package_or_filter_key(self) -> None:
+        expressions = (
+            "package(hana) & not test(native_rate)",
+            "package(hana) & !test(native_rate)",
+            "package(hana) & (test(native_rate) & test(render))",
+            "package(hana) | test(native_rate)",
+            "package(hana) & (test(native_rate) | not test(render))",
+            "package(hana) & test(native_rate) & kind(lib)",
+            "not package(hana) & test(native_rate)",
+            "package(hana) & test(/native.*/)",
+            "test(native_rate)",
+        )
+        for expression in expressions:
+            for option in ("-E", "--filterset="):
+                arguments = [option, expression] if option == "-E" else [option + expression]
+                for package_arguments in ([], ["-p", "hana"]):
+                    with self.subTest(expression=expression, option=option, package_arguments=package_arguments):
+                        argv = ["cargo", "nextest", "run", *package_arguments, *arguments]
+                        self.assertEqual(gate.test_filters(argv), ())
+                        self.assertEqual(gate.test_package(argv), "")
+
+    def test_multiple_filter_expressions_cannot_claim_a_verify_exact_key(self) -> None:
+        for second in ("test(render)", "not test(native_rate)", "package(hana) & test(render)"):
+            with self.subTest(second=second):
+                argv = ["cargo", "nextest", "run", "-E", "package(hana) & test(native_rate)", "-E", second]
+                self.assertEqual(gate.test_filters(argv), ())
+                self.assertEqual(gate.test_package(argv), "")
+
+    def test_non_verify_expression_keeps_the_broad_filtered_memory_estimate(self) -> None:
+        self.samples([15 * GIB] * 5, package="")
+        self.samples([2 * GIB] * 5, filters=("native_rate",))
+        argv = ["cargo", "nextest", "run", "-E", "package(hana) & not test(native_rate)"]
+        self.assertEqual(
+            gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, scope=gate.test_scope(argv),
+                               package=gate.test_package(argv), filters=gate.test_filters(argv)),
+            gate.ExpectedPeak(15 * GIB, "measured", 10),
+        )
+
+    def test_negated_index_expression_cannot_supply_a_positive_exact_promise(self) -> None:
+        self.samples([9 * GIB] * 5, filters=("other",))
+        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+            _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
+                           + "peak_mem_bytes INTEGER, argv TEXT)")
+            for expression in ("package(hana) & not test(native_rate)", "package(hana) & !test(native_rate)"):
+                _ = db.execute("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?)",
+                               (self.host, "hana", "nextest", store.utc_iso(HISTORY_AT.timestamp()), GIB,
+                                json.dumps(["cargo", "nextest", "run", "-E", expression])))
+        self.assertEqual(self.promise(), gate.ExpectedPeak(9 * GIB, "measured", 5))
+
+    def test_unscoped_filtered_run_without_history_retains_the_legacy_fallback(self) -> None:
+        argv = ["cargo", "nextest", "run", "--workspace", "-E", "test(native_rate)"]
+        self.assertEqual(
+            gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, scope=gate.test_scope(argv),
+                               package=gate.test_package(argv), filters=gate.test_filters(argv)),
+            gate.ExpectedPeak(gate.FALLBACK, "fallback", 0),
+        )
+
+    def test_unscoped_filtered_run_with_sparse_history_retains_the_legacy_sample_minimum(self) -> None:
+        self.samples([2 * GIB], package="", filters=("native_rate",))
+        self.assertEqual(
+            gate.expected_peak(HANA, "nextest", self.host, NOW, self.root,
+                               scope="filtered", filters=("native_rate",)),
+            gate.ExpectedPeak(gate.FALLBACK, "fallback", 0),
+        )
+
+    def test_unscoped_filtered_run_retains_the_cross_repository_pool(self) -> None:
+        self.samples([2 * GIB] * 3, package="")
+        other = gate.RepositoryIdentity("https://example.org/nate/other", "other", "other")
+        self.samples([9 * GIB] * 5, package="", repository=other)
+        self.assertEqual(
+            gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, scope="filtered"),
+            gate.ExpectedPeak(9 * GIB, "pooled", 8),
+        )
+
+    def test_no_filtered_history_uses_same_package_build_measurements(self) -> None:
+        self.samples([8 * GIB] * 5, step="build", scope="full")
+        self.samples([20 * GIB] * 5, step="build", scope="full", package="hana-ui")
+        self.assertEqual(self.promise(), gate.ExpectedPeak(8 * GIB, "measured", 5))
+
+    def test_build_measurements_precede_compile_index_history(self) -> None:
+        self.samples([8 * GIB] * 5, step="build", scope="full")
+        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+            _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
+                           + "peak_mem_bytes INTEGER, argv TEXT)")
+            _ = db.executemany("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?)", [
+                (self.host, "hana", "check", store.utc_iso(HISTORY_AT.timestamp()), 20 * GIB,
+                 json.dumps(["cargo", "check", "-p", "hana"]))
+            ] * 5)
+        self.assertEqual(self.promise(), gate.ExpectedPeak(8 * GIB, "measured", 5))
+
+    def test_no_filtered_history_uses_same_package_build_index_measurements(self) -> None:
+        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+            _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
+                           + "peak_mem_bytes INTEGER, argv TEXT)")
+            for package, peak in (("hana", 8 * GIB), ("hana-ui", 20 * GIB)):
+                _ = db.executemany("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?)", [
+                    (self.host, "hana", "build", store.utc_iso(HISTORY_AT.timestamp()), peak,
+                     json.dumps(["cargo", "build", "-p", package]))
+                ] * 5)
+        self.assertEqual(self.promise(), gate.ExpectedPeak(int(8 * GIB * gate.ANON_SHARE), "buildlog", 5))
+
+    def test_indexed_member_filter_promises_never_exceed_the_full_suite(self) -> None:
+        self.samples([12 * GIB] * 5, scope="full")
+        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+            _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
+                           + "peak_mem_bytes INTEGER, argv TEXT)")
+            _ = db.executemany("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?)", [
+                (self.host, "hana", "nextest", store.utc_iso(HISTORY_AT.timestamp()), 30 * GIB,
+                 json.dumps(["cargo", "nextest", "run", "-E",
+                             "package(hana_diegetic) & test(native_rate)"]))
+            ] * 66)
+        for filters in (("native_rate",), ("another_test",)):
+            with self.subTest(filters=filters):
+                self.assertEqual(
+                    gate.expected_peak(HANA, "nextest", self.host, NOW, self.root,
+                                       scope="filtered", package="hana_diegetic", filters=filters),
+                    gate.ExpectedPeak(12 * GIB, "buildlog", 66),
+                )
+        self.assertEqual(gate.expected_peak(HANA, "nextest", self.host, NOW, self.root),
+                         gate.ExpectedPeak(12 * GIB, "measured", 5))
+
+    def test_exact_filtered_measurements_are_capped_without_raising_smaller_promises(self) -> None:
+        self.samples([7 * GIB] * 5, scope="full")
+        self.samples([20 * GIB], filters=("native_rate",))
+        self.samples([2 * GIB], filters=("small_test",))
+        self.assertEqual(self.promise(), gate.ExpectedPeak(7 * GIB, "measured", 1))
+        self.assertEqual(self.promise(("small_test",)), gate.ExpectedPeak(2 * GIB, "measured", 1))
+
+    def test_compile_fallback_is_capped_by_the_full_suite_promise(self) -> None:
+        self.samples([4 * GIB] * 5, scope="full")
+        self.samples([8 * GIB] * 5, step="build", scope="full")
+        self.assertEqual(self.promise(), gate.ExpectedPeak(4 * GIB, "measured", 5))
+
+    def test_filtered_cap_uses_the_requested_test_width(self) -> None:
+        with (self.root / "admission/anon_peaks.jsonl").open("a") as output:
+            for scope, width, peak, count in (("full", 16, 6 * GIB, 5),
+                                               ("full", 4, 30 * GIB, 5),
+                                               ("filtered", 16, 20 * GIB, 1)):
+                for _ in range(count):
+                    _ = output.write(json.dumps({
+                        "host": self.host, "repo": HANA.name, "repo_identity": HANA.key,
+                        "step": "nextest", "test_scope": scope, "test_threads": width,
+                        "package": "hana", "filters": ["native_rate"], "anon_peak_bytes": peak,
+                        "ended_at": store.utc_iso(HISTORY_AT.timestamp()),
+                    }) + "\n")
+        self.assertEqual(
+            gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, test_threads=16,
+                               scope="filtered", package="hana", filters=("native_rate",)),
+            gate.ExpectedPeak(6 * GIB, "measured", 1),
+        )
 
 
 class RepositoryHistoryTests(unittest.TestCase):
@@ -820,6 +1119,160 @@ class PressureAdmissionTests(MemoryQueueFixture):
         self.assertEqual(fields[6], "0")
 
 
+class LiveMemoryTripwireTests(MemoryQueueFixture):
+    record: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.record = self.root / "expected-live-memory-reads.jsonl"
+        (self.root / "proc").mkdir()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(self.record),
+            "BUILDLOG_MEMINFO": str(self.meminfo),
+        })))
+
+    def refusal(self, reading: str) -> str:
+        return (
+            f"live memory reading {reading} in a test; "
+            + "fake BUILDLOG_MEMINFO and BUILDLOG_MEMORY_PRESSURE (scripts/lint/memory_test_support.py)"
+        )
+
+    def assert_record(self, reading: str, *, in_process: bool = True) -> None:
+        lines = self.record.read_text().splitlines()
+        self.assertEqual(len(lines), 1)
+        row = cast(dict[str, object], json.loads(lines[0]))
+        self.assertEqual(row["reading"], reading)
+        self.assertIsInstance(row["argv"], list)
+        arguments = cast(list[object], row["argv"])
+        self.assertTrue(arguments)
+        self.assertTrue(all(isinstance(argument, str) for argument in arguments))
+        self.assertIsInstance(row["pid"], int)
+        self.assertGreater(cast(int, row["pid"]), 0)
+        if in_process:
+            self.assertEqual(row["argv"], sys.argv)
+            self.assertEqual(row["pid"], os.getpid())
+
+    def test_default_pressure_refuses_before_reading_and_records_the_process(self) -> None:
+        del os.environ["BUILDLOG_MEMORY_PRESSURE"]
+        with patch.object(Path, "read_text", side_effect=AssertionError("must refuse before reading memory")):
+            with self.assertRaises(gate.LiveMemoryReading) as raised:
+                _ = gate.read_pressure()
+        self.assertIsInstance(raised.exception, RuntimeError)
+        self.assertEqual(str(raised.exception), self.refusal("/proc/pressure/memory"))
+        self.assert_record("/proc/pressure/memory")
+
+    def test_meminfo_and_its_symlink_refuse_before_reading_and_record_the_live_path(self) -> None:
+        link = self.root / "live-meminfo"
+        link.symlink_to("/proc/meminfo")
+        for path in (Path("/proc/meminfo"), link):
+            with self.subTest(path=path):
+                self.record.unlink(missing_ok=True)
+                with patch.object(Path, "read_text", side_effect=AssertionError("must refuse before reading memory")):
+                    with self.assertRaises(gate.LiveMemoryReading) as raised:
+                        _ = gate.read_meminfo(path)
+                self.assertEqual(str(raised.exception), self.refusal("/proc/meminfo"))
+                self.assert_record("/proc/meminfo")
+
+    def test_live_readings_append_records_without_replacing_earlier_entries(self) -> None:
+        del os.environ["BUILDLOG_MEMORY_PRESSURE"]
+        with self.assertRaises(gate.LiveMemoryReading):
+            _ = gate.read_meminfo(Path("/proc/meminfo"))
+        with self.assertRaises(gate.LiveMemoryReading):
+            _ = gate.read_pressure()
+        rows = [cast(dict[str, object], json.loads(line)) for line in self.record.read_text().splitlines()]
+        self.assertEqual([row["reading"] for row in rows], ["/proc/meminfo", "/proc/pressure/memory"])
+
+    def test_fake_readings_admit_check_and_queue_without_a_record(self) -> None:
+        result = self.check(need=8, free=40)
+        self.assertEqual(result.decision.state, "admit")
+        self.assertIsInstance(result.reservation, gate.Reserved)
+        if isinstance(result.reservation, gate.Reserved):
+            result.reservation.path.unlink()
+        _ = self.head(need=8)
+        view, _ = gate.read_queue(gate.admission_dir(self.root), gate.process_table(gate.PROC), NOW.timestamp())
+        self.assertEqual(len(view.waiting), 1)
+        reason = view.waiting[0].reason
+        self.assertIsInstance(reason, gate.HeadAdmissionStatus)
+        if isinstance(reason, gate.HeadAdmissionStatus):
+            self.assertEqual(reason.decision.state, "admit")
+        self.assertFalse(self.record.exists() and self.record.read_text())
+
+    def test_queue_propagates_live_memory_refusals(self) -> None:
+        _ = self.meminfo.write_text("MemTotal: 67108864 kB\nMemAvailable: 67108864 kB\n")
+        for variable, reading in (("BUILDLOG_MEMINFO", "/proc/meminfo"),
+                                  ("BUILDLOG_MEMORY_PRESSURE", "/proc/pressure/memory")):
+            with self.subTest(variable=variable), patch.dict(os.environ):
+                del os.environ[variable]
+                self.record.unlink(missing_ok=True)
+                with self.assertRaises(gate.LiveMemoryReading) as raised:
+                    _ = gate.read_queue(gate.admission_dir(self.root), {}, NOW.timestamp())
+                self.assertEqual(str(raised.exception), self.refusal(reading))
+                self.assert_record(reading)
+
+    def test_unwritable_record_keeps_the_named_refusal_in_direct_and_queue_calls(self) -> None:
+        _ = self.meminfo.write_text("MemTotal: 67108864 kB\nMemAvailable: 67108864 kB\n")
+        record = self.root / "missing-directory" / "tripwire.jsonl"
+        for variable, reading in (("BUILDLOG_MEMINFO", "/proc/meminfo"),
+                                  ("BUILDLOG_MEMORY_PRESSURE", "/proc/pressure/memory")):
+            with patch.dict(os.environ, {"BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(record), variable: reading}):
+                with self.subTest(reading=reading, caller="direct"):
+                    with self.assertRaises(gate.LiveMemoryReading) as raised:
+                        gate.check_memory_reading(Path(reading))
+                    self.assertEqual(str(raised.exception), self.refusal(reading))
+                with self.subTest(reading=reading, caller="queue"):
+                    with self.assertRaises(gate.LiveMemoryReading) as raised:
+                        _ = gate.read_queue(gate.admission_dir(self.root), {}, NOW.timestamp())
+                    self.assertEqual(str(raised.exception), self.refusal(reading))
+
+    def test_default_pressure_still_returns_pressure_when_tripwire_is_unset_or_empty(self) -> None:
+        del os.environ["BUILDLOG_MEMORY_PRESSURE"]
+        for setting in (None, ""):
+            with self.subTest(tripwire=setting), patch.dict(os.environ):
+                if setting is None:
+                    del os.environ["BUILDLOG_LIVE_MEMORY_TRIPWIRE"]
+                else:
+                    os.environ["BUILDLOG_LIVE_MEMORY_TRIPWIRE"] = setting
+                self.assertIsInstance(gate.read_pressure(), gate.Pressure)
+
+    def test_checker_cli_exits_two_with_refusal_as_last_stderr_line(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(MEMORY_GATE.with_name("memory_admit.py")), "check", "/proc/meminfo",
+             str(os.getpid()), "", "0", "test", "check", "test", str(GIB), "fallback", "0", "/bin/true"],
+            env=dict(os.environ), capture_output=True, text=True, check=False, timeout=10,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr.splitlines()[-1], self.refusal("/proc/meminfo"))
+        self.assert_record("/proc/meminfo", in_process=False)
+
+    def test_shell_refuses_live_meminfo_or_pressure_and_records_one_reading(self) -> None:
+        _ = self.meminfo.write_text("MemTotal: 67108864 kB\nMemAvailable: 67108864 kB\n")
+        for variable, reading in (("BUILDLOG_MEMINFO", "/proc/meminfo"),
+                                  ("BUILDLOG_MEMORY_PRESSURE", "/proc/pressure/memory")):
+            with self.subTest(variable=variable):
+                self.record.unlink(missing_ok=True)
+                environment = {
+                    **os.environ, "HOME": str(self.root),
+                    "BUILD_HOLD_DIR": str(self.root / "holders"),
+                    "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
+                    "UNIT_ACTIVE_DIR": str(self.root / "active"), "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
+                    "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                    "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                    "MAC_TEST_STATE_DIR": str(self.root / "mac-state"),
+                }
+                del environment[variable]
+                result = subprocess.run(
+                    ["bash", "-c", 'source "$1"; buildlog_wait_for_memory', "test", str(MEMORY_GATE)],
+                    env=environment, capture_output=True, text=True, check=False, timeout=10,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr.strip(), f"memory admission check failed ({self.refusal(reading)}); step refused")
+                self.assertNotIn("waiting for memory", result.stderr)
+                self.assert_record(reading, in_process=False)
+
+
 class QueueApiTests(MemoryQueueFixture):
     @override
     def setUp(self) -> None:
@@ -1431,7 +1884,9 @@ class ShellTests(unittest.TestCase):
             sidecar = root / "step.cgroup"
             _ = meminfo.write_text("MemAvailable: 0 kB\n")
             _ = sidecar.write_text("unused")
-            argv = ["cargo", "nextest", "run", "-E", "test(one)"]
+            # verify.sh test hana --filter native_rate builds this nextest expression.
+            argv = ["cargo", "nextest", "run", "--test-threads", "16",
+                    "-E", "package(hana) & test(native_rate)"]
             first = ["memory_admit.py", "check", str(meminfo), "400", str(sidecar), "0",
                      "", "", "", "-", "", "0", *argv]
             output = io.StringIO()
@@ -1455,8 +1910,12 @@ class ShellTests(unittest.TestCase):
                 _ = reservation.with_suffix(".max").write_text(str(GIB))
                 gate.release(reservation, 0, root)
             self.assertEqual((identity.call_count, history.call_count), (1, 1))
+            assert history.call_args is not None
+            self.assertEqual(history.call_args.kwargs["package"], "hana")
+            self.assertEqual(history.call_args.kwargs["filters"], ("native_rate",))
             sample = cast(dict[str, object], json.loads((root / "admission/anon_peaks.jsonl").read_text()))
             self.assertEqual((sample["repo_identity"], sample["test_scope"]), (HANA.key, "filtered"))
+            self.assertEqual((sample["package"], sample["filters"]), ("hana", ["native_rate"]))
 
     def test_invoke_twice_with_temporary_home(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

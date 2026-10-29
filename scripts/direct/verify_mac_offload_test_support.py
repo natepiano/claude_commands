@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Exercise verify.sh Mac offload routing with disposable command stand-ins."""
 
 from __future__ import annotations
@@ -640,6 +639,8 @@ class VerifyMacOffloadFixture(unittest.TestCase):
                 }
             ],
         }
+        assertion_guard = self.root / "assertion-guard.py"
+        self.write_executable(assertion_guard, "raise SystemExit(0)\n")
         self.environment = {
             **{
                 name: value
@@ -672,6 +673,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "XDG_STATE_HOME": str(self.root / "state"),
             "XDG_CACHE_HOME": str(self.root / "cache"),
             "VERIFY_STEPS_DIR": str(self.root / "verify-steps"),
+            "VERIFY_ASSERTION_GUARD_SCRIPT": str(assertion_guard),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILDLOG_BUILDS_CGROUP": str(self.root / "cgroup"),
             "BUILDLOG_CI_CGROUP": str(self.root / "cgroup"),

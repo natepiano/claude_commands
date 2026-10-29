@@ -57,7 +57,7 @@ class EndSessionTests(unittest.TestCase):
         _ = shutil.copy2(UNIT_RUNS, scripts / "lib" / "unit_runs.py")
         self.script = direct_dir / "end_session.sh"
         _ = shutil.copy2(END_SESSION, self.script)
-        # Resolve the real package and its evolving lifecycle dependencies.
+        # Import the real package, so the script's current imports resolve.
         (direct_dir / "remove_run_scratch.py").symlink_to(REMOVE_RUN_SCRATCH)
         _ = (direct_dir / "remove_workers.py").write_text("", encoding="utf-8")
         (agents / "codex_mesh.py").symlink_to(END_SESSION.parents[1] / "agents" / "codex_mesh.py")

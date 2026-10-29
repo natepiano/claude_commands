@@ -33,6 +33,63 @@ class VaultTests(unittest.TestCase):
         body = "Use [[render graph]] with [[issue structure#feature|a feature]] and [[ui|UI]]."
         self.assertEqual(vault.clean_body(body), "Use render graph with a feature and UI.")
 
+    def test_area_definitions_read_normalized_table_rows_without_writing_the_file(self) -> None:
+        path = self.root / "issue-areas.md"
+        content = (
+            "# Draft definitions for user review\n\n"
+            "| area | definition | issues |\n| --- | --- | --- |\n"
+            '| "[[Rendering]]" | Drawing scenes and managing render passes. | 12 |\n'
+            "| TOOLING | Tools used to build and inspect the project. | 3 |\n"
+        )
+        _ = path.write_text(content, encoding="utf-8")
+        before = path.stat()
+        definitions = vault.load_area_definitions(path)
+        self.assertEqual(definitions, {
+            "rendering": "Drawing scenes and managing render passes.",
+            "tooling": "Tools used to build and inspect the project.",
+        })
+        self.assertNotIn("unfiled", definitions)
+        self.assertEqual(path.read_text(encoding="utf-8"), content)
+        self.assertEqual(path.stat().st_mtime_ns, before.st_mtime_ns)
+
+    def test_missing_area_definition_file_raises_with_its_path_without_creating_it(self) -> None:
+        path = self.root / "conf" / "issue-areas.md"
+        with self.assertRaises(ValueError) as raised:
+            _ = vault.load_area_definitions(path)
+        self.assertIn(str(path), str(raised.exception))
+        self.assertIn("not found", str(raised.exception))
+        self.assertFalse(path.parent.exists())
+
+    def test_area_definitions_without_outer_pipes_load_every_row_and_stop_at_prose(self) -> None:
+        path = self.root / "issue-areas.md"
+        _ = path.write_text(
+            "# Draft definitions\n\n"
+            + "area | definition | issues\n--- | --- | ---\n"
+            + '"[[Rendering]]" | Drawing scenes. | 12\n'
+            + "TOOLING | Building and inspecting projects. | 3\n"
+            + "Definitions end here.\n"
+            + "ignored | Outside the definitions table. | 1\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(vault.load_area_definitions(path), {
+            "rendering": "Drawing scenes.",
+            "tooling": "Building and inspecting projects.",
+        })
+
+    def test_area_definition_file_without_usable_definitions_raises_with_its_path(self) -> None:
+        path = self.root / "issue-areas.md"
+        for content in (
+            "# No table here.\n",
+            "| area | definition | issues |\n| --- | --- | --- |\n",
+            "area | definition | issues\n--- | --- | ---\nrendering | | 0\n",
+        ):
+            with self.subTest(content=content):
+                _ = path.write_text(content, encoding="utf-8")
+                with self.assertRaises(ValueError) as raised:
+                    _ = vault.load_area_definitions(path)
+                self.assertIn(str(path), str(raised.exception))
+                self.assertIn("no area definitions", str(raised.exception))
+
     def test_long_body_cuts_before_the_section_that_would_cross_the_cap(self) -> None:
         kept = "# Problem\n" + "a" * 14_000 + "\n"
         discarded = "## Implementation\n" + "b" * 13_000

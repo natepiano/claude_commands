@@ -61,6 +61,9 @@ store: BuildLogStore = cast(BuildLogStore, cast(object, importlib.import_module(
 
 GIB = 1 << 30
 FALLBACK = 12 * GIB
+# 111 natedev filtered single-test runs with no recompilation in the 14 days
+# to 2026-10-29 had anon p90 0.671 GiB and p95 0.784 GiB.
+FILTERED_FLOOR = GIB
 # On natedev, isolated hana nextest scopes had p90 anon / memory.peak 61%;
 # clippy had 65%, so 0.65 covers the measured p90 process-memory share.
 ANON_SHARE = 0.65
@@ -92,6 +95,17 @@ Repository = RepositoryIdentity | UnknownRepository
 TestScope = Literal["full", "filtered"]
 
 
+@dataclass(frozen=True)
+class PackageTestSelection:
+    package: str
+    filters: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class BroadTestSelection:
+    pass
+
+
 class Reservation(TypedDict):
     pid: int
     start_time: str
@@ -105,6 +119,8 @@ class Reservation(TypedDict):
     call_id: str | None
     repo_identity: NotRequired[str]
     test_scope: NotRequired[TestScope]
+    package: NotRequired[str]
+    filters: NotRequired[list[str]]
 
 
 @dataclass(frozen=True)
@@ -166,6 +182,8 @@ class Waiter(TypedDict):
     repository_name: NotRequired[str]
     legacy_name: NotRequired[str]
     test_scope: NotRequired[TestScope]
+    package: NotRequired[str]
+    filters: NotRequired[list[str]]
 
 
 @dataclass(frozen=True)
@@ -421,7 +439,8 @@ def test_threads(argv: list[str]) -> int | None:
 
 
 def expected_peak(repository: Repository, step: str, host: str, now: datetime, root: Path,
-                  test_threads: int | None = None, *, scope: TestScope = "full") -> ExpectedPeak:
+                  test_threads: int | None = None, *, scope: TestScope = "full",
+                  filters: tuple[str, ...] = (), package: str = "") -> ExpectedPeak:
     """The p90 process-memory peak of a step over HISTORY_DAYS.
 
     The gate pools every test width: one width's history is thin and rebuild-heavy, and the
@@ -430,6 +449,12 @@ def expected_peak(repository: Repository, step: str, host: str, now: datetime, r
     """
     if isinstance(repository, UnknownRepository):
         return ExpectedPeak(FALLBACK, "fallback", 0)
+    if scope == "filtered" and package:
+        filtered = filtered_peak(repository, step, host, now, root, test_threads,
+                                 tuple(sorted(set(filters))), package)
+        full = expected_peak(repository, step, host, now, root, test_threads, scope="full")
+        # A filtered run builds the same targets and runs fewer tests than the full suite.
+        return ExpectedPeak(min(filtered.bytes, full.bytes), filtered.source, filtered.count)
     cutoff = store.utc_iso((now - timedelta(days=HISTORY_DAYS)).timestamp())
     before = store.utc_iso(now.timestamp())
     measured: list[int] = []
@@ -498,6 +523,116 @@ def expected_peak(repository: Repository, step: str, host: str, now: datetime, r
     return ExpectedPeak(FALLBACK, "fallback", 0)
 
 
+def history_arguments(raw: object) -> list[str]:
+    """Decode argv from the build-log index; absent arguments prove no selection."""
+    if not isinstance(raw, str):
+        return []
+    try:
+        decoded = cast(object, json.loads(raw))
+        if isinstance(decoded, list):
+            return [word for word in cast(list[object], decoded) if isinstance(word, str)]
+    except (ValueError, TypeError):
+        pass
+    return []
+
+
+def filtered_peak(repository: RepositoryIdentity, step: str, host: str, now: datetime,
+                  root: Path, width: int | None, filters: tuple[str, ...],
+                  package: str) -> ExpectedPeak:
+    """Prefer the exact filter set, then this package's filtered runs, at any count.
+
+    Old anon rows lack the package and cannot identify a workspace member. The
+    index's argv can, so those older measured runs remain usable there. Build
+    and check peaks cover compilation when no filtered run has been measured; no other
+    repository's test or compile peak participates in this estimate.
+    """
+    cutoff = store.utc_iso((now - timedelta(days=HISTORY_DAYS)).timestamp())
+    before = store.utc_iso(now.timestamp())
+    measured: list[int] = []
+    exact: list[int] = []
+    compile_peaks: list[int] = []
+    compile_index: list[int] = []
+    try:
+        with (root / "admission/anon_peaks.jsonl").open() as lines:
+            for line in lines:
+                try:
+                    item = cast(dict[str, object], json.loads(line))
+                    own = (item.get("repo_identity") == repository.key
+                           or (not item.get("repo_identity") and repository.legacy_name
+                               and item.get("repo") == repository.legacy_name))
+                    if (not own or item.get("host") != host
+                            or not cutoff <= str(item.get("ended_at", "")) < before):
+                        continue
+                    peak = item.get("anon_peak_bytes")
+                    if not isinstance(peak, int) or peak <= 0:
+                        continue
+                    sample_package = item.get("package", "")
+                    if (item.get("step") in ("check", "build")
+                            and (sample_package == package
+                                 or (not sample_package and package == repository.name))):
+                        compile_peaks.append(peak)
+                    if (item.get("step") != step or item.get("test_scope") != "filtered"
+                            or sample_package != package
+                            or (width is not None and item.get("test_threads") != width)):
+                        continue
+                    measured.append(peak)
+                    names = item.get("filters")
+                    if (filters and isinstance(names, list)
+                            and all(isinstance(name, str) for name in cast(list[object], names))
+                            and tuple(sorted(set(cast(list[str], names)))) == filters):
+                        exact.append(peak)
+                except (ValueError, TypeError, AttributeError):
+                    continue
+    except OSError:
+        pass
+    if exact:
+        return ExpectedPeak(percentile(exact), "measured", len(exact))
+    indexed: list[int] = []
+    indexed_exact: list[int] = []
+    if repository.legacy_name:
+        try:
+            connection = sqlite3.connect(f"file:{root / store.INDEX_NAME}?mode=ro", uri=True)
+            try:
+                columns = {str(row[1]) for row in cast(list[tuple[object, ...]],
+                           connection.execute("PRAGMA table_info(steps)").fetchall())}
+                argv_column = "argv" if "argv" in columns else "NULL"
+                rows = cast(list[tuple[int, str | None, str]], connection.execute(
+                    f"SELECT peak_mem_bytes, {argv_column}, step FROM steps "
+                    + "WHERE host = ? AND repo = ? AND step IN (?, 'check', 'build') "
+                    + "AND started_at >= ? AND started_at < ? AND peak_mem_bytes > 0",
+                    (host, repository.legacy_name, step, cutoff, before),
+                ).fetchall())
+                for value, raw_argv, sample_step in rows:
+                    arguments = history_arguments(raw_argv)
+                    sample_package = test_package(arguments)
+                    if sample_step in ("check", "build"):
+                        if (sample_package == package
+                                or (not sample_package and package == repository.name)):
+                            compile_index.append(int(value))
+                    elif (sample_package == package and test_scope(arguments) == "filtered"
+                          and (width is None or test_threads(arguments) == width)):
+                        indexed.append(int(value))
+                        if filters and test_filters(arguments) == filters:
+                            indexed_exact.append(int(value))
+            finally:
+                connection.close()
+        except (OSError, sqlite3.Error):
+            pass
+    for values, source in ((indexed_exact, "buildlog"),
+                           (measured, "measured"), (indexed, "buildlog")):
+        if values:
+            peak = percentile(values)
+            if source == "buildlog":
+                peak = int(peak * ANON_SHARE)
+            return ExpectedPeak(peak, cast(Literal["measured", "buildlog"], source), len(values))
+    if compile_peaks:
+        return ExpectedPeak(max(FILTERED_FLOOR, percentile(compile_peaks)), "measured", len(compile_peaks))
+    if compile_index:
+        return ExpectedPeak(max(FILTERED_FLOOR, int(percentile(compile_index) * ANON_SHARE)),
+                            "buildlog", len(compile_index))
+    return ExpectedPeak(FILTERED_FLOOR, "fallback", 0)
+
+
 def process_start_time(pid: int) -> str | None:
     try:
         stat = (Path("/proc") / str(pid) / "stat").read_text()
@@ -560,7 +695,32 @@ def step_memory(row: Reservation, now: datetime, processes: dict[int, ProcessIde
     return reading
 
 
+class LiveMemoryReading(RuntimeError):
+    """A test tried to read the host's memory state."""
+
+
+def check_memory_reading(path: Path) -> None:
+    record_path = os.environ.get("BUILDLOG_LIVE_MEMORY_TRIPWIRE", "")
+    if not record_path:
+        return
+    live_path = os.path.realpath(path)
+    if live_path not in ("/proc/meminfo", "/proc/pressure/memory"):
+        return
+    try:
+        with Path(record_path).open("a") as output:
+            fcntl.flock(output, fcntl.LOCK_EX)
+            _ = output.write(json.dumps({"reading": live_path, "argv": sys.argv, "pid": os.getpid()}) + "\n")
+            output.flush()
+    except OSError:
+        pass  # The refusal below still stops the read; callers swallow OSError.
+    raise LiveMemoryReading(
+        f"live memory reading {live_path} in a test; fake BUILDLOG_MEMINFO and "
+        + "BUILDLOG_MEMORY_PRESSURE (scripts/lint/memory_test_support.py)"
+    )
+
+
 def read_meminfo(path: Path) -> tuple[int, int | None]:
+    check_memory_reading(path)
     available: int | None = None
     total: int | None = None
     for line in path.read_text().splitlines():
@@ -578,8 +738,9 @@ def read_meminfo(path: Path) -> tuple[int, int | None]:
 def read_pressure() -> Pressure:
     """An unreadable pressure file does not block; the memory rule still applies."""
     full = 0.0
+    path = Path(os.environ.get("BUILDLOG_MEMORY_PRESSURE", "/proc/pressure/memory"))
+    check_memory_reading(path)
     try:
-        path = Path(os.environ.get("BUILDLOG_MEMORY_PRESSURE", "/proc/pressure/memory"))
         for line in path.read_text().splitlines():
             parts = line.split()
             if parts and parts[0] == "full":
@@ -723,6 +884,63 @@ def git_identity(argv: list[str], cwd: str) -> tuple[Repository, str]:
     return UnknownRepository(), worktree
 
 
+def filter_expressions(argv: list[str]) -> list[str]:
+    expressions: list[str] = []
+    arguments = iter(argv)
+    for word in arguments:
+        if word in ("-E", "--filter-expr", "--filterset"):
+            expressions.append(next(arguments, ""))
+        elif word.startswith(("--filter-expr=", "--filterset=")):
+            expressions.append(word.split("=", 1)[1])
+        elif word.startswith("-E") and len(word) > 2:
+            expressions.append(word[2:].removeprefix("="))
+    return expressions
+
+
+def verify_test_selection(argv: list[str]) -> PackageTestSelection | BroadTestSelection:
+    """Recognize the whole positive expression verify emits, never its fragments."""
+    expressions = filter_expressions(argv)
+    if len(expressions) != 1:
+        return BroadTestSelection()
+    package_predicate = r"package\(([A-Za-z0-9_-]+)\)"
+    name_predicate = r"test\([A-Za-z0-9_:]+\)"
+    union = rf"\(\s*{name_predicate}(?:\s*\|\s*{name_predicate})+\s*\)"
+    match = re.fullmatch(rf"\s*{package_predicate}\s*&\s*(?:{name_predicate}|{union})\s*",
+                         expressions[0])
+    if match:
+        names = cast(list[str], re.findall(r"\btest\(([A-Za-z0-9_:]+)\)", expressions[0]))
+        return PackageTestSelection(match.group(1), tuple(sorted(set(names))))
+    # Full package runs retain their package metadata, without an exact filter set.
+    match = re.fullmatch(rf"\s*{package_predicate}\s*", expressions[0])
+    if match and test_scope(argv) == "full":
+        return PackageTestSelection(match.group(1), ())
+    return BroadTestSelection()
+
+
+def test_filters(argv: list[str]) -> tuple[str, ...]:
+    """Verify's positive filter names, sorted and deduplicated like its cache key."""
+    selection = verify_test_selection(argv)
+    return selection.filters if isinstance(selection, PackageTestSelection) else ()
+
+
+def test_package(argv: list[str]) -> str:
+    """A verify test selection or compile package; empty means broader history."""
+    if parse.step_name(argv) not in ("check", "build"):
+        selection = verify_test_selection(argv)
+        return selection.package if isinstance(selection, PackageTestSelection) else ""
+    packages: list[str] = []
+    arguments = iter(argv)
+    for word in arguments:
+        if word in ("-p", "--package"):
+            packages.append(next(arguments, ""))
+        elif word.startswith("--package="):
+            packages.append(word.split("=", 1)[1])
+        elif word.startswith("-p") and len(word) > 2:
+            packages.append(word[2:])
+    selected = set(packages)
+    return selected.pop() if len(selected) == 1 else ""
+
+
 def test_scope(argv: list[str]) -> TestScope:
     """Keep test selection separate from package, target and execution options."""
     step = parse.step_name(argv)
@@ -763,6 +981,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
     root = root if root is not None else store.root()
     now = now if now is not None else datetime.now(UTC)
     width = test_threads(argv)
+    package, filters = test_package(argv), test_filters(argv)
     if profile is not None and profile.estimated_at and now.timestamp() - profile.estimated_at >= HEAD_SECONDS:
         profile = None
     if profile is None:
@@ -771,7 +990,8 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
         scope = test_scope(argv)
         step = parse.step_name(argv) if argv else "build"
         host = store.host_name()
-        peak = expected_peak(repository, step, host, now, root, scope=scope)
+        peak = expected_peak(repository, step, host, now, root, scope=scope,
+                             package=package, filters=filters)
         profile = StepProfile(repo, step, worktree, peak, repository, scope, now.timestamp())
     elif not profile.estimated_at:
         profile = replace(profile, estimated_at=now.timestamp())
@@ -805,6 +1025,8 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
         waiter: Waiter = {"pid": pid, "start_time": start or "", "need": peak.bytes, "since": waited_from,
                           "label": f"{worktree or repo} {step} ({os.environ.get('BUILDLOG_CALLER') or 'caller'} pid {pid})"}
         waiter["test_scope"] = profile.scope
+        waiter["package"] = package
+        waiter["filters"] = list(filters)
         waiter["estimated_at"] = profile.estimated_at
         waiter["repo_identity"] = ""
         if isinstance(profile.repository, RepositoryIdentity):
@@ -850,6 +1072,8 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                                     "test_threads": width,
                                     "call_id": os.environ.get("BUILDLOG_CALL_ID") or None}
                 row["test_scope"] = profile.scope
+                row["package"] = package
+                row["filters"] = list(filters)
                 if isinstance(profile.repository, RepositoryIdentity):
                     row["repo_identity"] = profile.repository.key
                 _ = path.write_text(json.dumps(row, separators=(",", ":")))
@@ -1058,6 +1282,7 @@ def release(path: Path, status: int, root: Path | None = None) -> None:
                     "worktree": row["worktree"], "anon_peak_bytes": peak, "status": status,
                     "test_threads": row.get("test_threads"), "call_id": row.get("call_id"),
                     "repo_identity": row.get("repo_identity"), "test_scope": row.get("test_scope", "full"),
+                    "package": row.get("package", ""), "filters": row.get("filters", []),
                     "ended_at": store.utc_iso(time.time()),
                 })
         except (OSError, ValueError):
@@ -1092,8 +1317,11 @@ def clean_field(value: str) -> str:
     return value.replace("|", " ").replace("\n", " ")
 
 
-def main() -> None:
+def run_action() -> None:
     action = sys.argv[1]
+    if action == "tripwire":
+        check_memory_reading(Path(sys.argv[2]))
+        return
     if action == "release":
         release(Path(sys.argv[2]), int(sys.argv[3]))
         return
@@ -1108,6 +1336,9 @@ def main() -> None:
             row = cast(Waiter, json.loads((store.root() / "admission" / f"{pid}-{start}.waiting").read_text()))
             # An empty key is the explicit unknown identity. Old rows must refresh.
             if ("repo_identity" in row and "test_scope" in row and "estimated_at" in row
+                    and (row["test_scope"] == "full"
+                         or (row.get("package") == test_package(argv)
+                             and row.get("filters") == list(test_filters(argv))))
                     and 0 <= time.time() - row["estimated_at"] < HEAD_SECONDS):
                 key = row["repo_identity"]
                 repository: Repository = (RepositoryIdentity(key, row.get("repository_name", cached_repo), row.get("legacy_name", ""))
@@ -1139,6 +1370,14 @@ def main() -> None:
             details += f"; head {result.head_label} needs {result.head_need / GIB:.1f} GiB"
         fields[8] = f"{summary}; {details}" if summary else details
     print("|".join(clean_field(str(field)) for field in fields))
+
+
+def main() -> None:
+    try:
+        run_action()
+    except LiveMemoryReading as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(2)
 
 
 if __name__ == "__main__":

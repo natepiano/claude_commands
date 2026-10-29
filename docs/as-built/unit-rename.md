@@ -6,7 +6,7 @@ with three actions: `plan`, `apply` and `verify`.
 
 ## Names
 
-- The unit id (`<stem>-unit`) is the key. An `<old>` that is exactly a Units cell is kept as given, so a guild head such as `designers` is found; any other `<old>`, and every `<new>`, take `-unit` (`rename_unit._ids`). A stem already starting with `<slug>-` keeps that prefix
+- The unit id (`<stem>-unit`) is the key. An `<old>` that is exactly a Units cell is kept as given, so a unit without the suffix is found; any other `<old>`, and every `<new>`, take `-unit` (`rename_unit._ids`). A stem already starting with `<slug>-` keeps that prefix
   once in branch, worktree and host session names. When the new stem equals the old branch or
   worktree folder name, that branch or worktree stays: `names-unit` → `cargo-liner-style-names-unit`
   keeps branch and folder `cargo-liner-style-names`.
@@ -91,7 +91,7 @@ steps:
    - the newest run record and the recorder state;
    - this production's open proposal issues and phase notes (`phase_table.owned_notes`).
    - the herdr pane record drops the old unit's entries (`pane_record.forget_unit`), in each session's file. The relaunched unit records its new pane at SessionStart; an old entry would resume the old name.
-   - each held design role of the unit (`roles.rename_holder`, `docs/as-built/guilds.md`): with the role idle, the ownership authority moves the checkout and advances the generation, and the holder, checkout, document and binding paths, `guild_context.json` and the roster `cwd` take the new names. A failure raises `RenameRefused`, and the journal retries the step.
+   - each held design role of the unit (`roles.rename_holder`, `docs/as-built/long-lived-workers.md#lasting-roles`): with the role idle, the ownership authority moves the checkout and advances the generation, and the holder, checkout, document and binding paths, `guild_context.json` and the roster `cwd` take the new names. A failure raises `RenameRefused`, and the journal retries the step.
    Style productions also call `Ledger.rename_unit` with their Repository: queued, assigned and
    checkpointed tickets and sync waits take the new unit id; ticket ids and closed rows stay. It
    refuses a target that owns current rows or maps to another family, and a repeat moves nothing.
@@ -145,7 +145,20 @@ A unit that was not running has no record, so steps 9 and 10 do nothing for it.
   checkpointed ticket or a sync wait that still names the old id. The postmaster's replies are history.
   So are the pause hook's scheduled prompts (`conversation-pause/scheduled-prompts/`): they are copies
   of queued prompt texts, such as the relaunch prompt with its rename note, and the hook matches each
-  incoming prompt to them exactly, so a rewrite would break the match. In the guild role store
+  incoming prompt to them exactly, so a rewrite would break the match. In the held role store
   (`guilds/roles/`), `prompts/`, `replies/`, `adoption.json` and `transfer.json` are history, and role
   `name` and `aliases` in `design.json` and the entry names and `aliases` in a role mesh roster are identity, not live names. A hit outside the history classes fails and names its file. Shutdown paths print as `(masked)`.
   On natedev a sweep takes about 80 s.
+
+## Tests
+
+`test_rename_unit.py` covers Git moves, planning and refusals. The neighboring
+`test_rename_unit_{style,sessions,waits,state,processes}.py` modules cover style
+identities, session records and verification, live coordination and locks, moved
+state and journal retries, and stopped-run process ownership respectively.
+`rename_unit_test_support.py` builds one Git fixture per class and restores a
+private copy at the same absolute path for each test. Synchronous cases use the
+real CLI parser and handlers in-process, including the fake herdr response CLI;
+Git commands remain real. Entry-point errors, cross-process locks, shutdown and
+relaunch coordination retain subprocesses. Fixture file waits use directory
+events with a 300-second hang guard.
