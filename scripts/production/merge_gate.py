@@ -14,7 +14,8 @@ a job still running at the module time limit (default 1800 s).
 After the parallel pass, up to eight failed test modules run once more, alone.
 Runner-killed jobs and the type check do not run again. Each test module uses a
 builds.slice scope when its probe succeeds, unless disabled or already in that slice.
---tests-only runs the same suite runner without performing any git operations.
+--tests-only runs the same suite runner without changing git refs or files.
+Clean trees reuse passed test modules on the same host; type jobs still run.
 A unit checkpoint commit without its Change-Review line is refused before the merge. After the
 push, each visible change becomes a row in the change-review list that --change-review names, or
 the production's top-level showrunner keeps (`change_review.list_path`), with the doc stamped into
@@ -29,6 +30,7 @@ from collections import deque
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import Enum, auto
 import fcntl
 import json
@@ -43,19 +45,22 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import TextIO, cast
+from typing import Literal, TextIO, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import change_review  # noqa: E402
 from scripts.direct.local_release_wait import local_release_waiter  # noqa: E402
 from scripts.build_targets import build_targets  # noqa: E402
 from scripts.build_hold import build_hold  # noqa: E402
+from scripts.buildlog.store import host_name  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
 
 TEST_SUITES = (
     "lib", "hooks", "message", "accounts", "whoami", "agents", "build_hold", "build_queue",
     "mac_test", "usage", "bevy_upgrade", "bevy_migration_plan", "production", "direct", "buildlog",
     "lint", "nightly_review", "build_targets", "shutdown", "feature_log",
     "model_study", "herdr", "notify", "statusline", "astra", "style", "history", "guilds", "issue_score",
+    "hierarchies",
 )
 DEFAULT_MEMORY_CAP_MIB = 4096
 DEFAULT_MAX_RUNNING_JOBS = max(1, (os.cpu_count() or 2) // 2)
@@ -137,10 +142,11 @@ class GateRun:
     seconds: float
     peak_memory_mib: float
     memory_within_cap: bool = True
+    tests_reused: bool = False
 
     @property
     def passed(self) -> bool:
-        return self.memory_within_cap and bool(self.jobs) and all(job.returncode == 0 for job in self.jobs)
+        return self.memory_within_cap and (bool(self.jobs) or self.tests_reused) and all(job.returncode == 0 for job in self.jobs)
 
 
 @dataclass
@@ -539,9 +545,99 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
     return GateJobResult(job.suite, job.path.name, status, seconds, captured, job.killed_for, bool(calls))
 
 
+@dataclass(frozen=True)
+class CleanTestTree:
+    tree: str
+    commit: str
+
+
+@dataclass(frozen=True)
+class UnrecordableTestTree:
+    reason: str
+
+
+def clean_test_tree(repo: Path) -> CleanTestTree | UnrecordableTestTree:
+    if checked_git(repo, "status", "--porcelain", "--untracked-files=all"):
+        return UnrecordableTestTree("checkout is dirty")
+    return CleanTestTree(checked_git(repo, "rev-parse", "HEAD^{tree}"), checked_git(repo, "rev-parse", "HEAD"))
+
+
+@dataclass
+class PassedTreeLedger:
+    repo: Path
+    source: Literal["tests-only", "checkpoint"]
+    tree: CleanTestTree | UnrecordableTestTree
+    unavailable: bool = False
+
+    @property
+    def path(self) -> Path:
+        directory = Path(os.environ.get("MERGE_GATE_PASSED_DIR", "~/.local/state/merge-gate")).expanduser()
+        return directory / "passed-trees.jsonl"
+
+    def report_error(self, error: Exception) -> None:
+        if not self.unavailable:
+            print(f"Test pass ledger unavailable; tests cannot be reused or recorded: {str(error).replace(chr(10), '; ')}", flush=True)
+        self.unavailable = True
+
+    def reuse(self) -> bool:
+        if isinstance(self.tree, UnrecordableTestTree):
+            return False
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            # Opening for both operations also refuses reuse when recording is
+            # unavailable. Missing history starts with an empty ledger.
+            with self.path.open("a+", encoding="utf-8") as ledger:
+                _ = ledger.seek(0)
+                records: list[dict[str, object]] = []
+                for line in ledger:
+                    value = cast(object, json.loads(line))
+                    if not isinstance(value, dict):
+                        raise ValueError("invalid test pass record")
+                    record = cast(dict[str, object], value)
+                    if (not all(isinstance(record.get(key), str) for key in
+                                ("tree", "commit", "at", "host", "checkout", "source"))
+                            or not isinstance(record.get("suites"), list)
+                            or not all(isinstance(name, str) for name in cast(list[object], record["suites"]))
+                            or record["source"] not in ("tests-only", "checkpoint")):
+                        raise ValueError("invalid test pass fields")
+                    records.append(record)
+            for record in reversed(records):
+                if (record["tree"] == self.tree.tree and record["host"] == host_name()
+                        and record["suites"] == sorted(TEST_SUITES)):
+                    at = datetime.fromisoformat(cast(str, record["at"]))
+                    if at.tzinfo is None:
+                        raise ValueError("test pass time has no zone")
+                    when = at.astimezone(user_zone()).strftime("%Y-%m-%d %H:%M:%S %Z")
+                    print(f"tests reused from {self.tree.tree[:12]} ({when}, {record['source']}, {record['checkout']})", flush=True)
+                    return True
+        except (OSError, ValueError) as error:
+            self.report_error(error)
+        return False
+
+    def record_pass(self) -> None:
+        if self.unavailable or isinstance(self.tree, UnrecordableTestTree):
+            return
+        try:
+            # A changed HEAD or a test that leaves edits must not certify a
+            # tree that differs from the clean tree at the start of the run.
+            ending = clean_test_tree(self.repo)
+            if not isinstance(ending, CleanTestTree) or ending.tree != self.tree.tree:
+                return
+            record = {"tree": self.tree.tree, "commit": self.tree.commit,
+                      "at": datetime.now(UTC).isoformat(), "host": host_name(),
+                      "checkout": str(self.repo.resolve()), "suites": sorted(TEST_SUITES), "source": self.source}
+            with self.path.open("a", encoding="utf-8") as ledger:
+                line = (json.dumps(record) + "\n").encode("utf-8")
+                if os.write(ledger.fileno(), line) != len(line):
+                    raise OSError("incomplete test pass write")
+        except (GateRefused, OSError, ValueError) as error:
+            self.report_error(error)
+
+
 def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_dirs: Sequence[str] = (),
                module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S,
-               max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS) -> GateRun:
+               max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS, *,
+               source: Literal["tests-only", "checkpoint"] = "tests-only") -> GateRun:
     if memory_cap_mib <= 0:
         raise GateRefused("memory cap must be positive")
     if module_time_limit_s <= 0:
@@ -564,6 +660,13 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     hold = BuildHoldWait()
     hold.wait_until_free()
     initial_hold_seconds = hold.seconds
+    try:
+        tested_tree = clean_test_tree(repo)
+    except (GateRefused, OSError) as error:
+        tested_tree = UnrecordableTestTree(str(error))
+        print(f"Test tree unavailable; tests cannot be reused or recorded: {str(error).replace(chr(10), '; ')}", flush=True)
+    ledger = PassedTreeLedger(repo, source, tested_tree)
+    reused = ledger.reuse()
     print(f"Runner: {len(modules)} modules, sampled memory cap {memory_cap_mib} MiB", flush=True)
     scope_prefix = suite_scope_prefix()
     timings_path = gate_state_dir() / "module_seconds.json"
@@ -575,7 +678,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     slow_modules: list[str] = []
     history_path = gate_state_dir() / "module_history.json"
     history = read_history(history_path)
-    pending = deque(module_order(modules, timings))
+    pending = deque(module_order(modules, timings) if not reused else [])
     running: list[RunningGateJob] = []
     results: list[GateJobResult] = []
     first_runs: dict[tuple[str, str], GateJobResult] = {}
@@ -699,6 +802,9 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     ending_load = one_minute_load()
     maximum_load = max(maximum_load, ending_load)
     for suite in TEST_SUITES:
+        if reused:
+            print(f"{suite}: OK reused", flush=True)
+            continue
         failed = [module for module in results if module.suite == suite and module.returncode]
         print(f"{suite}: {'RED' if failed else 'OK'} {suite_finished[suite] - suite_started[suite]:.2f}s", flush=True)
         for module in (result for result in results if result.suite == suite):
@@ -723,7 +829,10 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     print(f"One-minute load: start={starting_load:.2f} max={maximum_load:.2f} end={ending_load:.2f}", flush=True)
     if admission.peak_mib > memory_cap_mib:
         print("RED: sampled memory exceeded the cap", flush=True)
-    return GateRun(tuple(results), elapsed, admission.peak_mib, admission.peak_mib <= memory_cap_mib)
+    run = GateRun(tuple(results), elapsed, admission.peak_mib, admission.peak_mib <= memory_cap_mib, reused)
+    if run.passed and not reused:
+        ledger.record_pass()
+    return run
 
 
 def check_settings(repo: Path, revision: str, approved: str) -> None:
@@ -858,7 +967,7 @@ def merge_checkpoint(args: GateArguments) -> int:
             abort = git(repo, "merge", "--abort")
             raise GateRefused(f"merge failed; conflicts: {conflicts or '(none)'}; {result.stderr.strip()}"
                               + (f"; abort failed: {abort.stderr.strip()}" if abort.returncode else ""))
-        suites = run_suites(repo, int(args.memory_cap_mib), args.type_dirs, float(args.module_time_limit_s))
+        suites = run_suites(repo, int(args.memory_cap_mib), args.type_dirs, float(args.module_time_limit_s), source="checkpoint")
         if not suites.passed:
             raise GateRefused("RED: types or suites failed")
         check_settings(repo, "HEAD", str(args.settings_blob))
