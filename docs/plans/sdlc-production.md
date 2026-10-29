@@ -27,7 +27,7 @@
 | phases-unit | `docs/plans/sdlc-phases.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-phases` | `sdlc-phases` | — | `docs/plans/sdlc-phases.md`; `docs/plans/sdlc-phases-next.md`; `docs/plans/sdlc-phases-design.md`; `scripts/direct/phase_process.py`; `scripts/direct/test_phase_process.py` |
 | fix-rounds-unit | `docs/plans/sdlc-fix-rounds.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-fix-rounds` | `sdlc-fix-rounds` | — | `docs/plans/sdlc-fix-rounds.md`; `docs/plans/sdlc-fix-rounds-next.md`; `docs/plans/sdlc-fix-rounds-study.md`; `scripts/history/`; `commands/history.md` |
 | roles-unit | `docs/plans/sdlc-roles.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-roles` | `sdlc-roles` | — | `docs/plans/sdlc-roles.md`; `docs/plans/sdlc-roles-next.md`; `docs/plans/sdlc-roles-design.md`; `scripts/production/roles_audit.py`; `scripts/production/test_roles_audit.py`; `scripts/production/role_terms.toml` |
-| hierarchies-unit | docs/plans/build-followups-hierarchies.md | /home/natepiano/worktrees/claude-build-followups-hierarchies | build-followups-hierarchies | — | — |
+| hierarchies-unit | `docs/plans/build-followups-hierarchies.md` | `/home/natepiano/worktrees/claude-build-followups-hierarchies` | `build-followups-hierarchies` | — | `docs/plans/build-followups-hierarchies.md`; `docs/plans/build-followups-hierarchies-next.md`; `docs/plans/build-followups-hierarchies-design.md`; `scripts/hierarchies/` |
 
 Scope of each unit:
 
@@ -40,7 +40,7 @@ Scope of each unit:
 
 As built (`docs/as-built/guilds.md`; the user's G1b and G7 in Review decisions):
 
-- Each guild head is a unit director with the guild's exact ID, `designers`, `reviewers`, `showrunners` or `units`, under the top-level `guilds` production on natedev (`docs/plans/guilds-production.md`). The heads are not units of sdlc.
+- Each guild head is a unit director with the guild's exact ID, `designers`, `reviewers`, `showrunners` or `units`, under the `guilds` production on natedev (`docs/plans/guilds-production.md`). The heads are not units of sdlc. The guilds showrunner reports to sdlc in the showrunner tree (G1c); its herdr space stays top level.
 - Goddess names are on hold. `astra-designer` and `astra-reviewer` name only the per-design Astra roles and their census edges, not the heads.
 - guild-process-unit owns process changes, not head operations. A head sends a process proposal through the guilds showrunner to sdlc for guild-process-unit.
 
@@ -58,8 +58,9 @@ These three files are also hub files in build-followups. An edit to one of them 
 
 | Gate | Waiting | Waits on | Clears when |
 | --- | --- | --- | --- |
+| G1 | hierarchies-unit Phase 4 (measure.py reads wait records and merge receipts) | phases-unit Phase 6 (HI7 wait records and merge receipts; depends on its phase 3) | That checkpoint is on origin/sdlc and ~/.claude main, its notice names the record file and commit, and the file holds at least one wait record and one receipt from a real phase. |
 
-No gates yet. The plans are not written. When a plan needs another unit's checkpoint, the gate goes here.
+When a plan needs another unit's checkpoint, the gate goes here.
 
 ## Close-out
 
@@ -90,7 +91,8 @@ Model, in the user's words (2026-10-21): the goal of a guild is to help guild me
 | # | Item | Decision |
 | --- | --- | --- |
 | G1 | Which jobs get a guild (showrunners, unit directors, designers, reviewers; workers?) | Four guilds: showrunners, unit directors, designers, reviewers. Workers have no guild; they get better guidance through their unit director's work orders. |
-| G1b | The head's form | Each head is a unit director, one per guild, under one lasting top-level guilds showrunner (not sdlc). In herdr: a top-level guilds space, the guilds showrunner as the first tab, then the four head unit directors in alphabetical order. This replaces the brief's "each head is a top-level showrunner". |
+| G1b | The head's form | Each head is a unit director, one per guild, under one lasting guilds showrunner, not under sdlc. In herdr: a top-level guilds space, the guilds showrunner as the first tab, then the four head unit directors in alphabetical order. This replaces the brief's "each head is a top-level showrunner". |
+| G1c | Where the guilds showrunner sits in the showrunner tree | Under sdlc (the user, 2026-10-28: "attach"). sdlc's dailies show guilds as one row; `/next all-below` in sdlc adds its items. Its herdr space stays top level; it keeps its own units, merge branch and `/next`, and still serves every production. Replaces guilds rule 1's "no parent". |
 | G2 | What heads watch, since they do not read every turn | Events plus records: a head reads turns when an event fires (G3), and once a day reads the records already kept (repair rounds, time per phase step, review findings); it reads turns only where a record looks bad. |
 | G3 | The events that make a member write to its guild or head | The member sends one short message to its head only, never to the whole guild, when: the user corrects it; a phase reaches repair round 4; the same review finding comes back twice; it works around a tool fault or a rule that slowed it; it finds a way that saved real time. The head decides what goes to the whole guild. |
 | G3b | Where the heads keep the guild tips | In ~/rust/nate_style: one folder per guild plus one shared folder, one tip per markdown file like the rust rules, and a base folder per guild with Obsidian views by tag like rust_base. The head adds and edits tip files. A member loads its guild's tips when its skill starts. Tips reach both machines through git; the design's copy step and receipts go. Replaces docs/guilds in ~/.claude. |

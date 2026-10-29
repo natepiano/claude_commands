@@ -11,7 +11,9 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 from typing import cast, override
+from unittest import mock
 
+from scripts.build_hold import build_hold
 from scripts.direct import test_verify_untested_examples
 from scripts.direct.test_verify_hold_wait import read_cycle_file, release_registered_call
 
@@ -44,7 +46,7 @@ class VerifyReleaseAckTests(unittest.TestCase):
         lint_reader = self.root / "lint-config.sh"
         _ = lint_reader.write_text('lint_config_enabled() { return 0; }\nlint_config_skip_notice() { :; }\n')
         stubs = self.root / "stubs"
-        stubs.mkdir()
+        tool_path = test_verify_untested_examples.rust_tool_path(stubs)
         recorder = stubs / "compile"
         _ = recorder.write_text(r'''#!/bin/sh
 python3 - "$CYCLE_FILE" "$STEP_STATE_LOG" <<'PY'
@@ -55,9 +57,6 @@ with open(sys.argv[2], "a") as output:
 PY
 ''')
         recorder.chmod(0o755)
-        cargo = stubs / "cargo"
-        _ = cargo.write_text(recorder.read_text())
-        cargo.chmod(0o755)
         sweep = stubs / "sweep.py"
         _ = sweep.write_text('#!/bin/sh\nexit 0\n')
         sweep.chmod(0o755)
@@ -66,7 +65,7 @@ PY
             **{name: value for name, value in os.environ.items()
                if name not in {"CODEX_THREAD_ID", "CODEX_SESSION_ID", "UNIT_DETACHED_RUN"}},
             "HOME": str(self.root),
-            "PATH": f"{stubs}:{os.environ['PATH']}",
+            "PATH": tool_path,
             "TMPDIR": str(self.root),
             "XDG_RUNTIME_DIR": str(self.root),
             "BUILD_HOLD_DIR": str(holders),
@@ -126,6 +125,7 @@ PY
     def release_memory_after_poll(self) -> None:
         _ = Path(self.environment["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 8388608 kB\n")
         sleeper = self.root / "stubs" / "sleep"
+        sleeper.unlink()
         _ = sleeper.write_text(r'''#!/bin/sh
 python3 - "$CYCLE_FILE" "$WAIT_STATE_LOG" <<'PY'
 import json, sys
@@ -180,6 +180,7 @@ class VerifyRoutingTests(unittest.TestCase):
         self.fixture.setUp()
         self.addCleanup(self.fixture.tearDown)
         root = self.fixture.root
+        self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(root / "buildlog")}))
         holders = root / "build-hold"
         release = root / "release"
         (release / CYCLE_ID).mkdir(parents=True)
@@ -194,6 +195,7 @@ class VerifyRoutingTests(unittest.TestCase):
         self.fixture.environment.update({
             "HOME": str(root),
             "CLAUDE_PYTHON": sys.executable,
+            "BUILDLOG_DIR": str(root / "buildlog"),
             "BUILD_HOLD_DIR": str(holders),
             "BUILD_HOLD_RELEASE_DIR": str(release),
             "UNIT_ACTIVE_DIR": str(root / "active"),
@@ -204,13 +206,12 @@ class VerifyRoutingTests(unittest.TestCase):
             "VERIFY_MAC_RUNNER": str(root / "no-mac-runner"),
             "CLAUDE_CODE_SESSION_ID": "unit-director",
         })
-        toolchain = subprocess.run(
-            ["rustup", "which", "cargo"], capture_output=True, text=True, check=True,
-        ).stdout.strip()
-        self.fixture.environment["REAL_CARGO"] = toolchain
-        self.fixture.environment["RUSTUP_HOME"] = os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup"))
         self.fixture.environment["BUILD_TARGETS_POLL_S"] = "0.01"
         self.fixture.environment["BUILD_TARGETS_NOW"] = ""
+        _ = self.enterContext(mock.patch.object(build_hold, "start_recorder", side_effect=self.record_hold_event))
+
+    def record_hold_event(self, command: list[str]) -> None:
+        _ = subprocess.run(command, env=self.fixture.environment, capture_output=True, check=True, timeout=10)
 
     def set_owner_marker(self) -> None:
         run = self.fixture.root / "unit-run"
@@ -256,6 +257,12 @@ class VerifyRoutingTests(unittest.TestCase):
             first = self.fixture.verify("test", "sample")
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.assertEqual(self.state(), "Delivered")
+        rows = [cast(dict[str, object], json.loads(line)) for path in (self.fixture.root / "buildlog").rglob("*.jsonl")
+                for line in path.read_text().splitlines()]
+        hold_rows = [row for row in rows if row.get("kind") == "hold_event"]
+        self.assertTrue(hold_rows, "The release must write a hold row to the private build log")
+        self.assertTrue(all(row["holder"] == "holder" and row["reason"] == "the test" for row in hold_rows))
+        self.assertEqual({row["event"] for row in hold_rows}, {"ended"})
 
         self.reset_cycle()
         second = self.fixture.verify("test", "sample")

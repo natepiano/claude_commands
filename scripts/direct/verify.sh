@@ -203,7 +203,10 @@ PY="${HOME}/.claude/scripts/lib/py"
 # The single bottom layer: run(), lint.conf gating, fmt_cargo, run_nextest,
 # invoke_clippy_fix, invoke_clippy, and sandbox-failure detection come from here.
 # shellcheck source=/dev/null
-source "$HOME/.claude/scripts/lint/invoke.sh"
+source "$HOME/.claude/scripts/lint/invoke.sh" || {
+    printf 'verify.sh: cannot load admission and hold checks; step refused\n' >&2
+    exit 2
+}
 BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_targets" && pwd)/build_targets.py}"
 LOCAL_RELEASE_WAIT_SCRIPT="${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/local_release_wait.py}"
 
@@ -255,6 +258,12 @@ run() {
         else
             status=$?
             RUN_STEP_PID=""
+        fi
+        # A repairable tool failure may continue a lint pass. A failed check
+        # must end the call even when that tool's caller handles failures.
+        if [[ -n "${BUILDLOG_CHECK_FAILED_FILE:-}" && -f "$BUILDLOG_CHECK_FAILED_FILE" ]]; then
+            rm -f "$step_log"
+            exit "$status"
         fi
         # A Mac copy that finished first stopped this step: no memory retry.
         if [[ -n "${VERIFY_STEP_INFO_FILE:-}" && -e "$VERIFY_STEP_INFO_FILE.stopped" ]]; then
@@ -895,7 +904,7 @@ while [[ $# -gt 0 ]]; do
             # never ends; the Mac hold is the one way to keep tests off the Mac
             # (user, 2026-10-18).
             if [[ "$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" =~ (^|[^[:alpha:]])(reserve|reserved|reservation|hold|holds|held|blocked|claim|claims|busy|showrunner|ruling)([^[:alpha:]]|$) ]]; then
-                printf 'verify.sh: --local is only for a test that cannot pass on macOS, not to keep tests off the Mac ("%s"). To reserve the Mac, its holder runs /build:hold hold <why> target mac: tests then skip the Mac by themselves, /build:targets shows the hold, and it ends at its expiry. Leave --local off.\n' "$2" >&2
+                printf 'verify.sh: --local is only for a test that cannot pass on macOS, not to keep tests off the Mac ("%s"). To reserve the Mac, its holder runs /build:hold hold <why> target mac: tests then skip the Mac by themselves, /build:status shows the hold, and it ends at its expiry. Leave --local off.\n' "$2" >&2
                 exit 2
             fi
             LOCAL_ONLY=1
@@ -954,6 +963,10 @@ interrupt_hold_wait() {
 
 finish_hold_wait() {
     collect_hold_wait
+    if [[ -n "${TOKEN_WAIT_ENTRY:-}" ]]; then rm -f -- "$TOKEN_WAIT_ENTRY"; fi
+    if [[ "$CMD" == test && -f "${MAC_IDLE_SCRIPT:-/nonexistent}" ]]; then
+        "$PY" "$MAC_IDLE_SCRIPT" remove "$BUILDLOG_CALL_ID" || true
+    fi
     if [[ -n "$HOLD_WAIT_DIR" ]]; then
         rm -rf "$HOLD_WAIT_DIR"
         HOLD_WAIT_DIR=""
@@ -1179,6 +1192,9 @@ note_event() {
 
 MAC_RUNNER="${VERIFY_MAC_RUNNER:-$HOME/.claude/scripts/mac_test/offload.py}"
 MAC_TEST_SCRIPT="${VERIFY_MAC_TEST_SCRIPT:-$HOME/.claude/scripts/mac_test/mac_test.py}"
+MAC_IDLE_SCRIPT="$(dirname "${BASH_SOURCE[0]}")/../buildlog/mac_idle.py"
+MAC_IDLE_MARKER=""
+export BUILDLOG_MAC_IDLE_HOOK=""
 MAC_COPY_WATCH="${VERIFY_MAC_COPY_WATCH:-$(dirname "$MAC_RUNNER")/copy_watch.py}"
 COPY_WATCH_PID=""
 COPY_WATCH_DIR=""
@@ -1216,6 +1232,7 @@ forward_mac_runner_signal() {
 }
 
 try_mac_test() {
+    [[ -z "$MAC_IDLE_MARKER" ]] || rm -f -- "$MAC_IDLE_MARKER"
     local caller_traps
     caller_traps="$(trap -p INT TERM HUP)"
     trap 'forward_mac_runner_signal INT 130' INT
@@ -1340,15 +1357,33 @@ check_routing_hold() {
         cat "$HOLD_WAIT_DIR/routing-diagnostic" >&2
         cp "$HOLD_WAIT_DIR/routing-diagnostic" "$HOLD_WAIT_DIR/last-routing-diagnostic"
     fi
-    return "$admission"
+    build_hold_check_result "$admission" register-local
 }
 
 # Keep one retry rule for routing and local memory or hold waits.
+register_mac_wait() {
+    [[ "${OSTYPE:-}" == linux* && -f "$MAC_IDLE_SCRIPT" ]] || return 0
+    local board="${UNIT_RUN_DIR:-${UNIT_SESSION_DIR:-}}"
+    MAC_IDLE_MARKER="$("$PY" "$MAC_IDLE_SCRIPT" register "$BUILDLOG_CALL_ID" "$$" \
+        "$(git rev-parse --show-toplevel)" "$PKG" "$1" "$2" \
+        "${BUILDLOG_HOLD_WAITER_FILE:-}" "${board:+$board/token_waiters}" \
+        "${CLAUDE_CODE_SESSION_ID:-}" "${TMPDIR:-}" 1)" || MAC_IDLE_MARKER=""
+    if [[ -n "$MAC_IDLE_MARKER" ]]; then
+        BUILDLOG_MAC_IDLE_HOOK="$(printf 'test -f %q && ' "$MAC_IDLE_MARKER")$(mac_retry_hook "$1" 0)"
+        export BUILDLOG_MAC_IDLE_HOOK
+    fi
+}
+
 remember_mac_retry() {
     case "$BUILDLOG_MAC:$BUILDLOG_MAC_REASON" in
         declined:no_tests|declined:off|declined:repo|declined:linux_only|declined:local_flag)
             if [[ "$MAC_LEAVE_SETTINGS" == "$1" ]]; then
                 MAC_LEAVE_SETTINGS="" MAC_LEAVE_REASON="" MAC_RETRY_AFTER=0
+                BUILDLOG_MAC_IDLE_HOOK=""
+                if [[ -n "$MAC_IDLE_MARKER" ]]; then
+                    "$PY" "$MAC_IDLE_SCRIPT" exclude "$BUILDLOG_CALL_ID" "$BUILDLOG_MAC_REASON" || true
+                    MAC_IDLE_MARKER=""
+                fi
             fi
             return 1 ;;
     esac
@@ -1360,14 +1395,17 @@ remember_mac_retry() {
             MAC_RETRY_NOTICE_SHOWN=1
         fi
     fi
+    register_mac_wait "$1" "$MAC_RETRY_AFTER"
 }
 
 # The same command gates routing retries and both local wait hooks. The
 # deadline uses the call's monotonic clock. free-now reads local state only.
 mac_retry_hook() {
     if [[ "$2" != 0 ]]; then
+        printf '{ '
+        if [[ -n "$MAC_IDLE_MARKER" ]]; then printf 'test -f %q || ' "$MAC_IDLE_MARKER"; fi
         printf '%q ' "$PY" -c 'import sys, time; sys.exit(time.monotonic() < float(sys.argv[1]))' "$2"
-        printf '&& '
+        printf '; } && '
     fi
     printf '%q ' "$PY" "$MAC_TEST_SCRIPT" free-now --settings "$1" \
         --repo-root "$(git rev-parse --show-toplevel)"
@@ -1380,11 +1418,31 @@ route_test() {
     if [[ "$LOCAL_ONLY" -eq 1 ]]; then
         eligible_args+=(--local "$LOCAL_REASON")
     fi
-    table="$(python3 "$BUILD_TARGETS_SCRIPT" "${eligible_args[@]}")"
+    if table="$(python3 "$BUILD_TARGETS_SCRIPT" "${eligible_args[@]}")"; then
+        :
+    else
+        admission=$?
+        printf 'verify.sh: target eligibility check failed (exit %s); step refused\n' "$admission" >&2
+        exit "$admission"
+    fi
+    if [[ -z "$table" ]]; then
+        printf 'verify.sh: target eligibility check returned no targets; step refused\n' >&2
+        exit 2
+    fi
+    while IFS=$'\t' read -r name eligibility reason settings; do
+        if [[ -z "$name" || ( "$eligibility" != eligible && "$eligibility" != excluded ) || -z "$reason" || -z "$settings" || "$settings" == *$'\t'* ]]; then
+            printf 'verify.sh: target eligibility check returned invalid targets; step refused\n' >&2
+            exit 2
+        fi
+    done <<< "$table"
 
     # Read exclusions before selecting a target so local-first routing also
     # records why a Mac cannot run this package.
     while IFS=$'\t' read -r name eligibility reason settings; do
+        if [[ "$eligibility" == eligible && "$settings" != - && -f "$MAC_RUNNER" ]]; then
+            MAC_LEAVE_SETTINGS="$settings"
+            register_mac_wait "$settings" 0
+        fi
         if [[ "$eligibility" == excluded && "$settings" != - ]]; then
             BUILDLOG_MAC=declined
             if [[ "$LOCAL_ONLY" -eq 0 ]]; then
@@ -1401,7 +1459,7 @@ route_test() {
             check_routing_hold || admission=$?
             case "$admission" in
                 0) return 0 ;;
-                10|12) continue ;;
+                10) continue ;;
                 *) exit "$admission" ;;
             esac
         fi
@@ -1432,8 +1490,13 @@ route_test() {
         fi
         "$PY" "$LOCAL_RELEASE_WAIT_SCRIPT" "${BUILD_TARGETS_POLL_S:-15}" "$BUILDLOG_CALL_ID" &
         HOLD_WAITER_PID=$!
-        wait "$HOLD_WAITER_PID"
+        admission=0
+        wait "$HOLD_WAITER_PID" || admission=$?
         HOLD_WAITER_PID=""
+        if [[ "$admission" != 0 ]]; then
+            printf 'verify.sh: local release check failed (exit %s); step refused\n' "$admission" >&2
+            exit "$admission"
+        fi
 
         # Try a free Mac before checking natedev again.
         for ((retry_index=0; retry_index<${#retry_settings[@]}; retry_index++)); do
@@ -1756,6 +1819,7 @@ fi
 HOLD_WAIT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-hold.$$.XXXXXX")"
 export BUILDLOG_HOLD_WAIT_FILE="$HOLD_WAIT_DIR/seconds"
 export BUILDLOG_HOLD_WAITER_FILE="$HOLD_WAIT_DIR/waiter"
+export BUILDLOG_CHECK_FAILED_FILE="$HOLD_WAIT_DIR/check-failed"
 trap 'hold_status=$?; interrupt_hold_wait; finish_hold_wait; exit "$hold_status"' EXIT
 hold_interrupted() {
     local signal_name=$1 code=$2
@@ -1790,7 +1854,9 @@ while ! build_hold_nothing_held; do
         remember_mac_retry "$MAC_LEAVE_SETTINGS" || true
         continue
     fi
-    if [[ "$HOLD_WAIT_STATUS" != 0 ]]; then exit "$HOLD_WAIT_STATUS"; fi
+    if [[ "$HOLD_WAIT_STATUS" != 0 ]]; then
+        build_hold_check_result "$HOLD_WAIT_STATUS" wait-local || exit "$HOLD_WAIT_STATUS"
+    fi
     break
 done
 trap - INT TERM HUP
@@ -2042,6 +2108,11 @@ acquire_token() {
             TOKEN_WAITER_PID=""
             (( status != 4 )) || token_wait_orphaned
         fi
+        if [[ "$CMD" == test && -n "$MAC_LEAVE_SETTINGS" ]] \
+              && eval "$(mac_retry_hook "$MAC_LEAVE_SETTINGS" "$MAC_RETRY_AFTER")" >/dev/null 2>&1; then
+            try_mac_test "$MAC_LEAVE_SETTINGS" "$MAC_LEAVE_REASON"
+            remember_mac_retry "$MAC_LEAVE_SETTINGS" || true
+        fi
         token_wait_clock
         waited=$(( (TOKEN_CLOCK_NOW - started) / 60 ))
         if (( noted < 0 )); then
@@ -2096,6 +2167,9 @@ lock = Path(sys.argv[1])
 holder = sys.argv[2]
 command = sys.argv[3:]
 
+def shell_status(status: int) -> int:
+    return status if status >= 0 else 128 - status
+
 def identity(pid):
     try:
         fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
@@ -2119,7 +2193,7 @@ if child:
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(signum, forward)
     _, status = os.waitpid(child, 0)
-    sys.exit(os.waitstatus_to_exitcode(status))
+    sys.exit(shell_status(os.waitstatus_to_exitcode(status)))
 
 os.setsid()
 with (lock.parent / "cargo.guard").open("a+") as guard:
@@ -2139,7 +2213,7 @@ with (lock.parent / "cargo.guard").open("a+") as guard:
     os.replace(record, lock / "owned")
     fcntl.flock(guard, fcntl.LOCK_UN)
 
-sys.exit(subprocess.call(command))
+sys.exit(shell_status(subprocess.call(command)))
 '
 
 # Preserve the shared invocation policy (including systemd scopes and its
@@ -2196,11 +2270,11 @@ try_token_now() {
 # token wait reaches the call record through TOKEN_WAIT_FILE.
 eval "$(declare -f buildlog_wait_for_memory | sed '1s/buildlog_wait_for_memory/buildlog_wait_for_memory_only/')"
 buildlog_wait_for_memory() {
-    local memory_wait limit
+    local memory_wait
     if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then
         : > "${TOKEN_WAIT_FILE}.given_back"
     fi
-    buildlog_wait_for_memory_only "$@"
+    buildlog_wait_for_memory_only "$@" || return $?
     [[ "$BUILDLOG_MEM_OUTCOME" != LeftQueue ]] || return 0
     TOKEN_WAITED=0
     if ! try_token_now; then
@@ -2208,7 +2282,7 @@ buildlog_wait_for_memory() {
         acquire_token
         memory_wait=$BUILDLOG_MEM_WAIT_S
         # The second pass keeps the step's place in the memory queue from its first wait.
-        BUILDLOG_MEM_WAIT_SINCE=$BUILDLOG_MEM_WAIT_FROM buildlog_wait_for_memory_only "$@"
+        BUILDLOG_MEM_WAIT_SINCE=$BUILDLOG_MEM_WAIT_FROM buildlog_wait_for_memory_only "$@" || return $?
         BUILDLOG_MEM_WAIT_S=$(( memory_wait + BUILDLOG_MEM_WAIT_S ))
         if [[ "$BUILDLOG_MEM_OUTCOME" == LeftQueue ]]; then
             if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then
@@ -2243,7 +2317,7 @@ build_hold_wait_local() {
         : > "${TOKEN_WAIT_FILE}.given_back"
     fi
     build_hold_wait_local_only "$@" || status=$?
-    [[ "$status" != "$LINT_LEFT_QUEUE_STATUS" ]] || return "$status"
+    [[ "$status" == 0 ]] || return "$status"
     acquire_token
     [[ -z "${TOKEN_WAIT_FILE:-}" ]] || rm -f "${TOKEN_WAIT_FILE}.given_back"
     if (( TOKEN_WAITED > 0 )) && [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
