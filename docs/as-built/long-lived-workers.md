@@ -144,8 +144,9 @@ Plan headers accept both Production forms and resolve former production names.
 Later reads use the saved identity, so moving a worktree does not change owners.
 `rename.py unit` also repoints run worktree and plan paths and worker roster
 launch paths, while keeping paused threads and Codex homes. For older moves,
-use `rename.py repair-workers <production> [--dry-run]`; see
-`production-rename.md`.
+use `rename.py repair-workers <production> [--dry-run]`. It matches current
+Units rows with saved run or worker paths even without journaled moves, and
+skips ambiguous unit matches; see `production-rename.md`.
 
 ### Measurement: `scripts/whoami/worker_usage.py`
 

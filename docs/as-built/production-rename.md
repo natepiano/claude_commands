@@ -161,12 +161,18 @@ Threads, Codex homes and paused state stay the same. The journal records
 `workers_repointed` after these writes; a retry repeats partial writes safely
 and skips a completed worker step.
 
-`rename.py repair-workers <production> [--dry-run]` applies the same repair
-to each journaled unit that reached step 2, including completed moves made
-before this repair existed. It prints one line per change and one line for
-each unit with nothing to change. Dry run writes nothing. A second repair
-changes nothing. Units without a journaled worktree move are outside this
-command's scope.
+`rename.py repair-workers <production> [--dry-run]` reads journaled moves
+at step 2 or later and the current production doc's Units rows. It also works
+without a rename journal, using the doc named by the update timer. Missing
+old worktrees in run state or worker roster paths are matched by saved unit
+identity, a plan header, then the old folder name. Former production names
+come from the journal and the doc's Formerly line. A run that matches two
+units is named and skipped. Each change and each unit with nothing to change
+gets one line; no matches prints the reason. Dry run writes no file or lock.
+A second repair changes nothing.
+
+Apply updates its own journal fields and retains all other keys, including
+`unit_moves`, later step names and the completed `done` value on a rerun.
 
 The destination is a sibling named `<repository>-<new>-<stem>`. The repository
 prefix comes from the conventional old basename, or the showrunner checkout's

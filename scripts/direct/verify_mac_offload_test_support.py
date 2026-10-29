@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Exercise verify.sh Mac offload routing with disposable command stand-ins."""
 
 from __future__ import annotations

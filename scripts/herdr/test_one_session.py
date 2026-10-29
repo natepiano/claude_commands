@@ -8,9 +8,13 @@ that would start one, open a session-sized workspace of its own, or send the use
 from __future__ import annotations
 
 import re
+import sys
 import unittest
 from pathlib import Path
 from typing import final
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.code_kind import is_test_code  # noqa: E402
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 LIBRARY = REPOSITORY / "scripts" / "herdr" / "herdr.py"
@@ -26,8 +30,7 @@ FORBIDDEN = {
 def _sources() -> list[Path]:
     scripts = [path for path in (REPOSITORY / "scripts").rglob("*")
                if path.suffix in (".py", ".sh") and path.is_file()
-               and not path.name.startswith(("test_", "fake_"))
-               and not path.stem.endswith("_test_support") and path != LIBRARY]
+               and not is_test_code(path) and path != LIBRARY]
     return sorted([*scripts, *(REPOSITORY / "commands").rglob("*.md")])
 
 
