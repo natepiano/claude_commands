@@ -136,6 +136,17 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/direct/
 
   It reads `thread/queue/list` for loaded threads; queued submissions or unreadable queue state keep the server. It prints `pid  port  verdict  reason  owner` with verdict `in use`, `unused`, `stopped` or `kept`. With `--stop`, it judges a second time under the owner's mesh folder server lock before stopping a server. Ordinary idle-stop and retired-server reclamation can free an unused server while the director lives; the next dispatch resumes the same worker name and thread. Servers listening on `--listen unix://` are never touched. Each server also has its own watcher, which wakes every 300 s and runs `idle-stop` once the server record has gone 30 minutes untouched. If a server fails to start, its process is terminated and its record dropped.
 
+`scripts/direct/workers.py` stores unit ownership under
+`~/.local/state/unit-workers/<production>/<unit>.json` (`UNIT_WORKERS_STATE`
+selects a private root). On first ledger binding, a production unit's run
+saves explicit production and unit fields in `progress_history_state.json`.
+Plan headers accept both Production forms and resolve former production names.
+Later reads use the saved identity, so moving a worktree does not change owners.
+`rename.py unit` also repoints run worktree and plan paths and worker roster
+launch paths, while keeping paused threads and Codex homes. For older moves,
+use `rename.py repair-workers <production> [--dry-run]`; see
+`production-rename.md`.
+
 ### Measurement: `scripts/whoami/worker_usage.py`
 
 `worker_usage.py` is a view over the usage store (`docs/as-built/usage-ledger.md`, Worker readout). It reads no rollout, ssh, git or readings file; the hourly collector stores Codex requests from both machines, compactions, edits, checkpoints, account readings and account role changes, and the readout opens the store read-only through `usage_report.open_read_store`.

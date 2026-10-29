@@ -19,6 +19,9 @@ import account
 from scripts.accounts import accounts
 from scripts.production import showrunners
 # `messages` reads the message review from its own folder, as the timer does.
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 sys.path.insert(0, str(Path(nightly_review.__file__).resolve().parents[1] / "notify"))
 if TYPE_CHECKING:
     from scripts.notify import review
@@ -76,7 +79,7 @@ class NightlyReviewTests(unittest.TestCase):
         _ = (whoami / "account.py").write_text("def process_config_dir(pid): pass\n")
         result = subprocess.run([sys.executable, "-I", "-c",
                                  "import runpy,sys; runpy.run_path(sys.argv[1], run_name='copied_library')", str(copied)],
-                                cwd=self.root, capture_output=True, text=True, check=False, timeout=10)
+                                cwd=self.root, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_transcripts_use_session_accounts_and_timer_identity_after_rename(self) -> None:

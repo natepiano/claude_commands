@@ -47,6 +47,10 @@ import style_rules
 import style_units
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
+
 @final
 class StylePlanTests(unittest.TestCase):
     root: Path = Path()
@@ -322,9 +326,10 @@ class StylePlanTests(unittest.TestCase):
                 with (mock.patch.object(style_plan, "busy_files", side_effect=read_during_refill),
                       ThreadPoolExecutor(max_workers=2) as pool):
                     first = pool.submit(style_plan.next_phase, "names-unit", self.plan, self.repo)
-                    self.assertTrue(first_read.wait(5), "first refill did not read busy files")
+                    self.assertTrue(first_read.wait(TEST_HANG_GUARD_SECS), "first refill did not read busy files")
                     second = pool.submit(style_plan.next_phase, "types-unit", types_plan, self.repo)
-                    first_result, second_result = first.result(timeout=10), second.result(timeout=10)
+                    first_result = first.result(timeout=TEST_HANG_GUARD_SECS)
+                    second_result = second.result(timeout=TEST_HANG_GUARD_SECS)
                 self.assertIsInstance(first_result, style_plan.PhaseWritten)
                 self.assertIsInstance(second_result, style_plan.PhaseWritten)
                 ledger = self.ledger()
@@ -2394,18 +2399,185 @@ class StylePlanTests(unittest.TestCase):
             _ = connection.execute("INSERT OR IGNORE INTO sync_waits (unit,since,token) VALUES ('names-unit','2026-01-01T00:00:00+00:00','seed-wait')")
             connection.commit()
 
-    def test_refill_waits_without_selecting_work_when_the_branch_point_is_unsynced(self) -> None:
+    def test_refill_holds_the_selected_ticket_when_main_touches_its_file(self) -> None:
         _ = self.rule("read")
         self.sync()
         before = self.plan.read_bytes()
-        self.write("README.md", "Branch point moved without a sync notice.\n")
-        branch_tip = self.commit()
-        with mock.patch.object(berth_board, "read_board", side_effect=AssertionError("board read before sync")):
-            self.assertEqual(self.run_next(), (
-                3, f"waiting for sync: main {branch_tip[:7]} is not in the synced tip {self.tip[:7]}\n", ""))
+        self.write(self.sources[0], "pub fn changed_on_main() {}\n")
+        _ = self.commit()
+        self.assertEqual(self.run_next(), (
+            3, f"waiting for sync: read crates/alpha: main touched {self.sources[0]}\n", ""))
         self.assertEqual(self.plan.read_bytes(), before)
         self.assertEqual(self.count_tickets(), 0)
         self.assertEqual([row[0] for row in self.sync_wait_rows()], ["names-unit"])
+
+    def test_refill_starts_on_the_old_synced_tip_when_main_touches_only_another_crate(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        self.write(self.sources[2], "pub fn other_crate_on_main() {}\n")
+        _ = self.commit()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        ticket = self.ledger().ticket_open("names-unit")[0]
+        self.assertEqual((ticket["crate"], ticket["base"]), ("crates/alpha", self.tip))
+        self.assertEqual(ticket["files"], list(self.sources[:2]))
+        self.assertEqual(self.sync_wait_rows(), [])
+
+    def test_refill_holds_for_crate_and_workspace_build_inputs(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        for path in ("crates/alpha/Cargo.toml", "crates/alpha/build.rs", "Cargo.toml", "Cargo.lock"):
+            with self.subTest(path=path):
+                _ = self.git("reset", "--hard", self.tip)
+                content = (self.repo / path).read_text() if (self.repo / path).exists() else ""
+                self.write(path, content + "# incoming build input\n")
+                _ = self.commit()
+                self.assertEqual(self.run_next(), (3, f"waiting for sync: read crates/alpha: main touched {path}\n", ""))
+                self.assertEqual(self.count_tickets(), 0)
+
+    def test_refill_holds_for_a_rename_in_another_crate(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        _ = self.git("mv", self.sources[2], "crates/beta/src/moved.rs")
+        _ = self.commit()
+        self.assertEqual(self.run_next(), (3, "waiting for sync: touched set unknown: rename or copy in main range\n", ""))
+        self.assertEqual(self.count_tickets(), 0)
+
+    def test_refill_holds_for_a_copy_in_another_crate(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        self.write("crates/beta/src/copied.rs", (self.repo / self.sources[2]).read_text())
+        _ = self.commit()
+        self.assertEqual(self.run_next(), (3, "waiting for sync: touched set unknown: rename or copy in main range\n", ""))
+        self.assertEqual(self.count_tickets(), 0)
+
+    def test_refill_holds_when_the_synced_tip_is_missing(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        with mock.patch.object(style_plan, "synced_tip", return_value="0" * 40):
+            code, output, errors = self.run_next()
+        self.assertEqual(code, 3, errors)
+        self.assertIn("waiting for sync: touched set unknown:", output)
+        self.assertEqual(self.count_tickets(), 0)
+
+    def test_refill_holds_when_the_synced_tip_and_main_diverge(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        _ = (self.style / "style.txt").write_text("style tip\n")
+        _ = self.git("add", "style.txt", cwd=self.style)
+        _ = self.git("commit", "-qm", "Style tip", cwd=self.style)
+        self.tip = self.git("rev-parse", "HEAD", cwd=self.style)
+        self.sync()
+        self.write("README.md", "main tip\n")
+        _ = self.commit()
+        self.assertEqual(self.run_next(), (
+            3, "waiting for sync: touched set unknown: synced tip is not an ancestor of main\n", ""))
+
+    def test_refill_checks_every_main_commit_even_when_the_edit_was_reverted(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        self.write(self.sources[0], "pub fn temporary() {}\n")
+        _ = self.commit()
+        self.write(self.sources[0], "pub fn value() {}\n")
+        _ = self.commit()
+        self.assertEqual(self.run_next(), (
+            3, f"waiting for sync: read crates/alpha: main touched {self.sources[0]}\n", ""))
+
+    def test_refill_preserves_a_queued_ticket_when_main_touches_its_file(self) -> None:
+        rule = self.rule("read")
+        self.sync()
+        ledger = self.ledger()
+        ledger.ticket_add("names-unit-1", "names-unit", "read", "names", "crates/alpha", [self.sources[0]], [rule])
+        self.write(self.sources[0], "pub fn changed_on_main() {}\n")
+        _ = self.commit()
+        self.assertEqual(self.run_next(), (
+            3, f"waiting for sync: read crates/alpha: main touched {self.sources[0]}\n", ""))
+        self.assertEqual([ticket["id"] for ticket in ledger.queued_tickets("names-unit")], ["names-unit-1"])
+        self.assertEqual(ledger.ticket_open("names-unit"), ())
+
+    def test_refill_holds_the_selected_decision_before_starting_it(self) -> None:
+        rule = self.rule("read")
+        self.sync()
+        issue = self.approved_decision(rule, self.sources[:1], "rename")
+        self.write(self.sources[0], "pub fn changed_on_main() {}\n")
+        _ = self.commit()
+        with mock.patch.object(style_proposals, "proposal_command") as start:
+            self.assertEqual(self.run_next(), (
+                3, f"waiting for sync: proposal crates/alpha {rule}: main touched {self.sources[0]}\n", ""))
+        start.assert_not_called()
+        self.assertEqual(self.count_tickets(), 0)
+        self.assertEqual(self.ledger().proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket())
+
+    def test_refill_holds_a_rename_when_main_adds_a_reference(self) -> None:
+        rule = self.rule("read")
+        issue = self.file_rename_decision(rule, (("crates/alpha/src/probe.rs", "Rename probe.rs to frame_log.rs"),))
+        path = "crates/alpha/src/gauge.rs"
+        self.write(path, "pub fn level() { crate::probe::sample(); }\n")
+        _ = self.commit()
+        before = self.plan.read_bytes()
+        with mock.patch.object(style_proposals, "proposal_command") as start:
+            self.assertEqual(self.run_next(), (
+                3, f"waiting for sync: proposal crates/alpha {rule}: main touched {path}\n", ""))
+        start.assert_not_called()
+        self.assertEqual(self.count_tickets(), 0)
+        self.assertEqual(self.plan.read_bytes(), before)
+        self.assertEqual(self.ledger().proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket())
+
+    def test_refill_preserves_a_queued_rename_when_main_adds_a_reference(self) -> None:
+        rule = self.rule("read")
+        issue = self.file_rename_decision(rule, (("crates/alpha/src/probe.rs", "Rename probe.rs to frame_log.rs"),))
+        ledger = self.ledger()
+        finding = ledger.proposal_findings(issue)[0]
+        ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "crates/alpha", [finding.path], [rule],
+                          proposal=str(issue), finding_ids=(finding.finding_id,))
+        path = "crates/alpha/src/gauge.rs"
+        self.write(path, "pub fn level() { crate::probe::sample(); }\n")
+        _ = self.commit()
+        with mock.patch.object(style_proposals, "proposal_command") as start:
+            self.assertEqual(self.run_next(), (
+                3, f"waiting for sync: proposal crates/alpha: main touched {path}\n", ""))
+        start.assert_not_called()
+        self.assertEqual([ticket["id"] for ticket in ledger.queued_tickets("names-unit")], ["names-unit-1"])
+        self.assertEqual(ledger.ticket_open("names-unit"), ())
+
+    def test_refill_holds_when_the_selected_footprint_at_main_cannot_be_read(self) -> None:
+        rule = self.rule("read")
+        _ = self.file_rename_decision(rule, (("crates/alpha/src/probe.rs", "Rename probe.rs to frame_log.rs"),))
+        self.write(self.sources[2], "pub fn unrelated() {}\n")
+        main = self.commit()
+        original = style_plan.EditedFiles.of
+
+        def footprint(edits: style_plan.EditedFiles, finding: style_ledger.HeldFinding) -> tuple[str, ...]:
+            if edits.base == style_plan.UnitBranchTip(main):
+                raise style_ledger.CheckCouldNotRun("main footprint unavailable")
+            return original(edits, finding)
+
+        with (mock.patch.object(style_plan.EditedFiles, "of", footprint),
+              mock.patch.object(style_proposals, "proposal_command") as start):
+            self.assertEqual(self.run_next(), (
+                3, f"waiting for sync: proposal crates/alpha {rule}: touched set unknown: "
+                + "cannot read selected footprint at main: main footprint unavailable\n", ""))
+        start.assert_not_called()
+        self.assertEqual(self.count_tickets(), 0)
+
+    def test_refill_holds_when_main_touches_a_filename_with_a_carriage_return(self) -> None:
+        rule = self.rule("read")
+        path = "crates/alpha/src/line\rbreak.rs"
+        self.write(path, "pub fn before() {}\n")
+        self.commit_to_every_checkout()
+        ledger = self.ledger()
+        ledger.ticket_add("names-unit-1", "names-unit", "read", "names", "crates/alpha", [path], [rule])
+        self.write(path, "pub fn after() {}\n")
+        _ = self.commit()
+        self.assertEqual(self.run_next(), (
+            3, f"waiting for sync: read crates/alpha: main touched {path}\n", ""))
+        self.assertEqual([ticket["id"] for ticket in ledger.queued_tickets("names-unit")], ["names-unit-1"])
+        self.assertEqual(ledger.ticket_open("names-unit"), ())
+
+    def test_main_changes_refuses_a_path_that_cannot_cross_the_ledger_text_boundary(self) -> None:
+        path = os.fsdecode(b"crates/alpha/src/non_utf8_\xff.rs")
+        self.write(path, "pub fn new_file() {}\n")
+        _ = self.commit()
+        self.assertIsInstance(style_plan.main_changes(self.ledger(), "main", self.tip), style_plan.UnknownMainChanges)
 
     def test_refill_selects_work_despite_an_unpushed_local_branch_point_merge(self) -> None:
         _ = self.rule("read")
@@ -2424,7 +2596,7 @@ class StylePlanTests(unittest.TestCase):
         self.assertEqual(self.count_tickets(), 1)
         self.assertEqual(self.sync_wait_rows(), [])
 
-    def test_refill_waits_for_sync_after_the_local_branch_point_merge_is_pushed(self) -> None:
+    def test_refill_selects_work_after_an_unrelated_local_branch_point_merge_is_pushed(self) -> None:
         _ = self.rule("read")
         self.sync()
         origin = self.root / "origin.git"
@@ -2435,24 +2607,18 @@ class StylePlanTests(unittest.TestCase):
         _ = self.git("add", "README.md", cwd=self.style)
         _ = self.git("commit", "-qm", "Style checkpoint", cwd=self.style)
         _ = self.git("merge", "--no-ff", "-qm", "Integration", "style/main")
-        branch_tip = self.git("rev-parse", "HEAD")
         _ = self.git("push", "-q", "origin", "main")
-        before = self.plan.read_bytes()
-
-        self.assertEqual(self.run_next(), (
-            3, f"waiting for sync: main {branch_tip[:7]} is not in the synced tip {self.tip[:7]}\n", ""))
-
-        self.assertEqual(self.count_tickets(), 0)
-        self.assertEqual(self.plan.read_bytes(), before)
-        self.assertEqual([row[0] for row in self.sync_wait_rows()], ["names-unit"])
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        self.assertEqual(self.ledger().ticket_open("names-unit")[0]["base"], self.tip)
+        self.assertEqual(self.sync_wait_rows(), [])
 
     def test_refill_selects_work_after_sync_merges_the_branch_point_into_a_distinct_style_tip(self) -> None:
         _ = self.rule("read")
         self.sync()
-        self.write("README.md", "Incoming branch-point work.\n")
+        self.write(self.sources[0], "pub fn incoming_branch_point_work() {}\n")
         branch_tip = self.commit()
         self.assertEqual(self.run_next(), (
-            3, f"waiting for sync: main {branch_tip[:7]} is not in the synced tip {self.tip[:7]}\n", ""))
+            3, f"waiting for sync: read crates/alpha: main touched {self.sources[0]}\n", ""))
         _ = self.git("merge", "--no-ff", "-qm", "Sync branch point", "main", cwd=self.style)
         self.tip = self.git("rev-parse", "HEAD", cwd=self.style)
         self.assertNotEqual(self.tip, branch_tip)
@@ -3621,7 +3787,7 @@ class StylePlanTests(unittest.TestCase):
               mock.patch.object(style_proposals, "ranked_below_unit", return_value=False),
               mock.patch.object(style_proposals, "proposal_command"), redirect_stdout(baseline_output)):
             baseline = style_plan._select_phase(ledger, "names-unit", "demo-style-names", self.plan, self.repo,  # pyright: ignore[reportPrivateUsage]
-                                               self.doc, original, unit_plans.AllCrates(), busy, frozenset(), definitions)
+                                               self.doc, original, unit_plans.AllCrates(), busy, frozenset(), definitions, style_plan.MainChanges(self.tip))
         self.assertIsInstance(baseline, style_plan.PhaseWritten)
         expected_phase = self.plan.read_bytes()
         with closing(sqlite3.connect(ledger.database)) as connection, connection:
@@ -3646,7 +3812,7 @@ class StylePlanTests(unittest.TestCase):
               mock.patch.object(style_proposals, "proposal_command") as command,
               mock.patch.object(style_proposals, "renumber") as renumber, redirect_stdout(output)):
             result = style_plan._select_phase(ledger, "names-unit", "demo-style-names", self.plan, self.repo,  # pyright: ignore[reportPrivateUsage]
-                                             self.doc, original, unit_plans.AllCrates(), busy, frozenset(), definitions)
+                                             self.doc, original, unit_plans.AllCrates(), busy, frozenset(), definitions, style_plan.MainChanges(self.tip))
         self.assertIsInstance(result, style_plan.PhaseWritten)
         read_paths.assert_called_once_with(self.repo, self.tip, (paths["first"],))
         self.assertEqual(self.plan.read_bytes(), expected_phase)
@@ -3831,7 +3997,7 @@ class StylePlanTests(unittest.TestCase):
                                               style_plan.BusyFiles(self.board(), frozenset()), definitions, cache, measured_at)
             _ = style_plan._select_phase(ledger, "names-unit", "demo-style-names", self.plan, self.repo,  # pyright: ignore[reportPrivateUsage]
                                          self.doc, self.plan.read_text(), unit_plans.AllCrates(),
-                                         style_plan.BusyFiles(self.board(), frozenset()), frozenset(), definitions)
+                                         style_plan.BusyFiles(self.board(), frozenset()), frozenset(), definitions, style_plan.MainChanges(self.tip))
         self.assertEqual(split, style_ledger.RecordedSplit(0, 1, 1, 0, measured_at))
         self.assertIn(f"waiting names: {self.sources[0]} has open types work\n", output.getvalue())
         changed = next(finding for finding in findings if finding.path == self.sources[1])
@@ -3914,15 +4080,19 @@ class StylePlanTests(unittest.TestCase):
 
         limit_seconds = 0.25
         deadline = style_plan.SplitDeadline(limit_seconds, limit_seconds / 60)
-        write_durations: list[float] = []
+        busy_budgets: list[tuple[int]] = []
         record_split = style_ledger.record_split
 
-        def timed_write(repo: Path, unit: str, split: style_ledger.RecordedSplit, *, busy_timeout_seconds: float) -> None:
-            began = time.monotonic()
-            try:
+        connect = sqlite3.connect
+
+        def observe_connect(database: str, *, uri: bool, timeout: float) -> sqlite3.Connection:
+            connection = connect(database, uri=uri, timeout=timeout)
+            busy_budgets.append(cast(tuple[int], connection.execute("PRAGMA busy_timeout").fetchone()))
+            return connection
+
+        def bounded_write(repo: Path, unit: str, split: style_ledger.RecordedSplit, *, busy_timeout_seconds: float) -> None:
+            with mock.patch.object(sqlite3, "connect", side_effect=observe_connect):
                 record_split(repo, unit, split, busy_timeout_seconds=busy_timeout_seconds)
-            finally:
-                write_durations.append(time.monotonic() - began)
 
         # Scan setup cannot spend the write budget. Without SIGALRM, SQLite itself
         # must bound the real lock wait using the remaining deadline passed by split.
@@ -3933,7 +4103,7 @@ class StylePlanTests(unittest.TestCase):
               mock.patch.object(style_plan, "busy_files", return_value=style_plan.BusyFiles(self.board(), frozenset())),
               mock.patch.object(style_plan, "classify_split", return_value=style_ledger.RecordedSplit(
                   1, 2, 3, 4, "2026-10-28T12:00:00+00:00")),
-              mock.patch.object(style_ledger, "record_split", side_effect=timed_write) as record,
+              mock.patch.object(style_ledger, "record_split", side_effect=bounded_write) as record,
               redirect_stdout(output), redirect_stderr(errors)):
             _ = writer.execute("BEGIN IMMEDIATE")
             code = style_plan.main(["split", "--unit", "names-unit", "--repo", str(self.unit),
@@ -3943,9 +4113,7 @@ class StylePlanTests(unittest.TestCase):
         self.assertRegex(errors.getvalue(), r"^split names-unit: (time limit.*|database is locked)\n$")
         record.assert_called_once()
         self.assertEqual(record.call_args.kwargs["busy_timeout_seconds"], limit_seconds)
-        elapsed, = write_durations
-        self.assertGreaterEqual(elapsed, limit_seconds * 0.9)
-        self.assertLess(elapsed, limit_seconds + 1)
+        self.assertEqual(busy_budgets, [(250,)])
         with closing(sqlite3.connect(ledger.database)) as connection:
             self.assertEqual(tuple(connection.iterdump()), before)
 
@@ -6037,8 +6205,8 @@ class RefillRecordingTests(unittest.TestCase):
             (style_plan.WaitingForSync(0), "waiting for sync", 3, "waiting for sync\n"),
             (style_plan.WaitingForStructure(("alpha", "beta"), 0), "waiting for structure: alpha, beta", 3,
              "waiting for structure: alpha, beta\n"),
-            (style_plan.WaitingForBranchPointSync("main", "abcdef123", "765432123"),
-             "waiting for branch-point sync", 3, "waiting for sync: main abcdef1 is not in the synced tip 7654321\n"),
+            (style_plan.WaitingForSync(0, "read alpha: main touched alpha/lib.rs"),
+             "waiting for sync", 3, "waiting for sync: read alpha: main touched alpha/lib.rs\n"),
             (style_plan.MergeStyleBranchFirst(1, "abcdef123", "refs/heads/style/main"),
              "merge the style branch first", 6, "merge the style branch first: 1 cell judged at abcdef1 wait for style/main\n"),
             (berth_board.BoardUnavailable("offline"), "board unavailable", 4, "board unavailable: offline\n"),

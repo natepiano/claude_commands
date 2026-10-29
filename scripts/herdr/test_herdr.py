@@ -20,6 +20,9 @@ from types import SimpleNamespace
 from typing import BinaryIO, cast, final, override
 from unittest.mock import Mock, call, patch
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -1173,7 +1176,7 @@ class HerdrTests(unittest.TestCase):
             self.assertGreater(timeout, 0)
             self.assertLessEqual(timeout, 0.2)
             # The simulated deadline bounds library work, not OS scheduling of the fake.
-            return execute(argv, timeout=10.0)
+            return execute(argv, timeout=TEST_HANG_GUARD_SECS)
         opener = ["-na", "/Applications/Nix Apps/Ghostty.app", "--args", "-e", str(self.fake),
                   "session", "attach", "fixture"]
         for failure in (True, False):
@@ -1345,7 +1348,7 @@ class HerdrTests(unittest.TestCase):
             "herdr._PLATFORM='linux'; print(herdr.attached_clients('fixture'))"
         )
         result = subprocess.run([sys.executable, "-I", "-c", probe, str(isolated)],
-                                capture_output=True, text=True, check=False, timeout=10)
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "ClientsAttached(count=1)\n")
         self.assertEqual(result.stderr, "")
@@ -3185,7 +3188,7 @@ class HerdrTests(unittest.TestCase):
         clean_environment.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
         for directory in (requested, foreign):
             result = subprocess.run([GIT_BINARY, "init", str(directory)], env=clean_environment,
-                                    capture_output=True, text=True, check=False, timeout=10)
+                                    capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(result.returncode, 0, result.stderr)
         config = self.root / "claude.json"
         _ = config.write_text(json.dumps({"projects": {

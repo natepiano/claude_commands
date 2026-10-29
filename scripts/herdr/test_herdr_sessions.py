@@ -26,6 +26,9 @@ from scripts.shutdown import launch_permission
 from scripts.accounts import accounts
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 class SessionListReply(TypedDict):
     ok: bool
     result: herdr.SessionListResult
@@ -394,7 +397,7 @@ class HerdrSessionsTests(unittest.TestCase):
         with patch.dict(os.environ, {"HERDR_BIN": "herdr", "PATH": str(self.root)}):
             result = subprocess.run(
                 [sys.executable, str(Path(herdr_sessions.__file__)), "attach", "target"],
-                capture_output=True, text=True, check=False, timeout=5,
+                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
             )
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
         self.assertEqual(self.commands(), [

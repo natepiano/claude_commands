@@ -51,6 +51,7 @@ class Event(TypedDict, total=False):
 
 class JsonRow(TypedDict):
     run: str
+    run_id: str
     phase: str
     title: str
     plan: str
@@ -61,6 +62,7 @@ class JsonRow(TypedDict):
     causes: dict[str, int]
     findings: int
     fix_seconds: float
+    reviewed: bool
 
 
 class JsonReport(TypedDict):
@@ -136,6 +138,30 @@ def restarted_batch_events() -> list[dict[str, object]]:
     events += ledger_events(at=BASE + 60, finding="UX", lens="ux")
     events += pass_events(BASE + 70, BASE + 80, name="second-batch")
     events += ledger_events(at=BASE + 90, finding="UNSTARTED")
+    return events
+
+
+def reviewed_summary_events() -> list[dict[str, object]]:
+    """Three reviewed phases and five unreviewed phases with unequal repair time."""
+    events: list[dict[str, object]] = []
+    for name, reviewed, count, seconds in (
+        ("reviewed-heavy", True, 3, 10),
+        ("reviewed-light", True, 1, 10),
+        ("reviewed-clean", True, 0, 0),
+        ("unreviewed-heavy", False, 4, 100),
+        ("unreviewed-clean-1", False, 0, 0),
+        ("unreviewed-clean-2", False, 0, 0),
+        ("unreviewed-clean-3", False, 0, 0),
+        ("unreviewed-clean-4", False, 0, 0),
+    ):
+        events += phase_events(run=name, instance=name)
+        if reviewed:
+            events += pass_events(BASE + 1, BASE + 2, run=name, instance=name,
+                                  name=f"{name}-review", kind="review")
+        for index in range(count):
+            start = BASE + 10 + index * 200
+            events += pass_events(start, start + seconds, run=name, instance=name,
+                                  name=f"{name}-fix-{index}", number=index + 1)
     return events
 
 
@@ -459,6 +485,101 @@ class RepairRoundTests(unittest.TestCase):
 
 @final
 class RoundsCommandTests(unittest.TestCase):
+    def test_summary_excludes_unreviewed_phases_from_median_and_shares(self) -> None:
+        report = self.report(reviewed_summary_events())
+        meta = report["_meta"]
+        self.assertEqual(meta["median_rounds"], 1)
+        self.assertEqual(meta["reviewed_phases"], 3)
+        self.assertEqual(meta["unreviewed_phases"], 5)
+        self.assertEqual(meta["heavy_phases"], 1)
+        self.assertAlmostEqual(cast(float, meta["heavy_phase_share"]), 100 / 3)
+        self.assertEqual(meta["heavy_fix_seconds"], 30)
+        self.assertEqual(meta["reviewed_fix_seconds"], 40)
+        self.assertAlmostEqual(cast(float, meta["heavy_fix_share"]), 75)
+        self.assertEqual(meta["phases"], 8)
+        self.assertEqual(meta["fix_seconds"], 440)
+        self.assertEqual(meta["rounds"], 8)
+        self.assertEqual(meta["causes"], {"review-ux": 0, "review-code": 0, "gate": 0,
+                                         "merge": 0, "live": 0, "other": 8})
+        # Limiting displayed rows must not change the population being summarized.
+        self.assertEqual(self.report(reviewed_summary_events(), top=1)["_meta"], meta)
+
+    def test_rows_retain_unreviewed_repairs_and_reviewed_zero_round_phases(self) -> None:
+        rows = {row["run_id"]: row for row in self.report(reviewed_summary_events())["rows"]}
+        self.assertEqual(len(rows), 8)
+        self.assertEqual({name for name, row in rows.items() if row["reviewed"]},
+                         {"reviewed-heavy", "reviewed-light", "reviewed-clean"})
+        self.assertEqual(rows["reviewed-clean"]["rounds"], 0)
+        self.assertEqual(rows["unreviewed-heavy"]["rounds"], 4)
+        self.assertEqual(rows["unreviewed-heavy"]["fix_seconds"], 400)
+
+    def test_text_names_the_reviewed_population_and_counts_unreviewed_separately(self) -> None:
+        events = reviewed_summary_events()
+        args = argparse.Namespace(since="", until="", status="all", top=25,
+                                  plan="", format="table", skill="")
+        tally = {"unreadable": 0, "future_spine": 0, "unknown_stage": 0}
+        output = io.StringIO()
+        with patch.object(rounds, "_events", return_value=(
+                [("unit-history", record) for record in events], tally)), \
+                contextlib.redirect_stdout(output):
+            rounds.run(args)
+        lines = output.getvalue().splitlines()
+        self.assertTrue(any("8 phases counted; 3 reviewed; median 1 rounds over reviewed phases"
+                            in line for line in lines), output.getvalue())
+        self.assertTrue(any("5 phases with no review recorded (not in the median or shares)"
+                            in line for line in lines), output.getvalue())
+
+    def test_an_empty_reviewed_set_has_zero_statistics_but_keeps_all_repair_time(self) -> None:
+        events = phase_events()
+        for index in range(4):
+            events += pass_events(BASE + 10 + index * 20, BASE + 20 + index * 20,
+                                  name=f"fix-{index}", number=index + 1)
+        report = self.report(events)
+        meta = report["_meta"]
+        for key in ("reviewed_phases", "median_rounds", "heavy_phases", "heavy_phase_share",
+                    "heavy_fix_seconds", "reviewed_fix_seconds", "heavy_fix_share"):
+            with self.subTest(field=key):
+                self.assertEqual(meta[key], 0)
+        self.assertEqual(meta["unreviewed_phases"], 1)
+        self.assertEqual(meta["fix_seconds"], 40)
+        self.assertEqual(meta["rounds"], 4)
+        self.assertFalse(report["rows"][0]["reviewed"])
+
+    def test_review_identity_uses_run_and_instance_when_phase_numbers_repeat(self) -> None:
+        events = phase_events(instance="first", phase="7", title="First attempt")
+        events += phase_events(instance="second", phase="7", title="Second attempt",
+                               start=BASE + 2_000, finish=BASE + 3_000)
+        events += pass_events(BASE + 10, BASE + 20, instance="first", phase="7", kind="review")
+        events += phase_events(run="other-run", instance="first", phase="7", title="Other run")
+        rows = {row["title"]: row for row in self.report(events)["rows"]}
+        self.assertTrue(rows["First attempt"]["reviewed"])
+        self.assertFalse(rows["Second attempt"]["reviewed"])
+        self.assertFalse(rows["Other run"]["reviewed"])
+        self.assertEqual(self.report(events)["_meta"]["reviewed_phases"], 1)
+
+    def test_interrupted_review_start_counts_but_a_finish_without_a_start_does_not(self) -> None:
+        events = phase_events(instance="interrupted", title="Interrupted review")
+        events += pass_events(BASE + 10, BASE + 20, instance="interrupted", kind="review")[:1]
+        events += phase_events(instance="finish-only", title="Legacy finish only")
+        events += pass_events(BASE + 10, BASE + 20, instance="finish-only", kind="review")[1:]
+        rows = {row["title"]: row for row in self.report(events)["rows"]}
+        self.assertTrue(rows["Interrupted review"]["reviewed"])
+        self.assertEqual(rows["Interrupted review"]["rounds"], 0)
+        self.assertFalse(rows["Legacy finish only"]["reviewed"])
+
+    def test_phase_window_does_not_clip_review_evidence_or_include_an_older_phase(self) -> None:
+        events = phase_events(start=BASE + 400, finish=BASE + 1_000)
+        events += pass_events(BASE + 800, BASE + 900, kind="review")
+        events += phase_events(run="old", instance="old", start=BASE, finish=BASE + 1_000)
+        events += pass_events(BASE + 450, BASE + 460, run="old", instance="old", kind="review")
+        report = self.report(events, since="2026-10-20T00:05:00+00:00",
+                             until="2026-10-20T00:10:00+00:00", cli=True)
+        row, = report["rows"]
+        self.assertEqual(row["run"], "run-a")
+        self.assertTrue(row["reviewed"])
+        self.assertEqual(report["_meta"]["reviewed_phases"], 1)
+        self.assertEqual(report["_meta"]["unreviewed_phases"], 0)
+
     def test_json_cli_reports_each_batch_once_after_fix_numbers_restart(self) -> None:
         report = self.report(restarted_batch_events(), cli=True)
         row, = report["rows"]

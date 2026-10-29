@@ -13,6 +13,9 @@ from typing import cast, override
 from unittest import mock
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 SCRIPT = Path(__file__).with_name("dailies_render.py")
 HOLD_SCRIPT = SCRIPT.parent.parent / "build_hold" / "build_hold.py"
 AT = "2026-10-04T11:00"
@@ -398,7 +401,7 @@ class DailiesHoldTests(unittest.TestCase):
         child = (
             "import sys, threading; sys.path.insert(0, sys.argv.pop(1)); import build_hold; "
             "status = build_hold.main(sys.argv[1:]); "
-            "[thread.join(timeout=5) for thread in threading.enumerate() if thread.name == 'hold-event-recorder']; "
+            f"[thread.join(timeout={TEST_HANG_GUARD_SECS}) for thread in threading.enumerate() if thread.name == 'hold-event-recorder']; "
             "assert not any(thread.name == 'hold-event-recorder' for thread in threading.enumerate()); "
             "sys.exit(status)"
         )

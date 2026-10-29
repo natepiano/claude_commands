@@ -11,6 +11,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import cast, override
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.guilds import astra_work  # noqa: E402
 
@@ -48,7 +51,7 @@ class AstraWorkTests(unittest.TestCase):
                                "--phase", phase, "--member", "fixture-designer", "--document", str(self.document),
                                "--round", "2", "--text-file", str(self.text_file)],
                               env={**os.environ, "HOME": str(self.root)}, capture_output=True, text=True,
-                              check=False, timeout=10)
+                              check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def header_payload(self, path: Path) -> dict[str, object]:
         first = path.read_text(encoding="utf-8").splitlines()[0]

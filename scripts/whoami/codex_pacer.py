@@ -42,7 +42,7 @@ import json
 import os
 import re
 import sys
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -229,7 +229,8 @@ def rollout_files(now: datetime, days: int) -> Iterator[Path]:
     local = now.astimezone()
     for back in range(days, -1, -1):
         day = local - timedelta(days=back)
-        yield from sorted((SESSIONS / day.strftime("%Y/%m/%d")).glob("rollout-*.jsonl"))
+        # Paths share one parent. Filename order keeps the same ingestion order.
+        yield from sorted((SESSIONS / day.strftime("%Y/%m/%d")).glob("rollout-*.jsonl"), key=str)
 
 
 def ingest(state: State, files: Iterator[Path]) -> None:
@@ -468,10 +469,11 @@ def record(state: State, tier: str, now: datetime) -> None:
         state["history"].append([now.isoformat(timespec="seconds"), tier])
 
 
-def prune(state: State, now: datetime) -> None:
+def prune(state: State, now: datetime, retained_rollouts: Iterable[Path]) -> None:
     oldest = hour_key(now - timedelta(days=FIT_DAYS + 1))
     state["buckets"] = {k: b for k, b in state["buckets"].items() if k >= oldest}
-    keep = {str(p) for p in rollout_files(now, SCAN_DAYS)}
+    # A rollout deleted during ingestion must not leave an offset for its replacement.
+    keep = {str(p) for p in retained_rollouts if p.exists()}
     state["files"] = {k: f for k, f in state["files"].items() if k in keep}
     hour = now.timestamp() / 3600
     state["windows"] = {k: v for k, v in state["windows"].items() if float(k) > hour - 24}
@@ -483,11 +485,13 @@ def prune(state: State, now: datetime) -> None:
 def tick(notes: Sequence[AgentNote], now: datetime | None = None) -> Plan:
     now = now or datetime.now(timezone.utc)
     state = load_state()
-    ingest(state, rollout_files(now, SCAN_DAYS))
+    # Use this tick's discovery for pruning instead of scanning the same days twice.
+    files = tuple(rollout_files(now, SCAN_DAYS))
+    ingest(state, iter(files))
     registry = registry_tier()
     plan = make_plan(state, notes, registry, now)
     record(state, launch_tier(registry, plan["tier"]), now)
-    prune(state, now)
+    prune(state, now, files)
     write_atomic(STATE_FILE, json.dumps(state))
     write_atomic(PLAN_FILE, json.dumps(plan, indent=2) + "\n")
     write_atomic(TIER_FILE, plan["tier"] + "\n")
@@ -504,7 +508,7 @@ def backfill(days: int, fast_from: datetime | None, fast_until: datetime | None)
             state["history"].append([fast_until.isoformat(timespec="seconds"), "default"])
     ingest(state, rollout_files(now, days))
     record(state, launch_tier(registry_tier(), "default"), now)
-    prune(state, now)
+    prune(state, now, rollout_files(now, SCAN_DAYS))
     write_atomic(STATE_FILE, json.dumps(state))
     return state
 

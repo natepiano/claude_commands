@@ -28,6 +28,9 @@ import unit_runs
 from sessions import SessionRecord
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 SCRIPT = Path(__file__).with_name("build_hold.py")
 MEMORY_GATE = Path(__file__).resolve().parent.parent / "lint" / "memory_gate.sh"
 # Loaded by every Python process a test starts. It opens a writer on the test's
@@ -61,7 +64,7 @@ def write_holder(folder: Path, name: str, since: str, purpose: str, release: str
 
 
 def recorded_hold_events(root: Path, expected: int) -> list[HoldEventRecord]:
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + TEST_HANG_GUARD_SECS
     while True:
         rows = [cast(HoldEventRecord, json.loads(line))
                 for path in root.rglob("[0-9][0-9][0-9][0-9]-*.jsonl") for line in path.read_text().splitlines()]
@@ -130,7 +133,7 @@ class IsolatedBuildHoldTest(unittest.TestCase):
         so wait again until a read returns EOF.
         """
         os.close(self.lifetime_writer)
-        deadline = time.monotonic() + 30
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
         try:
             while True:
                 remaining = max(deadline - time.monotonic(), 0)
@@ -1450,7 +1453,7 @@ class HoldRecordingTests(IsolatedBuildHoldTest):
                 result = subprocess.run(
                     ["python3", str(SCRIPT), "hold", "--holder", "alice", "--for", "render checks",
                      "--proc-root", str(self.scratch / "proc")],
-                    env=dict(os.environ), capture_output=True, text=True, timeout=10, check=False)
+                    env=dict(os.environ), capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn("natedev is held for render checks.", result.stdout)
                 self.assertTrue((self.scratch / "holders" / "alice").is_file())

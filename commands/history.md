@@ -55,7 +55,7 @@ unconverted.
   keys are rejected
 - `phases` — review and fix rounds per phase, grouped by `(run, phase)`; columns
   `run  phase  reviews  fixes  impl  fix  total`
-- `rounds` — repair rounds and causes per phase instance; `--top N` (default 25), `--plan <substring>`, `--status`, `--until` (same forms as `--since`); marks mixed phase records
+- `rounds` — repair rounds and causes per phase instance; median and shares cover phases with a recorded review start; lists unreviewed phases separately in the summary; `--top N` (default 25), `--plan <substring>`, `--status`, `--until` (same forms as `--since`); marks mixed phase records
 - `routed [--open] [--since <time>] [--format text|json]` — routed findings, owners, Work Orders, due checkpoints, age and closure; read-only (the user, 2026-10-28)
 - `runs` — one row per run
 - `tests` — verification and smoke history

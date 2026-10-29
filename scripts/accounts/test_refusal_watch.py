@@ -12,8 +12,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
-from collections.abc import Generator, Mapping
+from contextlib import AbstractContextManager, contextmanager, nullcontext, redirect_stderr, redirect_stdout
+from collections.abc import Generator, Iterator, Mapping
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
@@ -3261,10 +3261,64 @@ class RefusalWatchTests(unittest.TestCase):
         nested.parent.mkdir()
         _ = nested.write_text(json.dumps({"type": "assistant", "message": {"content": "normal reply"}}) + "\n")
         os.utime(nested, (transcript.stat().st_mtime + 60, transcript.stat().st_mtime + 60))
-        with patch.object(refusal_watch, "session_refusal", wraps=refusal_watch.session_refusal) as detect:
+        with patch.object(refusal_watch, "_newest_exchange", wraps=refusal_watch._newest_exchange) as detect:  # pyright: ignore[reportPrivateUsage]
             _, output, _ = self.cli("--dry-run")
         self.assertIn("owner refused: refused; move", output)
-        detect.assert_called_once_with("refused")
+        detect.assert_called_once_with(transcript)
+
+    def test_refusal_pass_searches_projects_once_and_keeps_each_latest_exchange(self) -> None:
+        for identity in ("first", "second", "continued"):
+            _ = self.owner(identity)
+            _ = self.transcript(identity)
+        continued = self.transcript("continued", tail={"type": "user", "message": {"content": "continue"}})
+        # A resumed copy in another project must still win by modification time.
+        newer = continued.parent.parent / "resumed" / "first.jsonl"
+        newer.parent.mkdir()
+        _ = newer.write_text(json.dumps({"type": "user", "message": {"content": "continue"}}) + "\n")
+        original = continued.parent / "first.jsonl"
+        os.utime(newer, (original.stat().st_mtime + 60, original.stat().st_mtime + 60))
+        expected = {identity: refusal_watch.session_refusal(identity)
+                    for identity in ("first", "second", "continued")}
+        def read_individually(identities: list[str]) -> dict[str, refusal_watch.TranscriptRefusal | refusal_watch.ProofRefusal | refusal_watch.NoSessionRefusal]:
+            return {identity: refusal_watch.session_refusal(identity) for identity in identities}
+
+        with patch.object(refusal_watch, "session_refusals", side_effect=read_individually):
+            expected_code, expected_output, expected_error = self.cli("--dry-run")
+        glob = Path.glob
+        with (patch.object(Path, "glob", autospec=True, side_effect=glob) as search,
+              patch.object(refusal_watch, "_newest_exchange", wraps=refusal_watch._newest_exchange) as read):  # pyright: ignore[reportPrivateUsage]
+            code, output, error = self.cli("--dry-run")
+        self.assertEqual((code, output, error), (expected_code, expected_output, expected_error))
+        self.assertIn("owner second: refused; move", output)
+        self.assertNotIn("owner first: refused", output)
+        self.assertNotIn("owner continued: refused", output)
+        self.assertEqual(read.call_count, 3)
+        project_searches = [item for item in search.call_args_list
+                            if item.args[0] == self.home / ".claude/projects"]
+        self.assertLessEqual(len(project_searches), 1)
+        self.assertEqual(expected, {identity: refusal_watch.session_refusal(identity)
+                                   for identity in expected})
+        # A later exchange must be read on the next pass, without a persistent cache.
+        _ = self.transcript("continued", entry_id="new-refusal")
+        _, next_output, _ = self.cli("--dry-run")
+        self.assertIn("owner continued: refused; move", next_output)
+
+    def test_refusal_pass_reads_known_transcripts_in_an_unlistable_project(self) -> None:
+        _ = self.owner("refused")
+        transcript = self.transcript("refused")
+        scan = os.scandir
+
+        def project_entries(path: str | Path) -> AbstractContextManager[Iterator[os.DirEntry[str]]]:
+            if Path(path) == transcript.parent:
+                raise PermissionError("project permits traversal only")
+            return scan(path)
+
+        with patch.object(os, "scandir", side_effect=project_entries):
+            code, output, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("owner refused: refused; move", output)
+        self.assertEqual(len(self.commands), 1)
+        self.assertEqual([entry["kind"] for entry in moves.read_moves()], ["requested"])
 
     def assert_five_hour_moves(self, reset: datetime) -> None:
         _ = self.owner("refused")

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Load and prove a worktree's nix environment before starting a process.
 
-Only envrc files below ~/rust, ~/worktrees or ~/.claude* are allowed
-automatically. Other directories keep direnv's explicit approval boundary.
+Envrc files below ~/rust, ~/worktrees or ~/.claude*, and in linked worktrees
+registered by repositories below those roots, are allowed automatically.
+Other directories keep direnv's explicit approval boundary.
 No envrc means the caller's environment is retained, without running direnv.
 """
 from __future__ import annotations
@@ -10,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import stat
 import subprocess
 import sys
 from collections.abc import Mapping
@@ -52,14 +54,51 @@ def nearest_envrc(directory: Path) -> Path | None:
                  if (parent / ".envrc").is_file()), None)
 
 
-def trusted_envrc(envrc: Path) -> bool:
-    """Approval belongs to the file's resolved location, never a symlink alias."""
+def trusted_root(path: Path) -> bool:
+    """Whether the resolved path belongs to an automatically approved root."""
     try:
-        relative = envrc.resolve().relative_to(Path.home().resolve())
-    except ValueError:
+        relative = path.resolve().relative_to(Path.home().resolve())
+    except (OSError, ValueError, RuntimeError):
         return False
     return bool(relative.parts and (relative.parts[0] in {"rust", "worktrees"}
                                   or relative.parts[0].startswith(".claude")))
+
+
+def registered_worktree(folder: Path) -> bool:
+    """Prove registration by a trusted repository using only git's pointer files."""
+    try:
+        folder = folder.resolve(strict=True)
+        git_file = folder / ".git"
+        if not stat.S_ISREG(git_file.lstat().st_mode):
+            return False
+        lines = git_file.read_text(encoding="utf-8").splitlines()
+        if len(lines) != 1 or not lines[0].startswith("gitdir: "):
+            return False
+        pointer = lines[0][len("gitdir: "):]
+        if not pointer:
+            return False
+        entry = (folder / pointer).resolve(strict=True)
+        if not entry.is_dir() or entry.parent.name != "worktrees":
+            return False
+        common_text = (entry / "commondir").read_text(encoding="utf-8").strip()
+        back_text = (entry / "gitdir").read_text(encoding="utf-8").strip()
+        if not common_text or not back_text or len(common_text.splitlines()) != 1 or len(back_text.splitlines()) != 1:
+            return False
+        common = (entry / common_text).resolve(strict=True)
+        back_pointer = (entry / back_text).resolve(strict=True)
+        return (common.is_dir() and common == entry.parent.parent
+                and trusted_root(common) and back_pointer == git_file)
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+def trusted_envrc(envrc: Path) -> bool:
+    """Approval belongs to the file's resolved location, never a symlink alias."""
+    try:
+        envrc = envrc.resolve(strict=True)
+        return trusted_root(envrc) or registered_worktree(envrc.parent)
+    except (OSError, ValueError, RuntimeError):
+        return False
 
 
 def last_line(text: str, fallback: str) -> str:

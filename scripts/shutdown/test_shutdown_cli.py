@@ -1089,6 +1089,8 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         saved = session_shutdown(record.SessionRestartFailed(kind="restart failed", at=OCTOBER,
             reason="restart prompt not submitted"))
         self.assertTrue(record.create_session(saved))
+        restart_work._save_prompt_outcome(saved, herdr.PromptNotSubmitted(  # pyright: ignore[reportPrivateUsage]
+            "not submitted", "Claude fixture\n❯ unsent opening prompt"))
         report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
         for liveness in (restart_work.SessionLive(), restart_work.SessionNotLive(),
                          restart_work.SessionLivenessUnknown("scratch registry unreadable")):
@@ -1106,6 +1108,8 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                     code, follow_text = self.follow_request()
                 self.assertEqual(code, 1)
                 for text in (status_text, follow_text):
+                    self.assertIn("\n  last screen of the failed prompt submit:\n    Claude fixture\n    ❯ unsent opening prompt\n", text)
+                    self.assertEqual(text.count("last screen of the failed prompt submit:"), 1)
                     if isinstance(liveness, restart_work.SessionLive):
                         command = settle.shutdown_command("forget", "session-123", "--account", LOGIN)
                         self.assertIn("restart prompt not confirmed; session is running — check it, " +
@@ -1124,6 +1128,8 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                 saved = session_shutdown(record.SessionRestartFailed(kind="restart failed", at=OCTOBER,
                     reason="restart prompt not submitted"), "peer-session")
                 saved["machine"] = peer_machine
+                restart_work._save_prompt_outcome(saved, herdr.PromptNotSubmitted(  # pyright: ignore[reportPrivateUsage]
+                    "not submitted", "local receipt must not describe a peer"))
                 local = inventory.Inventory(machine=local_machine, login=LOGIN, label=LABEL,
                                             sessions=[], unattributed=[])
                 peer = inventory.Inventory(machine=peer_machine, login=LOGIN, label=LABEL,
@@ -1156,6 +1162,31 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                 self.assertNotIn("shutdown.py restart", text)
                 self.assertNotIn("bring back:", text)
                 self.assertNotIn("liveness unknown", text)
+                self.assertNotIn("last screen of the failed prompt submit:", text)
+                self.assertNotIn("local receipt must not describe a peer", text)
+
+    def test_peer_failed_status_never_reads_a_local_submit_receipt(self) -> None:
+        saved = session_shutdown(record.SessionRestartFailed(kind="restart failed", at=OCTOBER,
+            reason="restart prompt not submitted"))
+        saved["machine"] = "Mac"
+        for observed in (restart_work.SessionLive(), restart_work.SessionNotLive()):
+            with (self.subTest(observed=observed),
+                  patch.object(shutdown, "_restart_failed_liveness", return_value=observed),
+                  patch.object(restart_work, "saved_prompt_screen", side_effect=AssertionError("peer has no receipt here"))):
+                lines = shutdown._shutdown_record_lines(  # pyright: ignore[reportPrivateUsage]
+                    {"kind": "records", "records": [saved]}, local_observation=False)
+            self.assertNotIn("last screen of the failed prompt submit:", "\n".join(lines))
+
+    def test_status_and_follow_omit_screen_when_submit_never_read_one(self) -> None:
+        saved = session_shutdown(record.SessionRestartFailed(kind="restart failed", at=OCTOBER,
+            reason="restart prompt not submitted"))
+        self.assertTrue(record.create_session(saved))
+        restart_work._save_prompt_outcome(saved, herdr.PromptNotSubmitted("no pane read"))  # pyright: ignore[reportPrivateUsage]
+        with patch.object(shutdown, "_restart_failed_liveness", return_value=restart_work.SessionNotLive()):
+            lines = shutdown._shutdown_record_lines({"kind": "records", "records": [saved]})  # pyright: ignore[reportPrivateUsage]
+            code, follow_text = self.follow_request()
+        self.assertEqual(code, 1)
+        self.assertNotIn("last screen of the failed prompt submit:", "\n".join(lines) + follow_text)
 
     def test_printed_closing_command_forgets_the_running_sessions_failed_record(self) -> None:
         saved = session_shutdown(record.SessionRestartFailed(kind="restart failed", at=OCTOBER,

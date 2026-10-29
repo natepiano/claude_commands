@@ -410,14 +410,18 @@ def _shutdown_record_lines(
 ) -> list[str]:
     match outcome["kind"]:
         case "records":
-            return [
-                line
-                for record in outcome["records"]
-                for line in (["  " + settle.running_restart_line(record)]
-                             if record["progress"]["kind"] == "restart failed"
-                             and isinstance(_restart_failed_liveness(record, observations), restart_work.SessionLive)
-                             else settle.status_record_lines(record, _observed_owner(record, observations), local_observation=local_observation))
-            ]
+            lines: list[str] = []
+            for record in outcome["records"]:
+                if (record["progress"]["kind"] == "restart failed"
+                        and isinstance(_restart_failed_liveness(record, observations), restart_work.SessionLive)):
+                    record_lines = ["  " + settle.running_restart_line(record)]
+                else:
+                    record_lines = settle.status_record_lines(
+                        record, _observed_owner(record, observations), local_observation=local_observation)
+                if local_observation:
+                    record_lines[1:1] = settle.failed_prompt_screen_lines(record)
+                lines.extend(record_lines)
+            return lines
         case "unreachable":
             return [
                 f"{outcome['machine']}: shutdown record not reached (unreachable)"
@@ -793,7 +797,7 @@ def _follow_action(saved: SessionShutdown) -> str:
     if kind == "restart failed":
         observed = _restart_failed_liveness(saved)
         if isinstance(observed, restart_work.SessionLive):
-            return settle.running_restart_line(saved)
+            return "\n".join([settle.running_restart_line(saved), *settle.failed_prompt_screen_lines(saved)])
         if isinstance(observed, restart_work.SessionLivenessUnknown):
             liveness_reason = f"; liveness unknown: {observed.reason}"
     if progress["kind"] == "manual restart":
@@ -804,7 +808,8 @@ def _follow_action(saved: SessionShutdown) -> str:
         return f"{saved['session']['name']}: process identity lost; inspect its window before restarting; {place}: {command}"
     if kind == "waiting":
         return settle.holdout_line(saved)
-    return f"{saved['session']['name']}: {kind}{liveness_reason}; {place}: {command}"
+    return "\n".join([f"{saved['session']['name']}: {kind}{liveness_reason}; {place}: {command}",
+                      *settle.failed_prompt_screen_lines(saved)])
 
 
 def follow(login: str, request_id: str) -> int:

@@ -439,9 +439,13 @@ def _ledger_for_run(run: Path) -> UnitWorkerLedger:
             content = (worktree / plan).read_text(encoding="utf-8") if plan else ""
         except OSError:
             content = ""
-        match = re.search(r'^> \*\*Production: (.+?)\*\* — unit `([^`]+)`;', content, re.MULTILINE)
+        match = re.search(r'^> \*\*Production:(?: (.+?)\*\*|\*\* (.+?)) — unit `([^`]+)`;', content, re.MULTILINE)
         if match:
-            production, unit = match.groups()
+            production = match.group(1) or match.group(2)
+            unit = match.group(3)
+            from scripts.production import showrunners
+            notifier = Path(os.environ.get("NOTIFIER_STATE_DIR", str(Path.home() / ".local/state/notifier")))
+            production = showrunners.canonical_slug(production, notifier)
     if not production or not unit:
         production = "adhoc"
         digest = hashlib.sha256(str(worktree).encode()).hexdigest()[:12]
@@ -458,6 +462,11 @@ def ledger_for_run(run: Path) -> UnitWorkerLedger:
     if journal.exists():
         _finish_move(_read(journal))
         store = _ledger_for_run(run)
+    if store.path.parent.name != "adhoc" and (run / STATE).exists():
+        state = _read(run / STATE)
+        if (state.get("production"), state.get("unit")) != (store.path.parent.name, store.path.stem):
+            from scripts.direct import progress_history
+            progress_history.set_unit(run, store.path.parent.name, store.path.stem)
     return store
 
 
@@ -1277,6 +1286,111 @@ def move_unit(from_production: str, to_production: str, unit: str, *, runs: tupl
 def rename_unit(production: str, old: str, new: str, *, runs: tuple[Path, ...] = ()) -> None:
     """Change shown unit context; worker addresses and backend identities stay."""
     _move_ledger(ledger_path(production, old), ledger_path(production, new), runs)
+
+
+def _ledger_runs(path: Path) -> tuple[Path, ...]:
+    return _runs(UnitWorkers(workers={name: _decode_worker(name, _object(record))
+                                    for name, record in _object(_read(path).get("workers")).items()}))
+
+
+def _moved_path(value: str, old: Path, new: Path) -> str:
+    if value == str(old) or value.startswith(f"{old}/"):
+        return str(new) + value[len(str(old)):]
+    return value
+
+
+def repoint_unit_worktree(production: str, unit: str, old: Path, new: Path, branch: str,
+                          *, from_production: str, dry_run: bool = False) -> tuple[str, ...]:
+    """Repair unit identity and paths after a stopped unit's worktree moved.
+
+    The production rename journal retains both paths until this completes.
+    Each write repeats safely if the caller stops before marking it complete.
+    """
+    from scripts.agents import codex_mesh
+    from scripts.lib import unit_runs
+    old, new = old.expanduser().resolve(), new.expanduser().resolve()
+    target = ledger_path(production, unit)
+    former = ledger_path(from_production, unit)
+    root = target.parent.parent
+    runs: set[Path] = set()
+    for directory in unit_runs.run_roots(os.environ.get("UNIT_RUN_ROOT") or os.environ.get("RETIRE_UNIT_RUN_ROOT")):
+        for path in directory.glob(f"*/{STATE}"):
+            state = _read(path)
+            if (state.get("working_dir") in (str(old), str(new))
+                    or (state.get("production") in (from_production, production) and state.get("unit") == unit)):
+                runs.add(path.parent)
+    sources: set[Path] = ({former} if former != target and (former.exists() or former.with_suffix(".move.json").exists())
+                         else set())
+    for path in (target, former):
+        runs.update(_ledger_runs(path))
+    # Older callers may have lost their plan before the identity was saved.
+    # Their ledger history still names the run, even if its roster is gone.
+    for path in (root / "adhoc").glob("*.json"):
+        if path.name.endswith(".move.json"):
+            continue
+        histories = _ledger_runs(path)
+        if runs.intersection(histories):
+            sources.add(path)
+            runs.update(histories)
+    changes: list[str] = []
+    for source in sorted(sources):
+        changes.append(f"worker ledger {source} -> {target}")
+        if not dry_run:
+            _move_ledger(source, target, tuple(sorted(runs)))
+    # Lock order matches adoption: ledger, then roster, then progress state.
+    # Dry reads take no ledger lock because locked() writes on exit.
+    def repoint_runs() -> None:
+        for run in sorted(runs):
+            if not run.is_dir():
+                continue
+            if (run / ROSTER).exists():
+                with _roster_locked(run) as (handle, roster):
+                    changed = False
+                    for name, raw in roster.items():
+                        record = _object(raw)
+                        cwd = _text(record.get("cwd"))
+                        moved = _moved_path(cwd, old, new)
+                        if moved != cwd or record.get("unit_ledger") != str(target):
+                            changes.append(f"worker {run}/{name}: {moved or 'cwd unchanged'}; ledger {target}")
+                            if not dry_run:
+                                changed = True
+                                if moved != cwd:
+                                    record["cwd"] = moved
+                                record["unit_ledger"] = str(target)
+                                codex_mesh.advance_worker_roster_revision(record)
+                    if changed:
+                        _write_roster(handle, roster)
+            if not (run / STATE).exists():
+                continue
+            with ExitStack() as locks:
+                if not dry_run:
+                    lock = locks.enter_context((run / ".progress_history.lock").open("a+", encoding="utf-8"))
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                state = _read(run / STATE)
+                updated = dict(state)
+                updated.update({"production": production, "unit": unit})
+                if state.get("working_dir") in (str(old), str(new)):
+                    updated.update({"working_dir": str(new), "worktree": new.name, "branch": branch})
+                for key in ("plan_doc", "project_plan_doc"):
+                    if isinstance(state.get(key), str):
+                        updated[key] = _moved_path(_text(state[key]), old, new)
+                if state != updated:
+                    changes.append(f"run {run}: unit {production}/{unit}; worktree {updated.get('working_dir', '')}")
+                    if not dry_run:
+                        _atomic(run / STATE, updated)
+                marker = run / "working_dir"
+                if marker.exists() and marker.read_text().strip() == str(old):
+                    changes.append(f"run {run}: working_dir -> {new}")
+                    if not dry_run:
+                        _ = marker.write_text(str(new) + "\n", encoding="utf-8")
+    if dry_run:
+        repoint_runs()
+    elif runs or target.exists():
+        store = UnitWorkerLedger(target)
+        with store.locked() as ledger:
+            _recover(store, ledger)
+            repoint_runs()
+    return tuple(changes)
 
 
 def main() -> int:
