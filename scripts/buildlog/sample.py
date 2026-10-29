@@ -1,4 +1,4 @@
-"""Record one machine-wide memory sample without opening the SQLite index."""
+"""Record machine resource counters without opening the SQLite index."""
 
 from __future__ import annotations
 
@@ -12,6 +12,9 @@ import store
 
 MEMINFO = Path("/proc/meminfo")
 PRESSURE = Path("/proc/pressure/memory")
+CPU_PRESSURE = Path("/proc/pressure/cpu")
+IO_PRESSURE = Path("/proc/pressure/io")
+STAT = Path("/proc/stat")
 BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
 CI_CGROUP = Path("/sys/fs/cgroup/hana.slice/hana-ci.slice")
 POWER_PROFILE_STATE = Path("/var/lib/power-profiles-daemon/state.ini")
@@ -54,14 +57,46 @@ def read_power_profile(path: Path) -> PowerProfile | Unmeasured:
     return Unmeasured.VALUE
 
 
-class MemoryStallTotals(NamedTuple):
+class StallTotals(NamedTuple):
     some_us: int
     full_us: int
 
 
-class PartialMemoryStallTotals(NamedTuple):
+class PartialStallTotals(NamedTuple):
     some_us: int | Unmeasured
     full_us: int | Unmeasured
+
+
+class CpuTicks(NamedTuple):
+    idle: int
+    iowait: int
+    total: int
+
+
+def parse_cpu_ticks(text: str) -> CpuTicks:
+    """Read aggregate CPU ticks, excluding guest ticks already in user and nice."""
+    for line in text.splitlines():
+        if line.startswith("cpu "):
+            fields = line.split()[1:]
+            if len(fields) < 8:
+                raise ValueError("cpu stat lacks the first eight counters")
+            ticks = [int(value) for value in fields[:8]]
+            return CpuTicks(ticks[3], ticks[4], sum(ticks))
+    raise ValueError("cpu stat lacks aggregate cpu line")
+
+
+def read_cpu_ticks(path: Path) -> CpuTicks | Unmeasured:
+    try:
+        return parse_cpu_ticks(path.read_text())
+    except (OSError, ValueError):
+        return Unmeasured.VALUE
+
+
+def read_pressure(path: Path) -> PartialStallTotals:
+    try:
+        return parse_pressure(path.read_text(), require_both=False)
+    except (OSError, ValueError):
+        return PartialStallTotals(Unmeasured.VALUE, Unmeasured.VALUE)
 
 
 def parse_meminfo(text: str) -> MachineMemoryUse:
@@ -80,15 +115,15 @@ def parse_meminfo(text: str) -> MachineMemoryUse:
 
 
 @overload
-def parse_pressure(text: str, *, require_both: Literal[True] = True) -> MemoryStallTotals: ...
+def parse_pressure(text: str, *, require_both: Literal[True] = True) -> StallTotals: ...
 
 
 @overload
-def parse_pressure(text: str, *, require_both: Literal[False]) -> PartialMemoryStallTotals: ...
+def parse_pressure(text: str, *, require_both: Literal[False]) -> PartialStallTotals: ...
 
 
-def parse_pressure(text: str, *, require_both: bool = True) -> MemoryStallTotals | PartialMemoryStallTotals:
-    """Read PSI totals; require both for a machine sample, allow missing scope lines."""
+def parse_pressure(text: str, *, require_both: bool = True) -> StallTotals | PartialStallTotals:
+    """Read PSI totals; require both for machine memory, allow partial readings otherwise."""
     totals: dict[str, int] = {}
     for line in text.splitlines():
         words = line.split()
@@ -104,8 +139,8 @@ def parse_pressure(text: str, *, require_both: bool = True) -> MemoryStallTotals
     if require_both and len(totals) != 2:
         raise ValueError("memory pressure lacks some or full total")
     if require_both:
-        return MemoryStallTotals(totals["some"], totals["full"])
-    return PartialMemoryStallTotals(totals.get("some", Unmeasured.VALUE), totals.get("full", Unmeasured.VALUE))
+        return StallTotals(totals["some"], totals["full"])
+    return PartialStallTotals(totals.get("some", Unmeasured.VALUE), totals.get("full", Unmeasured.VALUE))
 
 
 def parse_boot_id(text: str) -> str:
@@ -151,6 +186,9 @@ def sample() -> SampleTaken:
     boot_id = parse_boot_id(BOOT_ID.read_text())
     memory = parse_meminfo(MEMINFO.read_text())
     stalls = parse_pressure(PRESSURE.read_text())
+    cpu_stalls = read_pressure(CPU_PRESSURE)
+    io_stalls = read_pressure(IO_PRESSURE)
+    ticks = read_cpu_ticks(STAT)
     builds_path = Path(os.environ.get("BUILDLOG_BUILDS_CGROUP", f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/builds.slice"))
     builds = anon_bytes(builds_path)
     sccache = sccache_in_service(builds_path)
@@ -168,6 +206,13 @@ def sample() -> SampleTaken:
         "ci_anon_bytes": ci if isinstance(ci, int) else None,
         "stall_some_us": stalls.some_us,
         "stall_full_us": stalls.full_us,
+        "cpu_stall_some_us": cpu_stalls.some_us if isinstance(cpu_stalls.some_us, int) else None,
+        "cpu_stall_full_us": cpu_stalls.full_us if isinstance(cpu_stalls.full_us, int) else None,
+        "io_stall_some_us": io_stalls.some_us if isinstance(io_stalls.some_us, int) else None,
+        "io_stall_full_us": io_stalls.full_us if isinstance(io_stalls.full_us, int) else None,
+        "cpu_idle_ticks": ticks.idle if isinstance(ticks, CpuTicks) else None,
+        "cpu_iowait_ticks": ticks.iowait if isinstance(ticks, CpuTicks) else None,
+        "cpu_total_ticks": ticks.total if isinstance(ticks, CpuTicks) else None,
         "power_profile": profile.name if isinstance(profile, PowerProfile) else None,
         "power_profile_since": store.utc_iso(profile.since_epoch) if isinstance(profile, PowerProfile) else None,
     }
