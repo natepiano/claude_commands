@@ -843,11 +843,47 @@ def check_settings(repo: Path, revision: str, approved: str) -> None:
         raise GateRefused(f"settings.json differs from approved blob {approved}: {actual}")
 
 
+# Use a fresh index for the file comparison. The live index can hide edits
+# with assume-unchanged or skip-worktree flags. Never change that index.
+PROMOTION_TRACKED_CHECK = '''import json, os, subprocess, tempfile
+from pathlib import Path
+
+environment = dict(os.environ)
+environment.pop("GIT_INDEX_FILE", None)
+environment["GIT_OPTIONAL_LOCKS"] = "0"
+
+def git(*arguments, env=environment):
+    return subprocess.run(["git", *arguments], env=env, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, check=True).stdout
+
+try:
+    staged = git("diff", "--cached", "--no-ext-diff", "--name-only", "-z", "HEAD", "--")
+    with tempfile.TemporaryDirectory(prefix="promotion-index-") as temporary:
+        private = {**environment, "GIT_INDEX_FILE": str(Path(temporary) / "index")}
+        git("read-tree", "HEAD", env=private)
+        files = git("diff", "--no-ext-diff", "--name-only", "-z", "HEAD", "--", env=private)
+    changed = sorted({os.fsdecode(path) for path in (staged + files).split(b"\\0") if path})
+    if changed:
+        print("tracked edits differ from HEAD: " + "; ".join(json.dumps(path) for path in changed))
+        raise SystemExit(1)
+except (OSError, subprocess.SubprocessError) as error:
+    print("tracked edit check failed: " + str(error))
+    raise SystemExit(1)
+'''
+
+
+def require_clean_promotion(repo: Path) -> None:
+    result = command([sys.executable, "-c", PROMOTION_TRACKED_CHECK], repo)
+    if result.returncode:
+        raise GateRefused("promotion refused: " + (result.stdout.strip() or result.stderr.strip()))
+
+
 def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WAIT_S,
             release_lock_poll_s: float = 0.2) -> None:
+    main_repo = Path(str(args.main_repo)).expanduser().resolve()
+    require_clean_promotion(main_repo)
     hold = BuildHoldWait()
     hold.wait_until_free()
-    main_repo = Path(str(args.main_repo)).expanduser().resolve()
     wait_for_release_lock(release_lock_wait_s, release_lock_poll_s)
     if checked_git(main_repo, "branch", "--show-current") != "main":
         raise GateRefused("promotion checkout must be on main")
@@ -858,14 +894,17 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
         raise GateRefused("main is not an ancestor of the merge branch")
     check_settings(main_repo, f"origin/{args.merge_branch}", str(args.settings_blob))
     hold.wait_until_free()
+    require_clean_promotion(main_repo)
     _ = checked_git(main_repo, "merge", "--ff-only", f"origin/{args.merge_branch}")
     _ = checked_git(main_repo, "push", "origin", "main")
     promoted = checked_git(main_repo, "rev-parse", "HEAD")
     # Retain shell expansion of ~, while quoting arbitrary non-home paths.
     mac_repo = str(args.mac_repo)
     remote_path = '"$HOME"/' + shlex.quote(mac_repo[2:]) if mac_repo.startswith("~/") else shlex.quote(mac_repo)
-    remote = (f"(cd {remote_path} && git fetch -q origin +refs/heads/main:refs/remotes/origin/main && "
-              "git merge --ff-only -q origin/main); rc=$?; "
+    remote_check = "python3 -c " + shlex.quote(PROMOTION_TRACKED_CHECK)
+    remote = (f"(cd {remote_path} && {remote_check} && "
+              "git fetch -q origin +refs/heads/main:refs/remotes/origin/main && "
+              f"{remote_check} && git merge --ff-only -q origin/main); rc=$?; "
               "printf 'ff_rc=%s\\n' \"$rc\"; exit 0")
     try:
         result = subprocess.run([args.ssh, "-o", "ConnectTimeout=10", args.mac_host, remote],
@@ -876,7 +915,8 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
     print(result.stdout, end="", flush=True)
     statuses = re.findall(r"^ff_rc=(\d+)\s*$", result.stdout, re.MULTILINE)
     if result.returncode or statuses != ["0"]:
-        raise GateRefused(f"main promoted to {promoted}; Mac fast-forward failed: ssh exit={result.returncode}, ff_rc={statuses}; {result.stderr.strip()}; the claude-sync job on the Mac retries within 15 minutes")
+        detail = "; ".join(result.stdout.splitlines() + result.stderr.splitlines())
+        raise GateRefused(f"main promoted to {promoted}; Mac fast-forward failed: ssh exit={result.returncode}, ff_rc={statuses}; {detail}; the claude-sync job on the Mac retries within 15 minutes")
 
 
 def rollback_merge(repo: Path, baseline: str) -> None:

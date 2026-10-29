@@ -1553,14 +1553,109 @@ with Path(sys.argv[1]).open("r+") as lock:
         self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.checkpoint)
         self.assertEqual(len([call for call in self.calls() if call["tool"] == "ssh"]), 2)
 
-    def test_promote_preserves_unrelated_local_edits_and_untracked_files(self) -> None:
+    def test_promote_refuses_unrelated_local_edits_and_keeps_untracked_files(self) -> None:
+        _ = self.publish_for_promotion()
         self.write(self.main / "subject.txt", "uncommitted main\n")
+        self.write(self.main / "settings.json", "local settings\n")
         self.write(self.main / "accounts.lock", "untracked\n")
-        result = self.run_gate("--promote")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = self.run_promote_only()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('"subject.txt"', result.stderr)
+        self.assertIn('"settings.json"', result.stderr)
         self.assertEqual((self.main / "subject.txt").read_text(), "uncommitted main\n")
         self.assertEqual((self.main / "accounts.lock").read_text(), "untracked\n")
-        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.git(self.checkout, "rev-parse", "HEAD"))
+        self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+        self.assertFalse(any(call["tool"] == "ssh" for call in self.calls()))
+
+    def test_promotion_refuses_staged_edits_even_when_the_file_matches_head(self) -> None:
+        _ = self.publish_for_promotion()
+        self.write(self.main / "subject.txt", "staged main\n")
+        _ = self.git(self.main, "add", "subject.txt")
+        self.write(self.main / "subject.txt", "base\n")
+        result = self.run_promote_only()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('"subject.txt"', result.stderr)
+        self.assertEqual(self.git(self.main, "show", ":subject.txt"), "staged main")
+        self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+
+    def test_promotion_refuses_edits_hidden_by_index_flags(self) -> None:
+        self.write(self.unit / "subject.txt", "promoted contents\n")
+        self.checkpoint = self.commit(self.unit, "update subject")
+        _ = self.publish_for_promotion()
+        for flag in ("assume-unchanged", "skip-worktree"):
+            with self.subTest(flag=flag):
+                _ = self.git(self.main, "update-index", "--" + flag, "subject.txt")
+                self.write(self.main / "subject.txt", "live contents\n")
+                self.assertEqual(self.git(self.main, "status", "--porcelain", "--untracked-files=no"), "")
+                result = self.run_promote_only()
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('"subject.txt"', result.stderr)
+                self.assertEqual((self.main / "subject.txt").read_text(), "live contents\n")
+                self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.base)
+                self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+                _ = self.git(self.main, "update-index", "--no-" + flag, "subject.txt")
+
+    def test_promotion_checks_edits_after_the_last_hold_wait(self) -> None:
+        args = self.publish_for_promotion()
+        waits = 0
+
+        def edit_during_wait() -> None:
+            nonlocal waits
+            waits += 1
+            if waits == 2:
+                self.write(self.main / "subject.txt", "edited during hold\n")
+
+        with mock.patch.dict(os.environ, self.environment), \
+                mock.patch.object(merge_gate.BuildHoldWait, "wait_until_free", side_effect=edit_during_wait):
+            with self.assertRaisesRegex(merge_gate.GateRefused, 'tracked edits differ from HEAD: "subject.txt"'):
+                merge_gate.promote(args)
+        self.assertEqual((self.main / "subject.txt").read_text(), "edited during hold\n")
+        self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+        self.assertFalse(any(call["tool"] == "ssh" for call in self.calls()))
+
+    def test_promotion_allows_untracked_files(self) -> None:
+        _ = self.publish_for_promotion()
+        self.write(self.main / "accounts.lock", "untracked\n")
+        result = self.run_promote_only()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.main / "accounts.lock").read_text(), "untracked\n")
+        self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.checkpoint)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.checkpoint)
+
+    def test_mac_promotion_checks_real_files_and_index_in_a_private_clone(self) -> None:
+        args = self.publish_for_promotion()
+        self.write(self.bin / "ssh", f'#!{sys.executable}\nimport subprocess, sys\n'
+                   + 'raise SystemExit(subprocess.call(["sh", "-c", sys.argv[-1]]))\n')
+        for state in ("modified", "staged", "assume-unchanged", "skip-worktree", "untracked", "clean"):
+            with self.subTest(state=state):
+                mac = self.root / ("mac-" + state)
+                _ = self.git(self.root, "clone", "-q", "--branch", "main", str(self.origin), str(mac))
+                # Keep each Mac at the old promotion, even after natedev advances.
+                _ = self.git(mac, "reset", "--hard", self.base)
+                args.mac_repo = str(mac)
+                if state in ("assume-unchanged", "skip-worktree"):
+                    _ = self.git(mac, "update-index", "--" + state, "subject.txt")
+                if state not in ("untracked", "clean"):
+                    self.write(mac / "subject.txt", "Mac local contents\n")
+                if state == "staged":
+                    _ = self.git(mac, "add", "subject.txt")
+                if state == "untracked":
+                    self.write(mac / "local.lock", "keep\n")
+                with mock.patch.dict(os.environ, self.environment), redirect_stdout(io.StringIO()):
+                    if state in ("untracked", "clean"):
+                        merge_gate.promote(args)
+                        self.assertEqual(self.git(mac, "rev-parse", "HEAD"), self.checkpoint)
+                    else:
+                        with self.assertRaisesRegex(merge_gate.GateRefused, 'Mac fast-forward failed:.*"subject.txt"'):
+                            merge_gate.promote(args)
+                        self.assertEqual(self.git(mac, "rev-parse", "HEAD"), self.base)
+                        self.assertEqual((mac / "subject.txt").read_text(), "Mac local contents\n")
+                self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.checkpoint)
+                if state == "untracked":
+                    self.assertEqual((mac / "local.lock").read_text(), "keep\n")
 
     def test_promote_preserves_local_edits_that_block_fast_forward(self) -> None:
         self.write(self.unit / "subject.txt", "checkpoint changes this file\n")

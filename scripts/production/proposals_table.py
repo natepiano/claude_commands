@@ -34,8 +34,7 @@ import showrunners
 from production_units import Refusal
 from issues import Issue
 from proposal_issue import AwaitingApproval, InProgress, ProposalProgress, proposal_progress
-from footer_counts import ledger
-from proposals_folder import open_proposals, owners, scope_docs, slug_of
+from proposals_folder import ledger, open_proposals, owners, scope_docs, slug_of
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
 import phase_table
