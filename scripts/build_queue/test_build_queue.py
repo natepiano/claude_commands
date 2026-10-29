@@ -11,6 +11,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+import unittest.mock
 from unittest import mock
 from typing import cast, override
 from zoneinfo import ZoneInfo
@@ -86,14 +87,30 @@ class QueueTests(unittest.TestCase):
         line = build_queue.render_queue(view, ZoneInfo("UTC"))[0]
         self.assertTrue(line.endswith("needs 10.8 GiB; builds 17.6 of 20.0 GiB budget"))
 
-    def test_head_reason_names_the_steps_that_must_end(self) -> None:
+    def test_head_reason_names_measured_budget_limit_and_start_level(self) -> None:
+        need, available = int(15.1 * GIB), int(19.5 * GIB)
+        memory: list[memory_admit.StepMemory] = [memory_admit.MeasuredMemory(int(1.32 * GIB)) for _ in range(10)]
+        with unittest.mock.patch.dict(os.environ, {"BUILDLOG_BUILD_BUDGET_GIB": "20"}):
+            decision = memory_admit.decide(available, 60 * GIB, need, memory)
         waiting = memory_admit.WaitingStep(
             10, "waiting-id", "unit", "nextest", "/tmp/tree", NOW - 2400,
-            int(19.3 * GIB), memory_admit.HeadWaitingForDrain(2),
+            need, memory_admit.head_wait_reason(decision, need, available),
         )
-        view = memory_admit.QueueView((waiting,), (), 20 * GIB, 0, 3 * GIB, NOW)
+        view = memory_admit.QueueView((waiting,), (), available, 0, 3 * GIB, NOW)
         line = build_queue.render_queue(view, ZoneInfo("UTC"))[0]
-        self.assertTrue(line.endswith("head: waits for 2 running steps to end"))
+        self.assertTrue(line.endswith("head: needs 15.1 GiB; builds use 13.2 of the 20.0 GiB budget "
+                                      + "(starts when build use falls to 4.9 GiB)"))
+
+    def test_head_reason_names_only_free_memory_when_budget_passes(self) -> None:
+        need, available = int(15.1 * GIB), 18 * GIB
+        decision = memory_admit.decide(available, 60 * GIB, need, [memory_admit.MeasuredMemory(GIB)])
+        waiting = memory_admit.WaitingStep(
+            10, "waiting-id", "unit", "nextest", "/tmp/tree", NOW - 2400,
+            need, memory_admit.head_wait_reason(decision, need, available),
+        )
+        view = memory_admit.QueueView((waiting,), (), available, 0, 3 * GIB, NOW)
+        line = build_queue.render_queue(view, ZoneInfo("UTC"))[0]
+        self.assertTrue(line.endswith("head: needs 18.1 GiB free; 18.0 free"))
 
     def test_live_queue_pressure_reason_reaches_the_cli(self) -> None:
         process = self.root / "proc/100"

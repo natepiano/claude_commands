@@ -59,7 +59,7 @@ FALLBACK = 12 * GIB
 ANON_SHARE = 0.65
 HISTORY_DAYS = 14
 # Build anon at 16–20 GiB averaged 10.4% full PSI; at 20–24 GiB it averaged 16.4%.
-BUILD_BUDGET_BYTES = 20 * GIB
+BUILD_BUDGET_BYTES = 21 * GIB
 RAMP_SECONDS = 120
 PROC = Path("/proc")
 # A step held this long gets room first when it can start.
@@ -177,8 +177,10 @@ class BehindHead:
 
 
 @dataclass(frozen=True)
-class HeadWaitingForDrain:
-    running_count: int
+class HeadAdmissionHold:
+    decision: AdmissionDecision
+    need: int
+    available: int
 
 
 @dataclass(frozen=True)
@@ -191,7 +193,27 @@ class ReadingUnavailable:
     pass
 
 
-WaitReason = NeedsBuildBudget | NeedsMemory | BehindHead | HeadWaitingForDrain | ReadyForAdmission | ReadingUnavailable | MemoryPressure
+WaitReason = NeedsBuildBudget | NeedsMemory | BehindHead | HeadAdmissionHold | ReadyForAdmission | ReadingUnavailable | MemoryPressure
+
+
+def head_wait_reason(decision: AdmissionDecision, need: int, available: int) -> HeadAdmissionHold | MemoryPressure | ReadyForAdmission:
+    if isinstance(decision.pressure, MemoryPressure):
+        return decision.pressure
+    if decision.state == "hold":
+        return HeadAdmissionHold(decision, need, available)
+    return ReadyForAdmission()
+
+
+def head_wait_text(reason: HeadAdmissionHold) -> str:
+    decision = reason.decision
+    parts: list[str] = []
+    if decision.charged + reason.need > decision.budget:
+        parts.append(f"needs {reason.need / GIB:.1f} GiB; builds use {decision.charged / GIB:.1f} "
+                     + f"of the {decision.budget / GIB:.1f} GiB budget "
+                     + f"(starts when build use falls to {(decision.budget - reason.need) / GIB:.1f} GiB)")
+    if reason.available < decision.threshold:
+        parts.append(f"needs {decision.threshold / GIB:.1f} GiB free; {reason.available / GIB:.1f} free")
+    return "head: " + "; ".join(parts)
 
 
 @dataclass(frozen=True)
@@ -262,6 +284,7 @@ class CheckResult:
     profile: StepProfile
     head_need: int = 0
     head_label: str = ""
+    head_reason: HeadAdmissionHold | MemoryPressure | ReadyForAdmission = ReadyForAdmission()
 
 
 def build_budget_bytes() -> int:
@@ -649,7 +672,10 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                 reservation = Reserved(path)
             else:
                 reservation = NotReserved("untracked")
-        return CheckResult(decision, peak, [row for _, row in live], reservation, repo, step, available, profile, head_need, head_label)
+        head_reason = (head_wait_reason(decision, peak.bytes, available)
+                       if isinstance(head, HeadPriority) and head.waiter is waiter else ReadyForAdmission())
+        return CheckResult(decision, peak, [row for _, row in live], reservation, repo, step, available, profile,
+                           head_need, head_label, head_reason)
 
 
 def waiter_identity(repo: str, step: str, worktree: str) -> WaiterIdentity:
@@ -765,8 +791,8 @@ def read_queue(directory: Path, processes: dict[int, ProcessIdentity], now: floa
             reason = BehindHead(head_identity["session_name"] or Path(head_identity["folder"]).name or str(head.waiter["pid"]), head.waiter["since"])
         elif isinstance(own.pressure, MemoryPressure):
             reason = own.pressure
-        elif own.state == "hold" and isinstance(head, HeadPriority) and row is head.waiter and memory:
-            reason = HeadWaitingForDrain(len(memory))
+        elif isinstance(head, HeadPriority) and row is head.waiter:
+            reason = head_wait_reason(own, row["need"], available)
         elif own.state == "hold":
             reason = (NeedsMemory(row["need"], available) if available < own.threshold
                       else NeedsBuildBudget(row["need"], own.charged, own.budget))
@@ -896,6 +922,8 @@ def main() -> None:
     summary = ", ".join(f"{row['repo']} {row['step']} in {row['worktree']}" for row in live)
     if isinstance(decision.pressure, MemoryPressure):
         summary = f"{pressure_text(decision.pressure)}; {summary}".rstrip("; ")
+    elif isinstance(result.head_reason, HeadAdmissionHold):
+        summary = f"{head_wait_text(result.head_reason)}; {summary}".rstrip("; ")
     reservation = result.reservation
     path = str(reservation.path) if isinstance(reservation, Reserved) else ""
     reason = "reserved" if isinstance(reservation, Reserved) else reservation.reason
