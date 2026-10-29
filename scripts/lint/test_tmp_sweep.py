@@ -550,7 +550,7 @@ class RunFolderTests(TmpSweepCase):
                 _ = self.sweep()
                 self.assertTrue(payload.is_file())
 
-    def test_an_unended_roster_seat_keeps_its_idle_run(self) -> None:
+    def test_an_unended_roster_worker_keeps_its_idle_run(self) -> None:
         for status in ("starting", "running", "done", "failed"):
             with self.subTest(status=status):
                 payload = write(self.unit / status / "board.log")
@@ -558,7 +558,7 @@ class RunFolderTests(TmpSweepCase):
                 _ = self.sweep()
                 self.assertTrue(payload.is_file())
 
-    def test_a_paused_roster_seat_keeps_the_run_and_its_temp_entries(self) -> None:
+    def test_a_paused_roster_worker_keeps_the_run_and_its_temp_entries(self) -> None:
         payload = write(self.delegate / "paused" / "tmp" / "old" / "file")
         roster = write(payload.parents[2] / "mesh_roster.json", json.dumps({"fix": {"status": "paused"}}))
         _ = self.sweep()
@@ -635,6 +635,106 @@ class RunFolderTests(TmpSweepCase):
                 result = self.sweep()
                 self.assertFalse(run.exists())
                 self.assertIn(str(run), [entry["path"] for entry in result.deleted])
+
+
+class HandCleanupTests(TmpSweepCase):
+    def ended_run(self, name: str) -> Path:
+        run = write(self.unit / name / "board.log").parent
+        _ = write(run / "mesh_roster.json", json.dumps({"fix": {"status": "ended"}}))
+        return run
+
+    def command(self, *arguments: str) -> tuple[int, str]:
+        output = io.StringIO()
+        with (redirect_stdout(output), redirect_stderr(output),
+              mock.patch.object(tmp_sweep, "default_roots", return_value=self.roots()),
+              mock.patch.object(tmp_sweep, "PROC_DIR", str(self.proc)),
+              mock.patch("time.time", return_value=self.now)):
+            status = tmp_sweep.main(list(arguments))
+        return status, output.getvalue()
+
+    def test_plan_lists_keep_and_remove_reasons_and_changes_nothing(self) -> None:
+        ended = self.ended_run("ended")
+        paused = self.ended_run("paused")
+        _ = write(paused / "mesh_roster.json", json.dumps({"fix": {"status": "paused"}}))
+        plan = self.tmp.parent / "plan.json"
+        status, output = self.command("--plan", str(plan))
+        self.assertEqual(status, 0, output)
+        self.assertTrue((ended / "board.log").is_file())
+        self.assertTrue((paused / "board.log").is_file())
+        self.assertIn(f"remove {ended}: all recorded workers ended", output)
+        self.assertIn(f"keep {paused}: a worker has not ended", output)
+        self.assertIn(f"tmp sweep: plan {plan}", output)
+        self.assertEqual(tmp_sweep.planned_removals(plan), [str(ended)])
+        self.assertFalse(self.state.exists())
+
+    def test_age_without_end_evidence_keeps_an_unused_folder(self) -> None:
+        idle = write(self.tmp / "unknown" / "file").parent
+        plan = self.tmp.parent / "plan.json"
+        status, output = self.command("--plan", str(plan))
+        self.assertEqual(status, 0, output)
+        self.assertIn(f"keep {idle}: no recorded end", output)
+        status, output = self.command("--apply", str(plan))
+        self.assertEqual(status, 0, output)
+        self.assertTrue((idle / "file").is_file())
+
+    def test_apply_removes_only_planned_paths_and_logs_each_removal(self) -> None:
+        ended = self.ended_run("ended")
+        kept = self.ended_run("kept")
+        _ = write(kept / "mesh_roster.json", json.dumps({"fix": {"status": "paused"}}))
+        plan = self.tmp.parent / "plan.json"
+        status, output = self.command("--plan", str(plan))
+        self.assertEqual(status, 0, output)
+        added = self.ended_run("added-after-plan")
+        _ = write(kept / "mesh_roster.json", json.dumps({"fix": {"status": "ended"}}))
+        status, output = self.command("--apply", str(plan))
+        self.assertEqual(status, 0, output)
+        self.assertFalse(ended.exists())
+        self.assertTrue((added / "board.log").is_file())
+        self.assertTrue((kept / "board.log").is_file())
+        self.assertIn(f"tmp sweep: deleted {ended}", output)
+        deleted = cast(list[dict[str, object]], self.log()[0]["deleted"])
+        self.assertEqual([entry["path"] for entry in deleted], [str(ended)])
+
+    def test_apply_rechecks_worker_marker_process_and_unreadable_record(self) -> None:
+        for change in ("worker", "marker", "process", "unreadable"):
+            with self.subTest(change=change):
+                run = self.ended_run(change)
+                plan = self.tmp.parent / f"{change}.json"
+                status, output = self.command("--plan", str(plan))
+                self.assertEqual(status, 0, output)
+                if change == "worker":
+                    _ = write(run / "mesh_roster.json", json.dumps({"fix": {"status": "paused"}}))
+                elif change == "marker":
+                    _ = write(self.unit / "active" / change, str(run) + "\n")
+                elif change == "process":
+                    fake_process(self.proc, 123, cwd=str(run))
+                else:
+                    _ = write(run / "mesh_roster.json", "{")
+                status, output = self.command("--apply", str(plan))
+                self.assertEqual(status, 0, output)
+                self.assertTrue((run / "board.log").is_file())
+                self.assertIn(f"keep {run}:", output)
+                self.assertNotIn(f"deleted {run}", output)
+
+    def test_apply_cannot_delete_a_path_outside_the_current_candidates(self) -> None:
+        outside = write(self.tmp.parent / "outside" / "file").parent
+        plan = write(self.tmp.parent / "plan.json", json.dumps({"version": 1, "entries": [
+            {"path": str(outside), "action": "remove", "reason": "all recorded workers ended"},
+        ]}))
+        status, output = self.command("--apply", str(plan))
+        self.assertEqual(status, 0, output)
+        self.assertTrue((outside / "file").is_file())
+        self.assertIn(f"keep {outside}: no current sweep candidate", output)
+
+    def test_an_existing_plan_is_preserved_and_bad_plans_remove_nothing(self) -> None:
+        run = self.ended_run("ended")
+        plan = write(self.tmp.parent / "plan.json", "not json")
+        status, output = self.command("--plan", str(plan))
+        self.assertEqual(status, 1, output)
+        self.assertEqual(plan.read_text(), "not json")
+        status, output = self.command("--apply", str(plan))
+        self.assertEqual(status, 1, output)
+        self.assertTrue((run / "board.log").is_file())
 
 
 class RunningSessionTests(unittest.TestCase):
