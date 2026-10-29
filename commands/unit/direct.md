@@ -22,62 +22,17 @@ review, gate and report. Every prompt sent to a worker carries them inline per
 - Free text amends or narrows the selected work.
 - `single` and `verbose` are mutually exclusive.
 
-<Guild>
-Your guild is `units`. Your head is the `units` unit director in the `guilds` production on natedev. At skill start, use the Tips lock/pull rule for `~/rust/nate_style` and load `guilds/common/` and `guilds/units/`; a Codex holder does this for its worker. Report to your head when the user corrects you, a phase needs repair round 4, a finding meets the Events repeat rule, you use a workaround for a tool fault or slow rule, or a method saves measured time. Send one report of at most 100 words, with evidence and result. Resolve the head from `message/roster.py --json` by production `guilds` and unit `units`; send with `message/send.py` or SendMessage. A Codex worker puts the report in its reply for its holder to send. Send only to the head. Never wake an idle Codex member for guild advice.
-
-Load tips: ~/.claude/scripts/lib/py ~/.claude/scripts/guilds/tips.py load --guild units
-
-Use Events in `~/.claude/docs/as-built/guilds.md` for report detection and form.
-In Synthesize / FixDispatch, send the units report when `findings.py gate` first
-returns `verdict=dispatch` with `round=4` for a phase instance; a repeated read
-sends no new report. The gate outcome does not change.
-For repeated titles in one run, normalize case and spaces. Count matching
-`finding_opened` titles across distinct `(phase_instance_id, round)` groups,
-or a `still_open`/`reopened` verdict after `finding_batch_landed` names that
-finding. Count one group once across lenses and one verdict per finding/round.
-Missing phase, round or repair order means `RepeatNotProven`; cite both event IDs.
-Send at most 100 words in six lines: Guild/event, Member/holder, Work,
-Evidence/time, Change, Result/cost/limit. Keep unsent reports with phase evidence.
-
-In LaunchImplementation, include `config/guilds/designer.md`, the expanded
-designers block and the loaded designers tip text in each Astra designer brief.
-For a designer that `roles.py` does not hold, save the brief before dispatch with:
-`~/.claude/scripts/lib/py ~/.claude/scripts/guilds/astra_work.py brief
---run-directory <SESSION_DIR> --phase <id> --member <mesh name>
---document <path> --round <N> --text-file <brief>`.
-Save the reply as `<SESSION_DIR>/design/phase<id>/round<N>_reply.md` without
-overwrite. A holder passes both `--run-directory` and `--phase` to each phase
-`astra_review.py` call. Codex holders pass the expanded block and loaded tip text
-to their worker, and relay its guild report unchanged.
-</Guild>
-
-<GuildHeadStanding>
-A plan headed `> **Standing:** guild-head` uses its event/daily loop instead
-of ticket dispatch. This branch takes precedence at startup, restart,
-compaction, phase selection in <NextPhase/>, and entry to <StandingPlanRefill/>.
-Read the plan and its production row, then process a member report or user
-feedback: check the cited evidence, publish an owned tip with
-`tips.py publish --head <guild> --from <folder>`, and reply with the tip path
-and pushed commit or a reason to decline. At a daily check-in, read only the
-uncovered interval on natedev and once on the Mac as the plan directs; record
-host coverage, and read turns only for flagged rows. Duplicate check-ins do
-no second read; cover a downtime gap once and state its length.
-
-Run no `style_plan.py` refill, ticket dispatch, phase, worker, checkpoint,
-shrink, FinalGate or RunSummary for this loop. The head writes its tips
-directly under the publish contract and routes process proposals through
-guilds to sdlc for guild-process-unit. Keep the session for its next report
-or timer. It remains a units guild member under <Guild/>; this section changes
-no other standing plan. An idle head ends each turn with
-`— holding: waiting on the next guild report or daily check-in`.
-</GuildHeadStanding>
-
 <HeldAstraRoles>
 For LongLivedWorkers and LaunchImplementation, the director briefs and accepts;
 Astra authors the assigned design. Use one `roles.py` designer and at most one
 reviewer per design, with models resolved from `guild` in `agents.conf`. Open
 once; resume the same instance across rounds, phases and runs. `roles.py` saves
 each headed prompt and reply; do not also use `astra_work.py brief` for that role.
+For a designer outside `roles.py`, include `config/guilds/designer.md` in its brief
+and save it with `astra_work.py brief --run-directory <SESSION_DIR> --phase <id>
+--member <mesh name> --document <path> --round <N> --text-file <brief>`.
+Save its reply as `<SESSION_DIR>/design/phase<id>/round<N>_reply.md` without
+overwrite. Pass both `--run-directory` and `--phase` to phase `astra_review.py` calls.
 
 For DelegatedPhaseReservationContract, prepare exact phase files, baseline and
 reservation before dispatch. Bind the designer to those output paths with explicit
@@ -1221,6 +1176,10 @@ reports `No active phase to report`, continue without the progress report.
 
 <FixDispatch>
 Apply <LongLivedWorkers/>.
+
+Find a failing test's cause before you scope its repair: read the failure text
+and the fixture it runs in. A repair aimed at a cause no one has checked costs
+a full round.
 
 For a `dispatch` batch, set `${FIX_ROUND}` from the gate's `round` and create
 `${SESSION_DIR}/fix_prompt_${FIX_ROUND}.md` under
