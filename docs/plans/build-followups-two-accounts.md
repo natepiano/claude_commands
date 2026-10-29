@@ -2589,33 +2589,28 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Depends on:** Phase 91
 
-#### Work Order
+#### As-built
 
-**Goal:** One reused 2-minute pass of `scripts/whoami/agent_notes.py` (no arguments, usage reading younger than 10 minutes) uses less CPU. After Phase 91 (live 2026-10-28 23:05 EDT) a run still uses 10–11 s of CPU (0.4–0.55 core) on natedev, and the usage read is no longer its largest part.
-
-**Spec:**
-- Profile one reused pass with `cProfile` (or another method that needs no py-spy). Run the argument-free `agent_notes.main()` twice in a scratch `HOME` with fixture notes, homes and sessions, and profile the second run, which reuses `timer-usage.json` (`usage_store.recent_timer_usage`). A by-hand `refresh` always reads live, so it shows no reuse.
-- The profile covers every step of the argument-free run: `update_alert_pass` (`accounts.sweep_claude_temp_files`, `rename_legacy_notes`, `note_file.read_notes`, `timer_usage_signature`, `urgent_usage_read`, `codex_alert_pass`, `accounts.group_note_labels`, `session_table.live_sessions`, `write_note` per note, `five_hour.watch`), then `alert`, `codex_pacer.tick` and `mark_tier`, then `refusal_watch.run` (with `unit_watchdog`). Name the largest costs by cumulative CPU time in the phase report, with the top entries of the profile.
-- Cut the largest cost. Keep each result of the pass the same: the note text, the sessions sections, the alerts, the pacer tier, the refusal placement and the watchdog.
-- Fixture reads stand in for every remote read: `role_map.is_role_map_host` and `roster.peer_snapshot` (the ssh peer read in `session_table.live_sessions`) are patched. Their CPU shows only in the live numbers.
-- No other behavior changes.
+- A reused argument-free pass of `scripts/whoami/agent_notes.py` gives the same note text, sessions sections, alerts, pacer tier, refusal placement and watchdog as before. Its two largest costs are outside `agent_notes.py`: the refusal watch transcript lookup and the Codex pacer rollout listing.
+- `refusal_watch.session_refusals(session_ids: list[str]) -> dict[str, TranscriptRefusal | ProofRefusal | NoSessionRefusal]` finds the transcripts of one pass with one `os.scandir` listing per project folder under `~/.claude/projects`. When a folder cannot be listed, it does known-name `exists()` lookups in that folder. An error on one path does not stop the other paths. `_run` calls it in place of one `session_refusal` glob per session. `transcript_refusal` and `session_refusals` share `_transcript_refusal(paths)`, which reads the newest transcript by mtime. The index lives for one pass; a new transcript or exchange is read on the next pass.
+- `codex_pacer.tick` lists rollouts once (`rollout_files`) and gives the list to `ingest` and to `prune(state, now, retained_rollouts)`. `rollout_files` sorts each day with `key=str`. `prune` keeps only the offsets of listed rollouts that still exist. `backfill` gives `prune` its own `rollout_files(now, SCAN_DAYS)`.
+- At a live-sized fixture the pass goes from 0.587 s to 0.212 s. On natedev the live CPU per run shows no measurable drop: 9.1–9.2 s before, 9.4–11.7 s after, at load 120–130.
 
 **Files:**
-- `scripts/whoami/agent_notes.py` and the module that holds the largest cost (named by the profile).
-- The test module beside each changed file (for example `scripts/whoami/test_agent_notes.py`): one test that proves the cut work no longer runs, or runs less, on a reused pass, and that the pass output stays the same.
-
-**Workers:** 1 writer, no split (the cut is in one place, named by the profile).
-- `impl` — the profile, the cut and its tests.
-
-**Constraints from prior phases:** Phase 91's reuse rules stay: the live-read triggers (`refresh`, a waiting next-moves queue on the role-map host, an in-use account at or below `LIVE_USAGE_REMAINING_THRESHOLD`, an active Codex fallback, a passed reset, a changed login or selection), and the refusal watch, unit watchdog, session table and note sessions sections on every pass. Tests and the profile use a scratch `HOME` and `AGENT_NOTES_DIR`, as `AgentNotesTests.setUp` does. They never touch live dirs, `~/.local/state`, usage stores, ssh or real sessions.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/<dir> -p 'test_*.py'` passes for `scripts/whoami`, `scripts/accounts` and each other touched dir; `basedpyright <changed files>` reads `0 errors, 0 warnings, 0 notes`. Live check (the director, not a worker test): on natedev, the CPU per run in the `Consumed … CPU time` lines of `journalctl --user -u agent-sessions-snapshot.service` and in the director's per-run sampler (it reads `/proc/<pid>/stat` utime + stime + reaped children of the next timer-run `agent_notes.py` until it exits; the Phase 91 after-number was 10–11 s), before and after the change is live, drops.
+- `scripts/accounts/refusal_watch.py` — `session_refusals`, `_transcript_refusal`, `_run`.
+- `scripts/whoami/codex_pacer.py` — `rollout_files`, `tick`, `prune`, `backfill`.
+- `scripts/accounts/test_refusal_watch.py` — one search per project with each latest exchange; a project folder that cannot be listed.
+- `scripts/whoami/test_codex_pacer.py` — filename order, one listing per tick with the same plan and state, a deleted rollout before its replacement.
 
 **Gotchas:**
-- The service runs `agent-sessions-snapshot.py`, which starts `agent_notes.py` as its own process. Its `Consumed` figure counts the whole service, so compare runs of the same service before and after.
-- The Mac has no snapshot timer; the live numbers come from natedev only.
+- A project folder can be traversable but not listable. Keep the known-name fallback, or readable transcripts are missed.
+- A saved offset for a deleted rollout must not apply to a new file at the same path; `prune` checks `exists()`.
+- The live 10 s target is not met. The rest of the live cost is outside what the fixture profile reaches.
 
-### Phase 95 — A failed restart shows its saved screen  · status: todo
+**Ruled out:**
+- A cut in `agent_notes.py`: its own work is not the largest cost in the profile.
+
+### Phase 95 — A failed restart shows its saved screen  · status: done
 
 **Depends on:** Phase 94 (order only)
 
@@ -2623,7 +2618,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 #### Work Order
 
-**Goal:** A `restart failed` record whose opening-prompt submit failed shows the last screen that submit saw. Phase 69 saves the screen in the `<move note>.prompt-outcome.json` receipt, but no user surface shows it, so to diagnose `restart prompt not submitted` the user opens the receipt by hand.
+**Goal:** A `restart failed` record whose opening-prompt submit failed shows the last screen that submit saw. Phase 69 saves the screen in the receipt `<SHUTDOWN_STATE_DIR>/<login>/restart-note-<session id>.prompt-outcome.json` (`restart._prompt_outcome_path`), but no user surface shows it, so to diagnose `restart prompt not submitted` the user opens the receipt by hand.
 
 **Spec:**
 - One reader in `scripts/shutdown/restart.py`: `saved_prompt_screen(record) -> str | herdr.PromptScreenNotRead`. It reads the receipt through `_prompt_outcome(record)` (the request id, session id and target checks stay) and returns `outcome.screen` for a `herdr.PromptNotSubmitted` with a read screen, else `herdr.PromptScreenNotRead()`. The screen is ANSI-stripped, the last 40 lines (Phase 69).
@@ -2651,7 +2646,35 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 **Acceptance gate:** `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py'` passes; `basedpyright scripts/shutdown/restart.py scripts/shutdown/shutdown.py scripts/shutdown/settle.py` and the three test files read `0 errors, 0 warnings, 0 notes`.
 
 **Gotchas:**
-- A receipt holds a screen only after the first typing; a failure before any typing has `PromptScreenNotRead`, and the surfaces print nothing for it.
+- A receipt holds a screen when the submit read the pane at least once. `herdr.wait_for_prompt_input` keeps the last screen it read, so a failure before any typing can hold one too (`destination never became ready for input` after a `destination has no empty composer` read). A receipt has `PromptScreenNotRead` when no pane read happened (the agent never became interactive-ready) or when `restart.py` saved its own reason (`launch has no submit proof`, `restart launcher supplied no submit proof`). The surfaces print nothing for it.
+
+### Phase 94b — Cut the top live cost of the notes timer pass  · status: todo
+
+**Depends on:** Phase 95 (order only)
+
+#### Work Order
+
+**Goal:** One live timer pass of `scripts/whoami/agent_notes.py` uses less CPU. Phase 94 cut 0.587 s to 0.212 s at a live-sized fixture, but live runs still use 9.4–11.7 s of CPU (6.0 s in-process, 2.9 s in child processes). The live cost is in work the fixture does not reach.
+
+**Spec:**
+- A profile script, `scripts/whoami/profile_notes_pass.py`, runs the timer's exact command (the `ExecStart` of `agent-sessions-snapshot.service`, the same environment) in-process under `cProfile`, writing the stats to a file the caller names. It reads live data as it is. It patches every call that writes or acts to a no-op: note writes, the timer usage file, phone and showrunner alerts, the pacer tier and plan files, refusal moves, and unit watchdog actions. The state files those calls read are scratch copies. Its output names each patched call, so the cost the profile skips is not missed. A second run beside the timer's own run changes nothing.
+- The director runs the profile on natedev, names the top live costs by cumulative CPU, and gives them to the writer. The writer cuts the largest one and keeps each result of the pass the same (Phase 94's list).
+- Before and after numbers come from the same method: the profile script, then the timer runs (`notes_cpu` sampler and the service `Consumed` lines).
+
+**Files:**
+- `scripts/whoami/profile_notes_pass.py` (new) and its test `scripts/whoami/test_profile_notes_pass.py`: the patch list covers each side-effect call; a pass under the script writes nothing outside the scratch folder.
+- The module that holds the top live cost, and the test module beside it.
+
+**Workers:** 1 writer, no split.
+- `impl` — the profile script, then the cut.
+
+**Constraints from prior phases:** Phase 91's reuse rules and Phase 94's cuts stay. Tests use a scratch `HOME` and `AGENT_NOTES_DIR`; they never touch live dirs, `~/.local/state`, usage stores, ssh or real sessions. Only the director runs the profile on live data.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/<dir> -p 'test_*.py'` passes for `scripts/whoami`, `scripts/accounts` and each other touched dir; `basedpyright <changed files>` reads `0 errors, 0 warnings, 0 notes`. Live check (the director): the profile's total and the timer runs' CPU per run both drop after the cut, at a similar load.
+
+**Gotchas:**
+- The machine load on natedev is often 100 or more, which makes CPU time read high. Compare runs at a similar load.
+- Never run `agent_notes.py` by hand without the profile script: it sends alerts and can move sessions.
 
 ### Phase 96 — All consumers import shared whoami modules by one name  · status: todo
 
@@ -2673,13 +2696,22 @@ After a worker launch's own turn has ended, a move to the selected seats home th
   - `scripts/message/roster.py`; `scripts/nightly_review/nightly_review.py` (not in the next-items entry; found at planning).
   - 27 test files in `scripts/whoami`, `scripts/accounts`, `scripts/shutdown`, `scripts/production` and `scripts/nightly_review`.
   - `scripts/agents/agent_exec.sh`: its inline Python puts only `scripts/whoami` on `sys.path` and runs `from agent_accounts import workers_home`. It puts the repository root (`$script_dir/../..`) on `sys.path` and imports `scripts.whoami.agent_accounts`.
+- The repository root must be on `sys.path` before the first `scripts.` import of each consumer. Today many consumers get the root only as a side effect of a bare `import account` or `import agent_accounts` (`account.py:19` and `agent_accounts.py:46` insert `parents[2]`); `settle.py:42` and `restart.py:28` already import `scripts.accounts` through that side effect. After the change the package import must find the root first. Each consumer file that has no module-level root insert adds `sys.path.insert(0, str(Path(__file__).resolve().parents[2]))` before its first `scripts.` import. Found at planning: `scripts/whoami/whoami.py` (its root insert is inside a function, line 69), `run_out.py`, `session_table.py`; `scripts/accounts/refusals.py`, `unit_watchdog.py`; `scripts/production/dailies_render.py`, `cli_fixture.py`; `scripts/shutdown/inventory.py`, `pane_record.py`, `pane_restore.py`, `record.py`, `restart.py`, `settle.py`, `shutdown.py`.
 - Remove the `if __name__ == "<module>": … elif __name__ == "scripts.whoami.<module>": …` block from each of the six modules.
 - Other whoami modules (`quota_alert`, `five_hour`, `codex_pacer`, `agent_notes`) keep their current import names; `scripts/lib/nix_env.py` keeps its own two-name block. Both are out of scope.
 - No other behavior changes.
 
 **Files:**
 - `scripts/whoami/agent_accounts.py`, `account.py`, `note_file.py`, `session_table.py`, `run_out.py`, `usage_store.py` — the registration blocks.
-- The consumer files and test files listed in the Spec.
+- `scripts/whoami/five_hour.py`, `scripts/whoami/quota_alert.py`, `scripts/whoami/codex_pacer.py`, `scripts/whoami/agent_notes.py`, `scripts/whoami/whoami.py` — consumers.
+- `scripts/accounts/accounts.py`, `scripts/accounts/new_account.py`, `scripts/accounts/refusal_watch.py`, `scripts/accounts/refusals.py`, `scripts/accounts/unit_watchdog.py` — consumers.
+- `scripts/shutdown/inventory.py`, `scripts/shutdown/pane_record.py`, `scripts/shutdown/pane_restore.py`, `scripts/shutdown/record.py`, `scripts/shutdown/restart.py`, `scripts/shutdown/settle.py`, `scripts/shutdown/shutdown.py` — consumers.
+- `scripts/production/cli_fixture.py`, `scripts/production/dailies_render.py`, `scripts/production/showrunner_move.py` — consumers.
+- `scripts/message/roster.py`, `scripts/nightly_review/nightly_review.py` — consumers.
+- `scripts/whoami/test_agent_notes.py`, `scripts/whoami/test_codex_alert_accounts.py`, `scripts/whoami/test_codex_homes.py`, `scripts/whoami/test_codex_pacer.py`, `scripts/whoami/test_five_hour.py`, `scripts/whoami/test_note_file.py`, `scripts/whoami/test_quota_alert.py`, `scripts/whoami/test_run_out.py`, `scripts/whoami/test_session_table.py`, `scripts/whoami/test_usage_store.py` — tests.
+- `scripts/accounts/test_accounts.py`, `scripts/accounts/test_cutover_home.py`, `scripts/accounts/test_new_account.py`, `scripts/accounts/test_refusals.py`, `scripts/accounts/test_refusal_watch.py`, `scripts/accounts/test_unit_watchdog.py` — tests.
+- `scripts/shutdown/test_account_move.py`, `scripts/shutdown/test_inventory.py`, `scripts/shutdown/test_pane_record.py`, `scripts/shutdown/test_restart.py`, `scripts/shutdown/test_settle.py`, `scripts/shutdown/test_shutdown_cli.py`, `scripts/shutdown/test_shutdown_status.py`, `scripts/shutdown/test_stop.py` — tests.
+- `scripts/production/test_add_showrunner.py`, `scripts/production/test_add_unit.py`, `scripts/nightly_review/test_nightly_review.py` — tests.
 - `scripts/agents/agent_exec.sh` — the inline Python import.
 - `scripts/agents/codex_mesh.py`, `scripts/herdr/herdr_sessions.py` — already package form; read to confirm, change only a bare import found.
 
@@ -2689,8 +2721,9 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Constraints from prior phases:** Tests sit beside the code (Delegation Context); after this phase they import the six modules by the package name, the same object the code uses. Tests never touch live dirs: `HOME`, `AGENT_NOTES_DIR` and the patched `note_file.AGENTS_DIR` point at scratch folders. No `Any`, no file-level ignores.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/<dir> -p 'test_*.py'` passes for `whoami`, `accounts`, `shutdown`, `production`, `message`, `nightly_review`, `agents`, `herdr`, `usage`, `nix_env` and `lib`; `basedpyright` on every changed file and each caller module reads `0 errors, 0 warnings, 0 notes`; `grep -rnE '^\s*(import|from) (agent_accounts|account|note_file|session_table|run_out|usage_store)\b' scripts` finds nothing (it covers the `.sh` inline Python too); no `sys.modules.setdefault` remains in `scripts/whoami`.
+**Acceptance gate:** `python3 -m unittest discover -s scripts/<dir> -p 'test_*.py'` passes for `whoami`, `accounts`, `shutdown`, `production`, `message`, `nightly_review`, `agents`, `herdr`, `usage`, `nix_env` and `lib`; `basedpyright` on every changed file and each caller module reads `0 errors, 0 warnings, 0 notes`; `grep -rnE '^\s*(import|from) (agent_accounts|account|note_file|session_table|run_out|usage_store)\b' scripts` finds nothing (it covers the `.sh` inline Python too); no `sys.modules.setdefault` remains in `scripts/whoami`; with `/tmp` as the working directory and only the file's own directory on `sys.path` (as a script run has it), `python3 -c 'import sys; sys.path.insert(0, "<dir>"); import <module>'` imports each changed non-test consumer without `ModuleNotFoundError` (import only; never call its `main`).
 
 **Gotchas:**
 - A test that imports a module by the other name gets a second module object. Its `patch.object(note_file, "AGENTS_DIR", …)` then misses the object the code uses, and the code can write to the live notes dir. Change each test's import in the same commit as its module's consumers.
 - Type identity: a `KnownCodexAccount` or `Report` made from one module object fails `isinstance` against the other. A remaining bare import shows as a failing `isinstance` test, not an import error.
+- The unit suites run from the repository root, so the working directory puts the root on `sys.path` and hides a missing root insert. Only the import check from `/tmp` in the acceptance gate finds one.
