@@ -1654,6 +1654,22 @@ class RosterTests(unittest.TestCase):
 
 
 class UnitLabelsTests(unittest.TestCase):
+    def test_folder_name_joins_showrunner_and_unit(self) -> None:
+        self.assertEqual(roster.UnitLabels("director", "hana", "lfo").folder_name(), "hana-lfo")
+        self.assertEqual(roster.UnitLabels("director", "hana", "hanami").folder_name(), "hana-hanami")
+
+    def test_folder_name_does_not_repeat_the_units_showrunner_prefix(self) -> None:
+        for unit in ("cargo-liner-style", "cargo-liner-style-types"):
+            with self.subTest(unit=unit):
+                self.assertEqual(roster.UnitLabels("director", "cargo-liner-style", unit).folder_name(), unit)
+
+    def test_folder_name_drops_a_missing_relationship(self) -> None:
+        self.assertEqual(roster.UnitLabels("director", "builds", "—").folder_name(), "builds")
+        self.assertEqual(roster.UnitLabels("director", "—", "lfo").folder_name(), "lfo")
+
+    def test_folder_name_uses_the_session_when_both_relationships_are_missing(self) -> None:
+        self.assertEqual(roster.UnitLabels("scratch").folder_name(), "scratch")
+
     def entry(
         self, session_id: str, name: str, *,
         showrunner: roster.ShowrunnerRelationship = NO_SHOWRUNNER,

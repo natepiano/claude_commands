@@ -50,7 +50,7 @@ verify-unit's Work Order for the copy folder name (roster.py join `<showrunner>-
   - `scripts/build_queue/test_build_queue.py` — table tests; its `setUp` fakes `BUILDLOG_DIR`, `BUILDLOG_PROC`, `BUILDLOG_MEMINFO`, `BUILDLOG_MEMORY_PRESSURE`, `NOTIFIER_SESSIONS_DIR` and `USER_ZONE`
   - `scripts/lint/memory_admit.py` — `waiter_identity` (line ~865), `QueueIdentityReader.identity` (line ~894), `read_queue` (line ~929), `head_wait_text` (line ~262), `bump_waiter` (line ~1010), `WaitingStep` / `RunningStep` (line ~285)
   - `scripts/lint/test_memory_admit.py` — memory gate tests, including `head_wait_text` and queue view cases
-  - `scripts/message/roster.py` — `roster(environment, ThisMachine())` (line ~1386) returns `Roster(entries, problems)`; `RosterEntry` (line ~202) with `kind`, `role`, `name`, `session: ClaudeSession | NoClaudeSession`, `thread: CodexThread | NoCodexThread`, `showrunner: RunsProduction | UnderShowrunner | ProductionWithoutRunningShowrunner | NoShowrunner`, `director: DirectsUnit | UnderDirector | NoDirector` (classes at lines ~69–170)
+  - `scripts/message/roster.py` — `roster(environment, ThisMachine())` (line ~1504) returns `Roster(entries, problems)`; `RosterEntry` (line ~219) with `kind`, `role`, `name`, `session: ClaudeSession | NoClaudeSession`, `thread: CodexThread | NoCodexThread`, `showrunner: RunsProduction | UnderShowrunner | ProductionWithoutRunningShowrunner | NoShowrunner`, `director: DirectsUnit | UnderDirector | NoDirector` (classes at lines ~86–178)
 - **Test lanes:** none — tests sit beside the code (`scripts/build_queue/test_build_queue.py`, `scripts/lint/test_memory_admit.py`).
 - **Build:** none (Python).
 - **Test:** from the worktree root, `python3 -m unittest scripts.build_queue.test_build_queue scripts.lint.test_memory_admit`; the merge gate runs the full suite.
@@ -147,7 +147,7 @@ verify-unit's Work Order for the copy folder name (roster.py join `<showrunner>-
 
 **Ruled out:** a label fast path with its own copy of the slug and mark rules — it drifts from `unit_lookup` and `showrunners`; a package-import migration of the other shutdown modules — the record name clash belongs to shutdown-unit.
 
-### Phase 4 — Copy folders take one showrunner-unit name  · status: todo
+### Phase 4 — Copy folders take one showrunner-unit name  · status: done
 
 **Depends on:** Phase 3
 

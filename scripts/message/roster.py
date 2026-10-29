@@ -244,6 +244,21 @@ class UnitLabels:
     showrunner: str = "—"
     unit: str = "—"
 
+    def folder_name(self) -> str:
+        """Name a copies folder from the owning director's labels.
+
+        Look up labels with unit_labels_for([<session id from
+        build_hold.owning_session()>], environment), so a Codex worker
+        resolves to its unit director.
+        """
+        if self.showrunner == "—":
+            return self.session if self.unit == "—" else self.unit
+        if self.unit == "—":
+            return self.showrunner
+        if self.unit == self.showrunner or self.unit.startswith(self.showrunner + "-"):
+            return self.unit
+        return f"{self.showrunner}-{self.unit}"
+
 
 def _unit_labels(name: str, showrunner: ShowrunnerRelationship,
                  director: DirectorRelationship) -> UnitLabels:
