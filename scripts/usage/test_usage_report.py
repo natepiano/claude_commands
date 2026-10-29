@@ -21,6 +21,9 @@ from scripts.usage.test_collect import FIXTURES as COLLECT_FIXTURES, MacStreamRe
 from scripts.usage.test_outcomes import OutcomeFixture
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 FIXTURES = Path(__file__).with_name("fixtures") / "report"
 REPORT = Path(__file__).with_name("usage_report.py")
 METRICS = ("weighted", "weighted_per_checkpoint", "before_first_edit_share", "cache_read_share",
@@ -100,13 +103,13 @@ class ReportFixture(OutcomeFixture):
         return subprocess.run([sys.executable, str(REPORT), "--db", str(self.db_path),
                                "--production-docs", str(self.production_docs), *arguments],
                               env=self.report_environment(), cwd=REPOSITORY, capture_output=True,
-                              text=True, check=False, timeout=10)
+                              text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def report_script(self, script: str, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, "-c", script, "--db", str(self.db_path),
                                "--production-docs", str(self.production_docs), *arguments],
                               env=self.report_environment(), cwd=REPOSITORY, capture_output=True,
-                              text=True, check=False, timeout=30)
+                              text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def mac_complete_times(self) -> dict[str, str]:
         rows = self.rows("SELECT family, last_complete_at FROM turn_sources WHERE machine = 'mac' ORDER BY family")
@@ -561,7 +564,7 @@ raise SystemExit(main(sys.argv[1:]))
         result = subprocess.run([sys.executable, "-c", script, "--db", str(self.db_path),
                                  "--production-docs", str(self.production_docs), "turn_count"],
                                 env=self.report_environment(), cwd=REPOSITORY, capture_output=True,
-                                text=True, check=False, timeout=10)
+                                text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
         self.assertEqual(result.stdout, self.expected_report("turn-count"))

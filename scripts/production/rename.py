@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import add_unit  # noqa: E402
@@ -25,10 +25,32 @@ from unit_move import PathMove  # noqa: E402
 import rename_checkout  # noqa: E402
 import rename_outside  # noqa: E402
 import rename_state  # noqa: E402
+import rename_unit  # noqa: E402
 from rename_state import RenameRefused, read_json, write_json, write_text  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.guilds import roles  # noqa: E402
+
+if TYPE_CHECKING:
+    from scripts.shutdown import record as shutdown_record
+    from scripts.shutdown.record import SessionShutdown
+else:
+    import record as shutdown_record
+    from record import SessionShutdown
+
+
+class StoppedUnitRestore(TypedDict):
+    kind: Literal["stopped"]
+    login: str
+    session_id: str
+
+
+class UnitWithoutRestore(TypedDict):
+    kind: Literal["absent"]
+
+
+UnitRestore = StoppedUnitRestore | UnitWithoutRestore
+
 
 REVIEW_POOL_STATE = Path(os.environ.get("REVIEW_POOL_STATE") or Path.home() / ".local/state/review-pool")
 
@@ -219,14 +241,14 @@ def _move_record(move: PathMove) -> dict[str, str]:
     return {"source": str(move.source), "destination": str(move.destination)}
 
 
-def _save(plan: RenamePlan, step: int) -> None:
+def _save(plan: RenamePlan, completed: tuple[str, ...]) -> None:
     write_json(plan.journal, {
         "version": 1, "old": plan.old, "new": plan.new, "old_doc": str(plan.old_doc),
         "new_doc": str(plan.new_doc), "checkout": str(plan.checkout), "merge_branch": plan.merge_branch,
         "base": plan.base, "units": list(plan.units), "plans": [str(path) for path in plan.plans],
         "timer": _move_record(plan.timer), "state": [_move_record(move) for move in plan.state],
         "stall": [_move_record(move) for move in plan.stall], "review_pool": _move_record(plan.review_pool),
-        "step": step, "done": False,
+        "completed": list(completed), "done": False,
     })
 
 
@@ -264,7 +286,21 @@ def _read_moves(value: object) -> tuple[PathMove, ...]:
     return tuple(_read_move(item) for item in cast(list[object], value))
 
 
-def _load(path: Path, old: str, new: str) -> tuple[RenamePlan, int]:
+def _completed_steps(fields: dict[str, object]) -> tuple[str, ...] | None:
+    """Return the completed apply step names, or None when the record is not valid."""
+    if "completed" in fields:
+        names = fields["completed"]
+        if not isinstance(names, list) or not all(isinstance(name, str) and name in APPLY_STEP_NAMES for name in cast(list[object], names)):
+            return None
+        return tuple(cast(list[str], names))
+    # A journal written before apply recorded step names holds a count of the 7-step list.
+    step = fields.get("step")
+    if type(step) is not int or not 0 <= step <= len(COUNTED_APPLY_STEP_NAMES):
+        return None
+    return COUNTED_APPLY_STEP_NAMES[:step]
+
+
+def _load(path: Path, old: str, new: str) -> tuple[RenamePlan, tuple[str, ...]]:
     fields = _object(read_json(path))
     if fields.get("version") != 1 or fields.get("new") != new:
         raise RenameRefused(f"{path}: incompatible rename journal")
@@ -272,8 +308,8 @@ def _load(path: Path, old: str, new: str) -> tuple[RenamePlan, int]:
     if old not in (recorded_old, new) and showrunners.canonical_slug(old) not in (recorded_old, new):
         raise RenameRefused(f"{path}: rename is from {recorded_old}, not {old}")
     state = _read_moves(fields.get("state"))
-    step = fields.get("step")
-    if len(state) != len(tidy_wrapped.owned_paths(new)) or type(step) is not int or not 0 <= step <= len(APPLY_STEPS) or not isinstance(fields.get("done"), bool):
+    completed = _completed_steps(fields)
+    if len(state) != len(tidy_wrapped.owned_paths(new)) or completed is None or not isinstance(fields.get("done"), bool):
         raise RenameRefused(f"{path}: invalid rename progress")
     result = RenamePlan(recorded_old, new, Path(_string(fields, "old_doc")), Path(_string(fields, "new_doc")),
                         Path(_string(fields, "checkout")), _string(fields, "merge_branch"), _string(fields, "base"),
@@ -282,7 +318,7 @@ def _load(path: Path, old: str, new: str) -> tuple[RenamePlan, int]:
                         _read_move(fields.get("review_pool")))
     if result.journal != path:
         raise RenameRefused(f"{path}: journal state directory changed")
-    return result, step
+    return result, completed
 
 
 def plan(old: str, new: str) -> RenamePlan:
@@ -499,6 +535,10 @@ def _rename_branch(plan: RenamePlan) -> None:
 
 APPLY_STEPS = (_rename_doc, _rewrite_plans, _rename_timer, _rename_showrunner_state,
                _rename_stall_watch, _rename_review_pool, _rename_unit_workers, _rename_branch)
+APPLY_STEP_NAMES = tuple(step.__name__ for step in APPLY_STEPS)
+# The step list of journals that recorded a count; its order maps a count to step names.
+COUNTED_APPLY_STEP_NAMES = ("_rename_doc", "_rewrite_plans", "_rename_timer", "_rename_showrunner_state",
+                            "_rename_stall_watch", "_rename_review_pool", "_rename_branch")
 
 
 def apply(old: str, new: str) -> RenamePlan:
@@ -515,13 +555,14 @@ def apply(old: str, new: str) -> RenamePlan:
             result, completed = _load(result.journal, old, new)
         else:
             _preflight(result)
-            _save(result, 0)
-            completed = 0
-        for number, run in enumerate(APPLY_STEPS, start=1):
-            if number <= completed:
+            completed = ()
+            _save(result, completed)
+        for run in APPLY_STEPS:
+            if run.__name__ in completed:
                 continue
             run(result)
-            _save(result, number)
+            completed = (*completed, run.__name__)
+            _save(result, completed)
     return result
 
 
@@ -534,8 +575,9 @@ def _rename_journal(new: str) -> Generator[tuple[RenamePlan, dict[str, object]]]
         raise RenameRefused(f"{new} has no rename journal")
     with unit_move.production_lock():
         result, completed = _load(path, new, new)
-        if completed != len(APPLY_STEPS):
-            raise RenameRefused(f"{new}: apply must complete step {len(APPLY_STEPS)} first")
+        missing = [name for name in APPLY_STEP_NAMES if name not in completed]
+        if missing:
+            raise RenameRefused(f"{new}: apply must complete {', '.join(missing)} first")
         yield result, _object(read_json(path))
 
 
@@ -559,6 +601,55 @@ def _stopped_unit(plan: RenamePlan, name: str) -> None:
         raise RenameRefused(f"{name} has a live Claude; wait until its run stops")
     if isinstance(state, unit_lookup.ClaudeUnknown):
         raise RenameRefused(f"{name}: cannot tell whether Claude is running: {state.reason}")
+
+
+def _stopped_restore(plan: RenamePlan, name: str) -> UnitRestore:
+    records = [*rename_unit.shutdown_records(plan.old, (name,)),
+               *rename_unit.shutdown_records(plan.new, (name,))]
+    if not records:
+        return UnitWithoutRestore(kind="absent")
+    if len(records) != 1:
+        raise RenameRefused(f"{name} has {len(records)} shutdown records; settle them first")
+    saved = records[0]
+    if saved["progress"]["kind"] not in rename_unit.STOPPED:
+        raise RenameRefused(f"{name}'s shutdown record reads {saved['progress']['kind']}; settle it first")
+    return StoppedUnitRestore(kind="stopped", login=saved["login"], session_id=saved["session"]["session_id"])
+
+
+def _saved_restore(record: dict[str, object]) -> UnitRestore:
+    restore = _object(record["restore"])
+    if restore.get("kind") == "absent":
+        return UnitWithoutRestore(kind="absent")
+    if restore.get("kind") != "stopped":
+        raise RenameRefused("invalid unit restore in rename journal")
+    return StoppedUnitRestore(kind="stopped", login=_string(restore, "login"),
+                              session_id=_string(restore, "session_id"))
+
+
+def _repoint_unit_restore(plan: RenamePlan, name: str, record: dict[str, object],
+                          restore: StoppedUnitRestore) -> None:
+    import herdr
+
+    old, new = _string(record, "old_worktree"), _string(record, "new_worktree")
+    branch = _string(record, "new_branch")
+    note = (f"While you were paused the production moved your unit: your worktree is now {new} "
+            f"on branch {branch}. {old} no longer exists; wherever your instructions name it, use {new}.")
+    host_names = {herdr.generated_session_name(_string(record, "old_branch")):
+                  herdr.generated_session_name(branch)}
+
+    def change(saved: SessionShutdown) -> None:
+        host = saved["session"]["host"]
+        if host["kind"] != "unit" or host["unit"] != name or host["production"] not in (plan.old, plan.new):
+            raise RenameRefused(f"shutdown record {restore['session_id']} is not {name}'s")
+        rename_unit.repoint_shutdown_worktree(saved, old, new, host_names, note)
+        host["production"] = plan.new
+        if host["doc"] == str(plan.old_doc):
+            host["doc"] = str(plan.new_doc)
+
+    try:
+        _ = shutdown_record.update_session(restore["login"], restore["session_id"], change)
+    except (shutdown_record.NoLiveRecord, shutdown_record.InvalidRecord, OSError) as error:
+        raise RenameRefused(f"{name}'s shutdown record: {error}") from error
 
 
 def _prepare_unit(plan: RenamePlan, name: str, row: dict[str, str]) -> dict[str, object]:
@@ -652,10 +743,20 @@ def unit(new: str, name: str) -> None:
             if any(_object(value).get("step") != 5 for value in records.values()):
                 raise RenameRefused("complete interrupted unit moves before starting another unit")
             _stopped_unit(result, name)
+            restore = _stopped_restore(result, name)
             record = _prepare_unit(result, name, row)
+            record["restore"] = restore
             records[name] = record
             journal["unit_moves"] = records
             write_json(result.journal, journal)
+        if "restore" not in record:
+            record["restore"] = _stopped_restore(result, name)
+            write_json(result.journal, journal)
+        restore = _saved_restore(record)
+        if not record.get("restore_repointed", False):
+            # Check again before changing a branch or worktree on a resumed move.
+            if _stopped_restore(result, name) != restore:
+                raise RenameRefused(f"{name}'s shutdown record changed during the move")
         completed = record.get("step")
         if type(completed) is not int or not 0 <= completed <= 5:
             raise RenameRefused(f"{name}: invalid unit rename progress")
@@ -670,6 +771,11 @@ def unit(new: str, name: str) -> None:
             _stopped_unit(result, name)
             _move_unit_worktree(result, record)
             record["step"] = 2
+            write_json(result.journal, journal)
+        if not record.get("restore_repointed", False):
+            if restore["kind"] == "stopped":
+                _repoint_unit_restore(result, name, record, restore)
+            record["restore_repointed"] = True
             write_json(result.journal, journal)
         if completed < 3:
             _move_unit_configs(record)
@@ -688,6 +794,10 @@ def unit(new: str, name: str) -> None:
             unit_move.delete_branch(result.checkout, _string(record, "old_branch"), _string(record, "tip"))
             record["step"] = 5
             write_json(result.journal, journal)
+        if restore["kind"] == "stopped":
+            print(f"relaunch: shutdown.py restart --only {shlex.quote(restore['session_id'])}")
+        else:
+            print(f"{name} has no shutdown record to relaunch from")
         print(f"{name} moved to {_string(record, 'new_worktree')}; add_unit writes the herdr mark at next launch")
 
 

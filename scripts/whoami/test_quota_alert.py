@@ -23,6 +23,9 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import quota_alert
@@ -279,11 +282,11 @@ class QuotaAlertTests(unittest.TestCase):
             with usage_store.store_file().with_name("usage.lock").open("a") as lock:
                 with self.assertRaises(BlockingIOError):
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.assertTrue(claiming.wait(timeout=2))
+            self.assertTrue(claiming.wait(timeout=TEST_HANG_GUARD_SECS))
             return merge(stored, reports, at)
 
         def claim() -> agent_accounts.UsageReadClaim | agent_accounts.UsageReadHeld:
-            self.assertTrue(merging.wait(timeout=2))
+            self.assertTrue(merging.wait(timeout=TEST_HANG_GUARD_SECS))
             claiming.set()
             return usage_store.claim_read(login, self.now)
 
@@ -291,8 +294,8 @@ class QuotaAlertTests(unittest.TestCase):
               ThreadPoolExecutor(max_workers=2) as pool):
             saved = pool.submit(quota_alert._save_codex_readings, readings, self.now)  # pyright: ignore[reportPrivateUsage]
             claimed = pool.submit(claim)
-            saved.result(timeout=3)
-            result = claimed.result(timeout=3)
+            saved.result(timeout=TEST_HANG_GUARD_SECS)
+            result = claimed.result(timeout=TEST_HANG_GUARD_SECS)
         self.assertIsInstance(result, agent_accounts.UsageReadClaim)
         stored = usage_store.load()
         self.assertEqual(stored[login].get("attempted_at"), self.now.isoformat())

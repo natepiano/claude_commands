@@ -61,7 +61,7 @@ class QueueTests(unittest.TestCase):
         output = "\n".join(lines)
         self.assertIn("| 1 | clone88ci | check | clone88 | 14:20 (40 min) | 10.9 GiB | "
                       + "head: needs 10.9 GiB; builds use 15.0 of the 21.0 GiB budget "
-                      + "(starts when build use falls to 10.1 GiB); younger steps wait |", output)
+                      + "(starts when build use falls to 10.1 GiB); younger steps wait until 15:10 |", output)
         self.assertIn("| 2 | tree | doc | tree | 14:55 (5 min) | 11.6 GiB | "
                       + "needs 11.6 GiB; 23.1 free; behind clone88ci (waiting 40 min) |", output)
         self.assertNotIn("head-id", output)
@@ -106,7 +106,7 @@ class QueueTests(unittest.TestCase):
         view = memory_admit.QueueView((waiting,), (), available, 0, 3 * GIB, NOW)
         line = next(line for line in build_queue.render_queue(view, ZoneInfo("UTC")) if "head:" in line)
         self.assertTrue(line.endswith("head: needs 15.1 GiB; builds use 13.2 of the 20.0 GiB budget "
-                                      + "(starts when build use falls to 4.9 GiB); younger steps wait |"))
+                                      + "(starts when build use falls to 4.9 GiB); younger steps wait until 19:10 |"))
 
     def test_head_reason_names_only_free_memory_when_budget_passes(self) -> None:
         need, available = int(15.1 * GIB), 18 * GIB
@@ -118,14 +118,14 @@ class QueueTests(unittest.TestCase):
         )
         view = memory_admit.QueueView((waiting,), (), available, 0, 3 * GIB, NOW)
         line = next(line for line in build_queue.render_queue(view, ZoneInfo("UTC")) if "head:" in line)
-        self.assertTrue(line.endswith("head: needs 18.1 GiB free; 18.0 free; younger steps wait |"))
+        self.assertTrue(line.endswith("head: needs 18.1 GiB free; 18.0 free; younger steps wait until 19:10 |"))
 
     def test_head_backfill_label_uses_the_since_zone_and_becomes_strict_at_ten_minutes(self) -> None:
         need, available = int(15.1 * GIB), 18 * GIB
         decision = memory_admit.decide(available, 60 * GIB, need, [memory_admit.MeasuredMemory(GIB)])
         for waited, bump, suffix in ((540, 0, "younger steps may start until 15:01"),
-                                      (600, 0, "younger steps wait"),
-                                      (60, -1, "younger steps wait")):
+                                      (600, 0, "younger steps wait until 15:10"),
+                                      (60, -1, "younger steps wait until 15:10")):
             with self.subTest(waited=waited, bump=bump):
                 row: memory_admit.Waiter = {"pid": 10, "start_time": "10", "need": need,
                                            "since": NOW - waited, "bump_order": bump}

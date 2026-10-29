@@ -208,6 +208,8 @@ class ProductionRenameTests(unittest.TestCase):
             "HOME": str(self.home), "CLAUDE_CONFIG_DIR": str(config),
             "XDG_CONFIG_HOME": str(self.home / ".config"),
             "XDG_STATE_HOME": str(self.root / "state"),
+            "SHUTDOWN_STATE_DIR": str(self.home / ".local/state/shutdown"),
+            "BUILDLOG_DIR": str(self.root / "buildlog"),
             "NOTIFIER_STATE_DIR": str(self.notifier),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "state/sessions"),
             "SHOWRUNNER_STATE_DIR": str(self.state),
@@ -318,6 +320,9 @@ class ProductionRenameTests(unittest.TestCase):
     def journal(self) -> dict[str, object]:
         return cast(dict[str, object], json.loads((self.state / "new/rename.json").read_text()))
 
+    def completed_steps(self) -> int:
+        return len(cast(list[str], self.journal()["completed"]))
+
     def unit_worktree(self, slug: str, unit: str) -> Path:
         return self.worktrees / f"repo.name_with_punctuation-{slug}-{unit}"
 
@@ -337,6 +342,40 @@ class ProductionRenameTests(unittest.TestCase):
         command = [sys.executable, *(["-c", wrapper] if wrapper else []), str(SCRIPT), *arguments]
         return subprocess.run(command, cwd=self.checkout, env={**self.env, **environment},
                               capture_output=True, text=True, check=False, timeout=60)
+
+    def seed_shutdown_record(self, progress: str = "stopped") -> Path:
+        old = self.unit_worktree(OLD, "alpha-unit")
+        session: dict[str, object] = {
+            "session_id": "sid-alpha", "config_dir": str(self.home / ".claude"), "pid": 4242, "proc_start": "1",
+            "name": "alpha", "cwd": f"{old}/sub", "status": "idle", "updated_at": 0, "probe": False,
+            "model": {"kind": "no reply yet"},
+            "checkout": {"kind": "git", "path": str(old), "head": {"kind": "branch", "name": "old-alpha-unit"},
+                         "upstream": {"kind": "tracking", "ahead": 0}, "dirty": []},
+            "run_dirs": [], "codex_servers": [], "timers": [], "kind": "unit",
+            "host": {"kind": "unit", "production": OLD, "unit": "alpha-unit", "doc": str(self.doc),
+                     "session_name": "old-alpha-unit", "session_host": "herdr",
+                     "plan": {"kind": "plan", "path": f"{old}/docs/plans/alpha-unit.md"}}}
+        worker = {**session, "session_id": "sid-worker", "name": "worker", "cwd": f"{old}/worker",
+                  "kind": "worker", "host": {"kind": "terminal"},
+                  "owner": {"kind": "director", "session_id": "sid-alpha"}}
+        saved: dict[str, object] = {
+            "login": "owner@example.com", "label": "claude2", "machine": "natedev",
+            "requested_at": "2026-10-09T21:49:10+00:00", "request_id": "request",
+            "requested_by": {"kind": "terminal"}, "hold": "session", "then": "stop", "force": "wait for ready",
+            "alerts": "none", "probe": False, "session": session, "workers": [worker], "timers": [],
+            "settle_message": {"kind": "not sent"}, "where": {"kind": "not said"},
+            "progress": {"kind": progress, "at": "2026-10-09T21:50:00+00:00"}, "stop_issues": [], "trail": [],
+            "codex_seats": [{"run_dir": str(self.root / "runs/r1"), "seat": "impl", "role": "impl",
+                             "thread_id": "thread-impl", "turn_live": True, "launcher_command": [
+                                 "bash", "/scripts/direct/implement.sh", str(old), f"{old}/prompt.md"]}]}
+        self.write(self.root / "runs/r1/impl.resume-prompt.md", "Continue the task.\n")
+        script = ("import json, sys; sys.path.insert(0, sys.argv[1]); import record; "
+                  "assert record.create_session(json.loads(sys.stdin.read()))")
+        created = subprocess.run([sys.executable, "-c", script, str(SCRIPT.parents[1] / "shutdown")],
+                                 input=json.dumps(saved), env=self.env, capture_output=True, text=True,
+                                 check=False, timeout=60)
+        self.assertEqual(created.returncode, 0, created.stderr)
+        return self.home / ".local/state/shutdown/owner@example.com/sessions/sid-alpha.json"
 
     def marked_unit(self, unit: str) -> None:
         fake_unit_host.write(self.env, [fake_unit_host.HostedUnit(
@@ -429,7 +468,7 @@ class ProductionRenameTests(unittest.TestCase):
         self.assertEqual(self.git("ls-remote", "origin", "refs/heads/new"), f"{new_tip}\trefs/heads/new")
         self.assertEqual(self.git("ls-remote", "origin", "refs/heads/old"), f"{self.old_tip}\trefs/heads/old")
         self.assertEqual(self.git("status", "--porcelain"), "")
-        self.assertEqual(self.journal()["step"], 8)
+        self.assertEqual(self.completed_steps(), 8)
         self.assertIs(self.journal()["done"], False)
 
     def test_plan_ignores_as_built_paths_and_prose_in_plan_cells(self) -> None:
@@ -624,11 +663,11 @@ class ProductionRenameTests(unittest.TestCase):
             cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False, timeout=60)
         self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
         self.assertIn("simulated unit header rewrite failure", failed.stderr)
-        self.assertEqual(self.journal()["step"], 1)
+        self.assertEqual(self.completed_steps(), 1)
         self.assertTrue((self.notifier / "showrunner-old/conf").exists())
         self.assertFalse((self.notifier / "showrunner-new").exists())
         self.assert_success(self.run_rename("apply", source="ancient"))
-        self.assertEqual(self.journal()["step"], 8)
+        self.assertEqual(self.completed_steps(), 8)
         self.assertEqual(self.git("rev-parse", "new^"), base)
         self.assertEqual(self.git("status", "--porcelain"), "")
 
@@ -638,7 +677,7 @@ class ProductionRenameTests(unittest.TestCase):
             cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False, timeout=60)
         self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
         self.assertIn("simulated git mv index failure", failed.stderr)
-        self.assertEqual(self.journal()["step"], 0)
+        self.assertEqual(self.completed_steps(), 0)
         self.assertFalse(self.doc.exists())
         self.assertTrue(self.new_doc.exists())
         self.assertEqual(self.git("ls-files", "--", "docs/plans/old-production.md",
@@ -711,7 +750,7 @@ class ProductionRenameTests(unittest.TestCase):
             self.assertTrue(self.stall_path(OLD, unit).exists())
             self.assertRegex(self.plan_path(unit).read_text(),
                              r"(?m)^> \*\*Production:(?: new\*\*|\*\* new) — unit")
-        self.assertEqual(self.journal()["step"], 3)
+        self.assertEqual(self.completed_steps(), 3)
         self.assertIs(self.journal()["done"], False)
         self.assert_success(self.run_rename("apply"))
         self.assert_applied()
@@ -755,6 +794,100 @@ class ProductionRenameTests(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertIn(destination, result.stdout + result.stderr)
                     self.assertEqual(self.snapshot(), before)
+
+    def test_unit_repoints_stopped_restore_and_prints_its_relaunch(self) -> None:
+        self.prepare_unit_moves()
+        path = self.seed_shutdown_record()
+        self.assert_success(self.run_rename("apply"))
+        result = self.run_command("unit", NEW, "alpha-unit")
+        self.assert_success(result)
+        self.assert_unit_moved("alpha-unit")
+        saved = cast(dict[str, object], json.loads(path.read_text()))
+        session = cast(dict[str, object], saved["session"])
+        host = cast(dict[str, object], session["host"])
+        new = self.unit_worktree(NEW, "alpha-unit")
+        self.assertEqual((session["session_id"], session["name"], host["unit"]),
+                         ("sid-alpha", "alpha", "alpha-unit"))
+        self.assertEqual(session["cwd"], f"{new}/sub")
+        self.assertEqual(cast(list[dict[str, object]], saved["workers"])[0]["cwd"], f"{new}/worker")
+        self.assertEqual(cast(dict[str, object], host["plan"])["path"], f"{new}/docs/plans/alpha-unit.md")
+        self.assertEqual((host["session_name"], host["production"], host["doc"]),
+                         ("new-alpha-unit", NEW, str(self.new_doc)))
+        worker = cast(list[dict[str, object]], saved["codex_seats"])[0]
+        self.assertEqual(worker["launcher_command"],
+                         ["bash", "/scripts/direct/implement.sh", str(new), f"{new}/prompt.md"])
+        note = (self.root / "runs/r1/impl.resume-prompt.md").read_text()
+        self.assertTrue(note.startswith("Continue the task.\n"))
+        self.assertIn(f"your worktree is now {new} on branch new-alpha-unit", note)
+        self.assertIn("shutdown.py restart --only sid-alpha", result.stdout)
+
+    def test_unit_refuses_an_unstopped_restore_before_any_change(self) -> None:
+        self.prepare_unit_moves()
+        _ = self.seed_shutdown_record(progress="waiting")
+        self.assert_success(self.run_rename("apply"))
+        before = self.snapshot()
+        result = self.run_command("unit", NEW, "alpha-unit")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("shutdown record reads waiting", result.stderr)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_unit_without_restore_moves_and_reports_no_relaunch(self) -> None:
+        self.prepare_unit_moves()
+        self.assert_success(self.run_rename("apply"))
+        result = self.run_command("unit", NEW, "alpha-unit")
+        self.assert_success(result)
+        self.assert_unit_moved("alpha-unit")
+        self.assertIn("alpha-unit has no shutdown record to relaunch from", result.stdout)
+        self.assertNotIn("shutdown.py restart", result.stdout)
+
+    def test_unit_resume_after_record_step_does_not_repoint_again(self) -> None:
+        self.prepare_unit_moves()
+        path = self.seed_shutdown_record()
+        self.assert_success(self.run_rename("apply"))
+        failed = self.run_command("unit", NEW, "alpha-unit", wrapper=INTERRUPT_UNIT_GIT,
+                                  RENAME_TEST_REFUSE="unit-doc")
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("simulated unit-doc failure", failed.stderr)
+        moves = cast(dict[str, dict[str, object]], self.journal()["unit_moves"])
+        self.assertIs(moves["alpha-unit"]["restore_repointed"], True)
+        before = path.read_bytes()
+        prompt = self.root / "runs/r1/impl.resume-prompt.md"
+        note = prompt.read_bytes()
+        wrapper = """import runpy, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]).parent))
+import rename_unit
+def refuse(*args):
+    raise AssertionError("restore repeated")
+rename_unit.repoint_shutdown_worktree = refuse
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name="__main__")
+"""
+        result = self.run_command("unit", NEW, "alpha-unit", wrapper=wrapper)
+        self.assert_success(result)
+        self.assert_unit_moved("alpha-unit")
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(prompt.read_bytes(), note)
+        self.assertIn("shutdown.py restart --only sid-alpha", result.stdout)
+
+    def test_a_journal_that_counted_seven_steps_finishes_with_the_worker_step_only(self) -> None:
+        self.prepare_unit_moves()
+        self.marked_unit("alpha-unit")
+        self.assert_success(self.run_rename("apply"))
+        journal = self.journal()
+        del journal["completed"]
+        journal["step"] = 7
+        _ = (self.state / "new/rename.json").write_text(json.dumps(journal))
+        branch_tip = self.git("rev-parse", NEW)
+        refused = self.run_command("unit", NEW, "alpha-unit")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("apply must complete _rename_unit_workers first", refused.stdout + refused.stderr)
+        self.assert_success(self.run_rename("apply"))
+        self.assertEqual(self.journal()["completed"], [
+            "_rename_doc", "_rewrite_plans", "_rename_timer", "_rename_showrunner_state", "_rename_stall_watch",
+            "_rename_review_pool", "_rename_branch", "_rename_unit_workers"])
+        self.assertEqual(self.git("rev-parse", NEW), branch_tip)
+        self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
 
     def test_unit_moves_punctuated_transcript_paths_and_default_and_named_account_trust(self) -> None:
         self.prepare_unit_moves()
@@ -958,13 +1091,13 @@ class ProductionRenameTests(unittest.TestCase):
     def test_unit_and_finish_wait_for_apply_to_complete(self) -> None:
         failed = self.run_rename("apply", fail_state=True)
         self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
-        self.assertEqual(self.journal()["step"], 3)
+        self.assertEqual(self.completed_steps(), 3)
         for arguments in (("unit", NEW, "alpha-unit"), ("finish", NEW)):
             with self.subTest(arguments=arguments):
                 before = self.snapshot()
                 refused = self.run_command(*arguments)
                 self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
-                self.assertIn("step 8", refused.stderr)
+                self.assertIn("apply must complete _rename_showrunner_state, ", refused.stderr)
                 self.assertEqual(self.snapshot(), before)
 
     def test_unit_retry_repairs_a_worktree_already_moved_before_interruption(self) -> None:
@@ -1069,7 +1202,7 @@ class ProductionRenameTests(unittest.TestCase):
         self.assertEqual((archived["old"], archived["new"]), (OLD, NEW))
         current = cast(dict[str, object], json.loads((self.state / "next/rename.json").read_text()))
         self.assertIs(current["done"], False)
-        self.assertEqual(current["step"], 8)
+        self.assertEqual(len(cast(list[str], current["completed"])), 8)
 
     def test_a_merge_branch_not_named_for_the_production_is_kept(self) -> None:
         self.prepare_unit_moves()

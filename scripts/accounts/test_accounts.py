@@ -41,6 +41,9 @@ import usage_store
 import quota_alert
 from scripts.whoami import run_out
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 send_role_map_command = role_map.ssh_role_map
 
 
@@ -5105,7 +5108,7 @@ _ = sys.stdin.read()
         process = subprocess.Popen([sys.executable, str(Path(accounts.__file__)), "setup", "codex1"],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment)
         try:
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + TEST_HANG_GUARD_SECS
             while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
                 time.sleep(0.01)
             self.assertTrue(ready.exists(), "The fake server must wait for its startup answer")
@@ -5115,7 +5118,7 @@ _ = sys.stdin.read()
             output_pipe = cast(TextIO, process.stdout)
             with selectors.DefaultSelector() as selector:
                 _ = selector.register(output_pipe, selectors.EVENT_READ)
-                self.assertTrue(selector.select(timeout=1), "The setup wait line must be flushed to its pipe")
+                self.assertTrue(selector.select(timeout=TEST_HANG_GUARD_SECS), "The setup wait line must be flushed to its pipe")
             line = output_pipe.readline()
             self.assertIn("initialize", line)
             self.assertIn("limit", line)
@@ -5123,7 +5126,7 @@ _ = sys.stdin.read()
         finally:
             release.touch()
             try:
-                output, errors = process.communicate(timeout=5)
+                output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
             except subprocess.TimeoutExpired:
                 process.kill()
                 output, errors = process.communicate()

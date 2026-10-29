@@ -19,6 +19,7 @@ import unittest.mock
 
 import folder_audit
 import scratch
+import tmp_sweep
 
 DAY = 86_400
 
@@ -151,7 +152,7 @@ class FolderAuditTests(unittest.TestCase):
         dry = run(False)
         self.assertEqual(dry["plain"], folder_audit.WOULD_REMOVE)
         self.assertEqual(dry["fresh"], folder_audit.LISTED)
-        self.assertIn("uncommitted changes", dry["dirty"])
+        self.assertEqual(dry["dirty"], tmp_sweep.UNSAVED_WORK)
         self.assertEqual(dry["held"], folder_audit.HELD)
         self.assertEqual(dry["used"], "pid 12 works in it")
         self.assertEqual(dry["listening"], folder_audit.LIVE_SOCKET)

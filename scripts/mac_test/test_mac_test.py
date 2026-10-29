@@ -322,6 +322,8 @@ class MacTestCommandTests(unittest.TestCase):
             "BUILD_HOLD_DIR": str(self.root / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
+            "PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": "",
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
         }
         self.children = []
@@ -739,6 +741,80 @@ class MacTestCommandTests(unittest.TestCase):
         self.assert_command(self.command("claim", "--pid", str(owner.pid), "--what", "unowned tests",
                                          environment=environment), 0, "claimed\n")
         self.assertNotIn("holder_session", self.run_state())
+
+    def unit_environment(self, session: str) -> dict[str, str]:
+        active = self.root / "active"
+        active.mkdir(exist_ok=True)
+        run = str(self.root / "unit-run")
+        _ = (active / session).write_text(run)
+        return {**self.environment, "UNIT_RUN_DIR": run,
+                "CLAUDE_CODE_SESSION_ID": "worker-session"}
+
+    def test_active_and_pending_blocks_admit_their_session_claims(self) -> None:
+        owner = self.start_child()
+        environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": "session-a"}
+        for state in ("active", "pending"):
+            with self.subTest(state=state):
+                _ = self.write_block(session="session-a", state=state,
+                                     waiting_on={"kind": "ci_job"} if state == "pending" else None,
+                                     free_message={"kind": "not_needed"} if state == "active" else None)
+                self.assert_command(self.command("claim", "--pid", str(owner.pid), "--what", "own tests",
+                                                 environment=environment), 0, "claimed\n")
+                self.assertEqual(self.run_state().get("holder_session"), "session-a")
+                self.assert_command(self.command("release", "--pid", str(owner.pid)), 0, "")
+
+    def test_unit_worker_claim_uses_director_identity_for_block_and_record(self) -> None:
+        owner = self.start_child()
+        environment = self.unit_environment("session-a")
+        _ = self.write_block(session="session-a", free_message={"kind": "not_needed"})
+        self.assert_command(self.command("claim", "--pid", str(owner.pid), "--what", "unit tests",
+                                         environment=environment), 0, "claimed\n")
+        self.assertEqual(self.run_state().get("holder_session"), "session-a")
+
+    def test_block_refuses_other_and_unknown_sessions_without_writing_claims(self) -> None:
+        owner = self.start_child()
+        _ = self.write_block(session="session-a", free_message={"kind": "not_needed"})
+        for session in ("session-b", ""):
+            with self.subTest(session=session):
+                environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": session}
+                self.assert_command(self.command("claim", "--pid", str(owner.pid), "--what", "other tests",
+                                                 environment=environment), 10, "blocked by alice: release work\n")
+                self.assertFalse((self.state_directory / "run.json").exists())
+
+    def test_holder_queue_block_refuses_claims_from_every_session(self) -> None:
+        owner = self.start_child()
+        _ = self.write_block(free_message={"kind": "not_needed"})
+        for session in ("alice", "session-b", ""):
+            with self.subTest(session=session):
+                environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": session}
+                self.assert_command(self.command("claim", "--pid", str(owner.pid), "--what", "tests",
+                                                 environment=environment), 10, "blocked by alice: release work\n")
+                self.assertFalse((self.state_directory / "run.json").exists())
+
+    def test_free_now_reads_past_own_block_to_free_or_busy(self) -> None:
+        self.write_config(offload="on")
+        _ = self.write_block(session="session-a", free_message={"kind": "not_needed"})
+        environment = self.unit_environment("session-a")
+        self.assert_command(self.command("free-now", environment=environment), 0, "free\n")
+        other = {**self.environment, "CLAUDE_CODE_SESSION_ID": "session-b"}
+        self.assert_command(self.command("free-now", environment=other), 1, "blocked\n")
+        owner = self.start_child()
+        self.assert_command(self.command("claim", "--pid", str(owner.pid), "--what", "own tests",
+                                         environment=environment), 0, "claimed\n")
+        self.assert_command(self.command("free-now", environment=environment), 1, "busy\n")
+        self.assertEqual(self.logged_arguments("gh"), [])
+
+    def test_unit_block_records_director_session_and_keeps_ci_off(self) -> None:
+        environment = self.unit_environment("session-a")
+        result = self.command("block", "--holder", "alice", "--for", "unit tests",
+                              environment=environment)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.block_state()["session"], "session-a")
+        self.assertEqual(self.read_fixture_variable(), "false")
+        owner = self.start_child()
+        self.assert_command(self.command("claim", "--pid", str(owner.pid), "--what", "unit tests",
+                                         environment=environment), 0, "claimed\n")
+        self.assertEqual(self.run_state().get("holder_session"), "session-a")
 
     def test_takeover_keeps_holder_session_and_starts_claim_watcher(self) -> None:
         previous = self.kept_claim()
@@ -1323,6 +1399,66 @@ for arguments in (
         _ = self.command("status")
         self.assertEqual(self.block_state()["state"], "active")
         self.assertEqual(len(self.hold_events()), 1)
+
+    def test_pending_block_with_only_own_claim_activates_without_free_message(self) -> None:
+        self.write_config(ci_repo=None)
+        owner = self.start_child()
+        environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": "session-a"}
+        self.assert_command(self.command("claim", "--pid", str(owner.pid), "--what", "own tests",
+                                         environment=environment), 0, "claimed\n")
+        _ = self.write_block(session="session-a", state="pending",
+                             waiting_on={"kind": "local_run", "what": "own tests"})
+
+        result = self.command("status")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.block_state()["state"], "active")
+        self.assertEqual(self.block_state()["free_message"], {"kind": "not_needed"})
+        self.assertEqual(self.run_state().get("holder_session"), "session-a")
+        self.assertEqual(self.logged_arguments("send"), [])
+        self.assertEqual(self.logged_arguments("send-delivered"), [])
+
+    def test_pending_block_waits_on_other_or_unrecorded_claim_beside_own_claim(self) -> None:
+        own_repository = self.repository("alpha")
+        other_repository = self.repository("beta")
+        owner = self.start_child()
+        other = self.start_child()
+        environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": "session-a"}
+        self.assert_command(self.command("claim", "--pid", str(owner.pid), "--what", "own tests",
+                                         "--worktree", str(own_repository), environment=environment),
+                            0, "claimed\n")
+        for session in ("session-b", ""):
+            with self.subTest(session=session):
+                (self.state_directory / "block.json").unlink(missing_ok=True)
+                other_environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": session}
+                self.assert_command(self.command("claim", "--pid", str(other.pid), "--what", "other tests",
+                                                 "--worktree", str(other_repository), environment=other_environment),
+                                    0, "claimed\n")
+                _ = self.write_block(session="session-a", state="pending",
+                                     waiting_on={"kind": "local_run", "what": "own tests"})
+
+                result = self.command("status")
+
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.block_state()["state"], "pending")
+                self.assertEqual(self.block_state()["waiting_on"], {"kind": "local_run", "what": "other tests"})
+                self.assert_command(self.command("release", "--pid", str(other.pid)), 0, "")
+        self.assertEqual(self.logged_arguments("send-delivered"), [])
+
+    def test_block_placed_during_own_claim_is_active_without_free_message(self) -> None:
+        owner = self.start_child()
+        environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": "session-a"}
+        self.assert_command(self.command("claim", "--pid", str(owner.pid), "--what", "own tests",
+                                         environment=environment), 0, "claimed\n")
+
+        result = self.command("block", "--holder", "alice", "--for", "own work", environment=environment)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.block_state()["state"], "active")
+        self.assertEqual(self.block_state()["free_message"], {"kind": "not_needed"})
+        self.assertEqual(self.run_state().get("holder_session"), "session-a")
+        self.assertEqual(self.read_fixture_variable(), "false")
+        self.assertEqual(self.logged_arguments("send-delivered"), [])
 
     def test_block_records_state_and_turns_the_switch_off(self) -> None:
         environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": "session-123"}

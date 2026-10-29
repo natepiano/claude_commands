@@ -71,6 +71,8 @@ RAMP_SECONDS = 120
 PROC = Path("/proc")
 # A step held this long gets room first when it can start.
 HEAD_SECONDS = 600
+STRICT_SECONDS = 600
+BACKFILL_SECONDS = 120
 QUEUE_LOCK_TIMEOUT_SECONDS = 10.0
 
 
@@ -158,6 +160,8 @@ class Waiter(TypedDict):
     folder: NotRequired[str]
     bump_order: NotRequired[int]
     holds_younger: NotRequired[bool]
+    priority_since: NotRequired[float]
+    estimated_at: NotRequired[float]
     repo_identity: NotRequired[str]
     repository_name: NotRequired[str]
     legacy_name: NotRequired[str]
@@ -167,6 +171,7 @@ class Waiter(TypedDict):
 @dataclass(frozen=True)
 class HeadPriority:
     waiter: Waiter
+    window: StrictUntil | BackfillUntil
 
 
 @dataclass(frozen=True)
@@ -211,8 +216,8 @@ class BackfillUntil:
 
 
 @dataclass(frozen=True)
-class YoungerStepsWait:
-    pass
+class StrictUntil:
+    deadline: float
 
 
 @dataclass(frozen=True)
@@ -220,7 +225,7 @@ class HeadAdmissionStatus:
     decision: AdmissionDecision
     need: int
     available: int
-    backfill: BackfillUntil | YoungerStepsWait
+    backfill: BackfillUntil | StrictUntil
 
 
 @dataclass(frozen=True)
@@ -238,10 +243,20 @@ WaitReason = NeedsBuildBudget | NeedsMemory | BehindHead | HeadAdmissionStatus |
 
 def head_wait_reason(decision: AdmissionDecision, need: int, available: int,
                      waiter: Waiter, now: float) -> HeadAdmissionStatus:
-    backfill = (BackfillUntil(waiter["since"] + HEAD_SECONDS)
-                if now - waiter["since"] < HEAD_SECONDS and waiter.get("bump_order", 0) >= 0
-                and not waiter.get("holds_younger", False) else YoungerStepsWait())
-    return HeadAdmissionStatus(decision, need, available, backfill)
+    return HeadAdmissionStatus(decision, need, available, head_window(waiter, now))
+
+
+def head_window(waiter: Waiter, now: float) -> BackfillUntil | StrictUntil:
+    if (not waiter.get("holds_younger", False) and waiter.get("bump_order", 0) >= 0
+            and now - waiter["since"] < HEAD_SECONDS):
+        return BackfillUntil(waiter["since"] + HEAD_SECONDS)
+    start = waiter.get("priority_since", now)
+    cycle = STRICT_SECONDS + BACKFILL_SECONDS
+    elapsed = max(0.0, now - start)
+    cycle_start = start + (elapsed // cycle) * cycle
+    if elapsed % cycle < STRICT_SECONDS:
+        return StrictUntil(cycle_start + STRICT_SECONDS)
+    return BackfillUntil(cycle_start + cycle)
 
 
 def head_wait_text(reason: HeadAdmissionStatus, zone: ZoneInfo) -> str:
@@ -258,11 +273,11 @@ def head_wait_text(reason: HeadAdmissionStatus, zone: ZoneInfo) -> str:
                          + f"(starts when build use falls to {(decision.budget - reason.need) / GIB:.1f} GiB)")
         if reason.available < decision.threshold:
             parts.append(f"needs {decision.threshold / GIB:.1f} GiB free; {reason.available / GIB:.1f} free")
+    until = datetime.fromtimestamp(reason.backfill.deadline, zone).strftime("%H:%M")
     if isinstance(reason.backfill, BackfillUntil):
-        until = datetime.fromtimestamp(reason.backfill.deadline, zone).strftime("%H:%M")
         parts.append(f"younger steps may start until {until}")
     else:
-        parts.append("younger steps wait")
+        parts.append(f"younger steps wait until {until}")
     return "head: " + "; ".join(parts)
 
 
@@ -322,6 +337,7 @@ class StepProfile:
     peak: ExpectedPeak
     repository: Repository = UnknownRepository()
     scope: TestScope = "full"
+    estimated_at: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -642,14 +658,15 @@ def head_priority(waiters: list[Waiter], available: int, total: int | None,
         decision = decide(available, total, head["need"], running)
         if (head.get("holds_younger", False) or decision.state == "admit"
                 or available + decision.measured >= head["need"] + decision.reserve):
-            return HeadPriority(head)
+            return HeadPriority(head, head_window(head, now))
     return NoHeadPriority()
 
 
 def queue_decision(available: int, total: int | None, row: Waiter,
                    running: list[StepMemory], head: HeadPriority | NoHeadPriority,
                    pressure: Pressure) -> AdmissionDecision:
-    younger = isinstance(head, HeadPriority) and waiter_order(head.waiter) < waiter_order(row)
+    younger = (isinstance(head, HeadPriority) and isinstance(head.window, StrictUntil)
+               and waiter_order(head.waiter) < waiter_order(row))
     head_need = head.waiter["need"] if younger and isinstance(head, HeadPriority) else 0
     decision = decide(available, total, row["need"], running, head_need, pressure)
     if younger:
@@ -746,6 +763,8 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
     root = root if root is not None else store.root()
     now = now if now is not None else datetime.now(UTC)
     width = test_threads(argv)
+    if profile is not None and profile.estimated_at and now.timestamp() - profile.estimated_at >= HEAD_SECONDS:
+        profile = None
     if profile is None:
         repository, worktree = git_identity(argv, os.getcwd())
         repo = repository.name if isinstance(repository, RepositoryIdentity) else ""
@@ -753,7 +772,9 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
         step = parse.step_name(argv) if argv else "build"
         host = store.host_name()
         peak = expected_peak(repository, step, host, now, root, scope=scope)
-        profile = StepProfile(repo, step, worktree, peak, repository, scope)
+        profile = StepProfile(repo, step, worktree, peak, repository, scope, now.timestamp())
+    elif not profile.estimated_at:
+        profile = replace(profile, estimated_at=now.timestamp())
     repo, step, worktree, peak = profile.repo, profile.step, profile.worktree, profile.peak
     if not argv and not (root / "admission").exists():
         available, total = read_meminfo(meminfo)
@@ -784,6 +805,8 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
         waiter: Waiter = {"pid": pid, "start_time": start or "", "need": peak.bytes, "since": waited_from,
                           "label": f"{worktree or repo} {step} ({os.environ.get('BUILDLOG_CALLER') or 'caller'} pid {pid})"}
         waiter["test_scope"] = profile.scope
+        waiter["estimated_at"] = profile.estimated_at
+        waiter["repo_identity"] = ""
         if isinstance(profile.repository, RepositoryIdentity):
             waiter["repo_identity"] = profile.repository.key
             waiter["repository_name"] = profile.repository.name
@@ -793,18 +816,22 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                 waiter["bump_order"] = previous["bump_order"]
             if previous.get("holds_younger", False):
                 waiter["holds_younger"] = True
+            if "priority_since" in previous:
+                waiter["priority_since"] = previous["priority_since"]
         available, total = read_meminfo(meminfo)
         pressure = read_pressure()
         candidates = sorted([row for path, row in waiting if path != mine] + ([waiter] if argv else []),
                             key=waiter_order)
         head = head_priority(candidates, available, total, running, now.timestamp())
-        if isinstance(head, HeadPriority) and not head.waiter.get("holds_younger", False):
+        if isinstance(head, HeadPriority) and "priority_since" not in head.waiter:
             head.waiter["holds_younger"] = True
+            head.waiter["priority_since"] = now.timestamp()
             for head_path, head_row in waiting:
                 if head_path != mine and head_row is head.waiter:
                     _ = head_path.write_text(json.dumps(head_row, separators=(",", ":")))
         head_need, head_label = 0, ""
-        if isinstance(head, HeadPriority) and waiter_order(head.waiter) < waiter_order(waiter):
+        if (isinstance(head, HeadPriority) and isinstance(head.window, StrictUntil)
+                and waiter_order(head.waiter) < waiter_order(waiter)):
             head_need, head_label = head.waiter["need"], waiter_label(head.waiter)
         decision = queue_decision(available, total, waiter, running, head, pressure)
         reservation: Reserved | NotReserved = NotReserved("held" if argv else "launch")
@@ -943,7 +970,8 @@ def read_queue(directory: Path, processes: dict[int, ProcessIdentity], now: floa
         reason: WaitReason = ReadyForAdmission()
         if unavailable:
             reason = ReadingUnavailable()
-        elif isinstance(head, HeadPriority) and waiter_order(head.waiter) < waiter_order(row):
+        elif (isinstance(head, HeadPriority) and isinstance(head.window, StrictUntil)
+              and waiter_order(head.waiter) < waiter_order(row)):
             head_identity = identities.identity(head.waiter["pid"], cast(dict[str, object], cast(object, head.waiter)))
             reason = BehindHead(head_identity["session_name"] or Path(head_identity["folder"]).name or str(head.waiter["pid"]), head.waiter["since"])
         elif row is ordered[0][1]:
@@ -1001,6 +1029,8 @@ def bump_waiter(selector: str, actor: str) -> WaitingStep:
         path, row = ordered[position]
         # Each move gets an order before all current waiters. Keep the wait time.
         row["bump_order"] = min(0, *(item.get("bump_order", 0) for _, item in ordered)) - 1
+        row["holds_younger"] = True
+        row["priority_since"] = time.time()
         temporary = path.with_suffix(".bump")
         _ = temporary.write_text(json.dumps(row, separators=(",", ":")))
         os.replace(temporary, path)
@@ -1073,20 +1103,20 @@ def main() -> None:
     _, _, meminfo, pid, sidecar, since, cached_repo, cached_step, cached_worktree, cached_need, cached_source, cached_count, *argv = sys.argv
     profile = None
     if cached_need != "-":
-        # The shell caches the estimate; the waiter caches its repository key.
         start = process_start_time(int(pid))
         try:
             row = cast(Waiter, json.loads((store.root() / "admission" / f"{pid}-{start}.waiting").read_text()))
-            key = row.get("repo_identity", "")
-            repository: Repository = (RepositoryIdentity(key, row.get("repository_name", cached_repo), row.get("legacy_name", ""))
-                                      if key else UnknownRepository())
-            scope = row.get("test_scope", "full")
-        except (OSError, ValueError, TypeError):
-            repository = git_identity(argv, os.getcwd())[0]
-            scope = test_scope(argv)
-        profile = StepProfile(cached_repo, cached_step, cached_worktree,
-                              ExpectedPeak(int(cached_need), cast(Literal["measured", "buildlog", "pooled", "fallback"], cached_source), int(cached_count)),
-                              repository, scope)
+            # An empty key is the explicit unknown identity. Old rows must refresh.
+            if ("repo_identity" in row and "test_scope" in row and "estimated_at" in row
+                    and 0 <= time.time() - row["estimated_at"] < HEAD_SECONDS):
+                key = row["repo_identity"]
+                repository: Repository = (RepositoryIdentity(key, row.get("repository_name", cached_repo), row.get("legacy_name", ""))
+                                          if key else UnknownRepository())
+                profile = StepProfile(cached_repo, cached_step, cached_worktree,
+                                      ExpectedPeak(int(cached_need), cast(Literal["measured", "buildlog", "pooled", "fallback"], cached_source), int(cached_count)),
+                                      repository, row["test_scope"], row["estimated_at"])
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
     result = check(Path(meminfo), int(pid), sidecar, argv, float(since or 0), profile=profile)
     decision, peak, live = result.decision, result.peak, result.live
     summary = ", ".join(f"{row['repo']} {row['step']} in {row['worktree']}" for row in live)

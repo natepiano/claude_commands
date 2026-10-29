@@ -205,6 +205,73 @@ class CheckpointDocGateTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertEqual(self.decision(command), {})
 
+    def test_merge_checkpoint_script_with_git_log_substitution_passes(self) -> None:
+        command = (
+            'cd /home/natepiano/worktrees/cargo-liner && S=/tmp/checkpoint-session; '
+            '$HOME/.claude/scripts/lib/py '
+            '$HOME/.claude/scripts/production/merge_checkpoint.py '
+            '--session-dir "$S" --phase 8 --commit 719c9b28 '
+            '--started "$(git log -1 --format=%cI 719c9b28)"'
+        )
+        self.assertEqual(self.decision(command), {})
+
+    def test_expanded_non_git_paths_and_argument_text_do_not_trigger_the_gate(self) -> None:
+        checkpoint = shlex.quote(CHECKPOINT)
+        commands = (
+            'echo "checkpoint(x): commit message"',
+            'echo "checkpoint(x): git commit message"',
+            '$HOME/.claude/scripts/lib/py send.py --text ' + checkpoint,
+            '"$HOME/.claude/scripts/lib/py" merge_checkpoint.py --text ' + checkpoint,
+            '${HOME}/.claude/scripts/lib/py commit.py --text ' + checkpoint,
+            '"${TOOLS}/py" merge.py --text ' + checkpoint,
+            '$(which python3)/py --text ' + checkpoint,
+            '$HOME/tools/git/helper.py --text ' + checkpoint,
+            '$HOME/tools/git-status.py --text ' + checkpoint,
+            '$PY script.py --text ' + checkpoint,
+            'send.py --text "$MESSAGE" --title ' + checkpoint,
+            'send.py --text "$(git log -1 --format=%s)" --title ' + checkpoint,
+            '$HOME/.claude/scripts/lib/py send.py --text "$(git status)" --title ' + checkpoint,
+        )
+        for cwd in (self.repo, self.root):
+            for command in commands:
+                with self.subTest(cwd=cwd, command=command):
+                    self.assertEqual(self.decision(command, cwd=cwd), {})
+
+    def test_possible_expanded_git_words_and_eval_still_refuse_checkpoints(self) -> None:
+        commands = (
+            '$GIT commit -m "checkpoint(x): p"',
+            '${GIT} commit -m "checkpoint(x): p"',
+            '$PROGRAM commit -m "checkpoint(x): p"',
+            '"$(command -v git)" commit -m "checkpoint(x): p"',
+            '`command -v git` merge topic -m "checkpoint(x): p"',
+            '$HOME/bin/git commit -m "checkpoint(x): p"',
+            'git${SUFFIX} commit -m "checkpoint(x): p"',
+            'eval "git commit -m \\"checkpoint(x): p\\""',
+        )
+        for cwd in (self.repo, self.root):
+            for command in commands:
+                with self.subTest(cwd=cwd, command=command):
+                    reason = self.assert_denied(command, cwd=cwd)
+                    self.assertIn("command word is expanded or eval-generated", reason)
+
+    def test_expanded_non_git_command_keeps_real_git_substitutions_checked(self) -> None:
+        for command in (
+            '$HOME/.claude/scripts/lib/py send.py --text "$(' + CHECKPOINT + ')"',
+            '$HOME/.claude/scripts/lib/py send.py --text `' + CHECKPOINT + '`',
+            '$HOME/.claude/scripts/lib/py send.py --text ready; ' + CHECKPOINT,
+        ):
+            with self.subTest(command=command):
+                reason = self.assert_denied(command)
+                self.assertIn("first command of its own Bash call", reason)
+
+    def test_literal_git_file_message_still_requires_the_doc_record(self) -> None:
+        message = self.repo / "msg"
+        _ = message.write_text("checkpoint(x): commit message\n", encoding="utf-8")
+        reason = self.assert_denied("git commit -F msg")
+        self.assertIn("no doc pass record", reason)
+        _ = self.record()
+        self.assertEqual(self.decision("git commit -F msg"), {})
+
     def test_real_git_command_words_are_checked_through_shell_prefixes(self) -> None:
         target = shlex.quote(str(self.repo))
         for command in (

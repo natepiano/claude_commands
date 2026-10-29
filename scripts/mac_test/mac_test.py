@@ -1718,8 +1718,11 @@ def full_settle(
     if isinstance(block, PendingMacBlock):
         with locked(paths.lock):
             claims = live_claims(paths)
-        if claims:
-            block = pending_with_wait(block, WaitingOnLocalRun(claims[0].record["what"]))
+        waiting_claims = tuple(claim for claim in claims if not claim_belongs_to_block(claim.record, block))
+        # The holder's running work does not need a Mac-free message.
+        message_needed = activation_message_needed and not claims
+        if waiting_claims:
+            block = pending_with_wait(block, WaitingOnLocalRun(waiting_claims[0].record["what"]))
             with locked(paths.lock):
                 write_block(paths.block, block)
         elif config.ci_repo:
@@ -1734,11 +1737,11 @@ def full_settle(
                 with locked(paths.lock):
                     write_block(paths.block, block)
             else:
-                block = activate_block(block, now, activation_message_needed)
+                block = activate_block(block, now, message_needed)
                 with locked(paths.lock):
                     write_block(paths.block, block)
         else:
-            block = activate_block(block, now, activation_message_needed)
+            block = activate_block(block, now, message_needed)
             with locked(paths.lock):
                 write_block(paths.block, block)
 
@@ -1788,11 +1791,32 @@ def block_duration(raw: str, config: MacTestConfig) -> BlockDuration:
 
 
 def requested_delivery(holder: str) -> MessageDelivery:
-    session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    owner = build_hold.owning_session()
     return (
-        RecordedSession(session, holder)
-        if session is not None
+        RecordedSession(owner.session_id, holder)
+        if isinstance(owner, build_hold.OwningSession)
         else HolderQueue(holder)
+    )
+
+
+def block_belongs_to(
+    block: PendingMacBlock | ActiveMacBlock,
+    owner: build_hold.OwningSession | build_hold.NoOwningSession,
+) -> bool:
+    return (
+        isinstance(owner, build_hold.OwningSession)
+        and isinstance(block.delivery, RecordedSession)
+        and block.delivery.name == owner.session_id
+    )
+
+
+def claim_belongs_to_block(
+    claim: RunRecord,
+    block: PendingMacBlock | ActiveMacBlock,
+) -> bool:
+    return (
+        isinstance(block.delivery, RecordedSession)
+        and claim.get("holder_session") == block.delivery.name
     )
 
 
@@ -1834,7 +1858,8 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope) -> Clai
     except (OSError, StateReadError):
         print(f"state unreadable: {paths.block}")
         return ClaimFinished(12)
-    if not isinstance(block, NoMacBlock):
+    owner = build_hold.owning_session()
+    if not isinstance(block, NoMacBlock) and not block_belongs_to(block, owner):
         print(f"blocked by {block.holder}: {block.reason}")
         return ClaimFinished(10)
     if overlapping:
@@ -1858,13 +1883,8 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope) -> Clai
     if isinstance(args.remote, str):
         remote_claim: RemoteJobClaim = {**claimed, "remote_host": args.remote}
         claimed = remote_claim
-    session = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-    if session:
-        claimed["holder_session"] = session
-    else:
-        owner = build_hold.owning_session()
-        if isinstance(owner, build_hold.OwningSession):
-            claimed["holder_session"] = owner.session_id
+    if isinstance(owner, build_hold.OwningSession):
+        claimed["holder_session"] = owner.session_id
     path = claim_path(paths, scope)
     path.parent.mkdir(parents=True, exist_ok=True)
     write_json(path, claimed)
@@ -1967,7 +1987,8 @@ def free_now(
         return "backoff"
     scope = claim_scope(str(repo_root))
     try:
-        if not isinstance(read_claim_block(paths), NoMacBlock):
+        block = read_claim_block(paths)
+        if not isinstance(block, NoMacBlock) and not block_belongs_to(block, build_hold.owning_session()):
             return "blocked"
         claims = read_claims(paths)
     except (OSError, StateReadError):
@@ -2046,39 +2067,22 @@ def command_block(
             now = utc_now()
             expires = now + timedelta(hours=duration.hours)
             if isinstance(existing, NoMacBlock):
-                if claims:
-                    block: PendingMacBlock | ActiveMacBlock = PendingMacBlock(
-                        args.holder,
-                        args.reason,
-                        now,
-                        expires,
-                        requested_delivery(args.holder),
-                        requested_showrunner(args.showrunner),
-                        "still_on",
-                        WaitingOnLocalRun(claims[0].record["what"]),
-                    )
-                elif config.ci_repo:
-                    block = PendingMacBlock(
-                        args.holder,
-                        args.reason,
-                        now,
-                        expires,
-                        requested_delivery(args.holder),
-                        requested_showrunner(args.showrunner),
-                        "still_on",
-                        WAITING_ON_UNKNOWN_CI,
-                    )
-                else:
-                    block = ActiveMacBlock(
-                        args.holder,
-                        args.reason,
-                        now,
-                        expires,
-                        requested_delivery(args.holder),
-                        requested_showrunner(args.showrunner),
-                        "still_on",
-                        FREE_MESSAGE_NOT_NEEDED,
-                    )
+                pending = PendingMacBlock(
+                    args.holder,
+                    args.reason,
+                    now,
+                    expires,
+                    requested_delivery(args.holder),
+                    requested_showrunner(args.showrunner),
+                    "still_on",
+                    WAITING_ON_UNKNOWN_CI,
+                )
+                waiting_claims = tuple(claim for claim in claims if not claim_belongs_to_block(claim.record, pending))
+                block: PendingMacBlock | ActiveMacBlock = pending
+                if waiting_claims:
+                    block = pending_with_wait(pending, WaitingOnLocalRun(waiting_claims[0].record["what"]))
+                elif not config.ci_repo:
+                    block = activate_block(pending, now, False)
                 new_block = True
             elif isinstance(existing, PendingMacBlock):
                 block = PendingMacBlock(
