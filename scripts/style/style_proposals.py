@@ -18,7 +18,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from types import UnionType
-from typing import cast
+from typing import Protocol, cast
 from urllib.parse import quote
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -519,7 +519,40 @@ class RankExemptions:
         return 0 not in occupied and any(not any(start <= other <= end for other in occupied) for start, end in modules)
 
 
-def judged_at_current_file(ledger: style_ledger.Ledger, finding: style_ledger.HeldFinding, tip: str) -> bool:
+class ProposalGitReader(Protocol):
+    """The git inputs shared by refill and the split scan."""
+
+    def blob(self, commit: str, path: str) -> str: ...
+
+    def crate_directories(self, commit: str) -> tuple[str, ...]: ...
+
+
+class GitProposalReader:
+    """Read proposal inputs with refill's existing git commands."""
+
+    def __init__(self, ledger: style_ledger.Ledger) -> None:
+        self.ledger: style_ledger.Ledger = ledger
+
+    def blob(self, commit: str, path: str) -> str:
+        try:
+            return git(self.ledger.repo, "rev-parse", "--verify", f"{commit}:{path}")
+        except style_ledger.LedgerError:
+            return ""
+
+    def crate_directories(self, commit: str) -> tuple[str, ...]:
+        return tuple(member.directory for member in coverage_report.workspace(self.ledger, commit))
+
+
+@dataclass(frozen=True)
+class DefaultProposalReads:
+    """Use refill's existing git commands."""
+
+
+_DEFAULT_PROPOSAL_READS = DefaultProposalReads()
+
+
+def judged_at_current_file(ledger: style_ledger.Ledger, finding: style_ledger.HeldFinding, tip: str, *,
+                           reader: ProposalGitReader | DefaultProposalReads = _DEFAULT_PROPOSAL_READS) -> bool:
     """Whether the file at the synced tip is the file that the finding's holding ticket judged, or that its last
     declaration follow read.
 
@@ -530,18 +563,15 @@ def judged_at_current_file(ledger: style_ledger.Ledger, finding: style_ledger.He
         return True
     read = (judged.commit, *((finding.follow.commit,) if isinstance(finding.follow, style_ledger.FollowedDeclaration) else ()))
 
-    def blob(commit: str) -> str:
-        try:
-            return git(ledger.repo, "rev-parse", "--verify", f"{commit}:{finding.path}")
-        except style_ledger.LedgerError:
-            return ""
-
-    current = blob(tip)
-    return bool(current) and any(blob(commit) == current for commit in read)
+    if isinstance(reader, DefaultProposalReads):
+        reader = GitProposalReader(ledger)
+    current = reader.blob(tip, finding.path)
+    return bool(current) and any(reader.blob(commit, finding.path) == current for commit in read)
 
 
 def ranked_work(ledger: style_ledger.Ledger, cells: Iterable[style_ledger.Cell],
-                scopes: Mapping[rules.Family, PilotScope]) -> RankedWork:
+                scopes: Mapping[rules.Family, PilotScope], *,
+                reader: ProposalGitReader | DefaultProposalReads = _DEFAULT_PROPOSAL_READS) -> RankedWork:
     """The open work of each family that has a unit, in that unit's pilot scope.
 
     Open work at a file is a cell in OPEN_CELL_STATES, a filed finding (its decision unanswered or approved and not
@@ -559,13 +589,16 @@ def ranked_work(ledger: style_ledger.Ledger, cells: Iterable[style_ledger.Cell],
     findings = tuple(finding for finding in ledger.held_findings(style_ledger.AllHeldFindings())
                      if isinstance(finding.state, style_ledger.Filed | style_ledger.Unfiled))
     if findings:
+        if isinstance(reader, DefaultProposalReads):
+            reader = GitProposalReader(ledger)
         families: dict[str, rules.Family | None] = {rule.rule_id: rule.family for rule in rules.load_rules(ledger.repo)}
-        directories = workspace_directories(ledger)
         tip = ledger.synced_commit()
+        directories = reader.crate_directories(tip)
         for finding in findings:
             family = families.get(finding.rule.removesuffix("#uncovered"))
             if family is not None and counts(family, crate_for(directories, finding.path)) and (
-                    isinstance(finding.state, style_ledger.Filed) or judged_at_current_file(ledger, finding, tip)):
+                    isinstance(finding.state, style_ledger.Filed)
+                    or judged_at_current_file(ledger, finding, tip, reader=reader)):
                 work[finding.path].add(family)
     return RankedWork({path: frozenset(present) for path, present in work.items()})
 
