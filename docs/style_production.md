@@ -318,6 +318,21 @@ Refill only the unit worktree's own plan copy:
 ~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py queue --repo <checkout> [--unit <unit>]
 ```
 
+Refill tries the unit's own family first. When that selection has no buildable
+ticket, the idle unit borrows approved work from the family with the most
+buildable findings in that family's pilot scope; ties follow the ledger's
+family rank order. The same rule-version, rank, busy-file, sync and waiting
+checkpoint footprint checks apply. Both selection paths use the ledger's full
+open-ticket footprint, including widened paths and rename references, when
+checking busy files. Family counts use the locations a dry-run declaration
+follow would write, so a moved finding is ranked at its current file without
+changing the ledger. The ticket records the borrowed family and
+pins its rules; its phase explains `Borrowed from <family>: <unit family> has
+no buildable work (<reason>).` One waiting checkpoint and one disjoint successor
+remain the limit. Only when every family lacks buildable work does the unit
+stay idle: `no available work: <family> <reason>, ...` lists every family, while
+the exit code continues to follow the unit's own hold reason.
+
 `next-phase` returns 0 after writing a phase, resuming an assigned ticket, or
 reporting `repair first`; 3 means `waiting for sync` (with `: <kind> <crate> [<rule>]: main touched <path>`
 or `: touched set unknown: <reason>` for a main-related hold), or

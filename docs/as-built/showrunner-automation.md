@@ -70,6 +70,7 @@ Its Plan cell keeps `(retired <date>, worktree removed, session <id>)`, adding `
 
 `merge_checkpoint.py --production <doc> <unit> <phase> <hash> --started <ISO> [--review-trial "<line>"] [--parallel "<line>"] [--delivers "<line>"] [--shrink | --as-built] [--also <path>]… [--trailer <line>]… [--regime after|trial] [--holds K] [--merge-defects D] [--excluded "<why>"] [--cancel-prior] [--scratch <dir>]`. `produce.md` `<MergeCheckpoint/>` runs it in the background after the showrunner's own judgments. `--as-built` (2026-10-13, from the herdr trial) merges a unit's closing as-built commit like a shrink: no tests and no review-ledger row, held until a code checkpoint of that phase merged, subject `Merge <unit> phase <N> as-built (<short>) into <branch>`, and scope limited to `.md` paths that include a change to or deletion of the unit's plan. `Promote: none` is read as no promotion, the same as an absent field, and at load every local Promote checkout must exist, so a bad destination refuses before anything is pushed.
 
+- **Origin ancestry:** the checkpoint must be on an origin branch. The Units-row Branch is fetched and checked first. If it is absent or does not contain the checkpoint, all origin heads are fetched with stale tracking refs pruned, including when the checkout normally fetches only one branch. The ancestry line names the branch that contains the checkpoint; no containing branch keeps `commit is not on origin`. Scope, conflict checking and merging use the submitted checkpoint hash, not that branch's later tip. The other-units overlap report still checks the other units' Branch rows and dirty worktrees; it skips the submitting unit.
 - **Doc fields read:** `Merge branch`, `Showrunner checkout`, `Log`, the Units rows (Branch, Owns), `## Hub files` rows naming this unit, **Merge tests**, **Known flakes** (package names), **Known flaky tests** (nextest test names, as `` `<path::test>`, `<path::test>` ``), **Push:** (`validate_and_push` default, or `git`) and **Promote:** (`<checkout>[, mac <path>]`, read as `NoPromotion | PromoteTo(checkouts, MacCheckout | NoMac)`). An absent field and `none` (any case) are both `NoPromotion`; at load every local Promote checkout must exist, so a bad destination is refused before anything is pushed.
 - **Input rules.** A code checkpoint needs `--review-trial` (exactly `review trial: ux <N> findings, code <N> findings, review-worker minutes <M>, ux check minutes <U>, ux repair minutes <R>`) and a one-line `--delivers`; a shrink refuses `--delivers`. It also needs `--parallel` matching `Parallel: Phase <N>[, Phase <M>…] could start` or `Parallel: none — <reason>`; `Parallel: unknown` is refused with the instruction to add the plan's `**Depends on:**` lines and rerun (`check_parallel`). `--cancel-prior` is refused with `Push: git`. `MergeRequest.delivers` and `excluded` are `str`, `""` for absent.
 - **Review numbers.** The unit takes the `--review-trial` line from `progress_history.py review-trial`, which reports the phase in state, active or just closed by `finish-phase`. The code number is what the reviewers raised: the sum of `raised` over the phase's `reviewed` code turns in `review_turns/<session>/` (`_raised_code_findings`), matched by phase instance. Both review launchers stamp each turn with the named phase. `RecordedCodeFindings(0)` records a zero; `NoRecordedCodeReview` means no review record. Earlier `pool` and current `own` turns both count, including several files of one launcher. A phase with no such turn falls back to the `finding_opened` events: an event is a code finding when it names any lens other than `ux`, or no lens. The ux number always comes from `finding_opened`. An event naming `ux` and a code lens adds one to each number; the legacy lens word `both` reads as `adversary,contract` through `_finding_lenses` and adds one to the code number. `merge_checkpoint.py` parses the printed line, so its form is fixed. In the review ledger (`review_regime.py`) the code number is every code finding the phase's review raised from 2026-10-07, and the `craft` lens alone before that date; `report` prints its mean per regime as `code findings per phase (mean)`.
@@ -239,7 +240,7 @@ Each subcommand takes `--production`; `main` catches `merge_checkpoint.Stop`, so
 
 - An activity on a closed phase leaves that phase's record as `finish-phase` wrote it: status, `finished_at` and elapsed time. The printed `review trial:` line keeps its form, which `merge_checkpoint.py` parses.
 
-- The stall watch's standing-by, run-finished and retired-row skips, then its waiting-kind reset, run before any bump or notice. The turn-end pattern is built from `WAITING_KINDS` and `HOLDING_KIND`, so the pattern and the wait test cannot drift.
+- The stall watch's standing-by, run-finished and retired-row skips, then its waiting-kind reset, run before any bump or notice. The turn-end pattern is built from `WAITING_KINDS` and `HOLDING_KIND`, so the pattern and the wait test cannot drift; a one-line reply's `●` or `⏺` bullet is allowed before the turn end.
 
 - Unit directors launch only on Claude. `production` has only `[production.claude]`; `claude --resume` never runs without resolved flags.
 
@@ -325,12 +326,18 @@ Each subcommand takes `--production`; `main` catches `merge_checkpoint.Stop`, so
 ## Session hosting
 
 Unit lookup reads only herdr. `Place` is `HerdrPlace(session, pane)`;
-`MarkedUnit(unit, claude, place)` exposes the server name as `place.session`.
+`MarkedUnit(unit, claude, place, pid, command)` exposes the server name as `place.session`.
 `every_marked_unit()` raises `OSError` when herdr cannot be read, and
-`marked_units(slug)` selects one production. Duplicate marks refuse that
-production. Registry records join by pid through `herdr_processes` and
+`marked_units(slug)` selects one production. A live Claude joins only marks on
+its exact PID. A marked shell or other non-Claude process retains its stopped
+pane as `ClaudeNotRunning`, for recovery, resume and status. Live or unknown
+Claude holders take precedence over stopped panes; only those holders count
+toward duplicate faults. With only stopped holders, the first pane is retained.
+Duplicate live or unknown marks refuse that production and name each holder's
+PID, command and pane. Transfer and rename verification reject former marks
+only for live or unknown holders, ignoring leftover non-Claude processes. Registry records join by pid through `herdr_processes` and
 `herdr_place_of`; unreadable cwd preserves placement. An unreadable registry
-keeps an unresolved Claude as `ClaudeUnknown(reason)`.
+keeps an unresolved Claude as `ClaudeUnknown(reason)`; a registered running Claude without its messaging socket is also unknown, never absent.
 
 Units launch exclusively in herdr and restore through `add_unit.py --host-session`.
 Resume models come from transcripts. Existing Units rows can be reused;

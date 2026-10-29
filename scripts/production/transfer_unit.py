@@ -120,6 +120,8 @@ class UnitTransfer:
 TEXT_FIELDS = tuple(field.name for field in fields(UnitTransfer) if field.name != "step")
 # The fields a fresh transfer fills; the rest start empty.
 REQUIRED = TEXT_FIELDS[:TEXT_FIELDS.index("plan_commit")]
+# These are current locations, not recovery state. Old journals may contain them.
+LOCATION_FIELDS = ("from_doc", "to_doc", "from_checkout", "to_checkout")
 
 
 def _row(doc: Path, unit: str) -> dict[str, str] | None:
@@ -491,8 +493,10 @@ def verify_failures(transfer: UnitTransfer) -> list[str]:
         if not _live(transfer.to_slug, unit):
             failures.append(f"{unit} is not running under {transfer.to_slug}; relaunch it with "
                             + f"shutdown.py restart --here --only {transfer.session_id}")
-    if unit in unit_lookup.marked_units(transfer.from_slug):
-        failures.append(f"a session still carries the marks {transfer.from_slug} {unit}")
+    holder = unit_lookup.marked_units(transfer.from_slug).get(unit)
+    if holder is not None and isinstance(holder.claude, (unit_lookup.LiveClaude, unit_lookup.ClaudeUnknown)):
+        failures.append(f"a session still carries the marks {transfer.from_slug} {unit}: "
+                        + unit_lookup.holder_text(holder))
     if leased := _leased(transfer.from_slug, unit):
         failures.append(f"review pool {transfer.from_slug}: {', '.join(leased)} still leased to {unit}")
     from scripts.astra import design_roles
@@ -563,25 +567,35 @@ def journal(slug: str) -> Path:
     return tidy_wrapped.owned_paths(slug)[-1] / "transfer_unit.json"
 
 
-def _load(path: Path) -> UnitTransfer:
+def _load(path: Path, to_doc: Path) -> UnitTransfer:
     values = unit_move.json_object(read_json(path))
     step = values.get("step")
-    if (type(step) is not int or not all(isinstance(values.get(name, ""), str) for name in TEXT_FIELDS)
-            or not all(values.get(name) for name in REQUIRED)):
+    if (type(step) is not int
+            or not all(isinstance(values.get(name, ""), str) for name in TEXT_FIELDS if name not in LOCATION_FIELDS)
+            or not all(values.get(name) for name in REQUIRED if name not in LOCATION_FIELDS)):
         raise RenameRefused(f"{path}: invalid unit transfer journal")
+    receiving = read_production(to_doc.expanduser().resolve())
+    if receiving.slug != values["to_slug"]:
+        raise RenameRefused(f"the recorded transfer is {values['unit']} to {values['to_slug']}")
+    giving = _production(cast(str, values["from_slug"]))
+    values.update(from_doc=str(giving.doc), from_checkout=str(giving.checkout),
+                  to_doc=str(receiving.doc), to_checkout=str(receiving.checkout))
     return UnitTransfer(*(cast(str, values.get(name, "")) for name in TEXT_FIELDS[:len(REQUIRED)]), step=step,
                         **{name: cast(str, values.get(name, "")) for name in TEXT_FIELDS[len(REQUIRED):]})
 
 
 def _save(path: Path, transfer: UnitTransfer) -> None:
-    write_json(path, {**asdict(transfer), "done": transfer.step == len(STEPS)})
+    saved = cast(dict[str, object], asdict(transfer))
+    for name in LOCATION_FIELDS:
+        del saved[name]
+    write_json(path, {**saved, "done": transfer.step == len(STEPS)})
 
 
 def _resumed(path: Path, unit: str, to_doc: Path) -> UnitTransfer | None:
     """The unfinished transfer the journal holds, which must be this request; None without one."""
     if not rename_state.unfinished(path):
         return None
-    recorded = _load(path)
+    recorded = _load(path, to_doc)
     if recorded.unit not in (unit, unit_names.unit_id(unit)) or Path(recorded.to_doc) != to_doc.expanduser().resolve():
         raise RenameRefused(f"the unfinished transfer is {recorded.unit} to {recorded.to_slug}; resume it first with "
                             + f"transfer_unit.py apply {recorded.from_slug} {recorded.unit} {recorded.to_doc}")
@@ -644,7 +658,7 @@ def verify(from_slug: str, unit: str, to_doc: Path) -> UnitTransfer:
     path = journal(from_slug)
     if not path.exists():
         raise RenameRefused(f"{from_slug} has no unit transfer to verify")
-    recorded = _load(path)
+    recorded = _load(path, to_doc)
     if recorded.unit not in (unit, unit_names.unit_id(unit)) or Path(recorded.to_doc) != to_doc.expanduser().resolve():
         raise RenameRefused(f"the recorded transfer is {recorded.unit} to {recorded.to_slug}")
     if recorded.step < len(STEPS) - 1:
