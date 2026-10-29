@@ -342,7 +342,7 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 - The replay after the change: neither count rises for any repository, and each count falls in total. The before and after table goes in the checkpoint notice.
 - Change-Review line: memory promises match each repository's real use | on natedev run `cargo clippy` in `~/rust/cargo-liner` and read its reservation in `~/.local/state/buildlog/admission` | its `need` is near the compile-only keyed p90 that the replay measures (the phase report gives the figure), not 3.0 GiB.
 
-### Phase 12 — Memory admission counts host swap, sccache compiles and each step's peak  · status: todo
+### Phase 12 — Memory admission counts host swap, sccache compiles and each step's peak  · status: done
 **Depends on:** Phase 10 (same file, `memory_admit.py`). Runs before Phase 11.
 
 **Approved:** showrunner 2026-10-29 14:58 EDT, as proposed after the 14:48 and 14:51 EDT freezes; ETA 19:00 EDT, right after the Phase 10 checkpoint. The showrunner kept `RAMP_SECONDS` at 120 for now: herdr is fixing the swapped herdr server, which was the main cause. If a freeze happens after herdr reports its fix, the director makes `RAMP_SECONDS = 600` as a small fix checkpoint on this branch and sends the notice.
