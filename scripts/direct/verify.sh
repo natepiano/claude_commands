@@ -2772,6 +2772,9 @@ case "$CMD" in
         if [[ -n "${UNIT_SESSION_DIR:-}" ]]; then
             ASSERTION_ARGS+=(--rulings "$UNIT_SESSION_DIR")
         fi
+        if [[ -n "${VERIFY_ASSERTION_BASE:-}" ]]; then
+            ASSERTION_ARGS+=(--base "$VERIFY_ASSERTION_BASE")
+        fi
         [[ "$PKG" != --workspace ]] || echo 'style-lint: assertion guard start'
         "$PY" "$ASSERTION_GUARD_SCRIPT" "${ASSERTION_ARGS[@]}"
         [[ "$PKG" != --workspace ]] || echo 'style-lint: assertion guard passed'

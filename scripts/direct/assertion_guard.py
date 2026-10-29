@@ -588,19 +588,34 @@ def read_sources(repo: Path, base: str, head: str, staged: bool,
     return sources
 
 
-def default_base(repo: Path) -> str:
-    choices: list[str] = []
+def default_base(repo: Path, explicit_base: str = "") -> str:
+    """Use the branch's upstream or its nearest unambiguous remote ancestor."""
+    if explicit_base:
+        return git(repo, "rev-parse", "--verify", f"{explicit_base}^{{commit}}").strip()
     try:
-        choices.append(git(repo, "symbolic-ref", "refs/remotes/origin/HEAD").strip())
+        return git(repo, "merge-base", "HEAD", "@{upstream}").strip()
     except GuardError:
         pass
-    choices.extend(("origin/main", "origin/master", "main", "master"))
-    for choice in choices:
+    default_remote = ""
+    try:
+        default_remote = git(repo, "symbolic-ref", "refs/remotes/origin/HEAD").strip()
+    except GuardError:
+        pass
+    nearest: dict[str, int] = {}
+    for reference in git(repo, "for-each-ref", "--format=%(refname)", "refs/remotes/").splitlines():
+        if reference.endswith("/HEAD") or reference == default_remote:
+            continue
         try:
-            return git(repo, "merge-base", "HEAD", choice).strip()
+            base = git(repo, "merge-base", "HEAD", reference).strip()
+            nearest[base] = int(git(repo, "rev-list", "--count", f"{base}..HEAD").strip())
         except GuardError:
             continue
-    raise GuardError("no default branch resolves; tried origin/HEAD, origin/main, origin/master, main, master; set --base")
+    if nearest:
+        distance = min(nearest.values())
+        bases = [base for base, count in nearest.items() if count == distance]
+        if len(bases) == 1:
+            return bases[0]
+    raise GuardError("cannot determine branch base; set VERIFY_ASSERTION_BASE (or --base)")
 
 
 def name_tests(findings: list[Finding], sources: dict[tuple[str, Side], list[str]]) -> list[Finding]:
@@ -651,7 +666,7 @@ def run(arguments: list[str]) -> int:
     _ = parser.parse_args(arguments, namespace=args)
     repo = Path(args.repo).expanduser().resolve()
     repo = Path(git(repo, "rev-parse", "--show-toplevel").strip())
-    base = args.base or default_base(repo)
+    base = default_base(repo, args.base)
     head = args.head
     staged = args.staged
     diff_args = ["diff", "--no-color", "--no-ext-diff", "-U0", "--find-renames"]
