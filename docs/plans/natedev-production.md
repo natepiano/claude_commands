@@ -55,7 +55,7 @@
 | review-unit | (retired 2026-10-18, worktree removed) docs/plans/build-followups-review.md | /home/natepiano/worktrees/claude-build-followups-review | build-followups-review | — | — |
 | efficiency-unit | docs/as-built/token-efficiency-study.md | `/home/natepiano/worktrees/claude-natedev-efficiency` | `natedev-efficiency` | — | the efficiency proposals ledger (~/.local/state/nightly-review/ledger.md and its night reports); the token-efficiency investigation |
 | typesafe-unit | docs/plans/build-followups-typesafe.md | `/home/natepiano/worktrees/claude-natedev-typesafe` | `natedev-typesafe` | — | — |
-| postmaster-unit | permanent | /home/natepiano/worktrees/claude-build-followups-postmaster | build-followups-postmaster | — | — |
+| postmaster-unit | permanent | `/home/natepiano/worktrees/claude-natedev-postmaster` | `natedev-postmaster` | — | — |
 | ups-unit | permanent | /home/natepiano/worktrees/claude-build-followups-ups | build-followups-ups | — | — |
 | verify-unit | docs/plans/natedev-verify.md | /home/natepiano/worktrees/claude-build-followups-verify | natedev-verify | — | `scripts/direct/verify.sh`, `scripts/direct/final_pass.py`, the verify cache, lint and test scope, verify speed, the Mac test code (`scripts/mac_test/`), from builds-unit |
 
