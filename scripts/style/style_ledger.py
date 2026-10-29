@@ -2992,14 +2992,14 @@ class Ledger:
         if state == target:
             if target == "assigned" and ticket["branch"] != branch:
                 raise LedgerError(f"{ticket['id']}: assigned to branch {ticket['branch']}")
-            if target == "checkpointed" and ticket["checkpoint"] != commit:
-                raise LedgerError(f"{ticket['id']}: checkpointed at {ticket['checkpoint']}")
             if target == "checkpointed" and reservation[0]:
                 held = self._ticket_reservation(ticket["id"])
                 if held[0] and held != reservation:
                     raise LedgerError(f"{ticket['id']}: checkpointed holding the reservation of phase {held[1]} in {held[0]}")
                 # A repeat stores the reservation an earlier checkpoint did not name.
-                return held == reservation
+                return ticket["checkpoint"] == commit and held == reservation
+            if target == "checkpointed":
+                return ticket["checkpoint"] == commit
             return True
         predecessor = {"assigned": "queued", "checkpointed": "assigned", "merged": "checkpointed"}
         if (target == "dropped" and state in ("merged", "dropped")) or (target != "dropped" and predecessor.get(target) != state):
@@ -3033,6 +3033,12 @@ class Ledger:
             if self._ticket_arrived(ticket, target, commit, branch, reservation):
                 return True
             if target == "checkpointed":
+                if ticket["state"] == "checkpointed" and ticket["checkpoint"] != commit:
+                    if not self._is_ancestor(ticket["checkpoint"], commit):
+                        raise LedgerError(f"{id}: checkpointed at {ticket['checkpoint']}")
+                    branch_tip = _git(self.repo, "rev-parse", "--verify", f"{ticket['branch']}^{{commit}}")
+                    if not self._is_ancestor(commit, branch_tip):
+                        raise LedgerError(f"{id}: checkpoint {commit[:7]} is not on {ticket['branch']}")
                 missing = self.unjudged_ticket_cells(id, commit, lambda path: not isinstance(self._file_at(commit, path), MissingFile))
                 if missing:
                     raise LedgerError(f"{id}: unjudged cells: " + ", ".join(f"{cell.rule} {cell.path}" for cell in missing))
@@ -3060,6 +3066,10 @@ class Ledger:
             ticket = self._ticket(id)
             if arrived(ticket):
                 return ()
+            if target == "merged":
+                style_branch, branch_tip = self._style_branch_tip()
+                if not branch_tip or not self._is_ancestor(ticket["checkpoint"], branch_tip):
+                    raise LedgerError(f"{id}: checkpoint {ticket['checkpoint'][:7]} is not on {style_branch or 'the style branch'}")
             checkpoint = commit if target == "checkpointed" else ticket["checkpoint"]
             restamps = self.checkpoint_restamps(ticket, checkpoint) if target in ("checkpointed", "merged") else NoRestamps()
             building = target == "merged" and ticket["kind"] == "proposal"
@@ -3342,10 +3352,6 @@ class Ledger:
         if self._ticket_arrived(ticket, "merged"):
             # Merge clears the build ticket of a rename that is not applied, so a finding that keeps it has no check.
             return tuple(FindingNotBuilt(finding.finding_id, NoAppliedCheck(finding.kind)) for finding in self.filed_build_findings(id))
-        branch, branch_tip = self._style_branch_tip()
-        contained = bool(branch_tip) and self._is_ancestor(ticket["checkpoint"], branch_tip)
-        if not contained:
-            raise LedgerError(f"{id}: checkpoint {ticket['checkpoint'][:7]} is not on {branch or 'the style branch'}")
         return self._ticket_transition(id, "merged")
 
     def _style_branch_tip(self) -> tuple[str, str]:
