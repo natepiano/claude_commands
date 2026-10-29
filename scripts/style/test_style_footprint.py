@@ -5,11 +5,12 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import final, override
 from unittest import mock
@@ -24,14 +25,26 @@ SCRIPT = Path(__file__).with_name("style_footprint.py")
 class StyleFootprintTests(unittest.TestCase):
     repo: Path = Path()
 
+    template_repo: Path = Path()
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.template_repo = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="style-footprint-template-")))
+        fixture = cls(methodName="runTest")
+        fixture.repo = cls.template_repo
+        _ = fixture.git("init", "-q", "--initial-branch=main")
+        _ = fixture.git("config", "user.name", "Footprint tests")
+        _ = fixture.git("config", "user.email", "footprint@example.invalid")
+        _ = fixture.git("config", "commit.gpgsign", "false")
+        fixture.write("Cargo.toml", '[package]\nname = "sample"\nversion = "0.1.0"\nedition = "2021"\n')
+
     @override
     def setUp(self) -> None:
-        self.repo = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="style-footprint-")))
-        _ = self.git("init", "-q", "--initial-branch=main")
-        _ = self.git("config", "user.name", "Footprint tests")
-        _ = self.git("config", "user.email", "footprint@example.invalid")
-        _ = self.git("config", "commit.gpgsign", "false")
-        self.write("Cargo.toml", '[package]\nname = "sample"\nversion = "0.1.0"\nedition = "2021"\n')
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="style-footprint-")))
+        self.repo = root / "sample"
+        _ = shutil.copytree(self.template_repo, self.repo, symlinks=True)
 
     def git(self, *arguments: str) -> str:
         return subprocess.run(
@@ -48,11 +61,23 @@ class StyleFootprintTests(unittest.TestCase):
         _ = self.git("commit", "--allow-empty", "-qm", "Fixture change")
         return self.git("rev-parse", "HEAD")
 
+    def cli(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        output, errors = io.StringIO(), io.StringIO()
+        code = 0
+        with redirect_stdout(output), redirect_stderr(errors):
+            try:
+                code = style_footprint.main(list(arguments))
+            except SystemExit as error:
+                if isinstance(error.code, int):
+                    code = error.code
+                elif error.code is not None:
+                    print(error.code, file=sys.stderr)
+                    code = 1
+        return subprocess.CompletedProcess([sys.executable, str(SCRIPT), *arguments], code,
+                                           output.getvalue(), errors.getvalue())
+
     def check(self, base: str, head: str = "HEAD", *extra: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [sys.executable, str(SCRIPT), "check", "--repo", str(self.repo), "--base", base, "--head", head, *extra],
-            capture_output=True, text=True, check=False,
-        )
+        return self.cli("check", "--repo", str(self.repo), "--base", base, "--head", head, *extra)
 
     def assert_mechanical(self, base: str, head: str = "HEAD") -> None:
         result = self.check(base, head)
@@ -78,10 +103,7 @@ class StyleFootprintTests(unittest.TestCase):
         return self.commit()
 
     def worktree_check(self, base: str, *extra: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [sys.executable, str(SCRIPT), "check", "--repo", str(self.repo), "--base", base, "--worktree", *extra],
-            capture_output=True, text=True, check=False,
-        )
+        return self.cli("check", "--repo", str(self.repo), "--base", base, "--worktree", *extra)
 
     def test_worktree_literal_change_is_judged_even_when_head_equals_base(self) -> None:
         self.write("src/lib.rs", "fn value() -> usize { 1 }\n")

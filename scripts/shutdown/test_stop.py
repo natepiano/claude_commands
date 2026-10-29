@@ -31,6 +31,9 @@ import stop
 import relaunch
 import unit_lookup
 
+# Hang guard: natedev reached load 136 on 2026-10-29; scheduling delays are not failures.
+HANG_GUARD_SECONDS = 300
+
 LOGIN = "owner@example.com"
 LABEL = "claude2"
 NOW = "2026-10-09T21:49:10+00:00"
@@ -662,7 +665,7 @@ class StopTests(ShutdownTestCase):
 
         def kill(_pid: int, _sent: int) -> None:
             entered.set()
-            self.assertTrue(release.wait(0.8))
+            self.assertTrue(release.wait(HANG_GUARD_SECONDS))
 
         def worker() -> None:
             try:
@@ -679,7 +682,7 @@ class StopTests(ShutdownTestCase):
         thread = threading.Thread(target=worker)
         thread.start()
         try:
-            self.assertTrue(entered.wait(0.8))
+            self.assertTrue(entered.wait(HANG_GUARD_SECONDS))
             with patch.object(settle, 'run_notifier') as timers, patch.object(settle, 'send_message') as send, redirect_stdout(io.StringIO()):
                 _ = settle.cancel(Account('claude', LOGIN, LABEL), here=True)
             timers.assert_not_called()
@@ -688,7 +691,7 @@ class StopTests(ShutdownTestCase):
             self.assertEqual(self.stored_record()['timers'], saved['timers'])
         finally:
             release.set()
-            thread.join(0.8)
+            thread.join(HANG_GUARD_SECONDS)
         self.assertFalse(thread.is_alive())
         self.assertEqual(failures, [])
 
@@ -1443,7 +1446,7 @@ class StopTests(ShutdownTestCase):
 
         def report(_login: str, _only: frozenset[str]) -> inventory.Inventory:
             paused.set()
-            if not release.wait(60):
+            if not release.wait(HANG_GUARD_SECONDS):
                 raise RuntimeError("stop worker was not released")
             return machine_inventory([])
 
@@ -1461,7 +1464,7 @@ class StopTests(ShutdownTestCase):
         worker = threading.Thread(target=first_worker)
         worker.start()
         try:
-            self.assertTrue(paused.wait(60))
+            self.assertTrue(paused.wait(HANG_GUARD_SECONDS))
             replacement_time = NOW_UTC + timedelta(seconds=record.CLAIM_STALE_SECONDS)
             stopped = stop.stop_session(
                 self.stored_record(), kill=lambda _pid, _sent: None,
@@ -1479,7 +1482,7 @@ class StopTests(ShutdownTestCase):
             replacement = record.update_session(LOGIN, "owner", relaunch)
         finally:
             release.set()
-            worker.join(60)
+            worker.join(HANG_GUARD_SECONDS)
         self.assertFalse(worker.is_alive())
         self.assertEqual(errors, [])
         self.assertEqual(returned, [replacement])

@@ -36,17 +36,42 @@ class WorkerStateTests(unittest.TestCase):
             self.assertEqual(sorted(path.name for path in run.iterdir()),
                              ["impl_claim_impl.json", "impl_worker_claim.lock", "impl_worker_impl.json", "seats", "workers"])
 
-    def test_a_repair_workers_record_moves_out_of_the_impl_slot_file(self) -> None:
+    def test_an_existing_repair_identity_keeps_its_file_and_a_new_impl_gets_a_distinct_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             run = Path(directory)
             repair = {"name": "project-fix", "slot": "impl", "family": "codex", "model": "model", "worker_id": "thread-fix"}
-            _ = (run / "impl_worker_impl.json").write_text(json.dumps(repair))
+            _ = (run / "mesh_roster.json").write_text(json.dumps({"project-fix": {"role": "fix"}}))
+            identity = run / "impl_worker_impl.json"
+            _ = identity.write_text(json.dumps(repair))
             with worker_claim_lock(run):
-                self.assertFalse((run / "impl_worker_impl.json").exists())
-                self.assertEqual(json.loads((run / "impl_worker_fix.json").read_text()), repair)
-            self.assertEqual(worker_record_path(run, "project-impl", "impl"), run / "impl_worker_impl.json")
-            self.assertEqual(worker_record_path(run, "project-fix", "impl"), run / "impl_worker_fix.json")
-            self.assertEqual(worker_record_path(run, "builder", "impl"), run / "impl_worker_impl.json")
+                self.assertEqual(json.loads(identity.read_text()), repair)
+                separate = worker_record_path(run, "project-impl", "impl", role="impl")
+                self.assertNotEqual(separate, identity)
+                _ = separate.write_text(json.dumps({"name": "project-impl", "slot": "impl",
+                                                    "role": "impl", "worker_id": "thread-impl"}))
+            self.assertEqual(worker_record_path(run, "project-fix", "impl", role="impl"), identity)
+            self.assertEqual(worker_record_path(run, "project-impl", "impl", role="fix"), separate)
+            self.assertEqual(json.loads(identity.read_text()), repair)
+
+    def test_record_path_uses_stored_role_instead_of_the_worker_address(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            _ = (run / "mesh_roster.json").write_text(json.dumps({
+                "w7": {"role": "fix"}, "misleading-fix": {"role": "impl"},
+            }))
+            self.assertEqual(worker_record_path(run, "w7", "impl"), run / "impl_worker_fix.json")
+            self.assertEqual(worker_record_path(run, "misleading-fix", "impl"), run / "impl_worker_impl.json")
+
+    def test_explicit_claude_repair_role_uses_its_own_record_without_a_roster(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            original = run / "impl_worker_impl.json"
+            _ = original.write_text('{"name":"w7","role":"impl","family":"claude"}')
+            before = original.read_bytes()
+            path = worker_record_path(run, "w8", "impl", role="fix")
+            self.assertEqual(path, run / "impl_worker_fix.json")
+            _ = path.write_text('{"name":"w8","role":"fix","family":"claude"}')
+            self.assertEqual(original.read_bytes(), before)
 
     def test_worker_slot_reads_the_slot_the_identity_was_recorded_under(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -57,6 +82,17 @@ class WorkerStateTests(unittest.TestCase):
             self.assertEqual(worker_slot(run, "project-impl"), "impl")
             self.assertEqual(worker_slot(run, "project-fix"), "impl")
             self.assertIsNone(worker_slot(run, "project-test"))
+
+    def test_an_existing_worker_identity_is_stable_across_assignment_roles(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            identity = run / "impl_worker_impl.json"
+            _ = identity.write_text(json.dumps({"name": "w7", "slot": "impl", "role": "impl",
+                                               "family": "claude", "worker_id": "original-session"}))
+            for role in ("fix", "review", "test", "impl"):
+                with self.subTest(role=role), worker_claim_lock(run):
+                    self.assertEqual(worker_record_path(run, "w7", "impl", role=role), identity)
+                    self.assertEqual(json.loads(identity.read_text())["worker_id"], "original-session")
 
     def test_converted_lock_keeps_excluding_a_launcher_with_an_open_old_handle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

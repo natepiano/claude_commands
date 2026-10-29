@@ -59,6 +59,31 @@ class StylePlanTests(unittest.TestCase):
     tip: str = ""
     sources: tuple[str, ...] = tuple(f"crates/{crate}/src/{name}.rs" for crate in ("alpha", "beta") for name in ("lib", "other"))
 
+    template_repo: Path = Path()
+    template_tip: str = ""
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.template_repo = Path(cls.enterClassContext(tempfile.TemporaryDirectory())) / "sample"
+        cls.template_repo.mkdir()
+        fixture = cls(methodName="runTest")
+        fixture.repo = cls.template_repo
+        # Match setUp's isolated Git configuration while building the class template.
+        with mock.patch.dict(os.environ, {"HOME": str(cls.template_repo.parent)}):
+            _ = fixture.git("init", "-q", "--initial-branch=main")
+            _ = fixture.git("config", "user.name", "Planner tests")
+            _ = fixture.git("config", "user.email", "planner@example.invalid")
+            fixture.write("Cargo.toml", '[workspace]\nmembers = ["crates/alpha", "crates/beta"]\n')
+            for crate in ("alpha", "beta"):
+                fixture.write(f"crates/{crate}/Cargo.toml",
+                           f'[package]\nname = "{crate}"\nversion = "0.1.0"\nedition = "2021"\n')
+            for path in fixture.sources:
+                fixture.write(path, "pub fn value() {}\n")
+            cls.template_tip = fixture.commit()
+
+
     @override
     def setUp(self) -> None:
         # The shipped class list, checked against the real catalog before the test catalog takes its place.
@@ -70,7 +95,7 @@ class StylePlanTests(unittest.TestCase):
         self.style = self.root / "sample-style"
         self.unit = self.root / "sample-style-names"
         self.rule_dir = self.root / "nate_style/rust"
-        self.repo.mkdir()
+        _ = shutil.copytree(self.template_repo, self.repo, symlinks=True)
         self.rule_dir.mkdir(parents=True)
         fake_fmt.install(self.root / "bin", self.root / "fmt")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
@@ -81,16 +106,7 @@ class StylePlanTests(unittest.TestCase):
             "PATH": str(self.root / "bin") + os.pathsep + os.environ.get("PATH", ""),
         })))
         _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", self.rule_dir.parent))
-        _ = self.git("init", "-q", "--initial-branch=main")
-        _ = self.git("config", "user.name", "Planner tests")
-        _ = self.git("config", "user.email", "planner@example.invalid")
-        self.write("Cargo.toml", '[workspace]\nmembers = ["crates/alpha", "crates/beta"]\n')
-        for crate in ("alpha", "beta"):
-            self.write(f"crates/{crate}/Cargo.toml",
-                       f'[package]\nname = "{crate}"\nversion = "0.1.0"\nedition = "2021"\n')
-        for path in self.sources:
-            self.write(path, "pub fn value() {}\n")
-        self.tip = self.commit()
+        self.tip = self.template_tip
         _ = self.git("worktree", "add", "-q", "-b", "style/main", str(self.style))
         _ = self.git("worktree", "add", "-q", "-b", "demo-style-names", str(self.unit))
         _ = (self.repo / ".git/info/exclude").write_text("/docs/style-production/\n/docs/*production.md\n")

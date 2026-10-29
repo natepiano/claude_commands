@@ -152,6 +152,7 @@ ADD_UNIT = SCRIPTS / "production" / "add_unit.py"
 SEND = SCRIPTS / "message" / "send.py"
 SESSION_WAIT_SECONDS = 90.0
 SESSION_POLL_SECONDS = 0.5
+CONDUCTOR_ONLY_VARIABLES = frozenset({"REFUSAL_WATCH_INVENTORY", "PYTHONUNBUFFERED"})
 # herdr lists a stopped agent as live for a few seconds after its process ends.
 AGENT_EXIT_SECONDS = 15.0
 RESTART_LAUNCH_WORKERS = 6
@@ -511,7 +512,7 @@ def _run(argv: list[str], *, dry_run: bool, check: bool = True) -> subprocess.Co
         env={
             name: value
             for name, value in os.environ.items()
-            if not name.startswith("CLAUDE_")
+            if not name.startswith("CLAUDE_") and name not in CONDUCTOR_ONLY_VARIABLES
         },
     )
 
@@ -1116,7 +1117,8 @@ def _herdr_launch(
     session_kind: herdr.SecuritySession | herdr.SessionKindNotRead = _SESSION_KIND_NOT_READ,
 ) -> HerdrLaunch:
     """Resume Claude with its own arguments and one separate opening prompt."""
-    unset_variables: set[str] = {"CLAUDE_CODE_OAUTH_TOKEN"}
+    # A resumed session must not inherit the conductor's temporary controls.
+    unset_variables: set[str] = {"CLAUDE_CODE_OAUTH_TOKEN", *CONDUCTOR_ONLY_VARIABLES}
     if isinstance(parts.account, MoveResumeAccount):
         from scripts.accounts import accounts
 
@@ -2710,7 +2712,7 @@ def _launch_codex_snapshot(
         print(f"herdr {name}: CODEX_HOME={launch['home']} codex {shlex.join(arguments)} in a new tab in {herdr_space(owner)}")
         return SessionLaunched()
     prepared_environment = _prepare_resume_environment(owner["session_id"], owner["cwd"],
-        {"CODEX_HOME": launch["home"]}, herdr.NO_ENVIRONMENT_REMOVALS)
+        {"CODEX_HOME": launch["home"]}, CONDUCTOR_ONLY_VARIABLES)
     if isinstance(prepared_environment, herdr.nix_env.Refused):
         raise herdr.HerdrFailure(prepared_environment.reason)
     server = herdr.restore_server(name, 90_000, session_kind=state.session_kind)

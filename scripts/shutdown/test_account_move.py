@@ -37,6 +37,9 @@ from scripts.accounts import accounts, refusals
 from test_restart import RESTARTED, STOPPED, entry, worker_session, showrunner, top_level, unit
 from test_support import ShutdownTestCase
 
+# Hang guard: natedev reached load 136 on 2026-10-29; scheduling delays are not failures.
+HANG_GUARD_SECONDS = 300
+
 
 class AccountMoveTests(ShutdownTestCase):
     root: Path = Path()
@@ -231,7 +234,7 @@ class AccountMoveTests(ShutdownTestCase):
         result = subprocess.run(
             [sys.executable, str(accounts.SCRIPTS / "accounts" / "accounts.py"),
              "move", "showrunners", "claude3", "--dry-run"],
-            env=environment, capture_output=True, text=True, check=False, timeout=10,
+            env=environment, capture_output=True, text=True, check=False, timeout=HANG_GUARD_SECONDS,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("Traceback", result.stderr)
