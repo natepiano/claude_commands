@@ -12,7 +12,6 @@ import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, cast, override
 from unittest.mock import MagicMock, patch
@@ -22,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 from scripts.astra import astra_roles  # noqa: E402
 from scripts.accounts import role_map  # noqa: E402
 from scripts.agents import codex_mesh  # noqa: E402
-from scripts.guilds import astra_work, daily_read, roles, tips  # noqa: E402
+from scripts.guilds import astra_work, roles  # noqa: E402
 from scripts.guilds.roles import resolve_holder as resolve_current_holder  # noqa: E402
 from scripts.guilds.roles import release_servers as release_design_servers  # noqa: E402
 from scripts.message import sessions  # noqa: E402
@@ -60,7 +59,7 @@ class DurableRolesTests(unittest.TestCase):
             "HOME": str(self.root / "home"), "GUILD_ROLES_STATE": str(self.root / "roles"),
             "GUILD_OWNERSHIP_STATE": str(self.root / "ownership"), "GUILD_ROLES_HOST": "natedev",
             "ASTRA_ROLES_STATE": str(self.root / "holds"), "CLAUDE_CODE_SESSION_ID": self.holder_session,
-            "AGENTS_CONFIG_FILE": str(config), "GUILD_TIPS_REPO": str(self.root / "unused-tips"),
+            "AGENTS_CONFIG_FILE": str(config),
         })))
         _ = self.enterContext(patch.object(roles, "authority_request", side_effect=self.authority))
         _ = self.enterContext(patch.object(roles, "resolve_holder", side_effect=self.reach))
@@ -70,10 +69,6 @@ class DurableRolesTests(unittest.TestCase):
         _ = self.enterContext(patch.object(role_map, "read_role_map", return_value=role_map.RoleMap({}, "codex1")))
         _ = self.enterContext(patch.object(agent_accounts, "codex_account_home", return_value=
             agent_accounts.CodexHomeHoldingLogin("codex1", self.root / "codex-home", "fixture@example.invalid")))
-        def fixture_tips(guild: str) -> str:
-            return "Fixture tips: " + guild
-
-        _ = self.enterContext(patch.object(tips, "load", side_effect=fixture_tips))
         roles.register_repository("fixture-repo", {"natedev": str(self.repository),
                                                     "macbook": str(self.root / "mac-checkout")},
                                   inventory_complete=True)
@@ -226,13 +221,10 @@ class DurableRolesTests(unittest.TestCase):
         self.assertEqual(self.launches, [])
         self.assertEqual(list((self.root / "roles").glob("*/design.json")), [])
 
-    def test_invalid_model_or_missing_tip_baseline_refuses_before_thread_creation(self) -> None:
-        for failing_call in (roles.RoleRefused("invalid guild model"), tips.BaselineMissing("restore the guild tips baseline before starting")):
-            with self.subTest(reason=str(failing_call)):
-                patched_name = "resolve_model" if isinstance(failing_call, roles.RoleRefused) else "load"
-                target = roles if patched_name == "resolve_model" else tips
-                with patch.object(target, patched_name, side_effect=failing_call), self.assertRaises(ValueError):
-                    _ = self.open_designer()
+    def test_invalid_model_refuses_before_thread_creation(self) -> None:
+        with patch.object(roles, "resolve_model", side_effect=roles.RoleRefused("invalid guild model")), \
+                self.assertRaises(ValueError):
+            _ = self.open_designer()
         self.assertEqual(self.launches, [])
 
     def test_missing_or_disallowed_configured_model_never_uses_a_fallback(self) -> None:
@@ -252,7 +244,7 @@ class DurableRolesTests(unittest.TestCase):
         self.assertIsInstance(roles.access_policy(design, "reviewer"), roles.ReadOnlyReviewer)
         self.assertEqual(self.launches, [("reviewer", "thread-reviewer")])
 
-    def test_prompts_and_replies_are_saved_and_read_as_daily_assignments(self) -> None:
+    def test_prompts_and_replies_are_saved_with_phase_assignment_headers(self) -> None:
         design = self.open_designer()
         reply = self.resume(design, "designer")
         prompts = sorted(roles.design_directory(design.placement.design_id).glob("prompts/*.md"))
@@ -264,14 +256,6 @@ class DurableRolesTests(unittest.TestCase):
         self.assertEqual((header.member, header.role, header.reply_path),
                          (self.instance(design, "designer").name, "astra-designer", str(reply)))
         self.assertEqual(header.work, astra_work.phase_work(self.run_a, "1"))
-        self.assertEqual(prompts[-1].read_text().count("Your guild is `designers`."), 1)
-        now = datetime.now(UTC)
-        sources = daily_read.LocalSources((), self.root / "missing-history", self.root / "astra",
-                                         self.root / "roles", "fixture-host")
-        report = daily_read.read_daily("designers", now - timedelta(hours=1), now + timedelta(seconds=1), sources)
-        assignments = cast(list[dict[str, object]], report["assignments"])
-        self.assertTrue(any(row["member"] == header.member and row["role"] == header.role
-                            and row["outcome"] == "OutputRecorded" for row in assignments))
 
     def test_rebind_to_an_existing_second_run_keeps_thread_and_changes_next_header(self) -> None:
         design = self.open_designer()
@@ -293,8 +277,8 @@ class DurableRolesTests(unittest.TestCase):
 
     def test_pending_messages_clear_only_after_successful_turn_acceptance(self) -> None:
         design = self.open_designer()
-        message = roles.queue_message(design.placement.design_id, "designer", "guild-head", "Keep evidence.")
-        _ = roles.queue_message(design.placement.design_id, "designer", "guild-head", "Keep evidence.", message_id=message.id)
+        message = roles.queue_message(design.placement.design_id, "designer", "holder", "Keep evidence.")
+        _ = roles.queue_message(design.placement.design_id, "designer", "holder", "Keep evidence.", message_id=message.id)
         self.assertEqual(roles.pending_messages(design.placement.design_id, "designer"), (message,))
         self.fail_dispatch = True
         with self.assertRaises(roles.RoleRefused):

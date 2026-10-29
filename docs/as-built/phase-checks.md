@@ -1,13 +1,14 @@
 # Phase checks
 
-**What it is.** Every `/unit:direct` phase runs one named step, `<PhaseChecks/>`, made of six checks: cargo mend `--fix`, fmt, taplo, clippy, rustdoc and the style review. Each check has one place in the phase. Lint can repeat clippy and fmt to apply multiply-add repairs. The phase's workers fix the remaining failures. Run end does not repeat lint or style review. Each Cargo checkpoint needs its rustdoc pass. There is no separate `/clippy` skill.
+**What it is.** Every `/unit:direct` phase runs one named step, `<PhaseChecks/>`, made of seven checks: the assertion guard, cargo mend `--fix`, fmt, taplo, clippy, rustdoc and the style review. Each check has one place in the phase. Lint can repeat clippy and fmt to apply multiply-add repairs. The phase's workers fix the remaining failures. Run end does not repeat lint or style review. Each Cargo checkpoint needs its rustdoc pass. There is no separate `/clippy` skill.
 
 ## How it works
 
-**The six checks** (defined in `docs/direct/phase_checks.md`)
+**The seven checks** (defined in `docs/direct/phase_checks.md`)
 
 | Check | Runs in | Over |
 | --- | --- | --- |
+| assertion guard (`scripts/direct/assertion_guard.py`) | the first stage of every `verify.sh lint`, and the checkpoint commit hook | `.rs` and `.py` changes from the merge base with origin's default branch |
 | cargo mend `--fix` | the workers' last `verify.sh lint` | the workspace |
 | fmt (nightly) | the same `lint` | the named package plus every member that differs from HEAD |
 | taplo fmt `--check` | the same `lint` | the workspace TOML, run from the cargo workspace root |
@@ -15,7 +16,7 @@
 | rustdoc `-D warnings` | `verify.sh doc`, run by the unit director as the last command before the checkpoint commit | the workspace |
 | style review | the unit director's main review in `<DualReview/>`, pass 1 only | the phase's diff from `${PHASE_DIR}/phase_baseline`, untracked files included |
 
-`verify.sh lint` runs its stages in this order: mend, fmt, taplo, clippy. Mend rewrites the code first. Fmt formats what mend wrote. The clippy stage runs `cargo clippy --fix` and fmt, repeated while a pass changes the tree, at most three times. Then it updates the cache key and judges. Every clippy run in this path uses `--keep-going`. Workspace rustdoc runs separately through `verify.sh doc` after staging, immediately before the checkpoint commit; its exact-tree pass record is mandatory. See [Lint-step fix](build-followups-mul-add.md#lint-step-fix) for the pass rules.
+`verify.sh lint` runs its stages in this order: assertion guard, mend, fmt, taplo, clippy. The assertion guard reads one `git diff -U0` and the commit messages from the base, and reports removed, weaker, changed (a note that does not block), test removed and test turned off; it judges a multi-line assertion as one whole statement and ignores whitespace, so a reflow or a move is no finding. A finding blocks unless an `Assertion-Change: <path>::<test> — <why>` line in the run's work orders (`UNIT_SESSION_DIR`) or a commit message names it. It takes about 0.5 s on the 87,000-line cargo-liner-tile checkpoint e21d5b93. Mend rewrites the code first. Fmt formats what mend wrote. The clippy stage runs `cargo clippy --fix` and fmt, repeated while a pass changes the tree, at most three times. Then it updates the cache key and judges. Every clippy run in this path uses `--keep-going`. Workspace rustdoc runs separately through `verify.sh doc` after staging, immediately before the checkpoint commit; its exact-tree pass record is mandatory. See [Lint-step fix](build-followups-mul-add.md#lint-step-fix) for the pass rules.
 
 **Files and their roles**
 
@@ -68,7 +69,7 @@
 
 ## Invariants
 
-- Each of the six checks runs at the place `<PhaseChecks/>` names. The lint check owns its multiply-add repair rounds and the format and judgment that follow them.
+- Each of the seven checks runs at the place `<PhaseChecks/>` names. The lint check owns its multiply-add repair rounds and the format and judgment that follow them.
 - After the last phase, lint and style review do not repeat: `verify.sh final` stays check plus tests, `verify.sh` has no `fmt` arm, and `<FinalGate/>`, `<FinalGateCommit/>` and `/unit:checkpoint` do not lint, reformat or style-review. Each later Cargo checkpoint still needs its rustdoc pass.
 - `commands/unit/style_review.md` is the one source of the style review. The phase review reads it at the point of use and never restates it.
 - Workers never load the style guide. The unit director's main review is the only place style is audited in a phase.
