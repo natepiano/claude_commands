@@ -211,7 +211,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - `impl` — `measure.py`, `push_audit.py` and the doc
 - `test` — `test_measure.py` and `test_push_audit.py`: `compare` on fixtures with known before and after values, and the fixtures above
 
-**Constraints from prior phases:** shared log helpers live in `scripts/hierarchies/log_records.py`; `measure.py` imports `push_audit.py`, never the reverse; session names come only from `config/hierarchies/sessions.toml`. The wait records come from `progress_history.py waits` (phases-unit 820357a2) through the Phase 4 loader and types.
+**Constraints from prior phases:** shared log helpers live in `scripts/hierarchies/log_records.py`; `measure.py` imports `push_audit.py`, never the reverse; session names come only from `config/hierarchies/sessions.toml`. The wait records come from `progress_history.py waits` (phases-unit 820357a2) through the Phase 4 loader and types. From Phase 8: `measure.py baseline` and `push_audit.py report` print a short summary by default and their tables under `--full`; `compare` prints the same way.
 
 **Acceptance gate:** unit tests green; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; Results holds real numbers for each step, judged on the measure and review point each of Phases 3–5 names. **Measure and review point:** this phase is the review point for Steps 1, 2 and 4. At phase end the unit director sends the showrunner the Results and the keep-or-drop list as one question for the user.
 
@@ -233,33 +233,20 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 **Binds later work:** a later push count or comparison calls `push_audit.audit()`; it never adds a second reader or rule. New session names go only in `sessions.toml`.
 
 ### Phase 8 — The worker ownership report and the push audit open with what a person needs  · status: done
-**Depends on:** Phases 5 and 7 (showrunner returns of C443, C446 and C447, 2026-10-29: runs next, as a small checkpoint after Phase 7).
 
-#### Work Order
+#### As-built
 
-**Goal:** both reports show a person a short answer first. `worker_owners.py report` always finishes and ends with its Totals line. `push_audit.py report` opens with one summary line and puts its tables under `--full`, as `measure.py baseline` does. The session-name check changes the name and sees the change.
-
-**Hana link:** indirect. The Phase 6 review re-runs both reports; a report that stops on one bad file, or buries its total in 25 long rows, gives it no usable number.
-
-**Spec:**
-- `worker_owners.py` (C443):
-  - An empty or unreadable source file (seen live: an empty `~/.local/state/review-pool/build-followups/mesh/0/mesh_roster.json`, "Expecting value: line 1 column 1 (char 0)") is a source problem. The report still prints every worker row it could read.
-  - Text output order: worker rows, then source-problem lines, then the timer line, then the Totals line last. Totals also names the count of source problems (`source_problems=N`).
-  - `report` and `recover` exit 0 when they print the report, source problems included. `end` keeps its rules: no worker is ended while any source problem exists, and a failed end exits 1.
-  - Timers: by default the report prints one line, `Timers: <n> registered, <m> with no recorded request (the showrunner checks these; --full lists each)`. `--full` prints each timer line as today. `--json` is unchanged.
-- `push_audit.py report` (C446): by default prints a short summary like `measure.py`'s `baseline_summary`: the window; delivered pushes and pushes after a failed text check, with the count per class (ApprovedPriorityTwo, ApprovedRegisteredText, Unapproved); the source-problem count and `Use --full to print the tables.` `--full` prints the summary, then today's tables. The numbers are the same in both forms.
-- Session-name check (C447): the Change-Review row changes `display_name` in `config/hierarchies/sessions.toml` to another word, runs the full `push_audit.py report --full` command over a window with a hana row (2026-10-21T20:23 to 2026-10-28T20:23 has two), sees the new word, then changes it back. No code change unless the new word does not print.
+- `worker_owners.py report` and `recover` always finish and exit 0 when they print the report. An empty or unreadable source file is a source problem. The report still prints every worker row it can read.
+- Text output order: worker rows, notes, source-problem lines, one `Timers: <n> registered, <m> with no recorded request` line, then `Totals:` last with `source_problems=N`. `--full` prints each timer line in place of the one `Timers` line. `--json` is unchanged.
+- `worker_owners.py end` exits 1 when a source problem exists or an end fails. A timer source that cannot be read stops all ends.
+- `push_audit.py report` prints `report_summary()` by default: four lines (window; delivered pushes and pushes after a failed text check; counts per class ApprovedPriorityTwo / ApprovedRegisteredText / Unapproved; source-problem count and the `--full` hint). `--full` prints the summary, then the tables. Both forms show the same numbers.
+- Live Baseline window: 64 delivered, 17 after a failed text check, classes 1 / 16 / 0.
 
 **Files:**
-- `scripts/hierarchies/worker_owners.py`, `scripts/hierarchies/test_worker_owners.py` — output order, exit status, `--full`
-- `scripts/hierarchies/push_audit.py`, `scripts/hierarchies/test_push_audit.py` — summary and `--full`
+- `scripts/hierarchies/worker_owners.py`, `scripts/hierarchies/test_worker_owners.py` — output order, exit status, `--full` timers
+- `scripts/hierarchies/push_audit.py`, `scripts/hierarchies/test_push_audit.py` — `report_summary()` and `--full` tables
 
-**Workers:** `1 writer`
-- `impl` — all four files
-
-**Constraints from prior phases:** shared log helpers live in `scripts/hierarchies/log_records.py`; `push_audit.py` never imports `measure.py`. Session names come only from `config/hierarchies/sessions.toml`.
-
-**Acceptance gate:** unit tests green, with tests that pin: an empty roster file gives one source-problem line, worker rows from the other files, Totals as the last line and exit 0; the default worker report prints one timer line and `--full` prints each timer; `end` still ends nothing while a source problem exists; the default push audit prints the summary with the same totals as `--full` and no table rows. Per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green. Live on natedev: `worker_owners.py report` exits 0 and its last line starts `Totals:`; `push_audit.py report` over the Baseline window prints at most six lines and names 17 of 64. **Change-Review rows** (new, replacing C443, C446, C447): one per item above, each with a full command a person can paste.
+**Binds later work:** reports print a short summary by default and their tables under `--full`; a new report or compare follows the same form. `push_audit.py` never imports `measure.py`; shared log helpers live in `scripts/hierarchies/log_records.py`.
 
 ### Phase 9 — An attached production's earlier change rows reach /next and the count, under their own names  · status: todo
 **Depends on:** Phase 8 (showrunner request 2026-10-29: a defect in nested showrunners, fixed at its cause).
