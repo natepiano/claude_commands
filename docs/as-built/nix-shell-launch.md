@@ -20,7 +20,11 @@ of three frozen dataclasses:
 
 It searches the start directory and then its parents. Resolved `.envrc` files
 under `~/rust`, `~/worktrees`, and `~/.claude*` are approved with
-`direnv allow <envrc>`. Files elsewhere require existing explicit approval;
+`direnv allow <envrc>`. Linked worktrees outside those roots are also approved
+when their `.git`, `commondir`, and `gitdir` back pointer prove registration by
+a repository under a trusted root, using file reads alone. This covers
+style-sync lint snapshots made with `git worktree add` under `/tmp/claude/session`;
+clones and forged links still require explicit approval. Files elsewhere require existing explicit approval;
 a blocked-file refusal names the `direnv allow <path>` command. Each direnv
 command has a 600-second timeout. `direnv export json` runs in the requested
 directory with the supplied base environment. Strings replace variables;
@@ -50,7 +54,7 @@ resolver before calling `exec`.
 | `berth_fix/launch.sh` | Proves the worktree before opening a window; both window and current-terminal starts use `nix_env.py exec`. Worktree approval failure is fatal. |
 | `agents/agent_bg.sh` | Proves the cwd while making worker settings, passes the loaded env through settings for the long-lived background daemon, and starts the CLI through `exec`. |
 | `agents/agent_exec.sh` | Claude print runs use `exec` after changing to their requested directory. |
-| `agents/codex_mesh.py` | The shared Codex app-server calls `ensure(worktree, environment)` and starts Codex directly with the loaded env. Protected account, run, temporary-directory and guild values come from the caller. `Refused` logs the helper's line, remembers the failed shell, and falls back to the caller env so other workers keep their shared server. The recorded pid is the server's pid. |
+| `agents/codex_mesh.py` | The shared Codex app-server calls `ensure(worktree, environment)` and starts Codex directly with the loaded env. Protected account, run, temporary-directory and held-role values come from the caller. `Refused` logs the helper's line, remembers the failed shell, and falls back to the caller env so other workers keep their shared server. The recorded pid is the server's pid. |
 | `accounts/accounts.py` | `exec` calls `launch_shell_environment(cwd)` for every Claude and Codex label. That guard dynamically loads `nix_env` and calls `ensure(cwd, os.environ)`, puts the caller's HOME back, and exits 1 with the helper's reason on `Refused`. |
 | `cli_agent/cli_agent.sh` | Interactive and command Claude launches use `exec` in the caller's directory. |
 | `notify/review.py` | Loads the current directory's env before the Claude reviewer starts; refusal returns an unreviewed result. |

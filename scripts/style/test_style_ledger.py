@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+import fcntl
 import io
 import json
 import re
@@ -10,19 +11,23 @@ import sqlite3
 import subprocess
 import sys
 import threading
-import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from contextlib import closing, redirect_stdout
 from datetime import datetime, timezone
-from typing import cast, final
+from typing import IO, cast, final
 from unittest import mock
 import rules
 import style_ledger
+from approved_renames import AppliedInCode
 
 
 from ledger_test_support import (LedgerTestCase, LedgerStatus, PARENT_FILE)
+
+
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
 
 
 @final
@@ -33,20 +38,29 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         lock_path = self.root / "state" / self.repo.name / "refill.lock"
         self.assertEqual(lock_path.parent, style_ledger.ledger_location(self.repo).database.parent)
         self.assertFalse(lock_path.parent.exists())
-        attempting, acquired = threading.Event(), threading.Event()
+        blocked, acquired = threading.Event(), threading.Event()
+        flock = fcntl.flock
+
+        def observe_lock(file: IO[str], operation: int) -> None:
+            self.assertEqual(operation, fcntl.LOCK_EX)
+            try:
+                flock(file, operation | fcntl.LOCK_NB)
+            except BlockingIOError:
+                blocked.set()
+                flock(file, operation)
 
         def take_lock() -> None:
-            attempting.set()
             with style_ledger.refill_lock(worktree):
                 acquired.set()
 
         with ThreadPoolExecutor(max_workers=1) as pool:
             with style_ledger.refill_lock(self.repo):
                 self.assertTrue(lock_path.is_file())
-                contender = pool.submit(take_lock)
-                self.assertTrue(attempting.wait(5), "second worktree did not attempt refill")
-                self.assertFalse(acquired.wait(0.2), "second worktree entered a held refill lock")
-            contender.result(timeout=5)
+                with mock.patch.object(fcntl, "flock", side_effect=observe_lock):
+                    contender = pool.submit(take_lock)
+                    self.assertTrue(blocked.wait(TEST_HANG_GUARD_SECS), "second worktree did not contend for refill")
+                    self.assertFalse(acquired.is_set(), "second worktree entered a held refill lock")
+            contender.result(timeout=TEST_HANG_GUARD_SECS)
         self.assertTrue(acquired.is_set(), "refill lock was not released on context exit")
 
     def test_migration_25_backfills_from_merged_build_ticket_else_the_finding(self) -> None:
@@ -202,14 +216,21 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         before = self.refill_result(ledger.database)
         with closing(sqlite3.connect(ledger.database)) as writer:
             _ = writer.execute("BEGIN IMMEDIATE")
-            began = time.monotonic()
-            with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
+            connect = sqlite3.connect
+            busy_budgets: list[tuple[int]] = []
+
+            def observe_connect(database: str, *, uri: bool, timeout: float) -> sqlite3.Connection:
+                connection = connect(database, uri=uri, timeout=timeout)
+                busy_budgets.append(cast(tuple[int], connection.execute("PRAGMA busy_timeout").fetchone()))
+                return connection
+
+            with (mock.patch.object(sqlite3, "connect", side_effect=observe_connect),
+                  self.assertRaisesRegex(sqlite3.OperationalError, "database is locked")):
                 style_ledger.record_split(self.repo, "names-unit",
                                           style_ledger.RecordedSplit(1, 2, 3, 4, "2026-10-28T12:00:00+00:00"),
                                           busy_timeout_seconds=0.05)
-            elapsed = time.monotonic() - began
             writer.rollback()
-        self.assertLess(elapsed, 0.75)
+        self.assertEqual(busy_budgets, [(50,)])
         self.assertEqual(self.refill_result(ledger.database), before)
 
     def test_a_later_split_preserves_the_refill_and_a_refill_preserves_the_split(self) -> None:
@@ -1677,6 +1698,52 @@ class StyleLedgerRecordsTests(LedgerTestCase):
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
         self.assertEqual(versions, [(max(style_ledger.MIGRATIONS),)])
 
+
+    def test_workspace_checkpoint_shares_only_recorded_matching_ticket_proofs_across_reopen(self) -> None:
+        source = "fn f() {\n    let old = input;\n    consume(old);\n    let second = input;\n    consume(second);\n}\n"
+        ledger, issue, base = self.binding_ticket(source, ((2, "old", "fresh"),))
+        path = self.sources[0]
+        rule = self.rule("prefer-type-named-fields-and-bindings")
+        second = ledger.hold(rule, path, 4, source.splitlines()[3], "rename", "second", "next", self.blob(rule), "outside")
+        other_issue = self.root / "second.md"
+        ledger.file_held(second.finding_id, other_issue)
+        # Workspace tickets retain separate decisions and finding ownership.
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE tickets SET crate='.' WHERE id='names-1'")
+        ledger.ticket_add("names-second-1", "names-second", "proposal", "names", ".", [path], [rule],
+                          proposal=str(other_issue), finding_ids=(second.finding_id,))
+        ledger.ticket_assign("names-second-1", "main")
+        self.assertEqual(ledger.ticket_base("names-second-1"), base)
+        self.write(path, source.replace("old", "fresh").replace("second", "next"))
+        checkpoint = self.commit("Two separately approved binding renames")
+        ledger.set_tip(checkpoint, "main")
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        with self.assertRaises(style_ledger.LedgerError):
+            ledger.bulk_share_checkpoint(("names-1", "names-second-1"))
+        ledger.ticket_checkpoint("names-second-1", checkpoint)
+        first, = ledger.proposal_findings(issue)
+        self.assertNotIsInstance(ledger.applied_check(first, checkpoint), AppliedInCode)
+        for column, changed in (("base", self.initial_tip), ("branch", "refs/heads/unrelated"),
+                                ("checkpoint", base), ("rules", "[]"), ("crate", "crates/alpha"),
+                                ("kind", "read"), ("family", "values")):
+            with self.subTest(column=column), closing(sqlite3.connect(ledger.database)) as connection:
+                previous = cast(tuple[str], connection.execute(f"SELECT {column} FROM tickets WHERE id='names-second-1'").fetchone())[0]
+                with connection:
+                    _ = connection.execute(f"UPDATE tickets SET {column}=? WHERE id='names-second-1'", (changed,))
+                with self.assertRaises(style_ledger.LedgerError):
+                    ledger.bulk_share_checkpoint(("names-1", "names-second-1"))
+                with connection:
+                    _ = connection.execute(f"UPDATE tickets SET {column}=? WHERE id='names-second-1'", (previous,))
+        ledger.bulk_share_checkpoint(("names-1", "names-second-1"))
+        ledger.bulk_share_checkpoint(("names-second-1", "names-1"))  # Idempotent; also clears an earlier incomplete proof.
+        self.assertIsInstance(ledger.applied_check(first, checkpoint), AppliedInCode)
+        self.assertNotIsInstance(ledger.applied_check(first, base), AppliedInCode)
+        # A fresh process reads the group; merging the first ticket must not hide its proof from the second.
+        reopened = self.ledger()
+        self.assertEqual(reopened.ticket_merge("names-1"), ())
+        self.assertEqual(reopened.ticket_merge("names-second-1"), ())
+        self.assertTrue(all(isinstance(f.state, style_ledger.Built)
+                            for f in reopened.named_held((first.finding_id, second.finding_id))))
 
 if __name__ == "__main__":
     _ = unittest.main()

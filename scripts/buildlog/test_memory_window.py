@@ -20,6 +20,9 @@ import memory
 import store
 from test_index import Record, call, encode, point_root_at, sample, step
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 CLI = Path(__file__).with_name("cli.py")
 GIB = 2**30
 START = "2026-10-04T23:30-07:00"
@@ -89,7 +92,7 @@ class MemoryWindowTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
-            timeout=30,
+            timeout=TEST_HANG_GUARD_SECS,
         )
 
     def write(self, path: Path, *records: Record) -> None:

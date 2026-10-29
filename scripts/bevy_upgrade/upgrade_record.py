@@ -16,7 +16,7 @@ from pins import Pin, Pins
 from upstream import Item, TargetPrerelease, TargetReleased, TargetUnpublished
 
 if TYPE_CHECKING:
-    from add_unit import Production
+    from production_units import Production
 
 
 class Answer(TypedDict):

@@ -27,6 +27,9 @@ import scratch
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 SCRIPT = Path(__file__).with_name("merge_checkpoint.py")
 STARTED = "2026-10-06T12:00:00-07:00"
 TRIAL = ("review trial: ux 2 findings, code 3 findings, review-worker minutes 14, "
@@ -1334,7 +1337,7 @@ class MergeCheckpointTests(unittest.TestCase):
         for arguments in commands:
             result = subprocess.run(
                 [sys.executable, str(ledger), *arguments, "--repo", str(self.unit)],
-                env=self.env, capture_output=True, text=True, check=False, timeout=30,
+                env=self.env, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

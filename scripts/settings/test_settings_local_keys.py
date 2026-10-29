@@ -7,6 +7,9 @@ import unittest
 from pathlib import Path
 from typing import cast, final
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 KEYS = Path(__file__).with_name("settings_local_keys.sh")
 BASH = shutil.which("bash") or "/bin/bash"
 NATEDEV = {
@@ -33,7 +36,7 @@ def program(name: str, settings: object, sidecar: object | None = None) -> objec
     """Run one of the jq programs settings_local_keys.sh defines."""
     script = f'source "$0"; jq --argjson keys "$SETTINGS_LOCAL_KEYS_JSON" --argjson local "$1" "${name}"'
     ran = subprocess.run([BASH, "-c", script, str(KEYS), json.dumps([sidecar] if sidecar is not None else [])],
-                         input=json.dumps(settings), capture_output=True, text=True, check=True, timeout=30)
+                         input=json.dumps(settings), capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS)
     return cast(object, json.loads(ran.stdout))
 
 

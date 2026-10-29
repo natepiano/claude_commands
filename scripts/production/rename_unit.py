@@ -42,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "herdr"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "style"))
 import add_unit  # noqa: E402
+from production_units import Production, read_production  # noqa: E402
 import issues  # noqa: E402
 import merge_checkpoint  # noqa: E402
 import phase_table  # noqa: E402
@@ -163,12 +164,12 @@ def _swap(value: str, old_stem: str, new_stem: str, what: str) -> str:
     return swapped
 
 
-def _production(slug: str) -> add_unit.Production:
+def _production(slug: str) -> Production:
     instance = showrunners.NOTIFIER_STATE_DIR / f"showrunner-{slug}"
     checked = showrunners.checked_doc(instance)
     if isinstance(checked, showrunners.NoCheckedDoc):
         raise RenameRefused(f"{slug} has no readable update timer: {checked.reason}")
-    return add_unit.read_production(checked.path)
+    return read_production(checked.path)
 
 
 def _rows(doc: Path) -> list[dict[str, str]]:

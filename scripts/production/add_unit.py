@@ -14,7 +14,6 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast, override
-from zoneinfo import ZoneInfo
 from uuid import uuid4
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -29,10 +28,9 @@ import showrunners
 import sessions
 import unit_lookup
 import unit_names
-from production_units import Refusal, cell_value, plan_cell_is_retired, production_field, unit_rows, unit_headings, unit_table
+from production_units import Production, Refusal, cell_value, plan_cell_is_retired, read_production, unit_rows, unit_headings, unit_table
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from user_zone import user_zone  # noqa: E402
 from probe_session import PROBE_ENV  # noqa: E402
 
 if TYPE_CHECKING:
@@ -40,15 +38,6 @@ if TYPE_CHECKING:
     import launch_permission
     from scripts.accounts.accounts import ClaudeLaunchAccount
     from record import SessionShutdown
-
-
-class Production(NamedTuple):
-    doc: Path
-    slug: str
-    merge_branch: str
-    checkout: Path
-    log: Path
-    zone: ZoneInfo
 
 
 class ProductionPlanRequired(NamedTuple):
@@ -296,27 +285,6 @@ class MarkedUnitFound:
 @dataclass(frozen=True)
 class NoMarkedUnit:
     """No session carries the requested unit's marks."""
-
-
-def read_production(path: Path) -> Production:
-    """Read the production fields shared with merge_checkpoint.py."""
-    try:
-        doc = path.resolve(strict=True)
-        lines = doc.read_text(encoding="utf-8").splitlines()
-        merge_branch = production_field(lines, "Merge branch")
-        checkout = Path(production_field(lines, "Showrunner checkout")).expanduser().resolve()
-        log = Path(production_field(lines, "Log"))
-        zone = user_zone()
-        slug = doc.name.removesuffix("-production.md")
-        if slug == doc.name:
-            raise Refusal("production doc name must end in -production.md")
-        if log.is_absolute():
-            raise Refusal("production Log must be relative to Showrunner checkout")
-        if "## Units" not in lines:
-            raise Refusal("production doc lacks Units table")
-        return Production(doc, slug, merge_branch, checkout, checkout / log, zone)
-    except (OSError, UnicodeError, KeyError, ValueError) as error:
-        raise Refusal(f"cannot read production doc: {error}") from error
 
 
 def git(production: Production, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:

@@ -15,6 +15,9 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_roles  # noqa: E402
 from scripts.guilds import roles  # noqa: E402
@@ -49,7 +52,7 @@ class AstraRolesTests(unittest.TestCase):
 
     def command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), *arguments], env=self.environment,
-                              capture_output=True, text=True, check=False, timeout=5)
+                              capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def hold_mesh(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return self.command("hold", "designer", "--session-dir", str(self.mesh_run),
@@ -260,7 +263,7 @@ class AstraRolesTests(unittest.TestCase):
         finally:
             if process.stdin is not None:
                 process.stdin.close()
-            _ = process.wait(timeout=5)
+            _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(self.records(), [])
         self.assertFalse((self.state / "thread-reviewer.json").exists())
 
