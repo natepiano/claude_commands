@@ -7,6 +7,7 @@ import argparse
 from collections.abc import Callable
 from contextlib import ExitStack
 from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import importlib
 import json
@@ -17,7 +18,7 @@ import subprocess
 import sys
 import time
 from types import FrameType
-from typing import Protocol, TypedDict, cast, final
+from typing import Literal, Protocol, TypedDict, cast, final
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -26,6 +27,7 @@ from targets import (
     ANY_ELIGIBLE_TARGET,
     ConfigError,
     EligibleTarget,
+    ExcludedTarget,
     ExpiresAt,
     Free,
     Held,
@@ -69,6 +71,7 @@ class CliArguments(argparse.Namespace):
         self.signal_name: str = "TERM"
         self.repo_root: str = ""
         self.package: str = ""
+        self.kind: str = ""
         self.local_reason: str = ""
         self.leave_hook: str = ""
         self.caller: str = ""
@@ -141,13 +144,84 @@ def command_eligible(
         print(f"build targets: {error}", file=sys.stderr)
         return 2
     for result in eligibility:
-        target = result.target
-        disposition = "eligible" if isinstance(result, EligibleTarget) else "excluded"
-        reason = "-" if isinstance(result, EligibleTarget) else display_field(result.reason)
-        settings = str(target.settings) if isinstance(target, SshTarget) else "-"
-        print(f"{target.name}\t{disposition}\t{reason}\t{settings}")
+        print_eligible_target(result)
     return 0
 
+
+def print_eligible_target(result: EligibleTarget | ExcludedTarget) -> None:
+    target = result.target
+    disposition = "eligible" if isinstance(result, EligibleTarget) else "excluded"
+    reason = "-" if isinstance(result, EligibleTarget) else display_field(result.reason)
+    settings = str(target.settings) if isinstance(target, SshTarget) else "-"
+    print(f"{target.name}\t{disposition}\t{reason}\t{settings}")
+
+
+StepKind = Literal["check", "lint", "doc", "test", "build", "example", "final"]
+
+
+@dataclass(frozen=True)
+class MacAllowed:
+    pass
+
+
+@dataclass(frozen=True)
+class NatedevOnly:
+    reason: str
+
+
+def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
+                           package: str, kind: StepKind, routing: Routing
+                           ) -> EligibleTarget | ExcludedTarget:
+    if kind in ("build", "example"):
+        return ExcludedTarget(target, "makes natedev artifacts")
+    if kind == "final":
+        return ExcludedTarget(target, "full gate runs on natedev")
+    if isinstance(routing, LocalRequired):
+        return ExcludedTarget(target, routing.reason)
+    verb: offload.MacVerb = "nextest" if kind == "test" else "clippy" if kind == "lint" else kind
+    try:
+        config = offload.read_config(target.settings) if isinstance(target, SshTarget) else offload.read_config()
+        eligibility = offload.mac_step_eligibility(config, repo_root, package, verb)
+        if isinstance(eligibility, offload.IneligibleMacStep):
+            return ExcludedTarget(target, eligibility.reason)
+        probe = offload.probe_mac(offload.ProcessController(), config, eligibility)
+        if isinstance(probe, offload.UnavailableProbe):
+            return ExcludedTarget(target, "unreachable")
+        if probe.free_gib < config.free_floor_gib:
+            return ExcludedTarget(target, "disk")
+    except (OSError, UnicodeError, ValueError) as error:
+        return ExcludedTarget(target, f"state unreadable: {error}")
+    return EligibleTarget(target)
+
+
+def command_kind_eligible(repo_root: Path, package: str, kind: StepKind, routing: Routing) -> int:
+    try:
+        eligibility = tuple(
+            mac_target_eligibility(target, repo_root, package, kind, routing)
+            if target.platform == "macos" else EligibleTarget(target)
+            for target in read_targets()
+        )
+    except (ConfigError, OSError, UnicodeError, ValueError) as error:
+        print(f"natedev_only state unreadable: {display_field(str(error))}")
+        return 0
+    decision: MacAllowed | NatedevOnly = NatedevOnly("no Mac target configured")
+    if kind in ("build", "example"):
+        decision = NatedevOnly("makes natedev artifacts")
+    elif kind == "final":
+        decision = NatedevOnly("full gate runs on natedev")
+    elif isinstance(routing, LocalRequired):
+        decision = NatedevOnly(routing.reason)
+    for result in eligibility:
+        if result.target.platform != "macos":
+            continue
+        if isinstance(result, EligibleTarget):
+            decision = MacAllowed()
+            break
+        decision = NatedevOnly(result.reason)
+    print("mac_allowed" if isinstance(decision, MacAllowed) else f"natedev_only {display_field(decision.reason)}")
+    for result in eligibility:
+        print_eligible_target(result)
+    return 0
 
 
 def wait_clock() -> datetime:
@@ -398,7 +472,8 @@ def parser() -> argparse.ArgumentParser:
     _ = status.add_argument("--probe", action="store_true")
     eligible = commands.add_parser("eligible")
     _ = eligible.add_argument("--repo-root", required=True)
-    _ = eligible.add_argument("--package", required=True)
+    _ = eligible.add_argument("--package", default="")
+    _ = eligible.add_argument("--kind", choices=("check", "lint", "doc", "test", "build", "example", "final"), default="")
     _ = eligible.add_argument("--local", dest="local_reason", default="")
     register = commands.add_parser("register-local")
     _ = register.add_argument("--call-id", required=True)
@@ -421,6 +496,8 @@ def main() -> int:
     args = parser().parse_args(namespace=CliArguments())
     if args.command == "eligible":
         routing = LocalRequired(args.local_reason) if args.local_reason else ANY_ELIGIBLE_TARGET
+        if args.kind:
+            return command_kind_eligible(Path(args.repo_root).resolve(), args.package, cast(StepKind, args.kind), routing)
         return command_eligible(Path(args.repo_root).resolve(), args.package, routing)
     if args.command == "register-local":
         return command_register_local(args.call_id, pid=args.pid)

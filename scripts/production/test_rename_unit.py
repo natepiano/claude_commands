@@ -605,9 +605,17 @@ class UnitRenameTests(unittest.TestCase):
         _ = self.mark_live("gamma-unit", "sid-alpha")
         old = self.rust / "claude-demo-alpha"
         old.mkdir()
-        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], cwd=old)
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import sys; print('ready', flush=True); sys.stdin.read()"],
+            cwd=old, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         self.addCleanup(child.wait)
         self.addCleanup(child.kill)
+        assert child.stdin is not None
+        assert child.stdout is not None
+        self.addCleanup(child.stdin.close)
+        self.addCleanup(child.stdout.close)
+        # Python must finish startup before its cwd disappears; otherwise getpath can exit first.
+        self.assertEqual(child.stdout.readline(), "ready\n")
         # The folder is gone, but the process still has it as its working directory.
         old.rmdir()
         result = self.rename("verify")
