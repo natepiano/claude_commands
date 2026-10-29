@@ -181,7 +181,8 @@ class LedgerTests(unittest.TestCase):
         def caller_start(pid: int) -> str | None:
             return "start" if pid == self.pid else None
         _ = self.enterContext(patch.object(gate, "process_start_time", side_effect=caller_start))
-        _ = self.enterContext(patch.object(gate, "process_tree_memory", return_value=gate.MeasuredMemory(8 * GIB)))
+        _ = self.enterContext(patch.object(gate, "process_table", return_value={self.pid: gate.ProcessIdentity(1, "start")}))
+        _ = self.enterContext(patch.object(gate, "tree_memory", return_value=gate.MeasuredMemory(8 * GIB)))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root / "log")})))
 
     def check(self, available: int, *, force: bool = False, sidecar: str = "",
@@ -343,7 +344,8 @@ class LedgerTests(unittest.TestCase):
         first = gate.check(self.meminfo, self.pid, "", ["cargo", "nextest"], root=self.root, now=NOW)
         self.assertIsInstance(first.reservation, gate.Reserved)
         _ = self.meminfo.write_text("MemAvailable: 20971520 kB\n")
-        def grow(_row: gate.Reservation, _now: datetime) -> gate.StepMemory:
+        def grow(_row: gate.Reservation, _now: datetime, _processes: dict[int, gate.ProcessIdentity],
+                 _proc: Path) -> gate.StepMemory:
             _ = self.meminfo.write_text("MemAvailable: 8388608 kB\n")
             return gate.MeasuredMemory(8 * GIB)
         with patch.object(gate, "step_memory", side_effect=grow):
@@ -375,9 +377,13 @@ class MemoryQueueFixture(unittest.TestCase):
         self.readings = {100: gate.MeasuredMemory(GIB), 200: gate.MeasuredMemory(2 * GIB)}
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root)})))
         _ = self.enterContext(patch.object(gate, "process_start_time", side_effect=self.processes.get))
-        def reading(pid: int, _start: str) -> gate.MeasuredMemory | gate.GoneMemory:
+        def table(_proc: Path) -> dict[int, gate.ProcessIdentity]:
+            return {pid: gate.ProcessIdentity(1, start) for pid, start in self.processes.items()}
+        _ = self.enterContext(patch.object(gate, "process_table", side_effect=table))
+        def reading(pid: int, _start: str, _processes: dict[int, gate.ProcessIdentity],
+                    _proc: Path) -> gate.MeasuredMemory | gate.GoneMemory:
             return self.readings[pid]
-        _ = self.enterContext(patch.object(gate, "process_tree_memory", side_effect=reading))
+        _ = self.enterContext(patch.object(gate, "tree_memory", side_effect=reading))
 
     def running(self, pid: int, need: float, age: float = 60) -> Path:
         row: gate.Reservation = {"pid": pid, "start_time": self.processes[pid], "need": int(need * GIB),
@@ -683,9 +689,48 @@ class ProcessMemoryTests(unittest.TestCase):
                 fields = [state, str(parent), *(["0"] * 17), start]
                 _ = (path / "stat").write_text(f"{pid} (test process) " + " ".join(fields))
                 _ = (path / "status").write_text(f"VmRSS: {resident} kB\nVmSwap: {swap} kB\n")
-            self.assertEqual(gate.process_tree_memory(100, "start", proc), gate.MeasuredMemory(69 * 1024))
-            self.assertEqual(gate.process_tree_memory(100, "reused", proc), gate.GoneMemory())
-            self.assertEqual(gate.process_tree_memory(999, "gone", proc), gate.GoneMemory())
+            processes = gate.process_table(proc)
+            self.assertEqual(gate.tree_memory(100, "start", processes, proc), gate.MeasuredMemory(69 * 1024))
+            self.assertEqual(gate.tree_memory(100, "reused", processes, proc), gate.GoneMemory())
+            self.assertEqual(gate.tree_memory(999, "gone", processes, proc), gate.GoneMemory())
+
+    def test_check_reads_one_table_for_promised_measured_and_reused_reservations(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            proc = root / "proc"
+            for pid, parent, start, resident, swap in (
+                (100, 1, "fresh", 900, 0), (200, 1, "running", 20, 3),
+                (201, 200, "child", 30, 4), (300, 1, "reused", 800, 0),
+            ):
+                path = proc / str(pid)
+                path.mkdir(parents=True)
+                fields = ["S", str(parent), *(["0"] * 17), start]
+                _ = (path / "stat").write_text(f"{pid} (test process) " + " ".join(fields))
+                _ = (path / "status").write_text(f"VmRSS: {resident} kB\nVmSwap: {swap} kB\n")
+            directory = gate.admission_dir(root)
+            for pid, start, age in ((100, "fresh", 0), (200, "running", gate.START_SECONDS), (300, "old", 0)):
+                row: gate.Reservation = {
+                    "pid": pid, "start_time": start, "need": 4 * GIB, "repo": "test",
+                    "step": "check", "worktree": "test", "sidecar": "",
+                    "admitted_at": store.utc_iso(NOW.timestamp() - age),
+                    "test_threads": None, "call_id": None,
+                }
+                _ = (directory / f"{pid}.reservation").write_text(json.dumps(row))
+            _ = (directory / "300.max").write_text("100")
+            meminfo = root / "meminfo"
+            _ = meminfo.write_text(f"MemAvailable: {8 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
+            starts = {100: "fresh", 200: "running", 300: "old", 400: "caller"}
+            with patch.dict(os.environ, {"BUILDLOG_DIR": str(root), "BUILDLOG_PROC": str(proc)}), \
+                 patch.object(gate, "process_start_time", side_effect=starts.get), \
+                 patch.object(gate, "process_table", wraps=gate.process_table) as tables:
+                result = gate.check(meminfo, 400, "", ["cargo", "check"], root=root, now=NOW,
+                                    profile=gate.StepProfile("test", "check", "test", gate.ExpectedPeak(2 * GIB, "fallback", 0)))
+            tables.assert_called_once_with(proc)
+            self.assertEqual((result.decision.state, result.decision.promised, result.decision.measured),
+                             ("hold", 4 * GIB, 57 * 1024))
+            self.assertCountEqual([row["pid"] for row in result.live], [100, 200])
+            self.assertFalse((directory / "300.reservation").exists())
+            self.assertFalse((directory / "300.max").exists())
 
 
 
@@ -831,8 +876,9 @@ class ShellTests(unittest.TestCase):
             root = Path(folder)
             meminfo = root / "meminfo"
             _ = meminfo.write_text("MemAvailable: 8388608 kB\n")
+            # Advance a test clock so checker runtime cannot change notice order.
             command = (
-                'source "$1"; calls=0; sleep() { calls=$((calls + 1)); '
+                'source "$1"; unset SECONDS; SECONDS=0; calls=0; sleep() { calls=$((calls + 1)); '
                 'if (( calls == 1 )); then SECONDS=61; else printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO"; fi; }; '
                 'buildlog_wait_for_memory'
             )
