@@ -1,12 +1,13 @@
 """Deterministic decisions from Jev's independent probability distributions."""
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Literal
 
 from .client import Answer, ChoiceAnswer, ScoreAnswer, TypeSafeError
-from .questions import EVIDENCE_ABSENT, EVIDENCE_PRESENT, GOAL_LABELS, SPLIT_PROBABILITY, THRESHOLDS, URGENCY_EVIDENCE
+from .questions import ERROR_TARGETS, EVIDENCE_ABSENT, EVIDENCE_PRESENT, GOAL_LABELS, SPLIT_PROBABILITY, THRESHOLDS, URGENCY_EVIDENCE
+from .questions import ReportOnly as ReportOnly, Supported as Supported, ThresholdOutcome as ThresholdOutcome, Unsupported as Unsupported
 
 
 @dataclass(frozen=True)
@@ -19,6 +20,47 @@ class FieldDecision:
     possible_five: bool = False
     probabilities: dict[str, float] = field(default_factory=dict)
     hint: str = ""
+    structurally_eligible: bool = True
+    threshold_dependencies: dict[str, float] = field(default_factory=dict)
+    origin: Literal["score", "choice", "pressure", "urgency_evidence", "area_fallback"] = "score"
+
+
+@dataclass(frozen=True)
+class RiskPoint:
+    threshold: float
+    coverage: float
+    error_rate: float
+
+
+def select_threshold(field_name: str, points: Sequence[RiskPoint], *, complete: bool = True) -> ThresholdOutcome:
+    if field_name not in THRESHOLDS:
+        raise ValueError(f"Unknown threshold field: {field_name}")
+    if isinstance(THRESHOLDS[field_name], ReportOnly):
+        return ReportOnly()
+    if not complete:
+        return Unsupported("incomplete or non-tuning cohort; excluded from threshold selection")
+    for point in sorted(points, key=lambda item: item.threshold):
+        if point.coverage > 0 and point.error_rate <= ERROR_TARGETS[field_name] + 1e-12:
+            return Supported(point.threshold)
+    return Unsupported()
+
+
+def is_sure(field_name: str, decision: FieldDecision, thresholds: Mapping[str, ThresholdOutcome] = THRESHOLDS) -> bool:
+    """Only supported fields and supported dependencies can be sure."""
+    policy = thresholds[field_name]
+    if not isinstance(policy, Supported):
+        return False
+    if not decision.structurally_eligible or decision.split or decision.confidence < policy.threshold:
+        return False
+    for name, confidence in decision.threshold_dependencies.items():
+        dependency = thresholds[name]
+        if not isinstance(dependency, Supported) or confidence < dependency.threshold:
+            return False
+    return True
+
+
+def _certify(field_name: str, decision: FieldDecision) -> FieldDecision:
+    return replace(decision, certainty="sure" if is_sure(field_name, decision) else "unsure")
 
 
 def median_level(probabilities: Mapping[str, float]) -> int:
@@ -55,19 +97,17 @@ def decide_choice(first: ChoiceAnswer, second: ChoiceAnswer, field_name: str) ->
     winner = _top(probabilities)
     confidence = probabilities[winner]
     agree = _top(first["probabilities"]) == _top(second["probabilities"])
-    return FieldDecision(winner, confidence,
-                         "sure" if agree and confidence >= THRESHOLDS[field_name] else "unsure",
-                         probabilities=probabilities)
+    return _certify(field_name, FieldDecision(winner, confidence, "unsure",
+                    probabilities=probabilities, structurally_eligible=agree, origin="choice"))
 
 
 def decide_score(answer: ScoreAnswer, field_name: str) -> FieldDecision:
     level = median_level(answer["probabilities"])
     split = is_split(answer["probabilities"])
     confidence = answer["probabilities"][str(level)]
-    return FieldDecision(level + 1, confidence,
-                         "sure" if confidence >= THRESHOLDS[field_name] and not split else "unsure",
+    return _certify(field_name, FieldDecision(level + 1, confidence, "unsure",
                          split=split, check=field_name == "backlog_effort",
-                         probabilities={str(int(key) + 1): value for key, value in answer["probabilities"].items()})
+                         probabilities={str(int(key) + 1): value for key, value in answer["probabilities"].items()}))
 
 
 def decide_urgency(evidence: Mapping[str, float], pressure: ScoreAnswer) -> FieldDecision:
@@ -78,13 +118,12 @@ def decide_urgency(evidence: Mapping[str, float], pressure: ScoreAnswer) -> Fiel
     pressure_decision = decide_score(pressure, "backlog_urgency")
     if present:
         confidence = max(evidence.values())
-        return FieldDecision(4, confidence,
-                             "sure" if confidence >= THRESHOLDS["backlog_urgency"] and not ambiguous and not pressure_decision.split else "unsure",
+        return _certify("backlog_urgency", FieldDecision(4, confidence, "unsure",
                              split=pressure_decision.split, possible_five=True,
-                             probabilities={"4": confidence})
+                             probabilities={"4": confidence}, structurally_eligible=not ambiguous, origin="urgency_evidence"))
     confidence = min(pressure_decision.confidence, *(1 - value for value in evidence.values()))
-    return replace(pressure_decision, confidence=confidence,
-                   certainty="sure" if not ambiguous and not pressure_decision.split and confidence >= THRESHOLDS["backlog_urgency"] else "unsure")
+    return _certify("backlog_urgency", replace(pressure_decision, confidence=confidence,
+                    structurally_eligible=not ambiguous, origin="pressure"))
 
 
 def _choice(answers: Mapping[str, Answer], name: str) -> ChoiceAnswer:
@@ -114,15 +153,16 @@ def decide_answers(main: Mapping[str, Answer], area: Mapping[str, Answer]) -> di
     if goal_name not in GOAL_LABELS:
         raise TypeSafeError("Unknown goal in response")
     alignment = decide_score(_score(main, f"alignment_{goal_name}"), "backlog_alignment")
-    if goal.certainty == "unsure":
-        alignment = replace(alignment, certainty="unsure")
+    alignment = _certify("backlog_alignment", replace(alignment,
+        structurally_eligible=goal.structurally_eligible,
+        threshold_dependencies={"backlog_goal": goal.confidence}))
     area_decision = decide_choice(_choice(area, "area"), _choice(area, "area_reverse"), "area")
     fits = _noul(area, "area_fits")
     if fits < EVIDENCE_ABSENT:
-        area_decision = replace(area_decision, value="unfiled", hint=str(area_decision.value),
-                                confidence=1 - fits, certainty="sure" if 1 - fits >= THRESHOLDS["area"] else "unsure")
+        area_decision = _certify("area", replace(area_decision, value="unfiled", hint=str(area_decision.value),
+                                confidence=1 - fits, structurally_eligible=True, origin="area_fallback"))
     elif fits <= EVIDENCE_PRESENT:
-        area_decision = replace(area_decision, certainty="unsure")
+        area_decision = replace(area_decision, certainty="unsure", structurally_eligible=False)
     return {
         "backlog_goal": replace(goal, value=GOAL_LABELS[goal_name]),
         "backlog_alignment": alignment,

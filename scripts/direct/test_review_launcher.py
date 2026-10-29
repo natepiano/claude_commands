@@ -433,13 +433,40 @@ class ReviewLauncherPassTests(unittest.TestCase):
         self.assertEqual(len(commands), 3)
         self.assertIn("sys.version_info", commands[0])
         self.assertEqual(commands[1:], ["print('ready')"] * 2)
-        self.assertEqual((self.root / "cold-cache" / "claude" / "python3-3.10").read_text().strip(), str(interpreter))
+        self.assertEqual((self.root / "cold-cache" / "claude" / "python3-3.11").read_text().strip(), str(interpreter))
+
+    def test_interpreter_resolver_rejects_python310_and_its_old_cache(self) -> None:
+        launcher = self.root / "scripts" / "lib" / "py"
+        binaries = self.root / "python310-bin"
+        binaries.mkdir()
+        interpreter = binaries / "python3"
+        _ = interpreter.write_text(
+            f"#!{sys.executable}\n"
+            + "import datetime, sys\n"
+            + "sys.version_info = (3, 10, 0, 'final', 0)\n"
+            + "del datetime.UTC\n"
+            + "exec(sys.argv[2])\n",
+            encoding="utf-8",
+        )
+        interpreter.chmod(0o755)
+        environment = self.environment()
+        cache_root = self.root / "python310-cache"
+        old_cache = cache_root / "claude" / "python3-3.10"
+        old_cache.parent.mkdir(parents=True)
+        _ = old_cache.write_text(str(interpreter) + "\n")
+        environment.update({"PATH": str(binaries) + os.pathsep + environment["PATH"],
+                            "XDG_CACHE_HOME": str(cache_root)})
+        result = subprocess.run(
+            ["bash", str(launcher), "-c", "import datetime; print(datetime.UTC)"],
+            env=environment, capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual((result.returncode, result.stdout), (0, "UTC\n"), result.stderr)
 
     def environment(self) -> dict[str, str]:
         environment = os.environ.copy()
         environment["HOME"] = str(self.root)
         environment["XDG_CACHE_HOME"] = str(self.root / "cache")
-        cache = self.root / "cache" / "claude" / "python3-3.10"
+        cache = self.root / "cache" / "claude" / "python3-3.11"
         cache.parent.mkdir(parents=True, exist_ok=True)
         _ = cache.write_text(sys.executable + "\n")
         _ = environment.pop("CLAUDE_PYTHON", None)
