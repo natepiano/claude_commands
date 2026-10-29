@@ -94,6 +94,10 @@ import record as recovery_store  # noqa: E402
 import launch_permission as restore_permission  # noqa: E402
 from remote import other_machine, run_remote  # noqa: E402
 import sessions  # noqa: E402
+from sessions import (  # noqa: E402
+    SessionNotLive as SessionNotLive,
+    SessionLivenessUnknown as SessionLivenessUnknown,
+)
 import remote_control  # noqa: E402
 import stop as stop_work  # noqa: E402
 from push_texts import RenderedPush, render  # noqa: E402
@@ -148,6 +152,7 @@ ADD_UNIT = SCRIPTS / "production" / "add_unit.py"
 SEND = SCRIPTS / "message" / "send.py"
 SESSION_WAIT_SECONDS = 90.0
 SESSION_POLL_SECONDS = 0.5
+CONDUCTOR_ONLY_VARIABLES = frozenset({"REFUSAL_WATCH_INVENTORY", "PYTHONUNBUFFERED"})
 # herdr lists a stopped agent as live for a few seconds after its process ends.
 AGENT_EXIT_SECONDS = 15.0
 RESTART_LAUNCH_WORKERS = 6
@@ -203,18 +208,6 @@ DEFAULT_RESTART_ALERTS = AlertWhenNotBack()
 @dataclass(frozen=True)
 class SessionLive:
     """The registry or saved process identity positively identifies a live owner."""
-
-
-@dataclass(frozen=True)
-class SessionNotLive:
-    """A readable session registry contains no live record for the session."""
-
-
-@dataclass(frozen=True)
-class SessionLivenessUnknown:
-    """The session registry cannot safely establish whether the session is live."""
-
-    reason: str
 
 
 @dataclass(frozen=True)
@@ -519,7 +512,7 @@ def _run(argv: list[str], *, dry_run: bool, check: bool = True) -> subprocess.Co
         env={
             name: value
             for name, value in os.environ.items()
-            if not name.startswith("CLAUDE_")
+            if not name.startswith("CLAUDE_") and name not in CONDUCTOR_ONLY_VARIABLES
         },
     )
 
@@ -529,48 +522,15 @@ def _live_session_ids() -> frozenset[str]:
 
 
 def _process_liveness(pid: int, recorded_start: str) -> SessionLive | SessionNotLive | SessionLivenessUnknown:
-    if not recorded_start:
-        return SessionNotLive()
-    current = sessions.process_start(pid)
-    if current is not None and current != recorded_start:
-        return SessionNotLive()
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return SessionNotLive()
-    except PermissionError:
-        if current == recorded_start:
-            return SessionLive()
-    except (OSError, OverflowError) as error:
-        return SessionLivenessUnknown(f"process identity unreadable: {error}")
-    if current is None:
-        return SessionLivenessUnknown(f"process identity unreadable for pid {pid}")
-    return SessionLive()
+    observed = sessions.process_liveness(pid, recorded_start)
+    return SessionLive() if isinstance(observed, sessions.LiveSessionProcess) else observed
 
 
 def _session_liveness(
     session_id: str,
 ) -> SessionLive | SessionNotLive | SessionLivenessUnknown:
-    try:
-        paths = [path for path in sessions.sessions_dir().iterdir() if path.suffix == ".json"]
-    except OSError as error:
-        return SessionLivenessUnknown(f"session registry unreadable: {_error_reason(error)}")
-    unreadable_records: list[str] = []
-    for path in paths:
-        registered = sessions.read_session(path)
-        if isinstance(registered, sessions.UnreadableSessionRecord):
-            unreadable_records.append(path.name)
-            continue
-        if registered["sessionId"] != session_id:
-            continue
-        if sessions.running_session(registered):
-            return SessionLive()
-        observed = _process_liveness(registered["pid"], registered.get("procStart", ""))
-        if not isinstance(observed, SessionNotLive):
-            return observed
-    if unreadable_records:
-        return SessionLivenessUnknown("unreadable session registry record: " + unreadable_records[0])
-    return SessionNotLive()
+    observed = sessions.session_liveness(session_id)
+    return SessionLive() if isinstance(observed, sessions.LiveSessionProcess) else observed
 
 
 def _owner_liveness(owner: Session) -> SessionLive | SessionNotLive | SessionLivenessUnknown:
@@ -1146,12 +1106,19 @@ def _heal_folder_trust(session: Session, folder: Path, config_dir: Path, *, dry_
         raise FolderNotTrusted(reason, accounts.trust_command(folder, accounts.NamedAccount(target, config_dir)))
 
 
+def _prepare_resume_environment(session_id: str, cwd: str, environment: dict[str, str],
+                                unset_variables: frozenset[str]) -> herdr.PreparedAgentEnvironment | herdr.nix_env.Refused:
+    """Consume a healer's scoped proof, or load before any window is restored."""
+    return herdr.prepare_session_environment(session_id, cwd, environment, unset_variables)
+
+
 def _herdr_launch(
     parts: ResumeParts, destination: HerdrDestination, session: Session, *, dry_run: bool,
     session_kind: herdr.SecuritySession | herdr.SessionKindNotRead = _SESSION_KIND_NOT_READ,
 ) -> HerdrLaunch:
     """Resume Claude with its own arguments and one separate opening prompt."""
-    unset_variables: set[str] = {"CLAUDE_CODE_OAUTH_TOKEN"}
+    # A resumed session must not inherit the conductor's temporary controls.
+    unset_variables: set[str] = {"CLAUDE_CODE_OAUTH_TOKEN", *CONDUCTOR_ONLY_VARIABLES}
     if isinstance(parts.account, MoveResumeAccount):
         from scripts.accounts import accounts
 
@@ -1174,6 +1141,10 @@ def _herdr_launch(
         print(f"herdr {name}: resume {session['session_id']} in {location}")
         return HerdrLaunch(herdr.ServerAdopted(), herdr.PromptNotSubmitted("dry run"))
     try:
+        prepared_environment = _prepare_resume_environment(session["session_id"], parts.cwd, environment,
+                                                          frozenset(unset_variables))
+        if isinstance(prepared_environment, herdr.nix_env.Refused):
+            raise herdr.HerdrFailure(prepared_environment.reason)
         server = herdr.restore_server(name, 90_000,
             session_kind=herdr.security_session() if isinstance(session_kind, herdr.SessionKindNotRead) else session_kind)
         server_environment = herdr.server_environment(name)
@@ -1183,8 +1154,11 @@ def _herdr_launch(
                     f"herdr server {name} carries {variable} from where it started; "
                     + f"start the {name} server again from a shell without it, then restart"
                 )
-        if isinstance(server, (herdr.ServerCreated, herdr.WindowServerCreated)) and herdr.keeps_restored_layout(name):
+        if (isinstance(server, (herdr.ServerCreated, herdr.WindowServerCreated)) and herdr.keeps_restored_layout(name)
+                and not os.environ.get(herdr.nix_env.HEAL_SESSION_ENV)):
             # The restored panes no shutdown record owns come back on their own accounts.
+            # A heal is scoped to its prepared session; unrelated panes could
+            # otherwise load direnv after the healer's final hold check.
             import pane_restore
 
             try:
@@ -1211,14 +1185,11 @@ def _herdr_launch(
                 # The session resumes in its own new tab, so a busy old pane is left as it is.
                 print(f"herdr {name}:{destination.pane_id}: pane runs {', '.join(activity.commands)}; left open")
         _record_scheduled_restart_prompt(session["session_id"], parts.opening_prompt, dry_run=False)
-        pane = herdr.open_tab(name, herdr_space(session), session["name"], parts.cwd, environment)
-        try:
-            outcome = client.start_agent(session["name"], pane, kind="claude", agent_arguments=list(parts.claude_arguments),
-                opening=herdr.OpeningPrompt(parts.opening_prompt,
-                    herdr.SessionTranscript(config_dir, session["session_id"])), timeout_ms=90_000)
-        except herdr.AgentExited:
-            herdr.close_agent(name, pane)
-            raise
+        launched = herdr.launch_prepared_agent(name, herdr_space(session), session["name"], prepared_environment,
+            kind="claude", agent=session["name"], agent_arguments=list(parts.claude_arguments),
+            opening=herdr.OpeningPrompt(parts.opening_prompt,
+                herdr.SessionTranscript(config_dir, session["session_id"])), timeout_ms=90_000)
+        pane, outcome = launched.pane, launched.outcome
         if isinstance(server, (herdr.ServerAdopted, herdr.WindowServerCreated)):
             focused = _focus_restored_pane(client, pane, session["name"])
             if focused and isinstance(server, herdr.WindowServerCreated):
@@ -1687,6 +1658,25 @@ def clear_running_on_target(records: list[SessionShutdown]) -> TargetCheck:
         archive_session(record["login"], record["session"]["session_id"])
         finished.append({**record, "progress": progress})
     return TargetCheck(remaining, finished)
+
+
+def finish_attached_session(saved: SessionShutdown, target: str, outcome: herdr.PromptSubmitOutcome) -> TargetCheck:
+    """Treat a stopped session's explicit unit handoff as a manual relaunch, then finish it normally."""
+    if saved["progress"]["kind"] not in {"stopped", "already gone"}:
+        raise ValueError("attach requires a completed shutdown stop")
+
+    def await_confirmation(current: SessionShutdown) -> None:
+        if current["request_id"] != saved["request_id"] or current["progress"] != saved["progress"]:
+            raise ValueError("shutdown record changed during attach")
+        if target != current["label"]:
+            current["target"] = target
+            current["source_label"] = current["label"]
+        current["progress"] = SessionRestartFailed(kind="restart failed", at=settle.record_time(),
+                                                  reason="unit attach awaits live confirmation")
+
+    current = update_session(saved["login"], saved["session"]["session_id"], await_confirmation)
+    _save_prompt_outcome(current, outcome)
+    return clear_running_on_target([current])
 
 
 def _record_timer_restore_progress(
@@ -2188,27 +2178,67 @@ def launch_entry(
     return EntryLaunched(relaunching_pending_timers)
 
 
+def _resume_phase_id(seat: PausedSeat) -> str:
+    """Use the phase recorded for this worker; a slot can belong to another worker."""
+    try:
+        raw = cast(object, json.loads((Path(seat["run_dir"]) / "progress_history_state.json").read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(raw, dict):
+        return ""
+    passes = cast(dict[str, object], raw).get("pass")
+    if not isinstance(passes, dict):
+        return ""
+    recorded_passes = cast(dict[str, object], passes)
+    # Older state holds one pass directly; newer state holds a pass per slot.
+    candidates = [recorded_passes] if "instance_id" in recorded_passes else recorded_passes.values()
+    phase_ids: set[str] = set()
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        record = cast(dict[str, object], candidate)
+        if record.get("worker_name") != seat["seat"]:
+            continue
+        phase = record.get("phase")
+        if not isinstance(phase, dict):
+            return ""
+        phase_id = cast(dict[str, object], phase).get("id")
+        if not isinstance(phase_id, str) or not phase_id.strip():
+            return ""
+        phase_ids.add(phase_id)
+    return next(iter(phase_ids)) if len(phase_ids) == 1 else ""
+
+
 def _resume_worker_command(seat: PausedSeat, cwd: str) -> str:
-    """Build a complete launcher invocation that continues this seat's thread."""
+    """Build a complete launcher invocation that continues this worker's thread."""
     launcher = "review.sh" if seat["role"] == "review" else "implement.sh"
     prompt = str(Path(seat["run_dir"]) / f"{seat['seat']}.resume-prompt.md")
     resumed = _resumed_launcher_command(seat["launcher_command"], seat["seat"], prompt) if seat["turn_live"] else None
     if resumed is not None:
         return resumed
-    # The launchers are not executable files: `bash` runs them as pasted.
-    start = ["bash", str(SCRIPTS / "direct" / launcher), "--to", seat["seat"], seat["run_dir"], cwd, prompt]
-    if launcher == "review.sh":
-        return shlex.join([*start, "review", "resume after a move", "resuming after a move"])
     from scripts.direct.worker_state import worker_slot
 
     # The roster role is the last pass kind; implement.sh claims the worker by the slot its identity names.
-    team_role = worker_slot(Path(seat["run_dir"]), seat["seat"]) or seat["role"]
+    recorded_slot = worker_slot(Path(seat["run_dir"]), seat["seat"]) or ""
+    team_role = recorded_slot or seat["role"]
+    phase_id = _resume_phase_id(seat)
+    # The launchers are not executable files: `bash` runs them as pasted.
+    start = ["bash", str(SCRIPTS / "direct" / launcher), "--to", seat["seat"]]
+    if phase_id:
+        start.extend(("--phase", phase_id))
     kind = team_role if team_role in {"impl", "test", "fix"} else "impl"
+    if seat["role"] == "fix":
+        kind = "fix"
+    if launcher == "implement.sh" and kind == "fix":
+        start.extend(("--fix-cause", "resume after a move"))
+    start.extend((seat["run_dir"], cwd, prompt))
+    if launcher == "review.sh":
+        return shlex.join([*start, "review", "resume after a move", "resuming after a move"])
     return shlex.join([*start, kind, "resume after a move", kind, "resuming after a move", "0", team_role])
 
 
 def _resumed_launcher_command(command: list[str], seat: str, prompt: str) -> str | None:
-    """Keep the recorded task arguments, following the seat with its resume prompt; None when incomplete."""
+    """Keep the recorded task arguments, following the worker with its resume prompt; None when incomplete."""
     index = next((i for i, arg in enumerate(command) if Path(arg).name in {"implement.sh", "review.sh"}), -1)
     if index < 0:
         return None
@@ -2237,13 +2267,13 @@ def _send_worker_resume(record: SessionShutdown) -> None:
     lines = ["Resume your Codex workers; do not open new ones."]
     cwd = record["session"]["cwd"]
     for seat in seats:
-        # An idle seat stays paused on its thread until the next dispatch; a command now would need an open phase.
+        # An idle worker stays paused on its thread until the next dispatch; a command now would need an open phase.
         if seat["turn_live"]:
             lines.append(f"{seat['seat']} ({seat['role']}, was working): {_resume_worker_command(seat, cwd)}")
         else:
             lines.append(f"{seat['seat']} ({seat['role']}, idle): paused on its thread; nothing to run now. "
                          + f"Your next dispatch with --to {seat['seat']} resumes it.")
-    lines.append("Each seat continues its own thread; after resuming, send later work with --to as usual.")
+    lines.append("Each worker continues its own thread; after resuming, send later work with --to as usual.")
     identity = record["session"]["session_id"]
     try:
         result = _run([*_send_command(), "--to", f"session:{identity}", "--from", "shutdown",
@@ -2681,14 +2711,14 @@ def _launch_codex_snapshot(
     if dry_run:
         print(f"herdr {name}: CODEX_HOME={launch['home']} codex {shlex.join(arguments)} in a new tab in {herdr_space(owner)}")
         return SessionLaunched()
+    prepared_environment = _prepare_resume_environment(owner["session_id"], owner["cwd"],
+        {"CODEX_HOME": launch["home"]}, CONDUCTOR_ONLY_VARIABLES)
+    if isinstance(prepared_environment, herdr.nix_env.Refused):
+        raise herdr.HerdrFailure(prepared_environment.reason)
     server = herdr.restore_server(name, 90_000, session_kind=state.session_kind)
-    pane = herdr.open_tab(name, herdr_space(owner), title, owner["cwd"], {"CODEX_HOME": launch["home"]})
-    try:
-        _ = herdr.start_agent(name, pane, kind="codex", agent=title, agent_arguments=arguments,
-                          opening=herdr.NoOpeningPrompt(), timeout_ms=90_000)
-    except (herdr.HerdrFailure, OSError, subprocess.SubprocessError):
-        herdr.close_agent(name, pane)
-        raise
+    launched = herdr.launch_prepared_agent(name, herdr_space(owner), title, prepared_environment,
+        kind="codex", agent=title, agent_arguments=arguments, opening=herdr.NoOpeningPrompt(), timeout_ms=90_000)
+    pane = launched.pane
     focused = _focus_restored_pane(herdr.Herdr(name), pane, owner["name"])
     if focused and isinstance(server, herdr.WindowServerCreated):
         _close_startup_workspaces(herdr.Herdr(name), pane)

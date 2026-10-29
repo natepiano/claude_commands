@@ -42,7 +42,7 @@
 #   <session_dir>/review_findings_<N>.txt  — review findings for pass N
 #   <session_dir>/review_agent_<N>.log     — full agent log for pass N; a worker's
 #                                            pass adds `-<slot>`, a pool's `-pool`, so
-#                                            two seats on one pass keep separate logs
+#                                            two workers on one pass keep separate logs
 #   <session_dir>/review_findings.txt      — symlink to the current pass's findings
 #   <session_dir>/review_agent.log         — symlink to the current pass's log
 #   <session_dir>/review_agent         — resolved task, family, agent, and effort
@@ -221,8 +221,8 @@ mkdir -p "${ARTIFACT_DIR}"
 FINDINGS_FILE="${ARTIFACT_DIR}/review_findings_${PASS_INDEX}${SUFFIX}.txt"
 STATUS_FILE="${ARTIFACT_DIR}/review_status${SUFFIX}"
 SLOT_FILE="${ARTIFACT_DIR}/review_slot${SUFFIX}"
-# Each seat logs on its own: a second seat taking the same pass and lens would
-# otherwise truncate the first one's log, and with it the reason that seat failed.
+# Each worker logs on its own: a second worker taking the same pass and lens would
+# otherwise truncate the first one's log, and with it the reason that worker failed.
 if [[ -n "${REVIEW_WORKER}" ]]; then
   SEAT_SUFFIX="-${TEAM_SLOT}"
 elif [[ -n "${POOL_TYPE}" ]]; then
@@ -244,6 +244,19 @@ HEARTBEAT_FILE="${SESSION_DIR}/heartbeat.log"
 PROGRESS_HELPER="${SCRIPT_DIR}/progress_history.py"
 PROGRESS_STATE="${SESSION_DIR}/progress_history_state.json"
 HEARTBEAT_INTERVAL_SECS=60
+
+# Validate before pool allocation, compaction or any reviewer starts. UX has no
+# pass window, so this command also records its launch evidence.
+if [[ -f "${PROGRESS_STATE}" ]]; then
+  if ! UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" check-launch \
+    --session-dir "${SESSION_DIR}" --pass-kind review \
+    --prompt-file "${PROMPT_FILE}" --lens "${LENS}" \
+    ${PHASE_ID:+--phase-id "${PHASE_ID}"}; then
+    echo "ERROR: unable to check the review launch." >&2
+    echo "error" > "${STATUS_FILE}"
+    exit 1
+  fi
+fi
 
 initialize_review_artifacts() {
   # Every reader of the unnumbered paths — the unit director's mid-run
@@ -397,7 +410,7 @@ with worker_claim_lock(root):
         "model": model,
         "worker_id": worker_id,
     }
-    worker_record_path(root, name, slot).write_text(json.dumps(identity))
+    worker_record_path(root, name, slot, role="review").write_text(json.dumps(identity))
 PY
 }
 
@@ -696,8 +709,10 @@ record_pass_start() {
   if ! UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" start-pass \
     --session-dir "${SESSION_DIR}" \
     --pass-kind review \
+    --prompt-file "${PROMPT_FILE}" \
     --activity "${PASS_ACTIVITY}" \
     --called-task "${TASK}" \
+    --worker-name "${REVIEW_WORKER}" \
     --called-family "${AGENT_FAMILY}" \
     --called-model "${AGENT_MODEL}" \
     --called-effort "${AGENT_EFFORT:-unset}" \
@@ -825,7 +840,6 @@ if [[ -n "${POOL_TYPE}" || -n "${FOLLOW_TO}" ]]; then
 fi
 
 if [[ "${AGENT_CODE}" -eq 0 && "${TREE_CHANGED}" -eq 0 ]]; then
-  echo "reviewed" > "${STATUS_FILE}"
   # A completed early review is a real pass only once the sentinel exists: the
   # worker can beat the 5s poll to the finish, leaving the start unrecorded
   # above. Before the sentinel there is nothing to record. The implementation
@@ -833,8 +847,13 @@ if [[ "${AGENT_CODE}" -eq 0 && "${TREE_CHANGED}" -eq 0 ]]; then
   # later progress call would be refused for having no active window; and the
   # verdict is void regardless, because the final diff does not exist yet.
   if [[ "${PASS_STARTED}" -eq 0 && -e "${EARLY_READY_FILE}" ]]; then
-    record_pass_start || echo "ERROR: unable to record the review pass start." >&2
+    if ! record_pass_start; then
+      echo "ERROR: unable to record the review pass start." >&2
+      echo "error" > "${STATUS_FILE}"
+      exit 1
+    fi
   fi
+  echo "reviewed" > "${STATUS_FILE}"
   if [[ -f "${PROGRESS_STATE}" && "${PASS_STARTED}" -eq 1 ]]; then
     if ! UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status completed; then

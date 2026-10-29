@@ -24,7 +24,7 @@ A named folder idle for REMOVE_AFTER_SECONDS is removed when all of these are tr
   * no process works in it, holds a file in it open or maps one (one /proc scan; lsof on the Mac);
   * no socket in it is bound by a live process (/proc/net/unix; on the Mac any socket keeps it);
   * no git repo in it holds work on no remote: uncommitted changes, a stash, commits on no remote
-    (scratch.unsaved_work).
+    (tmp_sweep.git_work, shared with the temp sweep). A failed git check keeps the folder.
 
 A removed linked worktree is pruned from its source repo. Removal runs only once armed
 (`folder_audit.py arm` writes ARMED_NAME in the folder-sweep state folder; `disarm` removes it);
@@ -292,8 +292,8 @@ def judge(found: list[tuple[Path, float]], now: float, removing: bool, proc: str
             outcomes[path] = uses[str(path)]
         elif live_socket(path, bound):
             outcomes[path] = LIVE_SOCKET
-        elif (problem := scratch.unsaved_work(path)) is not None:
-            outcomes[path] = problem
+        elif (git := tmp_sweep.git_work(path)) is not tmp_sweep.GitWork.SAVED:
+            outcomes[path] = git.value
         else:
             outcomes[path] = remove(path, changed[path], now) if removing else WOULD_REMOVE
     return outcomes

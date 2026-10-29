@@ -33,7 +33,10 @@ Show the output. On a nonzero exit, show the refusal and stop. Use this order:
    its exact Units-row name. Keep it stopped until the command succeeds.
    The command pushes its new branch, moves and repairs its worktree, moves
    account transcripts and copies trust entries, commits the new Worktree and
-   Branch cells, then retires its old branch. **Tell the unit director the new
+   Branch cells, then retires its old branch. It updates the stopped shutdown
+   record and prints `shutdown.py restart --only <session-id>`; relaunch the unit
+   with that command after `unit` succeeds. With no record it reports that no
+   relaunch is available. **Tell the unit director the new
    worktree path printed by the command before it resumes.** `add_unit` writes
    the new herdr production mark at the unit's next launch; existing marks may
    still name the old production.

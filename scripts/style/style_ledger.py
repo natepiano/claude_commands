@@ -30,6 +30,9 @@ from typing import Literal, TypedDict, cast
 import rules as rule_catalog
 import style_footprint
 import declarations
+import finding_sites
+from finding_sites import (NeedsJudgment as NeedsJudgment,
+                           SiteEvidence as SiteEvidence, UnchangedSite as UnchangedSite)
 import style_rules
 from approved_renames import (AppliedCheck, AppliedInCode, BindingProof, BindingRename, FileRename, Folder, MissingFile,
                               NoAppliedCheck, RenameNotApplied, applied_check, binding_rename, binding_rename_check, file_rename)
@@ -1093,10 +1096,18 @@ class KeptForOpenBuild:
     ticket: str
 
 
+@dataclass(frozen=True)
+class FindingSite:
+    """A finding's source evidence at the tip; it says nothing about cell coverage."""
+
+    finding: HeldFinding
+    evidence: SiteEvidence
+
+
 DeclarationOutcome = (DeclarationNotRead | DeclarationInPlace | DeclarationMoved | DeclarationRemoved
                       | DeclaredInSeveralFiles | DeclaredInAnotherCrate | DeclarationRenamed | RenameAwaitingApproval
                       | DeclarationGoneFromFile | KeptForOpenBuild | TraitIdentityUncertain | OutsideRenameUnresolved
-                      | StatementNotFollowed)
+                      | StatementNotFollowed | FindingSite)
 # The outcomes that leave a finding as it is for a person to waive or fix in the code.
 DeclarationLeft = (DeclaredInSeveralFiles | DeclaredInAnotherCrate | DeclarationGoneFromFile | TraitIdentityUncertain
                    | OutsideRenameUnresolved | StatementNotFollowed)
@@ -1638,12 +1649,15 @@ def _tip(repo: Path, commit: str) -> RepositoryTip:
         mode, kind, name = metadata.split()
         entries[path] = TreeEntry(mode, kind, name)
     blobs = {path: entry.object for path, entry in entries.items() if entry.kind == "blob"}
-    manifests = {path: _git(repo, "show", f"{commit}:{path}") for path in blobs if PurePosixPath(path).name == "Cargo.toml"}
+    configs = (".claude/config/berth.toml", "rustfmt.toml", ".rustfmt.toml")
+    inputs = {path: blob for path, blob in blobs.items() if PurePosixPath(path).name == "Cargo.toml" or path in configs}
+    contents = {path: content.decode(errors="replace") for path, content in blob_contents(repo, inputs)}
+    manifests = {path: text for path, text in contents.items() if PurePosixPath(path).name == "Cargo.toml"}
     directories = tuple(member.directory for member in rule_catalog.workspace_members(manifests))
     ignored: list[str] = []
-    for config in (".claude/config/berth.toml", "rustfmt.toml", ".rustfmt.toml"):
+    for config in configs:
         if config in blobs:
-            ignored.extend(_ignored_paths(_table(tomllib.loads(_git(repo, "show", f"{commit}:{config}")))))
+            ignored.extend(_ignored_paths(_table(tomllib.loads(contents[config]))))
     files = tuple(sorted(path for path in blobs if path.endswith(".rs") and not _is_ignored(path, tuple(ignored))))
     return RepositoryTip(commit, tree, blobs, directories, files, entries)
 
@@ -1743,7 +1757,10 @@ def _rust_code(content: bytes) -> RustCode | NotTokenized:
     except UnicodeDecodeError:
         return NOT_TOKENIZED
     code = style_footprint.tokens(text)
-    spans = style_footprint.token_spans(text)
+    try:
+        spans = style_footprint.token_spans(text)
+    except style_footprint.UnreadableTokenSpans:
+        return NOT_TOKENIZED
     if len(spans) != len(code):
         return NOT_TOKENIZED
     # Only whitespace and comments lie between two code tokens, so each gap holds the comments at one code position.
@@ -1808,6 +1825,12 @@ def _config_hash(repo: Path, tip: RepositoryTip, tool: LintTool) -> str:
         if global_config.is_file():
             inputs.append(("global:cargo-mend/config.toml", hashlib.sha256(global_config.read_bytes()).hexdigest()))
     return hashlib.sha256(json.dumps(inputs, separators=(",", ":")).encode()).hexdigest()
+
+
+def legacy_built_at_sql(finding: str = "held_findings") -> str:
+    """The build time of a built finding before schema 25, using its SQL table name or alias."""
+    return (f"COALESCE((SELECT updated_at FROM tickets WHERE id={finding}.build_ticket "
+            + f"AND state='merged'), {finding}.updated_at)")
 
 
 MIGRATIONS = {
@@ -1942,13 +1965,87 @@ MIGRATIONS = {
             PRIMARY KEY(finding_id, ticket)
         );
     """,
+    25: f"""
+        CREATE TABLE refill_results (
+            unit TEXT PRIMARY KEY, at TEXT NOT NULL, outcome TEXT NOT NULL,
+            split_at TEXT NOT NULL DEFAULT '', ready INTEGER NOT NULL DEFAULT 0,
+            changed INTEGER NOT NULL DEFAULT 0, structure INTEGER NOT NULL DEFAULT 0,
+            other INTEGER NOT NULL DEFAULT 0
+        );
+        ALTER TABLE held_findings ADD COLUMN built_at TEXT NOT NULL DEFAULT '';
+        UPDATE held_findings SET built_at={legacy_built_at_sql()} WHERE state='built';
+    """,
 }
 
 
+class GitReadCache:
+    """The trees and blob bytes read by one split scan."""
+
+    def __init__(self, repo: Path) -> None:
+        self.repo: Path = repo
+        self.tips: dict[str, RepositoryTip] = {}
+        self.contents: dict[str, bytes] = {}
+        self.warmed: set[str] = set()
+
+    def tip(self, commit: str) -> RepositoryTip:
+        if not re.fullmatch(r"[0-9a-f]{40}", commit):
+            commit = _git(self.repo, "rev-parse", "--verify", f"{commit}^{{commit}}")
+        if commit not in self.tips:
+            self.tips[commit] = _tip(self.repo, commit)
+        return self.tips[commit]
+
+    def read(self, commit: str, paths: Iterable[str]) -> None:
+        tip = self.tip(commit)
+        self.read_blobs(blob for path in paths if (blob := tip.blobs.get(path, "")))
+
+    def read_blobs(self, blobs: Iterable[str]) -> None:
+        """Read each immutable blob once, shared by file and site-proof reads."""
+        unread = {blob: blob for blob in blobs if blob not in self.contents}
+        if unread:
+            self.contents.update(blob_contents(self.repo, unread))
+
+    def warm(self, commit: str) -> None:
+        """Read source and manifest bytes in one batch for the whole tree."""
+        commit = self.tip(commit).commit
+        if commit not in self.warmed:
+            self.read(commit, (path for path in self.tip(commit).blobs if path.endswith((".rs", ".md", ".toml"))))
+            self.warmed.add(commit)
+
+    def blob(self, commit: str, path: str) -> str:
+        try:
+            return self.tip(commit).blobs.get(path, "")
+        except LedgerError:
+            return ""
+
+    def crate_directories(self, commit: str) -> tuple[str, ...]:
+        return self.tip(commit).crate_dirs
+
+    def file(self, commit: str, path: str) -> bytes | Folder | MissingFile:
+        tip = self.tip(commit)
+        if path not in tip.blobs:
+            return Folder() if any(name.startswith(path.rstrip("/") + "/") for name in tip.entries) else MissingFile()
+        self.warm(tip.commit)
+        self.read(tip.commit, (path,))
+        return self.contents[tip.blobs[path]]
+
+    def text(self, commit: str, path: str) -> str:
+        content = self.file(commit, path)
+        return content.decode(errors="replace") if isinstance(content, bytes) else ""
+
+
+@dataclass(frozen=True)
+class NoGitReadCache:
+    """Ordinary ledger operations use their existing read paths."""
+
+
+_NO_GIT_READ_CACHE = NoGitReadCache()
+
+
 class Ledger:
-    def __init__(self, repo: Path, database: Path) -> None:
+    def __init__(self, repo: Path, database: Path, *, git_cache: GitReadCache | NoGitReadCache = _NO_GIT_READ_CACHE) -> None:
         self.repo: Path = repo
         self.database: Path = database
+        self.git_cache: GitReadCache | NoGitReadCache = git_cache
         self._catalog: tuple[Rule, ...] = rule_catalog.load_rules(repo)
         self._tips: dict[str, RepositoryTip] = {}
         self._fingerprints: dict[tuple[str, CellInputScope, str], str] = {}
@@ -1965,6 +2062,14 @@ class Ledger:
         self._commit_files: dict[tuple[str, str], bytes | Folder | MissingFile] = {}
         self._binding_proofs: dict[tuple[str, str, str], BindingProof] = {}
         self._declared_files: dict[tuple[str, str], DeclaredFile] = {}
+        self._site_sources: dict[str, finding_sites.SourceSites] = {}
+        self._site_maps: dict[tuple[str, str, str], dict[int, int]] = {}
+        self._site_evidence: dict[tuple[HeldFinding, str], SiteEvidence] = {}
+        self._follow_evidence: dict[tuple[HeldFinding, str], SiteEvidence] = {}
+        self._site_rows_version: tuple[int, int] = (-1, -1)
+        self._site_rows: dict[tuple[str, str], tuple[Judgment, ...]] = {}
+        self._site_holding_rows: dict[tuple[str, str], list[tuple[str, Judgment]]] = {}
+        self._site_rule_families: dict[str, str] = {}
         self._file_modules: dict[tuple[str, str], dict[str, RootedFileModule]] = {}
         self._outside_diffs: dict[tuple[str, str, str, str], str] = {}
         self._extern_names: dict[tuple[str, str], frozenset[str] | UnresolvedTypeArguments] = {}
@@ -2013,7 +2118,11 @@ class Ledger:
         return self._tip(self.synced_commit())
 
     def _tip(self, commit: str) -> RepositoryTip:
-        commit = _git(self.repo, "rev-parse", "--verify", f"{commit}^{{commit}}")
+        # Only full object names are immutable; resolve branch names before either cache.
+        if not re.fullmatch(r"[0-9a-f]{40}", commit):
+            commit = _git(self.repo, "rev-parse", "--verify", f"{commit}^{{commit}}")
+        if isinstance(self.git_cache, GitReadCache):
+            return self.git_cache.tip(commit)
         if commit not in self._tips:
             self._tips[commit] = _tip(self.repo, commit)
         return self._tips[commit]
@@ -2034,6 +2143,10 @@ class Ledger:
     def _rust_code(self, blob: str) -> RustCode | NotTokenized:
         """What _rust_code reads in a blob, read once."""
         if blob not in self._rust_codes:
+            if isinstance(self.git_cache, GitReadCache):
+                self.git_cache.read_blobs((blob,))
+                self._rust_codes[blob] = _rust_code(self.git_cache.contents[blob])
+                return self._rust_codes[blob]
             result = subprocess.run(["git", "-C", str(self.repo), "cat-file", "blob", blob], capture_output=True, check=False)
             if result.returncode:
                 raise CheckCouldNotRun(result.stderr.decode(errors="replace").strip() or f"git cat-file blob {blob} failed")
@@ -2600,6 +2713,8 @@ class Ledger:
 
     def _file_at(self, commit: str, path: str) -> bytes | Folder | MissingFile:
         """What is at path in commit: a file's bytes, a folder or nothing. A git error raises, so it never reads as nothing."""
+        if isinstance(self.git_cache, GitReadCache):
+            return self.git_cache.file(commit, path)
         entry = _git(self.repo, "ls-tree", commit, "--", path)
         if not entry:
             return MissingFile()
@@ -2691,7 +2806,7 @@ class Ledger:
                         if isinstance(check, AppliedInCode):
                             # A person's reading was of the old build, so a new build clears it.
                             _ = self._connection.execute(
-                                "UPDATE held_findings SET state='built',person_read_by='',updated_at=? WHERE finding_id=?", (now, finding_id),
+                                "UPDATE held_findings SET state='built',person_read_by='',built_at=CASE WHEN built_at='' THEN ? ELSE built_at END,updated_at=? WHERE finding_id=?", (now, now, finding_id),
                             )
                             continue
                         if isinstance(check, RenameNotApplied):
@@ -3284,6 +3399,14 @@ class Ledger:
         ).fetchall())
         return tuple(Path(row[0]) for row in rows)
 
+    def open_build_finding_ids(self) -> frozenset[str]:
+        """Filed findings that a ticket which is not final holds."""
+        rows = cast(list[tuple[str]], self._connection.execute(
+            "SELECT h.finding_id FROM held_findings h JOIN tickets t ON t.id=h.build_ticket "
+            + "WHERE h.state='filed' AND t.state NOT IN ('merged','dropped')",
+        ).fetchall())
+        return frozenset(row[0] for row in rows)
+
     def moved_findings(self, source: Path) -> dict[str, Path]:
         """The decision of each finding that a migration moved from source."""
         rows = cast(list[tuple[str, str]], self._connection.execute(
@@ -3338,7 +3461,7 @@ class Ledger:
                         raise LedgerError(f"{duplicate.finding_id}: build ticket {ticket['id']} still holds the finding")
                 source = finding.state.proposal
                 _ = self._connection.execute(
-                    "UPDATE held_findings SET state='withdrawn',duplicate_of=?,withdrawn_by=0,proposal=?,"
+                    "UPDATE held_findings SET state='withdrawn',built_at='',duplicate_of=?,withdrawn_by=0,proposal=?,"
                     + "moved_from=CASE WHEN ?=proposal THEN moved_from ELSE ? END,updated_at=? WHERE finding_id=?",
                     (duplicate.qualified, str(duplicate.decision), str(duplicate.decision), str(source), now, duplicate.finding_id),
                 )
@@ -3427,7 +3550,7 @@ class Ledger:
                         or any(self.newest_held_judgment(*cell) != read for cell, read in reads.items())):
                     raise ChangedBeforeLock("the findings or their judgments changed while they were declined; rerun")
                 now = _now()
-                _ = self._connection.executemany("UPDATE held_findings SET state='waived',waive_provenance=?,waived_by=?,updated_at=? WHERE finding_id=?",
+                _ = self._connection.executemany("UPDATE held_findings SET state='waived',built_at='',waive_provenance=?,waived_by=?,updated_at=? WHERE finding_id=?",
                                                  [(provenance, by, now, finding.finding_id) for finding in findings])
                 for cell, read in reads.items():
                     if isinstance(read, NewestHeldJudgment) and isinstance(decisions[cell], CellWaived):
@@ -4321,6 +4444,200 @@ class Ledger:
         return OutsideRenameNotProven(self._outside_mapping(read, tip.commit, finding.path, finding.line),
                                      NoOutsideCandidates(), (OutsideFailure.CHILD_UNPROVED,))
 
+    def _refresh_site_rows(self) -> None:
+        version = (cast(tuple[int], self._connection.execute("PRAGMA data_version").fetchone())[0],
+                   self._connection.total_changes)
+        if version == self._site_rows_version:
+            return
+        self._site_rows_version = version
+        self._site_evidence.clear()
+        self._follow_evidence.clear()
+        pinned = cast(list[tuple[str, bytes]], self._connection.execute("SELECT blob,text FROM rule_texts").fetchall())
+        self._site_rule_families.clear()
+        for blob, text in pinned:
+            try:
+                source = text.decode()
+            except UnicodeDecodeError:
+                self._site_rule_families[blob] = "unreadable"
+                continue
+            if match := re.search(r"(?m)^family:[ \t]*(names|values|types|modules)[ \t]*$", source):
+                self._site_rule_families[blob] = match[1]
+        grouped: dict[tuple[str, str], list[Judgment]] = {}
+        self._site_holding_rows.clear()
+        rows = cast(list[tuple[str, str, str, str, str, Verdict, str, str, str, str]], self._connection.execute(
+            'SELECT rule,path,rule_blob,input_fingerprint,"commit",verdict,input_scope,declared_scope,read_files,ticket '
+            + 'FROM judgments ORDER BY recorded_at DESC,id DESC').fetchall())
+        for rule, path, blob, fingerprint, commit, verdict, scope, declared, reads, ticket in rows:
+            judgment = Judgment(blob, fingerprint, commit, verdict, CellInputScope(scope), DeclaredInputScope(declared), _read_files(reads), ticket)
+            grouped.setdefault((rule, path), []).append(judgment)
+            self._site_holding_rows.setdefault((rule, ticket), []).append((path, judgment))
+        self._site_rows = {key: tuple(rows) for key, rows in grouped.items()}
+
+    def _prepare_sites(self, findings: tuple[HeldFinding, ...], tip: RepositoryTip) -> None:
+        """Read each needed immutable blob once, using Git's existing batch reader."""
+        wanted: dict[str, str] = {}
+        for finding in findings:
+            judged = self.judged_commit(finding)
+            if isinstance(judged, NoJudgedCommit):
+                continue
+            read = finding.follow.commit if isinstance(finding.follow, FollowedDeclaration) else judged.commit
+            before = self._tip(read)
+            for tree in (before, tip):
+                blob = tree.blobs.get(finding.path, "")
+                if blob and blob not in self._site_sources:
+                    wanted[blob] = blob
+        if isinstance(self.git_cache, GitReadCache):
+            self.git_cache.read_blobs(wanted)
+            cached = self.git_cache.contents
+            contents = ((blob, cached[blob]) for blob in wanted)
+        else:
+            contents = blob_contents(self.repo, wanted)
+        for blob, content in contents:
+            try:
+                self._site_sources[blob] = finding_sites.SourceSites(content.decode())
+            except UnicodeDecodeError:
+                # Non-UTF-8 is not source evidence.
+                continue
+
+    def _site_source(self, tip: RepositoryTip, path: str) -> finding_sites.SourceSites:
+        blob = tip.blobs.get(path, "")
+        if not blob:
+            return finding_sites.SourceSites("")
+        if blob not in self._site_sources:
+            if isinstance(self.git_cache, GitReadCache):
+                self.git_cache.read_blobs((blob,))
+                content = self.git_cache.contents[blob]
+            else:
+                content = next(blob_contents(self.repo, {path: blob}))[1]
+            self._site_sources[blob] = finding_sites.SourceSites(content.decode())
+        return self._site_sources[blob]
+
+    def _original_site_inputs(self, finding: HeldFinding, read: RepositoryTip, tip: RepositoryTip,
+                              *, line_local: bool = False) -> bool:
+        """Retain the original judgment's scope even when today's rule has narrowed it."""
+        candidates = [(path, row) for path, row in self._site_holding_rows.get((finding.rule, finding.ticket), ())
+                      if _under(finding.path, path)]
+        contextual = finding.rule in {
+            "global:rust/no-duplicate-implementations.md", "global:rust/one-mechanism-per-behavior.md",
+            "global:rust/crate-apis-expose-behavior.md", "global:rust/behavior-lives-in-its-most-cohesive-crate.md",
+        }
+        if not candidates:
+            return line_local and not contextual
+        longest = max(len(path) for path, _ in candidates)
+        path, row = next((path, row) for path, row in candidates if len(path) == longest)
+        if (row.rule_blob != finding.rule_blob or not self._is_ancestor(row.commit, tip.commit)
+                or row not in self._rows_after_removals(self._site_rows[(finding.rule, path)], tip.commit)):
+            return False
+        scope = _comparison_scope(row.declared_scope, row.input_scope)
+        whole_inputs = contextual or row.input_scope in (CellInputScope.CRATE, CellInputScope.MANIFEST)
+        if line_local and not whole_inputs:
+            return True
+        original = self._tip(row.commit)
+        if not self._judgment_inputs_match(row, original, scope, path, None):
+            return False
+        old = (_read_inputs(original, path, row.reads) if isinstance(row.reads, ReadFiles)
+               else self._scope_inputs(original, scope, path))
+        new = (_read_inputs(tip, path, row.reads) if isinstance(row.reads, ReadFiles)
+               else self._scope_inputs(tip, scope, path))
+        if whole_inputs:
+            return old == new and self._is_ancestor(row.commit, read.commit)
+        # A prior follow is site provenance, not authority to reset broader input evidence.
+        return ({name: entry for name, entry in old.items() if name != finding.path}
+                == {name: entry for name, entry in new.items() if name != finding.path}
+                and self._is_ancestor(row.commit, read.commit))
+
+    def finding_site(self, finding: HeldFinding, at: str) -> SiteEvidence:
+        """The shared follow result consumed by filing and both refill rank gates."""
+        self._refresh_site_rows()
+        tip = self._tip(at)
+        key = (finding, tip.commit)
+        if key not in self._follow_evidence:
+            _ = self._declaration_reading((finding.finding_id,), tip, lambda _: False)
+        return self._follow_evidence.get(key, NeedsJudgment("finding changed while reading"))
+
+    def _site_after_refusal(self, outcome: DeclarationNotRead | DeclarationInPlace, tip: RepositoryTip) -> DeclarationOutcome:
+        evidence = self._site_proof(outcome.finding, tip.commit)
+        if not isinstance(evidence, NeedsJudgment):
+            return FindingSite(outcome.finding, evidence)
+        return outcome
+
+    def _site_proof(self, finding: HeldFinding, at: str) -> SiteEvidence:
+        """Additional strict evidence, used only after the existing declaration proofs refuse."""
+        self._refresh_site_rows()
+        tip = self._tip(at)
+        key = (finding, tip.commit)
+        if key not in self._site_evidence:
+            try:
+                self._site_evidence[key] = self._finding_site(finding, tip)
+            except (LedgerError, UnicodeDecodeError, finding_sites.UnreadableSourceItems, style_footprint.UnreadableTokenSpans):
+                self._site_evidence[key] = NeedsJudgment("source or input proof unreadable")
+        return self._site_evidence[key]
+
+    def _finding_site(self, finding: HeldFinding, tip: RepositoryTip) -> SiteEvidence:
+        if not isinstance(finding.state, (Unfiled, Filed)) or not finding.path.endswith(".rs"):
+            return NeedsJudgment("not an open Rust finding")
+        judged = self.judged_commit(finding)
+        if isinstance(judged, NoJudgedCommit):
+            return NeedsJudgment("no judged commit")
+        read = finding.follow.commit if isinstance(finding.follow, FollowedDeclaration) else judged.commit
+        rows = self._site_rows.get((finding.rule, finding.path), ())
+        # Share the removal rule with coverage. Include the site's commit as a candidate even if
+        # this legacy finding has no matching cell row.
+        site_row = Judgment(finding.rule_blob, "", read, "held", CellInputScope.FILE, DeclaredInputScope.FILE)
+        eligible = self._rows_after_removals((site_row, *rows), tip.commit)
+        original_row = replace(site_row, commit=judged.commit)
+        if (not self._is_ancestor(judged.commit, read) or not self._is_ancestor(read, tip.commit)
+                or site_row not in eligible
+                or original_row not in self._rows_after_removals((original_row, *rows), tip.commit)):
+            return NeedsJudgment("judgment crossed ancestry or removal boundary")
+        before = self._tip(read)
+        definition = next((rule for rule in self._catalog
+                           if rule.rule_id == finding.rule.removesuffix("#uncovered")), None)
+        family = self._site_rule_families.get(finding.rule_blob, "")
+        if not family and definition is not None and definition.blob == finding.rule_blob:
+            family = definition.family or ""
+        for tree in (before, tip):
+            entry = tree.entries.get(finding.path)
+            if entry is not None and entry.mode not in REGULAR_FILE_MODES:
+                return NeedsJudgment("not a regular source file")
+        if family not in ("names", "values", "types", "modules"):
+            return NeedsJudgment("pinned rule family unreadable")
+        if not self._original_site_inputs(finding, before, tip, line_local=family in ("names", "values")):
+            return NeedsJudgment("original context inputs changed or missing")
+        old = self._site_source(before, finding.path)
+        new = self._site_source(tip, finding.path)
+        # A partial item parse cannot establish an unambiguous owner, even on an equal line.
+        _ = old.items, new.items
+        if before.blobs.get(finding.path) == tip.blobs.get(finding.path) and finding.path in tip.blobs:
+            # The file gate itself is satisfied; context rules also retain their original external inputs.
+            return UnchangedSite(finding.path, finding.line)
+        if not (1 <= finding.line <= len(old.lines)):
+            return NeedsJudgment("old source coordinate unreadable")
+        line = old.lines[finding.line - 1]
+        if not line.strip() or finding.text.strip() != line.strip():
+            return NeedsJudgment("finding text is not its old source line")
+        if finding.kind == "type" and not old.locates_subject(finding.line, finding.before):
+            return NeedsJudgment("proposed type subject is not located in its original item")
+        key = (read, tip.commit, finding.path)
+        if key not in self._site_maps:
+            # A proven binding rename already supplies this alignment; never run a second checker.
+            proof = self._binding_proofs.get(key)
+            if proof is not None and proof.explained and any(isinstance(check, AppliedInCode) for check in proof.checks.values()):
+                self._site_maps[key] = dict(proof.line_map)
+            else:
+                patch = _git(self.repo, "diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames",
+                             "--diff-algorithm=myers", "--no-indent-heuristic", "--unified=0", read, tip.commit, "--", finding.path)
+                self._site_maps[key] = finding_sites.unchanged_lines(patch, old, new)
+        mapped = self._site_maps[key].get(finding.line, 0)
+        if (mapped and mapped <= len(new.lines) and line == new.lines[mapped - 1]
+                and old.same_owner(finding.line, new, mapped)):
+            if family in ("names", "values"):
+                return UnchangedSite(finding.path, mapped)
+            if old.same_item(finding.line, new, mapped):
+                return UnchangedSite(finding.path, mapped)
+            return NeedsJudgment("enclosing item, owner, imports or original inputs changed")
+        return NeedsJudgment("unchanged source site not proved")
+
     def _declaration_outcome(self, finding: HeldFinding, tip: RepositoryTip, rust_files: frozenset[str],
                              approved: Callable[[Path], bool], renames: tuple[BuiltRename, ...],
                              built_findings: tuple[HeldFinding, ...]) -> DeclarationOutcome:
@@ -4347,7 +4664,7 @@ class Ledger:
         old_file = self._declared_file(read, finding.path)
         old = old_file.declaration_at(finding.line)
         if not isinstance(old, DeclaredItem):
-            return DeclarationNotRead(finding)
+            return self._site_after_refusal(DeclarationNotRead(finding), tip)
         declaration = old.declaration
         requirement = _trait_requirement(old, read, finding.path)
         if isinstance(old.implemented_trait, UnreadableImplementedTrait):
@@ -4356,7 +4673,7 @@ class Ledger:
         if isinstance(in_place, TraitIdentityUncertain):
             return in_place
         if in_place:
-            return DeclarationInPlace(finding)
+            return self._site_after_refusal(DeclarationInPlace(finding), tip)
         # A destination must gain the same member, including its proved trait identity.
         found: dict[str, tuple[DeclaredItem, ...]] = {}
         for path in self.files_naming(tip.commit, declaration.name):
@@ -4694,6 +5011,7 @@ class Ledger:
 
     def _declaration_reading(self, finding_ids: tuple[str, ...], tip: RepositoryTip,
                              approved: Callable[[Path], bool]) -> DeclarationReading:
+        self._prepare_sites(tuple(self._held(finding_id) for finding_id in finding_ids), tip)
         rust_files = frozenset(tip.rust_files)
         built_renames: list[BuiltRename] = []
         built_findings = self.held_findings(HeldFindingsInState("built"))
@@ -4716,9 +5034,26 @@ class Ledger:
                     self._trait_site_position(judged.commit, before_path, before_line, finding.before),
                     self._trait_site_position(read.commit, finding.path, finding.line, finding.after)))
         renames = tuple(built_renames)
-        return DeclarationReading(tip.commit, tuple(self._declaration_outcome(self._held(finding_id), tip, rust_files, approved, renames,
-                                                                                   built_findings)
-                                                    for finding_id in finding_ids))
+        self._refresh_site_rows()
+        outcomes = tuple(self._declaration_outcome(self._held(finding_id), tip, rust_files, approved, renames,
+                                                   built_findings) for finding_id in finding_ids)
+        for outcome in outcomes:
+            finding = outcome.finding
+            if isinstance(outcome, FindingSite):
+                evidence = outcome.evidence
+            elif isinstance(outcome, DeclarationMoved):
+                evidence = UnchangedSite(outcome.path, outcome.line)
+            elif isinstance(outcome, DeclarationRemoved):
+                evidence = NeedsJudgment("no source site after proved declaration removal")
+            elif isinstance(outcome, DeclarationNotRead) and isinstance(self.judged_commit(finding), NoJudgedCommit):
+                # Existing untracked findings are eligible for filing; this is not a new carry.
+                evidence = UnchangedSite(finding.path, finding.line)
+            elif isinstance(outcome, (DeclarationInPlace, DeclarationNotRead)):
+                evidence = self._site_proof(finding, tip.commit)
+            else:
+                evidence = NeedsJudgment("existing declaration proof refused this transition")
+            self._follow_evidence[(finding, tip.commit)] = evidence
+        return DeclarationReading(tip.commit, outcomes)
 
     def declaration_reading(self, finding_ids: Iterable[str], approved: Callable[[Path], bool]) -> DeclarationReading:
         """What follow_declarations writes for the findings at the synced tip; it writes nothing.
@@ -4748,9 +5083,11 @@ class Ledger:
             tip = self._tip(at)
             plan = self._declaration_reading(ids, tip, approved)
             moves = [item for item in plan.outcomes if isinstance(item, DeclarationMoved)]
+            sites = [item for item in plan.outcomes if isinstance(item, FindingSite)]
+            follows = [(item.finding, item.evidence) for item in sites if isinstance(item.evidence, UnchangedSite)]
             renames = [item for item in plan.outcomes if isinstance(item, DeclarationRenamed)]
             removals = [item for item in plan.outcomes if isinstance(item, DeclarationRemoved)]
-            if not moves and not renames and not removals:
+            if not moves and not renames and not removals and not follows:
                 return plan
             with self._connection:
                 _ = self._connection.execute("BEGIN IMMEDIATE")
@@ -4762,14 +5099,15 @@ class Ledger:
                 _ = self._connection.executemany(
                     "UPDATE held_findings SET path=?,line=?,followed_from=?,followed_from_line=?,followed_at=?,updated_at=? WHERE finding_id=?",
                     [(item.path, item.line, item.finding.path, item.finding.line, tip.commit, now, item.finding.finding_id)
-                     for item in moves],
+                     for item in moves] + [(site.path, site.line, finding.path, finding.line, tip.commit, now, finding.finding_id)
+                                         for finding, site in follows],
                 )
                 # A person's reading was of an old build, so the new build clears it. A rename follows to its new
                 # declaration, in its own file too, so reopen checks that site and its line reads at the tip.
                 _ = self._connection.executemany(
                     "UPDATE held_findings SET state='built',person_read_by='',path=?,line=?,followed_from=?,followed_from_line=?,"
-                    + "followed_at=?,updated_at=? WHERE finding_id=?",
-                    [(item.path, item.line, item.finding.path, item.finding.line, tip.commit, now, item.finding.finding_id)
+                    + "followed_at=?,built_at=CASE WHEN built_at='' THEN ? ELSE built_at END,updated_at=? WHERE finding_id=?",
+                    [(item.path, item.line, item.finding.path, item.finding.line, tip.commit, now, now, item.finding.finding_id)
                      for item in renames],
                 )
                 _ = self._connection.executemany(
@@ -4816,8 +5154,9 @@ class Ledger:
                 if current != finding or merged_build_ticket(current) != ticket:
                     raise ChangedBeforeLock(f"{finding_id}: the finding changed while it was marked built; rerun")
                 # A person's reading was of the old build, so a new build clears it.
-                _ = self._connection.execute("UPDATE held_findings SET state='built',person_read_by='',updated_at=? WHERE finding_id=?",
-                                             (_now(), finding_id))
+                now = _now()
+                _ = self._connection.execute("UPDATE held_findings SET state='built',person_read_by='',built_at=CASE WHEN built_at='' THEN ? ELSE built_at END,updated_at=? WHERE finding_id=?",
+                                             (now, now, finding_id))
 
         return retry_on_change(attempt)
 
@@ -4878,8 +5217,8 @@ class Ledger:
                 for item in built:
                     by = item.reading.by if isinstance(item.reading, ReadByPerson) else ""
                     _ = self._connection.execute(
-                        "UPDATE held_findings SET state='built',person_read_by=?,updated_at=? WHERE finding_id=?",
-                        (by, now, item.finding_id),
+                        "UPDATE held_findings SET state='built',person_read_by=?,built_at=CASE WHEN built_at='' THEN ? ELSE built_at END,updated_at=? WHERE finding_id=?",
+                        (by, now, now, item.finding_id),
                     )
             return tuple(built)
 
@@ -4938,7 +5277,7 @@ class Ledger:
         cells = {(finding.rule, _finding_cell(self._component_rule(finding.rule), finding.path, tip)) for finding in findings}
         now = _now()
         _ = self._connection.executemany(
-            "UPDATE held_findings SET state='unfiled',proposal='',build_ticket='',moved_from='',updated_at=? WHERE finding_id=?",
+            "UPDATE held_findings SET state='unfiled',proposal='',build_ticket='',moved_from='',built_at='',updated_at=? WHERE finding_id=?",
             [(now, finding.finding_id) for finding in findings],
         )
         for rule, path in sorted(cells):
@@ -5019,7 +5358,7 @@ class Ledger:
                 if not isinstance(self._held(finding_id).state, Built):
                     raise LedgerError(f"{finding_id}: finding is not built")
                 _ = self._connection.execute(
-                    "UPDATE held_findings SET state='filed',build_ticket='',updated_at=? WHERE finding_id=?", (now, finding_id),
+                    "UPDATE held_findings SET state='filed',build_ticket='',built_at='',updated_at=? WHERE finding_id=?", (now, finding_id),
                 )
                 reading = refilings[finding_id]
                 if isinstance(reading, ReadByPerson):
@@ -5050,7 +5389,7 @@ class Ledger:
             # A unit cannot relabel an existing waive. A person's explicit waive protects it from replacement.
             if isinstance(finding.state, Withdrawn) or isinstance(finding.state, Waived) and isinstance(actor, WaiveByUnit):
                 return
-            _ = self._connection.execute("UPDATE held_findings SET state='waived',waive_provenance=?,waived_by=?,updated_at=? WHERE finding_id=?",
+            _ = self._connection.execute("UPDATE held_findings SET state='waived',built_at='',waive_provenance=?,waived_by=?,updated_at=? WHERE finding_id=?",
                                          (provenance, by, _now(), finding_id))
 
     def reconcile(self, branch_point: str, style_branch: str) -> tuple[str, ...]:
@@ -5724,6 +6063,61 @@ def open_ledger(repo: Path) -> Ledger:
     return Ledger(location.repo, location.database)
 
 
+def record_refill(repo: Path, unit: str, outcome: str) -> None:
+    """Save a refill result without loading rules or changing the schema."""
+    database = ledger_location(repo).database
+    if not database.is_file():
+        return
+    with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=rw", uri=True,
+                                timeout=BUSY_TIMEOUT_SECONDS)) as connection, connection:
+        if not connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='refill_results'").fetchone():
+            return
+        now = _now()
+        _ = connection.execute(
+            "INSERT INTO refill_results(unit,at,outcome) VALUES (?,?,?) "
+            + "ON CONFLICT(unit) DO UPDATE SET at=excluded.at,outcome=excluded.outcome",
+            (unit, now, outcome),
+        )
+
+
+@dataclass(frozen=True)
+class RecordedSplit:
+    ready: int
+    changed: int
+    structure: int
+    other: int
+    measured_at: str
+
+
+@dataclass(frozen=True)
+class NoSplitRecorded:
+    """The unit has no completed split scan."""
+
+
+def require_split_table(repo: Path) -> None:
+    """Refuse an old stored schema before a split scans its backup."""
+    database = ledger_location(repo).database
+    with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True,
+                                timeout=BUSY_TIMEOUT_SECONDS)) as connection:
+        if not connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='refill_results'").fetchone():
+            raise LedgerError("ledger has no refill_results (schema below 25)")
+
+
+def record_split(repo: Path, unit: str, split: RecordedSplit, *,
+                 busy_timeout_seconds: float = BUSY_TIMEOUT_SECONDS) -> None:
+    """Save a complete split without changing the last refill result."""
+    database = ledger_location(repo).database
+    with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=rw", uri=True,
+                                timeout=busy_timeout_seconds)) as connection, connection:
+        _ = connection.execute(
+            "INSERT INTO refill_results(unit,at,outcome,split_at,ready,changed,structure,other) "
+            + "VALUES (?,'','',?,?,?,?,?) ON CONFLICT(unit) DO UPDATE SET "
+            + "split_at=excluded.split_at,ready=excluded.ready,changed=excluded.changed,"
+            + "structure=excluded.structure,other=excluded.other",
+            (unit, split.measured_at, split.ready, split.changed, split.structure, split.other),
+        )
+
+
 @contextmanager
 def refill_lock(repo: Path) -> Generator[None]:
     """Serialize refill selection for units that share a ledger."""
@@ -5735,7 +6129,7 @@ def refill_lock(repo: Path) -> Generator[None]:
 
 
 @contextmanager
-def preview_ledger(repo: Path) -> Generator[Ledger]:
+def preview_ledger(repo: Path, *, git_cache: GitReadCache | NoGitReadCache = _NO_GIT_READ_CACHE) -> Generator[Ledger]:
     """Read and migrate a temporary copy without changing the stored ledger."""
     location = ledger_location(repo)
     with tempfile.TemporaryDirectory(prefix="style-ledger-preview-") as directory:
@@ -5745,7 +6139,7 @@ def preview_ledger(repo: Path) -> Generator[Ledger]:
                                           timeout=BUSY_TIMEOUT_SECONDS)) as source,
                   closing(sqlite3.connect(database, timeout=BUSY_TIMEOUT_SECONDS)) as destination):
                 source.backup(destination)
-        with Ledger(location.repo, database) as ledger:
+        with Ledger(location.repo, database, git_cache=git_cache) as ledger:
             yield ledger
 
 

@@ -173,10 +173,10 @@ def target_state(target: Target) -> TargetState:
     """Read state without probing a host or changing coordination files."""
     try:
         if isinstance(target, LocalTarget):
-            holds = build_hold.read_holders(build_hold.holder_directory())
-            if isinstance(holds, build_hold.NoHolders):
+            holds = build_hold.natedev_holds(build_hold.holder_directory())
+            if not holds.in_force:
                 return Free()
-            holder = holds.holders[0]
+            holder = holds.in_force[0]
             end = (
                 ReleaseEstimated(holder.release.at)
                 if isinstance(holder.release, build_hold.KnownReleaseEta)
@@ -195,5 +195,7 @@ def target_state(target: Target) -> TargetState:
             return Held(block.holder, block.reason, block.since, block_end)
         jobs = tuple(running_job(claim) for claim in claims if mac_test.run_is_live(claim.record))
         return Running(jobs) if jobs else Free()
+    except build_hold.ReleaseRecordReadError as error:
+        return StateUnreadable(build_hold.release_record_error_line(error))
     except (OSError, UnicodeError, mac_test.StateReadError) as error:
         return StateUnreadable(str(error))

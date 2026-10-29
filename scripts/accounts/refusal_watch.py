@@ -12,7 +12,7 @@ import socket
 import subprocess
 import sys
 import tempfile
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -462,6 +462,13 @@ def transcript_refusal(session_id: str, *, config_dir: Path | None = None) -> Tr
     root = config_dir if config_dir is not None else Path.home() / ".claude"
     try:
         paths = list((root / "projects").glob("*/" + session_id + ".jsonl"))
+    except OSError:
+        return NoSessionRefusal()
+    return _transcript_refusal(paths)
+
+
+def _transcript_refusal(paths: list[Path]) -> TranscriptRefusal | NoSessionRefusal:
+    try:
         if not paths:
             return NoSessionRefusal()
         transcript = max(paths, key=lambda path: path.stat().st_mtime)
@@ -535,6 +542,42 @@ def assumed_refusal(session_id: str) -> ProofRefusal | NoSessionRefusal:
 def session_refusal(session_id: str) -> TranscriptRefusal | ProofRefusal | NoSessionRefusal:
     assumed = assumed_refusal(session_id)
     return transcript_refusal(session_id) if isinstance(assumed, NoSessionRefusal) else assumed
+
+
+def session_refusals(session_ids: list[str]) -> dict[str, TranscriptRefusal | ProofRefusal | NoSessionRefusal]:
+    """Find this pass's transcripts with one directory scan per project."""
+    detected: dict[str, TranscriptRefusal | ProofRefusal | NoSessionRefusal] = {
+        session_id: assumed_refusal(session_id) for session_id in session_ids}
+    wanted = {session_id + ".jsonl": session_id for session_id, refusal in detected.items()
+              if isinstance(refusal, NoSessionRefusal)}
+    if not wanted:
+        return detected
+    paths: dict[str, list[Path]] = {session_id: [] for session_id in wanted.values()}
+    # Keep the index within this pass. New transcripts and exchanges are read next pass.
+    try:
+        with os.scandir(Path.home() / ".claude/projects") as projects:
+            for project in projects:
+                try:
+                    if not project.is_dir():
+                        continue
+                    with os.scandir(project.path) as transcripts:
+                        for transcript in transcripts:
+                            if transcript.name in wanted:
+                                paths[wanted[transcript.name]].append(Path(transcript.path))
+                except OSError:
+                    # A project may permit known-file reads without directory listing.
+                    for name, session_id in wanted.items():
+                        candidate = Path(project.path) / name
+                        try:
+                            if candidate.exists():
+                                paths[session_id].append(candidate)
+                        except OSError:
+                            continue
+    except OSError:
+        pass
+    for session_id, candidates in paths.items():
+        detected[session_id] = _transcript_refusal(candidates)
+    return detected
 
 
 def clear_assumed(session_id: str) -> None:
@@ -707,7 +750,8 @@ def _reading_values_fingerprint() -> str:
     return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 
-def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_FILTER) -> list[str]:
+def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_FILTER, *,
+         refresh_usage: Callable[[], None] = lambda: None) -> list[str]:
     state = _load_state()
     original_state = deepcopy(state)
     configured = read_auto_move_rules() if not proof_group else ()
@@ -730,13 +774,19 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
     selected_groups = accounts.GroupAccounts() if proof_group else accounts.group_accounts()
     unconfigured = {group for group in (() if proof_group else accounts.CLAUDE_GROUPS) if isinstance(accounts.group_label(selected_groups, group), accounts.GroupNotConfigured)}
     reported_unconfigured: set[accounts.ClaudeGroup] = set()
-    detected = {session["sessionId"]: session_refusal(session["sessionId"]) for session in sessions.live_sessions()
-        if session["sessionId"] not in open_ids and (not proof_group or session["sessionId"] in proof_group)}
-    refused_ids = frozenset(session_id for session_id, refusal in detected.items() if isinstance(refusal, (TranscriptRefusal, ProofRefusal)))
+    detected = session_refusals([session["sessionId"] for session in sessions.live_sessions()
+        if session["sessionId"] not in open_ids and (not proof_group or session["sessionId"] in proof_group)])
+    refused_ids = frozenset(session_id for session_id, refusal in detected.items()
+        if isinstance(refusal, (TranscriptRefusal, ProofRefusal))
+        and not ((previous := state["sessions"].get(session_id)) and previous["entry_id"] == refusal.entry_id
+                 and previous["state"] in ("requested", "cancelled", "continued", "group selected")))
     refusing_logins: set[str] = set()
     owners = live_owners(only=refused_ids) if refused_ids else []
     owners = [session for session in owners if not isinstance(detected[session["session_id"]], ProofRefusal)
               or accounts.session_group(session) == "ungrouped"]
+    if owners and not dry_run:
+        refresh_usage()
+        now = max(now, datetime.now(timezone.utc))
     waiting_groups: set[accounts.ClaudeGroup] = set()
     blocked_groups: set[accounts.ClaudeGroup] = set()
     tick_logins = frozenset(identity.login.casefold() for session in owners
@@ -1260,7 +1310,8 @@ def renew_expired_logins(now: datetime, dry_run: bool) -> list[str]:
 
 
 @role_map.role_map_command
-def run(now: datetime | None = None, *, dry_run: bool = False, proof_group: frozenset[str] = NO_SESSION_FILTER) -> list[str]:
+def run(now: datetime | None = None, *, dry_run: bool = False, proof_group: frozenset[str] = NO_SESSION_FILTER,
+        refresh_usage: Callable[[], None] = lambda: None) -> list[str]:
     from scripts.accounts import unit_watchdog
 
     at = now or datetime.now(timezone.utc)
@@ -1272,7 +1323,7 @@ def run(now: datetime | None = None, *, dry_run: bool = False, proof_group: froz
         renewed = renew_expired_logins(at, False)
         # A probe can save a reading after the pass started.
         after_renewal = max(at, datetime.now(timezone.utc)) if renewed else at
-        return [*renewed, *_run(after_renewal, False, proof_group),
+        return [*renewed, *_run(after_renewal, False, proof_group, refresh_usage=refresh_usage),
                 *(unit_watchdog.run(after_renewal, dry_run=False) if not proof_group else [])]
 
 

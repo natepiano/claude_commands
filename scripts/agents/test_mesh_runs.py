@@ -277,6 +277,15 @@ class MeshRunsTests(unittest.TestCase):
         self.assertIn("FAIL (no exit status)", cast(list[str], self.pending()["messages"])[0])
         self.assertFalse(codex_mesh._close_messages_if_empty(session, WORKER, thread))  # pyright: ignore[reportPrivateUsage]
 
+    def test_a_supervisor_for_a_different_record_is_not_trusted(self) -> None:
+        path = self.live_run(["echo", "x"])
+        original = cast(mesh_runs.RunRecord, json.loads(path.read_text()))
+        self.assertTrue(mesh_runs.supervises(original["pid"], path))
+        another = path.with_name("another.json")
+        _ = another.write_text(path.read_text())
+        self.assertFalse(mesh_runs.supervises(original["pid"], another))
+        self.assertFalse(mesh_runs.supervises(os.getpid(), path))
+
     def test_a_live_supervisor_is_not_ended(self) -> None:
         path = self.live_run(["bash", "verify.sh", "check"])
         self.assertEqual(mesh_runs.reap_orphans(str(self.session)), [])
@@ -401,7 +410,9 @@ class MeshRunsTests(unittest.TestCase):
         record = self.supervise(self.record([sys.executable, "-c", "raise SystemExit(2)"]))
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(self.sent[0].session_id, "director-session")
-        for part in (f"Seat: {WORKER}", "Command: ", "FAIL (exit 2)", "Log: "):
+        for part in (f"Worker {WORKER}'s run", f"Worker: {WORKER}",
+                     f"Dispatch the worker (implement.sh --to {WORKER})",
+                     "Command: ", "FAIL (exit 2)", "Log: "):
             self.assertIn(part, self.sent[0].text)
         self.assertEqual(self.pending(), {})
         self.assertIn("sent to director", record.get("delivery", ""))
@@ -486,8 +497,9 @@ class MeshRunsTests(unittest.TestCase):
                 del timeout
                 calls.append((method, params))
                 if method == "thread/read":
-                    return {"result": {"thread": {"status": {"type": "active"},
-                                                  "turns": [{"id": "turn-9", "status": "inProgress"}]}}}
+                    return {"result": {"thread": {"status": {"type": "active"}, "turns": []}}}
+                if method == "thread/turns/list":
+                    return {"result": {"data": [{"id": "turn-9", "status": "inProgress"}]}}
                 return {"result": {}}
 
             def close(self) -> None:

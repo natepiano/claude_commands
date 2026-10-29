@@ -17,9 +17,19 @@ from issues import PROPOSAL_TAG as PROPOSAL_TAG
 from production_units import Refusal, production_field, unit_table
 
 PROPOSALS_FIELD = "Proposals"
+IMPROVEMENT_QUEUE_FIELD = "Improvement queue"
 PRODUCTION_SUFFIX = "-production.md"
 # `types-unit (cargo-liner-style)`: a unit with the production it works in.
 UNIT_IN_PRODUCTION = re.compile(r".+?\s*\((?P<production>[^()]+)\)")
+
+
+def ledger(doc: Path) -> Path | None:
+    """The ledger the doc's Improvement queue line names, or None when it names none."""
+    try:
+        return Path(production_field(doc.read_text(encoding="utf-8").splitlines(),
+                                     IMPROVEMENT_QUEUE_FIELD)).expanduser()
+    except Refusal:
+        return None
 
 
 def issues_folder(doc: Path) -> Path | None:

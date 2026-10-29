@@ -3,10 +3,9 @@
 The status line and the dailies report's own footer show it; no reply carries it (user,
 2026-10-18). Each count is the production's own: the showrunners above and below it count their
 own (user, 2026-10-27). Changes are the rows still to review that are the production's
-(change_review.scope_rows), proposals the open proposal issues in its Proposals folder that are its
-own and that the user has not approved (see proposals_folder and proposal_issue.proposal_progress), efficiency proposals
-the proposed or deferred lines in its Efficiency ledger, and projects the improvement-queue
-lines still to decide or hand out, for a doc with an Improvement queue line.
+(change_review.scope_rows), proposals the issues and plan-backlog lines that /next proposal
+lists for review (proposals_table.waiting_entries), and efficiency the proposed or deferred
+lines in its Efficiency ledger. Accepted plan-backlog lines are work in progress and do not count.
 """
 from __future__ import annotations
 
@@ -15,23 +14,18 @@ from pathlib import Path
 from typing import NamedTuple
 
 import change_review
-import proposal_issue
 import proposals_folder
+import proposals_table
 from production_units import Refusal, production_field
 
-IMPROVEMENT_QUEUE_FIELD = "Improvement queue"
 EFFICIENCY_LEDGER_FIELD = "Efficiency ledger"
 COUNTS_HEAD = "For you: "
-# A ledger line: `- <date> <title> (<file>) — <status>`.
-LEDGER_STATUS = re.compile(r"^- \d{4}-\d\d-\d\d .* — (?P<status>.*)$")
 EFFICIENCY_LINE = re.compile(r"^- \d{4}-\d\d-\d\d .*? — (?P<status>.*)$")
-SETTLED = re.compile(r"\b(assigned|applied|built|declined)\b", re.IGNORECASE)
 
 
 class FooterCounts(NamedTuple):
     changes: int = 0
     proposals: int = 0
-    projects: int = 0
     questions: int = 0
     efficiency: int = 0
 
@@ -48,17 +42,7 @@ def changes(doc: Path) -> int:
 
 
 def proposals(doc: Path) -> int:
-    return sum(isinstance(proposal_issue.proposal_progress(issue), proposal_issue.AwaitingApproval)
-               for issue in proposals_folder.open_proposals(doc))
-
-
-def open_project(line: str) -> bool:
-    """A ledger line still to decide (`proposed`), or accepted and not yet handed out or settled."""
-    match = LEDGER_STATUS.match(line)
-    if match is None:
-        return False
-    status = match.group("status").strip()
-    return status.startswith("proposed") or (status.startswith("accepted") and SETTLED.search(status) is None)
+    return len(proposals_table.waiting_entries(doc)[0])
 
 
 def open_efficiency(line: str) -> bool:
@@ -72,11 +56,6 @@ def _field_path(doc: Path, field: str) -> Path | None:
         return Path(production_field(doc.read_text(encoding="utf-8").splitlines(), field)).expanduser()
     except Refusal:
         return None
-
-
-def ledger(doc: Path) -> Path | None:
-    """The ledger the doc's Improvement queue line names, or None when it names none."""
-    return _field_path(doc, IMPROVEMENT_QUEUE_FIELD)
 
 
 def efficiency_ledger(doc: Path) -> Path | None:
@@ -96,21 +75,10 @@ def efficiency(doc: Path) -> int:
     return sum(open_efficiency(line) for line in lines)
 
 
-def projects(doc: Path) -> int:
-    path = ledger(doc)
-    if path is None:
-        return 0
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return 0
-    return sum(open_project(line) for line in lines)
-
-
 def read_counts(doc: Path, *, questions: int = 0) -> FooterCounts:
     """Each count for one production doc; a source that cannot be read counts nothing."""
     try:
-        return FooterCounts(changes(doc), proposals(doc), projects(doc), questions, efficiency(doc))
+        return FooterCounts(changes(doc), proposals(doc), questions, efficiency(doc))
     except OSError:
         return FooterCounts(questions=questions)
 
@@ -127,7 +95,7 @@ def sources(doc: Path) -> list[Path]:
         listed = None
     folder = proposals_folder.issues_folder(doc)
     try:
-        queue = ledger(doc)
+        queue = proposals_folder.ledger(doc)
         efficiency_queue = efficiency_ledger(doc)
     except OSError:
         queue = None
@@ -145,7 +113,7 @@ def plural(count: int, word: str) -> str:
 
 
 def counts_line(counts: FooterCounts) -> str | None:
-    """`For you: 1 question, 2 changes, 130 efficiency, 2 proposals, 3 projects`.
+    """`For you: 1 question, 2 changes, 130 efficiency, 2 proposals`.
 
     Questions come first because they need the user most (user, 2026-10-20). "efficiency" has
     no plural. Zero counts are left out; None when all are zero.
@@ -154,6 +122,5 @@ def counts_line(counts: FooterCounts) -> str | None:
         (counts.questions, plural(counts.questions, "question")),
         (counts.changes, plural(counts.changes, "change")),
         (counts.efficiency, f"{counts.efficiency} efficiency"),
-        (counts.proposals, plural(counts.proposals, "proposal")),
-        (counts.projects, plural(counts.projects, "project"))) if count]
+        (counts.proposals, plural(counts.proposals, "proposal"))) if count]
     return COUNTS_HEAD + ", ".join(parts) if parts else None

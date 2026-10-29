@@ -18,11 +18,18 @@ import unittest
 from unittest import mock
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 
 import record as recorder
 import sample
 import store
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
+if TYPE_CHECKING:
+    from ..direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
+else:
+    from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
 from test_index import point_root_at
 
 SCRIPT = Path(__file__).with_name("record.py")
@@ -92,6 +99,8 @@ class RecordTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        tools = rust_tool_path(self.base / "tools")
+        self.enterContext(mock.patch.dict(os.environ, {"PATH": tools}))
         self.root = self.base / "buildlog"
         point_root_at(self, self.root)
         self.repo = self.base / "hana"
@@ -172,6 +181,7 @@ class RecordTests(unittest.TestCase):
         record = self.step(1, "0", str(handoff), str(peak), NEXTEST, {"BUILDLOG_CALL_ID": CALL_ID})
         self.assertEqual(record["kind"], "step")
         self.assertEqual(record["step"], "nextest")
+        self.assertEqual(record["rustc"], FIXED_RUSTC)
         self.assertEqual(record["status"], 1)
         self.assertEqual(record["started_at"], "2026-10-02T12:00:00.000Z")
         self.assertEqual(record["duration_s"], 12.5)
@@ -254,13 +264,13 @@ class RecordTests(unittest.TestCase):
             )
             try:
                 assert process.stderr is not None
-                readable, _, _ = select.select([process.stderr], [], [], 5)
+                readable, _, _ = select.select([process.stderr], [], [], TEST_HANG_GUARD_SECS)
                 self.assertTrue(readable, "memory wait message did not arrive")
                 first_message = cast(str, process.stderr.readline())
                 self.assertIn("waiting for memory since ", first_message)
                 time.sleep(1.1)
                 _ = meminfo.write_text("MemAvailable: 12582912 kB\n")
-                output, remaining_errors = process.communicate(timeout=8)
+                output, remaining_errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                 errors = first_message + remaining_errors
             finally:
                 if process.poll() is None:
@@ -280,23 +290,27 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(started, 1790942500)
         self.assertEqual(duration, 7)
 
-    def test_memory_admission_explains_limit_once(self) -> None:
+    def test_launch_memory_wait_limit_refuses_once(self) -> None:
         meminfo = self.base / "meminfo"
         _ = meminfo.write_text("MemAvailable: 11010048 kB\n")
-        command = 'source "$1"; buildlog_wait_for_memory; printf "%s\\n" "$BUILDLOG_MEM_WAIT_S"'
+        command = ('source "$1"; sleep() { SECONDS=$((SECONDS + 1)); }; '
+                   'status=0; buildlog_wait_for_memory || status=$?; '
+                   'printf "%s\\n" "$BUILDLOG_MEM_WAIT_S"; exit "$status"')
         environment = self.environment(BUILDLOG_MEMINFO=str(meminfo), BUILDLOG_MEM_POLL_S="1", BUILDLOG_MEM_WAIT_LIMIT_S="1")
         result = subprocess.run(
             ["bash", "-c", command, "bash", str(SCRIPT.parent.parent / "lint" / "invoke.sh")],
-            env=environment, capture_output=True, text=True, check=False, timeout=5,
+            env=environment, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 2, result.stderr)
         self.assertRegex(result.stderr, r"waiting for memory since \d\d:\d\d P[DS]T: the machine has 10\.5 GiB free; a build starts at 12\.0")
         self.assertEqual(result.stderr.count("waiting for memory since "), 1)
-        self.assertIn("memory wait limit reached after 15 min; starting the launch anyway", result.stderr)
+        reason = "memory admission check failed (launch wait limit reached without admission); step refused"
+        self.assertEqual(result.stderr.count(reason), 1)
+        self.assertNotIn("starting", result.stderr)
         self.assertGreaterEqual(int(result.stdout.strip()), 1)
 
-    def test_memory_admission_skips_unreadable_or_invalid_meminfo(self) -> None:
-        command = 'source "$1"; buildlog_wait_for_memory; printf "%s\\n" "$BUILDLOG_MEM_WAIT_S"'
+    def test_memory_admission_refuses_invalid_readings_and_allows_at_floor(self) -> None:
+        command = 'set -e; source "$1"; buildlog_wait_for_memory; printf "%s\\n" "$BUILDLOG_MEM_WAIT_S"'
         cases = {
             "missing": self.base / "missing-meminfo",
             "unreadable": self.base / "directory",
@@ -315,11 +329,16 @@ class RecordTests(unittest.TestCase):
                 result = subprocess.run(
                     ["bash", "-c", command, "bash", str(SCRIPT.parent.parent / "lint" / "invoke.sh")],
                     env=self.environment(BUILDLOG_MEMINFO=str(meminfo)),
-                    capture_output=True, text=True, check=False, timeout=5,
+                    capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
                 )
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stderr, "")
-                self.assertEqual(result.stdout.strip(), "0")
+                if name in ("at floor", "above floor"):
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stderr, "")
+                    self.assertEqual(result.stdout.strip(), "0")
+                else:
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertEqual(result.stderr, f"memory admission check failed (cannot read MemAvailable from {meminfo}); step refused\n")
+                    self.assertEqual(result.stdout, "")
 
     def test_memory_admission_does_not_count_a_slow_read_above_floor(self) -> None:
         meminfo = self.base / "meminfo-fifo"
@@ -336,7 +355,7 @@ class RecordTests(unittest.TestCase):
             time.sleep(1.1)
             with meminfo.open("w") as writer:
                 _ = writer.write("MemAvailable: 12582912 kB\n")
-            output, errors = process.communicate(timeout=5)
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         finally:
             if process.poll() is None:
                 process.kill()
@@ -352,11 +371,16 @@ class RecordTests(unittest.TestCase):
 
     def test_cargo_fmt_step_starts_without_memory_wait(self) -> None:
         cargo = self.base / "cargo"
-        _ = cargo.write_text('#!/bin/sh\nprintf "fmt started\\n"\n')
+        _ = cargo.write_text(
+            '#!/bin/sh\ncase "$*" in\n'
+            + 'fmt|"+nightly fmt") printf "fmt started\\n" ;;\n'
+            + '*) echo "Unexpected cargo call: $*" >&2; exit 99 ;;\nesac\n'
+        )
         cargo.chmod(0o755)
         for toolchain in ([], ["+nightly"]):
             with self.subTest(toolchain=toolchain):
                 self.assert_step_starts_without_memory_wait(["cargo", *toolchain, "fmt"], "fmt started")
+                self.assertEqual(self.records()[-1]["rustc"], FIXED_RUSTC)
 
     def assert_step_starts_without_memory_wait(self, argv: list[str], output_line: str) -> None:
         meminfo = self.base / "meminfo"
@@ -371,7 +395,7 @@ class RecordTests(unittest.TestCase):
             env=self.environment(PATH=f"{self.base}:{os.environ['PATH']}", BUILDLOG_OFF="0", BUILDLOG_SCOPE="0",
                                  BUILDLOG_MEMINFO=str(meminfo), BUILDLOG_MEM_POLL_S="1",
                                  BUILDLOG_MEM_WAIT_LIMIT_S="0", BUILDLOG_SYNC="1"),
-            capture_output=True, text=True, check=False, timeout=5,
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(output_line, result.stdout)
@@ -400,7 +424,7 @@ class RecordTests(unittest.TestCase):
         )
         try:
             assert process.stderr is not None
-            readable, _, _ = select.select([process.stderr], [], [], 5)
+            readable, _, _ = select.select([process.stderr], [], [], TEST_HANG_GUARD_SECS)
             self.assertTrue(readable, "memory wait message did not arrive")
             first_message = cast(str, process.stderr.readline())
             self.assertIn("waiting for memory since ", first_message)
@@ -408,7 +432,7 @@ class RecordTests(unittest.TestCase):
             time.sleep(1.1)
             released_at = time.time()
             _ = meminfo.write_text("MemAvailable: 12582912 kB\n")
-            output, remaining_errors = process.communicate(timeout=8)
+            output, remaining_errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
             errors = first_message + remaining_errors
         finally:
             if process.poll() is None:
@@ -710,6 +734,15 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.records()[-1]["mac_holder"], "hana nextest")
 
+    def test_queue_bump_uses_the_hold_event_log_and_names_the_move(self) -> None:
+        recorder.queue_bump("actor-id", "moved-id", "nextest", "/tmp/tree", 4, START)
+        row = self.records()[-1]
+        self.assertEqual({key: row[key] for key in ("kind", "actor", "session", "step", "folder", "old_position")},
+                         {"kind": "queue_bump", "actor": "actor-id", "session": "moved-id", "step": "nextest",
+                          "folder": "/tmp/tree", "old_position": 4})
+        self.assertEqual(row["at"], store.utc_iso(START))
+        self.assertTrue(store.host_file(store.host_name(), START).exists())
+
     def test_hold_event_keeps_the_key_and_the_locked_utc_time(self) -> None:
         result = self.record("hold-event", "began", "mac", "block-key", "hana", "render",
                              "2026-10-12T12:00:00.123456+00:00", "2026-10-12T14:00:00+00:00")
@@ -746,6 +779,32 @@ class RecordTests(unittest.TestCase):
                              "2026-10-12T12:00:00Z", "")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.records()[-1]["until"], "")
+
+    def test_hold_build_deduplicates_lifetimes_and_holds_in_permanent_log(self) -> None:
+        since = "2026-10-28T12:00:00+00:00"
+        arguments = ["hold-build", "holder", since, "boot-one", "123", "456", "other_session",
+                     "session", "cargo test", "/repo"]
+        for _ in range(2):
+            result = self.record(*arguments)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        row, = self.records()
+        self.assertEqual((row["kind"], row["hold_key"], row["pid"], row["proc_start"], row["class"]),
+                         ("hold_build", "holder", 123, "456", "other_session"))
+        self.assertEqual((row["session"], row["command"], row["cwd"]), ("session", "cargo test", "/repo"))
+        arguments[3] = "boot-two"
+        _ = self.record(*arguments)
+        arguments[5] = "457"
+        _ = self.record(*arguments)
+        arguments[2] = "2026-10-28T13:00:00+00:00"
+        _ = self.record(*arguments)
+        self.assertEqual(len(self.records()), 4)
+
+    def test_hold_build_refuses_holder_and_admitted_rows(self) -> None:
+        for classification in ("holder", "admitted"):
+            result = self.record("hold-build", "holder", "2026-10-28T12:00:00Z", "boot", "123", "456",
+                                 classification, "session", "cargo test", "/repo")
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.records(), [])
 
     def test_call_records_mac_result_and_local_reason(self) -> None:
         local_reason = 'needs Linux path handling with a "quoted" mount'

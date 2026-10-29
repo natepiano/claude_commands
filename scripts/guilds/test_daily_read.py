@@ -11,6 +11,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, cast, override
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.guilds import astra_work  # noqa: E402
 
@@ -126,7 +129,7 @@ class DailyReadTests(unittest.TestCase):
             [sys.executable, str(SCRIPT), "--guild", guild, "--since", SINCE, "--until", UNTIL,
              *(["--json"] if as_json else [])],
             env={**self.environment, "GUILD_DAILY_HOST": host}, text=True, capture_output=True,
-            check=False, timeout=20,
+            check=False, timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
         return result.stdout
@@ -643,6 +646,110 @@ class DailyReadTests(unittest.TestCase):
                 self.assertEqual(self.rows(report, "phases"), [])
                 self.assertEqual(self.mapping(report["counts"])["repair_rounds"], 0)
 
+    def test_repairs_count_starts_in_window_and_ignore_an_earlier_fourth_round(self) -> None:
+        boundary = datetime.fromisoformat(SINCE).timestamp() - NOON
+        other = self.save_run(self.phase_events(run_id="run-two", instance="phase-two", rounds=1),
+                              run_id="run-two", instance="phase-two")
+        _ = self.assignment("astra-designer", other, instance="phase-two", member="second-designer")
+        for old_rounds, current_offsets in ((1, (boundary, 10)), (4, ())):
+            with self.subTest(old_rounds=old_rounds):
+                events = self.phase_events(start=boundary - 100, duration=50000)
+                for number in range(1, old_rounds + 1):
+                    events.append(self.event("finding_batch_dispatched", boundary - 50 + number,
+                                             round=number, covered=["F001"]))
+                events.extend([
+                    self.event("pass_started", boundary - 50 + old_rounds, pass_kind="fix",
+                               pass_instance_id="earlier-repair", fix_pass=old_rounds,
+                               pass_started_at=NOON + boundary - 50 + old_rounds),
+                    self.event("pass_finished", boundary + 5, pass_kind="fix",
+                               pass_instance_id="earlier-repair", fix_pass=old_rounds,
+                               pass_started_at=NOON + boundary - 50 + old_rounds,
+                               pass_elapsed_seconds=55 - old_rounds),
+                ])
+                for number, offset in enumerate(current_offsets, old_rounds + 1):
+                    events.append(self.event("finding_batch_dispatched", offset, round=number, covered=["F002"]))
+                directory = self.save_run(events)
+                _ = self.assignment("astra-designer", directory)
+                report = self.report("designers")
+                phase = next(row for row in self.rows(report, "phases") if row["run_id"] == "run-one")
+                self.assertEqual(phase["repair_rounds"], len(current_offsets))
+                repairs = self.rows(phase, "rounds")
+                self.assertEqual([row["started_at"] for row in repairs],
+                                 [NOON + offset for offset in current_offsets])
+                self.assertEqual([row["round"] for row in repairs],
+                                 list(range(old_rounds + 1, old_rounds + len(current_offsets) + 1)))
+                self.assertNotIn("RepairRoundsBeyondThree", cast(list[str], phase["flags"]))
+                self.assertEqual(self.mapping(report["counts"])["repair_rounds"], len(current_offsets) + 1)
+
+    def test_plain_summary_orders_rows_and_limits_problem_details(self) -> None:
+        events = self.phase_events(rounds=4)
+        events.extend([
+            self.event("finding_opened", 5, finding_id="F001", title="Check input bounds", round=0),
+            self.event("finding_opened", 6, finding_id="F002", title="Check input bounds", round=1),
+        ])
+        directory = self.save_run(events)
+        _ = self.assignment("astra-designer", directory)
+        other = self.save_run(self.phase_events(run_id="run-two", instance="phase-two"),
+                              run_id="run-two", instance="phase-two")
+        _ = self.assignment("astra-designer", other, instance="phase-two", member="second-designer")
+        for number in range(2, 9):
+            _ = self.write(directory / "design/phase1" / f"round{number}_brief.md", "# Old brief\n")
+        _ = self.write(directory / "design/phase1/round9_brief.md", "<!-- astra_work {broken} -->\n")
+        lines = self.invoke("designers", as_json=False).splitlines()
+        self.assertLessEqual(len(lines), 24, lines)
+        for line in lines:
+            self.assertNotRegex(line, r'[{}]|"[a-z_]+"\s*:', line)
+        self.assertIn("natedev", lines[0])
+        self.assertIn("designers", lines[0])
+        self.assertIn(SINCE, lines[1])
+        self.assertIn(UNTIL, lines[1])
+        self.assertIn("UTC", lines[1])
+        self.assertIn("2026-10-20T20:00:00-04:00", lines[2])
+        self.assertIn("2026-10-21T20:00:00-04:00", lines[2])
+        self.assertIn("EDT", lines[2])
+        for field in ("members 2", "runs 2", "assignments 2", "phases 2", "partial yes"):
+            self.assertIn(field, lines[3])
+        self.assertTrue(lines[4].startswith("Counts:"), lines)
+        for field in ("phases 2", "assignments 2", "repair rounds 4", "repeated titles 1", "flagged 2", "problems 8"):
+            self.assertIn(field, lines[4])
+        phase_lines = lines[5:7]
+        for line, run, member, repairs, flag in zip(
+                phase_lines, ("run-one", "run-two"), ("fixture-designer", "second-designer"),
+                (4, 0), ("RepairRoundsBeyondThree", "no flags")):
+            self.assertIn("Phase 1", line)
+            self.assertIn(run, line)
+            self.assertIn(member, line)
+            self.assertIn(f"repair rounds started in window {repairs}", line)
+            self.assertIn(flag, line)
+        self.assertTrue(lines[7].startswith("Repeat:"), lines)
+        self.assertIn("Check input bounds", lines[7])
+        self.assertIn("run-one", lines[7])
+        flag_lines = lines[8:10]
+        self.assertTrue(all(line.startswith("Flag:") for line in flag_lines), lines)
+        self.assertTrue(any("RepairRoundsBeyondThree" in line for line in flag_lines), lines)
+        self.assertTrue(any("RepeatedTitle" in line for line in flag_lines), lines)
+        self.assertEqual(set(lines[10:12]), {"Problems: HeaderInvalid: 1", "Problems: MembershipNotRecorded: 7"})
+        self.assertTrue(all(line.startswith("problem:") for line in lines[12:17]), lines)
+        for line in lines[12:17]:
+            self.assertRegex(line, r"problem: (HeaderInvalid|MembershipNotRecorded): .+/round[2-9]_brief.md: .+")
+        self.assertEqual(lines[17], "and 3 more")
+        self.assertEqual(lines[18], "Phase totals are shared context, not an individual's delay. " +
+                         "Read turns only for flagged records.")
+        self.assertEqual(len(lines), 19)
+
+    def test_json_output_is_one_full_report_without_the_plain_summary(self) -> None:
+        directory = self.save_run(self.phase_events(rounds=4))
+        prompt = self.assignment("astra-designer", directory)
+        output = self.invoke("designers")
+        report = self.mapping(cast(object, json.loads(output)))
+        self.assertEqual(report["host"], "natedev")
+        self.assertEqual(report["guild"], "designers")
+        self.assertEqual(self.rows(report, "assignments")[0]["source"], str(prompt))
+        self.assertEqual(len(self.rows(self.only_phase(report), "rounds")), 4)
+        self.assertEqual(self.rows(report, "flagged")[0]["kind"], "RepairRoundsBeyondThree")
+        for section in ("interval", "coverage", "counts", "repeats", "waits", "receipts", "problems"):
+            self.assertIn(section, report)
+
     def test_both_host_reports_use_local_times_and_leave_all_evidence_unchanged(self) -> None:
         directory = self.save_run(self.phase_events())
         _ = self.assignment("astra-designer", directory)
@@ -662,6 +769,7 @@ class DailyReadTests(unittest.TestCase):
                 self.assertIn(host, text)
                 self.assertIn("fixture-designer", text)
                 self.assertIn("2026-10-20T20:00:00-04:00", text)
+                self.assertIn("partial no", text)
         after = {str(path.relative_to(self.root)): path.read_bytes()
                  for path in self.root.rglob("*") if path.is_file()}
         self.assertEqual(after, before)

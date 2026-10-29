@@ -641,6 +641,9 @@ def pause_confirmation_line(record: SessionShutdown) -> str:
     )
 
 
+RETIRE_REASON = "retired; /showrunner:resume_unit brings it back."
+
+
 def _settle_text(record: SessionShutdown, session: Session) -> str:
     """The pause message: a fixed first line the launching skills react to, then what to do now.
 
@@ -795,6 +798,8 @@ def begin(
             saved["move_id"] = move_id
         if checkout_move is not None:
             saved["checkout_move"] = checkout_move
+        if why:
+            saved["why"] = why
         if target:
             saved["target"] = target
             saved["source_label"] = report["label"]
@@ -1566,7 +1571,9 @@ def tell_showrunner_stopping(saved: SessionShutdown) -> None:
     back = (("it comes back on " + target if target else "it comes back") + " within minutes"
             if saved["then"] == "restart" else "it stays stopped until the user restarts it")
     summary = f"{name} is stopping: {why}"
-    _ = send_message(showrunner, summary, f"{summary}; {back}. One more line follows when it is back or has not come back.",
+    text = (summary if why == RETIRE_REASON and saved["then"] == "stop" else
+            f"{summary}; {back}. One more line follows when it is back or has not come back.")
+    _ = send_message(showrunner, summary, text,
                      key=f"shutdown-unit-{saved['session']['session_id']}")
 
 
@@ -1705,6 +1712,8 @@ def holdout_line(saved: SessionShutdown) -> str:
     command = shutdown_command("now", saved["login"], "--here", "--only", saved["session"]["session_id"])
     request = "restart" if saved["then"] == "restart" else "shutdown"
     after_stop = "the restart brings it back." if saved["then"] == "restart" else "it stays stopped until restarted."
+    if saved.get("why") == RETIRE_REASON and saved["then"] == "stop":
+        after_stop = RETIRE_REASON
     return (f"{saved['session']['name']} has not answered the pause for {minutes} minutes "
             f"in {_holdout_host(saved)}. A {saved['label']} {request} asked it to pause at a safe point and say ready. "
             f"Do nothing: the {request} keeps waiting. Stop now (recommended): ends Claude mid-step so the {request} goes on. "

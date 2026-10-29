@@ -4,7 +4,7 @@
 
 > **As-built disposition: create**
 
-> **Production: build-followups** — unit `accounts-unit`; production doc `docs/plans/build-followups-production.md`
+> **Production: natedev** — unit `accounts-unit`; production doc `docs/plans/natedev-production.md`
 
 ## Source
 
@@ -83,7 +83,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 
    Phase 2 also edits `settings.json`: allow rules and sandbox write entries for `~/.claude1`–`~/.claude3`. That edit reaches main only with the user's go.
 2. **Shell commands and the guide (Phase 5). Nothing live changes.**
-   - The aliases are `claude1`, `claude2`, `claude3` and `claude-unit`; plain `claude` is unchanged. natedev commits them to `/etc/nixos`, and the user rebuilds when ready. Until a dir exists, each alias runs plain `claude` or refuses.
+   - The aliases are `claude1`, `claude2` and `claude3`; plain `claude` is unchanged. natedev commits them to `/etc/nixos`, and the user rebuilds when ready. Until a dir exists, each alias runs plain `claude` or refuses.
    - `~/.claude/docs/accounts.md` says how to start a session on each account, how to log in and out without moving `~/.claude` off claude 2, and how to see which account a session is on.
 3. **Prove one account dir works (Phase 6). The first live step, only when the user says go; about 15 minutes of their time.**
    - The unit creates `~/.claude3`. The user runs `claude3` and logs in as claude 3 (`rubrics.dogwood-1f@icloud.com`).
@@ -299,7 +299,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 - `account_directory_readiness(label) -> AccountDirectoryReadiness` returns one frozen tagged value: `AccountDirectoryReady(login)`, `AccountDirectoryLoggedOut`, `AccountDirectoryWrongLogin(login)`, `AccountDirectoryNotSetUp`, `AccountDirectoryBrokenLinks` or `AccountDirectoryUnreadable`, each carrying every coexisting problem. It reads the dir's `.claude.json` (`ClaudeDirectoryLogin | ClaudeDirectoryLoggedOut | UnreadableClaudeDirectoryIdentity`) and the label's note (`ExpectedClaudeLogin | MissingClaudeAccountNote | UnreadableClaudeAccountNote`) at the filesystem boundary. `exec` and `check` both read it; `check(label)` returns its problems, so only ready passes.
 - `check` requires the dir's login to match `login:` in the requested label's note (case-insensitive); a dir with no `claude N` note is a problem. Through the selection, a mismatched dir leaves `named_accounts`, a mismatched unit dir makes `unit_account` an `UnreadableClaudeAccount` (unit launch and swap refuse), and `multiple_accounts` stays true; `account_identity` still reports the dir's actual login.
 - `setup` creates the missing always-linked shared targets (`projects`, `sessions`) under `~/.claude` before linking; `_link_problems` inspects a named entry even when its optional source is gone and reports a dangling expected link as `accounts: <path> is broken`. `note_file.read_note` returns None for a non-UTF-8 note.
-- Aliases `claude1`, `claude2`, `claude3` and `claude-unit`, each `"~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec 'claude N'"` (`exec unit` for `claude-unit`). The alias text lives in natedev's `/etc/nixos` `modules/linux/shell.nix` under `programs.zsh.shellAliases`; committing and rebuilding are outside this repo, and the Mac has none. Plain `claude` stays `~/.claude`'s account.
+- Aliases `claude1`, `claude2` and `claude3`, each `"~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec 'claude N'"`. The alias text lives in natedev's `/etc/nixos` `modules/linux/shell.nix` under `programs.zsh.shellAliases`; committing and rebuilding are outside this repo, and the Mac has none. Plain `claude` stays `~/.claude`'s account.
 - `docs/accounts.md` covers which account a session is on, starting a session (aliases and the alias-free `accounts.py exec` form), Log out and in, swapping the unit account with every refusal and recovery line, setting up a dir, low-quota alerts, and a unit that will not start.
 
 **Files:**
@@ -431,7 +431,7 @@ Asked for by the user through the showrunner. Text above this section that names
 - `commands/showrunner/produce.md` — unit resume through `add_unit.py --resume`.
 - `docs/accounts.md` ("Move a session"), `commands/showrunner/accounts.md`, `docs/as-built/shutdown-and-restart.md`; `pyrightconfig.json` — shutdown extraPaths include the repo root.
 
-**Binds later work:** "Claude sessions move on a refusal", "An account picked by room, not by role" and "Readout of the moves" call `accounts.move()` / `down --to`. Removing the unit role takes `swap unit` with it, but `exec unit` stays because nixos `shell.nix` aliases `claude-unit` to `accounts.py exec unit`. The readout counts `SessionShutdown` records with a `target` as moves.
+**Binds later work:** "Claude sessions move on a refusal", "An account picked by room, not by role" and "Readout of the moves" call `accounts.move()` / `down --to`. Removing the unit role takes `swap unit` with it, but `exec unit` stays. The readout counts `SessionShutdown` records with a `target` as moves.
 
 **Gotchas:**
 - Live Ghostty titles carry a status glyph (`✳ natedev`) and the shell retitles the window after exit.
@@ -761,9 +761,9 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `scripts/nightly_review/nightly_review.py` — launches on the picked account.
 - `scripts/whoami/agent_accounts.py`, `agent_notes.py`, `quota_alert.py`, `whoami.py` — `ClaudeAccountsInUse` and its readers.
 - `scripts/shutdown/restart.py` — wrote `@claude_config_dir` on a tmux respawn with a target; it now resumes a tmux session in a new herdr session and writes no option.
-- `docs/accounts.md`, `commands/showrunner/accounts.md`, `docs/quota_alerts.md` — `pick`, no unit role, `claude-unit` on the picked account.
+- `docs/accounts.md`, `commands/showrunner/accounts.md`, `docs/quota_alerts.md` — `pick`, no unit role.
 
-**Binds later work:** "Codex workers move on a refusal" and "Claude sessions move on a refusal" call `accounts.pick(tool, now, *, exclude, keep) -> PickedAccount | NoAccountWithRoom` with `exclude={refusing label}`; `pick` never returns an excluded label, and with no fresh reading anywhere it returns `keep` else `default`, else `NoAccountWithRoom` when readings exist but none has room. Both write refusals through `refusals.py`: `AccountRefusal{tool, login, window: KnownWindow | UnknownWindow, reset: KnownReset | NoResetKnown, at}`, `write_refusal` (locked, atomic, an older refusal never replaces a newer one) and `resolved(refusal, reading, now)`. `accounts.stored_reading(tool, login, now) -> FreshReading | StaleReading | NoReading` is the only path from `StoredUsage` into picker types. `restart.py` resumes a targeted tmux record in a new herdr session (`_herdr_launch`, the target's environment on its pane) and writes no `@claude_config_dir`; restart edits sit beside `_herdr_launch`. `ClaudeAccountsInUse` carries `live_logins` and `live_directories` (a live login on a dir failing `check` still reports). `set-role unit` and `swap unit` refuse with `UNIT_ROLE_GONE`; `exec unit` stays because `/etc/nixos/modules/linux/shell.nix` aliases `claude-unit` to it. A Codex move line parallels `unit_swap_line`'s move line.
+**Binds later work:** "Codex workers move on a refusal" and "Claude sessions move on a refusal" call `accounts.pick(tool, now, *, exclude, keep) -> PickedAccount | NoAccountWithRoom` with `exclude={refusing label}`; `pick` never returns an excluded label, and with no fresh reading anywhere it returns `keep` else `default`, else `NoAccountWithRoom` when readings exist but none has room. Both write refusals through `refusals.py`: `AccountRefusal{tool, login, window: KnownWindow | UnknownWindow, reset: KnownReset | NoResetKnown, at}`, `write_refusal` (locked, atomic, an older refusal never replaces a newer one) and `resolved(refusal, reading, now)`. `accounts.stored_reading(tool, login, now) -> FreshReading | StaleReading | NoReading` is the only path from `StoredUsage` into picker types. `restart.py` resumes a targeted tmux record in a new herdr session (`_herdr_launch`, the target's environment on its pane) and writes no `@claude_config_dir`; restart edits sit beside `_herdr_launch`. `ClaudeAccountsInUse` carries `live_logins` and `live_directories` (a live login on a dir failing `check` still reports). `set-role unit` and `swap unit` refuse with `UNIT_ROLE_GONE`; `exec unit` stays. A Codex move line parallels `unit_swap_line`'s move line.
 
 **Gotchas:** The Mac has no usage timer, so every launch there lands on keep/default; `--explain` says `no fresh readings on this machine; using <label>`. A missing reading is never a refusal: only `refusals.json` excludes an account regardless of readings, because the usage store keeps the last good reading after a failed read. A showrunner resume must never take an unrelated session that shares its name: `add_showrunner.py` refuses when a herdr session of that name is live. A relative `--config-dir` resolves against the invoking cwd, not the script's.
 
@@ -2511,3 +2511,186 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - A clear must use the time of the observation it acts on, never the time of the clear: a cached reading is old by the time a slow loop reaches it.
 - Known minor residual: an old alert claimed inside the one registry read that sees the unit live survives the clear; a new crash before the next watchdog live pass (about 2 minutes) then sends no push.
 - `scripts.agents.test_mesh_runs` `test_a_live_supervisor_is_not_ended` failed once under the full parallel gate and passed alone and on the rerun: a load flake outside this unit.
+
+### Phase 91 — The account notes cost less CPU  · status: done (b0c06054)
+
+**Depends on:** Phase 90
+
+#### As-built
+
+- The 2-minute timer pass of `agent_notes.py` reuses a usage reading younger than 10 minutes (`usage_store.recent_timer_usage`/`save_timer_usage`, file `timer-usage.json`, keyed by `timer_usage_signature` over logins, homes and the account selection). A reused pass keeps the original reading times and skips the quota note apply, the usage store save and the readings log.
+- A pass reads live when it is `agent_notes.py refresh`, a next-moves queue waits on the role-map host, an in-use account (Claude in use, or the selected Codex workers account) is at or below `LIVE_USAGE_REMAINING_THRESHOLD` (10%) weekly or 5-hour remaining, a Codex fallback is active, a reset passed, or a login or selection changed.
+- The refusal watch, the unit watchdog, the session table and the note sessions sections run on every pass. `refusal_watch.run(refresh_usage=…)` reads usage before it places a new refusal on a reused pass. Refusals already open, cancelled, continued or group-selected do not cause a read. A failed read is reported and never stops placement or the watchdog. The refresh saves with the same login labels as the main pass.
+- `live_reports` passes `use_disk_identity=True`: `claude_live` takes the login and `subscriptionType` from the stored credentials and starts no `claude auth status`. Without a stored plan it keeps the CLI read, so `/whoami` and the notes show the same plan as before.
+- Measured before: one timer run of `agent_notes.py` used 43.4 s CPU in 39.5 s wall, and the service used 42–64 s per run. The figures after promotion come from the real timer runs.
+
+#### Files
+
+`scripts/whoami/agent_notes.py`, `agent_accounts.py`, `usage_store.py`, `scripts/accounts/refusal_watch.py`; tests `test_agent_notes.py`, `test_agent_accounts.py`, `test_usage_store.py`, `test_session_table.py`, `test_codex_homes.py`, `test_quota_alert.py`, `scripts/accounts/test_refusal_watch.py`; `docs/accounts.md`.
+
+#### Gotchas
+
+- Weekly and 5-hour usage alerts can come up to 10 minutes later. The showrunner accepted this, because those alerts only give information.
+- An in-use account that runs out from above 10% inside the 10 minutes is not moved from the reading. It moves on its first refusal: Codex at once through `codex_mesh`'s `blocked` path, Claude on the next 2-minute refusal pass. The worst case is one refused request before the move.
+- Measure a timer cut on the real timer runs (`journalctl --user -u agent-sessions-snapshot.service`, "Consumed … CPU time"). A by-hand `refresh` always reads live, so it shows no reuse.
+
+### Phase 92 — Every claude and codex launch loads the folder's nix shell  · status: done
+
+**Depends on:** Phase 91
+
+#### As-built
+
+- `accounts.py exec <label>` loads the nix shell of the launch folder before it starts Claude, Codex or the `relaunch.py` supervisor, for every label: `claude`, `claudeN`, `codexN`, `units`, `workers`, `showrunners`, `unit`. One call site, `launch_shell_environment(Path.cwd())`, feeds the Claude and the Codex branch of `exec_account`. It calls `scripts/lib/nix_env.ensure(directory, os.environ)`, imported lazily through `import_module("scripts.lib.nix_env")`. There is no second loader.
+- A refused folder, a missing helper or an unknown result raises `LaunchShellError`. `main` prints the helper's line (for example the `direnv allow` command) and exits 1; no agent starts. Other exec errors stay exit 2, which `renew_login` reads as "program not found".
+- After the load, the caller's `HOME` is put back (or removed when the caller had none), and then the account variables are applied. A folder `.envrc` cannot change the account.
+- `exec claude` uses the default `~/.claude` home: `PreparedAccount({}, remove={CLAUDE_CONFIG_DIR, CLAUDE_CODE_REMOTE_MEMORY_DIR, CLAUDE_CODE_OAUTH_TOKEN})`, with no readiness check and no group selection. `--probe` works.
+- `resolve_program(tool, *, environment)` searches the loaded `PATH`, then `~/.local/bin`. It skips a `#!` script that names `nix_env.py` or `lib.nix_env`, so a `PATH` wrapper cannot load the shell two times. An executable it cannot read is still used. A `PATH` with only wrappers gives `accounts: could not start ...` and exit 2.
+- The `claude-unit` alias is gone from the docs and the plan; `exec unit` stays.
+- Live check: a folder whose `.envrc` was not allowed yet loaded 27 nix `PATH` entries and kept `HOME`; a folder with no `.envrc` loaded none; `exec claude --version` printed the version in both.
+
+#### Files
+
+`scripts/accounts/accounts.py` (`LaunchShellEnvironment`, `LaunchShellRefusal`, `NixShellLoader` protocols, `LaunchShellError`, `launch_shell_environment`, `resolve_program`, `exec_account`, `_exec_codex_account`, `main`); `scripts/accounts/nix_env_fake.py` (a fake helper with no side effects, and `imports_with_nix_loader`); tests `test_launch_accounts.py`, `test_accounts.py`, `test_cutover_home.py`, `test_role_map.py`; `docs/accounts.md`, `commands/showrunner/accounts.md`.
+
+#### Gotchas
+
+- Tests patch `accounts.import_module` with `nix_env_fake.imports_with_nix_loader`, and each exec test sets the fake in `setUp`. Never patch `sys.modules`: it changed the imports of other modules' tests.
+- On natedev `~/.claude` holds no login (home cutover, `home_cutovers` in `config/accounts.json`), so `exec claude` starts signed out there; `docs/accounts.md` states this. The bare `claude` alias (`/etc/nixos/modules/common/shell.nix`) runs `exec showrunners --remote-control ...`, which loads the shell too. Do not point it at `exec claude` while `~/.claude` has no login.
+- `scripts/lib/test_claude_launch_scan.py` exempts `accounts/accounts.py`. Its guard check finds only a literal `nix_env.ensure` call, not `launch_shell_environment`.
+- The Mac has explicit `claude1`-`claude4`, `codex`, `codex1` and `codex2` aliases in `modules/darwin/shell.nix`. `new_account.alias_step` still returns None on darwin and reads only `modules/linux/shell.nix`.
+
+#### Ruled out
+
+- Patching `sys.modules` in test fixtures: it changed other modules' tests.
+
+### Phase 93 — /new_account gives the alias step on the Mac  · status: done
+
+**Depends on:** Phase 92
+
+#### As-built
+
+- `/new_account` gives the `claudeN` or `codexN` alias step on natedev and on the Mac. `_shell_module_path()` gives `modules/darwin/shell.nix` on darwin and `modules/linux/shell.nix` on other machines. `nixos_shell_module()` looks for that path in `/etc/nixos`, then in `accounts.accounts_home() / "nixos"` (`~/nixos` on the Mac).
+- `alias_step(account) -> Step` never returns None. It has four results:
+  - No module found: not done. The text names the account and the path it looked for.
+  - The module holds `ALIAS_LOOP_MARKER` (`hanadocs/agents/claude`) and the account is a Claude account: done, the alias comes from the account note. For a Codex account the marker does not count.
+  - A `<name> =` line is in the module: done, live after a rebuild.
+  - Else: not done. It prints the line to add to `shellAliases`, then rebuild: `<name> = "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec <label>";`.
+- A new `codexN` in a module that has only the Claude note loop and no `codexN =` line gets the add line (`test_claude_alias_loop_does_not_define_a_new_codex_alias`).
+- `new_account` appends the alias step for a Claude account with no None check. `codex_steps` appends it after a successful setup and after a successful signed-in check. A failed setup or check returns no alias step.
+
+**Files:**
+- `scripts/accounts/new_account.py` — `_shell_module_path`, `nixos_shell_module`, `alias_step`, `new_account`, `codex_steps`.
+- `scripts/accounts/test_new_account.py` — Mac and Linux module lookup and repository order, existing and missing alias lines, missing module path text, Codex setup and signed-in paths on both platforms, the Claude-loop-only test. Scratch repositories only.
+
+**Gotchas:**
+- The Phase 92 gotcha that `new_account.alias_step` "still returns None on darwin" and reads only `modules/linux/shell.nix` is no longer true. `alias_step` reads this machine's module on both machines.
+
+### Phase 94 — The notes timer pass costs less than 10 s of CPU  · status: done
+
+**Depends on:** Phase 91
+
+#### Work Order
+
+**Goal:** One reused 2-minute pass of `scripts/whoami/agent_notes.py` (no arguments, usage reading younger than 10 minutes) uses less CPU. After Phase 91 (live 2026-10-28 23:05 EDT) a run still uses 10–11 s of CPU (0.4–0.55 core) on natedev, and the usage read is no longer its largest part.
+
+**Spec:**
+- Profile one reused pass with `cProfile` (or another method that needs no py-spy). Run the argument-free `agent_notes.main()` twice in a scratch `HOME` with fixture notes, homes and sessions, and profile the second run, which reuses `timer-usage.json` (`usage_store.recent_timer_usage`). A by-hand `refresh` always reads live, so it shows no reuse.
+- The profile covers every step of the argument-free run: `update_alert_pass` (`accounts.sweep_claude_temp_files`, `rename_legacy_notes`, `note_file.read_notes`, `timer_usage_signature`, `urgent_usage_read`, `codex_alert_pass`, `accounts.group_note_labels`, `session_table.live_sessions`, `write_note` per note, `five_hour.watch`), then `alert`, `codex_pacer.tick` and `mark_tier`, then `refusal_watch.run` (with `unit_watchdog`). Name the largest costs by cumulative CPU time in the phase report, with the top entries of the profile.
+- Cut the largest cost. Keep each result of the pass the same: the note text, the sessions sections, the alerts, the pacer tier, the refusal placement and the watchdog.
+- Fixture reads stand in for every remote read: `role_map.is_role_map_host` and `roster.peer_snapshot` (the ssh peer read in `session_table.live_sessions`) are patched. Their CPU shows only in the live numbers.
+- No other behavior changes.
+
+**Files:**
+- `scripts/whoami/agent_notes.py` and the module that holds the largest cost (named by the profile).
+- The test module beside each changed file (for example `scripts/whoami/test_agent_notes.py`): one test that proves the cut work no longer runs, or runs less, on a reused pass, and that the pass output stays the same.
+
+**Workers:** 1 writer, no split (the cut is in one place, named by the profile).
+- `impl` — the profile, the cut and its tests.
+
+**Constraints from prior phases:** Phase 91's reuse rules stay: the live-read triggers (`refresh`, a waiting next-moves queue on the role-map host, an in-use account at or below `LIVE_USAGE_REMAINING_THRESHOLD`, an active Codex fallback, a passed reset, a changed login or selection), and the refusal watch, unit watchdog, session table and note sessions sections on every pass. Tests and the profile use a scratch `HOME` and `AGENT_NOTES_DIR`, as `AgentNotesTests.setUp` does. They never touch live dirs, `~/.local/state`, usage stores, ssh or real sessions.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/<dir> -p 'test_*.py'` passes for `scripts/whoami`, `scripts/accounts` and each other touched dir; `basedpyright <changed files>` reads `0 errors, 0 warnings, 0 notes`. Live check (the director, not a worker test): on natedev, the CPU per run in the `Consumed … CPU time` lines of `journalctl --user -u agent-sessions-snapshot.service` and in the director's per-run sampler (it reads `/proc/<pid>/stat` utime + stime + reaped children of the next timer-run `agent_notes.py` until it exits; the Phase 91 after-number was 10–11 s), before and after the change is live, drops.
+
+**Gotchas:**
+- The service runs `agent-sessions-snapshot.py`, which starts `agent_notes.py` as its own process. Its `Consumed` figure counts the whole service, so compare runs of the same service before and after.
+- The Mac has no snapshot timer; the live numbers come from natedev only.
+
+### Phase 95 — A failed restart shows its saved screen  · status: todo
+
+**Depends on:** Phase 94 (order only)
+
+**Also touches:** shutdown-unit (`scripts/shutdown`).
+
+#### Work Order
+
+**Goal:** A `restart failed` record whose opening-prompt submit failed shows the last screen that submit saw. Phase 69 saves the screen in the `<move note>.prompt-outcome.json` receipt, but no user surface shows it, so to diagnose `restart prompt not submitted` the user opens the receipt by hand.
+
+**Spec:**
+- One reader in `scripts/shutdown/restart.py`: `saved_prompt_screen(record) -> str | herdr.PromptScreenNotRead`. It reads the receipt through `_prompt_outcome(record)` (the request id, session id and target checks stay) and returns `outcome.screen` for a `herdr.PromptNotSubmitted` with a read screen, else `herdr.PromptScreenNotRead()`. The screen is ANSI-stripped, the last 40 lines (Phase 69).
+- Every surface that prints a `restart failed` record prints the screen under that record's line, when the reader returns one: a header line `  last screen of the failed prompt submit:`, then each screen line indented 4 spaces.
+  - `shutdown status`: `shutdown._shutdown_record_lines`, in both forms: the live-session line `settle.running_restart_line` and the lines of `settle.status_record_lines`. A screen added only to `status_record_lines` never shows for a live `restart failed` record.
+  - `shutdown follow`: `shutdown._follow_action` for a `restart failed` record, live or not.
+  - The stop report: `settle.report_stop`, after the `running_restart_line` line or the `<name>: <reason>` line of a `restart failed` record.
+- The receipt is in the record machine's `SHUTDOWN_STATE_DIR`. A peer record that `shutdown status` reads from `records --json` has no receipt here: it prints no screen.
+- The phone push stays the same (`restart.send_failure_pushes`, `settle.alert_user`), because a push carries only what the user must do. `settle.tell_showrunners_outcome` stays the same.
+- No other behavior changes.
+
+**Files:**
+- `scripts/shutdown/restart.py` — `saved_prompt_screen`.
+- `scripts/shutdown/shutdown.py` — `_shutdown_record_lines`, `_follow_action`.
+- `scripts/shutdown/settle.py` — `report_stop`, and one shared function that renders the screen lines.
+- `scripts/shutdown/test_restart.py` — the reader: a matching receipt with a screen, one with no screen, one of another request, a missing or unreadable file.
+- `scripts/shutdown/test_shutdown_cli.py`, `scripts/shutdown/test_settle.py` — status (live and not live), follow and the stop report print the screen; a peer record and a record without a screen print none; the push text is unchanged.
+- `docs/as-built/shutdown-and-restart.md` — where the saved screen shows.
+
+**Workers:** 1 writer, no split (three modules in one directory share one render function).
+- `impl` — all files.
+
+**Constraints from prior phases:** Phase 70: a `restart failed` record can belong to a live session; the liveness reads (`_restart_failed_liveness`, `restart_failed_liveness`) and the printed commands stay as they are. Phase 71/72: `settle.running_restart_line` stays the one source of the live-session line, and its text does not change. Tests set `HOME` and `SHUTDOWN_STATE_DIR` to scratch folders and write fixture receipts; they never touch `~/.local/state/shutdown`, live dirs, ssh or real sessions.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py'` passes; `basedpyright scripts/shutdown/restart.py scripts/shutdown/shutdown.py scripts/shutdown/settle.py` and the three test files read `0 errors, 0 warnings, 0 notes`.
+
+**Gotchas:**
+- A receipt holds a screen only after the first typing; a failure before any typing has `PromptScreenNotRead`, and the surfaces print nothing for it.
+
+### Phase 96 — All consumers import shared whoami modules by one name  · status: todo
+
+**Depends on:** Phase 95 (order only)
+
+**Also touches:** the herdr, shutdown, message, production and agents owners.
+
+#### Work Order
+
+**Goal:** Every consumer imports each shared whoami module by its package name, `scripts.whoami.<module>`, and the two-name registrations go. Today sibling imports (`import note_file`) and package imports (`from scripts.whoami import note_file`) coexist. Six modules register both names in `sys.modules` to keep one module object, so type identity and patched settings stay shared: `agent_accounts`, `account`, `note_file`, `session_table`, `run_out` and `usage_store`.
+
+**Spec:**
+- The package name is the one name: it works from every directory with only the repository root on `sys.path`, and the agents, herdr, usage and nix_env consumers already use it.
+- Change every bare import of the six modules (`import <module>`, `from <module> import …`, also inside functions) to the package form. Bare-import consumers found at planning:
+  - `scripts/whoami`: `five_hour.py`, `quota_alert.py`, `codex_pacer.py`, `agent_notes.py`, `run_out.py`, `session_table.py`, `whoami.py`.
+  - `scripts/accounts`: `accounts.py`, `new_account.py`, `refusal_watch.py`, `refusals.py`, `unit_watchdog.py`.
+  - `scripts/shutdown`: `inventory.py`, `pane_record.py`, `pane_restore.py`, `record.py`, `restart.py`, `settle.py`, `shutdown.py`.
+  - `scripts/production`: `cli_fixture.py`, `dailies_render.py`, `showrunner_move.py`.
+  - `scripts/message/roster.py`; `scripts/nightly_review/nightly_review.py` (not in the next-items entry; found at planning).
+  - 27 test files in `scripts/whoami`, `scripts/accounts`, `scripts/shutdown`, `scripts/production` and `scripts/nightly_review`.
+  - `scripts/agents/agent_exec.sh`: its inline Python puts only `scripts/whoami` on `sys.path` and runs `from agent_accounts import workers_home`. It puts the repository root (`$script_dir/../..`) on `sys.path` and imports `scripts.whoami.agent_accounts`.
+- Remove the `if __name__ == "<module>": … elif __name__ == "scripts.whoami.<module>": …` block from each of the six modules.
+- Other whoami modules (`quota_alert`, `five_hour`, `codex_pacer`, `agent_notes`) keep their current import names; `scripts/lib/nix_env.py` keeps its own two-name block. Both are out of scope.
+- No other behavior changes.
+
+**Files:**
+- `scripts/whoami/agent_accounts.py`, `account.py`, `note_file.py`, `session_table.py`, `run_out.py`, `usage_store.py` — the registration blocks.
+- The consumer files and test files listed in the Spec.
+- `scripts/agents/agent_exec.sh` — the inline Python import.
+- `scripts/agents/codex_mesh.py`, `scripts/herdr/herdr_sessions.py` — already package form; read to confirm, change only a bare import found.
+
+**Workers:** 2 writers, split by directory (no file in both).
+- `whoami` — `scripts/whoami` modules and tests, the six registration blocks.
+- `consumers` — `scripts/accounts`, `scripts/shutdown`, `scripts/production`, `scripts/message`, `scripts/nightly_review`, `scripts/agents`, `scripts/herdr`, and their tests.
+
+**Constraints from prior phases:** Tests sit beside the code (Delegation Context); after this phase they import the six modules by the package name, the same object the code uses. Tests never touch live dirs: `HOME`, `AGENT_NOTES_DIR` and the patched `note_file.AGENTS_DIR` point at scratch folders. No `Any`, no file-level ignores.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/<dir> -p 'test_*.py'` passes for `whoami`, `accounts`, `shutdown`, `production`, `message`, `nightly_review`, `agents`, `herdr`, `usage`, `nix_env` and `lib`; `basedpyright` on every changed file and each caller module reads `0 errors, 0 warnings, 0 notes`; `grep -rnE '^\s*(import|from) (agent_accounts|account|note_file|session_table|run_out|usage_store)\b' scripts` finds nothing (it covers the `.sh` inline Python too); no `sys.modules.setdefault` remains in `scripts/whoami`.
+
+**Gotchas:**
+- A test that imports a module by the other name gets a second module object. Its `patch.object(note_file, "AGENTS_DIR", …)` then misses the object the code uses, and the code can write to the live notes dir. Change each test's import in the same commit as its module's consumers.
+- Type identity: a `KnownCodexAccount` or `Report` made from one module object fails `isinstance` against the other. A remaining bare import shows as a failing `isinstance` test, not an import error.

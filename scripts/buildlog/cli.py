@@ -13,7 +13,7 @@
   buildlog ci                       record new GitHub Actions run attempts
   buildlog launches                 collect example build and start times from Claude Code
   buildlog disk                     measure disk usage for the next report
-  buildlog sample                   record machine memory and stall counters once
+  buildlog sample                   record memory counters and check for idle Mac test waits
   buildlog snapshot                 record slice and zram counters now
   buildlog memory START END         report memory between offset-bearing instants
   buildlog hourly                   sync, ci, screenshot scan, then Rust release check
@@ -39,6 +39,7 @@ import disk
 import index
 import launches
 import mac_report
+import mac_idle
 import memory
 import record
 import report
@@ -285,6 +286,11 @@ def main(argv: list[str]) -> int:
             _ = memory.write_snapshot(taken.at, taken.host)
         except (OSError, ValueError) as error:
             print(f"buildlog sample: memory snapshot unavailable: {error}", file=sys.stderr)
+        if taken.host == "natedev":
+            try:
+                mac_idle.watch_once(mac_idle.watch_paths(), taken.at, time.monotonic())
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                print(f"buildlog sample: Mac idle check failed: {error}", file=sys.stderr)
         return 0
     if command == "snapshot":
         if rest:

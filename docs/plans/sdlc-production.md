@@ -27,7 +27,7 @@
 | phases-unit | `docs/plans/sdlc-phases.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-phases` | `sdlc-phases` | — | `docs/plans/sdlc-phases.md`; `docs/plans/sdlc-phases-next.md`; `docs/plans/sdlc-phases-design.md`; `scripts/direct/phase_process.py`; `scripts/direct/test_phase_process.py` |
 | fix-rounds-unit | `docs/plans/sdlc-fix-rounds.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-fix-rounds` | `sdlc-fix-rounds` | — | `docs/plans/sdlc-fix-rounds.md`; `docs/plans/sdlc-fix-rounds-next.md`; `docs/plans/sdlc-fix-rounds-study.md`; `scripts/history/`; `commands/history.md` |
 | roles-unit | `docs/plans/sdlc-roles.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-roles` | `sdlc-roles` | — | `docs/plans/sdlc-roles.md`; `docs/plans/sdlc-roles-next.md`; `docs/plans/sdlc-roles-design.md`; `scripts/production/roles_audit.py`; `scripts/production/test_roles_audit.py`; `scripts/production/role_terms.toml` |
-| hierarchies-unit | docs/plans/build-followups-hierarchies.md | /home/natepiano/worktrees/claude-build-followups-hierarchies | build-followups-hierarchies | — | — |
+| hierarchies-unit | `docs/plans/build-followups-hierarchies.md` | `/home/natepiano/worktrees/claude-build-followups-hierarchies` | `build-followups-hierarchies` | — | `docs/plans/build-followups-hierarchies.md`; `docs/plans/build-followups-hierarchies-next.md`; `docs/plans/build-followups-hierarchies-design.md`; `scripts/hierarchies/` |
 
 Scope of each unit:
 
@@ -40,7 +40,7 @@ Scope of each unit:
 
 As built (`docs/as-built/guilds.md`; the user's G1b and G7 in Review decisions):
 
-- Each guild head is a unit director with the guild's exact ID, `designers`, `reviewers`, `showrunners` or `units`, under the top-level `guilds` production on natedev (`docs/plans/guilds-production.md`). The heads are not units of sdlc.
+- Each guild head is a unit director with the guild's exact ID, `designers`, `reviewers`, `showrunners` or `units`, under the `guilds` production on natedev (`docs/plans/guilds-production.md`). The heads are not units of sdlc. The guilds showrunner reports to sdlc in the showrunner tree (G1c); its herdr space stays top level.
 - Goddess names are on hold. `astra-designer` and `astra-reviewer` name only the per-design Astra roles and their census edges, not the heads.
 - guild-process-unit owns process changes, not head operations. A head sends a process proposal through the guilds showrunner to sdlc for guild-process-unit.
 
@@ -58,8 +58,9 @@ These three files are also hub files in build-followups. An edit to one of them 
 
 | Gate | Waiting | Waits on | Clears when |
 | --- | --- | --- | --- |
+| G1 | hierarchies-unit Phase 4 (measure.py reads wait records and merge receipts) | phases-unit Phase 6 (HI7 wait records and merge receipts; depends on its phase 3) | That checkpoint is on origin/sdlc and ~/.claude main, its notice names the record file and commit, and the file holds at least one wait record and one receipt from a real phase. |
 
-No gates yet. The plans are not written. When a plan needs another unit's checkpoint, the gate goes here.
+When a plan needs another unit's checkpoint, the gate goes here.
 
 ## Close-out
 
@@ -90,7 +91,8 @@ Model, in the user's words (2026-10-21): the goal of a guild is to help guild me
 | # | Item | Decision |
 | --- | --- | --- |
 | G1 | Which jobs get a guild (showrunners, unit directors, designers, reviewers; workers?) | Four guilds: showrunners, unit directors, designers, reviewers. Workers have no guild; they get better guidance through their unit director's work orders. |
-| G1b | The head's form | Each head is a unit director, one per guild, under one lasting top-level guilds showrunner (not sdlc). In herdr: a top-level guilds space, the guilds showrunner as the first tab, then the four head unit directors in alphabetical order. This replaces the brief's "each head is a top-level showrunner". |
+| G1b | The head's form | Each head is a unit director, one per guild, under one lasting guilds showrunner, not under sdlc. In herdr: a top-level guilds space, the guilds showrunner as the first tab, then the four head unit directors in alphabetical order. This replaces the brief's "each head is a top-level showrunner". |
+| G1c | Where the guilds showrunner sits in the showrunner tree | Under sdlc (the user, 2026-10-28: "attach"). sdlc's dailies show guilds as one row; `/next all-below` in sdlc adds its items. Its herdr space stays top level; it keeps its own units, merge branch and `/next`, and still serves every production. Replaces guilds rule 1's "no parent". |
 | G2 | What heads watch, since they do not read every turn | Events plus records: a head reads turns when an event fires (G3), and once a day reads the records already kept (repair rounds, time per phase step, review findings); it reads turns only where a record looks bad. |
 | G3 | The events that make a member write to its guild or head | The member sends one short message to its head only, never to the whole guild, when: the user corrects it; a phase reaches repair round 4; the same review finding comes back twice; it works around a tool fault or a rule that slowed it; it finds a way that saved real time. The head decides what goes to the whole guild. |
 | G3b | Where the heads keep the guild tips | In ~/rust/nate_style: one folder per guild plus one shared folder, one tip per markdown file like the rust rules, and a base folder per guild with Obsidian views by tag like rust_base. The head adds and edits tip files. A member loads its guild's tips when its skill starts. Tips reach both machines through git; the design's copy step and receipts go. Replaces docs/guilds in ~/.claude. |
@@ -111,43 +113,44 @@ Model, in the user's words (2026-10-21): the goal of a guild is to help guild me
 | R2 | Q1 who owns the guild tips | Settled by G3b and G4: each guild head keeps its guild's tips in nate_style/guilds. |
 | R3 | Q5 head names versus per-design role names | Settled by G7: heads are named designers, reviewers, showrunners, units; astra-designer and astra-reviewer stay for the per-design threads; goddess names on hold. |
 | R4 | Q2 "gate" | A "wait" is one unit waiting on another. A "gate" always means a check that must pass (verification). This replaces roles-unit's recommendation ("gate" for the wait, "verification gate" for the check). |
-| R5 | Q3 "reviewer" | |
-| R6 | Q4 "proposal", "add-on", "change" | |
-| R7 | Q6 "orchestrator" | |
-| R8 | Q7 "worker" and its other names | |
-| R9 | Step 1: retire "seat" and add a check | |
-| R10 | Q8 "as-built" | |
+| R5 | Q3 "reviewer" | Name by the job: design reviewer, code reviewer, UI reviewer, and designer. This replaces roles-unit's "Astra reviewer / pooled reviewer". |
+| R5b | Reviewer names across productions (the user, 2026-10-28) | Every shown name carries production · unit · job, for example "sdlc · roles · code reviewer 6", in reports, messages and thread names. The address stays as it is. |
+| R6 | Q4 "proposal", "add-on", "change" | Approved as roles-unit recommended (the user, directly with roles-unit, 2026-10-28 13:18 EDT: "yes to all"). |
+| R7 | Q6 "orchestrator" | Approved as roles-unit recommended (the user, directly with roles-unit, 2026-10-28 13:18 EDT: "yes to all"). |
+| R8 | Q7 "worker" and its other names | Approved as roles-unit recommended (the user, directly with roles-unit, 2026-10-28 13:18 EDT: "yes to all"). "Small-fix helper" does no code work (the 2026-10-28 rule). |
+| R9 | Step 1: retire "seat" and add a check | Approved as roles-unit recommended (the user, directly with roles-unit, 2026-10-28 13:18 EDT: "yes to all"). roles-unit builds it as its phase 3. |
+| R10 | Q8 "as-built" | Approved as roles-unit recommended (the user, directly with roles-unit, 2026-10-28 13:18 EDT: "yes to all"). |
 
 ### fix-rounds-unit
 
 | # | Item | Decision |
 | --- | --- | --- |
-| F1 | Goal and plan: a true count of repair rounds, a study of the phases with the most, changes that cut rounds and keep the work; done 1-4; next 5 (apply approved changes), 6 (measure them) | |
-| F2 | P1 the director runs unchanged lint and test commands itself | |
-| F3 | P2 from round 4, a missing acceptance item becomes a follow-up | |
-| F4 | P3 from round 4, an open finding outside the kept kinds becomes a follow-up | |
-| F5 | P4 each launch checks the active phase and records planned work apart from repairs | |
-| F6 | P5 each repair prompt carries the accepted checks its edits can break | |
+| F1 | Goal and plan: a true count of repair rounds, a study of the phases with the most, changes that cut rounds and keep the work; done 1-4; next 5 (apply approved changes), 6 (measure them) | OK. The user: the fixes could be far-ranging, so the lasting result is a process that finds them and improves the work. |
+| F2 | P1 the director runs unchanged lint and test commands itself | Approved (the user, 2026-10-28). |
+| F3 | P2 from round 4, a missing acceptance item becomes a follow-up | Approved as a 30-exposed-phase trial, from round 4 (the user, 2026-10-28). |
+| F4 | P3 from round 4, an open finding outside the kept kinds becomes a follow-up || Approved as a 30-phase trial (the user, 2026-10-28). Add (the user): at each fix limit, try something different with an Astra review. When a phase reaches repair round 4 with a finding still open, or a kept finding has failed two fixes, the director runs /astra_review on a short note: the finding, the tries so far and why each failed. Astra's new approach goes into the next try, or into the follow-up Work Order when the finding moves out. |
+| F5 | P4 each launch checks the active phase and records planned work apart from repairs || Approved as a 30-phase accuracy trial; a stale or missing phase refuses the launch (the user, 2026-10-28). |
+| F6 | P5 each repair prompt carries the accepted checks its edits can break || Approved as a 30-phase trial, for all repairs (the user, 2026-10-28). |
 
 ### phases-unit
 
 | # | Item | Decision |
 | --- | --- | --- |
-| PH1 | Goal and plan: measure how a phase and the doc pipeline run, find where time and tokens go, change one step at a time; done 1 (measure); in 2 (recommend); next 3 (build first step), 4 (measure it) | |
-| PH2 | Step 1: tokens first (cheap A) or dispatch time first (C, then cheap A) | |
+| PH1 | Goal and plan: measure how a phase and the doc pipeline run, find where time and tokens go, change one step at a time; done 1 (measure); in 2 (recommend); next 3 (build first step), 4 (measure it) || Approved (the user, 2026-10-28). |
+| PH2 | Step 1: tokens first (cheap A) or dispatch time first (C, then cheap A) || Tokens first: cheap A, each step reads only its own rule file (the user, 2026-10-28). |
 
 ### hierarchies-unit (moving into sdlc)
 
 | # | Item | Decision |
 | --- | --- | --- |
-| HI1 | Goal and plan: the organization that ships Hana fastest under the user's constraints; recommends A (repair today's tree) | |
-| HI2 | Q3 must build-followups and sdlc cut a measured Hana cost, or get a fixed share | |
-| HI3 | Q4 the user's daily review budget; may old unreviewed changes close | |
-| HI4 | Q5 is the account count fixed | |
-| HI5 | Q6 where each newly created showrunner and unit sits in the tree | |
-| HI6 | Q7 push-authorization audit | |
-| HI7 | Q8 record waits and merge receipts | |
-| HI8 | Q9 cargo Hana-cost note | |
-| HI9 | Q10 run-end ownership check | |
-| HI10 | Q11 trial B, only under both conditions | |
-| HI11 | Q12 defer C | |
+| HI1 | Goal and plan: the organization that ships Hana fastest under the user's constraints; recommends A (repair today's tree) || A, as an experiment (the user, 2026-10-28: "i think of this all as experimental and you should treat it as such"). Each rule, the cargo Hana-cost test included, is a trial with a measure and a review point, and it is dropped if it does not help. |
+| HI2 | Q3 must build-followups and sdlc cut a measured Hana cost, or get a fixed share || Revised and approved (the user, 2026-10-28: "all of this work is at the very least transitively supportive... we use natedev as a test bed for ideas for hana"). Every new piece of work in build-followups, sdlc and cargo names its link to Hana, direct or indirect. No measured Hana cost and no fixed share. Record the links; review later which paid off. This softens HI1's cargo rule to the same link rule. |
+| HI3 | Q4 the user's daily review budget; may old unreviewed changes close || Part 1, budget: no daily budget (the user, 2026-10-28). The user wants what is being built: a Jev-driven mechanism (scripts/issue_score) that always sorts every item for review by importance, so each review gives the most decision value. Part 2: keep open; no change closes without the user's check (the user: "i was on vacation for 7 days and things accumulated - that's why i want priority sorting"). |
+| HI4 | Q5 is the account count fixed || Fixed, with proposals: the account count stays; when records show one more account ships more Hana work, the showrunner brings a proposal with the numbers; cost per phase alone is no case (the user, 2026-10-28). |
+| HI5 | Q6 where each newly created showrunner and unit sits in the tree || Dropped (the user, 2026-10-28: does not recall the need). The live showrunner tree is the record; a production doc that disagrees with it is fixed by its owner. |
+| HI6 | Q7 push-authorization audit || Approved (the user, 2026-10-28). Each showrunner checks which of its sends to the user pass a failed text check, fixes only paths confirmed as not approved, and records which approved exception each send uses. A change to an exception is its own question. |
+| HI7 | Q8 record waits and merge receipts || Approved as a 4-week experiment (the user, 2026-10-28). Each phase records each wait and its cause; each merge leaves a receipt (project, issue, commit, branch, time) that the receiving showrunner checks. After four weeks, hierarchies reports which waits slow Hana. phases-unit builds the records, roles-unit writes the duties; no gate changes. |
+| HI8 | Q9 cargo Hana-cost note || Settled by HI2 (showrunner call, 2026-10-28). The note is a link to Hana, direct or indirect, not a measured cost. It is written at a new unit, a later run, added work and a board pull; user orders, demo and herdr work and small fixes start at once. No peer check: a later review checks which links helped Hana. |
+| HI9 | Q10 run-end ownership check || Approved with the user's note (2026-10-28): "as we name workers for a unit - we reuse them - unit directors need to rely on building up context and most of our unit directors are very long lived, so must most of their workers be long lived". Workers live as long as their unit director, across runs, and are reused by name. The run-end check ends only workers whose unit director is gone or whose owner cannot be found; active workers and pooled reviewers stay. Each showrunner removes timers nobody asked for. |
+| HI10 | Q11 trial B, only under both conditions || Settled by HI2 (showrunner call, 2026-10-28). HI2 ruled out a measured Hana cost, so B's added rule does not start as written. If the HI7 wait records show non-Hana work slowing Hana, hierarchies brings a new proposal. |
+| HI11 | Q12 defer C || Dropped (the user, 2026-10-28: "i see no reason for natedev to hand out workers or for their to be a centralized worker mechanism"). C is not a later option; each showrunner keeps starting its own workers. |

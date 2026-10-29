@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -77,6 +78,31 @@ class StyleProposalsTests(unittest.TestCase):
     propose: str = "global:rust/propose.md"
     calls: list[tuple[str, ...]] = []
 
+    template_repo: Path = Path()
+    template_tip: str = ""
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.template_repo = Path(cls.enterClassContext(tempfile.TemporaryDirectory())) / "sample"
+        cls.template_repo.mkdir()
+        fixture = cls(methodName="runTest")
+        fixture.repo = cls.template_repo
+        # Match setUp's isolated Git configuration while building the class template.
+        with mock.patch.dict(os.environ, {"HOME": str(cls.template_repo.parent)}):
+            _ = fixture.git("init", "-q", "--initial-branch=main")
+            _ = fixture.git("config", "user.name", "Proposal tests")
+            _ = fixture.git("config", "user.email", "proposals@example.invalid")
+            fixture.write("Cargo.toml", '[workspace]\nmembers = ["alpha", "beta"]\n')
+            for crate in ("alpha", "beta"):
+                fixture.write(f"{crate}/Cargo.toml", f'[package]\nname = "{crate}"\nversion = "0.1.0"\n')
+                fixture.write(f"{crate}/src/lib.rs", APPLIED + "fn value() -> u32 { 1 }\n")
+            _ = fixture.git("add", "--all")
+            _ = fixture.git("commit", "-qm", "Workspace")
+            cls.template_tip = fixture.git("rev-parse", "HEAD")
+
+
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -85,7 +111,7 @@ class StyleProposalsTests(unittest.TestCase):
         self.catalog = self.root / "nate_style/rust"
         self.proposals = self.root / "vault/issues"
         self.template = self.root / "issue.yaml"
-        self.repo.mkdir()
+        _ = shutil.copytree(self.template_repo, self.repo, symlinks=True)
         self.catalog.mkdir(parents=True)
         _ = self.template.write_text(TEMPLATE)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
@@ -94,16 +120,7 @@ class StyleProposalsTests(unittest.TestCase):
             "STYLE_HISTORY_NATE_STYLE_DIR": str(self.catalog.parent),
         })))
         _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", self.catalog.parent))
-        _ = self.git("init", "-q", "--initial-branch=main")
-        _ = self.git("config", "user.name", "Proposal tests")
-        _ = self.git("config", "user.email", "proposals@example.invalid")
-        self.write("Cargo.toml", '[workspace]\nmembers = ["alpha", "beta"]\n')
-        for crate in ("alpha", "beta"):
-            self.write(f"{crate}/Cargo.toml", f'[package]\nname = "{crate}"\nversion = "0.1.0"\n')
-            self.write(f"{crate}/src/lib.rs", APPLIED + "fn value() -> u32 { 1 }\n")
-        _ = self.git("add", "--all")
-        _ = self.git("commit", "-qm", "Workspace")
-        self.tip = self.git("rev-parse", "HEAD")
+        self.tip = self.template_tip
         _ = self.git("branch", "style/main")
         for name, metadata in (("names", "tier: C\nfamily: names\ninput_scope: file\n"),
                                ("modules", "tier: D\nfamily: modules\ninput_scope: crate\n"),
@@ -808,6 +825,23 @@ class StyleProposalsTests(unittest.TestCase):
         finding = self.hold(ledger, ticket=ticket, kind="restructure")
         ledger.ticket_drop(ticket)
         return finding
+
+    def test_current_file_gate_uses_shared_site_proof_without_certifying_changed_rule(self) -> None:
+        source = "fn work() {\n    consume(791);\n}\n"
+        with self.ledger() as ledger:
+            _ = self.commit_tip(ledger, {"alpha/src/lib.rs": source})
+            ticket = self.assign_ticket(ledger, "names-unit")
+            _ = ledger.ticket_base(ticket)
+            blob = next(rule.blob for rule in rules.load_rules(self.repo) if rule.rule_id == self.rename)
+            finding = ledger.hold(self.rename, "alpha/src/lib.rs", 2, source.splitlines()[1], "restructure",
+                                  "791", "LIMIT", blob, ticket)
+            ledger.ticket_drop(ticket)
+            _ = (self.catalog / "names.md").write_text((self.catalog / "names.md").read_text() + "A changed requirement\n")
+            tip = self.commit_tip(ledger, {finding.path: "fn sibling() {}\n" + source})
+            self.assertTrue(style_proposals.judged_at_current_file(ledger, finding, tip))
+            self.assertTrue(style_ledger.rule_changed_since_judged(finding, {rule.rule_id: rule for rule in rules.load_rules(self.repo)}))
+            changed = self.commit_tip(ledger, {finding.path: source.replace("791", "792")})
+            self.assertFalse(style_proposals.judged_at_current_file(ledger, finding, changed))
 
     def test_decision_b_files_only_local_bindings_while_types_work_is_open(self) -> None:
         with self.ledger() as ledger:

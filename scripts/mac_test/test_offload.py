@@ -36,6 +36,7 @@ import treekey
 SCRIPT = Path(__file__).with_name("offload.py")
 STATE_SCRIPT = Path(__file__).with_name("mac_test.py")
 FILTER = "package(hana) & (test(a) | test(b))"
+WORKING_TREE_SOURCE = offload.RepositoryWorkingTree()
 
 
 class RemoteLine(TypedDict):
@@ -73,6 +74,7 @@ class CommandEvent(TypedDict):
     claimed: bool
     exclude: NotRequired[str]
     copy_claim: NotRequired[bool]
+    what: NotRequired[str]
 
 
 class SelectorEvent(TypedDict):
@@ -122,7 +124,9 @@ event = {
     "claimed": (Path(os.environ["MAC_TEST_STATE_DIR"]) / "claims" / "hana.json").exists(),
 }
 try:
-    event["copy_claim"] = json.loads((Path(os.environ["MAC_TEST_STATE_DIR"]) / "claims" / "hana.json").read_text()).get("copy", False)
+    claim = json.loads((Path(os.environ["MAC_TEST_STATE_DIR"]) / "claims" / "hana.json").read_text())
+    event["copy_claim"] = claim.get("copy", False)
+    event["what"] = claim["what"]
 except (OSError, ValueError):
     pass
 if command == "rsync":
@@ -175,7 +179,7 @@ if "select_leftovers()" in remote and "lsof" in remote:
     for line in fixture["cleanup_lines"]:
         print(line, flush=True)
     raise SystemExit(int(fixture["cleanup_status"]))
-if "lint nextest" in remote:
+if any("lint " + verb in remote for verb in ("nextest", "check", "clippy", "mend-check", "doc")):
     (root / "run-started").write_text("started\n", encoding="utf-8")
     time.sleep(float(fixture["run_delay_s"]))
     for index, line in enumerate(fixture["run_lines"]):
@@ -200,6 +204,26 @@ for line in fixture["probe_lines"]:
     print(line, flush=True)
 raise SystemExit(int(fixture["probe_status"]))
 '''
+
+
+class LintVerbTests(unittest.TestCase):
+    def test_check_and_mend_check_use_the_public_lint_command_without_rewrites(self) -> None:
+        lint = Path(__file__).resolve().parents[1] / "lint" / "lint"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            invoke = root / ".claude/scripts/lint/invoke.sh"
+            invoke.parent.mkdir(parents=True)
+            _ = invoke.write_text(
+                'run() { printf "%s\\n" "$@"; }\n'
+                + 'invoke_mend() { printf "%s\\n" mend "$@"; }\n')
+            environment = {**os.environ, "HOME": str(root), "BUILDLOG_DIR": str(root / "buildlog")}
+            for verb, expected in (("check", ["cargo", "check", "--workspace", "--all-features"]),
+                                   ("mend-check", ["mend", "--fail-on-warn", "--workspace", "--all-features"])):
+                with self.subTest(verb=verb):
+                    answer = subprocess.run(["bash", str(lint), verb, "--workspace", "--all-features"],
+                                            env=environment, cwd=root, capture_output=True, text=True, check=False)
+                    self.assertEqual(answer.returncode, 0, answer.stderr)
+                    self.assertEqual(answer.stdout.splitlines(), expected)
 
 
 HANA = offload.KnownRepository("hana")
@@ -686,6 +710,9 @@ class OffloadCommandTests(unittest.TestCase):
         last_decline: str = "",
         separate_stderr: bool = False,
         copy: bool = False,
+        verb: offload.MacVerb = "nextest",
+        package: str = "hana",
+        source: offload.MacSource = WORKING_TREE_SOURCE,
     ) -> subprocess.CompletedProcess[str]:
         self.result_path.unlink(missing_ok=True)
         arguments = [
@@ -694,11 +721,14 @@ class OffloadCommandTests(unittest.TestCase):
             "run",
             "--repo-root",
             str(self.repository if repository is None else repository),
-            "--package",
-            "hana",
             "--call-id",
             "call-17",
         ]
+        if isinstance(source, offload.StagedDocSnapshot):
+            arguments.extend(["--source-root", str(source.root)])
+        if package:
+            arguments.extend(["--package", package])
+        arguments.extend(["--verb", verb])
         if filter_run:
             arguments.append("--filter-run")
         if copy:
@@ -1490,6 +1520,125 @@ raise SystemExit(offload.main())
         self.assertIsNone(treekey.tree_key(str(self.repository)))
         self.assertFalse(any(word.startswith("BUILDLOG_SENT_TREE_KEY=") for word in self.sent_command_words()))
         self.assert_stable_copy_sends_key()
+
+    def write_portable_workspace(self) -> None:
+        _ = (self.repository / "Cargo.toml").write_text('[workspace]\nmembers=["portable"]\n')
+        member = self.repository / "portable"
+        member.mkdir(exist_ok=True)
+        _ = (member / "Cargo.toml").write_text('[package]\nname="portable"\nversion="0.1.0"\n')
+
+    def test_each_mac_verb_keeps_arguments_and_names_its_claim(self) -> None:
+        self.write_portable_workspace()
+        self.config["mac_skip.hana"] = "test(skip-this)"
+        self.sync_config()
+        for verb in ("nextest", "check", "clippy", "mend-check", "doc"):
+            with self.subTest(verb=verb):
+                words = ("--workspace", "--all-features")
+                result = self.command(*words, verb=verb)
+                self.assertEqual(result.returncode, 0, result.stdout)
+                sent = shlex.split(self.events_for("ssh")[-1]["args"][-1].rpartition("; echo mac_exit=$?")[0])
+                position = sent.index("~/.claude/scripts/lint/lint")
+                self.assertEqual(sent[position + 1:], [verb, *words])
+                if verb == "doc":
+                    self.assertIn("LINT_CONFIG_FORCE=1", sent[:position])
+                # The local claim is read by rsync before remote execution.
+                held = self.events_for("rsync")[-1]
+                self.assertTrue(held["claimed"])
+                self.assertEqual(held.get("what"), f"{verb} hana")
+
+    def test_no_package_names_the_mac_claim_for_the_workspace(self) -> None:
+        self.write_portable_workspace()
+        result = self.command("--workspace", verb="check", package="")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.events_for("rsync")[-1].get("what"), "check workspace")
+
+    def test_exit_four_is_no_tests_only_for_nextest(self) -> None:
+        self.write_portable_workspace()
+        self.fixture["run_status_line"] = "mac_exit=4"
+        self.sync_fixture()
+        for verb in ("check", "clippy", "mend-check", "doc"):
+            with self.subTest(verb=verb):
+                result = self.command("--workspace", verb=verb)
+                self.assertEqual(result.returncode, 4, result.stdout)
+                self.assertIn("fix the finding in the local worktree", result.stdout)
+                self.assertNotIn("only a test", result.stdout)
+                self.assert_wire("failed", "")
+        result = self.command("--workspace")
+        self.assertEqual(result.returncode, 75, result.stdout)
+        self.assertIn("mac_test: no test matched on the Mac; running on natedev instead", result.stdout)
+        self.assert_wire("declined", "no_tests")
+
+    def test_non_test_verbs_never_apply_nextest_skip_words_or_start_a_copy(self) -> None:
+        self.write_portable_workspace()
+        self.config["mac_skip.hana"] = "test(skip-this)"
+        self.sync_config()
+        for verb in ("check", "clippy", "mend-check", "doc"):
+            with self.subTest(verb=verb):
+                result = self.command("-E", "leave-this-argument", verb=verb)
+                self.assertEqual(result.returncode, 0, result.stdout)
+                remote = self.events_for("ssh")[-1]["args"][-1]
+                self.assertIn("-E leave-this-argument", remote)
+                self.assertNotIn("skip-this", remote)
+                self.assertFalse(self.events_for("rsync")[-1].get("copy_claim"))
+                for option in ("copy", "filter"):
+                    with self.subTest(option=option):
+                        result = self.command(verb=verb, copy=option == "copy", filter_run=option == "filter")
+                        self.assertEqual(result.returncode, 2, result.stdout)
+
+    def test_linux_only_workspace_member_declines_every_non_test_verb_before_claim(self) -> None:
+        self.write_portable_workspace()
+        self.config["linux_only.hana"] = "portable"
+        self.sync_config()
+        for verb in ("check", "clippy", "mend-check", "doc"):
+            with self.subTest(verb=verb):
+                self.assert_declined(self.command("--workspace", verb=verb), "linux_only")
+        self.assertEqual(self.events_for("ssh"), [])
+        self.assertEqual(self.events_for("rsync"), [])
+
+    def test_implicit_linux_member_blocks_workspace_verbs_through_target_and_shared_dependencies(self) -> None:
+        for section in ("dependencies", "dev-dependencies", "build-dependencies", 'target.\'cfg(unix)\'.dependencies'):
+            with self.subTest(section=section):
+                self.write_portable_workspace()
+                _ = (self.repository / "Cargo.toml").write_text(
+                    '[workspace]\nmembers=["portable"]\n[workspace.dependencies]\nimplicit={path="implicit"}\n')
+                member = self.repository / "implicit"
+                member.mkdir(exist_ok=True)
+                _ = (member / "Cargo.toml").write_text('[package]\nname="linux-part"\nversion="0.1.0"\n')
+                with (self.repository / "portable/Cargo.toml").open("a") as output:
+                    _ = output.write(f'[{section}]\nimplicit={{workspace=true}}\n')
+                self.config["linux_only.hana"] = "linux-part"
+                self.sync_config()
+                for verb in ("check", "clippy", "mend-check", "doc"):
+                    self.assert_declined(self.command("--workspace", verb=verb), "linux_only")
+        self.assertEqual(self.events_for("ssh"), [])
+        self.assertEqual(self.events_for("rsync"), [])
+
+    def test_unreadable_implicit_membership_refuses_workspace_before_claim(self) -> None:
+        self.write_portable_workspace()
+        with (self.repository / "portable/Cargo.toml").open("a") as output:
+            _ = output.write('[dependencies]\nmissing={path="../missing"}\n')
+        for verb in ("check", "clippy", "mend-check", "doc"):
+            self.assert_declined(self.command("--workspace", verb=verb), "repo")
+        self.assertEqual(self.events_for("ssh"), [])
+        self.assertEqual(self.events_for("rsync"), [])
+
+    def test_doc_copies_the_supplied_snapshot_without_working_tree_ignores(self) -> None:
+        self.write_portable_workspace()
+        snapshot = self.root / "staged-doc"
+        snapshot.mkdir()
+        _ = (snapshot / "Cargo.toml").write_text('[package]\nname="staged"\nversion="0.1.0"\n')
+        _ = (self.repository / ".gitignore").write_text("staged-file.rs\n")
+        _ = (snapshot / "staged-file.rs").write_text("staged source")
+        result = self.command("--workspace", verb="doc", source=offload.StagedDocSnapshot(snapshot))
+        self.assertEqual(result.returncode, 0, result.stdout)
+        copied, = self.events_for("rsync")
+        self.assertIn(str(snapshot) + "/", copied["args"])
+        self.assertNotIn(str(self.repository) + "/", copied["args"])
+        self.assertNotIn("/staged-file.rs", copied.get("exclude", ""))
+        self.config["linux_only.hana"] = "staged"
+        self.sync_config()
+        self.assert_declined(self.command("--workspace", verb="doc", source=offload.StagedDocSnapshot(snapshot)), "linux_only")
+        self.assertEqual(len(self.events_for("rsync")), 1)
 
     def test_remote_test_command_sets_development_deployment_target_before_nextest(self) -> None:
         words = ("--no-fail-fast", "unit_case")

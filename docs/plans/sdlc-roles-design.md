@@ -1,6 +1,6 @@
 # Duties and names in the development process
 
-> **Status: DESIGN — phase 2 proposals.** Questions Q1–Q8 remain open. This phase changes no live duty or name. Phase 1 made only the two approved reporting wording fixes.
+> **Status: DESIGN — phase 2 proposals.** Q2, Q3 and R5b are answered below; other questions remain open. This phase changes no live duty or name. Phase 1 made only the two approved reporting wording fixes.
 
 Scope: `docs/plans/sdlc-roles.md`, Decisions and Phases 1–2. Duties and names belong here. Structure belongs to hierarchies-unit; designer and reviewer contracts belong to guilds-unit; phase steps and the document pipeline belong to phases-unit; repair rules belong to fix-rounds-unit. This document refers to their work and does not replace it.
 
@@ -105,17 +105,19 @@ The machine-readable inventory is `scripts/production/role_terms.toml`. The tabl
 | showrunner | role | Session that coordinates, merges, tests, settles designs and reports; PF, Words | orchestrator is a broader coordinator name: Format, introduction, specifically for a unit director | showrunner for a production coordinator |
 | unit | record | One plan-backed run with its worktree and branch; PF, Words | — | unit; `<area>-unit` for its ID |
 | unit director | role | Session that orders, dispatches, gates and checkpoints unit work; PF, Words | orchestrator: Format, introduction; `/unit:direct` names its command, not a worker | unit director |
-| worker | role | Dispatched Codex thread that writes, tests, repairs or reviews; PF, Words | seat and Codex seat: UD, `<WorkerRuns>`, `commands/showrunner/rename_unit.md`; delegate: UD, opening, `docs/delegate/write_prompt_contract.md`, `<PhaseMesh>`; subagent also describes the separate Small-fix helper in nixos memory `small-fixes-by-subagent-in-main.md`; Codex worker: UD, `<LongLivedWorkers>` | worker in prose; retain slot names such as `impl` and `test` as identities |
+| worker | role | Dispatched Codex thread that writes, tests, repairs or reviews; PF, Words | seat and Codex seat: UD, `<WorkerRuns>`, `commands/showrunner/rename_unit.md`; delegate: UD, opening, `docs/delegate/write_prompt_contract.md`, `<PhaseMesh>`; subagent also describes the separate Small-fix helper in nixos memory `small-fixes-by-subagent-in-main.md`; Codex worker: UD, `<LongLivedWorkers>` | worker in prose (approved user, sdlc review; phase 3 Work Order, 2026-10-28); retain slot names such as `impl` and `test` as identities |
+| shown name | label | Answered R5b: every shown name carries production · unit · job; user decision, relayed by the sdlc showrunner and then the unit director (2026-10-28) | Reports, messages and Codex thread names; the address stays as it is | `production · unit · job`, for example `sdlc · roles · code reviewer 6`; answer recorded only, no source rename in this phase |
 | review pool | record | Reusable reviewers allocated by script; PF, Words | — | review pool |
-| reviewer | role | Read-only Codex thread in the pool; PF, Words | pooled reviewer: Hierarchy, Map → Roles; Astra reviewer is a distinct planned role: Guilds, Phase 2 → Roles | pooled reviewer in shared prose; ask about the distinct design role |
+| reviewer | role | Answered Q3: distinguish review duties; user, sdlc review, relayed in phase 3 Work Order (2026-10-28) | Existing pool and held Astra roles remain separate; Guilds, Guilds and heads | design reviewer, code reviewer and UI reviewer; designer for the design role; no source rename in this phase |
 | template | record | Thread with standing review instructions; never leased; PF, Words | review template: Hierarchy, Map → Roles | review template in shared prose |
 | lease | record | Lasting reviewer assignment to one unit, distinct from ownership of one active review; `scripts/direct/review_pool.py:32`, `UnitLease`, and `:676`, `command_end_lease` (no-op). PF, Words still describes a phase lease and needs correction against this code. | review lease is a proposed qualifier, not a phase lifecycle | review lease in shared prose (proposed); define its lasting unit lifetime |
 | merge branch | record | Branch that receives unit checkpoints; PF, Words | trunk: PF, Words, retained as cargo-berth's term; SR, `<Dependencies>` also records a former unit named trunk | merge branch, or the actual branch name where needed |
-| gate | step | Dependency that blocks a phase until another checkpoint merges; PF, Words | Verification check: UD, `<FinalGate>` and `docs/delegate/phase_checks.md`, `<PhaseChecks>`; required user interaction: UD, `<TurnEndGate>` (`:200`), including authorization and phase approval | dependency gate, verification gate and user gate for the distinct meanings; ask before changing; keep `gate:` status syntax |
+| gate | step | Answered Q2: a check that must pass; user, sdlc review, relayed in phase 3 Work Order (2026-10-28) | Earlier source meanings: PF, Words; UD, `<FinalGate>` and `<TurnEndGate>` | gate; preserve `gate:` syntax; no source rename in this phase |
+| wait | step | Answered Q2: one unit waiting on another; user, sdlc review, relayed in phase 3 Work Order (2026-10-28) | Earlier inter-unit gate wording: PF, Words | wait; no source rename in this phase |
 | parent showrunner | role | Showrunner that receives another production's reports; PF, Words | parent: SR, `<Throughout>` → Nested showrunners | parent showrunner when the hierarchy is relevant |
 | child showrunner | role | Showrunner with its own production that reports to a parent; PF, Words | lower showrunner: `commands/showrunner/add_showrunner.md`, opening | child showrunner |
 | root showrunner | role | Top of an attached production tree; PF, Words | root: SR, `<Throughout>` → Nested showrunners; top-level showrunner: Hierarchy, Map → Roles | root showrunner for a tree; top-level showrunner for a peer without a parent |
-| small-fix helper | role | Helper that writes a small unowned fix in place; nixos memory `small-fixes-by-subagent-in-main.md`, How to apply; no defining live role file | subagent and helper: that memory; helper is broader in UD, `<PhaseCleanup>` | small-fix helper; definition still needs a live owner file |
+| small-fix helper | role | Approved name: a showrunner helper that does no code work; user, sdlc review, relayed in phase 3 Work Order (2026-10-28) | Earlier code-writing helper wording remains in the D29 source inventory pending a separately approved duty correction | small-fix helper; no source duty change in this phase |
 | astra-designer | role | Two planned uses: the per-design Codex role writes and revises a design in the same thread (D51; Guilds, Phase 2 → Spec and Roles); the temporary top-level designer guild-head ID names D30 (SDLC, Guild heads) | chief designer: SDLC, Guild heads; Guilds, Decisions → edge role ids and Phase 2 → Names require the head and per-design uses to be named apart | Astra designer for the per-design role; chief designer for the head until cargo-liner settles its name with the user |
 | astra-reviewer | role | Two planned uses: the per-design Codex role reviews the design and returns findings (D52; Guilds, Phase 2 → Spec and Roles); the temporary top-level reviewer guild-head ID names D31 (SDLC, Guild heads) | chief reviewer: SDLC, Guild heads; Guilds, Phase 2 → Roles distinguishes the per-design role from pooled code and UI reviewers and one-turn `/astra_review` | Astra reviewer for the per-design role; chief reviewer for the head until cargo-liner settles its name with the user; pooled reviewer for D15 |
 | Work Order | document | Self-contained dispatch specification against named files and Delegation Context; Format, Document structure and Rules 2–3 | work order: `docs/delegate/compose_work_order.md`, title; case variants count together | Work Order |
@@ -556,9 +558,11 @@ These are proposed questions for the showrunner to present. They do not ask for 
 
 Q1. For D32, should each guild head own its guild's shared tips and distribution, or should the sdlc showrunner own both; recommend each guild head, with the final route designed by guilds-unit?
 
-Q2. Should shared prose use `dependency gate` for an inter-unit wait, `verification gate` for a check, and `user gate` for a required authorization or phase approval, or keep `gate` with local definitions; recommend the scoped terms (F14; UD, `<TurnEndGate>`)? Keep the `gate:` status syntax unless a separate compatibility change is approved.
+Q2. **Answered (user, sdlc review; relayed in the phase 3 Work Order, 2026-10-28):** a `wait` is one unit waiting on another; a `gate` is a check that must pass. This phase records the answer only. Keep the `gate:` status syntax; source changes need a later approved step.
 
-Q3. Should `reviewer` alone mean a pooled code reviewer (D15), with `Astra reviewer` for the planned per-design reviewer (D52), or should both keep the same name; recommend explicit `pooled reviewer` and `Astra reviewer` in shared prose, with guilds-unit defining the full design-review contract (PF, Words → Reviewer; Guilds, Phase 2 → Roles)?
+Q3. **Answered (user, sdlc review; relayed in the phase 3 Work Order, 2026-10-28):** name the roles `design reviewer`, `code reviewer`, `UI reviewer` and `designer`. This phase records the answer only; it does not rename sources, role IDs, guild heads or running threads.
+
+R5b. **Answered (user decision, relayed by the sdlc showrunner and then the unit director, 2026-10-28):** every shown name carries `production · unit · job`, for example `sdlc · roles · code reviewer 6`, in reports, messages and Codex thread names. The address stays as it is. This phase records the answer only; it makes no source rename.
 
 Q4. Should `proposal` mean a filed issue and `add-on` an unfiled follow-up candidate, or should both keep `proposal`; recommend the distinct names and keep `change` for an implemented result awaiting review (F16)?
 
@@ -811,7 +815,7 @@ P-A and P-B cover D01–D06, D08–D15, D17–D19, D21, D24, D26–D28, D33–D3
 
 ### Guild meanings and tips (former Step 10)
 
-Q1, Q3 and Q5 remain open. O32-A is recommended, subject to guilds-unit's actual contract; O32-B is the editor alternative. Sources are `docs/as-built/guilds.md` and `/home/natepiano/worktrees/claude-build-followups-sdlc/docs/plans/sdlc-production.md`. Each Astra ID has n=2 definition sources in the checked n=36-term set, but head and per-design meanings must be approved separately before a target can be stated. The heads shipped as `designers`, `reviewers`, `showrunners` and `units`, and `astra-designer` / `astra-reviewer` now name only the per-design roles and census edges. The shared-tips contract shipped in Guilds, Tips: each head owns its guild's tip files and publishes them with `tips.py publish`. Undo of a later approved meaning/contract change must be coordinated with those owners and must not rename a running head.
+Q1 and Q5 remain open; Q3 is answered above (2026-10-28). O32-A is recommended, subject to guilds-unit's actual contract; O32-B is the editor alternative. Sources are `docs/as-built/guilds.md` and `/home/natepiano/worktrees/claude-build-followups-sdlc/docs/plans/sdlc-production.md`. Each Astra ID has n=2 definition sources in the checked n=36-term set, but head and per-design meanings must be approved separately before a target can be stated. The heads shipped as `designers`, `reviewers`, `showrunners` and `units`, and `astra-designer` / `astra-reviewer` now name only the per-design roles and census edges. The shared-tips contract shipped in Guilds, Tips: each head owns its guild's tip files and publishes them with `tips.py publish`. Undo of a later approved meaning/contract change must be coordinated with those owners and must not rename a running head.
 
 ### Alias removal, meanings and remaining source pools (former Step 11)
 
@@ -924,3 +928,287 @@ After each approved numbered phase, run `~/.claude/scripts/lib/py scripts/produc
 ## Next steps
 
 The adversarial judge and Astra review dated 2026-10-20 are folded into Candidates, Comparison, Recommendation and Steps. The director checked these repairs, recorded the source-only scan time, and sends the showrunner the Recommendation and Step 1 as a question with buildable answers and the recommended answer. The false-failure replay runs first in Step 1's build phase. Use only a numbered phase-ready step for a build Work Order; promote later work only after its exact files, dependencies and before/target are complete. No open question or later candidate is approved by accepting another step.
+
+## Step log
+
+### Step 1 freeze — 2026-10-28, phase 3
+
+Source tree before the first rename: `2bd53a04b4c42ac7c1b4f0f72c8498e8b01a9f7b`; the pre-existing edit to `docs/plans/sdlc-roles.md` is outside this worker's file set. Read-only classification uses the current `roles_audit.read_live_files(Path('.'))` extraction and `without_paths(text, tuple(name for term in terms for name in term.kept))`, followed by `re.finditer(r'(?<![\w-])seats?(?![\w-])', text, re.I)`. Command: `python3 - <<'PY'` importing `roles_audit` from `scripts/production`, loading `scripts/production/role_terms.toml` with `parse_terms`, and applying those calls to each returned live file. This reads source only and starts no session or message. The extracted file set is n=563 live files; read issues n=0. Files without a match are omitted from the table. Each cell is eligible / kept; overlapping `Codex seat` and `Codex seats` earn no extra credit.
+
+Before baseline recorded by the unit director at 13:37 EDT on 2026-10-28: `python3 scripts/production/roles_audit.py --root /tmp/claude-1000/-home-natepiano-worktrees-claude-build-followups-sdlc-roles/a58b133c-41b8-408d-967e-e41b631ab545/scratchpad/before_tree --since 2026-10-14 --until 2026-10-27 baseline`. The root is a `git archive` export of pre-change tree `2bd53a04b4c42ac7c1b4f0f72c8498e8b01a9f7b`. Source set: n=563 live files. Names reports worker / `seat`: n=69 in n=14 files; worker / `Codex seat`: n=9 in n=4 files. These alias counts overlap and are not added. The output is `/tmp/claude/unit/d739a3b3-2f5e-42d2-a9c8-d79b5de75d2a/phases/3/before_baseline.md`; source issues n=0. Its message window is [2026-10-14T00:00:00-04:00, 2026-10-28T00:00:00-04:00), labelled America/Curacao in that output. This is the director’s recorded before baseline, separate from the plural-aware source classification below.
+
+| Measured live file | Singular eligible / kept (n) | Plural eligible / kept (n) |
+| --- | --- | --- |
+| `commands/showrunner/rename_unit.md` | 5 / 0 | 2 / 0 |
+| `commands/showrunner/retire_unit.md` | 0 / 0 | 2 / 0 |
+| `commands/showrunner/transfer_unit.md` | 0 / 0 | 1 / 0 |
+| `commands/unit/direct.md` | 8 / 0 | 0 / 0 |
+| `docs/as-built/agent-registry.md` | 1 / 0 | 1 / 0 |
+| `docs/as-built/build-memory-admission.md` | 1 / 1 | 0 / 0 |
+| `docs/as-built/guilds.md` | 1 / 0 | 0 / 0 |
+| `docs/as-built/long-lived-workers.md` | 5 / 0 | 0 / 0 |
+| `docs/as-built/message-clarity.md` | 0 / 0 | 0 / 1 |
+| `docs/as-built/shutdown-and-restart.md` | 25 / 14 | 7 / 3 |
+| `docs/as-built/unit-rename.md` | 1 / 0 | 2 / 0 |
+| `docs/as-built/usage-ledger.md` | 0 / 0 | 0 / 1 |
+| `docs/delegate/dual_review.md` | 1 / 0 | 0 / 0 |
+| `docs/production_format.md` | 0 / 0 | 1 / 0 |
+| Prose subtotal, n=14 matching files | 48 / 15 | 16 / 5 |
+| `scripts/agents/codex_mesh.py` | 2 / 0 | 0 / 0 |
+| `scripts/agents/mesh_runs.py` | 1 / 0 | 0 / 0 |
+| `scripts/direct/implement.sh` | 1 / 0 | 0 / 0 |
+| `scripts/direct/phase_reservation.py` | 0 / 0 | 1 / 0 |
+| `scripts/production/rename_unit.py` | 1 / 0 | 2 / 0 |
+| `scripts/production/retire_unit.py` | 0 / 0 | 2 / 0 |
+| `scripts/production/transfer_unit.py` | 0 / 0 | 1 / 0 |
+| `scripts/shutdown/restart.py` | 1 / 0 | 0 / 0 |
+| `scripts/usage/collect.py` | 0 / 0 | 0 / 2 |
+| Script subtotal, n=9 matching files | 6 / 0 | 6 / 2 |
+| Total, n=23 matching live files | 54 / 15 | 22 / 7 |
+
+Singular-only before n=69; plural before n=29; combined before n=98. Eligible n=76 (prose n=64, script n=12); kept n=22. Complete retirement target: singular n=15, plural n=7, combined n=22. With the n=8 director-owned singular uses pending and the n=1 singular at the absent replacement path pending, this writer's expected reduction is n=67 (singular n=45, plural n=22); interim lexical target n=31 (singular n=24, plural n=7). Kept history is not a rename saving. Script counts remain lower bounds: comments, docstrings and some f-string text excluded by extraction earn no extra count credit.
+
+Kept contexts, with reasons:
+
+- `docs/as-built/shutdown-and-restart.md`: literal stored field `seat` (n=1 singular); all `<seat>` placeholders (n=10 singular after existing path masking, including filename fragments, reopen arguments/output and idle/working resume command examples) document unchanged protocol or filename contracts. Keep the exact source spelling and its file scope. Keep the full dated 2026-10-16 resume-workers probe paragraph (n=3 singular, n=3 plural), including recorded output and worker identity. Total n=14 singular, n=3 plural. Plain role prose and the live `Each seat continues…` quotation are eligible.
+- `docs/as-built/build-memory-admission.md`: the sentence beginning `Before this, a seat started one lint run three times` through `build time.` (n=1 singular) records the dated 2026-10-21 hana_catalyst-inspectors incident. Keep the record; the preceding current-role explanation changes.
+- `docs/as-built/message-clarity.md`: the retirement record at `291e1da55`, dated 2026-10-16 by blame (n=1 plural).
+- `docs/as-built/usage-ledger.md`: the old stored `seats` migration value (n=1 plural); `scripts/usage/collect.py`: the two SQL migration input values (n=2 plural). They remain recognized input values.
+- Identifiers, API and JSON fields (`seat`, `codex_seats`, `PausedSeat`), flags, transport addresses, filenames and placeholders documenting them remain unchanged. Raw source uses in `scripts/accounts/worker_names.py`, `scripts/agents/agent_bg.sh`, `scripts/buildlog/index.py`, `scripts/direct/worker_state.py`, `scripts/feature_log/inventory.py`, `scripts/shutdown/inventory.py`, `scripts/shutdown/record.py` and `scripts/shutdown/stop.py` are contracts or migration values, not eligible role prose.
+- Temporary check exceptions at opening: `commands/unit/direct.md` had n=8 eligible singular uses pending phases-unit ownership. Repair round 1 refreshes that count to n=9 and the exact lines below. The old-path `dual_review.md` mismatch at opening is resolved in repair round 1. Only the director-owned request has authorized exact-context check exceptions; do not mask files wholesale.
+
+Pre-edit dependencies read: `commands/showrunner/produce.md` `<Guild>`; `docs/production_format.md` `<GuildHeads>` (there is no `<Guild>` tag in that file); hierarchies Map change via `git -C /home/natepiano/worktrees/claude-build-followups-hierarchies show d14a7368 -- docs/plans/build-followups-hierarchies-design.md`. The Map distinguishes four guild heads from held per-design Astra roles. `produce.md` has no eligible worker-seat spelling; no edit is needed there. The 2026-10-20 replay stands by the Work Order amendment; it is not repeated.
+
+Replay lesson: when a retirement leaves a live key, value or flag, add that contract to the per-file kept list with its reason in the same change. A kept context copied to another file or changed text must require fresh classification.
+
+### Director-owned change requests — refreshed at `8b3b83bd`
+
+**Applied (2026-10-28):** phases-unit is paused, so by the showrunner's call the unit director applied the 9 replacements below in `commands/unit/direct.md` in the Step 1 checkpoint and removed the 8 pending `direct.md` kept contexts from `role_terms.toml`. No eligible use remains pending; phases-unit receives an also-touches line.
+
+Exact whole-line replacements below match the merged source byte for byte, including leading spaces. These change n=9 singular uses on n=8 lines and no duties. Line 863 is new in the merged tree; line 886 also has new upstream text.
+
+Line 374:
+
+```text
+OLD: launcher is attached carries the result to you: dispatch that seat
+NEW: launcher is attached carries the result to you: dispatch that worker
+```
+
+Line 474:
+
+```text
+OLD: never open a new seat for a role a paused seat holds. A forced stop without this
+NEW: never open a new worker for a role a paused worker holds. A forced stop without this
+```
+
+Line 863:
+
+```text
+OLD: | First touch to `Active` | The Codex seat hook, or `phase_reservation.py record-active` at <CheckpointCommit/> step 5 |
+NEW: | First touch to `Active` | The Codex worker hook, or `phase_reservation.py record-active` at <CheckpointCommit/> step 5 |
+```
+
+Line 886:
+
+```text
+OLD: | `Active` | A clear check that acquired or already held the scopes: the Codex seat hook, or the checkpoint backstop for a first touch no hook recorded. A later clear check that names another reservation of the same phase replaces it, as after berth released the recorded one. `repair` may restore it from berth's session map only after the board confirms it is active | Copies the returned reservation and coordination-run ids, phase, and protected phase-start HEAD; supplies a release argument. |
+NEW: | `Active` | A clear check that acquired or already held the scopes: the Codex worker hook, or the checkpoint backstop for a first touch no hook recorded. A later clear check that names another reservation of the same phase replaces it, as after berth released the recorded one. `repair` may restore it from berth's session map only after the board confirms it is active | Copies the returned reservation and coordination-run ids, phase, and protected phase-start HEAD; supplies a release argument. |
+```
+
+Line 954:
+
+```text
+OLD:    two open, it is how a seat's edit finds its phase, so keep each path in
+NEW:    two open, it is how a worker's edit finds its phase, so keep each path in
+```
+
+Line 955:
+
+```text
+OLD:    exactly one phase's list and add a path a seat's refusal names. Then invoke
+NEW:    exactly one phase's list and add a path a worker's refusal names. Then invoke
+```
+
+Line 973:
+
+```text
+OLD:    atomically acquires exact `file:` scopes before the edit. A Codex seat's
+NEW:    atomically acquires exact `file:` scopes before the edit. A Codex worker's
+```
+
+Line 990:
+
+```text
+OLD:    leaves the pending state intact; a seat reports the refusal to you, and you
+NEW:    leaves the pending state intact; a worker reports the refusal to you, and you
+```
+
+The former `docs/delegate/dual_review.md` path is now `docs/direct/dual_review.md`. F001 is in this writer’s file set; the line 38 replacement is applied in repair round 1, so no routing exception is needed.
+
+### Source classification after the opening writer edits — `2bd53a04`
+
+Read-only command (run from the worktree root; no tests, state reads or session starts):
+
+```sh
+python3 - <<'PY'
+import re
+import sys
+from pathlib import Path
+sys.path.insert(0, 'scripts/production')
+import roles_audit as audit
+files, issues = audit.read_live_files(Path('.'))
+pattern = re.compile(r'(?<![\w-])seats?(?![\w-])', re.I)
+kept_paths = ('docs/delegate/', 'scripts/direct/', 'scripts/delegate/')
+totals = [0, 0]
+for file in files:
+    text = audit.without_paths(file.text, kept_paths)
+    counts = [sum(match.group().lower() == word
+                  for match in pattern.finditer(text))
+              for word in ('seat', 'seats')]
+    if any(counts):
+        print(file.path, *counts)
+    totals = [left + right for left, right in zip(totals, counts)]
+print('SOURCE CLASSIFICATION AFTER', len(files), 'files', totals,
+      'total', sum(totals), 'issues', issues)
+PY
+```
+
+The same extraction and original global kept-path masking give the following after counts, over n=563 live files, read issues n=0. The before classification used the same calls, then divided each match by the frozen per-file kept contexts above. This preserves comparability while the test worker adds scoped check exceptions.
+
+| Remaining measured live file | Singular (n) | Plural (n) | Reason |
+| --- | --- | --- | --- |
+| `commands/unit/direct.md` | 8 | 0 | Eligible; pending phases-unit request above |
+| `docs/as-built/build-memory-admission.md` | 1 | 0 | Dated incident kept |
+| `docs/as-built/message-clarity.md` | 0 | 1 | Dated retirement kept |
+| `docs/as-built/shutdown-and-restart.md` | 14 | 3 | Contract placeholders, stored field and dated probe kept |
+| `docs/as-built/usage-ledger.md` | 0 | 1 | Migration value kept |
+| `docs/delegate/dual_review.md` | 1 | 0 | Eligible; assigned replacement path absent |
+| `scripts/usage/collect.py` | 0 | 2 | Migration values kept |
+| Total, n=7 matching live files | 24 | 7 | n=31 combined |
+
+Measured writer reduction: singular n=45 (69 to 24), plural n=22 (29 to 7), combined n=67 (98 to 31). Remaining eligible uses n=9, outside the writer's editable paths. Remaining kept uses n=22. The new plural matcher and kept history earn no rename credit. Source-only comment/docstring changes have no numeric credit. No identifiers, API/JSON fields, flags, transport addresses, filenames or historical identities changed.
+
+The after baseline ran once the build hold ended; see **After measure** at the end of this Step log.
+
+Execution record: the opening slot did not run verification under the build hold; the director supplied the before baseline above. The opening path mismatch is resolved by the upstream move to `docs/direct/`. Installed `board.sh post ... handoff` requires a machine-readable role prefix, so handoffs use `role=impl`. The replay is not repeated, per the amendment. No source rename for Q2/Q3 and no duty change were made.
+
+### Repair round 1 — merged tree `8b3b83bd`
+
+The director fast-forwarded to `8b3b83bd` and reapplied both slots' changes. Each of this writer's eight conflict blocks in six files first takes upstream's content; worker-role wording is then reapplied. This retains `UNIT_RUN_DIR`, `TMPDIR`, dev-shell behavior, durable model identity, the shared pause deadline and `_exit_words` output formatting.
+
+The same read-only method uses n=596 live files, read issues n=0. For a comparable merged before set, `git archive HEAD` is read in memory with `tarfile`; each member passes the same folder, extension, test/fixture and plan filters as `read_live_files`. Scripts use `python_prose(text).text` or `shell_prose(text).text`; every file then uses `without_paths(text, ('docs/delegate/', 'scripts/direct/', 'scripts/delegate/'))` and `re.finditer(r'(?<![\w-])seats?(?![\w-])', text, re.I)`. No checkout, state source, build or test is involved. This measures the merged source before the role edits rather than mixing conflict markers or partially reapplied edits into its denominator. Cells remain eligible / kept. Kept contexts and reasons are the same as the opening freeze: stored field and placeholders, dated probe and incident, dated retirement, and migration input values. `Codex seat(s)` overlaps receive no extra credit.
+
+| Merged before live file | Singular eligible / kept (n) | Plural eligible / kept (n) |
+| --- | --- | --- |
+| `commands/showrunner/rename_unit.md` | 5 / 0 | 2 / 0 |
+| `commands/showrunner/retire_unit.md` | 0 / 0 | 2 / 0 |
+| `commands/showrunner/transfer_unit.md` | 0 / 0 | 1 / 0 |
+| `commands/unit/direct.md` | 9 / 0 | 0 / 0 |
+| `docs/as-built/agent-registry.md` | 1 / 0 | 1 / 0 |
+| `docs/as-built/build-memory-admission.md` | 1 / 1 | 0 / 0 |
+| `docs/as-built/guilds.md` | 1 / 0 | 0 / 0 |
+| `docs/as-built/long-lived-workers.md` | 6 / 0 | 0 / 0 |
+| `docs/as-built/message-clarity.md` | 0 / 0 | 0 / 1 |
+| `docs/as-built/rustdoc-once-and-final-targets.md` | 2 / 0 | 0 / 0 |
+| `docs/as-built/shutdown-and-restart.md` | 26 / 14 | 8 / 3 |
+| `docs/as-built/unit-rename.md` | 1 / 0 | 2 / 0 |
+| `docs/as-built/usage-ledger.md` | 0 / 0 | 0 / 1 |
+| `docs/direct/dual_review.md` | 1 / 0 | 0 / 0 |
+| `docs/production_format.md` | 0 / 0 | 1 / 0 |
+| `scripts/agents/codex_mesh.py` | 2 / 0 | 0 / 0 |
+| `scripts/agents/mesh_runs.py` | 1 / 0 | 0 / 0 |
+| `scripts/direct/implement.sh` | 1 / 0 | 0 / 0 |
+| `scripts/direct/phase_reservation.py` | 0 / 0 | 1 / 0 |
+| `scripts/production/rename_unit.py` | 1 / 0 | 2 / 0 |
+| `scripts/production/retire_unit.py` | 0 / 0 | 2 / 0 |
+| `scripts/production/transfer_unit.py` | 0 / 0 | 1 / 0 |
+| `scripts/shutdown/restart.py` | 1 / 0 | 0 / 0 |
+| `scripts/usage/collect.py` | 0 / 0 | 0 / 2 |
+| Total, n=24 matching live files | 59 / 15 | 23 / 7 |
+
+Merged before: singular n=74, plural n=30, combined n=104; eligible n=82, kept n=22. Compared with the opening tree's n=98, source drift adds n=6 eligible uses: direct.md n=1 singular, long-lived-workers.md n=1 singular, rustdoc-once-and-final-targets.md n=2 singular, and shutdown-and-restart.md n=1 singular and n=1 plural. The moved dual_review.md use keeps its original count. The whole-file scan after selecting upstream conflict blocks, before this repair's wording edits, reports n=45 (singular n=37, plural n=8) in n=10 matching files; that intermediate count includes opening edits already reapplied and is not a new retirement baseline.
+
+New or newly found eligible uses outside this writer's files were routed to the unit director, who applied the replacements below in F006. The rustdoc paragraphs explain current build policy with an undated old role label; they are not dated incident records. Exact whole-line replacements follow. The README and inventory docstring are outside Names extraction, so their edits receive no count credit.
+
+`docs/as-built/rustdoc-once-and-final-targets.md:5`:
+
+```text
+OLD: Rustdoc runs once per phase, as the unit director's last command before a Rust checkpoint commit. It does not run in every `verify.sh lint` call. A PreToolUse hook refuses a checkpoint commit in a Cargo repository unless a passing rustdoc run exists for the exact tree that the commit writes, so the check cannot be skipped. `lint.conf` cannot switch it off. `verify.sh final` type-checks every example once with `cargo check --all-targets`. Its nextest build no longer builds and links the examples again. A scan before any build refuses an example that holds a test or sets `test = true`, so no test is lost. The reason is fewer and shorter builds with the same guarantees: rustdoc used much seat time on each lint call and caught few errors, and the second example build in `final` added work but no checks.
+NEW: Rustdoc runs once per phase, as the unit director's last command before a Rust checkpoint commit. It does not run in every `verify.sh lint` call. A PreToolUse hook refuses a checkpoint commit in a Cargo repository unless a passing rustdoc run exists for the exact tree that the commit writes, so the check cannot be skipped. `lint.conf` cannot switch it off. `verify.sh final` type-checks every example once with `cargo check --all-targets`. Its nextest build no longer builds and links the examples again. A scan before any build refuses an example that holds a test or sets `test = true`, so no test is lost. The reason is fewer and shorter builds with the same guarantees: rustdoc used much worker time on each lint call and caught few errors, and the second example build in `final` added work but no checks.
+```
+
+`docs/as-built/rustdoc-once-and-final-targets.md:111`:
+
+```text
+OLD: Rustdoc ran in every `verify.sh lint` call. It used much seat time and caught few errors. One run per phase, at the checkpoint, keeps the check and removes the repeats. The user required that it be impossible to skip rustdoc in a phase, so a hook enforces it, and the record is keyed to the exact committed tree. An edit after the doc run, or a file left out of the commit, makes the record not match.
+NEW: Rustdoc ran in every `verify.sh lint` call. It used much worker time and caught few errors. One run per phase, at the checkpoint, keeps the check and removes the repeats. The user required that it be impossible to skip rustdoc in a phase, so a hook enforces it, and the record is keyed to the exact committed tree. An edit after the doc run, or a file left out of the commit, makes the record not match.
+```
+
+`scripts/berth/install/README.md:11`:
+
+```text
+OLD: A unit's Codex seats edit through `apply_patch`, which none of these see.
+NEW: A unit's Codex workers edit through `apply_patch`, which none of these see.
+```
+
+`scripts/berth/install/README.md:12`:
+
+```text
+OLD: `scripts/hooks/pre-tool-use-berth.py` is their `PreToolUse` check: for a seat
+NEW: `scripts/hooks/pre-tool-use-berth.py` is their `PreToolUse` check: for a worker
+```
+
+`scripts/shutdown/inventory.py:888`:
+
+```text
+OLD:     """An earlier stop paused every seat, and the director has written no board line since.
+NEW:     """An earlier stop paused every worker, and the director has written no board line since.
+```
+
+The `<seat>.resume-prompt.md` placeholder in `scripts/shutdown/inventory.py:890` remains a filename contract. Only the preceding worker-role sentence is eligible. The new direct.md line 863 is included in the refreshed owner request above; its nine uses remain eligible and temporarily excepted by exact OLD lines until phases-unit applies them. The unit director applied F006: both rustdoc replacements, both README replacements and the inventory docstring replacement above. The rustdoc uses no longer remain in the source result; no kept exception was added for them.
+
+### Repair round 1 source result
+
+The read-only source classification command shown above, run after repair with the original path masking, reads n=596 live files with n=0 issues. After the unit director applied F006, removing the two rustdoc uses from that result gives:
+
+| Remaining measured live file | Singular eligible / kept (n) | Plural eligible / kept (n) |
+| --- | --- | --- |
+| `commands/unit/direct.md` | 9 / 0 | 0 / 0 |
+| `docs/as-built/build-memory-admission.md` | 0 / 1 | 0 / 0 |
+| `docs/as-built/message-clarity.md` | 0 / 0 | 0 / 1 |
+| `docs/as-built/shutdown-and-restart.md` | 0 / 14 | 0 / 3 |
+| `docs/as-built/usage-ledger.md` | 0 / 0 | 0 / 1 |
+| `scripts/usage/collect.py` | 0 / 0 | 0 / 2 |
+| Total, n=6 matching live files | 9 / 15 | 0 / 7 |
+
+Singular n=24; plural n=7; combined n=31. On the same merged source set, the rename reduction is singular n=50 (74 to 24), plural n=23 (30 to 7), combined n=73 (104 to 31). Remaining eligible n=9 are all in direct.md. Kept n=22 remains unchanged. The writer repair and director F006 edits remove n=14 measured occurrences from the partially reapplied tree (45 to 31); that intermediate change is not added to the full rename reduction. Source comments/docstrings and the routed README receive no extra count credit.
+
+F001 is fixed at `docs/direct/dual_review.md:38`. F003 is fixed by the director's before-baseline record above. F005 is fixed by re-matching all eight OLD lines to the merged read-only direct.md and sending their exact text to test for its kept contexts. The upstream changes within all six conflict files remain; every conflict marker in those files is removed. No source identifiers, stored fields, flags, transport addresses, filenames or historical records change.
+
+Repair verification is deferred: hold status names build-speed-unit since 13:37 EDT, with release ETA 15:00 EDT. The assigned basedpyright, shell syntax and after-baseline commands were not started. No test or merge gate ran in this slot.
+
+Repair follow-up: the extraction API now returns `SourceProse`; the reproducible merged-before method above uses `python_prose(text).text` / `shell_prose(text).text`. Names text and the classification method stay the same. The final eight direct.md OLD lines were sent again to test with exact leading spaces. R5b is recorded as answered in the term table and Questions from the unit director’s relay of the sdlc showrunner’s 2026-10-28 user decision; this adds no live rename.
+
+### After measure — merged tree `8b3b83bd` with all repairs
+
+Command: `python3 scripts/production/roles_audit.py --root . --since 2026-10-14 --until 2026-10-27 baseline`, run at 14:25 EDT on 2026-10-28 after the build hold ended, over n=596 live files, exit 0. The test slot ran it after the measure fix for unreadable Python tokens.
+
+| Worker alias | Uses (n) | Files (n) |
+| --- | --- | --- |
+| `seat` | 15 | 2 |
+| `seats` | 7 | 4 |
+| `Codex seat` | 1 | 1 |
+| `Codex seats` | 0 | 0 |
+
+Singular n=15 and plural n=7 match the kept target of the opening freeze (n=22 combined). Every remaining use is a kept context with its reason in `role_terms.toml`; eligible uses remaining n=0, `commands/unit/direct.md` included. The before measure on the `2bd53a04` export read `seat` n=69 and `Codex seat` n=9. The `Codex seat` row overlaps the `seat` row and earns no extra count. The repository check `test_repository_sources_have_no_unkept_retired_names` passes on this tree.
+
+### Retired-name check timing — 2026-10-28
+
+The check now selects candidate files before full extraction, splits each Python file's source lines once, and reads and extracts the files of a full-tree scan in 8 processes (results keep the sorted source order). On natedev, on the full tree at merged HEAD `35fb3d20`, with the output byte-for-byte the same as before:
+
+| Command | Before (wall, 1-minute load) | Candidate selection only (wall, 1-minute load) | With 8 processes (wall, 1-minute load; 3 runs) |
+| --- | --- | --- | --- |
+| `python3 scripts/production/roles_audit.py --root . check` | 39.8 s, 78.2 | 2.5 s, 24.0 | 1.28 s, 1.10 s, 1.16 s at 67–69 |
+| `python3 -m unittest discover -s scripts/production -p 'test_roles_audit.py'` (31 tests) | not measured alone (about 38 s for the check inside it) | 4.1 s, 22.7; 8.4 s, 38–44 | 1.68 s, 1.50 s, 1.69 s at 67 |
+
+Times depend on load. With candidate selection only, one suite run took 8.4 s at load 38–44, so the review asked for more margin. With 8 processes, runs at load 87–102 took 2.5–4.4 s for the check and 3.7–5.6 s for the suite. The merge gate cost is measured in real gates later.

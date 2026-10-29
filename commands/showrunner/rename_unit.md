@@ -23,12 +23,12 @@ The script lives at
    - the unit is on the Mac.
 
    A running unit is not a refusal: apply stops it itself, at step 1. The stop is at once: it does
-   not wait for the director or its Codex seats to go idle, and a seat in the middle of a turn
+   not wait for the director or its Codex workers to go idle, and a worker in the middle of a turn
    pauses there. The unit's commits that are not merged move with the branch.
 2. Run `apply` once, in the background: one run does the whole rename, with no rerun. It waits for the
    unit to stop (up to an hour), for a merge gate that is running, and for the relaunched unit to come
    up. It journals each step, so a rerun after a refusal resumes from the step that stopped. The steps are:
-   1. stop the unit and its Codex seats at once through the shutdown path (`down`, then `now`), then
+   1. stop the unit and its Codex workers at once through the shutdown path (`down`, then `now`), then
       stop its runs' app-servers (`codex_mesh.py stop`) and SIGTERM their supervisors and app-server
       watchers left in the worktree;
    2. merge the merge branch into the unit, except while its work is in progress (an open phase or
@@ -43,9 +43,9 @@ The script lives at
    7. move the unit's state; style productions also move current ledger tickets, sync waits and
       open proposal issues to the new id, keeping ticket ids and history;
    8. retire the old branch when its name changed;
-   9. point the unit's shutdown record at the new names, also each paused Codex seat's launcher
-      folder, and add the new worktree path to each seat's resume prompt;
-   10. relaunch the unit; it resumes each Codex seat's own thread in the new worktree;
+   9. point the unit's shutdown record at the new names, also each paused Codex worker's launcher
+      folder, and add the new worktree path to each worker's resume prompt;
+   10. relaunch the unit; it resumes each Codex worker's own thread in the new worktree;
    11. verify.
    - **Exit 2** means the unit was still stopping after an hour. Find out why its stop holds, then rerun `apply`.
    - **Exit 1** names the step that refused. Fix the cause and rerun `apply`.
@@ -54,5 +54,5 @@ The script lives at
    A failure leaves the journal open. A stale live place is a bug in the rename. A file nothing
    classifies is a place to add to `unit_rename_sweep.py`: history or live. Then run `verify` alone.
 4. When the rename is done, the unit restarts. Its first prompt gives its new id, worktree, branch and plan,
-   and each Codex seat's resume prompt gives the new worktree. A moved worktree leaves no link or copy at the old path.
+   and each Codex worker's resume prompt gives the new worktree. A moved worktree leaves no link or copy at the old path.
    Tell the user the new name in one line.

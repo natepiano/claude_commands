@@ -6,6 +6,7 @@ import argparse
 import json
 from collections.abc import Iterator
 import os
+import re
 import subprocess
 import sys
 import time
@@ -19,14 +20,16 @@ from uuid import uuid4
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS.parent))
 sys.path.insert(0, str(SCRIPTS / "hooks"))
+sys.path.insert(0, str(SCRIPTS / "message"))
 sys.path.insert(0, str(SCRIPTS / "shutdown"))
 
 import autocompact
 import rename_state
 import showrunners
+import sessions
 import unit_lookup
 import unit_names
-from production_units import Refusal, cell_value, production_field, unit_rows, unit_headings, unit_table
+from production_units import Refusal, cell_value, plan_cell_is_retired, production_field, unit_rows, unit_headings, unit_table
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from user_zone import user_zone  # noqa: E402
@@ -34,7 +37,9 @@ from probe_session import PROBE_ENV  # noqa: E402
 
 if TYPE_CHECKING:
     import herdr
+    import launch_permission
     from scripts.accounts.accounts import ClaudeLaunchAccount
+    from record import SessionShutdown
 
 
 class Production(NamedTuple):
@@ -44,6 +49,14 @@ class Production(NamedTuple):
     checkout: Path
     log: Path
     zone: ZoneInfo
+
+
+class ProductionPlanRequired(NamedTuple):
+    """The launch needs a plan with a Production header."""
+
+
+class ExistingConversationPlan(NamedTuple):
+    """An existing director resumes with its own recorded plan, even after condensation."""
 
 
 class PlanGiven(NamedTuple):
@@ -94,13 +107,48 @@ class NewSession(NamedTuple):
     pass
 
 
+class ResumeStoppedSession(NamedTuple):
+    """The caller expects no process to be running on the conversation."""
+
+
+class AttachRunningSession(NamedTuple):
+    """The caller requests a safe shutdown before the conversation becomes a unit."""
+
+
 class ResumedSession(NamedTuple):
     session_id: str
     cwd: Path
+    handoff: ResumeStoppedSession | AttachRunningSession = ResumeStoppedSession()
+
+
+class NoSessionHandoff(NamedTuple):
+    pass
+
+
+class RunningSessionHandoff(NamedTuple):
+    session_id: str
+    pid: int
+    proc_start: str
+    login: str
+
+
+class StoppedSessionHandoff(NamedTuple):
+    """The shutdown record confirms a stop and both old identity and registry are clear."""
+
+    source: RunningSessionHandoff
+    record: SessionShutdown
+
+    @property
+    def session_id(self) -> str:
+        return self.source.session_id
 
 
 class NewWorkLaunch(NamedTuple):
     pass
+
+
+class ResumeInStartFolderLaunch(NamedTuple):
+    """A retired unit resumes outside its worktree and needs no worktree or branch."""
 
 
 class UnitRestoreLaunch(NamedTuple):
@@ -137,12 +185,21 @@ class NoUnitRow(NamedTuple):
     pass
 
 
+class ActiveUnitRow(NamedTuple):
+    pass
+
+
+class RetiredUnitRow(NamedTuple):
+    pass
+
+
 class ExistingUnitRow(NamedTuple):
     plan: str
     worktree: str
     branch: str
     port: str
     owns: str
+    state: ActiveUnitRow | RetiredUnitRow
 
 
 class UnitIdentity(NamedTuple):
@@ -160,7 +217,7 @@ class UnitLaunchConfiguration:
     port: OmittedCell | SuppliedCell
     owns: OmittedCell | SuppliedCell
     session: NewSession | ResumedSession
-    launch_kind: NewWorkLaunch | UnitRestoreLaunch
+    launch_kind: NewWorkLaunch | UnitRestoreLaunch | ResumeInStartFolderLaunch
     timeout: float
 
     @property
@@ -226,6 +283,7 @@ class ReadyToLaunch(NamedTuple):
     launch: UnitLaunch
     row: NoUnitRow | ExistingUnitRow
     director: DirectorAgent
+    handoff: NoSessionHandoff | RunningSessionHandoff = NoSessionHandoff()
 
 
 @dataclass(frozen=True)
@@ -308,6 +366,9 @@ def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
     else:
         plan = Standby(permanent)
     resumed = cast(str | None, args.resume)
+    attached = cast(str | None, getattr(args, "attach", None))
+    identity = attached if attached is not None else resumed
+    session_flag = "--attach" if attached is not None else "--resume"
     cwd = cast(str | None, args.cwd)
     restart_note = cast(str | None, args.restart_note)
     session_name = cast(str | None, args.session_name)
@@ -324,12 +385,15 @@ def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
     probe = cast(bool, args.probe)
     if probe and restart_note is None:
         raise Refusal("--probe requires a shutdown restore with --restart-note")
-    if (resumed is None) != (cwd is None):
-        raise Refusal("--resume and --cwd must be given together")
-    if resumed is not None and isinstance(plan, BriefGiven):
-        raise Refusal("--resume requires --plan, --standby, or --permanent")
-    session: NewSession | ResumedSession = (ResumedSession(resumed, Path(cwd).expanduser().resolve())
-                                            if resumed is not None and cwd is not None else NewSession())
+    if (identity is None) != (cwd is None):
+        raise Refusal(f"{session_flag} and --cwd must be given together")
+    if identity is not None and isinstance(plan, BriefGiven):
+        raise Refusal(f"{session_flag} requires --plan, --standby, or --permanent")
+    session: NewSession | ResumedSession = (
+        ResumedSession(identity, Path(cwd).expanduser().resolve(),
+                       AttachRunningSession() if attached is not None else ResumeStoppedSession())
+        if identity is not None and cwd is not None else NewSession()
+    )
     launch_kind: NewWorkLaunch | UnitRestoreLaunch
     if (
         resumed is not None
@@ -384,15 +448,20 @@ def row_is_present(request: RequestedUnitLaunch, lines: list[str]) -> NoUnitRow 
     # A restore creates no worktree or branch, so the naming pattern behind `request.worktree` and
     # `request.branch` neither reserves them against other rows nor has to match the unit's own row.
     restoring = isinstance(request.launch_kind, UnitRestoreLaunch)
-    # A resumed session also runs in its row's worktree, whatever the naming rule now gives.
+    # A resumed session keeps its row's worktree and branch, whatever the naming rule now gives.
     row_names_place = restoring or isinstance(request.session, ResumedSession)
     matching: list[ExistingUnitRow] = []
     for cells in unit_table(lines):
         fields = {heading: cell_value(cell) for heading, cell in cells.items()}
         if fields.get("Unit") == request.unit:
             try:
+                state = RetiredUnitRow() if plan_cell_is_retired(cells["Plan"]) else ActiveUnitRow()
+                if (isinstance(state, RetiredUnitRow) and not restoring
+                        and isinstance(request.session, ResumedSession)
+                        and isinstance(request.session.handoff, ResumeStoppedSession)):
+                    fields["Plan"] = cell_value(re.sub(r"^\s*\(retired [^)]*\)\s*", "", cells["Plan"]))
                 matching.append(ExistingUnitRow(fields["Plan"], fields["Worktree"], fields["Branch"],
-                                                fields["Port"], fields["Owns"]))
+                                                fields["Port"], fields["Owns"], state))
             except KeyError as error:
                 raise Refusal(f"unit {request.unit} has an invalid Units row") from error
         elif not restoring and (fields.get("Worktree") == str(request.worktree)
@@ -488,6 +557,19 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
     from scripts.accounts.accounts import trust_command
     from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust, repository_trust_key
 
+    handoff: NoSessionHandoff | RunningSessionHandoff = NoSessionHandoff()
+    if isinstance(request.session, ResumedSession):
+        session_id = request.session.session_id
+        observed = sessions.session_liveness(session_id)
+        if isinstance(observed, sessions.SessionLivenessUnknown):
+            raise Refusal(f"cannot tell whether session {session_id} runs: {observed.reason}")
+        if isinstance(request.session.handoff, AttachRunningSession):
+            if isinstance(observed, sessions.SessionNotLive):
+                raise Refusal(f"session {session_id} does not run; use --resume")
+            handoff = attach_source(session_id, observed.pid)
+        elif isinstance(observed, sessions.LiveSessionProcess):
+            raise Refusal(f"session {session_id} already runs as pid {observed.pid}; "
+                          + f"to make it this unit, run add_unit with --attach {session_id}")
     production = request.production
     branch = git(production, "branch", "--show-current").stdout.strip()
     if branch != production.merge_branch:
@@ -501,6 +583,11 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
     lines = production.doc.read_text(encoding="utf-8").splitlines()
     existing = row_is_present(request, lines)
     restoring = isinstance(request.launch_kind, UnitRestoreLaunch)
+    plan_context: ProductionPlanRequired | ExistingConversationPlan = ProductionPlanRequired()
+    if (not restoring and isinstance(existing, ExistingUnitRow)
+            and isinstance(request.session, ResumedSession)
+            and isinstance(request.session.handoff, ResumeStoppedSession)):
+        plan_context = ExistingConversationPlan()
     if restoring:
         if isinstance(existing, NoUnitRow):
             raise Refusal(f"unit {request.unit} has no Units row; a restore never adds one")
@@ -508,7 +595,11 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
         request = replace(request, worktree=Path(existing.worktree), branch=existing.branch)
     elif isinstance(request.session, ResumedSession) and isinstance(existing, ExistingUnitRow):
         if request.session.cwd != Path(existing.worktree).expanduser().resolve():
-            raise Refusal(f"unit {request.unit} resumes in {request.session.cwd}; its Units row names {existing.worktree}")
+            if (isinstance(existing.state, RetiredUnitRow)
+                    and isinstance(request.session.handoff, ResumeStoppedSession)):
+                request = replace(request, launch_kind=ResumeInStartFolderLaunch())
+            else:
+                raise Refusal(f"unit {request.unit} resumes in {request.session.cwd}; its Units row names {existing.worktree}")
         request = replace(request, worktree=Path(existing.worktree), branch=existing.branch)
     launch = UnitLaunch(
         production=request.production,
@@ -533,11 +624,11 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
     if isinstance(trust, Untrusted):
         label = account.label
         raise Refusal(f"{request.unit}: Claude is not trusted in {folder} on {label}. Run: {trust_command(check_folder, account)}")
-    if restoring:
-        # A restore adopts the row it matched and creates nothing: how the unit was first added, whether
-        # its Plan cell still names a live plan rather than its as-built, and whether its worktree and
-        # branch are free all describe new work, not the session it resumes.
-        return ReadyToLaunch(launch, existing, director_agent(launch))
+    if restoring or isinstance(launch.launch_kind, ResumeInStartFolderLaunch):
+        # These launches adopt the row and need no worktree: how the unit was first added, whether
+        # its Plan cell still names a live plan, and whether its worktree and branch are free
+        # describe new work, not the session it resumes.
+        return ReadyToLaunch(launch, existing, director_agent(launch), handoff)
     if isinstance(existing, ExistingUnitRow) and recorded_mode(launch, existing) != launch.mode_name:
         raise Refusal(f"unit name {launch.identity.unit} is already taken in Units table")
     has_worktree = worktree_on_branch(launch)
@@ -548,7 +639,7 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
     if (local_branch or remote_head(production, request.branch)) and not (
             isinstance(existing, ExistingUnitRow) and has_worktree):
         raise Refusal(f"branch {request.branch} already exists")
-    if isinstance(launch.plan, PlanGiven):
+    if isinstance(launch.plan, PlanGiven) and isinstance(plan_context, ProductionPlanRequired):
         result = git(production, "show", f"{production.merge_branch}:{launch.plan.path.as_posix()}", check=False)
         valid_plan = (_is_excluded_standing_plan(production, launch.plan.path) if result.returncode != 0
                       else any(line.startswith("> **Production:") for line in result.stdout.splitlines()))
@@ -562,7 +653,95 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
         if (not any(line.startswith("> **Production:") for line in content.splitlines())
                 or len(saved_words) != 2 or saved_words[1] != launch.plan.words + "\n"):
             raise Refusal(f"stub plan {launch.plan.stub} already exists with different content")
-    return ReadyToLaunch(launch, existing, director_agent(launch))
+    return ReadyToLaunch(launch, existing, director_agent(launch), handoff)
+
+
+def attach_source(session_id: str, pid: int) -> RunningSessionHandoff:
+    """Require one live, attributed inventory identity before requesting its safe stop."""
+    import inventory
+    from record import session_records
+
+    processes = sessions.session_processes(session_id)
+    if isinstance(processes, sessions.SessionLivenessUnknown):
+        raise Refusal(f"cannot attach {session_id}: {processes.reason}")
+    if processes.pids != (pid,):
+        raise Refusal(f"cannot attach {session_id}: expected one process; pids found: {list(processes.pids)}")
+    matches = [entry for entry in inventory.listing() if entry.session_id == session_id and entry.pid == pid]
+    identities = {(entry.login, entry.proc_start) for entry in matches}
+    if len(identities) != 1:
+        raise Refusal(f"cannot attach {session_id}: source account is unclear in the shutdown inventory")
+    login, proc_start = identities.pop()
+    if not login or not proc_start:
+        raise Refusal(f"cannot attach {session_id}: source account or process identity is unreadable")
+    if any(saved["session"]["session_id"] == session_id for saved in session_records(login)):
+        raise Refusal(f"cannot attach {session_id}: a shutdown record already owns this session")
+    return RunningSessionHandoff(session_id, pid, proc_start, login)
+
+
+def run_attach_shutdown(arguments: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+    """The only stop boundary: the ordinary shutdown command, with its bounded follower."""
+    return subprocess.run([sys.executable, str(SCRIPTS / "shutdown/shutdown.py"), *arguments],
+                          env=launch_environment(), capture_output=True, text=True, check=False, timeout=timeout)
+
+
+def stop_for_attach(handoff: RunningSessionHandoff) -> SessionShutdown:
+    import restart
+    import settle
+    from record import session_records
+
+    identity = str(uuid4())
+    cancel = settle.shutdown_command("cancel", handoff.login, "--here", "--only", handoff.session_id)
+    try:
+        down = run_attach_shutdown(["down", handoff.login, "--here", "--only", handoff.session_id,
+                                    "--request-id", identity], restart.SESSION_WAIT_SECONDS)
+        if down.returncode != 0:
+            raise Refusal(down.stderr.strip() or down.stdout.strip() or "shutdown down failed")
+        followed = run_attach_shutdown(["follow", handoff.login, "--request", identity],
+                                      settle.NOT_ANSWERING_AFTER.total_seconds() + settle.SETTLE_INTERVAL_SECONDS)
+        if followed.returncode != 0:
+            raise Refusal(followed.stderr.strip() or followed.stdout.strip() or "shutdown follow failed")
+        records = [saved for saved in session_records(handoff.login)
+                   if saved["session"]["session_id"] == handoff.session_id and saved["request_id"] == identity]
+        if (len(records) != 1 or records[0]["progress"]["kind"] not in {"stopped", "already gone"}
+                or records[0]["stop_issues"]):
+            raise Refusal("shutdown record does not confirm a completed stop")
+        return records[0]
+    except (OSError, ValueError, subprocess.SubprocessError, Refusal) as error:
+        raise Refusal(f"attach stop did not finish for {handoff.session_id}: {error}; to cancel: {cancel}") from error
+
+
+def require_stopped_session(handoff: RunningSessionHandoff) -> None:
+    processes = sessions.session_processes(handoff.session_id)
+    if isinstance(processes, sessions.SessionLivenessUnknown):
+        raise Refusal(f"cannot attach {handoff.session_id}: {processes.reason}")
+    old = sessions.process_liveness(handoff.pid, handoff.proc_start)
+    if isinstance(old, sessions.SessionLivenessUnknown):
+        raise Refusal(f"cannot attach {handoff.session_id}: {old.reason}")
+    if processes.pids or isinstance(old, sessions.LiveSessionProcess):
+        pids = sorted(set(processes.pids) | ({old.pid} if isinstance(old, sessions.LiveSessionProcess) else set()))
+        raise Refusal(f"cannot attach {handoff.session_id}: processes still run after shutdown; pids found: {pids}")
+
+
+def attached_pid(handoff: RunningSessionHandoff) -> int:
+    processes = sessions.session_processes(handoff.session_id)
+    if isinstance(processes, sessions.SessionLivenessUnknown):
+        raise Refusal(f"ATTACH UNPROVEN for {handoff.session_id}: {processes.reason}")
+    if len(processes.pids) != 1 or handoff.pid in processes.pids:
+        raise Refusal(f"ATTACH UNPROVEN for {handoff.session_id}: expected one new process; "
+                      + f"pids found: {list(processes.pids)}; old pid: {handoff.pid}")
+    return processes.pids[0]
+
+
+def finish_attach(handoff: StoppedSessionHandoff,
+                  selected: ClaudeLaunchAccount, outcome: herdr.PromptSubmitOutcome, timeout: float) -> int:
+    import restart
+
+    _ = restart.wait_for_confirmation(frozenset({handoff.session_id}), timeout)
+    checked = restart.finish_attached_session(handoff.record, selected.label, outcome)
+    pid = attached_pid(handoff.source)
+    if checked.remaining or len(checked.finished) != 1:
+        raise Refusal(f"attached {handoff.session_id} runs as pid {pid}, but its shutdown record did not finish")
+    return pid
 
 
 def write_stub(request: UnitLaunch) -> None:
@@ -763,16 +942,14 @@ def launch_session(
     host = herdr.shared_session()
     _ = herdr.start_server(host, timeout_ms)
     production = request.production
-    pane = herdr.open_tab(host, showrunners.herdr_space(production.slug, str(production.doc)),
-                          session_name, str(request.session_cwd), environment)
-    try:
-        outcome = herdr.start_agent(host, pane, kind="claude", agent=host_session_name(request), agent_arguments=arguments,
-            opening=herdr.OpeningPrompt(prompt, herdr.SessionTranscript(selected.dir, session_id)),
-            timeout_ms=timeout_ms)
-        return outcome if isinstance(outcome, (herdr.PromptSubmitted, herdr.PromptNotSubmitted)) else herdr.PromptNotSubmitted("launcher returned no submit proof")
-    except herdr.AgentExited:
-        herdr.close_agent(host, pane)
-        raise
+    launched = herdr.launch_agent(host, showrunners.herdr_space(production.slug, str(production.doc)),
+        session_name, str(request.session_cwd), environment, kind="claude", agent=host_session_name(request),
+        agent_arguments=arguments, opening=herdr.OpeningPrompt(prompt, herdr.SessionTranscript(selected.dir, session_id)),
+        timeout_ms=timeout_ms)
+    if isinstance(launched, herdr.nix_env.Refused):
+        raise Refusal(launched.reason)
+    outcome = launched.outcome
+    return outcome if isinstance(outcome, (herdr.PromptSubmitted, herdr.PromptNotSubmitted)) else herdr.PromptNotSubmitted("launcher returned no submit proof")
 
 
 def close_untyped_session(request: UnitLaunch, outcome: herdr.PromptNotSubmitted) -> str:
@@ -802,6 +979,18 @@ def launch_environment() -> dict[str, str]:
         for key, value in os.environ.items()
         if not key.startswith("CLAUDE_")
     }
+
+
+def require_shutdown_launch_permission(selected: ClaudeLaunchAccount, purpose: launch_permission.LaunchPurpose) -> None:
+    import launch_permission
+
+    environment = launch_environment()
+    environment["CLAUDE_CONFIG_DIR"] = str(selected.dir)
+    permission = launch_permission.launch_permission(environment, purpose)
+    if isinstance(permission, launch_permission.BlockedByShutdown):
+        raise Refusal(f"{permission.reason}; /shutdown restart first")
+    if isinstance(permission, launch_permission.ShutdownStateUnreadable):
+        raise Refusal(f"shutdown state unreadable: {permission.detail}")
 
 
 def record_scheduled_restore_prompt(session_id: str, prompt: str) -> None:
@@ -1022,7 +1211,9 @@ def main(argv: list[str]) -> int:
     _ = parser.add_argument("--port", type=int)
     _ = parser.add_argument("--owns")
     _ = parser.add_argument("--timeout", type=float, default=90.0)
-    _ = parser.add_argument("--resume")
+    conversation = parser.add_mutually_exclusive_group()
+    _ = conversation.add_argument("--resume")
+    _ = conversation.add_argument("--attach", help="safely stop a running session and resume it as this unit")
     _ = parser.add_argument("--account", default="")
     _ = parser.add_argument("--source-fallback", action="store_true", help=argparse.SUPPRESS)
     _ = parser.add_argument("--model", default="")
@@ -1040,6 +1231,7 @@ def main(argv: list[str]) -> int:
         request = launch_request(args)
         explicit_autocompact = cast(str, args.autocompact)
         if (explicit_autocompact and isinstance(request.session, ResumedSession)
+                and isinstance(request.session.handoff, ResumeStoppedSession)
                 and isinstance(request.launch_kind, NewWorkLaunch) and registered_unit(request)):
             # Setting a registered unit's window is not new work: no new-work check or launch applies.
             set_autocompact(request, request.session.session_id, explicit_autocompact, cast(bool, args.check))
@@ -1059,6 +1251,21 @@ def main(argv: list[str]) -> int:
         # Read the shutdown launch barrier only when a unit is launched.
         import launch_permission
 
+        handoff: NoSessionHandoff | StoppedSessionHandoff = NoSessionHandoff()
+        if isinstance(request.session, ResumedSession) and isinstance(request.session.handoff, AttachRunningSession):
+            # Release the launch barrier before down creates its own shutdown record.
+            with launch_permission.launch_barrier():
+                require_shutdown_launch_permission(unit_account, launch_permission.NewWorkLaunchPurpose())
+                attach_ready = preflight(request, unit_account)
+            source = attach_ready.handoff
+            if cast(bool, args.check):
+                return 0
+            assert isinstance(source, RunningSessionHandoff)
+            saved = stop_for_attach(source)
+            require_stopped_session(source)
+            handoff = StoppedSessionHandoff(source, saved)
+            request = replace(request, session=request.session._replace(handoff=ResumeStoppedSession()))
+
         barrier = launch_permission.launch_barrier()
         try:
             _ = barrier.__enter__()
@@ -1073,23 +1280,11 @@ def main(argv: list[str]) -> int:
                     request.launch_kind.session_id
                 )
                 if isinstance(request.launch_kind, UnitRestoreLaunch)
+                else launch_permission.RecordedSessionRestoreLaunchPurpose(handoff.session_id)
+                if isinstance(handoff, StoppedSessionHandoff)
                 else launch_permission.NewWorkLaunchPurpose()
             )
-            permission_environment = launch_environment()
-            permission_environment["CLAUDE_CONFIG_DIR"] = str(unit_account.dir)
-            permission = launch_permission.launch_permission(
-                permission_environment, purpose
-            )
-            if isinstance(permission, launch_permission.BlockedByShutdown):
-                raise Refusal(
-                    f"{permission.reason}; /shutdown restart first"
-                )
-            if isinstance(
-                permission, launch_permission.ShutdownStateUnreadable
-            ):
-                raise Refusal(
-                    f"shutdown state unreadable: {permission.detail}"
-                )
+            require_shutdown_launch_permission(unit_account, purpose)
 
             ready = preflight(request, unit_account)
             request = ready.launch
@@ -1114,11 +1309,14 @@ def main(argv: list[str]) -> int:
                     except herdr.HerdrFailure as error:
                         raise Refusal(f"cannot end session {unit.place.session}: {error}") from error
                     marked_unit = NoMarkedUnit()
-            write_stub(request)
-            append_row(request, ready.row)
-            commit_unit(request)
-            # A restore resumes in the recorded cwd and creates no worktree or branch.
-            if not isinstance(request.launch_kind, UnitRestoreLaunch):
+            if isinstance(handoff, StoppedSessionHandoff) and isinstance(marked_unit, MarkedUnitFound):
+                raise Refusal(f"cannot attach {handoff.session_id}: unit tab already runs")
+            if not isinstance(request.launch_kind, ResumeInStartFolderLaunch):
+                write_stub(request)
+                append_row(request, ready.row)
+                commit_unit(request)
+            # A restore or a retired unit's external start folder needs no worktree or branch.
+            if not isinstance(request.launch_kind, (UnitRestoreLaunch, ResumeInStartFolderLaunch)):
                 ensure_worktree(request)
             if isinstance(marked_unit, NoMarkedUnit):
                 prompt = prompt_for(request)
@@ -1139,8 +1337,15 @@ def main(argv: list[str]) -> int:
             print(f"{request.identity.unit} restore launched: {attach_hint(request)}")
             return 0
         if isinstance(outcome, herdr.PromptNotSubmitted) and isinstance(marked_unit, NoMarkedUnit):
+            if isinstance(handoff, StoppedSessionHandoff):
+                raise Refusal(f"ATTACH UNPROVEN for {handoff.session_id}: opening prompt not submitted: {outcome.reason}")
             raise RuntimeError(f"{request.identity.unit}: opening prompt not submitted: {outcome.reason}"
                                + close_untyped_session(request, outcome))
+        if isinstance(handoff, StoppedSessionHandoff):
+            pid = finish_attach(handoff, unit_account, outcome, request.timeout)
+            record(request)
+            print(f"attached {handoff.session_id} as {request.identity.unit}: one process, pid {pid}")
+            return 0
         _ = wait_for_remote_control(request)
         record(request)
         print(f"{request.identity.unit} started: {attach_hint(request)}")

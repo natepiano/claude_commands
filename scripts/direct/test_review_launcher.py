@@ -26,6 +26,24 @@ from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorde
 DIRECT_DIR = Path(__file__).parent
 AGENTS_DIR = DIRECT_DIR.parent / "agents"
 
+LEGACY_RECORDER_ARGUMENTS = """
+# Compatibility for older launch cases whose subject is root-level artifacts.
+# The new launch-boundary tests remove this flag and use the recorder unchanged.
+import json as _fixture_json
+import os as _fixture_os
+from pathlib import Path as _FixturePath
+import sys as _fixture_sys
+if (_fixture_os.environ.get("TEST_LEGACY_LAUNCH") == "1"
+        and len(_fixture_sys.argv) > 1 and _fixture_sys.argv[1] in ("start-pass", "check-launch")):
+    if "--phase-id" not in _fixture_sys.argv:
+        _fixture_session = _FixturePath(
+            _fixture_sys.argv[_fixture_sys.argv.index("--session-dir") + 1])
+        _fixture_state = _fixture_json.loads(
+            (_fixture_session / "progress_history_state.json").read_text())
+        _fixture_sys.argv.extend(["--phase-id", _fixture_state["phase"]["id"]])
+
+"""
+
 # The wrapper calls this as: <task> readonly <working_dir> <prompt> <findings> <log>.
 # Writing both outputs and exiting immediately drives the wrapper's completion
 # branch without a model call.
@@ -33,6 +51,7 @@ STUB_AGENT_EXEC = """#!/usr/bin/env bash
 set -euo pipefail
 printf 'No findings.\\n' > "$5"
 printf 'stub agent log\\n' > "$6"
+if [[ -n "${TEST_WORKER_STARTED:-}" ]]; then : > "$TEST_WORKER_STARTED"; fi
 """
 
 STUB_MESH = """#!/usr/bin/env python3
@@ -312,6 +331,7 @@ class ReviewLauncherPassTests(unittest.TestCase):
             "\n".join([
                 "UNIT_PROGRESS_INTERVAL_SECONDS=180",
                 "UNIT_COMPACT_ABOVE_TOKENS=100000",
+                "ROUTING_FROM_ROUND=4", "ASTRA_AFTER_FAILED_FIXES=2",
                 "",
             ]),
             encoding="utf-8",
@@ -349,8 +369,8 @@ class ReviewLauncherPassTests(unittest.TestCase):
         """Copy the real wrapper beside a stub agent, so nothing calls a model.
 
         Resolution, heartbeat writing, board and recorder helpers stay real.
-        Mesh, agent execution, pool allocation and the waiting heartbeat watcher
-        are controlled so tests spend no model tokens or minute-long sleeps.
+        Mesh, agent execution and pool allocation are controlled so tests spend
+        no model tokens. The real heartbeat watcher uses a short interval.
         """
         direct_dir = self.root / "scripts" / "direct"
         agents = self.root / "scripts" / "agents"
@@ -366,33 +386,22 @@ class ReviewLauncherPassTests(unittest.TestCase):
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "agents_registry.py", lib / "agents_registry.py")
         for name in (
             "review.sh", "implement.sh", "progress_history.py", "plan_history.py", "phase_reservation.py", "recorder_state.py",
-            "findings.py", "review_tree.py", "board.sh", "worker_name.sh", "worker_state.py",
+            "findings.py", "review_tree.py", "board.sh", "worker_name.sh", "worker_state.py", "tag_inventory.py",
         ):
             _ = shutil.copy2(DIRECT_DIR / name, direct_dir / name)
-        for name in ("agents_config.sh", "agents_overlay.sh", "agents_overlay.awk", "heartbeat.sh"):
-            _ = shutil.copy2(AGENTS_DIR / name, agents / name)
-        # Keep the watcher alive for early-launch tests without a shell sleep
-        # child inheriting the subprocess output pipes for sixty seconds.
-        _ = (agents / "heartbeat_watch.sh").write_text(
-            """#!/usr/bin/env bash
-exec "$(dirname "$0")/../lib/py" -c '
-import os, select, sys, time
-try: descriptor = os.pidfd_open(int(sys.argv[1]))
-except ProcessLookupError: pass
-except AttributeError:
-    deadline = time.monotonic() + 300
-    while True:
-        try: os.kill(int(sys.argv[1]), 0)
-        except ProcessLookupError: break
-        if time.monotonic() >= deadline: raise TimeoutError("watcher child did not exit")
-        time.sleep(0.01)
-else:
-    if not select.select([descriptor], [], [], 300)[0]:
-        raise TimeoutError("watcher child did not exit")
-    os.close(descriptor)
-' "$3"
-""", encoding="utf-8",
+        recorder = direct_dir / "progress_history.py"
+        _ = recorder.write_text(recorder.read_text().replace(
+            "from __future__ import annotations\n",
+            "from __future__ import annotations\n" + LEGACY_RECORDER_ARGUMENTS, 1,
+        ))
+        launcher = direct_dir / "review.sh"
+        _ = launcher.write_text(
+            launcher.read_text(encoding="utf-8").replace(
+                "HEARTBEAT_INTERVAL_SECS=60", "HEARTBEAT_INTERVAL_SECS=1"
+            ), encoding="utf-8",
         )
+        for name in ("agents_config.sh", "agents_overlay.sh", "agents_overlay.awk", "heartbeat.sh", "heartbeat_watch.sh"):
+            _ = shutil.copy2(AGENTS_DIR / name, agents / name)
         stub = agents / "agent_exec.sh"
         _ = stub.write_text(STUB_AGENT_EXEC, encoding="utf-8")
         stub.chmod(0o755)
@@ -401,39 +410,6 @@ else:
         mesh.chmod(0o755)
         _ = (direct_dir / "review_pool.py").write_text(STUB_POOL, encoding="utf-8")
         return direct_dir / "review.sh"
-
-    def test_heartbeat_watcher_ends_without_pidfd_support(self) -> None:
-        marker = self.root / "portable-watcher-ready"
-        _ = (self.root / "sitecustomize.py").write_text(
-            "import os\nfrom pathlib import Path\n"
-            + "os.__dict__.pop('pidfd_open', None)\n"
-            + f"Path({str(marker)!r}).touch()\n"
-        )
-        child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
-                                 stdin=subprocess.PIPE)
-        environment = self.environment()
-        environment["PYTHONPATH"] = str(self.root)
-        watcher = subprocess.Popen(
-            ["bash", str(self.root / "scripts" / "agents" / "heartbeat_watch.sh"),
-             "fixture", "fixture", str(child.pid)],
-            env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-        try:
-            wait_for_file(marker)
-            assert child.stdin is not None
-            child.stdin.close()
-            self.assertEqual(child.wait(timeout=300), 0)
-            output, errors = watcher.communicate(timeout=300)
-            self.assertEqual(watcher.returncode, 0, output + errors)
-        finally:
-            for process in (child, watcher):
-                if process.poll() is None:
-                    process.kill()
-                _ = process.wait(timeout=300)
-            if watcher.stdout is not None:
-                watcher.stdout.close()
-            if watcher.stderr is not None:
-                watcher.stderr.close()
 
     def test_interpreter_cache_reuses_the_resolved_python_without_a_version_probe(self) -> None:
         launcher = self.root / "scripts" / "lib" / "py"
@@ -473,6 +449,7 @@ else:
         environment["UNIT_SYNC_WRITES"] = "0"
         environment["TEST_WAIT_HELPER_DIR"] = str(DIRECT_DIR.resolve())
         environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
+        environment["TEST_LEGACY_LAUNCH"] = "1"
         environment["UNIT_CONFIG"] = str(self.config_file)
         environment["AGENTS_CONFIG_FILE"] = str(self.root / ".claude" / "config" / "agents.conf")
         environment["TZ"] = "UTC"
@@ -496,6 +473,92 @@ else:
         environment["UNIT_PASS_OWNER"] = "launcher"
         result = invoke_recorder(arguments, environment, Path.cwd())
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def checked_review(
+        self, session: Path, *options: str, lens: str = "", early: str = "",
+    ) -> subprocess.CompletedProcess[str]:
+        environment = self.environment()
+        _ = environment.pop("TEST_LEGACY_LAUNCH", None)
+        environment["TEST_WORKER_STARTED"] = str(session / "review-worker-started")
+        return subprocess.run(
+            ["bash", str(self.review_script), *options, str(session), str(self.working_dir),
+             str(self.prompt_file), "review", "blind review", "reviewing the diff", "1", lens, early],
+            check=False, capture_output=True, text=True, env=environment, timeout=300,
+        )
+
+    def test_ux_launch_checks_identity_before_the_worker_and_records_valid_checks(self) -> None:
+        stale = self.start_implementation("ux-stale-identity")
+        self.finish_implementation(stale)
+        _ = self.prompt_file.write_text("Phase 3 — Old title\nReview the layout.\n")
+        refused = self.checked_review(stale, "--phase", "3", lens="ux")
+        self.assertNotEqual(refused.returncode, 0, refused.stderr)
+        self.assertFalse((stale / "review-worker-started").exists())
+        rejected, = [row for row in self.events(stale.name) if row["event_type"] == "launch_refused"]
+        self.assertEqual(rejected["prompt_file"], str(self.prompt_file))
+        self.assertEqual(rejected["phase_id"], "3")
+        self.assertTrue(rejected["reason"])
+        self.assertEqual((stale / "phases/3/review_status_ux").read_text().strip(), "error")
+
+        valid = self.start_implementation("ux-valid-identity")
+        self.finish_implementation(valid)
+        _ = self.prompt_file.write_text("Phase 3 — Retry handling\nReview the layout.\n")
+        launched = self.checked_review(valid, "--phase", "3", lens="ux")
+        self.assertEqual(launched.returncode, 0, launched.stderr)
+        self.assertTrue((valid / "review-worker-started").exists())
+        events = self.events(valid.name)
+        checked, = [row for row in events if row["event_type"] == "launch_checked"]
+        check = cast(dict[str, object], checked["launch_check"])
+        self.assertEqual((check["phase_id"], check["phase_title"], check["prompt_phase_line"]),
+                         ("3", "Retry handling", "matched"))
+        self.assertFalse(any(row["event_type"] == "pass_started" and row["pass_kind"] == "review"
+                             for row in events))
+
+    def test_an_early_review_with_no_phase_refuses_before_starting_its_worker(self) -> None:
+        session = self.start_implementation("early-missing-phase")
+        self.finish_implementation(session)
+        result = self.checked_review(session, early=str(session / "not-ready"))
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((session / "review-worker-started").exists())
+        self.assertEqual((session / "review_status").read_text().strip(), "error")
+        refused, = [row for row in self.events(session.name) if row["event_type"] == "launch_refused"]
+        self.assertEqual(refused["phase_id"], "")
+        self.assertIn("phase", str(refused["reason"]).lower())
+        self.assertFalse(any(row["event_type"] == "pass_started" and row["pass_kind"] == "review"
+                             for row in self.events(session.name)))
+
+    def test_review_passes_the_prompt_file_to_the_launch_check(self) -> None:
+        session = self.start_implementation("checked-review")
+        self.finish_implementation(session)
+        _ = self.prompt_file.write_text("Phase 3 — Retry handling\nReview the diff.\n")
+        result = self.checked_review(session, "--phase", "3")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        review, = [row for row in self.events(session.name)
+                   if row["event_type"] == "pass_started" and row["pass_kind"] == "review"]
+        check = cast(dict[str, object], review["launch_check"])
+        self.assertEqual((check["phase_id"], check["phase_title"], check["prompt_phase_line"]),
+                         ("3", "Retry handling", "matched"))
+        self.assertTrue((session / "review-worker-started").exists())
+
+    def test_review_stops_before_the_worker_on_a_recorder_refusal(self) -> None:
+        for label, options, text in (
+            ("stale-prompt", ("--phase", "3"), "Phase 3 — Wrong title\n"),
+            ("missing-phase", (), "Review the diff.\n"),
+        ):
+            with self.subTest(label=label):
+                session = self.start_implementation(f"checked-review-{label}")
+                self.finish_implementation(session)
+                _ = self.prompt_file.write_text(text)
+                result = self.checked_review(session, *options)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((session / "review-worker-started").exists())
+                records = self.events(session.name)
+                self.assertFalse(any(row["event_type"] == "pass_started" and row["pass_kind"] == "review"
+                                     for row in records))
+                refused, = [row for row in records if row["event_type"] == "launch_refused"]
+                self.assertEqual(refused["prompt_file"], str(self.prompt_file))
+                self.assertEqual(refused["pass_kind"], "review")
+                self.assertTrue(refused["reason"])
+                self.assertIn("prompt" if label == "stale-prompt" else "phase", result.stderr.lower())
 
     def test_early_delivery_probes_default_to_five_seconds_without_test_overrides(self) -> None:
         session = self.start_implementation("default-early-poll")
@@ -583,7 +646,7 @@ else:
             "--phase-id", "3", "--phase-title", "Retry handling",
         )
         self.recorder(
-            "start-pass", "--session-dir", str(session_dir),
+            "start-pass", "--session-dir", str(session_dir), "--phase-id", "3",
             "--pass-kind", "impl", "--activity", "writing the retry path",
             "--called-task", "direct.implementation", "--called-family", "codex",
             "--called-model", "gpt-called", "--called-effort", "xhigh",
@@ -1485,6 +1548,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
             [(event["event_type"], event.get("team_slot")) for event in reviews],
             [("pass_started", "impl"), ("pass_finished", "impl")],
         )
+        self.assertEqual(reviews[0]["worker_name"], worker)
 
     def test_a_review_opened_worker_has_durable_identity_for_an_implementation_claim(self) -> None:
         session_dir = self.start_implementation("new-worker")
@@ -1557,6 +1621,30 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
             (session_dir / "impl_status_review2").read_text(encoding="utf-8"),
             "implemented\n",
         )
+
+    def test_a_test_worker_keeps_one_identity_when_assigned_a_review(self) -> None:
+        run = self.start_implementation("test-becomes-review")
+        self.finish_implementation(run)
+        worker = "project-test"
+        identity = {"name": worker, "slot": "test", "role": "test", "family": "codex",
+                    "model": "gpt-called", "worker_id": "thread-test"}
+        path = run / "impl_worker_test.json"
+        _ = path.write_text(json.dumps(identity))
+        _ = (run / "mesh_roster.json").write_text(json.dumps({worker: {
+            "thread_id": "thread-test", "status": "done", "role": "test", "context_tokens": 0}}))
+        _ = (run / "workers").write_text(f"thread-test\t{worker}\n")
+
+        reviewed = self.run_assigned_review(run, worker)
+
+        self.assertEqual(reviewed.returncode, 0, reviewed.stderr)
+        records = [cast(dict[str, object], json.loads(item.read_text()))
+                   for item in run.glob("impl_worker_*.json")]
+        identities = [record for record in records if record.get("name") == worker]
+        self.assertEqual(len(identities), 1, records)
+        self.assertEqual(identities[0]["worker_id"], "thread-test")
+        self.assertEqual(cast(dict[str, object], json.loads(path.read_text()))["name"], worker)
+        roster = cast(dict[str, dict[str, object]], json.loads((run / "mesh_roster.json").read_text()))
+        self.assertEqual(roster[worker]["role"], "review")
 
     def test_hyphenated_new_slot_is_refused_to_keep_followup_identity_stable(self) -> None:
         session_dir = self.start_implementation("hyphenated-slot")

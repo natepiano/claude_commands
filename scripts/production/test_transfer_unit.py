@@ -15,6 +15,7 @@ from typing import cast, final, override
 from unittest import mock
 
 from scripts.guilds import roles
+from scripts.direct import workers
 
 SCRIPT = Path(__file__).with_name("transfer_unit.py")
 
@@ -43,6 +44,8 @@ class UnitTransferTests(unittest.TestCase):
             path.mkdir(parents=True)
         self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         self.env.update({
+            "UNIT_WORKERS_STATE": str(self.root / "state/unit-workers"),
+            "RETIRE_UNIT_RUN_ROOT": str(self.root / "runs"),
             "HOME": str(home), "CLAUDE_CONFIG_DIR": str(config),
             "XDG_CONFIG_HOME": str(home / ".config"), "XDG_STATE_HOME": str(self.root / "state"),
             "NOTIFIER_STATE_DIR": str(self.root / "state/notifier"),
@@ -191,8 +194,51 @@ class UnitTransferTests(unittest.TestCase):
         before = self.git("rev-parse", "demo", "other", "demo-alpha")
         result = self.transfer("plan")
         self.assert_ok(result)
+        self.assertIn("stop alpha-unit and its Codex workers through the shutdown path", result.stdout)
         self.assertIn("8. verify: alpha-unit shows under other and nowhere under demo", result.stdout)
         self.assertEqual(self.git("rev-parse", "demo", "other", "demo-alpha"), before)
+
+    def test_worker_migration_conflict_prints_a_refusal_without_a_traceback(self) -> None:
+        result = subprocess.run([sys.executable, "-c", 'import runpy, sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[2]))\nfrom scripts.direct import workers\ndef unavailable(*args, **kwargs):\n    raise workers.WorkerUnavailable("worker ownership changed; rerun apply")\nworkers.move_unit = unavailable\nworkers.rename_unit = unavailable\nworkers.end_unit = unavailable\nsys.argv = sys.argv[1:]\nsys.path.insert(0, str(Path(sys.argv[0]).parent))\nrunpy.run_path(sys.argv[0], run_name="__main__")\n', str(SCRIPT), "apply", "demo", "alpha-unit",
+            str(self.receiving / "docs/plans/other-production.md"), "--scratch", str(self.root / "scratch")],
+            cwd=self.giving, env=self.env, capture_output=True, text=True, timeout=120, check=False)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("worker ownership changed; rerun apply", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_transfer_rebinds_the_writer_ledger_without_changing_its_thread_or_owner(self) -> None:
+        run = self.root / "runs" / "carried"
+        run.mkdir(parents=True)
+        state = run / "progress_history_state.json"
+        self.write(state, json.dumps({"production": "demo", "unit": "alpha-unit", "working_dir": str(self.unit)}))
+        with mock.patch.dict(os.environ, self.env):
+            store = workers.UnitWorkerLedger(workers.ledger_path("demo", "alpha-unit"))
+            worker = workers.UnitWorker("w7", "impl", "codex", "kept-model", "xhigh", {},
+                workers.CodexThread("original-thread", str(self.root / "codex")), workers.Paused(),
+                [workers.WorkerEvent("opened", "fixture", str(run), 1_793_188_800.0, {})])
+            with store.locked() as ledger:
+                ledger.workers[worker.name] = worker
+        roster = run / "mesh_roster.json"
+        self.write(roster, json.dumps({"w7": {"thread_id": "original-thread", "role": "impl",
+            "status": "paused", "unit_ledger": str(store.path)}}))
+        record = run / "mesh_runs" / "kept-command.json"
+        with subprocess.Popen([sys.executable, "-c", "import sys; from pathlib import Path; sys.stdin.read(); Path('command-finished').write_text(str(Path.cwd()))",
+                               "mesh_runs.py", "supervise", str(record)],
+                              cwd=self.unit, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as command:
+            self.write(record, json.dumps({"worker": "w7", "status": "running", "pid": command.pid, "cwd": str(self.unit)}))
+            self.assert_ok(self.transfer("apply"))
+            self.assertIsNone(command.poll(), "transfer ended the paused worker's detached command")
+            _output, errors = command.communicate(timeout=5)
+            self.assertEqual(command.returncode, 0, errors.decode())
+            self.assertEqual((self.unit / "command-finished").read_text(), str(self.unit))
+            self.assertTrue(record.exists())
+        with mock.patch.dict(os.environ, self.env):
+            target = workers.ledger_for_run(run)
+            self.assertEqual(target.path, workers.ledger_path("other", "alpha-unit"))
+            with target.locked() as ledger:
+                self.assertEqual(ledger.workers["w7"], worker)
+        self.assertFalse(store.path.exists())
+        self.assertEqual(json.loads(roster.read_text())["w7"]["unit_ledger"], str(target.path))
 
     def test_apply_moves_the_row_header_and_state_and_keeps_the_branch(self) -> None:
         tip = self.git("rev-parse", "demo-alpha")

@@ -28,6 +28,9 @@ from unit_lookup import UnitState
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 SCRIPT = Path(__file__).with_name("dailies_input.py")
 RENDERER = SCRIPT.with_name("dailies_render.py")
 CI_POINTS = SCRIPT.with_name("ci_points.py")
@@ -1975,7 +1978,7 @@ class DailiesInputTests(unittest.TestCase):
     def style_ledger_cli(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         ledger = SCRIPT.parent.parent / "style/style_ledger.py"
         result = subprocess.run([sys.executable, str(ledger), *arguments, "--repo", str(self.checkout)],
-                                env=self.env, capture_output=True, text=True, check=False, timeout=30)
+                                env=self.env, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
 

@@ -48,7 +48,7 @@ production's own plumbing words (PLUMBING).
 --reports-to  With --footer, for a showrunner under a root: adds the bullet
          `reports to <root slug>`.
 --doc    With --footer, the production doc: the line after the header counts
-         its changes, efficiency, proposals and projects (footer_counts.py). A
+         its changes, efficiency and proposals (footer_counts.py). A
          report reads the doc from its input's `doc`.
 
 The input format is in ~/.claude/commands/showrunner/dailies.md.
@@ -75,7 +75,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import run_out
 import note_file
 from run_out import READINGS_LOG, Reading
-from build_hold import NO_ADMISSION_ACK_S, ActiveHolders, DeliveryFailed, HoldCycle, HoldState, KnownReleaseEta, MemoryGateReturned, NoAdmissionAck, NoHolders, Holder, NothingToBuild, RecipientGone, ReleaseEntry, ReleaseRecordReadError, holder_directory, read_cycle, read_holders, read_release_state, release_record_error_line
+from build_hold import ActiveHolders, HoldCycle, HoldState, KnownReleaseEta, NoHolders, Holder, ReleaseEntry, ReleaseRecordReadError, holder_directory, read_cycle, read_holders, release_record_error_line
 from mac_test import ActiveMacBlock, NoMacBlock, PendingMacBlock, ci_may_still_be_on, read_block, state_paths
 import urgency
 from urgency import Urgency, UrgencyError
@@ -1530,16 +1530,9 @@ def release_text(release: KnownReleaseEta, now: datetime, zone: ZoneInfo) -> str
 
 
 def release_progress(cycle: HoldCycle, zone: ZoneInfo) -> str:
-    """Where a started release stands: when it began and how many sessions are free to build again."""
+    """When the hold ended; the memory gate now orders the builds."""
     started = datetime.fromisoformat(cycle["release_started_at"]).astimezone(zone)
-    states = [read_release_state(entry) for entry in cycle["entries"]]
-    # A session that has gone is no longer one to bring back.
-    expected = [state for state in states if not isinstance(state, RecipientGone)]
-    words = f"released {started:%H:%M} {started:%Z}"
-    if not expected:
-        return words
-    free = sum(isinstance(state, (MemoryGateReturned, NothingToBuild)) for state in expected)
-    return f"{words}; {free} of {len(expected)} session{'' if len(expected) == 1 else 's'} free to build again"
+    return f"released {started:%H:%M} {started:%Z}; the memory gate orders builds"
 
 
 def hold_line(holder: Holder, now: datetime, zone: ZoneInfo, cycle: HoldCycle | None = None) -> str:
@@ -1563,11 +1556,7 @@ def hold_action_lines(cycle: HoldCycle) -> list[str]:
     """One line for each session a release could not bring back, so that someone looks at it."""
     lines: list[str] = []
     for entry in cycle["entries"]:
-        state = read_release_state(entry)
-        if isinstance(state, NoAdmissionAck):
-            lines.append(f"{released_session(entry)} has not answered the release for "
-                         + f"{NO_ADMISSION_ACK_S // 60} minutes; check it")
-        elif isinstance(state, DeliveryFailed):
+        if entry["delivery"] in {"DeliveryFailed", "RecipientGone", "QueuedUnconfirmed"}:
             lines.append(f"{released_session(entry)} could not be told builds are released; tell it")
     return lines
 
@@ -2057,7 +2046,7 @@ def main(arguments: list[str]) -> int:
     _ = parser.add_argument("--below", type=Path, action="append", default=[],
                             help="with --footer, once per lower production: its list, counted with --outstanding; one that cannot be read is named")
     _ = parser.add_argument("--reports-to", default="", help="with --footer: the root production a lower showrunner is under")
-    _ = parser.add_argument("--doc", type=Path, help="with --footer: the production doc whose changes, proposals and projects are counted")
+    _ = parser.add_argument("--doc", type=Path, help="with --footer: the production doc whose changes, efficiency and proposals are counted")
     options = parser.parse_args(arguments)
     input_path = cast(Path | None, options.input)
     chart = cast(str | None, options.chart)

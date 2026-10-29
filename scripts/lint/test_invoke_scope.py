@@ -15,6 +15,9 @@ from pathlib import Path
 from typing import cast
 
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 INVOKE = Path(__file__).with_name("invoke.sh")
 OOM_SCORE_ADJ = "/proc/self/oom_score_adj"
 
@@ -120,9 +123,7 @@ class BuildScopeTests(unittest.TestCase):
                      "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
                      "UNIT_ACTIVE_DIR": str(root / "active"),
                      "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-                     "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-                     "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
-                     "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                     "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                      "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": directory, "LINT_CONFIG_READER": str(root / "missing-config")},
             )
             sampler_pid = 0
@@ -130,15 +131,15 @@ class BuildScopeTests(unittest.TestCase):
                 assert shell.stdout is not None
                 sampler_pid = int(cast(str, shell.stdout.readline()).strip())
                 os.kill(shell.pid, signal.SIGKILL)
-                _ = shell.wait(timeout=3)
-                deadline = time.monotonic() + 3
+                _ = shell.wait(timeout=TEST_HANG_GUARD_SECS)
+                deadline = time.monotonic() + TEST_HANG_GUARD_SECS
                 while time.monotonic() < deadline and self.process_running(sampler_pid):
                     time.sleep(0.05)
                 self.assertFalse(self.process_running(sampler_pid), "sampler survived its parent shell")
             finally:
                 if shell.poll() is None:
                     shell.kill()
-                    _ = shell.wait(timeout=3)
+                    _ = shell.wait(timeout=TEST_HANG_GUARD_SECS)
                 if sampler_pid and self.process_running(sampler_pid):
                     os.kill(sampler_pid, signal.SIGKILL)
                 if shell.stdout is not None:
@@ -185,9 +186,7 @@ class BuildScopeTests(unittest.TestCase):
                      "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
                      "UNIT_ACTIVE_DIR": str(root / "active"),
                      "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-                     "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-                     "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
-                     "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                     "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                      "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": directory, "TMPDIR": directory,
                      "LINT_CONFIG_READER": str(root / "missing-config")},
             )
@@ -212,10 +211,10 @@ class SweepStartupTests(unittest.TestCase):
             )
             os.close(writer)
             try:
-                output, errors = process.communicate(timeout=10)
+                output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(process.returncode, 0, output + errors)
                 events = b""
-                deadline = time.monotonic() + 10
+                deadline = time.monotonic() + TEST_HANG_GUARD_SECS
                 while True:
                     ready, _, _ = select.select([reader], [], [], max(0, deadline - time.monotonic()))
                     self.assertTrue(ready, "sweep stand-in still holds its pipe")
@@ -229,7 +228,7 @@ class SweepStartupTests(unittest.TestCase):
             finally:
                 if process.poll() is None:
                     process.kill()
-                    _ = process.communicate(timeout=5)
+                    _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                 os.close(reader)
 
     def test_offload_switch_starts_no_detached_sweep(self) -> None:
@@ -257,9 +256,7 @@ class BuildAdmissionTests(unittest.TestCase):
                  "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
                  "UNIT_ACTIVE_DIR": str(root / "active"),
                  "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-                 "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-                 "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
-                 "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                 "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                  "MAC_TEST_STATE_DIR": str(root / "mac-state"),
                  "LINT_CONFIG_READER": str(root / "missing-config")},
         )
@@ -286,9 +283,7 @@ buildlog_wait_for_memory() {
     echo memory >> "$events"
     BUILDLOG_MEM_WAIT_S=0 BUILDLOG_MEM_OUTCOME=Granted
 }
-build_hold_step_started() { :; }
-build_hold_check_admission() { return 0; }
-build_hold_mark() { :; }
+build_hold_check_local() { return 0; }
 buildlog_begin() {
     printf 'begin %s\n' "$*" >> "$events"
     BUILDLOG_START="" BUILDLOG_PEAK="" BUILDLOG_MEM_RESERVATION=""

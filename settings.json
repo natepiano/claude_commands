@@ -186,36 +186,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/scripts/hooks/post-tool-use-random-ack.sh --hook"
-          }
-        ]
-      },
-      {
-        "matcher": "Edit|MultiEdit|Write",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/post-tool-use-basedpyright.py\""
-          },
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/post-tool-use-fn-length.py\""
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/post-tool-use-context-usage.py\""
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/post-tool-use-banned-words.py\""
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/hook_dispatch.py\" post_tool_use",
+            "timeout": 2430
           }
         ]
       }
@@ -232,15 +204,12 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Bash|Write|NotebookEdit",
         "hooks": [
           {
             "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/pre-tool-use-heredoc-guard.py\""
-          },
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/pre-tool-use-tool-output-read.py\""
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/hook_dispatch.py\" pre_tool_use",
+            "timeout": 3040
           }
         ]
       },
@@ -249,25 +218,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/pre-tool-use-showrunner-move-guard.py\""
-          }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/pre-tool-use-change-review-gate.py\""
-          }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/pre-tool-use-checkpoint-doc-gate.py\""
+            "command": "\"$HOME/.claude/scripts/hooks/pre-tool-use-build-hold-guard.sh\""
           }
         ]
       },
@@ -297,16 +248,6 @@
             "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/pre-tool-use-push-gate.py\"",
             "timeout": 120
-          }
-        ]
-      },
-      {
-        "matcher": "Bash|Write|NotebookEdit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/pre-tool-use-scratch-guard.py\"",
-            "timeout": 10
           }
         ]
       }
@@ -373,19 +314,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/stop-direct-continue.py\""
-          },
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/stop-conversation-pause.py\""
-          },
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/stop-assistant-prose-banned-words.py\""
-          },
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/herdr_tab_title.py\""
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/hook_dispatch.py\" stop",
+            "timeout": 2430
           }
         ]
       }
@@ -510,7 +440,7 @@
       "**Machine configuration**: /etc/nixos (natepiano/nixos, PRIVATE) is the user's own NixOS/nix-darwin configuration; running its read-only checks (`check`, nixfmt --check, statix, deadnix, nix eval), committing to its main and pushing it are routine. ~/.claude (natepiano/claude_commands, PUBLIC) holds the user's own commands, scripts and settings; committing and pushing there is routine.",
       "**cargo-berth**: the user's own coordination tool for their local worktrees (~/rust/cargo-liner and its worktrees, ~/rust/hana and its worktrees). Its ledger under each repo's .git/cargo-berth is local state the user's sessions share by design. Every cargo-berth verb (claim with --before/--after/--defer/--override/--proposal, sequence, resolve, release, renew, retire) is routine work for any session in the user's repos. The showrunner session decides integration order for its production: the user delegated that authority to it, and a unit that records the order the showrunner chose is doing routine work. The user asked for cargo-berth, its skills (~/.claude/commands, ~/.claude/docs) and the berth memories to drop the human-approval handshake for overlap answers and to name an optional approver session instead; that work in ~/rust/berth-fix (branch fix/berth) is their requested design change.",
       "Starting Codex workers with `bash ~/.claude/scripts/direct/implement.sh` and the unit's own prompt files is a unit director's routine work.",
-      "When the user asks, deleting obsolete folders under /tmp/claude, /tmp/mat-test-* and /tmp/style-sync-lint-* is routine cleanup: only folders with no file changed in 24 hours, that no running process uses, and that belong to no live Claude session."
+      "When the user asks, deleting obsolete folders under /tmp/claude, /tmp/mat-test-* and /tmp/style-sync-lint-* is routine cleanup: only folders with no file changed in 24 hours, that no running process uses, and that belong to no live Claude session. Never /tmp/claude/unit or /tmp/claude/delegate: those hold paused units' run state, and only tmp_sweep.py cleans them."
     ]
   },
   "voiceEnabled": true,

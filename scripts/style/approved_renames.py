@@ -679,14 +679,20 @@ class _BindingScan:
 
 def binding_scope(source: str, rename: BindingRename) -> BindingScope | NoBindingScope:
     """Locate one binding and subtract each inner pattern and scope that shadows its old name."""
-    scan = _BindingScan(source)
+    try:
+        scan = _BindingScan(source)
+    except style_footprint.UnreadableTokenSpans as error:
+        return NoBindingScope(str(error))
     refusal = scan.file_refusal(rename)
     return NoBindingScope(refusal) if refusal else scan.locate(rename)
 
 
 def binding_comments(source: str, rename: BindingRename) -> BindingComments | NoBindingScope:
     """Plan only exact code/link mentions; prose requires a normal ticket."""
-    scan = _BindingScan(source)
+    try:
+        scan = _BindingScan(source)
+    except style_footprint.UnreadableTokenSpans as error:
+        return NoBindingScope(str(error))
     scope = scan.locate(rename)
     return scope if isinstance(scope, NoBindingScope) else scan.binding_comments(scope, rename)
 
@@ -771,7 +777,11 @@ def _binding_alignment(before: _BindingScan, after: _BindingScan,
 
 def binding_rename_check(path: str, before: str, after: str, renames: tuple[BindingRename, ...]) -> BindingProof:
     """Prove each scoped rename and whether those proven renames explain every token edit in the file."""
-    original, edited = _BindingScan(before), _BindingScan(after)
+    try:
+        original, edited = _BindingScan(before), _BindingScan(after)
+    except style_footprint.UnreadableTokenSpans as error:
+        return BindingProof({rename: NoAppliedCheck("rename") for rename in renames},
+                            {rename: str(error) for rename in renames}, False, {})
     alignment, edits, aligned = _binding_alignment(original, edited, frozenset((r.old, r.new) for r in renames))
     checks: dict[BindingRename, AppliedCheck] = {}
     refusals: dict[BindingRename, str] = {}
