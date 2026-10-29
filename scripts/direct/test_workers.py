@@ -991,7 +991,9 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         new = old.with_name("moved-repository")
         _ = old.rename(new)
         with patch.dict(os.environ, {"UNIT_RUN_ROOT": str(self.session_dir.parent)}):
-            changes = workers.repoint_unit_worktree("demo", "builders", old, new, "new-branch", from_production="demo")
+            found = workers.find_moved_unit_runs((workers.UnitWorktree("demo", "builders", new, "new-branch"),), ())
+            self.assertEqual(len(found.moves), 1)
+            changes = workers.repoint_moved_unit_runs(found.moves[0], from_production="demo")
             self.assertTrue(changes)
             before = {path: path.read_bytes() for path in self.session_dir.rglob("*") if path.is_file()}
             self.assertEqual(workers.repoint_unit_worktree(
