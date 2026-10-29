@@ -461,10 +461,34 @@ class WaitRecordsTest(unittest.TestCase):
         return {
             "schema_version": 1, "event_type": "phase_started", "event_id": "phase-start",
             "run_id": "hana-run", "phase_id": "4", "phase_instance_id": "hana-phase",
-            "worktree": "/archive/hana_catalyst-fixture", "production": "hana",
+            "worktree": "/archive/hana_catalyst-fixture",
+            "production": {"state": "Recorded", "value": "hana"},
+            "repository": {"state": "NotRecorded", "reason": "phase working directory is unavailable"},
             "timestamp": self.start.isoformat(), "timestamp_epoch": self.start.timestamp(),
             "wait_coverage": {"state": "Recorded"},
         }
+
+    def test_wait_report_attributes_recorded_origins_and_earlier_text_to_hana(self) -> None:
+        for field, value in (("production", "hana"), ("repository", "hana_catalyst"),
+                             ("plan_doc", "docs/plans/tool-based-ui-demo.md")):
+            for tagged in (True, False):
+                with self.subTest(field=field, tagged=tagged):
+                    phase = wait_phase_fixture(wait_n=0)
+                    phase["unit"] = "/archive/other-unit"
+                    phase[field] = {"state": "Recorded", "value": value} if tagged else value
+                    history = m.parse_wait_report(wait_report_fixture(self.window, [], [phase]))
+                    self.assertEqual([(item.run, item.instance) for item in history.phases],
+                                     [("hana-run", "hana-phase")])
+                    self.assertEqual(history.phases[0].state, m.CoveredWaitHistory(0))
+
+    def test_wait_report_does_not_attribute_not_recorded_origins_by_their_reason(self) -> None:
+        phase = wait_phase_fixture()
+        phase["unit"] = "/archive/other-unit"
+        for field in ("plan_doc", "production", "repository"):
+            phase[field] = {"state": "NotRecorded", "reason": "hana origin is unavailable"}
+        history = m.parse_wait_report(wait_report_fixture(self.window, [], [phase]))
+        self.assertEqual(history.phases, ())
+        self.assertEqual(history.waits, ())
 
     def test_six_wait_kinds_report_their_own_completed_minutes_and_counts(self) -> None:
         kinds = (
@@ -1198,6 +1222,34 @@ class SourcesTest(unittest.TestCase):
             counts = {problem.source: problem.reason for problem in problems}
             self.assertIn("2 invalid JSON rows", counts[str(first)])
             self.assertIn("1 invalid JSON rows", counts[str(second)])
+
+    def test_phase_completions_read_tagged_origins_and_report_malformed_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base: log_records.JsonObject = {
+                "event_type": "phase_finished", "status": "completed",
+                "timestamp": "2026-10-14T00:00:00Z", "phase_elapsed_seconds": 60,
+            }
+            missing = {"state": "NotRecorded", "reason": "hana origin is unavailable"}
+            records: list[log_records.JsonObject] = []
+            for field, value in (("production", "hana"), ("repository", "hana_catalyst"),
+                                 ("plan_doc", "docs/plans/tool-based-ui-demo.md")):
+                records.append({**base, "event_id": field, field: {"state": "Recorded", "value": value}})
+            records.append({**base, "event_id": "absent", "plan_doc": missing,
+                            "production": missing, "repository": missing})
+            for field in ("plan_doc", "production", "repository"):
+                for bad in ({"state": "Recorded"}, {"state": "NotRecorded", "reason": ""},
+                            {"state": "Other"}, 7):
+                    records.append({**base, field: bad})
+            path = root / "events.jsonl"
+            _ = path.write_text("\n".join(json.dumps(record) for record in records))
+            problems: list[log_records.SourceProblem] = []
+            phases = m.read_phases(root, problems)
+            self.assertEqual([(phase.identity, phase.hana) for phase in phases],
+                             [("production", True), ("repository", True), ("plan_doc", True), ("absent", False)])
+            self.assertEqual(len(problems), 1)
+            self.assertEqual(problems[0].source, str(path))
+            self.assertIn("12 invalid phase field rows", problems[0].reason)
 
     def test_deleted_hana_worktree_phases_use_record_provenance_and_known_prefixes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -55,6 +55,9 @@ from the calling showrunner's update timer when no doc is given; add, show and v
 list the same way unless --list names one; edit does too. Every write names its production, the same way.
 For edit, verdict and mark-important, --row takes the ID /next printed: C434 selects the current
 list; production/C9 selects that production's named list. An explicit --list must match that name.
+With a production, show reads its current and earlier lists and keeps the same pin as /next.
+Rows in other lists carry their list name; current-list rows keep their plain IDs. Without a
+production, show --list reads every row in that explicit list.
 """
 from __future__ import annotations
 
@@ -67,6 +70,7 @@ import sys
 from collections.abc import Callable, Collection, Iterable, Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime
+from enum import Enum
 from pathlib import Path
 from typing import TypeVar, cast
 
@@ -649,6 +653,31 @@ def scope_entries(path: Path, doc: Path, below: bool = False) -> list[urgency.En
     return entries
 
 
+class WholeReviewList(Enum):
+    """An explicit list shown without a production filter."""
+
+    ALL_ROWS = "all rows"
+
+
+@dataclass(frozen=True)
+class ChangeQueue:
+    """The change rows a person can review and the name that keeps their pin and moved rows."""
+
+    name: str
+    entries: list[urgency.Entry[dict[str, str]]]
+
+
+def change_queue(path: Path, scope: Path | WholeReviewList, below: bool = False) -> ChangeQueue:
+    """The same change rows and pin for /next and change_review show."""
+    if isinstance(scope, WholeReviewList):
+        return ChangeQueue(queue(path), row_entries(pending(path)))
+    import showrunners
+
+    slug = slug_of(scope)
+    name = queue(path) if slug == showrunners.root_of(slug) else f"{queue(path)}-{slug}"
+    return ChangeQueue(urgency.scope_queue(name, below), scope_entries(path, scope, below))
+
+
 def row_production(production: Path) -> str:
     """The Production cell for a change of the production doc `production`: the slug of the production
     it is credited to (`credited`)."""
@@ -1158,10 +1187,14 @@ def _run(options: CommandLine) -> int:
             print(edit_row(target.path, target.row, item, today(), production_doc(options.production)))
         case "show":
             # One row only: the user asks for the next one when they want it (user, 2026-10-20).
-            path = _list(options)
-            waiting = pending(path)
-            shown = urgency.top(row_entries(waiting), queue(path))
-            print(describe(shown.item) + (f"\n\n{len(waiting) - 1} more to review" if len(waiting) > 1 else "")
+            if options.list and not options.production:
+                waiting = change_queue(_list(options), WholeReviewList.ALL_ROWS)
+            else:
+                doc = production_doc(options.production)
+                path = Path(options.list).expanduser() if options.list else scope_list(doc)
+                waiting = change_queue(path, doc)
+            shown = urgency.top(waiting.entries, waiting.name)
+            print(describe(shown.item) + (f"\n\n{len(waiting.entries) - 1} more to review" if len(waiting.entries) > 1 else "")
                   if shown is not None else "nothing to review")
         case "mark-important":
             target = _row_option(options)

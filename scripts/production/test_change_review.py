@@ -218,6 +218,17 @@ class AttachedListTest(unittest.TestCase):
         entries = change_review.scope_entries(self.current, self.doc)
         self.assertEqual([(entry.key, entry.item["Change"]) for entry in entries], [("C9", "Current child")])
 
+    def test_show_for_the_calling_production_includes_earlier_rows_and_scoped_count(self) -> None:
+        before = {path: path.read_bytes() for path in (self.current, self.earlier)}
+        with mock.patch.object(change_review, "production_doc", return_value=self.doc), \
+                mock.patch.object(change_review, "production_list", return_value=self.current):
+            code, output, error = run("show")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(output.splitlines()[0], "child/C9 Earlier child")
+        self.assertEqual(output.splitlines()[-1], "2 more to review")
+        self.assertNotIn("Parent-only", output)
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+
     def test_current_list_prerequisites_keep_their_local_row_ids_after_attachment(self) -> None:
         _ = self.current.write_text("## To review\n\n| # | Change | Production | How to check | Merged | Urgency |\n" +
             "| --- | --- | --- | --- | --- | --- |\n" +

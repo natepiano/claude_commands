@@ -108,11 +108,21 @@ class WindowTokenUsage:
 
 
 @dataclass(frozen=True)
+class RecordedOrigin:
+    value: str
+
+
+@dataclass(frozen=True)
+class OriginNotRecorded:
+    reason: str
+
+
+@dataclass(frozen=True)
 class PhaseOrigin:
     working_dir: str
-    plan: str
-    production: str
-    repository: str
+    plan: RecordedOrigin | OriginNotRecorded
+    production: RecordedOrigin | OriginNotRecorded
+    repository: RecordedOrigin | OriginNotRecorded
 
 
 @dataclass(frozen=True)
@@ -497,11 +507,31 @@ def wait_candidates(record: log_records.JsonObject) -> tuple[WaitCandidate, ...]
                  for item in object_rows(record, "candidates"))
 
 
+def origin_field(record: log_records.JsonObject, key: str) -> RecordedOrigin | OriginNotRecorded:
+    """Read tagged origin metadata and the text stored in earlier history files."""
+    if key not in record:
+        return OriginNotRecorded(f"{key} not recorded")
+    value = record[key]
+    if isinstance(value, str):
+        return RecordedOrigin(value) if value.strip() else OriginNotRecorded(f"{key} not recorded")
+    fields = log_records.object_record(value)
+    state = log_records.field_text(fields, "state")
+    if state == "Recorded":
+        text = log_records.field_text(fields, "value")
+        if text.strip():
+            return RecordedOrigin(text)
+    elif state == "NotRecorded":
+        reason = log_records.field_text(fields, "reason")
+        if reason.strip():
+            return OriginNotRecorded(reason)
+    raise ValueError(f"{key}: expected Recorded value or NotRecorded reason")
+
+
 def wait_origin(record: log_records.JsonObject, prefixes: Sequence[str]) -> bool:
     return hana_origin(PhaseOrigin(
         log_records.field_text(record, "working_dir") or log_records.field_text(record, "unit"),
-        log_records.field_text(record, "plan_doc"), log_records.field_text(record, "production"),
-        log_records.field_text(record, "repository")), prefixes)
+        origin_field(record, "plan_doc"), origin_field(record, "production"),
+        origin_field(record, "repository")), prefixes)
 
 
 def parse_wait_report(record: log_records.JsonObject, prefixes: Sequence[str] = ()) -> HanaWaitHistory:
@@ -1123,15 +1153,15 @@ def read_tokens(path: Path, window: log_records.Window) -> list[WindowTokenUsage
 
 def hana_origin(origin: PhaseOrigin, prefixes: Sequence[str]) -> bool:
     """Use durable provenance before consulting a worktree that may be deleted."""
-    if origin.production in ("hana", "tool-based-ui"):
+    if isinstance(origin.production, RecordedOrigin) and origin.production.value in ("hana", "tool-based-ui"):
         return True
-    if origin.repository and Path(origin.repository).expanduser().name in ("hana", "hana_catalyst"):
+    if isinstance(origin.repository, RecordedOrigin) and Path(origin.repository.value).expanduser().name in ("hana", "hana_catalyst"):
         return True
     patterns = ("hana_catalyst", "tool-based-ui-", *prefixes)
-    for value in (origin.working_dir, origin.plan):
-        if not value:
+    for value in (RecordedOrigin(origin.working_dir), origin.plan):
+        if not isinstance(value, RecordedOrigin) or not value.value:
             continue
-        if any(part.startswith(patterns) for part in Path(value).parts):
+        if any(part.startswith(patterns) for part in Path(value.value).parts):
             return True
     return bool(origin.working_dir) and is_hana(origin.working_dir)
 
@@ -1139,9 +1169,10 @@ def hana_origin(origin: PhaseOrigin, prefixes: Sequence[str]) -> bool:
 def parse_phase(record: log_records.JsonObject, prefixes: Sequence[str]) -> tuple[PhaseCompletion, ...]:
     if log_records.field_text(record, "event_type") != "phase_finished" or log_records.field_text(record, "status") != "completed":
         return ()
-    plan = log_records.field_text(record, "plan_doc") or log_records.field_text(record, "plan_path") or log_records.field_text(record, "project_plan_doc")
+    plan = next((origin_field(record, key) for key in ("plan_doc", "plan_path", "project_plan_doc")
+                 if key in record and record[key] != ""), OriginNotRecorded("plan document not recorded"))
     origin = PhaseOrigin(log_records.field_text(record, "working_dir"), plan,
-                         log_records.field_text(record, "production"), log_records.field_text(record, "repository"))
+                         origin_field(record, "production"), origin_field(record, "repository"))
     at = log_records.record_time(record)
     identity = log_records.field_text(record, "event_id")
     if not identity:

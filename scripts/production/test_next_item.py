@@ -57,6 +57,13 @@ def run(*arguments: str) -> tuple[int, str, str]:
     return code, out.getvalue(), err.getvalue()
 
 
+def review_show(doc: Path) -> tuple[int, str, str]:
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = change_review.main(["show", "--production", str(doc)])
+    return code, out.getvalue(), err.getvalue()
+
+
 @final
 class NextItemTests(unittest.TestCase):
     root: Path = Path()
@@ -323,6 +330,48 @@ class NextItemTests(unittest.TestCase):
         self.assertEqual(run("move-to-end", "--kind", "change", "--all-below", "--production", str(docs["kid"])),
                          (0, "change: moved C434 to the end\n", ""))
         self.assertEqual(urgency.pinned(child_queue.name), "kid/C9")
+
+    def test_change_review_shows_the_earlier_row_pinned_by_next_and_the_same_queue_count(self) -> None:
+        doc = self.attached_changes()["kid"]
+        next_code, next_output, next_error = run("show", "--kind", "change", "--order", "oldest",
+                                                  "--production", str(doc))
+        self.assertEqual((next_code, next_error), (0, ""))
+        self.assertEqual(next_output.splitlines()[1], "kid/C9 Earlier child change")
+        code, output, error = review_show(doc)
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(output.splitlines()[0], next_output.splitlines()[1])
+        self.assertEqual(output.splitlines()[-1], f"{footer_counts.changes(doc) - 1} more to review")
+        self.assertEqual(footer_counts.changes(doc), 4)
+        self.assertNotIn("Root-only", output)
+        self.assertEqual(run("move-to-end", "--kind", "change", "--production", str(doc)),
+                         (0, "change: moved kid/C9 to the end\n", ""))
+        self.assertEqual(review_show(doc)[1].splitlines()[0], "kid/C10 Urgent child change")
+
+    def test_next_keeps_the_change_review_pin_after_another_row_ranks_first(self) -> None:
+        doc = self.attached_changes()["kid"]
+        code, output, error = review_show(doc)
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(output.splitlines()[0], "kid/C10 Urgent child change")
+        earlier = change_review.list_file("kid")
+        _ = earlier.write_text(earlier.read_text().replace("| blocks |", "| |"))
+        next_code, next_output, next_error = run("show", "--kind", "change", "--production", str(doc))
+        self.assertEqual((next_code, next_error), (0, ""))
+        self.assertEqual(next_output.splitlines()[1], output.splitlines()[0])
+
+    def test_change_review_leaves_one_unreadable_list_out_and_matches_next(self) -> None:
+        doc = self.attached_changes()["kid"]
+        broken = change_review.list_file("kid")
+        _ = broken.write_bytes(b"\xff")
+        code, output, error = review_show(doc)
+        self.assertEqual(code, 0)
+        self.assertEqual(output.splitlines()[0], "C9 Current child change")
+        self.assertEqual(output.splitlines()[-1], "1 more to review")
+        self.assertEqual(len(error.splitlines()), 1)
+        self.assertIn(str(broken), error)
+        next_code, next_output, next_error = run("show", "--kind", "change", "--production", str(doc))
+        self.assertEqual(next_code, 0)
+        self.assertEqual(next_output.splitlines()[1], output.splitlines()[0])
+        self.assertEqual(next_error, error)
 
     def test_unreadable_earlier_list_keeps_current_rows_with_one_stderr_line(self) -> None:
         doc = self.attached_changes()["kid"]
