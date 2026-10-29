@@ -10532,7 +10532,7 @@ class SweepTests(unittest.TestCase):
                 pass
 
             @bounded_fixture
-            def call(self, method: str, params: dict[str, object], _timeout: float = 0.0) -> dict[str, object]:
+            def call(self, method: str, params: dict[str, object], **_options: object) -> dict[str, object]:
                 if method == "thread/loaded/list":
                     return loaded
                 if method == "thread/turns/list":
@@ -11244,7 +11244,7 @@ class SignInChangeTests(unittest.TestCase):
     def test_a_resident_worker_mid_turn_stays_until_its_turn_ends(self) -> None:
         class BusyClient:
             @bounded_fixture
-            def call(self, method: str, _params: dict[str, object], _timeout: float = 0.0) -> dict[str, object]:
+            def call(self, method: str, _params: dict[str, object], **_options: object) -> dict[str, object]:
                 if method == "thread/turns/list":
                     return {"result": {"data": [{"id": "t", "status": "inProgress"}]}}
                 return {"result": {"thread": {"status": {"type": "active"}, "turns": []}}}
