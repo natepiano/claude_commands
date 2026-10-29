@@ -321,15 +321,21 @@ and 2 for invalid arguments.
 
 ## State roots and tests
 
-`test_rename.py` covers moves, kept history, interrupted steps, branch
-changes, account data, trust retries, refusals and repeated completion.
+`test_rename.py` covers planning, state moves and interrupted apply steps.
+`test_rename_units.py` covers unit worktree moves, account data and interrupted
+unit steps; `test_rename_workers.py` covers worker ledgers and repair.
+`test_rename_finish.py` covers trust retries, branch preservation and repeated
+completion. These suites share `rename_test_support.py`: each class seeds Git
+once and restores independent copies at the same paths, while synchronous
+commands call the real handlers in-process. One apply case retains the CLI
+subprocess boundary.
 `test_rename_checkout.py` moves a real linked worktree and repeats the move,
 refuses before the git move, and runs the `checkout` verb's stop and push.
 `test_showrunners.py`, `test_unit_lookup.py` and `test_stall_watch.py` cover
 Formerly resolution, old session marks, strict discovery and detached work.
 
 ```sh
-python3 -m unittest scripts.production.test_rename scripts.production.test_rename_checkout scripts.production.test_unit_lookup scripts.production.test_showrunners scripts.production.test_stall_watch
+python3 -m unittest scripts.production.test_rename scripts.production.test_rename_units scripts.production.test_rename_workers scripts.production.test_rename_finish scripts.production.test_rename_checkout scripts.production.test_unit_lookup scripts.production.test_showrunners scripts.production.test_stall_watch
 ```
 
 `unit_lookup.py` is shared: the shutdown inventory
