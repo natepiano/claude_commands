@@ -21,6 +21,7 @@ SHARED_TEST_HELPERS = frozenset({
     "scripts/shutdown/test_support.py", "scripts/shutdown/test_account_move.py",
     "scripts/shutdown/test_inventory.py", "scripts/production/cli_fixture.py",
     "scripts/production/add_unit_test_support.py",
+    "scripts/whoami/quota_alert_test_support.py",
     "scripts/usage/fixtures/collect/mac/fake_ssh.py",
     "scripts/direct/recorder_fixture.py", "scripts/direct/wait_for_test_state.py",
     "scripts/direct/verify_mac_offload_test_support.py",
