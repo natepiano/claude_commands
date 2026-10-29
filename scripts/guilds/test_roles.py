@@ -1022,10 +1022,11 @@ class DurableRolesTests(unittest.TestCase):
 
         def request(method: str, params: object, **options: object) -> dict[str, object]:
             del params, options
+            if method == "thread/turns/list":
+                return {"result": {"data": [{"id": "still-running", "status": "inProgress"}] if active else []}}
             if method != "thread/read":
                 raise AssertionError("unexpected cleanup proof request: " + method)
-            return {"result": {"thread": {"id": "thread-designer", "status": {"type": "active" if active else "idle"},
-                "turns": [{"id": "still-running", "status": "inProgress"}] if active else []}}}
+            return {"result": {"thread": {"id": "thread-designer", "status": {"type": "active" if active else "idle"}}}}
 
         mesh = roles.mesh_directory(design.placement.design_id)
         _ = (mesh / "mesh_server.json").write_text(json.dumps({"pid": os.getpid(), "port": 32100}))
