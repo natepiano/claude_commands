@@ -27,7 +27,7 @@
 | phases-unit | `docs/plans/sdlc-phases.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-phases` | `sdlc-phases` | — | `docs/plans/sdlc-phases.md`; `docs/plans/sdlc-phases-next.md`; `docs/plans/sdlc-phases-design.md`; `scripts/direct/phase_process.py`; `scripts/direct/test_phase_process.py` |
 | fix-rounds-unit | `docs/plans/sdlc-fix-rounds.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-fix-rounds` | `sdlc-fix-rounds` | — | `docs/plans/sdlc-fix-rounds.md`; `docs/plans/sdlc-fix-rounds-next.md`; `docs/plans/sdlc-fix-rounds-study.md`; `scripts/history/`; `commands/history.md` |
 | roles-unit | `docs/plans/sdlc-roles.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-roles` | `sdlc-roles` | — | `docs/plans/sdlc-roles.md`; `docs/plans/sdlc-roles-next.md`; `docs/plans/sdlc-roles-design.md`; `scripts/production/roles_audit.py`; `scripts/production/test_roles_audit.py`; `scripts/production/role_terms.toml` |
-| hierarchies-unit | docs/plans/build-followups-hierarchies.md | /home/natepiano/worktrees/claude-build-followups-hierarchies | build-followups-hierarchies | — | — |
+| hierarchies-unit | `docs/plans/build-followups-hierarchies.md` | `/home/natepiano/worktrees/claude-build-followups-hierarchies` | `build-followups-hierarchies` | — | `docs/plans/build-followups-hierarchies.md`; `docs/plans/build-followups-hierarchies-next.md`; `docs/plans/build-followups-hierarchies-design.md`; `scripts/hierarchies/` |
 
 Scope of each unit:
 
