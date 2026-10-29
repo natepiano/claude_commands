@@ -1193,8 +1193,16 @@ def _herdr_launch(
                 # The session resumes in its own new tab, so a busy old pane is left as it is.
                 print(f"herdr {name}:{destination.pane_id}: pane runs {', '.join(activity.commands)}; left open")
         _record_scheduled_restart_prompt(session["session_id"], parts.opening_prompt, dry_run=False)
-        launched = herdr.launch_prepared_agent(name, herdr_space(session), session["name"], prepared_environment,
-            kind="claude", agent=session["name"], agent_arguments=list(parts.claude_arguments),
+        production = environment.get("SHOWRUNNER_UNIT", "")
+        unit = environment.get("SHOWRUNNER_UNIT_ID", "")
+        if session["kind"] == "showrunner":
+            from showrunners import production_slug
+            production, unit = production_slug(session["doc"]), ""
+        elif session["kind"] == "unit":
+            production, unit = session["host"]["production"], session["host"]["unit"]
+        title = herdr.session_title(session["name"], production, unit)
+        launched = herdr.launch_prepared_agent(name, herdr_space(session), title, prepared_environment,
+            kind="claude", agent=session["name"], label=session["name"], agent_arguments=list(parts.claude_arguments),
             opening=herdr.OpeningPrompt(parts.opening_prompt,
                 herdr.SessionTranscript(config_dir, session["session_id"])), timeout_ms=90_000)
         pane, outcome = launched.pane, launched.outcome
