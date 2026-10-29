@@ -732,6 +732,54 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                 for path in self.state.glob("*.json"):
                     path.unlink()
 
+    def test_one_line_blocked_reply_supersedes_older_holding_with_either_bullet(self) -> None:
+        for bullet in ("●", "⏺"):
+            with self.subTest(bullet=bullet):
+                self.panes["unit-one"]["pane"] = (
+                    "  — holding: waiting on the Codex writer for ticket 49\n"
+                    + f"{bullet} — blocked: waiting on the showrunner: sync\n")
+                for at in (START, START + 300, START + 600):
+                    self.assertEqual(self.tick(at).returncode, 0)
+                    self.assertEqual(self.sent(), [])
+                    path, = self.state.glob("*.json")
+                    stretch = cast(stall_watch.Stretch, json.loads(path.read_text()))
+                    self.assertEqual(stretch["since"], at)
+                    self.assertFalse(stretch["bump_sent"])
+                    self.assertFalse(stretch["tell_sent"])
+                    self.assertEqual(stretch["reported_status"], "")
+
+    def test_one_line_holding_reply_resets_reported_stretch_and_tells_without_bullet(self) -> None:
+        old = "— holding: waiting on the Codex writer for ticket 49"
+        self.panes["unit-one"]["pane"] = f"  {old}\n"
+        self.assertEqual(self.tick(START).returncode, 0)
+        self.assertEqual(self.tick(START + 300).returncode, 0)
+        self.assertEqual(len(self.sent()), 2)
+        path, = self.state.glob("*.json")
+        stretch = cast(stall_watch.Stretch, json.loads(path.read_text()))
+        self.assertEqual(stretch["reported_status"], old)
+        status = "— holding: ready for next task"
+        self.panes["unit-one"]["pane"] += f"● {status}\n"
+        self.assertEqual(self.tick(START + 301).returncode, 0)
+        stretch = cast(stall_watch.Stretch, json.loads(path.read_text()))
+        self.assertEqual(stretch["since"], START + 301)
+        self.assertFalse(stretch["bump_sent"])
+        self.assertFalse(stretch["tell_sent"])
+        self.assertEqual(stretch["reported_status"], "")
+        self.assertEqual(self.tick(START + 600).returncode, 0)
+        self.assertEqual(len(self.sent()), 2)
+        self.assertEqual(self.tick(START + 601).returncode, 0)
+        self.assertEqual(len(self.sent()), 4)
+        tell = next(item for item in self.sent()[2:] if item["key"].endswith(":tell"))
+        self.assertTrue(tell["text"].endswith(f"Last status: {status}"))
+        self.assertNotIn("●", tell["text"])
+        stretch = cast(stall_watch.Stretch, json.loads(path.read_text()))
+        self.assertEqual(stretch["reported_status"], status)
+
+    def test_turn_end_words_inside_sentences_do_not_match(self) -> None:
+        for line in ("● I was holding: on the user", "※ recap: the unit said — holding: on the user"):
+            with self.subTest(line=line):
+                self.assertIsNone(stall_watch.TURN_END.search(line))
+
     def test_gate_turn_end_waits_until_a_later_holding_status_stalls(self) -> None:
         self.configure({"showrunner": ["unit-one"]}, stall_minutes=10)
         for status in ("— gate: the user runs the Mac Claude go-live and controls at a Mac terminal\n",

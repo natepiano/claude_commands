@@ -235,7 +235,7 @@ Each subcommand takes `--production`; `main` catches `merge_checkpoint.Stop`, so
 
 - An activity on a closed phase leaves that phase's record as `finish-phase` wrote it: status, `finished_at` and elapsed time. The printed `review trial:` line keeps its form, which `merge_checkpoint.py` parses.
 
-- The stall watch's standing-by, run-finished and retired-row skips, then its waiting-kind reset, run before any bump or notice. The turn-end pattern is built from `WAITING_KINDS` and `HOLDING_KIND`, so the pattern and the wait test cannot drift.
+- The stall watch's standing-by, run-finished and retired-row skips, then its waiting-kind reset, run before any bump or notice. The turn-end pattern is built from `WAITING_KINDS` and `HOLDING_KIND`, so the pattern and the wait test cannot drift; a one-line reply's `●` or `⏺` bullet is allowed before the turn end.
 
 - Unit directors launch only on Claude. `production` has only `[production.claude]`; `claude --resume` never runs without resolved flags.
 
