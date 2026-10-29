@@ -75,6 +75,10 @@ are taken for deletion, without waiting, and released before the next target.
 The pass stops once successful deletions cover the shortfall. Changed output
 and targets used since candidate discovery began are skipped. Output checks
 compare identity, size and mtime; unlinking another hard link does not change them.
+For real floor and budget passes, each unlink uses the current link count:
+only a successful last-link unlink credits file blocks. A failed or partial
+removal credits only the files it removed. Dry runs use the scan's link counts
+as an estimate and do not delete files.
 --floor-only skips the workspace sweep for disk-floor.nix's 2-minute timer.
 Each such pass first runs tmp_sweep.py once an hour, which deletes agent
 scratch under /tmp/claude and /tmp/claude-<uid>/<project>/ that no process
@@ -157,6 +161,7 @@ import os
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -911,8 +916,23 @@ def walk(directory: str, owner: Group | None, roots: dict[str, Group], scan: Sca
             group.inodes.append(key)
 
 
-def freed_by(group: Group, scan: Scan, remaining: dict[InodeKey, int]) -> int:
-    """Blocks that come back once a group's links go, counting them off remaining.
+@dataclass(frozen=True)
+class ReclamationEstimate:
+    """Blocks a dry run expects to free from the scan's link counts."""
+
+    bytes: int
+
+
+@dataclass(frozen=True)
+class ConfirmedDeletion:
+    """Blocks freed by successful last-link unlinks, and failed removal attempts."""
+
+    bytes: int
+    failures: int
+
+
+def freed_by(group: Group, scan: Scan, remaining: dict[InodeKey, int]) -> ReclamationEstimate:
+    """Estimate blocks once a group's links go, counting them off remaining.
 
     A file's blocks come back only when its last link goes, so a file with a
     link outside the group frees nothing until that link goes too.
@@ -922,7 +942,7 @@ def freed_by(group: Group, scan: Scan, remaining: dict[InodeKey, int]) -> int:
         remaining[key] -= 1
         if remaining[key] == 0:
             freed += scan.blocks[key]
-    return freed
+    return ReclamationEstimate(freed)
 
 
 def unit_age(group: Group, now: float) -> tuple[float, float]:
@@ -930,40 +950,73 @@ def unit_age(group: Group, now: float) -> tuple[float, float]:
     return (-int((now - group.last_used) // DAY_SECONDS), group.compiled)
 
 
-def choose(
-    scan: Scan, total: int, budget: int, remaining: dict[InodeKey, int], removal_order: RemovalOrder
-) -> tuple[list[tuple[Group, int]], int]:
-    """Groups to remove, first in removal_order first, and the size left once they go."""
-    chosen: list[tuple[Group, int]] = []
-    for group in sorted(scan.groups, key=removal_order):
-        if total <= budget:
-            break
-        freed = freed_by(group, scan, remaining)
-        chosen.append((group, freed))
-        total -= freed
-    return chosen, total
+def remove_entry(path: str) -> ConfirmedDeletion:
+    """Anchor deletion to the parent directory; never traverse a replacement symlink."""
+    parent, name = os.path.split(os.path.normpath(path))
+    try:
+        parent_fd = os.open(parent or ".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            return remove_entry_at(name, parent_fd, path)
+        finally:
+            os.close(parent_fd)
+    except FileNotFoundError:
+        return ConfirmedDeletion(0, 0)
+    except OSError as error:
+        print(f"lint sweep: could not remove {path}: {error}", file=sys.stderr)
+        return ConfirmedDeletion(0, 1)
 
 
-def remove(groups: list[Group]) -> int:
+def remove_entry_at(name: str, parent_fd: int, display_path: str) -> ConfirmedDeletion:
+    """Check opened directory identity and account for each unlink relative to its parent."""
+    freed = failures = 0
+    try:
+        before = os.lstat(name, dir_fd=parent_fd)
+        if stat.S_ISDIR(before.st_mode):
+            directory_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+            try:
+                if not os.path.samestat(before, os.fstat(directory_fd)):
+                    raise OSError("directory changed before open")
+                with os.scandir(directory_fd) as entries:
+                    children = [entry.name for entry in entries]
+                for child in children:
+                    account = remove_entry_at(child, directory_fd, os.path.join(display_path, child))
+                    freed += account.bytes
+                    failures += account.failures
+                if not os.path.samestat(before, os.lstat(name, dir_fd=parent_fd)):
+                    raise OSError("directory changed before removal")
+                os.rmdir(name, dir_fd=parent_fd)
+            finally:
+                os.close(directory_fd)
+        else:
+            os.unlink(name, dir_fd=parent_fd)
+            if before.st_nlink == 1:
+                freed = before.st_blocks * 512
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        failures += 1
+        print(f"lint sweep: could not remove {display_path}: {error}", file=sys.stderr)
+    return ConfirmedDeletion(freed, failures)
+
+
+def remove(groups: list[Group]) -> ConfirmedDeletion:
     failures = 0
+    freed = 0
     changed_trees: set[str] = set()
     for group in groups:
         for path in group.entries:
-            try:
-                if os.path.isdir(path) and not os.path.islink(path):
-                    shutil.rmtree(path)
-                else:
-                    os.unlink(path)
-                changed_trees.add(group.build_tree)
-            except FileNotFoundError:
-                continue
-            except OSError as error:
-                # A failed recursive removal may already have deleted some files.
-                changed_trees.add(group.build_tree)
-                failures += 1
-                print(f"lint sweep: could not remove {path}: {error}", file=sys.stderr)
+            account = remove_entry(path)
+            freed += account.bytes
+            failures += account.failures
+            changed_trees.add(group.build_tree)
     record_target_deletes(sorted(changed_trees))
-    return failures
+    return ConfirmedDeletion(freed, failures)
+
+
+def reclaim(group: Group, scan: Scan, remaining: dict[InodeKey, int],
+            dry_run: bool) -> ReclamationEstimate | ConfirmedDeletion:
+    """Keep scan estimates separate from the live unlink account."""
+    return freed_by(group, scan, remaining) if dry_run else remove([group])
 
 
 def directory_blocks(directory: str, seen: set[InodeKey] | None = None) -> int:
@@ -1123,15 +1176,12 @@ def shrink(
     if scan.orphans:
         orphaned = 0
         for group in scan.orphans:
-            freed = freed_by(group, scan, remaining)
-            orphaned += freed
-            if dry_run:
-                taken.append((group, freed))
-            else:
-                failed = remove([group])
-                failures += failed
-                if not failed:
-                    taken.append((group, freed))
+            account = reclaim(group, scan, remaining, dry_run)
+            orphaned += account.bytes
+            failed = account.failures if isinstance(account, ConfirmedDeletion) else 0
+            failures += failed
+            if not failed:
+                taken.append((group, account.bytes))
         total -= orphaned
         print(
             f"lint sweep: {verb} {sum(len(group.entries) for group in scan.orphans)} orphaned files ({gib(orphaned)}),"
@@ -1139,18 +1189,21 @@ def shrink(
         )
     if total <= budget:
         return total, failures, taken
-    chosen, left = choose(scan, total, budget, remaining, removal_order)
-    for group, freed in chosen:
-        if dry_run:
-            taken.append((group, freed))
-        else:
-            failed = remove([group])
-            failures += failed
-            if not failed:
-                taken.append((group, freed))
+    chosen: list[Group] = []
+    left = total
+    for group in sorted(scan.groups, key=removal_order):
+        if left <= budget:
+            break
+        chosen.append(group)
+        account = reclaim(group, scan, remaining, dry_run)
+        left -= account.bytes
+        failed = account.failures if isinstance(account, ConfirmedDeletion) else 0
+        failures += failed
+        if not failed:
+            taken.append((group, account.bytes))
     if chosen:
-        units = sum(1 for group, _ in chosen if group.kind == "unit")
-        uses = [group.last_used for group, _ in chosen]
+        units = sum(1 for group in chosen if group.kind == "unit")
+        uses = [group.last_used for group in chosen]
         print(
             f"lint sweep: {verb} {units} build units and {len(chosen) - units} incremental dirs"
             + f" ({gib(total - left)}), last used {when(min(uses))}"
@@ -1236,12 +1289,12 @@ def shrink_floor(
                 if not group_unchanged(group):
                     continue
                 attempted.append(group)
-                failed = 0 if dry_run else remove([group])
+                account = reclaim(group, scan, remaining, dry_run)
+                left -= account.bytes
+                failed = account.failures if isinstance(account, ConfirmedDeletion) else 0
                 failures += failed
                 if not failed:
-                    freed = freed_by(group, scan, remaining)
-                    left -= freed
-                    taken.append((group, freed))
+                    taken.append((group, account.bytes))
                     removed_output |= group.kind != "orphan"
             if removed_output and not dry_run:
                 record_sweep_removal(root, "floor take")

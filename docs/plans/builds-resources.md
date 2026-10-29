@@ -293,7 +293,7 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 - The notice has `also touches` lines for verify.sh and invoke.sh (verify-unit, against `origin/natedev-verify` and `origin/natedev`), merge_gate.py and the hold callers (their owners, against `origin/natedev`), and build_queue.py (report-unit, against `origin/builds-report`); it confirms no read-side prefix strip remains in `memory_admit.py` or `build_queue.py`.
 - Change-Review line: `/build:queue` shows the repository and the step in separate columns | in a Claude session on natedev while a build waits, type `/build:queue` | each row shows e.g. `hana` and `clippy` apart, and no row reads "hana clippy".
 
-### Phase 9 — The floor sweep counts what a deletion really frees  · status: todo
+### Phase 9 — The floor sweep counts what a deletion really frees  · status: done
 **Depends on:** Phase 3
 
 #### Work Order
