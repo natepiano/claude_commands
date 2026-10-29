@@ -1,4 +1,7 @@
-"""Bulk local renames on a temporary Cargo project, including the real LSP boundary when installed."""
+"""Bulk local renames on a temporary Cargo project with private Rust tool stubs.
+
+Real LSP and compiler tests use BULK_RENAME_REAL_TOOLS=1; the merge gate never sets it.
+"""
 from __future__ import annotations
 
 import json
@@ -21,6 +24,7 @@ import berth_board
 import rules
 import style_ledger
 import style_rules
+from scripts.direct.test_verify_untested_examples import rust_tool_path, workspace_metadata
 from approved_renames import AppliedInCode, BindingRename, binding_rename_check
 
 
@@ -58,6 +62,7 @@ class CargoProjectTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="bulk-rename-test-")))
+        self.set_up_tools()
         self.repo = self.root / "project"
         (self.repo / "src").mkdir(parents=True)
         _ = (self.repo / "Cargo.toml").write_text('[package]\nname="bulk_sample"\nversion="0.1.0"\nedition="2021"\n')
@@ -68,6 +73,17 @@ class CargoProjectTests(unittest.TestCase):
         _ = self.git("config", "user.email", "bulk@example.invalid")
         _ = self.git("add", ".")
         _ = self.git("commit", "-qm", "fixture")
+
+    def set_up_tools(self) -> None:
+        tools = rust_tool_path(self.root / "tools")
+        analyzer = Path(tools) / "rust-analyzer"
+        _ = analyzer.write_text('#!/bin/sh\necho "Unexpected rust-analyzer call" >&2\nexit 99\n')
+        analyzer.chmod(0o755)
+        self.enterContext(mock.patch.dict(os.environ, {
+            "PATH": tools,
+            "CARGO_HOME": str(self.root / "cargo-home"),
+            "RUSTUP_HOME": str(self.root / "rustup"),
+        }))
 
     def git(self, *args: str) -> str:
         return subprocess.run(["git", "-C", str(self.repo), *args], capture_output=True, text=True, check=True).stdout.strip()
@@ -500,6 +516,16 @@ class ValidationTests(CargoProjectTests):
             _ = (folder / "Cargo.toml").write_text(
                 f'[package]\nname="{name}"\nversion="0.1.0"\nedition="2021"\n'
                 + f'[dependencies]\n{dependency}={{path="{path}"}}\n')
+        metadata = self.root / "metadata.json"
+        _ = metadata.write_text(json.dumps(workspace_metadata(self.repo)))
+        cargo = self.root / "tools/cargo"
+        _ = cargo.write_text(
+            '#!/bin/sh\n'
+            + 'if [ "$*" = "metadata --no-deps --format-version 1" ]; then\n'
+            + '    cat "$TEST_METADATA_FILE"; exit 0\n'
+            + 'fi\necho "Unexpected cargo call: $*" >&2; exit 99\n'
+        )
+        self.enterContext(mock.patch.dict(os.environ, {"TEST_METADATA_FILE": str(metadata)}))
         self.assertEqual(bulk.verification_packages(self.repo, "."), ("bulk_sample", "dependent", "last"))
         self.assertEqual(bulk.verification_packages(self.repo, "last"), ("last",))
 
@@ -603,8 +629,15 @@ class LedgerTests(CargoProjectTests):
             analyzer.assert_not_called()
 
 
-@unittest.skipUnless(shutil.which("rust-analyzer"), "rust-analyzer is absent; skipping real LSP tests only")
+@unittest.skipUnless(
+    os.environ.get("BULK_RENAME_REAL_TOOLS") == "1" and shutil.which("rust-analyzer"),
+    "real LSP and compiler tests run only with BULK_RENAME_REAL_TOOLS=1 and rust-analyzer on PATH",
+)
 class RustAnalyzerTests(CargoProjectTests):
+    @override
+    def set_up_tools(self) -> None:
+        """Keep the caller's PATH, CARGO_HOME and RUSTUP_HOME."""
+
     def test_real_lsp_renames_all_site_kinds_shorthand_captures_and_shadowing_then_cargo_checks(self) -> None:
         source = '''struct Record { value: usize }
 pub fn run(parameter: usize) -> usize {
@@ -650,6 +683,46 @@ pub fn run(parameter: usize) -> usize {
             result = bulk.rename_file(analyzer, self.repo / "src/lib.rs", "src/lib.rs", source, findings)
         self.assertEqual(result.refusals, ())
         self.assertEqual(result.edited, source.replace("first", "first_number").replace("second", "second_number"))
+
+
+class ToolEnvironmentTests(unittest.TestCase):
+    def test_only_real_tool_setup_keeps_the_callers_paths(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="bulk-tool-paths-") as directory:
+            root = Path(directory)
+            caller_tools = root / "caller-tools"
+            caller_tools.mkdir()
+            for name in ("cargo", "rust-analyzer"):
+                tool = caller_tools / name
+                _ = tool.write_text("#!/bin/sh\nexit 99\n")
+                tool.chmod(0o755)
+            caller_environment = {
+                "PATH": str(caller_tools),
+                "CARGO_HOME": str(root / "caller-cargo"),
+                "RUSTUP_HOME": str(root / "caller-rustup"),
+            }
+            for fixture in (CargoProjectTests(), RustAnalyzerTests(
+                "test_real_lsp_parameter_comments_rebase_the_next_prepare_rename"
+            )):
+                with self.subTest(fixture=type(fixture).__name__), mock.patch.dict(
+                    os.environ, caller_environment
+                ), mock.patch.object(fixture, "git", return_value=""):
+                    try:
+                        fixture.setUp()
+                        stubs = fixture.root / "tools"
+                        if isinstance(fixture, RustAnalyzerTests):
+                            expected_tools = caller_tools
+                            self.assertEqual(os.environ["CARGO_HOME"], caller_environment["CARGO_HOME"])
+                            self.assertEqual(os.environ["RUSTUP_HOME"], caller_environment["RUSTUP_HOME"])
+                            self.assertFalse(stubs.exists())
+                        else:
+                            expected_tools = stubs
+                            self.assertEqual(os.environ["CARGO_HOME"], str(fixture.root / "cargo-home"))
+                            self.assertEqual(os.environ["RUSTUP_HOME"], str(fixture.root / "rustup"))
+                        self.assertEqual(os.environ["PATH"], str(expected_tools))
+                        for name in ("cargo", "rust-analyzer"):
+                            self.assertEqual(shutil.which(name), str(expected_tools / name))
+                    finally:
+                        _ = fixture.doCleanups()
 
 
 if __name__ == "__main__":
