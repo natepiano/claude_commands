@@ -11,6 +11,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, cast, override
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.guilds import astra_work  # noqa: E402
 
@@ -126,7 +129,7 @@ class DailyReadTests(unittest.TestCase):
             [sys.executable, str(SCRIPT), "--guild", guild, "--since", SINCE, "--until", UNTIL,
              *(["--json"] if as_json else [])],
             env={**self.environment, "GUILD_DAILY_HOST": host}, text=True, capture_output=True,
-            check=False, timeout=20,
+            check=False, timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
         return result.stdout

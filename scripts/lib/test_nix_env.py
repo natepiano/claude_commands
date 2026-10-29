@@ -9,6 +9,9 @@ import sys
 from typing import cast
 from unittest.mock import patch
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import nix_env
 from scripts.lib.nix_env_test_support import HELPER, NixFixture
@@ -104,7 +107,7 @@ class EnsureTests(NixFixture):
 
     def cli(self, *arguments: str, extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(HELPER), *arguments], cwd=self.work,
-                              env={**self.env, **(extra or {})}, capture_output=True, text=True, timeout=10, check=False)
+                              env={**self.env, **(extra or {})}, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
 
     def test_cli_ensure_json_and_refusal_exit(self) -> None:
         _ = self.envrc(self.work)

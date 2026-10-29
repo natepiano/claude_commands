@@ -26,6 +26,9 @@ import herdr as runtime
 from scripts.herdr import herdr
 from scripts.herdr.fake_herdr import CommandResponse
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 SCRIPT = Path(__file__).with_name("add_showrunner.py")
 SHARED = herdr.SHARED_SESSION
 PARENT_SESSION = "11111111-2222-3333-4444-555555555555"
@@ -190,7 +193,7 @@ class AddShowrunnerTests(unittest.TestCase):
     def close_processes(self) -> None:
         for process in self.processes:
             process.terminate()
-            _ = process.wait(timeout=2)
+            _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
 
     def record(self, session: str, name: str = "") -> tuple[str, str]:
         """A live session's record: where it is kept and what it holds. Its name is read from a live process's;

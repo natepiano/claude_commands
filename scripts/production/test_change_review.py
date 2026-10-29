@@ -25,6 +25,9 @@ from change_review import Invisible, Malformed, Visible
 # Importable once change_review has put scripts/lib on the path.
 import scratch
 
+# Hang guards allow for load 136 on natedev (2026-10-29).
+TEST_HANG_GUARD_SECS = 300
+
 LIST = """# Change review list
 
 ## To review
@@ -436,14 +439,30 @@ class ActionTest(unittest.TestCase):
         writers = [threading.Thread(target=change_review.append_rows,
                                     args=(self.path, [Visible(f"Row {index}", "Look", "It")], date(2026, 10, 15), "", PRODUCTION))
                    for index in range(8)]
-        for writer in writers:
-            writer.start()
-        writers[0].join(0.3)
-        self.assertTrue(writers[0].is_alive())
-        self.assertEqual(self.path.read_text(encoding="utf-8"), LIST)
-        os.close(held)
-        for writer in writers:
-            writer.join(10)
+        blocked = threading.Event()
+        real_flock = fcntl.flock
+
+        def observe_lock(descriptor: int, operation: int) -> None:
+            if operation == fcntl.LOCK_EX:
+                try:
+                    real_flock(descriptor, operation | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    blocked.set()
+                else:
+                    return
+            real_flock(descriptor, operation)
+
+        with mock.patch.object(fcntl, "flock", side_effect=observe_lock):
+            try:
+                for writer in writers:
+                    writer.start()
+                self.assertTrue(blocked.wait(TEST_HANG_GUARD_SECS), "writer did not reach the held lock")
+                self.assertTrue(writers[0].is_alive())
+                self.assertEqual(self.path.read_text(encoding="utf-8"), LIST)
+            finally:
+                os.close(held)
+                for writer in writers:
+                    writer.join(TEST_HANG_GUARD_SECS)
         rows = [row for row in self.path.read_text(encoding="utf-8").splitlines() if "| Row " in row]
         self.assertEqual(sorted(row.split(" ")[1] for row in rows), [f"C{number}" for number in range(81, 89)])
 
