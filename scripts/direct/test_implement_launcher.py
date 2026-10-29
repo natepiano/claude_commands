@@ -18,6 +18,16 @@ from scripts.direct.wait_for_test_state import wait_for_pid
 
 
 class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
+    def test_named_phase_reaches_worker_verification_environment(self) -> None:
+        session = self.start_phase("phase-environment")
+        _ = self.prompt_file.write_text("Phase 3 — Retry handling\nWrite the retry path.\n")
+        stub = self.root / "scripts" / "agents" / "agent_exec.sh"
+        with stub.open("a") as output:
+            _ = output.write('printf "%s|%s" "$UNIT_RUN_DIR" "$UNIT_TEAM_ROLE" > "$UNIT_RUN_DIR/wait-context"\n')
+        result = self.checked_launch(session, "--phase", "3")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((session / "wait-context").read_text(), f"{session}|impl")
+
     def test_a_codex_seat_on_the_mac_opens_only_after_its_phase_claims_its_files(self) -> None:
         # A Mac Codex seat runs no berth check of its own, so the launcher claims the phase first.
         session = self.start_phase("claim-before-seat")

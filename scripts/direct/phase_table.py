@@ -30,7 +30,7 @@ from scripts.direct import plan_history
 from scripts.lib.user_zone import user_zone
 from scripts.production import showrunners, unit_lookup
 from production_units import Production, Refusal, cell_value, live_unit_table, read_production
-from scripts.production.merge_checkpoint import PromoteTo, promotion_from_doc
+from scripts.production.production_doc import PromoteTo, promotion_from_doc
 
 # The finding_opened event schema uses these severities. Importing findings to
 # read its SEVERITIES also validates command-only convergence configuration.
