@@ -8,6 +8,8 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from contextlib import closing
 from datetime import datetime, timezone
@@ -25,6 +27,202 @@ from ledger_test_support import (LedgerTestCase, LedgerStatus)
 
 @final
 class StyleLedgerTicketsTests(LedgerTestCase):
+    def git_read_failure(self) -> style_ledger.GitReadFailed:
+        return style_ledger.GitReadFailed(("git", "-C", str(self.repo), "rev-parse"), 128, "fatal: PRIVATE GIT STDERR")
+
+    def ledger_contents(self, ledger: style_ledger.Ledger) -> tuple[str, ...]:
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            return tuple(connection.iterdump())
+
+    def assert_git_refusal(self, ledger: style_ledger.Ledger, context: str, operation: Callable[[], object]) -> None:
+        before = self.ledger_contents(ledger)
+        with self.assertRaises(style_ledger.LedgerError) as refused:
+            _ = operation()
+        self.assertIn(context, str(refused.exception))
+        self.assertNotIn("PRIVATE GIT STDERR", str(refused.exception))
+        self.assertNotIn("fatal:", str(refused.exception))
+        self.assertIsInstance(refused.exception.__cause__, style_ledger.GitReadFailed)
+        self.assertEqual(self.ledger_contents(ledger), before, "failed proof must roll back all rows and reservations")
+
+    def test_git_boundary_checkpoint_restamp_failure_is_contextual_and_atomic(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        ledger.ticket_add("other-1", "other", "read", "names", "crates/beta", [self.sources[2]], [self.rule("read")])
+        ledger.ticket_assign("other-1", "main")
+        _ = ledger.ticket_base("other-1")
+        self.record(self.rule("read"), self.sources[2], self.initial_tip, ticket="other-1")
+        ledger._ancestors.clear()  # pyright: ignore[reportPrivateUsage]
+        original = mock.Mock(wraps=subprocess.run)
+
+        def fail_ancestry(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            if "merge-base" in command:
+                return subprocess.CompletedProcess(command, 128, b"", b"fatal: PRIVATE GIT STDERR")
+            return cast(subprocess.CompletedProcess[bytes], original(command, **kwargs))
+
+        with mock.patch.object(subprocess, "run", side_effect=fail_ancestry):
+            self.assert_git_refusal(ledger, "ticket other-1 checkpoint:",
+                                    lambda: ledger.ticket_checkpoint("other-1", self.initial_tip, "held-run", "7"))
+        failure = self.git_read_failure()
+        with mock.patch.object(style_ledger, "_git", side_effect=failure):
+            # The catch inside checkpoint_restamps must propagate, rather than silently omit verdicts.
+            with self.assertRaises(style_ledger.GitReadFailed):
+                _ = ledger.checkpoint_restamps(ledger.ticket_open("other")[0], self.initial_tip)
+
+    def test_git_boundary_restamp_judgment_read_is_not_silently_skipped(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        rule = self.rule("restamp")
+        self.add_ticket("restamp-1", [rule], unit="restamp")
+        ledger.ticket_assign("restamp-1", "main")
+        _ = ledger.ticket_base("restamp-1")
+        for path in self.sources[:2]:
+            self.record(rule, path, self.initial_tip, ticket="restamp-1")
+        self.write("README.md", "a later checkpoint\n")
+        checkpoint = self.commit("Advance checkpoint")
+        original = mock.Mock(wraps=subprocess.run)
+
+        def fail_history(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            if "--full-history" in command:
+                return subprocess.CompletedProcess(command, 128, b"", b"fatal: PRIVATE GIT STDERR")
+            return cast(subprocess.CompletedProcess[bytes], original(command, **kwargs))
+
+        with mock.patch.object(subprocess, "run", side_effect=fail_history):
+            self.assert_git_refusal(ledger, "ticket restamp-1 checkpoint:",
+                                    lambda: ledger.ticket_checkpoint("restamp-1", checkpoint, "held-run", "5"))
+
+    def test_git_boundary_pending_pipeline_writes_roll_back_for_each_transition(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        rule = ledger.ticket_open("read")[0]["rules"][0]
+        ledger.ticket_add("read-2", "read", "read", "names", "crates/beta", [self.sources[2]], [rule])
+        original = mock.Mock(wraps=subprocess.run)
+
+        def fail_diff(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            if "diff" in command:
+                return subprocess.CompletedProcess(command, 128, b"", b"fatal: PRIVATE GIT STDERR")
+            return cast(subprocess.CompletedProcess[bytes], original(command, **kwargs))
+
+        with mock.patch.object(subprocess, "run", side_effect=fail_diff):
+            self.assert_git_refusal(ledger, "ticket read-2 assign:", lambda: ledger.ticket_assign("read-2", "main"))
+        ledger.ticket_assign("read-2", "main")
+        self.record(rule, self.sources[2], self.initial_tip, ticket="read-2")
+        with mock.patch.object(subprocess, "run", side_effect=fail_diff):
+            self.assert_git_refusal(ledger, "ticket read-2 resume check:", lambda: ledger.check_ticket_pipeline("read-2"))
+            self.assert_git_refusal(ledger, "ticket read-2 checkpoint:",
+                                    lambda: ledger.ticket_checkpoint("read-2", self.initial_tip, "held-run", "8"))
+        with mock.patch.object(ledger, "_check_ticket_pipelines", side_effect=self.git_read_failure()):
+            self.assert_git_refusal(ledger, "ticket read-2 drop:", lambda: ledger.ticket_drop("read-2"))
+
+    def test_git_boundary_widen_callback_and_pending_writes_keep_reservations(self) -> None:
+        ledger, _ = self.widen_ticket()
+        for failure in (subprocess.CalledProcessError(128, ["git", "show", "HEAD:x"], stderr="fatal: PRIVATE GIT STDERR"),
+                        style_ledger.CheckCouldNotRun("fatal: PRIVATE GIT STDERR")):
+            with self.subTest(failure=type(failure).__name__):
+                self.assert_git_refusal(ledger, "ticket names-1 widen:",
+                    lambda: ledger.ticket_widen("names-1", ("extra.rs",), "reference", "worker", mock.Mock(side_effect=failure)))
+        with mock.patch.object(ledger, "_check_ticket_pipelines", side_effect=self.git_read_failure()):
+            self.assert_git_refusal(ledger, "ticket names-1 widen:",
+                lambda: ledger.ticket_widen("names-1", ("extra.rs",), "reference", "worker", lambda: frozenset()))
+
+    def test_git_boundary_all_public_operations_keep_typed_failure_context(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        rule = self.rule("new")
+        with mock.patch.object(rules, "load_rules", side_effect=subprocess.CalledProcessError(
+                128, ["git", "hash-object", "rule"], stderr="fatal: PRIVATE GIT STDERR")):
+            self.assert_git_refusal(ledger, "ticket new-1 add:",
+                lambda: ledger.ticket_add("new-1", "new", "read", "names", "crates/alpha", [self.sources[0]], [rule]))
+        self.add_ticket("new-1", [rule], unit="new")
+        ledger.ticket_assign("new-1", "main")
+        with mock.patch.object(style_ledger, "_git", side_effect=self.git_read_failure()):
+            self.assert_git_refusal(ledger, "ticket new-1 base:", lambda: ledger.ticket_base("new-1"))
+            self.assert_git_refusal(ledger, "ticket read-1 merge:", lambda: ledger.ticket_merge("read-1"))
+        with mock.patch.object(ledger, "_yielded_findings", side_effect=self.git_read_failure()):
+            self.assert_git_refusal(ledger, "ticket new-1 yield:", lambda: ledger.ticket_yield("new-1", self.sources[0]))
+        _ = ledger.ticket_merge("read-1")
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            _ = connection.execute("UPDATE tickets SET reservation_session_dir='held-run',reservation_phase='3' WHERE id='read-1'")
+            connection.commit()
+        with mock.patch.object(style_ledger, "_git", side_effect=self.git_read_failure()):
+            self.assert_git_refusal(ledger, "ticket read-1 release:", lambda: ledger.release_held_reservation("read-1"))
+
+    def test_git_boundary_later_reconcile_failure_preserves_prior_commits_and_nested_context(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        self.add_ticket("other-1", [self.rule("other")], unit="other")
+        ledger.ticket_assign("other-1", "missing-branch")
+        # other sorts before read; reconcile commits its drop before a later read-1 merge fails.
+        with mock.patch.object(ledger, "_load_rules", side_effect=self.git_read_failure()):
+            with self.assertRaisesRegex(style_ledger.LedgerError, r"ticket read-1 reconcile \(merge\): git rev-parse failed") as refused:
+                _ = ledger.reconcile("main", "main")
+        self.assertNotIn("PRIVATE GIT STDERR", str(refused.exception))
+        self.assertFalse(ledger.ticket_open("other"))
+        self.assertEqual(ledger.ticket_open("read")[0]["state"], "checkpointed")
+        with mock.patch.object(style_ledger, "_git", side_effect=self.git_read_failure()):
+            self.assert_git_refusal(ledger, "reconcile refs/heads/main:", lambda: ledger.reconcile("main", "main"))
+
+    def test_git_boundary_proof_catches_preserve_failures_and_negative_git_answers(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        original = mock.Mock(wraps=subprocess.run)
+
+        def negative(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            if "merge-base" in command or "grep" in command:
+                return subprocess.CompletedProcess(command, 1, b"", b"")
+            return cast(subprocess.CompletedProcess[bytes], original(command, **kwargs))
+
+        with mock.patch.object(subprocess, "run", side_effect=negative):
+            self.assertFalse(ledger._is_ancestor("missing", "other"))  # pyright: ignore[reportPrivateUsage]
+            self.assertFalse(ledger.files_naming(self.initial_tip, "absent_name"))
+        tip = ledger._tip(self.initial_tip)  # pyright: ignore[reportPrivateUsage]
+        with mock.patch.object(ledger, "_tip", side_effect=self.git_read_failure()):
+            with self.assertRaises(style_ledger.GitReadFailed):
+                _ = ledger._judgment_inputs_match(  # pyright: ignore[reportPrivateUsage]
+                    style_ledger.Judgment("blob", "different", self.initial_tip, "clean", style_ledger.CellInputScope.CRATE,
+                                          style_ledger.DeclaredInputScope.RULE),
+                    tip, style_ledger.CellInputScope.CRATE, self.sources[0], "modules")
+        outside = style_ledger.GitReadFailed(("git", "rev-parse", "--show-toplevel"), 128,
+                                            "fatal: not a git repository: PRIVATE GIT STDERR")
+        self.assertIn("not a git repository", str(outside))
+        self.assertNotIn("PRIVATE GIT STDERR", str(outside))
+        self.assertNotIn("fatal:", str(outside))
+
+    def test_git_boundary_cli_failure_exits_two_and_schema_errors_stay_separate(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        original = mock.Mock(wraps=subprocess.run)
+
+        def fail_checkpoint(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            if "missing-commit^{commit}" in command:
+                return subprocess.CompletedProcess(command, 128, b"", b"fatal: PRIVATE GIT STDERR")
+            return cast(subprocess.CompletedProcess[bytes], original(command, **kwargs))
+
+        with mock.patch.object(subprocess, "run", side_effect=fail_checkpoint):
+            refused = self.cli("ticket", "checkpoint", "--id", "read-1", "--commit", "missing-commit", success=False)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("ticket read-1 checkpoint:", refused.stderr)
+        self.assertNotIn("PRIVATE GIT STDERR", refused.stderr)
+        self.assertNotIn("fatal:", refused.stderr)
+        error = style_ledger.CheckCouldNotRun("unsupported ledger schema version 999")
+        with mock.patch.object(ledger, "_style_branch_tip", side_effect=error):
+            with self.assertRaises(style_ledger.CheckCouldNotRun) as refused_schema:
+                _ = ledger.ticket_merge("read-1")
+        self.assertIs(refused_schema.exception, error)
+
+    def test_git_boundary_repeats_and_invalid_states_make_zero_git_calls(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        rule = ledger.ticket_open("read")[0]["rules"][0]
+        with mock.patch.object(subprocess, "run", wraps=subprocess.run) as git:
+            ledger.ticket_add("read-1", "read", "read", "names", "crates/alpha", list(self.sources[:2]), [rule])
+            ledger.ticket_checkpoint("read-1", self.initial_tip)
+            self.assertEqual(ledger.ticket_base("read-1"), self.initial_tip)
+            for operation in (lambda: ledger.ticket_assign("read-1", "main"),
+                              lambda: ledger.ticket_yield("read-1", self.sources[0])):
+                with self.assertRaises(style_ledger.LedgerError):
+                    _ = operation()
+            git.assert_not_called()
+        _ = ledger.ticket_merge("read-1")
+        with mock.patch.object(subprocess, "run", wraps=subprocess.run) as git:
+            self.assertEqual(ledger.ticket_merge("read-1"), ())
+            self.assertIsNone(ledger.release_held_reservation("read-1"))
+            for operation in (lambda: ledger.ticket_drop("read-1"), lambda: ledger.check_ticket_pipeline("read-1")):
+                with self.assertRaises(style_ledger.LedgerError):
+                    _ = operation()
+            git.assert_not_called()
+
     def test_widen_records_each_path_with_its_reason_name_and_time(self) -> None:
         ledger, issue = self.widen_ticket()
         extra, more = "crates/alpha/src/extra.rs", "crates/alpha/src/more.rs"
@@ -1587,6 +1785,185 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         self.record(rule, self.sources[0], self.initial_tip, ticket="another-ticket")
         self.assertEqual(self.states(rule)[self.sources[0]], "current")
 
+    def checkpointed_read_transition(self) -> style_ledger.Ledger:
+        rule = self.rule("read")
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "main")
+        self.add_ticket("read-1", [rule], unit="read")
+        ledger.ticket_assign("read-1", "main")
+        _ = ledger.ticket_base("read-1")
+        for path in self.sources[:2]:
+            self.record(rule, path, self.initial_tip, ticket="read-1")
+        ledger.ticket_checkpoint("read-1", self.initial_tip)
+        return ledger
+
+    def test_transition_audit_checkpoint_missing_commit_names_ticket_and_verb(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        refused = self.cli("ticket", "checkpoint", "--id", "read-1", "--commit", "missing-commit", success=False)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("ticket read-1 checkpoint: git rev-parse failed", refused.stderr)
+        self.assertNotIn("fatal:", refused.stderr)
+        self.assertEqual(ledger.ticket_open("read")[0]["checkpoint"], self.initial_tip)
+        with mock.patch.object(style_ledger, "_git", side_effect=self.git_read_failure()):
+            with self.assertRaisesRegex(style_ledger.LedgerError, "ticket read-1 checkpoint: git rev-parse failed"):
+                ledger.ticket_checkpoint("read-1", "missing-commit")
+
+    def test_transition_audit_exact_checkpoint_repeat_counts_zero_git_calls(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        with mock.patch.object(style_ledger, "_git", return_value=self.initial_tip) as git:
+            with mock.patch.object(subprocess, "run", wraps=subprocess.run) as process:
+                ledger.ticket_checkpoint("read-1", self.initial_tip)
+            self.assertEqual(process.call_count, 0)
+            self.assertEqual(git.call_count, 0)
+
+    def test_transition_audit_empty_first_checkpoint_is_not_an_exact_repeat(self) -> None:
+        ledger = self.ledger()
+        rule = self.rule("read")
+        self.add_ticket("read-1", [rule], unit="read")
+        ledger.ticket_assign("read-1", "main")
+        with mock.patch.object(style_ledger, "_git", side_effect=self.git_read_failure()) as git:
+            with self.assertRaisesRegex(style_ledger.LedgerError, "ticket read-1 checkpoint: git rev-parse failed"):
+                ledger.ticket_checkpoint("read-1", "")
+            self.assertEqual(git.call_args, mock.call(self.repo, "rev-parse", "--verify", "^{commit}"))
+        self.assertEqual(ledger.ticket_open("read")[0]["state"], "assigned")
+
+    def test_transition_audit_queued_proposal_gate_keeps_pipeline_validation(self) -> None:
+        ledger, _ = self.widen_ticket()
+        with (mock.patch.object(ledger, "_check_ticket_pipelines") as proof,
+              mock.patch.object(style_ledger, "_git") as git):
+            ledger.check_ticket_pipeline("names-1")
+            proof.assert_called_once_with("names")
+            git.assert_not_called()
+
+    def test_transition_audit_assignment_unit_state_precedes_branch_git(self) -> None:
+        ledger = self.ledger()
+        rule = self.rule("read")
+        self.add_ticket("read-1", [rule], unit="read")
+        self.add_ticket("read-2", [rule], unit="read")
+        ledger.ticket_assign("read-1", "main")
+        with mock.patch.object(style_ledger, "_git", side_effect=self.git_read_failure()) as git:
+            with self.assertRaisesRegex(style_ledger.LedgerError, "already has read-1 in state assigned"):
+                ledger.ticket_assign("read-2", "main")
+            git.assert_not_called()
+
+    def test_transition_audit_merge_predecessor_state_precedes_git(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        rule = ledger.ticket_open("read")[0]["rules"][0]
+        ledger.ticket_add("read-2", "read", "read", "names", "crates/beta", [self.sources[2]], [rule])
+        ledger.ticket_assign("read-2", "main")
+        self.record(rule, self.sources[2], self.initial_tip, ticket="read-2")
+        ledger.ticket_checkpoint("read-2", self.initial_tip)
+        with mock.patch.object(style_ledger, "_git", side_effect=self.git_read_failure()) as git:
+            with self.assertRaisesRegex(style_ledger.LedgerError, "waiting for predecessor read-1"):
+                _ = ledger.ticket_merge("read-2")
+            git.assert_not_called()
+
+    def test_transition_audit_state_refusals_and_other_exact_repeats_use_no_git(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        with mock.patch.object(style_ledger, "_git", return_value=self.initial_tip) as git:
+            self.assertEqual(ledger.ticket_base("read-1"), self.initial_tip)
+            with self.assertRaisesRegex(style_ledger.LedgerError, "cannot become assigned from checkpointed"):
+                ledger.ticket_assign("read-1", "main")
+            with self.assertRaisesRegex(style_ledger.LedgerError, "cannot yield from checkpointed"):
+                _ = ledger.ticket_yield("read-1", self.sources[0])
+            git.assert_not_called()
+        _ = ledger.ticket_merge("read-1")
+        with mock.patch.object(style_ledger, "_git", return_value=self.initial_tip) as git:
+            self.assertEqual(ledger.ticket_merge("read-1"), ())
+            with self.assertRaisesRegex(style_ledger.LedgerError, "cannot become dropped from merged"):
+                ledger.ticket_drop("read-1")
+            with self.assertRaisesRegex(style_ledger.LedgerError, "cannot resume or gate from merged"):
+                ledger.check_ticket_pipeline("read-1")
+            git.assert_not_called()
+        self.add_ticket("drop-1", [self.rule("drop")], unit="drop")
+        ledger.ticket_drop("drop-1")
+        with mock.patch.object(style_ledger, "_git", return_value=self.initial_tip) as git:
+            ledger.ticket_drop("drop-1")
+            with self.assertRaisesRegex(style_ledger.LedgerError, "cannot record start commit in state dropped"):
+                _ = ledger.ticket_base("drop-1")
+            git.assert_not_called()
+        self.add_ticket("assign-1", [self.rule("assign")], unit="assign")
+        ledger.ticket_assign("assign-1", "main")
+        with mock.patch.object(style_ledger, "_git", return_value=self.initial_tip) as git:
+            ledger.ticket_assign("assign-1", "main")
+            git.assert_not_called()
+
+    def test_transition_audit_widen_repeat_and_reason_refusal_precede_approval_and_git(self) -> None:
+        ledger, _ = self.widen_ticket()
+        path = "crates/alpha/src/extra.rs"
+        first = ledger.ticket_widen("names-1", (path,), "reference", "worker", lambda: frozenset())
+        approved = mock.Mock(return_value=frozenset())
+        with (mock.patch.object(style_ledger, "_git", return_value=self.initial_tip) as git,
+              mock.patch.object(ledger, "_check_ticket_pipelines") as proof):
+            self.assertEqual(ledger.ticket_widen("names-1", (path,), "reference", "worker", approved), first)
+            with self.assertRaisesRegex(style_ledger.LedgerError, "already widened for another reason"):
+                _ = ledger.ticket_widen("names-1", (path,), "different", "worker", approved)
+            approved.assert_not_called()
+            proof.assert_not_called()
+            git.assert_not_called()
+
+    def test_transition_audit_git_errors_name_base_and_merge_operations(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        self.add_ticket("other-1", [self.rule("other")], unit="other")
+        ledger.ticket_assign("other-1", "main")
+        with mock.patch.object(style_ledger, "_git", side_effect=self.git_read_failure()):
+            with self.assertRaisesRegex(style_ledger.LedgerError, "ticket other-1 base: git rev-parse failed"):
+                _ = ledger.ticket_base("other-1")
+            with self.assertRaisesRegex(style_ledger.LedgerError, "ticket read-1 merge: git rev-parse failed"):
+                _ = ledger.ticket_merge("read-1")
+        with (mock.patch.object(ledger, "_style_branch_tip", return_value=("main", self.initial_tip)),
+              mock.patch.object(ledger, "_is_ancestor", side_effect=self.git_read_failure())):
+            with self.assertRaisesRegex(style_ledger.LedgerError, "ticket read-1 merge: git rev-parse failed"):
+                _ = ledger.ticket_merge("read-1")
+
+    def test_transition_audit_reconcile_git_errors_name_the_ticket(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        with mock.patch.object(ledger, "_is_ancestor", side_effect=self.git_read_failure()):
+            with self.assertRaisesRegex(style_ledger.LedgerError, "ticket read-1 reconcile: git rev-parse failed"):
+                _ = ledger.reconcile("main", "main")
+
+    def test_ticket_transition_state_refusals_precede_git_and_footprint_work(self) -> None:
+        rule = self.rule("read")
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "main")
+        self.add_ticket("read-1", [rule], unit="read")
+        with (self.subTest(state="queued"),
+              mock.patch.object(style_ledger, "_git", side_effect=style_ledger.LedgerError("git before state check"))):
+            with self.assertRaisesRegex(style_ledger.LedgerError, "cannot become checkpointed from queued"):
+                ledger.ticket_checkpoint("read-1", "missing-commit")
+        ledger.ticket_assign("read-1", "main")
+        for path in self.sources[:2]:
+            self.record(rule, path, self.initial_tip, ticket="read-1")
+        ledger.ticket_checkpoint("read-1", self.initial_tip)
+        for state in ("checkpointed", "merged"):
+            with self.subTest(state=state):
+                if state == "merged":
+                    _ = ledger.ticket_merge("read-1")
+                with (mock.patch.object(style_ledger, "_git", side_effect=style_ledger.LedgerError("git before state check")),
+                      mock.patch.object(ledger, "_check_ticket_pipelines", side_effect=AssertionError("footprint before state check"))):
+                    with self.assertRaisesRegex(style_ledger.LedgerError, f"cannot become assigned from {state}"):
+                        ledger.ticket_assign("read-1", "missing-branch")
+                    if state == "merged":
+                        with self.assertRaisesRegex(style_ledger.LedgerError, "cannot become checkpointed from merged"):
+                            ledger.ticket_checkpoint("read-1", "missing-commit")
+
+    def test_ticket_assignment_with_an_unreadable_successor_branch_fails_closed_with_context(self) -> None:
+        rule = self.rule("read")
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "main")
+        self.add_ticket("read-1", [rule], unit="read")
+        self.add_ticket("read-2", [rule], unit="read")
+        ledger.ticket_assign("read-1", "main")
+        for path in self.sources[:2]:
+            self.record(rule, path, self.initial_tip, ticket="read-1")
+        ledger.ticket_checkpoint("read-1", self.initial_tip)
+        refused = self.cli("ticket", "assign", "--id", "read-2", "--branch", "missing-branch", success=False)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("ticket read-2 assign: git rev-parse failed", refused.stderr)
+        self.assertNotIn("fatal:", refused.stderr)
+        self.assertEqual([ticket["id"] for ticket in ledger.queued_tickets("read")], ["read-2"])
+        self.assertEqual([ticket["id"] for ticket in ledger.ticket_open("read")], ["read-1"])
+
     def test_ticket_resume_transitions_repeats_and_rejected_skips(self) -> None:
         rule_id = self.rule("read")
         _ = self.cli("set-tip", "--tip", self.initial_tip, "--style-branch", "main")
@@ -2479,7 +2856,8 @@ class StyleLedgerTicketsTests(LedgerTestCase):
                               "--family", "names", "--crate", "crates/alpha", "--files", json.dumps([self.sources[0]]),
                               "--rules", json.dumps([rule]), success=False)
         self.assertEqual(result.returncode, 2)
-        self.assertEqual(result.stderr.strip(), "style_ledger: pin hash unavailable")
+        self.assertIn("style_ledger: ticket read-1 add: git hash-object failed (exit 17)", result.stderr)
+        self.assertNotIn("pin hash unavailable", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
         self.assertEqual(self.ledger().queued_tickets("read"), ())
         with closing(sqlite3.connect(self.ledger().database)) as connection:

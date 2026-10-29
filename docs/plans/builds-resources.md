@@ -71,54 +71,29 @@ Own what a build may use and when it starts: memory admission and the memory que
 
 **Ruled out:** a second JSON/flock writer in bash (the shell delegates to `memory_admit.py tripwire`); the process table in the tripwire (the gate reads only the pids the test's ledger names).
 
-### Phase 2 — The merge gate sets the tripwire for every test module, and every caller's tests fake both readings  · status: todo
-**Depends on:** Phase 1
+### Phase 2 — The merge gate sets the tripwire for every test module, and every caller's tests fake both readings  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** every test module in the merge gate runs with the tripwire set; a module that reads live memory fails the gate with the reading named, and no module in the suite does.
-
-**Spec:**
-
-1. **The gate sets the tripwire.** `test_module_environment` adds `BUILDLOG_LIVE_MEMORY_TRIPWIRE=<root>/live-memory-reads.jsonl` (`root` is the module's temporary folder). The `types` suite does not get it.
-2. **The gate fails a tripped module.** `finish_gate_job` reads `live-memory-reads.jsonl` like `build-tool-calls.jsonl`: for each line it appends `<module>: a test read live memory <reading>: <shlex-joined argv>` to the output, and any line sets status 1. Each line is a JSON object `{"reading": <path>, "argv": [...], "pid": <pid>}`, not the argv list that `build-tool-calls.jsonl` holds. Rename `GateJobResult.build_tool_started` to `tripwire_tripped` (true for a build-tool call or a live memory reading); :859 keeps a tripped module out of the alone rerun, as it does now for build tools. Update every reader of the old field name.
-3. **Find the set.** With items 1–2 in place, run the full merge gate with the worktree's own runner, since `~/.claude` main's copy has neither item: `env HERDR_BIN=/nonexistent/herdr python3 <worktree>/scripts/production/merge_gate.py --checkout <worktree> --tests-only --full` (`--checkout` selects the test tree only; the runner code is the file that runs). Every module that fails with `a test read live memory` goes on the list in the phase report, with its owner (Delegation Context survey).
-4. **Fix each module on the list.** Each module takes its memory variables from `fake_memory_readings` (Phase 1). Where a module already writes its own meminfo for a test value (for example `test_record.py` :249 compares `MemAvailable: 12582912 kB`), it keeps that value and writes it to the helper's file, or keeps its own file and adds the helper's `BUILDLOG_MEMORY_PRESSURE` entry. Assertions stay as they are. A module whose fix needs more than adding the helper goes to the unit director, who routes it to its owner with the gate output; it does not block the rest.
-5. **The pressure-only leaks the survey names** get the helper's `BUILDLOG_MEMORY_PRESSURE` entry even when the gate run in item 3 does not trip them: `scripts/buildlog/test_record.py`, `scripts/buildlog/test_mac_idle.py`, `scripts/direct/test_verify_doc.py`, `test_verify_release_ack.py`, `scripts/production/test_dailies_render_holds.py`. The tripwire trips on the read itself, not on a wait, so item 3 lists them on any machine; this item is the check that it did. Where a module takes its environment from a shared fixture module (`verify_*_test_support.py`, or another test module it imports), the fix goes in that fixture module, not in each consumer. The modules the survey lists under fake both need no change.
-6. **A test of the gate** in `scripts/production/test_merge_gate_suites.py`, beside `test_module_tool_calls_fail_even_when_its_tests_pass` :132: a module folder whose `live-memory-reads.jsonl` has one line gives status 1, the `a test read live memory` line and `tripwire_tripped` true; an empty or absent file leaves status as the module returned it. And an end-to-end case through `run_gate`, like the build-tool test: a fixture module whose tests pass but which writes one record line to the `BUILDLOG_LIVE_MEMORY_TRIPWIRE` path it receives makes the gate exit 1, prints `<module>: a test read live memory <reading>: <args>`, runs the module once (no `Rerun alone:`), and gives two modules distinct record paths; the `types` job gets no `BUILDLOG_LIVE_MEMORY_TRIPWIRE`. The build-tool tests stay as they are.
-7. **Docs.** `docs/as-built/merge-gate-and-test-speed.md`: the tripwire line names the live memory tripwire next to the build-tool tripwires. `docs/as-built/build-memory-admission.md`: the tests invariant says that the merge gate sets the tripwire for every module, and names its two limits: `test_memory_admit.py` `test_default_pressure_still_returns_pressure_when_tripwire_is_unset_or_empty` reads live pressure with the tripwire removed, by design; and a reading whose record write fails still refuses but leaves no record, so the gate sees only recorded readings. The same doc's floor sweep **Order** paragraph (:209) still teaches the order before Phase 3: correct it to the shipped order in `build-targets.md`, and say that the 60-minute window gives recent output a lower eviction priority, not full protection (Phase 3 architect review, F14).
+- `test_module_environment` sets `BUILDLOG_LIVE_MEMORY_TRIPWIRE=<module tmp>/live-memory-reads.jsonl` for every test module. The `types` suite gets no tripwire.
+- `finish_gate_job` reads that file. Each line is `{"reading": <path>, "argv": [...], "pid": <pid>}` and adds `<module>: a test read live memory <reading>: <args>` to the output and sets status 1. A line that does not parse also trips the module, with its raw text in the output.
+- `GateJobResult.tripwire_tripped` (was `build_tool_started`) is true for a build-tool call or a live memory reading. A tripped module is not rerun alone, and the hold retry keeps the result.
+- The five pressure-only leaks (`test_record.py`, `test_mac_idle.py`, `test_verify_doc.py`, `test_verify_release_ack.py`, `test_dailies_render_holds.py`) fake both readings with `fake_memory_readings`. No other module in the suite reads live memory.
 
 **Files:**
-- `scripts/production/merge_gate.py` — items 1–2 (owner: natedev showrunner).
-- `scripts/production/test_merge_gate_suites.py` — item 6 (owner: natedev showrunner).
-- `scripts/direct/test_verify_doc.py`, `scripts/direct/test_verify_release_ack.py` — item 5 (owner verify-unit).
-- `scripts/buildlog/test_mac_idle.py` — item 5 (owner verify-unit).
-- `scripts/buildlog/test_record.py` — item 5 (owner report-unit).
-- `scripts/production/test_dailies_render_holds.py` — item 5 (owner natedev showrunner).
-- `docs/as-built/merge-gate-and-test-speed.md`, `docs/as-built/build-memory-admission.md` — item 7.
+- `scripts/production/merge_gate.py` — tripwire environment, record read, tripped result.
+- `scripts/production/test_merge_gate_suites.py` — unit and end-to-end tripwire tests.
+- `scripts/buildlog/test_record.py`, `scripts/buildlog/test_mac_idle.py`, `scripts/direct/test_verify_doc.py`, `scripts/direct/test_verify_release_ack.py`, `scripts/production/test_dailies_render_holds.py` — fake both readings.
+- `docs/as-built/merge-gate-and-test-speed.md`, `docs/as-built/build-memory-admission.md` — the tripwire, its two limits, and the shipped floor sweep order.
 
-The item 3 gate run listed no other module, so the folder entries are now exact paths (Phase 3 architect review, F12).
+**Binds later work:** every test module runs under the tripwire in the merge gate, so a new test fakes both readings with `fake_memory_readings` or fails the gate. A test that trips on purpose uses a private record path, never the inherited one.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — items 1–5 and 7: the gate change, the full gate run, and each module's environment change. The writer reports the item 3 list with each module's owner and the failing test names.
-- `test` — item 6, written from this Spec alone.
+**Gotchas:**
+- `test_memory_admit.py` `test_default_pressure_still_returns_pressure_when_tripwire_is_unset_or_empty` reads live pressure with the tripwire removed, by design.
+- A reading whose record write fails still refuses but leaves no record. The gate sees only recorded readings.
+- A shell-side read records through `memory_admit.py tripwire <path>`, so `argv` names the checker, not the test. The output line takes the module name from the job.
 
-**Showrunner approval (2026-10-29):** edits to other owners' test files only add the helper to each test; nothing else in those files changes. verify-unit is a natedev unit until natedev transfers it: trial-merge its files against `origin/natedev-verify` and `origin/natedev`, and name each owner in the notice's also-touches line.
-
-**Constraints from prior phases:**
-- Phase 1's `fake_memory_readings` signature (`scripts/lint/memory_test_support.py`). An inherited `BUILDLOG_LIVE_MEMORY_TRIPWIRE` stays in use, an inherited empty value stays empty, and the default `root/"live-memory-reads.jsonl"` applies only when the variable is absent. So under item 1 a module's helper calls write to the gate's record file.
-- The refusal text: `live memory reading <live path> in a test; fake BUILDLOG_MEMINFO and BUILDLOG_MEMORY_PRESSURE (scripts/lint/memory_test_support.py)`. `memory_admit.py` `check_memory_reading` writes the record and raises `LiveMemoryReading`; a record write that fails still raises but leaves no line. The gate's record folder exists for the whole module run, so only a test that removes it can lose a record; the gate detects recorded readings only.
-- A shell-side read (`memory_gate.sh`) records through `memory_admit.py tripwire <path>`, so its `argv` names the checker, not the test. The gate's output line names the module from the job, not from `argv`.
-- Tests that trip on purpose use a private record path and never the inherited one: `test_memory_admit.py` :1128 and :1215, `test_brp_launch_gate.py` :136. Keep that rule in every fix, or the gate fails the module.
-- `test_memory_admit.py` `test_default_pressure_still_returns_pressure_when_tripwire_is_unset_or_empty` :1228 reads live `/proc/pressure/memory` with the tripwire removed, by design (it proves live behavior is unchanged). It writes no record; do not change it.
-- The worktree carries natedev 367da4f1 and c495a0b2 (director merge 73a8d903 of `origin/builds` ff44142b). Anchors in this Work Order are that tree's `merge_gate.py` and split tests.
-
-**Acceptance gate:**
-- A `--full` merge gate run with the worktree's runner (item 3's command) green with no `a test read live memory` line; the summary gives the item 3 list before the fixes and its count after (0).
-- `basedpyright` over the Lint directories and the directory of every changed module reports `0 errors, 0 warnings, 0 notes`.
-- The checkpoint notice has one `also touches` line per owner (verify-unit, report-unit, natedev showrunner), each with `git merge-tree --write-tree HEAD origin/<owner branch>` clean, and a trial merge against `origin/natedev`.
-- Module times for `test_brp_launch_gate.py`, `test_record.py` and `test_verify_token_wait.py` from this gate run next to their medians from the merge gate's own module history (`/build:report` has no module rows).
-- Change-Review line: the merge gate fails a test module that reads live machine memory | in a scratch copy of `~/.claude` (`git clone --shared ~/.claude <scratch>`), remove the `BUILDLOG_MEMORY_PRESSURE` entry from `test_brp_launch_gate.py` `setUp`, then run `env HERDR_BIN=/nonexistent/herdr python3 ~/.claude/scripts/production/merge_gate.py --checkout <scratch> --tests-only` | the module fails with `a test read live memory /proc/pressure/memory: …`.
+**Ruled out:** module medians from `/build:report`, which has no module rows; the merge gate's own timing history is the source.
 
 ### Phase 3 — The floor sweep keeps build output that is in use  · status: done
 
