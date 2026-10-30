@@ -46,6 +46,7 @@ if [[ $# -lt 1 ]]; then
 fi
 
 NAME="$1"
+GENERATION_OPTIONS="$(printf '%q ' "$@")"
 shift
 
 CRATE_TYPE="bin"
@@ -73,15 +74,75 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-# --- shared setup ---------------------------------------------------------
+# Every complete-file write uses a sibling, synced temporary file. Python's
+# fsync works on both supported platforms; mv publishes only complete bytes.
+publish_file() (
+  local destination="$1" temporary="$1.rust-generate-tmp"
+  shift
+  trap 'rm -f "$temporary"' EXIT
+  "$@" > "$temporary"
+  "$PY" -c 'import os, sys
+with open(sys.argv[1], "rb") as handle:
+    os.fsync(handle.fileno())' "$temporary"
+  mv -f "$temporary" "$destination"
+)
 
-if ! command -v cargo-generate &>/dev/null; then
-  echo "=== Installing cargo-generate ==="
-  cargo install cargo-generate
-fi
+cleanup_generation() {
+  rm -f "$DEST/.rust-generate-owner"
+  rm -f "$GENERATION_STATE"
+}
 
-[[ -f "$TEMPLATE_DIR/cargo-generate.toml" ]] || {
-  echo "Error: template not found at $TEMPLATE_DIR" >&2; exit 1
+complete_generation() {
+  publish_file "$GENERATION_STATE" printf '%s\n%s\ncompleted\n' "$GENERATION_OPTIONS" "$GENERATION_TOKEN"
+  cleanup_generation
+}
+
+generate_project() {
+  local parent stage
+  parent="$(dirname "$DEST")"
+  GENERATION_STATE="$parent/.$NAME.rust-generate"
+  stage="$parent/.$NAME.rust-generate-work"
+  mkdir -p "$parent"
+  if [[ -f "$GENERATION_STATE" ]]; then
+    if [[ "$(sed -n '1p' "$GENERATION_STATE")" != "$GENERATION_OPTIONS" ]]; then
+      echo "Error: $DEST has an unfinished generation with different options" >&2
+      exit 1
+    fi
+    GENERATION_TOKEN="$(sed -n '2p' "$GENERATION_STATE")"
+    [[ -n "$GENERATION_TOKEN" ]] || { echo "Error: invalid generation record" >&2; exit 1; }
+    if [[ "$(sed -n '3p' "$GENERATION_STATE")" == "completed" ]]; then
+      cleanup_generation
+      exit 0
+    fi
+  elif [[ -e "$DEST" ]]; then
+    echo "Error: $DEST already exists" >&2
+    exit 1
+  else
+    GENERATION_TOKEN="$("$PY" -c 'import uuid; print(uuid.uuid4().hex)')"
+    publish_file "$GENERATION_STATE" printf '%s\n%s\n' "$GENERATION_OPTIONS" "$GENERATION_TOKEN"
+  fi
+  if [[ -e "$DEST" ]] && { [[ ! -f "$DEST/.rust-generate-owner" ]] || [[ "$(cat "$DEST/.rust-generate-owner")" != "$GENERATION_TOKEN" ]]; }; then
+    echo "Error: $DEST already exists" >&2
+    exit 1
+  fi
+  if [[ ! -d "$DEST" ]]; then
+    if ! command -v cargo-generate &>/dev/null; then
+      echo "=== Installing cargo-generate ==="
+      cargo install cargo-generate
+    fi
+    [[ -f "$TEMPLATE_DIR/cargo-generate.toml" ]] || {
+      echo "Error: template not found at $TEMPLATE_DIR" >&2; exit 1
+    }
+    # Only unpublished template output is disposable. The ownership record is
+    # saved before generation; the final destination is published in one move.
+    rm -rf "$stage"
+    mkdir "$stage"
+    cargo generate --path "$TEMPLATE_DIR" --silent --name "$NAME" \
+      --destination "$stage" --define "bevy=$BEVY" "$@" "--$CRATE_TYPE"
+    publish_file "$stage/$NAME/.rust-generate-owner" printf '%s\n' "$GENERATION_TOKEN"
+    mv "$stage/$NAME" "$DEST"
+    rmdir "$stage"
+  fi
 }
 
 # =========================================================================
@@ -96,7 +157,6 @@ if [[ -n "$WORKSPACE_ROOT" ]]; then
 
   CRATES_DIR="$ROOT/crates"
   DEST="$CRATES_DIR/$NAME"
-  [[ -d "$DEST" ]] && { echo "Error: $DEST already exists" >&2; exit 1; }
   mkdir -p "$CRATES_DIR"
 
   # clippy::cargo_common_metadata (denied via the workspace cargo lint group)
@@ -111,19 +171,13 @@ if [[ -n "$WORKSPACE_ROOT" ]]; then
   HOMEPAGE="${REPO_URL%/}/tree/main/crates/$NAME"
 
   echo "=== Generating workspace member from template ==="
-  cargo generate --path "$TEMPLATE_DIR" \
-    --silent \
-    --vcs none \
-    --name "$NAME" \
-    --destination "$CRATES_DIR" \
-    --define "bevy=$BEVY" \
+  generate_project --vcs none \
     --define "workspace_member=true" \
     --define "published=$PUBLISHED" \
     --define "description=$DESCRIPTION" \
     --define "keywords=$KEYWORDS" \
     --define "categories=$CATEGORIES" \
-    --define "homepage_url=$HOMEPAGE" \
-    "--$CRATE_TYPE"
+    --define "homepage_url=$HOMEPAGE"
 
   if [[ "$BEVY" == "true" ]]; then
     echo "=== Adding bevy ==="
@@ -134,19 +188,20 @@ if [[ -n "$WORKSPACE_ROOT" ]]; then
 
   if [[ "$SHARED_DEP" == "true" ]]; then
     echo "=== Registering $NAME in [workspace.dependencies] ==="
-    "$PY" - "$ROOT/Cargo.toml" "$NAME" <<'PY'
+    publish_file "$ROOT/Cargo.toml" "$PY" - "$ROOT/Cargo.toml" "$NAME" <<'PY'
 import re, sys
 path, name = sys.argv[1], sys.argv[2]
 src = open(path).read()
 if re.search(rf'^\s*{re.escape(name)}\s*=', src, re.M):
-    print("  already present, skipping")
+    print("  already present, skipping", file=sys.stderr)
+    sys.stdout.write(src)
 else:
     line = f'{name} = {{ path = "crates/{name}" }}\n'
     new = re.sub(r'^\[workspace\.dependencies\]\n', lambda m: m.group(0) + line, src, count=1, flags=re.M)
     if new == src:
         sys.exit("  [workspace.dependencies] not found — add the path dep manually")
-    open(path, 'w').write(new)
-    print(f"  added {name} = {{ path = \"crates/{name}\" }}")
+    sys.stdout.write(new)
+    print(f"  added {name} = {{ path = \"crates/{name}\" }}", file=sys.stderr)
 PY
   fi
 
@@ -166,7 +221,14 @@ PY
   ( cd "$ROOT" && taplo fmt Cargo.toml "crates/$NAME/Cargo.toml" )
 
   echo "=== Committing to the workspace repo ==="
-  ( cd "$ROOT" && git add "crates/$NAME" Cargo.toml && git commit -m "feat: scaffold $NAME workspace member" )
+  (
+    cd "$ROOT"
+    git add "crates/$NAME" Cargo.toml ":(exclude)crates/$NAME/.rust-generate-owner"
+    if ! git diff --cached --quiet -- "crates/$NAME" Cargo.toml; then
+      git commit --only -m "feat: scaffold $NAME workspace member" -- "crates/$NAME" Cargo.toml ":(exclude)crates/$NAME/.rust-generate-owner"
+    fi
+  )
+  complete_generation
 
   echo "=== Done! ==="
   echo "Member: $DEST"
@@ -179,19 +241,8 @@ fi
 # =========================================================================
 DEST="$HOME/rust/$NAME"
 
-if [[ -d "$DEST" ]]; then
-  echo "Error: $DEST already exists" >&2
-  exit 1
-fi
-
 echo "=== Generating project from template ==="
-cargo generate --path "$TEMPLATE_DIR" \
-  --silent \
-  --name "$NAME" \
-  --destination "$HOME/rust" \
-  --define "bevy=$BEVY" \
-  --define "workspace_member=false" \
-  "--$CRATE_TYPE"
+generate_project --define "workspace_member=false"
 
 cd "$DEST"
 
@@ -204,11 +255,15 @@ if [[ "$BEVY" == "true" ]]; then
 fi
 
 echo "=== Excluding settings.local.json from git ==="
-echo "settings.local.json" >> .git/info/exclude
+if ! grep -qxF 'settings.local.json' .git/info/exclude; then
+  echo "settings.local.json" >> .git/info/exclude
+fi
 
 echo "=== Creating default settings.local.json ==="
 mkdir -p .claude
-cp "$HOME/.claude/templates/settings_local.json" .claude/settings.local.json
+if [[ ! -f .claude/settings.local.json ]]; then
+  publish_file .claude/settings.local.json cat "$HOME/.claude/templates/settings_local.json"
+fi
 
 if ! command -v cargo-mend &>/dev/null; then
   echo "=== Installing cargo-mend ==="
@@ -222,8 +277,11 @@ echo "=== Generating Cargo.lock ==="
 cargo generate-lockfile
 
 echo "=== Creating initial commit ==="
-git add -A
-git commit -m "Initial commit"
+git add -A -- . ':(exclude).rust-generate-owner'
+if ! git diff --cached --quiet; then
+  git commit -m "Initial commit"
+fi
+complete_generation
 
 echo "=== Done! ==="
 echo "Project: $DEST"
