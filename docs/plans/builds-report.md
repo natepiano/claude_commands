@@ -133,6 +133,7 @@ including the details to make it clear
 - `scripts/buildlog/launches.py` — `collect()` finishes pending launches
 - `scripts/buildlog/report.py` — `launches_section` shows "no admission"
 - `scripts/hana_shot/hana_shot.py` — one recorder call in cleanup
+- `scripts/hana_shot/test_hana_shot.py` — `BuildLogIsolatedTest` gives every test its own `BUILDLOG_DIR`; a test proves the real log stays unchanged
 - `scripts/buildlog/test_launch_recording.py` — 16 tests
 - `docs/as-built/buildlog-memory-stalls.md` — launch rows
 
