@@ -8,7 +8,7 @@ Every unit director on this machine, whatever its production, is found by its ho
 `/effort <level>` through the host's typing interface, never C-c or Escape; typing
 while it is mid-turn is fine. A pane showing a form, prompt or menu, or a draft in its input line,
 is skipped and reported. The registry's `production.director` row keeps its model and takes the
-level, through agent_admin.sh, before anything is typed. `--check` sends nothing and changes nothing.
+level, through agent_admin.sh and its shared-registry publisher, before anything is typed. `--check` sends nothing and changes nothing.
 """
 from __future__ import annotations
 
@@ -69,7 +69,7 @@ def director_row() -> DirectorRow:
 
 
 def set_row(model: str, level: str) -> str:
-    """Point the launch row at `<model>:<level>`; the empty string when it took, else why not."""
+    """Publish the shared launch row at `<model>:<level>`; empty on success, else why not."""
     done = subprocess.run(["bash", str(AGENTS / "agent_admin.sh"), ROW, f"{model}:{level}"],
                           capture_output=True, text=True, check=False)
     if done.returncode == 0:
