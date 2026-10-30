@@ -61,8 +61,8 @@ class ScoreIssuesTests(unittest.TestCase):
         definitions_path = self.root / "vault" / "conf" / "issue-areas.md"
         definitions_path.parent.mkdir()
         _ = definitions_path.write_text(
-            "| area | definition | issues |\n| --- | --- | --- |\n"
-            + "| unused-fixture-area | A definition outside the fixture vocabulary. | 1 |\n",
+            "| area | definition |\n| --- | --- |\n"
+            + "| unused-fixture-area | A definition outside the fixture vocabulary. |\n",
             encoding="utf-8",
         )
         read_definitions = vault.load_area_definitions
@@ -73,6 +73,16 @@ class ScoreIssuesTests(unittest.TestCase):
             return read_definitions(path)
 
         _ = self.enterContext(mock.patch.object(vault, "load_area_definitions", side_effect=temporary_definitions))
+        bases = self.root / "vault" / "home-base"
+        bases.mkdir()
+        _ = (bases / "issues - diegetic.base").write_text(
+            'filters:\n  and:\n    - project.contains(link("hana_diegetic"))\n')
+        read_projects = vault.load_project_names
+
+        def temporary_projects(base_dir: Path = vault.PROJECT_BASES_DIR) -> dict[str, str]:
+            return read_projects(bases if base_dir == vault.PROJECT_BASES_DIR else base_dir)
+
+        _ = self.enterContext(mock.patch.object(vault, "load_project_names", side_effect=temporary_projects))
 
     def issue(self, name: str, *, area: str = "rendering", extra: str = "") -> Path:
         path = self.issues / (name + ".md")
@@ -126,8 +136,8 @@ class ScoreIssuesTests(unittest.TestCase):
         _ = self.issue("Vocabulary tooling", area="tooling")
         definitions_path = self.root / "vault" / "conf" / "issue-areas.md"
         _ = definitions_path.write_text(
-            "| area | definition | issues |\n| --- | --- | --- |\n"
-            + "| rendering | Drawing scenes and managing render passes. | 1 |\n", encoding="utf-8")
+            "| area | definition |\n| --- | --- |\n"
+            + "| rendering | Drawing scenes and managing render passes. |\n", encoding="utf-8")
         before = {path: path.read_bytes() for path in self.issues.glob("*.md")}
         body_path = self.root / "body.md"
         _ = body_path.write_text("Repair [[render graph|the graph]].\n", encoding="utf-8")
@@ -225,25 +235,24 @@ class ScoreIssuesTests(unittest.TestCase):
         self.assertEqual(parts[5], "category feature (unsure)")
         self.assertIn("category feature / enhancement (unsure)", alternatives)
 
-    def test_propose_normalizes_every_issue_project_shorthand_before_building_state(self) -> None:
-        expected_projects = {
-            "bei": "bevy_enhanced_input", "biz": "biz", "brp": "bevy_brp_mcp",
-            "bwm": "bevy_window_manager", "cargo-berth": "cargo-berth", "cargo-liner": "cargo-liner",
-            "cargo-mend": "cargo-mend", "cargo-port": "cargo-port", "conduit": "hana_conduit",
-            "diegetic": "hana_diegetic", "fairy_dust": "fairy_dust", "hana": "hana",
-            "lading": "hana_lading", "lagrange": "bevy_lagrange", "liminal": "hana_liminal",
-            "nateroids": "nateroids", "panorbit": "bevy_panorbit_camera", "rust-template": "rust-template",
-        }
+    def test_propose_reads_a_new_project_base_and_refuses_it_after_removal(self) -> None:
+        base = self.root / "vault" / "home-base" / "issues - new-short.base"
+        _ = base.write_text('filters:\n  and:\n    - project.contains(link("hana_diegetic"))\n')
         _ = self.issue("Vocabulary rendering")
         _ = self.issue("Vocabulary tooling", area="tooling")
-        for shorthand, canonical in expected_projects.items():
-            with self.subTest(project=shorthand), mock.patch.object(client, "urlopen", side_effect=self.replay) as http:
-                _ = self.proposal(shorthand)
-                self.assertEqual(http.call_count, 2)
-                for call in http.call_args_list:
-                    payload = cast(run_records.RequestPayload, json.loads(gzip.decompress(cast(bytes, call.args[0].data))))
-                    self.assertEqual(payload["state"]["issue"]["project"], canonical)
-                    self.assertEqual(payload["state"]["issue"]["project_about"], questions.PROJECT_ABOUT[canonical])
+        with mock.patch.object(client, "urlopen", side_effect=self.replay) as http:
+            _ = self.proposal("new-short")
+        self.assertEqual(http.call_count, 2)
+        for call in http.call_args_list:
+            payload = cast(run_records.RequestPayload, json.loads(gzip.decompress(cast(bytes, call.args[0].data))))
+            self.assertEqual(payload["state"]["issue"]["project"], "hana_diegetic")
+            self.assertEqual(payload["state"]["issue"]["project_about"], questions.PROJECT_ABOUT["hana_diegetic"])
+        base.unlink()
+        with mock.patch.object(client, "urlopen") as http:
+            code, stdout, stderr = self.proposal_cli(["--project", "new-short", "--title", "Repair graph"])
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("new-short", stderr)
+        http.assert_not_called()
 
     def test_propose_unknown_project_exits_two_before_any_http_request(self) -> None:
         with mock.patch.object(client, "urlopen") as http:
@@ -341,6 +350,33 @@ class ScoreIssuesTests(unittest.TestCase):
         self.assertEqual({path: path.read_bytes() for path in before}, before)
         self.assertNotIn("fixture-key", result.read_text())
 
+    def test_score_includes_rated_unrated_default_style_and_reviewed_style_issues(self) -> None:
+        rated = self.issue("Target rated")
+        unrated = self.issue("Target unrated")
+        _ = unrated.write_text(unrated.read_text().replace("backlog_goal: \"1 - Ship Hana\"", "backlog_goal:")
+                               .replace("backlog_impact: ⭐", "backlog_impact:"))
+        default = self.issue("Target default style", extra=(
+            'style_rule: "global:rust/names.md"\nstyle_count: 2\n'), )
+        _ = default.write_text(default.read_text().replace("backlog_alignment: ⭐", "backlog_alignment: ⭐⭐")
+                               .replace("backlog_impact: ⭐", "backlog_impact: ⭐⭐"))
+        style = self.issue("Target reviewed style", extra=(
+            'style_rule: "global:rust/names.md"\nstyle_count: 2\n'))
+        _ = style.write_text(style.read_text().replace("backlog_impact: ⭐", "backlog_impact: ⭐⭐⭐⭐"))
+        closed = self.issue("Target closed")
+        _ = closed.write_text(closed.read_text().replace("status: open", "status: closed"))
+        _ = self.issue("Vocabulary tooling", area="tooling")
+        before = {path: path.read_bytes() for path in self.issues.glob("*.md")}
+        rules = self.root / "rules" / "rust"
+        rules.mkdir(parents=True)
+        _ = (rules / "names.md").write_text('---\nsummary: Name the semantic role.\n---\n')
+        with mock.patch.object(client, "urlopen", side_effect=self.replay) as http:
+            run = score_issues.score("Target*", issues_dir=self.issues, state_dir=self.state, rules_dirs=(rules.parent,))
+        self.assertEqual(run.failure_count, 0)
+        self.assertEqual(http.call_count, 8)
+        self.assertEqual({entry["issue_path"] for entry in self.records(run.result_path)},
+                         {str(path) for path in (rated, unrated, default, style)})
+        self.assertEqual({path: path.read_bytes() for path in self.issues.glob("*.md")}, before)
+
     def test_identical_content_version_and_model_reuse_cache_without_http(self) -> None:
         _ = self.issue("Target graph")
         _ = self.issue("Vocabulary seed", area="tooling")
@@ -360,8 +396,8 @@ class ScoreIssuesTests(unittest.TestCase):
         definitions = self.root / "issue-areas.md"
         first_definition = "Drawing scenes and managing render passes."
         second_definition = "Drawing scenes and managing GPU render passes."
-        original = ("| area | definition | issues |\n| --- | --- | --- |\n"
-                    f"| rendering | {first_definition} | 1 |\n")
+        original = ("| area | definition |\n| --- | --- |\n"
+                    f"| rendering | {first_definition} |\n")
         _ = definitions.write_text(original, encoding="utf-8")
         with mock.patch.object(client, "urlopen", side_effect=self.replay) as http:
             first = score_issues.score(only="Target*", issues_dir=self.issues, state_dir=self.state,
@@ -396,8 +432,8 @@ class ScoreIssuesTests(unittest.TestCase):
         _ = self.issue("Vocabulary seed", area="tooling")
         definitions = self.root / "issue-areas.md"
         _ = definitions.write_text(
-            "| area | definition | issues |\n| --- | --- | --- |\n"
-            + "| rendering | Drawing scenes and managing render passes. | 1 |\n", encoding="utf-8")
+            "| area | definition |\n| --- | --- |\n"
+            + "| rendering | Drawing scenes and managing render passes. |\n", encoding="utf-8")
         replacement = questions.area_questions(["rendering", "tooling"], {})["area_fits"]
         replacement["instructions"] = "Does `issue` concern an area in `areas`?"
 
@@ -558,6 +594,57 @@ class ScoreIssuesTests(unittest.TestCase):
         self.assertEqual(http.call_count, 4)
         state = cast(questions.AreaState, self.records(updated)[0]["payloads"]["area"]["state"])
         self.assertEqual(state["areas"], ["layout", "rendering"])
+
+    def test_every_style_input_invalidates_cache_without_changing_ordinary_labels(self) -> None:
+        target = self.issue("Target style", extra=(
+            'style_rule: "global:rust/names.md"\nstyle_crate: renderer\nstyle_count: 3\n'))
+        _ = self.issue("Vocabulary rendering")
+        _ = self.issue("Vocabulary tooling", area="tooling")
+        rules = self.root / "rules" / "rust"
+        rules.mkdir(parents=True)
+        rule = rules / "names.md"
+        _ = rule.write_text('---\nsummary: Name the guarantee.\n---\n')
+        renamed_rule = rules / "roles.md"
+        _ = renamed_rule.write_text(rule.read_text())
+        before = target.read_bytes()
+
+        def score_style() -> run_records.ScoredIssue:
+            run = score_issues.score("Target style", issues_dir=self.issues, state_dir=self.state,
+                                     rules_dirs=(rules.parent,))
+            return self.records(run.result_path)[0]
+
+        with mock.patch.object(client, "urlopen", side_effect=self.replay) as http:
+            previous = score_style()
+            self.assertEqual(http.call_count, 2)
+            self.assertEqual(target.read_bytes(), before)
+            style = previous["payloads"]["main"]["state"]["issue"]
+            self.assertEqual(style.get("style_crate"), "renderer")
+            self.assertEqual(style.get("finding_count"), 3)
+            self.assertEqual(previous.get("style_inputs"), {
+                "style_rules": style.get("style_rules"), "style_crate": "renderer", "finding_count": 3,
+            })
+            for name in ("summary", "rule name", "crate", "finding count", "definition"):
+                with self.subTest(input=name):
+                    if name == "summary":
+                        _ = rule.write_text('---\nsummary: Name the semantic role.\n---\n')
+                    elif name == "rule name":
+                        _ = renamed_rule.write_text(rule.read_text())
+                        _ = target.write_text(target.read_text().replace("names.md", "roles.md"))
+                    elif name == "crate":
+                        _ = target.write_text(target.read_text().replace("style_crate: renderer", "style_crate: widgets"))
+                    elif name == "finding count":
+                        _ = target.write_text(target.read_text().replace("style_count: 3", "style_count: 4"))
+                    else:
+                        definitions = self.root / "vault" / "conf" / "issue-areas.md"
+                        _ = definitions.write_text("area | definition\n--- | ---\nrendering | Drawing scenes.\n")
+                    calls = http.call_count
+                    updated = score_style()
+                    self.assertEqual(http.call_count, calls + 2)
+                    self.assertNotEqual(previous["content_hash"], updated["content_hash"])
+                    stable = score_style()
+                    self.assertEqual(http.call_count, calls + 2)
+                    self.assertEqual(stable["content_hash"], updated["content_hash"])
+                    previous = updated
 
     def test_scoring_runs_eight_issues_concurrently_and_writes_each_once(self) -> None:
         for number in range(10):
