@@ -503,3 +503,29 @@ Unpriced (below every priced one):
 - The first scan after landing re-parses local transcripts once; the Mac mirror and its cursors do not change.
 - `--settle` takes integer extra frames, not seconds.
 - Tests never start Hana: the natedev Hana ban holds, so the texts are proven against the fake BRP server only.
+
+### Phase 14 — A stopped `/hana_shot launch` never blocks the next launch or `shutdown` · status: todo
+
+#### Work Order
+
+**Goal:** a launch stopped while it writes its launch record leaves either no record or a whole one, and `hana_shot.py shutdown <port>` finishes its cleanup even when the record is broken, so a rerun works.
+
+**Spec:**
+- Source: `~/.claude/docs/plans/sdlc-rerun-sweep.md` (main 4dfc4dce), section screenshot-unit, row `scripts/hana_shot/hana_shot.py:2078` (showrunner, 2026-10-29). Today `launch` writes the record with `state_path.write_text(json.dumps(state))` after the app has started. A stop inside that write leaves incomplete JSON. `shutdown` (line 2129) calls `json.loads(state_path.read_text())` before it asks the app to stop, so it raises, and the app keeps the port; the next launch refuses that port.
+- Write the record atomically: one private helper writes the JSON to a temporary file in the same folder (`tempfile.NamedTemporaryFile(dir=state_path.parent, delete=False)` or `mkstemp`), flushes and fsyncs it, then `os.replace` puts it at `state_path`. On any exception before the replace, remove the temporary file. A stop at any point leaves no record or a whole record, never part of one.
+- `shutdown` reads the record through one private reader that returns `LaunchState | None` and a reason. It treats a record that does not parse as JSON, or that lacks `pid`, `binary`, `log` or `scratch`, as unreadable: it still calls `brp_extras/shutdown` on the port, prints one line `hana_shot: launch record <path> is unreadable (<reason>); asked Hana on port <port> to stop and removed the record` to stderr, and removes the record. It cannot know the scratch folder, so the line also names the scratch parent folder to check. It never kills a process group it cannot identify.
+- `shutdown` also removes any temporary record files beside `state_path` that this helper's name pattern left (a stop between write and replace).
+- Rerun behavior to prove: after a stop at line 2078, `shutdown <port>` exits 0 and leaves no record; then a new launch on that port starts normally.
+- No change to the record's fields, to `LaunchState`, or to the launch, settle and capture paths.
+
+**Files:**
+- `scripts/hana_shot/hana_shot.py` — atomic record write helper; tolerant record reader used by `shutdown`.
+- `scripts/hana_shot/test_hana_shot.py` — the rerun tests.
+
+**Workers:** 1 writer + 1 tester
+- `impl` — `scripts/hana_shot/hana_shot.py`.
+- `test` — `scripts/hana_shot/test_hana_shot.py`: (1) stop at the named line: write a partial record (`{"pid": 1, "po`) at `launch_state_path(port)` under a temporary state folder, with a fake BRP server on the port; `shutdown(port)` returns, sends `brp_extras/shutdown`, prints the unreadable line and removes the record; (2) a record missing `binary`: same result; (3) `os.replace` patched to raise during the write: no file at `state_path` and no temporary file left; (4) a stale temporary file beside the record is removed by `shutdown`; (5) a whole record still takes today's path (pid wait, scratch removal).
+
+**Constraints from prior phases:** failure texts follow Phase 10's "names its next step" form; `launch_state_path(port)` (line 1956) and `LaunchState` are unchanged; the fake-server test helpers in `test_hana_shot.py` already exist (Phase 13).
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/hana_shot -p 'test_*.py'` green with the five tests above; `basedpyright scripts/hana_shot/hana_shot.py scripts/hana_shot/test_hana_shot.py` ends `0 errors, 0 warnings, 0 notes`; the checkpoint merge gate (`python3 ~/.claude/scripts/production/merge_gate.py --checkout <tree> --tests-only`) green.
