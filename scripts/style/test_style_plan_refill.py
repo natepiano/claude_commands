@@ -17,6 +17,7 @@ import style_plan
 import style_proposals
 
 import berth_board
+import coverage_report
 import style_ledger
 
 from style_plan_test_support import StylePlanFixture
@@ -69,17 +70,46 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(ticket["files"], list(self.sources[:2]))
         self.assertEqual(self.sync_wait_rows(), [])
 
-    def test_refill_holds_for_crate_and_workspace_build_inputs(self) -> None:
+    def test_refill_starts_when_only_crate_and_workspace_build_inputs_change(self) -> None:
         _ = self.rule("read")
         self.sync()
         for path in ("crates/alpha/Cargo.toml", "crates/alpha/build.rs", "Cargo.toml", "Cargo.lock"):
+            content = (self.repo / path).read_text() if (self.repo / path).exists() else ""
+            self.write(path, content + "# incoming build input\n")
+        _ = self.commit()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        ticket = self.ledger().ticket_open("names-unit")[0]
+        self.assertEqual((ticket["files"], ticket["base"]), (list(self.sources[:2]), self.tip))
+        self.assertEqual(self.sync_wait_rows(), [])
+
+    def test_ticket_sync_check_ignores_lockfile_changes_for_rust_files(self) -> None:
+        changes = style_plan.MainChanges(self.tip, frozenset({"Cargo.lock"}))
+        self.assertEqual(style_plan.ticket_sync_check(changes, self.sources[:2]), style_plan.SyncNotNeeded())
+
+    def test_ticket_sync_check_ignores_crate_manifest_and_build_script_changes_for_rust_files(self) -> None:
+        changes = style_plan.MainChanges(self.tip, frozenset({"crates/alpha/Cargo.toml", "crates/alpha/build.rs"}))
+        self.assertEqual(style_plan.ticket_sync_check(changes, self.sources[:2]), style_plan.SyncNotNeeded())
+
+    def test_ticket_sync_check_waits_for_explicitly_listed_build_inputs(self) -> None:
+        for path in ("Cargo.toml", "Cargo.lock", "crates/alpha/Cargo.toml", "crates/alpha/build.rs"):
             with self.subTest(path=path):
-                _ = self.git("reset", "--hard", self.tip)
-                content = (self.repo / path).read_text() if (self.repo / path).exists() else ""
-                self.write(path, content + "# incoming build input\n")
-                _ = self.commit()
-                self.assertEqual(self.run_next(), (3, f"waiting for sync: read crates/alpha: main touched {path}\n", ""))
-                self.assertEqual(self.count_tickets(), 0)
+                changes = style_plan.MainChanges(self.tip, frozenset({path}))
+                self.assertEqual(style_plan.ticket_sync_check(changes, (path,)),
+                                 style_plan.SyncNeeded(f"main touched {path}"))
+
+    def test_ticket_sync_check_waits_for_a_listed_rust_file_without_crate_metadata(self) -> None:
+        path = self.sources[0]
+        changes = style_plan.MainChanges(self.tip, frozenset({path}))
+        self.assertEqual(style_plan.ticket_sync_check(changes, self.sources[:2]),
+                         style_plan.SyncNeeded(f"main touched {path}"))
+
+    def test_main_changes_does_not_read_the_workspace_for_touched_paths(self) -> None:
+        self.write("README.md", "Main changed an unrelated file.\n")
+        main = self.commit()
+        ledger = self.ledger()
+        with mock.patch.object(coverage_report, "workspace", side_effect=AssertionError("workspace read")):
+            self.assertEqual(style_plan.main_changes(ledger, "main", self.tip),
+                             style_plan.MainChanges(main, frozenset({"README.md"})))
 
     def test_refill_starts_after_a_rename_in_another_crate(self) -> None:
         _ = self.rule("read")
@@ -111,14 +141,14 @@ class StylePlanTests(StylePlanFixture):
                             f"{self.tip}..{main}")
         self.assertRegex(detected, rf"^C0[56]\d\t{source}\t{copied}$")
         self.assertEqual(style_plan.main_changes(self.ledger(), "main", self.tip),
-                         style_plan.MainChanges(main, frozenset({copied}), ("crates/alpha", "crates/beta")))
+                         style_plan.MainChanges(main, frozenset({copied})))
 
     def test_main_changes_reads_both_rename_paths(self) -> None:
         old, new = self.sources[2], "crates/beta/src/moved.rs"
         _ = self.git("mv", old, new)
         main = self.commit()
         self.assertEqual(style_plan.main_changes(self.ledger(), "main", self.tip),
-                         style_plan.MainChanges(main, frozenset({old, new}), ("crates/alpha", "crates/beta")))
+                         style_plan.MainChanges(main, frozenset({old, new})))
 
     def test_ticket_sync_check_uses_only_the_copy_destination(self) -> None:
         source, copied = self.sources[2], "crates/beta/src/copied.rs"
@@ -140,7 +170,7 @@ class StylePlanTests(StylePlanFixture):
                 expected = style_plan.SyncNeeded(f"main touched {path}") if path in (old, new) else style_plan.SyncNotNeeded()
                 self.assertEqual(style_plan.ticket_sync_check(changes, (path,)), expected)
 
-    def test_ticket_sync_check_protects_build_inputs_after_copies_and_renames(self) -> None:
+    def test_ticket_sync_check_ignores_unlisted_build_inputs_after_copies_and_renames(self) -> None:
         ledger = self.ledger()
         for operation, path in (("copy", "Cargo.lock"), ("copy", "crates/alpha/build.rs"),
                                 ("rename", "Cargo.toml"), ("rename", "crates/alpha/Cargo.toml")):
@@ -152,7 +182,8 @@ class StylePlanTests(StylePlanFixture):
                     _ = self.git("mv", path, path + ".old")
                 _ = self.commit()
                 changes = style_plan.main_changes(ledger, "main", self.tip)
-                self.assertEqual(style_plan.ticket_sync_check(changes, self.sources[:1]),
+                self.assertEqual(style_plan.ticket_sync_check(changes, self.sources[:1]), style_plan.SyncNotNeeded())
+                self.assertEqual(style_plan.ticket_sync_check(changes, (path,)),
                                  style_plan.SyncNeeded(f"main touched {path}"))
 
     def test_refill_holds_when_the_synced_tip_is_missing(self) -> None:
@@ -211,6 +242,21 @@ class StylePlanTests(StylePlanFixture):
         start.assert_not_called()
         self.assertEqual(self.count_tickets(), 0)
         self.assertEqual(self.ledger().proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket())
+
+    def test_refill_starts_the_selected_decision_when_only_the_lockfile_changes(self) -> None:
+        rule = self.rule("read")
+        self.sync()
+        issue = self.approved_decision(rule, self.sources[:1], "rename")
+        self.write("Cargo.lock", "# incoming lockfile update\n")
+        _ = self.commit()
+        with mock.patch.object(style_proposals, "proposal_command") as start:
+            code, output, errors = self.run_next()
+        self.assertEqual(code, 0, errors + output)
+        start.assert_called_once()
+        ticket = self.ledger().ticket_open("names-unit")[0]
+        self.assertEqual((ticket["kind"], ticket["proposal"], ticket["files"], ticket["base"]),
+                         ("proposal", str(issue), list(self.sources[:1]), self.tip))
+        self.assertEqual(self.sync_wait_rows(), [])
 
     def test_refill_holds_a_rename_when_main_adds_a_reference(self) -> None:
         rule = self.rule("read")

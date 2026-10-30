@@ -184,14 +184,16 @@ EOF
     [[ "$family_display" == *" word=sol"* && "$family_display" == *" agent=gpt-6.10-sol "* ]] \
         || fail "/agent did not display both the family word and its current slug"
 
-    # Missing, malformed and hidden-only caches must never fall back to the
+    # Unreadable and hidden-only caches must never fall back to the
     # previously generated family row. Explicit slugs remain usable offline.
     no_model_message="no Codex model for 'sol' in ~/.codex/models_cache.json; run codex once to refresh the cache, or name the full slug"
-    for cache_state in other-family hidden-only missing malformed unreadable; do
+    for cache_state in other-family hidden-only missing empty malformed unreadable; do
+        expected_error="the models cache could not be read: $CODEX_MODELS_CACHE_FILE"
         case "$cache_state" in
-            other-family) printf '%s\n' '{"models":[{"slug":"gpt-6-astra","visibility":"list"}]}' > "$CODEX_MODELS_CACHE_FILE" ;;
-            hidden-only) printf '%s\n' '{"models":[{"slug":"gpt-9-sol","visibility":"hide"}]}' > "$CODEX_MODELS_CACHE_FILE" ;;
+            other-family) printf '%s\n' '{"models":[{"slug":"gpt-6-astra","visibility":"list"}]}' > "$CODEX_MODELS_CACHE_FILE"; expected_error="$no_model_message" ;;
+            hidden-only) printf '%s\n' '{"models":[{"slug":"gpt-9-sol","visibility":"hide"}]}' > "$CODEX_MODELS_CACHE_FILE"; expected_error="$no_model_message" ;;
             missing) rm -f "$CODEX_MODELS_CACHE_FILE" ;;
+            empty) : > "$CODEX_MODELS_CACHE_FILE" ;;
             malformed) printf '%s\n' '{invalid' > "$CODEX_MODELS_CACHE_FILE" ;;
             unreadable)
                 printf '%s\n' '{"models":[{"slug":"gpt-6.10-sol","visibility":"list"}]}' > "$CODEX_MODELS_CACHE_FILE"
@@ -205,8 +207,11 @@ EOF
         fi
         resolve_status=0
         stderr_out="$(agents_resolve launch.work 2>&1 >/dev/null)" || resolve_status=$?
-        [[ "$resolve_status" -eq 1 && "$stderr_out" == *"$no_model_message"* ]] \
+        [[ "$resolve_status" -eq 1 && "$stderr_out" == *"$expected_error"* ]] \
             || fail "$cache_state cache did not refuse sol with the named recovery message: $stderr_out"
+        if [[ "$expected_error" != "$no_model_message" && "$stderr_out" == *"no Codex model"* ]]; then
+            fail "$cache_state cache was mistaken for a missing model"
+        fi
         agents_resolve launch.pinned || fail "full slug required a usable cache ($cache_state)"
         [[ "$AGENT_MODEL" == gpt-6.9-sol && "$AGENT_EFFORT" == high ]] \
             || fail "offline full slug resolved incorrectly ($cache_state)"
@@ -292,11 +297,11 @@ EOF
 
     agents_set_assignment dormant claude
     rm "$CODEX_MODELS_CACHE_FILE"
-    no_model_message="no Codex model for 'sol' in ~/.codex/models_cache.json; run codex once to refresh the cache, or name the full slug"
+    no_model_message="the models cache could not be read: $CODEX_MODELS_CACHE_FILE"
     admin_output="$(bash "$SCRIPT_DIR/agent_admin.sh" dormant)" \
         || fail "missing cache blocked status for a function running on Claude"
     dormant_display="$(printf '%s\n' "$admin_output" | awk '/^task=dormant.work family=codex /')"
-    [[ "$dormant_display" == *"sol (unresolved: $no_model_message)"* && "$dormant_display" == *"active=no"* ]] \
+    [[ "$dormant_display" == *"sol (unresolved: $no_model_message"* && "$dormant_display" == *"active=no"* ]] \
         || fail "status omitted the unresolved dormant family and its recovery reason: $admin_output"
     [[ "$admin_output" == *"task=dormant.work family=claude agent=haiku effort=high active=yes"* \
         && "$admin_output" == *"# current family: claude"* ]] \
@@ -305,7 +310,7 @@ EOF
     [[ "$AGENT_MODEL" == haiku ]] || fail "Claude launch used the dormant family"
     admin_output="$(bash "$SCRIPT_DIR/agent_admin.sh" probe)" \
         || fail "missing cache blocked status for an active family row"
-    [[ "$admin_output" == *"sol (unresolved: $no_model_message)"* ]] \
+    [[ "$admin_output" == *"sol (unresolved: $no_model_message"* ]] \
         || fail "active family status did not show its resolution failure"
     resolve_status=0
     stderr_out="$(agents_resolve probe.work 2>&1 >/dev/null)" || resolve_status=$?
