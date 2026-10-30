@@ -106,7 +106,7 @@ Known input for the inventory: `scripts/agents/test_codex_mesh.py` was killed at
 
 **Ruled out:** the gate in the production checkout (a merge may start there), in a copied `.git` pointer (it moves the real branch) or in an export with no git (it fails a shutdown test); a second copy of the test-step, pass or flake code.
 
-### Phase 2c — The assertion guard pairs a moved Rust string continuation  · status: todo
+### Phase 2c — The assertion guard pairs a moved Rust string continuation  · status: done
 **Depends on:** none
 
 #### Work Order

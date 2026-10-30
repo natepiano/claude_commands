@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from typing import ClassVar, override
@@ -80,6 +81,14 @@ class GitRepositoryFixture(unittest.TestCase):
 
     def rust(self, assertion: str, name: str = "test_value") -> str:
         return f"#[test]\nfn {name}() {{\n    {assertion}\n}}\n"
+
+    def move_rust_assertion_to_test_file(self, before: str, after: str,
+                                       name: str = "test_value") -> None:
+        _ = self.save("render.rs", "mod tests {\n" + textwrap.indent(self.rust(before, name), "    ") + "}\n")
+        _ = self.save("render/tests/mod.rs", "// Destination for the moved test.\n")
+        self.commit_base()
+        _ = self.save("render.rs", "// Tests moved to render/tests/mod.rs.\n")
+        _ = self.save("render/tests/mod.rs", self.rust(after, name))
 
     def python(self, assertion: str, name: str = "test_value") -> str:
         return f"def {name}(self):\n    {assertion}\n"

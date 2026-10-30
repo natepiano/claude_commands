@@ -6,6 +6,60 @@ import unittest
 from scripts.direct.assertion_guard_test_support import AssertionFindingFixture
 
 class AssertionStringTests(AssertionFindingFixture):
+    def test_moved_rust_message_continuation_ignores_the_new_indent(self) -> None:
+        for prefix in ("", "b", "c"):
+            with self.subTest(prefix=prefix):
+                assertion = f'assert!(short < long, {prefix}"fewer rows \\\n         cost less");'
+                self.move_rust_assertion_to_test_file(
+                    assertion, assertion, "a_short_tree_asks_for_fewer_rows_than_a_long_one",
+                )
+                self.assert_clean(self.guard())
+
+    def test_moved_rust_message_continuation_still_reports_a_changed_word(self) -> None:
+        for prefix in ("", "b", "c"):
+            with self.subTest(prefix=prefix):
+                before = f'assert!(short < long, {prefix}"fewer rows \\\n         cost less");'
+                after = f'assert!(short < long, {prefix}"fewer rows \\\n         require less");'
+                self.move_rust_assertion_to_test_file(before, after)
+                _ = self.assert_finding(self.guard(), "render.rs", "removed")
+
+    def test_moved_escaped_backslashes_and_raw_strings_keep_message_whitespace(self) -> None:
+        for prefix, suffix, backslashes in (
+            ("", "", 2), ("b", "", 2), ("c", "", 2), ("", "", 4),
+            ("r", "", 1), ("r#", "#", 1), ("br#", "#", 1), ("cr#", "#", 1),
+        ):
+            with self.subTest(prefix=prefix, backslashes=backslashes):
+                assertion = (f'assert!(short < long, {prefix}"fewer rows '
+                             + "\\" * backslashes + '\n         cost less"' + suffix + ');')
+                self.move_rust_assertion_to_test_file(assertion, assertion)
+                _ = self.assert_finding(self.guard(), "render.rs", "removed")
+
+    def test_python_message_continuation_keeps_leading_whitespace(self) -> None:
+        before = 'assert short < long, "fewer rows \\\n             cost less"'
+        after = 'assert short < long, "fewer rows \\\n         cost less"'
+        self.change("test_value.py", self.python(before), self.python(after))
+        _ = self.assert_finding(self.guard(), "test_value.py", "changed", status=0)
+
+    def test_python_f_string_changed_nested_string_is_a_finding(self) -> None:
+        before = "self.assertEqual(actual, f'{str(' ')}')"
+        after = "self.assertEqual(actual, f'{str('')}')"
+        self.change("test_value.py", self.python(before), self.python(after))
+        _ = self.assert_finding(self.guard(), "test_value.py", "changed", status=0)
+
+    def test_moved_python_f_string_expression_ignores_operator_spacing(self) -> None:
+        _ = self.save("test_old.py", self.python("self.assertEqual(actual, f'{value + 1}')"))
+        _ = self.save("test_new.py", "# Destination for the moved test.\n")
+        self.commit_base()
+        _ = self.save("test_old.py", "# Test moved to test_new.py.\n")
+        _ = self.save("test_new.py", self.python("self.assertEqual(actual, f'{value+1}')"))
+        self.assert_clean(self.guard())
+
+    def test_python_numeric_message_continuation_keeps_leading_whitespace(self) -> None:
+        before = 'self.assertEqual(len(rows), 3, "fewer rows \\\n             cost less")'
+        after = 'self.assertEqual(len(rows), 3, "fewer rows \\\n         cost less")'
+        self.change("test_value.py", self.python(before), self.python(after))
+        _ = self.assert_finding(self.guard(), "test_value.py", "changed", status=0)
+
     def test_unreadable_code_refuses_constant_pairing(self) -> None:
         for syntax in ("fn é() {}", "fn r#helper() {}", "extern crate std as harmless;"):
             for in_glob in (False, True):

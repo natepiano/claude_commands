@@ -45,8 +45,8 @@ NUMERIC_LITERAL = re.compile(
 NUMERIC_TYPES = frozenset(("i8", "i16", "i32", "i64", "i128", "isize",
                            "u8", "u16", "u32", "u64", "u128", "usize", "f32", "f64"))
 RUST_LITERAL = re.compile(
-    r'''(?:br(?<!\wbr)|r(?<!\wr))(?P<hashes>\#*)"(?s:.*?)"(?P=hashes)'''
-    + r'''|b?"(?:\\.|[^"\\])*"|b?'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^'\\])'|//[^\n]*|/\*'''
+    r'''(?:br(?<!\wbr)|cr(?<!\wcr)|r(?<!\wr))(?P<hashes>\#*)"(?s:.*?)"(?P=hashes)'''
+    + r'''|[bc]?"(?:\\.|[^"\\])*"|b?'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^'\\])'|//[^\n]*|/\*'''
     + r"|(?<!\w)(?:" + NUMERIC_LITERAL.pattern + r")(?!\w)", re.DOTALL)
 BLOCK_COMMENT = re.compile(r"/\*|\*/")
 IDENTIFIER = re.compile(r"\b[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*\b")
@@ -74,7 +74,7 @@ class DiffLine(NamedTuple):
 
     @property
     def key(self) -> str:
-        return normalized(self.text)
+        return normalized(self.text, self.path.endswith(".rs"))
 
 
 @dataclass(frozen=True)
@@ -137,12 +137,22 @@ class TouchedAssertion(NamedTuple):
     numeric_constants: tuple[NumericOccurrence, ...] = ()
 
 
-def normalized(text: str) -> str:
+def rust_string_key(literal: str) -> str:
+    """Drop string continuations; keep every other escape as written."""
+    # Consume escape pairs in order so an escaped backslash stays literal.
+    return re.sub(r"\\(?:\r?\n[ \t\n\r]*|.)",
+                  lambda escape: "" if escape[0].startswith(("\\\n", "\\\r\n")) else escape[0], literal)
+
+
+def normalized(text: str, rust: bool) -> str:
     parts: list[str] = []
     cursor = 0
     for token in lexical_spans(text, True):
         if token.kind == "literal":
-            parts.extend(("".join(text[cursor:token.first].split()), text[token.first:token.last]))
+            literal = text[token.first:token.last]
+            if rust and literal.startswith(('"', 'b"', 'c"')):
+                literal = rust_string_key(literal)
+            parts.extend(("".join(text[cursor:token.first].split()), literal))
             cursor = token.last
     parts.append("".join(text[cursor:].split()))
     return "".join(parts)
@@ -791,7 +801,7 @@ def argument_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def comparison_operands(text: str) -> tuple[tuple[str, ...], bool]:
+def comparison_operands(text: str, rust: bool) -> tuple[tuple[str, ...], bool]:
     """Read a top-level comparison, including one followed by another condition."""
     text = text.strip()
     openings: list[int] = []
@@ -828,13 +838,14 @@ def comparison_operands(text: str) -> tuple[tuple[str, ...], bool]:
             end -= 1
     for level, index, right, operator in comparisons:
         if level == depth:
-            return ((normalized(text[start:index]), normalized(text[right:end])),
+            return ((normalized(text[start:index], rust), normalized(text[right:end], rust)),
                     operator in ("==", "!=", "is"))
-    return (normalized(text[start:end]),), False
+    return (normalized(text[start:end], rust),), False
 
 
 def parse_assertion(line: DiffLine, hunks: tuple[int, ...], comparison: str) -> Assertion:
-    match = ASSERTION.search(code_lines([comparison], line.path.endswith(".rs"))[0])
+    rust = line.path.endswith(".rs")
+    match = ASSERTION.search(code_lines([comparison], rust)[0])
     if match is None:
         raise GuardError("cannot read assertion")
     name = match.group("macro") or match.group("method") or match.group("bare") or match.group("raises")
@@ -843,10 +854,10 @@ def parse_assertion(line: DiffLine, hunks: tuple[int, ...], comparison: str) -> 
                      if arguments[start:end].strip())
     exact = name in EXACT_CALLS
     if name in ("assert", "debug_assert", "prop_assert") and operands:
-        operands, exact = comparison_operands(operands[0])
+        operands, exact = comparison_operands(operands[0], rust)
     else:
-        operands = tuple(normalized(operand) for operand in operands)
-    subject_text = normalized(arguments) if match.group("bare") else normalized(comparison)
+        operands = tuple(normalized(operand, rust) for operand in operands)
+    subject_text = normalized(arguments if match.group("bare") else comparison, rust)
     return Assertion(line, name, operands, exact, not exact and is_weaker(comparison), hunks, subject_text)
 
 
@@ -1047,6 +1058,7 @@ class NumericAssertionBucket:
 def numeric_comparison(assertion: TouchedAssertion) -> NumericComparison:
     """Keep the whole assertion and every digit exact, with numeric types separate."""
     text = assertion.comparison
+    rust = assertion.source.path.endswith(".rs")
     occurrences = list(assertion.numeric_constants)
     for span in lexical_spans(text, True):
         if span.kind == "literal" and not text[:span.first].rstrip().endswith("-"):
@@ -1059,12 +1071,12 @@ def numeric_comparison(assertion: TouchedAssertion) -> NumericComparison:
     values: list[NumericLiteral | NumericConstant] = []
     cursor = 0
     for occurrence in occurrences:
-        fragments.append(normalized(text[cursor:occurrence.first]))
+        fragments.append(normalized(text[cursor:occurrence.first], rust))
         value = occurrence.value
         digits.append(value.literal.digits if isinstance(value, NumericConstant) else value.digits)
         values.append(value)
         cursor = occurrence.last
-    fragments.append(normalized(text[cursor:]))
+    fragments.append(normalized(text[cursor:], rust))
     return NumericComparison(NumericAssertionKey(assertion.source.path, tuple(fragments), tuple(digits)), tuple(values))
 
 
@@ -1425,7 +1437,9 @@ def findings_against_base(repo: Path, base: str, head: str, staged: bool,
 
 def finding_identity(finding: Finding) -> tuple[str, str, Kind, str, str]:
     """Match the same change across parents even when source line numbers differ."""
-    return (finding.source.path, finding.test, finding.kind, normalized(finding.old), normalized(finding.new))
+    rust = finding.source.path.endswith(".rs")
+    return (finding.source.path, finding.test, finding.kind,
+            normalized(finding.old, rust), normalized(finding.new, rust))
 
 
 def run(arguments: list[str]) -> int:
