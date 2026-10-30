@@ -17,30 +17,7 @@ $ARGUMENTS contains: `<project-shorthand> <issue title on first line>\n<optional
 
 ## Project mapping
 
-Look up the project shorthand from the base files in the vault's home-base/ folder (`~/rust/hanadocs/home-base/issues - <short>.base`). The mapping is:
-
-| Shorthand | Project link | Base file |
-|-----------|-------------|-----------|
-| bei | bevy_enhanced_input | issues - bei.base |
-| biz | biz | issues - biz.base |
-| brp | bevy_brp_mcp | issues - brp.base |
-| bwm | bevy_window_manager | issues - bwm.base |
-| cargo-berth | cargo-berth | issues - cargo-berth.base |
-| cargo-liner | cargo-liner | issues - cargo-liner.base |
-| cargo-mend | cargo-mend | issues - cargo-mend.base |
-| cargo-port | cargo-port | issues - cargo-port.base |
-| conduit | hana_conduit | issues - conduit.base |
-| diegetic | hana_diegetic | issues - diegetic.base |
-| fairy_dust | fairy_dust | issues - fairy_dust.base |
-| hana | hana | issues - hana.base |
-| lading | hana_lading | issues - lading.base |
-| lagrange | bevy_lagrange | issues - lagrange.base |
-| liminal | hana_liminal | issues - liminal.base |
-| nateroids | nateroids | issues - nateroids.base |
-| panorbit | bevy_panorbit_camera | issues - panorbit.base |
-| rust-template | rust-template | issues - rust-template.base |
-
-If the shorthand doesn't match any of these, tell the user and stop.
+Read the canonical project from `~/rust/hanadocs/home-base/issues - <short>.base` (`vault.load_project_names()` in `scripts/issue_score/vault.py`). These base files are the only shorthand source. If the base file is missing, tell the user and stop.
 
 ## Process
 
