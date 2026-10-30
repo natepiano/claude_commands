@@ -100,6 +100,19 @@ tripwire records and refuses a real cgroup read before opening the file.
 The service charge stays in the queue view and can be a blocker unit. It is
 not a running build step, so it does not disable either run-alone exception.
 
+The peak charge expires after **1500 s (25 min)** without a recorded sample
+at or above half the current peak. This bound adds margin to the longest
+measured hana nextest wave gap, 954 s (2026-10-29, sparse slice samples).
+The sampler publishes `.max` first, then records the committed peak and its
+last near-peak time in `.wave` with an atomic rename, at most once per 60 s
+while use stays near the peak, and with every new peak. Decay requires the
+recorded peak to match `.max`; a failed time update cannot discard a new peak.
+After expiry, current memory and any ramp promise still count. A step with no
+`.wave` (a sampler from before the decay) decays 1500 s after its `.max` file
+last changed. An unreadable, malformed, old time-only or mismatched record,
+or a negative time, keeps the peak charge.
+Release and stale-reservation cleanup remove `.wave` with `.max`.
+
 A pressure hold enables start spacing, including a launch hold before the
 admission ledger exists. The first step can start as soon as pressure clears and the ordinary memory rules allow it. Each later start is
 at least **30 s** after the preceding start, until **120 s** after the first

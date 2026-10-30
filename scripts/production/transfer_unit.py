@@ -209,11 +209,18 @@ def preflight(transfer: UnitTransfer) -> None:
                             + f"{transfer.to_merge_branch} lacks; they would move with the unit")
 
 
-def _check_doc(checkout: Path, merge_branch: str, doc: Path) -> None:
+def _check_doc(checkout: Path, merge_branch: str, doc: Path, expected: str = "") -> None:
     if git(checkout, "branch", "--show-current") != merge_branch:
         raise RenameRefused(f"{checkout} is not on {merge_branch}")
     if git(checkout, "status", "--porcelain", "--", str(doc)):
-        raise RenameRefused(f"{doc} has uncommitted changes")
+        # A journaled row step can have written (or staged) exactly its own edit before stopping.
+        if not expected or doc.read_text(encoding="utf-8") != expected:
+            raise RenameRefused(f"{doc} has uncommitted changes")
+        relative = doc.relative_to(checkout)
+        committed = _blob_text(checkout, f"HEAD:{relative}")
+        staged = _blob_text(checkout, f":{relative}")
+        if staged not in (committed, expected):
+            raise RenameRefused(f"{doc} has uncommitted changes")
 
 
 def _check_ready(transfer: UnitTransfer) -> None:
@@ -353,14 +360,15 @@ def _commit_to(transfer: UnitTransfer, save: Callable[[], None]) -> None:
     if transfer.to_commit:
         return
     if git(checkout, "show", "-s", "--format=%s", "HEAD") != transfer.to_message:
-        _check_doc(checkout, transfer.to_merge_branch, doc)
         row = _row(Path(transfer.from_doc), transfer.unit)
         if row is None:
             raise RenameRefused(f"{transfer.unit} has no Units row in {transfer.from_doc} to move")
-        lines = doc.read_text(encoding="utf-8").splitlines()
+        lines = _blob_text(checkout, f"HEAD:{doc.relative_to(checkout)}").splitlines()
         insert_at, _ = production_units.unit_rows(lines)
         lines.insert(insert_at, _row_line(row, production_units.unit_headings(lines)))
-        write_text(doc, "\n".join(lines) + "\n")
+        expected = "\n".join(lines) + "\n"
+        _check_doc(checkout, transfer.to_merge_branch, doc, expected)
+        write_text(doc, expected)
     transfer.to_commit = _commit_only(checkout, [doc], transfer.to_message)
     save()
 
@@ -370,14 +378,15 @@ def _commit_from(transfer: UnitTransfer, save: Callable[[], None]) -> None:
     if transfer.from_commit:
         return
     if git(checkout, "show", "-s", "--format=%s", "HEAD") != transfer.from_message:
-        _check_doc(checkout, transfer.from_merge_branch, doc)
-        lines = doc.read_text(encoding="utf-8").splitlines(keepends=True)
+        lines = _blob_text(checkout, f"HEAD:{doc.relative_to(checkout)}").splitlines(keepends=True)
         start = lines.index("## Units\n")
         end = next((index for index in range(start + 1, len(lines)) if lines[index].startswith("## ")), len(lines))
         kept = [line for index, line in enumerate(lines) if not (
             start < index < end and line.startswith("|")
             and production_units.cell_value(production_units.row_cells(line)[0]) == transfer.unit)]
-        write_text(doc, "".join(kept))
+        expected = "".join(kept)
+        _check_doc(checkout, transfer.from_merge_branch, doc, expected)
+        write_text(doc, expected)
     transfer.from_commit = _commit_only(checkout, [doc], transfer.from_message)
     save()
 
