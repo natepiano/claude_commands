@@ -868,12 +868,18 @@ class DurableRolesTests(unittest.TestCase):
                                                  "host": "natedev"}), authority_before)
 
     def test_adoption_preserves_thread_alias_and_pending_text_and_is_retryable(self) -> None:
+        self.assert_adoption_preserves_thread_and_pending_text({"model": "gpt-fixture", "effort": "xhigh"})
+
+    def test_adoption_with_only_accepted_turn_settings_preserves_the_thread_and_pending_text(self) -> None:
+        self.assert_adoption_preserves_thread_and_pending_text({"turn_model": "gpt-fixture", "turn_effort": "xhigh"})
+
+    def assert_adoption_preserves_thread_and_pending_text(self, settings: dict[str, str]) -> None:
         source = self.root / "old-run"
         source.mkdir()
         name, thread = "original-designer-alias", "original-thread"
         _ = (source / "mesh_roster.json").write_text(json.dumps({name: {
             "thread_id": thread, "status": "done", "cwd": str(self.repository),
-            "model": "gpt-fixture", "effort": "xhigh"}}))
+            **settings}}))
         _ = (source / "mesh_server.json").write_text(json.dumps({"port": 32100, "pid": os.getpid(),
                                                                  "codex_home": str(self.root / "codex-home")}))
         holder = design_roles.UnitHolder("demo", "design-unit")

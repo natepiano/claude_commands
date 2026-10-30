@@ -323,7 +323,7 @@ with (patch.object(agent_accounts, 'command_json', return_value={
             http.assert_called_once()
             finish.assert_not_called()
             self.assertEqual(errors.getvalue().splitlines(),
-                ["usage store: could not claim the read; read without a hold"])
+                [f"usage store: could not claim the read; {error}; read without a hold"])
 
     def test_a_finish_store_error_keeps_the_good_live_report(self) -> None:
         for error in (OSError("disk full"), ValueError("bad store")):
@@ -338,7 +338,7 @@ with (patch.object(agent_accounts, 'command_json', return_value={
             self.assertIsNone(report.quota_problem)
             http.assert_called_once()
             self.assertEqual(errors.getvalue().splitlines(),
-                ["usage store: could not save the read; keep the live report"])
+                [f"usage store: could not save the read; {error}; keep the live report"])
 
     def test_stale_token_makes_no_attempt(self) -> None:
         with (patch.object(agent_accounts, "claude_credentials", return_value={

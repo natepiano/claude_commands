@@ -12,7 +12,6 @@ from collections.abc import Callable
 import subprocess
 import sys
 import tempfile
-import unittest
 from pathlib import Path
 from typing import ClassVar, cast, override
 from unittest import mock
@@ -20,12 +19,15 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fake_showrunner
-import fake_unit_host
+from scripts.production import fake_unit_host
 
 from scripts.herdr import fake_herdr
 from scripts.direct import review_pool
-from scripts.production import showrunners as pool_showrunners
+from scripts.production import staff, showrunners as pool_showrunners
 from scripts.production.cli_fixture import invoke_cli
+from scripts.production.rename_test_support import bind_staff_fixture
+from scripts.production.staff_test_support import StaffTestCase
+from scripts.lib.atomic_file import write_text_atomic
 import transfer_unit
 import rename_unit
 import retire_unit
@@ -41,7 +43,7 @@ TEST_HANG_GUARD_SECS = 300
 SCRIPT = Path(__file__).with_name("transfer_unit.py")
 
 
-class UnitTransferFixture(unittest.TestCase):
+class UnitTransferFixture(StaffTestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root: Path = Path()
@@ -69,10 +71,15 @@ class UnitTransferFixture(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         # Preserve absolute Git worktree and document paths, with private writable copies.
         _ = shutil.copytree(self.snapshot, self.fixture_root)
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.bind_fixture(self.fixture_root)
+        bind_staff_fixture(self, self.env, {"demo": ("alpha-unit", "beta-unit"), "other": ("gamma-unit",)})
+        self.write(self.root / "state/notifier/showrunner-other/conf",
+                   "TARGET=session:other-showrunner\nCHECK=" + shlex.join(["zsh", "/scripts/production_check.sh",
+                   str(self.receiving / "docs/plans/other-production.md")]) + "\n")
         for module, name, value in (
             (pool_showrunners, "NOTIFIER_STATE_DIR", self.root / "state/notifier"),
             (pool_showrunners, "SHOWRUNNER_STATE_DIR", self.root / "state/showrunner"),
@@ -172,7 +179,34 @@ class UnitTransferFixture(unittest.TestCase):
 
     def write(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        _ = path.write_text(content, encoding="utf-8")
+        write_text_atomic(path, content)
+
+    def add_destination(self, slug: str) -> Path:
+        checkout = self.rust / f"claude-{slug}-trunk"
+        _ = self.git("branch", slug)
+        _ = self.git("push", "origin", slug)
+        _ = self.git("worktree", "add", str(checkout), slug)
+        doc = checkout / f"docs/plans/{slug}-production.md"
+        self.write(doc, self.production_doc(slug, checkout, "| Unit | Plan | Worktree | Branch |",
+                                          "| --- | --- | --- | --- |"))
+        _ = self.git("add", str(doc), cwd=checkout)
+        _ = self.git("commit", "-m", f"fixture production {slug}", cwd=checkout)
+        _ = self.git("push", "origin", slug, cwd=checkout)
+        self.write(self.root / f"state/notifier/showrunner-{slug}/conf",
+                   f"TARGET=session:{slug}-showrunner\nCHECK=" + shlex.join([
+                       "zsh", "/scripts/production_check.sh", str(doc)]) + "\n")
+        _ = staff.ensure("showrunner", name=slug)
+        return doc
+
+    def add_transfer_unit(self, stem: str) -> None:
+        plan = self.giving / f"docs/plans/{stem}.md"
+        self.write(plan, f"# {stem}\n\n> **Production: demo** — unit `{stem}-unit`; "
+                   + "production doc `docs/plans/demo-production.md`\n")
+        _ = self.git("add", str(plan))
+        _ = self.git("commit", "-m", f"fixture plan {stem}")
+        _ = self.git("push", "origin", "demo")
+        _ = self.git("worktree", "add", "-b", f"demo-{stem}", str(self.rust / f"claude-demo-{stem}"), "demo")
+        _ = self.git("push", "origin", f"demo-{stem}")
 
     def git(self, *arguments: str, cwd: Path | None = None) -> str:
         result = subprocess.run(["git", *arguments], cwd=cwd or self.giving, env=self.env,
@@ -194,24 +228,9 @@ class UnitTransferFixture(unittest.TestCase):
     def seed_record(self) -> Path:
         """A stopped unit's shutdown record, as `shutdown.py down` leaves it, and a shutdown stub that logs calls."""
         home = self.root / "home"
-        session: dict[str, object] = {
-            "session_id": "sid-alpha", "config_dir": str(home / ".claude"), "pid": 4242, "proc_start": "1",
-            "name": "alpha", "cwd": str(self.unit), "status": "idle", "updated_at": 0, "probe": False,
-            "model": {"kind": "no reply yet"},
-            "checkout": {"kind": "git", "path": str(self.unit), "head": {"kind": "branch", "name": "demo-alpha"},
-                         "upstream": {"kind": "tracking", "ahead": 0}, "dirty": []},
-            "run_dirs": [], "codex_servers": [], "timers": [], "kind": "unit",
-            "host": {"kind": "unit", "production": "demo", "unit": "alpha-unit",
-                     "doc": str(self.giving / "docs/plans/demo-production.md"), "session_name": "demo-alpha",
-                     "session_host": "herdr", "plan": {"kind": "plan", "path": f"{self.unit}/docs/plans/alpha.md"}}}
-        saved: dict[str, object] = {
-            "login": "owner@example.com", "label": "claude2", "machine": "natedev",
-            "requested_at": "2026-10-09T21:49:10+00:00", "request_id": "request",
-            "requested_by": {"kind": "terminal"}, "hold": "session", "then": "stop", "force": "wait for ready",
-            "alerts": "none", "probe": False, "session": session, "workers": [], "timers": [],
-            "settle_message": {"kind": "not sent"}, "where": {"kind": "not said"},
-            "progress": {"kind": "stopped", "at": "2026-10-09T21:50:00+00:00"}, "stop_issues": [], "trail": [],
-            "codex_seats": []}
+        saved = fake_unit_host.stopped_record(home / ".claude", self.unit,
+            doc=self.giving / "docs/plans/demo-production.md", host_session="demo-alpha",
+            branch="demo-alpha", plan=self.unit / "docs/plans/alpha.md")
         script = ("import json, sys; sys.path.insert(0, sys.argv[1]); import shutdown_record; "
                   + "assert shutdown_record.create_session(json.loads(sys.stdin.read()))")
         created = subprocess.run([sys.executable, "-c", script, str(SCRIPT.parents[1] / "shutdown")],

@@ -2718,7 +2718,7 @@ def _pane_shell_pids(session: str) -> list[int]:
     return shells
 
 
-def _pane_scopes(groups: list[tuple[str, Path]]) -> list[tuple[str, Path]]:
+def pane_scopes(groups: list[tuple[str, Path]]) -> list[tuple[str, Path]]:
     """The pane scopes under PANE_SLICE that hold a process, from its systemd memberships."""
     return [(hierarchy, scope) for hierarchy, path in groups
             for scope in (path, *path.parents) if scope.parent.name == PANE_SLICE]
@@ -2727,7 +2727,7 @@ def _pane_scopes(groups: list[tuple[str, Path]]) -> list[tuple[str, Path]]:
 def _add_scope_owners(owners: dict[tuple[str, Path], set[str]], pids: Sequence[int], sessions: dict[int, str]) -> None:
     """Record the session of each matched process in its pane scope."""
     for pid in pids:
-        for scope in _pane_scopes(_systemd_cgroups(_proc_root() / str(pid))):
+        for scope in pane_scopes(_systemd_cgroups(_proc_root() / str(pid))):
             owners.setdefault(scope, set()).add(sessions[pid])
 
 
@@ -2791,7 +2791,7 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[i
                         break
                 if pid in sessions:
                     break
-            if pid not in sessions and (scopes := _pane_scopes(groups)):
+            if pid not in sessions and (scopes := pane_scopes(groups)):
                 loose[pid] = scopes
         # A pane scope holds one pane's processes, as the unit's cgroup held
         # them before. Only a scope that no matched process explains needs the

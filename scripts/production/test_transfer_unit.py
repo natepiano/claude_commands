@@ -11,9 +11,16 @@ import unittest
 from pathlib import Path
 from typing import cast, final
 from unittest import mock
+from collections.abc import Callable
+from contextlib import ExitStack
 
 from scripts.astra import design_roles
 from scripts.direct import workers
+from scripts.production import staff
+from scripts.production.rename_test_support import legacy_staff_journal, stop_at_staff_write
+from scripts.production.rename_rerun_test_support import final_files, saved_fixture
+from scripts.production.staff_test_support import SOURCES_SCRIPT, PROCESS_TIMEOUT
+from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production.transfer_unit_test_support import (
     UnitTransferFixture, SCRIPT, TEST_HANG_GUARD_SECS,
 )
@@ -25,6 +32,118 @@ import fake_unit_host
 
 @final
 class UnitTransferTests(UnitTransferFixture):
+    def test_unfinished_transfer_refusal_names_its_exact_resume_command(self) -> None:
+        _ = self.pause_before_source_commit()
+        before = final_files(self.root)
+        refused = self.transfer("apply", "beta-unit", self.giving / "docs/plans/demo-production.md")
+        command = f"transfer_unit.py apply demo alpha-unit {self.receiving / 'docs/plans/other-production.md'}"
+        self.assert_refused(refused, f"the unfinished transfer is alpha-unit to other; resume it first with {command}")
+        self.assertEqual(final_files(self.root), before)
+
+    def test_completed_transfer_allows_another_destination_and_its_own_rerun(self) -> None:
+        self.assert_ok(self.transfer("apply"))
+        self.add_transfer_unit("beta")
+        third = self.add_destination("third")
+        self.assert_ok(self.transfer("apply", "beta-unit", third))
+        before = final_files(self.root)
+        repeated = self.transfer("apply")
+        self.assert_ok(repeated)
+        self.assertIn("done", repeated.stdout)
+        self.assertEqual(final_files(self.root), before)
+        rows = staff.snapshot()
+        alpha, beta = rows.by_path("other/alpha"), rows.by_path("third/beta")
+        assert alpha is not None and beta is not None
+        self.assertEqual(alpha.name, "alpha")
+        self.assertEqual(beta.name, "beta")
+
+    def test_legacy_journal_resumes_after_the_destination_row_changed(self) -> None:
+        path = self.pause_before_source_commit()
+        legacy_staff_journal(path)
+        self.assert_transfer_resumed(path)
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        self.assertTrue(fields["staff_id"])
+        self.assertTrue(fields["parent_staff_id"])
+
+    def test_completed_legacy_journal_migrates_once_and_reports_done(self) -> None:
+        self.assert_ok(self.transfer("apply"))
+        expected = final_files(self.root)
+        legacy_staff_journal(self.root / "state/showrunner/demo/transfer_unit.json")
+        finished = self.transfer("apply")
+        self.assert_ok(finished)
+        self.assertIn("done", finished.stdout)
+        self.assertEqual(final_files(self.root), expected)
+
+    def test_transfer_keeps_staff_ids_and_workers(self) -> None:
+        row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
+        parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "other")
+        worker = staff.ensure("worker", name="impl1", parent=row.id)
+        self.assert_ok(self.transfer("apply"))
+        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "alpha", parent.id))
+        self.assertEqual(staff.snapshot().by_id(worker.id), worker)
+        saved = cast(dict[str, object], json.loads((self.root / "state/showrunner/demo/transfer_unit.json").read_text()))
+        self.assertEqual(saved["staff_id"], row.id)
+
+    def test_taken_staff_name_refuses_before_sources_change(self) -> None:
+        parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "other")
+        _ = staff.ensure("unit", name="alpha", parent=parent.id)
+        before = final_files(self.root)
+        failed = self.transfer("apply")
+        self.assertEqual(failed.returncode, 2, failed.stderr)
+        self.assertIn("StaffRefused", failed.stderr)
+        self.assertEqual(final_files(self.root), before)
+
+    def test_missing_staff_member_refuses_before_sources_change(self) -> None:
+        row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
+        _ = staff.retire(row.id)
+        before = final_files(self.root)
+        failed = self.transfer("apply")
+        self.assertEqual(failed.returncode, 2, failed.stderr)
+        self.assertEqual(final_files(self.root), before)
+
+    def test_transfer_unit_rerun(self) -> None:
+        self.env.update(GIT_AUTHOR_DATE="2026-10-29T12:00:00Z", GIT_COMMITTER_DATE="2026-10-29T12:00:00Z")
+        with saved_fixture(self.root) as restore:
+            self.assert_ok(self.transfer("apply"))
+            expected = final_files(self.root)
+            for after in (False, True):
+                with self.subTest(after=after):
+                    restore()
+                    with stop_at_staff_write("move", after=after):
+                        failed = self.transfer("apply")
+                    self.assertNotEqual(failed.returncode, 0)
+                    self.assertIn("stopped at staff step", failed.stderr)
+                    self.assert_ok(self.transfer("apply"))
+                    self.assertEqual(final_files(self.root), expected)
+                    finished = self.transfer("apply")
+                    self.assert_ok(finished)
+                    self.assertIn("done", finished.stdout)
+                    self.assertEqual(final_files(self.root), expected)
+
+    def test_seed_waits_between_staff_move_and_units_update(self) -> None:
+        row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
+        parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "other")
+        commit_to = cast(Callable[[transfer_unit.UnitTransfer, Callable[[], None]], None], getattr(transfer_unit, "_commit_to"))
+        pending: list[subprocess.Popen[str]] = []
+
+        lock = self.staff_file.parent / "operation.lock"
+        with short_socket_directory() as directory, ExitStack() as contexts:
+            with mock.patch.object(self, "root", Path(directory)):
+                listener = contexts.enter_context(self.lock_notice(lock))
+            def pause(transfer: transfer_unit.UnitTransfer, save: Callable[[], None]) -> None:
+                self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "alpha", parent.id))
+                process = self.start_script(SOURCES_SCRIPT, "seed")
+                pending.append(process)
+                self.assert_operation_blocks(process, listener)
+                commit_to(transfer, save)
+
+            steps = tuple(step._replace(run=pause) if step.run is commit_to else step for step in transfer_unit.STEPS)
+            notices = {name: os.environ[name] for name in ("STAFF_TEST_LOCK_NOTICE", "STAFF_TEST_LOCK_TARGET")}
+            with mock.patch.object(transfer_unit, "STEPS", steps), mock.patch.dict(self.env, notices):
+                self.assert_ok(self.transfer("apply"))
+            output, errors = pending[0].communicate(timeout=PROCESS_TIMEOUT)
+        self.assertEqual(pending[0].returncode, 0, output + errors)
+        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "alpha", parent.id))
+
     def test_rerun_finishes_each_uncommitted_document_write(self) -> None:
         snapshot = Path(self.enterContext(tempfile.TemporaryDirectory())) / "before"
         _ = shutil.copytree(self.root, snapshot)

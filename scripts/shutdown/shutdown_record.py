@@ -12,7 +12,7 @@ import stat
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -45,6 +45,17 @@ from account import ResolvedHistoryLabel, HistoricalAccountUnresolved
 CLAIM_STALE_SECONDS = 120
 CONDUCTOR_LOCK_RETRY_DELAYS = (0.05,) * 5
 _ROOT_METADATA = frozenset({"launch.lock", "snapshot_attempt.json", "snapshot_attempt.lock"})
+
+
+def merge_timer_restores(*groups: Iterable[TimerRestore]) -> list[TimerRestore]:
+    """A disabled observation cannot erase an inherited enable intent."""
+    enabled: dict[str, bool] = {}
+    for group in groups:
+        for timer in group:
+            instance = timer["instance"]
+            enabled[instance] = enabled.get(instance, False) or timer["was_enabled"]
+    return [TimerRestore(instance=instance, was_enabled=was_enabled)
+            for instance, was_enabled in enabled.items()]
 
 
 def _is_root_metadata(name: str) -> bool:
