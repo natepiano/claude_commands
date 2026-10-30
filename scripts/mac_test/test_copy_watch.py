@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -500,6 +501,26 @@ class CopyWatchProcessTests(unittest.TestCase):
         self.assertTrue((self.root / "runner-stopped").exists())
         self.assertEqual((values["copy"], values["copy_count"]), ("natedev_won", "1"))
         self.assertNotIn("mac", values)
+        self.assertIsNone(step.poll())
+
+    def test_result_publication_does_not_recreate_a_removed_hold_folder(self) -> None:
+        step = self.start_step()
+        hold = self.root / "verify-hold" / "verify-copy"
+        hold.mkdir(parents=True)
+        self.result = hold / "result"
+        self.start_watcher("hold")
+        self.compile_and_wait_for_copies(1)
+        self.wait_until((self.root / "runner-ready").exists, "the copy to run")
+        shutil.rmtree(hold.parent)
+        watcher = self.watcher
+        assert watcher is not None
+        watcher.terminate()
+        output, _ = watcher.communicate(timeout=HANG_GUARD_S)
+        self.assertEqual(watcher.returncode, 1, output)
+        self.assertIn("cannot publish result", output)
+        self.assertNotIn("Traceback", output)
+        self.assertFalse(hold.parent.exists())
+        self.assertTrue((self.root / "runner-stopped").exists())
         self.assertIsNone(step.poll())
 
     def test_a_copy_that_gives_way_may_become_a_copy_again(self) -> None:

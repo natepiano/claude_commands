@@ -33,9 +33,11 @@ from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 if TYPE_CHECKING:
     from ..lib import process_start
+    from ..lib.atomic_file import write_text_atomic
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.lib import process_start
+    from scripts.lib.atomic_file import write_text_atomic
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
@@ -246,16 +248,6 @@ class StepProgress:
             return os.getpgid(self.info.pgid) == self.info.pgid
         except OSError:
             return False
-
-
-def write_text_atomic(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False
-    ) as output:
-        temporary = Path(output.name)
-        _ = output.write(text)
-    os.replace(temporary, path)
 
 
 def read_candidate(path: Path) -> CandidateRecord | None:
@@ -521,6 +513,9 @@ class Watch:
                 "call_started": self.request.call_started,
                 "call_id": self.request.call_id,
             }
+            # Candidate state is ours to create; the result folder belongs to
+            # verify.sh and must never be recreated after it has been retired.
+            self.candidate.parent.mkdir(parents=True, exist_ok=True)
             write_text_atomic(self.candidate, json.dumps(record) + "\n")
         return wanted
 
@@ -633,7 +628,11 @@ def main() -> int:
                 report = watch.run(wakeup)
             finally:
                 watch.close()
-        write_text_atomic(request.result, result_text(report))
+        try:
+            write_text_atomic(request.result, result_text(report))
+        except OSError as error:
+            print(f"copy_watch.py: cannot publish result {request.result}: {error}", file=sys.stderr)
+            return 1
     return 0
 
 

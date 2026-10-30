@@ -12,6 +12,7 @@ import json
 import os
 import shlex
 import select
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -22,6 +23,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO, cast, override
 from unittest.mock import patch
+from uuid import uuid4
 
 from scripts.direct import phase_reservation, phase_table, plan_history, progress_history, recorder_state
 # These regressions check the private verifier's semantic result before wait closure.
@@ -1819,6 +1821,189 @@ print('two homes isolated; recorder lock retained; caller restored')
         _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "6",
                              "--phase-title", "Wait coverage", at=1010)
         return session
+
+    def publish_during(self, session: Path, marker: Path, interleave: Callable[[], None],
+                       *selectors: str) -> str:
+        publish_file = cast(Callable[[progress_history.WaitIdFile | progress_history.TurnWaitFile, str], None],
+                            vars(progress_history)["_publish_wait_file"])
+
+        def interleaved(publication: progress_history.WaitIdFile | progress_history.TurnWaitFile, wait_id: str) -> None:
+            publish_file(publication, wait_id)
+            interleave()
+
+        args = recorder_parser().parse_args(["start-wait", "--session-dir", str(session),
+                                            "--kind", "WaitingForUser", "--owner-session", "director", *selectors])
+        with patch.dict(os.environ, {"UNIT_NOW_EPOCH": "1020", "CLAUDE_PROBE_SESSION": "0"}), patch.object(
+            progress_history, "_publish_wait_file", interleaved
+        ):
+            return progress_history.publish_wait(session, args, progress_history.WaitIdFile(marker))
+
+    def test_publication_requires_the_marker_to_still_name_its_wait_under_the_append_lock(self) -> None:
+        for change in ("remove-folder", "replace-id"):
+            with self.subTest(change=change):
+                name = "publication-marker-" + change
+                session = self.covered_wait_phase(name)
+                directory = session / "recovery"
+                directory.mkdir()
+                marker = directory / "wait"
+
+                def recover() -> None:
+                    if change == "remove-folder":
+                        shutil.rmtree(directory)
+                    else:
+                        _ = marker.write_text("another-wait\n")
+
+                with self.assertRaises(SystemExit) as stopped:
+                    _ = self.publish_during(session, marker, recover, "--phase-id", "6")
+                self.assertEqual(stopped.exception.code, 5)
+                report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
+                self.assertEqual(report["waits"], [])
+                self.assertEqual(report["abandoned_n"], 1)
+                if change == "remove-folder":
+                    self.assertFalse(directory.exists())
+                else:
+                    self.assertEqual(marker.read_text(), "another-wait\n")
+
+    def test_publication_abandons_the_wait_when_its_phase_or_pass_changes_before_append(self) -> None:
+        for change in ("finished-phase", "reopened-phase", "replaced-pass"):
+            with self.subTest(change=change):
+                name = "publication-attribution-" + change
+                session = self.covered_wait_phase(name)
+                self.team_slot = "impl"
+                if change == "replaced-pass":
+                    _ = self.run_command("start-pass", "--session-dir", str(session), "--phase-id", "6",
+                                         "--pass-kind", "impl", "--activity", "first dispatch", "--called-task", "direct.impl",
+                                         "--called-family", "codex", "--called-model", "fixture", at=1015)
+
+                def advance() -> None:
+                    if change == "replaced-pass":
+                        _ = self.run_command("finish-pass", "--session-dir", str(session), "--status", "completed", at=1030)
+                        _ = self.run_command("start-pass", "--session-dir", str(session), "--phase-id", "6",
+                                             "--pass-kind", "impl", "--activity", "next dispatch", "--called-task", "direct.impl",
+                                             "--called-family", "codex", "--called-model", "fixture", at=1031)
+                    else:
+                        _ = self.run_command("finish-phase", "--session-dir", str(session), "--status", "completed", at=1030)
+                        if change == "reopened-phase":
+                            _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "6",
+                                                 "--phase-title", "New instance", at=1031)
+
+                selector = ("--slot", "impl") if change == "replaced-pass" else ("--phase-id", "6")
+                with self.assertRaises(SystemExit) as stopped:
+                    _ = self.publish_during(session, session / "wait", advance, *selector)
+                self.assertEqual(stopped.exception.code, 5)
+                report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
+                self.assertEqual(report["waits"], [])
+                self.assertEqual(report["abandoned_n"], 1)
+
+    def test_wait_publication_preserves_marker_permissions_and_does_not_recreate_a_removed_parent(self) -> None:
+        session = self.covered_wait_phase("publication-atomic-file")
+        marker = session / "wait"
+        _ = marker.write_text("stale-marker\n")
+        marker.chmod(0o640)
+        _ = self.publish_during(session, marker, lambda: None, "--phase-id", "6")
+        self.assertEqual(marker.stat().st_mode & 0o777, 0o640)
+        removed = session / "removed"
+        args = recorder_parser().parse_args(["start-wait", "--session-dir", str(session), "--kind", "WaitingForUser"])
+        before = self.read_events("publication-atomic-file")
+        with self.assertRaises(OSError):
+            _ = progress_history.publish_wait(session, args, progress_history.WaitIdFile(removed / "wait"))
+        self.assertFalse(removed.exists())
+        self.assertEqual(self.read_events("publication-atomic-file"), before)
+
+    def test_unavailable_turn_wait_history_keeps_the_marker_and_returns_with_a_diagnostic(self) -> None:
+        session = self.covered_wait_phase("turn-history-unavailable")
+        with patch.dict(os.environ, {"UNIT_NOW_EPOCH": "1020", "CLAUDE_PROBE_SESSION": "0"}):
+            self.assertTrue(progress_history.record_turn_wait(session, "director", "decision: approve trial"))
+            marker = session / "turn_wait.json"
+            before = marker.read_bytes()
+            history = Path(str(self.read_state(session)["history_file"]))
+            _ = history.write_bytes(history.read_bytes() + b"{malformed\n")
+            diagnostic = io.StringIO()
+            with redirect_stderr(diagnostic):
+                progress_history.finish_turn_wait(session, "director", source="TYPED", prompt="Approved.")
+            self.assertEqual(marker.read_bytes(), before)
+            self.assertIn("WaitHistoryUnavailable", diagnostic.getvalue())
+
+    def test_repeat_wait_ids_preserve_first_attribution_and_each_terminal_state(self) -> None:
+        for state in ("started", "not-recorded", "finished", "unclosed"):
+            with self.subTest(state=state):
+                name = "repeat-id-" + state
+                session = self.covered_wait_phase(name)
+                wait_id = str(uuid4())
+                selector = ("--slot", "missing-slot") if state == "not-recorded" else ("--phase-id", "6")
+                result = self.run_command("start-wait", "--session-dir", str(session), "--wait-id", wait_id,
+                                          "--kind", "WaitingForMemoryOrSlot", "--owner-session", "first-owner",
+                                          "--reason", "first reason", *selector, at=1020)
+                self.assertEqual(result, wait_id)
+                if state == "finished":
+                    _ = self.run_command("finish-wait", "--session-dir", str(session), "--wait-id", wait_id, at=1030)
+                elif state == "unclosed":
+                    _ = self.run_command("finish-phase", "--session-dir", str(session), "--status", "completed", at=1030)
+                original = self.read_events(name)
+                result = self.run_command("start-wait", "--session-dir", str(session), "--wait-id", wait_id,
+                                          "--kind", "WaitingForUser", "--owner-session", "different-owner",
+                                          "--reason", "changed reason", "--slot", "different-slot", at=1040)
+                self.assertEqual(result, wait_id)
+                self.assertEqual(self.read_events(name), original)
+                starts = [event for event in original if event.get("wait_id") == wait_id
+                          and event["event_type"] in ("wait_started", "wait_not_recorded")]
+                self.assertEqual(len(starts), 1)
+                self.assertEqual((starts[0]["owner_session"], starts[0]["wait_reason"]), ("first-owner", "first reason"))
+                report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1050)))
+                intervals = [row for row in cast(list[dict[str, object]], report["waits"]) if row["wait_id"] == wait_id]
+                if state == "not-recorded":
+                    self.assertEqual(intervals, [])
+                    self.assertGreater(cast(int, report["missing_n"]), 0)
+                else:
+                    self.assertEqual(len(intervals), 1)
+                    self.assertEqual(cast(dict[str, object], intervals[0]["wait_end"])["state"],
+                                     {"started": "Open", "finished": "Finished", "unclosed": "Unclosed"}[state])
+
+    def test_never_started_close_abandons_the_id_and_prevents_a_late_start(self) -> None:
+        name = "abandoned-id"
+        session = self.covered_wait_phase(name)
+        wait_id = str(uuid4())
+        for at in (1020, 1030):
+            closed = self.run_failing_command("finish-wait", "--session-dir", str(session), "--wait-id", wait_id, at=at)
+            self.assertEqual(closed.returncode, 4, closed.stderr)
+            self.assertIn("never started", closed.stderr.lower())
+        evidence = self.read_events(name)
+        abandoned = [event for event in evidence if event.get("wait_id") == wait_id]
+        self.assertEqual(len(abandoned), 1)
+        self.assertEqual(abandoned[0]["event_type"], "wait_abandoned")
+        late = self.run_failing_command("start-wait", "--session-dir", str(session), "--wait-id", wait_id,
+                                       "--kind", "WaitingForMemoryOrSlot", at=1040)
+        self.assertEqual(late.returncode, 5, late.stderr)
+        self.assertIn("abandoned", late.stderr.lower())
+        self.assertEqual(self.read_events(name), evidence)
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1050)))
+        self.assertFalse(any(row["wait_id"] == wait_id for row in cast(list[dict[str, object]], report["waits"])))
+        self.assertEqual(report["abandoned_n"], 1)
+        abandoned_rows = cast(list[dict[str, object]], report["abandoned"])
+        self.assertEqual([row["wait_id"] for row in abandoned_rows], [wait_id])
+
+    def test_wait_lookup_proves_absence_only_after_reading_the_complete_history(self) -> None:
+        session = self.covered_wait_phase("typed-wait-lookup")
+        wait_id = self.run_command("start-wait", "--session-dir", str(session),
+                                   "--kind", "WaitingForUser", at=1020)
+        state = self.read_state(session)
+        self.assertIsInstance(progress_history.read_wait(state, wait_id), progress_history.RecordedWait)
+        absent_id = str(uuid4())
+        self.assertIsInstance(progress_history.read_wait(state, absent_id), progress_history.NeverStartedWait)
+        history = Path(str(state["history_file"]))
+        valid = history.read_bytes()
+        for bad_tail in (b'{"event_type":', b'\xff\n', b'[]\n'):
+            with self.subTest(tail=bad_tail):
+                _ = history.write_bytes(valid + bad_tail)
+                self.assertIsInstance(progress_history.read_wait(state, absent_id), progress_history.WaitHistoryUnavailable)
+                closed = self.run_failing_command("finish-wait", "--session-dir", str(session), "--wait-id", absent_id, at=1030)
+                self.assertNotEqual(closed.returncode, 0)
+                self.assertNotEqual(closed.returncode, 4)
+                self.assertIn("unavailable", closed.stderr.lower())
+                self.assertEqual(history.read_bytes(), valid + bad_tail)
+        history.unlink()
+        history.mkdir()
+        self.assertIsInstance(progress_history.read_wait(state, absent_id), progress_history.WaitHistoryUnavailable)
 
     def forwarded_supplier_wait(self, name: str, body: str = "The checkpoint is merged.") -> tuple[Path, Path, str]:
         session = self.covered_wait_phase(name)

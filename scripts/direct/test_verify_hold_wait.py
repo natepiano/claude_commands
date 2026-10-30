@@ -2,21 +2,27 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
+import signal
+import shutil
 import subprocess
 import sys
 import unittest
 from pathlib import Path
 from typing import cast
+from unittest import mock
 
+from scripts.direct import progress_history
+# Stop this private publication boundary without a production fault switch.
+from scripts.direct.progress_history import _publish_wait_file  # pyright: ignore[reportPrivateUsage]
 from scripts.lib import process_start
 from scripts.lib.process_start_test_support import write_stat
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.direct.verify_hold_wait_test_support import (
     TEST_HANG_GUARD_SECS,
-    VERIFY,
     VerifyHoldWaitFixture,
     WaitObservation,
     grant_call,
@@ -26,6 +32,314 @@ from scripts.direct.verify_hold_wait_test_support import (
 
 
 class VerifyHoldWaitTests(VerifyHoldWaitFixture):
+    def test_overlapping_turn_declarations_leave_one_recoverable_wait(self) -> None:
+        history = self.record_phase()
+        control = self.pause_publication("before-file")
+        session = Path(self.fixture.environment["UNIT_RUN_DIR"])
+        callers: list[subprocess.Popen[str]] = []
+        for mode in ("--record-turn-wait", "--observe-turn-wait"):
+            caller = subprocess.Popen(
+                [str(control.interpreter), mode, str(session), "fixture-director", "decision: approve trial"],
+                cwd=self.fixture.root, env=self.fixture.environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, start_new_session=True,
+            )
+            self.addCleanup(self.stop_process, caller)
+            callers.append(caller)
+            self.wait_for_call(caller, "wait publication paused: before-file" if len(callers) == 1 else "turn wait lock:")
+        first, second = callers
+        admitted = "turn wait lock: acquired" in self.wait_diagnostics[second.pid]
+        try:
+            if admitted:
+                code, output = self.finish(second)
+                self.assertEqual(code, 0, output)
+        finally:
+            control.continue_child()
+        code, output = self.finish(first)
+        self.assertEqual(code, 0, output)
+        if not admitted:
+            code, output = self.finish(second)
+            self.assertEqual(code, 0, output)
+        with mock.patch.dict(os.environ, self.fixture.environment):
+            progress_history.finish_turn_wait(session, "fixture-director", source="TYPED", prompt="Approved.")
+        self.assertEqual([event["event_type"] for event in self.wait_events(history)
+                          if str(event["event_type"]).startswith("wait_")], ["wait_started", "wait_finished"])
+        self.assertFalse((session / "turn_wait.json").exists())
+
+    def test_recovery_abandons_a_wait_published_after_its_file_scan_and_removes_the_folder(self) -> None:
+        history = self.record_phase()
+        session = Path(self.fixture.environment["UNIT_RUN_DIR"])
+        directory = self.recovery_root() / f"verify-hold.{self.stopped_owner_pid()}.late-publication"
+        directory.mkdir(parents=True)
+        _ = (directory / "seconds").write_text("0\n")
+        marker = directory / "phase-wait.late.hold"
+        ids: list[str] = []
+
+        def recover_before_publication(publication: progress_history.WaitIdFile | progress_history.TurnWaitFile,
+                                       wait_id: str) -> None:
+            self.assertEqual(publication.path, marker)
+            ids.append(wait_id)
+            self.assertEqual(self.publish_marker_during_cleanup(directory, wait_id), marker)
+            result = self.fixture.verify("test", "sample", "--no-cache", "--local", "late publication", "--filter", "smoke")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        args = argparse.Namespace(session_dir=str(session), kind="WaitingForMemoryOrSlot", reason="build hold",
+                                  worker_thread_id="thread-impl", owner_session="thread-impl", unit="")
+        with mock.patch.dict(os.environ, self.fixture.environment), mock.patch.object(
+            progress_history, "_publish_wait_file", recover_before_publication
+        ), self.assertRaises(SystemExit) as abandoned:
+            _ = progress_history.publish_wait(session, args, progress_history.WaitIdFile(marker))
+        self.assertEqual(abandoned.exception.code, 5)
+        self.assertFalse(directory.exists())
+        wait_id, = ids
+        self.assertEqual([row["event_type"] for row in self.wait_events(history) if row.get("wait_id") == wait_id],
+                         ["wait_abandoned"])
+        self.assertFalse(any(row["wait_id"] == wait_id for row in cast(list[dict[str, object]], self.waits_report()["waits"])))
+
+    def test_recovery_removes_a_dead_writers_atomic_temp_file_before_recording_later_waits(self) -> None:
+        history = self.record_phase()
+        directory = self.recovery_root() / f"verify-hold.{self.stopped_owner_pid()}.temporary"
+        directory.mkdir(parents=True)
+        temporary = directory / ".phase-wait.stopped.hold.partial"
+        _ = temporary.write_text("incomplete")
+        self.hold()
+        caller = self.start("test", "sample", "--no-cache", "--local", "stale publication", "--filter", "smoke")
+        self.wait_for_call(caller)
+        grant_call(self.cycle_file)
+        code, output = self.finish(caller)
+        self.assertEqual(code, 0, output)
+        self.assertFalse(directory.exists())
+        starts = [row for row in self.wait_events(history) if row["event_type"] == "wait_started"]
+        wait, = starts
+        self.assertEqual(wait["wait_reason"], "build hold")
+        self.assertEqual(len([row for row in self.wait_events(history)
+                              if row["event_type"] == "wait_finished" and row["wait_id"] == wait["wait_id"]]), 1)
+        self.assertNotIn("NotRecorded", output)
+
+    def test_publication_after_deletion_snapshot_cannot_restore_a_retired_wait_folder(self) -> None:
+        history = self.record_phase()
+        session = Path(self.fixture.environment["UNIT_RUN_DIR"])
+        directory = self.recovery_root() / f"verify-hold.{self.stopped_owner_pid()}.snapshot"
+        directory.mkdir(parents=True)
+        _ = (directory / "owner.json").write_text("{}")
+        marker = directory / "phase-wait.late.hold"
+        publish = _publish_wait_file
+
+        def publish_during_delete(publication: progress_history.WaitIdFile | progress_history.TurnWaitFile,
+                                  wait_id: str) -> None:
+            failures: list[OSError] = []
+
+            def late_publication() -> None:
+                try:
+                    publish(publication, wait_id)
+                except OSError as error:
+                    failures.append(error)
+
+            with self.after_wait_owner_deleted(directory, late_publication):
+                result = invoke_recorder(["recover-wait-folder", "--session-dir", str(session),
+                                          "--directory", str(directory)], self.fixture.environment, self.fixture.root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            if failures:
+                raise failures[0]
+
+        args = argparse.Namespace(session_dir=str(session), kind="WaitingForMemoryOrSlot", reason="build hold", unit="",
+                                  worker_thread_id="thread-impl", owner_session="thread-impl")
+        with mock.patch.dict(os.environ, self.fixture.environment), mock.patch.object(
+            progress_history, "_publish_wait_file", publish_during_delete
+        ), self.assertRaises(OSError):
+            _ = progress_history.publish_wait(session, args, progress_history.WaitIdFile(marker))
+        self.assertFalse(directory.exists())
+        self.assertFalse(any(row["event_type"] == "wait_started" for row in self.wait_events(history)))
+        self.assertEqual(self.waits_report()["waits"], [])
+
+    def test_partial_retired_folder_deletion_cannot_leave_an_open_wait_without_an_owner(self) -> None:
+        history = self.record_phase()
+        session = Path(self.fixture.environment["UNIT_RUN_DIR"])
+        directory = self.recovery_root() / f"verify-hold.{self.stopped_owner_pid()}.partial"
+        directory.mkdir(parents=True)
+        _ = (directory / "owner.json").write_text("{}")
+        marker = directory / "phase-wait.late.hold"
+        publish = _publish_wait_file
+        ids: list[str] = []
+
+        def publish_before_partial_delete(publication: progress_history.WaitIdFile | progress_history.TurnWaitFile,
+                                          wait_id: str) -> None:
+            ids.append(wait_id)
+            rename = os.rename
+            remove = shutil.rmtree
+
+            def publish_before_rename(source: Path, target: Path) -> None:
+                if source == directory:
+                    publish(publication, wait_id)
+                rename(source, target)
+
+            def delete_after_publication(path: Path) -> None:
+                # On the old path no rename occurs; publish after the history
+                # scan at its corresponding boundary, before recursive delete.
+                if path == directory:
+                    publish(publication, wait_id)
+                remove(path)
+
+            def stop_after_owner() -> None:
+                raise OSError("interrupted after deleting owner.json")
+
+            with self.after_wait_owner_deleted(directory, stop_after_owner), mock.patch.object(
+                os, "rename", publish_before_rename
+            ), mock.patch.object(shutil, "rmtree", delete_after_publication):
+                result = invoke_recorder(["recover-wait-folder", "--session-dir", str(session),
+                                          "--directory", str(directory)], self.fixture.environment, self.fixture.root)
+            self.assertNotEqual(result.returncode, 0)
+
+        args = argparse.Namespace(session_dir=str(session), kind="WaitingForMemoryOrSlot", reason="build hold", unit="",
+                                  worker_thread_id="thread-impl", owner_session="thread-impl")
+        with mock.patch.dict(os.environ, self.fixture.environment), mock.patch.object(
+            progress_history, "_publish_wait_file", publish_before_partial_delete
+        ), self.assertRaises(SystemExit) as abandoned:
+            _ = progress_history.publish_wait(session, args, progress_history.WaitIdFile(marker))
+        self.assertEqual(abandoned.exception.code, 5)
+        self.assertFalse(directory.exists())
+        retired, = self.recovery_root().glob(".verify-hold-removing.*")
+        self.assertFalse((retired / "owner.json").exists())
+        wait_id, = ids
+        self.assertEqual([row["event_type"] for row in self.wait_events(history) if row.get("wait_id") == wait_id],
+                         ["wait_abandoned"])
+        with self.unavailable_wait_history(history):
+            result = self.fixture.verify("test", "sample", "--no-cache", "--local", "partial delete", "--filter", "smoke")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(retired.exists())
+        self.assertEqual(self.waits_report()["waits"], [])
+
+    def test_rerun_finishes_deletion_interrupted_after_retirement_without_reading_history(self) -> None:
+        history = self.record_phase()
+        session = Path(self.fixture.environment["UNIT_RUN_DIR"])
+        wait_id = self.start_saved_wait()
+        directory = self.recovery_root() / f"verify-hold.{self.stopped_owner_pid()}.retirement"
+        directory.mkdir(parents=True)
+        _ = (directory / "owner.json").write_text("{}")
+        _ = (directory / "phase-wait.stopped.hold").write_text(wait_id + "\n")
+        with mock.patch.object(shutil, "rmtree", side_effect=OSError("stopped before deletion")):
+            result = invoke_recorder(["recover-wait-folder", "--session-dir", str(session), "--directory", str(directory)],
+                                     self.fixture.environment, self.fixture.root)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(directory.exists())
+        retired, = self.recovery_root().glob(".verify-hold-removing.*")
+        self.assertEqual((retired / "phase-wait.stopped.hold").read_text().strip(), wait_id)
+        self.assertEqual([row["event_type"] for row in self.wait_events(history) if row.get("wait_id") == wait_id],
+                         ["wait_started", "wait_finished"])
+        # The retired folder is no longer an owner record or a history input.
+        _ = (retired / "owner.json").write_text(json.dumps({"pid": os.getpid(), "start_time": "unknown"}))
+        with self.unavailable_wait_history(history):
+            result = self.fixture.verify("test", "sample", "--no-cache", "--local", "retired delete", "--filter", "smoke")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(retired.exists())
+
+    def test_failed_folder_recovery_keeps_owner_identity_for_a_replaced_pid_retry(self) -> None:
+        history = self.record_phase()
+        start = process_start.process_start(os.getpid())
+        if not isinstance(start, process_start.ProcessStartTime):
+            self.skipTest("fake proc checks need Linux ticks")
+        wait_id = self.start_saved_wait()
+        directory = self.recovery_root() / f"verify-hold.{os.getpid()}.failed-close"
+        directory.mkdir(parents=True)
+        owner = directory / "owner.json"
+        owner_text = json.dumps({"pid": os.getpid(), "start_time": start.text})
+        _ = owner.write_text(owner_text)
+        marker = directory / "phase-wait.stopped.hold"
+        _ = (directory / "seconds").write_text("0\n")
+        proc_root = self.fixture.root / "replaced-owner-proc"
+        proc_root.mkdir()
+        observer = self.fixture.root / "replaced-owner-reader"
+        self.fixture.write_executable(observer, f'''import os, sys
+if len(sys.argv) > 2 and sys.argv[1] == "-c" and 'owner.json' in sys.argv[2]:
+    os.environ["VERIFY_PROC_ROOT"] = {str(proc_root)!r}
+else:
+    os.environ.pop("VERIFY_PROC_ROOT", None)
+os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
+''')
+        self.fixture.environment["CLAUDE_PYTHON"] = str(observer)
+        # An empty marker cannot be closed. Recovery must keep the whole folder.
+        _ = marker.write_text("")
+        first = self.fixture.verify("test", "sample", "--no-cache", "--local", "failed close", "--filter", "smoke")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertTrue(marker.exists())
+        self.assertTrue(owner.is_file(), "Failed recovery removed the recorded owner identity")
+        self.assertEqual(owner.read_text(), owner_text)
+        self.assertIn("NotRecorded", first.stderr)
+        _ = marker.write_text(wait_id + "\n")
+        _ = write_stat(proc_root, os.getpid(), start_ticks=start.ticks + 1)
+        self.recover_saved_wait_after_failed_read(marker, history, wait_id)
+        self.assertFalse(directory.exists())
+
+    def test_rerun_abandons_a_wait_published_before_its_start_event(self) -> None:
+        self.assert_stopped_publication_recovers("before-event")
+
+    def test_rerun_closes_a_published_start_event_once(self) -> None:
+        self.assert_stopped_publication_recovers("after-event")
+
+    def test_rerun_keeps_a_wait_file_when_its_history_cannot_be_read(self) -> None:
+        history = self.record_phase()
+        wait_id = self.start_saved_wait()
+        directory = self.recovery_root() / f"verify-hold.{self.stopped_owner_pid()}.history-unavailable"
+        directory.mkdir(parents=True)
+        marker = directory / "phase-wait.stopped.hold"
+        _ = marker.write_text(wait_id + "\n")
+        with self.unavailable_wait_history(history):
+            result = self.fixture.verify("test", "sample", "--no-cache", "--local", "unreadable history",
+                                         "--filter", "smoke")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(marker.read_text().strip(), wait_id)
+            self.assertIn("unavailable", result.stderr.lower())
+            self.assertIn(wait_id, result.stderr)
+        interval, = [row for row in cast(list[dict[str, object]], self.waits_report()["waits"])
+                     if row["wait_id"] == wait_id]
+        self.assertEqual(cast(dict[str, object], interval["wait_end"])["state"], "Open")
+        self.recover_saved_wait_after_failed_read(marker, history, wait_id)
+
+    def test_a_recorder_child_cannot_start_an_id_abandoned_after_its_shell_dies(self) -> None:
+        history = self.record_phase()
+        control = self.pause_publication("before-lock")
+        self.hold()
+        first = self.start("test", "sample", "--no-cache", "--local", "late recorder", "--filter", "smoke")
+        self.wait_for_call(first, "wait publication paused: before-lock")
+        marker = self.saved_publication_file()
+        wait_id = marker.read_text().strip()
+        os.kill(first.pid, signal.SIGKILL)
+        _ = first.wait(timeout=TEST_HANG_GUARD_SECS)
+        self.recover_publication()
+        control.continue_child()
+        code, output = self.finish(first)
+        self.assertEqual(code, -signal.SIGKILL, output)
+        self.assertIn("abandoned", output.lower())
+        self.assertFalse(marker.exists())
+        events = [row for row in self.wait_events(history) if row.get("wait_id") == wait_id]
+        self.assertFalse(any(row["event_type"] == "wait_started" for row in events), events)
+        self.assertFalse(any(row["wait_id"] == wait_id for row in cast(list[dict[str, object]], self.waits_report()["waits"])))
+
+    def test_the_next_turn_closes_a_wait_interrupted_after_its_event(self) -> None:
+        history = self.record_phase()
+        control = self.pause_publication("after-event")
+        session = Path(self.fixture.environment["UNIT_RUN_DIR"])
+        process = subprocess.Popen(
+            [str(control.interpreter), "--record-turn-wait", str(session), "fixture-director", "decision: approve trial"],
+            cwd=self.fixture.root, env=self.fixture.environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True,
+        )
+        self.addCleanup(self.stop_process, process)
+        self.wait_for_call(process, "wait publication paused: after-event")
+        marker = session / "turn_wait.json"
+        self.assertTrue(marker.exists(), "A declared wait needs its recovery marker before the start event")
+        started, = [row for row in self.wait_events(history) if row["event_type"] == "wait_started"]
+        self.assertEqual(cast(dict[str, object], json.loads(marker.read_text()))["wait_id"], started["wait_id"])
+        self.stop_process(process)
+        with mock.patch.dict(os.environ, self.fixture.environment):
+            progress_history.finish_turn_wait(session, "fixture-director", source="TYPED", prompt="Approved.")
+            progress_history.finish_turn_wait(session, "fixture-director", source="TYPED", prompt="Approved again.")
+        events = [row for row in self.wait_events(history) if row.get("wait_id") == started["wait_id"]]
+        self.assertEqual([row["event_type"] for row in events], ["wait_started", "wait_finished"])
+        self.assertFalse(marker.exists())
+        intervals = cast(list[dict[str, object]], self.waits_report()["waits"])
+        self.assertEqual(len(intervals), 1)
+        self.assertEqual(cast(dict[str, object], intervals[0]["wait_end"])["state"], "Finished")
+
     def recovery_root(self) -> Path:
         session = Path(self.fixture.environment["UNIT_RUN_DIR"])
         tree_key = hashlib.sha256(str(self.fixture.root.resolve()).encode()).hexdigest()
@@ -204,21 +518,8 @@ os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
         directory.mkdir(parents=True)
         wait_file = directory / "phase-wait.stopped.hold"
         _ = wait_file.write_text(wait_id + "\n")
-        injection = self.fixture.root / "remove-before-wait-read.sh"
-        removed = self.fixture.root / "wait-removed-by-scanner"
-        _ = injection.write_text('''set -T
-trap 'if [[ "$BASH_COMMAND" == *"read -r id"* && "${file:-}" == "$TEST_VANISH_WAIT_FILE" ]]; then
-    trap - DEBUG
-    "$TEST_REAL_PYTHON" "$TEST_WAIT_RECORDER" finish-wait --session-dir "$UNIT_RUN_DIR" --wait-id "$TEST_VANISH_WAIT_ID"
-    rm -f "$TEST_VANISH_WAIT_FILE"
-    printf removed > "$TEST_VANISH_MARKER"
-fi' DEBUG
-''')
-        result = self.fixture.verify("test", "sample", "--no-cache", "--local", "concurrent recovery", "--filter", "smoke",
-                                     extra={"BASH_ENV": str(injection), "TEST_VANISH_WAIT_FILE": str(wait_file),
-                                            "TEST_REAL_PYTHON": sys.executable,
-                                            "TEST_WAIT_RECORDER": str(VERIFY.with_name("progress_history.py")),
-                                            "TEST_VANISH_WAIT_ID": wait_id, "TEST_VANISH_MARKER": str(removed)})
+        removed = self.remove_wait_after_recovery_scan(wait_file, wait_id)
+        result = self.fixture.verify("test", "sample", "--no-cache", "--local", "concurrent recovery", "--filter", "smoke")
         self.assertEqual(removed.read_text(), "removed")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("No such file", result.stdout + result.stderr)
@@ -304,7 +605,7 @@ fi' DEBUG
         observer = self.fixture.root / "wait-close-observer"
         self.fixture.write_executable(observer, f'''import os, sys
 from pathlib import Path
-if len(sys.argv) > 2 and sys.argv[1].endswith("/progress_history.py") and sys.argv[2] == "finish-wait" and Path({str(fault)!r}).exists():
+if len(sys.argv) > 2 and sys.argv[1].endswith("/progress_history.py") and sys.argv[2] in ("finish-wait", "recover-wait-folder") and Path({str(fault)!r}).exists():
     raise SystemExit(17)
 os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
 ''')

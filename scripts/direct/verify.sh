@@ -1021,7 +1021,7 @@ else:
 
 '
 phase_wait_start() {
-    local key=$1 reason=$2 id file
+    local key=$1 reason=$2 file
     [[ "${CLAUDE_PROBE_SESSION:-}" != 1 && -n "$PHASE_WAIT_SESSION" \
         && -f "$PHASE_WAIT_SESSION/progress_history_state.json" && "$PHASE_WAIT_PUBLISHED" -eq 1 ]] || return 0
     if ! phase_wait_retry_pending; then
@@ -1030,7 +1030,7 @@ phase_wait_start() {
     fi
     file="$HOLD_WAIT_DIR/phase-wait.${BASHPID:-$$}.$key"
     [[ ! -s "$file" ]] || return 0
-    local args=(start-wait --session-dir "$PHASE_WAIT_SESSION"
+    local args=(start-wait --session-dir "$PHASE_WAIT_SESSION" --wait-file "$file"
         --kind WaitingForMemoryOrSlot --reason "$reason")
     local owner="${CODEX_THREAD_ID:-}"
     if [[ -n "$owner" ]]; then
@@ -1038,9 +1038,7 @@ phase_wait_start() {
     else
         args+=(--director --owner-session "${CLAUDE_CODE_SESSION_ID:-}")
     fi
-    if id="$("$PY" "$PHASE_WAIT_RECORDER" "${args[@]}")" && [[ -n "$id" ]]; then
-        printf '%s\n' "$id" > "$file"
-    else
+    if ! "$PY" "$PHASE_WAIT_RECORDER" "${args[@]}" >/dev/null; then
         printf 'verify.sh: wait history NotRecorded: %s\n' "$reason" >&2
     fi
 }
@@ -1048,7 +1046,7 @@ phase_wait_finish() {
     phase_wait_finish_file "$HOLD_WAIT_DIR/phase-wait.${BASHPID:-$$}.$1" || true
 }
 phase_wait_finish_file() {
-    local file=$1 id=""
+    local file=$1 id="" status=0
     [[ -s "$file" ]] || return 0
     if ! { read -r id < "$file"; } 2>/dev/null; then
         # Another scanner may have finished and removed it after the size check.
@@ -1056,24 +1054,33 @@ phase_wait_finish_file() {
         printf 'verify.sh: wait history NotRecorded: cannot read %s\n' "$file" >&2
         return 1
     fi
-    if "$PY" "$PHASE_WAIT_RECORDER" finish-wait --session-dir "$PHASE_WAIT_SESSION" --wait-id "$id"; then
+    "$PY" "$PHASE_WAIT_RECORDER" finish-wait --session-dir "$PHASE_WAIT_SESSION" --wait-id "$id" || status=$?
+    if [[ "$status" -eq 0 || "$status" -eq 4 ]]; then
         rm -f "$file"
     else
         printf 'verify.sh: wait history NotRecorded: cannot close %s\n' "$id" >&2
         return 1
     fi
 }
-phase_wait_finish_all() {
-    local file
-    [[ -n "$HOLD_WAIT_DIR" ]] || return 0
-    for file in "$HOLD_WAIT_DIR"/phase-wait.*; do
-        [[ -s "$file" ]] || continue
-        phase_wait_finish_file "$file" || true
-    done
+phase_wait_recover_folder() {
+    if ! "$PY" "$PHASE_WAIT_RECORDER" recover-wait-folder \
+        --session-dir "$PHASE_WAIT_SESSION" --directory "$1"; then
+        printf 'verify.sh: wait history NotRecorded: cannot close waits in %s\n' "$1" >&2
+        return 1
+    fi
 }
 phase_wait_retry_pending() {
-    local directory file pending owner_status failed=0
+    local directory owner_status failed=0
     [[ -n "$PHASE_WAIT_RETRY_ROOT" ]] || return 0
+    # These folders were closed and renamed under the recorder lock. They are
+    # only pending deletion; partial deletion may have removed their owner.
+    for directory in "$PHASE_WAIT_RETRY_ROOT"/.verify-hold-removing.*; do
+        [[ -d "$directory" ]] || continue
+        if ! rm -rf -- "$directory"; then
+            printf 'verify.sh: cannot remove retired wait folder %s\n' "$directory" >&2
+            failed=1
+        fi
+    done
     for directory in "$PHASE_WAIT_RETRY_ROOT"/.verify-hold-new.*; do
         [[ -d "$directory" ]] || continue
         if "$PY" -c "$PHASE_WAIT_OWNER_PY" staging-live "$directory" "$PROCESS_REPOSITORY"; then
@@ -1096,15 +1103,7 @@ phase_wait_retry_pending() {
                 continue
             fi
         fi
-        pending=0
-        for file in "$directory"/phase-wait.*; do
-            phase_wait_finish_file "$file" || pending=1
-        done
-        if [[ "$pending" -eq 0 ]]; then
-            rm -rf "$directory"
-        else
-            failed=1
-        fi
+        phase_wait_recover_folder "$directory" || failed=1
     done
     return "$failed"
 }
@@ -1163,23 +1162,18 @@ interrupt_hold_wait() {
 }
 
 finish_hold_wait() {
-    local file
-    phase_wait_finish_all
     collect_hold_wait
     if [[ -n "${TOKEN_WAIT_ENTRY:-}" ]]; then rm -f -- "$TOKEN_WAIT_ENTRY"; fi
     if [[ -n "$MAC_IDLE_MARKER" && -f "${MAC_IDLE_SCRIPT:-/nonexistent}" ]]; then
         "$PY" "$MAC_IDLE_SCRIPT" remove "$BUILDLOG_CALL_ID" || true
     fi
     if [[ -n "$HOLD_WAIT_DIR" ]]; then
-        for file in "$HOLD_WAIT_DIR"/phase-wait.*; do
-            if [[ -s "$file" ]]; then
-                # Keep the owner and ids. The next call retries once this
-                # owner has exited, even if cleanup stops at this line.
-                HOLD_WAIT_DIR=""
-                return 0
-            fi
-        done
-        rm -rf "$HOLD_WAIT_DIR"
+        if [[ "$PHASE_WAIT_PUBLISHED" -eq 1 ]]; then
+            phase_wait_recover_folder "$HOLD_WAIT_DIR" || true
+        else
+            # This admission-only folder has no recorded owner or wait ids.
+            rm -rf -- "$HOLD_WAIT_DIR"
+        fi
         HOLD_WAIT_DIR=""
     fi
 }

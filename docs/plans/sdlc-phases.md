@@ -482,7 +482,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 - `scripts/direct/progress_history.py` — `_counted_uncertain_reasons`
 - `scripts/direct/test_progress_history.py` — the repeated-reason test
 
-### Phase 20 — A stopped verify.sh wait is found and closed on a rerun  · status: todo
+### Phase 20 — A stopped verify.sh wait is found and closed on a rerun  · status: done
 **Depends on:** Phase 17 (its wait publication in `verify.sh`)
 
 Phase 17's closure work found this fault (Astra review of F008, 2026-10-30): `phase_wait_start` in `scripts/direct/verify.sh` runs `progress_history.py start-wait`, and only after it returns does the shell save the new wait id in its wait file. The recorder writes the open `wait_started` event first. A stop between the two leaves an open wait in history with no wait file, so no rerun can find it, and `phase_wait_retry_pending` and `phase_wait_finish_all` never close it. Phase 17 did not change this order; the fault is older.

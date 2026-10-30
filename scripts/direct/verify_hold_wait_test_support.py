@@ -15,6 +15,7 @@ import time
 import unittest
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import ClassVar, Literal, TypedDict, cast, override
@@ -59,6 +60,108 @@ class StepObservation(TypedDict):
 
 class CallWithHoldWait(CallRecord):
     hold_wait_s: float
+
+
+@dataclass(frozen=True)
+class PausedWaitPublication:
+    """A real recorder child stopped at one selected publication boundary."""
+
+    interpreter: Path
+    resume: Path
+
+    def continue_child(self) -> None:
+        with self.resume.open("w") as output:
+            _ = output.write("continue\n")
+
+
+def pause_wait_publication(
+    root: Path, boundary: Literal["before-event", "after-event", "before-lock", "before-file"],
+) -> PausedWaitPublication:
+    """Wrap the real recorder, with one FIFO stop rather than timing a race.
+
+    Only the first wait start is stopped. Other recorder and interpreter calls
+    keep their normal entry point, including recovery in a second verify shell.
+    """
+    control = root / "publication-stop"
+    control.mkdir()
+    resume = control / "resume"
+    os.mkfifo(resume)
+    armed = control / "armed"
+    armed.touch()
+    interpreter = control / "interpreter"
+    repository = VERIFY.parents[2]
+    _ = interpreter.write_text(f'''#!{sys.executable}
+import fcntl
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, {str(repository)!r})
+from scripts.direct import progress_history
+
+armed = Path({str(armed)!r})
+def pause():
+    try:
+        armed.unlink()
+    except FileNotFoundError:
+        return
+    print("wait publication paused: {boundary}", file=sys.stderr, flush=True)
+    with Path({str(resume)!r}).open() as input:
+        input.readline()
+
+arguments = sys.argv[1:]
+turn = arguments and arguments[0] in ("--record-turn-wait", "--observe-turn-wait")
+recorder = arguments and arguments[0].endswith("/progress_history.py")
+if turn or recorder:
+    append = progress_history._append_event
+    def observed_append(state, event):
+        selected = event.get("event_type") == "wait_started"
+        if selected and {boundary!r} == "before-event":
+            pause()
+        append(state, event)
+        if selected and {boundary!r} == "after-event":
+            pause()
+    progress_history._append_event = observed_append
+    publish = progress_history._publish_wait_file
+    def observed_publication(publication, wait_id):
+        if {boundary!r} == "before-file" and arguments[0] != "--observe-turn-wait":
+            pause()
+        publish(publication, wait_id)
+    progress_history._publish_wait_file = observed_publication
+    if arguments[0] == "--observe-turn-wait":
+        flock = fcntl.flock
+        announced = False
+        def observe_admission(descriptor, operation):
+            global announced
+            if not announced and operation == fcntl.LOCK_EX and os.readlink("/proc/self/fd/" + str(descriptor)).endswith("/.progress_history.lock"):
+                announced = True
+                try:
+                    flock(descriptor, operation | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    print("turn wait lock: blocked", file=sys.stderr, flush=True)
+                else:
+                    print("turn wait lock: acquired", file=sys.stderr, flush=True)
+                    return
+            return flock(descriptor, operation)
+        fcntl.flock = observe_admission
+    if {boundary!r} == "before-lock" and not turn and "start-wait" in arguments:
+        flock = fcntl.flock
+        def observed_lock(descriptor, operation):
+            published = "--wait-file" not in arguments or Path(arguments[arguments.index("--wait-file") + 1]).exists()
+            if published and operation == fcntl.LOCK_EX and os.readlink("/proc/self/fd/" + str(descriptor)).endswith("/.progress_history.lock"):
+                pause()
+            return flock(descriptor, operation)
+        fcntl.flock = observed_lock
+    if turn:
+        progress_history.record_turn_wait(Path(arguments[1]), arguments[2], arguments[3])
+    else:
+        sys.argv = arguments
+        progress_history.main()
+else:
+    os.execv({sys.executable!r}, [{sys.executable!r}, *arguments])
+''')
+    interpreter.chmod(0o755)
+    return PausedWaitPublication(interpreter, resume)
 
 def read_cycle_file(path: Path) -> build_hold.HoldCycle:
     return cast(build_hold.HoldCycle, json.loads(path.read_text()))
@@ -344,6 +447,159 @@ else:
         _ = (session / "mesh_roster.json").write_text(json.dumps({
             "fixture-impl": {"thread_id": "thread-impl"}}))
         return self.fixture.root / "history" / "runs" / f"{session.name}.jsonl"
+
+    def pause_publication(self, boundary: Literal["before-event", "after-event", "before-lock", "before-file"]) -> PausedWaitPublication:
+        control = pause_wait_publication(self.fixture.root, boundary)
+        self.fixture.environment["CLAUDE_PYTHON"] = str(control.interpreter)
+        return control
+
+    def publish_marker_during_cleanup(self, directory: Path, wait_id: str) -> Path:
+        """Publish after the real recovery scan, just before folder retirement."""
+        marker = directory / "phase-wait.late.hold"
+        armed = self.fixture.root / "cleanup-publication-armed"
+        armed.touch()
+        interpreter = self.fixture.root / "late-recovery-publication"
+        self.fixture.write_executable(interpreter, f'''import os, sys
+from pathlib import Path
+sys.path.insert(0, {str(VERIFY.parents[2])!r})
+from scripts.direct import progress_history
+arguments = sys.argv[1:]
+if len(arguments) > 1 and arguments[0].endswith("/progress_history.py") and arguments[1] == "recover-wait-folder":
+    rename = os.rename
+    def publish_before_rename(source, target, *args, **kwargs):
+        armed = Path({str(armed)!r})
+        if Path(source) == Path({str(directory)!r}) and armed.exists():
+            armed.unlink()
+            progress_history._publish_wait_file(progress_history.WaitIdFile(Path({str(marker)!r})), {wait_id!r})
+        return rename(source, target, *args, **kwargs)
+    os.rename = publish_before_rename
+    sys.argv = arguments
+    progress_history.main()
+else:
+    os.execv({sys.executable!r}, [{sys.executable!r}, *arguments])
+''')
+        self.fixture.environment["CLAUDE_PYTHON"] = str(interpreter)
+        return marker
+
+    @contextmanager
+    def after_wait_owner_deleted(self, directory: Path, action: Callable[[], None]) -> Generator[None, None, None]:
+        """Interrupt the real recursive delete after its snapshot and owner unlink."""
+        identity = directory.stat()
+        unlink = os.unlink
+        invoked = False
+
+        def after_unlink(path: str, *, dir_fd: int | None = None) -> None:
+            nonlocal invoked
+            unlink(path, dir_fd=dir_fd)
+            if invoked or path != "owner.json" or dir_fd is None:
+                return
+            parent = os.fstat(dir_fd)
+            if (parent.st_dev, parent.st_ino) == (identity.st_dev, identity.st_ino):
+                invoked = True
+                action()
+
+        with mock.patch.object(os, "unlink", after_unlink):
+            yield
+        self.assertTrue(invoked, "Recovery never reached deletion after its folder snapshot")
+
+    def remove_wait_after_recovery_scan(self, marker: Path, wait_id: str) -> Path:
+        """Finish an id, then remove its marker after recovery lists it."""
+        removed = self.fixture.root / "wait-removed-by-scanner"
+        interpreter = self.fixture.root / "remove-before-wait-read"
+        self.fixture.write_executable(interpreter, f'''import os, sys
+from pathlib import Path
+sys.path.insert(0, {str(VERIFY.parents[2])!r})
+from scripts.direct import progress_history
+arguments = sys.argv[1:]
+if len(arguments) > 1 and arguments[0].endswith("/progress_history.py") and arguments[1] == "recover-wait-folder":
+    sys.argv = [arguments[0], "finish-wait", "--session-dir", os.environ["UNIT_RUN_DIR"], "--wait-id", {wait_id!r}]
+    progress_history.main()
+    read_text = Path.read_text
+    def remove_before_read(path, *args, **kwargs):
+        if path == Path({str(marker)!r}) and path.exists():
+            path.unlink()
+            Path({str(removed)!r}).write_text("removed")
+        return read_text(path, *args, **kwargs)
+    Path.read_text = remove_before_read
+    sys.argv = arguments
+    progress_history.main()
+else:
+    os.execv({sys.executable!r}, [{sys.executable!r}, *arguments])
+''')
+        self.fixture.environment["CLAUDE_PYTHON"] = str(interpreter)
+        return removed
+
+    def saved_publication_file(self) -> Path:
+        session = Path(self.fixture.environment["UNIT_RUN_DIR"])
+        files = list((session / "verify_waits").glob("*/verify-hold.*/phase-wait.*"))
+        self.assertEqual(len(files), 1, f"One recoverable wait file must exist before the event append: {files}")
+        return files[0]
+
+    def wait_events(self, history: Path) -> list[dict[str, object]]:
+        return [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
+
+    @contextmanager
+    def unavailable_wait_history(self, history: Path) -> Generator[None, None, None]:
+        saved = history.read_bytes()
+        history.unlink()
+        history.mkdir()
+        try:
+            yield
+        finally:
+            history.rmdir()
+            _ = history.write_bytes(saved)
+
+    def recover_saved_wait_after_failed_read(self, marker: Path, history: Path, wait_id: str) -> None:
+        result = self.fixture.verify("test", "sample", "--no-cache", "--local", "retry readable history",
+                                     "--filter", "smoke")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(marker.exists())
+        finishes = [row for row in self.wait_events(history)
+                    if row.get("wait_id") == wait_id and row["event_type"] == "wait_finished"]
+        self.assertEqual(len(finishes), 1)
+
+    def waits_report(self) -> dict[str, object]:
+        result = invoke_recorder(["waits", "--session-dir", self.fixture.environment["UNIT_RUN_DIR"]],
+                                 self.fixture.environment, self.fixture.root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return cast(dict[str, object], json.loads(result.stdout))
+
+    def recover_publication(self) -> None:
+        rerun = self.start("test", "sample", "--no-cache", "--local", "recover publication", "--filter", "smoke")
+        self.wait_for_call(rerun)
+        grant_call(self.cycle_file)
+        code, output = self.finish(rerun)
+        self.assertEqual(code, 0, output)
+
+    def assert_stopped_publication_recovers(self, boundary: Literal["before-event", "after-event"]) -> None:
+        history = self.record_phase()
+        _ = self.pause_publication(boundary)
+        self.hold()
+        first = self.start("test", "sample", "--no-cache", "--local", "stop publication", "--filter", "smoke")
+        self.wait_for_call(first, f"wait publication paused: {boundary}")
+        marker = self.saved_publication_file()
+        wait_id = marker.read_text().strip()
+        self.assertTrue(wait_id)
+        before = [row for row in self.wait_events(history) if row.get("wait_id") == wait_id]
+        self.assertEqual(len(before), int(boundary == "after-event"))
+        self.stop_process(first)
+        self.recover_publication()
+        self.assertFalse(marker.exists())
+        events = [row for row in self.wait_events(history) if row.get("wait_id") == wait_id]
+        report = self.waits_report()
+        intervals = [row for row in cast(list[dict[str, object]], report["waits"]) if row["wait_id"] == wait_id]
+        if boundary == "after-event":
+            self.assertEqual([row["event_type"] for row in events], ["wait_started", "wait_finished"])
+            self.assertEqual(len(intervals), 1)
+            self.assertEqual(cast(dict[str, object], intervals[0]["wait_end"])["state"], "Finished")
+        else:
+            self.assertEqual([row["event_type"] for row in events], ["wait_abandoned"])
+            self.assertEqual(intervals, [])
+            abandoned = [row for row in cast(list[dict[str, object]], report["abandoned"]) if row["wait_id"] == wait_id]
+            self.assertEqual(len(abandoned), 1)
+            self.assertEqual(cast(dict[str, object], abandoned[0]["wait_end"])["state"], "NeverStarted")
+        self.assertFalse(any(cast(dict[str, object], row["wait_end"])["state"] == "Open"
+                             for row in cast(list[dict[str, object]], report["waits"])))
 
     def assert_wait_follows_worker_thread(self, worker_name: str) -> None:
         history = self.record_phase()
