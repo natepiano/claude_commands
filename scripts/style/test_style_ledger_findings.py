@@ -20,6 +20,61 @@ from ledger_test_support import (LedgerTestCase, PARENT_FILE, MOVED_FILE, TWIN_F
 
 @final
 class StyleLedgerFindingsTests(LedgerTestCase):
+    def test_held_add_refuses_the_whole_before_block_with_added_lines_without_writing(self) -> None:
+        rule = self.rule("comments-name-code-constructs")
+        before = "/// Enters at the bottom edge.\n/// Keeps the last position so animation can resume.\n"
+        added = "/// `BandDirection::Up` enters at the bottom edge.\n"
+        with self.ledger() as ledger:
+            original = self.held_rows(ledger.database)
+            for after in (added + before, before + added, added + before + added,
+                          (added + before).replace("\n", "\r\n")):
+                with self.subTest(after=after):
+                    result = self.cli(
+                        "held", "add", "--rule", rule, "--path", self.sources[0], "--line", "1",
+                        "--text", "Name the constructs and keep the reason", "--kind", "restructure",
+                        "--before", before, "--after", after, "--rule-blob", self.blob(rule),
+                        "--ticket", "outside", success=False,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn(rule, result.stderr)
+                    self.assertIn("after text must replace the whole before span, not keep it with added lines", result.stderr)
+                    self.assertEqual(self.held_rows(ledger.database), original)
+            with self.assertRaisesRegex(style_ledger.LedgerError, "after text must replace"):
+                _ = ledger.hold(rule, self.sources[0], 1, "Name the constructs", "type",
+                                before, added + before, self.blob(rule), "outside")
+            self.assertEqual(self.held_rows(ledger.database), original)
+
+    def test_held_add_accepts_a_whole_span_rewrite_and_partial_line_reuse(self) -> None:
+        rule = self.rule("comments-name-code-constructs")
+        pairs = (
+            ("/// Enters at the bottom edge.\n/// Keeps the last position so animation can resume.\n",
+             "/// `BandDirection::Up` enters at the bottom edge.\n/// `last_position` lets animation resume.\n"),
+            ("/// Direction.\n/// Enters at the bottom edge.\n",
+             "/// Direction.\n/// `BandDirection::Up` enters at the bottom edge.\n/// Preserves animation progress.\n"),
+            ("let total = count;", "let total = count + extra;\nuse_total(total);"),
+            ("", "/// Newly documented construct.\n"),
+        )
+        with self.ledger() as ledger:
+            for line, (before, after) in enumerate(pairs, 1):
+                with self.subTest(before=before):
+                    result = self.cli(
+                        "held", "add", "--rule", rule, "--path", self.sources[0], "--line", str(line),
+                        "--text", "Rewrite the span", "--kind", "restructure", "--before", before,
+                        "--after", after, "--rule-blob", self.blob(rule), "--ticket", "outside",
+                    )
+                    finding, = ledger.named_held((result.stdout.strip(),))
+                    self.assertEqual((finding.before, finding.after), (before, after))
+
+    def test_held_add_help_defines_before_and_after_as_whole_span_replacement(self) -> None:
+        result = self.cli("held", "add", "--help")
+        help_text = " ".join(result.stdout.split())
+        for option in ("--before BEFORE", "--after AFTER"):
+            with self.subTest(option=option):
+                description = help_text.rsplit(option, 1)[1].split(" --", 1)[0]
+                self.assertIn("The After text replaces the whole Before span.", description)
+                self.assertIn("never the old wording with a new line added", description)
+                self.assertIn("name the constructs and keep every reason", description)
+
     def test_proposal_merge_sets_built_at_once(self) -> None:
         rule, issue, ids = self.decision_findings()
         ledger = self.ledger()

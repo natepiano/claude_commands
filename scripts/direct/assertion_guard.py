@@ -7,7 +7,7 @@ import ast
 from bisect import bisect_right
 from collections import Counter, defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 import re
 import subprocess
@@ -18,9 +18,15 @@ Side = Literal["old", "new"]
 Kind = Literal["removed", "weaker", "changed", "test removed", "test turned off"]
 HUNK = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 FUNCTION = re.compile(r"\b(?:fn|def)\s+([A-Za-z_]\w*)\s*[(<]")
+ASSERTION_MACROS = (
+    "assert", "assert_eq", "assert_ne", "debug_assert", "debug_assert_eq", "debug_assert_ne",
+    "assert_matches", "prop_assert", "prop_assert_eq", "prop_assert_ne")
+TRUSTED_MACROS = frozenset(ASSERTION_MACROS + (
+    "matches", "print", "println", "eprint", "eprintln", "panic", "unreachable", "todo",
+    "unimplemented", "write", "writeln", "dbg"))
+MACRO_INVOCATION = re.compile(r"(?<!\w)(?P<name>(?:::\s*)?[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*)\s*!\s*[(\[{]")
 ASSERTION = re.compile(
-    r"\b(?P<macro>assert|assert_eq|assert_ne|debug_assert|debug_assert_eq|debug_assert_ne|"
-    + r"assert_matches|prop_assert|prop_assert_eq|prop_assert_ne)!\s*\("
+    r"\b(?P<macro>" + "|".join(ASSERTION_MACROS) + r")!\s*\("
     + r"|\b(?P<bare>assert)\s+|\bself\.(?P<method>assert\w+|fail)\s*\("
     + r"|\b(?P<raises>pytest\.raises)\s*\(")
 EXACT_CALLS = frozenset((
@@ -28,16 +34,24 @@ EXACT_CALLS = frozenset((
     "assertEqual", "assertNotEqual", "assertIs", "assertListEqual", "assertDictEqual",
     "assertTupleEqual", "assertSetEqual", "assertCountEqual", "assertMultiLineEqual", "assertSequenceEqual"))
 COMPARISON = re.compile(r"==|!=|<=|>=|(?<![<])<(?![<])|(?<![>])>(?![>])|\bis(?:\s+not)?\b")
-STATEMENT_TOKEN = re.compile(r'''"""|\'\'\'|["']|//|/\*|\*/|\#|[()[\]{}]''')
 PYTHON_LITERAL = re.compile(
     r"'''(?:\\.|'(?!'')|[^'\\])*'''"
     + r'|"""(?:\\.|"(?!"")|[^"\\])*"""'
     + r'''|'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|\#[^\n]*''', re.DOTALL)
+NUMERIC_LITERAL = re.compile(
+    r"(?P<digits>0x[0-9a-fA-F_]+|0o[0-7_]+|0b[01_]+|"
+    + r"[0-9][0-9_]*(?:\.(?:[0-9][0-9_]*|(?![.\w])))?(?:[eE][+-]?[0-9][0-9_]*)?)"
+    + r"(?P<suffix>[iu](?:8|16|32|64|128|size)|f(?:32|64))?")
+NUMERIC_TYPES = frozenset(("i8", "i16", "i32", "i64", "i128", "isize",
+                           "u8", "u16", "u32", "u64", "u128", "usize", "f32", "f64"))
 RUST_LITERAL = re.compile(
     r'''(?:br(?<!\wbr)|r(?<!\wr))(?P<hashes>\#*)"(?s:.*?)"(?P=hashes)'''
-    + r'''|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])'|//[^\n]*|/\*''', re.DOTALL)
+    + r'''|b?"(?:\\.|[^"\\])*"|b?'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^'\\])'|//[^\n]*|/\*'''
+    + r"|(?<!\w)(?:" + NUMERIC_LITERAL.pattern + r")(?!\w)", re.DOTALL)
 BLOCK_COMMENT = re.compile(r"/\*|\*/")
-FINDING_TOKEN = re.compile(r"assert|pytest\.raises|self\.fail|ignore|skip|expectedFailure|xfail")
+IDENTIFIER = re.compile(r"\b[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*\b")
+CONSTANT_ITEM = re.compile(r"\b(?:const|static)\s+(?:mut\s+)?([A-Za-z_]\w*)\s*:(?P<declared_type>[^={}]+)=")
+MODULE_DECLARATION = re.compile(r"\bmod\s+(\w+)\s*([;{])")
 WEAKER = re.compile(
     r"\b(?:assert|debug_assert|prop_assert)!\s*\(|\bassert\s+"
     + r"|\bself\.(?:assertTrue|assertFalse|assertLess\w*|assertGreater\w*|assertIn|"
@@ -113,23 +127,36 @@ class AssertionSpan(NamedTuple):
     first: int
     last: int
     text: str
+    comparison: str
 
 
 class TouchedAssertion(NamedTuple):
     source: DiffLine
     hunks: tuple[int, ...]
+    comparison: str
+    numeric_constants: tuple[NumericOccurrence, ...] = ()
 
 
 def normalized(text: str) -> str:
-    return "".join(text.split())
-
-
-def code_lines(lines: list[str], rust: bool) -> list[str]:
-    """Hide strings and comments, with the same line and column positions."""
-    token_pattern = RUST_LITERAL if rust else PYTHON_LITERAL
-    text = "\n".join(lines)
     parts: list[str] = []
     cursor = 0
+    for token in lexical_spans(text, True):
+        if token.kind == "literal":
+            parts.extend(("".join(text[cursor:token.first].split()), text[token.first:token.last]))
+            cursor = token.last
+    parts.append("".join(text[cursor:].split()))
+    return "".join(parts)
+
+
+class LexicalSpan(NamedTuple):
+    first: int
+    last: int
+    kind: Literal["literal", "comment"]
+
+
+def lexical_spans(text: str, rust: bool) -> Iterable[LexicalSpan]:
+    """Locate literals and comments, including nested Rust block comments."""
+    token_pattern = RUST_LITERAL if rust else PYTHON_LITERAL
     scan = 0
     while match := token_pattern.search(text, scan):
         end = match.end()
@@ -141,15 +168,552 @@ def code_lines(lines: list[str], rust: bool) -> list[str]:
                 if not depth:
                     end = delimiter.end()
                     break
-        if FINDING_TOKEN.search(text, match.start(), end):
-            parts.append(text[cursor:match.start()])
-            parts.append("\n".join(" " * len(row) for row in text[match.start():end].split("\n")))
-            cursor = end
+        yield LexicalSpan(match.start(), end,
+                          "comment" if match[0].startswith(("//", "/*", "#")) else "literal")
         scan = end
+
+
+def code_lines(lines: list[str], rust: bool, *, keep_literals: bool = False) -> list[str]:
+    """Hide strings and comments, with the same line and column positions."""
+    text = "\n".join(lines)
+    parts: list[str] = []
+    cursor = 0
+    for token in lexical_spans(text, rust):
+        if not keep_literals or token.kind == "comment":
+            parts.append(text[cursor:token.first])
+            parts.append("\n".join(" " * len(row) for row in text[token.first:token.last].split("\n")))
+            cursor = token.last
     if not parts:
         return lines
     parts.append(text[cursor:])
     return "".join(parts).split("\n")
+
+
+@dataclass(frozen=True)
+class LiteralExpression:
+    text: str
+
+
+@dataclass(frozen=True)
+class NumericLiteral:
+    digits: str
+    suffix: str
+    default_type: Literal["i32", "f64"]
+
+
+@dataclass(frozen=True)
+class NumericConstant:
+    literal: NumericLiteral
+    declared_type: str
+
+
+@dataclass(frozen=True)
+class NumericOccurrence:
+    first: int
+    last: int
+    value: NumericLiteral | NumericConstant
+
+
+@dataclass(frozen=True)
+class AssertionExpansion:
+    text: str
+    numeric_constants: tuple[NumericOccurrence, ...] = ()
+
+
+@dataclass(frozen=True)
+class UnresolvedConstant:
+    """Leave an unknown, cyclic or nonliteral expression unchanged."""
+
+
+UNRESOLVED_CONSTANT = UnresolvedConstant()
+
+
+@dataclass(frozen=True)
+class NameBinding:
+    module: tuple[str, ...]
+    value: LiteralExpression | NumericConstant | UnresolvedConstant
+
+
+class UseBinding(NamedTuple):
+    name: str
+    parts: tuple[str, ...]
+
+
+class GlobImport(NamedTuple):
+    module: tuple[str, ...]
+    parts: tuple[str, ...]
+
+
+class SourceFile(NamedTuple):
+    path: str
+    side: Side
+
+
+@dataclass
+class ScopeBlock:
+    first: int
+    last: int
+    module: tuple[str, ...]
+    module_items: bool = False
+    uncertain: bool = False
+    children: list[ScopeBlock] = field(default_factory=list)
+
+
+@dataclass
+class ConstantTable:
+    block: ScopeBlock
+    line_offsets: list[int]
+    bindings: dict[str, list[NameBinding]] = field(default_factory=dict)
+    globs: list[GlobImport] = field(default_factory=list)
+    external_modules: set[tuple[str, ...]] = field(default_factory=set)
+    inline_modules: set[tuple[str, ...]] = field(default_factory=set)
+    refused_names: set[str] = field(default_factory=set)
+    refuse_all: bool = False
+
+    def bind(self, name: str, block: ScopeBlock,
+             value: LiteralExpression | NumericConstant | UnresolvedConstant = UNRESOLVED_CONSTANT) -> None:
+        self.bindings.setdefault(name, []).append(NameBinding(block.module, value))
+
+    def assertion_scope(self, code: list[str], line: int) -> ScopeBlock:
+        match = ASSERTION.search(code[line - 1])
+        if match is None:
+            return ScopeBlock(0, 0, (), uncertain=True)
+        offset = self.line_offsets[line - 1] + match.start()
+        block = self.block
+        while not block.uncertain:
+            index = bisect_right(block.children, offset, key=lambda child: child.first) - 1
+            if index < 0 or block.children[index].last <= offset:
+                break
+            block = block.children[index]
+        return block
+
+    def expand(self, text: str, scope: ScopeBlock) -> AssertionExpansion:
+        """Substitute only a unique, visible, same-file bare literal const."""
+        if scope.uncertain or self.refuse_all:
+            return AssertionExpansion(text)
+        masked = constant_reference_code(text)
+        parts: list[str] = []
+        numbers: list[NumericOccurrence] = []
+        cursor = 0
+        displacement = 0
+        for identifier in IDENTIFIER.finditer(masked):
+            name = identifier[0]
+            before, after = masked[:identifier.start()].rstrip(), masked[identifier.end():].lstrip()
+            if ("::" in name or before.endswith((".", ":")) or after.startswith(":")
+                    or name in ("true", "false")):
+                continue
+            bindings = self.bindings.get(name, [])
+            if len(bindings) != 1 or name in self.refused_names:
+                continue
+            binding = bindings[0]
+            if scope.module[:len(binding.module)] != binding.module:
+                continue
+            if isinstance(binding.value, NumericConstant):
+                type_name = binding.value.declared_type
+                if type_name not in self.bindings and type_name not in self.refused_names:
+                    numbers.append(NumericOccurrence(identifier.start() + displacement,
+                                                     identifier.end() + displacement, binding.value))
+            elif isinstance(binding.value, LiteralExpression):
+                parts.extend((text[cursor:identifier.start()], binding.value.text))
+                cursor = identifier.end()
+                displacement += len(binding.value.text) - len(identifier[0])
+        parts.append(text[cursor:])
+        return AssertionExpansion("".join(parts), tuple(numbers))
+
+
+@dataclass(frozen=True)
+class SourceRevision:
+    commit: str
+    mode: Literal["commit", "index", "worktree"] = "commit"
+
+
+@dataclass
+class RevisionSourceCache:
+    """Read each changed file and build its census once per revision."""
+    sources: dict[tuple[SourceRevision, str], list[str]] = field(default_factory=dict)
+    tables: dict[tuple[SourceRevision, str], ConstantTable] = field(default_factory=dict)
+    files: dict[SourceRevision, set[str]] = field(default_factory=dict)
+    unreadable: set[tuple[SourceRevision, str]] = field(default_factory=set)
+
+
+def source_revision(base: str, head: str, staged: bool, side: Side) -> SourceRevision:
+    if side == "old":
+        return SourceRevision(base)
+    if staged:
+        return SourceRevision("", "index")
+    return SourceRevision(head) if head else SourceRevision("", "worktree")
+
+
+def use_bindings(text: str, prefix: tuple[str, ...] = ()) -> Iterable[UseBinding]:
+    """Collect possible bindings from use leaves, aliases and groups."""
+    for start, end in argument_spans(text):
+        item = " ".join(text[start:end].split())
+        if "{" in item:
+            path, group = item.split("{", 1)
+            yield from use_bindings(group.rsplit("}", 1)[0],
+                                    prefix + tuple(part for part in path.split("::") if part))
+        elif item:
+            path, _, alias = item.partition(" as ")
+            parts = prefix + tuple(part.strip() for part in path.strip().split("::"))
+            if parts[-1] == "self" and len(parts) > 1:
+                parts = parts[:-1]
+            if parts:
+                yield UseBinding(alias.strip() or parts[-1], parts)
+
+
+def declaration_end(text: str, start: int, stops: str) -> int:
+    """Find a delimiter outside nested groups in already masked code."""
+    depth = 0
+    for index in range(start, len(text)):
+        char = text[index]
+        if depth == 0 and char in stops:
+            return index
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+    return len(text)
+
+
+def pairing_code_is_certain(code: str) -> bool:
+    """Require fully read code and known statement/item macro environments."""
+    if not code.isascii() or re.search(r"\br#|\bextern\s+crate\s+\w+\s+as\b", code):
+        return False
+    tokens = re.compile(r"#\s*!?\s*\[|" + MACRO_INVOCATION.pattern + r"|[{};]")
+    cursor = boundary = 0
+    while token := tokens.search(code, cursor):
+        cursor = token.end()
+        if token[0].startswith("#"):
+            cursor = declaration_end(code, cursor, "]") + 1
+            if re.search(r"\bmacro_use\b", code[token.end():cursor]):
+                return False
+            if not code[boundary:token.start()].strip():
+                boundary = cursor
+        elif token["name"]:
+            prefix = code[boundary:token.start()].rstrip()
+            if prefix.endswith(":") or (token["name"] not in TRUSTED_MACROS and not prefix):
+                return False
+        else:
+            boundary = cursor
+    return True
+
+
+def constant_reference_code(text: str, *, allow_match_ranges: bool = True) -> str:
+    """Hide macro tokens except constant endpoints in matches! range patterns."""
+    masked = "\n".join(code_lines(text.split("\n"), True))
+    assertion = ASSERTION.search(masked)
+    parts: list[str] = []
+    cursor = 0
+    for macro in MACRO_INVOCATION.finditer(masked):
+        if macro.start() < cursor or (allow_match_ranges and assertion and macro.start() == assertion.start()):
+            continue
+        end = min(len(masked), declaration_end(masked, macro.end(), ")]}") + 1)
+        replacement = " " * (end - macro.start())
+        if allow_match_ranges and macro["name"] == "matches" and masked[end - 1] in ")]}":
+            replacement = (" " * (macro.end() - macro.start())
+                           + matches_range_endpoint_code(masked[macro.end():end - 1]) + " ")
+        parts.extend((masked[cursor:macro.start()], replacement))
+        cursor = end
+    parts.append(masked[cursor:])
+    return "".join(parts)
+
+
+def matches_range_endpoint_code(code: str) -> str:
+    """Expose bare range endpoints only in the second matches! argument."""
+    arguments = argument_spans(code)
+    result = [" "] * len(code)
+    if len(arguments) not in (2, 3) or (len(arguments) == 3 and code[arguments[2][0]:].strip()):
+        return "".join(result)
+    first, last = arguments[1]
+    pattern = constant_reference_code(code[first:last], allow_match_ranges=False)
+    guard = re.search(r"\bif\b", pattern)
+    if guard:
+        pattern = pattern[:guard.start()]
+    # Const blocks hold expressions, whose ranges are not range patterns.
+    if "{" in pattern:
+        return "".join(result)
+    for reference in IDENTIFIER.finditer(pattern):
+        before, after = pattern[:reference.start()].rstrip(), pattern[reference.end():].lstrip()
+        if "::" not in reference[0] and not before.endswith(("-", ":")) and (
+                before.endswith(("..", "..=")) or after.startswith("..")):
+            result[first + reference.start():first + reference.end()] = reference[0]
+    return "".join(result)
+
+
+def pattern_names(text: str) -> Iterable[str]:
+    """Overcount unfamiliar patterns rather than miss a possible binding."""
+    text = text[:declaration_end(text, 0, ":")]
+    return (match[0] for match in IDENTIFIER.finditer(text)
+            if match[0] not in ("const", "mut", "ref", "self", "Self", "_"))
+
+
+class GenericBindings(NamedTuple):
+    names: tuple[str, ...]
+    end: int
+
+
+def generic_bindings(text: str, start: int) -> GenericBindings:
+    """Count type and const parameters without counting names in their bounds."""
+    opening = start
+    while opening < len(text) and text[opening].isspace():
+        opening += 1
+    if opening == len(text) or text[opening] != "<":
+        return GenericBindings((), start)
+    names: list[str] = []
+    depth = 1
+    groups = 0
+    part = opening + 1
+    for index in range(part, len(text)):
+        char = text[index]
+        if char in "([{":
+            groups += 1
+        elif char in ")]}":
+            groups -= 1
+        elif not groups and char == "<":
+            depth += 1
+        elif not groups and char == ">" and text[index - 1] != "-":
+            depth -= 1
+        if (char == "," and depth == 1 and not groups) or depth == 0:
+            match = re.match(r"\s*(?:const\s+)?([A-Za-z_]\w*)", text[part:index])
+            if match:
+                names.append(match[1])
+            part = index + 1
+        if depth == 0:
+            return GenericBindings(tuple(names), index + 1)
+    return GenericBindings(tuple(names), len(text))
+
+
+def constant_table(lines: list[str], code: list[str]) -> ConstantTable:
+    """Census all bindings; only module-item consts can supply literals."""
+    text, masked = "\n".join(lines), "\n".join(code)
+    root = ScopeBlock(0, len(text), (), module_items=True)
+    table = ConstantTable(root, [0] + [match.end() for match in re.finditer("\n", text)])
+    if not pairing_code_is_certain(masked):
+        table.refuse_all = True
+        return table
+    blocks = [root]
+    tokens = re.compile(r"\b(?:const|static|use|mod|let|for|fn|type|struct|enum|union|trait|impl|extern|macro_rules)\b|[{};|]")
+    # Unknown keywords may introduce bindings: refuse their following name.
+    use_keywords = frozenset(("as", "async", "await", "break", "const", "continue", "crate", "dyn", "else",
+                              "enum", "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match",
+                              "mod", "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct",
+                              "super", "trait", "true", "type", "union", "unsafe", "use", "where", "while"))
+    for arm in re.finditer(r"(?:^|[{,])\s*([^{};]*?)=>", masked):
+        for name in pattern_names(arm[1]):
+            table.bind(name, root)
+    for words in re.finditer(r"(?=\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\b)", masked):
+        if words[1] not in use_keywords:
+            table.refused_names.add(words[2])
+    cursor = 0
+    boundary = 0
+    literal_definitions: set[int] = set()
+    while token := tokens.search(masked, cursor):
+        cursor = token.end()
+        value = token[0]
+        block = blocks[-1]
+        if value == "{":
+            header = masked[boundary:token.start()]
+            function = FUNCTION.search(header)
+            nested = ScopeBlock(token.start(), len(text), block.module,
+                                uncertain=block.uncertain or (block.module_items and not function)
+                                or bool(re.search(r"!\s*(?:\w+\s*)?$|=>|\||\b(?:for|mod|impl|trait|enum|struct)\b", header)))
+            block.children.append(nested)
+            blocks.append(nested)
+            boundary = cursor
+        elif value == "}":
+            if len(blocks) > 1:
+                blocks.pop().last = token.end()
+            else:
+                root.uncertain = True
+            boundary = cursor
+        elif value == ";":
+            boundary = cursor
+        elif value in ("let", "for"):
+            end = declaration_end(masked, cursor, "=;")
+            if value == "for":
+                in_keyword = re.search(r"\bin\b", masked[cursor:end])
+                if in_keyword:
+                    end = cursor + in_keyword.start()
+            for name in pattern_names(masked[cursor:end]):
+                table.bind(name, block)
+        elif value == "|":
+            end = masked.find("|", cursor)
+            if end >= 0 and not re.search(r"[;{}]", masked[cursor:end]):
+                for start, stop in argument_spans(masked[cursor:end]):
+                    for name in pattern_names(masked[cursor:end][start:stop]):
+                        table.bind(name, block)
+                cursor = end + 1
+        elif value == "macro_rules":
+            table.refuse_all = True
+        elif value == "extern":
+            imported_crate = re.match(r"\s+crate\s+(\w+)(?:\s+as\s+(\w+))?", masked[cursor:])
+            if imported_crate:
+                table.bind(imported_crate[2] or imported_crate[1], block)
+        elif value in ("fn", "type", "struct", "enum", "union", "trait", "impl"):
+            declaration_name = re.match(r"\s+([A-Za-z_]\w*)", masked[cursor:]) if value != "impl" else None
+            if declaration_name:
+                table.bind(declaration_name[1], block)
+                cursor += declaration_name.end()
+            generics = generic_bindings(masked, cursor)
+            for name in generics.names:
+                table.bind(name, block)
+            cursor = generics.end
+            if value == "enum":
+                opening = masked.find("{", cursor)
+                if opening >= 0:
+                    end = declaration_end(masked, opening + 1, "}")
+                    for first, last in argument_spans(masked[opening + 1:end]):
+                        variant = re.match(r"\s*(?:#\[[^]]*\]\s*)*(\w+)", masked[opening + 1:end][first:last])
+                        if variant:
+                            table.bind(variant[1], block)
+            if value == "fn":
+                opening = masked.find("(", cursor)
+                if opening >= 0:
+                    parameters = masked[opening + 1:declaration_end(masked, opening + 1, ")")]
+                    for start, end in argument_spans(parameters):
+                        for name in pattern_names(parameters[start:end]):
+                            table.bind(name, block)
+        elif value == "mod":
+            declaration = MODULE_DECLARATION.match(masked, token.start())
+            if not declaration:
+                continue
+            name = declaration[1]
+            table.bind(name, block)
+            if block.module_items:
+                standard_path = not re.search(
+                    r"#\s*\[\s*(?:path\s*=|cfg_attr\b[^]]*\bpath\s*=)", masked[boundary:token.start()])
+                cursor = declaration.end()
+                boundary = cursor
+                if declaration[2] == "{":
+                    table.inline_modules.add(block.module + (name,))
+                    nested = ScopeBlock(cursor - 1, len(text), block.module + (name,), module_items=True)
+                    block.children.append(nested)
+                    blocks.append(nested)
+                elif standard_path:
+                    table.external_modules.add(block.module + (name,))
+        elif value == "use":
+            end = masked.find(";", cursor)
+            if end >= 0:
+                for imported in use_bindings(masked[cursor:end].strip()):
+                    if imported.name in TRUSTED_MACROS:
+                        table.refuse_all = True
+                    if imported.name == "*":
+                        table.globs.append(GlobImport(block.module, imported.parts[:-1]))
+                    else:
+                        table.bind(imported.name, block)
+                cursor = end + 1
+                boundary = cursor
+        elif value in ("const", "static"):
+            match = CONSTANT_ITEM.match(masked, token.start())
+            if match:
+                end = declaration_end(masked, match.end(), ";")
+                if value == "const" and block.module_items:
+                    literal_definitions.add(match.start(1))
+                table.bind(match[1], block, literal_expression(text[match.end():end], match["declared_type"].strip())
+                           if value == "const" and block.module_items else UNRESOLVED_CONSTANT)
+                cursor = match.end()
+            else:
+                binding = re.match(r"\s+(?:mut\s+)?(\w+)\s*:", masked[cursor:])
+                if binding:
+                    table.bind(binding[1], block)
+    if len(blocks) != 1:
+        root.uncertain = True
+    for typed_name in re.finditer(r"\b([A-Za-z_]\w*)\s*:(?!:)", masked):
+        if typed_name.start(1) not in literal_definitions:
+            table.refused_names.add(typed_name[1])
+    return table
+
+
+def numeric_literal(text: str) -> NumericLiteral | UnresolvedConstant:
+    """Read unsigned numeric spelling without evaluating or changing its digits."""
+    match = NUMERIC_LITERAL.fullmatch(text)
+    if not match:
+        return UNRESOLVED_CONSTANT
+    digits, suffix = match["digits"], match["suffix"] or ""
+    floating = suffix.startswith("f") or (not digits.startswith(("0x", "0o", "0b"))
+                                          and ("." in digits or "e" in digits.lower()))
+    return NumericLiteral(digits, suffix, "f64" if floating else "i32")
+
+
+def literal_expression(text: str, declared_type: str) -> LiteralExpression | NumericConstant | UnresolvedConstant:
+    """Read one exact literal; numeric pairing also needs its declared type."""
+    text = "\n".join(code_lines(text.split("\n"), True, keep_literals=True)).strip()
+    number = numeric_literal(text)
+    if isinstance(number, NumericLiteral):
+        if (declared_type in NUMERIC_TYPES and (not number.suffix or number.suffix == declared_type)
+                and declared_type.startswith("f") == (number.default_type == "f64")):
+            return NumericConstant(number, declared_type)
+        return UNRESOLVED_CONSTANT
+    if text in ("true", "false"):
+        return LiteralExpression(text)
+    token = RUST_LITERAL.fullmatch(text)
+    if token:
+        if text.startswith("'"):
+            return LiteralExpression(text)
+        if text.startswith(('"', "r")) and re.fullmatch(r"&\s*(?:'static\s+)?str", declared_type):
+            return LiteralExpression(text)
+    return UNRESOLVED_CONSTANT
+
+
+def inspect_globs(repo: Path, base: str, head: str, staged: bool, path: str, side: Side,
+                  table: ConstantTable, cache: RevisionSourceCache) -> None:
+    """Read standard module globs only to refuse possible competing bindings."""
+    if not table.globs:
+        return
+    revision = source_revision(base, head, staged, side)
+    if revision not in cache.files:
+        arguments = ("ls-files", "--cached") if revision.mode != "commit" else (
+            "ls-tree", "-r", "--name-only", revision.commit)
+        cache.files[revision] = set(git(repo, *arguments).splitlines())
+    source = Path(path)
+    directory = source.parent
+    if source.name not in ("lib.rs", "main.rs", "mod.rs") and "src" in source.parts:
+        directory = source.with_suffix("")
+    for glob in table.globs:
+        owner, parts = glob.module, glob.parts
+        if parts and parts[0] == "crate":
+            if source.name not in ("lib.rs", "main.rs"):
+                table.refuse_all = True
+                continue
+            owner, parts = (), parts[1:]
+        elif parts and parts[0] == "self":
+            parts = parts[1:]
+        while parts and parts[0] == "super" and owner:
+            owner, parts = owner[:-1], parts[1:]
+        target = owner + parts
+        if not parts or any(len(table.bindings.get(name, [])) != 1 for name in target):
+            table.refuse_all = True
+            continue
+        if target in table.inline_modules:
+            table.refused_names.update(name for name, bindings in table.bindings.items()
+                                       if any(binding.module == target for binding in bindings))
+            continue
+        if target not in table.external_modules:
+            table.refuse_all = True
+            continue
+        module = directory.joinpath(*target)
+        candidates = [candidate.as_posix() for candidate in (module.with_suffix(".rs"), module / "mod.rs")
+                      if candidate.as_posix() in cache.files[revision]]
+        if len(candidates) != 1:
+            table.refuse_all = True
+            continue
+        key = revision, candidates[0]
+        try:
+            if key in cache.unreadable:
+                table.refuse_all = True
+                continue
+            if key not in cache.tables:
+                rows = read_sources(repo, base, head, staged, [], cache,
+                                    (SourceFile(candidates[0], side),))[candidates[0], side]
+                cache.tables[key] = constant_table(rows, code_lines(rows, True))
+            imported = cache.tables[key]
+            if imported.refuse_all or imported.globs or imported.block.uncertain:
+                table.refuse_all = True
+            table.refused_names.update(imported.bindings)
+            table.refused_names.update(imported.refused_names)
+        except (GuardError, OSError, UnicodeError):
+            cache.unreadable.add(key)
+            table.refuse_all = True
 
 
 def diff_path(text: str) -> str:
@@ -269,12 +833,12 @@ def comparison_operands(text: str) -> tuple[tuple[str, ...], bool]:
     return (normalized(text[start:end]),), False
 
 
-def parse_assertion(line: DiffLine, hunks: tuple[int, ...]) -> Assertion:
-    match = ASSERTION.search(code_lines([line.text], line.path.endswith(".rs"))[0])
+def parse_assertion(line: DiffLine, hunks: tuple[int, ...], comparison: str) -> Assertion:
+    match = ASSERTION.search(code_lines([comparison], line.path.endswith(".rs"))[0])
     if match is None:
         raise GuardError("cannot read assertion")
     name = match.group("macro") or match.group("method") or match.group("bare") or match.group("raises")
-    arguments = line.text[match.end():]
+    arguments = comparison[match.end():]
     operands = tuple(arguments[start:end].strip() for start, end in argument_spans(arguments)
                      if arguments[start:end].strip())
     exact = name in EXACT_CALLS
@@ -282,8 +846,8 @@ def parse_assertion(line: DiffLine, hunks: tuple[int, ...]) -> Assertion:
         operands, exact = comparison_operands(operands[0])
     else:
         operands = tuple(normalized(operand) for operand in operands)
-    subject_text = normalized(arguments) if match.group("bare") else line.key
-    return Assertion(line, name, operands, exact, not exact and is_weaker(line.text), hunks, subject_text)
+    subject_text = normalized(arguments) if match.group("bare") else normalized(comparison)
+    return Assertion(line, name, operands, exact, not exact and is_weaker(comparison), hunks, subject_text)
 
 
 def assertion_spans(lines: list[str], code_rows: list[str], rust: bool,
@@ -291,6 +855,15 @@ def assertion_spans(lines: list[str], code_rows: list[str], rust: bool,
     """Scan each assertion once and stop its statement after at most 40 lines."""
     index = 0
     cursor = 0
+    statements = code_lines(lines, rust, keep_literals=True)
+    text = "\n".join(lines)
+    offsets = [0] + [match.end() for match in re.finditer("\n", text)]
+    open_literal_rows: set[int] = set()
+    for token in lexical_spans(text, rust):
+        if token.kind == "literal":
+            first_row = bisect_right(offsets, token.first) - 1
+            last_row = bisect_right(offsets, token.last - 1) - 1
+            open_literal_rows.update(range(first_row, last_row))
     while index < len(lines):
         while cursor < len(changes) and changes[cursor].number <= index:
             cursor += 1
@@ -303,57 +876,23 @@ def assertion_spans(lines: list[str], code_rows: list[str], rust: bool,
             continue
         first = index
         depth = 0
-        quote = ""
-        block = 0
         parts: list[str] = []
         for index in range(first, min(first + 40, len(lines))):
-            row = lines[index]
-            code: list[str] = []
-            start = 0
-            for match in STATEMENT_TOKEN.finditer(row):
-                token = match[0]
-                offset = match.start()
-                if block:
-                    if token == "/*":
-                        block += 1
-                    elif token == "*/":
-                        block -= 1
-                        start = match.end()
-                    continue
-                if quote:
-                    if token == quote:
-                        before = offset - 1
-                        while before >= 0 and row[before] == "\\":
-                            before -= 1
-                        if (offset - before) % 2:
-                            quote = ""
-                elif (rust and token == "//") or (not rust and token == "#"):
-                    code.append(row[start:offset])
-                    start = len(row)
-                    break
-                elif rust and token == "/*":
-                    code.append(row[start:offset])
-                    block = 1
-                elif token[0] in "\"'":
-                    quote = token
-                elif token in "([{":
-                    depth += 1
-                elif token in ")]}":
-                    depth -= 1
-            if not block:
-                code.append(row[start:])
-            part = "".join(code).strip()
+            row = code_rows[index]
+            depth += sum(row.count(char) for char in "([{") - sum(row.count(char) for char in ")]}")
+            part = statements[index].strip()
             parts.append(part)
-            if depth <= 0 and not quote and not block and not part.endswith("\\"):
+            if depth <= 0 and index not in open_literal_rows and not part.endswith("\\"):
                 break
         text = " ".join(parts)
         if is_assertion(text):
-            yield AssertionSpan(first + 1, index + 1, text)
+            yield AssertionSpan(first + 1, index + 1, text,
+                                "\n".join(statements[first:index + 1]).strip())
         index += 1
 
 
 def touched_assertions(lines: list[DiffLine], sources: dict[tuple[str, Side], list[str]],
-                       code: dict[tuple[str, Side], list[str]]) -> list[TouchedAssertion]:
+                       code: dict[tuple[str, Side], list[str]], constants: dict[tuple[str, Side], ConstantTable]) -> list[TouchedAssertion]:
     groups: dict[tuple[str, Side], list[DiffLine]] = defaultdict(list)
     for line in lines:
         groups[line.path, line.side].append(line)
@@ -369,7 +908,11 @@ def touched_assertions(lines: list[DiffLine], sources: dict[tuple[str, Side], li
                 cursor += 1
             if hunks:
                 source = DiffLine(path, side, span.first, span.text, next(iter(hunks)))
-                assertions.append(TouchedAssertion(source, tuple(hunks)))
+                expansion = AssertionExpansion(span.comparison)
+                if path.endswith(".rs"):
+                    table = constants[path, side]
+                    expansion = table.expand(expansion.text, table.assertion_scope(code[path, side], span.first))
+                assertions.append(TouchedAssertion(source, tuple(hunks), expansion.text, expansion.numeric_constants))
             if cursor == len(changes):
                 break
     return assertions
@@ -448,20 +991,21 @@ def is_assertion(text: str) -> bool:
             and ASSERTION.search(text) is not None)
 
 
-def test_lines(lines: list[DiffLine]) -> list[tuple[DiffLine, str]]:
+def test_lines(lines: list[DiffLine], code: dict[tuple[str, Side], list[str]]) -> list[tuple[DiffLine, str]]:
     tests: list[tuple[DiffLine, str]] = []
     markers: dict[tuple[str, Side], int] = {}
     for line in lines:
-        if "#[" not in line.text and "def" not in line.text and "fn" not in line.text:
-            continue
         key = line.path, line.side
-        if "#[" in line.text and TEST_MARK.search(line.text):
+        text = code[key][line.number - 1]
+        if "#[" not in text and "def" not in text and "fn" not in text:
+            continue
+        if "#[" in text and TEST_MARK.search(text):
             markers[key] = line.number
-        match = PYTHON_TEST.search(line.text) if "def" in line.text else None
+        match = PYTHON_TEST.search(text) if "def" in text else None
         if match:
             tests.append((line, match[1]))
-        elif "fn" in line.text and line.path.endswith(".rs") and 0 < line.number - markers.get(key, -4) <= 3:
-            function = FUNCTION.search(line.text)
+        elif "fn" in text and line.path.endswith(".rs") and 0 < line.number - markers.get(key, -4) <= 3:
+            function = FUNCTION.search(text)
             if function:
                 tests.append((line, function[1]))
     return tests
@@ -480,12 +1024,105 @@ def unmatched_lines(lines: list[DiffLine]) -> list[DiffLine]:
     return unmatched
 
 
+type NumericValues = tuple[NumericLiteral | NumericConstant, ...]
+
+
+class NumericAssertionKey(NamedTuple):
+    path: str
+    fragments: tuple[str, ...]
+    digits: tuple[str, ...]
+
+
+class NumericComparison(NamedTuple):
+    key: NumericAssertionKey
+    values: NumericValues
+
+
+@dataclass
+class NumericAssertionBucket:
+    old: dict[NumericValues, deque[TouchedAssertion]] = field(default_factory=dict)
+    new: dict[NumericValues, deque[TouchedAssertion]] = field(default_factory=dict)
+
+
+def numeric_comparison(assertion: TouchedAssertion) -> NumericComparison:
+    """Keep the whole assertion and every digit exact, with numeric types separate."""
+    text = assertion.comparison
+    occurrences = list(assertion.numeric_constants)
+    for span in lexical_spans(text, True):
+        if span.kind == "literal" and not text[:span.first].rstrip().endswith("-"):
+            number = numeric_literal(text[span.first:span.last])
+            if isinstance(number, NumericLiteral):
+                occurrences.append(NumericOccurrence(span.first, span.last, number))
+    occurrences.sort(key=lambda occurrence: occurrence.first)
+    fragments: list[str] = []
+    digits: list[str] = []
+    values: list[NumericLiteral | NumericConstant] = []
+    cursor = 0
+    for occurrence in occurrences:
+        fragments.append(normalized(text[cursor:occurrence.first]))
+        value = occurrence.value
+        digits.append(value.literal.digits if isinstance(value, NumericConstant) else value.digits)
+        values.append(value)
+        cursor = occurrence.last
+    fragments.append(normalized(text[cursor:]))
+    return NumericComparison(NumericAssertionKey(assertion.source.path, tuple(fragments), tuple(digits)), tuple(values))
+
+
+def numeric_pair_matches(old: NumericLiteral | NumericConstant, new: NumericLiteral | NumericConstant) -> bool:
+    """A suffix proves the type; an unsuffixed assertion requires the default type."""
+    if isinstance(old, NumericConstant) and isinstance(new, NumericConstant):
+        return old == new
+    if isinstance(old, NumericLiteral) and isinstance(new, NumericLiteral):
+        return old == new
+    constant = old if isinstance(old, NumericConstant) else new
+    literal = old if isinstance(old, NumericLiteral) else new
+    if not isinstance(constant, NumericConstant) or not isinstance(literal, NumericLiteral):
+        return False
+    if literal.digits != constant.literal.digits:
+        return False
+    if literal.suffix:
+        return constant.declared_type == literal.suffix and constant.literal.suffix in ("", literal.suffix)
+    return constant.declared_type == literal.default_type and not constant.literal.suffix
+
+
+def pair_numeric_constants(touched: list[TouchedAssertion]) -> list[TouchedAssertion]:
+    """Pair numeric consts only after every occurrence proves the same type and digits."""
+    eligible_paths = {assertion.source.path for assertion in touched if assertion.numeric_constants}
+    if not eligible_paths:
+        return touched
+    buckets: dict[NumericAssertionKey, NumericAssertionBucket] = {}
+    for assertion in touched:
+        if assertion.source.path not in eligible_paths:
+            continue
+        comparison = numeric_comparison(assertion)
+        if not comparison.values:
+            continue
+        bucket = buckets.setdefault(comparison.key, NumericAssertionBucket())
+        side = bucket.old if assertion.source.side == "old" else bucket.new
+        side.setdefault(comparison.values, deque()).append(assertion)
+    paired: set[DiffLine] = set()
+    for bucket in buckets.values():
+        for old_values, old_assertions in bucket.old.items():
+            for new_values, new_assertions in bucket.new.items():
+                if not old_assertions:
+                    break
+                if (not new_assertions or not any(isinstance(value, NumericConstant)
+                                                  for value in (*old_values, *new_values))
+                        or not all(numeric_pair_matches(old, new) for old, new in zip(old_values, new_values))):
+                    continue
+                for _ in range(min(len(old_assertions), len(new_assertions))):
+                    paired.add(old_assertions.popleft().source)
+                    paired.add(new_assertions.popleft().source)
+    return [assertion for assertion in touched if assertion.source not in paired]
+
+
 def find_changes(lines: list[DiffLine], touched: list[TouchedAssertion],
                  code: dict[tuple[str, Side], list[str]]) -> list[Finding]:
-    statement_lines = unmatched_lines([assertion.source for assertion in touched])
+    touched = pair_numeric_constants(touched)
+    statement_lines = unmatched_lines([assertion.source._replace(text=assertion.comparison) for assertion in touched])
     remaining = set(statement_lines)
-    assertions = [parse_assertion(assertion.source, assertion.hunks)
-                  for assertion in touched if assertion.source in remaining]
+    assertions = [parse_assertion(assertion.source, assertion.hunks, assertion.comparison)
+                  for assertion in touched if assertion.source._replace(text=assertion.comparison) in remaining]
     additions = [assertion for assertion in assertions if assertion.source.side == "new"]
     unmatched = [assertion for assertion in assertions if assertion.source.side == "old"]
     weaker = weaker_subjects(additions, unmatched)
@@ -535,7 +1172,7 @@ def find_changes(lines: list[DiffLine], touched: list[TouchedAssertion],
                 findings.append(Finding(line, "removed", line.text.strip(), "(none)"))
         else:
             findings.append(Finding(line, "removed", line.text.strip(), "(none)"))
-    tests = test_lines(lines)
+    tests = test_lines(lines, code)
     new_tests = {name for line, name in tests if line.side == "new"}
     for line, name in tests:
         if line.side == "old" and name not in new_tests:
@@ -552,12 +1189,18 @@ def git(repo: Path, *arguments: str) -> str:
 
 
 def read_sources(repo: Path, base: str, head: str, staged: bool,
-                 lines: list[DiffLine]) -> dict[tuple[str, Side], list[str]]:
+                 lines: list[DiffLine], cache: RevisionSourceCache,
+                 extra_files: tuple[SourceFile, ...] = ()) -> dict[tuple[str, Side], list[str]]:
     """Read each changed side once; get all revision contents in one batch."""
     sources: dict[tuple[str, Side], list[str]] = {}
     requests: list[tuple[str, Side, str]] = []
     paths: dict[tuple[str, Side], None] = dict.fromkeys((line.path, line.side) for line in lines)
+    paths.update(dict.fromkeys(extra_files))
     for path, side in paths:
+        cache_key = source_revision(base, head, staged, side), path
+        if cache_key in cache.sources:
+            sources[path, side] = cache.sources[cache_key]
+            continue
         if side == "new" and not staged and not head:
             sources[path, side] = (repo / path).read_text(encoding="utf-8").splitlines()
         else:
@@ -585,6 +1228,8 @@ def read_sources(repo: Path, base: str, head: str, staged: bool,
                 raise GuardError("incomplete git cat-file output")
             sources[path, side] = content.decode("utf-8", errors="replace").splitlines()
             offset += 1
+    for (path, side), rows in sources.items():
+        cache.sources[source_revision(base, head, staged, side), path] = rows
     return sources
 
 
@@ -632,7 +1277,10 @@ def production_merge_branch(repo: Path) -> ProductionMergeBranch | NoProductionB
     for doc in dict.fromkeys(showrunners.timer_docs().values()):
         try:
             lines = doc.read_text(encoding="utf-8").splitlines()
-            rows = production_units.unit_table(lines)
+            rows = [row for row in production_units.unit_table(lines) if not any(
+                re.search(r"(?:^|[\s(`])(?:retired|removed)\b",
+                          row.get(column, ""), re.IGNORECASE)
+                for column in ("Status", "Worktree"))]
             worktree_matches = any(worktree_path_matches(
                 production_units.cell_value(row.get("Worktree", "")), worktree) for row in rows)
             branch_matches = bool(branch) and any(
@@ -749,7 +1397,8 @@ def read_rulings(sources: list[str], messages: str) -> dict[tuple[str, str], str
             if (why := match[3].strip().rstrip("\"'").strip())}
 
 
-def findings_against_base(repo: Path, base: str, head: str, staged: bool) -> list[Finding]:
+def findings_against_base(repo: Path, base: str, head: str, staged: bool,
+                          cache: RevisionSourceCache) -> list[Finding]:
     """Judge a single parent against the selected tree, index or revision."""
     diff_args = ["diff", "--no-color", "--no-ext-diff", "-U0", "--find-renames"]
     if staged:
@@ -760,10 +1409,18 @@ def findings_against_base(repo: Path, base: str, head: str, staged: bool) -> lis
     diff_args.extend(("--", "*.rs", "*.py"))
     diff = git(repo, *diff_args)
     lines = parse_diff(diff)
-    sources = read_sources(repo, base, head, staged, lines)
+    sources = read_sources(repo, base, head, staged, lines, cache)
     code = {key: code_lines(rows, key[0].endswith(".rs")) for key, rows in sources.items()}
-    assertions = touched_assertions(lines, sources, code)
-    return name_tests(find_changes(lines, assertions, code), sources)
+    constants: dict[tuple[str, Side], ConstantTable] = {}
+    for (path, side), rows in sources.items():
+        if path.endswith(".rs"):
+            key = source_revision(base, head, staged, side), path
+            if key not in cache.tables:
+                cache.tables[key] = constant_table(rows, code[path, side])
+            inspect_globs(repo, base, head, staged, path, side, cache.tables[key], cache)
+            constants[path, side] = cache.tables[key]
+    assertions = touched_assertions(lines, sources, code, constants)
+    return name_tests(find_changes(lines, assertions, code), code)
 
 
 def finding_identity(finding: Finding) -> tuple[str, str, Kind, str, str]:
@@ -789,11 +1446,12 @@ def run(arguments: list[str]) -> int:
         bases = [default_base(repo)]
         bases.extend(git(repo, "rev-list", "--parents", "-n", "1", "HEAD").split()[2:])
     bases = list(dict.fromkeys(bases))
-    findings = findings_against_base(repo, bases[0], args.head, args.staged)
+    cache = RevisionSourceCache()
+    findings = findings_against_base(repo, bases[0], args.head, args.staged, cache)
     common = Counter(finding_identity(finding) for finding in findings)
     for base in bases[1:]:
         common &= Counter(finding_identity(finding)
-                          for finding in findings_against_base(repo, base, args.head, args.staged))
+                          for finding in findings_against_base(repo, base, args.head, args.staged, cache))
     shared: list[Finding] = []
     for finding in findings:
         identity = finding_identity(finding)

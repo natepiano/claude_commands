@@ -54,6 +54,10 @@ LintTool = Literal["clippy", "mend", "rustfmt"]
 ProcessedTipReason = Literal["linted", "own hand-off"]
 # How long every ledger connection waits for another writer's lock before it fails.
 BUSY_TIMEOUT_SECONDS = 30
+FINDING_REPLACEMENT_GUIDANCE = (
+    "The After text replaces the whole Before span. Supply the full replacement, never the old wording with a new line added. "
+    + "Rewrite a comment to name the constructs and keep every reason."
+)
 
 
 class DeclaredInputScope(StrEnum):
@@ -3616,6 +3620,12 @@ class Ledger:
             raise LedgerError(f"{rule}: {path} is outside rule reach")
         if kind not in ("rename", "type", "restructure") or line < 1:
             raise LedgerError("held finding requires a valid kind and positive line")
+        before_lines, after_lines = before.splitlines(), after.splitlines()
+        if before_lines and len(after_lines) > len(before_lines) and any(
+            after_lines[start:start + len(before_lines)] == before_lines
+            for start in range(len(after_lines) - len(before_lines) + 1)
+        ):
+            raise LedgerError(f"{rule}: after text must replace the whole before span, not keep it with added lines")
         change = (kind, before, after)
         site = (rule, path, line, text, rule_blob)
         # The first id names the site. When a different change holds it, the change gets the second id, which also names
@@ -6758,8 +6768,10 @@ def main() -> None:
             elif name == "tip":
                 _ = command.add_argument("--tip", required=True)
             elif action == "add":
-                for field in ("rule", "path", "text", "before", "after", "rule-blob", "ticket"):
+                for field in ("rule", "path", "text", "rule-blob", "ticket"):
                     _ = command.add_argument(f"--{field}", required=True)
+                _ = command.add_argument("--before", required=True, help="The whole span to replace. " + FINDING_REPLACEMENT_GUIDANCE)
+                _ = command.add_argument("--after", required=True, help=FINDING_REPLACEMENT_GUIDANCE)
                 _ = command.add_argument("--line", type=int, required=True)
                 _ = command.add_argument("--kind", choices=("rename", "type", "restructure"), required=True)
             elif action == "list":

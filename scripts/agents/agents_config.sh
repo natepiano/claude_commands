@@ -263,7 +263,7 @@ _agents_effort_allowed() {
 # Resolve visible model-family versions with known effort rows. Numeric ties
 # use slug order, independent of cache order; a full slug needs no cache.
 _agents_model_slug() {
-    local family="$1" word="$2" model
+    local family="$1" word="$2" model cache_text
     if ! _agents_registry_has_key "$family.families" "$word"; then
         printf '%s' "$word"
         return 0
@@ -272,6 +272,8 @@ _agents_model_slug() {
         _agents_registry_get "$family.families" "$word"
         return 0
     fi
+    cache_text="$("$AGENTS_CONFIG_DIR/../lib/py" "$AGENTS_CONFIG_DIR/../lib/codex_models_cache.py" \
+        "$CODEX_MODELS_CACHE_FILE")" || return 1
     if model="$(jq -er --arg family "$word" \
         --arg catalog "$(_agents_config_section_values codex.agents)" '
         ($catalog | split("\n") | map(split("=")[0])) as $known_slugs
@@ -286,7 +288,7 @@ _agents_model_slug() {
         | max_by([.version_numbers, .slug])
         | select(. != null)
         | .slug
-    ' "$CODEX_MODELS_CACHE_FILE" 2>/dev/null)" && [[ -n "$model" ]]; then
+    ' <<< "$cache_text" 2>/dev/null)" && [[ -n "$model" ]]; then
         printf '%s' "$model"
         return 0
     fi

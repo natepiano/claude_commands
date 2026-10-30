@@ -87,14 +87,15 @@ class GitRepositoryFixture(unittest.TestCase):
 
 
     def register_production(self, merge_branch: str, *, worktree: str = "", branch: str = "unit",
-                            slug: str = "fixture") -> Path:
+                            slug: str = "fixture", status: str = "active", worktree_commentary: str = "") -> Path:
         doc = self.root / f"{slug}-production.md"
+        worktree_cell = f"`{worktree or self.repo}`" + (f" {worktree_commentary}" if worktree_commentary else "")
         _ = doc.write_text(
             f"- **Merge branch:** `{merge_branch}`\n\n## Units\n\n"
-            + "| Unit | Worktree | Branch |\n| --- | --- | --- |\n"
-            + f"| fixture | `{worktree or self.repo}` | `{branch}` |\n", encoding="utf-8")
+            + "| Unit | Worktree | Branch | Status |\n| --- | --- | --- | --- |\n"
+            + f"| fixture | {worktree_cell} | `{branch}` | {status} |\n", encoding="utf-8")
         timer = self.notifier_dir / f"showrunner-{slug}"
-        timer.mkdir()
+        timer.mkdir(exist_ok=True)
         _ = (timer / "conf").write_text(
             f"TARGET=session:fixture\nCHECK=production_check.sh {doc}\n", encoding="utf-8")
         return doc

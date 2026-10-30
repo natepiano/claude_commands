@@ -8,7 +8,7 @@
 
 | Check | Runs in | Over |
 | --- | --- | --- |
-| assertion guard (`scripts/direct/assertion_guard.py`) | the first stage of every `verify.sh lint`, and the checkpoint commit hook | `.rs` and `.py` changes from the newer upstream/production merge-branch base (nearest remote without upstream); commit parents in the hook |
+| assertion guard (`scripts/direct/assertion_guard.py`) | the first stage of every `verify.sh lint`, and the checkpoint commit hook | `.rs` and `.py` changes from the newer upstream/production merge-branch base (nearest remote without upstream); commit parents in the hook; uniquely bound same-file bare `const` names pair outside nested macros (also range-pattern endpoints in the second trusted `matches!` argument) for exact `&str`/`&'static str` string, char or bool literals, or unsigned numeric spelling with a proven matching primitive type (suffix, or default i32/f64); glob census only refuses names; non-ASCII code, raw identifiers, extern-crate aliases, incomplete macro paths, trusted macro-name imports, `macro_use`, definitions and untrusted item/statement macros refuse pairing; other typed bindings, byte strings, imports, statics and qualified paths stay written |
 | cargo mend `--fix` | the workers' last `verify.sh lint` | the workspace |
 | fmt (nightly) | the same `lint` | the named package plus every member that differs from HEAD |
 | taplo fmt `--check` | the same `lint` | the workspace TOML, run from the cargo workspace root |

@@ -33,6 +33,18 @@ TEST_HANG_GUARD_SECS = 300
 
 @final
 class StylePlanTests(StylePlanFixture):
+    def test_judge_notes_define_after_as_the_whole_before_span_replacement(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        self.assertEqual(self.run_next()[0], 0)
+        text = self.plan.read_text()
+        sentence = "The After text replaces the whole Before span."
+        self.assertIn(sentence, text.split("Note each window's findings", 1)[1].split("A site that breaks", 1)[0])
+        self.assertIn(sentence, text.split("style_ledger.py held add --ticket names-unit-1", 1)[1])
+        self.assertEqual(text.count(sentence), 2)
+        self.assertEqual(text.count("never the old wording with a new line added"), 2)
+        self.assertEqual(text.count("Rewrite a comment to name the constructs and keep every reason."), 2)
+
     def test_style_family_accepts_exact_suffixes_and_returns_a_typed_nonstyle_result(self) -> None:
         families: tuple[rules.Family, ...] = ("names", "types", "values", "modules")
         for family in families:

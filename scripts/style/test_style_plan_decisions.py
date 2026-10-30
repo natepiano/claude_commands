@@ -26,6 +26,17 @@ from style_plan_test_support import StylePlanFixture
 
 @final
 class StylePlanTests(StylePlanFixture):
+    def test_fix_worker_applies_after_as_the_whole_before_span_replacement(self) -> None:
+        ticket_id = self.approved_reference_ticket()
+        with self.ledger() as ledger:
+            ticket, = ledger.queued_tickets("names-unit")
+            text = style_plan.phase_text(ticket, ledger.pinned_rule_texts(ticket_id), self.plan, self.plan_header())
+        authorization = text.split("Read the issue for its sites and before/after changes.", 1)[1]
+        authorization = authorization.split("Hold every other non-mechanical finding.", 1)[0]
+        self.assertIn("The After text replaces the whole Before span.", authorization)
+        self.assertIn("never the old wording with a new line added", authorization)
+        self.assertIn("Rewrite a comment to name the constructs and keep every reason.", authorization)
+
     def test_completed_classified_catalog_waits_for_sync_without_creating_work(self) -> None:
         rule = self.rule("read")
         self.sync()

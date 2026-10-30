@@ -6,6 +6,128 @@ import unittest
 from scripts.direct.assertion_guard_test_support import AssertionFindingFixture
 
 class AssertionStringTests(AssertionFindingFixture):
+    def test_unreadable_code_refuses_constant_pairing(self) -> None:
+        for syntax in ("fn é() {}", "fn r#helper() {}", "extern crate std as harmless;"):
+            for in_glob in (False, True):
+                with self.subTest(syntax=syntax, in_glob=in_glob):
+                    _ = self.save("support.rs", syntax if in_glob else "")
+                    prefix = ("mod support;\nuse support::*;\n" if in_glob else syntax + "\n")
+                    prefix += 'const FIELD: &str = "strict";\n'
+                    self.change("value.rs", prefix + self.rust('assert!(stdout.contains("strict"));'),
+                                prefix + self.rust('assert!(stdout.contains(FIELD));'))
+                    _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_unreadable_syntax_in_literals_and_comments_allows_constant_pairing(self) -> None:
+        text = "é r#helper extern crate std as harmless;"
+        for syntax in (f'let text = "{text}";', f'let text = r###"{text}"###;',
+                       "let text = 'é';", "// " + text, "/* " + text + " */"):
+            with self.subTest(syntax=syntax):
+                prefix = 'const FIELD: &str = "strict";\n'
+                self.change("value.rs", prefix + self.rust(syntax + '\nassert!(stdout.contains("strict"));'),
+                            prefix + self.rust(syntax + '\nassert!(stdout.contains(FIELD));'))
+                self.assert_clean(self.guard())
+
+
+    def test_matches_bare_patterns_and_other_macro_positions_stay_written(self) -> None:
+        declarations = 'const LOW: i32 = 0;\nconst HIGH: i32 = 2;\n'
+        for expression, replacement in (
+            ('matches!(actual, 2)', 'matches!(actual, HIGH)'),
+            ('matches!(actual, Some(2))', 'matches!(actual, Some(HIGH))'),
+            ('matches!(Some(0..=2), Some(_))', 'matches!(Some(LOW..=HIGH), Some(_))'),
+            ('matches!(actual, Some(_) if (0..=2).contains(&value))',
+             'matches!(actual, Some(_) if (LOW..=HIGH).contains(&value))'),
+            ('matches!(actual, helper!(0..=2))', 'matches!(actual, helper!(LOW..=HIGH))'),
+            ('helper!(matches!(actual, 0..=2))', 'helper!(matches!(actual, LOW..=HIGH))'),
+            ('::std::matches!(actual, 0..=2)', '::std::matches!(actual, LOW..=HIGH)'),
+            ('::core::matches!(actual, 0..=2)', '::core::matches!(actual, LOW..=HIGH)'),
+        ):
+            with self.subTest(expression=expression):
+                self.change("value.rs", declarations + self.rust(f'assert!({expression});'),
+                            declarations + self.rust(f'assert!({replacement});'))
+                _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_constant_references_inside_nested_macros_stay_written(self) -> None:
+        for expression, replacement, declaration in (
+            ('stringify!("strict").contains("FIELD")', 'stringify!(FIELD).contains("FIELD")',
+             'const FIELD: &str = "strict";'),
+            ('helper!["strict"].contains("FIELD")', 'helper![FIELD].contains("FIELD")',
+             'const FIELD: &str = "strict";'),
+            ('helper! { "strict" }.contains("FIELD")', 'helper! { FIELD }.contains("FIELD")',
+             'const FIELD: &str = "strict";'),
+            ('stringify!(1i32).contains("LIMIT")', 'stringify!(LIMIT).contains("LIMIT")',
+             'const LIMIT: i32 = 1;'),
+        ):
+            with self.subTest(expression=expression):
+                prefix = declaration + "\n"
+                self.change("value.rs", prefix + self.rust(f'assert!({expression});'),
+                            prefix + self.rust(f'assert!({replacement});'))
+                _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_byte_string_constants_stay_written_across_slice_coercion(self) -> None:
+        for literal in ('b"x"', 'br###"x"###'):
+            with self.subTest(literal=literal):
+                prefix = f'const FIELD: &[u8] = {literal};\n'
+                local = 'let actual = 8usize;\n    '
+                self.change("value.rs", prefix + self.rust(
+                    local + f'assert!(std::mem::size_of_val(&{literal}).gt(&actual));'),
+                    prefix + self.rust(local + 'assert!(std::mem::size_of_val(&FIELD).gt(&actual));'))
+                _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_string_constant_requires_explicit_str_reference_type(self) -> None:
+        for type_name in ("&str", "&'static str", "Alias", "&Custom"):
+            with self.subTest(type_name=type_name):
+                self.change("value.rs", self.rust('assert!(values.contains("strict"));'),
+                            f'const FIELD: {type_name} = "strict";\n'
+                            + self.rust('assert!(values.contains(FIELD));'))
+                if type_name in ("&str", "&'static str"):
+                    self.assert_clean(self.guard())
+                else:
+                    _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_constant_literal_spelling_is_compared_exactly(self) -> None:
+        for before, value in (('"ab"', '"a b"'), ('r"ab"', 'r"a b"'),
+                              ('" "', r'"\x20"'), ('r"first\nsecond"', 'r"first second"')):
+            with self.subTest(before=before, value=value):
+                self.change("value.rs", self.rust(f'assert!(values.contains({before}));'),
+                            f'const FIELD: &str = {value};\n' + self.rust('assert!(values.contains(FIELD));'))
+                _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_changed_middle_of_triple_quoted_assertion_is_changed(self) -> None:
+        for quote in ('"""', "'''"):
+            with self.subTest(quote=quote):
+                self.change("test_value.py", self.python(f'assert actual == {quote}first\nsecond\nthird{quote}'),
+                            self.python(f'assert actual == {quote}first\nchanged\nthird{quote}'))
+                _ = self.assert_finding(self.guard(), "test_value.py", "changed", status=0)
+
+
+    def test_test_owners_ignore_functions_in_literals_and_comments(self) -> None:
+        fixtures = (
+            'let source = "pub fn internal_fn() {}";',
+            r'let source = "escaped \" quote; pub fn internal_fn() {}";',
+            'let source = r"pub fn internal_fn() {}";',
+            'let source = r####"a "### quote\npub fn internal_fn() {}\n"####;',
+            'let source = b"pub fn internal_fn() {}";',
+            'let source = br##"pub fn internal_fn() {}"##;',
+            '// pub fn internal_fn() {}',
+            '/* outer /* nested */ pub fn internal_fn() {} */',
+        )
+        for fixture in fixtures:
+            with self.subTest(fixture=fixture):
+                before = self.rust(fixture + "\n    assert_eq!(actual, expected);")
+                after = self.rust(fixture + "\n    helper();")
+                self.change("value.rs", before, after)
+                _ = self.assert_finding(self.guard(), "value.rs", "removed", "test_value")
+        self.change("test_value.py", self.python('source = """def internal_fn(): pass"""\n    assert ok'),
+                    self.python('source = """def internal_fn(): pass"""\n    helper()'))
+        _ = self.assert_finding(self.guard(), "test_value.py", "removed", "test_value")
+
+
     def test_removed_python_assertions_and_multiline_first_line(self) -> None:
         for assertion in ("assert actual == expected", "self.assertEqual(actual, expected)",
                           "self.assertTrue(actual)", "pytest.raises(ValueError)", "self.fail('missing')",

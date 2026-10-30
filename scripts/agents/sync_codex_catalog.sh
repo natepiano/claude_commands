@@ -185,7 +185,10 @@ warn_missing_claude_aliases() {
 command -v jq >/dev/null || fail "jq is required"
 [[ -f "$AGENTS_CONFIG_FILE" ]] || fail "agent registry not found: $AGENTS_CONFIG_FILE"
 [[ -f "$CODEX_CONFIG_FILE" ]] || fail "Codex config not found: $CODEX_CONFIG_FILE"
-[[ -f "$CODEX_MODELS_CACHE_FILE" ]] || fail "Codex model cache not found: $CODEX_MODELS_CACHE_FILE"
+# Every query below uses the same complete snapshot, even if Codex rewrites the
+# live file between queries. Only the shared reader opens/parses that file.
+cache_reader="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)"
+cache_text="$("$cache_reader/py" "$cache_reader/codex_models_cache.py" "$CODEX_MODELS_CACHE_FILE")" || exit 1
 REGISTRY_VIEW="$(mktemp "${AGENTS_CONFIG_FILE}.view.XXXXXX")"
 agents_registry_text > "$REGISTRY_VIEW"
 trap 'rm -f "$REGISTRY_VIEW"; release_lock' EXIT
@@ -233,13 +236,13 @@ models_text="$(
                 $models[] | [.slug, (.efforts | join(","))] | @tsv
             end
         end
-    ' "$CODEX_MODELS_CACHE_FILE"
+    ' <<< "$cache_text"
 )" || fail "invalid Codex model cache: $CODEX_MODELS_CACHE_FILE"
 
 cache_agents=()
 cache_agents_text="$(
     jq -r '.models[] | .slug | select(type == "string" and length > 0)' \
-        "$CODEX_MODELS_CACHE_FILE"
+        <<< "$cache_text"
 )"
 while IFS= read -r model; do
     [[ -n "$model" ]] && cache_agents+=("$model")
@@ -296,7 +299,7 @@ if [[ "$selected_is_visible" == false ]]; then
                     end;
                 first(.models[] | select(.slug == $selected) | efforts) // []
                 | join(",")
-            ' "$CODEX_MODELS_CACHE_FILE"
+            ' <<< "$cache_text"
         )" || fail "invalid Codex model cache: $CODEX_MODELS_CACHE_FILE"
         catalog_rows=("$codex_model=$selected_efforts" "${catalog_rows[@]}")
     else
@@ -322,7 +325,7 @@ families_text="$(
         | group_by(.family)[]
         | max_by([.version_numbers, .slug])
         | "\(.family)=\(.slug)"
-    ' "$CODEX_MODELS_CACHE_FILE"
+    ' <<< "$cache_text"
 )" || fail "invalid Codex model cache: $CODEX_MODELS_CACHE_FILE"
 
 assigned_rows="$(
