@@ -7,16 +7,20 @@ The review file samples the verified findings that the batch will build.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import queue
 import random
 import shutil
+import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tomllib
+import uuid
 from urllib.parse import unquote, urlparse
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
@@ -24,7 +28,7 @@ from dataclasses import asdict, dataclass, replace
 from functools import cache
 from pathlib import Path
 from types import MappingProxyType, TracebackType
-from typing import BinaryIO, Protocol, cast
+from typing import BinaryIO, Protocol, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
@@ -1219,6 +1223,140 @@ def verification_packages(repo: Path, crate: str) -> tuple[str, ...]:
         selected = expanded
 
 
+def atomic_json(path: Path, value: object) -> None:
+    """Durably publish complete batch state before any source edit."""
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                     prefix=f".{path.name}-", delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            _ = stream.write(json.dumps(value, indent=2) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    try:
+        os.replace(temporary, path)
+        descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+class UnfinishedFileEdit(TypedDict):
+    before: str
+    before_sha256: str
+    after: str
+
+
+class UnfinishedBatch(TypedDict):
+    batch: str
+    operation: str
+    base: str
+    branch: str
+    files: dict[str, UnfinishedFileEdit]
+    tickets: list[str]
+    findings: list[str]
+
+
+class BatchIntent:
+    """An interrupted batch may restore only its exact recorded edits, then start again."""
+
+    def __init__(self, repo: Path, operation: str) -> None:
+        self.repo: Path = repo
+        self.operation: str = operation
+        self.path: Path = Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "style-batch-intent.json"))
+        self.batch_id: str = uuid.uuid4().hex
+
+    def git(self, *arguments: str) -> str:
+        return subprocess.run(["git", *arguments], cwd=self.repo, capture_output=True, text=True, check=True).stdout.strip()
+
+    def refuse(self, reason: str) -> BulkRenameError:
+        archive = shlex.quote(str(self.path) + ".reviewed")
+        return BulkRenameError(f"unfinished batch {self.path}: {reason}; preserve and review the worktree and intent, "
+                               + f"then clear the intent with mv -- {shlex.quote(str(self.path))} {archive} and rerun {self.operation}")
+
+    def file_edits(self, files: tuple[FileRenames, ...]) -> dict[str, UnfinishedFileEdit]:
+        edits: dict[str, UnfinishedFileEdit] = {}
+        for file in files:
+            before = (self.repo / file.path).read_bytes()
+            edits[file.path] = {"before": before.hex(), "before_sha256": hashlib.sha256(before).hexdigest(),
+                                "after": file.edited.encode().hex()}
+        return edits
+
+    def begin(self, files: tuple[FileRenames, ...], tickets: Sequence[str] = (),
+              findings: Sequence[str] = ()) -> None:
+        if self.path.exists():
+            raise self.refuse("another batch has not finished")
+        self.batch_id = uuid.uuid4().hex
+        record: UnfinishedBatch = {"batch": self.batch_id, "operation": self.operation,
+                                   "base": self.git("rev-parse", "HEAD"), "branch": self.git("symbolic-ref", "HEAD"),
+                                   "files": self.file_edits(files), "tickets": list(tickets), "findings": list(findings)}
+        atomic_json(self.path, record)
+
+    def record_edits(self, files: tuple[FileRenames, ...]) -> None:
+        """Extend the pre-claim intent without losing its planned ticket ownership."""
+        record = object_fields(cast(object, json.loads(self.path.read_text())))
+        record["files"] = self.file_edits(files)
+        atomic_json(self.path, record)
+
+    def recover(self) -> tuple[str, ...]:
+        """Restore before bytes only when every dirty path is an exact recorded before/after state."""
+        if not self.path.exists():
+            return ()
+        try:
+            value = object_fields(cast(object, json.loads(self.path.read_text())))
+            batch_id = value["batch"]
+            if not isinstance(batch_id, str) or not batch_id:
+                raise ValueError("invalid batch owner")
+            self.batch_id = batch_id
+            files = object_fields(value["files"])
+            tickets = object_list(value["tickets"])
+            if not all(isinstance(ticket, str) for ticket in tickets):
+                raise ValueError("invalid tickets")
+            if (value["operation"] != self.operation or value["base"] != self.git("rev-parse", "HEAD")
+                    or value["branch"] != self.git("symbolic-ref", "HEAD")):
+                raise self.refuse("command, branch or HEAD changed")
+            if self.git("diff", "--cached", "--name-only"):
+                raise self.refuse("index changed")
+            changed = set(filter(None, self.git("diff", "HEAD", "--name-only", "-z").split("\0")))
+            if changed - files.keys():
+                raise self.refuse("unrecorded dirty files: " + ", ".join(sorted(changed - files.keys())))
+            originals: dict[Path, bytes] = {}
+            for name, raw in files.items():
+                if Path(name).is_absolute() or ".." in Path(name).parts:
+                    raise ValueError("invalid recorded path")
+                target = self.repo / name
+                if target.resolve() != target or not target.is_file():
+                    raise self.refuse(f"{name}: file was replaced or removed")
+                edit = object_fields(raw)
+                before, after, digest = edit["before"], edit["after"], edit["before_sha256"]
+                if not isinstance(before, str) or not isinstance(after, str):
+                    raise ValueError("invalid source bytes")
+                data = bytes.fromhex(before)
+                if hashlib.sha256(data).hexdigest() != digest or target.read_bytes() not in (data, bytes.fromhex(after)):
+                    raise self.refuse(f"{name}: bytes do not match the recorded edit")
+                originals[target] = data
+            # Check the whole set before restoring any file. Repeated recovery accepts before bytes too.
+            for target, data in originals.items():
+                with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as stream:
+                    temporary = Path(stream.name)
+                    _ = stream.write(data)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                temporary.chmod(target.stat().st_mode)
+                os.replace(temporary, target)
+            return tuple(cast(list[str], tickets))
+        except (KeyError, ValueError, OSError) as error:
+            raise self.refuse(f"cannot read or restore recorded state: {error}") from error
+
+    def finish(self) -> None:
+        self.path.unlink(missing_ok=True)
+
+
 class BatchWorkspace:
     """The clean tracked files before the batch; restore them between failed file subsets."""
 
@@ -1319,6 +1457,9 @@ def check_available(repo: Path, path: str) -> None:
 
 def run_batch(repo: Path, ticket_id: str) -> Path:
     repo = repo.resolve()
+    intent = BatchIntent(repo, f"bulk_rename --ticket {shlex.quote(ticket_id)} --repo {shlex.quote(str(repo))}")
+    _ = intent.recover()
+    intent.finish()
     status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=repo,
                             capture_output=True, text=True, check=True)
     if status.stdout:
@@ -1334,7 +1475,7 @@ def run_batch(repo: Path, ticket_id: str) -> Path:
         held = ledger.bulk_findings(ticket_id)
         groups: dict[str, list[RenameFinding]] = defaultdict(list)
         docs = repository_docs(repo)
-        refused: list[Refusal] = []
+        refused = [Refusal(row.finding_id, row.reason) for row in ledger.bulk_refusals(ticket_id)]
         for finding in held:
             rename = refactor_rename(finding.kind, finding.before, finding.after, finding.line, finding.text)
             path = repo / finding.path
@@ -1365,18 +1506,18 @@ def run_batch(repo: Path, ticket_id: str) -> Path:
             # Check again immediately before publishing the in-memory edits.
             for file in candidates:
                 check_available(repo, file.path)
+            intent.begin(candidates)
             good = validated_files(tuple(file.path for file in candidates), workspace.validate)
             workspace.keep()
             for file in candidates:
                 if file.path not in good:
                     refused.extend(Refusal(item.finding.finding_id, "crate verification failed for this file") for item in file.kept)
             kept = tuple(item for file in candidates if file.path in good for item in file.kept)
-            _ = ledger.bulk_release(ticket_id, {refusal.finding_id: refusal.reason for refusal in refused})
             folder = ledger.database.parent / "bulk_review"
             folder.mkdir(parents=True, exist_ok=True)
             review = folder / f"{ticket_id}.json"
             sample = sample_findings(kept)
-            _ = review.write_text(json.dumps({
+            atomic_json(review, {
                 "ticket": ticket_id, "base": ticket["base"] or ledger.ticket_base(ticket_id),
                 "status": "awaiting independent review; built at normal ticket merge",
                 "on_error": "return the entire batch to review",
@@ -1385,10 +1526,13 @@ def run_batch(repo: Path, ticket_id: str) -> Path:
                 "refusals": [asdict(refusal) for refusal in refused],
                 "sample": [asdict(item) for item in sample],
                 "files": {path: {"before": workspace.files[path].original, "after": (repo / path).read_text()} for path in good},
-            }, indent=2) + "\n")
+            })
+            _ = ledger.bulk_release(ticket_id, {refusal.finding_id: refusal.reason for refusal in refused})
         except BaseException:
             workspace.restore()
+            intent.finish()
             raise
+        intent.finish()
         print(f"bulk rename: {len(kept)} kept, {len(refused)} refused, {sum(item.macro_edits for item in kept)} macro edits; review {review}")
         return review
 

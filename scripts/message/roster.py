@@ -1029,14 +1029,12 @@ def _production_places(
 
 
 def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) -> dict[str, UnitLabels]:
-    """Resolve known Claude holders without a process scan, meshes or account reads."""
+    """Resolve Claude and Codex holders from files, without process scans, mesh calls or account reads."""
     wanted = set(session_ids)
     if not wanted:
         return {}
     try:
         records = _newest_sessions()
-        if not any(record["sessionId"] in wanted for record in records):
-            return {}
         problems: list[str] = []
         registered = _registered_showrunners(environment, problems,
                                             known_sessions={record["sessionId"]: record for record in records})
@@ -1062,6 +1060,7 @@ def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) 
                     unit = place.director.unit
                 director = UnderDirector(unit, names[owner], f"session:{owner}")
             labels[session_id] = _unit_labels(names[session_id], showrunner, director)
+        labels.update(_codex_unit_labels(wanted - labels.keys(), environment, records, places, problems))
         return labels
     except Exception:
         return {}
@@ -1249,14 +1248,19 @@ def _pid_alive(pid: int) -> bool:
 
 def _stopped_run_place(run: Path) -> _RunPlace:
     """Keep a worker's recorded unit without claiming that its director is live."""
-    from scripts.direct.progress_history import ProductionUnitIdentity, resolve_production_unit
-
     try:
         state = _read_object(run / unit_runs.STATE_FILE)
     except (OSError, UnicodeError, ValueError):
         return _RunPlace(NoDirector(), NoShowrunner(), "")
-    identity = resolve_production_unit(state)
     cwd = _as_string(state.get("working_dir"))
+    production, unit = _as_string(state.get("production")), _as_string(state.get("unit"))
+    if production and unit:
+        return _RunPlace(UnitWithoutRunningDirector(unit), ProductionWithoutRunningShowrunner(production), cwd)
+    # Older runs may keep their identity only in the plan. Import the history
+    # reader for that fallback, not for every lookup of recorded labels.
+    from scripts.direct.progress_history import ProductionUnitIdentity, resolve_production_unit
+
+    identity = resolve_production_unit(state)
     if isinstance(identity, ProductionUnitIdentity):
         return _RunPlace(UnitWithoutRunningDirector(identity.unit),
                          ProductionWithoutRunningShowrunner(identity.production), cwd)
@@ -1305,6 +1309,55 @@ def _mesh_records(run: _LiveRun, problems: list[str]) -> dict[str, _MeshWorker]:
         if isinstance(value, dict):
             records[name] = cast("_MeshWorker", cast("object", value))
     return records
+
+
+def _listed_mesh_worker(record: _MeshWorker) -> bool:
+    return not (record.get("status") == "ended" or record.get("transferring_role")
+                or record.get("role_redirect") or record.get("held_design_id"))
+
+
+def _codex_unit_labels(
+    wanted: set[str], environment: Mapping[str, str], records: list[SessionRecord],
+    places: Mapping[str, _ProductionPlace], problems: list[str],
+) -> dict[str, UnitLabels]:
+    if not wanted:
+        return {}
+    roots = unit_runs.run_roots(environment.get("ROSTER_RUN_ROOT"))
+    matches: dict[Path, dict[str, str]] = {}
+    # Check requested thread IDs before discovering live runs. Claude-only
+    # lookups and unknown IDs need no live-run discovery or account data.
+    for root in roots:
+        try:
+            paths = sorted(root.glob("*/mesh_roster.json"))
+        except OSError as error:
+            _problem(problems, f"Codex rosters in {root}", error)
+            continue
+        for path in paths:
+            run = _LiveRun(path.parent, _NoRunningDirector())
+            workers = {
+                thread: name for name, record in sorted(_mesh_records(run, problems).items())
+                if (thread := _as_string(record.get("thread_id"))) and thread in wanted and _listed_mesh_worker(record)
+            }
+            if workers:
+                matches[path.parent.resolve()] = workers
+    if not matches:
+        return {}
+    names = {record["sessionId"]: record["name"] for record in records}
+    labels: dict[str, UnitLabels] = {}
+    for run in _live_runs(roots, set(names), problems):
+        if run.path not in matches:
+            continue
+        if isinstance(run.director, _DirectorSession) and run.director.session_id in names:
+            place = places.get(run.director.session_id)
+            showrunner: ShowrunnerRelationship = place.showrunner if place is not None else NoShowrunner()
+            director: DirectorRelationship = place.director if place is not None else NoDirector()
+        else:
+            stopped = _stopped_run_place(run.path)
+            showrunner, director = stopped.showrunner, stopped.director
+        for thread, name in matches[run.path].items():
+            labels[thread] = _unit_labels(name, showrunner, director)
+    return labels
+
 
 
 def _run_server_homes(run: _LiveRun) -> dict[int, Path]:
@@ -1607,7 +1660,7 @@ def _unit_workers(
         place = _run_place(run, claude_entries, production_places)
         for name, record in sorted(_mesh_records(run, problems).items()):
             status = _as_string(record.get("status"))
-            if status == "ended" or record.get("transferring_role") or record.get("role_redirect") or record.get("held_design_id"):
+            if not _listed_mesh_worker(record):
                 continue
             thread_id = _as_string(record.get("thread_id"))
             if thread_id:

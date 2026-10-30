@@ -120,7 +120,9 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
 
     def test_uncertain_registry_switch_keeps_the_named_route_until_the_weekly_reset(self) -> None:
         for failed_step in ("edit", "confirmation"):
-            with self.subTest(failed_step=failed_step):
+            with (self.subTest(failed_step=failed_step),
+                  mock.patch.object(quota_alert, "STATE", self.root / f"{failed_step}-alerts.json"),
+                  mock.patch.object(quota_alert, "REGISTRY", self.root / f"{failed_step}-agents.conf")):
                 _ = write_registry(quota_alert.REGISTRY, base_text=REGISTRY)
                 owner = self.readings(self.now).selected_account
                 assert isinstance(owner, agent_accounts.KnownCodexAccount)

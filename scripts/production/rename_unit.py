@@ -304,6 +304,8 @@ def check_stoppable(rename: StopTarget) -> None:
         raise RenameRefused(f"{rename.new} already runs in session {new.place.session}")
     if old and isinstance(old.claude, unit_lookup.ClaudeUnknown):
         raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {old.claude.reason}")
+    if reason := unit_move.pane_shell_refusal(old, rename.worktree()):
+        raise RenameRefused(reason)
     if old and isinstance(old.claude, unit_lookup.LiveClaude):
         return
     inside = unit_move.processes_inside(rename.worktree())
@@ -663,11 +665,16 @@ def stop_unit(rename: StopTarget, _save: Callable[[], None]) -> None:
     A live process cannot change its env mark and the director's context holds the old paths, so a
     rename of a running unit is always a relaunch.
     """
+    # A resumed step rechecks the unsupported pane topology before stopping.
+    # Other processes are checked after the stop has settled its own run work.
+    _refuse_detached_worktree(rename)
+    try:
+        found = unit_lookup.marked_unit(rename.slug, rename.old)
+    except OSError as error:
+        raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {error}") from error
+    if reason := unit_move.pane_shell_refusal(found, rename.worktree()):
+        raise RenameRefused(reason)
     if not _unit_records(rename):
-        try:
-            found = unit_lookup.marked_unit(rename.slug, rename.old)
-        except OSError as error:
-            raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {error}") from error
         if found is None or isinstance(found.claude, unit_lookup.ClaudeNotRunning):
             _stop_runs(rename)
             return

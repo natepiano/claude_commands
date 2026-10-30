@@ -2679,18 +2679,23 @@ def _live_server_processes(candidates: list[Path]) -> dict[int, str]:
     return {next(iter(pids)): listeners[inode] for inode, pids in holders.items() if len(pids) == 1}
 
 
-def _systemd_cgroups(process: Path) -> list[tuple[str, Path]]:
-    """Read unified or legacy systemd membership, never a process environment."""
-    try:
-        lines = process.joinpath("cgroup").read_text().splitlines()
-    except OSError:
-        return []
+def systemd_cgroups(process: Path) -> list[tuple[str, Path]]:
+    """Read systemd memberships; callers decide whether a read error is uncertainty."""
+    lines = process.joinpath("cgroup").read_text().splitlines()
     groups: list[tuple[str, Path]] = []
     for line in lines:
         fields = line.split(":", 2)
         if len(fields) == 3 and fields[1] in ("", "name=systemd") and fields[2].startswith("/"):
             groups.append((fields[0], Path(fields[2])))
     return groups
+
+
+def _systemd_cgroups(process: Path) -> list[tuple[str, Path]]:
+    """Discovery outside a stop tolerates processes disappearing during a scan."""
+    try:
+        return systemd_cgroups(process)
+    except OSError:
+        return []
 
 
 def _pane_shell_pids(session: str) -> list[int]:

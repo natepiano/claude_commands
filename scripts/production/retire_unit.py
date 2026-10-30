@@ -201,6 +201,15 @@ def refusals(unit: Unit) -> list[str]:
     A merge of the merge branch into the unit carries nothing of the unit's own, so only commits
     that are not merges count."""
     found: list[str] = []
+    try:
+        marked = unit_lookup.marked_unit(unit.production.slug, unit.name)
+    except OSError as error:
+        return [f"cannot read unit mark: {error}"]
+    try:
+        if reason := unit_move.pane_shell_refusal(marked, unit.worktree):
+            return [reason]
+    except (OSError, ValueError) as error:
+        return [f"{unit.name}: cannot check its pane shell: {error}"]
     if unit_move.exists(unit.worktree):
         status = run(["git", "-C", str(unit.worktree), "status", "--short"])
         if status.returncode:
