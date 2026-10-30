@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -28,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import herdr  # noqa: E402
 import pane_record  # noqa: E402
 import sessions  # noqa: E402
+from scripts.shutdown.stop_resume import resume_arguments  # noqa: E402
 from scripts.whoami.account import named_account_environment  # noqa: E402
 from shutdown_record import all_session_records  # noqa: E402
 
@@ -35,34 +35,11 @@ START_TIMEOUT_MS = 90_000
 SERVER_TIMEOUT_MS = 60_000
 
 
-@dataclass(frozen=True)
-class RestoredPane:
-    pane_id: str
-    label: str
-    space: str
-    session_id: str
-
-
-def _restored_panes(client: herdr.Herdr) -> list[RestoredPane]:
-    spaces = {herdr.json_text(item.get("workspace_id"), "herdr workspace id"): str(item.get("label") or "")
-              for item in (herdr.json_object(row, "herdr workspace") for row in herdr.json_items(
-                  client.result("workspace", "list").get("workspaces"), "herdr workspace list"))}
-    panes: list[RestoredPane] = []
-    for row in herdr.json_items(client.result("pane", "list").get("panes"), "herdr pane list"):
-        pane = herdr.json_object(row, "herdr pane")
-        agent_session = pane.get("agent_session")
-        session_id = cast(dict[str, object], agent_session).get("value") if isinstance(agent_session, dict) else None
-        panes.append(RestoredPane(
-            herdr.json_text(pane.get("pane_id"), "herdr pane id"), str(pane.get("label") or ""), spaces.get(str(pane.get("workspace_id")), ""),
-            session_id if isinstance(session_id, str) else ""))
-    return panes
-
-
 def _has_transcript(config_dir: Path, session_id: str) -> bool:
     return any(path.is_file() for path in (config_dir / "projects").glob(f"*/{session_id}.jsonl"))
 
 
-def skip_reason(pane: RestoredPane, entry: pane_record.PaneLaunch | None, owned: set[str], live: set[str]) -> str:
+def skip_reason(pane: herdr.TabSession, entry: pane_record.PaneLaunch | None, owned: set[str], live: set[str]) -> str:
     """Why the pane stays as it is; empty when it is resumed."""
     if entry is None:
         return "no launch entry" if pane.session_id else ""
@@ -82,25 +59,13 @@ def skip_reason(pane: RestoredPane, entry: pane_record.PaneLaunch | None, owned:
     return ""
 
 
-def claude_arguments(entry: pane_record.PaneLaunch) -> list[str]:
-    arguments = ["--resume", entry["session_id"]]
-    if entry["name"]:
-        arguments.extend(("-n", entry["name"]))
-    if entry["remote_control"]:
-        arguments.extend(("--remote-control", entry["name"]) if entry["name"] else ("--remote-control",))
-    if entry["model"]:
-        arguments.extend(("--model", entry["model"]))
-    arguments.extend(("--settings", '{"disableAgentView": true}'))
-    return arguments
-
-
-def _resume(session: str, client: herdr.Herdr, pane: RestoredPane, entry: pane_record.PaneLaunch) -> None:
+def _resume(session: str, client: herdr.Herdr, pane: herdr.TabSession, entry: pane_record.PaneLaunch) -> None:
     if not isinstance(client.pane_activity(pane.pane_id), herdr.PaneAtShell):
         raise herdr.HerdrFailure("the pane runs a program")
     environment = {**entry["environment"], **named_account_environment(Path(entry["config_dir"]))}
     title = pane.label or entry["name"]
-    launched = herdr.launch_agent(session, pane.space, title, entry["cwd"], environment, "claude",
-        claude_arguments(entry), herdr.NoOpeningPrompt(), START_TIMEOUT_MS, agent=title)
+    launched = herdr.launch_agent(session, pane.workspace, title, entry["cwd"], environment, "claude",
+        resume_arguments(entry), herdr.NoOpeningPrompt(), START_TIMEOUT_MS, agent=title)
     if isinstance(launched, herdr.nix_env.Refused):
         raise herdr.HerdrFailure(launched.reason)
     # Ordering the tabs keeps each pane's id (herdr review, 2026-10-19).
@@ -113,7 +78,7 @@ def restore(session: str, *, dry_run: bool) -> int:
     owned = {saved["session"]["session_id"] for saved in all_session_records()}
     live = {item["sessionId"] for item in [*sessions.live_sessions(), *sessions.running_sessions()]}
     failures = 0
-    for pane in _restored_panes(client):
+    for pane in client.tab_sessions():
         entry = entries.get(pane.pane_id)
         reason = skip_reason(pane, entry, owned, live)
         if entry is None or reason:

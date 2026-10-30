@@ -77,6 +77,14 @@ class _MemberSources:
             row = record.by_path(f"{parent.row.name}/{unit_names.name(selector.unit)}")
         return MemberFound(row) if row is not None else NoSuchMember(selector)
 
+    def showrunner_members(self, record: staff.StaffSnapshot) -> dict[str, staff.StaffRow]:
+        found: dict[str, staff.StaffRow] = {}
+        for slug in self.productions:
+            selected = self.member(ShowrunnerMember(slug), record)
+            if isinstance(selected, MemberFound):
+                found[slug] = selected.row
+        return found
+
 
 def _member_sources() -> _MemberSources:
     session = herdr.shared_session()
@@ -97,13 +105,7 @@ def member(selector: MemberSelector, record: staff.StaffSnapshot) -> MemberFound
 
 def showrunner_members(record: staff.StaffSnapshot) -> dict[str, staff.StaffRow]:
     """Resolve local production slugs to rows with the same launch-first matching rule."""
-    sources = _member_sources()
-    found: dict[str, staff.StaffRow] = {}
-    for slug in sources.productions:
-        selected = sources.member(ShowrunnerMember(slug), record)
-        if isinstance(selected, MemberFound):
-            found[slug] = selected.row
-    return found
+    return _member_sources().showrunner_members(record)
 
 
 @dataclass(frozen=True)
@@ -135,12 +137,11 @@ def unit_parent(unit: str, session_id: str = "") -> UnitProduction:
     """Resolve the current staff edge; old launch marks supply identity only."""
     record, sources = staff.snapshot(), _member_sources()
     parent = _unit_member(unit, session_id, record, sources).parent
-    parents = [source for slug, source in sources.productions.items()
-               if isinstance(found := sources.member(ShowrunnerMember(slug), record), MemberFound)
-               and found.row.id == parent]
+    parents = [slug for slug, row in sources.showrunner_members(record).items() if row.id == parent]
     if len(parents) != 1:
         raise staff.StaffUnreadable(f"{unit}: staff parent has no unique production document")
-    return UnitProduction(parents[0].timer.slug, str(parents[0].timer.doc))
+    slug = parents[0]
+    return UnitProduction(slug, str(sources.productions[slug].timer.doc))
 
 
 def _showrunner_key(slug: str) -> str:
