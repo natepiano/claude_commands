@@ -25,11 +25,8 @@ import tidy_wrapped  # noqa: E402
 import unit_lookup  # noqa: E402
 import herdr  # noqa: E402
 import pane_record  # noqa: E402
-import launch_permission  # noqa: E402
 if TYPE_CHECKING:
     from scripts.shutdown import shutdown_record
-else:
-    import shutdown_record
 from rename_state import RenameRefused, read_json, write_json  # noqa: E402
 
 BERTH_KEY = "cargoBerthTarget"
@@ -296,84 +293,32 @@ def processes_inside(worktree: Path) -> list[int]:
 
 
 class UnitPane(NamedTuple):
-    production: str
     unit: str
     place: herdr.HerdrPlace
     shell: int
-    started: str
 
 
-def unit_pane(found: unit_lookup.MarkedUnit | None, production: str) -> UnitPane | None:
-    """Prepare closure only for the exact marked pane and its own shell.
-
-    An exec-launched Claude replaced its shell and needs no terminal cleanup.
-    Missing/foreign shell marks or uncertain liveness retain the preflight refusal.
-    """
+def unit_pane(found: unit_lookup.MarkedUnit | None, _production: str) -> UnitPane | None:
+    """Find the unit's exact pane; an exec-launched Claude leaves no shell to close."""
     if found is None:
         return None
-    if isinstance(found.claude, unit_lookup.ClaudeUnknown):
-        raise RenameRefused(f"{found.unit}: cannot tell whether Claude is running: {found.claude.reason}")
     try:
         shell = pane_record.pane_shell_pid(found.place)
-        if isinstance(found.claude, unit_lookup.LiveClaude) and shell == found.claude.pid:
-            return None
-        state = pane_record.pane_shell_state(found.place)
-        rows = [row for row in herdr.herdr_processes() if row.place == found.place]
-        _own_shell(rows, production, found.unit, state.pid)
-        if pane_record.still_running(state.members - {row.pid for row in rows}):
-            raise RenameRefused("unknown occupant in the unit pane")
-        return UnitPane(production, found.unit, found.place, state.pid, state.started)
-    except (herdr.HerdrFailure, OSError, ValueError, IndexError, KeyError, subprocess.SubprocessError) as error:
-        raise RenameRefused(f"{found.unit}: cannot prove its pane shell safe to close: {error}") from error
+    except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+        raise RenameRefused(f"{found.unit}: cannot find its pane shell: {error}") from error
+    if isinstance(found.claude, unit_lookup.LiveClaude) and shell == found.claude.pid:
+        return None
+    return UnitPane(found.unit, found.place, shell)
 
 
-def _own_shell(rows: list[herdr.HerdrProcess], production: str, unit: str, shell: int) -> None:
-    expected = {unit_lookup.PRODUCTION_MARK: production, unit_lookup.UNIT_MARK: unit}
-    if not any(row.pid == shell and row.marks == expected for row in rows):
-        raise RenameRefused("the pane shell does not carry this unit's own marks")
-    if any(row.marks != expected for row in rows):
-        raise RenameRefused("foreign or unknown occupant in the unit pane")
-
-
-def close_unit_pane(pane: UnitPane | None, saved: shutdown_record.SessionShutdown) -> None:
-    """Close only the proven shell, after cleanup, under launch and stop locks."""
+def close_unit_pane(pane: UnitPane | None, _saved: shutdown_record.SessionShutdown) -> None:
+    """Close the unit's exact session-qualified pane after the caller stops the unit."""
     if pane is None:
         return
-
-    def close(current: shutdown_record.SessionShutdown) -> None:
-        owner = current["session"]
-        if (current["request_id"] != saved["request_id"] or owner != saved["session"]
-                or current["then"] != "stop" or current["progress"]["kind"] not in {"stopped", "already gone"}
-                or shutdown_record.stop_incomplete(current)):
-            raise RenameRefused("pane close requires the same completed clean stop request")
-        host = owner["host"]
-        if host["kind"] != "unit" or (host["production"], host["unit"]) != (pane.production, pane.unit):
-            raise RenameRefused("pane close stop record belongs to another unit")
-        for pending in launch_permission.pending_launches():
-            # add_unit admits its unit id before open_tab publishes a pane or
-            # a new conversation id. Name collisions conservatively defer close.
-            if (pending.session_id == owner["session_id"] or pending.name == pane.unit
-                    or herdr.HerdrPlace(pending.herdr_session, pending.pane) == pane.place):
-                raise RenameRefused("pane close refused: director launch in progress")
-        with herdr.process_action():
-            state = pane_record.pane_shell_state(pane.place)
-            rows = [row for row in herdr.herdr_processes() if row.place == pane.place]
-            # Refresh director exit AFTER the process scan (F009), under admission.
-            fresh = unit_lookup.marked_unit(pane.production, pane.unit)
-            if fresh is None or fresh.place != pane.place or not isinstance(fresh.claude, unit_lookup.ClaudeNotRunning):
-                raise RenameRefused("pane close refused: director resumed or its exit is unknown")
-            _own_shell(rows, pane.production, pane.unit, pane.shell)
-            if (state.pid, state.started) != (pane.shell, pane.started):
-                raise RenameRefused("pane shell generation changed before close")
-            if state.members != frozenset({pane.shell}) or any(row.pid != pane.shell for row in rows):
-                raise RenameRefused("foreign or unknown occupant remains in the unit pane")
-            _ = herdr.Herdr(pane.place.session).run("pane", "close", pane.place.pane)
-
     try:
-        with launch_permission.launch_barrier():
-            _ = shutdown_record.update_session(saved["login"], saved["session"]["session_id"], close)
-    except (herdr.HerdrFailure, OSError, ValueError, LookupError, subprocess.SubprocessError) as error:
-        raise RenameRefused(f"{pane.unit}: pane close refused: {error}") from error
+        _ = herdr.Herdr(pane.place.session).run("pane", "close", pane.place.pane)
+    except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+        raise RenameRefused(f"{pane.unit}: pane close failed: {error}") from error
 
 
 def _darwin_processes_inside(worktree: Path) -> list[int]:
