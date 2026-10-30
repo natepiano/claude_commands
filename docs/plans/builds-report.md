@@ -142,7 +142,7 @@ including the details to make it clear
 
 **Ruled out:** a launch memory wait (launches take no admission); a transcript backfill (rows start from the phase's landing).
 
-### Phase 4a — A bump by shown name moves only the step it names  · status: todo
+### Phase 4a — A bump by shown name moves only the step it names  · status: done
 
 #### Work Order
 
@@ -169,6 +169,8 @@ including the details to make it clear
 **Depends on:** Phase 1 (the typed `UnmatchedWaiter` refusal) and Phase 3 (both edit `memory_admit.py`).
 
 **Constraints from prior phases:** Phase 1: a selector refusal is `memory_admit.UnmatchedWaiter`, printed on stdout with exit 3; the mod forwards only that. Phase 3: a waiting row's `session_id` is the writer's `CODEX_THREAD_ID` first, then `CLAUDE_CODE_SESSION_ID` (`waiter_identity`), so the identity `bump_selector` returns must be read from the row, never from the caller's environment; `read_queue` and `explain_queue` share one locked pass (`locked_queue_read`); the /build:queue head line prints from `QueueExplanation` and does no arithmetic. When origin/builds-resources' Phase 14 is merged, `queue_rows` keeps a reservation by `reservation_lifetime`, not by a live owner.
+
+**Assertion-Change:** `scripts/build_queue/test_build_queue.py` `test_bump_by_unique_shown_label_moves_and_logs_the_actual_waiter`: `bump.assert_called_once_with("2", "actor-id")` becomes `bump.assert_called_once_with(memory_admit.WaiterRowSelector(waiter_path.name, "organon-ci88"), "actor-id")`, because the hand-off is now the row key, not a position (unit director, review pass 1, 2026-10-30).
 
 **Acceptance gate:** `python3 -m unittest scripts.build_queue.test_build_queue scripts.lint.test_memory_admit` green (prefix `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY`); basedpyright 0/0/0 on the changed files.
 

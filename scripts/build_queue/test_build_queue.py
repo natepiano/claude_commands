@@ -302,7 +302,7 @@ class QueueTests(unittest.TestCase):
             "pid": pid, "start_time": str(pid), "need": 12 * GIB, "since": NOW + pid,
             "session_id": session, "session_name": name, "step": step, "folder": f"/tmp/tree-{pid}",
         }
-        path = directory / f"{pid}.waiting"
+        path = directory / f"{pid}-{pid}.waiting"
         _ = path.write_text(json.dumps(row))
         return path
 
@@ -443,14 +443,14 @@ class QueueTests(unittest.TestCase):
 
     def test_bump_by_unique_shown_label_moves_and_logs_the_actual_waiter(self) -> None:
         _ = self.write_waiter(100, "head-id", "head")
-        _ = self.write_waiter(200, "worker-id", "clone88ci")
+        waiter_path = self.write_waiter(200, "worker-id", "clone88ci")
         self.roster_read.return_value = roster.Roster([self.entry("worker-id", "organon-ci88", codex=True)], [])
         output = io.StringIO()
         with mock.patch.object(memory_admit, "bump_waiter", wraps=memory_admit.bump_waiter) as bump, \
              mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "actor-id"}), \
              mock.patch("sys.argv", ["build_queue.py", "bump", "organon-ci88"]), redirect_stdout(output):
             self.assertEqual(build_queue.main(), 0)
-        bump.assert_called_once_with("2", "actor-id")
+        bump.assert_called_once_with(memory_admit.WaiterRowSelector(waiter_path.name, "organon-ci88"), "actor-id")
         self.assertEqual(memory_admit.queue_view().waiting[0].session_id, "worker-id")
         self.assertEqual(output.getvalue(),
                          "actor-id moved organon-ci88: nextest in /tmp/tree-200 to the head; memory limits still apply\n")
@@ -459,6 +459,107 @@ class QueueTests(unittest.TestCase):
         self.assertEqual([(row["session"], row["step"], row["folder"]) for row in rows],
                          [("worker-id", "nextest", "/tmp/tree-200")])
         self.roster_read.assert_called_once_with(os.environ, roster.ThisMachine())
+
+    def bump_output(self, selector: str) -> tuple[int, str, str]:
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "actor-id"}), \
+             mock.patch("sys.argv", ["build_queue.py", "bump", selector]), \
+             redirect_stdout(output), redirect_stderr(errors):
+            status = build_queue.main()
+        return status, output.getvalue(), errors.getvalue()
+
+    def test_shown_name_removed_between_reads_refuses_without_moving_its_successor(self) -> None:
+        head = self.write_waiter(100, "head-id", "head")
+        chosen = self.write_waiter(200, "worker-id", "recorded-worker")
+        successor = self.write_waiter(300, "successor-id", "successor")
+        self.roster_read.return_value = roster.Roster([self.entry("worker-id", "shown-worker", codex=True)], [])
+        before = (head.read_bytes(), successor.read_bytes())
+        queue_read = memory_admit.locked_queue_read
+
+        def remove_chosen_after_read() -> memory_admit.QueueRead:
+            reading = queue_read()
+            self.assertEqual([step.pid for step in reading.view.waiting], [100, 200, 300])
+            chosen.unlink()
+            return reading
+
+        with mock.patch.object(memory_admit, "locked_queue_read", side_effect=remove_chosen_after_read):
+            status, output, errors = self.bump_output("shown-worker")
+        self.assertEqual(status, 3)
+        self.assertIn("build queue: 'shown-worker':", output)
+        self.assertEqual(len(output.splitlines()), 1)
+        self.assertEqual(errors, "")
+        self.assertEqual([step.pid for step in memory_admit.queue_view().waiting], [100, 300])
+        self.assertEqual((head.read_bytes(), successor.read_bytes()), before)
+        self.assertEqual(list((self.root / "buildlog").glob("*/*.jsonl")), [])
+
+    def test_shown_name_reordered_between_reads_moves_only_its_original_row(self) -> None:
+        head = self.write_waiter(100, "head-id", "head")
+        chosen = self.write_waiter(200, "worker-id", "recorded-worker")
+        younger = self.write_waiter(300, "younger-id", "younger")
+        self.roster_read.return_value = roster.Roster([self.entry("worker-id", "shown-worker", codex=True)], [])
+        head_before = head.read_bytes()
+        queue_read = memory_admit.locked_queue_read
+
+        def reorder_after_read() -> memory_admit.QueueRead:
+            reading = queue_read()
+            self.assertEqual([step.pid for step in reading.view.waiting], [100, 200, 300])
+            row = cast(memory_admit.Waiter, json.loads(younger.read_text()))
+            row["bump_order"] = -1
+            _ = younger.write_text(json.dumps(row))
+            self.assertEqual([step.pid for step in queue_read().view.waiting], [300, 100, 200])
+            return reading
+
+        with mock.patch.object(memory_admit, "locked_queue_read", side_effect=reorder_after_read):
+            status, output, errors = self.bump_output("shown-worker")
+        self.assertEqual(status, 0, errors)
+        self.assertIn("moved shown-worker: nextest in /tmp/tree-200", output)
+        self.assertEqual(errors, "")
+        self.assertEqual([step.pid for step in memory_admit.queue_view().waiting], [200, 300, 100])
+        self.assertEqual(head.read_bytes(), head_before)
+        self.assertEqual(cast(memory_admit.Waiter, json.loads(chosen.read_text())).get("session_id"), "worker-id")
+        rows = [cast(dict[str, object], json.loads(line)) for path in (self.root / "buildlog").glob("*/*.jsonl")
+                for line in path.read_text().splitlines()]
+        self.assertEqual([(row["session"], row["folder"], row["old_position"]) for row in rows],
+                         [("worker-id", "/tmp/tree-200", 3)])
+
+    def test_exact_shown_name_and_repeat_never_move_the_session_with_a_longer_name(self) -> None:
+        head = self.write_waiter(100, "head-id", "head")
+        longer = self.write_waiter(200, "longer-id", "recorded-longer")
+        _ = self.write_waiter(300, "chosen-id", "recorded-chosen")
+        self.roster_read.return_value = roster.Roster([
+            self.entry("longer-id", "frame-cost-fix3", codex=True),
+            self.entry("chosen-id", "frame-cost-fix", codex=True),
+        ], [])
+        before = (head.read_bytes(), longer.read_bytes())
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                status, output, errors = self.bump_output("frame-cost-fix")
+                self.assertEqual(status, 0, errors)
+                self.assertIn("moved frame-cost-fix: nextest in /tmp/tree-300", output)
+                self.assertEqual(errors, "")
+                self.assertEqual([step.pid for step in memory_admit.queue_view().waiting], [300, 100, 200])
+                self.assertEqual((head.read_bytes(), longer.read_bytes()), before)
+        rows = [cast(dict[str, object], json.loads(line)) for path in (self.root / "buildlog").glob("*/*.jsonl")
+                for line in path.read_text().splitlines()]
+        self.assertTrue(rows)
+        self.assertEqual({(row["session"], row["folder"]) for row in rows}, {("chosen-id", "/tmp/tree-300")})
+
+    def test_departed_row_key_does_not_match_another_step_in_the_same_session(self) -> None:
+        head = self.write_waiter(100, "head-id", "head")
+        chosen = self.write_waiter(200, "shared-id", "recorded-chosen", "clippy")
+        sibling = self.write_waiter(300, "shared-id", "recorded-sibling", "nextest")
+        reading = memory_admit.locked_queue_read()
+        selector = memory_admit.WaiterRowSelector(chosen.name, "shared-worker")
+        self.assertEqual([step.session_id for step in reading.view.waiting], ["head-id", "shared-id", "shared-id"])
+        before = (head.read_bytes(), sibling.read_bytes())
+        chosen.unlink()
+        for attempt in range(2):
+            with self.subTest(attempt=attempt), self.assertRaises(memory_admit.UnmatchedWaiter) as refused:
+                _ = memory_admit.bump_waiter(selector, "actor-id")
+            self.assertIn("shared-worker", str(refused.exception))
+            self.assertEqual([step.pid for step in memory_admit.queue_view().waiting], [100, 300])
+            self.assertEqual((head.read_bytes(), sibling.read_bytes()), before)
+        self.assertEqual(list((self.root / "buildlog").glob("*/*.jsonl")), [])
 
     def test_bump_unique_fallback_label_with_shared_session_and_unreadable_roster(self) -> None:
         for pid, folder in ((100, "/tmp/alpha"), (200, "/tmp/beta")):
