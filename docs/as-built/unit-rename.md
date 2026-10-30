@@ -32,7 +32,8 @@ The preflight, each step's checks, and every step except stop, relaunch and veri
 on `<git common dir>/showrunner-merge-<slug>.lock`, which `merge_checkpoint.py` holds for a
 whole gate run, unit checkpoints and `--from-child` hand-offs alike. A rename that finds a gate
 running prints `merge lock: waiting — …` and waits, and a gate waits for the step. The steps that
-wait do not hold the lock, so no gate waits behind a stop. Every step except the first and the last also checks that the unit is stopped. The
+wait do not hold the lock, so no gate waits behind a stop. Every step except the first and the last also checks that the unit is stopped;
+relaunch alone accepts the journal's session already live under the new id. The
 steps:
 
 1. **Stop.** A running unit is not a refusal: plan lists this step, and apply stops the unit
@@ -84,7 +85,10 @@ steps:
    A `Kind: style` production reads the Plan cell under `docs/style-production/units/`, keeps the
    filename, and updates the header in both the showrunner checkout and unit worktree. Its doc
    and plans stay git-excluded; `--allow-empty` records the rename subject even without a tracked
-   change. The journal records the commit's hash, so a retry only pushes it.
+   change. If a stop follows a doc or plan write, the pending step accepts only
+   files exactly equal to its transformations of HEAD; unrelated contents, paths
+   or mode changes still refuse. It finishes the remaining writes and commit.
+   The journal records the commit's hash, so a retry only pushes it.
 6. **Merge rename.** The unit branch takes the rename commit.
 7. **State.** These move to the new id:
    - the six showrunner state files (`rename_state.SCRATCH_FILES`) in `showrunners.session_state_dir(<slug>)`, or in the `--scratch` directory when one is given;
@@ -126,6 +130,10 @@ steps:
     waits for the new id to carry a live Claude mark (`_await_live`, `LIVE_WAIT_SECONDS`,
     `RENAME_UNIT_LIVE_WAIT`, default 180), so verify does not run before the unit is up. The rename
     claim (`rename_state.rename_claim`) refuses add_unit for both ids until step 9 is done.
+    If the restart succeeded before this step was saved, apply accepts only that
+    session id under the new unit id and retries restart's own recovery before
+    verification; it does not stop the restored workers. Another live session
+    or an unreadable session mark still refuses.
 11. **Verify** (below).
 
 A unit that was not running has no record, so steps 9 and 10 do nothing for it.
