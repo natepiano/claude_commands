@@ -43,7 +43,7 @@ import unit_lookup
 import unit_move
 import unit_names
 from production_units import Production
-from record import InvalidRecord
+from shutdown_record import InvalidRecord
 from atomic_file import write_text_atomic
 
 ADD_UNIT = Path(__file__).resolve().parent / "add_unit.py"

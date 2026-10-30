@@ -21,7 +21,7 @@ import production_units
 import launch_permission
 import unit_lookup
 import sessions
-import record as shutdown_store
+import shutdown_record as shutdown_store
 import restart
 import herdr
 from herdr import HerdrPlace

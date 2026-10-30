@@ -44,12 +44,12 @@ from quota_alert import (RefusedAt, _refusal_window, blocked_next_move_line, blo
                          TargetIsCurrentAccount as TargetIsCurrentAccount)
 
 if TYPE_CHECKING:
-    from scripts.shutdown import inventory as inventory_module, record
+    from scripts.shutdown import inventory as inventory_module, shutdown_record
     from scripts.herdr import herdr
     from scripts.message import sessions
 else:
     inventory_module = import_module("inventory")
-    record = import_module("record")
+    shutdown_record = import_module("shutdown_record")
     sessions = import_module("sessions")
     herdr = import_module("herdr")
 
@@ -60,11 +60,11 @@ class NoSessionRefusal:
 
 
 class ShutdownProgressReader(Protocol):
-    def shutdown_in_progress(self, saved: record.SessionShutdown) -> bool: ...
+    def shutdown_in_progress(self, saved: shutdown_record.SessionShutdown) -> bool: ...
 
 
 class RestartRecordLiveness(Protocol):
-    def restart_failed_session_running(self, saved: record.SessionShutdown) -> bool: ...
+    def restart_failed_session_running(self, saved: shutdown_record.SessionShutdown) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -798,7 +798,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
     pending_groups = (set(accounts.CLAUDE_GROUPS) if any(isinstance(rule, UnreadableNextMoveLog) for rule in configured)
                       else {rule.group for rule in configured if isinstance(rule, AutoMoveRule)})
     restart = cast(RestartRecordLiveness, cast(object, import_module("restart")))
-    open_ids = {saved["session"]["session_id"] for saved in record.all_session_records()
+    open_ids = {saved["session"]["session_id"] for saved in shutdown_record.all_session_records()
                 if not restart.restart_failed_session_running(saved)}
     entries = moves.read_moves()
     ended = {entry["move_id"] for entry in entries if entry["kind"] == "wait ended"}
@@ -1215,7 +1215,7 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
         return lines
     selected = accounts.group_accounts()
     shutdown_progress = cast(ShutdownProgressReader, cast(object, import_module("settle")))
-    in_flight = {accounts.session_group(saved["session"]) for saved in record.all_session_records()
+    in_flight = {accounts.session_group(saved["session"]) for saved in shutdown_record.all_session_records()
                  if shutdown_progress.shutdown_in_progress(saved)}
     moved = set(moved_groups)
     held_refusals = refusals.load()
