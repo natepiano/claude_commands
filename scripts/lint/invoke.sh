@@ -102,7 +102,7 @@ buildlog_now() {
 
 # buildlog_begin ARGV...
 buildlog_begin() {
-    BUILDLOG_START="" BUILDLOG_PEAK="" BUILDLOG_NOW="" BUILDLOG_TREE="" BUILDLOG_MEM_WAIT_S=0
+    BUILDLOG_START="" BUILDLOG_PEAK="" BUILDLOG_NOW="" BUILDLOG_TREE="" BUILDLOG_MEM_WAIT_S=0 BUILDLOG_TEST_PHASE_FILE=""
     [[ "${BUILDLOG_OFF:-0}" != 1 && -f "$BUILDLOG_RECORD" ]] || return 0
     BUILDLOG_TREE="$("$HOME/.claude/scripts/lib/py" "$BUILDLOG_RECORD" key ${1+"$@"} </dev/null 2>/dev/null)" \
         || BUILDLOG_TREE=""
@@ -156,16 +156,16 @@ buildlog_end() {
         mv -f "$log" "$held" 2>/dev/null || held=""
     fi
     if [[ "${BUILDLOG_SYNC:-0}" == 1 ]]; then
-        BUILDLOG_TREE_START="${BUILDLOG_TREE:-}" BUILDLOG_MEM_WAIT_S="${BUILDLOG_MEM_WAIT_S:-0}" "$HOME/.claude/scripts/lib/py" "$BUILDLOG_RECORD" step \
+        BUILDLOG_TEST_PHASE_FILE="${BUILDLOG_TEST_PHASE_FILE:-}" BUILDLOG_TREE_START="${BUILDLOG_TREE:-}" BUILDLOG_MEM_WAIT_S="${BUILDLOG_MEM_WAIT_S:-0}" "$HOME/.claude/scripts/lib/py" "$BUILDLOG_RECORD" step \
             "$status" "$BUILDLOG_START" "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"} \
             </dev/null >/dev/null 2>&1
     else
         ( trap '' HUP
-          BUILDLOG_TREE_START="${BUILDLOG_TREE:-}" BUILDLOG_MEM_WAIT_S="${BUILDLOG_MEM_WAIT_S:-0}" "$HOME/.claude/scripts/lib/py" "$BUILDLOG_RECORD" step \
+          BUILDLOG_TEST_PHASE_FILE="${BUILDLOG_TEST_PHASE_FILE:-}" BUILDLOG_TREE_START="${BUILDLOG_TREE:-}" BUILDLOG_MEM_WAIT_S="${BUILDLOG_MEM_WAIT_S:-0}" "$HOME/.claude/scripts/lib/py" "$BUILDLOG_RECORD" step \
             "$status" "$BUILDLOG_START" "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"} \
             </dev/null >/dev/null 2>&1 & )
     fi
-    BUILDLOG_START="" BUILDLOG_TREE=""
+    BUILDLOG_START="" BUILDLOG_TREE="" BUILDLOG_TEST_PHASE_FILE=""
     return 0
 }
 
@@ -174,6 +174,21 @@ buildlog_sample_anon() {
     local temporary="$maximum.tmp.${BASHPID:-$$}"
     local near_peak="${maximum%.max}.wave" last_near_peak_at=0 sampled_at peak_published
     local near_peak_temporary="$near_peak.tmp.${BASHPID:-$$}"
+    local phase_file=${4:-} reservation=${5:-} phase_context="" phase_started=null phase_peak=null
+    local phase_temporary="$phase_file.tmp.${BASHPID:-$$}" membership pid executable
+    local executables=()
+    if [[ -n "$phase_file" && -r "$reservation" ]]; then
+        phase_context=$(buildlog_memory_python "$BUILDLOG_RECORD" test-phase-context "$reservation" "${@:6}") || phase_context=""
+        if [[ "$phase_context" == \{*\} ]]; then
+            if printf '{"test_phase_peak_bytes":null,"test_phase_started_at":null,%s\n' "${phase_context#\{}" > "$phase_temporary"; then
+                mv -f "$phase_temporary" "$phase_file" || true
+            fi
+        else
+            phase_file=""
+        fi
+    else
+        phase_file=""
+    fi
     while :; do
         kill -0 "$parent" 2>/dev/null || return
         if [[ -r "$sidecar" ]]; then
@@ -184,6 +199,40 @@ buildlog_sample_anon() {
                         anon=${line#anon }
                         if [[ "$anon" =~ ^[0-9]+$ ]]; then
                             sampled_at=$(date +%s)
+                            if [[ -n "$phase_file" ]]; then
+                                if [[ "$phase_started" == null ]]; then
+                                    # memory.stat is hierarchical: one reading includes every
+                                    # parallel test, even when a child uses a nested cgroup.
+                                    executables=()
+                                    while IFS= read -r membership; do
+                                        while IFS= read -r pid; do
+                                            [[ "$pid" =~ ^[0-9]+$ ]] || continue
+                                            executables+=("${BUILDLOG_PROC:-/proc}/$pid/exe")
+                                        done < "$membership"
+                                    done < <(find "$scope" -name cgroup.procs -type f 2>/dev/null)
+                                    if (( ${#executables[@]} )); then
+                                        # One readlink process per tick, rather than one per
+                                        # compiler in a wide compilation before tests begin.
+                                        while IFS= read -r executable; do
+                                            if [[ "$executable" =~ /deps/[^/]+$ ]]; then
+                                                phase_started=$sampled_at
+                                                break
+                                            fi
+                                        done < <(readlink "${executables[@]}" 2>/dev/null)
+                                    fi
+                                fi
+                                if [[ "$phase_started" != null ]]; then
+                                    if [[ "$phase_peak" == null ]] || (( anon > phase_peak )); then
+                                        if printf '{"test_phase_peak_bytes":%s,"test_phase_started_at":%s,%s\n' \
+                                            "$anon" "$phase_started" "${phase_context#\{}" > "$phase_temporary" \
+                                            && mv -f "$phase_temporary" "$phase_file"; then
+                                            phase_peak=$anon
+                                        else
+                                            rm -f "$phase_temporary" || true
+                                        fi
+                                    fi
+                                fi
+                            fi
                             peak_published=0
                             if (( anon > peak )); then
                                 if printf '%s\n' "$anon" > "$temporary" && mv -f "$temporary" "$maximum"; then
@@ -289,7 +338,9 @@ run_once() {
         set -- "${LINT_NEXTEST_SHARED_ARGV[@]}"
     fi
     if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" && -n "${BUILDLOG_PEAK:-}" ]]; then
-        buildlog_sample_anon "$BUILDLOG_PEAK.cgroup" "${BUILDLOG_MEM_RESERVATION%.reservation}.max" "$parent_pid" &
+        BUILDLOG_TEST_PHASE_FILE="$BUILDLOG_PEAK.test-phase.json"
+        buildlog_sample_anon "$BUILDLOG_PEAK.cgroup" "${BUILDLOG_MEM_RESERVATION%.reservation}.max" "$parent_pid" \
+            "$BUILDLOG_TEST_PHASE_FILE" "$BUILDLOG_MEM_RESERVATION" "$@" &
         sampler_pid=$!
     fi
     if [[ -n "${BUILDLOG_START:-}" ]]; then
