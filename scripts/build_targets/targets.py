@@ -95,12 +95,28 @@ NOT_SEEN_IDLE = NotSeenIdle()
 
 
 @dataclass(frozen=True)
+class HolderSession:
+    """The Claude session recorded by the claim or hold."""
+
+    session_id: str
+
+
+@dataclass(frozen=True)
+class NoHolderSession:
+    """The claim or hold did not record a Claude session."""
+
+
+NO_HOLDER_SESSION = NoHolderSession()
+
+
+@dataclass(frozen=True)
 class RunningJob:
     """One live Mac claim: a job for one repository, or for the whole Mac."""
 
     what: str
     since: datetime
     idle: ClaimIdle
+    holder_session: HolderSession | NoHolderSession = NO_HOLDER_SESSION
 
 
 @dataclass(frozen=True)
@@ -116,6 +132,7 @@ class Held:
     reason: str
     since: datetime
     end: HoldEnd
+    holder_session: HolderSession | NoHolderSession = NO_HOLDER_SESSION
 
 
 @dataclass(frozen=True)
@@ -163,10 +180,12 @@ def utc_now() -> datetime:
 def running_job(claim: mac_test.HeldClaim) -> RunningJob:
     record = claim.record
     since = mac_test.aware_timestamp(record["since"], claim.path, "since")
+    session_id = record.get("holder_session", "")
+    holder = HolderSession(session_id) if session_id else NO_HOLDER_SESSION
     if "idle_since" not in record:
-        return RunningJob(record["what"], since, NOT_SEEN_IDLE)
+        return RunningJob(record["what"], since, NOT_SEEN_IDLE, holder)
     idle = mac_test.aware_timestamp(record["idle_since"], claim.path, "idle_since")
-    return RunningJob(record["what"], since, IdleSince(idle))
+    return RunningJob(record["what"], since, IdleSince(idle), holder)
 
 
 def target_state(target: Target) -> TargetState:
@@ -182,7 +201,7 @@ def target_state(target: Target) -> TargetState:
                 if isinstance(holder.release, build_hold.KnownReleaseEta)
                 else UntilReleased()
             )
-            return Held(holder.name, holder.purpose, holder.since, end)
+            return Held(holder.name, holder.purpose, holder.since, end, HolderSession(holder.key))
         paths = mac_test.state_paths()
         claims = mac_test.read_claims(paths)
         block = mac_test.read_claim_block(paths)
@@ -192,7 +211,9 @@ def target_state(target: Target) -> TargetState:
                 if block.expires > utc_now()
                 else AwaitingBlockRemoval()
             )
-            return Held(block.holder, block.reason, block.since, block_end)
+            session = (HolderSession(block.delivery.name)
+                       if isinstance(block.delivery, mac_test.RecordedSession) else NO_HOLDER_SESSION)
+            return Held(block.holder, block.reason, block.since, block_end, session)
         jobs = tuple(running_job(claim) for claim in claims if mac_test.run_is_live(claim.record))
         return Running(jobs) if jobs else Free()
     except build_hold.ReleaseRecordReadError as error:

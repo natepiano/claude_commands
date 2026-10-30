@@ -391,8 +391,8 @@ projection. Managed CONTROL is `<session>/run_control`; standalone CONTROL is
    `lint_failure_is_the_tree` excludes 77 as its Phase 7 excludes 125.
 5. **Copy path: the user's rule.** This design defines no copy path. Copies
    follow the user's rule of 2026-10-29: `/tmp/claude/copies/<showrunner>-<unit>/<phase>-<purpose>`
-   (example `/tmp/claude/copies/hana-lfo/54b-gate`), with names only from
-   `roster.py unit_labels`, never run or session ids. verify-unit's plan
+   (example `/tmp/claude/copies/hana-lfo/54b-gate`), with the folder name only from
+   `roster.UnitLabels.folder_name()` (labels from `roster.unit_labels_for`), never run or session ids. verify-unit's plan
    `docs/plans/verify-copies.md` owns it, and each copy is a `scratch.py` record
    made at birth with its task and provenance. The run-stop fields go in a
    provenance file inside that folder, written before execution: command id,
