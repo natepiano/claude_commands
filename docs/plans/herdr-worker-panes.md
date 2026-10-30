@@ -272,6 +272,10 @@ Each item is my call under the decision criteria unless it names the user. A one
 - The `NoSuchMember` test: with no matching row, add and resume make one with `ensure`; retire, wrap and promote skip that `retire`; rename and transfer exit 2 and change no source.
 - Full gate green.
 
+### Phase 3b — Staff move command  · status: done
+
+Inserted 2026-10-30 (user, via the showrunner). Work Order: `staff.py move <unit> <showrunner>` changes one field, the unit row's parent, and moves the unit's live tab into the new showrunner's workspace through herdr.py's existing pane move; `transfer_unit.py` becomes that move plus one message to the unit and one to each showrunner. No stop, no restart.
+
 ### Phase 4 — Member names come from the staff row  · status: todo
 
 **Depends on:** Phase 1, Phase 3
