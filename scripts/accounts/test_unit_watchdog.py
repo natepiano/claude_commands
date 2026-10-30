@@ -80,6 +80,8 @@ class UnitWatchdogTests(unittest.TestCase):
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=self.command))
         _ = self.enterContext(patch.object(herdr, "herdr_binary", return_value="/nonexistent/herdr"))
         _ = self.enterContext(patch.object(herdr.Herdr, "agents", return_value=[]))
+        _ = self.enterContext(patch.object(restart, "_prepare_restore_server"))
+        _ = self.enterContext(patch.object(herdr.Herdr, "close_restore_placeholders"))
         _ = self.fixture.groups(units="claude2")
         # Every account read, launch permission and message leaf is provided by the fixture.
         self.assertEqual(accounts.setup("claude4"), [])
@@ -624,7 +626,7 @@ class UnitWatchdogTests(unittest.TestCase):
         self.assertEqual(self.commands, [])
         self.assertTrue(any("no longer exists; restore dropped" in line for line in self.notices))
 
-    def test_folder_lost_after_dispatch_alerts_after_real_archive_and_retries_failed_push(self) -> None:
+    def test_folder_lost_after_dispatch_retains_record_and_retries_its_move_alert(self) -> None:
         saved = self.moved_outage()
         # This recovery exists only in its shutdown record.
         record.write_snapshot(record.RecoverySnapshot(machine="natedev", login=saved["login"],
@@ -641,39 +643,40 @@ class UnitWatchdogTests(unittest.TestCase):
             output = io.StringIO()
             with redirect_stdout(output):
                 status = restart.up(saved["login"], only=(saved["session"]["session_id"],))
-            self.assertIn("restore dropped", output.getvalue())
+            self.assertIn("no longer exists; restore the folder", output.getvalue())
             return subprocess.CompletedProcess(argv, status, output.getvalue(), "")
 
         with patch.object(subprocess, "run", side_effect=restart_command):
             unit_watchdog._finish_recovery(command[offset + 1], command[offset + 2],  # pyright: ignore[reportPrivateUsage]
                 Path(command[offset + 3]), command[offset + 4])
-        self.assertIsNone(record.find_session(saved["login"], saved["session"]["session_id"]))
+        retained = record.find_session(saved["login"], saved["session"]["session_id"])
+        assert retained is not None
+        self.assertEqual(retained["progress"]["kind"], "restart failed")
         self.assertEqual(record.all_snapshots()[0]["sessions"], [])
         result = Path(command[offset + 3])
         finished = result.read_text()
         result.unlink()
-        with patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()) as phone:
-            _ = self.pass_at(3)
-            phone.assert_not_called()
-            state = unit_watchdog._read_state()  # pyright: ignore[reportPrivateUsage]
-            self.assertIn("job", state["alpha"])
-        _ = result.write_text(finished)
+        # The retained move record owns its alert even before the job result arrives.
         with patch.object(quota_alert, "tell_user", side_effect=[
                 quota_alert.PushFailed("fixture delivery failed"), quota_alert.PushSent()]) as phone:
-            _ = self.pass_at(4)
+            _ = self.pass_at(3)
             phone.assert_called_once()
             push = cast(RenderedPush, phone.call_args.args[0])
-            self.assertEqual(push.values["account"], "claude4")
-            self.assertEqual(push.values["stopped"], saved["session"]["name"])
-            self.assertIn("restore dropped", push.values["cause"])
+            self.assertEqual(push.id, "shutdown.move_failed")
+            self.assertEqual(push.values["source"], "claude4")
+            self.assertEqual(push.values["target"], "claude2")
+            self.assertEqual(push.values["session"], saved["session"]["name"])
             state = unit_watchdog._read_state()  # pyright: ignore[reportPrivateUsage]
             self.assertFalse(state["alpha"]["alerted"])
-            self.assertNotIn("job", state["alpha"])
+            self.assertIn("job", state["alpha"])
+            _ = result.write_text(finished)
+            _ = self.pass_at(4)
+            self.assertEqual(phone.call_count, 2)
             _ = self.pass_at(6)
             self.assertEqual(phone.call_count, 2)
             _ = self.pass_at(8)
             self.assertEqual(phone.call_count, 2)
-        self.assertTrue(any("restore dropped" in line for line in self.notices))
+        self.assertTrue(any("no longer exists" in line for line in self.notices))
 
     def fail_moved_restart(self, saved: record.SessionShutdown) -> None:
         with (patch.object(restart, "_retire"),
@@ -686,7 +689,7 @@ class UnitWatchdogTests(unittest.TestCase):
             _ = restart.relaunch_session(saved, dry_run=False, desktop_state=restart.DesktopLaunchState())
         self.assertEqual(launch.call_count, 2)
 
-    def archive_pending_restore(self, saved: record.SessionShutdown) -> None:
+    def fail_pending_restore_with_missing_folder(self, saved: record.SessionShutdown) -> None:
         command = self.pending[-1]
         offset = command.index("--recover")
         Path(saved["session"]["cwd"]).rmdir()
@@ -696,13 +699,15 @@ class UnitWatchdogTests(unittest.TestCase):
             output = io.StringIO()
             with redirect_stdout(output):
                 status = restart.up(saved["login"], only=(saved["session"]["session_id"],))
-            self.assertIn("restore dropped", output.getvalue())
+            self.assertIn("no longer exists; restore the folder", output.getvalue())
             return subprocess.CompletedProcess(argv, status, output.getvalue(), "")
 
         with patch.object(subprocess, "run", side_effect=restart_command):
             unit_watchdog._finish_recovery(command[offset + 1], command[offset + 2],  # pyright: ignore[reportPrivateUsage]
                 Path(command[offset + 3]), command[offset + 4])
-        self.assertIsNone(record.find_session(saved["login"], saved["session"]["session_id"]))
+        retained = record.find_session(saved["login"], saved["session"]["session_id"])
+        assert retained is not None
+        self.assertEqual(retained["progress"]["kind"], "restart failed")
 
     def test_clear_removes_only_claims_before_the_live_observation(self) -> None:
         for delivered in (False, True):
@@ -899,7 +904,7 @@ class UnitWatchdogTests(unittest.TestCase):
                     settle.report_stop([saved])
                     report_phone.assert_called_once()
                     if archived:
-                        self.archive_pending_restore(saved)
+                        self.fail_pending_restore_with_missing_folder(saved)
                     _ = self.pass_at(10)
                     _ = self.pass_at(12)
                     watchdog_phone.assert_not_called()
@@ -930,7 +935,7 @@ class UnitWatchdogTests(unittest.TestCase):
             _ = self.pass_at(14)
             phone.assert_called_once()
 
-    def test_worker_delivery_survives_a_later_archived_missing_folder(self) -> None:
+    def test_worker_delivery_survives_a_later_retained_missing_folder(self) -> None:
         saved = self.moved_outage()
         record.write_snapshot(record.RecoverySnapshot(machine="natedev", login=saved["login"],
             label=saved["label"], taken_at=NOW.isoformat(), sessions=[]))
@@ -940,7 +945,7 @@ class UnitWatchdogTests(unittest.TestCase):
             self.fail_moved_restart(saved)
             phone.assert_called_once()
             self.assertEqual(cast(RenderedPush, phone.call_args.args[0]).id, "shutdown.move_failed")
-            self.archive_pending_restore(saved)
+            self.fail_pending_restore_with_missing_folder(saved)
             _ = self.pass_at(10)
             _ = self.pass_at(12)
             phone.assert_called_once()
@@ -973,7 +978,7 @@ class UnitWatchdogTests(unittest.TestCase):
             _ = self.pass_at(20)
         self.assertEqual(len(attempts), 2)
 
-    def test_failed_worker_delivery_allows_one_alert_after_archive(self) -> None:
+    def test_failed_worker_delivery_allows_one_move_alert_after_retained_failure(self) -> None:
         saved = self.moved_outage()
         record.write_snapshot(record.RecoverySnapshot(machine="natedev", login=saved["login"],
             label=saved["label"], taken_at=NOW.isoformat(), sessions=[]))
@@ -984,12 +989,12 @@ class UnitWatchdogTests(unittest.TestCase):
             worker_phone.assert_called_once()
         # The pass observes the failed delivery while the worker is still pending.
         _ = self.pass_at(3)
-        self.archive_pending_restore(saved)
+        self.fail_pending_restore_with_missing_folder(saved)
         with patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()) as phone:
             _ = self.pass_at(4)
             _ = self.pass_at(6)
             phone.assert_called_once()
-            self.assertEqual(cast(RenderedPush, phone.call_args.args[0]).id, "shutdown.restart_failed")
+            self.assertEqual(cast(RenderedPush, phone.call_args.args[0]).id, "shutdown.move_failed")
 
     def test_worker_delivery_then_live_unit_allows_one_new_outage_alert(self) -> None:
         saved = self.moved_outage()

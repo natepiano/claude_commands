@@ -12,6 +12,7 @@ import socket
 import stat
 import subprocess
 import sys
+import time
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -1021,6 +1022,282 @@ def listing(login: str | None = None, *,
         ):
             found.append(entry)
     return found
+
+
+def all_live_accounts() -> list[Inventory]:
+    """Read current restore details for every locally attributed Claude login."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    logins = sorted({item.login for item in listing()})
+    if not logins:
+        return []
+    def read_account(login: str) -> Inventory:
+        return inventory(login, refresh_desktops=False)
+
+    with ThreadPoolExecutor(max_workers=len(logins)) as pool:
+        return list(pool.map(read_account, logins))
+
+
+@dataclass(frozen=True)
+class ShutdownProcess:
+    """A process identity and its recorded ownership at shutdown observation."""
+
+    pid: int
+    parent: int
+    started: str
+    arguments: tuple[str, ...] = ()
+    session_id: str = ""
+    run_dir: str = ""
+    build_unit: str = ""
+    process_session: int = 0
+    observed_parents: frozenset[int] = frozenset()
+    observed_groups: frozenset[int] = frozenset()
+    ownership_unreadable: bool = False
+    unreconciled_ownership_text: str = ""
+    cgroups: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class ProcessObservation:
+    """Discovered identities plus every unresolved read that prevents proving absence."""
+
+    processes: dict[int, ShutdownProcess]
+    errors: tuple[str, ...] = ()
+    uncertain: frozenset[int] = frozenset()
+    terminated: frozenset[tuple[int, str]] = frozenset()
+    observed_identities: frozenset[tuple[int, str]] = frozenset()
+
+
+@dataclass(frozen=True)
+class ProcessLive:
+    started: str
+
+
+@dataclass(frozen=True)
+class ProcessGone:
+    """The process no longer exists (including a reaped/zombie identity)."""
+
+
+@dataclass(frozen=True)
+class ProcessUnknown:
+    reason: str
+
+
+ProcessIdentity = ProcessLive | ProcessGone | ProcessUnknown
+
+
+def shutdown_identity(pid: int, timeout: float = 5) -> ProcessIdentity:
+    try:
+        if sys.platform == "darwin":
+            shown = subprocess.run(["ps", "-p", str(pid), "-o", "stat=,lstart="],
+                capture_output=True, text=True, check=False, timeout=timeout,
+                env={**os.environ, "LC_ALL": "C", "TZ": "UTC"})
+            if shown.returncode == 1 and not shown.stdout.strip():
+                return ProcessGone()
+            if shown.returncode:
+                return ProcessUnknown(f"pid {pid}: ps exit {shown.returncode}: {shown.stderr.strip()}")
+            status, separator, started = shown.stdout.strip().partition(" ")
+            if not separator or not started.strip():
+                return ProcessUnknown(f"pid {pid}: malformed ps identity")
+            return ProcessGone() if status.startswith("Z") else ProcessLive(started.lstrip())
+        fields = Path(os.environ.get("HERDR_PROC", "/proc"), str(pid), "stat").read_bytes().rpartition(b")")[2].split()
+        return ProcessGone() if fields[0] == b"Z" else ProcessLive(fields[19].decode("ascii"))
+    except FileNotFoundError:
+        try:
+            present = Path(os.environ.get("HERDR_PROC", "/proc"), str(pid)).exists()
+        except OSError as error:
+            return ProcessUnknown(f"pid {pid}: identity unread: {error}")
+        return ProcessUnknown(f"pid {pid}: stat missing from existing process") if present else ProcessGone()
+    except (OSError, subprocess.SubprocessError, IndexError, UnicodeError) as error:
+        return ProcessUnknown(f"pid {pid}: identity unread: {error}")
+
+
+def shutdown_server_identities(timeout: float) -> frozenset[tuple[int, str]]:
+    """Only the service's verified main process is a permanent server keep."""
+    if sys.platform != "linux":
+        return frozenset()
+    expires = time.monotonic() + timeout
+    try:
+        shown = subprocess.run(["systemctl", "--user", "show", herdr.server_unit(herdr.shared_session()),
+            "--property=MainPID", "--value"], capture_output=True, text=True, check=False, timeout=timeout)
+        if shown.returncode or not shown.stdout.strip().isdecimal():
+            return frozenset()
+        pid = int(shown.stdout.strip())
+        remaining = expires - time.monotonic()
+        if pid <= 0 or remaining <= 0:
+            return frozenset()
+        identity = shutdown_identity(pid, remaining)
+        return frozenset({(pid, identity.started)}) if isinstance(identity, ProcessLive) else frozenset()
+    except (OSError, subprocess.SubprocessError):
+        return frozenset()
+
+
+def _collect_process_table(arguments: list[str], timeout: float) -> tuple[str, int]:
+    """Return the table and the exact collector pid, which is never a target."""
+    with subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env={**os.environ, "LC_ALL": "C", "TZ": "UTC"}) as collector:
+        try:
+            output, error = collector.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            collector.kill()
+            _ = collector.communicate()
+            raise
+        if collector.returncode:
+            raise subprocess.CalledProcessError(collector.returncode, arguments, output, error)
+        return output, collector.pid
+
+
+def shutdown_processes(timeout: float = 5) -> ProcessObservation:
+    """Observe ownership without turning failed or partial reads into absence."""
+    result: dict[int, ShutdownProcess] = {}
+    errors: list[str] = []
+    if sys.platform == "darwin":
+        tables: list[dict[int, tuple[ShutdownProcess, str, str]]] = []
+        collectors: set[tuple[int, str]] = set()
+        identity_errors: dict[tuple[int, str], list[str]] = {}
+        for flags in (("-axww",), ("eww", "-axww")):
+            try:
+                output, collector = _collect_process_table(
+                    ["ps", *flags, "-o", "pid=,ppid=,pgid=,stat=,lstart=,command="], max(0.001, timeout / 2))
+            except (OSError, subprocess.SubprocessError) as error:
+                return ProcessObservation(result, (f"ps observation: {error}",))
+            table: dict[int, tuple[ShutdownProcess, str, str]] = {}
+            for line in output.splitlines():
+                row = re.fullmatch(r"\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+\s+\S+\s+\d+\s+\d+:\d+:\d+\s+\d+)\s*(.*)", line)
+                if row is None:
+                    errors.append(f"ps malformed row: {line[:160]}")
+                    continue
+                pid, parent, group = map(int, row.groups()[:3])
+                status, started, text = row.groups()[3:]
+                row_errors = identity_errors.setdefault((pid, started), [])
+                ownership_unreadable = bool(re.fullmatch(r"\([^()]*\)", text))
+                if ownership_unreadable:
+                    row_errors.append(f"pid {pid}: argv unread: ps comm fallback")
+                try:
+                    arguments = tuple(shlex.split(text))
+                except ValueError:
+                    # ps renders argv as text, not shell syntax. Quotes do not
+                    # erase numeric ancestry or the raw environment suffix.
+                    arguments = ()
+                table[pid] = (ShutdownProcess(pid, parent, started, arguments, process_session=group,
+                    ownership_unreadable=ownership_unreadable,
+                    unreconciled_ownership_text=text if tables else ""), status, text)
+            # This collector produced its own row while still alive. Only that
+            # exact identity is exempt; a later reuse of its pid is ordinary.
+            if collector in table:
+                collectors.add((collector, table[collector][0].started))
+            tables.append(table)
+        uncertain: set[int] = set()
+        terminated: set[tuple[int, str]] = set()
+        for pid in tables[0].keys() | tables[1].keys():
+            first = tables[0].get(pid)
+            later = tables[1].get(pid)
+            latest = later if later is not None else first
+            assert latest is not None
+            process, status, text = latest
+            if (pid, process.started) in collectors:
+                continue
+            # Reconcile identity before status. Later Z proves this identity dead;
+            # it never proves an earlier/different identity alive.
+            if status.startswith("Z"):
+                gone = {(pid, row[0].started) for row in (first, later) if row is not None}
+                terminated.update(gone)
+                for identity in gone:
+                    _ = identity_errors.pop(identity, None)
+                continue
+            result[pid] = process
+            if first is None or later is None or first[0].started != later[0].started:
+                uncertain.add(pid)
+                errors.append(f"pid {pid}: unmatched process identity between tables")
+                continue
+            parents = frozenset({first[0].parent, process.parent})
+            groups = frozenset({first[0].process_session, process.process_session})
+            process = ShutdownProcess(pid, process.parent, process.started, process.arguments,
+                process_session=process.process_session, observed_parents=parents, observed_groups=groups,
+                ownership_unreadable=first[0].ownership_unreadable or process.ownership_unreadable)
+            result[pid] = process
+            argv = first[2]
+            if not text.startswith(argv) or (len(text) > len(argv) and not text[len(argv)].isspace()):
+                uncertain.add(pid)
+                result[pid] = ShutdownProcess(pid, process.parent, process.started, process.arguments,
+                    process_session=process.process_session, observed_parents=parents, observed_groups=groups,
+                    ownership_unreadable=process.ownership_unreadable, unreconciled_ownership_text=text)
+                errors.append(f"pid {pid}: environment prefix does not match argv identity")
+                continue
+            tail = text[len(argv):]
+            entries = list(re.finditer(r"(?:^|\s)([A-Za-z_][A-Za-z0-9_]*)=", tail))
+            ownership_keys = {"CLAUDE_CODE_SESSION_ID", "UNIT_RUN_DIR", "UNIT_SESSION_DIR"}
+            # ps does not encode environment value boundaries. A repeated key,
+            # or a marker after another value, might be text inside that value.
+            ambiguous = any(entry[1] in ownership_keys and (index != 0 or
+                bool(tail[:entry.start()].strip()) or sum(other[1] == entry[1] for other in entries) != 1)
+                for index, entry in enumerate(entries))
+            if ambiguous:
+                uncertain.add(pid)
+                errors.append(f"pid {pid}: ownership marker boundary unknown")
+                result[pid] = ShutdownProcess(pid, process.parent, process.started, first[0].arguments,
+                    process_session=process.process_session, observed_parents=parents, observed_groups=groups,
+                    ownership_unreadable=True, unreconciled_ownership_text=text)
+                continue
+            environment = {entry[1]: tail[entry.end():entries[index + 1].start()
+                if index + 1 < len(entries) else len(tail)].rstrip()
+                for index, entry in enumerate(entries)}
+            result[pid] = ShutdownProcess(pid, process.parent, process.started, first[0].arguments,
+                environment.get("CLAUDE_CODE_SESSION_ID", ""),
+                environment.get("UNIT_RUN_DIR") or environment.get("UNIT_SESSION_DIR", ""),
+                process_session=process.process_session, observed_parents=parents, observed_groups=groups,
+                ownership_unreadable=process.ownership_unreadable)
+        errors.extend(error for key, entries in identity_errors.items() if key not in collectors for error in entries)
+        identities = frozenset((pid, row[0].started) for table in tables for pid, row in table.items()
+                               if (pid, row[0].started) not in collectors)
+        return ProcessObservation(result, tuple(errors), frozenset(uncertain), frozenset(terminated), identities)
+    root = Path(os.environ.get("HERDR_PROC", "/proc"))
+    try:
+        paths = list(root.iterdir())
+    except OSError as error:
+        return ProcessObservation(result, (f"process table unread: {error}",))
+    for process in paths:
+        if not process.name.isdecimal():
+            continue
+        try:
+            if process.stat().st_uid != os.getuid():
+                continue
+            fields = process.joinpath("stat").read_text().rsplit(")", 1)[1].split()
+            if fields[0] == "Z":
+                continue
+            arguments = tuple(os.fsdecode(word) for word in process.joinpath("cmdline").read_bytes().split(b"\0") if word)
+            environment: dict[str, str] = {}
+            cgroups: list[str] = []
+            ownership_unreadable = False
+            try:
+                environment = _snapshot_environment(process)
+            except OSError as error:
+                errors.append(f"pid {process.name}: environment unread: {error}")
+            try:
+                cgroups = process.joinpath("cgroup").read_text().splitlines()
+            except OSError as error:
+                errors.append(f"pid {process.name}: cgroup unread: {error}")
+                ownership_unreadable = True
+            scope = next((Path(line.split(":", 2)[-1]).name for line in cgroups
+                          if "/builds.slice/" in line and line.endswith((".scope", ".service"))), "")
+            pid = int(process.name)
+            result[pid] = ShutdownProcess(pid, int(fields[1]), fields[19], arguments,
+                environment.get("CLAUDE_CODE_SESSION_ID", ""),
+                environment.get("UNIT_RUN_DIR") or environment.get("UNIT_SESSION_DIR", ""), scope, int(fields[3]),
+                ownership_unreadable=ownership_unreadable,
+                cgroups=frozenset(fields[2] for line in cgroups
+                    if len(fields := line.split(":", 2)) == 3 and fields[1] in {"", "name=systemd"}
+                    and fields[2].startswith("/")))
+        except FileNotFoundError:
+            try:
+                if process.exists():
+                    errors.append(f"pid {process.name}: required process file missing")
+            except OSError as error:
+                errors.append(f"pid {process.name}: observation unread: {error}")
+            continue
+        except (OSError, ValueError, IndexError) as error:
+            errors.append(f"pid {process.name}: observation unread: {error}")
+    return ProcessObservation(result, tuple(errors))
 
 
 def inventory(
