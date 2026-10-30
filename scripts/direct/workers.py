@@ -625,8 +625,9 @@ def _worker_from_record(name: str, run: Path, record: dict[str, object]) -> Unit
     policy: dict[str, object] = {"kind": type(access).__name__}
     if isinstance(access, PhaseBoundDesigner):
         policy.update({"binding_generation": access.binding_generation, "launch_sandbox": access.launch_sandbox})
-    return UnitWorker(name, _text(record.get("role")), "codex", _text(record.get("model")),
-                      _text(record.get("effort")), policy,
+    settings = codex_mesh.recorded_turn_settings(record)
+    return UnitWorker(name, _text(record.get("role")), "codex", settings.model,
+                      settings.effort, policy,
                       CodexThread(_text(record.get("thread_id")), _text(record.get("codex_home")) or
                                   str(codex_mesh.server_record_home(_read(run / "mesh_server.json")))),
                       HeldBy(str(run)), [_event("opened", "registered existing roster", run)])
@@ -822,8 +823,8 @@ def _adopt(store: UnitWorkerLedger, ledger: UnitWorkers, source: Path, destinati
             if worker is None or not isinstance(worker.backend, CodexThread):
                 raise WorkerUnavailable(f"{name}: removed run has no saved Codex backend")
             before = {"thread_id": worker.backend.thread_id, "codex_home": worker.backend.codex_home,
-                      "role": worker.role, "family": worker.family, "model": worker.model,
-                      "effort": worker.effort, "access_policy": worker.access_policy, "status": "paused"}
+                      "role": worker.role, "family": worker.family, "turn_model": worker.model,
+                      "turn_effort": worker.effort, "access_policy": worker.access_policy, "status": "paused"}
             giving = RemovedRun(source)
         taking_roster = locks.enter_context(_roster_locked(destination))
         new = taking_roster[1]
@@ -902,15 +903,17 @@ def note_backend(run: Path, name: str, thread_id: str, home: Path) -> None:
                                                 old_thread_id=backend.thread_id, thread_id=thread_id))
                 worker.role = _text(record.get("role")) or worker.role
                 worker.access_policy = _object(record.get("access_policy")) or worker.access_policy
+                from scripts.agents import codex_mesh
+                settings = codex_mesh.recorded_turn_settings(record)
+                worker.model, worker.effort = settings.model, settings.effort
                 worker.backend = CodexThread(thread_id, str(home.resolve()))
                 worker.ownership = HeldBy(str(run))
                 # The first exact-thread resume completes the incoming handoff.
                 # Future follows use ordinary live-turn checks and replacement.
                 _ = record.pop("adopted_from", None)
                 record.update({"codex_home": str(home.resolve()), "unit_ledger": str(store.path),
-                               "role": worker.role, "model": worker.model, "effort": worker.effort,
+                               "role": worker.role,
                                "access_policy": worker.access_policy})
-                from scripts.agents import codex_mesh
                 codex_mesh.advance_worker_roster_revision(record)
                 roster[name] = record
                 _write_roster(handle, roster)
@@ -991,12 +994,9 @@ def _resolve(run: Path, role: str, owner_pid: int, *, model: str = "", effort: s
             if role != "review":
                 raise WorkerUnavailable("incoming reviewer requires review role")
             return _register_reviewer(run, ledger, incoming)
-        def matches(record: Mapping[str, object]) -> bool:
-            return (not new_name and (not model or record.get("model") == model)
-                    and (not effort or record.get("effort") == effort))
         for name, value in sorted(roster.items(), key=lambda item: (role == "review" and item[0] != reviewer_base, item[0])):
             record = _object(value)
-            if record.get("role") != role or record.get("adopted_to") or not matches(record):
+            if record.get("role") != role or record.get("adopted_to") or new_name:
                 continue
             registered = ledger.workers.get(name)
             if registered is not None and isinstance(registered.ownership, Retired):
@@ -1013,8 +1013,7 @@ def _resolve(run: Path, role: str, owner_pid: int, *, model: str = "", effort: s
                 ledger.workers[name].ownership = HeldBy(str(run))
                 return name
         for name, worker in list(ledger.workers.items()):
-            if (new_name or worker.role != role or isinstance(worker.ownership, Retired)
-                    or model and worker.model != model or effort and worker.effort != effort):
+            if new_name or worker.role != role or isinstance(worker.ownership, Retired):
                 continue
             owner = worker.ownership
             previous_runs: list[str] = []
@@ -1033,7 +1032,7 @@ def _resolve(run: Path, role: str, owner_pid: int, *, model: str = "", effort: s
                     continue
         for name, value in sorted(roster.items(), key=lambda item: (role == "review" and item[0] != reviewer_base, item[0])):
             record = _object(value)
-            if (record.get("role") != role or not matches(record)
+            if (record.get("role") != role or new_name
                     or record.get("status") not in ("ended", "running", "starting")):
                 continue
             if codex_mesh.worker_idle_reason(str(run), name, record,

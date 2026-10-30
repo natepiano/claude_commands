@@ -488,7 +488,9 @@ class RoleMapTests(unittest.TestCase):
               patch.object(subprocess, "Popen", side_effect=AssertionError("unexpected Popen"))):
             for flags in ((), ("--json",)):
                 with self.subTest(flags=flags):
-                    self.assertEqual(self.cli("status", *flags), (1, "", expected + "\n"))
+                    observed = [f"* {label}: not set up; no folder holds this account; run accounts.py setup {label}"
+                                for label in ("claude1", "claude2", "claude3", "codex1", "codex3")]
+                    self.assertEqual(self.cli("status", *flags), (1, "", "\n".join([*observed, expected]) + "\n"))
             self.assertEqual(ssh.call_count, 2)
             ssh.reset_mock()
             code, output, error = self.cli("status", "--json", "--stored")
@@ -572,7 +574,7 @@ class RoleMapTests(unittest.TestCase):
         rows = cast(list[dict[str, object]], document["accounts"])
         selected = next(row for row in rows if row["label"] == "claude2")
         self.assertEqual(selected["roles"], ["units", "showrunners"])
-        self.assertIn("workers: cannot launch on this machine; workers is on codex1, which is not set up on this machine; run accounts.py setup codex1",
+        self.assertIn("codex1: not set up; no folder holds this account; affected roles: workers; run accounts.py setup codex1",
                       cast(list[str], document["problems"]))
         self.assertEqual(self.files(self.home), before)
 
@@ -691,11 +693,15 @@ class RoleMapTests(unittest.TestCase):
                 self.assertEqual((code, error), (0, ""))
                 self.assertEqual(ssh.call_count, 1)
                 self.assertIn("| Folder", output)
-                for role in ("units", "showrunners"):
-                    self.assertIn(f"{role}: cannot launch on this machine; {role} is on claude2, which is {state} on this machine; {claude_step}",
-                                  output.splitlines())
-                self.assertIn(f"workers: cannot launch on this machine; workers is on codex1, which is {state} on this machine; {codex_step}",
+                cause = (f"{self.home / '.claude2'} has no readable sign-in" if is_set_up
+                         else "no folder holds this account")
+                self.assertIn(("" if is_set_up else "* ") + f"claude2: {state}; {cause}; affected roles: units, showrunners; {claude_step}",
                               output.splitlines())
+                expected_codex = (f"~/.codex1: not logged in; the home has no readable sign-in; affected roles: workers; sign in as codex1 at ~/.codex1; {codex_step}"
+                    if is_set_up else f"* codex1: {state}; no folder holds this account; affected roles: workers; {codex_step}")
+                self.assertIn(expected_codex, output.splitlines())
+
+
 
 
 if __name__ == "__main__":

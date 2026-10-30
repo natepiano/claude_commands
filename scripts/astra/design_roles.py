@@ -17,7 +17,7 @@ import shlex
 import socket
 import subprocess
 import sys
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
@@ -42,6 +42,15 @@ class UnconfirmedThreadRelease(Protocol):
     reason: str
 
 
+class RecordedTurnEvidence(Protocol):
+    """The adoption transport exposes evidence without importing mesh internals."""
+
+    @property
+    def model(self) -> str: ...
+    @property
+    def effort(self) -> str: ...
+
+
 class MeshLifecycleTransport(Protocol):
     Client: Callable[[int, str], MeshLifecycleClient]
     ThreadIdle: type[object]
@@ -56,6 +65,7 @@ class MeshLifecycleTransport(Protocol):
     def _write_pending(self, handle: TextIO, thread: str, messages: list[str]) -> None: ...
     def _move_queue_to_pending(self, client: MeshLifecycleClient, thread: str, park: Callable[[str], None]) -> None: ...
     def _release_worker_thread(self, client: MeshLifecycleClient, thread: str, session_dir: str) -> object: ...
+    def recorded_turn_settings(self, record: Mapping[str, object]) -> RecordedTurnEvidence: ...
 
 
 class AstraCensusProjection(Protocol):
@@ -1037,7 +1047,8 @@ def _check_adoption_source(entry: dict[str, object], thread_id: str) -> None:
 
 def _adoption_model(source: Path, name: str, thread_id: str, entry: dict[str, object]) -> tuple[str, str]:
     """Read missing settings only from records linked to this source thread."""
-    settings: dict[str, object] = {key: entry.get(key) for key in ('model', 'effort')}
+    recorded = _mesh_transport().recorded_turn_settings(entry)
+    settings: dict[str, object] = {'model': recorded.model or None, 'effort': recorded.effort or None}
     for path in sorted(source.glob('impl_worker_*.json')):
         if all(value is not None for value in settings.values()):
             break
@@ -1153,7 +1164,8 @@ def adopt(repository: str, document: str, role: Role, holder: Holder, area: str,
         roster = _object(cast(object, json.load(source_lock)))
         entry = _object(roster.get(name))
         _check_adoption_source(entry, thread_id)
-        if entry.get('model', source_model) not in (None, model) or entry.get('effort', source_effort) not in (None, effort):
+        recorded = codex_mesh.recorded_turn_settings(entry)
+        if (recorded.model and recorded.model != model) or (recorded.effort and recorded.effort != effort):
             raise RoleRefused('adoption requires the configured model and effort, recorded at the source')
         fence = entry.get('transferring_role')
         destination = str(mesh_directory(design_id))

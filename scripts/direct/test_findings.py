@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import patch
 
 from scripts.direct.findings_test_support import FindingsLedgerFixture, findings
+from scripts.history.routed import routed_work
 
 
 class FindingsLedgerTests(FindingsLedgerFixture):
@@ -807,6 +808,48 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         self.assertEqual(closed["from"], "origin-run:origin-instance:F003")
         self.assertEqual(closed["evidence"], "abc123; retry tests pass; review accepted")
         self.assertEqual(closed["phase_instance_id"], "receiving-instance")
+
+    def test_close_route_closes_the_listed_key_from_before_a_phase_record(self) -> None:
+        self.write_progress_state("")
+        finding_id = self.open_finding("blocker", "missing owner rule")
+        _ = self.route_finding(finding_id)
+        origin_run = self.history_file.stem
+        records: list[tuple[str, dict[str, object]]] = [(origin_run, event) for event in self.events()]
+        outgoing, = routed_work(records, now=1_000)
+        self.assertEqual(outgoing["key"], f"{origin_run}::{finding_id}")
+        self.assertEqual(outgoing["phase_instance_id"], "")
+        self.assertEqual(outgoing["status"], "open")
+        self.assertEqual(outgoing["closure"], {})
+
+        self.history_file: Path = self.history_file.with_name("receiving-run.jsonl")
+        self.write_progress_state("receiving-instance", "6")
+        evidence = "abc123; owner tests pass; review accepted"
+        _ = self.run_command("close-route", "--from", outgoing["key"], "--evidence", evidence)
+        records.extend((self.history_file.stem, event) for event in self.events())
+
+        rows = routed_work(records, now=1_000)
+        closed, = rows
+        self.assertEqual(closed["key"], outgoing["key"])
+        self.assertEqual(closed["status"], "closed")
+        self.assertEqual(closed["closure"]["from"], outgoing["key"])
+        self.assertEqual(closed["closure"]["evidence"], evidence)
+        self.assertEqual(closed["closure"]["run"], "receiving-run")
+        self.assertEqual([row for row in rows if row["status"] == "open"], [])
+
+    def test_close_route_refuses_missing_ids_and_wrong_part_counts(self) -> None:
+        self.write_progress_state("receiving-instance", "6")
+        for source in (
+            "origin-run:origin-instance:", ":origin-instance:F001",
+            "origin-run::", "::F001", " :origin-instance:F001", "origin-run:origin-instance: ",
+            "origin-run", "origin-run:F001", "origin-run::F001:extra",
+        ):
+            with self.subTest(source=source):
+                denied = self.run_failing_command("close-route", "--from", source,
+                                                  "--evidence", "abc123; review accepted")
+                self.assertNotEqual(denied.returncode, 0)
+                self.assertIn("--from must be", denied.stderr)
+                self.assertIn("<run id>::<finding id>", denied.stderr)
+                self.assertEqual(self.events(), [])
 
     def test_a_run_without_progress_state_records_no_events(self) -> None:
         _ = self.open_finding("blocker", "null deref")

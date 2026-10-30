@@ -12,6 +12,7 @@
 - **Log:** `docs/plans/sdlc-log.md` — untracked: never added or committed (never `git add -A` or `-a`); one line per event
 - **Updates:** on demand (user, 2026-10-13: no timer unless asked); each update reports every unit in full
 - **Merge tests:** `env HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only` and `basedpyright scripts/direct scripts/production` (pass is its `0 errors, 0 warnings` line), run in the showrunner checkout
+- **Known flakes:** `merge test 1` — a red gate that reruns green merges, while agents/test_codex_mesh.py runs past its time limit under load (models fix pending; remove this line when it lands; user rule 2026-10-29: merge anyway on a known failure that will soon be obsolete)
 - **Push:** git
 - **Promote:** ~/.claude, mac ~/.claude
 - **Capacity:** natedev has 32 cores and 60 GB of memory; four units. The work is mostly documents and Python scripts, so the load is low. Its seats share natedev's build slots with build-followups.
@@ -28,7 +29,7 @@
 | roles-unit | `docs/plans/sdlc-roles.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-roles` | `sdlc-roles` | — | `docs/plans/sdlc-roles.md`; `docs/plans/sdlc-roles-next.md`; `docs/plans/sdlc-roles-design.md`; `scripts/production/roles_audit.py`; `scripts/production/test_roles_audit.py`; `scripts/production/role_terms.toml` |
 | hierarchies-unit | `docs/plans/build-followups-hierarchies.md` | `/home/natepiano/worktrees/claude-build-followups-hierarchies` | `build-followups-hierarchies` | — | `docs/plans/build-followups-hierarchies.md`; `docs/plans/build-followups-hierarchies-next.md`; `docs/plans/build-followups-hierarchies-design.md`; `scripts/hierarchies/` |
 | models-unit | `docs/as-built/usage-ledger.md` (run done; the user 2026-10-11 10:02 PDT via hana, start confirmed 10:21 PDT; follow-ups: `docs/plans/build-followups-usage-ledger-next.md`; earlier runs: `docs/as-built/long-lived-workers.md`, `docs/as-built/director-model-study.md`) | `/home/natepiano/worktrees/claude-natedev-models` | `natedev-models` | — | `docs/plans/build-followups-model-study.md`; `docs/as-built/long-lived-workers.md`; `scripts/model_study/`; `docs/as-built/director-model-study-results.md`; `scripts/delegate/` (seat launcher); `scripts/agents/codex_mesh.py`; `commands/unit/direct.md`; `commands/unit/delegate.md`; `docs/production_format.md`; `docs/as-built/usage-ledger.md`; `scripts/usage/`; also touches `review.sh`, `commands/showrunner/produce.md` (hub; the showrunner-start call) and `settings.json` (SessionStart hook; the user's go before main) |
-| devtools-unit | standby | /home/natepiano/worktrees/claude-build-followups-sdlc-devtools | sdlc-devtools | — | idempotency (rerun safety) of tools that change shared state in steps |
+| devtools-unit | `docs/plans/sdlc-devtools-tests.md` | /home/natepiano/worktrees/claude-build-followups-sdlc-devtools | sdlc-devtools | — | idempotency (rerun safety) of tools that change shared state in steps |
 
 Scope of each unit:
 

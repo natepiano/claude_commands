@@ -40,7 +40,7 @@ A style production is a standing child production named `<repo>-style`. A repo's
 | `commands/showrunner/add_style.md`, `style_report.md`, `proposal.md` | Showrunner commands |
 | `docs/style_production.md` | Runtime procedure (Tiers, Families, Ticket queue, Ledger, Sync, Merging back, Yielding, Big changes, Lifetime, Report) |
 
-`scripts/style` is a merge-gate suite (`TEST_SUITES` in `merge_gate.py`, `EXPECTED_SUITES` in `test_merge_gate.py`) and has its own pyright environment in `pyrightconfig.json`.
+The merge gate finds the `test_*.py` modules under `scripts/style` and reports them as the `style` suite. It has its own pyright environment in `pyrightconfig.json`.
 
 Import direction: `declarations → approved_renames → style_footprint`. `style_footprint` imports neither. `style_ledger` never imports `style_proposals` (two module copies under `__main__`), so vault-aware checks live in `style_proposals.py`, and the ledger takes approval as a callable.
 

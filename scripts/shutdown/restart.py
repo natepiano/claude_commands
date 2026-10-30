@@ -123,7 +123,9 @@ class ShutdownServices(Protocol):
     SHOWRUNNER_TOLD_BACK: str
 
     def _unit_showrunner(self, saved: SessionShutdown) -> str: ...
-    def _reserve_showrunner_line(self, saved: SessionShutdown, told: str) -> bool: ...
+    def showrunner_was_told(self, saved: SessionShutdown) -> bool: ...
+    def send_showrunner_line(self, saved: SessionShutdown, told: str, showrunner: str,
+                            summary: str, text: str) -> SessionShutdown: ...
 
     def record_time(self) -> str: ...
     def local_machine(self) -> str: ...
@@ -275,7 +277,7 @@ class IncompleteShutdownStillLive:
     """The owner is running, so its unfinished shutdown remains unchanged."""
 
 
-INCOMPLETE_PROGRESS = frozenset({"waiting", "ready", "held by usage limit", "reaping", "stopping"})
+INCOMPLETE_PROGRESS = frozenset({"waiting", "ready", "held by usage limit", "reaping", "stopping", "stop failed"})
 
 
 def _recover_incomplete_shutdown(
@@ -290,15 +292,23 @@ def _recover_incomplete_shutdown(
             return IncompleteShutdownRefused(reason)
         case SessionNotLive():
             pass
+    # The session's Claude process is gone, so its stop is done. An unconfirmed
+    # worker pause or cleanup never holds the restart: every thread can resume.
+    gone: SessionProgress = {"kind": "already gone", "at": settle.record_time()}
     if dry_run:
-        return {**saved, "progress": {"kind": "already gone", "at": settle.record_time()}}
-    # The stop path proves worker and host cleanup too, and owns its stopping claim.
-    cleaned = stop_work.stop_session(saved)
-    if cleaned["request_id"] != saved["request_id"]:
+        return {**saved, "progress": gone}
+
+    def mark_gone(current: SessionShutdown) -> None:
+        if current["request_id"] == saved["request_id"] and current["progress"]["kind"] in INCOMPLETE_PROGRESS:
+            current["progress"] = gone
+
+    try:
+        marked = update_session(saved["login"], saved["session"]["session_id"], mark_gone)
+    except NoLiveRecord:
         return IncompleteShutdownRefused("shutdown request changed during recovery")
-    if cleaned["progress"]["kind"] not in RESTARTABLE_PROGRESS or _unfinished_cleanup(cleaned):
-        return IncompleteShutdownRefused("owner cleanup not confirmed: " + cleaned["progress"]["kind"])
-    return cleaned
+    if marked["request_id"] != saved["request_id"] or marked["progress"]["kind"] not in RESTARTABLE_PROGRESS:
+        return IncompleteShutdownRefused("shutdown request changed during recovery")
+    return marked
 
 
 @dataclass(frozen=True)
@@ -1511,6 +1521,8 @@ def _restore_timers(
                 notifier = [override] if override else ["zsh", str(settle.NOTIFIER)]
                 _display([*notifier, "start", timer["instance"]])
             else:
+                undo_errors: list[Exception] = []
+
                 def stop_if_claim_lost(current: SessionShutdown) -> None:
                     assert claim is not None
                     same_attempt = (current["request_id"] == claim.request_id
@@ -1523,7 +1535,13 @@ def _restore_timers(
                     covers_resumed = (claim.resumed is not None
                                       and recovery_store.request_matches_process(current, claim.resumed))
                     if not same_attempt and stopping and covers_resumed:
-                        settle.run_notifier("stop", timer["instance"])
+                        current["timers"] = recovery_store.merge_timer_restores(current["timers"], [timer])
+                        try:
+                            settle.run_notifier("stop", timer["instance"])
+                        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+                            # update_session publishes only after this callback
+                            # returns. Keep the intent even if undoing start fails.
+                            undo_errors.append(error)
 
                 try:
                     if claim_error:
@@ -1537,6 +1555,8 @@ def _restore_timers(
                         # Missing/unreadable records are reconciliation failures,
                         # never evidence that a stop owns this process generation.
                         _update_timer_owner(record, stop_if_claim_lost, claim=claim)
+                        if undo_errors:
+                            raise undo_errors[0]
                 except (NoLiveRecord, OSError, RuntimeError, ValueError, UnreadableAccount, subprocess.SubprocessError) as error:
                     failures.append(
                         PendingTimer(
@@ -2140,12 +2160,11 @@ def _try_source_fallback(saved: SessionShutdown, error: BaseException,
 
 def _tell_source_fallback(saved: SessionShutdown) -> None:
     lines = [line for line in saved.get("restart_issues", []) if " came back on " in line]
-    if not lines or "showrunner_told" not in saved or saved["showrunner_told"] == settle.SHOWRUNNER_TOLD_BACK:
+    if not lines or not settle.showrunner_was_told(saved):
         return
     showrunner = settle._unit_showrunner(saved)  # pyright: ignore[reportPrivateUsage]
-    if showrunner and settle._reserve_showrunner_line(saved, settle.SHOWRUNNER_TOLD_BACK):  # pyright: ignore[reportPrivateUsage]
-        _ = settle.send_message(showrunner, lines[-1], lines[-1], key=f"shutdown-unit-{saved['session']['session_id']}")
-        saved["showrunner_told"] = settle.SHOWRUNNER_TOLD_BACK
+    if showrunner:
+        _ = settle.send_showrunner_line(saved, settle.SHOWRUNNER_TOLD_BACK, showrunner, lines[-1], lines[-1])
 
 
 def _host_needs_manual_restart(host: Host) -> bool:
@@ -3371,6 +3390,20 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
         or (record["progress"]["kind"] == "restarting" and
             (at - datetime.fromisoformat(record["progress"]["at"])).total_seconds() >= CLAIM_STALE_SECONDS)
     ]
+    if all_accounts and not ids:
+        restoring: list[SessionShutdown] = []
+        for saved in eligible:
+            if (saved["then"] == "stop" and saved["hold"] == "session"
+                    and saved["requested_by"]["kind"] != "snapshot"):
+                origin = saved["requested_by"]
+                reason = ("session stopped itself" if origin["kind"] == "session"
+                          and origin["session_id"] == saved["session"]["session_id"] else "single-session stop")
+                command = settle.shutdown_command("restart", saved["login"], "--here", "--only",
+                                                  saved["session"]["session_id"])
+                print(f"{saved['session']['name']}: skipped: {reason}; to restore it: {command}")
+            else:
+                restoring.append(saved)
+        eligible = restoring
     if not dry_run and (eligible or codex_entries):
         first = sum(saved["session"]["kind"] != "unit" for saved in eligible) + len(codex_entries)
         print(f"restoring {len(eligible) + len(codex_entries)} sessions: {first} showrunners and top-level, then {len(eligible) + len(codex_entries) - first} units", flush=True)

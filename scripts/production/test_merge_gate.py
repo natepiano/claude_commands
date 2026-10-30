@@ -13,11 +13,61 @@ from typing import cast, final
 from contextlib import redirect_stdout
 from unittest import mock
 from scripts.production import change_review, merge_gate
-from scripts.production.merge_gate_test_support import EXPECTED_SUITES, MergeGateFixture, gate_suites
+from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, MergeGateFixture, SUITE_MODULE, gate_suites
 
 
 @final
 class MergeGateCheckpointTests(MergeGateFixture):
+    @gate_suites("folder_from_the_checkout")
+    def test_a_folder_without_a_registry_entry_runs_and_is_reported(self) -> None:
+        result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_all_modules_started()
+        self.assertRegex(result.stdout, r"(?m)^folder_from_the_checkout: OK \d+\.\d+s$")
+        self.assertEqual(self.pass_records()[0]["suites"], ["folder_from_the_checkout"])
+
+    def test_nested_modules_run_and_retry_from_their_own_folder_under_the_top_suite(self) -> None:
+        nested = self.checkout / "scripts" / "hooks" / "tests" / "test_first.py"
+        self.write(nested, SUITE_MODULE)
+        _ = self.commit(self.checkout, "nested test fixture")
+        self.write(self.state / "fail-first-hooks", "fail")
+        result = self.run_gate("--tests-only", "--full")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        starts = [(row["suite"], row["module"]) for row in self.module_events() if row["event"] == "start"]
+        self.assertCountEqual(starts, [("hooks", "test_first.py"), ("hooks", "tests/test_first.py")] * 2)
+        self.assertIn("Rerun alone: hooks/tests/test_first.py passed", result.stdout)
+        self.assertIn("Rerun alone: hooks/test_first.py passed", result.stdout)
+        self.assertRegex(result.stdout, r"(?m)^hooks: OK \d+\.\d+s$")
+        self.assertNotRegex(result.stdout, r"(?m)^tests:")
+        launches = [call for call in self.calls() if call["tool"] == "suite-python"]
+        folders = [call["args"][call["args"].index("-s") + 1] for call in launches]
+        self.assertCountEqual(folders, [str(nested.parent), str(nested.parent.parent)] * 2)
+        self.assertTrue(all(call["cwd"] == str(self.checkout) for call in launches))
+        timings = merge_gate.read_measures(self.state / "runner" / "module_seconds.json")
+        self.assertEqual(set(timings), {"hooks/test_first.py", "hooks/tests/test_first.py"})
+        self.assertEqual(self.pass_records()[0]["suites"], ["hooks"])
+
+    def test_folders_without_test_modules_and_cached_files_are_not_suites(self) -> None:
+        scripts = self.checkout / "scripts"
+        self.write(scripts / "empty" / "helper.py", "raise AssertionError('helper was run')\n")
+        self.write(scripts / "cached" / "__pycache__" / "test_cached.py",
+                   "raise AssertionError('cached test was run')\n")
+        (scripts / "empty" / "test_directory.py").mkdir()
+        _ = self.commit(self.checkout, "non-test folder fixture")
+        result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_all_modules_started()
+        self.assertNotRegex(result.stdout, r"(?m)^(?:empty|cached|__pycache__):")
+        self.assertEqual(self.pass_records()[0]["suites"], ["hooks"])
+
+    @gate_suites()
+    def test_an_empty_test_list_is_refused_before_any_job_runs(self) -> None:
+        result = self.run_gate("--tests-only")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("the test list is empty", result.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.module_events(), [])
+
     def test_dirty_merge_checkout_is_refused_without_destroying_changes(self) -> None:
         self.write(self.checkout / "subject.txt", "uncommitted\n")
         self.assert_refused_before_gate(self.run_gate())
@@ -164,7 +214,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertIn("Change review: the production doc has no Change review line; no rows written",
                       result.stdout)
 
-    @gate_suites(*EXPECTED_SUITES)
+    @gate_suites(*FIXTURE_FOLDERS)
     def test_green_gate_pushes_no_ff_merge_with_subject_body_and_all_modules(self) -> None:
         self.write(self.state / "types-barrier", "overlap")
         self.write(self.state / "types-hold", "hold")

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
 import unittest
 from scripts.lib.test_agents_registry import write_registry
 from scripts.direct.implement_launcher_claims_test_support import CompletedWorkerFixture
 from scripts.direct.implement_launcher_test_support import AGENTS_REGISTRY as AGENTS_REGISTRY
-from scripts.direct.implement_launcher_test_support import TEST_HANG_GUARD_SECS as TEST_HANG_GUARD_SECS
 from typing import cast
 import json
 import subprocess
@@ -112,7 +113,7 @@ class ImplementLauncherWorkerTests(CompletedWorkerFixture):
 
         registry = self.root / ".claude" / "config" / "agents.conf"
         _ = write_registry(registry, {"direct.codex": {"impl": "gpt-blind:max"}}, base_text=AGENTS_REGISTRY)
-        # A registry row changed after the worker opened: the next dispatch uses it.
+        # The next turn follows the edited registry; the saved identity remains history.
         changed_model = self.mesh_launch(session_dir, to=name)
         self.assertEqual(changed_model.returncode, 0, changed_model.stderr)
         self.assertIn("agent=gpt-blind\n", (session_dir / "impl_agent_impl").read_text(encoding="utf-8"))
@@ -121,8 +122,7 @@ class ImplementLauncherWorkerTests(CompletedWorkerFixture):
         self.assertEqual(identity["model"], "gpt-called")
 
     def test_follow_up_resumes_a_worker_recorded_before_the_rename(self) -> None:
-        # Seats recorded before the delegate -> direct rename stored the model of the user's
-        # rows at that time, which the registry no longer names (rca of 2026-10-23).
+        # A historical identity may name a model the current registry no longer selects.
         session_dir, first = self.completed_worker()
         self.assertEqual(first.returncode, 0, first.stderr)
         path = session_dir / "impl_worker_impl.json"
@@ -131,6 +131,7 @@ class ImplementLauncherWorkerTests(CompletedWorkerFixture):
         resumed = self.mesh_launch(session_dir, to=str(identity["name"]))
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         self.assertIn("agent=gpt-called\n", (session_dir / "impl_agent_impl").read_text(encoding="utf-8"))
+        self.assertIn("effort=xhigh\n", (session_dir / "impl_agent_impl").read_text(encoding="utf-8"))
         self.assertEqual(json.loads(path.read_text()), {**identity, "model": "gpt-blind"})
 
     def test_mesh_disabled_follow_refuses_before_recording_a_pass(self) -> None:
