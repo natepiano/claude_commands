@@ -9,12 +9,14 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
-from typing import cast, override
+from typing import Literal, cast, override
 
 from scripts.hierarchies import worker_owners as owners
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message import roster
 
 
@@ -115,6 +117,125 @@ class WorkerOwnersTest(unittest.TestCase):
             "classification": worker.classification.value, "started_at": "2026-10-29T20:00:00+00:00",
         }]})
         return state
+
+    def mesh_command(self, worker: owners.Worker, action: Literal["reopen", "end"],
+                     *options: str) -> subprocess.CompletedProcess[str]:
+        """Run reopen or the explicit parser argv supplied by a test."""
+        return subprocess.run([sys.executable, str(owners.SCRIPTS / "agents/codex_mesh.py"), action,
+                               "--session-dir", worker.run, "--to", worker.name, *options],
+                              check=False, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+
+    def cleanup_result(self, record: owners.PendingEndCleanup) -> subprocess.CompletedProcess[str]:
+        """Keep diagnostics from the one real command owned by mesh_cleanup."""
+        real_run = subprocess.run
+        completed: list[subprocess.CompletedProcess[str]] = []
+
+        def run(command: list[str], *, check: bool, timeout: float,
+                capture_output: bool, text: Literal[True]) -> subprocess.CompletedProcess[str]:
+            result = real_run(command, check=check, timeout=timeout, capture_output=capture_output, text=text)
+            completed.append(result)
+            return result
+
+        with patch.object(subprocess, "run", side_effect=run):
+            code = owners.mesh_cleanup(record)
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(code, completed[0].returncode)
+        return completed[0]
+
+    def test_real_cleanup_retries_an_ended_worker_on_the_expected_thread_without_a_server(self) -> None:
+        worker = self.worker(classification="DirectorGone")
+        state = self.seed_pending_cleanup(worker)
+        problems: list[str] = []
+        pending = owners.read_pending_ends(state, problems)
+        self.assertEqual(problems, [])
+        self.assertEqual(owners.mesh_cleanup(pending[0]), 0)
+        route = owners.object_fields(owners.read_object(Path(worker.run) / "mesh_roster.json", problems)[worker.name])
+        self.assertEqual(problems, [])
+        self.assertEqual((route["thread_id"], route["status"]), (worker.thread_id, "ended"))
+        self.assertTrue((Path(worker.run) / (worker.name + ".end")).exists())
+        self.assertFalse((Path(worker.run) / "mesh_server.json").exists())
+
+    def test_real_cleanup_refuses_a_running_worker_without_changing_its_route_or_inbox(self) -> None:
+        worker = self.worker(classification="DirectorGone")
+        self.mesh_route(worker)
+        run = Path(worker.run)
+        route = run / "mesh_roster.json"
+        inbox = run / (worker.name + ".pending.json")
+        marker = run / (worker.name + ".end")
+        self.write_json(str(route), {worker.name: {"thread_id": worker.thread_id, "status": "running"}})
+        self.write_json(str(inbox), {"thread_id": worker.thread_id, "messages": ["keep this task"]})
+        before = (route.read_bytes(), inbox.read_bytes())
+
+        record = owners.PendingEndCleanup(worker.name, worker.thread_id, worker.run,
+                                          worker.classification, datetime.now(timezone.utc))
+        refused = self.cleanup_result(record)
+
+        self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+        self.assertEqual(refused.stderr, f"codex_mesh: {worker.name}: worker is running, not ended; nothing cleaned\n")
+        self.assertEqual((route.read_bytes(), inbox.read_bytes()), before)
+        self.assertFalse(marker.exists())
+
+    def test_real_cleanup_and_idle_only_filters_are_mutually_exclusive(self) -> None:
+        worker = self.worker(classification="DirectorGone")
+        self.mesh_route(worker)
+        run = Path(worker.run)
+        route = run / "mesh_roster.json"
+        before = route.read_bytes()
+
+        refused = self.mesh_command(worker, "end", "--expected-thread-id", worker.thread_id,
+                                    "--cleanup-only", "--idle-only")
+
+        self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+        self.assertIn("not allowed with argument --cleanup-only", refused.stderr)
+        self.assertEqual(route.read_bytes(), before)
+        self.assertFalse((run / (worker.name + ".pending.json")).exists())
+        self.assertFalse((run / (worker.name + ".end")).exists())
+
+    def test_real_reopen_between_route_check_and_cleanup_keeps_the_worker_paused_and_drops_pending_end(self) -> None:
+        worker = self.worker(classification="DirectorGone")
+        state = self.seed_pending_cleanup(worker)
+        run = Path(worker.run)
+        route = run / "mesh_roster.json"
+        inbox = run / (worker.name + ".pending.json")
+        marker = run / (worker.name + ".end")
+        self.write_json(str(inbox), {"thread_id": worker.thread_id, "messages": ["keep this task"]})
+        marker.touch()
+        inbox_before = inbox.read_bytes()
+
+        def reopen_then_cleanup(record: owners.PendingEndCleanup) -> int:
+            self.assertIsInstance(owners.pending_route_problem(record), owners.RouteEnded)
+            reopened = self.mesh_command(worker, "reopen")
+            self.assertEqual(reopened.returncode, 0, reopened.stdout + reopened.stderr)
+            self.assertFalse(marker.exists())
+            reopened_route = route.read_bytes()
+
+            refused = self.cleanup_result(record)
+            result = refused.returncode
+            self.assertEqual(result, 2)
+            self.assertEqual(route.read_bytes(), reopened_route)
+            self.assertEqual(inbox.read_bytes(), inbox_before)
+            self.assertFalse(marker.exists())
+            self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+            self.assertEqual(refused.stderr, f"codex_mesh: {worker.name}: worker is paused, not ended; nothing cleaned\n")
+            self.assertEqual(route.read_bytes(), reopened_route)
+            return result
+
+        sources = owners.OwnershipSources([], [], [], [])
+        result = owners.end_workers(sources, owners.WorkerClass.DirectorGone, state,
+                                    apply=True, cleanup=reopen_then_cleanup)
+        self.assertEqual(result.failed, (worker.thread_id,))
+        self.assertEqual(len(self.pending_records(state)), 1)
+        self.assertIn(worker.name + ": end cleanup failed: exit 2", result.evidence)
+        dropped = owners.end_workers(sources, owners.WorkerClass.DirectorGone, state, apply=True)
+        self.assertEqual(dropped.failed, ())
+        self.assertEqual(self.pending_records(state), [])
+        self.assertIn(worker.name + ": end cleanup dropped: mesh route is not ended", dropped.evidence)
+        problems: list[str] = []
+        current = owners.object_fields(owners.read_object(route, problems)[worker.name])
+        self.assertEqual(problems, [])
+        self.assertEqual((current["thread_id"], current["status"]), (worker.thread_id, "paused"))
+        self.assertEqual(inbox.read_bytes(), inbox_before)
+        self.assertFalse(marker.exists())
 
     def test_failed_end_saves_cleanup_before_handler_and_rerun_finishes_same_thread(self) -> None:
         worker = self.worker(classification="DirectorGone")
