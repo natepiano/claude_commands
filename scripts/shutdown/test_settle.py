@@ -627,15 +627,19 @@ class SettleTests(ShutdownTestCase):
                 saved = session_shutdown(owner, progress=record.SessionReaping(kind="reaping", at=NOW,
                     because="account out of usage", detail="weekly limit"))
                 self.save(saved)
+                def bounded(records: list[record.SessionShutdown], *, started: float, grace_seconds: float) -> list[record.SessionShutdown]:
+                    del started
+                    self.assertEqual(grace_seconds, 0)
+                    return [self.fake_stop(current) for current in records]
                 with (patch.object(settle, "_launch_conductor", side_effect=self.run_conductor) as launch,
                       patch.object(settle, "run_inventory", return_value=machine_inventory([owner])),
-                      patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(self.fake_stop)) as stop,
+                      patch.object(stop_work, "bounded_stop", side_effect=bounded) as stop,
                       patch.object(settle, "send_message") as send,
                       patch.object(settle, "report_stop"), redirect_stdout(io.StringIO())):
                     self.assertEqual(settle.now(Account("claude", LOGIN, LABEL), here=True, only=ids), 0)
-                launch.assert_called_once_with(LOGIN, LABEL)
+                launch.assert_not_called()
                 stop.assert_called_once()
-                self.assertEqual(stop.call_args.args[0]["progress"]["kind"], "reaping")
+                self.assertEqual(stop.call_args.args[0][0]["progress"]["kind"], "reaping")
                 current = record.find_session(LOGIN, owner["session_id"])
                 assert current is not None
                 self.assertEqual(current["progress"]["kind"], "stopped")
@@ -2206,8 +2210,7 @@ class SettleTests(ShutdownTestCase):
             return result
         def report(_records: list[record.SessionShutdown]) -> None:
             self.assertCountEqual(completed, ["first", "second"])
-        owners = [saved["session"] for saved in record.session_records(LOGIN)]
-        with patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(stop)), patch.object(settle, "_launch_conductor", side_effect=self.run_conductor), patch.object(settle, "run_inventory", return_value=machine_inventory(owners)), patch.object(settle, "report_stop", side_effect=report):
+        with patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(stop)), patch.object(settle, "_launch_conductor", side_effect=self.run_conductor), patch.object(settle, "run_inventory", return_value=machine_inventory([])), patch.object(settle, "report_stop", side_effect=report):
             self.assertEqual(settle.now(Account("claude", LOGIN, LABEL), True), 0)
         self.assertEqual([saved["progress"]["kind"] for saved in record.session_records(LOGIN)], ["stopped", "stopped"])
 
@@ -3865,16 +3868,20 @@ class SettleTests(ShutdownTestCase):
         stop.assert_not_called()
         launch.assert_called_once_with(LOGIN, LABEL)
 
-    def test_now_retries_stopped_owner_resource_cleanup_in_its_conductor(self) -> None:
+    def test_now_refreshes_a_live_owner_with_old_stopped_cleanup_before_bounded_stop(self) -> None:
         saved = session_shutdown(top_level("owner", "Owner"), progress={"kind": "stopped", "at": NOW})
         saved["stop_issues"] = [record.CodexServerLeftRunning(kind="codex server left running", at=NOW, run_dir="/tmp/run", cause="stop not confirmed")]
         self.save(saved)
         def cleaned(current: record.SessionShutdown) -> None:
             current["stop_issues"] = []
-        def cleanup(current: record.SessionShutdown) -> record.SessionShutdown:
-            self.assertEqual(current["force"], "now")
-            return record.update_session(LOGIN, "owner", cleaned)
-        with patch.object(settle, "_launch_conductor", side_effect=self.run_conductor), patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"]])), patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(cleanup)) as stop, patch.object(settle, "report_stop"):
+            current["progress"] = {"kind": "stopped", "at": NOW}
+        def cleanup(records: list[record.SessionShutdown], *, started: float, grace_seconds: float) -> list[record.SessionShutdown]:
+            del started
+            self.assertEqual(grace_seconds, 0)
+            self.assertEqual(records[0]["progress"]["kind"], "waiting")
+            self.assertEqual(records[0]["force"], "now")
+            return [record.update_session(LOGIN, "owner", cleaned)]
+        with patch.object(settle, "_launch_conductor", side_effect=self.run_conductor), patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"]])), patch.object(stop_work, "bounded_stop", side_effect=cleanup) as stop, patch.object(settle, "report_stop"):
             self.assertEqual(settle.now(Account("claude", LOGIN, LABEL), True), 0)
         stop.assert_called_once()
         current = record.find_session(LOGIN, "owner")

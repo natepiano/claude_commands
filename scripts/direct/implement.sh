@@ -301,7 +301,8 @@ with worker_claim_lock(root):
         # A worker recorded under another slot stays refused by this comparison.
         if identity != expected:
             fail(f"{name} has no matching durable worker identity for slot {slot}")
-        print(expected["model"])
+        # The identity check keeps the stored model; each turn runs at the current default.
+        print(model)
         status_path = root / f"impl_status_{slot}"
         claim = read(claim_file)
         pid = claim.get("pid", 0)
@@ -525,7 +526,6 @@ if [[ -n "${FOLLOW_TO}" ]]; then
       --role "${PASS_KIND}" --cwd "${WORKING_DIR}" \
       --message-file "${FOLLOW_MESSAGE}" --summary-file "${SUMMARY_FILE}" \
       --reply-file "${REPLY_FILE}" --log-file "${LOG_FILE}" \
-      --model "${AGENT_MODEL}" --effort "${AGENT_EFFORT:-}" \
       --task "${TASK}" --service-tier "${AGENT_SERVICE_TIER:-}" &
   else
     echo "ERROR: ${MESH_NAME} has mesh=none" >&2
@@ -549,8 +549,6 @@ elif [[ "${USE_CODEX_MESH}" == "1" ]]; then
     --summary-file "${SUMMARY_FILE}" \
     --reply-file "${REPLY_FILE}" \
     --log-file "${LOG_FILE}" \
-    --model "${AGENT_MODEL}" \
-    --effort "${AGENT_EFFORT:-}" \
     --task "${TASK}" --service-tier "${AGENT_SERVICE_TIER:-}" &
 else
   rm -f "${BG_ID_FILE}"
