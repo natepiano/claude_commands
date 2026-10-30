@@ -30,7 +30,7 @@ if not __package__:
 from scripts.direct import phase_reservation, plan_history, recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
 from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
-from scripts.lib import agents_registry, unit_runs  # noqa: E402
+from scripts.lib import unit_runs  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
@@ -302,13 +302,6 @@ def _config_digest() -> str:
     for path in (_agents_config_path(), _config_path()):
         try:
             contents.append(path.read_bytes())
-        except OSError:
-            return ""
-    # This machine's agent rows over the committed registry change the configuration too.
-    overlay = agents_registry.overlay_path(_agents_config_path())
-    if overlay.is_file():
-        try:
-            contents.append(overlay.read_bytes())
         except OSError:
             return ""
     return hashlib.sha256(b"".join(contents)).hexdigest()[:CONFIG_DIGEST_LENGTH]
@@ -3692,6 +3685,37 @@ def _current_worker_cells(
     return tuple(cells)
 
 
+def _worker_turn_windows(session_dir: Path, windows: list[StageWindow]) -> list[StageWindow]:
+    """Current worker notes show accepted-turn telemetry; historical windows stay intact."""
+    try:
+        roster = _json_object((session_dir / "mesh_roster.json").read_text(encoding="utf-8")) or {}
+    except OSError:
+        return windows
+    from scripts.agents.codex_mesh import recorded_turn_settings
+
+    slots: dict[str, str] = {}
+    for path in session_dir.glob("impl_worker_*.json"):
+        try:
+            identity = _json_object(path.read_text(encoding="utf-8")) or {}
+        except OSError:
+            continue
+        slots[_string(identity.get("name"))] = _string(identity.get("slot"))
+    models: dict[str, str] = {}
+    for name, value in roster.items():
+        record = _object_dict(value) or {}
+        settings = recorded_turn_settings(record)
+        if settings.model:
+            slot = slots.get(name) or _string(record.get("slot")) or name
+            models[slot] = _agent_display(settings.model, settings.effort)
+    result: list[StageWindow] = []
+    for window in windows:
+        current = window.copy()
+        if current["slot"] in models:
+            current["worker"] = models[current["slot"]]
+        result.append(current)
+    return result
+
+
 def _worker_note(
     windows: list[StageWindow],
     activity: dict[str, BoardActivity],
@@ -4344,7 +4368,7 @@ def _phase_section(
     # saying so, never a header with nothing under it.
     rows = round_table["rows"] or [["-", "-", "-", *(["-"] * len(slots)), "no stage yet"]]
     worker_note = _worker_note(
-        stage_windows, board_activity, now, slots,
+        _worker_turn_windows(session_dir, stage_windows), board_activity, now, slots,
         _current_worker_cells(stage_windows, stage_labels, role_changes, board_activity, slots, now)
         if not tables else (),
     )

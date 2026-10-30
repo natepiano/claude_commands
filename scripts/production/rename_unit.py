@@ -305,8 +305,7 @@ def check_stoppable(rename: StopTarget) -> None:
         raise RenameRefused(f"{rename.new} already runs in session {new.place.session}")
     if old and isinstance(old.claude, unit_lookup.ClaudeUnknown):
         raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {old.claude.reason}")
-    if reason := unit_move.pane_shell_refusal(old, rename.worktree()):
-        raise RenameRefused(reason)
+    pane = unit_move.unit_pane(old, rename.slug)
     if old and isinstance(old.claude, unit_lookup.LiveClaude):
         return
     inside = unit_move.processes_inside(rename.worktree())
@@ -314,6 +313,8 @@ def check_stoppable(rename: StopTarget) -> None:
     retained = _retained_command_sessions(rename.worktree())
     pids: list[int] = []
     for pid in inside:
+        if pane is not None and pid == pane.shell:
+            continue  # The guarded close, after the stop, must remove it.
         if pid in runs:
             continue
         try:
@@ -670,25 +671,29 @@ def stop_unit(rename: StopTarget, _save: Callable[[], None]) -> None:
     A live process cannot change its env mark and the director's context holds the old paths, so a
     rename of a running unit is always a relaunch.
     """
-    # A resumed step rechecks the unsupported pane topology before stopping.
+    # A resumed step rechecks whether its exact pane can be safely closed.
     # Other processes are checked after the stop has settled its own run work.
     _refuse_detached_worktree(rename)
     try:
         found = unit_lookup.marked_unit(rename.slug, rename.old)
     except OSError as error:
         raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {error}") from error
-    if reason := unit_move.pane_shell_refusal(found, rename.worktree()):
-        raise RenameRefused(reason)
+    pane = unit_move.unit_pane(found, rename.slug)
     if not _unit_records(rename):
         if found is None or isinstance(found.claude, unit_lookup.ClaudeNotRunning):
             _stop_runs(rename)
+            if pane is not None:
+                raise RenameRefused("pane close requires a completed clean stop record")
             return
         if isinstance(found.claude, unit_lookup.ClaudeUnknown):
             raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {found.claude.reason}")
         run_shutdown("down", "--only", found.claude.session_id)
     saved = _await_stopped(rename)
     rename.account, rename.session_id = saved["login"], saved["session"]["session_id"]
+    if shutdown_record.stop_incomplete(saved):
+        raise RenameRefused("unit stop has unresolved cleanup issues; settle it before closing its pane")
     _stop_runs(rename)
+    unit_move.close_unit_pane(pane, saved)
 
 
 def _refuse_detached_worktree(rename: StopTarget) -> None:

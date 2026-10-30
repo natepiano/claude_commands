@@ -6318,6 +6318,21 @@ with patch.object(fcntl, "flock", admission):
             self.assertIn(state, worker)
         self.assert_summary_without_round_table(report)
 
+    def test_current_worker_notes_show_accepted_turn_settings_through_the_saved_slot(self) -> None:
+        session_dir = self.short_report_fixture("turn-display")
+        _ = (session_dir / "impl_worker_impl.json").write_text(json.dumps({
+            "name": "full-worker-address", "slot": "impl", "model": "legacy-identity"}))
+        _ = (session_dir / "mesh_roster.json").write_text(json.dumps({"full-worker-address": {
+            "role": "fix", "status": "running", "model": "legacy-roster", "effort": "low",
+            "turn_model": "gpt-current-turn", "turn_effort": "max"}}))
+        report = self.short_progress(session_dir, self.report_time(16))
+        worker = next(line for line in report.splitlines() if "repairing retry recovery" in line)
+        self.assertIn("gpt-current-turn", worker)
+        self.assertIn("max", worker)
+        self.assertNotIn("legacy-identity", worker)
+        self.assertNotIn("legacy-roster", worker)
+        self.assertNotIn("gpt-impl", worker)
+
     def test_short_progress_names_the_first_eta_and_completed_fix_round(self) -> None:
         session_dir = self.short_report_fixture("short-first", promises=("16:10",), running_fix=False)
 

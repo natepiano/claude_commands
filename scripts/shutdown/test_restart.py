@@ -4840,12 +4840,14 @@ class RestartTests(ShutdownTestCase):
             self.assertEqual(restart.restart(restart.AccountNamed('nobody'), dry_run=False, alerts=restart.AlertWhenNotBack()), 2)
         alert_user.assert_not_called()
 
-    def run_restarts(self, *, live: frozenset[str] = EMPTY_SESSION_IDS, confirmed: frozenset[str] = EMPTY_SESSION_IDS) -> tuple[int, list[str]]:
+    def run_restarts(self, *, live: frozenset[str] = EMPTY_SESSION_IDS, confirmed: frozenset[str] = EMPTY_SESSION_IDS,
+                     only: tuple[str, ...] = (), all_accounts: bool = False,
+                     output: io.StringIO | None = None) -> tuple[int, list[str]]:
         launches: list[str] = []
 
         def launch(current: SessionShutdown, _note: str, _desktop: restart.DesktopLaunchState, *, dry_run: bool) -> restart.SessionLaunched:
             self.assertFalse(dry_run)
-            claim = shutdown_record.find_session(LOGIN, current["session"]["session_id"])
+            claim = shutdown_record.find_session(current["login"], current["session"]["session_id"])
             assert claim is not None
             self.assertEqual(claim["progress"]["kind"], "restarting")
             launches.append(current["session"]["session_id"])
@@ -4860,9 +4862,10 @@ class RestartTests(ShutdownTestCase):
             patch.object(restart, "_live_session_ids", return_value=live),
             patch.object(restart, "wait_for_confirmation", side_effect=wait),
             patch.object(restart, "_send_restart_note", return_value=settle.MessageSent(kind="sent")),
-            redirect_stdout(io.StringIO()),
+            redirect_stdout(output if output is not None else io.StringIO()),
         ):
-            result = restart.up(LOGIN)
+            result = (restart.restart_all(alerts=restart.NeverAlert()) if all_accounts
+                      else restart.up(LOGIN, only=only))
         return result, launches
 
     def test_dead_owner_in_stopping_finishes_cleanup_before_restore_and_keeps_intent(self) -> None:
@@ -6901,6 +6904,152 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(self.stored_record()["progress"], stopped)
         self.assertEqual(list((self.state_root / LOGIN / "history").glob("*.json")), [])
 
+    def test_target_stop_inherits_timer_intent_in_both_snapshot_publication_orders(self) -> None:
+        for publish_first in (True, False):
+            with self.subTest(publish_first=publish_first):
+                identity = f"takeover-{publish_first}"
+                saved = entry(top_level(identity), state=shutdown_record.SessionRestarting(
+                    kind="restarting", at=RESTARTED,
+                    prior=shutdown_record.SessionStopped(kind="stopped", at=STOPPED)),
+                    timers=[TimerRestore(instance="timer", was_enabled=True),
+                            TimerRestore(instance="kept-off", was_enabled=False)])
+                saved["target"] = "claude3"
+                self.create([saved])
+                live = self.running_on(saved, self.root / ".claude3")
+                live[0].update(pid=saved["session"]["pid"] + 1, procStart="resumed-process")
+                resumed = copy.deepcopy(saved["session"])
+                resumed.update(pid=live[0]["pid"], proc_start="resumed-process",
+                               config_dir=str(self.root / ".claude3"), timers=["timer", "kept-off"])
+                report = inventory.Inventory(machine="natedev", login="third@example.invalid",
+                    label="claude3", sessions=[resumed], unattributed=[])
+                start_entered, finish_start = threading.Event(), threading.Event()
+                snapshot_captured, publish_snapshot = threading.Event(), threading.Event()
+                enabled = {"timer": False, "kept-off": False}
+                errors: list[BaseException] = []
+                snapshots: list[list[TimerRestore]] = []
+                original_update = shutdown_record.update_session
+
+                def notifier_enabled(instance: str) -> bool:
+                    return enabled[instance]
+
+                def notifier(verb: str, instance: str) -> None:
+                    if verb == "start" and not start_entered.is_set():
+                        start_entered.set()
+                        if not finish_start.wait(HANG_GUARD_SECONDS):
+                            raise AssertionError("destination stop did not capture the disabled timer")
+                    enabled[instance] = verb == "start"
+
+                def update(login: str, session_id: str,
+                           change: Callable[[SessionShutdown], None]) -> SessionShutdown:
+                    if change.__name__ == "save_timers":
+                        snapshot_captured.set()
+                        if not publish_snapshot.wait(HANG_GUARD_SECONDS):
+                            raise AssertionError("source restore did not reconcile its late enable")
+                    return original_update(login, session_id, change)
+
+                def source_restart() -> None:
+                    try:
+                        restart._confirm_entries([saved])  # pyright: ignore[reportPrivateUsage]
+                    except BaseException as error:
+                        errors.append(error)
+
+                def destination_stop() -> None:
+                    try:
+                        snapshots.extend(item["timers"] for item in settle.begin(report["login"],
+                            only=[identity], request_id="covering-stop", then="restart", report=report))
+                    except BaseException as error:
+                        errors.append(error)
+
+                with (patch.object(sessions, "live_sessions", return_value=live),
+                      patch.object(restart, "wait_for_confirmation", side_effect=self.all_sessions_live),
+                      patch.object(settle, "prompt_state", return_value=settle.TakesPrompts("room")),
+                      patch.object(stop_work, "owner_pane_scopes", return_value=[]),
+                      patch.object(settle, "_notifier_enabled", side_effect=notifier_enabled),
+                      patch.object(settle, "run_notifier", side_effect=notifier) as timers,
+                      patch.object(shutdown_record, "update_session", side_effect=update),
+                      redirect_stdout(io.StringIO())):
+                    source = threading.Thread(target=source_restart)
+                    destination = threading.Thread(target=destination_stop)
+                    source.start()
+                    try:
+                        self.assertTrue(start_entered.wait(HANG_GUARD_SECONDS))
+                        destination.start()
+                        self.assertTrue(snapshot_captured.wait(HANG_GUARD_SECONDS))
+                        if publish_first:
+                            publish_snapshot.set()
+                            destination.join(HANG_GUARD_SECONDS)
+                        finish_start.set()
+                        source.join(HANG_GUARD_SECONDS)
+                    finally:
+                        finish_start.set()
+                        publish_snapshot.set()
+                        source.join(HANG_GUARD_SECONDS)
+                        if destination.ident is not None:
+                            destination.join(HANG_GUARD_SECONDS)
+                    self.assertFalse(source.is_alive())
+                    self.assertFalse(destination.is_alive())
+                    self.assertEqual(errors, [])
+                    self.assertEqual(len(snapshots), 1)
+                    self.assertEqual(enabled, {"timer": False, "kept-off": False})
+                    covering = shutdown_record.find_session(report["login"], identity)
+                    assert covering is not None
+                    self.assertEqual(covering["timers"], [TimerRestore(instance="timer", was_enabled=True),
+                        TimerRestore(instance="kept-off", was_enabled=False)])
+                    self.assertIsNone(shutdown_record.find_session(LOGIN, identity))
+                    history = [cast(SessionShutdown, json.loads(path.read_text()))
+                               for path in (self.state_root / LOGIN / "history").glob("*.json")]
+                    self.assertEqual(sum(item["session"]["session_id"] == identity for item in history), 1)
+                    _ = shutdown_record.update_session(report["login"], identity,
+                        lambda current: current.update(progress=shutdown_record.SessionStopped(kind="stopped", at=RESTARTED)))
+                    with (patch.object(restart, "_live_session_ids", return_value=frozenset()),
+                          patch.object(restart, "_retire"),
+                          patch.object(restart, "_launch_session", return_value=restart.SessionLaunched(SUBMITTED_PROMPT)) as launch):
+                        self.assertEqual(restart.up(report["login"], only=[identity]), 0)
+                    launch.assert_called_once()
+                    self.assertEqual(enabled, {"timer": True, "kept-off": False})
+                    self.assertIsNone(shutdown_record.find_session(report["login"], identity))
+                    self.assertEqual(timers.call_args_list, [call("start", "timer"), call("stop", "timer")]
+                        + ([] if publish_first else [call("stop", "timer")]) + [call("start", "timer")])
+
+    def test_failed_takeover_undo_still_persists_timer_restore_intent(self) -> None:
+        for start_fails in (False, True):
+            with self.subTest(start_fails=start_fails):
+                saved = entry(top_level(f"undo-{start_fails}"), timers=[TimerRestore(instance="timer", was_enabled=True)])
+                saved["target"] = "claude3"
+                self.create([saved])
+                live = self.running_on(saved, self.root / ".claude3")
+                live[0]["procStart"] = saved["session"]["proc_start"]
+                target = copy.deepcopy(saved["session"])
+                target["timers"] = ["timer"]
+                report = inventory.Inventory(machine="natedev", login="third@example.invalid", label="claude3",
+                                             sessions=[target], unattributed=[])
+                enabled = False
+
+                def notifier(verb: str, _instance: str) -> None:
+                    nonlocal enabled
+                    if verb == "start":
+                        self.assertEqual(len(settle.begin(report["login"], only=[saved["session"]["session_id"]], request_id="covering-stop",
+                            report=report)), 1)
+                        enabled = True
+                        if start_fails:
+                            raise RuntimeError("timer start reported failure after enabling")
+                    else:
+                        raise RuntimeError("late enable undo refused")
+
+                with (patch.object(sessions, "live_sessions", return_value=live),
+                      patch.object(settle, "prompt_state", return_value=settle.TakesPrompts("room")),
+                      patch.object(stop_work, "owner_pane_scopes", return_value=[]),
+                      patch.object(settle, "_notifier_enabled", return_value=False),
+                      patch.object(settle, "run_notifier", side_effect=notifier), redirect_stderr(io.StringIO()) as output):
+                    pending = restart._restore_timers(saved["timers"], record=saved, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+                self.assertTrue(enabled)
+                self.assertEqual([item["reason"] for item in pending], ["late enable undo refused"])
+                self.assertIn("late enable undo refused", output.getvalue())
+                current = shutdown_record.find_session(report["login"], saved["session"]["session_id"])
+                assert current is not None
+                self.assertEqual(current["request_id"], "covering-stop")
+                self.assertEqual(current["timers"], [TimerRestore(instance="timer", was_enabled=True)])
+
     def test_covering_stop_still_undoes_a_late_timer_enable(self) -> None:
         self.assert_overlapping_timer_restore(stop_takes_over=True)
 
@@ -6999,6 +7148,119 @@ class RestartTests(ShutdownTestCase):
         self.assertFalse(restart.owns_relaunch_claim(saved, result))
         self.assertEqual(self.stored_record()["progress"], replacement)
 
+
+    @staticmethod
+    def finish_stop_requests(records: list[SessionShutdown], **_options: object) -> list[SessionShutdown]:
+        return [shutdown_record.update_session(saved["login"], saved["session"]["session_id"],
+            lambda current: current.update(progress=shutdown_record.SessionStopped(kind="stopped", at=STOPPED)))
+            for saved in records]
+
+    def stopped_request(self, identity: str, *, requested_by: str | None = None) -> SessionShutdown:
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL,
+            sessions=[top_level(identity)], unattributed=[])
+        with (patch.object(settle, "prompt_state", return_value=settle.TakesPrompts("room")),
+              patch.object(stop_work, "owner_pane_scopes", return_value=[])):
+            added = settle.begin(LOGIN, requested_by, only=[identity], request_id=f"stop-{identity}", report=report)
+        self.assertEqual(len(added), 1)
+        return self.finish_stop_requests(added)[0]
+
+    def assert_morning_down_all_restore(self, taken_over: Sequence[inventory.Session] = ()) -> None:
+        selected = self.stopped_request("stay-down")
+        reports = [inventory.Inventory(machine="natedev", login=login, label=label,
+            sessions=[top_level(identity)], unattributed=[])
+            for login, label, identity in ((LOGIN, LABEL, "daily-owner"),
+                ("third@example.invalid", "claude3", "daily-other-account"))]
+        reports[0]["sessions"].extend(taken_over)
+        original = {owner["session_id"]: shutdown_record.find_session(LOGIN, owner["session_id"])
+                    for owner in taken_over}
+        with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}),
+              patch.object(inventory, "all_live_accounts", return_value=reports),
+              patch.object(settle, "prompt_state", return_value=settle.TakesPrompts("room")),
+              patch.object(stop_work, "owner_pane_scopes", return_value=[]),
+              patch.object(stop_work, "bounded_stop", side_effect=self.finish_stop_requests),
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(settle.down_all(), 0)
+        daily = [saved for saved in shutdown_record.all_session_records()
+                 if saved["session"]["session_id"].startswith("daily-")]
+        self.assertEqual(len(daily), 2)
+        self.assertTrue(all(saved["hold"] == "account" and saved["then"] == "stop" for saved in daily))
+        adopted = {identity: shutdown_record.find_session(LOGIN, identity) for identity in original}
+        snapshot = self.recovery([top_level("rebooted"), top_level("crashed")])
+        for item in snapshot["sessions"]:
+            item["boot_id"] = "old-boot"
+            if item["session"]["session_id"] == "rebooted":
+                del item["crash"]
+        shutdown_record.write_snapshot(snapshot)
+        observed = inventory.CompleteInventory("natedev", {}, {}, inventory.KnownBoot("new-boot"), frozenset())
+        restored = frozenset({"daily-owner", "daily-other-account", "rebooted", "crashed", *original})
+        output = io.StringIO()
+        with (patch.object(inventory, "snapshot_inventory", return_value=observed) as observation,
+              patch.object(restart, "_owner_liveness", return_value=restart.SessionNotLive())):
+            result, launched = self.run_restarts(all_accounts=True, confirmed=restored, output=output)
+        self.assertEqual(result, 0, output.getvalue())
+        self.assertEqual(set(launched), restored)
+        observation.assert_called_once()
+        self.assertEqual(shutdown_record.all_session_records(), [selected])
+        self.assertEqual(shutdown_record.all_snapshots()[0]["sessions"], [])
+        for owner in taken_over:
+            identity = owner["session_id"]
+            previous, stopped = original[identity], adopted[identity]
+            assert previous is not None and stopped is not None
+            self.assertEqual((stopped["hold"], stopped["then"], stopped["progress"]["kind"]),
+                             ("account", "stop", "stopped"))
+            self.assertEqual(stopped["session"], owner)
+            for field in ("request_id", "requested_at", "requested_by", "timers", "where"):
+                self.assertEqual(stopped[field], previous[field], field)
+
+    def test_restart_all_after_morning_down_all_and_reboot_preserves_explicit_session_stop(self) -> None:
+        self.assert_morning_down_all_restore()
+
+    def test_restart_all_after_morning_takeover_and_reboot_restores_selected_restart_requests(self) -> None:
+        self.maxDiff = None
+        same_generation = top_level("selected-restart-same")
+        resumed_generation = top_level("selected-restart-resumed")
+        prior_generation = copy.deepcopy(resumed_generation)
+        prior_generation["pid"] += 1
+        prior_generation["proc_start"] = "prior-generation"
+        records = [entry(owner, state=shutdown_record.SessionRestarting(
+            kind="restarting", at=RESTARTED,
+            prior=shutdown_record.SessionStopped(kind="stopped", at=STOPPED)))
+            for owner in (same_generation, prior_generation)]
+        for saved in records:
+            saved["request_id"] = f"restart-{saved['session']['session_id']}"
+            saved["hold"] = "session"
+            saved["requested_by"] = shutdown_record.FromSession(
+                kind="session", session_id=saved["session"]["session_id"])
+        self.create(records)
+        self.assert_morning_down_all_restore((same_generation, resumed_generation))
+
+    def test_restart_all_skips_single_session_stop_until_explicit_only(self) -> None:
+        saved = self.stopped_request("stay-down")
+        output = io.StringIO()
+        result, launched = self.run_restarts(all_accounts=True, output=output)
+        self.assertEqual((result, launched), (0, []))
+        self.assertEqual(shutdown_record.find_session(LOGIN, "stay-down"), saved)
+        lines = [line for line in output.getvalue().splitlines() if "skipped" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("stay-down: skipped: single-session stop", lines[0])
+        self.assertIn(f"restart {LOGIN} --here --only stay-down", lines[0])
+        result, launched = self.run_restarts(only=("stay-down",), confirmed=frozenset({"stay-down"}))
+        self.assertEqual((result, launched), (0, ["stay-down"]))
+        self.assertIsNone(shutdown_record.find_session(LOGIN, "stay-down"))
+
+    def test_restart_all_skips_self_stop_until_explicit_only(self) -> None:
+        saved = self.stopped_request("self-stopped", requested_by="self-stopped")
+        output = io.StringIO()
+        result, launched = self.run_restarts(all_accounts=True, output=output)
+        self.assertEqual((result, launched), (0, []))
+        self.assertEqual(shutdown_record.find_session(LOGIN, "self-stopped"), saved)
+        lines = [line for line in output.getvalue().splitlines() if "skipped" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("self-stopped: skipped: session stopped itself", lines[0])
+        self.assertIn(f"restart {LOGIN} --here --only self-stopped", lines[0])
+        result, launched = self.run_restarts(only=("self-stopped",), confirmed=frozenset({"self-stopped"}))
+        self.assertEqual((result, launched), (0, ["self-stopped"]))
+        self.assertIsNone(shutdown_record.find_session(LOGIN, "self-stopped"))
 
     def test_selected_up_restores_requester_while_same_request_siblings_wait(self) -> None:
         requester = entry(top_level("requester", name="Requester"))

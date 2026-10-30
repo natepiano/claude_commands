@@ -15,37 +15,24 @@ import json
 import os
 import shutil
 import subprocess
-import sys
-import tempfile
-import unittest
 from pathlib import Path
-from typing import TypedDict, ClassVar, cast, override
+from typing import TypedDict, cast, override
 
 from scripts.direct.recorder_fixture import (
-    STUB_ATOMIC_JSON_WRITER, TEST_HANG_GUARD_SECS as TEST_HANG_GUARD_SECS,
-    communicate_launcher, invoke_recorder,
+    LauncherFixture,
+    STUB_ATOMIC_JSON_WRITER,
+    TEST_HANG_GUARD_SECS as TEST_HANG_GUARD_SECS,
+    communicate_launcher,
+    configure_launcher_fixture,
+    launcher_environment,
+    launcher_registry,
+    prepare_launcher_runtime,
 )
 
 
 DIRECT_DIR = Path(__file__).parent
 
-LEGACY_RECORDER_ARGUMENTS = """
-# Compatibility for older launch cases whose subject is root-level artifacts.
-# The new launch-boundary tests remove this flag and use the recorder unchanged.
-import json as _fixture_json
-import os as _fixture_os
-from pathlib import Path as _FixturePath
-import sys as _fixture_sys
-if (_fixture_os.environ.get("TEST_LEGACY_LAUNCH") == "1"
-        and len(_fixture_sys.argv) > 1 and _fixture_sys.argv[1] in ("start-pass", "check-launch")):
-    if "--phase-id" not in _fixture_sys.argv:
-        _fixture_session = _FixturePath(
-            _fixture_sys.argv[_fixture_sys.argv.index("--session-dir") + 1])
-        _fixture_state = _fixture_json.loads(
-            (_fixture_session / "progress_history_state.json").read_text())
-        _fixture_sys.argv.extend(["--phase-id", _fixture_state["phase"]["id"]])
 
-"""
 
 # The wrapper calls this as: <task> write <working_dir> <prompt> <reply> <log>.
 # Writing both outputs and exiting immediately drives the wrapper's completion
@@ -256,86 +243,25 @@ class OpenPass(TypedDict):
 ProgressState = TypedDict("ProgressState", {"pass": dict[str, OpenPass]})
 
 
-AGENTS_REGISTRY = registry_text({'assignments': {'direct': 'codex'}, 'direct.codex': {'impl': 'gpt-called:xhigh', 'test': 'gpt-called:xhigh', 'fix': 'gpt-called:xhigh', 'review': 'gpt-blind:max'}, 'codex.agents': {'gpt-called': 'low,medium,high,xhigh,max', 'gpt-blind': 'low,medium,high,xhigh,max'}})
+AGENTS_REGISTRY = launcher_registry(("impl", "test", "fix"))
 
 
-def copy_launcher_dependencies(root: Path) -> None:
-    """Build the real script dependencies shared by both launcher fixtures."""
-    for directory, names in (
-        ("direct", ("implement.sh", "worker_name.sh", "worker_state.py",
-                    "progress_history.py", "plan_history.py", "phase_reservation.py",
-                    "recorder_state.py", "findings.py", "board.sh", "review.sh",
-                    "review_tree.py", "tag_inventory.py")),
-        ("agents", ("agents_config.sh", "agents_overlay.sh", "agents_overlay.awk",
-                    "heartbeat.sh", "heartbeat_watch.sh", "claude_account.sh", "agent_bg.sh")),
-        ("lib", ("py", "atomic_file.py", "process_start.py", "user_zone.py", "unit_runs.py",
-                 "agents_registry.py", "codex_models_cache.py", "nix_env.py", "probe_session.py")),
-        ("production", ("production_doc.py", "showrunners.py")),
-    ):
-        destination = root / "scripts" / directory
-        destination.mkdir(parents=True)
-        for name in names:
-            _ = shutil.copy2(DIRECT_DIR.parent / directory / name, destination / name)
-    home_lib = root / ".claude" / "scripts" / "lib"
-    home_lib.mkdir(parents=True, exist_ok=True)
-    _ = shutil.copy2(root / "scripts" / "lib" / "py", home_lib / "py")
-    recorder = root / "scripts" / "direct" / "progress_history.py"
-    _ = recorder.write_text(recorder.read_text().replace(
-        "from __future__ import annotations\n",
-        "from __future__ import annotations\n" + LEGACY_RECORDER_ARGUMENTS, 1,
-    ))
-
-
-class ImplementLauncherFixture(unittest.TestCase):
+class ImplementLauncherFixture(LauncherFixture):
     """Every worker carries a kind, and the board line says which."""
 
-    fixture_seed: ClassVar[Path]
-
-    temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
-    root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
-    history_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
-    working_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
-    config_file: Path  # pyright: ignore[reportUninitializedInstanceVariable]
-    implement_script: Path  # pyright: ignore[reportUninitializedInstanceVariable]
-    prompt_file: Path  # pyright: ignore[reportUninitializedInstanceVariable]
-
-    @classmethod
-    @override
-    def setUpClass(cls) -> None:
-        super().setUpClass()
-        seed_directory = tempfile.TemporaryDirectory()
-        cls.addClassCleanup(seed_directory.cleanup)
-        cls.fixture_seed = Path(seed_directory.name)
-        seed = cls("runTest")
-        seed.root = cls.fixture_seed
-        seed.prepare_fixture()
+    implement_script: Path = Path()
 
     @override
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
-        # Private files and Git objects/index/refs: mutations never reach another test.
-        _ = shutil.copytree(self.fixture_seed, self.root, dirs_exist_ok=True)
-        self.history_dir = self.root / "history"
-        self.working_dir = self.root / "project"
-        self.config_file = self.root / "direct.conf"
-        self.prompt_file = self.root / "implementation_prompt.md"
+        super().setUp()
+        self.prompt_file: Path = self.root / "implementation_prompt.md"
         self.implement_script = self.root / "scripts" / "direct" / "implement.sh"
 
+    @override
     def prepare_fixture(self) -> None:
-        self.history_dir = self.root / "history"
-        self.working_dir = self.root / "project"
-        self.working_dir.mkdir()
-        _ = subprocess.run(
-            ["git", "init", "-b", "feature/workers"],
-            cwd=self.working_dir,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        self.config_file = self.root / "direct.conf"
-        _ = self.config_file.write_text(
-            "\n".join((
+        self.prepare_project(
+            "feature/workers", "implementation_prompt.md", "Write the retry path.\n",
+            (
                 "UNIT_PROGRESS_INTERVAL_SECONDS=180",
                 "UNIT_COMPACT_ABOVE_TOKENS=100000",
                 "MAX_FIX_ATTEMPTS=3", "MAX_REOPENS=3", "STALLED_ROUNDS=3",
@@ -343,37 +269,26 @@ class ImplementLauncherFixture(unittest.TestCase):
                 "MIN_REPAIR_BUDGET=2", "MAX_CONSECUTIVE_SAME_KIND_PASSES=6",
                 "MAX_REVIEW_CANCELLATIONS=1", "ROUTING_FROM_ROUND=4",
                 "ASTRA_AFTER_FAILED_FIXES=2", "",
-            )),
-            encoding="utf-8",
+            ), AGENTS_REGISTRY,
         )
-        registry = self.root / ".claude" / "config" / "agents.conf"
-        registry.parent.mkdir(parents=True)
-        _ = write_registry(registry, base_text=AGENTS_REGISTRY)
         notes = self.root / "notes"
         notes.mkdir()
         _ = (notes / "claude2.md").write_text("---\nlogin: worker@example.invalid\n---\n")
         _ = (self.root / ".claude.json").write_text(json.dumps({
             "oauthAccount": {"emailAddress": "worker@example.invalid"},
         }))
-        self.prompt_file = self.root / "implementation_prompt.md"
-        _ = self.prompt_file.write_text("Write the retry path.\n", encoding="utf-8")
         self.implement_script = self.build_script_tree()
-
-    @override
-    def tearDown(self) -> None:
-        self.temporary.cleanup()
 
     def build_script_tree(self) -> Path:
         """Copy the real wrapper beside a stub agent, so nothing calls a model."""
-        copy_launcher_dependencies(self.root)
-        direct_dir = self.root / "scripts" / "direct"
-        agents = self.root / "scripts" / "agents"
-        launcher = direct_dir / "implement.sh"
-        _ = launcher.write_text(
-            launcher.read_text(encoding="utf-8").replace(
-                "HEARTBEAT_INTERVAL_SECS=60", "HEARTBEAT_INTERVAL_SECS=1"
-            ), encoding="utf-8",
-        )
+        direct_dir, agents, lib = prepare_launcher_runtime(self.root)
+        _ = shutil.copy2(DIRECT_DIR.parent / "lib/nix_env.py", lib / "nix_env.py")
+        home_lib = self.root / ".claude/scripts/lib"
+        home_lib.mkdir(parents=True, exist_ok=True)
+        _ = shutil.copy2(DIRECT_DIR.parent / "lib/py", home_lib / "py")
+        configure_launcher_fixture(direct_dir / "implement.sh")
+        for name in ("claude_account.sh", "agent_bg.sh"):
+            _ = shutil.copy2(DIRECT_DIR.parent / "agents" / name, agents / name)
         stub = agents / "agent_exec.sh"
         _ = stub.write_text(STUB_AGENT_EXEC, encoding="utf-8")
         stub.chmod(0o755)
@@ -388,9 +303,9 @@ class ImplementLauncherFixture(unittest.TestCase):
         )
         return direct_dir / "implement.sh"
 
+    @override
     def environment(self) -> dict[str, str]:
-        environment = os.environ.copy()
-        environment["HOME"] = str(self.root)
+        environment = launcher_environment(self.root)
         environment["AGENT_NOTES_DIR"] = str(self.root / "notes")
         # The copied shell helper uses the real account policy, while identity
         # and configuration stay in this fixture's home.
@@ -398,51 +313,12 @@ class ImplementLauncherFixture(unittest.TestCase):
         for name in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN",
                      "CLAUDE_CODE_REMOTE_MEMORY_DIR", "CODEX_HOME"):
             _ = environment.pop(name, None)
-        environment["XDG_CACHE_HOME"] = str(self.root / "cache")
-        cache = self.root / "cache" / "claude" / "python3-3.11"
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        _ = cache.write_text(sys.executable + "\n")
-        _ = environment.pop("CLAUDE_PYTHON", None)
-        environment["UNIT_WORKER_POLL_SECS"] = "0.01"
-        environment["UNIT_WORKER_WAIT_ATTEMPTS"] = "30000"
-        environment["UNIT_SYNC_WRITES"] = "0"
         environment["TEST_WAIT_HELPER"] = str(DIRECT_DIR.resolve() / "wait_for_test_state.py")
         environment["TEST_HEARTBEAT_READY"] = str(self.root / "heartbeat-ready")
-        environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
-        environment["TEST_LEGACY_LAUNCH"] = "1"
-        environment["UNIT_CONFIG"] = str(self.config_file)
-        environment["AGENTS_CONFIG_FILE"] = str(self.root / ".claude" / "config" / "agents.conf")
         # The plain launcher, so the stub above stands in for the agent. The mesh
         # path would need a live app-server, which is a different test's subject.
         environment["UNIT_CODEX_MESH"] = "0"
-        environment["TZ"] = "UTC"
-        environment["USER_ZONE"] = "UTC"
-        _ = environment.pop("CODEX_THREAD_ID", None)
-        _ = environment.pop("CLAUDE_CODE_SESSION_ID", None)
         return environment
-
-    def recorder(self, *arguments: str) -> None:
-        environment = self.environment()
-        environment["UNIT_PASS_OWNER"] = "launcher"
-        result = invoke_recorder(arguments, environment, Path.cwd())
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-    def start_phase(self, name: str) -> Path:
-        session_dir = self.root / name
-        session_dir.mkdir()
-        plan = self.working_dir / "plan.md"
-        _ = plan.write_text("## Delegation Context\n\n- **Project:** Test\n", encoding="utf-8")
-        self.recorder(
-            "start-run", "--session-dir", str(session_dir),
-            "--working-dir", str(self.working_dir), "--plan-doc", "plan.md",
-            "--main-family", "codex", "--main-model", "gpt-main",
-            "--main-effort", "xhigh", "--main-session-id", f"main-{name}",
-        )
-        self.recorder(
-            "start-phase", "--session-dir", str(session_dir),
-            "--phase-id", "3", "--phase-title", "Retry handling",
-        )
-        return session_dir
 
     def launch(
         self, session_dir: Path, kind: str, slot: str

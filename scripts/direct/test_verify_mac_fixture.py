@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import unittest
+import json
 import os
+import runpy
 import select
 import subprocess
 import sys
@@ -13,11 +15,61 @@ from pathlib import Path
 from typing import cast, final
 from unittest import mock
 from scripts.build_hold import build_hold
+from scripts.direct.verify_mac_offload_test_support import TARGETS_WRAPPER
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, HANG_GUARD_S as HANG_GUARD_S, VERIFY as VERIFY, stub_build_tool_path as stub_build_tool_path
 
 
 @final
 class VerifyMacFixtureTests(VerifyMacOffloadFixture):
+    def test_targets_wrapper_interrupted_publication_keeps_complete_state(self) -> None:
+        arguments = ["--leave-hook", "hook with spaces \N{SNOWMAN}"]
+        publications = (
+            ("wait-local", "local-wait-args", json.dumps(arguments), ""),
+            ("wait-local", "local-wait-args", json.dumps(arguments), '["previous complete args"]'),
+            ("wait-local", "local-wait-added", "added\n", ""),
+            ("register-local", "registered", "registered\n", ""),
+        )
+        replace = os.replace
+        for index, (command, name, content, previous) in enumerate(publications):
+            with self.subTest(name=name, previous=previous):
+                root = self.runner_state / str(index)
+                root.mkdir()
+                target = root / name
+                if previous:
+                    _ = target.write_text(previous, encoding="utf-8")
+
+                def interrupt_publication(source: str | Path, destination: str | Path) -> None:
+                    if Path(destination) == target:
+                        self.assertEqual(Path(source).read_text(encoding="utf-8"), content)
+                        self.assertEqual(target.exists(), bool(previous))
+                        if previous:
+                            self.assertEqual(target.read_text(encoding="utf-8"), previous)
+                        raise OSError("interrupted publication")
+                    replace(source, destination)
+
+                def run_wrapper() -> None:
+                    with self.assertRaises(SystemExit) as exited:
+                        exec(TARGETS_WRAPPER, {"__name__": "__main__"})
+                    self.assertEqual(exited.exception.code, 10)
+
+                with mock.patch.dict(os.environ, {**self.environment,
+                        "TEST_RUNNER_STATE": str(root), "TEST_LOCAL_WAIT_SECONDS": "1",
+                        "BUILDLOG_HOLD_WAIT_FILE": str(root / "hold-wait"),
+                        "TEST_REAL_TARGETS": str(VERIFY.parent.parent / "build_targets/build_targets.py")}), \
+                        mock.patch.object(sys, "argv", ["targets-wrapper", command, *arguments]), \
+                        mock.patch.object(sys, "path", sys.path.copy()), \
+                        mock.patch.object(runpy, "run_path", side_effect=SystemExit(10)):
+                    with mock.patch("scripts.lib.atomic_file.os.replace", side_effect=interrupt_publication):
+                        with self.assertRaisesRegex(OSError, "interrupted publication"):
+                            run_wrapper()
+                    self.assertEqual(target.exists(), bool(previous))
+                    if previous:
+                        self.assertEqual(target.read_text(encoding="utf-8"), previous)
+                    self.assertEqual(list(root.glob(f".{name}.*")), [])
+                    run_wrapper()
+                self.assertEqual(target.read_text(encoding="utf-8"), content)
+                self.assertEqual(list(root.glob(f".{name}.*")), [])
+
     def test_fixture_waits_for_a_detached_child_to_finish_before_checking_for_leaks(self) -> None:
         release = self.runner_state / "recorder-release"
         child = subprocess.Popen(

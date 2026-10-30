@@ -100,7 +100,7 @@ def refuse_real_home(path: Path, source: str) -> None:
 
 
 def assert_fixture_environment() -> None:
-    for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "AGENTS_CONFIG_FILE", "AGENTS_LOCAL_CONFIG_FILE"):
+    for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "AGENTS_CONFIG_FILE"):
         value = os.environ.get(name)
         if not value:
             raise AssertionError(f"{name} is unset; codex_mesh fixture requires setUpModule")
@@ -294,10 +294,10 @@ def setUpModule() -> None:
     restore_usage = set_environment("USAGE_STATE_DIR", usage.name)
     restore_home = set_environment("HOME", home.name)
     restore_notes = set_environment("AGENT_NOTES_DIR", home.name)
+    unittest.addModuleCleanup(set_environment("AGENTS_CONFIG_PUBLISH", "0"))
     # Tier tests never read the caller's registry, config, or pacer choice.
     tier_files = {
         "AGENTS_CONFIG_FILE": str(Path(home.name) / "agents.conf"),
-        "AGENTS_LOCAL_CONFIG_FILE": str(Path(home.name) / "agents.local.conf"),
         "CODEX_CATALOG_SYNC_STATE_FILE": str(Path(home.name) / "catalog-sync"),
         "CODEX_CONFIG_FILE": str(Path(home.name) / "codex.toml"),
         "CODEX_PACER_TIER_FILE": str(Path(home.name) / "pacer-tier"),
@@ -1542,8 +1542,8 @@ class FixtureHomeSafetyTests(unittest.TestCase):
         root = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/tmp")))
         real = root / "real"
         real.mkdir()
-        for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "AGENTS_CONFIG_FILE", "AGENTS_LOCAL_CONFIG_FILE"):
-            environment = {key: str(root / "safe") for key in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "AGENTS_CONFIG_FILE", "AGENTS_LOCAL_CONFIG_FILE")}
+        for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "AGENTS_CONFIG_FILE"):
+            environment = {key: str(root / "safe") for key in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "AGENTS_CONFIG_FILE")}
             environment[name] = str(real / "nested")
             with (self.subTest(variable=name), patch(f"{__name__}.REAL_HOME", real),
                   patch.dict(os.environ, environment),
@@ -1609,6 +1609,39 @@ class FixtureHomeSafetyTests(unittest.TestCase):
                         with self.assertRaisesRegex(AssertionError, "fixture targets"):
                             assert_real_codex_unchanged()
                     assert_real_codex_unchanged()
+
+
+@final
+class RecordedTurnSettingsTests(unittest.TestCase):
+    def test_accepted_turn_settings_take_precedence_over_legacy_roster_fields(self) -> None:
+        settings = codex_mesh.recorded_turn_settings({
+            "turn_model": "accepted-model", "turn_effort": "high",
+            "model": "historical-model", "effort": "low",
+        })
+        self.assertEqual((settings.model, settings.effort), ("accepted-model", "high"))
+
+    def test_an_accepted_model_without_effort_does_not_borrow_the_legacy_effort(self) -> None:
+        for effort in ({}, {"turn_effort": ""}, {"turn_effort": 123}):
+            with self.subTest(effort=effort):
+                settings = codex_mesh.recorded_turn_settings({
+                    "turn_model": "accepted-model", "model": "historical-model", "effort": "max", **effort,
+                })
+                self.assertEqual((settings.model, settings.effort), ("accepted-model", ""))
+
+    def test_a_missing_or_empty_accepted_model_uses_the_legacy_pair(self) -> None:
+        for model in ({}, {"turn_model": ""}, {"turn_model": 123}):
+            with self.subTest(model=model):
+                settings = codex_mesh.recorded_turn_settings({
+                    "turn_effort": "max", "model": "historical-model", "effort": "low", **model,
+                })
+                self.assertEqual((settings.model, settings.effort), ("historical-model", "low"))
+
+    def test_unrecorded_settings_are_empty_and_legacy_fields_remain_supported(self) -> None:
+        for record, expected in (({}, ("", "")), ({"model": "older-model"}, ("older-model", "")),
+                                 ({"model": "older-model", "effort": "medium"}, ("older-model", "medium"))):
+            with self.subTest(record=record):
+                settings = codex_mesh.recorded_turn_settings(record)
+                self.assertEqual((settings.model, settings.effort), expected)
 
 
 @final
@@ -3500,6 +3533,38 @@ class MeshCommandTests(MeshCommandFixture):
         starts = self.methods("turn/start")
         follow_params = cast("dict[str, object]", starts[1]["params"])
         self.assertEqual(follow_params["model"], "gpt-test")
+
+    def prepare_turn_display_worker(self) -> dict[str, str]:
+        registry = {"direct.codex": {"review": "gpt-current:high"},
+                    "codex.agents": {"gpt-current": "low,high"}}
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done", "role": "review",
+                                          "model": "legacy-model", "effort": "legacy-effort",
+                                          "turn_model": "previous-turn", "turn_effort": "low"}})
+        return self.tier_environment(registry)
+
+    def test_an_accepted_turn_records_display_settings_without_replacing_legacy_identity_fields(self) -> None:
+        with patch.dict(os.environ, self.prepare_turn_display_worker()):
+            code, _output, errors = self.run_mesh(self.follow_cli())
+        self.assertEqual((code, errors), (0, ""))
+        turn = _as_test_dict(self.methods("turn/start")[-1]["params"])
+        self.assertEqual((turn["model"], turn["effort"]), ("gpt-current", "high"))
+        record = self.worker_record()
+        self.assertEqual((record["turn_model"], record["turn_effort"]), ("gpt-current", "high"))
+        self.assertEqual((record["model"], record["effort"]), ("legacy-model", "legacy-effort"))
+
+    def test_follow_chooses_current_registry_settings_instead_of_either_roster_model_pair(self) -> None:
+        with patch.dict(os.environ, self.prepare_turn_display_worker()):
+            first, _output, errors = self.run_mesh(self.follow_cli())
+            self.assertEqual((first, errors), (0, ""))
+            registry_path = Path(os.environ["AGENTS_CONFIG_FILE"])
+            _ = write_registry(registry_path, {"direct.codex": {"review": "gpt-current:low"}}, update=True)
+            second, _output, errors = self.run_mesh(self.follow_cli())
+        self.assertEqual((second, errors), (0, ""))
+        turns = [_as_test_dict(item["params"]) for item in self.methods("turn/start")]
+        self.assertEqual([(turn["model"], turn["effort"]) for turn in turns],
+                         [("gpt-current", "high"), ("gpt-current", "low")])
+        self.assertEqual((self.worker_record()["turn_model"], self.worker_record()["turn_effort"]),
+                         ("gpt-current", "low"))
 
     def follow_with_name_taken(self, take_at: str, *, release_unknown: bool = False) -> tuple[int, str]:
         self.write_pool_roster({"worker": {"thread_id": "old-follow-thread", "status": "done",

@@ -258,7 +258,9 @@ class BoardJsonTests(unittest.TestCase):
         directory.mkdir(exist_ok=True)
         _ = (directory / "mesh_roster.json").write_text(json.dumps({
             "alpha-impl": {"slot": "1", "role": "impl", "status": "running",
-                           "thread_id": "thread-one", "turn_id": "turn-one"},
+                           "thread_id": "thread-one", "turn_id": "turn-one",
+                           "model": "legacy-identity", "effort": "low",
+                           "turn_model": "fixture-turn-model", "turn_effort": "high"},
             "alpha-test": {"slot": "test", "role": "test", "status": "idle",
                            "thread_id": "thread-test", "turn_id": "turn-test"},
         }), encoding="utf-8")
@@ -1297,7 +1299,7 @@ class BoardJsonTests(unittest.TestCase):
         self.assertEqual(set(workers), {"1", "test"})
         self.assertEqual(workers["1"]["role"], "impl")
         self.assertEqual(workers["1"]["state"], "running")
-        self.assertEqual(workers["1"]["model"], "codex/fixture-model")
+        self.assertEqual(workers["1"]["model"], "codex/fixture-turn-model:high")
         doing = str(workers["1"]["doing"])
         self.assertTrue(doing.startswith("building "), doing)
         self.assertLessEqual(len(doing), 80)

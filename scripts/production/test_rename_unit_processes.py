@@ -34,13 +34,12 @@ else:
     import shutdown_record
 
 from scripts.production.rename_unit_test_support import SLUG, TEST_HANG_GUARD_SECS, UnitRenameFixture
+from scripts.production.fake_unit_host import stopped_record
 
 
 # An app-server's idle-stop watcher, as codex_mesh starts it: the run folder is its fourth argument.
 WATCHER = 'while kill -0 "$1"; do sleep "$5"; "$4" "$0" idle-stop --session-dir "$3" --pid "$1" --port "$2"; done'
-STOPPED_RECORD = {"login": "owner@example.com", "then": "stop", "progress": {"kind": "stopped"},
-                  "session": {"session_id": "sid-alpha",
-                              "host": {"kind": "unit", "production": SLUG, "unit": "alpha-unit"}}}
+STOPPED_RECORD = stopped_record(Path(), Path())
 
 
 class RunRecordLookupTests(unittest.TestCase):

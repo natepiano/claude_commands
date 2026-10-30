@@ -352,7 +352,7 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
         identity_path = worker_record_path(dispatch.run, dispatch.worker, dispatch.worker, role=dispatch.role)
         identity = read_object(identity_path)
         slot = text(identity.get("slot")) or dispatch.worker
-        model = text(identity.get("model")) or text(record.get("model")) or dispatch.model
+        model = text(identity.get("model")) or dispatch.model
         expected = {"name": dispatch.worker, "slot": slot, "family": dispatch.family,
                     "model": model, "worker_id": record.get("thread_id")}
         _ = identity.pop("role", None)

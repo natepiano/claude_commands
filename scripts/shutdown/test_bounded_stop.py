@@ -20,7 +20,7 @@ from contextlib import redirect_stdout
 from datetime import timedelta
 from pathlib import Path
 from typing import cast, override
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from test_support import ShutdownTestCase, linux_process_fixture, empty_session_registry
 from test_stop import NOW_UTC, entry, machine_inventory, top_level, unit, showrunner, worker_session
@@ -2139,15 +2139,14 @@ class BoundedShutdownTests(ShutdownTestCase):
 
     def test_force_stop_pauses_worker_and_preserves_server_queue_only_after_director_dies(self) -> None:
         from scripts.agents import codex_mesh
-        from scripts.agents.test_codex_mesh import StubAppServer
 
         run = self.root / "queued-worker"
         run.mkdir()
         queued: list[dict[str, object]] = [{"id": "message-1", "input": [{"type": "text", "text": "finish the regression"}]}]
         interrupted: list[str] = []
-        def respond(request: dict[str, object]) -> list[dict[str, object]]:
+        def respond(method: str, _params: dict[str, object], timeout: float = codex_mesh.CALL_TIMEOUT_SECS) -> codex_mesh.RpcMessage:
+            del timeout
             result: dict[str, object] = {}
-            method = request.get("method")
             if method == "thread/loaded/list":
                 result = {"data": ["thread-1"], "nextCursor": None}
             elif method == "thread/queue/list":
@@ -2163,12 +2162,10 @@ class BoundedShutdownTests(ShutdownTestCase):
                 result = {"data": [{"id": "turn-1", "status": "inProgress"}], "nextCursor": None}
             elif method == "turn/interrupt":
                 interrupted.append("turn-1")
-            return [{"id": request["id"], "result": result}]
-        server = StubAppServer(respond)
-        self.addCleanup(server.close)
-        _ = (run / "mesh_server.json").write_text(json.dumps({"pid": 401, "port": server.port}))
+            return {"result": result}
+        _ = (run / "mesh_server.json").write_text(json.dumps({"pid": 401, "port": 9999}))
         _ = (run / "mesh_roster.json").write_text(json.dumps({"impl": {"thread_id": "thread-1",
-            "status": "running", "role": "impl", "turn_id": "turn-1", "port": server.port}}))
+            "status": "running", "role": "impl", "turn_id": "turn-1", "port": 9999}}))
         saved = self.save(top_level("director", 101, run_dirs=[str(run)]))
         self.process(401, arguments=("codex", "app-server"))
         def reap(pid: int) -> bool:
@@ -2187,13 +2184,18 @@ class BoundedShutdownTests(ShutdownTestCase):
         with (patch.object(codex_mesh, "_pid_alive", side_effect=alive),
               patch.object(codex_mesh, "_reap", side_effect=reap),
               patch.object(codex_mesh.unit_workers, "run_has_live_director", side_effect=director_alive),
-              patch.object(self, "pause_workers", side_effect=pause)):
+              patch.object(self, "pause_workers", side_effect=pause),
+              # This proves protocol ordering and durability, not socket timing.
+              # Real RPC waits must not race the stop's advancing fixture clock.
+              patch.object(codex_mesh, "Client", autospec=True,
+                           return_value=Mock(spec=codex_mesh.Client, call=Mock(side_effect=respond)))):
             stopped = self.run_stop([saved])[0]
         roster = cast(dict[str, dict[str, object]], json.loads((run / "mesh_roster.json").read_text()))
         self.assertEqual(roster["impl"]["status"], "paused")
         self.assertIs(roster["impl"]["paused_turn"], True)
         self.assertEqual(roster["impl"]["paused_from"], "running")
         self.assertIn("finish the regression", (run / "impl.pending.json").read_text())
+        self.assertEqual(stopped["progress"]["kind"], "stopped", stopped)
         self.assertEqual(interrupted, ["turn-1"])
         self.assertTrue(stopped.get("codex_seats", [])[0]["turn_live"])
         self.assertFalse(any(pid == 401 for _, pid, _ in self.signals))
