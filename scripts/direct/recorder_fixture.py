@@ -2,20 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import Future
-from dataclasses import dataclass, field
-import functools
+from scripts.lib import test_hang_guard
+
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 import os
 import signal
-import socket
 import shutil
 import sys
 import subprocess
 import tempfile
-import threading
-import time
 import unittest
 from typing import ClassVar, override
 from unittest.mock import patch
@@ -28,62 +24,6 @@ from scripts.lib.test_agents_registry import ExactRows, registry_text, write_reg
 from scripts.production.cli_fixture import invoke_cli
 
 
-# A real hang must fail well before the gate's 1800-second module limit.
-# Lifecycle deadlines use the test clock; this is only a wall-clock escape hatch.
-TEST_HANG_GUARD_SECS = 600
-
-
-@dataclass
-class LauncherHangGuard:
-    """Bound a launcher handshake without letting machine load advance test time."""
-
-    name: str
-    started: float = field(default_factory=time.monotonic)
-
-    def remaining(self) -> float:
-        remaining = TEST_HANG_GUARD_SECS - (time.monotonic() - self.started)
-        if remaining <= 0:
-            raise TimeoutError(f"{self.name}: launcher hang guard expired")
-        return remaining
-
-    def event(self, event: threading.Event) -> None:
-        if not event.wait(timeout=self.remaining()):
-            raise TimeoutError(f"{self.name}: launcher event never arrived")
-
-    def result[T](self, future: Future[T]) -> T:
-        return future.result(timeout=self.remaining())
-
-    def callback[**P, T](self, callback: Callable[P, T]) -> Callable[P, T]:
-        @functools.wraps(callback)
-        def bounded(*args: P.args, **kwargs: P.kwargs) -> T:
-            _ = self.remaining()
-            return callback(*args, **kwargs)
-
-        return bounded
-
-    def change[T](self, wait: Callable[[socket.socket, float], T],
-                  lifecycle_now: Callable[[], float]) -> T:
-        """Wake a frozen-clock file wait on a real hang, without expiring its deadline."""
-        expired = threading.Event()
-        wake, peer = socket.socketpair()
-        with wake, peer:
-            def interrupt() -> None:
-                expired.set()
-                try:
-                    peer.sendall(b"hang")
-                except OSError:
-                    pass  # The state event won the race and the wait already closed.
-
-            timer = threading.Timer(self.remaining(), interrupt)
-            timer.daemon = True
-            timer.start()
-            try:
-                outcome = wait(wake, lifecycle_now() + TEST_HANG_GUARD_SECS)
-                if expired.is_set():
-                    raise TimeoutError(f"{self.name}: launcher state never changed")
-                return outcome
-            finally:
-                timer.cancel()
 
 
 STUB_ATOMIC_JSON_WRITER = '''
@@ -254,7 +194,7 @@ def launcher_environment(root: Path) -> dict[str, str]:
     return environment
 
 
-def communicate_launcher(process: subprocess.Popen[str], timeout: float = TEST_HANG_GUARD_SECS) -> tuple[str, str]:
+def communicate_launcher(process: subprocess.Popen[str], timeout: float = test_hang_guard.TEST_HANG_GUARD_SECS) -> tuple[str, str]:
     """Reap a fixture's isolated launcher group before reporting a hang."""
     try:
         return process.communicate(timeout=timeout)

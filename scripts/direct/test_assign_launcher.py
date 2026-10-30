@@ -1,6 +1,8 @@
 """Named assignment dispatches through the real recorder and loopback app-server."""
 from __future__ import annotations
 
+from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
+
 from scripts.lib.test_agents_registry import write_registry
 
 import fcntl
@@ -16,9 +18,7 @@ from unittest.mock import patch
 
 from scripts.agents import codex_mesh, test_codex_mesh as mesh_fixture
 from scripts.direct import workers
-from scripts.direct.recorder_fixture import (
-    LauncherHangGuard, TEST_HANG_GUARD_SECS, communicate_launcher, invoke_recorder,
-)
+from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
 
 
 ROOT = Path(__file__).resolve().parents[2]

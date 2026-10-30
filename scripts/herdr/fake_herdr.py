@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Record argv and replay configured responses without starting external tools.
+"""Record argv, validate agent names and workspace ids, and replay responses without external tools.
 
 FAKE_HERDR_RESPONSES maps space-joined argv (excluding the executable) to
 {stdout, code} entries, optionally with stderr and write_files (path-to-text
@@ -56,6 +56,12 @@ def main(argv: list[str]) -> int:
             "code": "invalid_agent_name", "message": "invalid agent name",
         }}) + "\n")
         return 1
+    for option, workspace in zip(argv, argv[1:]):
+        if option == "--workspace" and re.fullmatch(r"w[0-9A-Z]+", workspace) is None:
+            _ = sys.stderr.write(json.dumps({"error": {
+                "code": "workspace_not_found", "message": f"workspace {workspace} not found",
+            }, "id": "cli:tab:list"}) + "\n")
+            return 1
     responses = cast(
         dict[str, CommandResponse | list[CommandResponse]],
         json.loads(Path(os.environ["FAKE_HERDR_RESPONSES"]).read_text()),

@@ -29,7 +29,6 @@ from scripts.production.rename_test_support import bind_staff_fixture
 from scripts.production.staff_test_support import StaffTestCase
 from scripts.lib.atomic_file import write_text_atomic
 import transfer_unit
-import rename_unit
 import retire_unit
 import pane_record
 import progress_history
@@ -52,6 +51,8 @@ class UnitTransferFixture(StaffTestCase):
         self.receiving: Path = Path()
         self.unit: Path = Path()
         self.env: dict[str, str] = {}
+        self.commands: list[list[str]] = []
+        self.showrunner_addresses: dict[str, str] = {}
 
     fixture_root: ClassVar[Path]
     snapshot: ClassVar[Path]
@@ -80,6 +81,9 @@ class UnitTransferFixture(StaffTestCase):
         self.write(self.root / "state/notifier/showrunner-other/conf",
                    "TARGET=session:other-showrunner\nCHECK=" + shlex.join(["zsh", "/scripts/production_check.sh",
                    str(self.receiving / "docs/plans/other-production.md")]) + "\n")
+        self.showrunner_addresses = {slug: self.running_showrunner(slug, session_id)
+                                     for slug, session_id in (("demo", "test-showrunner"),
+                                                               ("other", "other-showrunner"))}
         for module, name, value in (
             (pool_showrunners, "NOTIFIER_STATE_DIR", self.root / "state/notifier"),
             (pool_showrunners, "SHOWRUNNER_STATE_DIR", self.root / "state/showrunner"),
@@ -117,6 +121,8 @@ class UnitTransferFixture(StaffTestCase):
             "RENAME_UNIT_STOP_WAIT": "0", "RENAME_UNIT_LIVE_WAIT": "0",
             "REVIEW_POOL_STATE": str(self.root / "state/review-pool"),
             "SHOWRUNNERS_CONFIG": str(config / "showrunners.json"),
+            "SHOWRUNNERS_SEND": str(self.root / "fake_send.py"),
+            "TRANSFER_MESSAGE_LOG": str(self.root / "messages.jsonl"),
             "UNIT_ACTIVE_DIR": str(self.root / "active"),
             "UNIT_HISTORY_DIR": str(self.root / "history"),
             "PROGRESS_SESSION_ROOTS": str(self.root / "sessions"),
@@ -135,7 +141,19 @@ class UnitTransferFixture(StaffTestCase):
         for path in (self.giving, self.root / "home/.claude", self.root / "state/sessions"):
             path.mkdir(parents=True)
         self.write(self.root / "herdr-responses.json",
-                   json.dumps({"default": {"stdout": '{"sessions": []}', "code": 0}}))
+                   json.dumps({"default": {"stdout": '{"sessions": []}', "code": 0},
+                               "--session agents pane list": {"stdout": '{"result": {"panes": []}}', "code": 0}}))
+        self.write(self.root / "fake_send.py",
+                   "import json, os, sys\nfrom pathlib import Path\n"
+                   + f"sys.path.insert(0, {str(SCRIPT.parents[2])!r})\n"
+                   + "from scripts.lib.atomic_file import write_text_atomic\n"
+                   + "path = Path(os.environ['TRANSFER_MESSAGE_LOG'])\n"
+                   + "previous = path.read_text() if path.exists() else ''\n"
+                   + "write_text_atomic(path, previous + json.dumps(sys.argv[1:]) + '\\n')\n"
+                   + "if sys.argv[sys.argv.index('--to') + 1] == os.environ.get('TRANSFER_SEND_FAIL_TO'):\n"
+                   + "    print('fixture recipient unavailable', file=sys.stderr)\n"
+                   + "    raise SystemExit(3)\n"
+                   + "print('SENT: fixture')\n")
         origin = self.root / "origin.git"
         _ = self.git("init", "--bare", str(origin))
         _ = self.git("init", "-b", "demo")
@@ -226,7 +244,7 @@ class UnitTransferFixture(StaffTestCase):
         self.assertIn(text, result.stderr)
 
     def seed_record(self) -> Path:
-        """A stopped unit's shutdown record, as `shutdown.py down` leaves it, and a shutdown stub that logs calls."""
+        """A prior shutdown record and a command log that exposes any forbidden stop or restart."""
         home = self.root / "home"
         saved = fake_unit_host.stopped_record(home / ".claude", self.unit,
             doc=self.giving / "docs/plans/demo-production.md", host_session="demo-alpha",
@@ -247,7 +265,7 @@ class UnitTransferFixture(StaffTestCase):
 
     def moved_unit_with_leftover_marks(self) -> None:
         _ = self.seed_record()
-        self.assert_refused(self.transfer("apply"), "alpha-unit is not running under other")
+        self.assert_ok(self.transfer("apply"))
         fake_unit_host.write(self.env, [
             fake_unit_host.HostedUnit("old", "w3:p3Y", {"SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"}),
             fake_unit_host.HostedUnit("moved", "w4:p1", {"SHOWRUNNER_UNIT": "other", "SHOWRUNNER_UNIT_ID": "alpha-unit"})])
@@ -311,6 +329,7 @@ class UnitTransferFixture(StaffTestCase):
         original_run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
 
         def run(command: list[str], *args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            self.commands.append(command.copy())
             environment = cast(dict[str, str], kwargs.get("env") or dict(os.environ))
             cwd = Path(cast(str, kwargs.get("cwd") or os.getcwd()))
             if command[0] == self.env["HERDR_BIN"]:
@@ -319,11 +338,7 @@ class UnitTransferFixture(StaffTestCase):
                 return invoke_cli(review_pool, review_pool.main, command[2:], environment, cwd, production_state=True)
             return original_run(command, *args, **kwargs)
 
-        with (mock.patch.object(rename_unit, "SHUTDOWN", Path(self.env.get("RENAME_UNIT_SHUTDOWN")
-                         or str(SCRIPT.parents[1] / "shutdown/shutdown.py"))),
-              mock.patch.object(rename_unit, "STOP_WAIT_SECONDS", float(self.env["RENAME_UNIT_STOP_WAIT"])),
-              mock.patch.object(rename_unit, "LIVE_WAIT_SECONDS", float(self.env["RENAME_UNIT_LIVE_WAIT"])),
-              mock.patch.object(retire_unit, "MAC_CLAIMS", self.root / "home/.local/state/mac-test/claims"),
+        with (mock.patch.object(retire_unit, "MAC_CLAIMS", self.root / "home/.local/state/mac-test/claims"),
               mock.patch.object(subprocess, "run", run)):
             return invoke_cli(transfer_unit, lambda: transfer_unit.main(arguments), arguments,
                               self.env, self.giving, production_state=True)
@@ -341,7 +356,61 @@ class UnitTransferFixture(StaffTestCase):
         self.assert_refused(result, "fixture pause before source commit")
         path = self.root / "state/showrunner/demo/transfer_unit.json"
         saved = cast(dict[str, object], json.loads(path.read_text()))
-        self.assertEqual((saved["step"], saved["done"]), (3, False))
+        self.assertEqual((saved["step"], saved["done"]),
+                         (next(index for index, step in enumerate(transfer_unit.STEPS)
+                               if step.run.__name__ == "_commit_from"), False))
         for name in ("from_doc", "to_doc", "from_checkout", "to_checkout"):
             self.assertNotIn(name, saved)
         return path
+
+    def messages(self) -> list[list[str]]:
+        path = self.root / "messages.jsonl"
+        return [cast(list[str], json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def running_showrunner(self, slug: str, session_id: str) -> str:
+        """Publish a real fixture socket for the shared sender's slug lookup."""
+        held = fake_showrunner.write_session(self.root / "state/sessions", slug, session_id, self.live_pid())
+        self.addCleanup(held.close)
+        return f"uds:{held.getsockname()}"
+
+    def remove_showrunner_session(self, session_id: str) -> None:
+        """Make a timer's recipient absent without changing the production's source."""
+        for path in (self.root / "state/sessions").glob("*.json"):
+            record = cast(dict[str, object], json.loads(path.read_text()))
+            if record["sessionId"] == session_id:
+                path.unlink()
+
+    def running_unit(self) -> int:
+        """Publish a running director through the existing host and session fixtures."""
+        fake_unit_host.write(self.env, [fake_unit_host.HostedUnit("agents", "w1:p1", {
+            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit",
+        }, label="alpha")])
+        pid = self.live_pid()
+        socket = fake_showrunner.write_session(self.root / "state/sessions", "alpha", "sid-alpha", pid)
+        self.addCleanup(socket.close)
+        fake_unit_host.place_process(self.env, pid, "w1:p1")
+        self.configure_tab_move()
+        return pid
+
+    def configure_tab_move(self) -> None:
+        """Publish source placement and the shared pane-move response."""
+        path = Path(self.env["FAKE_HERDR_RESPONSES"])
+        responses = cast(dict[str, object], json.loads(path.read_text()))
+        replies = {
+            "workspace list": {"workspaces": [{"workspace_id": "w1", "label": "demo"},
+                                                {"workspace_id": "w2", "label": "other"}]},
+            "pane list": {"panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1", "label": "alpha"}]},
+            "pane move w1:p1 --new-tab --workspace w2": {
+                "move_result": {"created_tab": {"tab_id": "w2:t1"}, "pane": {"pane_id": "w1:p1"}}},
+            "tab rename w2:t1 alpha": {},
+            "tab list --workspace w2": {"tabs": [{"tab_id": "w2:t1", "label": "alpha", "workspace_id": "w2"}]},
+            "tab list": {"tabs": [{"tab_id": "w2:t1", "label": "alpha", "workspace_id": "w2"}]},
+        }
+        for command, result in replies.items():
+            responses[f"--session agents {command}"] = {"stdout": json.dumps({"result": result}), "code": 0}
+        after = {**responses, "--session agents pane list": {"stdout": json.dumps({"result": {
+            "panes": [{"pane_id": "w1:p1", "workspace_id": "w2", "tab_id": "w2:t1", "label": "alpha"}],
+        }}), "code": 0}}
+        move = cast(dict[str, object], responses["--session agents pane move w1:p1 --new-tab --workspace w2"])
+        move["write_files"] = {str(path): json.dumps(after)}
+        self.write(path, json.dumps(responses))
