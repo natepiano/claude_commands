@@ -172,6 +172,8 @@ buildlog_end() {
 buildlog_sample_anon() {
     local sidecar=$1 maximum=$2 parent=${3:-$$} scope="" line anon peak=0
     local temporary="$maximum.tmp.${BASHPID:-$$}"
+    local near_peak="${maximum%.max}.wave" last_near_peak_at=0 sampled_at peak_published
+    local near_peak_temporary="$near_peak.tmp.${BASHPID:-$$}"
     while :; do
         kill -0 "$parent" 2>/dev/null || return
         if [[ -r "$sidecar" ]]; then
@@ -180,11 +182,24 @@ buildlog_sample_anon() {
                 while IFS= read -r line; do
                     if [[ "$line" == 'anon '* ]]; then
                         anon=${line#anon }
-                        if [[ "$anon" =~ ^[0-9]+$ ]] && (( anon > peak )); then
-                            if printf '%s\n' "$anon" > "$temporary" && mv -f "$temporary" "$maximum"; then
-                                peak=$anon
-                            else
-                                rm -f "$temporary"
+                        if [[ "$anon" =~ ^[0-9]+$ ]]; then
+                            sampled_at=$(date +%s)
+                            peak_published=0
+                            if (( anon > peak )); then
+                                if printf '%s\n' "$anon" > "$temporary" && mv -f "$temporary" "$maximum"; then
+                                    peak=$anon
+                                    peak_published=1
+                                else
+                                    rm -f "$temporary" || true
+                                fi
+                            fi
+                            if (( peak_published || (anon * 2 >= peak && sampled_at - last_near_peak_at >= 60) )); then
+                                # Pair the time with the published peak; an old pair cannot decay a new peak.
+                                if printf '%s %s\n' "$peak" "$sampled_at" > "$near_peak_temporary" && mv -f "$near_peak_temporary" "$near_peak"; then
+                                    last_near_peak_at=$sampled_at
+                                else
+                                    rm -f "$near_peak_temporary" || true
+                                fi
                             fi
                         fi
                         break
