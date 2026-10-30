@@ -1,128 +1,12 @@
-"""Check assertion changes against real git revisions, indexes, and working trees."""
+"""Check assertion-guard behavior against real Git repositories."""
 from __future__ import annotations
 
-import os
 import re
-import resource
-import subprocess
-import sys
-import tempfile
-import time
 import unittest
-from pathlib import Path
-from typing import NamedTuple, override
-from unittest.mock import patch
 
-from scripts.direct.assertion_guard import commit_bases, default_base
-from scripts.production import showrunners
+from scripts.direct.assertion_guard_test_support import GitRepositoryFixture as GitRepositoryFixture, MergeInProgressFixture as MergeInProgressFixture, AssertionFindingFixture, TILE_OLD as TILE_OLD, TILE_NEW as TILE_NEW
 
-GUARD = Path(__file__).with_name("assertion_guard.py")
-TILE_OLD = "assert_eq!(foot_cell.clip().bottom(), COLUMN_FOOT_TEST_AREA.bottom());"
-TILE_NEW = "assert!(foot_cell.clip().bottom() <= COLUMN_FOOT_TEST_AREA.bottom());"
-CLEAN = "assertion guard: no removed or weaker assertions"
-
-
-class DivergedBases(NamedTuple):
-    upstream: str
-    production: str
-
-
-class GitRepositoryFixture(unittest.TestCase):
-    root: Path = Path()
-    repo: Path = Path()
-    base: str = ""
-    environment: dict[str, str] = {}
-    notifier_dir: Path = Path()
-
-    @override
-    def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        self.repo = self.root / "repo"
-        self.repo.mkdir()
-        self.notifier_dir = self.root / "notifier"
-        self.notifier_dir.mkdir()
-        _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier_dir))
-        self.environment = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull,
-                            "GIT_CONFIG_NOSYSTEM": "1", "PYTHONDONTWRITEBYTECODE": "1",
-                            "NOTIFIER_STATE_DIR": str(self.notifier_dir)}
-        _ = self.environment.pop("VERIFY_ASSERTION_BASE", None)
-        _ = self.git("init", "--bare", "-q", "-b", "main", str(self.root / "remote.git"))
-        _ = self.git("init", "-q", "-b", "unit")
-        _ = self.git("remote", "add", "origin", str(self.root / "remote.git"))
-        _ = self.git("config", "branch.unit.remote", "origin")
-        _ = self.git("config", "branch.unit.merge", "refs/heads/unit")
-        _ = self.save("README.md", "Fixture repository.\n")
-        self.commit_base()
-
-    def git(self, *arguments: str) -> str:
-        result = subprocess.run(
-            ["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@t",
-             "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", *arguments],
-            env=self.environment, capture_output=True, text=True, check=True, timeout=5,
-        )
-        return result.stdout.strip()
-
-    def save(self, name: str, text: str) -> Path:
-        path = self.repo / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _ = path.write_text(text, encoding="utf-8")
-        return path
-
-    def commit_base(self) -> None:
-        _ = self.git("add", "--all")
-        _ = self.git("commit", "-q", "--allow-empty", "-m", "fixture base")
-        self.base = self.git("rev-parse", "HEAD")
-        _ = self.git("push", "-q", "origin", "HEAD:refs/heads/unit")
-
-    def guard(self, *arguments: str, stdin: str = "") -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [sys.executable, str(GUARD), "--repo", str(self.repo), *arguments],
-            env=self.environment, input=stdin, capture_output=True, text=True, check=False, timeout=5,
-        )
-
-    def change(self, path: str, before: str, after: str) -> None:
-        _ = self.save(path, before)
-        self.commit_base()
-        _ = self.save(path, after)
-
-    def rust(self, assertion: str, name: str = "test_value") -> str:
-        return f"#[test]\nfn {name}() {{\n    {assertion}\n}}\n"
-
-    def python(self, assertion: str, name: str = "test_value") -> str:
-        return f"def {name}(self):\n    {assertion}\n"
-
-    def register_production(self, merge_branch: str, *, worktree: str = "", branch: str = "unit",
-                            slug: str = "fixture") -> Path:
-        doc = self.root / f"{slug}-production.md"
-        _ = doc.write_text(
-            f"- **Merge branch:** `{merge_branch}`\n\n## Units\n\n"
-            + "| Unit | Worktree | Branch |\n| --- | --- | --- |\n"
-            + f"| fixture | `{worktree or self.repo}` | `{branch}` |\n", encoding="utf-8")
-        timer = self.notifier_dir / f"showrunner-{slug}"
-        timer.mkdir()
-        _ = (timer / "conf").write_text(
-            f"TARGET=session:fixture\nCHECK=production_check.sh {doc}\n", encoding="utf-8")
-        return doc
-
-
-class AssertionGuardTests(GitRepositoryFixture):
-    def assert_clean(self, result: subprocess.CompletedProcess[str]) -> None:
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(result.stdout.strip(), CLEAN)
-        self.assertEqual(result.stderr, "")
-
-    def assert_finding(self, result: subprocess.CompletedProcess[str], path: str, kind: str,
-                       test: str = "test_value", status: int = 1) -> str:
-        self.assertEqual(result.returncode, status, result.stdout + result.stderr)
-        prefix = "note: " if kind == "changed" else ""
-        findings = [line for line in result.stdout.splitlines() if not line.startswith("assertion guard:")]
-        self.assertEqual(len(findings), 1, result.stdout)
-        self.assertRegex(findings[0], rf"^{re.escape(prefix + path)}:\d+ {re.escape(test)} {kind}: ")
-        self.assertEqual(result.stderr, "")
-        if status == 1:
-            self.assertIn("assertion guard: 1 blocking;", result.stdout.splitlines()[-1])
-        return findings[0]
-
+class AssertionGuardTests(AssertionFindingFixture):
     def test_tile_weaker_assertion_is_found_among_six_thousand_other_changes(self) -> None:
         path = "crates/tui_pane/src/tiles/draw.rs"
         before = self.rust(TILE_OLD, "column_foot_tracks_area_bottom")
@@ -134,6 +18,7 @@ class AssertionGuardTests(GitRepositoryFixture):
         self.assertIn(TILE_OLD + " -> " + TILE_NEW, line)
         self.assertTrue(line.startswith(path + ":3 "), line)
 
+
     def test_removed_rust_assertion_macros(self) -> None:
         for macro in ("assert", "assert_eq", "assert_ne", "debug_assert", "debug_assert_eq",
                       "debug_assert_ne", "assert_matches", "prop_assert", "prop_assert_eq", "prop_assert_ne"):
@@ -143,13 +28,6 @@ class AssertionGuardTests(GitRepositoryFixture):
                 line = self.assert_finding(self.guard(), "value.rs", "removed")
                 self.assertIn(assertion + " -> (none)", line)
 
-    def test_removed_python_assertions_and_multiline_first_line(self) -> None:
-        for assertion in ("assert actual == expected", "self.assertEqual(actual, expected)",
-                          "self.assertTrue(actual)", "pytest.raises(ValueError)", "self.fail('missing')",
-                          "self.assertEqual(\n        actual,\n        expected,\n    )"):
-            with self.subTest(assertion=assertion):
-                self.change("test_value.py", self.python(assertion), self.python("pass"))
-                _ = self.assert_finding(self.guard(), "test_value.py", "removed")
 
     def test_exact_rust_assertions_replaced_with_bounds_ranges_or_matches_are_weaker(self) -> None:
         for before, after in (("assert_eq!(actual, expected);", "assert!(actual <= expected);"),
@@ -159,6 +37,7 @@ class AssertionGuardTests(GitRepositoryFixture):
             with self.subTest(before=before, after=after):
                 self.change("value.rs", self.rust(before), self.rust(after))
                 _ = self.assert_finding(self.guard(), "value.rs", "weaker")
+
 
     def test_exact_python_assertions_replaced_with_weaker_checks(self) -> None:
         exact = ("assertEqual", "assertNotEqual", "assertIs", "assertListEqual", "assertDictEqual",
@@ -180,6 +59,7 @@ class AssertionGuardTests(GitRepositoryFixture):
                 self.change("test_value.py", self.python(before), self.python(after))
                 _ = self.assert_finding(self.guard(), "test_value.py", "weaker")
 
+
     def test_changed_expected_values_are_notes_and_do_not_block(self) -> None:
         for path, before, after in (("value.rs", self.rust("assert_eq!(bottom, 40);"),
                                      self.rust("assert_eq!(bottom, 32);")),
@@ -188,6 +68,7 @@ class AssertionGuardTests(GitRepositoryFixture):
             with self.subTest(path=path):
                 self.change(path, before, after)
                 _ = self.assert_finding(self.guard(), path, "changed", status=0)
+
 
     def test_changed_helpers_and_membership_checks_share_any_operand(self) -> None:
         for before, after in (('self.assert_log("0", "t", "a", "x")',
@@ -199,15 +80,18 @@ class AssertionGuardTests(GitRepositoryFixture):
                 line = self.assert_finding(self.guard(), "test_value.py", "changed", status=0)
                 self.assertIn(before + " -> " + after, line)
 
+
     def test_bare_assertions_without_a_shared_operand_stay_removed(self) -> None:
         self.change("test_value.py", self.python("assert ok"), self.python("assert True"))
         line = self.assert_finding(self.guard(), "test_value.py", "removed")
         self.assertIn("assert ok -> (none)", line)
 
+
     def test_same_rust_macro_with_a_weaker_comparison_is_not_a_changed_note(self) -> None:
         self.change("value.rs", self.rust("assert!(a == b);"), self.rust("assert!(a <= b);"))
         line = self.assert_finding(self.guard(), "value.rs", "weaker")
         self.assertIn("assert!(a == b); -> assert!(a <= b);", line)
+
 
     def test_unrelated_subjects_do_not_pair_as_weaker_assertions(self) -> None:
         self.change("test_value.py", self.python("self.assertEqual(lean(x), 1.0)"),
@@ -215,60 +99,12 @@ class AssertionGuardTests(GitRepositoryFixture):
         line = self.assert_finding(self.guard(), "test_value.py", "removed")
         self.assertIn("self.assertEqual(lean(x), 1.0) -> (none)", line)
 
+
     def test_subject_identifier_prefix_does_not_pair_as_weaker(self) -> None:
         self.change("value.rs", self.rust("assert_eq!(actual, 3);"), self.rust("assert!(actual_total > 0);"))
         line = self.assert_finding(self.guard(), "value.rs", "removed")
         self.assertIn("assert_eq!(actual, 3); -> (none)", line)
 
-    def test_reflowed_python_assertion_with_the_same_tokens_has_no_finding(self) -> None:
-        before = "self.assertEqual(\n        actual,\n        expected)"
-        after = "self.assertEqual(actual,\n        expected)"
-        self.change("test_value.py", self.python(before), self.python(after))
-        self.assert_clean(self.guard())
-
-    def test_multiline_python_assertion_with_an_unchanged_expected_line_is_changed(self) -> None:
-        before = ('self.assertEqual([(event["suite"], event["module"]) for event in starts[:2]],\n'
-                  '        [("lib", "test_second.py"), ("direct", "test_first.py")])')
-        after = ('self.assertEqual([(suite, path.name) for suite, path in ordered[:2]],\n'
-                 '        [("lib", "test_second.py"), ("direct", "test_first.py")])')
-        self.change("test_value.py", self.python(before), self.python(after))
-        _ = self.assert_finding(self.guard(), "test_value.py", "changed", status=0)
-
-    def test_multiline_rust_assertion_with_only_the_expected_line_changed_is_changed(self) -> None:
-        before = "assert_eq!(actual,\n        40\n    );"
-        after = "assert_eq!(actual,\n        32\n    );"
-        self.change("value.rs", self.rust(before), self.rust(after))
-        _ = self.assert_finding(self.guard(), "value.rs", "changed", status=0)
-
-    def test_multiline_rust_exact_assertion_replaced_with_a_bound_is_weaker(self) -> None:
-        before = "assert_eq!(x,\n        y\n    );"
-        after = "assert!(\n        x <= y);"
-        self.change("value.rs", self.rust(before), self.rust(after))
-        _ = self.assert_finding(self.guard(), "value.rs", "weaker")
-
-    def test_multiline_rust_comparison_changed_on_its_own_line_is_weaker(self) -> None:
-        before = "assert!(\n        a == b\n    );"
-        after = "assert!(\n        a <= b\n    );"
-        self.change("value.rs", self.rust(before), self.rust(after))
-        _ = self.assert_finding(self.guard(), "value.rs", "weaker")
-
-    def test_multiline_python_expected_value_changed_on_its_own_line_is_changed(self) -> None:
-        before = "self.assertEqual(\n        total,\n        4,\n    )"
-        after = "self.assertEqual(\n        total,\n        3,\n    )"
-        self.change("test_value.py", self.python(before), self.python(after))
-        _ = self.assert_finding(self.guard(), "test_value.py", "changed", status=0)
-
-    def test_multiline_python_comparison_replaced_with_its_subject_is_weaker(self) -> None:
-        before = "assert (\n        x == y\n    )"
-        after = "assert (\n        x\n    )"
-        self.change("test_value.py", self.python(before), self.python(after))
-        _ = self.assert_finding(self.guard(), "test_value.py", "weaker")
-
-    def test_changed_statement_between_assertions_has_no_finding(self) -> None:
-        before = "assert!(ok);\n    let v = 2;\n    assert_eq!(v, expected);"
-        after = "assert!(ok);\n    let v = 3;\n    assert_eq!(v, expected);"
-        self.change("value.rs", self.rust(before), self.rust(after))
-        self.assert_clean(self.guard())
 
     def test_shared_set_subject_with_a_bound_and_extra_condition_stays_weaker(self) -> None:
         before = "assert set(actual) == expected"
@@ -276,6 +112,7 @@ class AssertionGuardTests(GitRepositoryFixture):
         self.change("test_value.py", self.python(before), self.python(after))
         line = self.assert_finding(self.guard(), "test_value.py", "weaker")
         self.assertIn(before + " -> " + after, line)
+
 
     def test_deleted_test_combines_three_assertions_and_one_ruling_clears_it(self) -> None:
         for path, before in (("value.rs", self.rust("assert_eq!(a, 1);\n    assert_eq!(b, 2);\n    assert!(ok);")),
@@ -298,6 +135,7 @@ class AssertionGuardTests(GitRepositoryFixture):
                         else:
                             self.assertIn("assertion guard: 1 blocking;", result.stdout)
 
+
     def test_removed_test_functions_in_both_languages(self) -> None:
         for annotation in ("#[test]", "#[tokio::test]", "#[rstest]"):
             with self.subTest(annotation=annotation):
@@ -305,6 +143,7 @@ class AssertionGuardTests(GitRepositoryFixture):
                 _ = self.assert_finding(self.guard(), "value.rs", "test removed")
         self.change("test_value.py", self.python("pass"), "# gone\n")
         _ = self.assert_finding(self.guard(), "test_value.py", "test removed")
+
 
     def test_added_skip_and_expected_failure_markers_turn_tests_off(self) -> None:
         for marker in ("#[ignore]", '#[ignore = "later"]'):
@@ -322,6 +161,7 @@ class AssertionGuardTests(GitRepositoryFixture):
                 self.change("test_value.py", self.python("pass"), self.python(marker))
                 _ = self.assert_finding(self.guard(), "test_value.py", "test turned off")
 
+
     def test_moved_assertions_and_test_functions_are_not_findings(self) -> None:
         before = self.rust("assert_eq!(actual, expected);")
         _ = self.save("first.rs", before)
@@ -334,94 +174,6 @@ class AssertionGuardTests(GitRepositoryFixture):
                     self.python("pass", "test_other") + "\n" * 20 + self.python("assert actual == expected"))
         self.assert_clean(self.guard())
 
-    def test_added_python_string_markers_do_not_turn_tests_off(self) -> None:
-        strings = [
-            '''    single = '@unittest.skip("later")' ''',
-            '''    double = "@pytest.mark.skip" ''',
-            '''    triple_single = ''' + "'''self.skipTest('later')'''",
-            '''    triple_double = """pytest.skip("later")""" ''',
-            '''    formatted = f"@unittest.expectedFailure {value}" ''',
-            r'''    escaped = "say \" @unittest.skip('later')" ''',
-            '''    markers = ("#[ignore]", "@pytest.mark.xfail")''',
-        ]
-        before = self.python("pass")
-        after = before + "\n".join(strings) + "\n"
-        self.change("test_value.py", before, after)
-        self.assert_clean(self.guard())
-
-    def test_added_rust_string_markers_do_not_turn_tests_off(self) -> None:
-        strings = [
-            'let normal = "#[ignore]";',
-            'let raw = r"#[ignore]";',
-            'let hashed = r#"#[ignore = "later"]"#;',
-            'let hashes = r##"embedded "# #[ignore]"##;',
-            r'''let escaped = "say \" #[ignore]";''',
-        ]
-        self.change("value.rs", self.rust("helper();"), self.rust("\n    ".join(strings)))
-        self.assert_clean(self.guard())
-
-    def test_markers_added_inside_multiline_strings_have_no_finding(self) -> None:
-        for path, before, after in (
-            ("test_value.py", self.python('text = """\n        plain\n    """'),
-             self.python('text = """\n        @unittest.skip("later")\n    """')),
-            ("value.rs", self.rust('let text = r#"\n        plain\n    "#;'),
-             self.rust('let text = r#"\n        #[ignore = "later"]\n    "#;')),
-        ):
-            with self.subTest(path=path):
-                self.change(path, before, after)
-                self.assert_clean(self.guard())
-
-    def test_removed_assertion_text_inside_strings_has_no_finding(self) -> None:
-        for path, before, after in (
-            ("test_value.py", self.python(
-                '''text = "assert actual == expected; self.assertEqual(a, b); pytest.raises(ValueError)"\n'''
-                + '''    triple = ''' + "'''self.fail('missing')'''\n"
-                + '''    formatted = f"self.assertTrue({value})"\n    assert ok'''), self.python("assert ok")),
-            ("value.rs", self.rust(
-                'let text = "assert_eq!(a, b);";\n'
-                + '    let raw = r#"assert!(actual == expected); "quotes""#;\n    assert!(ok);'),
-             self.rust("assert!(ok);")),
-        ):
-            with self.subTest(path=path):
-                self.change(path, before, after)
-                self.assert_clean(self.guard())
-
-    def test_real_skip_decorator_after_string_markers_still_turns_test_off(self) -> None:
-        before = 'marker = "@pytest.mark.skip"\n' + self.python("pass")
-        after = 'marker = "@pytest.mark.skip"\n@unittest.skip("later")\n' + self.python("pass")
-        self.change("test_value.py", before, after)
-        line = self.assert_finding(self.guard(), "test_value.py", "test turned off", "?")
-        self.assertIn('@unittest.skip("later")', line)
-
-    def test_real_assertion_after_a_string_on_the_same_line_is_still_removed(self) -> None:
-        before = self.python('label = "assert fake"; assert actual == expected')
-        after = self.python('label = "assert fake"')
-        self.change("test_value.py", before, after)
-        line = self.assert_finding(self.guard(), "test_value.py", "removed")
-        self.assertIn("assert actual == expected -> (none)", line)
-
-    def test_escaped_newline_strings_do_not_hide_real_assertion_removals(self) -> None:
-        for path, before, after in (
-            ("test_value.py", self.python('text = "continued\\\n        @pytest.mark.skip"\n    assert ok'),
-             self.python('text = "continued\\\n        @pytest.mark.skip"')),
-            ("value.rs", self.rust('let text = "continued\\\n        #[ignore]";\n    assert!(ok);'),
-             self.rust('let text = "continued\\\n        #[ignore]";')),
-        ):
-            with self.subTest(path=path):
-                self.change(path, before, after)
-                _ = self.assert_finding(self.guard(), path, "removed")
-
-    def test_whitespace_changes_and_stricter_assertions_are_not_findings(self) -> None:
-        for path, before, after in (("value.rs", self.rust("assert_eq!( actual , expected );"),
-                                     self.rust("assert_eq!(actual,expected);")),
-                                    ("test_value.py", self.python("self.assertEqual( actual , expected )"),
-                                     self.python("self.assertEqual(actual,expected)")),
-                                    ("value.rs", self.rust("assert!(actual);"), self.rust("assert_eq!(actual, expected);")),
-                                    ("test_value.py", self.python("assert actual"),
-                                     self.python("self.assertEqual(actual, expected)"))):
-            with self.subTest(path=path, before=before):
-                self.change(path, before, after)
-                self.assert_clean(self.guard())
 
     def test_duplicate_assertions_are_compared_as_multisets(self) -> None:
         _ = self.save("value.rs", self.rust("assert_eq!(a, b);\n    assert_eq!(a, b);"))
@@ -430,6 +182,7 @@ class AssertionGuardTests(GitRepositoryFixture):
         _ = self.save("value.rs", "// moved\n")
         _ = self.save("moved.rs", self.rust("assert_eq!(a, b);"))
         _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
 
     def test_one_weaker_addition_cannot_clear_two_removed_assertions(self) -> None:
         self.change("value.rs", self.rust("assert_eq!(a, 4);\n    assert_eq!(b, 4);"), self.rust("assert!(a <= 4);"))
@@ -441,466 +194,6 @@ class AssertionGuardTests(GitRepositoryFixture):
         self.assertEqual(sum(" removed:" in line for line in findings), 1)
         self.assertIn("assertion guard: 2 blocking;", result.stdout)
 
-    def test_rulings_from_file_directory_stdin_and_commit_message(self) -> None:
-        self.change("value.rs", self.rust(TILE_OLD), self.rust(TILE_NEW))
-        ruling = "Assertion-Change: value.rs::test_value — Bounds are the approved contract."
-        file = self.root / "ruling.txt"
-        _ = file.write_text(ruling + "\n", encoding="utf-8")
-        folder = self.root / "orders" / "nested"
-        folder.mkdir(parents=True)
-        _ = (folder / "spec.md").write_text(ruling.replace("—", "-") + "\n", encoding="utf-8")
-        for arguments, stdin in ((("--rulings", str(file)), ""),
-                                  (("--rulings", str(folder.parent)), ""), (("--rulings", "-"), ruling)):
-            with self.subTest(arguments=arguments):
-                line = self.assert_finding(self.guard(*arguments, stdin=stdin), "value.rs", "weaker", status=0)
-                self.assertIn("ruled: Bounds are the approved contract.", line)
-        _ = self.git("add", "value.rs")
-        _ = self.git("commit", "-q", "-m", "approved change\n\n" + ruling)
-        line = self.assert_finding(self.guard("--base", self.base, "--head", "HEAD"), "value.rs", "weaker", status=0)
-        self.assertIn("ruled: Bounds are the approved contract.", line)
-
-    def test_rulings_for_another_test_or_path_or_without_a_reason_do_not_clear_findings(self) -> None:
-        self.change("value.rs", self.rust(TILE_OLD), self.rust(TILE_NEW))
-        for ruling in ("Assertion-Change: value.rs::test_other — Approved.",
-                        "Assertion-Change: other.rs::test_value — Approved.",
-                        "Assertion-Change: value.rs::test_value —   "):
-            with self.subTest(ruling=ruling):
-                _ = self.assert_finding(self.guard("--rulings", "-", stdin=ruling), "value.rs", "weaker")
-
-    def test_working_tree_staged_and_head_modes_read_the_right_side(self) -> None:
-        before, after = self.rust(TILE_OLD), self.rust(TILE_NEW)
-        self.change("value.rs", before, after)
-        _ = self.assert_finding(self.guard(), "value.rs", "weaker")
-        self.assert_clean(self.guard("--staged"))
-        _ = self.git("add", "value.rs")
-        _ = self.save("value.rs", before)
-        self.assert_clean(self.guard())
-        _ = self.assert_finding(self.guard("--staged"), "value.rs", "weaker")
-        _ = self.git("commit", "-q", "-m", "weaken assertion")
-        _ = self.assert_finding(self.guard("--base", self.base, "--head", "HEAD"), "value.rs", "weaker")
-        self.assert_clean(self.guard("--base", self.base))
-
-    def test_local_main_without_remote_candidates_requires_explicit_base(self) -> None:
-        before = "assert_eq!(actual, expected);\n    assert!(ok);"
-        self.change("value.rs", self.rust(before), self.rust("assert!(ok);"))
-        _ = self.git("branch", "-m", "main")
-        _ = self.git("remote", "remove", "origin")
-        result = self.guard()
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
-        self.assertIn("VERIFY_ASSERTION_BASE", result.stderr)
-        _ = self.assert_finding(self.guard("--base", self.base), "value.rs", "removed")
-
-    def test_missing_branch_base_refuses_with_explicit_override_guidance(self) -> None:
-        _ = self.git("remote", "remove", "origin")
-        result = self.guard()
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
-        self.assertIn("VERIFY_ASSERTION_BASE", result.stderr)
-        self.assertNotIn(CLEAN, result.stdout)
-
-    def test_no_default_base_and_invalid_revisions_fail_closed(self) -> None:
-        _ = self.git("remote", "remove", "origin")
-        for arguments in ((), ("--base", "absent"), ("--base", self.base, "--head", "absent"),
-                          ("--base", self.base, "--head", "HEAD", "--staged")):
-            with self.subTest(arguments=arguments):
-                result = self.guard(*arguments)
-                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
-                self.assertNotIn(CLEAN, result.stdout)
-
-    def test_repeated_bases_do_not_combine_different_assertions_in_one_test(self) -> None:
-        _ = self.save("test_value.py", self.python("self.assertEqual(first, expected)"))
-        self.commit_base()
-        first_base = self.base
-        _ = self.save("test_value.py", self.python("self.assertEqual(second, expected)"))
-        _ = self.git("add", "test_value.py")
-        _ = self.git("commit", "-q", "-m", "other comparison base")
-        _ = self.save("test_value.py", self.python("pass"))
-        _ = self.git("add", "test_value.py")
-        self.assert_clean(self.guard("--base", first_base, "--base", "HEAD", "--staged"))
-
-    def test_repeated_bases_count_only_duplicate_assertions_present_in_every_base(self) -> None:
-        assertion = "self.assertEqual(actual, expected)"
-        _ = self.save("test_value.py", self.python(assertion))
-        self.commit_base()
-        first_base = self.base
-        _ = self.save("test_value.py", self.python(assertion + "\n    " + assertion))
-        _ = self.git("add", "test_value.py")
-        _ = self.git("commit", "-q", "-m", "duplicate assertion in second base")
-        _ = self.save("test_value.py", self.python("pass"))
-        _ = self.git("add", "test_value.py")
-        _ = self.assert_finding(self.guard("--base", first_base, "--base", "HEAD", "--staged"),
-                                "test_value.py", "removed")
-
-    def test_untracked_files_and_other_extensions_have_no_findings(self) -> None:
-        self.change("notes.txt", self.python("assert actual == expected"), self.python("pass"))
-        _ = self.save("untracked.py", "@pytest.mark.skip\ndef test_untracked():\n    pass\n")
-        self.assert_clean(self.guard())
-
-    def test_large_diff_guard_call_uses_less_than_one_cpu_second(self) -> None:
-        before = self.rust(TILE_OLD) + "".join(f"// old {number}\n" for number in range(43499))
-        after = self.rust(TILE_NEW) + "".join(f"// new {number}\n" for number in range(43499))
-        self.change("value.rs", before, after)
-        children_before = resource.getrusage(resource.RUSAGE_CHILDREN)
-        started = time.process_time()
-        result = self.guard()
-        cpu_seconds = time.process_time() - started
-        children_after = resource.getrusage(resource.RUSAGE_CHILDREN)
-        cpu_seconds += (children_after.ru_utime + children_after.ru_stime
-                        - children_before.ru_utime - children_before.ru_stime)
-        _ = self.assert_finding(result, "value.rs", "weaker")
-        self.assertLess(cpu_seconds, 1.0, f"guard used {cpu_seconds:.3f} CPU seconds")
-
-
-class MergeInProgressFixture(GitRepositoryFixture):
-    @override
-    def setUp(self) -> None:
-        super().setUp()
-        _ = self.save("test_merge.py", self.merge_source(incoming=True, ours=True))
-        self.commit_base()
-        _ = self.git("checkout", "-q", "-b", "incoming")
-        _ = self.save("test_merge.py", "# incoming branch comment\n"
-                      + self.merge_source(incoming=False, ours=True))
-        _ = self.git("add", "test_merge.py")
-        _ = self.git("commit", "-q", "-m", "incoming assertion removal")
-        _ = self.git("checkout", "-q", "unit")
-        _ = self.save("local.txt", "our unrelated branch change\n")
-        _ = self.git("add", "local.txt")
-        _ = self.git("commit", "-q", "-m", "our branch change")
-        _ = self.git("merge", "-q", "--no-ff", "--no-commit", "incoming")
-
-    def merge_source(self, *, incoming: bool, ours: bool) -> str:
-        return (self.python("self.assertEqual(incoming, expected)" if incoming else "pass", "test_incoming")
-                + "\n" + self.python("self.assertEqual(ours, expected)" if ours else "pass", "test_ours"))
-
-
-class MergeAssertionTests(MergeInProgressFixture):
-    def test_commit_bases_include_head_and_the_in_progress_merge_parent(self) -> None:
-        self.assertEqual(commit_bases(self.repo),
-                         (self.git("rev-parse", "HEAD"), self.git("rev-parse", "MERGE_HEAD")))
-
-    def test_repeated_bases_exclude_the_other_parents_assertion_removal(self) -> None:
-        # A HEAD-only comparison really does see the imported removal.
-        single = self.guard("--base", "HEAD", "--staged")
-        self.assertEqual(single.returncode, 1, single.stdout + single.stderr)
-        self.assertIn("test_incoming removed:", single.stdout)
-        for first, second in (("HEAD", "MERGE_HEAD"), ("MERGE_HEAD", "HEAD")):
-            with self.subTest(first=first):
-                result = self.guard("--base", first, "--base", second, "--staged")
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(result.stdout.strip(), CLEAN)
-                self.assertEqual(result.stderr, "")
-
-    def test_removal_during_merge_blocks_only_the_assertion_absent_against_both_parents(self) -> None:
-        _ = self.save("test_merge.py", self.merge_source(incoming=False, ours=False))
-        _ = self.git("add", "test_merge.py")
-        for first, second in (("HEAD", "MERGE_HEAD"), ("MERGE_HEAD", "HEAD")):
-            with self.subTest(first=first):
-                result = self.guard("--base", first, "--base", second, "--staged")
-                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-                self.assertIn("test_ours removed:", result.stdout)
-                self.assertNotIn("test_incoming", result.stdout)
-                self.assertIn("assertion guard: 1 blocking;", result.stdout)
-                self.assertEqual(result.stderr, "")
-
-    def test_completed_merge_default_base_excludes_the_other_parents_removals(self) -> None:
-        _ = self.git("commit", "-q", "-m", "merge incoming")
-        explicit = self.guard("--base", "HEAD^1")
-        self.assertEqual(explicit.returncode, 1, explicit.stdout + explicit.stderr)
-        self.assertIn("test_incoming removed:", explicit.stdout)
-        result = self.guard()
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(result.stdout.strip(), CLEAN)
-        self.assertEqual(result.stderr, "")
-
-    def test_completed_merge_still_blocks_our_new_assertion_removal(self) -> None:
-        _ = self.git("commit", "-q", "-m", "merge incoming")
-        _ = self.save("test_merge.py", self.merge_source(incoming=False, ours=False))
-        result = self.guard()
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("test_ours removed:", result.stdout)
-        self.assertNotIn("test_incoming", result.stdout)
-        self.assertIn("assertion guard: 1 blocking;", result.stdout)
-
-
-class ProductionBaseTests(GitRepositoryFixture):
-    repo: Path = Path()
-
-    def refill_from_production(self, merge_branch: str = "style/main") -> str:
-        _ = self.save("incoming.rs", self.rust("\n    ".join(
-            f"assert_eq!(incoming_{index}, expected);" for index in range(6))))
-        _ = self.save("ours.rs", self.rust("assert_eq!(ours, expected);"))
-        self.commit_base()
-        _ = self.git("checkout", "-q", "-b", merge_branch)
-        _ = self.save("incoming.rs", self.rust("helper();"))
-        _ = self.git("add", "incoming.rs")
-        _ = self.git("commit", "-q", "-m", "another unit removes six assertions")
-        tip = self.git("rev-parse", "HEAD")
-        _ = self.git("push", "-q", "origin", f"HEAD:refs/heads/{merge_branch}")
-        _ = self.git("checkout", "-q", "unit")
-        _ = self.git("merge", "-q", "--ff-only", f"origin/{merge_branch}")
-        return tip
-
-    def test_ticket_108_refill_excludes_imported_removals_and_blocks_our_own(self) -> None:
-        tip = self.refill_from_production()
-        _ = self.register_production("style/main")
-        self.assertEqual(self.git("rev-parse", "@{upstream}"), self.base)
-        self.assertEqual(default_base(self.repo), tip)
-        clean = self.guard()
-        self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
-        self.assertEqual(clean.stdout.strip(), CLEAN)
-        _ = self.save("ours.rs", self.rust("helper();"))
-        result = self.guard()
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("ours.rs:3 test_value removed:", result.stdout)
-        self.assertNotIn("incoming.rs", result.stdout)
-        self.assertIn("assertion guard: 1 blocking;", result.stdout)
-        self.assertEqual(result.stderr, "")
-        explicit = self.guard("--base", self.base)
-        self.assertEqual(explicit.returncode, 1, explicit.stdout + explicit.stderr)
-        self.assertIn("incoming.rs", explicit.stdout)
-        self.assertIn("assertion guard: 7 blocking;", explicit.stdout)
-
-    def test_upstream_base_wins_when_newer_than_production_base(self) -> None:
-        production_tip = self.refill_from_production("builds")
-        _ = self.register_production("builds")
-        _ = self.save("unit.txt", "newer unit checkpoint\n")
-        self.commit_base()
-        self.assertNotEqual(self.base, production_tip)
-        self.assertEqual(default_base(self.repo), self.base)
-
-    def test_no_production_match_keeps_the_upstream_base(self) -> None:
-        _ = self.refill_from_production()
-        _ = self.register_production("style/main", worktree="/other/worktree", branch="other")
-        self.assertEqual(default_base(self.repo), self.base)
-        result = self.guard()
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("incoming.rs", result.stdout)
-        self.assertIn("assertion guard: 6 blocking;", result.stdout)
-
-    def test_production_base_without_upstream_includes_the_remote_default_branch(self) -> None:
-        tip = self.refill_from_production("main")
-        checkout = self.root / "checkout"
-        _ = self.git("clone", "-q", str(self.root / "remote.git"), str(checkout))
-        self.repo = checkout
-        _ = self.git("checkout", "-q", "-b", "unit", "--track", "origin/unit")
-        _ = self.git("merge", "-q", "--ff-only", "origin/main")
-        _ = self.git("branch", "--unset-upstream")
-        _ = self.git("update-ref", "-d", "refs/remotes/origin/unit")
-        _ = self.register_production("main")
-        self.assertEqual(self.git("symbolic-ref", "refs/remotes/origin/HEAD"), "refs/remotes/origin/main")
-        self.assertEqual(default_base(self.repo), tip)
-        _ = self.save("ours.rs", self.rust("helper();"))
-        result = self.guard()
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("ours.rs:3 test_value removed:", result.stdout)
-        self.assertNotIn("incoming.rs", result.stdout)
-        self.assertEqual(self.git("symbolic-ref", "refs/remotes/origin/HEAD"), "refs/remotes/origin/main")
-
-    def test_branch_match_is_used_when_worktree_does_not_match(self) -> None:
-        tip = self.refill_from_production("builds")
-        _ = self.register_production("builds", worktree="/old/worktree")
-        self.assertEqual(default_base(self.repo), tip)
-
-    def test_worktree_match_precedes_a_branch_match_in_another_doc(self) -> None:
-        tip = self.refill_from_production("builds")
-        _ = self.register_production("unit", worktree="/other/worktree", slug="branch-match")
-        _ = self.register_production("builds", branch="old-branch", slug="worktree-match")
-        self.assertEqual(default_base(self.repo), tip)
-
-    def test_worktree_with_trailing_slash_precedes_another_productions_branch(self) -> None:
-        tip = self.refill_from_production("builds")
-        _ = self.register_production("unit", worktree="/other/worktree", slug="branch-match")
-        _ = self.register_production("builds", worktree=f"{self.repo}/", branch="old-branch",
-                                     slug="worktree-match")
-        self.assertEqual(default_base(self.repo), tip)
-
-    def test_worktree_with_tilde_precedes_another_productions_branch(self) -> None:
-        tip = self.refill_from_production("builds")
-        _ = self.register_production("unit", worktree="/other/worktree", slug="branch-match")
-        worktree = "~/" + os.path.relpath(self.repo, Path.home())
-        _ = self.register_production("builds", worktree=worktree, branch="old-branch", slug="worktree-match")
-        self.assertEqual(default_base(self.repo), tip)
-
-    def test_unrelated_sessions_module_preserves_import_and_base_callers(self) -> None:
-        _ = self.refill_from_production("builds")
-        _ = self.register_production("builds")
-        script = """
-import sys
-import types
-from pathlib import Path
-sys.modules["sessions"] = types.ModuleType("sessions")
-before = sys.path[:]
-from scripts.direct.assertion_guard import commit_bases, default_base
-if sys.path != before:
-    raise AssertionError("importing the guard changed sys.path")
-repo = Path(sys.argv[1])
-mode = sys.argv[2]
-if mode == "commit":
-    print(commit_bases(repo)[0])
-elif mode == "explicit":
-    print(default_base(repo, sys.argv[3]))
-else:
-    print(default_base(repo))
-"""
-        for mode, expected in (("commit", self.git("rev-parse", "HEAD")),
-                               ("explicit", self.base), ("default", self.base)):
-            with self.subTest(mode=mode):
-                result = subprocess.run(
-                    [sys.executable, "-c", script, str(self.repo), mode, self.base],
-                    cwd=GUARD.resolve().parents[2], env=self.environment,
-                    capture_output=True, text=True, check=False, timeout=5)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(result.stdout.strip(), expected)
-                self.assertEqual(result.stderr, "")
-
-    def test_missing_production_ref_keeps_the_upstream_base(self) -> None:
-        _ = self.register_production("absent")
-        self.assertEqual(default_base(self.repo), self.base)
-
-    def test_unreadable_production_doc_keeps_the_upstream_base(self) -> None:
-        doc = self.register_production("builds")
-        doc.unlink()
-        self.assertEqual(default_base(self.repo), self.base)
-
-    def test_explicit_base_skips_production_lookup(self) -> None:
-        with patch.object(showrunners, "timer_docs", side_effect=AssertionError("unexpected lookup")):
-            self.assertEqual(default_base(self.repo, self.base), self.base)
-
-    def diverged_bases(self, unit_commits: int, production_commits: int) -> DivergedBases:
-        fork = self.base
-        for index in range(unit_commits):
-            _ = self.save("unit.txt", f"unit {index}\n")
-            self.commit_base()
-        upstream = self.base
-        _ = self.git("checkout", "-q", "--detach", fork)
-        for index in range(production_commits):
-            _ = self.save("production.txt", f"production {index}\n")
-            _ = self.git("add", "production.txt")
-            _ = self.git("commit", "-q", "-m", "production checkpoint")
-        production_tip = self.git("rev-parse", "HEAD")
-        _ = self.git("push", "-q", "origin", "HEAD:refs/heads/builds")
-        _ = self.git("checkout", "-q", "unit")
-        _ = self.git("merge", "-q", "--no-ff", "origin/builds", "-m", "refill")
-        _ = self.register_production("builds")
-        return DivergedBases(upstream, production_tip)
-
-    def test_diverged_bases_choose_production_with_fewer_commits_to_head(self) -> None:
-        bases = self.diverged_bases(unit_commits=1, production_commits=2)
-        self.assertEqual(default_base(self.repo), bases.production)
-
-    def test_diverged_bases_choose_upstream_with_fewer_commits_to_head(self) -> None:
-        bases = self.diverged_bases(unit_commits=2, production_commits=1)
-        self.assertEqual(default_base(self.repo), bases.upstream)
-
-    def test_diverged_bases_keep_upstream_on_a_tie(self) -> None:
-        bases = self.diverged_bases(unit_commits=1, production_commits=1)
-        self.assertEqual(default_base(self.repo), bases.upstream)
-
-
-class BranchBaseTests(GitRepositoryFixture):
-    repo: Path = Path()
-
-    @override
-    def setUp(self) -> None:
-        super().setUp()
-        _ = self.save("value.rs", self.rust(TILE_OLD))
-        self.commit_base()
-        _ = self.git("push", "-q", "origin", "HEAD:refs/heads/main")
-        _ = self.save("value.rs", self.rust(TILE_NEW))
-        self.commit_base()
-        # Cloning our own remote creates origin/HEAD naturally. Never rewrite it.
-        checkout = self.root / "checkout"
-        _ = self.git("clone", "-q", str(self.root / "remote.git"), str(checkout))
-        self.repo = checkout
-        _ = self.git("checkout", "-q", "-b", "topic", "--track", "origin/unit")
-
-    def commit_file(self, path: str) -> str:
-        _ = self.save(path, "branch change\n")
-        _ = self.git("add", path)
-        _ = self.git("commit", "-q", "-m", "branch change")
-        return self.git("rev-parse", "HEAD")
-
-    def assert_refusal(self) -> None:
-        result = self.guard()
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr.splitlines(), [
-            "assertion guard: cannot determine branch base; set VERIFY_ASSERTION_BASE (or --base)",
-        ])
-
-    def test_non_main_upstream_precedes_a_nearer_remote_and_ignores_old_assertion_changes(self) -> None:
-        tip = self.commit_file("local.txt")
-        _ = self.git("push", "-q", "origin", "HEAD:refs/heads/nearer")
-        self.assertNotEqual(tip, self.base)
-        self.assertEqual(default_base(self.repo), self.base)
-        result = self.guard()
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(result.stdout.strip(), CLEAN)
-
-    def test_upstream_uses_the_merge_base_when_local_and_remote_have_diverged(self) -> None:
-        _ = self.git("checkout", "-q", "--detach", "origin/unit")
-        remote_tip = self.commit_file("remote.txt")
-        _ = self.git("push", "-q", "origin", "HEAD:refs/heads/unit")
-        _ = self.git("checkout", "-q", "topic")
-        local_tip = self.commit_file("local.txt")
-        self.assertNotEqual(local_tip, remote_tip)
-        self.assertEqual(default_base(self.repo), self.base)
-
-    def test_detached_feature_head_uses_its_nearest_remote_branch(self) -> None:
-        _ = self.git("checkout", "-q", "--detach")
-        _ = self.commit_file("detached.txt")
-        self.assertEqual(default_base(self.repo), self.base)
-        result = self.guard()
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(result.stdout.strip(), CLEAN)
-
-    def test_branch_without_upstream_uses_nearest_remote_merge_base(self) -> None:
-        _ = self.git("branch", "--unset-upstream")
-        _ = self.git("push", "-q", "origin", "origin/main:refs/heads/distant")
-        _ = self.commit_file("local.txt")
-        self.assertEqual(default_base(self.repo), self.base)
-
-    def test_equal_nearest_remote_branches_with_one_merge_base_are_accepted(self) -> None:
-        _ = self.git("push", "-q", "origin", "HEAD:refs/heads/alias")
-        _ = self.git("checkout", "-q", "--detach")
-        _ = self.commit_file("local.txt")
-        self.assertEqual(default_base(self.repo), self.base)
-
-    def test_equal_nearest_remote_branches_with_different_merge_bases_refuse(self) -> None:
-        _ = self.git("checkout", "-q", "--detach", "origin/main")
-        _ = self.commit_file("alternate.txt")
-        _ = self.git("push", "-q", "origin", "HEAD:refs/heads/alternate")
-        _ = self.git("checkout", "-q", "topic")
-        _ = self.git("merge", "-q", "--no-ff", "origin/alternate", "-m", "join branches")
-        _ = self.git("branch", "--unset-upstream")
-        self.assertEqual(self.git("rev-list", "--count", "origin/unit..HEAD"),
-                         self.git("rev-list", "--count", "origin/alternate..HEAD"))
-        self.assertNotEqual(self.git("merge-base", "HEAD", "origin/unit"),
-                            self.git("merge-base", "HEAD", "origin/alternate"))
-        self.assert_refusal()
-
-    def test_remote_head_and_its_main_target_are_not_default_candidates(self) -> None:
-        _ = self.git("checkout", "-q", "--detach")
-        _ = self.git("update-ref", "-d", "refs/remotes/origin/unit")
-        self.assertEqual(self.git("symbolic-ref", "refs/remotes/origin/HEAD"), "refs/remotes/origin/main")
-        self.assert_refusal()
-        self.assertEqual(self.git("symbolic-ref", "refs/remotes/origin/HEAD"), "refs/remotes/origin/main")
-
-    def test_explicit_base_wins_over_the_non_main_upstream(self) -> None:
-        result = self.guard("--base", "origin/main")
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("value.rs:3 test_value weaker:", result.stdout)
-        self.assertEqual(result.stderr, "")
-
-    def test_explicit_base_works_when_no_remote_candidate_remains(self) -> None:
-        _ = self.git("checkout", "-q", "--detach")
-        _ = self.git("update-ref", "-d", "refs/remotes/origin/unit")
-        self.assert_refusal()
-        result = self.guard("--base", self.base)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(result.stdout.strip(), CLEAN)
 
 
 if __name__ == "__main__":

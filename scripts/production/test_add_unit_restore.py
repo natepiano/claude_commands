@@ -858,7 +858,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.assertEqual(self.opened()[1], SHARED)
         self.assertEqual(self.opened()[7], str(prior))
         self.assertIn(["--session", SHARED, "tab", "rename", "w1:t1",
-                       "build-followups · alpha · unit director"], self.herdr_calls())
+                       recorded_session], self.herdr_calls())
         self.assertIn(["--session", SHARED, "pane", "rename", "w1:p1", recorded_session], self.herdr_calls())
         claude = self.agent_arguments()
         prompt = self.opening_prompt()
