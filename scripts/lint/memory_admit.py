@@ -422,6 +422,10 @@ class WaiterGone(FileNotFoundError):
     """The requested waiter has left the admission ledger."""
 
 
+class UnmatchedWaiter(ValueError):
+    """A bump selector matched no waiting step, or more than one."""
+
+
 def blocker_fields(blocker: Blocker) -> dict[str, str]:
     if isinstance(blocker, ReservationBlocker):
         return {"session_id": blocker.session_id, "session_name": blocker.session_name, "pool": blocker.pool}
@@ -1576,7 +1580,7 @@ def bump_waiter(selector: str, actor: str) -> WaitingStep:
         if len(matches) != 1:
             labels = ", ".join(f"{position + 1}: {item.session_name or item.session_id or item.pid} {item.folder}"
                                for position, item in enumerate(view.waiting) if not matches or position in matches)
-            raise ValueError(f"{selector!r}: {'unknown' if not matches else 'ambiguous'} waiter; matches: {labels or 'none'}")
+            raise UnmatchedWaiter(f"{selector!r}: {'unknown' if not matches else 'ambiguous'} waiter; matches: {labels or 'none'}")
         position = matches[0]
         moved = view.waiting[position]
         path, row = ordered[position]

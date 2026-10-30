@@ -75,6 +75,133 @@ class QueueTests(unittest.TestCase):
             self.assertEqual(build_queue.main(), 0)
         return output.getvalue()
 
+    def json_output(self, view: memory_admit.QueueView) -> build_queue.QueueSnapshot:
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch.object(memory_admit, "queue_view", return_value=view) as read, \
+             mock.patch("sys.argv", ["build_queue.py", "--json"]), \
+             redirect_stdout(output), redirect_stderr(errors):
+            self.assertEqual(build_queue.main(), 0)
+        read.assert_called_once_with()
+        self.assertEqual(errors.getvalue(), "")
+        return cast(build_queue.QueueSnapshot, json.loads(output.getvalue()))
+
+    def test_json_cli_matches_text_cells_and_preserves_all_roster_problems(self) -> None:
+        self.roster_read.return_value = roster.Roster([
+            self.entry("worker-id", "shown-worker", codex=True,
+                       showrunner=roster.UnderShowrunner("builds", "director", "session:director"),
+                       director=roster.UnderDirector("report-unit", "report", "session:report")),
+        ], ["first roster problem", "second roster problem"])
+        running = (
+            memory_admit.RunningStep("worker-id", "old-name", "lint", "/tmp/tree", 8 * GIB,
+                                    memory_admit.MeasuredMemory(GIB)),
+            memory_admit.RunningStep("starting", "starting", "doc", "/tmp/docs", 2 * GIB,
+                                    memory_admit.PromisedMemory(2 * GIB)),
+            memory_admit.RunningStep("ended", "ended", "check", "/tmp/gone", GIB,
+                                    memory_admit.GoneMemory()),
+        )
+        waiting = memory_admit.WaitingStep(10, "worker-id", "old-name", "nextest", "/tmp/tree",
+                                          NOW - 300, 12 * GIB, memory_admit.ReadyForAdmission())
+        view = memory_admit.QueueView((waiting,), running, 20 * GIB, 2 * GIB, 3 * GIB, NOW)
+        snapshot = self.json_output(view)
+        text = self.cli_output(view)
+        cells = [[cell.strip() for cell in line.split("|")[1:-1]]
+                 for line in text.splitlines() if line.startswith("| ") and "| --- |" not in line]
+        self.assertEqual(cells, [snapshot["running_header"], *snapshot["running"],
+                                 snapshot["waiting_header"], *snapshot["waiting"]])
+        self.assertEqual(snapshot["running"][0], [
+            "1", "builds", "report", "shown-worker", "lint", "tree", "8.0 GiB", "1.0 GiB", "7.0 GiB", "measured"])
+        self.assertEqual(snapshot["running"][1][-4:], ["2.0 GiB", "—", "—", "starting"])
+        self.assertEqual(snapshot["waiting"][0][6], "14:55 (5 min)")
+        self.assertEqual(snapshot["totals"], {
+            "promised": "10.0 GiB", "measured": "1.0 GiB", "free": "20.0 GiB", "reserve": "3.0 GiB"})
+        self.assertIn(snapshot["head"]["text"], text.splitlines())
+        self.assertLess(text.index(snapshot["head"]["text"]), text.index("**Waiting**"))
+        self.assertEqual(snapshot["problems"], ["first roster problem", "second roster problem"])
+
+    def test_json_empty_tables_are_arrays_and_do_not_invent_a_head(self) -> None:
+        snapshot = self.json_output(memory_admit.QueueView((), (), 20 * GIB, 0, GIB, NOW))
+        self.assertEqual(snapshot["running"], [])
+        self.assertEqual(snapshot["waiting"], [])
+        self.assertEqual(snapshot["head"], {"text": "", "tone": "default"})
+        self.assertEqual(snapshot["problems"], [])
+        self.assertEqual(snapshot["totals"]["promised"], "0.0 GiB")
+
+    def test_budget_head_names_every_charged_step_with_its_actual_measured_use(self) -> None:
+        running = (
+            memory_admit.RunningStep("holder", "stale-name", "nextest", "/tmp/title", int(10.8 * GIB),
+                                    memory_admit.MeasuredMemory(int(0.5 * GIB), observed_peak=int(10.8 * GIB))),
+            memory_admit.RunningStep("starting", "starting-worker", "doc", "/tmp/docs", 4 * GIB,
+                                    memory_admit.PromisedMemory(4 * GIB)),
+            memory_admit.RunningStep("gone", "ended-worker", "check", "/tmp/gone", GIB,
+                                    memory_admit.GoneMemory()),
+        )
+        need, available = 12 * GIB, 30 * GIB
+        with mock.patch.dict(os.environ, {"BUILDLOG_BUILD_BUDGET_GIB": "20"}):
+            decision = memory_admit.decide(available, 60 * GIB, need, [step.measured for step in running])
+        row: memory_admit.Waiter = {"pid": 10, "start_time": "10", "need": need, "since": NOW - 300}
+        head = memory_admit.WaitingStep(10, "head", "head-worker", "check", "/tmp/head", row["since"], need,
+                                       memory_admit.head_wait_reason(decision, need, available, row, NOW))
+        entries = [self.entry("holder", "widget-enhancements-title", codex=True)]
+        view = memory_admit.QueueView((head,), running, available, 4 * GIB, 3 * GIB, NOW)
+        snapshot = build_queue.queue_snapshot(view, ZoneInfo("UTC"), entries)
+        line = snapshot["head"]["text"]
+        self.assertIn("widget-enhancements-title nextest: charged 10.8 GiB, using 0.5 GiB", line)
+        self.assertIn("starting-worker doc: charged 4.0 GiB, using — (starting)", line)
+        self.assertIn("builds use 14.8 of the 20.0 GiB budget", line)
+        self.assertNotIn("stale-name", line)
+        self.assertNotIn("ended-worker", line)
+        self.assertEqual(snapshot["head"]["tone"], "default")
+
+    def test_free_memory_head_uses_the_existing_decision_threshold_and_available_reading(self) -> None:
+        need, available = 8 * GIB, 7 * GIB
+        decision = memory_admit.decide(available, 60 * GIB, need, [])
+        row: memory_admit.Waiter = {"pid": 10, "start_time": "10", "need": need, "since": NOW - 300}
+        head = memory_admit.WaitingStep(10, "head", "head-worker", "check", "/tmp/head", row["since"], need,
+                                       memory_admit.head_wait_reason(decision, need, available, row, NOW))
+        view = memory_admit.QueueView((head,), (), available, 0, 3 * GIB, NOW)
+        with mock.patch.object(memory_admit, "decide", side_effect=AssertionError("Do not decide again")):
+            line = build_queue.head_line(view, {}, ZoneInfo("UTC"))
+        self.assertIn("needs 11.0 GiB free: this step 8.0, earlyoom 3.0", line["text"])
+        self.assertIn("free 7.0 GiB, step needs 8.0 GiB", line["text"])
+        self.assertEqual(line["tone"], "default")
+
+    def test_pressure_head_uses_the_pressure_decision_instead_of_a_budget_explanation(self) -> None:
+        need, available = 8 * GIB, 30 * GIB
+        with mock.patch.dict(os.environ, {"BUILDLOG_BUILD_BUDGET_GIB": "20"}):
+            decision = memory_admit.decide(available, 60 * GIB, need,
+                                           [memory_admit.MeasuredMemory(19 * GIB)],
+                                           pressure=memory_admit.MemoryPressure(23.4))
+        row: memory_admit.Waiter = {"pid": 10, "start_time": "10", "need": need, "since": NOW - 300}
+        head = memory_admit.WaitingStep(10, "head", "head-worker", "check", "/tmp/head", row["since"], need,
+                                       memory_admit.head_wait_reason(decision, need, available, row, NOW))
+        running = memory_admit.RunningStep("other", "other", "doc", "/tmp/other", 19 * GIB,
+                                          memory_admit.MeasuredMemory(19 * GIB))
+        line = build_queue.head_line(memory_admit.QueueView((head,), (running,), available, 0, 3 * GIB, NOW),
+                                     {}, ZoneInfo("UTC"))
+        self.assertIn("memory pressure: full avg10 23.4", line["text"])
+        self.assertNotIn("charged", line["text"])
+        self.assertNotIn("budget", line["text"])
+
+    def test_stalled_head_starts_at_fifteen_minutes_only_when_free_memory_covers_need(self) -> None:
+        for elapsed, available, stalled in ((899, 8 * GIB, False), (900, 8 * GIB, True),
+                                             (901, 8 * GIB - 1, False), (1200, 30 * GIB, True)):
+            with self.subTest(elapsed=elapsed, available=available):
+                head = memory_admit.WaitingStep(10, "head", "worker", "nextest", "/tmp/head", NOW - elapsed,
+                                               8 * GIB, memory_admit.NeedsBuildBudget(8 * GIB, 19 * GIB, 20 * GIB))
+                line = build_queue.queue_snapshot(
+                    memory_admit.QueueView((head,), (), available, 0, 3 * GIB, NOW), ZoneInfo("UTC"))["head"]
+                self.assertEqual(line["text"].startswith("Stalled:"), stalled)
+                self.assertEqual(line["tone"], "error" if stalled else "default")
+
+    def test_unavailable_head_never_claims_a_stall_even_after_fifteen_minutes(self) -> None:
+        head = memory_admit.WaitingStep(10, "head", "worker", "check", "/tmp/head", NOW - 1800,
+                                       0, memory_admit.ReadingUnavailable())
+        line = build_queue.head_line(memory_admit.QueueView((head,), (), 0, 0, 0, NOW), {}, ZoneInfo("UTC"))
+        self.assertIn("memory reading unavailable", line["text"])
+        self.assertNotIn("Stalled:", line["text"])
+        self.assertNotIn("free 0.0", line["text"])
+        self.assertEqual(line["tone"], "default")
+
     def write_waiter(self, pid: int, session: str, name: str, step: str = "nextest") -> Path:
         process = self.root / "proc" / str(pid)
         process.mkdir()
@@ -275,10 +402,10 @@ class QueueTests(unittest.TestCase):
         with mock.patch.object(memory_admit, "bump_waiter", wraps=memory_admit.bump_waiter) as bump, \
              mock.patch("sys.argv", ["build_queue.py", "bump", "shared"]), \
              redirect_stderr(errors), redirect_stdout(output):
-            self.assertEqual(build_queue.main(), 2)
+            self.assertEqual(build_queue.main(), 3)
         bump.assert_not_called()
-        self.assertIn("'shared': ambiguous waiter; matches:", errors.getvalue())
-        self.assertEqual(output.getvalue(), "")
+        self.assertIn("'shared': ambiguous waiter; matches:", output.getvalue())
+        self.assertEqual(errors.getvalue(), "")
         self.assertEqual((first.read_text(), second.read_text()), before)
         self.assertEqual(list((self.root / "buildlog").glob("*/*.jsonl")), [])
 
@@ -323,7 +450,7 @@ class QueueTests(unittest.TestCase):
             memory_admit.RunningStep("three", "", "test", "/three", 8 * GIB, memory_admit.MeasuredMemory(GIB)),
         )
         view = memory_admit.QueueView((waiting,), running, int(23.1 * GIB), pending, 3 * GIB, NOW)
-        line = next(line for line in build_queue.render_queue(view, ZoneInfo("UTC")) if "earlyoom" in line)
+        line = next(line for line in build_queue.render_queue(view, ZoneInfo("UTC")) if line.startswith("| ") and "earlyoom" in line)
         self.assertTrue(line.endswith(
             "11.6 GiB | 23.1 GiB | needs 38.1 GiB free: this step 11.6, "
             + "running steps may grow 23.5, earlyoom 3.0 |"))
@@ -378,7 +505,7 @@ class QueueTests(unittest.TestCase):
             int(10.8 * GIB), memory_admit.NeedsBuildBudget(int(10.8 * GIB), int(17.6 * GIB), 20 * GIB),
         )
         view = memory_admit.QueueView((waiting,), (), 30 * GIB, 0, 3 * GIB, NOW)
-        line = next(line for line in build_queue.render_queue(view, ZoneInfo("UTC")) if "budget" in line)
+        line = next(line for line in build_queue.render_queue(view, ZoneInfo("UTC")) if line.startswith("| ") and "budget" in line)
         self.assertTrue(line.endswith("10.8 GiB | 30.0 GiB | builds use 17.6 of the 20.0 GiB budget |"))
 
     def test_head_reason_names_measured_budget_limit_and_start_level(self) -> None:
@@ -455,7 +582,7 @@ class QueueTests(unittest.TestCase):
         )
         view = memory_admit.QueueView((step, follower), (), 0, 0, 0, NOW)
         lines = build_queue.render_queue(view, ZoneInfo("UTC"))
-        line = next(line for line in lines if "unavailable" in line)
+        line = next(line for line in lines if line.startswith("| ") and "unavailable" in line)
         self.assertTrue(line.endswith("12.0 GiB | — | memory reading unavailable |"))
         for position in (1, 2):
             row = next(line for line in lines if line.startswith(f"| {position} |"))
@@ -555,13 +682,98 @@ class QueueTests(unittest.TestCase):
         print(f"queue render: 20000 rows in {elapsed:.6f} s")
 
     def test_bump_passes_selector_and_caller_and_reports_ambiguous_match(self) -> None:
-        errors = io.StringIO()
+        output = io.StringIO()
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "caller-id", "CODEX_THREAD_ID": ""}), \
-             mock.patch.object(memory_admit, "bump_waiter", side_effect=ValueError("two folders match; use position")) as bump, \
-             mock.patch("sys.argv", ["build_queue.py", "bump", "tree"]), redirect_stderr(errors):
-            self.assertEqual(build_queue.main(), 2)
+             mock.patch.object(memory_admit, "bump_waiter", side_effect=memory_admit.UnmatchedWaiter("two folders match; use position")) as bump, \
+             mock.patch("sys.argv", ["build_queue.py", "bump", "tree"]), redirect_stdout(output):
+            self.assertEqual(build_queue.main(), 3)
         bump.assert_called_once_with("tree", "caller-id")
-        self.assertIn("two folders match; use position", errors.getvalue())
+        self.assertIn("two folders match; use position", output.getvalue())
+
+    def test_unknown_bump_selector_exits_three_with_refusal_only_on_stdout(self) -> None:
+        _ = self.write_waiter(100, "head-id", "head")
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch("sys.argv", ["build_queue.py", "bump", "unknown-worker"]), \
+             redirect_stdout(output), redirect_stderr(errors):
+            self.assertEqual(build_queue.main(), 3)
+        self.assertEqual(output.getvalue(),
+                         "build queue: 'unknown-worker': unknown waiter; matches: 1: head /tmp/tree-100\n")
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(memory_admit.queue_view().waiting[0].session_id, "head-id")
+        self.assertEqual(list((self.root / "buildlog").glob("*/*.jsonl")), [])
+
+    def test_ambiguous_shown_bump_selector_exits_three_without_calling_bump_waiter(self) -> None:
+        _ = self.write_waiter(100, "first-id", "first")
+        _ = self.write_waiter(200, "second-id", "second")
+        self.roster_read.return_value = roster.Roster([
+            self.entry("first-id", "shared"), self.entry("second-id", "shared", codex=True)], [])
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch.object(memory_admit, "bump_waiter") as bump, \
+             mock.patch("sys.argv", ["build_queue.py", "bump", "shared"]), \
+             redirect_stdout(output), redirect_stderr(errors):
+            self.assertEqual(build_queue.main(), 3)
+        bump.assert_not_called()
+        self.assertEqual(output.getvalue(),
+                         "build queue: 'shared': ambiguous waiter; matches: 1: shared /tmp/tree-100, 2: shared /tmp/tree-200\n")
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_bump_queue_read_failures_exit_two_with_diagnostics_only_on_stderr(self) -> None:
+        for error in (PermissionError(13, "Permission denied", "/private/admission/lock"),
+                      ValueError("queue reading invalid")):
+            with self.subTest(error=error):
+                output, errors = io.StringIO(), io.StringIO()
+                with mock.patch.object(memory_admit, "queue_view", side_effect=error), \
+                     mock.patch.object(memory_admit, "bump_waiter") as bump, \
+                     mock.patch("sys.argv", ["build_queue.py", "bump", "unknown-worker"]), \
+                     redirect_stdout(output), redirect_stderr(errors):
+                    self.assertEqual(build_queue.main(), 2)
+                bump.assert_not_called()
+                self.assertEqual(output.getvalue(), "")
+                self.assertEqual(errors.getvalue(), f"build queue: {error}\n")
+
+    def test_bump_lock_oserror_exits_two_with_diagnostics_only_on_stderr(self) -> None:
+        output, errors = io.StringIO(), io.StringIO()
+        error = PermissionError(13, "Permission denied", "/private/admission/lock")
+        with mock.patch.object(memory_admit, "bump_waiter", side_effect=error), \
+             mock.patch("sys.argv", ["build_queue.py", "bump", "unknown-worker"]), \
+             redirect_stdout(output), redirect_stderr(errors):
+            self.assertEqual(build_queue.main(), 2)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(errors.getvalue(), f"build queue: {error}\n")
+
+    def test_bump_locked_queue_valueerror_is_not_a_selector_refusal(self) -> None:
+        _ = self.write_waiter(100, "head-id", "head")
+        view = memory_admit.queue_view()
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch.object(memory_admit, "queue_view", return_value=view), \
+             mock.patch.object(memory_admit, "read_queue", side_effect=ValueError("PRIVATE locked queue reading invalid")) as read, \
+             mock.patch("sys.argv", ["build_queue.py", "bump", "unknown-worker"]), \
+             redirect_stdout(output), redirect_stderr(errors):
+            self.assertEqual(build_queue.main(), 2)
+        read.assert_called_once()
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(errors.getvalue(), "build queue: PRIVATE locked queue reading invalid\n")
+
+    def test_bump_refusal_escapes_control_characters_in_candidate_folders(self) -> None:
+        waiter = self.write_waiter(100, "head-id", "head")
+        row = json.loads(waiter.read_text())
+        row["folder"] = "/tmp/tree\nsecond\rpart\t\x1b\x7f\u0085\u2028"
+        _ = waiter.write_text(json.dumps(row))
+        for selector, entries in (
+            ("unknown-worker", []),
+            ("shared", [self.entry("head-id", "shared"), self.entry("other-id", "shared")]),
+        ):
+            with self.subTest(selector=selector):
+                if entries:
+                    _ = self.write_waiter(200, "other-id", "other")
+                self.roster_read.return_value = roster.Roster(entries, [])
+                output, errors = io.StringIO(), io.StringIO()
+                with mock.patch("sys.argv", ["build_queue.py", "bump", selector]), \
+                     redirect_stdout(output), redirect_stderr(errors):
+                    self.assertEqual(build_queue.main(), 3)
+                self.assertEqual(len(output.getvalue().splitlines()), 1)
+                self.assertIn("/tmp/tree\\nsecond\\rpart\\t\\u001b\\u007f\\u0085\\u2028", output.getvalue())
+                self.assertEqual(errors.getvalue(), "")
 
     def test_bump_cli_moves_the_step_and_names_the_actor_in_output_and_log(self) -> None:
         for pid in (100, 200):

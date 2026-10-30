@@ -43,12 +43,12 @@ including the details to make it clear
 - **Test lanes:** `scripts/buildlog/test_*.py`, `scripts/build_queue/test_build_queue.py`, `mods/unit-board/tests/`.
 - **Test:** `python3 -m unittest <module>` from the worktree root for Python; the mod's test command as its as-built (`docs/as-built/unit-board.md`) names it.
 - **Lint:** `basedpyright <the slot's own Python files>`; footer must read `0 errors, 0 warnings, 0 notes`.
-- **Ownership:** `mods/unit-board/` belongs to natedev's unit-board-unit; the user asked report-unit for this change and allowed shared code (21:00 EDT). The showrunner approved Phases 1 and 2 side by side and told natedev. `scripts/lint/memory_admit.py` is resources-unit's: no edit in Phases 1, 2 and 4 (showrunner, 21:10 EDT); Phase 3 adds its read-only explain function and the waiter's need-source fields (showrunner, 22:0x EDT), and its notice names resources as also-touches, tested against origin/builds-resources. `scripts/hana_shot/hana_shot.py` is screenshot-unit's: edit it only through cargo-berth, and the checkpoint notice names it.
+- **Ownership:** `mods/unit-board/` belongs to natedev's unit-board-unit; the user asked report-unit for this change and allowed shared code (21:00 EDT). The showrunner approved Phases 1 and 2 side by side and told natedev. `scripts/lint/memory_admit.py` is resources-unit's: no edit in Phases 2 and 4 (showrunner, 21:10 EDT); Phase 1 adds only the typed bump refusal `UnmatchedWaiter(ValueError)` (unit director's call 22:3x: the refusal is decided there, so its type lives there); Phase 3 adds its read-only explain function and the waiter's need-source fields (showrunner, 22:0x EDT), and its notice names resources as also-touches, tested against origin/builds-resources. `scripts/hana_shot/hana_shot.py` is screenshot-unit's: edit it only through cargo-berth, and the checkpoint notice names it.
 - **Invariants:** build-log `.jsonl` files are appended and never edited (`store.py` docstring). Shown names are separate short names; only copy folders join showrunner and unit.
 
 ## Phases
 
-### Phase 1 — /build:queue opens a mod pane and says at once why the head waits  · status: todo
+### Phase 1 — /build:queue opens a mod pane and says at once why the head waits  · status: done
 
 #### Work Order
 
@@ -61,10 +61,12 @@ including the details to make it clear
 - Shared code: the accounts pane lifecycle in `hooks/register.tsx` (open, loading, one run per tick, busy guard, 10 s timer, reload restart from `$.ui.panes()`, close, fixed failure reason) becomes one table-pane helper. `/accounts-board` and `/build:queue` both use it; `/accounts-board` behaves exactly as before.
 - `commands/build/queue.md` keeps its frontmatter; its body still runs the script, so a session without the mod still gets the tables, and names `/reload-plugins` for a session started before the mod change.
 - Assertion-Change: `scripts/build_queue/test_build_queue.py` — `test_budget_reason_names_charged_builds_and_the_limit`, `test_memory_reason_names_free_memory_and_earlyoom_reserve` and `test_unavailable_reading_does_not_claim_zero_free_memory` select only table rows (lines that start with `| `), because the head line now holds the same reason text. Each assertion string stays the same.
-- Assertion-Change: `scripts/build_queue/test_build_queue.py` — `test_bump_shared_shown_label_is_ambiguous_even_when_recorded_name_is_unique` and `test_bump_passes_selector_and_caller_and_reports_ambiguous_match` expect exit 3 with the refusal on stdout (was exit 2 on stderr): a selector refusal has its own exit code so the mod forwards only it, never an operational error. Each refusal text check stays.
+- A bump selector refusal is a type: `memory_admit.bump_waiter` raises `UnmatchedWaiter(ValueError)` (beside `WaiterGone`) for an unknown or ambiguous selector, and `build_queue.py` catches only that and its own ambiguous-name refusal; any other error, a `ValueError` from the locked reread included, stays exit 2.
+- Assertion-Change: `scripts/build_queue/test_build_queue.py` — `test_bump_shared_shown_label_is_ambiguous_even_when_recorded_name_is_unique` and `test_bump_passes_selector_and_caller_and_reports_ambiguous_match` expect exit 3 with the refusal on stdout (was exit 2 on stderr): a selector refusal has its own exit code so the mod forwards only it, never an operational error. Each refusal text check stays. The second one's patched `bump_waiter` side effect becomes `memory_admit.UnmatchedWaiter`, the typed refusal.
 
 **Files:**
 - `scripts/build_queue/build_queue.py` — `--json`, head line
+- `scripts/lint/memory_admit.py` — `bump_waiter` raises `UnmatchedWaiter(ValueError)` for an unknown or ambiguous selector, nothing else
 - `scripts/build_queue/test_build_queue.py` — JSON equals text cells; head line per hold kind; `Stalled:` at 15 min
 - `mods/unit-board/hooks/register.tsx` — table-pane helper; `build:queue` command
 - `mods/unit-board/hooks/queue.tsx` — new: the build queue pane view
@@ -192,3 +194,31 @@ including the details to make it clear
 **Constraints from prior phases:** Phase 2: the index never rewrites a source log.
 
 **Acceptance gate:** the buildlog tests green; basedpyright 0/0/0. Live: after one `/hana_shot` on this unit's port, the build log has a new launch row with `mem_wait_s`, and `/build:report` counts it.
+
+### Phase 5 — A bump by shown name moves only the step it names  · status: todo
+
+#### Work Order
+
+**Goal:** `build_queue.py bump <shown name>` moves the waiting step that name matched, or refuses; it never moves another step because the queue changed between reads.
+
+**Spec:**
+- Defect (Astra review of phase 1 F005, 2026-10-29; pre-existing since e6baef45): `bump_selector` (`scripts/build_queue/build_queue.py:248`) turns a roster shown name into a position from its first queue read; `memory_admit.bump_waiter` applies that position to its locked reread. With waiters `[A, B, C]`, selecting `B` gives `"2"`; if `B` leaves first, position 2 moves `C`.
+- Fix: resolve the shown name to a stable waiter identity (pid and start time from the waiter row) and have `bump_waiter` accept that identity and check it under the lock; a waiter that has left gives the typed `UnmatchedWaiter` refusal naming the original selector. Session id alone is not enough: several waiters can share one.
+- Tests: a waiter removed between the two reads, and a reorder between them; each refuses or moves the named step only.
+
+**Files:**
+- `scripts/build_queue/build_queue.py` — `bump_selector` returns a waiter identity
+- `scripts/lint/memory_admit.py` — `bump_waiter` takes and checks the identity under the lock (also-touches resources)
+- `scripts/build_queue/test_build_queue.py` — removal and reorder cases
+
+**Workers:** 1 writer + 1 tester.
+- `impl` — `build_queue.py`, `memory_admit.py`
+- `test` — `test_build_queue.py`
+
+**State:** waiter rows (`bump_order`, `holds_younger`, `priority_since` written by a bump)
+
+**Depends on:** Phase 1 (the typed `UnmatchedWaiter` refusal) and Phase 3 (both edit `memory_admit.py`).
+
+**Constraints from prior phases:** Phase 1: a selector refusal is `memory_admit.UnmatchedWaiter`, printed on stdout with exit 3; the mod forwards only that.
+
+**Acceptance gate:** `python3 -m unittest scripts.build_queue.test_build_queue scripts.lint.test_memory_admit` green (prefix `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY`); basedpyright 0/0/0 on the changed files.

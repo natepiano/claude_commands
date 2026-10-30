@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -11,7 +12,7 @@ from functools import lru_cache
 import os
 from pathlib import Path
 import sys
-from typing import assert_never
+from typing import Literal, TypedDict, assert_never
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -26,6 +27,29 @@ class QueueArguments(argparse.Namespace):
         super().__init__()
         self.command: str = ""
         self.selector: str = ""
+        self.json: bool = False
+
+
+class HeadLine(TypedDict):
+    text: str
+    tone: Literal["default", "error"]
+
+
+class QueueTotals(TypedDict):
+    promised: str
+    measured: str
+    free: str
+    reserve: str
+
+
+class QueueSnapshot(TypedDict):
+    running_header: list[str]
+    running: list[list[str]]
+    waiting_header: list[str]
+    waiting: list[list[str]]
+    head: HeadLine
+    totals: QueueTotals
+    problems: list[str]
 
 
 def field(value: str) -> str:
@@ -127,12 +151,46 @@ def local_minute(minute: int, zone: ZoneInfo) -> str:
     return f"{datetime.fromtimestamp(minute * 60, zone):%H:%M}"
 
 
-def render_queue(view: memory_admit.QueueView, zone: ZoneInfo,
-                 entries: Sequence[roster.RosterEntry] = (), problems: Sequence[str] = ()) -> list[str]:
+def head_line(view: memory_admit.QueueView, labels: Mapping[str, roster.UnitLabels], zone: ZoneInfo) -> HeadLine:
+    if not view.waiting:
+        return {"text": "", "tone": "default"}
+    head = view.waiting[0]
+    reason = head.reason
+    explanation = reason_text(head, view, zone, labels).removeprefix("head: ")
+    budget_hold = isinstance(reason, memory_admit.NeedsBuildBudget)
+    if isinstance(reason, memory_admit.HeadAdmissionStatus):
+        budget_hold = (reason.decision.state == "hold"
+                       and not isinstance(reason.decision.pressure, memory_admit.MemoryPressure)
+                       and reason.decision.charged + reason.need > reason.decision.budget)
+    if budget_hold:
+        holders: list[str] = []
+        for step in view.running:
+            charge = memory_admit.build_charge(step.measured)
+            if charge <= 0:
+                continue
+            used = (memory_text(step.measured.bytes) if isinstance(step.measured, memory_admit.MeasuredMemory)
+                    else "— (starting)")
+            holders.append(f"{step_labels(step, labels).session} {step.step}: "
+                           + f"charged {memory_text(charge)}, using {used}")
+        if holders:
+            explanation += "; " + "; ".join(holders)
+    if isinstance(reason, memory_admit.NeedsMemory | memory_admit.HeadAdmissionStatus):
+        available = reason.free if isinstance(reason, memory_admit.NeedsMemory) else reason.available
+        explanation += f"; free {memory_text(available)}, step needs {memory_text(head.need)}"
+    stalled = (view.now - head.since >= 15 * 60 and view.available >= head.need
+               and not isinstance(reason, memory_admit.ReadingUnavailable))
+    prefix = "Stalled:" if stalled else "Head:"
+    return {"text": field(f"{prefix} {step_labels(head, labels).session} {head.step}: {explanation}"),
+            "tone": "error" if stalled else "default"}
+
+
+def queue_snapshot(view: memory_admit.QueueView, zone: ZoneInfo,
+                   entries: Sequence[roster.RosterEntry] = (), problems: Sequence[str] = ()) -> QueueSnapshot:
     labels = roster.unit_labels(entries)
     running_header = ["#", "Showrunner", "Unit", "Session", "Step", "Folder", "Promised", "Using", "Delta", "State"]
     waiting_header = ["#", "Showrunner", "Unit", "Session", "Step", "Folder", "Waiting since", "Needs", "Free", "Reason"]
-    lines = ["**Running**", "", table_row(running_header), table_row(["---"] * len(running_header))]
+    running: list[list[str]] = []
+    waiting: list[list[str]] = []
     promised_total, measured_total, position = 0, 0, 0
     for step in view.running:
         match step.measured:
@@ -149,26 +207,41 @@ def render_queue(view: memory_admit.QueueView, zone: ZoneInfo,
         promised_total += step.promise
         folder = step.folder.rstrip("/").rpartition("/")[2] or "unknown"
         identity = step_labels(step, labels)
-        lines.append(table_row([str(position), identity.showrunner, identity.unit, identity.session, step.step, folder,
-                                memory_text(step.promise), using, delta, state]))
-    if not position:
-        lines.append(table_row(["empty"] + [""] * (len(running_header) - 1)))
-    lines.extend(["", "**Waiting**", "", table_row(waiting_header), table_row(["---"] * len(waiting_header))])
+        running.append([field(cell) for cell in [str(position), identity.showrunner, identity.unit, identity.session,
+                        step.step, folder, memory_text(step.promise), using, delta, state]])
     free = ("—" if any(isinstance(step.reason, memory_admit.ReadingUnavailable) for step in view.waiting)
             else memory_text(view.available))
     for position, step in enumerate(view.waiting, 1):
         since = local_minute(int(step.since // 60), zone)
         folder = step.folder.rstrip("/").rpartition("/")[2] or "unknown"
         identity = step_labels(step, labels)
-        lines.append(table_row([str(position), identity.showrunner, identity.unit, identity.session, step.step, folder,
-                                f"{since} ({age(step.since, view.now)} min)",
-                                memory_text(step.need), free, reason_text(step, view, zone, labels)]))
-    if not view.waiting:
-        lines.append(table_row(["empty"] + [""] * (len(waiting_header) - 1)))
-    lines.extend(["", f"Totals: promised {memory_text(promised_total)}; measured {memory_text(measured_total)}; "
-                  + f"free {memory_text(view.available)}; reserve {memory_text(view.reserve)}"])
-    if problems:
-        lines.append(f"Roster: {field(problems[0])}; Showrunner and Unit show — for unmatched steps")
+        waiting.append([field(cell) for cell in [str(position), identity.showrunner, identity.unit, identity.session,
+                        step.step, folder, f"{since} ({age(step.since, view.now)} min)",
+                        memory_text(step.need), free, reason_text(step, view, zone, labels)]])
+    return {"running_header": running_header, "running": running, "waiting_header": waiting_header, "waiting": waiting,
+            "head": head_line(view, labels, zone),
+            "totals": {"promised": memory_text(promised_total), "measured": memory_text(measured_total),
+                       "free": memory_text(view.available), "reserve": memory_text(view.reserve)},
+            "problems": [field(problem) for problem in problems]}
+
+
+def render_queue(view: memory_admit.QueueView, zone: ZoneInfo,
+                 entries: Sequence[roster.RosterEntry] = (), problems: Sequence[str] = ()) -> list[str]:
+    snapshot = queue_snapshot(view, zone, entries, problems)
+    lines: list[str] = []
+    for title, header, rows in (("Running", snapshot["running_header"], snapshot["running"]),
+                                ("Waiting", snapshot["waiting_header"], snapshot["waiting"])):
+        if lines:
+            lines.append("")
+        if title == "Waiting" and snapshot["head"]["text"]:
+            lines.extend([snapshot["head"]["text"], ""])
+        lines.extend([f"**{title}**", "", table_row(header), table_row(["---"] * len(header))])
+        lines.extend(table_row(row) for row in (rows or [["empty"] + [""] * (len(header) - 1)]))
+    totals = snapshot["totals"]
+    lines.extend(["", f"Totals: promised {totals['promised']}; measured {totals['measured']}; "
+                  + f"free {totals['free']}; reserve {totals['reserve']}"])
+    if snapshot["problems"]:
+        lines.append(f"Roster: {snapshot['problems'][0]}; Showrunner and Unit show — for unmatched steps")
     return lines
 
 
@@ -178,7 +251,7 @@ def bump_selector(selector: str, view: memory_admit.QueueView, labels: Mapping[s
     if len(matches) > 1:
         descriptions = ", ".join(f"{position}: {step_labels(step, labels).session} {step.folder}"
                                  for position, step in matches)
-        raise ValueError(f"{selector!r}: ambiguous waiter; matches: {descriptions}")
+        raise memory_admit.UnmatchedWaiter(f"{selector!r}: ambiguous waiter; matches: {descriptions}")
     if matches:
         return str(matches[0][0])
     return selector
@@ -189,8 +262,15 @@ def caller() -> str:
             or f"user:{os.environ.get('USER', 'unknown')}")
 
 
+def refusal_text(refusal: memory_admit.UnmatchedWaiter) -> str:
+    escaped = "".join(character if character.isprintable() else json.dumps(character)[1:-1]
+                      for character in str(refusal))
+    return f"build queue: {escaped}"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    _ = parser.add_argument("--json", action="store_true", help="print formatted queue cells as JSON")
     commands = parser.add_subparsers(dest="command")
     bump = commands.add_parser("bump", help="move a waiting position, session or folder to the head")
     _ = bump.add_argument("selector")
@@ -200,9 +280,15 @@ def main() -> int:
         if arguments.command == "bump":
             actor = caller()
             labels = roster.unit_labels(sessions.entries)
-            moved = memory_admit.bump_waiter(bump_selector(arguments.selector, view, labels), actor)
+            try:
+                moved = memory_admit.bump_waiter(bump_selector(arguments.selector, view, labels), actor)
+            except memory_admit.UnmatchedWaiter as error:
+                print(refusal_text(error))
+                return 3
             print(f"{field(actor)} moved {step_labels(moved, labels).session}: "
                   + f"{field(moved.step)} in {field(moved.folder)} to the head; memory limits still apply")
+        elif arguments.json:
+            print(json.dumps(queue_snapshot(view, user_zone(), sessions.entries, sessions.problems)))
         else:
             print("\n".join(render_queue(view, user_zone(), sessions.entries, sessions.problems)))
     except (OSError, ValueError) as error:
