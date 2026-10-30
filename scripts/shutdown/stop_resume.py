@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import os
+import argparse
 import json
 import shlex
 import signal
 import sys
 import subprocess
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
@@ -17,6 +18,7 @@ from io import StringIO
 from threading import Event
 from time import monotonic
 from typing import cast
+from uuid import uuid4
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 for dependency in ("herdr", "message", "whoami", "lib"):
@@ -26,8 +28,10 @@ import herdr
 import pane_record
 import sessions
 from shutdown_record import PausedSeat
+from launch_permission import shutdown_state_root
 
 STOP_GRACE_SECONDS = 2.0
+KILL_GRACE_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -52,6 +56,11 @@ class Resumed:
     session_id: str
     pane_id: str
     account: str
+
+
+@dataclass(frozen=True)
+class MoveHandedOff:
+    session_id: str
 
 
 @dataclass(frozen=True)
@@ -126,6 +135,12 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
         _ = Event().wait(STOP_GRACE_SECONDS)
         if _same_claude(identity, live.pid, started):
             os.kill(live.pid, signal.SIGKILL)
+            deadline = monotonic() + KILL_GRACE_SECONDS
+            while _same_claude(identity, live.pid, started):
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    return StopFailed(identity, f"pid {live.pid} is still running after SIGKILL")
+                _ = Event().wait(min(0.1, remaining))
         return Stopped(identity, live.pid)
     except ProcessLookupError:
         return NotRunning(identity)
@@ -221,7 +236,27 @@ def resume(session: str, *, why: str, to: str | None = None) -> Resumed | Resume
         return ResumeFailed(identity, str(error))
 
 
-MoveResult = Resumed | StopFailed | ResumeFailed | SessionNotFound
+MoveResult = Resumed | MoveHandedOff | StopFailed | ResumeFailed | SessionNotFound
+
+
+def _handoff_batch(selected: list[str], target: str, why: str, warn_seconds: int) -> None:
+    """Keep the batch coordinator outside every session it will stop."""
+    logs = shutdown_state_root() / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    log = logs / f"move-{uuid4().hex}.log"
+    environment = dict(os.environ)
+    _ = environment.pop("CLAUDE_CODE_SESSION_ID", None)
+    command = [sys.executable, str(Path(__file__).resolve()), "batch", "--target", target,
+               "--why", why, "--warn-seconds", str(warn_seconds), "--log", str(log), "--", *selected]
+    if sys.platform == "darwin":
+        _ = subprocess.Popen(command, env=environment, start_new_session=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        # The user manager has its own environment; unset the caller there too.
+        _ = subprocess.run(["systemd-run", "--user", "--collect", "--quiet", "--no-block",
+                            "env", "-u", "CLAUDE_CODE_SESSION_ID", *command],
+                           env=environment, stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, check=True, timeout=15)
 
 
 def _warn_session(session: str, target: str, why: str, seconds: int) -> None:
@@ -241,6 +276,17 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
     selected = list(dict.fromkeys(sessions))
     if not selected:
         return []
+    _record_launches()  # Herdr learns a new session's id late; the launch entry knows it now.
+    caller = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if caller:
+        try:
+            tabs = [_tab_of(session) for session in selected]
+            if any(isinstance(tab, herdr.TabSession) and tab.session_id == caller for tab in tabs):
+                _handoff_batch(selected, target, why, warn_seconds)
+                return [MoveHandedOff(tab.session_id) if isinstance(tab, herdr.TabSession) and tab.session_id
+                        else SessionNotFound(session) for session, tab in zip(selected, tabs)]
+        except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
+            return [StopFailed(session, f"cannot hand off move: {error}") for session in selected]
     with ThreadPoolExecutor(max_workers=len(selected)) as pool:
         if warn_seconds:
             warning_until = monotonic() + warn_seconds
@@ -251,7 +297,6 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
                 except Exception:
                     pass  # An undeliverable warning cannot prevent the requested interruption.
             _ = Event().wait(max(0.0, warning_until - monotonic()))
-        _record_launches()
         stops = [pool.submit(_stop, session) for session in selected]
         stopped: list[Stopped | NotRunning | StopFailed | SessionNotFound] = []
         for session, future in zip(selected, stops):
@@ -359,3 +404,28 @@ def _resumed_launcher_command(command: list[str], seat: str, prompt: str) -> str
         return None
     arguments[2] = prompt
     return shlex.join([*command[:index + 1], *options, "--to", seat, *arguments])
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    batch = commands.add_parser("batch")
+    _ = batch.add_argument("--target", required=True)
+    _ = batch.add_argument("--why", required=True)
+    _ = batch.add_argument("--warn-seconds", type=int, default=0)
+    _ = batch.add_argument("--log", type=Path, required=True)
+    _ = batch.add_argument("sessions", nargs="+")
+    args = parser.parse_args(argv)
+    # Even a directly invoked batch must not hand itself off a second time.
+    _ = os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+    log = cast(Path, args.log)
+    with log.open("a", encoding="utf-8") as output:
+        results = move_sessions(cast(list[str], args.sessions), cast(str, args.target),
+                                why=cast(str, args.why), warn_seconds=cast(int, args.warn_seconds))
+        for result in results:
+            _ = output.write(json.dumps({"result": type(result).__name__, **asdict(result)}) + "\n")
+    return int(any(not isinstance(result, Resumed) for result in results))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
