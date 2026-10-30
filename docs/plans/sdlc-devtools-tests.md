@@ -62,6 +62,8 @@ Known input for the inventory: `scripts/agents/test_codex_mesh.py` was killed at
 
 Source: the sdlc showrunner, 2026-10-30. 106 test files under `scripts/` each define their own `TEST_HANG_GUARD_SECS` (105 at 300 s, `recorder_fixture.py` at 600 s), and many set their own short real-time limits that fail under load (the cause of the `agents/test_codex_mesh.py` red in Phase 1's gate). After models' checkpoint, one mechanical checkpoint from devtools: every other test imports the one guard; each short real-time limit goes onto the guard, or onto the shared `LifecycleTestClock` where time is the behavior under test; and a check refuses a new local copy. Owners are many; tell natedev which natedev-owned folders it touches. The merge gate finds every `scripts/**/test_*.py` itself (Phase 1), so the copy check runs in every gate from any folder with no list edit; a test file directly in `scripts/` is refused. The Work Order is written when models sends the import form.
 
+From Phase 4: `scripts/production/test_merge_gate_suites_resources.py` has CPU workloads that burn real CPU and sleep in real time so `os.wait4` can tell them apart. The sweep moves their hang guard but keeps those workloads and their assertions, and the merge gate CPU tests are in the acceptance run.
+
 ### Phase 3 — Close-route closes a route made before its phase record  · status: done
 **Depends on:** none
 
@@ -78,31 +80,25 @@ Source: the sdlc showrunner, 2026-10-30. 106 test files under `scripts/` each de
 **Ruled out:** a second `--from` form, or a translation from one form to the other — `--from` is always the exact listed key.
 
 ### Phase 4 — The gate records each job's CPU time  · status: done
-**Depends on:** Phase 1
 
-#### Work Order
+#### As-built
 
-**Goal:** each gate job's CPU time is recorded beside its seconds and memory peak, and the report names the jobs that used the most CPU, so "less CPU" has a measure.
-
-**Spec:**
-
-- Cause: the gate records each module's seconds (`module_seconds.json`) and peak (`module_peak_mib.json`), but no CPU time. In full gate 3 (2026-10-30) the one-minute load went to 97 on 32 CPUs, and nothing says which modules made it.
-- Measure: a job's CPU seconds are the user + system time of its leader process and every child that the leader waited for, read when the gate reaps the leader (for example `os.wait4` in place of `poll` in the run loop, `scripts/production/merge_gate.py:891`). A child killed by `kill_job_group` after its leader exits is not counted; say so in the as-built.
-- `GateJobResult` gets the CPU seconds. The runner saves them at run end in `module_cpu_seconds.json` in the gate state dir, under the same `<suite>/<path within the suite>` key as `module_seconds.json`, with `save_measures`. The type-check job's CPU seconds go under its own key, as its peak does. A job killed for a limit records nothing, the same as for its peak.
-- Report: after the `Largest module peak:` line, one line names the three jobs with the most CPU seconds and the run's total CPU seconds: `Most CPU: <seconds> s <suite/module>, …; total <seconds> s`.
-- Docs: `docs/as-built/merge-gate-and-test-speed.md` names the new record and the report line.
-- Tests: a job that spins for a measured time records CPU seconds near that time; a job that sleeps records near zero; a killed job records nothing; the report line names the largest job first.
+- `reap_gate_job` in `merge_gate.py` reaps a job leader with `os.wait4`. It stores the exit status and `ru_utime + ru_stime` on the job, and `GateJobResult.cpu_seconds` carries the value.
+- `reap_gate_job` blocks SIGTERM and SIGHUP (`ROLLBACK_SIGNALS`) with `signal.pthread_sigmask` across `os.wait4` and the stores. An interrupt arrives only after the status and CPU are stored, so it cannot lose a reaped status or stop the cleanup of later jobs.
+- At run end, `save_measures` writes `module_cpu_seconds.json` in the gate state dir, under the `<suite>/<module>` keys of `module_seconds.json`; the type-check job uses `types/basedpyright`. A job killed for a limit records nothing.
+- After `Largest module peak:`, the report prints `Most CPU: <s> s <suite/module>, …; total <s> s`: the three keys with the most CPU, largest first. The run total adds every attempt, killed and requeued attempts too.
 
 **Files:**
-- `scripts/production/merge_gate.py`
-- `scripts/production/test_merge_gate_suites_resources.py`
-- `docs/as-built/merge-gate-and-test-speed.md`
+- `scripts/production/merge_gate.py` — `reap_gate_job`, the CPU record, the `Most CPU:` line
+- `scripts/production/test_merge_gate_suites_resources.py` — spin and sleep CPU, killed job, report order, interrupt after a reap
+- `docs/as-built/merge-gate-and-test-speed.md` — names the record and the report line
 
-**Workers:** `1 writer` — one change in one module and its tests.
+**Binds later work:** "The slowest modules lose their real-time waits" ranks modules by wall seconds minus CPU seconds from `module_seconds.json` and `module_cpu_seconds.json`. "The gate runs a large module's test classes as separate jobs" builds on two facts: `reap_gate_job` is the one path that reaps a job and reads its CPU, and one CPU key names one job.
 
-**State:** new `module_cpu_seconds.json` in the gate state dir, written at run end with `save_measures`.
-
-**Acceptance gate:** the merge gate tests pass (`python3 -m unittest discover -s scripts/production -p 'test_merge_gate*.py'`); basedpyright prints `0 errors, 0 warnings, 0 notes` on the changed Python files; the checkout's own gate (`merge_gate.py --repo . --tests-only --full`) is green and prints the `Most CPU:` line.
+**Gotchas:**
+- `systemd-run --scope` execs the test in place, so the leader's rusage holds the test and the children it waited for. A child that `kill_job_group` kills after its leader exits is not counted.
+- The signal mask covers the calling thread only. The gate starts no other thread.
+- `module_seconds.json` holds the first attempt's wall time, and `module_cpu_seconds.json` holds the last finished attempt's CPU. Compare the two only from one attempt.
 
 ### Phase 5 — The gate runs a large module's test classes as separate jobs  · status: todo
 **Depends on:** Phase 4; resources-unit's be4d46f7 on main (it changes the same `merge_gate.py` hunks)
@@ -111,7 +107,11 @@ Source: devtools-unit from the full gate 3 measure, 2026-10-30; natedev's go, 20
 
 Precondition (the sdlc showrunner, 2026-10-30): `production/test_dailies_input.py` `test_style_summary_is_saved_only_for_a_style_production_and_keeps_every_ledger_key` fails only in a full `scripts/production` discover run (`rules_total` 58, expected 1) and passes alone. The likely cause: `style_rules` reads `NATE_STYLE_DIR` at import, and `dailies_input_test_support.py:276` runs `style_ledger` in the same process, so an earlier test's rule catalog stays. Fix it at the cause (read the variable when called, not at import). A class or module split must not hide it.
 
+From Phase 4 (architect review, 2026-10-30): `agents/test_codex_mesh.py` has `setUpModule`, so natedev's condition keeps it one job, and the other named modules have one class each. Before the Work Order, list the modules that the condition allows and that hold more than one class, with their recorded seconds. If no allowed module would cut the gate's wall time, tell the sdlc showrunner and drop this phase. A Work Order must: give each job one explicit target (whole module or `module:Class`) carried through the job lifecycle with one identity rule, so class records do not overwrite each other in `module_seconds.json`, `module_peak_mib.json` and `module_cpu_seconds.json`; say how `module_order` and Phase 6 read class records and ignore stale module records; keep `reap_gate_job` as the one reaping path (be4d46f7 still uses `poll()`/`wait()`); keep the interrupt-cleanup, waited-child, retry-total and killed-record tests; accept on distinct class records, nested paths and a rerun of only the failed class.
+
 ### Phase 6 — The slowest modules lose their real-time waits  · status: todo
 **Depends on:** Phase 4; Phase 2
 
 Source: devtools-unit, 2026-10-30. From Phase 4's CPU measure, each module over 60 s whose time is mostly waiting (low CPU) gets its cause found and fixed in its own test or fixture. First candidates: `direct/test_verify_hold_wait.py` (5 tests, 311 s) and `direct/test_assign_launcher.py` (41 tests, 734 s). Fence (the sdlc showrunner, 2026-10-30): models owns the real-time waits in `scripts/agents/test_codex_mesh.py` and `scripts/agents/test_heartbeat.py` (its hang guard checkpoint). This phase leaves those two files out, unless Phase 4's measure still shows them on top after models' checkpoint merges; then agree the split with models first. The Work Order is written from Phase 4's measure.
+
+From Phase 4: the input is `module_cpu_seconds.json` beside `module_seconds.json`. The two can come from different attempts (wall time from the first attempt, CPU time from the last attempt that finished; a limit kill updates wall time only), so the ranking uses wall and CPU seconds from the same attempt (the paired `GateJobResult` values), with tests for a retry and a limit kill.
