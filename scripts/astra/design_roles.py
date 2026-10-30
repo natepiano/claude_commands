@@ -26,7 +26,7 @@ from typing import Literal, Protocol, TextIO, cast
 from uuid import UUID, uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.guilds import astra_work
+from scripts.astra import astra_work
 
 ROOT = Path(__file__).resolve().parents[2]
 Role = Literal['designer', 'reviewer']
@@ -197,15 +197,15 @@ class RoleRefused(ValueError):
 
 
 def state_root() -> Path:
-    return Path(os.environ.get('GUILD_ROLES_STATE') or '~/.local/state/guilds/roles').expanduser()
+    return Path(os.environ.get('DESIGN_ROLES_STATE') or '~/.local/state/astra/design-roles').expanduser()
 
 
 def ownership_root() -> Path:
-    return Path(os.environ.get('GUILD_OWNERSHIP_STATE') or '~/.local/state/guilds/ownership').expanduser()
+    return Path(os.environ.get('DESIGN_OWNERSHIP_STATE') or '~/.local/state/astra/design-ownership').expanduser()
 
 
 def local_host() -> str:
-    return os.environ.get('GUILD_ROLES_HOST') or socket.gethostname().split('.', 1)[0]
+    return os.environ.get('DESIGN_ROLES_HOST') or socket.gethostname().split('.', 1)[0]
 
 
 def design_directory(design_id: str) -> Path:
@@ -357,14 +357,14 @@ def _set_lifecycle(design: HeldDesign, role: Role, lifecycle: Lifecycle) -> Held
 def authority_request(operation: str, payload: dict[str, object]) -> dict[str, object]:
     """Send an ownership request after releasing all design and mesh locks."""
     config = configparser.ConfigParser()
-    path = Path(os.environ.get('GUILD_CONFIG_FILE') or ROOT / 'config/guilds.conf')
+    path = Path(os.environ.get('DESIGN_ROLES_CONFIG') or ROOT / 'config/design_roles.conf')
     if not config.read(path):
         raise RoleRefused('ownership authority is not configured')
     authority = config.get('ownership', 'host')
     if authority == local_host():
         return _authority_local(operation, payload)
     command = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', authority,
-               '~/.claude/scripts/lib/py ~/.claude/scripts/guilds/roles.py authority ' + shlex.quote(operation)]
+               '~/.claude/scripts/lib/py ~/.claude/scripts/astra/design_roles.py authority ' + shlex.quote(operation)]
     result = subprocess.run(command, input=json.dumps(payload), capture_output=True, text=True, timeout=30, check=False)
     if result.returncode:
         raise RoleRefused('ownership authority unavailable: ' + (result.stderr or result.stdout).strip())
@@ -520,15 +520,15 @@ def _authorize(design: HeldDesign) -> HolderReach:
 
 def resolve_model(role: Role) -> tuple[str, str]:
     result = subprocess.run(['bash', '-c',
-                             'source "$1"; agents_resolve "guild.$2" || exit; ' +
+                             'source "$1"; agents_resolve "design_roles.$2" || exit; ' +
                              '[[ "$AGENT_FAMILY" == codex ]] || exit 1; ' +
                              'printf "%s\\n%s\\n" "$AGENT_MODEL" "$AGENT_EFFORT"',
-                             'guild-model', str(ROOT / 'scripts/agents/agents_config.sh'), role],
+                             'design-role-model', str(ROOT / 'scripts/agents/agents_config.sh'), role],
                             capture_output=True, text=True, check=False, timeout=15,
                             env={**os.environ, 'AGENTS_CONFIG_TIER_ONLY': '1'})
     values = result.stdout.strip().splitlines()
     if result.returncode or len(values) != 2 or not all(values):
-        raise RoleRefused('invalid guild model configuration: ' + result.stderr.strip())
+        raise RoleRefused('invalid design-role model configuration: ' + result.stderr.strip())
     return values[0], values[1]
 
 
@@ -604,7 +604,7 @@ def _prompt(design: HeldDesign, role: Role, text: str) -> tuple[Path, Path]:
     reply = directory / 'replies' / f'{role}-{token}.md'
     prompt = directory / 'prompts' / f'{role}-{token}.md'
     if role == 'designer':
-        instructions = (ROOT / 'config/guilds/designer.md').read_text(encoding='utf-8')
+        instructions = (ROOT / 'config/design_roles/designer.md').read_text(encoding='utf-8')
         instructions += '\nUse apply_patch for all repository edits. Edit only the bound output paths.\n'
     else:
         review_prompt = cast(Callable[[Path, str], str],
@@ -629,7 +629,7 @@ def access_policy(design: HeldDesign, role: Role) -> ThreadAccessPolicy:
 
 
 def _mesh_context(design: HeldDesign, reach: HolderReach) -> None:
-    _atomic(mesh_directory(design.placement.design_id) / 'guild_context.json',
+    _atomic(mesh_directory(design.placement.design_id) / 'design_context.json',
             {'design_id': design.placement.design_id, 'generation': design.placement.generation,
              'holder_session': reach.session_id, 'binding': _tag(design.binding), 'cwd': design.repository})
 
@@ -688,7 +688,7 @@ def refresh_census(design_id: str) -> None:
 
 def _allow_new_roles() -> None:
     config = configparser.ConfigParser()
-    _ = config.read(os.environ.get('GUILD_CONFIG_FILE') or ROOT / 'config/guilds.conf')
+    _ = config.read(os.environ.get('DESIGN_ROLES_CONFIG') or ROOT / 'config/design_roles.conf')
     if not config.getboolean('roles', 'new_open', fallback=True):
         raise RoleRefused('new role opens and adoptions are disabled; keep existing identities and evidence')
 
@@ -1068,7 +1068,7 @@ def _adoption_model(source: Path, name: str, thread_id: str, entry: dict[str, ob
     if any(value is None for value in settings.values()):
         try:
             server = _read(source / 'mesh_server.json')
-            client = _mesh_transport().Client(_integer(server, 'port'), 'guild-adopt-evidence')
+            client = _mesh_transport().Client(_integer(server, 'port'), 'design-role-adopt-evidence')
         except (OSError, ValueError, ConnectionError, SystemExit) as error:
             raise RoleRefused('AdoptionRequired: source model or effort evidence is unavailable') from error
         try:
@@ -1141,7 +1141,7 @@ def adopt(repository: str, document: str, role: Role, holder: Holder, area: str,
     _check_adoption_source(entry, thread_id)
     source_model, source_effort = _adoption_model(source, name, thread_id, entry)
     if source_model != model or source_effort != effort:
-        raise RoleRefused('AdoptionRequired: source model or effort differs from the configured guild model and effort')
+        raise RoleRefused('AdoptionRequired: source model or effort differs from the configured design-role model and effort')
     transfer = {'adoption_id': adoption_id, 'destination': str(mesh_directory(design_id))}
     if entry.get('transferring_role') is not None and entry.get('transferring_role') != transfer:
         raise RoleRefused('source is fenced by another adoption')
@@ -1172,7 +1172,7 @@ def adopt(repository: str, document: str, role: Role, holder: Holder, area: str,
         source_lock.flush()
     server = _read(source / 'mesh_server.json')
     port = _integer(server, 'port')
-    client = codex_mesh.Client(port, 'guild-adopt')
+    client = codex_mesh.Client(port, 'design-role-adopt')
     try:
         with codex_mesh._pending_file(str(source), name) as pending:  # pyright: ignore[reportPrivateUsage]
             state = codex_mesh._read_live_turn(client, thread_id)  # pyright: ignore[reportPrivateUsage]
@@ -1463,7 +1463,7 @@ def holder_failures(old_holder: Holder, old_checkout: str = '') -> list[str]:
                     entry = _object(value)
                     if entry.get('cwd') == old_checkout:
                         failures.append(str(path) + ': launch cwd still names old checkout')
-            context_path = mesh_directory(design.placement.design_id) / 'guild_context.json'
+            context_path = mesh_directory(design.placement.design_id) / 'design_context.json'
             if context_path.exists():
                 context = _read(context_path)
                 if (old_checkout and context.get('cwd') == old_checkout) or (
@@ -1574,7 +1574,7 @@ def main(argv: list[str]) -> int:
                                 inventory_complete=cast(bool, args['inventory_complete']))
         elif command == 'authority':
             config = configparser.ConfigParser()
-            _ = config.read(os.environ.get('GUILD_CONFIG_FILE') or ROOT / 'config/guilds.conf')
+            _ = config.read(os.environ.get('DESIGN_ROLES_CONFIG') or ROOT / 'config/design_roles.conf')
             if config.get('ownership', 'host') != local_host():
                 raise RoleRefused('this host is not the ownership authority')
             print(json.dumps(_authority_local(argument('operation'), _object(cast(object, json.load(sys.stdin))))))
@@ -1582,7 +1582,7 @@ def main(argv: list[str]) -> int:
             report = list_roles()
             print(json.dumps(report) if args.get('json') else render_roles(report))
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, configparser.Error) as error:
-        print('roles: ' + str(error).replace('\n', ' '), file=sys.stderr)
+        print('design_roles: ' + str(error).replace('\n', ' '), file=sys.stderr)
         return 2
     return 0
 

@@ -31,7 +31,7 @@ if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 if TYPE_CHECKING:
-    from scripts.direct.review_pool import Pool, ProductionPool
+    from scripts.direct.review_pool import Pool, ProductionPool, Reviewer
     from scripts.lib.names import JobKey
 
 ROSTER = "mesh_roster.json"
@@ -83,6 +83,12 @@ class ReviewerDeferred:
     reason: str
 
 
+@dataclass(frozen=True)
+class ReviewerReleased:
+    reviewer: str
+    unit: str
+
+
 class ReviewerConflictCause(Enum):
     NO_DESTINATION = "no destination run is named"
     WRONG_UNIT = "destination belongs to another production or unit"
@@ -103,7 +109,7 @@ class ReviewerConflict:
         return self.cause.value
 
 
-ReviewerTransfer = ReviewerMigrated | ReviewerDeferred | ReviewerConflict
+ReviewerTransfer = ReviewerMigrated | ReviewerReleased | ReviewerDeferred | ReviewerConflict
 
 
 @dataclass(frozen=True)
@@ -612,7 +618,7 @@ def _event(kind: Literal["opened", "replaced", "adopted"], cause: str, run: Path
 
 def _worker_from_record(name: str, run: Path, record: dict[str, object]) -> UnitWorker:
     from scripts.agents import codex_mesh
-    from scripts.guilds.roles import PhaseBoundDesigner
+    from scripts.astra.design_roles import PhaseBoundDesigner
     access = codex_mesh.roster_access_policy(record)
     policy: dict[str, object] = {"kind": type(access).__name__}
     if isinstance(access, PhaseBoundDesigner):
@@ -1275,9 +1281,9 @@ def transfer_reviewers(production: str, runs: Mapping[str, Path], *, dry_run: bo
     with pool_store.locked(write=False) as pool:
         if pool.stopping:
             raise WorkerUnavailable("reviewer pool is stopping")
-        before = set(pool.reviewers)
+        before = {name: reviewer.lease for name, reviewer in pool.reviewers.items()}
         results = _transfer_reviewers(pool_store, pool, runs, dry_run=False, only_units=only_units)
-        if set(pool.reviewers) != before:
+        if {name: reviewer.lease for name, reviewer in pool.reviewers.items()} != before:
             pool_store.save(pool)
         # The receipt follows the durable removal. A unit never has to open the
         # archive again once all of its leased code threads have moved.
@@ -1289,7 +1295,10 @@ def transfer_reviewers(production: str, runs: Mapping[str, Path], *, dry_run: bo
             remaining = any(reviewer.type == "code" and isinstance(reviewer.lease, review_pool.UnitLease)
                             and reviewer.lease.unit.removesuffix("-unit") == unit.removesuffix("-unit")
                             for reviewer in pool.reviewers.values())
-            if not remaining and store.path.exists():
+            released = any(isinstance(result, ReviewerReleased)
+                           and result.unit.removesuffix("-unit") == unit.removesuffix("-unit")
+                           for result in results)
+            if not remaining and (store.path.exists() or released):
                 with store.locked() as ledger:
                     ledger.reviewers_adopted = True
         return results
@@ -1301,7 +1310,22 @@ def _transfer_reviewers(pool_store: ProductionPool, pool: Pool, runs: Mapping[st
     source = pool_store.mesh_dir(pool.generation)
     results: list[ReviewerTransfer] = []
     planned: dict[Path, set[str]] = {}
-    for reviewer, leased in sorted(pool.reviewers.items()):
+    selected: dict[Path, str] = {}
+    adopted: set[Path] = set()
+    surplus: list[tuple[str, Reviewer, str, Path]] = []
+
+    def order(entry: tuple[str, Reviewer]) -> tuple[bool, float, str]:
+        name, reviewer = entry
+        transaction = _read(pool_store.directory / "worker-transfers" / str(pool.generation) / f"{name}.json")
+        current = _object(_read_roster(source).get(name)) if transaction else {}
+        # A saved choice wins after a crash, even if allocation times have changed.
+        recovering = bool(transaction) and (current.get("reviewer_transfer") == transaction.get("id")
+                                            or current == _object(transaction.get("before")))
+        return recovering, reviewer.last_allocated, name
+
+    candidates = [(name, reviewer) for name, reviewer in pool.reviewers.items()
+                  if reviewer.type == "code" and isinstance(reviewer.lease, review_pool.UnitLease)]
+    for reviewer, leased in sorted(candidates, key=order, reverse=True):
         lease = leased.lease
         if leased.type != "code" or not isinstance(lease, review_pool.UnitLease):
             continue
@@ -1332,6 +1356,16 @@ def _transfer_reviewers(pool_store: ProductionPool, pool: Pool, runs: Mapping[st
                 if not dry_run:
                     journal.unlink()
                 transaction = {}
+        current_owner = _object(_read_roster(destination).get(_reviewer_destination(destination)))
+        if (not transaction and current_owner.get("role") == "review"
+                and current_owner.get("thread_id") and not current_owner.get("adopted_to")
+                and current_owner.get("thread_id") != leased.thread_id):
+            adopted.add(destination)
+            surplus.append((reviewer, leased, unit, destination))
+            continue
+        if selected.setdefault(destination, reviewer) != reviewer:
+            surplus.append((reviewer, leased, unit, destination))
+            continue
         if transaction:
             if (transaction.get("destination") != str(destination)
                     or _object(transaction.get("after")).get("thread_id") != leased.thread_id):
@@ -1345,10 +1379,12 @@ def _transfer_reviewers(pool_store: ProductionPool, pool: Pool, runs: Mapping[st
                     continue
             if dry_run:
                 results.append(ReviewerMigrated(reviewer, unit, _required(transaction, "worker"), leased.thread_id))
+                adopted.add(destination)
                 continue
             result = _finish_reviewer_transfer(journal, transaction)
             if isinstance(result, ReviewerMigrated):
                 _ = pool.reviewers.pop(reviewer)
+                adopted.add(destination)
             results.append(result)
             continue
         if not review_pool.reviewer_is_idle(leased):
@@ -1363,7 +1399,10 @@ def _transfer_reviewers(pool_store: ProductionPool, pool: Pool, runs: Mapping[st
             continue
         conflict = _transfer_conflict(destination, source, leased.thread_id)
         if isinstance(conflict, ReviewerConflictCause):
-            results.append(ReviewerConflict(reviewer, unit, conflict))
+            # A ledger-owned reviewer can live in an earlier run. Ordinary
+            # resolution carries it forward after the pool leases are released.
+            adopted.add(destination)
+            surplus.append((reviewer, leased, unit, destination))
             continue
         data = _read(_ledger_for_run(destination).path)
         occupied: dict[str, object] = {**_object(data.get("workers")), **_read_roster(destination)}
@@ -1376,6 +1415,7 @@ def _transfer_reviewers(pool_store: ProductionPool, pool: Pool, runs: Mapping[st
             continue
         if dry_run:
             results.append(ReviewerMigrated(reviewer, unit, name, leased.thread_id))
+            adopted.add(destination)
             continue
         after = dict(before)
         for key in ("launcher_pid", "port", "turn_id", "paused_from", "paused_turn", "adopted_to"):
@@ -1401,7 +1441,20 @@ def _transfer_reviewers(pool_store: ProductionPool, pool: Pool, runs: Mapping[st
         result = _finish_reviewer_transfer(journal, transaction)
         if isinstance(result, ReviewerMigrated):
             _ = pool.reviewers.pop(reviewer)
+            adopted.add(destination)
         results.append(result)
+    for reviewer, leased, unit, destination in surplus:
+        if destination not in adopted:
+            results.append(ReviewerDeferred(reviewer, unit, "waiting for the selected reviewer to move"))
+            continue
+        before = _object(_read_roster(source).get(reviewer))
+        reason = _reviewer_busy_reason(source, reviewer, before)
+        if not review_pool.reviewer_is_idle(leased) or reason:
+            results.append(ReviewerDeferred(reviewer, unit, reason or "reviewer is busy"))
+            continue
+        if not dry_run:
+            leased.lease = review_pool.Unleased()
+        results.append(ReviewerReleased(reviewer, unit))
     return tuple(results)
 
 
@@ -2046,12 +2099,15 @@ def main() -> int:
                     action = "migrated" if args.apply else "would migrate"
                     print(f"{prefix}{action}: {result.unit}: {result.reviewer} -> {result.worker} " +
                           f"(owner {owner}; thread {result.thread_id} checked)")
+                elif isinstance(result, ReviewerReleased):
+                    action = "released" if args.apply else "would release"
+                    print(f"{prefix}{action}: {result.unit}: {result.reviewer}: returned to pool ({checked})")
                 elif isinstance(result, ReviewerDeferred):
                     print(f"{prefix}deferred: {result.unit}: {result.reviewer}: {result.reason} ({checked})")
                 else:
                     print(f"{prefix}conflict: {result.unit}: {result.reviewer}: {result.reason} ({checked})")
             print(f"Archive after each completed move: {pool_store.directory.parent}; the moved worker does not read it.")
-            return int(args.apply and any(not isinstance(result, ReviewerMigrated) for result in results))
+            return int(args.apply and any(isinstance(result, (ReviewerDeferred, ReviewerConflict)) for result in results))
         if args.command == "shown-name":
             print(shown_name(run, args.name))
         else:
