@@ -554,7 +554,8 @@ def _move_state(rename: UnitRename, _save: Callable[[], None]) -> None:
     today = datetime.now(user_zone()).date()
     for issue in _unit_proposals(rename, rename.old):
         _ = proposal_issue.edit(issue.path, {"unit": rename.new}, today)
-    _ = phase_table.rename_unit(rename.slug, rename.old, rename.new)
+    identity = phase_table.production_identity(read_production(Path(rename.doc)))
+    _ = phase_table.rename_unit(identity, rename.old, rename.new)
 
 
 def _other_showrunner_states(rename: UnitRename) -> tuple[list[Path], list[Path]]:
@@ -916,8 +917,9 @@ def _state_failures(rename: UnitRename) -> list[str]:
                 failures.append(f"style ledger: current tickets still name {rename.old}")
             if any(wait.unit == rename.old for wait in ledger.sync_waits()):
                 failures.append(f"style ledger: sync wait still names {rename.old}")
+    identity = phase_table.production_identity(read_production(Path(rename.doc)))
     failures.extend(f"{note}: phase note still names {rename.old}"
-                    for note in phase_table.owned_notes(rename.slug, rename.old))
+                    for note in phase_table.owned_notes(identity, rename.old))
     from scripts.guilds import roles
     failures.extend(roles.rename_failures(rename.slug, rename.old, rename.old_worktree))
     return failures

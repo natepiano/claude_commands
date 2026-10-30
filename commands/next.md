@@ -74,9 +74,10 @@ kind's script (below).
 
 ## change
 
-The next change for the user to check, from the change review list of the
-production's root: its row. A row belongs to the production its Production
-cell names, and a row without one to the root. Mark: `change_review.py mark-important --row C<n>`. Say
+The next change for the user to check, from its current and earlier lists.
+A row belongs to the production its Production cell names; without one, to
+its list's production. Mark: `change_review.py mark-important --row <id>`.
+Pass the ID as `/next` shows it, such as `C434` or `sdlc/C9`. Say
 what changed, how to try it and what the user sees, in plain words. Record the
 user's verdict through `/change_review` → verdict.
 

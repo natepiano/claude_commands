@@ -1,5 +1,9 @@
 # Production rename
 
+Code reviews now use the unit's persistent `review` and `review2` workers
+through `assign.sh --role review`. Any pool maintenance paths described below
+remain only for the pending archive cleanup; they do not dispatch new reviews.
+
 ## What it is
 
 `scripts/production/rename.py` changes a registered production's slug, then
@@ -316,7 +320,7 @@ and 2 for invalid arguments.
 ## Why
 
 - **Unknown slugs pass through.** A resolver that raised on an unknown slug
-  would break the review pool and unit lookup for timer-less productions.
+  would break legacy reviewer-state lookup and unit lookup for timer-less productions.
 
 - **Units move separately, between runs.** A moved cwd breaks a live session,
   and the rename must not modify another session's claims. That is also why

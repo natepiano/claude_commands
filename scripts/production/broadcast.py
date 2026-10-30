@@ -24,6 +24,7 @@ from typing import Literal, NamedTuple, cast
 MESSAGE = Path(__file__).resolve().parent.parent / "message"
 sys.path.insert(0, str(MESSAGE))
 import roster  # noqa: E402
+from scripts.lib import names as display_names  # noqa: E402
 
 SEND = Path(os.environ.get("BROADCAST_SEND") or MESSAGE / "send.py")
 USAGE = ("usage: broadcast.py [--here] --from <your session> (--all TEXT | --showrunners TEXT | --units TEXT"
@@ -81,7 +82,7 @@ FLAGS: dict[str, BroadcastGroup] = {
 
 class Recipient(NamedTuple):
     session: str
-    role: str
+    address: str = ""
 
 
 @dataclass(frozen=True)
@@ -136,22 +137,11 @@ def ending(told: Collection[BroadcastGroup], scope: roster.RosterScope = roster.
     """A message's last line names the selected groups, which may overlap."""
     names: list[str] = []
     for group in told:
-        match group:
-            case AllRoles():
-                labels = ["showrunners", "unit directors", "agents"]
-            case Showrunners():
-                labels = ["showrunners"]
-            case UnitDirectors():
-                labels = ["unit directors"]
-            case Agents():
-                labels = ["agents"]
-            case Workers():
-                labels = ["workers"]
-            case WorkersOfUnit(unit=unit):
-                labels = [f"workers of {unit}"]
-            case TopLevel():
-                labels = ["top level"]
-        names.extend(label for label in labels if label not in names)
+        groups = (Showrunners(), UnitDirectors(), Agents()) if isinstance(group, AllRoles) else (group,)
+        for item in groups:
+            label = _group_name(item)
+            if label not in names:
+                names.append(label)
     machines = os.environ.get("BROADCAST_CLOSING_MACHINES", "")
     if not machines:
         machines = (f"{roster.machine_name()} and {roster.remote.other_machine()}"
@@ -190,7 +180,8 @@ def _broadcast(
 
     def deliver(chosen_entry: tuple[roster.RosterEntry, str]) -> Delivery:
         entry, text = chosen_entry
-        recipient = Recipient(entry.name, entry.role)
+        shown = roster.shown_name(entry)
+        recipient = Recipient(shown.render(), shown.address)
         match entry.reach:
             case roster.CannotReceiveMessages():
                 return Delivery(recipient, "no live session", _unreachable(entry, entry.reach))
@@ -221,8 +212,9 @@ def report(deliveries: list[Delivery]) -> bool:
                 print(f"{host}: {line}")
             case GroupWithoutMembers(group):
                 print(f"{_group_name(group)} - none on this machine")
-            case Recipient(session, role):
-                print(f"{session} - {role} - {outcome}" + (f": {detail}" if detail else ""))
+            case Recipient(session, address):
+                label = f"{session} [{address}]" if address and address != session else session
+                print(f"{label} - {outcome}" + (f": {detail}" if detail else ""))
     return all(delivery.outcome != "NOT sent" for delivery in deliveries)
 
 
@@ -237,7 +229,9 @@ def _unit_group(target: str, entries: Sequence[roster.RosterEntry]) -> WorkersOf
         descriptions = [f"  {entry.director.unit if isinstance(entry.director, roster.DirectsUnit) else entry.name}"
                         + f" ({entry.name}, {entry.machine}): {address}"
                         for entry, address in known]
-        reason = f"{target} matches more than one unit director:" if matches else f"unknown unit {target}; known units:"
+        loaded = display_names.runtime_names()
+        role_label = loaded.job("unit_director") if isinstance(loaded, display_names.Names) else "director"
+        reason = f"{target} matches more than one {role_label}:" if matches else f"unknown unit {target}; known units:"
         raise ValueError("\n".join([reason, *descriptions]))
     director, address = matches[0]
     return WorkersOfUnit(address,
@@ -246,21 +240,26 @@ def _unit_group(target: str, entries: Sequence[roster.RosterEntry]) -> WorkersOf
 
 
 def _group_name(group: BroadcastGroup) -> str:
+    loaded = display_names.runtime_names()
+    if not isinstance(loaded, display_names.Names):
+        return type(group).__name__
+    key: display_names.AudienceKey
     match group:
         case AllRoles():
-            return "all roles"
+            key = "all_roles"
         case Showrunners():
-            return "showrunners"
+            key = "showrunners"
         case UnitDirectors():
-            return "unit directors"
+            key = "unit_directors"
         case Agents():
-            return "agents"
+            key = "agents"
         case Workers():
-            return "workers"
+            key = "workers"
         case WorkersOfUnit(unit=unit):
-            return f"workers of {unit}"
+            return f"{loaded.audience('workers')} of {unit}"
         case TopLevel():
-            return "top level"
+            key = "top_level"
+    return loaded.audience(key)
 
 
 def _machine_texts(

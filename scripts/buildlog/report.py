@@ -59,7 +59,7 @@ CALLER_LABELS = {
     "brp-launch": "example launches (brp)",
     "unknown": "unknown",
 }
-OUTCOME_ORDER = ["ran", "failed", "interrupted", "reused", "replayed", "superseded", "deferred"]
+OUTCOME_ORDER = ["ran", "failed", "interrupted", "cancelled", "reused", "replayed", "superseded", "deferred"]
 SCRATCH = "(cwd LIKE '/tmp/%' OR cwd LIKE '/var/folders/%' OR cwd LIKE '/private/var/folders/%')"
 GROUP_AS_SCRATCH = f"({SCRATCH} AND caller != 'brp-launch')"
 SCRATCH_LABEL = "scratch (temp folders)"
@@ -1670,7 +1670,7 @@ def tests_per_edit_data(connection: sqlite3.Connection, end_day: str) -> TestsPe
                 recovery.minutes_to_green += minutes
                 recovery.recovery_minutes.append(minutes)
             edits_since_green[worker] = 0
-        elif outcome not in ("interrupted", "superseded") and (outcome == "failed" or status is not None and status != 0) and in_window:
+        elif outcome not in ("interrupted", "superseded", "cancelled") and (outcome == "failed" or status is not None and status != 0) and in_window:
             edits = edits_since_green.get(worker, 0)
             bin_index = failure_bin(edits)
             bins[bin_index].failures += 1
