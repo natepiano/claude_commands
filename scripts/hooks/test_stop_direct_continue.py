@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.test_agents_registry import write_registry
+
 import json
 import os
 import subprocess
@@ -72,7 +74,7 @@ def director_stop_fixture() -> Generator[DirectorStopFixture]:
         marker = active / SESSION
         _ = marker.write_text(str(run), encoding="utf-8")
         config = root / "agents.conf"
-        _ = config.write_text("[claude.context]\ndefault=200k\n", encoding="utf-8")
+        _ = write_registry(config, {'claude.context': {'default': '200k'}}, replace_sections=('claude.context',))
         environment = {
             "PATH": os.environ.get("PATH", ""), "HOME": str(root),
             "PYTHONDONTWRITEBYTECODE": "1", "HERDR_BIN": "/nonexistent/herdr",
