@@ -320,7 +320,7 @@ def unit_pane(found: unit_lookup.MarkedUnit | None, production: str) -> UnitPane
         state = pane_record.pane_shell_state(found.place)
         rows = [row for row in herdr.herdr_processes() if row.place == found.place]
         _own_shell(rows, production, found.unit, state.pid)
-        if state.members - {row.pid for row in rows}:
+        if pane_record.still_running(state.members - {row.pid for row in rows}):
             raise RenameRefused("unknown occupant in the unit pane")
         return UnitPane(production, found.unit, found.place, state.pid, state.started)
     except (herdr.HerdrFailure, OSError, ValueError, IndexError, KeyError, subprocess.SubprocessError) as error:

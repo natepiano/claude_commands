@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import os
+import shutil
 import sys
 import subprocess
 import tempfile
@@ -224,6 +225,41 @@ class UnitOperationPaneTests(unittest.TestCase):
         with mock.patch.object(herdr, 'herdr_processes', side_effect=scan):
             with self.assertRaisesRegex(RenameRefused, 'resumed|unknown'):
                 self.stop()
+        self.assertEqual(self.pane.close_calls(), [])
+
+    def test_process_that_exits_during_the_scan_is_not_an_occupant(self) -> None:
+        read_groups = herdr.systemd_cgroups
+        job = self.root / 'proc/991551'
+        for error in (FileNotFoundError, ProcessLookupError, PermissionError):
+            with self.subTest(error=error.__name__):
+                self.pane.unmarked_occupant_scenario(991551, 'scope')
+
+                def exiting_groups(process: Path, error: type[OSError] = error) -> list[tuple[str, Path]]:
+                    if process != job:
+                        return read_groups(process)
+                    if error is not PermissionError:
+                        shutil.rmtree(job)
+                    raise error(str(job / 'cgroup'))
+
+                with mock.patch.object(herdr, 'systemd_cgroups', side_effect=exiting_groups):
+                    if error is PermissionError:
+                        with self.assertRaisesRegex(RenameRefused, 'cannot prove its pane shell safe to close'):
+                            _ = unit_move.unit_pane(self.pane.found, 'demo')
+                    else:
+                        self.assertIsNotNone(unit_move.unit_pane(self.pane.found, 'demo'))
+                self.assertEqual(self.pane.close_calls(), [])
+
+    def test_member_that_exits_before_the_herdr_read_is_not_an_occupant(self) -> None:
+        listed = herdr.herdr_processes
+        job = self.root / 'proc/991551'
+
+        def after_exit() -> list[herdr.HerdrProcess]:
+            shutil.rmtree(job)
+            return listed()
+
+        self.pane.unmarked_occupant_scenario(991551, 'session')
+        with mock.patch.object(herdr, 'herdr_processes', side_effect=after_exit):
+            self.assertIsNotNone(unit_move.unit_pane(self.pane.found, 'demo'))
         self.assertEqual(self.pane.close_calls(), [])
 
     def test_foreign_or_unmarked_occupant_in_owned_pane_blocks_without_close(self) -> None:
