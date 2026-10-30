@@ -23,7 +23,6 @@ import fake_showrunner
 import fake_unit_host
 
 from scripts.herdr import fake_herdr
-from scripts.direct import review_pool
 from scripts.production import showrunners as pool_showrunners
 from scripts.production.cli_fixture import invoke_cli
 import transfer_unit
@@ -296,8 +295,6 @@ class UnitTransferFixture(unittest.TestCase):
             cwd = Path(cast(str, kwargs.get("cwd") or os.getcwd()))
             if command[0] == self.env["HERDR_BIN"]:
                 return invoke_cli(fake_herdr, lambda: fake_herdr.main(command[1:]), command[1:], environment, cwd)
-            if command[:2] == [sys.executable, str(transfer_unit.POOL)]:
-                return invoke_cli(review_pool, review_pool.main, command[2:], environment, cwd, production_state=True)
             return original_run(command, *args, **kwargs)
 
         with (mock.patch.object(rename_unit, "SHUTDOWN", Path(self.env.get("RENAME_UNIT_SHUTDOWN")

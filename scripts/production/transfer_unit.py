@@ -56,8 +56,6 @@ else:
     # rename_unit puts the shutdown folder on the path.
     from record import SessionShutdown
 
-POOL = Path(__file__).resolve().parent.parent / "direct" / "review_pool.py"
-
 
 @dataclass
 class UnitTransfer:
@@ -392,8 +390,8 @@ def _commit_from(transfer: UnitTransfer, save: Callable[[], None]) -> None:
 
 
 def _move_state(transfer: UnitTransfer, _save: Callable[[], None]) -> None:
-    """The stall-watch stretch moves to the receiving slug; the giving pool's reviewers retire, so
-    the receiving pool leases its own; the old pane entry goes, since the relaunch records a new one.
+    """The stall-watch stretch moves to the receiving slug; the old pane entry goes,
+    since the relaunch records a new one.
     The unit's held design roles name the receiving production as holder, so they resume under it.
     The phase note follows on the unit's next refresh, and the giving showrunner's report state
     keeps its rows as history."""
@@ -408,10 +406,6 @@ def _move_state(transfer: UnitTransfer, _save: Callable[[], None]) -> None:
         raise RenameRefused(f"held roles: {error}") from error
     for path in (stall_watch.stretch_path, stall_watch.prompt_path):
         unit_move.move(PathMove(path(transfer.from_slug, transfer.unit), path(transfer.to_slug, transfer.unit)))
-    retired = subprocess.run([sys.executable, str(POOL), "retire", "--production", transfer.from_slug,
-                              "--unit", transfer.unit], capture_output=True, text=True, check=False)
-    if retired.returncode:
-        raise RenameRefused(f"review pool: {(retired.stderr or retired.stdout).strip()}")
     _ = pane_record.forget_unit(transfer.unit)
 
 
@@ -470,17 +464,6 @@ def _relaunch(transfer: UnitTransfer, _save: Callable[[], None]) -> None:
         time.sleep(rename_unit.POLL_SECONDS)
 
 
-def _leased(slug: str, unit: str) -> list[str]:
-    """The reviewers of `slug`'s pool still leased to `unit`."""
-    listed = subprocess.run([sys.executable, str(POOL), "status", "--production", slug],
-                            capture_output=True, text=True, check=False)
-    if listed.returncode:
-        return [f"(the review pool is unreadable: {(listed.stderr or listed.stdout).strip()})"]
-    return [fields[0] for fields in (line.split("\t") for line in listed.stdout.splitlines())
-            if len(fields) >= 4 and fields[2] != "unleased"
-            and retire_unit.same_unit(fields[2].rsplit(":", 1)[0], unit)]
-
-
 def verify_failures(transfer: UnitTransfer) -> list[str]:
     """Every place that names the unit's production names the receiving one."""
     unit, failures = transfer.unit, list[str]()
@@ -506,8 +489,6 @@ def verify_failures(transfer: UnitTransfer) -> list[str]:
     if holder is not None and isinstance(holder.claude, (unit_lookup.LiveClaude, unit_lookup.ClaudeUnknown)):
         failures.append(f"a session still carries the marks {transfer.from_slug} {unit}: "
                         + unit_lookup.holder_text(holder))
-    if leased := _leased(transfer.from_slug, unit):
-        failures.append(f"review pool {transfer.from_slug}: {', '.join(leased)} still leased to {unit}")
     from scripts.astra import design_roles
     failures.extend(design_roles.holder_failures(design_roles.UnitHolder(transfer.from_slug, unit)))
     return failures
@@ -544,7 +525,7 @@ def _describe_from(t: UnitTransfer) -> str:
 
 def _describe_state(t: UnitTransfer) -> str:
     return (f"state: stall-watch stretch {t.from_slug} -> {t.to_slug}; held design roles' holder "
-            + f"{t.from_slug} -> {t.to_slug}; retire the {t.from_slug} reviewers; forget the old pane")
+            + f"{t.from_slug} -> {t.to_slug}; forget the old pane")
 
 
 def _describe_record(t: UnitTransfer) -> str:

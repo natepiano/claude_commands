@@ -10,9 +10,6 @@ ids; a Codex worker member is its thread id, since a Codex worker has no Claude 
 - a unit director to each Codex worker of its run, with the worker's role from `mesh_roster.json`;
 - a unit director to each Claude worker of its run, its member that worker's Claude session id and
   its role the one `board.sh roles` reports for its slot;
-- a unit director to each pool reviewer it leases, role `review`, its member the reviewer's thread
-  id, from the review pool's `pool.json`. It also carries `unit` (the lease's unit), `thread_id`,
-  `state` (`busy` while its `busy_pid` runs, else `idle`) and `type`. Templates are left out.
 - a Claude manager to each local Astra thread it holds, role `astra-designer` or
   `astra-reviewer`, from the Astra role records. Each adds `codex_home` and `state`
   (`busy` while its mesh worker runs or waits for capacity, or its exec pid runs; else `idle`).
@@ -65,20 +62,9 @@ class Edge(TypedDict):
     role: Role
 
 
-class ReviewerEdge(Edge):
-    unit: str
-    thread_id: str
-    state: Literal["busy", "idle"]
-    type: str
-
-
 class AstraEdge(Edge):
     codex_home: str
     state: Literal["busy", "idle"]
-
-
-def pool_root() -> Path:
-    return Path(os.environ.get("REVIEW_POOL_STATE", "~/.local/state/review-pool")).expanduser()
 
 
 def _warn(text: str) -> None:
@@ -216,43 +202,6 @@ def _claude_edges(director: str, run: Path, workers: dict[str, str]) -> list[Edg
     return edges
 
 
-def _pid_running(pid: object) -> bool:
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
-
-
-def reviewer_edges(running: set[str], marked: unit_lookup.MarkedProductions) -> list[ReviewerEdge]:
-    """Each leased pool reviewer under the running unit director that holds its lease."""
-    edges: list[ReviewerEdge] = []
-    for slug, units in sorted(marked.units.items()):
-        reviewers = _json_object(pool_root() / slug / "pool.json").get("reviewers")
-        if not isinstance(reviewers, dict):
-            continue
-        for _name, raw in sorted(cast(dict[str, object], reviewers).items()):
-            if not isinstance(raw, dict):
-                continue
-            reviewer = cast(dict[str, object], raw)
-            lease = reviewer.get("lease")
-            leased = cast(dict[str, object], lease).get("unit") if isinstance(lease, dict) else None
-            thread, kind = reviewer.get("thread_id"), reviewer.get("type")
-            director = units.get(leased) if isinstance(leased, str) else None
-            claude = director.claude if director is not None else None
-            if (isinstance(leased, str) and isinstance(thread, str) and thread and isinstance(kind, str)
-                    and isinstance(claude, unit_lookup.LiveClaude) and claude.session_id in running):
-                edges.append(ReviewerEdge(manager=claude.session_id, member=thread, role="review", unit=leased,
-                                          thread_id=thread,
-                                          state="busy" if _pid_running(reviewer.get("busy_pid")) else "idle",
-                                          type=kind))
-    return edges
-
-
 def astra_edges() -> list[AstraEdge]:
     """Each live Astra thread under its Claude manager, wherever that manager runs."""
     return [AstraEdge(manager=record["manager"], member=record["thread_id"],
@@ -289,7 +238,7 @@ def tree() -> list[Edge]:
     sessions = showrunner_sessions()
     marked = marked_units()
     astra = astra_edges()
-    managed: list[Edge] = [*unit_edges(sessions, running, marked), *reviewer_edges(running, marked)] if marked is not None else []
+    managed: list[Edge] = unit_edges(sessions, running, marked) if marked is not None else []
     return [*showrunner_edges(sessions, running), *managed,
             *worker_edges(running, {edge["member"] for edge in astra}), *astra]
 

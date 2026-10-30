@@ -134,17 +134,11 @@ class NotMeshWorker:
 Caller = MeshCaller | NotMeshWorker
 
 
-def _pool_state() -> Path:
-    return Path(os.environ.get("REVIEW_POOL_STATE") or Path.home() / ".local/state/review-pool").expanduser()
-
-
 def _roster_folders() -> Iterator[Path]:
     """Read unit runs first, before inspecting retained external meshes."""
     for root in RUN_ROOTS:
         for path in sorted(root.glob(f"*/{codex_mesh.ROSTER_FILE}")):
             yield path.parent
-    for path in sorted(_pool_state().glob(f"*/mesh/*/{codex_mesh.ROSTER_FILE}")):
-        yield path.parent
     from scripts.astra import design_roles
     yield from design_roles.durable_meshes()
 

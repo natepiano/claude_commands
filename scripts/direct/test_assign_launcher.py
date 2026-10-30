@@ -286,10 +286,39 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         self.assertEqual(len(self.methods("thread/start")), 1)
         self.assertEqual(self.methods("thread/fork"), [])
         self.assertEqual(len(self.methods("turn/start")), 2)
+
         ledger = workers.ledger_for_run(self.session_dir)
         with ledger.locked() as saved:
             self.assertEqual(saved.workers[name].backend,
                              workers.CodexThread(str(thread), os.environ["CODEX_HOME"]))
+
+    def test_frozen_implement_post_turn_step_records_identity_with_pool_module_absent(self) -> None:
+        # Execute the Python text already held by an old shell, after its turn.
+        # An import finder makes the retired module unavailable, including through
+        # any transitive import made by the step.
+        launcher = (ROOT / "scripts/direct/implement.sh").read_text()
+        held_step = launcher.split("worker_record() {", 1)[1].split("<<'PY'\n", 1)[1].split("\nPY\n}", 1)[0]
+        name = "project-impl"
+        roster = self.session_dir / codex_mesh.ROSTER_FILE
+        _ = roster.write_text(json.dumps({name: {"thread_id": "completed-worker-thread", "status": "done"}}))
+        unavailable_module = """import importlib.abc, sys
+class RemovedPool(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in ('scripts.direct.review_pool', 'review_pool'):
+            raise ModuleNotFoundError('retired module unavailable', name=fullname)
+sys.meta_path.insert(0, RemovedPool())
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", unavailable_module + held_step, "record", str(self.session_dir),
+             "impl", name, "codex", "gpt-kept-sol", str(self.session_dir / "impl_agent_impl"), "1",
+             str(ROOT / "scripts/agents/codex_mesh.py"), str(ROOT / "scripts/direct/board.sh"), "0", "impl"],
+            env=os.environ.copy(), capture_output=True, text=True, timeout=15, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(read_object(self.session_dir / "impl_worker_impl.json"), {
+            "name": name, "slot": "impl", "family": "codex", "model": "gpt-kept-sol",
+            "worker_id": "completed-worker-thread",
+        })
+        self.assertEqual(read_object(roster)[name], {"thread_id": "completed-worker-thread", "status": "done"})
 
     def test_ignored_code_flags_reuse_the_units_own_reviewer_across_passes(self) -> None:
         for arguments in (["init", "-q"], ["add", "plan.md"],
@@ -320,34 +349,6 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         self.assertTrue(all(turn["arm"] == "own" for turn in turns))
         self.assertFalse(archive.exists(), "a review without an old lease must not create pool state")
 
-    def test_the_first_assigned_review_adopts_the_pool_thread_before_dispatch(self) -> None:
-        pool_root = self.session_dir.parent / "review-pool"
-        pool = pool_root / "fixture-production/pool.json"
-        source = pool.parent / "mesh/0"
-        source.mkdir(parents=True)
-        _ = (source / codex_mesh.SERVER_FILE).write_bytes((self.session_dir / codex_mesh.SERVER_FILE).read_bytes())
-        instructions = source / "code.md"
-        _ = instructions.write_text("Keep this reviewer's context.\n")
-        _ = (source / codex_mesh.ROSTER_FILE).write_text(json.dumps({"code6": {
-            "thread_id": mesh_fixture.THREAD_ID, "status": "done", "role": "review",
-            "model": "gpt-kept-sol", "effort": "high", "family": "codex", "port": self.server.port,
-            "codex_home": os.environ["CODEX_HOME"], "cwd": str(self.project),
-            "instructions_file": str(instructions), "access_policy": {"kind": "ReadOnlyReviewer"},
-        }}))
-        _ = pool.write_text(json.dumps({"generation": 0, "templates": {}, "reviewers": {
-            "code6": {"type": "code", "thread_id": mesh_fixture.THREAD_ID, "prime_hash": "saved-context",
-                      "lease": {"unit": "fixture-unit", "ordinal": 6}, "busy_pid": None, "reviews": 6},
-        }}))
-        with patch.dict(os.environ, {"REVIEW_POOL_STATE": str(pool_root)}):
-            _ = self.successful("review", "--lens", "contract", "--pass", "1")
-        name, record = next(iter(self.assignment_records().items()))
-        self.assertEqual(name, "project-review")
-        self.assertEqual(record["thread_id"], mesh_fixture.THREAD_ID)
-        self.assertEqual(record["role"], "review")
-        self.assertEqual(read_object(pool)["reviewers"], {})
-        self.assertEqual(self.methods("thread/start"), [])
-        self.assertEqual(self.methods("thread/fork"), [])
-        self.assertEqual(len(self.methods("turn/start")), 1)
 
     def test_a_review_worker_dispatched_for_implementation_keeps_one_durable_identity(self) -> None:
         _ = self.successful("review", "--lens", "contract", "--pass", "1")

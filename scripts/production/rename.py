@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import argparse
-import os
 import re
 import shlex
 import sys
 from contextlib import contextmanager, nullcontext
 from collections.abc import Generator
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
@@ -52,7 +52,10 @@ class UnitWithoutRestore(TypedDict):
 UnitRestore = StoppedUnitRestore | UnitWithoutRestore
 
 
-REVIEW_POOL_STATE = Path(os.environ.get("REVIEW_POOL_STATE") or Path.home() / ".local/state/review-pool")
+class LegacyApplyStep(str, Enum):
+    """Completed work retained from a retired rename operation."""
+
+    REVIEW_POOL_RETIRED = "legacy_review_pool_retired"
 
 
 @dataclass(frozen=True)
@@ -69,7 +72,6 @@ class RenamePlan:
     timer: PathMove
     state: tuple[PathMove, ...]
     stall: tuple[PathMove, ...]
-    review_pool: PathMove
 
     @property
     def journal(self) -> Path:
@@ -229,8 +231,7 @@ def _build(old: str, new: str) -> RenamePlan:
         tuple(units), tuple(plans), PathMove(instance, instance.with_name(f"showrunner-{new}")),
         tuple(PathMove(source, destination) for source, destination in
               zip(tidy_wrapped.owned_paths(old), tidy_wrapped.owned_paths(new), strict=True)),
-        tuple(PathMove(stall_watch.stretch_path(old, unit), stall_watch.stretch_path(new, unit)) for unit in units),
-        PathMove(REVIEW_POOL_STATE.expanduser() / old, REVIEW_POOL_STATE.expanduser() / new))
+        tuple(PathMove(stall_watch.stretch_path(old, unit), stall_watch.stretch_path(new, unit)) for unit in units))
     for path in (result.old_doc, *result.plans):
         _ = unit_move.git(result.checkout, "ls-files", "--error-unmatch", "--", _relative(result, path))
         _ = path.read_text(encoding="utf-8")
@@ -280,18 +281,25 @@ def _strings(fields: dict[str, object], key: str) -> tuple[str, ...]:
     return tuple(cast(str, item) for item in items)
 
 
-def _completed_steps(fields: dict[str, object]) -> tuple[str, ...] | None:
-    """Return the completed apply step names, or None when the record is not valid."""
+def _completed_steps(fields: dict[str, object]) -> tuple[str, ...]:
+    """Decode current and legacy progress without restoring retired operations."""
     if "completed" in fields:
         names = fields["completed"]
         if not isinstance(names, list) or not all(isinstance(name, str) and name for name in cast(list[object], names)):
-            return None
-        return tuple(cast(list[str], names))
-    # A journal written before apply recorded step names holds a count of the 7-step list.
-    step = fields.get("step")
-    if type(step) is not int or not 0 <= step <= len(COUNTED_APPLY_STEP_NAMES):
-        return None
-    return COUNTED_APPLY_STEP_NAMES[:step]
+            raise RenameRefused("invalid rename progress")
+        completed = tuple(cast(list[str], names))
+    else:
+        # Counted journals used the original seven-step order.
+        step = fields.get("step")
+        if type(step) is not int or not 0 <= step <= len(COUNTED_APPLY_STEP_NAMES):
+            raise RenameRefused("invalid rename progress")
+        completed = COUNTED_APPLY_STEP_NAMES[:step]
+    decoded = tuple(LegacyApplyStep.REVIEW_POOL_RETIRED.value if name == "_rename_review_pool" else name
+                    for name in completed)
+    # Later installs may own other named steps; preserve that progress.
+    if len(set(decoded)) != len(decoded):
+        raise RenameRefused("invalid rename progress")
+    return decoded
 
 
 def _current_production(old: str, new: str, completed: tuple[str, ...]) -> production_units.Production:
@@ -327,7 +335,7 @@ def _load(path: Path, old: str, new: str) -> tuple[RenamePlan, tuple[str, ...]]:
     if old not in (recorded_old, new) and showrunners.canonical_slug(old) not in (recorded_old, new):
         raise RenameRefused(f"{path}: rename is from {recorded_old}, not {old}")
     completed = _completed_steps(fields)
-    if completed is None or not isinstance(fields.get("done"), bool):
+    if not isinstance(fields.get("done"), bool):
         raise RenameRefused(f"{path}: invalid rename progress")
     production = _current_production(recorded_old, new, completed)
     units = _strings(fields, "units")
@@ -351,8 +359,7 @@ def _load(path: Path, old: str, new: str) -> tuple[RenamePlan, tuple[str, ...]]:
                         tuple(PathMove(source, destination) for source, destination in
                               zip(tidy_wrapped.owned_paths(recorded_old), tidy_wrapped.owned_paths(new), strict=True)),
                         tuple(PathMove(stall_watch.stretch_path(recorded_old, unit),
-                                       stall_watch.stretch_path(new, unit)) for unit in units),
-                        PathMove(REVIEW_POOL_STATE.expanduser() / recorded_old, REVIEW_POOL_STATE.expanduser() / new))
+                                       stall_watch.stretch_path(new, unit)) for unit in units))
     if result.journal != path:
         raise RenameRefused(f"{path}: journal state directory changed")
     return result, completed
@@ -385,12 +392,11 @@ def _describe(plan: RenamePlan) -> list[str]:
             f"4. held design roles: holder {plan.old} showrunner -> {plan.new} showrunner",
             *rename_outside.describe(plan.old, plan.new, plan.old_doc, plan.new_doc),
             *(stretches or ["5. stall-watch: no Units rows"]),
-            f"6. review pool {moves(plan.review_pool)}",
-            (f"7. merge branch {plan.merge_branch} -> {plan.new}; commit {plan.message!r}; push origin {plan.new}; "
+            (f"6. merge branch {plan.merge_branch} -> {plan.new}; commit {plan.message!r}; push origin {plan.new}; "
              + f"keep {plan.merge_branch} until finish" if plan.renames_branch else
-             f"7. merge branch {plan.merge_branch} kept (not named for the production); commit {plan.message!r}; "
+             f"6. merge branch {plan.merge_branch} kept (not named for the production); commit {plan.message!r}; "
              + f"push origin {plan.merge_branch}"),
-            f"8. phase notes: {plan.old} -> {plan.new_doc}"]
+            f"7. phase notes: {plan.old} -> {plan.new_doc}"]
 
 
 def _dirty(plan: RenamePlan) -> list[str]:
@@ -412,7 +418,7 @@ def _preflight(plan: RenamePlan) -> None:
         raise RenameRefused(f"branch {plan.new} already exists")
     if plan.renames_branch and unit_move.git(plan.checkout, "ls-remote", "--heads", "origin", f"refs/heads/{plan.new}"):
         raise RenameRefused(f"origin branch {plan.new} already exists")
-    for move in (PathMove(plan.old_doc, plan.new_doc), plan.timer, *plan.state[:-1], *plan.stall, plan.review_pool):
+    for move in (PathMove(plan.old_doc, plan.new_doc), plan.timer, *plan.state[:-1], *plan.stall):
         if unit_move.exists(move.destination):
             raise RenameRefused(f"destination already exists: {move.destination}")
     for path in rename_outside.destinations(plan.old, plan.new, plan.old_doc):
@@ -519,10 +525,6 @@ def _rename_stall_watch(plan: RenamePlan) -> None:
         unit_move.move(move)
 
 
-def _rename_review_pool(plan: RenamePlan) -> None:
-    unit_move.move(plan.review_pool)
-
-
 def _rename_unit_workers(plan: RenamePlan) -> None:
     from scripts.direct import workers
     root = workers.ledger_path(plan.old, "unused").parent
@@ -580,7 +582,7 @@ def _retarget_phase_notes(plan: RenamePlan) -> None:
 
 
 APPLY_STEPS = (_rename_doc, _rewrite_plans, _rename_timer, _rename_showrunner_state,
-               _rename_stall_watch, _rename_review_pool, _rename_unit_workers, _rename_branch,
+               _rename_stall_watch, _rename_unit_workers, _rename_branch,
                _retarget_phase_notes)
 APPLY_STEP_NAMES = tuple(step.__name__ for step in APPLY_STEPS)
 # The step list of journals that recorded a count; its order maps a count to step names.

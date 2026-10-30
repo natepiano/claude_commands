@@ -2706,8 +2706,7 @@ def _server_environment(session_dir: str, workers_home: Path) -> dict[str, str]:
     A worker's hooks and verify.sh runs read the run from UNIT_RUN_DIR. The caller's copy
     cannot be trusted: implement.sh exports it only after its claim step, whose `compact` call may
     already have started this server. A run folder is known here, so the server names it itself. A
-    review pool's mesh directory, or any other mesh directory, is not a run: one pool server
-    serves the turns of many units, so it keeps the caller's environment unchanged.
+    A shared mesh directory is not a unit run, so it keeps the caller's environment unchanged.
     """
     environment = {**os.environ, "CODEX_HOME": str(workers_home)}
     context = _design_context(session_dir)
@@ -5931,32 +5930,6 @@ def _release_adopted_writer(source: str, name: str, thread_id: str, target_port:
                 client.close()
 
 
-def detach_reviewer_transport(source: str, name: str, thread_id: str,
-                              inbox: TextIO, pending: dict[str, object]) -> None:
-    """Carry server submissions and release the old writer before archiving it."""
-    for port in _run_servers(source):
-        client = Client(port, f"reviewer-transfer-{name}")
-        try:
-            if thread_id not in _loaded_thread_ids(client, time.monotonic() + THREAD_RELEASE_TIMEOUT_SECS):
-                continue
-            if not isinstance(_read_live_turn(client, thread_id), ThreadIdle):
-                raise unit_workers.WorkerUnavailable(f"{name}: reviewer still has a live turn")
-            def park(message: str) -> None:
-                messages = cast(list[str], pending.get("messages", []))
-                pending.update({"thread_id": thread_id, "messages": [*messages, message]})
-                _ = inbox.seek(0)
-                _ = inbox.truncate()
-                _ = inbox.write(json.dumps(pending))
-                inbox.flush()
-                os.fsync(inbox.fileno())
-            _move_queue_to_pending(client, thread_id, park)
-            released = _release_worker_thread(client, thread_id, source)
-            if isinstance(released, WorkerThreadStateUnknown):
-                raise unit_workers.WorkerUnavailable(released.reason)
-        finally:
-            client.close()
-
-
 def worker_launcher_attached(record: Mapping[str, object]) -> bool:
     """A launcher claim is occupied while its recorded process is alive."""
     return _pid_alive(_as_int(record.get("launcher_pid")))
@@ -8135,7 +8108,6 @@ def command_serve(args: argparse.Namespace) -> int:
     port, _fresh = ensure_server(_as_str(_attr(args, "session_dir")))
     print(port)
     return 0
-
 
 
 def _failure_account_detail(error: BaseException, serving: CodexServingState) -> str:

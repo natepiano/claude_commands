@@ -6,9 +6,10 @@ import json
 import os
 import shlex
 import unittest
-from collections.abc import Callable
-from typing import cast, final
+from collections.abc import Callable, Iterator
+from typing import BinaryIO, TextIO, cast, final
 from unittest import mock
+from pathlib import Path
 
 from scripts.direct import workers
 from scripts.production import rename_test_support as support
@@ -67,6 +68,61 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.assert_applied()
         self.assert_journal_has_no_current_locations()
 
+    def test_legacy_progress_resumes_without_reading_or_moving_the_archive(self) -> None:
+        self.assert_success(self.run_rename("apply"))
+        tip = self.git("rev-parse", NEW)
+        baseline = self.journal()
+        archive = {path: path.read_bytes() for path in self.pool.rglob("*") if path.is_file()}
+        original_open = Path.open
+        original_glob = Path.glob
+
+        def refuse_open(path: Path, mode: str = "r", buffering: int = -1,
+                        encoding: str | None = None, errors: str | None = None,
+                        newline: str | None = None) -> TextIO | BinaryIO:
+            if path.is_relative_to(self.pool):
+                raise AssertionError(f"legacy rename opened the archive: {path}")
+            return cast(TextIO | BinaryIO, original_open(path, mode, buffering, encoding, errors, newline))
+
+        def refuse_glob(path: Path, pattern: str, *, case_sensitive: bool | None = None,
+                        recurse_symlinks: bool = False) -> Iterator[Path]:
+            if path.is_relative_to(self.pool):
+                raise AssertionError(f"legacy rename scanned the archive: {path}")
+            return original_glob(path, pattern, case_sensitive=case_sensitive, recurse_symlinks=recurse_symlinks)
+
+        legacy_steps = ["_rename_doc", "_rewrite_plans", "_rename_timer", "_rename_showrunner_state",
+                        "_rename_stall_watch", "_rename_review_pool", "_rename_branch"]
+        for progress in ({"step": 7}, {"completed": legacy_steps}):
+            with self.subTest(progress=progress):
+                journal = {key: value for key, value in baseline.items() if key != "completed"}
+                journal.update(progress)
+                self.write(self.state / "new/rename.json", json.dumps(journal))
+                with mock.patch.object(Path, "open", refuse_open), \
+                        mock.patch.object(Path, "glob", refuse_glob):
+                    self.assert_success(self.run_rename("apply"))
+                self.assertIn("legacy_review_pool_retired", cast(list[str], self.journal()["completed"]))
+                self.assertNotIn("_rename_review_pool", cast(list[str], self.journal()["completed"]))
+                self.assertNotIn("review_pool", self.journal())
+                self.assertEqual(self.git("rev-parse", NEW), tip)
+                self.assertEqual({path: path.read_bytes() for path in archive}, archive)
+                self.assertFalse((self.pool / "new").exists())
+
+    def test_malformed_progress_refuses_before_changing_the_journal_or_archive(self) -> None:
+        _ = self.interrupt_apply(0)
+        baseline = self.journal()
+        for progress in ({"step": -1}, {"step": 8}, {"step": True}, {"step": "1"},
+                         {"completed": None}, {"completed": "_rename_doc"},
+                         {"completed": [""]}, {"completed": [1]},
+                         {"completed": ["_rename_doc", "_rename_doc"]}):
+            with self.subTest(progress=progress):
+                journal = {key: value for key, value in baseline.items() if key != "completed"}
+                journal.update(progress)
+                self.write(self.state / "new/rename.json", json.dumps(journal))
+                before = self.snapshot()
+                result = self.run_rename("apply")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("invalid rename progress", result.stdout + result.stderr)
+                self.assertEqual(self.snapshot(), before)
+
     def test_resume_after_doc_timer_steps_after_checkout_moves(self) -> None:
         _ = self.interrupt_apply(3)
         self.move_showrunner_checkout()
@@ -88,7 +144,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         journal.update(checkout=str(self.checkout), old_doc=str(self.doc), new_doc=str(self.new_doc),
                        plans=[str(path) for path in plan.plans], timer=move_record(plan.timer),
                        state=[move_record(move) for move in plan.state],
-                       stall=[move_record(move) for move in plan.stall], review_pool=move_record(plan.review_pool))
+                       stall=[move_record(move) for move in plan.stall], review_pool={"source": str(self.pool / "old"), "destination": str(self.pool / "new")})
         self.write(self.state / "new/rename.json", json.dumps(journal))
         self.move_showrunner_checkout()
         self.assert_success(self.run_rename("apply"))
@@ -220,12 +276,11 @@ class ProductionRenameTests(support.ProductionRenameFixture):
                      *(self.state / directory / f"{slug}.json"
                        for directory in ("review-paused", "outstanding") for slug in (OLD, NEW)),
                      self.state / "child/parent",
-                     *(self.stall_path(slug, unit) for unit in UNITS for slug in (OLD, NEW)),
-                     self.pool / "old", self.pool / "new"):
+                     *(self.stall_path(slug, unit) for unit in UNITS for slug in (OLD, NEW))):
             self.assertIn(str(path), result.stdout)
         self.assertIn(f"{self.state}/*/parent", result.stdout)
         steps = [int(line.split(".", 1)[0]) for line in result.stdout.splitlines()]
-        self.assertEqual(set(steps), set(range(1, 9)))
+        self.assertEqual(set(steps), set(range(1, 8)))
         self.assertEqual(steps, sorted(steps))
         self.assertIn("merge branch old -> new", result.stdout)
         self.assertIn("push origin new", result.stdout)
@@ -331,7 +386,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.assertTrue((self.notifier / "showrunner-old/conf").exists())
         self.assertFalse((self.notifier / "showrunner-new").exists())
         self.assert_success(self.run_rename("apply", source="ancient"))
-        self.assertEqual(self.completed_steps(), 9)
+        self.assertEqual(self.completed_steps(), 8)
         self.assertEqual(self.git("rev-parse", "new^"), base)
         self.assertEqual(self.git("status", "--porcelain"), "")
 

@@ -4,14 +4,21 @@ from __future__ import annotations
 
 import unittest
 from scripts.direct import implement_launcher_test_support as support
+from scripts.direct.review_launcher_test_support import without_retired_pool
 from scripts.direct.implement_launcher_test_support import DIRECT_DIR as DIRECT_DIR
-from typing import cast
+from typing import cast, override
 import json
 import subprocess
 import sys
 
 
 class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
+    @override
+    def environment(self) -> dict[str, str]:
+        # Successful and failed turns exercise finish-pass and landed/abandon
+        # after the worker exits, with no retired module to import.
+        return without_retired_pool(self.root, super().environment())
+
     def test_a_companion_fix_starts_after_the_resolver_lands_its_round(self) -> None:
         session = self.start_phase("landed-companion")
         self.open_repair_round(session)

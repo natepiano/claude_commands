@@ -2,10 +2,8 @@
 
 Code reviewers belong to the unit ledger. `assign.sh --role review` resumes
 `<worktree>-review`; concurrent work uses `<worktree>-review2`. Both are
-read-only and persist across phases and plans. The first dispatch adopts the
-unit's leased thread before ordinary allocation. A busy lease holds its slot
-until it can move. After the move, resume, queued messages, idle checks and
-restart use only the unit transport; the former pool state is an unread archive.
+read-only and persist across phases and plans. Reviewer allocation, resume,
+queued messages, idle checks and restart use only the unit transport.
 `review.sh --pool code` and `--lease` are ignored for one release with one
 stderr line. `--pool ui` refuses; the fresh Claude helper in `<UXReview/>`
 remains the design check.
@@ -21,17 +19,15 @@ worker ledger. Usage reports compare checkpointed phases through the usage store
 
 ## Unit code reviewers
 
-Code reviewers use the ordinary unit worker ledger. A reviewer already in the
-unit's destination slot wins, whether the unit opened it or adopted it from the
-pool. Ordinary resolution registers a roster-only reviewer in the ledger and
-keeps its thread. Otherwise the first own dispatch adopts the unit's most recently
-allocated leased code thread (`Reviewer.last_allocated`, with the reviewer name
-breaking ties) before opening any new reviewer. A saved transfer keeps its choice
-on recovery. Other idle leases return to the pool as `Unleased`; busy surplus
-leases are released on a later dispatch. Once no code leases remain for the unit,
-the ledger records `reviewers_adopted`, so later dispatches skip the pool. A busy chosen lease holds
-`review`, so concurrent work uses `review2`. A later dispatch
-adopts the first thread when its turn ends.
+Code reviewers use the ordinary unit worker ledger. Resolution registers a
+roster-only reviewer in the ledger and keeps its thread. It reuses an idle
+reviewer, carries a prior run's worker forward, or opens a new read-only worker.
+A busy reviewer keeps its slot, so concurrent work uses `review2`.
+
+The retired allocator and its transfer command are removed. Its archive stays
+on disk for one release. Worker resolution, messaging, ownership reports and
+the production tree do not read that archive. Already migrated reviewers use
+the same ledger and lifecycle as newly opened reviewers.
 
 | Worker slot | Role | Access | Lifetime |
 | --- | --- | --- | --- |
@@ -55,31 +51,6 @@ A held design, or a run outside a production, takes its placement from the
 roster (`roster.mesh_title`). Each turn sets the title again, so it follows the
 current assignment.
 
-### Transfer the leased code reviewers
-
-Read the proposed transfer first. Name each destination run explicitly:
-
-```sh
-python3 scripts/direct/workers.py transfer-reviewers --production <slug> \
-  --session-dir <unit-run> --session-dir <another-unit-run>
-```
-
-The default prints `preview: would migrate` and writes nothing. It also lists
-surplus leases as `preview: would release`, busy reviewers as deferred, conflicts,
-and each skipped UI or unleased reviewer.
-Use `--apply` for an explicit move. Each applied result names the destination
-owner and the checked thread id. The command exits non-zero while any leased
-code reviewer is deferred or in conflict.
-
-The move keeps the thread id, account home, account-move marker, standing
-instructions and queued messages. It rejects an inbox with invalid queue fields
-and names its path. Both inboxes keep their bytes on that refusal. It fences
-the old transport, carries queued server input and releases the old writer,
-then registers the unit worker. The journal and inbox receipts let a rerun
-finish an interrupted move without copying messages twice. The unit receipt
-ends archive reads after the durable lease removal. The command prints the
-archive path; moved workers do not read it. This phase does not run a live apply.
-
 ## How it works
 
 ### Worker lifecycle in `scripts/agents/codex_mesh.py`
@@ -94,7 +65,7 @@ There is no wrapper on worker commands: the app-server passes the loaded dev-she
 
 The server record stores `dev_shell_worktree` for a successful dev-shell launch. When a cwd caller receives a definite probe answer and the required dev-shell differs from the record (including a legacy record with no dev-shell), `ensure_server` retires the server and starts its replacement through the same path as an account or compaction-limit change. Existing turns retain the retired server until released. This also removes a previously loaded shell when its `.envrc` disappears or is no longer allowed. An unknown probe answer does not retire the server for a dev-shell mismatch. A caller without a cwd never retires a server for that reason.
 
-`mesh_dev_shell.json` in the session folder stores the last successfully served dev-shell folder as `worktree`, independently of the current server record. When `compact`, `serve`, `fork`, or another cwd-free caller must restart after idle-stop, it rechecks that folder's approval and uses the same dev-shell when still allowed. A definite answer selecting the ordinary environment clears this preference; an unknown answer preserves it for a later retry. A pre-existing server record can also supply the folder when the preference has not yet been written. Review pools and other shared mesh folders never load a worktree's dev-shell.
+`mesh_dev_shell.json` in the session folder stores the last successfully served dev-shell folder as `worktree`, independently of the current server record. When `compact`, `serve`, `fork`, or another cwd-free caller must restart after idle-stop, it rechecks that folder's approval and uses the same dev-shell when still allowed. A definite answer selecting the ordinary environment clears this preference; an unknown answer preserves it for a later retry. A pre-existing server record can also supply the folder when the preference has not yet been written. Shared mesh folders never load a worktree's dev-shell.
 
 The berth hook takes the session directory from `UNIT_RUN_DIR` when it names a folder that exists. When the variable is unset or its folder is gone, it reads the director's run marker (`unit_runs.marker`), so a stale variable never lets an edit through unchecked. The marker names one run, so a worker in a director's side run would otherwise check the main run's reservations.
 
@@ -104,7 +75,7 @@ The verbs:
 | --- | --- | --- |
 | `start` | `--session-dir --name [--role impl\|test\|fix\|review] [--lens] --cwd --prompt-file --summary-file [--reply-file] --log-file [--model --effort --service-tier] [--sandbox danger-full-access] [--resident]` | Opens a thread and blocks until its turn ends. `--role` is optional, and roleless threads such as ask-a-friend friends leave it out. A given role, with `--lens` when passed, is appended to `agents.jsonl` for the new thread. |
 | `follow` | `--session-dir --to --role (required) [--lens] [--claim-pid] --message-file --summary-file [--reply-file] --log-file [--model --effort --service-tier] [--cwd] [--read-only] [--image …]` | Runs one more turn on a finished thread. If the old server is gone, it resumes the thread on a new one. `--cwd`, `--read-only` and `--image` apply to that turn only and also apply to unit-owned reviewers; without them the request is the worker's usual one. |
-| `prime`, `fork`, `reset` | see `docs/as-built/review-pool.md` | Create a read-only reviewer template with standing instructions, fork a named reviewer from it, and remove every turn from an idle reviewer. Only the retained legacy allocator calls them. |
+| `prime`, `fork`, `reset` | mesh CLI help | Low-level thread creation, forking and reset. Held designs use `prime --held-design --held-role`; held threads refuse fork and reset. |
 | `compact` | `--session-dir --to` | Exits 2 for a worker that is running or busy, a worker with no recorded context size, and a worker whose size is `not_measured_since_compaction` (`size not measured since its last compaction; compact refused`). Otherwise it reads the entry's `revision`, resumes the thread, waits up to 60 s (`COMPACT_IDLE_WAIT_SECS`) for a turn still live on it to end, exits 3 (`COMPACT_TURN_STILL_LIVE`) if one stays live, and calls `thread/compact/start`. It waits until the compaction turn has a `thread/compacted` notice or a `contextCompaction` item, a token-usage update and a `turn/completed`. It then writes the new size under `RosterUnchanged(thread_id, revision)`, so a turn that wrote the entry in between keeps its record. A size above 0 prints `compacted <worker>: <before> -> <after> tokens`; a compaction turn that reports 0 stores `not_measured_since_compaction` and prints `compacted <worker>: <before> tokens, size not measured until its next turn`. A compaction that has not finished in 300 s (`CompactionTimedOut`) is interrupted with `turn/interrupt` and the thread is read until idle, up to the same 60 s: idle is exit 1 with `…; interrupted the compaction turn, the worker is idle and not compacted`, so a follow-up can still be sent; a turn still live is exit 3. |
 | `can-follow` | `--session-dir --to --role [--lens] [--claim-pid]` | Refuses a worker that cannot take a follow-up. With `--claim-pid`, it claims the worker under the roster `flock`: it sets `status: starting`, `launcher_pid`, `previous_status`, the new `role`, and `previous_role` (the role the worker held before), and appends the role and lens to the role log `agents.jsonl` (`docs/as-built/usage-ledger.md`). |
 | `release-follow` | `--session-dir --to --claim-pid` | Releases a claim that never started a turn. It restores `previous_role`, or removes `role` if the worker had none, returns the worker to its previous status, and appends the restored role to `agents.jsonl`. A follow that did run keeps the role it was claimed with, so after a completed review the worker's role stays `review`. |
@@ -127,7 +98,7 @@ A held design role (a roster entry with `held_design_id`, `docs/as-built/long-li
 - `context_tokens`: `tokenUsage.last.inputTokens` from the turn's latest `thread/tokenUsage/updated`, or `"not_measured_since_compaction"` after a compaction turn that reported 0, until the worker's next turn reports a size.
 - `revision`: raised by one on every write inside the roster lock; an entry without one reads as 0. `_update_roster_if_expected` writes only when the entry still matches what the writer expects (still on its thread, absent, ended on its thread, or at an unchanged revision), so a command still at work for an earlier thread, or a compaction that ends late, cannot replace a newer record (`docs/as-built/usage-ledger.md`, Worker roster guards).
 - During a claim only: `previous_role` and `previous_status`.
-- For a pooled reviewer, its template or a held design role: `instructions_file`, whose text is sent again as `developerInstructions` on every resume and fork.
+- For a reviewer with standing instructions or a held design role: `instructions_file`, whose text is sent again as `developerInstructions` on every resume and fork.
 - `access_policy`, which decides the sandbox (`_worker_sandbox`, `_resume_params`): `{"kind": "ReadOnlyReviewer"}` (written by `prime` and `fork`, and for a held reviewer) gives `read-only`; `PhaseBoundDesigner` (a held designer) gives its `launch_sandbox`. An entry with no policy takes `--sandbox` or the default `danger-full-access`; an entry with `instructions_file` and no policy refuses with `recovery required`. Access never comes from the instructions text.
 
 The read-only roster reader `scripts/message/roster.py` (`docs/as-built/session-roster.md`) reads `thread_id`, `status`, `role`, `lens`, `launcher_pid` and `cwd`, and leaves `ended` workers out. A `review` worker with a `lens` field shows as `review (<lens>)`, but no launcher writes `lens` into the mesh roster. `codex_mesh.py --lens` records the lens in `agents.jsonl` only; it also appears in artifact names and in the progress and findings records.
@@ -458,5 +429,5 @@ Other public functions: `queue_message`, `pending_messages`, `held_document`, `e
 - **One natedev authority with explicit checkout mappings.** A URL spelling, a new worktree or an unreachable host must not make a second identity for the same document. Reservation before creation and retries with the same request ID mean an uncertain launch never frees the slot.
 - **Raw pause refused for held roles.** `stop --pause` truncates pending text and drops queued text, and raw `stop` deletes server records without move markers. Held roles release servers only through `_release_held_server`, which parks queues and proves idle first.
 - **Patch-only write check.** The berth hook sees `apply_patch` paths before the edit; other tools give no path list, and writers run with full sandbox access. So the guarantee covers patches, and the designer prompt tells designers to edit only by patch.
-- **Explicit access policy.** Access must not follow from prompt text. The mesh once inferred read-only access from `instructions_file`; a typed `ThreadAccessPolicy` on the roster entry now keeps access through start, follow, account recovery and adoption. `roster_access_policy` in `codex_mesh.py` is the one reader. An entry from before the policy existed gets its policy by what it is: with `instructions_file` and no `held_design_id` it is a reviewer template or fork (pool or `review.sh --slot`) and gets `ReadOnlyReviewer`; with `held_design_id` it is a damaged held role and refuses, naming `design_roles.py recover`; with neither it is a worker and keeps its launch sandbox. Each locked roster load stores the reviewer policy on every such entry in the file, so the first write after install migrates a whole pool; a read without the lock writes nothing.
+- **Explicit access policy.** Access must not follow from prompt text. The mesh once inferred read-only access from `instructions_file`; a typed `ThreadAccessPolicy` on the roster entry now keeps access through start, follow, account recovery and adoption. `roster_access_policy` in `codex_mesh.py` is the one reader. An entry from before the policy existed gets its policy by what it is: with `instructions_file` and no `held_design_id` it is a legacy reviewer template or fork and gets `ReadOnlyReviewer`; with `held_design_id` it is a damaged held role and refuses, naming `design_roles.py recover`; with neither it is a worker and keeps its launch sandbox. Each locked roster load stores the reviewer policy on every such entry in the file, so the first write after install stores every reviewer policy; a read without the lock writes nothing.
 - **Short cited rulings.** Revisions that answered every finding with more mechanism grew a design without a correctness gain. Holders resume the same writer with short rulings that cite files, and change the Work Order only when scope changes.

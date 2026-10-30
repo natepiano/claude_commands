@@ -4864,6 +4864,26 @@ with patch.object(fcntl, "flock", admission):
                              progress_history.RecordedCodeFindings(0))
         self.assertIn("code 0 findings", self.run_command("review-trial", "--session-dir", str(session), at=started_at + 40))
 
+    def test_legacy_and_own_zero_reviews_remain_distinct_from_absent_evidence(self) -> None:
+        self.write_full_config()
+        session = self.start_run("retired-review-evidence", 71_650)
+        self.start_phase(session, 71_660)
+        state = cast(dict[str, object], json.loads((session / "progress_history_state.json").read_text()))
+        instance = str(cast(dict[str, object], state["phase"])["instance_id"])
+        records = self.history_dir / "review_turns" / session.name
+        records.mkdir(parents=True)
+        with patch.object(plan_history, "history_root", return_value=self.history_dir):
+            for arm in ("pool", "own"):
+                with self.subTest(arm=arm):
+                    self.assertIsInstance(progress_history._raised_code_findings(session, instance),  # pyright: ignore[reportPrivateUsage]
+                                          progress_history.NoRecordedCodeReview)
+                    record = records / "zero.json"
+                    _ = record.write_text(json.dumps({"phase_instance_id": instance, "arm": arm,
+                        "kind": "broad", "status": "reviewed", "raised": 0}))
+                    self.assertEqual(progress_history._raised_code_findings(session, instance),  # pyright: ignore[reportPrivateUsage]
+                                     progress_history.RecordedCodeFindings(0))
+                    record.unlink()
+
     def test_pool_and_own_review_records_with_one_launcher_sequence_all_count(self) -> None:
         self.write_full_config()
         started_at = 71_700

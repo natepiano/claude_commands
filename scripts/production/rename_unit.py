@@ -52,7 +52,6 @@ import proposals_folder  # noqa: E402
 import retire_unit  # noqa: E402
 import pane_record  # noqa: E402
 import rename_state  # noqa: E402
-import review_pool  # noqa: E402
 import showrunners  # noqa: E402
 import stall_watch  # noqa: E402
 import unit_lookup  # noqa: E402
@@ -589,10 +588,6 @@ def _move_state(rename: UnitRename, _save: Callable[[], None]) -> None:
     _ = pane_record.forget_unit(rename.old)
     unit_move.move(PathMove(stall_watch.stretch_path(rename.slug, rename.old),
                             stall_watch.stretch_path(rename.slug, rename.new)))
-    try:
-        _ = review_pool.rename_unit(rename.slug, rename.old, rename.new)
-    except review_pool.PoolError as error:
-        raise RenameRefused(str(error)) from error
     old, new = Path(rename.old_worktree), Path(rename.new_worktree)
     run = unit_move.newest_run(old) or unit_move.newest_run(new)
     if run is not None:

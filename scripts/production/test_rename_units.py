@@ -104,7 +104,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         completed = cast(list[str], self.journal()["completed"])
         self.assertEqual(completed[:8], [
             "_rename_doc", "_rewrite_plans", "_rename_timer", "_rename_showrunner_state", "_rename_stall_watch",
-            "_rename_review_pool", "_rename_branch", "_rename_unit_workers"])
+            "legacy_review_pool_retired", "_rename_branch", "_rename_unit_workers"])
         self.assertEqual(len(completed), 9)
         self.assertEqual(self.git("rev-parse", NEW), branch_tip)
         self.assert_success(self.run_command("unit", NEW, "alpha-unit"))

@@ -212,7 +212,6 @@ def run_rename(arguments: list[str], environment: dict[str, str], cwd: Path,
             (tidy_wrapped, {"STATE_DIR": Path(environment["SHOWRUNNER_STATE_DIR"]),
                             "NOTIFIER_STATE_DIR": Path(environment["NOTIFIER_STATE_DIR"])}),
             (stall_watch, {"STATE_DIR": Path(environment["STALL_WATCH_STATE_DIR"])}),
-            (rename, {"REVIEW_POOL_STATE": Path(environment["REVIEW_POOL_STATE"])}),
         ):
             for name, value in fields.items():
                 _ = scope.enter_context(mock.patch.object(module, name, value))
@@ -552,9 +551,10 @@ class ProductionRenameFixture(unittest.TestCase):
         self.assertEqual((self.state / "child/parent").read_text(), "new\n")
         self.assertEqual((self.state / "other/parent").read_text(), "oldish\n")
         self.assertEqual(self.stall_path("unrelated", "alpha-unit").read_text(), '{"stretch": 99}\n')
-        self.assertFalse((self.pool / "old").exists())
-        self.assertEqual((self.pool / "new/pool.json").read_text(), '{"generation": 7, "reviewers": {}}\n')
-        self.assertEqual((self.pool / "new/alpha-unit/2").read_text(), "retained reviewer lease\n")
+        self.assertTrue((self.pool / "old").exists())
+        self.assertFalse((self.pool / "new").exists())
+        self.assertEqual((self.pool / "old/pool.json").read_text(), '{"generation": 7, "reviewers": {}}\n')
+        self.assertEqual((self.pool / "old/alpha-unit/2").read_text(), "retained reviewer lease\n")
         self.assertEqual(self.git("rev-parse", OLD), self.old_tip)
         self.assertEqual(self.git("rev-parse", "new^"), self.old_tip)
         self.assertEqual(self.git("log", "-1", "--format=%s", NEW), "chore(new): rename production from old")
@@ -566,7 +566,7 @@ class ProductionRenameFixture(unittest.TestCase):
         self.assertEqual(self.git("ls-remote", "origin", "refs/heads/new"), f"{new_tip}\trefs/heads/new")
         self.assertEqual(self.git("ls-remote", "origin", "refs/heads/old"), f"{self.old_tip}\trefs/heads/old")
         self.assertEqual(self.git("status", "--porcelain"), "")
-        self.assertEqual(self.completed_steps(), 9)
+        self.assertEqual(self.completed_steps(), 8)
         self.assertIs(self.journal()["done"], False)
 
     def held_design(self, repository_id: str, checkout: Path, holder: design_roles.Holder) -> design_roles.HeldDesign:

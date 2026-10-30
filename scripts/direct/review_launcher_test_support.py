@@ -230,40 +230,20 @@ with (run / "fixture_workers.lock").open("a+") as lock:
 '''
 
 
-STUB_POOL = r'''#!/usr/bin/env python3
-import argparse
-import json
-import os
-from pathlib import Path
-import sys
+def without_retired_pool(root: Path, environment: dict[str, str]) -> dict[str, str]:
+    """Run the real launcher helpers with the retired module unavailable."""
+    guard = root / "retired_module_guard"
+    guard.mkdir(exist_ok=True)
+    _ = (guard / "sitecustomize.py").write_text(
+        "import importlib.abc, sys\n"
+        + "class RetiredModule(importlib.abc.MetaPathFinder):\n"
+        + "    def find_spec(self, fullname, path=None, target=None):\n"
+        + "        if fullname in ('scripts.direct.review_pool', 'review_pool'):\n"
+        + "            raise ModuleNotFoundError('retired module unavailable', name=fullname)\n"
+        + "sys.meta_path.insert(0, RetiredModule())\n", encoding="utf-8")
+    return {**environment, "PYTHONPATH": os.pathsep.join(
+        [str(guard), environment.get("PYTHONPATH", "")])}
 
-parser = argparse.ArgumentParser()
-sub = parser.add_subparsers(dest="verb", required=True)
-for verb in ("allocate", "release"):
-    command = sub.add_parser(verb)
-    command.add_argument("--production", required=True)
-    command.add_argument("--pid", type=int, required=True)
-    if verb == "allocate":
-        for flag in ("--type", "--unit", "--phase", "--pass"):
-            command.add_argument(flag, required=True)
-        command.add_argument("--lens", default="")
-        command.add_argument("--fresh", action="store_true")
-    else:
-        command.add_argument("--reviewer", required=True)
-        command.add_argument("--thread-id", default="")
-args = parser.parse_args()
-with Path(os.environ["STUB_POOL_CALLS"]).open("a") as calls:
-    calls.write(json.dumps(vars(args)) + "\n")
-if args.verb == "allocate":
-    if os.environ.get("STUB_POOL_FAILURE"):
-        sys.exit("review_pool: allocation failed")
-    if os.environ.get("STUB_POOL_RETIRED"):
-        print("review_pool: retired code0: reset failed", file=sys.stderr)
-    print(json.dumps({"reviewer": os.environ.get("STUB_POOL_REVIEWER", "code1"), "thread_id": "thread-pool",
-                      "mesh_dir": os.environ["STUB_POOL_MESH_DIR"],
-                      "lease_ordinal": int(os.environ.get("STUB_LEASE_ORDINAL", "4")),
-                      "prime_hash": "contract-hash"}))
-'''
 
 class OpenPass(TypedDict):
     kind: str
@@ -389,7 +369,7 @@ class ReviewLauncherFixture(unittest.TestCase):
         """Copy the real wrapper beside a stub agent, so nothing calls a model.
 
         Resolution, heartbeat writing, board and recorder helpers stay real.
-        Mesh, agent execution and pool allocation are controlled so tests spend
+        Mesh and agent execution are controlled so tests spend
         no model tokens. The real heartbeat watcher uses a short interval.
         """
         direct_dir = self.root / "scripts" / "direct"
@@ -433,7 +413,6 @@ class ReviewLauncherFixture(unittest.TestCase):
         mesh = agents / "codex_mesh.py"
         _ = mesh.write_text(STUB_MESH, encoding="utf-8")
         mesh.chmod(0o755)
-        _ = (direct_dir / "review_pool.py").write_text(STUB_POOL, encoding="utf-8")
         _ = (direct_dir / "workers.py").write_text(STUB_WORKERS, encoding="utf-8")
         return direct_dir / "review.sh"
 
@@ -468,7 +447,7 @@ class ReviewLauncherFixture(unittest.TestCase):
                 + "    _ = calls.write(json.dumps(sys.argv[1:]) + '\\n')\n", encoding="utf-8")
         environment["MESH_RUNS_SCRIPT"] = str(mesh_runs)
         environment["MESH_RUNS_CALLS"] = str(self.root / "mesh_runs_calls.jsonl")
-        return environment
+        return without_retired_pool(self.root, environment)
 
     def recorder(self, *arguments: str) -> None:
         environment = self.environment()

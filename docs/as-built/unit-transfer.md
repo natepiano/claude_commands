@@ -20,9 +20,9 @@ script is `scripts/production/transfer_unit.py`, with three actions: `plan`, `ap
   pushed. The plan's prose is history and does not change. Work in progress stays: the commit is
   built from HEAD's plan in a temporary index (`commit-tree`, then `update-ref`), and the same header
   change then goes into the real index and the worktree file (showrunner, 2026-10-21).
-- The stall-watch stretch and its prompt file move to the receiving slug. This pool's reviewers of
-  the unit retire (`review_pool.py retire`), so the receiving pool leases its own. The old pane
-  entry is forgotten, because the relaunch records a new pane.
+- The stall-watch stretch and its prompt file move to the receiving slug. Unit workers,
+  including reviewers, keep their threads through the ledger move. The old pane entry
+  is forgotten, because the relaunch records a new pane.
 - Each held design the unit holds (`scripts/astra/design_roles.py`) takes the receiving production as
   holder (`design_roles.move_holder`), so resume, rebind and end accept the relaunched unit. The role
   threads, role names, checkout paths and saved prompts stay.
@@ -73,5 +73,5 @@ row commit does (user, 2026-10-08). The unit takes the receiving merge branch at
 verify fails when the receiving doc has no row, the giving doc still has one, a plan header does
 not name the receiving production, the stretch is still under the giving slug, the shutdown record
 does not name the receiving production, the unit is not live under the receiving slug, a session
-still carries the giving marks, a giving reviewer is still leased to the unit, or a held design
+still carries the giving marks, or a held design
 still names the giving production as the unit's holder (`design_roles.holder_failures`).

@@ -72,7 +72,7 @@ class UnitRenameTests(UnitRenameFixture):
         self.assertTrue(self.stall_path("gamma-unit").exists())
         pool = cast(dict[str, dict[str, dict[str, object]]],
                     json.loads((self.root / "state/review-pool/demo/pool.json").read_text()))
-        self.assertEqual(pool["reviewers"]["r1"]["lease"], {"unit": "gamma-unit", "ordinal": 3})
+        self.assertEqual(pool["reviewers"]["r1"]["lease"], {"unit": "alpha-unit", "ordinal": 3})
         self.assertEqual(pool["reviewers"]["r1"]["thread_id"], "thread-r1")
         self.assertEqual(cast(dict[str, object], pool["reviewers"]["r2"]["lease"])["unit"], "mul_add-unit")
         started = cast(dict[str, object], json.loads((self.root / "history/runs/run-1.jsonl").read_text().splitlines()[0]))

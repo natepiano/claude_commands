@@ -953,11 +953,9 @@ R1b and R5b, built in phase 5. A session's name and its role are separate. Every
 
 An Astra held role keeps its own assignment state; it is not a worker assignment.
 A unit owns its code reviewers in the worker ledger, role `review`, job key
-`code_reviewer`, slots `review` and `review2`. The first own dispatch adopts the
-unit's leased reviewer on its existing thread before it opens any new reviewer.
-A busy lease reserves `review` while new work uses `review2`. Once moved, the
-worker's transport and history no longer read the archived pool meshes. Legacy
-pool rows remain visible only until the next phase removes their readers.
+`code_reviewer`, slots `review` and `review2`. The review pool is retired: its
+leased reviewers moved to their units before the pool code was deleted, and no
+reader of the archived pool state or pool meshes remains.
 The name never supplies a role: a record without a role keeps its explicit state.
 
 **Shown name.** Parts join with ` · `. The production part is the production slug. The unit part is the unit name without its `-unit` suffix. The job part is the job word, then the slot or the number that tells several holders apart. An absent part is left out. A session with no production, no unit and no job shows its address.

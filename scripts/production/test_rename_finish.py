@@ -78,7 +78,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.assertEqual((archived["old"], archived["new"]), (OLD, NEW))
         current = cast(dict[str, object], json.loads((self.state / "next/rename.json").read_text()))
         self.assertIs(current["done"], False)
-        self.assertEqual(len(cast(list[str], current["completed"])), 9)
+        self.assertEqual(len(cast(list[str], current["completed"])), 8)
 
     def test_a_merge_branch_not_named_for_the_production_is_kept(self) -> None:
         self.prepare_unit_moves()

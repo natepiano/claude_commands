@@ -27,10 +27,9 @@ the reason:
    through `shutdown.py down`: it pauses and stops at its ready mark. Its restore is then forgotten,
    so no restart brings it back.
 2. Each run of the worktree with an app-server stops it and ends its Codex workers. `workers.end_unit` then prints one line for each pending message, owed continuation, detached run and reservation it cancels, and for each quarantined entry it removes, and deletes the unit's worker ledger. A worker that cannot end refuses the retire; run it again.
-3. The unit's review-pool reviewers retire. A reviewer still reviewing stays.
-4. The build holds of the unit's sessions release, its berth reservations release, and the process
+3. The build holds of the unit's sessions release, its berth reservations release, and the process
    of each Mac claim on the worktree stops.
-5. Each process still working inside the worktree, a build or a test, gets SIGTERM.
+4. Each process still working inside the worktree, a build or a test, gets SIGTERM.
 
 When nothing is left running, the Units row's Plan cell gets
 `(retired <date>, worktree removed, session <id>)`, committed on the merge branch (the next merge

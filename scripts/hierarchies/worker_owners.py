@@ -34,7 +34,6 @@ from scripts.accounts.role_map import stored_role_map
 
 class WorkerClass(str, Enum):
     OwnedLive = "OwnedLive"
-    PooledReviewer = "PooledReviewer"
     DirectorGone = "DirectorGone"
     OwnerUnknown = "OwnerUnknown"
 
@@ -92,11 +91,6 @@ class RecordedDirectorOwner:
 
 
 @dataclass(frozen=True)
-class PooledReviewerOwner:
-    pass
-
-
-@dataclass(frozen=True)
 class ConflictingOwners:
     candidates: tuple[LiveDirectorOwner | RecordedDirectorOwner, ...]
 
@@ -105,7 +99,7 @@ class ConflictingOwners:
             raise ValueError("conflicting ownership requires distinct candidate directors")
 
 
-WorkerOwnership = LiveDirectorOwner | RecordedDirectorOwner | MissingDirectorRecord | PooledReviewerOwner | ConflictingOwners
+WorkerOwnership = LiveDirectorOwner | RecordedDirectorOwner | MissingDirectorRecord | ConflictingOwners
 
 
 @dataclass(frozen=True)
@@ -124,8 +118,6 @@ class Worker:
             return WorkerClass.OwnedLive
         if isinstance(self.ownership, RecordedDirectorOwner):
             return WorkerClass.DirectorGone
-        if isinstance(self.ownership, PooledReviewerOwner):
-            return WorkerClass.PooledReviewer
         return WorkerClass.OwnerUnknown
 
     @property
@@ -146,18 +138,16 @@ class OwnershipEvidence:
     run: str
     owner: Director | MissingDirectorRecord
     evidence: tuple[str, ...]
-    pooled: bool = False
 
     @classmethod
     def from_worker(cls, worker: Worker) -> OwnershipEvidence:
         if isinstance(worker.ownership, ConflictingOwners):
             raise ValueError("conflicting owners cannot become a single ownership record")
         owner = worker.ownership.director if isinstance(worker.ownership, (LiveDirectorOwner, RecordedDirectorOwner)) else MissingDirectorRecord(worker.unit)
-        return cls(worker.name, worker.thread_id, worker.run, owner, worker.evidence,
-                   worker.classification == WorkerClass.PooledReviewer)
+        return cls(worker.name, worker.thread_id, worker.run, owner, worker.evidence)
 
     def worker(self) -> Worker:
-        ownership = PooledReviewerOwner() if self.pooled else ownership_record(self.owner)
+        ownership = ownership_record(self.owner)
         return Worker(self.name, self.thread_id, self.run, ownership, self.evidence)
 
 
@@ -222,7 +212,7 @@ def ownership_record(owner: Director | MissingDirectorRecord) -> RecordedDirecto
 
 
 def classify_worker(worker: Worker, directors: Sequence[Director]) -> Worker:
-    if isinstance(worker.ownership, (ConflictingOwners, PooledReviewerOwner)):
+    if isinstance(worker.ownership, ConflictingOwners):
         return worker
     matches = [director for director in directors if (
         (worker.director and director.session_id == worker.director)
@@ -256,9 +246,7 @@ def merge_observations(records: Sequence[Worker], directors: Sequence[Director])
         if isinstance(item.ownership, (LiveDirectorOwner, RecordedDirectorOwner)):
             owners[(item.director, item.unit)] = item.ownership
     ownership: WorkerOwnership = candidates[0].ownership
-    if any(isinstance(item.ownership, PooledReviewerOwner) for item in candidates):
-        ownership = PooledReviewerOwner()
-    elif len(owners) > 1:
+    if len(owners) > 1:
         ownership = ConflictingOwners(tuple(owners.values()))
         supporting = evidence_lines(supporting, ("conflicting ownership evidence; worker kept",))
     elif owners:
@@ -402,7 +390,7 @@ def saved_ownership(record: JsonObject) -> OwnershipEvidence:
     director = text_field(record, "director")
     owner = Director(director, "", text_field(record, "unit")) if director else MISSING_DIRECTOR_RECORD
     return OwnershipEvidence(text_field(record, "name"), text_field(record, "thread_id"), text_field(record, "run"),
-                             owner, evidence, record.get("classification") == WorkerClass.PooledReviewer.value)
+                             owner, evidence)
 
 
 def enrich_director_record(worker: Worker, provenance: Sequence[OwnershipEvidence]) -> Worker:
@@ -429,16 +417,13 @@ def collect_sources() -> OwnershipSources:
             prefix = re.sub(r"[^A-Za-z0-9._-]", "-", Path(entry.cwd).name)[:40] if entry.cwd else ""
             directors.append(Director(entry.session.session_id, entry.name, unit, prefix))
     roots = unit_runs.run_roots(os.environ.get("ROSTER_RUN_ROOT"))
-    pool = Path(os.environ.get("REVIEW_POOL_STATE", str(Path.home() / ".local/state/review-pool")))
     excluded = {entry.thread.thread_id for entry in observed.entries
                 if entry.role.startswith("astra-") and isinstance(entry.thread, roster.CodexThread)}
     observations: dict[str, list[Worker]] = {}
     mesh_paths = [path for root in roots for path in source_files(root, "*/mesh_roster.json", problems)]
-    mesh_paths.extend(source_files(pool, "*/mesh/*/mesh_roster.json", problems))
     for path in mesh_paths:
         owner = unit_runs.director(path.parent)
         unit = next((item.unit for item in directors if item.session_id == owner), "")
-        pooled = path.is_relative_to(pool)
         for name, raw in read_object(path, problems).items():
             record = object_fields(raw)
             thread = text_field(record, "thread_id")
@@ -452,7 +437,7 @@ def collect_sources() -> OwnershipSources:
                 problems.append(f"{path}: {name}: thread id missing")
                 continue
             identity = Director(owner, "", unit) if owner else MISSING_DIRECTOR_RECORD
-            ownership = PooledReviewerOwner() if pooled else ownership_record(identity)
+            ownership = ownership_record(identity)
             observations.setdefault(thread, []).append(Worker(name, thread, str(path.parent), ownership,
                 (f"mesh roster {path}", f"recorded status {text_field(record, 'status')}"),
                 status=WorkerTurnState.from_status(text_field(record, "status"))))
@@ -529,8 +514,6 @@ class EndEligible:
 def end_decision(worker: Worker, selected_class: WorkerClass, problems: Sequence[str], first_run: bool) -> WorkerKept | EndEligible:
     if isinstance(worker.ownership, LiveDirectorOwner):
         return WorkerKept("unit director is live")
-    if isinstance(worker.ownership, PooledReviewerOwner):
-        return WorkerKept("pooled reviewer")
     if isinstance(worker.ownership, ConflictingOwners):
         return WorkerKept("conflicting ownership evidence")
     if worker.status == WorkerTurnState.Attached:

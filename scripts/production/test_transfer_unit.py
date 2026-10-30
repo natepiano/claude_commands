@@ -198,7 +198,7 @@ class UnitTransferTests(UnitTransferFixture):
         self.assertFalse(self.stall_path("demo", "alpha-unit").exists())
         self.assertEqual(self.stall_path("other", "alpha-unit").read_text(encoding="utf-8"), '{"stretch": 17}\n')
         pool = (self.root / "state/review-pool/demo/pool.json").read_text(encoding="utf-8")
-        self.assertNotIn("alpha-unit", pool)
+        self.assertIn("alpha-unit", pool)
         self.assert_ok(self.transfer("verify"))
 
     def test_a_held_role_moves_to_the_receiving_holder_and_keeps_its_thread_and_paths(self) -> None:

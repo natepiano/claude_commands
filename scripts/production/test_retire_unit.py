@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""retire_unit.py in process. Git runs in temporary repositories; shutdown, the Codex mesh, the review
-pool and build_hold are recording stand-ins, and the unit's Claude sessions are records the test
+"""retire_unit.py in process. Git runs in temporary repositories; shutdown, the Codex mesh and
+build_hold use recording stand-ins, and the unit's Claude sessions are records the test
 writes: nothing real stops."""
 from __future__ import annotations
 
@@ -69,7 +69,6 @@ class RetireUnitTests(unittest.TestCase):
     run_folder: Path = Path()
     calls: list[list[str]] = []
     claude: list[SessionRecord] = []
-    pool_lines: str = ""
     marked: unit_lookup.MarkedUnit | None = None
     config: Path = Path()
     records: list[SessionShutdown] = []
@@ -119,7 +118,6 @@ class RetireUnitTests(unittest.TestCase):
         self.calls = []
         self.records = []
         self.claude = [session(DIRECTOR, "alpha", 4101), session(SEAT, "alpha-seat", 4102)]
-        self.pool_lines = "code-1\tcode\talpha-unit:1\tidle\t3\ncode-2\tcode\tbeta-unit:1\tidle\t1\n"
         production = read_production(self.doc)
 
         def production_of(_slug: str) -> Production:
@@ -183,12 +181,7 @@ class RetireUnitTests(unittest.TestCase):
         call = [Path(argv[1]).name, *argv[2:]] if argv[0] == sys.executable else argv
         self.calls.append(call)
         stdout = ""
-        if call[:2] == ["review_pool.py", "status"]:
-            stdout = self.pool_lines
-        elif call[:2] == ["review_pool.py", "retire"]:
-            stdout = "".join(line.split("\t")[0] + "\n" for line in self.pool_lines.splitlines()
-                             if "\talpha-unit:" in line and "\tidle\t" in line)
-        elif call[:2] == ["shutdown.py", "down"]:
+        if call[:2] == ["shutdown.py", "down"]:
             self.claude = []
             self.marked = None
         return subprocess.CompletedProcess(argv, 0, stdout, "")
@@ -200,7 +193,7 @@ class RetireUnitTests(unittest.TestCase):
         return code, output.getvalue()
 
     def stops(self) -> list[list[str]]:
-        return [call for call in self.calls if call[:2] != ["review_pool.py", "status"]]
+        return self.calls
 
     def test_refuses_uncommitted_work_and_an_unmerged_checkpoint_and_changes_nothing(self) -> None:
         _ = (self.worktree / "late.txt").write_text("late\n", encoding="utf-8")
@@ -233,7 +226,7 @@ class RetireUnitTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn(f"refused: uncommitted work in {self.worktree}: work.txt", output)
 
-    def test_dry_run_lists_the_seat_the_worker_and_the_reviewer_and_changes_nothing(self) -> None:
+    def test_dry_run_lists_the_seat_and_worker_and_changes_nothing(self) -> None:
         before = self.doc.read_text(encoding="utf-8")
 
         code, output = self.retire("--dry-run")
@@ -242,7 +235,6 @@ class RetireUnitTests(unittest.TestCase):
         for line in (f"would stop: Claude session alpha ({DIRECTOR}, pid 4101), through shutdown down",
                      f"would stop: Claude session alpha-seat ({SEAT}, pid 4102), through shutdown down",
                      f"would stop: app-server pid {os.getpid()} of run run-1; workers alpha-impl",
-                     "would retire: reviewer code-1",
                      f"would release: build hold of {DIRECTOR}",
                      f"would remove: worktree {self.worktree}",
                      "would delete: branch alpha-branch here and on origin"):
@@ -286,7 +278,7 @@ class RetireUnitTests(unittest.TestCase):
         self.assertIn("invalid backend", output)
         self.assertIn(str(store.path), output)
 
-    def test_retires_a_unit_with_a_seat_a_worker_and_a_reviewer(self) -> None:
+    def test_retires_a_unit_with_a_seat_and_a_worker(self) -> None:
         code, output = self.retire()
 
         self.assertEqual(code, 0, output)
@@ -296,10 +288,8 @@ class RetireUnitTests(unittest.TestCase):
             ["shutdown.py", "forget", DIRECTOR],
             ["shutdown.py", "forget", SEAT],
             ["codex_mesh.py", "stop", "--session-dir", str(self.run_folder)],
-            ["review_pool.py", "retire", "--production", "alpha", "--unit", "alpha-unit"],
             ["build_hold.py", "release", "--holder", DIRECTOR],
         ])
-        self.assertIn("stopped: reviewer code-1", output)
         self.assertIn("alpha-unit retired", output)
         row = next(line for line in self.doc.read_text(encoding="utf-8").splitlines() if line.startswith("| alpha-unit"))
         self.assertRegex(row, r"^\| alpha-unit \| \(retired \d{4}-\d{2}-\d{2}, worktree removed, session "
@@ -374,16 +364,6 @@ class RetireUnitTests(unittest.TestCase):
         self.assertEqual(code, 0, output)
         self.assertIn(f"worktree removed, session {DIRECTOR}) docs/plans/alpha.md", self.doc.read_text(encoding="utf-8"))
 
-    def test_a_reviewer_still_reviewing_keeps_the_unit_from_retiring(self) -> None:
-        self.pool_lines = "code-1\tcode\talpha-unit:1\tbusy\t3\n"
-
-        code, output = self.retire()
-
-        self.assertEqual(code, 1)
-        self.assertIn("left running: reviewer code-1: it is reviewing", output)
-        self.assertIn("alpha-unit is not retired: rerun once these stop", output)
-        self.assertTrue(self.worktree.is_dir())
-        self.assertNotIn("(retired", self.doc.read_text(encoding="utf-8"))
 
     def outside_director(self) -> Path:
         (self.run_folder / "director").unlink()

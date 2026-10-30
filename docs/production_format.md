@@ -47,9 +47,6 @@ must not drift from it:
 - **Reviewer** — a unit's read-only worker, role `review`. Its thread keeps
   context across phases and plans; its standing instructions are in
   `config/review/code.md`.
-- **Template** — a thread holding a type's standing prompt, forked into reviewers
-  and never leased.
-- **Lease** — one reviewer's assignment to one unit's phase, cleared at phase end.
 - **Merge branch** — the branch every unit's checkpoints merge into. cargo-berth
   calls it the trunk. In prose, call it by its branch name, because a unit may be
   named `trunk-unit`.

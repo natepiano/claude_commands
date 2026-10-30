@@ -8,7 +8,6 @@ import contextlib
 import io
 import json
 import os
-import re
 import shlex
 import socket
 import subprocess
@@ -368,13 +367,8 @@ def shown_name(entry: RosterEntry) -> ShownName:
             job = JobUnassigned(f"assignment record not readable: {record}: {assignment.role.value}")
         else:
             slot = assignment.slot
-            pool = re.fullmatch(r"(code|ui)([0-9]+)", slot)
-            if assignment.role == "review" and pool:
-                job = ShownJob("ui_reviewer" if assignment.reviewer_type == "ui" else "code_reviewer",
-                               JobNumber(int(pool[2])))
-            else:
-                job = ShownJob("code_reviewer" if assignment.role == "review" else "worker",
-                               JobSlot(slot) if slot else Unqualified())
+            job = ShownJob("code_reviewer" if assignment.role == "review" else "worker",
+                           JobSlot(slot) if slot else Unqualified())
     address = _address(entry) or _session_address(entry)
     return ShownName(ProductionPart(production) if production else NoProduction(),
                      UnitPart(unit) if unit else NoUnit(), job, address or entry.name)
@@ -1172,47 +1166,6 @@ def _worker_assignment(run: Path, slot: str, record: Mapping[str, object]) -> Wo
     return WorkerAssignment(label, str(run), role, slot)
 
 
-@dataclass(frozen=True)
-class _PoolReviewer:
-    reviewer_type: Literal["code", "ui"]
-    director: UnderDirector | NoDirector
-
-
-def _pool_root() -> Path:
-    return Path(os.environ.get("REVIEW_POOL_STATE", "~/.local/state/review-pool")).expanduser().resolve()
-
-
-def _pool_reviewers(path: Path) -> dict[str, _PoolReviewer]:
-    reviewers = _snapshot_object(_read_object(path).get("reviewers"))
-    result: dict[str, _PoolReviewer] = {}
-    for name, raw in reviewers.items():
-        reviewer = _snapshot_object(raw)
-        kind = reviewer.get("type")
-        if kind not in ("code", "ui"):
-            raise ValueError(f"invalid reviewer type for {name}")
-        lease = reviewer.get("lease")
-        unit = _snapshot_string(_snapshot_object(lease), "unit") if lease is not None else ""
-        result[name] = _PoolReviewer(kind, UnderDirector(unit, "", "") if unit else NoDirector())
-    return result
-
-
-def _pool_context(run: Path, name: str) -> tuple[ShowrunnerRelationship, DirectorRelationship, str]:
-    """A pool reviewer's current lease supplies its unit, never its mesh name."""
-    root = _pool_root()
-    try:
-        relative = run.resolve().relative_to(root)
-    except ValueError:
-        return NoShowrunner(), NoDirector(), ""
-    if len(relative.parts) != 3 or relative.parts[1] != "mesh":
-        return NoShowrunner(), NoDirector(), ""
-    slug = relative.parts[0]
-    try:
-        reviewer = _pool_reviewers(root / slug / "pool.json")[name]
-    except (OSError, UnicodeError, ValueError, KeyError):
-        return ProductionWithoutRunningShowrunner(slug), NoDirector(), ""
-    return ProductionWithoutRunningShowrunner(slug), reviewer.director, reviewer.reviewer_type
-
-
 def _held_location(holder: design_roles.Holder) -> tuple[ShowrunnerRelationship, DirectorRelationship]:
     return (ProductionWithoutRunningShowrunner(holder.production_slug),
             UnderDirector(holder.unit_name, "", "") if isinstance(holder, design_roles.UnitHolder) else NoDirector())
@@ -1244,21 +1197,18 @@ def mesh_shown_name(session_dir: str, name: str, record: Mapping[str, object]) -
             machine="", kind="codex", role="astra-designer" if held_role == "designer" else "astra-reviewer",
             name=name, status="", reach=Messageable(name), cwd=design.repository,
             showrunner=showrunner, director=director, assignment=HeldDesignRole(held_role, session_dir)))
-    showrunner, director, reviewer_type = _pool_context(run, name)
-    if isinstance(showrunner, NoShowrunner):
-        problems: list[str] = []
-        records = _newest_sessions()
-        details = _raw_session_details(records, problems)
-        registered = _registered_showrunners(os.environ, problems)
-        places = _production_places(records, details, registered,
-                                    _showrunner_ids(records, registered), set(), problems)
-        place = places.get(unit_runs.director(run))
-        if place is not None:
-            showrunner, director = place.showrunner, UnderDirector(place.director.unit, "", "")
+    showrunner: ShowrunnerRelationship = NoShowrunner()
+    director: DirectorRelationship = NoDirector()
+    problems: list[str] = []
+    records = _newest_sessions()
+    details = _raw_session_details(records, problems)
+    registered = _registered_showrunners(os.environ, problems)
+    places = _production_places(records, details, registered,
+                                _showrunner_ids(records, registered), set(), problems)
+    place = places.get(unit_runs.director(run))
+    if place is not None:
+        showrunner, director = place.showrunner, UnderDirector(place.director.unit, "", "")
     assignment = _worker_assignment(run, _worker_slot(run, name, record, []), record)
-    if reviewer_type in ("code", "ui"):
-        assignment = WorkerAssignment(assignment.slot_role, session_dir, assignment.role, name,
-                                      reviewer_type)
     entry = RosterEntry(machine="", kind="codex", role="worker", name=name, status="",
                         reach=Messageable(name), cwd="", showrunner=showrunner,
                         director=director, assignment=assignment)
@@ -1355,7 +1305,6 @@ def _mesh_records(run: _LiveRun, problems: list[str]) -> dict[str, _MeshWorker]:
         if isinstance(value, dict):
             records[name] = cast("_MeshWorker", cast("object", value))
     return records
-
 
 
 def _run_server_homes(run: _LiveRun) -> dict[int, Path]:
@@ -1691,57 +1640,6 @@ def _unit_workers(
     return entries, worker_threads
 
 
-def _pool_workers(
-    machine: str, claude_entries: Mapping[str, RosterEntry],
-    production_places: Mapping[str, _ProductionPlace], problems: list[str], known_threads: set[str],
-) -> tuple[list[RosterEntry], set[str]]:
-    """Discover pool reviewers even when their mesh is outside the unit runs."""
-    entries: list[RosterEntry] = []
-    threads: set[str] = set()
-    directors = {
-        (place.showrunner.production, place.director.unit):
-            UnderDirector(place.director.unit, director.name, _session_address(director))
-        for session_id, place in production_places.items()
-        if (director := claude_entries.get(session_id)) is not None
-    }
-    root = _pool_root()
-    for path in sorted(root.glob("*/pool.json")):
-        try:
-            reviewers = _pool_reviewers(path)
-            meshes = sorted((path.parent / "mesh").glob("*/mesh_roster.json"))
-        except (OSError, UnicodeError, ValueError) as error:
-            _problem(problems, f"review pool {path}", error)
-            continue
-        for mesh in meshes:
-            run = _LiveRun(mesh.parent, _NoRunningDirector())
-            homes = _run_server_homes(run)
-            for name, record in sorted(_mesh_records(run, problems).items()):
-                reviewer = reviewers.get(name)
-                status = _as_string(record.get("status"))
-                thread = _as_string(record.get("thread_id"))
-                if (reviewer is None or status == "ended" or record.get("transferring_role")
-                        or record.get("role_redirect") or not thread or thread in known_threads or thread in threads):
-                    continue
-                threads.add(thread)
-                assignment = _worker_assignment(run.path, name, {**record, "role": "review"})
-                director = reviewer.director
-                if isinstance(director, UnderDirector):
-                    director = directors.get((path.parent.name, director.unit), director)
-                entries.append(RosterEntry(
-                    machine=machine, kind="codex", role="worker", name=name,
-                    status=_worker_status(status),
-                    reach=(Messageable(f"worker:review-pool/{path.parent.name}/{run.path.name}/{name}")
-                           if status in MESSAGEABLE_WORKER_STATUSES else
-                           CannotReceiveMessages(_between_turns_reason(director))),
-                    cwd=_as_string(record.get("cwd")),
-                    showrunner=ProductionWithoutRunningShowrunner(path.parent.name),
-                    director=director,
-                    assignment=WorkerAssignment(assignment.slot_role, assignment.session_dir, "review",
-                                                name, reviewer.reviewer_type),
-                    thread=CodexThread(thread), account=_worker_account(run, record, homes)))
-    return entries, threads
-
-
 def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], problems: list[str]) -> tuple[list[RosterEntry], set[str]]:
     entries: list[RosterEntry] = []
     threads: set[str] = set()
@@ -1851,9 +1749,6 @@ def _local_roster(environment: Mapping[str, str]) -> Roster:
     unit_workers, worker_threads = _unit_workers(
         machine, runs, claude, production_places, problems, home_state=home_state
     )
-    pool_workers, pool_threads = _pool_workers(machine, claude, production_places, problems, worker_threads)
-    unit_workers.extend(pool_workers)
-    worker_threads.update(pool_threads)
     durable_roles, durable_threads = _durable_roles(machine, claude, problems)
     unit_workers.extend(durable_roles)
     worker_threads.update(durable_threads)
@@ -1916,7 +1811,6 @@ def peer_snapshot(environment: Mapping[str, str]) -> Roster | PeerNotReached:
         detail = (done.stderr or "invalid roster snapshot").strip().splitlines()
         return PeerNotReached(host, detail[0] if detail else "invalid roster snapshot")
     return Roster(result.entries, [f"{host}: {problem}" for problem in result.problems])
-
 
 
 def peer_roster(environment: Mapping[str, str]) -> Roster:

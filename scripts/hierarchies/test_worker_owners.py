@@ -6,6 +6,7 @@ from dataclasses import replace
 import io
 import json
 import os
+from collections.abc import Iterator
 from pathlib import Path
 import subprocess
 import tempfile
@@ -54,9 +55,7 @@ class WorkerOwnersTest(unittest.TestCase):
         status: owners.WorkerTurnState = owners.WorkerTurnState.Idle,
     ) -> owners.Worker:
         ownership: owners.WorkerOwnership = owners.MissingDirectorRecord(unit)
-        if classification == "PooledReviewer":
-            ownership = owners.PooledReviewerOwner()
-        elif classification == "OwnedLive":
+        if classification == "OwnedLive":
             ownership = owners.LiveDirectorOwner(owners.Director(director, "", unit))
         elif director:
             ownership = owners.RecordedDirectorOwner(owners.Director(director, "", unit))
@@ -112,13 +111,32 @@ class WorkerOwnersTest(unittest.TestCase):
         self.assertEqual({worker.thread_id: worker.classification for worker in sources.workers}, {
             "thread-paused": owners.WorkerClass.OwnedLive,
             "thread-finished": owners.WorkerClass.OwnedLive,
-            "thread-pool": owners.WorkerClass.PooledReviewer,
         })
         self.assertEqual({str(path): path.read_bytes() for path in self.root.rglob("*") if path.is_file()}, before)
         paused = next(worker for worker in sources.workers if worker.name == "paused")
         self.assertEqual((paused.run, paused.unit, paused.director),
                          (str(self.root / "unit/run-one"), "hierarchies", "director-one"))
         self.assertIn("recorded status paused", paused.evidence)
+
+    def test_unit_reviewer_ownership_does_not_scan_the_retired_archive(self) -> None:
+        archive = self.root / "pool"
+        self.write_text("unit/run-one/director", "director-one\n")
+        self.write_json("unit/run-one/mesh_roster.json", {
+            "project-review": {"thread_id": "unit-review-thread", "status": "paused", "role": "review"},
+        })
+        original_glob = Path.glob
+
+        def refuse_archive(path: Path, pattern: str, *, case_sensitive: bool | None = None,
+                           recurse_symlinks: bool = False) -> Iterator[Path]:
+            if path.is_relative_to(archive):
+                raise AssertionError(f"ownership scanned the retired archive: {path}")
+            return original_glob(path, pattern, case_sensitive=case_sensitive, recurse_symlinks=recurse_symlinks)
+
+        with patch.object(Path, "glob", refuse_archive):
+            sources = self.collect([self.director_entry()])
+        self.assertEqual(sources.problems, [])
+        self.assertEqual([(worker.name, worker.thread_id, worker.classification) for worker in sources.workers],
+                         [("project-review", "unit-review-thread", owners.WorkerClass.OwnedLive)])
 
     def test_live_director_worktree_prefix_protects_named_worker_with_lost_run_metadata(self) -> None:
         sources = self.collect([
@@ -217,7 +235,7 @@ class WorkerOwnersTest(unittest.TestCase):
         self.assertFalse((self.root / "state").exists())
 
     def test_empty_roster_keeps_other_workers_and_ends_reports_with_totals(self) -> None:
-        self.write_text("pool/build-followups/mesh/0/mesh_roster.json", "")
+        self.write_text("unit/bad/mesh_roster.json", "")
         self.write_json("unit/good/mesh_roster.json", {
             "valid-worker": {"thread_id": "thread-valid", "status": "paused"},
         })
@@ -232,7 +250,7 @@ class WorkerOwnersTest(unittest.TestCase):
                 self.assertIn("thread=thread-valid", lines[0])
                 problems = [line for line in lines if line.startswith("source problem:")]
                 self.assertEqual(len(problems), 1)
-                self.assertIn("pool/build-followups/mesh/0/mesh_roster.json", problems[0])
+                self.assertIn("unit/bad/mesh_roster.json", problems[0])
                 self.assertIn("Expecting value", problems[0])
                 self.assertLess(lines.index(problems[0]), len(lines) - 2)
                 self.assertTrue(lines[-2].startswith("Timers:"))
@@ -272,7 +290,7 @@ class WorkerOwnersTest(unittest.TestCase):
             "valid-worker": {"thread_id": "thread-valid", "status": "paused"},
         })
         self.write_json("state/first-report.json", {})
-        for relative, content in (("pool/review/mesh/0/mesh_roster.json", b""),
+        for relative, content in (("unit/bad/mesh_roster.json", b""),
                                   ("notifiers/bad/conf", b"\xff")):
             with self.subTest(source=relative):
                 path = self.root / relative
@@ -303,12 +321,6 @@ class WorkerOwnersTest(unittest.TestCase):
         result = owners.classify_worker(self.worker(unit="", director=""), [])
         self.assertEqual(result.classification, owners.WorkerClass("OwnerUnknown"))
 
-    def test_pooled_reviewer_does_not_need_a_unit_director(self) -> None:
-        result = owners.classify_worker(self.worker(
-            name="code-reviewer", run="review-pool/models/mesh/account-one",
-            unit="", director="", classification="PooledReviewer", evidence=("review pool roster",),
-        ), [])
-        self.assertEqual(result.classification, owners.WorkerClass("PooledReviewer"))
 
     def test_a_different_units_live_director_does_not_protect_worker(self) -> None:
         result = owners.classify_worker(
@@ -371,9 +383,8 @@ class WorkerOwnersTest(unittest.TestCase):
     def test_first_applied_end_reports_then_only_ends_the_selected_gone_worker(self) -> None:
         gone = self.worker(name="gone", thread="gone-thread", director="director-gone")
         live = self.worker(name="live", thread="live-thread")
-        pooled = self.worker(name="reviewer", thread="review-thread", director="", unit="", classification="PooledReviewer")
         unknown = self.worker(name="unknown", thread="unknown-thread", unit="", director="")
-        sources = owners.OwnershipSources([gone, live, pooled, unknown],
+        sources = owners.OwnershipSources([gone, live, unknown],
                                          [owners.Director("director-one", "unit-director", "other-unit")], [], [])
         self.mesh_route(gone)
         calls: list[owners.Worker] = []
@@ -469,13 +480,13 @@ class WorkerOwnersTest(unittest.TestCase):
         self.assertEqual((blocked.ended, calls), ((), []))
         self.assertTrue(any("source problems" in item for item in blocked.evidence))
 
-    def test_end_never_accepts_live_or_pooled_classes(self) -> None:
+    def test_end_never_accepts_live_classes(self) -> None:
         sources = owners.OwnershipSources([], [], [], [])
 
         def forbidden_end(worker: owners.Worker) -> int:
             self.fail("end callback reached for " + worker.name)
 
-        for kind in (owners.WorkerClass.OwnedLive, owners.WorkerClass.PooledReviewer):
+        for kind in (owners.WorkerClass.OwnedLive,):
             with self.subTest(kind=kind), self.assertRaises(ValueError):
                 _ = owners.end_workers(sources, kind, self.root / "end-state", apply=True, end_worker=forbidden_end)
 
@@ -952,9 +963,8 @@ class WorkerOwnersTest(unittest.TestCase):
     def test_applied_end_logs_only_workers_in_the_selected_class(self) -> None:
         gone = self.worker(name="gone", thread="gone-thread", director="departed", unit="departed-unit")
         live = self.worker(name="live", thread="live-thread", classification="OwnedLive")
-        pooled = self.worker(name="pool", thread="pool-thread", classification="PooledReviewer")
         unknown = self.worker(name="unknown", thread="unknown-thread", director="", unit="")
-        sources = owners.OwnershipSources([gone, live, pooled, unknown],
+        sources = owners.OwnershipSources([gone, live, unknown],
                                          [owners.Director("director-one", "unit-director", "hierarchies")], [], [])
         state = self.root / "selected-log"
         with patch.object(subprocess, "run") as command:
