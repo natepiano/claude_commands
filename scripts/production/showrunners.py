@@ -16,6 +16,8 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Mapping
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
 
@@ -69,6 +71,14 @@ class Timer(NamedTuple):
     target: str
     doc: Path
     zone: str
+
+
+@dataclass(frozen=True)
+class ShowrunnerSource:
+    """One readable timer and the production document read with it."""
+
+    timer: Timer
+    document: str
 
 
 class CheckedDoc(NamedTuple):
@@ -130,9 +140,12 @@ def _fields(path: Path) -> dict[str, str]:
 def checked_doc(instance: Path) -> CheckedDoc | NoCheckedDoc:
     """Read the production doc passed to an update instance's production check."""
     try:
-        check = _fields(instance / "conf").get("CHECK")
+        return _checked_doc(_fields(instance / "conf").get("CHECK"))
     except (OSError, UnicodeError) as error:
         return NoCheckedDoc(f"conf could not be read: {error}")
+
+
+def _checked_doc(check: str | None) -> CheckedDoc | NoCheckedDoc:
     if check is None:
         return NoCheckedDoc("CHECK is missing")
     try:
@@ -175,24 +188,47 @@ def _session_name(session_id: str) -> str:
     raise ValueError(f"session {session_id} has no live named process")
 
 
-def _readable(doc: Path) -> None:
-    """Refuse a production doc that cannot be read."""
-    try:
-        _ = doc.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as error:
-        raise ValueError(f"production doc could not be read: {error}") from error
-
-
-def _timer(instance: Path) -> Timer:
+def _source(instance: Path) -> ShowrunnerSource:
     fields = _fields(instance / "conf")
     target = fields["TARGET"]
     if not target.startswith("session:") or not target[8:]:
         raise ValueError("invalid TARGET")
-    doc = checked_doc(instance)
+    doc = _checked_doc(fields.get("CHECK"))
     if isinstance(doc, NoCheckedDoc):
         raise ValueError(doc.reason)
-    _readable(doc.path)
-    return Timer(instance.name.removeprefix("showrunner-"), target, doc.path, user_zone_name())
+    try:
+        document = doc.path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise ValueError(f"production doc could not be read: {error}") from error
+    timer = Timer(instance.name.removeprefix("showrunner-"), target, doc.path, user_zone_name())
+    return ShowrunnerSource(timer, document)
+
+
+def _timer(instance: Path) -> Timer:
+    return _source(instance).timer
+
+
+class UnreadableTimerPolicy(Enum):
+    """Whether unreadable timer evidence must stop discovery or may be skipped by seed."""
+
+    RAISE = "raise"
+    SKIP = "skip"
+
+
+def read_sources(state_dir: Path | None = None, *,
+                 unreadable: UnreadableTimerPolicy) -> list[ShowrunnerSource]:
+    """Read each timer/doc once, applying the caller's policy to unreadable timers."""
+    found: list[ShowrunnerSource] = []
+    for instance in sorted((state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*")):
+        if not instance.is_dir():
+            continue
+        try:
+            found.append(_source(instance))
+        except (OSError, KeyError, ValueError, UnicodeError) as error:
+            if isinstance(error, OSError) and unreadable is UnreadableTimerPolicy.RAISE:
+                raise
+            print(f"showrunners: skipping {instance.name}: {error}", file=sys.stderr)
+    return found
 
 
 class DiscoverSessions(NamedTuple):
@@ -202,9 +238,8 @@ class DiscoverSessions(NamedTuple):
 DISCOVER_SESSIONS = DiscoverSessions()
 
 
-def _registered(instance: Path, *,
+def _registered(timer: Timer, *,
                 known_sessions: Mapping[str, SessionRecord] | DiscoverSessions = DISCOVER_SESSIONS) -> Showrunner:
-    timer = _timer(instance)
     if isinstance(known_sessions, DiscoverSessions):
         socket = socket_for(timer.target) or ""
         name = _session_name(timer.target[8:]) if socket else ""
@@ -224,18 +259,16 @@ def registered_showrunners(
 
     The timer is addressed to the Claude session id and holds the production doc, so it is the one
     record of a showrunner and holds no name: the name is looked up here, at each call. Raises OSError
-    when the session records cannot say whether a showrunner runs; a timer that is not a complete
-    showrunner's is left out, with the reason on stderr. Supplied live session records avoid
+    when a timer conf cannot be read or session records cannot say whether a showrunner runs;
+    an incomplete timer is left out, with the reason on stderr. Supplied live session records avoid
     rereading the registry or starting the sessions subprocess; an empty mapping means none are live.
     """
     found: list[Showrunner] = []
-    for instance in sorted((state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*")):
-        if not instance.is_dir():
-            continue
+    for source in read_sources(state_dir, unreadable=UnreadableTimerPolicy.RAISE):
         try:
-            found.append(_registered(instance, known_sessions=known_sessions))
+            found.append(_registered(source.timer, known_sessions=known_sessions))
         except (KeyError, ValueError, UnicodeError) as error:
-            print(f"showrunners: skipping {instance.name}: {error}", file=sys.stderr)
+            print(f"showrunners: skipping showrunner-{source.timer.slug}: {error}", file=sys.stderr)
     return found
 
 
@@ -363,6 +396,11 @@ def herdr_space(slug: str, doc: str) -> str:
         text = Path(doc).read_text(encoding="utf-8")
     except (OSError, UnicodeError):
         text = ""
+    return space_from_text(slug, text)
+
+
+def space_from_text(slug: str, text: str) -> str:
+    """The workspace name from an already-read production document."""
     line = re.search(r"^- \*\*Showrunner session:\*\*\s*`?([^`\s]+)`?\s*$", text, re.MULTILINE)
     return line[1] if line else slug
 
@@ -404,10 +442,18 @@ def timer_slugs(state_dir: Path | None = None) -> set[str]:
     return set(timer_docs(state_dir))
 
 
-def _stored_parent(child: str) -> str:
-    """What the child's parent file says, whether or not that edge counts. Empty when it has none."""
+def stored_parent(child: str) -> str:
+    """The stored slug, or empty when absent; unreadable parent evidence raises."""
     try:
         return (SHOWRUNNER_STATE_DIR / child / PARENT_FILE).read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return ""
+
+
+def _stored_parent(child: str) -> str:
+    """The forgiving reader retained for existing tree and lifecycle callers."""
+    try:
+        return stored_parent(child)
     except (OSError, UnicodeError):
         return ""
 
@@ -429,7 +475,12 @@ def edges(slugs: set[str] | None = None) -> dict[str, str]:
     each of them is a root.
     """
     known = timer_slugs() if slugs is None else slugs
-    stored = {child: parent for child in known if (parent := _stored_parent(child)) in known and parent != child}
+    return parent_edges({child: _stored_parent(child) for child in known})
+
+
+def parent_edges(parents: Mapping[str, str]) -> dict[str, str]:
+    """Apply the tree's local-endpoint and cycle rules to already-read parent evidence."""
+    stored = {child: parent for child, parent in parents.items() if parent in parents and parent != child}
     return {child: parent for child, parent in stored.items() if not _on_cycle(child, stored)}
 
 
