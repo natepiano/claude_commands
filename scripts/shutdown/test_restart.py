@@ -2701,6 +2701,19 @@ class RestartTests(ShutdownTestCase):
         started.assert_not_called()
         acknowledge.assert_not_called()
 
+    def test_stopping_record_whose_claude_is_gone_restarts_without_the_stop_path(self) -> None:
+        owner = top_level("gone-owner", cwd=str(self.root))
+        saved = entry(owner, state=shutdown_record.SessionStopping(kind="stopping", at=STOPPED))
+        self.create([saved])
+        with (patch.object(restart, "_owner_liveness", return_value=restart.SessionNotLive()),
+              patch.object(stop_work, "stop_session", side_effect=AssertionError("no stop retry"))):
+            recovered = restart._recover_incomplete_shutdown(saved, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        assert not isinstance(recovered, (restart.IncompleteShutdownRefused, restart.IncompleteShutdownStillLive))
+        self.assertEqual(recovered["progress"]["kind"], "already gone")
+        stored = shutdown_record.find_session(LOGIN, owner["session_id"])
+        assert stored is not None
+        self.assertEqual(stored["progress"]["kind"], "already gone")
+
     def test_heal_waits_for_the_conductors_matching_completed_stop_record(self) -> None:
         owner = top_level("heal-owner", cwd=str(self.root))
         saved = entry(owner, state=shutdown_record.SessionStopping(kind="stopping", at=STOPPED))
@@ -4866,17 +4879,13 @@ class RestartTests(ShutdownTestCase):
                       else restart.up(LOGIN, only=only))
         return result, launches
 
-    def test_dead_owner_in_stopping_finishes_cleanup_before_restore_and_keeps_intent(self) -> None:
+    def test_dead_owner_in_stopping_restores_without_the_stop_path_and_keeps_intent(self) -> None:
         saved = entry(top_level("crashed", host=inventory.HerdrHost(kind="herdr", herdr_session="crashed", pane_id="w1:p1", presentation="detached")),
                       state=shutdown_record.SessionStopping(kind="stopping", at=STOPPED))
         saved["target"] = "claude3"
         saved["where"] = shutdown_record.WhereSaid(kind="said", at=STOPPED, text="resume the repair")
         saved["timers"] = [TimerRestore(instance="timer", was_enabled=True)]
         self.create([saved])
-        def cleanup(current: SessionShutdown) -> SessionShutdown:
-            self.assertEqual(current["progress"]["kind"], "stopping")
-            return shutdown_record.update_session(LOGIN, "crashed", lambda changing: changing.update(
-                progress=shutdown_record.SessionAlreadyGone(kind="already gone", at=RESTARTED)))
         launched: list[SessionShutdown] = []
         def launch(current: SessionShutdown, _note: str, _desktop: restart.DesktopLaunchState, *,
                    dry_run: bool, source_fallback: bool = False) -> restart.SessionLaunched:
@@ -4886,7 +4895,7 @@ class RestartTests(ShutdownTestCase):
             return restart.SessionLaunched(SUBMITTED_PROMPT)
         with (patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
               patch.object(restart, "_process_liveness", return_value=restart.SessionNotLive()),
-              patch.object(stop_work, "stop_session", side_effect=cleanup) as stop,
+              patch.object(stop_work, "stop_session") as stop,
               patch.object(restore_permission, "launch_permission", return_value=restore_permission.AllowedByShutdownState()),
               patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()) as phone,
               patch.object(restart, "_retire"),
@@ -4895,7 +4904,7 @@ class RestartTests(ShutdownTestCase):
               patch.object(restart, "wait_for_confirmation", return_value=restart.RegistryConfirmation()),
               redirect_stdout(io.StringIO())):
             _ = restart.up(LOGIN)
-        stop.assert_called_once()
+        stop.assert_not_called()
         self.assertEqual(len(launched), 2)
         self.assertEqual(launched[1].get("target"), LABEL)
         self.assertEqual((launched[1]["timers"], launched[1]["where"], launched[1]["request_id"]),
