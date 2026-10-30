@@ -65,12 +65,12 @@ class OverlayTests(unittest.TestCase):
         return done.stdout
 
     def test_an_overlay_row_wins_and_an_overlay_only_row_and_section_are_read(self) -> None:
-        overlay = "[direct.codex]\nimpl=gpt-b:high\nfix=gpt-b:low\n\n[guild.codex]\ndesigner=gpt-b:xhigh\n"
-        _ = self.overlay.write_text(overlay + "\n[assignments]\nguild=codex\n", encoding="utf-8")
+        overlay = "[direct.codex]\nimpl=gpt-b:high\nfix=gpt-b:low\n\n[design_roles.codex]\ndesigner=gpt-b:xhigh\n"
+        _ = self.overlay.write_text(overlay + "\n[assignments]\ndesign_roles=codex\n", encoding="utf-8")
         self.assertEqual(self.resolve("direct.impl"), "gpt-b:high")
         self.assertEqual(self.resolve("direct.review"), "gpt-a:max")
         self.assertEqual(self.resolve("direct.fix"), "gpt-b:low")
-        self.assertEqual(self.resolve("guild.designer"), "gpt-b:xhigh")
+        self.assertEqual(self.resolve("design_roles.designer"), "gpt-b:xhigh")
         environment = {"AGENTS_CONFIG_FILE": str(self.registry)}
         with mock.patch.dict(os.environ, environment):
             bash_view = self.bash(f'source "{AGENTS}/agents_overlay.sh" && agents_registry_text').stdout
