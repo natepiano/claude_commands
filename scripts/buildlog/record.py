@@ -477,6 +477,10 @@ def step(args: list[str]) -> None:
             "cwd": cwd,
             **git_facts(directory),
             **tree,
+            # A reusable test build needs verify's Cargo inputs as well as
+            # unchanged sources. Older callers leave this unknown.
+            "test_build_key": (os.environ.get("BUILDLOG_TEST_BUILD_KEY") or None)
+            if name == "nextest" and tree["tree_changed"] is False else None,
             "caller": step_caller,
             **who(),
             "call_id": os.environ.get("BUILDLOG_CALL_ID") or None,
@@ -614,6 +618,17 @@ def queue_bump(actor: str, session: str, step: str, folder: str, old_position: i
         "kind": "queue_bump", "v": RECORD_VERSION,
         "id": f"{host}-{time.time_ns()}", "host": host, "at": store.utc_iso(at),
         "actor": actor, "session": session, "step": step, "folder": folder, "old_position": old_position,
+    })
+
+
+def head_admission(action: Literal["set", "admitted", "lapsed"], unit: str, step: str,
+                   need: int, free: int, reserve: int, why: str, set_by: str, at: float) -> None:
+    host = store.host_name()
+    store.append_line(store.host_file(host, at), {
+        "kind": "head_admission", "v": RECORD_VERSION,
+        "id": f"{host}-{time.time_ns()}", "host": host, "at": store.utc_iso(at),
+        "action": action, "unit": unit, "step": step, "need": need, "free": free,
+        "reserve": reserve, "why": why, "set_by": set_by,
     })
 
 

@@ -121,7 +121,22 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
         self.write_tool(stubs / "cargo", CARGO)
         self.write_shell_tool(stubs / "taplo", "exit 0\n")
         self.write_shell_tool(stubs / "rustc", "printf 'rustc fixture\\n'\n")
-        self.write_tool(stubs / "assertion-guard", "raise SystemExit(0)\n")
+        self.write_tool(stubs / "assertion-guard", """
+class GuardError(Exception):
+    pass
+
+def default_base(repo, explicit_base=""):
+    return "fixture-base"
+
+def git(repo, *arguments):
+    return "fixture-head" if arguments[0] == "rev-parse" else ""
+
+def read_rulings(sources, messages):
+    return {}
+
+if __name__ == "__main__":
+    raise SystemExit(0)
+""")
         # Keep real heartbeat/board sleeps; only controlled memory transitions
         # use already-published routing readiness or the meminfo change event.
         sleep = shutil.which("sleep")
