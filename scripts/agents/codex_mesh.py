@@ -5404,6 +5404,30 @@ def _turn_service_tier(client: Client, args: argparse.Namespace) -> str:
         return "default"
 
 
+def _turn_model_effort(args: argparse.Namespace) -> tuple[str, str]:
+    """Select explicit dispatch settings or the current role default at send time."""
+    role = _worker_role(args)
+    model = _as_str(_attr(args, "model"))
+    effort = _as_str(_attr(args, "effort"))
+    resolved = subprocess.run([
+        "bash", "-c", '''source "$1"; agents_resolve "direct.$2" || exit 2
+if [[ -n "$3" || -n "$4" ]]; then
+ pair="${3:-$AGENT_MODEL}"
+ [[ "$pair" == *:* ]] || pair="$pair:${4:-$AGENT_EFFORT}"
+ [[ -z "$4" ]] || pair="${pair%%:*}:$4"
+ _agents_validate_pair "direct.$2" "$AGENT_FAMILY" "$pair" || exit 2
+fi
+printf '%s\\n' "$AGENT_MODEL" "$AGENT_EFFORT"
+''', "mesh-turn", str(Path(__file__).with_name("agents_config.sh")), role, model, effort,
+    ], capture_output=True, text=True, timeout=30)
+    if resolved.returncode:
+        raise SystemExit(resolved.stderr.strip() or "cannot resolve turn model and effort")
+    fields = resolved.stdout.splitlines()
+    if len(fields) != 2:
+        raise SystemExit("turn model resolver returned an invalid model/effort pair")
+    return fields[0], fields[1]
+
+
 def _start_turn(
     client: Client, args: argparse.Namespace, thread_id: str, worker_sandbox: str, message: str,
     pending: tuple[str, ...] = (),
@@ -5424,17 +5448,33 @@ def _start_turn(
     # turn that leaves it out would inherit a previous `--read-only` turn's sandbox.
     params["sandboxPolicy"] = _turn_sandbox_policy(
         READ_ONLY_SANDBOX if _attr(args, "read_only") is True else worker_sandbox)
-    model = _as_str(_attr(args, "model"))
-    if model:
-        params["model"] = model
-    effort = _as_str(_attr(args, "effort"))
-    if effort:
-        params["effort"] = effort
+    # Resolve at every submission, including continuations and capacity retries.
+    # Roster/identity values are display history, never input to this choice.
+    model, effort = _turn_model_effort(args)
+    params["model"], params["effort"] = model, effort
     service_tier = _turn_service_tier(client, args)
     params["serviceTier"] = service_tier
     client.turn_submitted_at = time.time()
     result = _serving_request(client, "turn/start", params, submits_work=True)
     turn_id = _as_str(_as_dict(result.get("turn")).get("id"))
+    if turn_id:
+        session_dir = _as_str(_attr(args, "session_dir"))
+        name = _as_str(_attr(args, "name")) or _as_str(_attr(args, "to"))
+        with _session_path(session_dir, ROSTER_FILE).open("r+", encoding="utf-8") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            roster = _load_roster_for_write(handle)
+            entry = _as_dict(roster.get(name))
+            if entry.get("thread_id") == thread_id and not entry.get("adopted_to"):
+                entry.update({"model": model, "effort": effort})
+                _advance_roster_revision(entry)
+                roster[name] = entry
+                _ = handle.seek(0)
+                _ = handle.truncate()
+                _ = handle.write(json.dumps(roster, indent=2, sort_keys=True))
+        log_file = _as_str(_attr(args, "log_file"))
+        if log_file:
+            with Path(log_file).open("a", encoding="utf-8") as log:
+                _ = log.write(f"turn/start thread={thread_id} turn={turn_id} model={model} effort={effort}\n")
     receipt_file = _as_str(_attr(args, "submission_receipt_file"))
     if turn_id and receipt_file:
         with Path(receipt_file).open("a", encoding="utf-8") as receipt:

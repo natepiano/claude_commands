@@ -337,7 +337,6 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
         record = read_roster(dispatch.run, dispatch.worker)
         if not record or record.get("adopted_to"):
             refuse(f"{dispatch.worker}: worker is missing or adopted")
-        args = dispatch.args
         identity_path = worker_record_path(dispatch.run, dispatch.worker, dispatch.worker, role=dispatch.role)
         identity = read_object(identity_path)
         slot = text(identity.get("slot")) or dispatch.worker
@@ -525,8 +524,12 @@ def execute(dispatch: Dispatch, paths: list[str]) -> int:
     follow = [PYTHON, MESH, "follow", "--session-dir", str(dispatch.run), "--to", dispatch.worker,
               "--claim-pid", str(os.getpid()), "--role", dispatch.role, "--cwd", str(dispatch.cwd),
               "--message-file", str(message), "--summary-file", str(summary), "--reply-file", str(reply),
-              "--log-file", str(log), "--model", dispatch.model, "--effort", dispatch.effort,
+              "--log-file", str(log),
               "--task", f"direct.{dispatch.role}", "--service-tier", dispatch.tier]
+    if args.model:
+        follow += ["--model", args.model]
+    if args.effort:
+        follow += ["--effort", args.effort]
     if dispatch.role == "review":
         follow += ["--read-only"]
     if args.lens:
