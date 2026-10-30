@@ -30,6 +30,7 @@ the build log has no brp-launch rows after 2026-10-15T18:59Z (411 rows from 09-0
 ## Delegation Context
 
 - **Project:** `~/.claude` — the build log, the build queue view and the unit-board Claude Code mod.
+- **Project started:** 2026-10-29T11:45:32-04:00
 - **Stack:** Python 3.13 (basedpyright strict, unittest); TypeScript mod under `mods/unit-board/` (its own tests in `mods/unit-board/tests/`).
 - **Layout:** `scripts/buildlog/` (record, index, launches, report); `scripts/build_queue/build_queue.py`; `scripts/lint/memory_admit.py` (read only: resources-unit's); `mods/unit-board/hooks/` and `mods/unit-board/tests/`; `commands/build/queue.md`; `scripts/hana_shot/hana_shot.py` (natedev screenshot-unit's).
 - **Key files:** `scripts/build_queue/build_queue.py` — the queue tables; `mods/unit-board/hooks/register.tsx` — mod commands, panes, timers; `mods/unit-board/hooks/accounts.tsx` — the accounts pane view; `scripts/buildlog/index.py` — the SQLite index over the append-only `.jsonl` logs; `scripts/buildlog/store.py` — where records live and how a line is appended; `scripts/buildlog/launches.py` — launch rows from transcripts.
@@ -53,6 +54,7 @@ the build log has no brp-launch rows after 2026-10-15T18:59Z (411 rows from 09-0
 - The mod answers `command.run` on `{ command: 'build:queue' }`, as it answers `showrunner:unit_board`, and never calls `next`. Open: store `loading`, run `[~/.claude/scripts/lib/py, ~/.claude/scripts/build_queue/build_queue.py, "--json"]`, reply `Build queue opened.`. Refresh every 10 s while open. `close`, Escape or the close mark closes it (`Build queue closed.`). `bump <selector>` runs `build_queue.py bump <selector>`, replies with its result line and refreshes an open pane. It never parses the text table. A failed run shows `Build queue could not be read.`, never process output.
 - Shared code: the accounts pane lifecycle in `hooks/register.tsx` (open, loading, one run per tick, busy guard, 10 s timer, reload restart from `$.ui.panes()`, close, fixed failure reason) becomes one table-pane helper. `/accounts-board` and `/build:queue` both use it; `/accounts-board` behaves exactly as before.
 - `commands/build/queue.md` keeps its frontmatter; its body still runs the script, so a session without the mod still gets the tables, and names `/reload-plugins` for a session started before the mod change.
+- Assertion-Change: `scripts/build_queue/test_build_queue.py` — `test_budget_reason_names_charged_builds_and_the_limit`, `test_memory_reason_names_free_memory_and_earlyoom_reserve` and `test_unavailable_reading_does_not_claim_zero_free_memory` select only table rows (lines that start with `| `), because the head line now holds the same reason text. Each assertion string stays the same.
 
 **Files:**
 - `scripts/build_queue/build_queue.py` — `--json`, head line
@@ -76,7 +78,7 @@ the build log has no brp-launch rows after 2026-10-15T18:59Z (411 rows from 09-0
 
 **Acceptance gate:** `python3 -m unittest scripts.build_queue.test_build_queue` green; the mod test suite green with `accounts.test.ts` and `register.test.ts` unchanged; basedpyright 0/0/0 on the changed Python files. Live: after `/reload-plugins`, `/build:queue` opens the pane with no model turn, its rows match `python3 ~/.claude/scripts/build_queue/build_queue.py` run at the same time, and the head line names the step that holds the budget when one does.
 
-### Phase 2 — The index reads old field names and never rewrites a source log  · status: todo
+### Phase 2 — The index reads old field names and never rewrites a source log  · status: done
 
 #### Work Order
 
@@ -85,15 +87,17 @@ the build log has no brp-launch rows after 2026-10-15T18:59Z (411 rows from 09-0
 **Spec:**
 - Remove `migrate_worker_fields` (`scripts/buildlog/index.py:663-692`) and its call in `read_file`. While indexing a `step` or `call` record, read the old names as the new ones from `FORMER_FIELDS` (`seat`→`worker`, `delegate_session`→`unit_session`); a record with both keeps the new value.
 - The rerun sweep row (`docs/plans/sdlc-rerun-sweep.md` on main 4dfc4dce, `scripts/buildlog/index.py:689`, Q3) is closed by this: no index code writes a `.jsonl` file.
+- Assertion-Change: `scripts/buildlog/test_index.py` `test_first_index_read_migrates_worker_fields_and_preserves_incomplete_appends` becomes `test_first_index_read_maps_worker_fields_and_leaves_source_unchanged`: its two `assertNotIn` checks for `"seat"` and `"delegate_session"` in the source become one `assertEqual` of the source bytes before and after the update. The row, partial-append and second-update checks stay.
 
 **Files:**
 - `scripts/buildlog/index.py` — drop the rewrite; read-side rename
 - `scripts/buildlog/test_index_rerun.py` — new: stop-and-rerun test
+- `scripts/buildlog/test_index.py` — the old rewrite test now checks unchanged source bytes
 - `docs/as-built/buildlog-memory-stalls.md` — one line: the index reads old field names
 
 **Workers:** 1 writer + 1 tester.
 - `impl2` — `index.py`, the as-built line
-- `test2` — `test_index_rerun.py`
+- `test2` — `test_index_rerun.py`, `test_index.py`
 
 **State:** index rows (`index.sqlite`)
 
