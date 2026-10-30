@@ -457,7 +457,7 @@ Senders:
 
 **Imports**
 - `roster.py`'s module-level `sys.path` edits reach every importer: a change there must also run the herdr and shutdown folder suites.
-- buildlog and shutdown each have a `record.py`; with `scripts/shutdown` ahead on `sys.path`, `import record` loads the wrong one. This is why `roster.py` imports shutdown's `remote` by package.
+- Buildlog uses `record.py`; shutdown uses `shutdown_record.py`. Their bare imports have distinct module names even when both folders are on `sys.path`. Shutdown has no old-name alias or shim. `roster.py` imports shutdown's `remote` by package.
 
 **Tests**
 - `PROCESS_TABLE_PS` is read at import: a test that sets it reloads `process_table` or patches `process_table.PS`.

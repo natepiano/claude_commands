@@ -32,7 +32,7 @@ import unit_lookup
 from inventory import (Inventory, Session, ShutdownProcess, ProcessObservation, ProcessIdentity,
     ProcessLive, ProcessGone, ProcessUnknown, shutdown_identity, shutdown_processes, terminal_kind, live_supervisor, codex_seats)
 from user_zone import user_zone
-from record import (
+from shutdown_record import (
     CLAIM_STALE_SECONDS,
     NoLiveRecord,
     archive_session,
@@ -1334,7 +1334,7 @@ def _bounded_mesh(arguments: list[str], timeout: float) -> int | None:
 
 def _recorded_directors() -> dict[tuple[int, str], str]:
     """Candidate identities only; the current table must prove each live."""
-    from record import all_session_records
+    from shutdown_record import all_session_records
     saved = all_session_records()
     directors = {(item["session"]["pid"], item["session"]["proc_start"]): item["session"]["session_id"]
                  for item in saved}

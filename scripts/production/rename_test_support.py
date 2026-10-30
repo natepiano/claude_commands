@@ -467,8 +467,8 @@ class ProductionRenameFixture(unittest.TestCase):
                              "thread_id": "thread-impl", "turn_live": True, "launcher_command": [
                                  "bash", "/scripts/direct/implement.sh", str(old), f"{old}/prompt.md"]}]}
         self.write(self.root / "runs/r1/impl.resume-prompt.md", "Continue the task.\n")
-        script = ("import json, sys; sys.path.insert(0, sys.argv[1]); import record; "
-                  "assert record.create_session(json.loads(sys.stdin.read()))")
+        script = ("import json, sys; sys.path.insert(0, sys.argv[1]); import shutdown_record; "
+                  "assert shutdown_record.create_session(json.loads(sys.stdin.read()))")
         created = subprocess.run([sys.executable, "-c", script, str(SCRIPT.parents[1] / "shutdown")],
                                  input=json.dumps(saved), env=self.env, capture_output=True, text=True,
                                  check=False, timeout=TEST_HANG_GUARD_SECS)
