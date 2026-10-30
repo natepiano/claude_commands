@@ -45,8 +45,8 @@ NUMERIC_LITERAL = re.compile(
 NUMERIC_TYPES = frozenset(("i8", "i16", "i32", "i64", "i128", "isize",
                            "u8", "u16", "u32", "u64", "u128", "usize", "f32", "f64"))
 RUST_LITERAL = re.compile(
-    r'''(?:br(?<!\wbr)|r(?<!\wr))(?P<hashes>\#*)"(?s:.*?)"(?P=hashes)'''
-    + r'''|b?"(?:\\.|[^"\\])*"|b?'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^'\\])'|//[^\n]*|/\*'''
+    r'''(?<!\w)(?:br|cr|r)(?P<hashes>\#*)"(?s:.*?)"(?P=hashes)'''
+    + r'''|[bc]?"(?:\\.|[^"\\])*"|b?'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^'\\])'|//[^\n]*|/\*'''
     + r"|(?<!\w)(?:" + NUMERIC_LITERAL.pattern + r")(?!\w)", re.DOTALL)
 BLOCK_COMMENT = re.compile(r"/\*|\*/")
 IDENTIFIER = re.compile(r"\b[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*\b")
@@ -59,7 +59,8 @@ WEAKER = re.compile(
 TURNED_OFF = re.compile(
     r"#\[ignore\b|@unittest\.(?:skip|skipIf|skipUnless|expectedFailure)\b"
     + r"|@pytest\.mark\.(?:skip|skipif|xfail)\b|\bself\.skipTest\s*\(|\bpytest\.skip\s*\(")
-TEST_MARK = re.compile(r"#\[(?:test|tokio::test|rstest)\b")
+TEST_MARK = re.compile(r"#\s*\[\s*(?:test|(?:tokio|async_std)\s*::\s*test"
+                       + r"|rstest(?:\s*::\s*rstest)?|test_case(?:\s*::\s*test_case)?)\s*(?=[\](])")
 PYTHON_TEST = re.compile(r"\bdef\s+(test_\w*)\s*\(")
 RULING = re.compile(r"(?:^|(?:-[a-zA-Z]*m|--message)[= \t]*[\"']?)Assertion-Change:"
                     + r"[ \t]*(.+?)::([^\s]+)[ \t]+[—-][ \t]*(\S[^\n]*)$", re.MULTILINE)
@@ -361,16 +362,16 @@ def use_bindings(text: str, prefix: tuple[str, ...] = ()) -> Iterable[UseBinding
                 yield UseBinding(alias.strip() or parts[-1], parts)
 
 
-def declaration_end(text: str, start: int, stops: str) -> int:
+def declaration_end(text: str, start: int, stops: str, *, angles: bool = False) -> int:
     """Find a delimiter outside nested groups in already masked code."""
     depth = 0
     for index in range(start, len(text)):
         char = text[index]
         if depth == 0 and char in stops:
             return index
-        if char in "([{":
+        if char in ("([{<" if angles else "([{"):
             depth += 1
-        elif char in ")]}":
+        elif char in (")]}>" if angles else ")]}") and not (angles and char == ">" and text[index - 1] == "-"):
             depth -= 1
     return len(text)
 
@@ -997,16 +998,16 @@ def test_lines(lines: list[DiffLine], code: dict[tuple[str, Side], list[str]]) -
     for line in lines:
         key = line.path, line.side
         text = code[key][line.number - 1]
-        if "#[" not in text and "def" not in text and "fn" not in text:
+        if "#" not in text and "def" not in text and "fn" not in text:
             continue
-        if "#[" in text and TEST_MARK.search(text):
+        if TEST_MARK.search(text):
             markers[key] = line.number
         match = PYTHON_TEST.search(text) if "def" in text else None
         if match:
             tests.append((line, match[1]))
-        elif "fn" in text and line.path.endswith(".rs") and 0 < line.number - markers.get(key, -4) <= 3:
+        elif "fn" in text and line.path.endswith(".rs"):
             function = FUNCTION.search(text)
-            if function:
+            if function and 0 < line.number - markers.pop(key, -4) <= 3:
                 tests.append((line, function[1]))
     return tests
 
@@ -1361,24 +1362,103 @@ def commit_bases(repo: Path) -> tuple[str, ...]:
     return tuple(dict.fromkeys(bases))
 
 
-def name_tests(findings: list[Finding], sources: dict[tuple[str, Side], list[str]]) -> list[Finding]:
+@dataclass(frozen=True)
+class TestScope:
+    first: int
+    last: int
+    name: str
+
+
+def enclosing_tests(rows: list[str], rust: bool) -> Iterable[TestScope]:
+    """Bound test bodies by Python syntax or Rust's masked braces."""
+    text = "\n".join(rows)
+    if not rust:
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            return
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
+                yield TestScope(node.lineno, node.end_lineno or node.lineno, node.name)
+        return
+    offsets = [0] + [match.end() for match in re.finditer("\n", text)]
+    tokens = re.compile(r"#\s*\[|" + FUNCTION.pattern + r"|[{};]")
+    cursor = depth = 0
+    marked = False
+    pending_name = ""
+    pending_first = 0
+    bodies: dict[int, TestScope] = {}
+    scopes: list[TestScope] = []
+    while token := tokens.search(text, cursor):
+        cursor = token.end()
+        if token[0].startswith("#"):
+            end = declaration_end(text, cursor, "]")
+            if end == len(text):
+                return
+            cursor = end + 1
+            marked = marked or bool(TEST_MARK.search(text[token.start():cursor]))
+        elif function := FUNCTION.fullmatch(token[0]):
+            cursor = declaration_end(text, token.end() - 1, "{;", angles=True)
+            if cursor == len(text):
+                return
+            if marked:
+                pending_name = function[1]
+                pending_first = bisect_right(offsets, token.start())
+            marked = False
+        else:
+            if token[0] == "{":
+                depth += 1
+                if pending_name:
+                    bodies[depth] = TestScope(pending_first, len(rows), pending_name)
+            elif token[0] == "}":
+                if depth in bodies:
+                    scopes.append(replace(bodies.pop(depth), last=bisect_right(offsets, token.start())))
+                depth -= 1
+                if depth < 0:
+                    return
+            marked = False
+            pending_name = ""
+    if depth == 0:
+        yield from scopes
+
+
+def name_tests(findings: list[Finding], sources: dict[tuple[str, Side], list[str]],
+               code: dict[tuple[str, Side], list[str]]) -> list[Finding]:
     groups: dict[tuple[str, Side], list[Finding]] = defaultdict(list)
     for finding in findings:
         groups[finding.source.path, finding.source.side].append(finding)
     named: list[Finding] = []
     for (path, side), group in groups.items():
-        functions = [(number, match[1]) for number, text in enumerate(sources[path, side], 1)
+        rust = path.endswith(".rs")
+        rows = sources[path, side]
+        code_rows = code[path, side]
+        tests = deque(sorted(enclosing_tests(code_rows if rust else rows, rust), key=lambda test: test.first))
+        active: list[TestScope] = []
+        functions = [(number, match[1]) for number, text in enumerate(code_rows, 1)
                      if "fn" in text or "def" in text
                      if (match := FUNCTION.search(text))]
         positions = [number for number, _ in functions]
-        for finding in group:
+        for finding in sorted(group, key=lambda finding: finding.source.number):
+            while tests and tests[0].first <= finding.source.number:
+                test = tests.popleft()
+                while active and active[-1].last < test.first:
+                    _ = active.pop()
+                active.append(test)
+            while active and active[-1].last < finding.source.number:
+                _ = active.pop()
             index = bisect_right(positions, finding.source.number) - 1
-            named.append(replace(finding, test=functions[index][1] if index >= 0 else "?"))
-    removed_tests = {(finding.source.path, finding.test) for finding in named if finding.kind == "test removed"}
-    counts = Counter((finding.source.path, finding.test) for finding in named if finding.kind == "removed")
+            owner = active[-1].name if active else functions[index][1] if index >= 0 else "?"
+            named.append(replace(finding, test=owner))
+    return sorted(named, key=lambda finding: (finding.source.path, finding.source.number))
+
+
+def aggregate_test_removals(findings: list[Finding]) -> list[Finding]:
+    """Combine only removals that survived comparison against every base."""
+    removed_tests = {(finding.source.path, finding.test) for finding in findings if finding.kind == "test removed"}
+    counts = Counter((finding.source.path, finding.test) for finding in findings if finding.kind == "removed")
     combined = [replace(finding, removed_assertions=counts[finding.source.path, finding.test])
                 if finding.kind == "test removed" else finding
-                for finding in named if finding.kind != "removed"
+                for finding in findings if finding.kind != "removed"
                 or (finding.source.path, finding.test) not in removed_tests]
     return sorted(combined, key=lambda finding: (finding.source.path, finding.source.number))
 
@@ -1420,12 +1500,12 @@ def findings_against_base(repo: Path, base: str, head: str, staged: bool,
             inspect_globs(repo, base, head, staged, path, side, cache.tables[key], cache)
             constants[path, side] = cache.tables[key]
     assertions = touched_assertions(lines, sources, code, constants)
-    return name_tests(find_changes(lines, assertions, code), code)
+    return name_tests(find_changes(lines, assertions, code), sources, code)
 
 
-def finding_identity(finding: Finding) -> tuple[str, str, Kind, str, str]:
-    """Match the same change across parents even when source line numbers differ."""
-    return (finding.source.path, finding.test, finding.kind, normalized(finding.old), normalized(finding.new))
+def finding_identity(finding: Finding) -> tuple[str, Kind, str, str]:
+    """Intersect changes independently of owner; run keeps the first base's name."""
+    return (finding.source.path, finding.kind, normalized(finding.old), normalized(finding.new))
 
 
 def run(arguments: list[str]) -> int:
@@ -1462,7 +1542,7 @@ def run(arguments: list[str]) -> int:
                          for base in bases)
     rulings = read_rulings(args.rulings, messages)
     blocking = 0
-    for finding in shared:
+    for finding in aggregate_test_removals(shared):
         why = rulings.get((finding.source.path, finding.test), "")
         prefix = "note: " if finding.kind == "changed" else ""
         suffix = f" — ruled: {why}" if why else ""

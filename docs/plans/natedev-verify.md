@@ -310,6 +310,20 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 
 **Ruled out:** evaluating `concat!` or arithmetic in a `const` — a constant pairs only when its value is one literal.
 
+### Phase 6c — Name a removed assertion by the test that holds it, not by a nested function  · status: done
+
+**Depends on:** 6b (merged). Runs in `/home/natepiano/worktrees/claude-build-followups-verify-base`, branch `natedev-verify-base`, from origin/builds d27e24a1. Before the imported-constant follow-up.
+
+**Origin:** builds showrunner 2026-10-30, reported by models via devtools and natedev. Wrong result.
+
+**Defect:** `assertion_guard.py` names a removed assertion by the nearest nested `def`, not by the test that holds it. A test `test_outer` with a nested `def final_diff()` and a removed assertion after it reports `final_diff removed`, so a ruling must name `final_diff`, which is not a test. Reproduced on main d27e24a1.
+
+**Fix:** one place maps a line to its owning test. An assertion belongs to the innermost enclosing test (Python `test_*`; Rust `#[test]`-family fn), and a nested helper's scope ends where its body ends. An assertion in a non-test helper outside any test keeps its current name.
+
+**Files:** `scripts/direct/assertion_guard.py`, `scripts/direct/assertion_guard_test_support.py`, `scripts/direct/test_assertion_guard*.py`, `docs/as-built/phase-checks.md` if it describes the naming.
+
+**Acceptance gate:** regressions for Python and Rust (assertion after a nested helper; assertion inside a nested helper) name the enclosing test, and its ruling clears them; each fails without the fix. The 6b real cases still hold (7a4fb6b8 14/14, b1408dc8 6/6, 2520c27d 0 blocking). basedpyright 0/0/0 on changed files; the merge gate passes.
+
 ### Phase 7 — Keep the cargo token through a long lint, and keep a run's queue place when the Mac is taken  · status: todo
 
 **Depends on:** none. Urgent, ahead of Phases 1, 2 and 4. Runs in `/home/natepiano/worktrees/claude-build-followups-verify-guard`, branch `natedev-verify-token` (from origin/natedev d41fbd8c).
