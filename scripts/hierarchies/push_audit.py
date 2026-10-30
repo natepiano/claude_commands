@@ -4,6 +4,7 @@
 This module defines the audit's failed-check rule. Date-time ends are excluded;
 a date-only --until includes that local day. Ownership comes from current
 production tables and cannot reconstruct historical ownership.
+The report opens with a summary. Use --full to print the tables after it.
 """
 from __future__ import annotations
 
@@ -17,19 +18,21 @@ import json
 from pathlib import Path
 import re
 import sys
+import tomllib
 from typing import ClassVar, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS.parent))
 sys.path.insert(0, str(SCRIPTS / "notify"))
+sys.path.insert(0, str(SCRIPTS / "production"))
 
-from scripts.hierarchies import measure
+from scripts.hierarchies import log_records
 from scripts.notify.pushover import MESSAGE_MAX
 from scripts.production import production_units, showrunners
 
 STATE_DIR = Path.home() / ".local/state/notify"
+SESSION_CONFIG = SCRIPTS.parent / "config/hierarchies/sessions.toml"
 PUSHOVER_SEND = "scripts/notify/pushover.py send()"
-JsonObject = dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -80,7 +83,7 @@ class ShowrunnerNotRecorded:
 
 @dataclass(frozen=True)
 class SessionWithoutProduction:
-    name: str
+    key: str
 
 
 @dataclass(frozen=True)
@@ -95,6 +98,23 @@ ShowrunnerAttribution = ShowrunnerOwner | MachineService | SessionWithoutProduct
 class ProductionOwnership:
     exact_names: dict[str, ShowrunnerOwner]
     session_aliases: dict[str, ShowrunnerOwner]
+
+
+@dataclass(frozen=True)
+class TopLevelSession:
+    key: str
+    display_name: str
+
+
+@dataclass(frozen=True)
+class TopLevelSessions:
+    entries: tuple[TopLevelSession, ...]
+
+    def display_name(self, key: str) -> str:
+        for session in self.entries:
+            if session.key == key:
+                return session.display_name
+        return key
 
 
 class PushPriority(Enum):
@@ -202,8 +222,9 @@ ReviewMatch = ReviewRecord | ReviewNotMatched
 class AuditSources:
     pushes: list[PushRecord]
     reviews: list[ReviewRecord]
-    problems: list[measure.SourceProblem]
+    problems: list[log_records.SourceProblem]
     production_ownership: ProductionOwnership
+    sessions: TopLevelSessions
 
 
 @dataclass(frozen=True)
@@ -219,10 +240,12 @@ class AuditEntry:
 
 @dataclass(frozen=True)
 class AuditReport:
-    window: measure.Window
+    window: log_records.Window
     entries: tuple[AuditEntry, ...]
-    problems: tuple[measure.SourceProblem, ...]
+    problems: tuple[log_records.SourceProblem, ...]
     pushes_by_showrunner: dict[ShowrunnerAttribution, int]
+    delivered_pushes: tuple[PushRecord, ...]
+    sessions: TopLevelSessions
 
 
 def parse_sender(source: str) -> Sender:
@@ -234,8 +257,8 @@ def parse_sender(source: str) -> Sender:
     return BareSender(source)
 
 
-def parse_push(record: JsonObject) -> PushRecord:
-    text = measure.field_text
+def parse_push(record: log_records.JsonObject) -> PushRecord:
+    text = log_records.field_text
     outcome_text = text(record, "outcome")
     outcome = PushOutcome.NOT_DELIVERED
     if outcome_text.startswith("kept: silence"):
@@ -246,15 +269,15 @@ def parse_push(record: JsonObject) -> PushRecord:
             outcome = PushOutcome.FAILED_REVIEW_SENT
         elif "rewrite not applied" in outcome_text:
             outcome = PushOutcome.ORIGINAL_TEXT_SENT
-    return PushRecord(measure.record_time(record), parse_sender(text(record, "source")),
+    return PushRecord(log_records.record_time(record), parse_sender(text(record, "source")),
                       PushPriority(text(record, "priority")), text(record, "title"), text(record, "message"), outcome,
                       DeliveryTiming.RELEASED_FROM_SILENCE if "kept during silence" in outcome_text else DeliveryTiming.IMMEDIATE)
 
 
-def parse_review(record: JsonObject) -> tuple[ReviewRecord, ...]:
-    if any(measure.field_flag(record, key) for key in ("replay", "dry", "sample")):
+def parse_review(record: log_records.JsonObject) -> tuple[ReviewRecord, ...]:
+    if any(log_records.field_flag(record, key) for key in ("replay", "dry", "sample")):
         return ()
-    text = measure.field_text
+    text = log_records.field_text
     if text(record, "kind") in ("reply", "question"):
         return ()
     verdict_text = text(record, "verdict")
@@ -263,43 +286,43 @@ def parse_review(record: JsonObject) -> tuple[ReviewRecord, ...]:
     sent_value = record.get("sent")
     sent: SentReview | ReviewNotSent = ReviewNotSent()
     if sent_value is not None:
-        message = measure.object_record(sent_value)
+        message = log_records.object_record(sent_value)
         sent = SentReview(text(message, "title"), text(message, "body"), message == record.get("draft"))
     rules = record.get("failed_rules", [])
     if not isinstance(rules, list) or any(not isinstance(rule, str) for rule in cast(list[object], rules)):
         raise ValueError("failed_rules: expected a list of rule names")
     identity = text(record, "text_id")
-    return (ReviewRecord(measure.record_time(record), parse_sender(text(record, "source")), verdict, sent,
+    return (ReviewRecord(log_records.record_time(record), parse_sender(text(record, "source")), verdict, sent,
                          TextId(identity) if identity else TextNotRecorded(), tuple(cast(list[str], rules))),)
 
 
-def read_log[T](path: Path, parse: Callable[[JsonObject], T], problems: list[measure.SourceProblem]) -> list[T]:
+def read_log[T](path: Path, parse: Callable[[log_records.JsonObject], T], problems: list[log_records.SourceProblem]) -> list[T]:
     records: list[T] = []
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError) as error:
         kind = "missing" if isinstance(error, FileNotFoundError) else "unreadable"
-        problems.append(measure.SourceProblem(str(path), f"{kind}: {error}"))
+        problems.append(log_records.SourceProblem(str(path), f"{kind}: {error}"))
         return records
     for line_number, line in enumerate(lines, 1):
         if not line.strip():
             continue
         try:
             value = cast(object, json.loads(line))
-            records.append(parse(measure.object_record(value)))
+            records.append(parse(log_records.object_record(value)))
         except ValueError as error:
-            problems.append(measure.SourceProblem(str(path), f"unreadable line {line_number}: {error}"))
+            problems.append(log_records.SourceProblem(str(path), f"unreadable line {line_number}: {error}"))
     return records
 
 
-def read_owners(problems: list[measure.SourceProblem]) -> ProductionOwnership:
+def read_owners(problems: list[log_records.SourceProblem]) -> ProductionOwnership:
     """Read current production tables without session lookup or roster traffic."""
     exact_names: dict[str, set[str]] = defaultdict(set)
     session_aliases: dict[str, set[str]] = defaultdict(set)
     for instance in sorted(showrunners.NOTIFIER_STATE_DIR.glob("showrunner-*")):
         checked = showrunners.checked_doc(instance)
         if isinstance(checked, showrunners.NoCheckedDoc):
-            problems.append(measure.SourceProblem(str(instance / "conf"), checked.reason))
+            problems.append(log_records.SourceProblem(str(instance / "conf"), checked.reason))
             continue
         slug = instance.name.removeprefix("showrunner-")
         exact_names[slug].add(slug)
@@ -314,17 +337,36 @@ def read_owners(problems: list[measure.SourceProblem]) -> ProductionOwnership:
                     if name.endswith("-unit"):
                         session_aliases[name.removesuffix("-unit")].add(slug)
         except (OSError, UnicodeError, production_units.Refusal) as error:
-            problems.append(measure.SourceProblem(str(checked.path), f"unreadable ownership source: {error}"))
+            problems.append(log_records.SourceProblem(str(checked.path), f"unreadable ownership source: {error}"))
     return ProductionOwnership(
         {name: ShowrunnerOwner(next(iter(slugs))) for name, slugs in exact_names.items() if len(slugs) == 1},
         {name: ShowrunnerOwner(next(iter(slugs))) for name, slugs in session_aliases.items() if len(slugs) == 1})
 
 
+def read_sessions(path: Path, problems: list[log_records.SourceProblem]) -> TopLevelSessions:
+    try:
+        with path.open("rb") as file:
+            settings = log_records.object_record(cast(object, tomllib.load(file)))
+        if not settings:
+            raise ValueError("expected at least one session table")
+        sessions: list[TopLevelSession] = []
+        for key, value in settings.items():
+            fields = log_records.object_record(value)
+            display_name = log_records.field_text(fields, "display_name")
+            if not key.strip() or not display_name.strip() or set(fields) != {"display_name"}:
+                raise ValueError(f"{key}: expected a session table with a nonempty display_name")
+            sessions.append(TopLevelSession(key, display_name))
+        return TopLevelSessions(tuple(sessions))
+    except (OSError, UnicodeError, ValueError) as error:
+        problems.append(log_records.SourceProblem(str(path), f"unreadable session config: {error}"))
+        return TopLevelSessions(())
+
+
 def load_sources(folder: Path) -> AuditSources:
-    problems: list[measure.SourceProblem] = []
+    problems: list[log_records.SourceProblem] = []
     pushes = read_log(folder / "pushover.jsonl", parse_push, problems)
     reviews = [review for group in read_log(folder / "review.jsonl", parse_review, problems) for review in group]
-    return AuditSources(pushes, reviews, problems, read_owners(problems))
+    return AuditSources(pushes, reviews, problems, read_owners(problems), read_sessions(SESSION_CONFIG, problems))
 
 
 def notification_payload(message: str) -> str:
@@ -429,7 +471,7 @@ def classify(push: PushRecord, identity: TextIdentity, review: ReviewMatch) -> P
     return Unapproved(sending_path(push, review))
 
 
-def owner(sender: Sender, owners: ProductionOwnership) -> ShowrunnerAttribution:
+def owner(sender: Sender, owners: ProductionOwnership, sessions: TopLevelSessions) -> ShowrunnerAttribution:
     if isinstance(sender, SenderNotRecorded):
         return ShowrunnerNotRecorded()
     if sender.name in owners.exact_names:
@@ -437,23 +479,27 @@ def owner(sender: Sender, owners: ProductionOwnership) -> ShowrunnerAttribution:
     if isinstance(sender, SessionSender):
         if sender.name in owners.session_aliases:
             return owners.session_aliases[sender.name]
-        return SessionWithoutProduction(sender.name)
-    if sender.name == "hana":
+    for session in sessions.entries:
+        if sender.name == session.key:
+            return SessionWithoutProduction(session.key)
+    if isinstance(sender, SessionSender):
         return SessionWithoutProduction(sender.name)
     return MachineService(sender.name)
 
 
-def audit(sources: AuditSources, window: measure.Window) -> AuditReport:
+def audit(sources: AuditSources, window: log_records.Window) -> AuditReport:
     delivered = [push for push in sources.pushes if push.outcome not in (PushOutcome.NOT_DELIVERED, PushOutcome.KEPT)]
     kept = [push for push in sources.pushes if push.outcome is PushOutcome.KEPT]
     matches = pair_reviews(delivered, sources.reviews, kept)
     entries: list[AuditEntry] = []
+    window_pushes: list[PushRecord] = []
     counts: Counter[ShowrunnerAttribution] = Counter()
     for index, push in enumerate(delivered):
         if not window.contains(push.at):
             continue
         review = matches.get(index, ReviewNotMatched())
-        showrunner = owner(push.sender, sources.production_ownership)
+        window_pushes.append(push)
+        showrunner = owner(push.sender, sources.production_ownership, sources.sessions)
         counts[showrunner] += 1
         evidence = after_failed_check(push, review)
         if evidence is FailedCheckEvidence.NONE:
@@ -462,20 +508,20 @@ def audit(sources: AuditSources, window: measure.Window) -> AuditReport:
         entries.append(AuditEntry(push.at, push.sender, push.title, identity, showrunner,
                                   classify(push, identity, review), evidence))
     return AuditReport(window, tuple(sorted(entries, key=lambda entry: entry.at)),
-                       tuple(sources.problems), dict(counts))
+                       tuple(sources.problems), dict(counts), tuple(window_pushes), sources.sessions)
 
 
-def sender_label(sender: Sender) -> str:
-    return "not recorded" if isinstance(sender, SenderNotRecorded) else sender.name
+def sender_label(sender: Sender, sessions: TopLevelSessions) -> str:
+    return "not recorded" if isinstance(sender, SenderNotRecorded) else sessions.display_name(sender.name)
 
 
-def owner_label(attribution: ShowrunnerAttribution) -> str:
+def owner_label(attribution: ShowrunnerAttribution, sessions: TopLevelSessions) -> str:
     if isinstance(attribution, ShowrunnerOwner):
         return "showrunner / " + attribution.slug
     if isinstance(attribution, MachineService):
         return "machine service / " + attribution.name
     if isinstance(attribution, SessionWithoutProduction):
-        return "session / " + attribution.name + " (no current production names it)"
+        return "session / " + sessions.display_name(attribution.key) + " (no current production names it)"
     return "showrunner / not recorded"
 
 
@@ -486,7 +532,7 @@ def text_label(identity: TextIdentity) -> str:
 
 
 def render(report: AuditReport) -> str:
-    details = [measure.MeasureRow(f"{entry.at.isoformat()} / {sender_label(entry.sender)} / {entry.title}",
+    details = [log_records.MeasureRow(f"{entry.at.isoformat()} / {sender_label(entry.sender, report.sessions)} / {entry.title}",
                                  f"{type(entry.classification).__name__} / {text_label(entry.text_identity)}", 1,
                                  report.window.label,
                                  f"{entry.classification.code_path}; {entry.classification.reason}; {entry.evidence.value}")
@@ -496,21 +542,32 @@ def render(report: AuditReport) -> str:
         grouped[entry.showrunner][type(entry.classification)] += 1
     source = "pushover.jsonl + review.jsonl; this machine only; n = delivered pushes; current production ownership"
     incomplete = "incomplete; " if report.problems else ""
-    totals = [measure.MeasureRow(owner_label(attribution), incomplete +
+    totals = [log_records.MeasureRow(owner_label(attribution, report.sessions), incomplete +
                                 "; ".join(f"{kind.__name__} {grouped[attribution][kind]}" for kind in CLASSIFICATIONS),
                                 count, report.window.label, source)
-              for attribution, count in sorted(report.pushes_by_showrunner.items(), key=lambda item: owner_label(item[0]))]
+              for attribution, count in sorted(report.pushes_by_showrunner.items(),
+                                               key=lambda item: owner_label(item[0], report.sessions))]
     overall = Counter(type(entry.classification) for entry in report.entries)
-    totals.append(measure.MeasureRow("all senders", incomplete + f"after failed check {len(report.entries)}; " +
+    totals.append(log_records.MeasureRow("all senders", incomplete + f"after failed check {len(report.entries)}; " +
                                     "; ".join(f"{kind.__name__} {overall[kind]}" for kind in CLASSIFICATIONS),
                                     sum(report.pushes_by_showrunner.values()), report.window.label, source))
-    output = [measure.table("Sends after failed text checks (n = 1 per delivered push)", details),
-              measure.table("Totals per showrunner (current ownership; historical ownership may be missing)", totals),
+    output = [log_records.table("Sends after failed text checks (n = 1 per delivered push)", details),
+              log_records.table("Totals per showrunner (current ownership; historical ownership may be missing)", totals),
               "Neither notification log records a key. Text identity comes from the delivery footer or matched review."]
     if report.problems:
-        output.append(measure.table("Source problems (counts can be incomplete)",
-                                    measure.source_problem_rows(report.problems, report.window)))
+        output.append(log_records.table("Source problems (counts can be incomplete)",
+                                    log_records.source_problem_rows(report.problems, report.window)))
     return "\n\n".join(output)
+
+
+def report_summary(report: AuditReport) -> str:
+    counts = Counter(type(entry.classification) for entry in report.entries)
+    return "\n".join([
+        f"Window: {report.window.label}.",
+        f"Pushes: {len(report.delivered_pushes)} delivered; {len(report.entries)} after a failed text check.",
+        "; ".join(f"{kind.__name__}: {counts[kind]}" for kind in CLASSIFICATIONS) + ".",
+        f"Source problems: {len(report.problems)}. Use --full to print the tables.",
+    ])
 
 
 def main(arguments: Sequence[str] = ()) -> int:
@@ -518,13 +575,18 @@ def main(arguments: Sequence[str] = ()) -> int:
     _ = parser.add_argument("command", choices=("report",))
     _ = parser.add_argument("--since", metavar="DATE_OR_TIME", default="")
     _ = parser.add_argument("--until", metavar="DATE_OR_TIME", default="")
+    _ = parser.add_argument("--full", action="store_true", help="print the tables after the summary")
     args = parser.parse_args(arguments)
     now = datetime.now(timezone.utc)
     try:
-        window = measure.window_bounds(cast(str, args.since), cast(str, args.until), now)
+        window = log_records.window_bounds(cast(str, args.since), cast(str, args.until), now)
     except ValueError as error:
         parser.error(str(error))
-    print(render(audit(load_sources(STATE_DIR), window)))
+    report = audit(load_sources(STATE_DIR), window)
+    print(report_summary(report))
+    if cast(bool, args.full):
+        print()
+        print(render(report))
     return 0
 
 

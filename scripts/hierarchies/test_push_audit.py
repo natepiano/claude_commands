@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextlib import redirect_stdout
+import ast
+import io
 import json
 import os
 from pathlib import Path
@@ -10,9 +13,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from scripts.hierarchies import push_audit as audit
-from scripts.hierarchies import measure
+from scripts.hierarchies import log_records
+from scripts.production import showrunners
 
 
 JsonRecord = dict[str, object]
@@ -24,13 +29,21 @@ REGISTERED_TEXT = "shutdown.stop_failed"
 
 
 def detail_section(output: str) -> str:
-    return output.split("\n\nTotals per showrunner", 1)[0]
+    return output[output.index("Sends after failed text checks"):].split("\n\nTotals per showrunner", 1)[0]
 
 
 def total_cells(output: str) -> dict[str, list[str]]:
     return {cells[0]: cells[1:] for line in output.splitlines()
             if line.startswith(("showrunner / ", "machine service / ", "session / ", "all senders  "))
             for cells in [re.split(r" {2,}", line)]}
+
+
+def session_names_in_literals(source: str, sessions: audit.TopLevelSessions) -> set[str]:
+    names = {name for session in sessions.entries for name in (session.key, session.display_name)}
+    literals = [node.value for node in ast.walk(ast.parse(source))
+                if isinstance(node, ast.Constant) and isinstance(node.value, str)]
+    return {name for name in names if any(re.search(r"\b" + re.escape(name) + r"\b", text)
+                                        for text in literals)}
 
 
 class PushAuditTest(unittest.TestCase):
@@ -89,7 +102,7 @@ class PushAuditTest(unittest.TestCase):
             "NOTIFIER_STATE_DIR": str(self.home / ".local/state/notifier"),
         }
         result = subprocess.run(
-            [sys.executable, str(AUDIT_SCRIPT), "report", "--since", since, "--until", until],
+            [sys.executable, str(AUDIT_SCRIPT), "report", "--full", "--since", since, "--until", until],
             cwd=AUDIT_SCRIPT.parents[2], env=environment, capture_output=True, text=True,
             check=False, timeout=15,
         )
@@ -105,6 +118,52 @@ class PushAuditTest(unittest.TestCase):
         self.assertIn("hana", output)
         self.assertIn("Emergency fixture", output)
         self.assertNotIn("Unapproved", detail_section(output))
+
+    def test_default_summary_matches_full_totals_and_has_no_table_rows(self) -> None:
+        self.save(self.pushes, [
+            self.push("Priority fixture", priority="2"),
+            self.push("Registered fixture", text_id=REGISTERED_TEXT),
+            self.push("Unapproved fixture"),
+            self.push("Passed fixture"),
+        ])
+        self.save(self.reviews, [
+            self.failed_review("Priority fixture", priority="2"),
+            self.failed_review("Registered fixture", text_id=REGISTERED_TEXT),
+            self.failed_review("Unapproved fixture"),
+        ])
+        output = io.StringIO()
+        with patch.object(audit, "STATE_DIR", self.logs), \
+                patch.object(showrunners, "NOTIFIER_STATE_DIR", self.home / "notifiers"), \
+                patch.dict(os.environ, {"USER_ZONE": "America/New_York"}), redirect_stdout(output):
+            result = audit.main(["report", "--since", SINCE, "--until", UNTIL])
+        self.assertEqual(result, 0)
+        summary = output.getvalue()
+        full = self.report()
+        self.assertEqual(full.split("\n\n", 1)[0] + "\n", summary)
+        self.assertEqual(len(summary.splitlines()), 4)
+        self.assertIn("Window: 2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded).", summary)
+        self.assertIn("Pushes: 4 delivered; 3 after a failed text check.", summary)
+        self.assertIn("ApprovedPriorityTwo: 1; ApprovedRegisteredText: 1; Unapproved: 1.", summary)
+        self.assertIn("Source problems: 0. Use --full to print the tables.", summary)
+        self.assertNotIn("Sends after failed text checks", summary)
+        self.assertNotIn("Priority fixture", summary)
+        self.assertNotIn("Totals per showrunner", summary)
+        self.assertEqual(total_cells(full)["all senders"][:2], [
+            "after failed check 3; ApprovedPriorityTwo 1; ApprovedRegisteredText 1; Unapproved 1", "4",
+        ])
+
+    def test_summary_reports_missing_source_without_printing_tables(self) -> None:
+        self.reviews.unlink()
+        self.save(self.pushes, [self.push("Annotated fixture", priority="2",
+                                        outcome="sent, sent despite failed review: context")])
+        output = io.StringIO()
+        with patch.object(audit, "STATE_DIR", self.logs), \
+                patch.object(showrunners, "NOTIFIER_STATE_DIR", self.home / "notifiers"), redirect_stdout(output):
+            result = audit.main(["report", "--since", SINCE, "--until", UNTIL])
+        self.assertEqual(result, 0)
+        self.assertIn("Pushes: 1 delivered; 1 after a failed text check.", output.getvalue())
+        self.assertIn("Source problems: 1. Use --full to print the tables.", output.getvalue())
+        self.assertNotIn("review.jsonl", output.getvalue())
 
     def test_registered_text_names_its_exception_and_id(self) -> None:
         self.save(self.pushes, [self.push("Registered fixture", text_id=REGISTERED_TEXT,
@@ -295,6 +354,98 @@ class PushAuditTest(unittest.TestCase):
         self.assertEqual(totals["showrunner / hana-production"][1], "2")
         self.assertNotIn(label, totals)
 
+    def test_configured_session_names_are_absent_from_audit_string_literals(self) -> None:
+        problems: list[log_records.SourceProblem] = []
+        sessions = audit.read_sessions(audit.SESSION_CONFIG, problems)
+        self.assertEqual(problems, [])
+        self.assertEqual(session_names_in_literals(AUDIT_SCRIPT.read_text(), sessions), set(),
+                         "session names must come from the config")
+
+    def test_session_name_guard_finds_words_inside_strings_and_f_strings(self) -> None:
+        sessions = audit.TopLevelSessions((audit.TopLevelSession("hana", "Personal work"),))
+        cases: list[tuple[str, set[str]]] = [
+            ('source = "send.py in hana"', {"hana"}),
+            ('source = f"send.py in hana {suffix}"', {"hana"}),
+            ('source = f"{prefix} / Personal work / {suffix}"', {"Personal work"}),
+            ('source = "hanadocs and prehana and Personal workers"', set()),
+        ]
+        for source, expected in cases:
+            with self.subTest(source=source):
+                self.assertEqual(session_names_in_literals(source, sessions), expected)
+
+    def test_loaded_config_names_bare_sessions_and_prints_the_display_name(self) -> None:
+        config = self.home / "sessions.toml"
+        _ = config.write_text('[personal_work]\ndisplay_name = "Personal work"\n')
+        self.save(self.pushes, [self.push("Configured session fixture", source=source, priority="2",
+                                        outcome="sent, sent despite failed review: context")
+                                for source in ("personal_work", "send.py in personal_work")])
+        with patch.object(audit, "SESSION_CONFIG", config):
+            sources = audit.load_sources(self.logs)
+        attribution = audit.owner(audit.BareSender("personal_work"), sources.production_ownership, sources.sessions)
+        self.assertEqual(attribution, audit.SessionWithoutProduction("personal_work"))
+        window = log_records.window_bounds(SINCE, UNTIL, log_records.required_time(UNTIL))
+        output = audit.render(audit.audit(sources, window))
+        self.assertEqual(total_cells(output)["session / Personal work (no current production names it)"][1], "2")
+        self.assertIn(" / Personal work / Configured session fixture", detail_section(output))
+        self.assertNotIn("personal_work", output)
+
+    def test_sessions_with_one_display_name_keep_separate_totals(self) -> None:
+        config = self.home / "sessions.toml"
+        _ = config.write_text('[first_session]\ndisplay_name = "Personal work"\n' +
+                              '[second_session]\ndisplay_name = "Personal work"\n')
+        self.save(self.pushes, [
+            self.push("Failed check fixture", source="first_session", priority="2",
+                      outcome="sent, sent despite failed review: context"),
+            self.push("Passed check fixture", source="second_session"),
+        ])
+        with patch.object(audit, "SESSION_CONFIG", config):
+            sources = audit.load_sources(self.logs)
+        window = log_records.window_bounds(SINCE, UNTIL, log_records.required_time(UNTIL))
+        report = audit.audit(sources, window)
+        self.assertEqual(report.pushes_by_showrunner,
+                         {audit.SessionWithoutProduction("first_session"): 1,
+                          audit.SessionWithoutProduction("second_session"): 1})
+        output = audit.render(report)
+        totals = [re.split(r" {2,}", line) for line in output.splitlines()
+                  if line.startswith("session / Personal work (no current production names it)  ")]
+        self.assertEqual(len(totals), 2)
+        self.assertEqual([cells[2] for cells in totals], ["1", "1"])
+        self.assertEqual({cells[1] for cells in totals},
+                         {"ApprovedPriorityTwo 1; ApprovedRegisteredText 0; Unapproved 0",
+                          "ApprovedPriorityTwo 0; ApprovedRegisteredText 0; Unapproved 0"})
+        self.assertEqual(total_cells(output)["all senders"][1], "2")
+
+    def test_missing_or_malformed_session_config_reports_its_path_and_keeps_delivery_counts(self) -> None:
+        config = self.home / "sessions.toml"
+        self.save(self.pushes, [self.push("Config source fixture", priority="2",
+                                        outcome="sent, sent despite failed review: context")])
+        for kind, contents in [("missing", ""), ("invalid TOML", "["), ("empty config", ""),
+                               ("not a table", "session = 1"), ("missing display name", "[session]"),
+                               ("nontext display name", "[session]\ndisplay_name = 1")]:
+            with self.subTest(kind=kind):
+                config.unlink(missing_ok=True)
+                if kind != "missing":
+                    _ = config.write_text(contents)
+                with patch.object(audit, "SESSION_CONFIG", config):
+                    sources = audit.load_sources(self.logs)
+                window = log_records.window_bounds(SINCE, UNTIL, log_records.required_time(UNTIL))
+                output = audit.render(audit.audit(sources, window))
+                self.assertIn(str(config), output)
+                self.assertIn("Source problems (counts can be incomplete)", output)
+                self.assertIn("unreadable session config", output)
+                self.assertEqual(total_cells(output)["all senders"][1], "1")
+                self.assertIn("after failed check 1;", total_cells(output)["all senders"][0])
+
+    def test_held_agent_text_review_without_a_delivered_push_counts_nowhere(self) -> None:
+        review = {**self.failed_review("Held agent text", text_id="nate.adhoc"),
+                  "sent": None, "failed_rules": ["context", "action"], "detail": "not sent, failed review"}
+        self.save(self.reviews, [review])
+        output = self.report()
+        self.assertNotIn("Held agent text", detail_section(output))
+        self.assertEqual(total_cells(output)["all senders"][:2],
+                         ["after failed check 0; ApprovedPriorityTwo 0; ApprovedRegisteredText 0; Unapproved 0", "0"])
+        self.assertEqual(set(total_cells(output)), {"all senders"})
+
     def test_unmatched_session_is_named_without_claiming_a_missing_record(self) -> None:
         self.save(self.pushes, [self.push("Session outside production", source="send.py in independent-session",
                                         priority="2", outcome="sent, sent despite failed review: context")])
@@ -352,7 +503,7 @@ class PushAuditTest(unittest.TestCase):
                                            outcome="sent, sent despite failed review: context"),
                                 "message": "Historical body without a delivery footer"}])
         sources = audit.load_sources(self.logs)
-        window = measure.window_bounds(SINCE, UNTIL, measure.required_time(UNTIL))
+        window = log_records.window_bounds(SINCE, UNTIL, log_records.required_time(UNTIL))
         report = audit.audit(sources, window)
         self.assertIsInstance(report.entries[0].text_identity, audit.TextNotRecorded)
         self.assertIsInstance(report.entries[0].showrunner, audit.ShowrunnerNotRecorded)
@@ -366,7 +517,7 @@ class PushAuditTest(unittest.TestCase):
                                             outcome="sent, sent despite failed review: context"),
                                 "message": "Historical body without a delivery footer"}])
         sources = audit.load_sources(self.logs)
-        window = measure.window_bounds(SINCE, UNTIL, measure.required_time(UNTIL))
+        window = log_records.window_bounds(SINCE, UNTIL, log_records.required_time(UNTIL))
         report = audit.audit(sources, window)
         self.assertIsInstance(report.entries[0].text_identity, audit.FreeText)
         self.assertIsInstance(report.entries[1].text_identity, audit.TextNotRecorded)

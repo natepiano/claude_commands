@@ -171,6 +171,7 @@ buildlog_end() {
 
 buildlog_sample_anon() {
     local sidecar=$1 maximum=$2 parent=${3:-$$} scope="" line anon peak=0
+    local temporary="$maximum.tmp.${BASHPID:-$$}"
     while :; do
         kill -0 "$parent" 2>/dev/null || return
         if [[ -r "$sidecar" ]]; then
@@ -180,8 +181,11 @@ buildlog_sample_anon() {
                     if [[ "$line" == 'anon '* ]]; then
                         anon=${line#anon }
                         if [[ "$anon" =~ ^[0-9]+$ ]] && (( anon > peak )); then
-                            peak=$anon
-                            printf '%s\n' "$peak" > "$maximum"
+                            if printf '%s\n' "$anon" > "$temporary" && mv -f "$temporary" "$maximum"; then
+                                peak=$anon
+                            else
+                                rm -f "$temporary"
+                            fi
                         fi
                         break
                     fi

@@ -15,8 +15,7 @@
 - **Push:** git
 - **Promote:** ~/.claude, mac ~/.claude
 - **Capacity:** natedev has 32 cores and 60 GB of memory; four units. The work is mostly documents and Python scripts, so the load is low. Its seats share natedev's build slots with build-followups.
-- **Change review:** `~/rust/hanadocs/change-review/change-review - sdlc.md` — sdlc is a top-level showrunner, so the list is its own; the file is made on its first row
-- **Review pool:** code
+- **Change review:** `~/rust/hanadocs/change-review/change-review - natedev.md` — sdlc reports to natedev, so new rows go to the root list with Production `sdlc`; rows before 2026-10-29 stay in `change-review - sdlc.md`
 - **Proposals:** `~/rust/hanadocs/issues`
 
 ## Units

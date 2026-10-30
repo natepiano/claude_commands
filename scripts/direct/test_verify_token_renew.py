@@ -207,6 +207,7 @@ class MemoryQueueIdentityTests(unittest.TestCase):
             harness = root / "recheck-wait.sh"
             _ = harness.write_text('set -eu\nsource "$1"\n'
                                    + 'eval "$(declare -f buildlog_wait_for_memory | sed \'1s/buildlog_wait_for_memory/buildlog_wait_for_memory_only/\')"\n'
+                                   + shell_function(VERIFY, "remember_tree_reservation")
                                    + shell_function(VERIFY, "buildlog_wait_for_memory") + r'''
 unset EPOCHSECONDS SECONDS
 EPOCHSECONDS=100 SECONDS=0

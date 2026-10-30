@@ -20,15 +20,26 @@ from contextlib import contextmanager
 from collections.abc import Callable, Generator, Sequence
 from datetime import datetime
 from pathlib import Path
-from typing import TypedDict, cast, override
+from typing import ClassVar, TypedDict, cast, override
 from unittest import mock
 
 from scripts.build_hold import build_hold
+from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
+from scripts.production.cli_fixture import invoke_cli
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
-# Hang guards tolerate load 136 on natedev (2026-10-29); events advance tests.
-HANG_GUARD_S = 300
+# load 136 on natedev, 2026-10-29
+TEST_HANG_GUARD_SECS = 300
+# Existing fixture consumers import this name.
+HANG_GUARD_S = TEST_HANG_GUARD_SECS
+
+
+def invoke_mac_claim(arguments: list[str], environment: dict[str, str], cwd: Path) -> subprocess.CompletedProcess[str]:
+    """Run the real claim CLI; its copy signals still cross the process boundary."""
+    with mock.patch.object(sys, "path", [str(VERIFY.parent.parent / "mac_test"), *sys.path]):
+        from scripts.mac_test import mac_test
+        return invoke_cli(mac_test, mac_test.main, arguments, environment, cwd)
 
 
 def stub_build_tool_path(directory: Path) -> str:
@@ -102,8 +113,15 @@ def reap(marker: str) -> set[int]:
         with contextlib.suppress(ProcessLookupError):
             os.kill(pid, signal.SIGKILL)
     deadline = time.monotonic() + HANG_GUARD_S
-    while processes_carrying(marker) & stopped and time.monotonic() < deadline:
-        time.sleep(0.01)
+    for pid in stopped:
+        try:
+            descriptor = os.pidfd_open(pid)
+        except ProcessLookupError:
+            continue
+        try:
+            _ = select.select([descriptor], [], [], max(0, deadline - time.monotonic()))
+        finally:
+            os.close(descriptor)
     return stopped
 
 
@@ -214,8 +232,9 @@ if arguments[:2] == ["nextest", "run"] and os.environ.get("TEST_CARGO_HOLD") == 
     signal.signal(signal.SIGTERM, stop)
     print("   Compiling sample v0.1.0", flush=True)
     (root / "cargo-compiling").write_text(f"{os.getpid()}\n", encoding="utf-8")
-    while not (root / "cargo-release").exists():
-        time.sleep(0.01)
+    sys.path.insert(0, str(Path(os.environ["TEST_WAIT_HELPER"]).resolve().parents[2]))
+    from scripts.direct.wait_for_test_state import wait_for_file
+    wait_for_file(root / "cargo-release")
     if os.environ.get("TEST_CARGO_STARTING", "1") == "1":
         print("     Starting 1 test", flush=True)
 if arguments[:2] == ["nextest", "run"]:
@@ -313,8 +332,9 @@ if "--copy" in arguments:
     (root / "copy-started.tmp").write_text(str(os.getpid()), encoding="utf-8")
     os.replace(root / "copy-started.tmp", root / "copy-started")
     if os.environ.get("TEST_COPY_WAIT") == "1":
-        while not (root / "copy-release").exists():
-            time.sleep(0.01)
+        sys.path.insert(0, str(Path(os.environ["TEST_WAIT_HELPER"]).resolve().parents[2]))
+        from scripts.direct.wait_for_test_state import wait_for_file
+        wait_for_file(root / "copy-release")
     result.write_text("mac=" + os.environ.get("TEST_COPY_MAC", "failed") + "\nreason=\nseconds="
                       + os.environ.get("TEST_COPY_SECONDS", "2.5") + "\n", encoding="utf-8")
     release_copy_claim()
@@ -346,8 +366,9 @@ if os.environ.get("TEST_RUNNER_BUSY_UNTIL") and not Path(os.environ["TEST_RUNNER
     raise SystemExit(75)
 if attempt > 1 and os.environ.get("TEST_RUNNER_PAUSE_RETRY") == "1":
     (root / "retry-running").write_text("running\n")
-    while not (root / "continue-retry").exists():
-        time.sleep(0.01)
+    sys.path.insert(0, str(Path(os.environ["TEST_WAIT_HELPER"]).resolve().parents[2]))
+    from scripts.direct.wait_for_test_state import wait_for_file
+    wait_for_file(root / "continue-retry")
 
 if os.environ.get("TEST_RUNNER_HOLD") == "1":
     def stop(signum: int, _frame: object) -> None:
@@ -429,16 +450,79 @@ SLEEP_STUB = r'''#!/bin/sh
 # Record the requested interval; only explicit routing gates block this fixture.
 root=$TEST_RUNNER_STATE
 printf '%s\n' "$1" >> "$root/sleep-events"
+gate=""
 if [ "${TEST_STEP_ROUTING_SLEEP:-0}" = 1 ]; then
     step=$(wc -l < "$root/sleep-events")
     step=$((step + 0))
     printf 'sleeping\n' > "$root/routing-sleep"
     printf 'sleeping\n' > "$root/routing-sleep-$step"
-    exec "$TEST_REAL_PYTHON" "$TEST_WAIT_HELPER" "$root/continue-sleep-$step"
+    gate="$root/continue-sleep-$step"
 elif [ "${TEST_PAUSE_ROUTING_SLEEP:-0}" = 1 ]; then
     printf 'sleeping\n' > "$root/routing-sleep"
-    exec "$TEST_REAL_PYTHON" "$TEST_WAIT_HELPER" "$root/continue-sleep"
+    gate="$root/continue-sleep"
 fi
+if [ -f "$root/memory-event.py" ] && [ "${TEST_ROUTING_WAIT:-0}" != 1 ]; then
+    exec "$TEST_REAL_PYTHON" "$root/memory-event.py" "$gate"
+elif [ -n "$gate" ]; then
+    exec "$TEST_REAL_PYTHON" "$TEST_WAIT_HELPER" "$gate"
+fi
+'''
+
+
+MEMORY_EVENT_STUB = r'''
+import os
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(os.environ["TEST_WAIT_HELPER"]).resolve().parents[2]))
+from scripts.direct.local_release_wait import local_release_waiter
+from scripts.direct.wait_for_test_state import wait_for_file
+
+if len(sys.argv) > 1 and sys.argv[1]:
+    wait_for_file(Path(sys.argv[1]))
+root = Path(os.environ["TEST_RUNNER_STATE"])
+meminfo = Path(os.environ["BUILDLOG_MEMINFO"])
+clock = Path(os.environ["TEST_ROUTING_CLOCK"]) if os.environ.get("TEST_ROUTING_CLOCK") else root / "no-clock"
+probes = root / "retry-probes"
+idle = Path(os.environ["MAC_IDLE_STATE_DIR"]) / "calls"
+
+# A new memory wait announces its first held check before invoking its hook.
+# Advance that check once per Mac attempt; later checks need an input event.
+attempts = root / "runner-events.jsonl"
+checked = root / "memory-checked-attempt"
+attempt = str(len(attempts.read_text().splitlines()) if attempts.exists() else 0)
+if not checked.exists() or checked.read_text() != attempt:
+    checked.write_text(attempt)
+    raise SystemExit(0)
+
+def changed():
+    fields = meminfo.read_text().split()
+    return (len(fields) > 1 and int(fields[1]) > 0
+            or (root / "mac-free").exists() or (root / "free-once").exists()
+            or any(idle.glob("*.retry"))
+            or (clock.exists() and probes.exists() and probes.read_text().splitlines()
+                and clock.read_text().strip() != probes.read_text().splitlines()[-1]))
+
+# Subscribe before the predicate; the probe records the clock actually checked,
+# so a clock change before this process starts is also visible.
+with local_release_waiter(meminfo.parent, idle) as events:
+    import select
+    import time
+    from scripts.direct.local_release_wait import LocalReleaseEvents
+    deadline = time.monotonic() + float(os.environ["TEST_HANG_GUARD_SECS"])
+    while True:
+        events.arm()
+        if changed():
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("memory fixture was never released")
+        if isinstance(events, LocalReleaseEvents):
+            readable, _, _ = select.select([events.descriptor], [], [], remaining)
+            if readable:
+                _ = os.read(events.descriptor, 65536)
+        else:
+            events.wait(min(0.01, remaining))
 '''
 
 
@@ -446,6 +530,8 @@ fi
 # sleep stand-in so both entry paths share the same event and interval records.
 ROUTING_WAIT_STUB = r'''import os
 import sys
+# This invocation waits for routing release, before memory admission begins.
+os.environ["TEST_ROUTING_WAIT"] = "1"
 os.execv("/bin/sh", ["sh", os.environ["TEST_ROUTING_SLEEP_SCRIPT"], *sys.argv[1:]])
 '''
 
@@ -560,11 +646,49 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         self.cargo_events_path: Path = Path()
         self.environment: dict[str, str] = {}
 
+    fixture_root: ClassVar[Path]
+    fixture_seed: ClassVar[Path]
+    fixture_environment: ClassVar[dict[str, str]]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="verify-mac-")
+        cls.addClassCleanup(temporary.cleanup)
+        cls.fixture_root = Path(temporary.name) / "case"
+        cls.fixture_seed = Path(temporary.name) / "seed"
+        cls.fixture_root.mkdir()
+        builder = cls()
+        builder.root = cls.fixture_root
+        builder.build_fixture()
+        cls.fixture_environment = builder.environment.copy()
+        _ = shutil.copytree(cls.fixture_root, cls.fixture_seed, symlinks=True)
+        shutil.rmtree(cls.fixture_root)
+
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        if "fixture_seed" in type(self).__dict__:
+            self.root = self.fixture_root
+            _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
+            self.addCleanup(shutil.rmtree, self.root)
+            self.fixture_paths()
+            self.environment = self.fixture_environment.copy()
+        else:
+            # Standalone consumers own their fixture through doCleanups().
+            self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+            self.build_fixture()
         self.addCleanup(self.assert_nothing_outlives)
+
+    def fixture_paths(self) -> None:
         self.home = self.root / "home"
+        self.bin_directory = self.root / "bin"
+        self.board = self.root / "board"
+        self.runner_state = self.root / "runner-state"
+        self.cargo_events_path = self.root / "cargo-events.jsonl"
+        self.runner = self.root / "runner.py"
+
+    def build_fixture(self) -> None:
+        self.fixture_paths()
         self.home.mkdir()
         claude = self.home / ".claude"
         scripts = claude / "scripts"
@@ -576,13 +700,8 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         log = scripts / "buildlog"
         log.mkdir()
         self.write_executable(log / "record.py", RECORD_WRAPPER)
-        self.bin_directory = self.root / "bin"
         self.bin_directory.mkdir()
-        self.board = self.root / "board"
-        self.runner_state = self.root / "runner-state"
         self.runner_state.mkdir()
-        self.cargo_events_path = self.root / "cargo-events.jsonl"
-        self.runner = self.root / "runner.py"
         self.write_executable(self.bin_directory / "cargo", CARGO_STUB)
         self.write_executable(self.bin_directory / "git", GIT_STUB)
         self.write_executable(self.bin_directory / "rustc", RUSTC_STUB)
@@ -674,6 +793,9 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "HOME": str(self.home),
             "PATH": stub_build_tool_path(self.bin_directory),
             "RUSTUP_HOME": str(self.root / "rustup"),
+            # The private toolchain is complete; host Nix discovery is unrelated.
+            "IN_NIX_SHELL": "pure",
+            "BUILDLOG_BUILD_BUDGET_GIB": "64",
             "PACKAGE_ROOT": str(self.root),
             "CARGO_TARGET_DIR": str(self.root / "target"),
             "CARGO_HOME": str(self.root / "cargo-home"),
@@ -713,6 +835,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "VERIFY_MAC_TEST_SCRIPT": str(self.root / "free-now.py"),
             "TEST_RUNNER_STATE": str(self.runner_state),
             "TEST_REAL_PYTHON": sys.executable,
+            "TEST_HANG_GUARD_SECS": str(TEST_HANG_GUARD_SECS),
             "TEST_ROUTING_SLEEP_SCRIPT": str(self.bin_directory / "sleep"),
             "TEST_WAIT_HELPER": str(VERIFY.with_name("wait_for_test_state.py")),
             "TEST_CARGO_EVENTS": str(self.cargo_events_path),
@@ -809,16 +932,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             (self.runner_state / name).unlink(missing_ok=True)
 
     def wait_for_path(self, path: Path, processes: Sequence[subprocess.Popen[str]] = ()) -> None:
-        deadline = time.monotonic() + HANG_GUARD_S
-        while time.monotonic() < deadline:
-            if path.exists():
-                return
-            for process in processes:
-                if process.poll() is not None:
-                    output, errors = process.communicate(timeout=HANG_GUARD_S)
-                    self.fail(f"verify exited {process.returncode} before {path}: {output + errors}")
-            time.sleep(0.01)
-        self.fail(f"timed out waiting for {path}")
+        self.wait_until(path.exists, str(path), processes)
 
     def routing_fixture(self) -> Path:
         wrapper = self.root / "targets-wrapper.py"
@@ -978,23 +1092,51 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         self.wait_for_path(self.runner_state / f"routing-sleep-{step + 1}")
 
     def wait_until(self, condition: Callable[[], bool], what: str,
-                   processes: Sequence[subprocess.Popen[str]] = ()) -> None:
-        deadline = time.monotonic() + HANG_GUARD_S
-        while time.monotonic() < deadline:
-            if condition():
-                return
+                   processes: Sequence[subprocess.Popen[str]] = (), *, directory: Path | None = None) -> None:
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+        descriptors: list[int] = []
+        try:
             for process in processes:
-                if process.poll() is not None:
-                    output, errors = process.communicate(timeout=HANG_GUARD_S)
-                    self.fail(f"verify exited {process.returncode} before {what}: {output + errors}")
-            time.sleep(0.01)
-        self.fail(f"timed out waiting for {what}")
+                try:
+                    descriptors.append(os.pidfd_open(process.pid))
+                except ProcessLookupError:
+                    pass
+            with local_release_waiter(directory or self.root, self.root / "tmp") as events:
+                if isinstance(events, LocalReleaseEvents):
+                    add_watch = events.add_watch
+                    def watch_modifications(fd: int, path: bytes, mask: int) -> int:
+                        return add_watch(fd, path, mask | 0x2)
+
+                    events.add_watch = watch_modifications
+                while True:
+                    events.arm()
+                    if condition():
+                        return
+                    for process in processes:
+                        if process.poll() is not None:
+                            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                            self.fail(f"verify exited {process.returncode} before {what}: {output + errors}")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self.fail(f"timed out waiting for {what}")
+                    if isinstance(events, LocalReleaseEvents):
+                        readable, _, _ = select.select([events.descriptor, *descriptors], [], [], remaining)
+                        if events.descriptor in readable:
+                            # Fixture markers are arbitrary names, including open logs;
+                            # consume every directory event, not just hold-state names.
+                            _ = os.read(events.descriptor, 65536)
+                    else:
+                        events.wait(min(0.01, remaining))
+        finally:
+            for descriptor in descriptors:
+                os.close(descriptor)
 
     def hold_memory(self) -> Path:
         """Keep natedev's memory gate holding until the returned meminfo is rewritten."""
         meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
         _ = meminfo.write_text("MemAvailable: 0 kB\n", encoding="utf-8")
         self.write_executable(self.bin_directory / "sleep", SLEEP_STUB)
+        self.write_executable(self.runner_state / "memory-event.py", MEMORY_EVENT_STUB)
         return meminfo
 
     def leave_once(self) -> dict[str, str]:
@@ -1140,7 +1282,10 @@ trap hold_after_routing DEBUG
     def wait_for_reaped(self, pid: int, processes: Sequence[subprocess.Popen[str]]) -> None:
         # Only the watcher collects its copy, and it reads the copy's result
         # when it does: a gone pid means the watcher has taken the result.
-        self.wait_until(lambda: not Path(f"/proc/{pid}").exists(), f"the copy {pid} to be collected", processes)
+        # After collecting a yielded copy, the watcher publishes its next
+        # candidate. Watch that directory so PID collection wakes the predicate.
+        self.wait_until(lambda: not Path(f"/proc/{pid}").exists(), f"the copy {pid} to be collected", processes,
+                        directory=Path(self.environment["MAC_TEST_STATE_DIR"]) / "copy_candidates")
 
     def assert_copy_record(self, outcome: str, target: str) -> None:
         record = self.routing_record()

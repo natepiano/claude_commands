@@ -1,5 +1,5 @@
 import { describe, expect, test } from "claude-code/testing";
-import { isOutboxEntry as isEntry, isOutboxResult as isResult, isHeartbeat, isEntryId, isOutboxClaim, isDeliveryRouteFile, isReplyLog, PATHS } from "../hooks/protocol";
+import { isOutboxEntry as isEntry, isOutboxResult as isResult, isHeartbeat, isEntryId, isOutboxClaim, isDeliveryRouteFile, isForwardLog, isReplyLog, PATHS } from "../hooks/protocol";
 
 const entry = {
   id: "0123456789abcdef0123456789abcdef",
@@ -30,6 +30,7 @@ describe("postmaster protocol validators", () => {
     expect(isEntry({ ...entry, reply_to_session_id: "" })).toBe(true);
     expect(PATHS.delivered).toBe("delivered");
     expect(PATHS.replies).toBe("replies");
+    expect(PATHS.forwards).toBe("forwards");
   });
 
   test("route files accept open and withdrawn routes with unresolved wire destinations", () => {
@@ -49,25 +50,29 @@ describe("postmaster protocol validators", () => {
     for (const value of [null, undefined, [], "route"]) expect(isDeliveryRouteFile(value)).toBe(false);
   });
 
-  test("reply logs require the replying identity original sender body targets forward state and confirmed destinations", () => {
+  test("reply logs require the replying identity original sender body and intended targets", () => {
     const log = { at_ms: 1000, socket: "uds:/test-sockets/recipient.sock", name: "Recipient", session_id: "recipient",
-      senders: ["Original sender"], body: "answer", targets: ["original-session"], forward: "done", forwarded: ["original-session"] };
+      senders: ["Original sender"], body: "answer", targets: ["original-session"] };
     expect(isReplyLog(log)).toBe(true);
-    expect(isReplyLog({ ...log, forward: "pending", forwarded: [] })).toBe(true);
-    expect(isReplyLog({ ...log, targets: [], forwarded: [] })).toBe(true);
+    expect(isReplyLog({ ...log, targets: [] })).toBe(true);
     for (const field of Object.keys(log)) {
       const missing: Record<string, unknown> = { ...log };
       delete missing[field];
       expect(isReplyLog(missing)).toBe(false);
     }
-    for (const forwarded of ["original-session", [17], [""], null]) expect(isReplyLog({ ...log, forwarded })).toBe(false);
     for (const targets of ["original-session", [17], [""], null]) expect(isReplyLog({ ...log, targets })).toBe(false);
-    for (const forward of ["", "open", "DONE", null]) expect(isReplyLog({ ...log, forward })).toBe(false);
+  });
+
+  test("forward logs require a list of confirmed destinations", () => {
+    expect(isForwardLog({ forwarded: ["original-session"] })).toBe(true);
+    expect(isForwardLog({ forwarded: [] })).toBe(true);
+    for (const forwarded of ["original-session", [17], [""], null, undefined]) expect(isForwardLog({ forwarded })).toBe(false);
+    for (const value of [null, [], "forwarded"]) expect(isForwardLog(value)).toBe(false);
   });
 
   test("reply logs require a nonempty list of nonempty sender names", () => {
     const log = { at_ms: 1000, socket: "uds:/test-sockets/recipient.sock", name: "Recipient",
-      session_id: "recipient", senders: ["Alice", "Bob"], body: "answer", targets: [], forward: "done", forwarded: [] };
+      session_id: "recipient", senders: ["Alice", "Bob"], body: "answer", targets: [] };
     expect(isReplyLog(log)).toBe(true);
     for (const senders of [[], [""], ["Alice", ""], [17], "Alice", null]) {
       expect(isReplyLog({ ...log, senders })).toBe(false);

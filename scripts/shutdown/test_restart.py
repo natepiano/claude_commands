@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+from scripts.lib import names
+from scripts.lib.test_names import fixture_names
+
 import copy
 import io
 from types import SimpleNamespace
@@ -21,7 +24,7 @@ from collections.abc import Callable, Iterable, Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
-from typing import Literal, TypedDict, cast, final, override
+from typing import BinaryIO, Literal, TextIO, TypedDict, cast, final, override
 from unittest.mock import call, patch
 from zoneinfo import ZoneInfo
 
@@ -326,6 +329,7 @@ class RestartTests(ShutdownTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = self.enterContext(patch.object(names, "load_names", return_value=fixture_names()))
         _ = self.enterContext(patch.object(quota_alert, "tell_user",
             side_effect=AssertionError("restart test must fake the fallback push")))
         # Mac cases override the shared Linux fixture locally.
@@ -877,6 +881,46 @@ class RestartTests(ShutdownTestCase):
                 self.assertNotIn("private-thread-", text)
                 persisted = next(item for item in record.session_records(LOGIN) if item["session"]["session_id"] == owner["session_id"])
                 self.assertEqual(persisted["progress"]["kind"], "restarted")
+
+    def test_restarted_unit_keeps_its_adopted_reviewer_and_queue_with_the_pool_archive_unreadable(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESUME_CODEX_WORKERS)
+        owner = unit("adopted-review-owner")
+        run = self.root / "adopted-review-run"
+        run.mkdir()
+        name = "project-review"
+        thread = "adopted-private-thread"
+        archive = self.root / "review-pool"
+        archive.mkdir()
+        roster = run / "mesh_roster.json"
+        _ = roster.write_text(json.dumps({name: {"thread_id": thread, "role": "review",
+                                               "status": "paused", "slot": "review"}}))
+        inbox = run / (name + ".pending.json")
+        _ = inbox.write_text(json.dumps({"thread_id": thread, "messages": ["finish the saved review"]}))
+        before = {path: path.read_bytes() for path in (roster, inbox)}
+        saved = entry(owner)
+        saved["codex_seats"] = [record.PausedSeat(run_dir=str(run), seat=name, role="review", thread_id=thread,
+                                                  turn_live=False, launcher_command=[])]
+        self.create([saved])
+        commands = CommandRecorder()
+        original_open = Path.open
+
+        def refuse_archive(path: Path, mode: str = "r", buffering: int = -1,
+                           encoding: str | None = None, errors: str | None = None,
+                           newline: str | None = None) -> TextIO | BinaryIO:
+            if path.is_relative_to(archive):
+                raise AssertionError(f"restart read the archive: {path}")
+            return cast(TextIO | BinaryIO, original_open(path, mode, buffering, encoding, errors, newline))
+
+        with patch.dict(os.environ, {"REVIEW_POOL_STATE": str(archive)}), \
+                patch.object(Path, "open", refuse_archive), patch.object(restart, "_run", commands):
+            restart.confirm_entry(saved, RESTARTED, True, observed_at=time.time())
+        sends = [argv for argv in commands.calls if "resume-workers-" + owner["session_id"] in argv]
+        self.assertEqual(len(sends), 1)
+        self.assertIn("Your next dispatch with --to project-review resumes it.",
+                      sends[0][sends[0].index("--text") + 1])
+        self.assertNotIn(thread, sends[0][sends[0].index("--text") + 1])
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+        self.assertEqual(self.stored_record()["progress"]["kind"], "restarted")
 
     def test_confirmed_top_level_restart_with_a_paused_seat_also_gets_the_resume_message(self) -> None:
         self.allow_leaf(ShutdownSendLeaf.RESUME_CODEX_WORKERS)
@@ -2381,18 +2425,49 @@ class RestartTests(ShutdownTestCase):
         _ = cast(object, self.enterContext(patch.object(herdr, "server_environment", return_value={})))
         _ = cast(object, self.enterContext(patch.object(herdr.Herdr, "pane_activity", return_value=herdr.PaneAtShell())))
         # The fake server records a tab as a workspace it creates; workspace layout is herdr's own test.
-        def open_tab(name: str, _space: str, _title: str, cwd: str, environment: dict[str, str]) -> str:
+        def open_tab(name: str, _space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
             client = herdr.Herdr(name)
             arguments = ["workspace", "create", "--label", name, "--cwd", cwd]
             for key, value in {**environment, "HERDR_AGENT_PANE": "1"}.items():
                 arguments.extend(["--env", f"{key}={value}"])
             root_pane = herdr.json_object(client.result(*arguments, "--no-focus").get("root_pane"), "fake root pane")
             pane = herdr.json_text(root_pane.get("pane_id"), "fake root pane id")
-            _ = client.run("pane", "rename", pane, name)
+            _ = client.run("pane", "rename", pane, title)
             return pane
 
         _ = cast(object, self.enterContext(patch.object(herdr, "open_tab", open_tab)))
         return owner, responses, log
+
+    def test_restart_keeps_session_name_in_saved_layout_pane_and_attach_hint(self) -> None:
+        from scripts.herdr.test_herdr import TitledLayoutHerdr
+        owner = self.herdr_restart_fixture()[0]
+        _ = self.enterContext(patch.object(herdr, "herdr_processes", return_value=[]))
+        old = TitledLayoutHerdr()
+        _ = old.open_tab("ad-hoc", owner["name"], owner["cwd"], {})
+        _ = old.open_tab("ad-hoc", "other-key", owner["cwd"], {})
+        fresh = TitledLayoutHerdr()
+        _ = fresh.open_tab("ad-hoc", "other-key", owner["cwd"], {})
+
+        def open_tab(host: str, space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
+            self.assertEqual(host, "fixture")
+            return fresh.open_tab(space, title, cwd, environment)
+
+        parts = restart._resume_parts(owner, "restart")  # pyright: ignore[reportPrivateUsage]
+        parts = replace(parts, environment={**parts.environment, "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "roles-unit"})
+        with patch.object(names, "runtime_names", return_value=fixture_names(director="coordinator")), \
+                patch.object(herdr, "restore_server", return_value=herdr.ServerAdopted()), \
+                patch.object(herdr, "Herdr", return_value=fresh), \
+                patch.object(herdr, "open_tab", side_effect=open_tab), \
+                patch.object(herdr, "start_agent", return_value=SUBMITTED_PROMPT):
+            launched = restart._herdr_launch(parts,  # pyright: ignore[reportPrivateUsage]
+                restart.SharedHerdrTab("fixture"), owner, dry_run=False)
+        self.assertEqual(launched.prompt_outcome, SUBMITTED_PROMPT)
+        self.assertEqual([tab["pane_label"] for tab in fresh.tabs], [owner["name"], "other-key"])
+        found = fresh.lookup(owner["name"])
+        self.assertIsInstance(found, herdr.PaneFound)
+        self.assertEqual(fresh.tabs[0]["label"], owner["name"])
+        self.assertEqual(fresh.lookup(fresh.tabs[0]["label"]), found)
+        self.assertTrue(herdr.attach_hint("ad-hoc", owner["name"]).endswith("tab " + owner["name"]))
 
     def test_shared_tab_restart_carries_its_destination_transcript_and_failed_submit_outcome(self) -> None:
         owner, _responses, _log = self.herdr_restart_fixture()

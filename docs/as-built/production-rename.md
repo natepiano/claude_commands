@@ -1,5 +1,9 @@
 # Production rename
 
+Code reviews now use the unit's persistent `review` and `review2` workers
+through `assign.sh --role review`. Any pool maintenance paths described below
+remain only for the pending archive cleanup; they do not dispatch new reviews.
+
 ## What it is
 
 `scripts/production/rename.py` changes a registered production's slug, then
@@ -99,7 +103,9 @@ branch is renamed, and no unfinished prior rename journal for the old slug.
 | 4 | Move `footers-off/<slug>`, `review-paused/<slug>.json`, `outstanding/<slug>.json`, `counts/<slug>`, `reports/<slug>.json`, then each entry of `<slug>/` into the new directory; rewrite matching `*/parent` contents; each held design the showrunner holds takes `ShowrunnerHolder(<new>)` (`roles.move_holder`). Then `rename_outside.apply`: move the `next-`, `proposal-` and `question-<slug>` pins (and their `-all-below` forms) and rename their `<old>: ` item keys; rewrite Production cells naming `<old>` on the change-review list; point each child doc's Parent production line at the new doc; move the bevy upgrade record and notifier job (`RUN` names the new doc, `FROM` the new instance) and drop its lock; remove the derived `unit-board/<old>.json`; a Log line naming `<old>-log.md` takes `<new>-log.md`, the log and its `-recovered` copy move, and an info/exclude line naming an old one gains one for the new. The production's own log and its `-recovered` copy, by either name, may stand untracked: every clean-checkout check (`_dirty`, `_check_edits`) skips them, since a log is never committed. Every part repeats safely. |
 | 5 | Move each Units row's stall-watch file from `sha256(old\0unit).json` to `sha256(new\0unit).json`. |
 | 6 | Move the production's review-pool directory, including leases. |
-| 7 | Renamed merge branch: create and switch to `<new>` at the saved tip and update Merge branch. Kept merge branch: stay on it. Then commit documents and push with upstream. |
+| 7 | Move the units' worker ledgers from the old production to the new one. |
+| 8 | Renamed merge branch: create and switch to `<new>` at the saved tip and update Merge branch. Kept merge branch: stay on it. Then commit documents and push with upstream. |
+| 9 | Retarget phase notes from the old production to the current new doc. |
 
 The journal sits in `<new>/` from step 0, so step 4 merges the old directory's
 entries into it: a prior journal goes to `rename-history/<old>.json`, the old
@@ -223,12 +229,31 @@ logs and design docs that name the old path are history and keep it.
 
 ## Journal and recovery
 
-`SHOWRUNNER_STATE_DIR/<new>/rename.json` stores `version: 1`, the recorded
-plan, the completed apply `step` and `done`. Apply reaches step 7 with
-`done: false`. `unit_moves[<unit>]` stores each unit's paths, branches, tips
-and completed `step`. All modifying verbs hold the same `<new>/rename.lock`
-through `flock`; `plan` takes no lock. Individual moves and writes are atomic;
-the whole rename resumes rather than rolling back.
+`SHOWRUNNER_STATE_DIR/<new>/rename.json` stores `version: 1`, the old and
+new slugs, original branch and tip, unit identities, checkout-relative plan
+names, completed apply step names and `done`. It does not store the current
+checkout, production doc paths, timer, state, stall-watch or review-pool paths.
+On resume these are resolved from the current update timer and configured
+state roots. Until `_rename_timer` is recorded complete, the old slug's timer
+is required; afterwards the new slug's timer is required. The old timer may
+already name the new doc: `_rename_doc` points CHECK there before moving the
+doc, and `_rename_timer` moves the instance later. A missing or unreadable
+expected timer refuses with both slugs and the next step, even if the other
+slug's timer resolves. Recovery never guesses a checkout from a journal path.
+
+Older journals with absolute paths and counted progress still load. Their
+stored location fields are ignored; absolute plan entries are replaced by
+plans selected from the current doc's Units rows. Relative plan names resolve
+against the current checkout. Apply rewrites the journal without current
+locations, including a rerun with all steps already complete. Worker repair,
+unit moves and finish use the same resolver; read-only plan and dry-run repair
+do not rewrite the journal.
+
+`unit_moves[<unit>]` still stores the requested old/new unit worktree endpoints,
+branches, tips and completed unit step: these describe the move being recovered,
+not the showrunner's current location. Apply keeps these records and unknown
+future keys. All modifying verbs hold the production lock. Individual moves
+and writes are atomic; the whole rename resumes rather than rolling back.
 
 Rerun the same command after a refusal or interruption, once its cause is
 resolved. Apply's destination stays the selected new slug; its source accepts
@@ -238,7 +263,7 @@ so once the timer has moved they also accept the old or a former name. Leave
 `rename.lock` to the script. `rename-history/<source-slug>.json` files are
 archived completed journals and do not replace the current journal.
 
-Finish requires apply step 7, no unfinished unit moves, no non-retired row
+Finish requires all nine apply steps, no unfinished unit moves, no non-retired row
 with an `<old>-` branch, and the showrunner checkout on the merge branch after
 the rename. When the merge branch was renamed, it deletes the old one; a kept
 merge branch is not deleted, and finish prints `kept merge branch <name>`. `finish_step: 1` records remote deletion; `finish_step: 2` and
@@ -295,7 +320,7 @@ and 2 for invalid arguments.
 ## Why
 
 - **Unknown slugs pass through.** A resolver that raised on an unknown slug
-  would break the review pool and unit lookup for timer-less productions.
+  would break legacy reviewer-state lookup and unit lookup for timer-less productions.
 
 - **Units move separately, between runs.** A moved cwd breaks a live session,
   and the rename must not modify another session's claims. That is also why
@@ -321,15 +346,21 @@ and 2 for invalid arguments.
 
 ## State roots and tests
 
-`test_rename.py` covers moves, kept history, interrupted steps, branch
-changes, account data, trust retries, refusals and repeated completion.
+`test_rename.py` covers planning, state moves and interrupted apply steps.
+`test_rename_units.py` covers unit worktree moves, account data and interrupted
+unit steps; `test_rename_workers.py` covers worker ledgers and repair.
+`test_rename_finish.py` covers trust retries, branch preservation and repeated
+completion. These suites share `rename_test_support.py`: each class seeds Git
+once and restores independent copies at the same paths, while synchronous
+commands call the real handlers in-process. One apply case retains the CLI
+subprocess boundary.
 `test_rename_checkout.py` moves a real linked worktree and repeats the move,
 refuses before the git move, and runs the `checkout` verb's stop and push.
 `test_showrunners.py`, `test_unit_lookup.py` and `test_stall_watch.py` cover
 Formerly resolution, old session marks, strict discovery and detached work.
 
 ```sh
-python3 -m unittest scripts.production.test_rename scripts.production.test_rename_checkout scripts.production.test_unit_lookup scripts.production.test_showrunners scripts.production.test_stall_watch
+python3 -m unittest scripts.production.test_rename scripts.production.test_rename_units scripts.production.test_rename_workers scripts.production.test_rename_finish scripts.production.test_rename_checkout scripts.production.test_unit_lookup scripts.production.test_showrunners scripts.production.test_stall_watch
 ```
 
 `unit_lookup.py` is shared: the shutdown inventory

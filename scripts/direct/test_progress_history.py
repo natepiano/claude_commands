@@ -9,6 +9,7 @@ import io
 import json
 import os
 import shlex
+import select
 import subprocess
 import sys
 import tempfile
@@ -17,12 +18,15 @@ from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast, override
+from typing import TextIO, cast, override
 from unittest.mock import patch
 
 from scripts.direct import phase_reservation, phase_table, plan_history, progress_history, recorder_state
+# These regressions check the private verifier's semantic result before wait closure.
+from scripts.direct.progress_history import _supplier_message  # pyright: ignore[reportPrivateUsage]
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.history.rounds import load_phases
+from scripts.history import history as stage_history
 
 
 SCRIPT = Path(__file__).with_name("progress_history.py")
@@ -101,6 +105,27 @@ class ProgressHistoryTests(unittest.TestCase):
     @override
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_review_trial_counts_rerun_findings_as_code(self) -> None:
+        self.write_full_config()
+        session = self.start_run("rerun-findings", 71_000)
+        self.start_phase(session, 71_010)
+        _ = self.run_findings(session, "open", "--severity", "minor", "--title", "Claim blocks retry",
+                              "--caught-by", "worker", "--lens", "rerun", at=71_020)
+        self.assertEqual(self.run_command("review-trial", "--session-dir", str(session), at=71_030),
+                         "review trial: ux 0 findings, code 1 findings, review-worker minutes 0, "
+                         + "ux check minutes 0, ux repair minutes 0")
+
+    def test_production_resolver_accepts_both_plan_header_forms(self) -> None:
+        plan = self.working_dir / "unit-plan.md"
+        for header in ("**Production: Example**", "**Production:** Example"):
+            for field in ("project_plan_doc", "plan_doc"):
+                with self.subTest(header=header, field=field):
+                    _ = plan.write_text(f'> {header} — unit `unit-a`; production doc `production.md`\n')
+                    identity = progress_history.resolve_production_unit({
+                        "working_dir": str(self.working_dir), field: plan.name,
+                    })
+                    self.assertEqual(identity, progress_history.ProductionUnitIdentity("Example", "unit-a"))
 
     def test_set_unit_rebinds_ledger_identity_without_changing_run_history(self) -> None:
         run = self.start_run("identity", 1760658000)
@@ -1786,6 +1811,1117 @@ print('two homes isolated; recorder lock retained; caller restored')
         old = [{key: value for key, value in event.items() if key != "contract_revision"} for event in events]
         self.assertEqual(load_phases(old), phases)
         self.assertEqual((phases[0]["started_at"], phases[0]["finished_at"]), (1010, 1060))
+
+    def covered_wait_phase(self, name: str) -> Path:
+        session = self.start_run(name, 1000)
+        _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "6",
+                             "--phase-title", "Wait coverage", at=1010)
+        return session
+
+    def forwarded_supplier_wait(self, name: str, body: str = "The checkpoint is merged.") -> tuple[Path, Path, str]:
+        session = self.covered_wait_phase(name)
+        self.enterContext(patch.dict(os.environ, {
+            "HOME": str(self.root), "XDG_STATE_HOME": str(self.root / "state"),
+            "UNIT_NOW_EPOCH": "1020", "CLAUDE_PROBE_SESSION": "0", "UNIT_SYNC_WRITES": "0",
+        }))
+        # Alias lookup is outside the recorder's evidence check. Hook fixtures
+        # exercise the real live-session resolver with bound socket files.
+        _ = self.enterContext(patch("scripts.message.sessions.live_sessions", return_value=[{
+            "name": "postmaster", "sessionId": "postmaster-session", "formerNames": [],
+            "messagingSocketPath": "/fixture/postmaster/socket",
+        }]))
+        self.assertTrue(progress_history.record_turn_wait(session, "director", "blocked: waiting on uds:/supplier.sock"))
+        replies = self.root / "state/message/postmaster/replies"
+        replies.mkdir(parents=True, exist_ok=True)
+        record = replies / "1030000-2.json"
+        _ = record.write_text(json.dumps({
+            "at_ms": 1030000, "socket": "uds:/supplier.sock", "name": "renamed-supplier",
+            "session_id": "supplier-session", "senders": ["another-director", "director"],
+            "body": body, "targets": ["another-director", "director"],
+        }))
+        prompt = ('<cross-session-message from="uds:/fixture/postmaster/socket" from-name="postmaster">'
+                  + "Message from renamed-supplier (their answer to one of another-director, director, "
+                  + "passed on by postmaster) [1030000-9]:\n\n" + body + "</cross-session-message>")
+        os.environ["UNIT_NOW_EPOCH"] = "1030"
+        return session, record, prompt
+
+    def assert_forwarded_supplier_wait_stays_open(self, name: str, session: Path, prompt: str) -> None:
+        before = self.read_events(name)
+        marker = (session / "turn_wait.json").read_bytes()
+        progress_history.finish_turn_wait(session, "director", source="PEER", prompt=prompt)
+        self.assertEqual(self.read_events(name), before)
+        self.assertEqual((session / "turn_wait.json").read_bytes(), marker)
+
+    def test_pending_forward_preserves_body_whitespace_and_ignores_the_record_counter(self) -> None:
+        name = "pending-exact-body"
+        session, _, prompt = self.forwarded_supplier_wait(name, "\nThe checkpoint is merged.\n\n")
+        self.assertFalse((self.root / "state/message/postmaster/forwards").exists())
+        progress_history.finish_turn_wait(session, "director", source="PEER", prompt=prompt)
+        progress_history.finish_turn_wait(session, "director", source="PEER", prompt=prompt)
+        waits = [event for event in self.read_events(name) if str(event["event_type"]).startswith("wait_")]
+        self.assertEqual([event["event_type"] for event in waits], ["wait_started", "wait_finished"])
+        self.assertEqual((waits[1]["wait_id"], waits[1]["owner_session"], waits[1]["phase_instance_id"]),
+                         (waits[0]["wait_id"], "director", waits[0]["phase_instance_id"]))
+        self.assertEqual(cast(dict[str, object], waits[1]["wait_end"])["epoch"], 1030)
+        self.assertFalse((session / "turn_wait.json").exists())
+
+    def test_write_once_reply_ends_wait_with_a_forward_completion_record(self) -> None:
+        name = "forward-complete"
+        session, record, prompt = self.forwarded_supplier_wait(name)
+        forwards = record.parent.parent / "forwards"
+        forwards.mkdir()
+        # Completion ids do not decide whether this director was a target.
+        _ = (forwards / record.name).write_text(json.dumps({"forwarded": ["another-director"]}))
+        progress_history.finish_turn_wait(session, "director", source="PEER", prompt=prompt)
+        waits = [event for event in self.read_events(name) if str(event["event_type"]).startswith("wait_")]
+        self.assertEqual([event["event_type"] for event in waits], ["wait_started", "wait_finished"])
+        self.assertEqual(waits[1]["wait_id"], waits[0]["wait_id"])
+        self.assertFalse((session / "turn_wait.json").exists())
+
+    def test_old_form_reply_ends_wait_without_validating_extra_fields(self) -> None:
+        old_fields: tuple[tuple[str, object], ...] = (
+            ("pending", []), ("done", ["director"]), ("unknown", []), ("pending", "director"),
+        )
+        for index, (forward, forwarded) in enumerate(old_fields):
+            with self.subTest(forward=forward, forwarded=forwarded):
+                name = f"forward-old-form-{index}"
+                session, record, prompt = self.forwarded_supplier_wait(name)
+                fields = cast(dict[str, object], json.loads(record.read_text()))
+                fields.update(forward=forward, forwarded=forwarded)
+                _ = record.write_text(json.dumps(fields))
+                progress_history.finish_turn_wait(session, "director", source="PEER", prompt=prompt)
+                waits = [event for event in self.read_events(name) if str(event["event_type"]).startswith("wait_")]
+                self.assertEqual([event["event_type"] for event in waits], ["wait_started", "wait_finished"])
+                self.assertEqual(waits[1]["wait_id"], waits[0]["wait_id"])
+                self.assertFalse((session / "turn_wait.json").exists())
+
+    def test_missing_reply_record_leaves_the_supplier_wait_open(self) -> None:
+        name = "forward-missing"
+        session, record, prompt = self.forwarded_supplier_wait(name)
+        record.unlink()
+        self.assert_forwarded_supplier_wait_stays_open(name, session, prompt)
+
+    def test_duplicate_reply_records_leave_the_supplier_wait_open(self) -> None:
+        name = "forward-duplicate"
+        session, record, prompt = self.forwarded_supplier_wait(name)
+        _ = record.with_name("1030000-3.json").write_bytes(record.read_bytes())
+        self.assert_forwarded_supplier_wait_stays_open(name, session, prompt)
+
+    def test_reply_socket_and_target_must_match_the_supplier_wait(self) -> None:
+        name = "forward-address-mismatch"
+        session, record, prompt = self.forwarded_supplier_wait(name)
+        valid = cast(dict[str, object], json.loads(record.read_text()))
+        mismatches: tuple[tuple[str, object], ...] = (
+            ("socket", "uds:/another-supplier.sock"), ("targets", ["another-director"]),
+        )
+        for field, value in mismatches:
+            with self.subTest(field=field):
+                _ = record.write_text(json.dumps({**valid, field: value}))
+                self.assert_forwarded_supplier_wait_stays_open(name, session, prompt)
+
+    def test_direct_supplier_reply_ends_wait_without_a_reply_record(self) -> None:
+        name = "direct-supplier-reply"
+        session, record, _ = self.forwarded_supplier_wait(name)
+        record.unlink()
+        prompt = '<cross-session-message from="uds:/supplier.sock">The checkpoint is merged.</cross-session-message>'
+        progress_history.finish_turn_wait(session, "director", source="PEER", prompt=prompt)
+        waits = [event for event in self.read_events(name) if str(event["event_type"]).startswith("wait_")]
+        self.assertEqual([event["event_type"] for event in waits], ["wait_started", "wait_finished"])
+        self.assertEqual(waits[1]["wait_id"], waits[0]["wait_id"])
+        self.assertFalse((session / "turn_wait.json").exists())
+
+    def test_malformed_reply_record_is_rejected_after_one_read_without_sleep(self) -> None:
+        session, record, prompt = self.forwarded_supplier_wait("forward-read-malformed")
+        for malformed in ('{"at_ms":', "[]", OSError("record is unreadable")):
+            with self.subTest(malformed=malformed), patch.object(
+                Path, "read_text", side_effect=[malformed]
+            ) as read_record, patch("time.sleep") as pause:
+                message = _supplier_message("uds:/supplier.sock", prompt, "director")
+                if not isinstance(message, progress_history.UnverifiedSupplierMessage):
+                    self.fail("malformed record verified a reply")
+                self.assertEqual(message.rejection, progress_history.SupplierMessageRejection.NO_RECORD)
+                self.assertEqual(read_record.call_count, 1)
+                pause.assert_not_called()
+        _ = record.write_text('{"at_ms":')
+        self.assert_forwarded_supplier_wait_stays_open("forward-read-malformed", session, prompt)
+
+    def test_complete_reply_object_with_invalid_fields_is_not_retried(self) -> None:
+        session, record, prompt = self.forwarded_supplier_wait("forward-invalid-no-retry")
+        complete = record.read_text()
+        with patch.object(Path, "read_text", side_effect=["{}", complete]) as read_record, patch(
+            "time.sleep"
+        ) as pause:
+            message = _supplier_message("uds:/supplier.sock", prompt, "director")
+            if not isinstance(message, progress_history.UnverifiedSupplierMessage):
+                self.fail("invalid record fields verified a reply")
+            self.assertEqual(message.rejection, progress_history.SupplierMessageRejection.NO_RECORD)
+            read_record.assert_called_once_with(encoding="utf-8")
+            pause.assert_not_called()
+        self.assertTrue((session / "turn_wait.json").exists())
+
+    def test_record_timestamp_must_match_the_forward_even_when_the_filename_matches(self) -> None:
+        name = "forward-time-mismatch"
+        session, record, prompt = self.forwarded_supplier_wait(name)
+        fields = cast(dict[str, object], json.loads(record.read_text()))
+        fields["at_ms"] = 1029999
+        _ = record.write_text(json.dumps(fields))
+        self.assert_forwarded_supplier_wait_stays_open(name, session, prompt)
+
+    def test_body_whitespace_difference_leaves_the_supplier_wait_open(self) -> None:
+        name = "forward-body-mismatch"
+        session, record, prompt = self.forwarded_supplier_wait(name, "The checkpoint is merged.\n")
+        fields = cast(dict[str, object], json.loads(record.read_text()))
+        fields["body"] = "The checkpoint is merged."
+        _ = record.write_text(json.dumps(fields))
+        self.assert_forwarded_supplier_wait_stays_open(name, session, prompt)
+
+    def test_invalid_reply_record_schema_leaves_the_supplier_wait_open(self) -> None:
+        name = "forward-invalid-schema"
+        session, record, prompt = self.forwarded_supplier_wait(name)
+        valid = cast(dict[str, object], json.loads(record.read_text()))
+        invalid_fields: tuple[tuple[str, object], ...] = (
+            ("targets", "director"), ("at_ms", True), ("senders", []),
+        )
+        for field, invalid in invalid_fields:
+            with self.subTest(field=field):
+                _ = record.write_text(json.dumps({**valid, field: invalid}))
+                self.assert_forwarded_supplier_wait_stays_open(name, session, prompt)
+        _ = record.write_text("{unfinished record")
+        self.assert_forwarded_supplier_wait_stays_open(name, session, prompt)
+
+    def test_verified_forward_cannot_finish_another_owners_wait(self) -> None:
+        name = "forward-wrong-owner"
+        session, record, prompt = self.forwarded_supplier_wait(name)
+        fields = cast(dict[str, object], json.loads(record.read_text()))
+        fields["targets"] = ["director", "different-owner"]
+        _ = record.write_text(json.dumps(fields))
+        before = self.read_events(name)
+        marker = (session / "turn_wait.json").read_bytes()
+        progress_history.finish_turn_wait(session, "different-owner", source="PEER", prompt=prompt)
+        self.assertEqual(self.read_events(name), before)
+        self.assertEqual((session / "turn_wait.json").read_bytes(), marker)
+
+    def test_repeated_supplier_declaration_reuses_the_open_wait_after_an_unrelated_prompt(self) -> None:
+        session = self.covered_wait_phase("declared-repeat")
+        with patch.dict(os.environ, {"UNIT_NOW_EPOCH": "1020", "CLAUDE_PROBE_SESSION": "0"}):
+            self.assertTrue(progress_history.record_turn_wait(session, "director", "blocked: waiting on uds:/supplier.sock"))
+            marker = (session / "turn_wait.json").read_text()
+            os.environ["UNIT_NOW_EPOCH"] = "1030"
+            progress_history.finish_turn_wait(session, "director", source="PEER",
+                                             prompt='<cross-session-message from="uds:/other.sock">Ready.</cross-session-message>')
+            os.environ["UNIT_NOW_EPOCH"] = "1040"
+            self.assertTrue(progress_history.record_turn_wait(session, "director", "blocked: waiting on uds:/supplier.sock for review"))
+        waits = [event for event in self.read_events("declared-repeat") if str(event["event_type"]).startswith("wait_")]
+        self.assertEqual(len(waits), 1)
+        self.assertEqual((waits[0]["event_type"], waits[0]["wait_started_epoch"], waits[0]["owner_session"]),
+                         ("wait_started", 1020, "director"))
+        self.assertEqual((session / "turn_wait.json").read_text(), marker)
+
+    def test_phase_finish_closes_an_open_declared_supplier_wait_as_unclosed(self) -> None:
+        session = self.covered_wait_phase("declared-phase-end")
+        with patch.dict(os.environ, {"UNIT_NOW_EPOCH": "1020", "CLAUDE_PROBE_SESSION": "0"}):
+            self.assertTrue(progress_history.record_turn_wait(session, "director", "blocked: waiting on uds:/supplier.sock"))
+        _ = self.run_command("finish-phase", "--session-dir", str(session), "--status", "completed", at=1050)
+        events = self.read_events("declared-phase-end")
+        started, closed = [event for event in events if str(event["event_type"]).startswith("wait_")]
+        self.assertEqual((closed["event_type"], closed["wait_end"]), ("wait_unclosed", {"state": "Unclosed"}))
+        self.assertEqual((closed["wait_id"], closed["wait_started_epoch"], closed["phase_instance_id"]),
+                         (started["wait_id"], 1020, started["phase_instance_id"]))
+        self.assertLess(events.index(closed), next(index for index, event in enumerate(events)
+                                                 if event["event_type"] == "phase_finished"))
+
+    def test_thread_wait_retains_its_own_pass_with_shared_server_and_fix_worker_names(self) -> None:
+        for same_phase in (False, True):
+            for suffix in ("test", "fix"):
+                with self.subTest(same_phase=same_phase, suffix=suffix):
+                    name = f"thread-waits-{same_phase}-{suffix}"
+                    session = self.covered_wait_phase(name)
+                    for slot, phase, worker in (("impl", "6", "unit-impl"),
+                                                ("test", "6" if same_phase else "7", f"unit-{suffix}")):
+                        if phase == "7":
+                            _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "7",
+                                                 "--phase-title", "Parallel phase", at=1020)
+                        self.team_slot = slot
+                        _ = self.run_command("start-pass", "--session-dir", str(session), "--phase-id", phase,
+                                             "--pass-kind", "impl", "--activity", "work", "--called-task", "direct.impl",
+                                             "--worker-name", worker, "--called-family", "codex", "--called-model", "gpt-called", at=1021)
+                    _ = (session / "mesh_roster.json").write_text(json.dumps(
+                        {"unit-impl": {"thread_id": "impl-thread"}, f"unit-{suffix}": {"thread_id": "test-thread"}}))
+                    self.team_slot = "impl"
+                    ids: list[str] = []
+                    for thread in ("impl-thread", "test-thread"):
+                        ids.append(self.run_command("start-wait", "--session-dir", str(session),
+                            "--worker-thread-id", thread, "--owner-session", thread,
+                            "--kind", "WaitingForMemoryOrSlot", at=1030))
+                    _ = self.run_command("finish-wait", "--session-dir", str(session), "--wait-id", ids[0], at=1040)
+                    _ = self.run_command("finish-phase", "--session-dir", str(session), "--phase-id",
+                                         "6" if same_phase else "7", "--status", "completed", at=1050)
+                    events = self.read_events(name)
+                    passes = {str(event["worker_name"]): event for event in events if event["event_type"] == "pass_started"}
+                    report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1060)))
+                    waits = {str(wait["owner_session"]): wait for wait in cast(list[dict[str, object]], report["waits"])}
+                    for thread, worker in (("impl-thread", "unit-impl"), ("test-thread", f"unit-{suffix}")):
+                        wait = waits[thread]
+                        started = next(event for event in events if event["event_type"] == "wait_started"
+                                       and event["owner_session"] == thread)
+                        self.assertEqual((wait["worker_name"], wait["pass_instance_id"], wait["phase_instance_id"]),
+                                         (worker, passes[worker]["pass_instance_id"], passes[worker]["phase_instance_id"]))
+                        self.assertEqual((started["worker_name"], started["pass_instance_id"], started["phase_instance_id"]),
+                                         (wait["worker_name"], wait["pass_instance_id"], wait["phase_instance_id"]))
+                    completed = cast(dict[str, object], waits["impl-thread"]["wait_end"])
+                    self.assertEqual((completed["state"], completed["epoch"]), ("Finished", 1040))
+                    self.assertEqual(waits["test-thread"]["wait_end"], {"state": "Unclosed"})
+
+    def test_thread_attribution_miss_never_reports_candidate_phases_as_covered_zero(self) -> None:
+        session = self.covered_wait_phase("thread-miss")
+        self.team_slot = "impl"
+        _ = self.run_command("start-pass", "--session-dir", str(session), "--phase-id", "6",
+                             "--pass-kind", "impl", "--activity", "work", "--called-task", "direct.impl",
+                             "--worker-name", "unit-impl", "--called-family", "codex", "--called-model", "gpt-called", at=1015)
+        for roster in ({}, {"one": {"thread_id": "thread"}, "two": {"thread_id": "thread"}},
+                       {"unmatched": {"thread_id": "thread"}}):
+            _ = (session / "mesh_roster.json").write_text(json.dumps(roster))
+            _ = self.run_command("start-wait", "--session-dir", str(session), "--worker-thread-id", "thread",
+                                 "--owner-session", "thread", "--kind", "WaitingForQuotaRefusal", at=1020)
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1030)))
+        phase = cast(list[dict[str, object]], report["phases"])[0]
+        self.assertEqual((phase["state"], report["missing_record_n"], report["attribution_miss_n"]), ("UncertainCoverage", 3, 3))
+        self.assertNotIn("wait_n", phase)
+        self.assertEqual(len(cast(list[object], phase["attribution_miss_ids"])), 3)
+        for miss in cast(list[dict[str, object]], report["missing"]):
+            attribution = cast(dict[str, object], miss["wait_attribution"])
+            self.assertTrue(attribution["reason"])
+            self.assertTrue(attribution["candidates"])
+
+    def test_checkpoint_identity_survives_reopening_runs_and_active_later_instances(self) -> None:
+        for across_runs in (False, True):
+            for active_later in (False, True):
+                for associations in (0, 1, 2):
+                    with self.subTest(across_runs=across_runs, active_later=active_later, associations=associations):
+                        name = f"checkpoint-{across_runs}-{active_later}-{associations}"
+                        first = self.covered_wait_phase(name)
+                        commit = "a" * 40
+                        if associations:
+                            _ = self.run_command("checkpoint", "--session-dir", str(first), "--phase", "6", "--commit", commit, at=1015)
+                        _ = self.run_command("finish-phase", "--session-dir", str(first), "--status", "completed", at=1020)
+                        second = self.start_run(name + "-other", 1021) if across_runs else first
+                        _ = self.run_command("start-phase", "--session-dir", str(second), "--phase-id", "6",
+                                             "--phase-title", "Reopened", at=1030)
+                        if associations == 2:
+                            _ = self.run_command("checkpoint", "--session-dir", str(second), "--phase", "6", "--commit", commit, at=1035)
+                        if not active_later:
+                            _ = self.run_command("finish-phase", "--session-dir", str(second), "--status", "completed", at=1040)
+                        wait_id = self.run_command("start-checkpoint-wait", "--commit", commit,
+                            "--working-dir", str(self.working_dir), "--phase-id", "6", "--owner-session", "receiver", at=1050)
+                        _ = self.run_command("finish-external-wait", "--wait-id", wait_id, at=1060)
+                        report = cast(dict[str, object], json.loads(self.run_command("waits", at=1070)))
+                        # Each subcase has its own history selection. Remove earlier
+                        # fixture runs so one commit cannot acquire other owners.
+                        phases = cast(list[dict[str, object]], report["phases"])
+                        if associations == 1:
+                            waits = cast(list[dict[str, object]], report["waits"])
+                            self.assertEqual(sorted((str(phase["state"]), int(str(phase["wait_n"]))) for phase in phases), [("Covered", 0), ("Covered", 1)])
+                            first_start = next(event for event in self.read_events(name) if event["event_type"] == "phase_started")
+                            self.assertEqual(waits[0]["phase_instance_id"], first_start["phase_instance_id"])
+                            self.assertEqual(cast(dict[str, object], waits[0]["wait_end"])["state"], "Finished")
+                        else:
+                            self.assertEqual([phase["state"] for phase in phases], ["UncertainCoverage", "UncertainCoverage"])
+                            self.assertEqual(report["missing_record_n"], 1)
+                            self.assertEqual(report["waits"], [])
+                            for phase in phases:
+                                self.assertTrue(phase["reason"])
+                                self.assertEqual(len(cast(list[object], phase["candidates"])), 2)
+                                self.assertNotIn("wait_n", phase)
+                        for path in (self.history_dir / "runs").glob("*.jsonl"):
+                            path.unlink()
+                        (self.history_dir / "wait_attribution.jsonl").unlink()
+
+    def test_production_handoff_has_no_phase_attribution_or_phase_uncertainty(self) -> None:
+        session = self.covered_wait_phase("handoff")
+        wait_id = self.run_command("start-handoff-wait", "--production", "child-style", "--commit", "b" * 40,
+                                   "--owner-session", "parent", "--reason", "child checkpoint tests", at=1020)
+        report = cast(dict[str, object], json.loads(self.run_command("waits", at=1030)))
+        handoff = cast(list[dict[str, object]], report["handoffs"])[0]
+        self.assertEqual(handoff["wait_end"], {"state": "Open"})
+        self.assertNotIn("phase_instance_id", handoff)
+        self.assertEqual(cast(dict[str, object], handoff["wait_attribution"])["state"], "ProductionHandoff")
+        self.assertTrue(cast(dict[str, object], handoff["wait_attribution"])["reason"])
+        _ = self.run_command("finish-external-wait", "--wait-id", wait_id, at=1040)
+        _ = self.run_command("finish-external-wait", "--wait-id", wait_id, at=1050)
+        report = cast(dict[str, object], json.loads(self.run_command("waits", at=1060)))
+        self.assertEqual(report["production_handoff_n"], 1)
+        self.assertEqual(report["uncertain_phase_n"], 0)
+        self.assertEqual(cast(dict[str, object], cast(list[dict[str, object]], report["handoffs"])[0]["wait_end"])["epoch"], 1040)
+        phase_report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1060)))
+        self.assertEqual(cast(list[dict[str, object]], phase_report["phases"])[0]["wait_n"], 0)
+        self.assertEqual(phase_report["handoffs"], [])
+
+    def test_checkpoint_from_another_worktree_marks_the_requested_phases_uncertain(self) -> None:
+        first = self.start_run("other-checkpoint-owner", 1000)
+        _ = self.run_command("start-phase", "--session-dir", str(first), "--phase-id", "7", "--phase-title", "Owner", at=1010)
+        commit = "c" * 40
+        _ = self.run_command("checkpoint", "--session-dir", str(first), "--phase", "7", "--commit", commit, at=1015)
+        self.working_dir = self.root / "different-worktree"
+        self.working_dir.mkdir()
+        second = self.start_run("requested-worktree", 1020)
+        _ = self.run_command("start-phase", "--session-dir", str(second), "--phase-id", "7", "--phase-title", "Requested", at=1030)
+        _ = self.run_command("start-checkpoint-wait", "--commit", commit, "--working-dir", str(self.working_dir),
+                             "--phase-id", "7", "--owner-session", "receiver", at=1040)
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(second), at=1050)))
+        phase, = cast(list[dict[str, object]], report["phases"])
+        self.assertEqual((phase["state"], report["attribution_miss_n"]), ("UncertainCoverage", 1))
+        self.assertNotIn("wait_n", phase)
+        candidates = cast(list[dict[str, object]], phase["candidates"])
+        self.assertEqual({candidate["run_id"] for candidate in candidates}, {first.name, second.name})
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(report["waits"], [])
+
+    def test_director_wait_has_its_owner_and_requires_one_active_phase(self) -> None:
+        session = self.covered_wait_phase("director-wait")
+        _ = self.run_command("start-wait", "--session-dir", str(session), "--director", "--owner-session", "claude-director",
+                             "--kind", "WaitingForMemoryOrSlot", at=1020)
+        _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "7", "--phase-title", "Concurrent", at=1030)
+        _ = self.run_command("start-wait", "--session-dir", str(session), "--director", "--owner-session", "claude-director",
+                             "--kind", "WaitingForMemoryOrSlot", at=1040)
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1050)))
+        wait, = cast(list[dict[str, object]], report["waits"])
+        self.assertEqual((wait["owner_session"], wait["phase_id"]), ("claude-director", "6"))
+        self.assertEqual(report["attribution_miss_n"], 1)
+        miss, = cast(list[dict[str, object]], report["missing"])
+        candidates = cast(list[dict[str, object]], cast(dict[str, object], miss["wait_attribution"])["candidates"])
+        self.assertEqual({candidate["phase_id"] for candidate in candidates}, {"6", "7"})
+        phases = cast(list[dict[str, object]], report["phases"])
+        self.assertEqual([phase["state"] for phase in phases], ["UncertainCoverage", "UncertainCoverage"])
+        self.assertTrue(all("wait_n" not in phase for phase in phases))
+
+    def test_external_wait_prefers_the_receiving_claude_directors_owner(self) -> None:
+        _ = self.run_command("start-handoff-wait", "--production", "child", "--commit", "d" * 40, at=1020,
+                             claude_session="receiving-director", codex_session="inherited-worker")
+        report = cast(dict[str, object], json.loads(self.run_command("waits", at=1030)))
+        wait, = cast(list[dict[str, object]], report["handoffs"])
+        self.assertEqual(wait["owner_session"], "receiving-director")
+
+    def test_phase_finish_marks_an_external_gate_unclosed_and_preserves_later_gate_completion(self) -> None:
+        session = self.covered_wait_phase("external-close")
+        commit = "e" * 40
+        _ = self.run_command("checkpoint", "--session-dir", str(session), "--phase", "6", "--commit", commit, at=1015)
+        first = self.run_command("start-checkpoint-wait", "--commit", commit, "--working-dir", str(self.working_dir),
+                                 "--phase-id", "6", "--owner-session", "receiver", at=1020)
+        _ = self.run_command("finish-phase", "--session-dir", str(session), "--status", "completed", at=1030)
+        _ = self.run_command("finish-external-wait", "--wait-id", first, at=1040)
+        second = self.run_command("start-checkpoint-wait", "--commit", commit, "--working-dir", str(self.working_dir),
+                                  "--phase-id", "6", "--owner-session", "receiver", at=1050)
+        _ = self.run_command("finish-external-wait", "--wait-id", second, at=1060)
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1070)))
+        waits = {str(wait["wait_id"]): wait for wait in cast(list[dict[str, object]], report["waits"])}
+        self.assertEqual(waits[first]["wait_end"], {"state": "Unclosed"})
+        self.assertEqual(waits[second]["wait_end"], {"state": "Finished", "at": "1970-01-01T00:17:40.000+00:00", "epoch": 1060})
+
+    def test_external_start_serializes_with_phase_finish_publication(self) -> None:
+        session = self.covered_wait_phase("external-interleave")
+        commit = "f" * 40
+        _ = self.run_command("checkpoint", "--session-dir", str(session), "--phase", "6", "--commit", commit, at=1015)
+        environment = {**os.environ, "UNIT_HISTORY_DIR": str(self.history_dir), "UNIT_NOW_EPOCH": "1030",
+                       "UNIT_CONFIG": str(self.config_file), "AGENTS_CONFIG_FILE": str(self.agents_config_file)}
+        self.isolate_recorder_roots(environment)
+        self.isolate_identity(environment)
+        finish_program = '''import sys
+from unittest.mock import patch
+from scripts.direct import progress_history as recorder
+append = recorder._append_event
+def publication(state, event):
+    if event.get("event_type") == "phase_finished":
+        print("publishing", flush=True)
+        sys.stdin.readline()
+    append(state, event)
+sys.argv = ["progress_history.py", *sys.argv[1:]]
+with patch.object(recorder, "_append_event", publication):
+    recorder.main()
+'''
+        start_program = '''import fcntl, sys
+from unittest.mock import patch
+from scripts.direct import progress_history as recorder
+flock = fcntl.flock
+def admission(fd, operation):
+    if operation == fcntl.LOCK_EX:
+        try:
+            flock(fd, operation | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            print("blocked", flush=True)
+    flock(fd, operation)
+sys.argv = ["progress_history.py", *sys.argv[1:]]
+with patch.object(fcntl, "flock", admission):
+    recorder.main()
+'''
+        finish: subprocess.Popen[str] = subprocess.Popen([sys.executable, "-c", finish_program, "finish-phase", "--session-dir", str(session),
+                                   "--status", "completed"], env=environment, text=True,
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(lambda: finish.kill() if finish.poll() is None else None)
+        if finish.stdout is None:
+            raise AssertionError("finish fixture has no output pipe")
+        finish_output = cast(TextIO, finish.stdout)
+        self.assertTrue(select.select([finish_output], [], [], 15)[0], "finish never reaches publication")
+        self.assertEqual(finish_output.readline().strip(), "publishing")
+        start: subprocess.Popen[str] = subprocess.Popen([sys.executable, "-c", start_program, "start-checkpoint-wait", "--commit", commit,
+                                  "--working-dir", str(self.working_dir), "--phase-id", "6", "--owner-session", "receiver"],
+                                 env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(lambda: start.kill() if start.poll() is None else None)
+        try:
+            if start.stdout is None:
+                raise AssertionError("start fixture has no output pipe")
+            start_output = cast(TextIO, start.stdout)
+            self.assertTrue(select.select([start_output], [], [], 15)[0], "external start never attempts admission")
+            self.assertEqual(start_output.readline().strip(), "blocked")
+        finally:
+            finished_out, finished_errors = finish.communicate("release\n", timeout=30)
+        started_out, started_errors = start.communicate(timeout=30)
+        self.assertEqual(finish.returncode, 0, finished_out + finished_errors)
+        self.assertEqual(start.returncode, 0, started_out + started_errors)
+        wait_id = started_out.strip()
+        _ = self.run_command("finish-external-wait", "--wait-id", wait_id, at=1050)
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1060)))
+        wait, = cast(list[dict[str, object]], report["waits"])
+        self.assertEqual(cast(dict[str, object], wait["wait_end"])["state"], "Finished")
+
+    def test_capacity_waits_keep_session_and_unit_holders_in_observation_order(self) -> None:
+        name = "capacity-holders"
+        session = self.covered_wait_phase(name)
+        kinds = (("WaitingForQuotaRefusal", "account", "account-a"),
+                 ("WaitingForMemoryOrSlot", "memory", "build-pool"),
+                 ("ReadyWithoutCapacity", "slot", "worker-2"))
+        expected: dict[str, list[dict[str, object]]] = {}
+        for kind, resource_kind, resource in kinds:
+            for first_is_session in (True, False):
+                with self.subTest(kind=kind, first_is_session=first_is_session):
+                    owners = (("--holder-session", "other-session", {"state": "SessionHolder", "session_id": "other-session"}),
+                              ("--holder-unit", "other-unit", {"state": "UnitHolder", "unit": "other-unit"}))
+                    first, second = owners if first_is_session else tuple(reversed(owners))
+                    wait_id = self.run_command("start-wait", "--session-dir", str(session), "--kind", kind,
+                        "--owner-session", "waiting-session", "--holder-resource-kind", resource_kind,
+                        "--holder-resource", resource, first[0], first[1], at=1020)
+                    started = self.read_events(name)[-1]
+                    _ = self.run_command("wait-holder", "--session-dir", str(session), "--wait-id", wait_id,
+                        "--holder-resource-kind", resource_kind, "--holder-resource", resource + "-next",
+                        second[0], second[1], at=1030)
+                    changed = self.read_events(name)[-1]
+                    self.assertEqual(changed["event_type"], "wait_holder_seen")
+                    for field in ("wait_id", "owner_session", "wait_attribution", "phase_instance_id", "run_id"):
+                        self.assertEqual(changed[field], started[field])
+                    report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1031)))
+                    current = next(wait for wait in cast(list[dict[str, object]], report["waits"]) if wait["wait_id"] == wait_id)
+                    self.assertEqual(current["wait_end"], {"state": "Open"})
+                    expected[wait_id] = [
+                        {"at": datetime.fromtimestamp(at, UTC).isoformat(timespec="milliseconds"), "epoch": at,
+                         "holder": {"state": "NamedHolder", "resource_kind": resource_kind,
+                                    "resource": held_resource, "holder": owner}}
+                        for at, held_resource, owner in ((1020, resource, first[2]), (1030, resource + "-next", second[2]))
+                    ]
+                    self.assertEqual(current["holders"], expected[wait_id])
+                    _ = self.run_command("finish-wait", "--session-dir", str(session), "--wait-id", wait_id, at=1040)
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1050)))
+        waits = cast(list[dict[str, object]], report["waits"])
+        self.assertEqual(len(waits), 6)
+        for wait in waits:
+            self.assertEqual(wait["holders"], expected[str(wait["wait_id"])])
+            self.assertEqual(wait["owner_session"], "waiting-session")
+            self.assertEqual(cast(dict[str, object], wait["wait_end"])["epoch"], 1040)
+
+    def test_unnamed_holder_is_explicit_and_can_follow_a_named_holder(self) -> None:
+        session = self.covered_wait_phase("unnamed-holder")
+        wait_id = self.run_command("start-wait", "--session-dir", str(session), "--kind", "ReadyWithoutCapacity", at=1020)
+        _ = self.run_command("wait-holder", "--session-dir", str(session), "--wait-id", wait_id,
+                             "--holder-resource-kind", "slot", "--holder-resource", "slot-a", "--holder-unit", "unit-a", at=1030)
+        _ = self.run_command("wait-holder", "--session-dir", str(session), "--wait-id", wait_id, at=1040)
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1050)))
+        wait, = cast(list[dict[str, object]], report["waits"])
+        holders = cast(list[dict[str, object]], wait["holders"])
+        self.assertEqual([entry["epoch"] for entry in holders], [1020, 1030, 1040])
+        self.assertEqual([entry["holder"] for entry in holders], [
+            {"state": "HolderNotNamed", "reason": "producer named no holder"},
+            {"state": "NamedHolder", "resource_kind": "slot", "resource": "slot-a",
+             "holder": {"state": "UnitHolder", "unit": "unit-a"}},
+            {"state": "HolderNotNamed", "reason": "producer named no holder"}])
+
+    def test_incomplete_or_blank_holder_flags_are_refused_without_writing_history(self) -> None:
+        name = "invalid-holder-flags"
+        session = self.covered_wait_phase(name)
+        wait_id = self.run_command("start-wait", "--session-dir", str(session), "--kind", "ReadyWithoutCapacity", at=1020)
+        before = self.read_events(name)
+        invalid = (
+            ("--holder-resource-kind", "slot"), ("--holder-resource", "slot-a"), ("--holder-session", "session-a"),
+            ("--holder-unit", "unit-a"), ("--holder-resource-kind", "slot", "--holder-resource", "slot-a"),
+            ("--holder-resource-kind", "slot", "--holder-unit", "unit-a"),
+            ("--holder-resource", "slot-a", "--holder-session", "session-a"),
+            ("--holder-resource-kind", "slot", "--holder-resource", "slot-a", "--holder-session", "a", "--holder-unit", "b"),
+            ("--holder-resource-kind", "slot", "--holder-resource", " ", "--holder-session", "a"),
+            ("--holder-resource-kind", "slot", "--holder-resource", "slot-a", "--holder-session", ""),
+            ("--holder-resource-kind", "slot", "--holder-resource", "slot-a", "--holder-unit", " "),
+            ("--holder-resource-kind", "disk", "--holder-resource", "disk-a", "--holder-unit", "unit-a"),
+        )
+        for flags in invalid:
+            for verb, selector in (("start-wait", ("--kind", "ReadyWithoutCapacity")), ("wait-holder", ("--wait-id", wait_id))):
+                with self.subTest(flags=flags, verb=verb):
+                    result = self.run_failing_command(verb, "--session-dir", str(session), *selector, *flags, at=1030)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertEqual(self.read_events(name), before)
+
+    def test_holder_flags_are_refused_for_noncapacity_waits(self) -> None:
+        name = "noncapacity-holder"
+        session = self.covered_wait_phase(name)
+        flags = ("--holder-resource-kind", "slot", "--holder-resource", "slot-a", "--holder-session", "session-a")
+        for kind in ("WaitingForUser", "WaitingForSupplier", "WaitingForMergeGate"):
+            with self.subTest(kind=kind):
+                wait_id = self.run_command("start-wait", "--session-dir", str(session), "--kind", kind, at=1020)
+                before = self.read_events(name)
+                for verb, selector in (("start-wait", ("--kind", kind)), ("wait-holder", ("--wait-id", wait_id))):
+                    result = self.run_failing_command(verb, "--session-dir", str(session), *selector, *flags, at=1030)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertEqual(self.read_events(name), before)
+
+    def test_holder_update_refuses_closed_unknown_and_unclosed_waits(self) -> None:
+        name = "closed-holder"
+        session = self.covered_wait_phase(name)
+        finished = self.run_command("start-wait", "--session-dir", str(session), "--kind", "WaitingForQuotaRefusal", at=1020)
+        unclosed = self.run_command("start-wait", "--session-dir", str(session), "--kind", "WaitingForMemoryOrSlot", at=1021)
+        _ = self.run_command("finish-wait", "--session-dir", str(session), "--wait-id", finished, at=1030)
+        _ = self.run_command("finish-phase", "--session-dir", str(session), "--status", "completed", at=1040)
+        before = self.read_events(name)
+        for wait_id in (finished, unclosed, "not-recorded"):
+            with self.subTest(wait_id=wait_id):
+                result = self.run_failing_command("wait-holder", "--session-dir", str(session), "--wait-id", wait_id,
+                    "--holder-resource-kind", "account", "--holder-resource", "account-a", "--holder-unit", "unit-a", at=1050)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(self.read_events(name), before)
+
+    def test_history_before_holder_support_reports_unknown_holder_and_keeps_new_observations(self) -> None:
+        name = "old-holder-history"
+        session = self.covered_wait_phase(name)
+        wait_id = self.run_command("start-wait", "--session-dir", str(session), "--kind", "WaitingForQuotaRefusal", at=1020)
+        events = [{key: value for key, value in event.items() if key != "holder"} for event in self.read_events(name)]
+        path = self.history_dir / "runs" / f"{name}.jsonl"
+        _ = path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1030)))
+        wait, = cast(list[dict[str, object]], report["waits"])
+        expected: list[dict[str, object]] = [{"at": "1970-01-01T00:17:00.000+00:00", "epoch": 1020,
+                                            "holder": {"state": "HolderNotNamed", "reason": "recorded before holders"}}]
+        self.assertEqual(wait["holders"], expected)
+        _ = self.run_command("wait-holder", "--session-dir", str(session), "--wait-id", wait_id,
+            "--holder-resource-kind", "account", "--holder-resource", "account-a", "--holder-session", "session-a", at=1040)
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1050)))
+        wait, = cast(list[dict[str, object]], report["waits"])
+        holders = cast(list[dict[str, object]], wait["holders"])
+        self.assertEqual(holders[:1], expected)
+        self.assertEqual(holders[1]["epoch"], 1040)
+        self.assertEqual(holders[1]["holder"], {"state": "NamedHolder", "resource_kind": "account", "resource": "account-a",
+                                             "holder": {"state": "SessionHolder", "session_id": "session-a"}})
+
+    def test_each_wait_kind_records_its_cause_owner_phase_and_actual_end(self) -> None:
+        session = self.covered_wait_phase("wait-kinds")
+        kinds = ("WaitingForQuotaRefusal", "WaitingForMemoryOrSlot", "WaitingForMergeGate",
+                 "WaitingForUser", "WaitingForSupplier", "ReadyWithoutCapacity")
+        for index, kind in enumerate(kinds):
+            started = 1020 + index * 10
+            wait_id = self.run_command("start-wait", "--session-dir", str(session), "--kind", kind,
+                                       "--reason", f"Cause {kind}", "--owner-session", "worker-session",
+                                       "--unit", "unit-a", at=started)
+            _ = self.run_command("finish-wait", "--session-dir", str(session), "--wait-id", wait_id, at=started + 5)
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1100)))
+        waits = cast(list[dict[str, object]], report["waits"])
+        self.assertEqual((report["covered_n"], report["missing_n"]), (1, 0))
+        self.assertEqual([wait["wait_kind"] for wait in waits], list(kinds))
+        phase = next(event for event in self.read_events("wait-kinds") if event["event_type"] == "phase_started")
+        for index, wait in enumerate(waits):
+            self.assertEqual(wait["wait_reason"], f"Cause {kinds[index]}")
+            self.assertEqual((wait["phase_id"], wait["phase_instance_id"], wait["owner_session"], wait["unit"]),
+                             ("6", phase["phase_instance_id"], "worker-session", "unit-a"))
+            end = cast(dict[str, object], wait["wait_end"])
+            self.assertEqual(end, {"state": "Finished", "at": datetime.fromtimestamp(1025 + index * 10, UTC).isoformat(timespec="milliseconds"),
+                                   "epoch": 1025 + index * 10})
+            self.assertEqual(wait["wait_started_epoch"], 1020 + index * 10)
+
+    def test_explicit_and_account_probe_sessions_write_no_wait(self) -> None:
+        session = self.covered_wait_phase("wait-probes")
+        before = self.read_events("wait-probes")
+        for flag in (True, False):
+            with patch.dict(os.environ, {"CLAUDE_PROBE_SESSION": "0" if flag else "1"}):
+                result = self.run_command("start-wait", "--session-dir", str(session), "--kind", "WaitingForQuotaRefusal",
+                                          *(("--probe",) if flag else ()), at=1020)
+            self.assertEqual(result, "")
+        self.assertEqual(self.read_events("wait-probes"), before)
+
+    def test_closing_one_overlapping_wait_leaves_the_other_open_and_phase_end_marks_it_unclosed(self) -> None:
+        session = self.covered_wait_phase("wait-overlap")
+        first = self.run_command("start-wait", "--session-dir", str(session), "--kind", "WaitingForUser", at=1020)
+        second = self.run_command("start-wait", "--session-dir", str(session), "--kind", "WaitingForSupplier", at=1030)
+        _ = self.run_command("finish-wait", "--session-dir", str(session), "--wait-id", first, at=1040)
+        _ = self.run_command("finish-wait", "--session-dir", str(session), "--wait-id", first, at=1041)
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1050)))
+        waits = {str(wait["wait_id"]): wait for wait in cast(list[dict[str, object]], report["waits"])}
+        self.assertEqual(waits[second]["wait_end"], {"state": "Open"})
+        self.assertEqual(waits[first]["owner_session"], "main-wait-overlap")
+        _ = self.run_command("finish-phase", "--session-dir", str(session), "--status", "completed", at=1060)
+        _ = self.run_command("finish-wait", "--session-dir", str(session), "--wait-id", second, at=1070)
+        events = self.read_events("wait-overlap")
+        unclosed = [event for event in events if event["event_type"] == "wait_unclosed"]
+        self.assertEqual(len(unclosed), 1)
+        self.assertEqual((unclosed[0]["wait_id"], unclosed[0]["wait_started_epoch"], unclosed[0]["wait_end"]),
+                         (second, 1030, {"state": "Unclosed"}))
+        self.assertEqual(len([event for event in events if event["event_type"] == "wait_finished"]), 1)
+
+    def test_waits_keep_parked_and_reopened_phase_instances_apart(self) -> None:
+        session = self.covered_wait_phase("wait-instances")
+        first = self.run_command("start-wait", "--session-dir", str(session), "--kind", "WaitingForUser", at=1020)
+        _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "7", "--phase-title", "Other", at=1030)
+        second = self.run_command("start-wait", "--session-dir", str(session), "--kind", "WaitingForSupplier", at=1040)
+        third = self.run_command("start-wait", "--session-dir", str(session), "--phase-id", "6", "--kind", "WaitingForMergeGate", at=1045)
+        _ = self.run_command("finish-phase", "--session-dir", str(session), "--phase-id", "6", "--status", "completed", at=1050)
+        _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "6", "--phase-title", "Reopened", at=1060)
+        reopened = self.run_command("start-wait", "--session-dir", str(session), "--kind", "WaitingForUser", at=1070)
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1080)))
+        waits = {str(wait["wait_id"]): wait for wait in cast(list[dict[str, object]], report["waits"])}
+        self.assertEqual(waits[first]["wait_end"], {"state": "Unclosed"})
+        self.assertEqual(waits[third]["phase_instance_id"], waits[first]["phase_instance_id"])
+        self.assertEqual(waits[second]["wait_end"], {"state": "Open"})
+        self.assertNotEqual(waits[reopened]["phase_instance_id"], waits[first]["phase_instance_id"])
+        self.assertEqual(waits[reopened]["wait_end"], {"state": "Open"})
+
+    def test_covered_phase_without_any_wait_reports_zero_instead_of_missing_history(self) -> None:
+        session = self.covered_wait_phase("wait-zero")
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1020)))
+        self.assertEqual((report["covered_n"], report["missing_n"], report["waits"]), (1, 0, []))
+        phase = cast(list[dict[str, object]], report["phases"])[0]
+        self.assertEqual((phase["state"], phase["wait_n"]), ("Covered", 0))
+
+    def test_slot_waits_follow_the_live_pass_across_reused_servers_and_parked_phases(self) -> None:
+        session = self.covered_wait_phase("wait-slot")
+        self.team_slot = "impl"
+        _ = self.run_command("start-pass", "--session-dir", str(session), "--phase-id", "6",
+                             "--pass-kind", "impl", "--activity", "work in six", "--called-task", "direct.impl",
+                             "--called-family", "codex", "--called-model", "gpt-called", at=1015)
+        _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "7",
+                             "--phase-title", "Parallel phase", at=1020)
+        self.team_slot = "test"
+        _ = self.run_command("start-pass", "--session-dir", str(session), "--phase-id", "7",
+                             "--pass-kind", "impl", "--activity", "work in seven", "--called-task", "direct.impl",
+                             "--called-family", "codex", "--called-model", "gpt-called", at=1025)
+        with patch.dict(os.environ, {"UNIT_PHASE_ID": "closed-server-phase"}):
+            first = self.run_command("start-wait", "--session-dir", str(session), "--slot", "impl",
+                                     "--kind", "WaitingForMemoryOrSlot", at=1030)
+            self.team_slot = "impl"
+            _ = self.run_command("finish-pass", "--session-dir", str(session), "--status", "completed", at=1040)
+            _ = self.run_command("start-pass", "--session-dir", str(session), "--phase-id", "7",
+                                 "--pass-kind", "impl", "--activity", "next dispatch", "--called-task", "direct.impl",
+                                 "--called-family", "codex", "--called-model", "gpt-called", at=1045)
+            second = self.run_command("start-wait", "--session-dir", str(session), "--slot", "impl",
+                                      "--kind", "WaitingForMemoryOrSlot", at=1050)
+        records = {str(event["wait_id"]): event for event in self.read_events("wait-slot")
+                   if event["event_type"] == "wait_started"}
+        self.assertEqual((records[first]["phase_id"], records[second]["phase_id"]), ("6", "7"))
+        self.assertNotEqual(records[first]["phase_instance_id"], records[second]["phase_instance_id"])
+
+    def test_unresolved_slot_wait_is_counted_without_borrowing_the_current_phase(self) -> None:
+        session = self.covered_wait_phase("wait-missing-slot")
+        wait_id = self.run_command("start-wait", "--session-dir", str(session), "--slot", "absent",
+                                   "--kind", "WaitingForMemoryOrSlot", "--reason", "admission busy", at=1020)
+        _ = self.run_command("finish-wait", "--session-dir", str(session), "--wait-id", wait_id, at=1030)
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
+        self.assertEqual((report["missing_n"], report["waits"]), (1, []))
+        missing = cast(list[dict[str, object]], report["missing"])[0]
+        self.assertEqual((missing["wait_id"], missing["requested_slot"], missing["phase_instance_id"]),
+                         (wait_id, "absent", ""))
+        self.assertIn("no open pass", str(missing["wait_record_state"]))
+        self.assertEqual(missing["wait_end"], {"state": "NotRecorded"})
+        self.assertEqual(missing["wait_reason"], "admission busy")
+
+    def test_merge_wait_can_start_after_finish_and_keeps_the_original_phase_instance(self) -> None:
+        session = self.covered_wait_phase("wait-after-phase")
+        original = next(event for event in self.read_events("wait-after-phase") if event["event_type"] == "phase_started")
+        _ = self.run_command("finish-phase", "--session-dir", str(session), "--status", "completed", at=1020)
+        _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "6",
+                             "--phase-title", "Reopened six", at=1030)
+        wait_id = self.run_command("start-wait", "--session-dir", str(session), "--phase-instance-id",
+                                   str(original["phase_instance_id"]), "--kind", "WaitingForMergeGate", at=1040)
+        _ = self.run_command("finish-wait", "--session-dir", str(session), "--wait-id", wait_id, at=1050)
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1060)))
+        wait = cast(list[dict[str, object]], report["waits"])[0]
+        self.assertEqual(wait["phase_instance_id"], original["phase_instance_id"])
+        self.assertEqual(wait["phase_id"], "6")
+        self.assertEqual(cast(dict[str, object], wait["wait_end"])["epoch"], 1050)
+        phases = cast(list[dict[str, object]], report["phases"])
+        self.assertEqual([(phase["wait_n"], phase["state"]) for phase in phases], [(1, "Covered"), (0, "Covered")])
+
+    def test_missing_merge_emission_prevents_covered_zero_and_obeys_the_read_window(self) -> None:
+        session = self.covered_wait_phase("wait-missing-merge")
+        original = next(event for event in self.read_events("wait-missing-merge") if event["event_type"] == "phase_started")
+        _ = self.run_command("finish-phase", "--session-dir", str(session), "--status", "completed", at=1020)
+        _ = self.run_command("start-wait", "--session-dir", str(session), "--phase-instance-id",
+                             str(original["phase_instance_id"]), "--kind", "WaitingForMergeGate",
+                             "--missing-reason", "gate observer lost its start", at=1030)
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
+        phase = cast(list[dict[str, object]], report["phases"])[0]
+        self.assertEqual((report["covered_n"], report["missing_n"], phase["state"]), (0, 1, "HistoryNotRecorded"))
+        self.assertNotIn("wait_n", phase)
+        self.assertEqual(phase["wait_missing_n"], 1)
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session),
+                                  "--since", "1970-01-01T00:17:10Z", "--until", "1970-01-01T00:17:20Z", at=1050)))
+        self.assertEqual((report["phases"], report["missing_n"]), ([], 1))
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session),
+                                  "--until", "1970-01-01T00:17:10Z", at=1050)))
+        self.assertEqual(report["missing_n"], 0)
+
+    def test_unknown_phase_instance_is_a_missing_record_even_when_another_phase_is_open(self) -> None:
+        session = self.covered_wait_phase("wait-unknown-instance")
+        _ = self.run_command("start-wait", "--session-dir", str(session), "--phase-instance-id", "unknown-instance",
+                             "--kind", "WaitingForMergeGate", at=1020)
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
+        missing = cast(list[dict[str, object]], report["missing"])[0]
+        self.assertEqual((report["missing_n"], missing["requested_phase_instance_id"], missing["phase_instance_id"]),
+                         (1, "unknown-instance", ""))
+
+    def test_emitter_without_a_phase_selector_records_the_miss_without_charging_an_open_phase(self) -> None:
+        session = self.covered_wait_phase("wait-no-selector")
+        _ = self.run_command("start-wait", "--session-dir", str(session), "--kind", "WaitingForMemoryOrSlot",
+                             "--missing-reason", "verification has no worker slot", at=1020)
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
+        missing = cast(list[dict[str, object]], report["missing"])[0]
+        self.assertEqual((report["missing_n"], missing["phase_id"], missing["phase_instance_id"]), (1, "", ""))
+        phase = cast(list[dict[str, object]], report["phases"])[0]
+        self.assertEqual((phase["state"], phase["wait_n"]), ("Covered", 0))
+
+    def test_covered_zero_and_old_unrecorded_phase_are_distinct_and_window_is_half_open(self) -> None:
+        session = self.covered_wait_phase("wait-window")
+        _ = self.run_command("start-wait", "--session-dir", str(session), "--kind", "WaitingForUser", at=1020)
+        _ = self.run_command("start-wait", "--session-dir", str(session), "--kind", "WaitingForSupplier", at=1030)
+        history_file = self.history_dir / "runs" / "wait-window.jsonl"
+        events = self.read_events("wait-window")
+        old_phase = dict(next(event for event in events if event["event_type"] == "phase_started"))
+        old_phase.update({"run_id": "old", "phase_instance_id": "old-phase", "timestamp_epoch": 1015})
+        del old_phase["wait_coverage"]
+        _ = history_file.write_text("\n".join(json.dumps(event) for event in [*events, old_phase]))
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--since", "1970-01-01T00:16:50Z",
+                                            "--until", "1970-01-01T00:17:00Z", at=1100)))
+        self.assertEqual((report["covered_n"], report["missing_n"]), (1, 1))
+        phases = cast(list[dict[str, object]], report["phases"])
+        self.assertEqual(phases[0]["wait_n"], 0)
+        self.assertEqual(phases[1]["state"], "HistoryNotRecorded")
+        self.assertNotIn("wait_n", phases[1])
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--since", "1970-01-01T00:17:00Z",
+                                            "--until", "1970-01-01T00:17:10Z", at=1100)))
+        self.assertEqual([wait["wait_kind"] for wait in cast(list[dict[str, object]], report["waits"])], ["WaitingForUser"])
+
+    def test_wait_rows_without_ids_count_as_ignored_and_unrecorded_for_their_phase(self) -> None:
+        name = "wait-without-id"
+        session = self.covered_wait_phase(name)
+        _ = self.run_command("start-wait", "--session-dir", str(session), "--kind", "WaitingForUser", at=1020)
+        events = self.read_events(name)
+        wait = next(event for event in events if event["event_type"] == "wait_started")
+        history = self.history_dir / "runs" / f"{name}.jsonl"
+        for event_type in ("wait_started", "wait_finished", "wait_unclosed", "wait_not_recorded"):
+            for absent in (True, False):
+                with self.subTest(event_type=event_type, absent=absent):
+                    broken = {**wait, "event_type": event_type, "wait_id": ""}
+                    if absent:
+                        del broken["wait_id"]
+                    _ = history.write_text("\n".join(json.dumps(event) for event in [*events[:-1], broken]))
+                    for arguments in ((), ("--session-dir", str(session))):
+                        report = cast(dict[str, object], json.loads(self.run_command("waits", *arguments, at=1040)))
+                        phase, = cast(list[dict[str, object]], report["phases"])
+                        self.assertEqual((report["ignored_n"], report["wait_without_id_n"], report["covered_n"]), (1, 1, 0))
+                        self.assertEqual((phase["state"], phase["reason"], phase["wait_without_id_n"]),
+                                         ("HistoryNotRecorded", "wait record has no wait id", 1))
+                        self.assertNotIn("wait_n", phase)
+                        self.assertEqual(report["waits"], [])
+
+    def test_wait_without_id_keeps_missing_record_fields_and_matches_both_phase_keys(self) -> None:
+        name = "wait-without-id-and-missing"
+        session = self.covered_wait_phase(name)
+        phase = next(event for event in self.read_events(name) if event["event_type"] == "phase_started")
+        _ = self.run_command("start-wait", "--session-dir", str(session), "--phase-instance-id",
+                             str(phase["phase_instance_id"]), "--kind", "WaitingForMergeGate",
+                             "--missing-reason", "observer missed start", at=1020)
+        events = self.read_events(name)
+        broken = {**events[-1], "wait_id": "", "event_type": "wait_finished"}
+        other_run = {**phase, "run_id": "other-run"}
+        other_phase = {**phase, "phase_instance_id": "other-phase"}
+        _ = (self.history_dir / "runs" / f"{name}.jsonl").write_text(
+            "\n".join(json.dumps(event) for event in [*events, broken, other_run, other_phase]))
+        report = cast(dict[str, object], json.loads(self.run_command("waits", at=1040)))
+        first, second, third = cast(list[dict[str, object]], report["phases"])
+        self.assertEqual((report["wait_without_id_n"], report["ignored_n"], report["missing_record_n"]), (1, 1, 1))
+        self.assertEqual((first["state"], first["reason"], first["wait_missing_n"], first["recorded_wait_n"],
+                          first["wait_without_id_n"]), ("HistoryNotRecorded", "wait emission has a missing record", 1, 0, 1))
+        self.assertEqual((second["state"], third["state"]), ("Covered", "Covered"))
+        self.assertNotIn("wait_without_id_n", second)
+        self.assertNotIn("wait_without_id_n", third)
+
+    def phase_source_fixture(self, name: str) -> tuple[Path, Path, Path]:
+        session = self.start_run(name, 1000)
+        worktree = self.root / "widget-enhancements"
+        worktree.mkdir()
+        git_directory = self.root / "hana" / ".git" / "worktrees" / "widget-enhancements"
+        git_directory.mkdir(parents=True)
+        _ = (git_directory / "commondir").write_text("../..\n")
+        _ = (worktree / ".git").write_text("gitdir: ../hana/.git/worktrees/widget-enhancements\n")
+        plan = worktree / "tool-based-ui-widget.md"
+        _ = plan.write_text("> **Production:** Hana — unit `widgets`; production doc `hana.md`\n")
+        state_path = session / "progress_history_state.json"
+        state = cast(dict[str, object], json.loads(state_path.read_text()))
+        state.update(working_dir=str(worktree), worktree=worktree.name,
+                     project_plan_doc=plan.name, plan_doc="superseded-plan.md")
+        _ = state_path.write_text(json.dumps(state))
+        return session, worktree, plan
+
+    def test_new_phase_records_plan_production_and_common_repository_before_worktree_is_retired(self) -> None:
+        name = "phase-source-new"
+        session, worktree, plan = self.phase_source_fixture(name)
+        _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "6",
+                             "--phase-title", "Phase source", at=1010)
+        started = next(event for event in self.read_events(name) if event["event_type"] == "phase_started")
+        self.assertEqual(started["production"], {"state": "Recorded", "value": "Hana"})
+        self.assertEqual(started["unit"], {"state": "Recorded", "value": "widgets"})
+        self.assertEqual(started["repository"], {"state": "Recorded", "value": "hana"})
+        _ = worktree.rename(self.root / "retired-worktree")
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
+        phase, = cast(list[dict[str, object]], report["phases"])
+        self.assertEqual(phase["plan_doc"], {"state": "Recorded", "value": plan.name})
+        self.assertEqual(phase["production"], started["production"])
+        self.assertEqual(phase["repository"], started["repository"])
+        self.assertEqual(phase["unit"], "widget-enhancements")
+
+    def test_phase_source_prefers_explicit_run_identity_to_plan_header(self) -> None:
+        name = "phase-source-explicit"
+        session, worktree, plan = self.phase_source_fixture(name)
+        _ = self.run_command("set-unit", "--session-dir", str(session), "--production", "Other production",
+                             "--unit", "other-unit", at=1005)
+        _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "6",
+                             "--phase-title", "Phase source", at=1010)
+        started = next(event for event in self.read_events(name) if event["event_type"] == "phase_started")
+        self.assertEqual((started["production"], started["unit"]),
+                         ({"state": "Recorded", "value": "Other production"}, {"state": "Recorded", "value": "other-unit"}))
+        self.assertEqual(started["working_dir"], str(worktree))
+        report = cast(dict[str, object], json.loads(self.run_command("waits", at=1040)))
+        phase, = cast(list[dict[str, object]], report["phases"])
+        self.assertEqual(phase["production"], started["production"])
+        self.assertEqual(phase["plan_doc"], {"state": "Recorded", "value": plan.name})
+
+    def test_old_phases_resolve_plan_header_and_common_repository_once_per_run(self) -> None:
+        name = "phase-source-old"
+        session, worktree, plan = self.phase_source_fixture(name)
+        _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "6",
+                             "--phase-title", "Phase source", at=1010)
+        _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "7",
+                             "--phase-title", "Next phase source", at=1020)
+        events = self.read_events(name)
+        for event in events:
+            if event["event_type"] == "phase_started":
+                for key in ("production", "unit", "repository", "wait_coverage"):
+                    del event[key]
+                # Legacy plan_doc is still used when project_plan_doc is empty.
+                event.update(project_plan_doc="", plan_doc=plan.name)
+        _ = (self.history_dir / "runs" / f"{name}.jsonl").write_text("\n".join(json.dumps(event) for event in events))
+        reads: list[Path] = []
+        read_text = Path.read_text
+
+        def read_source(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            reads.append(path)
+            return read_text(path, encoding=encoding, errors=errors)
+
+        with patch.object(Path, "read_text", read_source), patch.object(
+            subprocess, "run", side_effect=AssertionError("waits must only read files")
+        ):
+            report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
+        phases = cast(list[dict[str, object]], report["phases"])
+        self.assertEqual(len(phases), 2)
+        for phase in phases:
+            self.assertEqual(phase["state"], "HistoryNotRecorded")
+            self.assertEqual(phase["plan_doc"], {"state": "Recorded", "value": plan.name})
+            self.assertEqual(phase["production"], {"state": "Recorded", "value": "Hana"})
+            self.assertEqual(phase["repository"], {"state": "Recorded", "value": "hana"})
+        self.assertEqual(reads.count(plan), 1)
+        self.assertEqual(reads.count(worktree / ".git"), 1)
+        self.assertEqual(sum(path.name == "commondir" for path in reads), 1)
+
+    def test_old_phase_with_removed_worktree_reports_metadata_not_recorded(self) -> None:
+        name = "phase-source-gone"
+        session, worktree, plan = self.phase_source_fixture(name)
+        _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "6",
+                             "--phase-title", "Phase source", at=1010)
+        events = self.read_events(name)
+        for event in events:
+            if event["event_type"] == "phase_started":
+                for key in ("production", "unit", "repository", "wait_coverage"):
+                    del event[key]
+        history = self.history_dir / "runs" / f"{name}.jsonl"
+        _ = history.write_text("\n".join(json.dumps(event) for event in events))
+        _ = worktree.rename(self.root / "retired-worktree")
+        report = cast(dict[str, object], json.loads(self.run_command("waits", at=1040)))
+        phase, = cast(list[dict[str, object]], report["phases"])
+        self.assertEqual(phase["plan_doc"], {"state": "Recorded", "value": plan.name})
+        self.assertEqual(phase["state"], "HistoryNotRecorded")
+        for field in ("production", "repository"):
+            value = cast(dict[str, object], phase[field])
+            self.assertEqual(value["state"], "NotRecorded")
+            self.assertTrue(value["reason"])
+        for event in events:
+            event.update(project_plan_doc="", plan_doc="")
+        _ = history.write_text("\n".join(json.dumps(event) for event in events))
+        report = cast(dict[str, object], json.loads(self.run_command("waits", at=1040)))
+        phase, = cast(list[dict[str, object]], report["phases"])
+        self.assertEqual(phase["plan_doc"], {"state": "NotRecorded", "reason": "phase has no plan document"})
+
+    def test_new_phases_record_production_without_requiring_a_unit_header(self) -> None:
+        name = "phase-bare-production-new"
+        session, worktree, plan = self.phase_source_fixture(name)
+        headers = (
+            ("> **Production:** natedev", "natedev", ""),
+            ("> **Production:** build-followups (enh-showrunner-unit)", "build-followups", ""),
+            (f"> **Production:** natedev — unit herdr-unit, worktree {worktree}", "natedev", "herdr-unit"),
+            ("> **Production: natedev**", "natedev", ""),
+            ("> **Production: build-followups** (enh-showrunner-unit)", "build-followups", ""),
+            (f"> **Production: natedev** — unit `herdr-unit`; worktree {worktree}", "natedev", "herdr-unit"),
+        )
+        for index, (header, production, unit) in enumerate(headers):
+            with self.subTest(header=header):
+                _ = plan.write_text(header + "\n", encoding="utf-8")
+                _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", str(index + 1),
+                                     "--phase-title", "Production without unit", at=1010 + index)
+                started = [event for event in self.read_events(name) if event["event_type"] == "phase_started"][-1]
+                self.assertEqual(started["production"], {"state": "Recorded", "value": production})
+                if unit:
+                    self.assertEqual(started["unit"], {"state": "Recorded", "value": unit})
+                else:
+                    self.assertEqual(started["unit"], {"state": "NotRecorded", "reason": "phase plan header names no unit"})
+                report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
+                phase = cast(list[dict[str, object]], report["phases"])[-1]
+                self.assertEqual(phase["production"], {"state": "Recorded", "value": production})
+
+    def test_old_phases_read_production_from_headers_without_a_quoted_unit(self) -> None:
+        name = "phase-bare-production-old"
+        session, worktree, plan = self.phase_source_fixture(name)
+        _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "6",
+                             "--phase-title", "Legacy production", at=1010)
+        events = self.read_events(name)
+        for event in events:
+            if event["event_type"] == "phase_started":
+                for key in ("production", "unit", "repository", "wait_coverage"):
+                    del event[key]
+        _ = (self.history_dir / "runs" / f"{name}.jsonl").write_text("\n".join(json.dumps(event) for event in events))
+        headers = (
+            ("> **Production:** natedev", "natedev"),
+            ("> **Production:** build-followups (enh-showrunner-unit)", "build-followups"),
+            (f"> **Production:** natedev — unit herdr-unit, worktree {worktree}", "natedev"),
+            ("> **Production: natedev**", "natedev"),
+            ("> **Production: build-followups** (enh-showrunner-unit)", "build-followups"),
+            (f"> **Production: natedev** — unit herdr-unit, worktree {worktree}", "natedev"),
+        )
+        for header, production in headers:
+            with self.subTest(header=header):
+                _ = plan.write_text(header + "\n", encoding="utf-8")
+                report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
+                phase, = cast(list[dict[str, object]], report["phases"])
+                self.assertEqual(phase["production"], {"state": "Recorded", "value": production})
+                self.assertEqual(phase["state"], "HistoryNotRecorded")
+
+    def test_phase_production_and_unit_each_keep_their_run_state_override(self) -> None:
+        name = "phase-partial-source"
+        session, worktree, plan = self.phase_source_fixture(name)
+        state_path = session / "progress_history_state.json"
+        for index, (field, value, header, production, unit) in enumerate((
+            ("unit", "assigned-unit", "> **Production:** natedev", "natedev", "assigned-unit"),
+            ("production", "assigned-production", f"> **Production:** natedev — unit herdr-unit, worktree {worktree}",
+             "assigned-production", "herdr-unit"),
+        )):
+            with self.subTest(field=field):
+                state = cast(dict[str, object], json.loads(state_path.read_text()))
+                _ = state.pop("production", None)
+                _ = state.pop("unit", None)
+                state[field] = value
+                _ = state_path.write_text(json.dumps(state))
+                _ = plan.write_text(header + "\n", encoding="utf-8")
+                _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", str(index + 1),
+                                     "--phase-title", "Independent source fields", at=1010 + index)
+                started = [event for event in self.read_events(name) if event["event_type"] == "phase_started"][-1]
+                self.assertEqual(started["production"], {"state": "Recorded", "value": production})
+                self.assertEqual(started["unit"], {"state": "Recorded", "value": unit})
+                report = cast(dict[str, object], json.loads(self.run_command("waits", at=1040)))
+                self.assertEqual(cast(list[dict[str, object]], report["phases"])[-1]["production"], started["production"])
+
+    def test_waits_returns_json_when_a_legacy_plan_is_invalid_utf8_or_unreadable(self) -> None:
+        name = "phase-unreadable-plan"
+        session, worktree, plan = self.phase_source_fixture(name)
+        _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "6",
+                             "--phase-title", "Unreadable legacy plan", at=1010)
+        events = self.read_events(name)
+        for event in events:
+            if event["event_type"] == "phase_started":
+                for key in ("production", "unit", "repository", "wait_coverage"):
+                    del event[key]
+        _ = (self.history_dir / "runs" / f"{name}.jsonl").write_text("\n".join(json.dumps(event) for event in events))
+        _ = plan.write_bytes(b"> **Production:** natedev\n\xff")
+        for unavailable in ("invalid UTF-8", "missing file", "directory"):
+            with self.subTest(unavailable=unavailable):
+                if unavailable == "missing file":
+                    plan.unlink()
+                elif unavailable == "directory":
+                    plan.mkdir()
+                report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
+                phase, = cast(list[dict[str, object]], report["phases"])
+                production = cast(dict[str, object], phase["production"])
+                self.assertEqual(production["state"], "NotRecorded")
+                self.assertIn("phase plan cannot be read:", str(production["reason"]))
+                self.assertEqual(phase["repository"], {"state": "Recorded", "value": "hana"})
+                self.assertEqual(phase["unit"], worktree.name)
+                self.assertEqual(phase["state"], "HistoryNotRecorded")
+
+    def test_wait_reader_does_not_create_a_missing_session_or_its_lock(self) -> None:
+        missing = self.root / "absent-reader"
+        result = self.run_failing_command("waits", "--session-dir", str(missing), at=1100)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(missing.exists())
+
+    def test_wait_events_and_coverage_do_not_change_old_history_readers(self) -> None:
+        session = self.start_run("wait-old-readers", 1000)
+        self.start_phase_and_pass(session, 1010)
+        wait_id = self.run_command("start-wait", "--session-dir", str(session), "--kind", "WaitingForMemoryOrSlot", at=1020)
+        _ = self.run_command("finish-wait", "--session-dir", str(session), "--wait-id", wait_id, at=1030)
+        _ = self.run_command("finish-phase", "--session-dir", str(session), "--status", "completed", at=1060)
+        events = self.read_events("wait-old-readers")
+        old = [{key: value for key, value in event.items() if key != "wait_coverage"} for event in events
+               if not str(event["event_type"]).startswith("wait_")]
+        self.assertEqual(load_phases(events), load_phases(old))
+        normalize = cast(Callable[[str, dict[str, object], dict[str, int], dict[str, int]], object],
+                         vars(stage_history)["_normalize"])
+        rows = [normalize("unit-history", event, {}, {}) for event in events]
+        old_rows = [normalize("unit-history", event, {}, {}) for event in old]
+        self.assertEqual([row for row in rows if row is not None], [row for row in old_rows if row is not None])
+        self.assertEqual(len([row for row in rows if row is not None]), 1)
+
+    def test_merge_receipts_distinguish_source_and_merge_and_deduplicate_retries(self) -> None:
+        with patch.dict(os.environ, {"UNIT_HISTORY_DIR": str(self.history_dir)}):
+            first = progress_history.write_merge_receipt(project="hana", phase_id="6", merge_commit="merge-a",
+                       source_checkpoint="source-a", target_branch="sdlc", merged_at=1020)
+            retry = progress_history.write_merge_receipt(project="hana", phase_id="6", merge_commit="merge-a",
+                       source_checkpoint="source-a", target_branch="sdlc", merged_at=1080)
+            _ = progress_history.write_merge_receipt(project="hana", phase_id="child", merge_commit="merge-b",
+                       source_checkpoint="source-b", target_branch="sdlc", merged_at=1030, issue="HI7")
+        self.assertEqual(retry, first)
+        report = cast(dict[str, object], json.loads(self.run_command("receipts", "--since", "1970-01-01T00:17:00Z",
+                                    "--until", "1970-01-01T00:17:10Z", "--project", "hana", at=1100)))
+        self.assertEqual((report["covered_n"], report["missing_n"]), (1, 0))
+        receipt = cast(list[dict[str, object]], report["receipts"])[0]
+        self.assertEqual((receipt["merge_commit"], receipt["source_checkpoint"], receipt["target_branch"], receipt["phase_id"]),
+                         ("merge-a", "source-a", "sdlc", "6"))
+        self.assertEqual(receipt["merged_at"], "1970-01-01T00:17:00.000+00:00")
+        missing = cast(dict[str, object], json.loads(self.run_command("receipts", "--merge-commit", "without-receipt", at=1100)))
+        self.assertEqual((missing["covered_n"], missing["missing_n"], missing["missing"]),
+                         (0, 1, [{"state": "ReceiptMissing", "merge_commit": "without-receipt"}]))
+        self.assertEqual(len((self.history_dir / "merge_receipts.jsonl").read_text().splitlines()), 2)
+
+    def test_receipt_reader_reports_missing_history_without_creating_it(self) -> None:
+        report = cast(dict[str, object], json.loads(self.run_command("receipts", "--merge-commit", "missing", at=1100)))
+        self.assertEqual((report["covered_n"], report["missing_n"]), (0, 1))
+        self.assertFalse(self.history_dir.exists())
 
     def test_start_phase_records_work_order_size(self) -> None:
         started_at = 60_000
@@ -3500,6 +4636,44 @@ print('two homes isolated; recorder lock retained; caller restored')
             "review trial: ux 0 findings, code 6 findings, review-worker minutes 0, "
             + "ux check minutes 0, ux repair minutes 0",
         )
+
+    def test_a_recorded_zero_review_does_not_fall_back_to_director_findings(self) -> None:
+        self.write_full_config()
+        started_at = 71_600
+        session = self.start_run("zero-review-evidence", started_at)
+        self.start_phase(session, started_at + 10)
+        state = cast(dict[str, object], json.loads((session / "progress_history_state.json").read_text()))
+        instance = str(cast(dict[str, object], state["phase"])["instance_id"])
+        _ = self.run_findings(session, "open", "--severity", "minor", "--title", "director finding",
+                              "--caught-by", "worker", "--lens", "contract", at=started_at + 20)
+        with patch.object(plan_history, "history_root", return_value=self.history_dir):
+            self.assertIsInstance(progress_history._raised_code_findings(session, instance),  # pyright: ignore[reportPrivateUsage]
+                                  progress_history.NoRecordedCodeReview)
+        self.assertIn("code 1 findings", self.run_command("review-trial", "--session-dir", str(session), at=started_at + 30))
+        records = self.history_dir / "review_turns" / session.name
+        records.mkdir(parents=True)
+        _ = (records / "71620-123-0.json").write_text(json.dumps({
+            "phase_instance_id": instance, "arm": "own", "kind": "broad", "status": "reviewed", "raised": 0,
+        }))
+        with patch.object(plan_history, "history_root", return_value=self.history_dir):
+            self.assertEqual(progress_history._raised_code_findings(session, instance),  # pyright: ignore[reportPrivateUsage]
+                             progress_history.RecordedCodeFindings(0))
+        self.assertIn("code 0 findings", self.run_command("review-trial", "--session-dir", str(session), at=started_at + 40))
+
+    def test_pool_and_own_review_records_with_one_launcher_sequence_all_count(self) -> None:
+        self.write_full_config()
+        started_at = 71_700
+        session = self.start_run("mixed-review-evidence", started_at)
+        self.start_phase(session, started_at + 10)
+        state = cast(dict[str, object], json.loads((session / "progress_history_state.json").read_text()))
+        instance = cast(dict[str, object], state["phase"])["instance_id"]
+        records = self.history_dir / "review_turns" / session.name
+        records.mkdir(parents=True)
+        for sequence, arm, raised in ((0, "pool", 2), (1, "own", 3), (2, "own", 0)):
+            _ = (records / f"71720-123-{sequence}.json").write_text(json.dumps({
+                "phase_instance_id": instance, "arm": arm, "kind": "broad", "status": "reviewed", "raised": raised,
+            }))
+        self.assertIn("code 5 findings", self.run_command("review-trial", "--session-dir", str(session), at=started_at + 40))
 
     def test_review_trial_reports_the_screenshot_check_and_its_repair_minutes(self) -> None:
         """The check's own minutes, and only the fix rounds that covered a ux finding."""
