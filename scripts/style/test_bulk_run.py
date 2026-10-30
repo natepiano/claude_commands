@@ -222,6 +222,230 @@ class WorkspaceRunTests(CargoProjectTests):
                             available=lambda repo, path: None)
         return bulk.object_fields(cast(object, json.loads(path.read_text())))
 
+    def setup_values(self, *, dual_target: bool = False) -> tuple[ledger_api.Ledger, rules.Rule, tuple[ledger_api.HeldFinding, ...]]:
+        source = 'pub fn run() {\n    let first: usize = 42;\n    let second: usize = 43;\n    let third: usize = 44;\n}\n'
+        for prefix in ('', 'beta/'):
+            _ = (self.repo / (prefix + 'src/lib.rs')).write_text('mod worker;\n')
+            _ = (self.repo / (prefix + 'src/worker.rs')).write_text(source)
+        if dual_target:
+            _ = (self.repo / 'src/main.rs').write_text('mod worker;\nfn main() {}\n')
+        _ = self.git('add', '.')
+        _ = self.git('commit', '-qm', 'values fixture')
+        self.base = self.git('rev-parse', 'HEAD')
+        self.tree = self.git('rev-parse', 'HEAD^{tree}')
+        ledger = self.ledger()
+        _ = (self.root / 'style/rust/no-magic-values.md').write_text(
+            '---\ntier: B\nfamily: values\ninput_scope: file\npre_filter: magic-values\napproval: always\n---\n# Values\n')
+        definition = next(rule for rule in rules.load_rules(self.repo) if rule.name == 'no-magic-values')
+        ledger.set_tip(self.base)
+        paths = ['src/worker.rs', 'beta/src/worker.rs']
+        ledger.ticket_add('values-read-1', 'values-read', 'read', 'values', '.', paths, [definition.rule_id])
+        ledger.ticket_assign('values-read-1', 'main')
+        _ = ledger.ticket_base('values-read-1')
+        identities: list[str] = []
+        for index, (path, line, after, answer) in enumerate((
+            (paths[0], 2, 'Add `const FIRST: usize = 42;` in constants.rs.', ''),
+            (paths[1], 2, 'Add `const FIRST: usize = 42;` in constants.rs.', 'approved'),
+            (paths[0], 3, 'Compute a better value instead.', ''),
+            (paths[0], 4, 'Add `const THIRD: usize = 44;` in constants.rs.', 'declined'),
+        )):
+            issue = self.root / f'values-{index}.md'
+            _ = issue.write_text('---\nstatus: open\n' + (f'style_answer: {answer}\n' if answer else '') + '---\nValues decision\n')
+            finding = ledger.hold(definition.rule_id, path, line, source.splitlines()[line - 1],
+                                  'restructure', str(40 + line), after, definition.blob, 'values-read-1')
+            ledger.file_held(finding.finding_id, issue)
+            identities.append(finding.finding_id)
+        ledger.ticket_drop('values-read-1')
+        return ledger, definition, ledger.named_held(identities)
+
+    def test_values_apply_in_one_tested_commit_and_keep_refusals_filed(self) -> None:
+        ledger, definition, findings = self.setup_values()
+        with mock.patch.object(bulk, 'RustAnalyzer', side_effect=AssertionError('values started rust-analyzer')):
+            path = run.run_rule(self.repo, definition.rule_id, self.tree, ledger, runner=self.runner,
+                                available=lambda repo, path: None)
+        report = bulk.object_fields(cast(object, json.loads(path.read_text())))
+        self.assertEqual((report['applied'], report['refused'], report['reverted']), (2, 1, 0))
+        self.assertIn('no exact constant', str(report['refusals']))
+        self.assertEqual(report['skip_counts'], {'decision not approved': 1})
+        self.assertEqual([args[2] for _, args in self.runner.calls if args[0] == 'bash'], ['final', 'lint', 'final-pass'])
+        self.assertEqual(self.git('rev-list', '--count', f'{self.base}..HEAD'), '1')
+        self.assertIn('checkpointed', str(report['status']))
+        for prefix in ('', 'beta/'):
+            self.assertIn('pub(super) const FIRST: usize = 42;', (self.repo / (prefix + 'src/constants.rs')).read_text())
+            self.assertIn('let first: usize = FIRST;', (self.repo / (prefix + 'src/worker.rs')).read_text())
+        self.assertTrue(all(row['family'] == 'values' for row in cast(list[dict[str, object]], report['counts'])))
+        rows = ledger.named_held(finding.finding_id for finding in findings)
+        refused = set(cast(dict[str, str], report['refusals']))
+        for row in rows:
+            if row.finding_id in refused:
+                self.assertIsInstance(row.state, ledger_api.Filed)
+                self.assertIsInstance(row.build_ticket, ledger_api.NoBuildTicket)
+        self.assertEqual(self.git('status', '--porcelain'), '')
+
+    def test_values_diagnostics_revert_created_module_and_its_whole_extraction(self) -> None:
+        ledger, definition, _ = self.setup_values()
+        def fail_root(repo: Path, arguments: Sequence[str]) -> run.CommandResult:
+            result = self.runner(repo, arguments)
+            if len(arguments) > 1 and arguments[1] in ('check', 'clippy') and (repo / 'src/constants.rs').exists():
+                return run.CommandResult(1, json.dumps({'level': 'error', 'spans': [{'file_name': 'src/constants.rs'}]}))
+            return result
+        path = run.run_rule(self.repo, definition.rule_id, self.tree, ledger, runner=fail_root,
+                            available=lambda repo, path: None)
+        report = bulk.object_fields(cast(object, json.loads(path.read_text())))
+        self.assertEqual((report['applied'], report['refused'], report['reverted']), (1, 1, 1))
+        self.assertFalse((self.repo / 'src/constants.rs').exists())
+        self.assertEqual((self.repo / 'src/lib.rs').read_text(), 'mod worker;\n')
+        self.assertIn('let first: usize = 42;', (self.repo / 'src/worker.rs').read_text())
+        self.assertTrue((self.repo / 'beta/src/constants.rs').is_file())
+
+    def test_values_formatter_drift_and_red_tests_restore_new_and_existing_files(self) -> None:
+        ledger, definition, _ = self.setup_values()
+        self.runner.break_proof = True
+        report = self.execute(ledger, definition)
+        self.assertEqual((report['applied'], report['reverted']), (0, 2))
+        self.assertIn('post-format constant proof', str(report['status']))
+        self.assertEqual(self.git('rev-parse', 'HEAD'), self.base)
+        self.assertEqual(self.git('status', '--porcelain'), '')
+        self.runner = FakeRunner()
+        self.runner.red_tests = True
+        report = self.execute(ledger, definition)
+        self.assertEqual((report['applied'], report['reverted']), (0, 2))
+        self.assertIn('tests failed', str(report['status']))
+        self.assertEqual(self.git('status', '--porcelain'), '')
+        self.assertFalse((self.repo / 'src/constants.rs').exists())
+
+    def test_values_resume_after_process_loss_removes_recorded_creations(self) -> None:
+        ledger, definition, _ = self.setup_values()
+        stop_after_edit(self.repo / 'src/constants.rs', lambda: self.execute(ledger, definition))
+        self.assertTrue((self.repo / 'src/constants.rs').is_file())
+        report = self.execute(ledger, definition)
+        self.assertEqual((report['applied'], report['refused'], report['reverted']), (2, 1, 0))
+        self.assertIn('checkpointed', str(report['status']))
+
+    def test_values_shared_module_in_two_targets_is_proved_for_both_and_counted_once(self) -> None:
+        ledger, definition, _ = self.setup_values(dual_target=True)
+        report = self.execute(ledger, definition)
+        self.assertEqual((report['applied'], report['refused'], report['reverted']), (2, 1, 0))
+        self.assertIn('mod constants;', (self.repo / 'src/lib.rs').read_text())
+        self.assertIn('mod constants;', (self.repo / 'src/main.rs').read_text())
+        self.assertIn('checkpointed', str(report['status']))
+
+    def test_values_unproved_target_route_refuses_shared_worker(self) -> None:
+        ledger, definition, findings = self.setup_values(dual_target=True)
+        shared = next(finding for finding in findings if finding.path == 'src/worker.rs' and finding.line == 2)
+        binary = ('#[path="worker.rs"] mod worker;\n'
+                  + 'mod constants { pub(super) const FIRST: usize = 99; }\n'
+                  + 'fn main() { worker::run(); }\n')
+        _ = (self.repo / 'src/main.rs').write_text(binary)
+        _ = self.git('add', '.')
+        _ = self.git('commit', '-qm', 'attributed binary instance with a different constant')
+        self.base = self.git('rev-parse', 'HEAD')
+        self.tree = self.git('rev-parse', 'HEAD^{tree}')
+        ledger.set_tip(self.base)
+        plan = run.plan_constants(self.repo, ledger, self.base, run.select(ledger, definition))
+        self.assertNotIn('src/worker.rs', {edit.path for edit in plan.files})
+        self.assertTrue(any(item.finding_id == shared.finding_id
+                            and 'target src/main.rs' in item.reason and 'attributed module route' in item.reason
+                            for item in plan.refusals), repr(plan.refusals))
+        report = self.execute(ledger, definition)
+        self.assertEqual(report['applied'], 1, 'the independently proved beta target still applies')
+        self.assertIn(shared.finding_id, cast(dict[str, str], report['refusals']))
+        self.assertIn('let first: usize = 42;', (self.repo / 'src/worker.rs').read_text())
+        self.assertEqual((self.repo / 'src/main.rs').read_text(), binary)
+        self.assertFalse((self.repo / 'src/constants.rs').exists())
+        self.assertIsInstance(ledger.named_held((shared.finding_id,))[0].state, ledger_api.Filed)
+
+    def test_values_dangling_creation_symlink_refuses_before_any_write(self) -> None:
+        ledger, definition, _ = self.setup_values()
+        outside = self.root / 'outside-constants.rs'
+        link = self.repo / 'src/constants.rs'
+        link.symlink_to(outside)
+        report = self.execute(ledger, definition)
+        self.assertEqual(report['applied'], 0)
+        self.assertFalse(outside.exists(), 'a refused creation must never write outside the workspace')
+        self.assertIn('symlink', str(report['status']))
+        self.assertTrue(link.is_symlink(), 'rollback must preserve a symlink it did not create')
+        self.assertEqual(link.readlink(), outside)
+        self.assertFalse((self.repo / 'beta/src/constants.rs').exists())
+        self.assertEqual(self.git('diff', self.base), '')
+        self.assertFalse(self.runner.calls, 'preflight must precede formatting and validation')
+
+    def test_values_rollback_removes_ignored_owned_creations(self) -> None:
+        ledger, definition, findings = self.setup_values()
+        exclude = Path(self.git('rev-parse', '--path-format=absolute', '--git-path', 'info/exclude'))
+        _ = exclude.write_text(exclude.read_text() + '\nconstants.rs\n')
+        self.runner.break_proof = True
+        report = self.execute(ledger, definition)
+        self.assertEqual((report['applied'], report['reverted']), (0, 2))
+        self.assertIn('post-format constant proof', str(report['status']))
+        self.assertEqual(self.git('diff', self.base), '')
+        for prefix in ('', 'beta/'):
+            self.assertFalse((self.repo / (prefix + 'src/constants.rs')).exists())
+            self.assertEqual((self.repo / (prefix + 'src/lib.rs')).read_text(), 'mod worker;\n')
+        intent = run.WorkspaceIntent(self.repo, 'unused')
+        self.assertFalse(intent.path.exists(), 'all owned files must be removed before clearing the journal')
+        rows = ledger.named_held(item.finding_id for item in findings)
+        self.assertTrue(all(isinstance(row.state, ledger_api.Filed) for row in rows))
+
+    def test_values_preserve_preexisting_untracked_constant_file(self) -> None:
+        ledger, definition, _ = self.setup_values()
+        untracked = self.repo / 'src/constants.rs'
+        _ = untracked.write_text('// user work\n')
+        report = self.execute(ledger, definition)
+        self.assertEqual(report['applied'], 0)
+        self.assertIn('overwrite an untracked file', str(report['status']))
+        self.assertEqual(untracked.read_text(), '// user work\n')
+        self.assertEqual(self.git('diff', self.base), '')
+
+    def test_values_recovery_refuses_modified_creation_without_restoring_any_other_file(self) -> None:
+        ledger, definition, _ = self.setup_values()
+        stop_after_edit(self.repo / 'src/constants.rs', lambda: self.execute(ledger, definition))
+        _ = (self.repo / 'src/constants.rs').write_text('// independently changed\n')
+        before = self.git('diff', self.base)
+        with self.assertRaisesRegex(bulk.BulkRenameError, 'bytes do not match the recorded creation'):
+            _ = self.execute(ledger, definition)
+        self.assertEqual(self.git('diff', self.base), before)
+        self.assertEqual((self.repo / 'src/constants.rs').read_text(), '// independently changed\n')
+
+    def test_values_skip_a_file_held_by_another_open_ticket(self) -> None:
+        ledger, definition, findings = self.setup_values()
+        other = next(finding for finding in findings if finding.path.startswith('beta/'))
+        assert isinstance(other.state, ledger_api.Filed)
+        ledger.ticket_add('other-values-1', 'other-values', 'proposal', 'values', 'beta', [other.path],
+                          [definition.rule_id], proposal=str(other.state.proposal), finding_ids=(other.finding_id,))
+        report = self.execute(ledger, definition)
+        self.assertEqual((report['applied'], report['refused']), (1, 1))
+        self.assertIn('held by another open ticket', str(report['skip_counts']))
+        self.assertFalse((self.repo / 'beta/src/constants.rs').exists())
+
+    def test_values_planner_reads_base_sources_and_configured_cargo_target(self) -> None:
+        ledger, definition, _ = self.setup_values()
+        manifest = self.repo / 'Cargo.toml'
+        _ = manifest.write_text(manifest.read_text() + '\n[lib]\npath="src/entry.rs"\n')
+        _ = self.git('mv', 'src/lib.rs', 'src/entry.rs')
+        _ = self.git('add', '.')
+        _ = self.git('commit', '-qm', 'custom library target')
+        base = self.git('rev-parse', 'HEAD')
+        _ = (self.repo / 'src/worker.rs').write_text('dirty checkout bytes must not enter the snapshot')
+        # Site lineage is held fixed to inspect the planner's source boundary directly.
+        selected = run.select(ledger, definition)
+        def unchanged(ledger: ledger_api.Ledger, finding: ledger_api.HeldFinding, head: str,
+                      sources: run.RenameSources) -> ledger_api.HeldFinding:
+            del ledger, head, sources
+            return finding
+        with mock.patch.object(run, 'current_finding', side_effect=unchanged):
+            plan = run.plan_constants(self.repo, ledger, base, selected)
+        self.assertEqual(len({item.finding.finding_id for file in plan.files for item in file.kept}), 2)
+        self.assertTrue(any(file.path == 'src/entry.rs' for file in plan.files))
+        self.assertTrue(all('dirty checkout' not in file.original for file in plan.files))
+
+    def test_third_rule_family_refuses_and_names_both_supported_families(self) -> None:
+        ledger, definition, _ = self.setup_findings()
+        with mock.patch.object(rules, 'load_rules', return_value=(replace(definition, family='types'),)):
+            with self.assertRaisesRegex(bulk.BulkRenameError, 'names or values'):
+                _ = self.execute(ledger, definition)
+        self.assertFalse(self.runner.calls)
+
     def test_identical_declaration_line_is_eligible_before_editing(self) -> None:
         ledger, _, findings = self.setup_findings()
         for finding in findings:
