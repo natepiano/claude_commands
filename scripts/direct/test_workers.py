@@ -174,10 +174,10 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
             (self.session_dir / codex_mesh.SERVER_FILE).read_bytes())
         return run
 
-    def resolve(self, run: Path, role: str = "impl") -> str:
+    def resolve(self, run: Path, role: str = "impl", *, working_dir: str = "") -> str:
         result = subprocess.run(
             [sys.executable, str(SCRIPT), "resolve", "--session-dir", str(run), "--role", role,
-             "--owner-pid", str(os.getpid())],
+             "--owner-pid", str(os.getpid()), *(["--working-dir", working_dir] if working_dir else [])],
             cwd=self.session_dir.parent / "repository", env=os.environ.copy(),
             capture_output=True, text=True, timeout=15, check=False,
         )
@@ -798,6 +798,55 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         self.assertEqual(self.resolve(self.session_dir, "review"), expected)
         self.assertTrue(expected.startswith("odd-worktree--"), expected)
         self.assertEqual(len(expected.removesuffix("-review")), 40)
+
+    def test_launcher_worktree_names_the_same_reviewer_without_run_state_on_rerun(self) -> None:
+        (self.session_dir / workers.STATE).unlink()
+        (self.session_dir / "working_dir").unlink()
+        store = workers.ledger_for_run(self.session_dir)
+        working = str(self.session_dir.parent / "repository")
+        self.configure_new_worker()
+        with (self.session_dir.parent / "registry.conf").open("a") as output:
+            _ = output.write("review=gpt-kept-sol:xhigh\n")
+
+        first = self.resolve(self.session_dir, "review", working_dir=working)
+        self.assertEqual(first, "repository-review")
+        self.assertEqual(workers.ledger_for_run(self.session_dir).path, store.path)
+        roster = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
+        thread = cast(dict[str, object], roster[first])["thread_id"]
+        self.complete_assignment(first, role="review")
+
+        self.assertEqual(self.resolve(self.session_dir, "review", working_dir=working), first)
+        roster = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
+        self.assertEqual(set(roster), {first})
+        self.assertEqual(cast(dict[str, object], roster[first])["thread_id"], thread)
+        self.assertEqual(len(self.methods("thread/start")), 1)
+        self.assertFalse((self.session_dir / workers.STATE).exists())
+        self.assertFalse((self.session_dir / "working_dir").exists())
+
+    def test_reviewer_without_state_or_launcher_worktree_is_unavailable(self) -> None:
+        (self.session_dir / workers.STATE).unlink()
+        (self.session_dir / "working_dir").unlink()
+        with self.assertRaisesRegex(workers.WorkerUnavailable, "^invalid worker state: missing working_dir$"):
+            _ = workers.resolve(self.session_dir, "review")
+        self.assertEqual(self.methods("thread/start"), [])
+
+    def test_reviewer_state_worktree_is_authoritative_over_the_launcher(self) -> None:
+        self.configure_new_worker()
+        with (self.session_dir.parent / "registry.conf").open("a") as output:
+            _ = output.write("review=gpt-kept-sol:xhigh\n")
+        self.assertEqual(self.resolve(self.session_dir, "review", working_dir=str(self.session_dir)),
+                         "repository-review")
+
+    def test_launcher_worktree_names_an_existing_unit_reviewer_during_lease_release(self) -> None:
+        pool, _source = self.own_reviewer_with_six_pool_leases()
+        state = json_object(self.session_dir / workers.STATE)
+        working = str(state.pop("working_dir"))
+        _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
+        self.assertEqual(self.resolve(self.session_dir, "review", working_dir=working), "repository-review")
+        with review_pool.ProductionPool(pool.parent).locked(write=False) as saved:
+            self.assertEqual(len(saved.reviewers), 6)
+            self.assertTrue(all(isinstance(reviewer.lease, review_pool.Unleased) for reviewer in saved.reviewers.values()))
+        self.assertEqual(self.methods("thread/start"), [])
 
     def test_transfer_conflicts_keep_closed_causes_and_plain_cli_messages(self) -> None:
         pool, source = self.leased_pool_reviewer()
