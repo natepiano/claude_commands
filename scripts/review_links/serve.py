@@ -15,6 +15,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, TypeVar, cast
 from urllib.parse import unquote, urlsplit
 
+if __package__:
+    from .review_link import private_name
+else:
+    from review_link import private_name  # pyright: ignore[reportImplicitRelativeImport]
+
 if TYPE_CHECKING:
     from typing import override
 else:
@@ -87,11 +92,13 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             decoded = unquote(urlsplit(self.path).path)
             if ".." in decoded.split("/"):
                 raise FileNotFoundError("parent traversal")
+            if any(private_name(part) for part in decoded.split("/")):
+                raise FileNotFoundError("private publisher file")
             file = (root / decoded.lstrip("/")).resolve()
-            if file == root / ".index.json" or file.name.startswith(".review-link-"):
-                raise FileNotFoundError("private index or unfinished write")
             if not file.is_relative_to(root) or not file.is_file():
                 raise FileNotFoundError("outside root or not a file")
+            if any(private_name(part) for part in file.relative_to(root).parts):
+                raise FileNotFoundError("private publisher file")
             stream = file.open("rb")
         except (OSError, ValueError, RuntimeError):
             self.send_error(404, "File not found")

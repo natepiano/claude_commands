@@ -1011,6 +1011,14 @@ class BuiltRename:
 
 
 @dataclass(frozen=True)
+class BuiltRenameEvidence:
+    """Built findings and their rename sites at one ledger version and repository tip."""
+
+    findings: tuple[HeldFinding, ...]
+    renames: tuple[BuiltRename, ...]
+
+
+@dataclass(frozen=True)
 class UnrestrictedTraitMembership:
     """The declaration is not an impl or trait member, so trait membership does not restrict it."""
 
@@ -2107,6 +2115,7 @@ class Ledger:
         self._site_maps: dict[tuple[str, str, str], dict[int, int]] = {}
         self._site_evidence: dict[tuple[HeldFinding, str], SiteEvidence] = {}
         self._follow_evidence: dict[tuple[HeldFinding, str], SiteEvidence] = {}
+        self._built_rename_evidence: dict[str, BuiltRenameEvidence] = {}
         self._site_rows_version: tuple[int, int] = (-1, -1)
         self._site_rows: dict[tuple[str, str], tuple[Judgment, ...]] = {}
         self._site_holding_rows: dict[tuple[str, str], list[tuple[str, Judgment]]] = {}
@@ -2116,6 +2125,7 @@ class Ledger:
         self._extern_names: dict[tuple[str, str], frozenset[str] | UnresolvedTypeArguments] = {}
         self._crate_names: dict[tuple[str, str, str], bool] = {}
         self._outside_bodies: dict[tuple[str, str, str, DeclaredItem, str, DeclaredItem], tuple[int, int, tuple[OutsideFailure, ...]]] = {}
+        self._item_bodies: dict[tuple[str, str, DeclaredItem], declarations.ReadableBody | declarations.UnreadableBody] = {}
         database.parent.mkdir(parents=True, exist_ok=True)
         self._connection: sqlite3.Connection = sqlite3.connect(database, timeout=BUSY_TIMEOUT_SECONDS)
         try:
@@ -4340,8 +4350,8 @@ class Ledger:
                             item: DeclaredItem) -> tuple[int, int, tuple[OutsideFailure, ...]]:
         key = (read, old_path, commit, old, path, item)
         if key not in self._outside_bodies:
-            old_body = declarations.item_body(self._declared_file(read, old_path), old)
-            body = declarations.item_body(self._declared_file(commit, path), item)
+            old_body = self._item_body(read, old_path, old)
+            body = self._item_body(commit, path, item)
             count = len(old_body.lines) if isinstance(old_body, declarations.ReadableBody) else 0
             unchanged = 0
             failures: tuple[OutsideFailure, ...] = ()
@@ -4353,6 +4363,13 @@ class Ledger:
                     failures = (OutsideFailure.BODY_FAILED,)
             self._outside_bodies[key] = (unchanged, count, failures)
         return self._outside_bodies[key]
+
+    def _item_body(self, commit: str, path: str, item: DeclaredItem) -> declarations.ReadableBody | declarations.UnreadableBody:
+        """An immutable item's body is shared by every candidate comparison."""
+        key = (commit, path, item)
+        if key not in self._item_bodies:
+            self._item_bodies[key] = declarations.item_body(self._declared_file(commit, path), item)
+        return self._item_bodies[key]
 
     def _outside_extern_names(self, commit: str, path: str) -> frozenset[str] | UnresolvedTypeArguments:
         """Read extern names only to refuse argument proof, never to resolve an alias."""
@@ -4732,6 +4749,7 @@ class Ledger:
         self._site_rows_version = version
         self._site_evidence.clear()
         self._follow_evidence.clear()
+        self._built_rename_evidence.clear()
         pinned = cast(list[tuple[str, bytes]], self._connection.execute("SELECT blob,text FROM rule_texts").fetchall())
         self._site_rule_families.clear()
         for blob, text in pinned:
@@ -4829,12 +4847,22 @@ class Ledger:
 
     def finding_site(self, finding: HeldFinding, at: str) -> SiteEvidence:
         """The shared follow result consumed by filing and both refill rank gates."""
+        return self.finding_sites((finding,), at)[finding.finding_id]
+
+    def finding_sites(self, findings: Iterable[HeldFinding], at: str) -> dict[str, SiteEvidence]:
+        """Read missing site evidence together; changed rows never borrow another row's proof."""
+        requested = tuple(findings)
+        if not requested:
+            return {}
         self._refresh_site_rows()
         tip = self._tip(at)
-        key = (finding, tip.commit)
-        if key not in self._follow_evidence:
-            _ = self._declaration_reading((finding.finding_id,), tip, lambda _: False)
-        return self._follow_evidence.get(key, NeedsJudgment("finding changed while reading"))
+        missing = tuple(dict.fromkeys(finding.finding_id for finding in requested
+                                      if (finding, tip.commit) not in self._follow_evidence))
+        if missing:
+            _ = self._declaration_reading(missing, tip, lambda _: False)
+        return {finding.finding_id: self._follow_evidence.get((finding, tip.commit),
+                                                             NeedsJudgment("finding changed while reading"))
+                for finding in requested}
 
     def _site_after_refusal(self, outcome: DeclarationNotRead | DeclarationInPlace, tip: RepositoryTip) -> DeclarationOutcome:
         evidence = self._site_proof(outcome.finding, tip.commit)
@@ -5292,10 +5320,10 @@ class Ledger:
                 found[path] = current
         return found
 
-    def _declaration_reading(self, finding_ids: tuple[str, ...], tip: RepositoryTip,
-                             approved: Callable[[Path], bool]) -> DeclarationReading:
-        self._prepare_sites(tuple(self._held(finding_id) for finding_id in finding_ids), tip)
-        rust_files = frozenset(tip.rust_files)
+    def _built_renames(self, tip: RepositoryTip) -> BuiltRenameEvidence:
+        self._refresh_site_rows()
+        if tip.commit in self._built_rename_evidence:
+            return self._built_rename_evidence[tip.commit]
         built_renames: list[BuiltRename] = []
         built_findings = self.held_findings(HeldFindingsInState("built"))
         for finding in built_findings:
@@ -5316,10 +5344,18 @@ class Ledger:
                     rename, finding.path, read.commit, before_path, judged.commit, finding.state.proposal,
                     self._trait_site_position(judged.commit, before_path, before_line, finding.before),
                     self._trait_site_position(read.commit, finding.path, finding.line, finding.after)))
-        renames = tuple(built_renames)
+        evidence = BuiltRenameEvidence(built_findings, tuple(built_renames))
+        self._built_rename_evidence[tip.commit] = evidence
+        return evidence
+
+    def _declaration_reading(self, finding_ids: tuple[str, ...], tip: RepositoryTip,
+                             approved: Callable[[Path], bool]) -> DeclarationReading:
+        self._prepare_sites(tuple(self._held(finding_id) for finding_id in finding_ids), tip)
+        rust_files = frozenset(tip.rust_files)
+        built = self._built_renames(tip)
         self._refresh_site_rows()
-        outcomes = tuple(self._declaration_outcome(self._held(finding_id), tip, rust_files, approved, renames,
-                                                   built_findings) for finding_id in finding_ids)
+        outcomes = tuple(self._declaration_outcome(self._held(finding_id), tip, rust_files, approved, built.renames,
+                                                   built.findings) for finding_id in finding_ids)
         for outcome in outcomes:
             finding = outcome.finding
             if isinstance(outcome, FindingSite):

@@ -46,7 +46,8 @@ for entry in "${GIT_FILTERS[@]}"; do
     # smudge existed has the right clean and a stale `cat` smudge.
     current_clean="$(git -C "$REPO_ROOT" config --local --get "filter.$name.clean" 2>/dev/null || true)"
     current_smudge="$(git -C "$REPO_ROOT" config --local --get "filter.$name.smudge" 2>/dev/null || true)"
-    [[ "$current_clean" == "$GF_CLEAN" && "$current_smudge" == "$GF_SMUDGE" ]] && continue
+    current_required="$(git -C "$REPO_ROOT" config --local --get "filter.$name.required" 2>/dev/null || true)"
+    [[ "$current_clean" == "$GF_CLEAN" && "$current_smudge" == "$GF_SMUDGE" && "$current_required" == true ]] && continue
 
     if git -C "$REPO_ROOT" config --local "filter.$name.clean" "$GF_CLEAN" 2>/dev/null &&
         git -C "$REPO_ROOT" config --local "filter.$name.smudge" "$GF_SMUDGE" 2>/dev/null &&

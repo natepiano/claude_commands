@@ -18,7 +18,7 @@ import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import cast, final, override
+from typing import TextIO, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -552,6 +552,49 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         self.assertIn("src/beta.py:1", result.stdout)
         self.assertIn("src/draft.py:1", result.stdout)
         self.assertIn(BETA, result.stdout)
+
+    def test_eta_request_is_retried_when_output_stops_before_the_seen_mark(self) -> None:
+        arguments = ("eta-request", ALPHA, "--phase", PHASE, "--state-dir", str(self.state))
+        expected = self.run_waiting(*arguments)
+        path = self.state / "eta_seen.json"
+        expected_state = path.read_bytes()
+        path.unlink()
+        real_print = print
+
+        def stop_request(*values: object, sep: str | None = None, end: str | None = "\n",
+                         file: TextIO | None = None, flush: bool = False) -> None:
+            if values and str(values[0]).startswith("request /unit:eta:"):
+                raise RuntimeError("output stopped")
+            real_print(*values, sep=sep, end=end, file=file, flush=flush)
+
+        with mock.patch("builtins.print", side_effect=stop_request), self.assertRaises(RuntimeError):
+            _ = self.run_waiting(*arguments)
+        retried = self.run_waiting(*arguments)
+        self.assertEqual(retried.stdout, expected.stdout)
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertEqual(path.read_bytes(), expected_state)
+
+    def test_agenda_retries_items_when_output_stops_before_the_seen_mark(self) -> None:
+        start = datetime.now(ZoneInfo("America/Los_Angeles")) - timedelta(hours=9)
+        self.agenda_log(start, PHASE)
+        expected = self.run_waiting("agenda", "--state-dir", str(self.state))
+        path = self.state / "agenda_seen.json"
+        expected_state = path.read_bytes()
+        path.unlink()
+        real_print = print
+
+        def stop_item(*values: object, sep: str | None = None, end: str | None = "\n",
+                         file: TextIO | None = None, flush: bool = False) -> None:
+            if values and str(values[0]).startswith(f"agenda: ok — {ALPHA}|"):
+                raise RuntimeError("output stopped")
+            real_print(*values, sep=sep, end=end, file=file, flush=flush)
+
+        with mock.patch("builtins.print", side_effect=stop_item), self.assertRaises(RuntimeError):
+            _ = self.run_waiting("agenda", "--state-dir", str(self.state))
+        retried = self.run_waiting("agenda", "--state-dir", str(self.state))
+        self.assertEqual(retried.stdout, expected.stdout)
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertEqual(path.read_bytes(), expected_state)
 
     def test_eta_request_records_requested_alone_once_per_phase(self) -> None:
         seen_path = self.state / "eta_seen.json"

@@ -51,10 +51,12 @@ import os
 import shlex
 import subprocess
 import sys
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple, cast, overload
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.atomic_file import write_text_atomic
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -355,14 +357,7 @@ def _record_worktree(directory: Path, root: Path) -> None:
         if previous.root.is_dir():
             raise StateRefused(f"phase worktree is {previous.root}; cannot claim it in {root}")
     directory.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix=".worktree-", dir=directory)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-            _ = output.write(str(root) + "\n")
-        os.replace(temporary, directory / WORKTREE_FILE)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    write_text_atomic(directory / WORKTREE_FILE, str(root) + "\n")
 
 
 def open_phases(session_dir: Path) -> list[OpenPhase]:
@@ -454,15 +449,7 @@ def _recorded(state: dict[str, object]) -> str:
 def _write_state(phase_dir: Path, state: dict[str, object]) -> None:
     """Replace the phase's state file atomically."""
     phase_dir.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix=".reservation-", suffix=".json", dir=phase_dir)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-            json.dump(state, output, separators=(",", ":"))
-            _ = output.write("\n")
-        os.replace(temporary, phase_dir / STATE_FILE)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    write_text_atomic(phase_dir / STATE_FILE, json.dumps(state, separators=(",", ":")) + "\n")
 
 
 class StateRefused(ValueError):
@@ -480,9 +467,10 @@ def enroll(phase_dir: Path, phase: str, board: str) -> str:
     current = _string(read_state(phase_dir).get("kind"))
     if current in HOLDS_RESERVATION:
         raise StateRefused(f"phase {phase} holds a reservation ({current}); enroll does not replace it")
-    _write_state(phase_dir, {"kind": kind, "phase": phase})
-    _ = (phase_dir / BOARD_RESULT_FILE).write_text(board + "\n", encoding="utf-8")
+    phase_dir.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(phase_dir / BOARD_RESULT_FILE, board + "\n")
     (phase_dir / RELEASED_FILE).unlink(missing_ok=True)
+    _write_state(phase_dir, {"kind": kind, "phase": phase})
     return kind
 
 
@@ -545,7 +533,7 @@ def clear(phase_dir: Path, released: str = "", repo: Path = WORKING_DIRECTORY) -
         raise StateRefused(f"the phase is {kind}; commit its checkpoint and confirm the release first")
     if released:
         # Publish proof before unlinking the state, so a concurrent edit never sees a lost record.
-        _ = (phase_dir / RELEASED_FILE).write_text(released + "\n", encoding="utf-8")
+        write_text_atomic(phase_dir / RELEASED_FILE, released + "\n")
     (phase_dir / STATE_FILE).unlink()
     return True
 
