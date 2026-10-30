@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from production_units import read_production  # noqa: E402
 import production_units  # noqa: E402
 import showrunners  # noqa: E402
+import showrunner_tree
 import stall_watch  # noqa: E402
 import tidy_wrapped  # noqa: E402
 import unit_lookup  # noqa: E402
@@ -385,8 +386,8 @@ def _describe(plan: RenamePlan) -> list[str]:
     def moves(move: PathMove) -> str:
         return f"{move.source} -> {move.destination}"
 
-    parents = [path for path in sorted(plan.state[-1].source.parent.glob("*/parent"))
-               if path.read_text(encoding="utf-8").strip() == plan.old]
+    parents = [plan.state[-1].source.parent / child / "parent"
+               for child in showrunner_tree.stored_children(plan.old)]
     headers = [f"2. Production header {path}: {plan.old} -> {plan.new}" for path in plan.plans]
     stretches = [f"5. stall-watch {unit}: {moves(move)}"
                  for unit, move in zip(plan.units, plan.stall, strict=True)]
@@ -514,9 +515,8 @@ def _rename_showrunner_state(plan: RenamePlan) -> None:
                 destination = directory.destination / "rename-history" / f"{plan.old}.json"
             unit_move.move(PathMove(path, destination))
         directory.source.rmdir()
-    for path in sorted(directory.destination.parent.glob("*/parent")):
-        if path.read_text(encoding="utf-8").strip() == plan.old:
-            write_text(path, plan.new + "\n")
+    for child in showrunner_tree.stored_children(plan.new):
+        write_text(directory.destination.parent / child / "parent", plan.new + "\n")
     _move_held_roles(design_roles.ShowrunnerHolder(plan.old), design_roles.ShowrunnerHolder(plan.new))
     rename_outside.apply(plan.old, plan.new, plan.old_doc, plan.new_doc)
 

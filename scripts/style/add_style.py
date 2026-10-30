@@ -16,6 +16,7 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS / "production"))
 
 import showrunners
+import showrunner_tree
 from add_showrunner import NoEndingTab, herdr_tab_open
 import herdr
 from production_units import Production, read_production
@@ -331,7 +332,7 @@ def _open_session_guidance(style: StyleProduction, reason: str) -> str:
 
 
 def _attach(style: StyleProduction) -> None:
-    current_parent = showrunners.parent_of(style.slug)
+    current_parent = showrunner_tree.parent_of(style.slug)
     if current_parent != style.parent.slug:
         if current_parent:
             _run_script(SHOWRUNNERS, "detach", style.slug)

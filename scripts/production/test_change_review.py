@@ -21,6 +21,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import change_review
 import showrunners
+import showrunner_tree
 from change_review import Invisible, Malformed, Visible
 
 # Importable once change_review has put scripts/lib on the path.
@@ -155,7 +156,7 @@ class ListTest(unittest.TestCase):
             return names.get(slug, "")
 
         with (mock.patch.object(showrunners, "canonical_slug", side_effect=str),
-              mock.patch.object(showrunners, "root_of", return_value="build-followups") as root,
+              mock.patch.object(showrunner_tree, "root_of", return_value="build-followups") as root,
               mock.patch.object(showrunners, "current_name", side_effect=name_of)):
             self.assertEqual(change_review.showrunner_of(Path("/p/child-production.md")), "natedev")
             root.assert_called_once_with("child")
@@ -172,8 +173,6 @@ class AttachedListTest(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        import showrunners
-
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
@@ -190,7 +189,7 @@ class AttachedListTest(unittest.TestCase):
             "| C9 | Earlier child | Check earlier | 2026-10-02 | |\n" +
             "| C11 | Dependent child | Check dependent | 2026-10-03 | blocks, after C9 |\n")
         _ = self.enterContext(mock.patch.object(change_review, "LISTS", self.root))
-        _ = self.enterContext(mock.patch.object(showrunners, "root_of", return_value="parent"))
+        _ = self.enterContext(mock.patch.object(showrunner_tree, "root_of", return_value="parent"))
 
     def test_columnless_earlier_rows_belong_to_the_attached_production_without_list_edits(self) -> None:
         before = {path: path.read_bytes() for path in (self.current, self.earlier)}

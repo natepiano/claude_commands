@@ -26,7 +26,7 @@ import unit_table_cells
 
 from scripts.direct import phase_table, plan_history
 from scripts.lib import unit_runs
-from scripts.production import production_units, showrunners, unit_run
+from scripts.production import showrunner_tree, production_units, showrunners, unit_run
 
 
 def text(value: object) -> str:
@@ -386,7 +386,7 @@ def resolve(cwd: str, production: str, session: str = "") -> list[showrunners.Sh
     by_slug = {runner["slug"]: runner for runner in registered}
     if production not in by_slug:
         return []
-    return [by_slug[slug] for slug in [production, *showrunners.descendants_of(production)] if slug in by_slug]
+    return [by_slug[slug] for slug in [production, *showrunner_tree.descendants_of(production)] if slug in by_slug]
 
 
 def build(runner: showrunners.Showrunner) -> dict[str, object]:

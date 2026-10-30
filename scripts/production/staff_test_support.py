@@ -19,12 +19,56 @@ from unittest import mock
 
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
+from scripts.shutdown import pane_record
 
 CHECKOUT = Path(__file__).resolve().parents[2]
 STAFF_SCRIPT = Path(__file__).with_name("staff.py")
 SOURCES_SCRIPT = Path(__file__).with_name("staff_sources.py")
 PROCESS_TIMEOUT = 30
 FixtureMachine = Literal["natedev", "mac"]
+
+
+@contextmanager
+def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[None]:
+    """Use the same private record in this process and its fixture children."""
+    environment["STAFF_FILE"] = str(path)
+    with ExitStack() as contexts:
+        _ = contexts.enter_context(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {"STAFF_FILE": str(path)})))
+        if "HERDR_PANE_RECORD_DIR" in environment:
+            _ = contexts.enter_context(mock.patch.object(
+                pane_record, "RECORD_DIR", Path(environment["HERDR_PANE_RECORD_DIR"]),
+            ))
+        yield
+
+
+def showrunner_relationship(name: str, parent: str = "") -> staff.StaffRow:
+    """Find fixture identities by their short names, then set the desired edge."""
+    with staff.operation():
+        rows = {row.name: row for row in staff.initial_snapshot().find(kind="showrunner")}
+
+        def intended_row(short_name: str) -> staff.StaffRow:
+            if short_name not in rows:
+                rows[short_name] = staff.ensure("showrunner", name=short_name)
+            return rows[short_name]
+
+        child = intended_row(name)
+        parent_id = intended_row(parent).id if parent else None
+        return staff.move(child.id, parent_id) if child.parent != parent_id else child
+
+
+def showrunner_launch(row: staff.StaffRow, session_id: str, environment: dict[str, str]) -> None:
+    """Pin timer identities when several fixture timers share one production doc."""
+    launch = pane_record.launch(f"fixture:{session_id}", session_id, str(CHECKOUT), {}, ["claude", "-n", row.name])
+    launch["environment"]["STAFF_ID"] = row.id
+    with mock.patch.object(pane_record, "RECORD_DIR", Path(environment["HERDR_PANE_RECORD_DIR"])):
+        pane_record.write("agents", launch)
+
+
+def fixture_showrunner_name(slug: str, doc: Path) -> str:
+    """Keep the real doc's workspace name; extra fixture productions use their slugs."""
+    from scripts.production import showrunners, production_units
+
+    return showrunners.herdr_space(slug, str(doc)) if slug == production_units.read_production(doc).slug else slug
 
 
 def source_environment(source: Path) -> dict[str, str]:
@@ -154,7 +198,6 @@ class StaffTestCase(unittest.TestCase):
         write_text_atomic(ssh, f"#!{sys.executable}\n{FAKE_SSH}")
         ssh.chmod(0o755)
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
-            "STAFF_FILE": str(self.staff_file),
             "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
             "STAFF_TEST_SSH_LOG": str(self.ssh_log),
             "STAFF_TEST_OWNER_FILE": str(self.staff_file),
@@ -168,6 +211,7 @@ class StaffTestCase(unittest.TestCase):
             "STAFF_TEST_LOCK_NOTICE": "",
             "PYTHONDONTWRITEBYTECODE": "1",
         })))
+        _ = self.enterContext(isolated_staff_file(self.staff_file, {}))
         _ = self.enterContext(self.machine("natedev"))
 
     @property
@@ -182,12 +226,14 @@ class StaffTestCase(unittest.TestCase):
         for folder in environment.values():
             Path(folder).mkdir(parents=True, exist_ok=True)
         environment.update({
-            "STAFF_FILE": str(self.staff_file if machine == "natedev" else self.mac_file),
             "STAFF_TEST_SOURCE_ROOT": str(source),
             "STAFF_TEST_PLATFORM": "linux" if machine == "natedev" else "darwin",
             "HERDR_SESSION": "agents",
         })
         with ExitStack() as contexts:
+            _ = contexts.enter_context(isolated_staff_file(
+                self.staff_file if machine == "natedev" else self.mac_file, environment,
+            ))
             _ = contexts.enter_context(cast(AbstractContextManager[object], mock.patch.dict(os.environ, environment)))
             _ = contexts.enter_context(mock.patch(
                 "scripts.shutdown.remote.other_machine", return_value="mac" if machine == "natedev" else "natedev",
