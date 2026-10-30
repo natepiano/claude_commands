@@ -144,35 +144,21 @@ including the details to make it clear
 
 ### Phase 4a — A bump by shown name moves only the step it names  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `build_queue.py bump <shown name>` moves the waiting step that name matched, or refuses; it never moves another step because the queue changed between reads.
-
-**Spec:**
-- Defect (Astra review of phase 1 F005, 2026-10-29; pre-existing since e6baef45): `bump_selector` (`scripts/build_queue/build_queue.py:248`) turns a roster shown name into a position from its first queue read; `memory_admit.bump_waiter` applies that position to its locked reread. With waiters `[A, B, C]`, selecting `B` gives `"2"`; if `B` leaves first, position 2 moves `C`.
-- Fix: resolve the shown name to a stable waiter identity (pid and start time from the waiter row) and have `bump_waiter` accept that identity and check it under the lock; a waiter that has left gives the typed `UnmatchedWaiter` refusal naming the original selector. Session id alone is not enough: several waiters can share one.
-- Seen live 2026-10-30 01:34 EDT (showrunner order, runs first after the 05:00 build hold, before Phase 4b): `bump tool-based-ui-frame-time-frame-cost-fix` read that worker's step at position 23; its call ended 05:34:23Z (status 77) and the bump at 05:34:24Z moved `tool-based-ui-trunk-fix3`'s nextest from position 23 (build-log `queue_bump` row, `old_position` 23).
-- The hand-off key is the key the waiter row already carries: its file name `{pid}-{start_time}.waiting` (`memory_admit.py` near line 1242). Add no second identity (showrunner, 2026-10-30).
-- Tests: a waiter removed between the two reads, and a reorder between them; each refuses or moves the named step only. Two sessions whose shown names share a prefix: only the exact name moves.
+- `build_queue.bump_selector(selector, reading: QueueRead, labels)` maps an exact shown name of one waiting step to `memory_admit.WaiterRowSelector(row_key, original_selector)`. `row_key` is the row's own file name, `{pid}-{start_time}.waiting`, read from `QueueRead.ordered`. The key comes from the row, never from the caller's environment.
+- `memory_admit.bump_waiter(selector: str | WaiterRowSelector, actor)` finds that row again by file name under the queue lock and moves only it. If the row left the queue, it gives `UnmatchedWaiter` that names the original shown name, on stdout with exit 3; no other row moves.
+- The `queue_bump` build-log row's `old_position` is the row's position under the lock.
+- Tests cover a row removed between reads, a reordered queue, two shown names with a shared prefix (and a repeat bump), and a departed row key with another step in the same session. Waiter fixture files use `{pid}-{start_time}.waiting`.
 
 **Files:**
-- `scripts/build_queue/build_queue.py` — `bump_selector` returns a waiter identity
-- `scripts/lint/memory_admit.py` — `bump_waiter` takes and checks the identity under the lock (also-touches resources; trial-merge against `origin/builds-resources`)
-- `scripts/build_queue/test_build_queue.py` — removal, reorder and shared-prefix cases
+- `scripts/build_queue/build_queue.py` — `bump_selector` makes the row-key hand-off
+- `scripts/lint/memory_admit.py` — `WaiterRowSelector`; `bump_waiter` matches the row key under the lock
+- `scripts/build_queue/test_build_queue.py` — race and prefix tests
 
-**Workers:** 1 writer + 1 tester.
-- `impl2` — `build_queue.py`, `memory_admit.py`
-- `test2` — `test_build_queue.py`
+**Gotchas:** a shown name with no match still goes to `bump_waiter` as a plain string, which then matches by position, session id, session name or folder. `old_position` is the locked position, not the position the user saw. `memory_admit.py` also-touches resources: trial-merge against `origin/builds-resources`.
 
-**State:** waiter rows (`bump_order`, `holds_younger`, `priority_since` written by a bump)
-
-**Depends on:** Phase 1 (the typed `UnmatchedWaiter` refusal) and Phase 3 (both edit `memory_admit.py`).
-
-**Constraints from prior phases:** Phase 1: a selector refusal is `memory_admit.UnmatchedWaiter`, printed on stdout with exit 3; the mod forwards only that. Phase 3: a waiting row's `session_id` is the writer's `CODEX_THREAD_ID` first, then `CLAUDE_CODE_SESSION_ID` (`waiter_identity`), so the identity `bump_selector` returns must be read from the row, never from the caller's environment; `read_queue` and `explain_queue` share one locked pass (`locked_queue_read`); the /build:queue head line prints from `QueueExplanation` and does no arithmetic. When origin/builds-resources' Phase 14 is merged, `queue_rows` keeps a reservation by `reservation_lifetime`, not by a live owner.
-
-**Assertion-Change:** `scripts/build_queue/test_build_queue.py` `test_bump_by_unique_shown_label_moves_and_logs_the_actual_waiter`: `bump.assert_called_once_with("2", "actor-id")` becomes `bump.assert_called_once_with(memory_admit.WaiterRowSelector(waiter_path.name, "organon-ci88"), "actor-id")`, because the hand-off is now the row key, not a position (unit director, review pass 1, 2026-10-30).
-
-**Acceptance gate:** `python3 -m unittest scripts.build_queue.test_build_queue scripts.lint.test_memory_admit` green (prefix `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY`); basedpyright 0/0/0 on the changed files.
+**Ruled out:** a second waiter identity (the row file name is the key); session id alone (several waiters share one).
 
 ### Phase 4b — A failed step's record survives a failed save, and a rerun finishes it  · status: todo
 
@@ -215,7 +201,7 @@ including the details to make it clear
 - Spec source: line 20 of `/tmp/claude/unit/abea5ffb-4b99-499e-ae41-7ebb04630f9f/phases/15/impl_summary_impl.txt`.
 - Sample once per second, from the first Cargo-profile `deps/` test binary seen in the scope until the scope ends. Count all parallel test processes in the scope.
 - Put the sampling in the existing per-step sampler `buildlog_sample_anon` (`scripts/lint/invoke.sh` near line 172), which already writes admission's `.max` and `.wave` files from the scope's `memory.stat` `anon`. One loop writes both those files and the test-phase window; keep its atomic publication (temp + `mv`) and its exit when the parent ends. Start no second sampler.
-- Admission release deletes its reservation and measurement files (`memory_admit.py` release, near line 2043), and both invoke.sh paths release before they call the recorder (near line 307). So invoke.sh writes the test-phase fields into the step's own sidecar before release, and copies admission's assigned charge there from admission's record, computing nothing; `record.py step` reads that sidecar. Admission's release API does not change (showrunner OK, 2026-10-30).
+- Admission release deletes its reservation and measurement files (`memory_admit.py` `release`, near line 2055), and both invoke.sh paths release before they call the recorder (near line 307). So invoke.sh writes the test-phase fields into the step's own sidecar before release, and copies admission's assigned charge there from admission's record, computing nothing; `record.py step` reads that sidecar. Admission's release API does not change (showrunner OK, 2026-10-30).
 - On release, persist these with the call/step identity: `test_phase_peak_bytes`, `test_phase_started_at` (epoch seconds), the actual `test_threads`, the repository and the filter family. A step with no test-phase mark records unknown, never 0.
 - Also persist the charge admission assigned at test-phase entry, with its history cutoff, form and contributing widths. Read it from admission's own record; never compute it. If admission has no such field, record unknown and tell the showrunner; resources adds the field in its follow-up.
 - Measure the sampler's CPU cost per step; the checkpoint notice names it.
