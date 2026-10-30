@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.test_agents_registry import write_registry
+
 import io
 import json
 import subprocess
@@ -45,7 +47,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
             self.assertLessEqual(text.count("recommended"), 1)
 
     def test_every_user_push_states_its_action_as_send_py_requires(self) -> None:
-        _ = quota_alert.REGISTRY.write_text(REGISTRY.replace("impl=opus:high", "impl=opus:ultra"))
+        _ = write_registry(quota_alert.REGISTRY, {"direct.claude": {"impl": "opus:ultra"}}, base_text=REGISTRY)
         claude = self.note("claude2.md", "active", "0", limit_reset_count="3")
         codex = self.note("codex1.md", "active", "0")
         spare = self.note("claude1.md", "inactive", "80", login="spare@example.invalid")
