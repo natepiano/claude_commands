@@ -62,7 +62,7 @@ Written by herdr-unit on 2026-10-29 for the sdlc showrunner, from the user's req
 
 Each item is my call under the decision criteria unless it names the user. A one-line plan change reverses it.
 
-1. **One staff record (user, 2026-10-30).** `scripts/production/staff.py` and one file per machine, `~/.local/state/staff/staff.json`, hold every showrunner, unit director and worker: a stable id, the current name, kind, role, production, unit and number. A rename changes only the name; the id never changes. There is no separate worker ledger: the unit worker ledger, `mesh_roster.json`, the run `workers` log and the slot claim files retire into this record. Live state (pane, socket, running or not) is never stored; it comes from herdr and the session records at read time. No such record exists today: the hierarchy is joined at each read from update timers, parent files, Units tables, pane marks and the worker ledgers (Reference → Staff record readers).
+1. **One staff record (user, 2026-10-30).** `scripts/production/staff.py` and one file, `~/.local/state/staff/staff.json` on natedev, hold every showrunner, unit director and worker: a stable id, the current name, kind, role, production, unit and number. A rename changes only the name; the id never changes. There is no separate worker ledger: the unit worker ledger, `mesh_roster.json`, the run `workers` log and the slot claim files retire into this record. Live state (pane, socket, running or not) is never stored; it comes from herdr and the session records at read time. No such record exists today: the hierarchy is joined at each read from update timers, parent files, Units tables, pane marks and the worker ledgers (Reference → Staff record readers).
 2. **One command starts or resumes a worker (user, 2026-10-30).** `worker_panes.py start-or-resume <name> <role>`. Both Claude Code and Codex resume a conversation by its name (user, 2026-10-30), so the command resumes by name and keeps no conversation id. At every start or resume it looks up kind, model, effort, service tier and sandbox for the role in the model registry. The worker name form is `<production>-<unit>-<role><n>`, for example `sdlc-models-impl1` or `hana-lfo-test1` (user, 2026-10-30); several workers of one role take numbers 1, 2, 3.
 3. **Idle panes close at phase end (user, 2026-10-30).** The conversation stays. To bring a worker back, the director calls `start-or-resume` again. This settles the keep-open question.
 4. **The worker's final reply signals completion; herdr's state only wakes the launcher.** Every dispatch has a dispatch id. The prompt file ends with: "End your final reply with the line `DONE <dispatch id>`." The launcher reads the final reply from the worker's own transcript and writes the status file only when it carries that line. The launcher writes the status file today (`implement.sh:629`); the worker writes only its summary. This works the same for read-only reviewers, which cannot write a file (`review.sh:689` starts them with `--sandbox read-only`): the launcher writes their findings file from the reply, as the mesh does today.
@@ -77,7 +77,7 @@ Each item is my call under the decision criteria unless it names the user. A one
 
 ## Questions for the user
 
-1. **Worker session names over 32 characters.** These names name the worker sessions: the herdr agent name and the Claude or Codex session name. You gave the form `<production>-<unit>-<role><n>` (2026-10-30). The only open point: herdr allows `[a-z][a-z0-9_-]{0,31}`, and `build-followups-cargo-liner-style-names-impl1` has 45 characters. Options: (A) a short name key per production and per unit, set once, used in every worker name; (B) cut each part and add a 4-character stable hash; (C) refuse, and such a unit keeps mesh workers until it has a shorter name. Recommendation: A, because the names stay readable. Until you answer, the code refuses (C), set by one line, `long_names = "refuse"`, in `config/staff.toml`.
+1. **Worker session names over 32 characters.** These names name the worker sessions: the herdr agent name and the Claude or Codex session name. You gave the form `<production>-<unit>-<role><n>` (2026-10-30). The only open point: herdr allows `[a-z][a-z0-9_-]{0,31}`, and `build-followups-cargo-liner-style-names-impl1` has 45 characters. Options: (A) a short name key per production and per unit, set once, used in every worker name; (B) cut each part and add a 4-character stable hash; (C) `add_unit.py` and `add_showrunner.py` refuse a production or unit name whose longest worker name passes 32 characters, so you pick a shorter name at creation. Recommendation: A, because the names stay readable. Until you answer, the code does B, set by one line, `long_names = "hash"`, in `config/staff.toml`; every unit gets workers, also after the mesh cleanup.
 2. **Pane border label (proposal).** The label on each worker pane: `{role}{n}` (`impl1`, `test1`, `review1`); the tab title already names the unit. Options: role and number; the full worker name; the joined form `production · unit · job`. Recommendation: role and number. One line, `pane_label`, in `config/staff.toml`.
 3. **herdr's `resume_agents_on_restore`.** Phase 4's probe decides whether herdr's own resume keeps each pane's `--env` (its account). If it does, nothing changes: herdr restores split tabs, and our per-pane restore code retires for them. If it does not, the only question is the config change: add `[session] resume_agents_on_restore = false` to `~/.config/herdr/config.toml` on natedev and the Mac (the file holds your own settings), and our restore owns split tabs. Recommendation: follow the probe; if it is negative, make the change before the default switch.
 4. **Model per pass, not per turn (710a6adb).** Tonight's fix 710a6adb (23:21) makes every Codex worker turn read model and effort fresh from `agents.conf` at send time (the dispatch's override, else the current default), so a config change reaches the next turn. A pane fixes its model when its process starts. Options: (A) look up only at start or resume, so a change reaches a worker at its next start, normally the next phase; (B) every dispatch calls `start-or-resume`, which resumes the pane on the new model when its start arguments differ from the registry, so a change reaches the next pass. Recommendation: B. It keeps 710a6adb's promise per pass, costs a few seconds only after a config change, and a `/model` typed by hand holds until the config changes. Phase 5 builds B; A is one deleted compare.
@@ -85,15 +85,17 @@ Each item is my call under the decision criteria unless it names the user. A one
 
 ## Phases
 
+**Critical path.** Phase 3 waits on the models unit, and no other phase needs it: pane work reads model and effort through the registry API under either file name. The director runs Phases 4-13 when Phase 3 is still blocked, and runs Phase 3 when the models unit lands. The critical path is Phase 1 → 4 → 5 → 6 → 7 → 8 → 9 → 11 → 13. Phases 2, 10 and 12 run beside it; Phase 11 also needs Phase 10 and questions items 3 and 5(c).
+
 ### Phase 1 — The staff record  · status: todo
 
 #### Work Order
 
-**Goal:** `scripts/production/staff.py` holds this machine's showrunners, unit directors and workers in one file with stable ids, answers lookups by id, by name and by production/unit/role, and `staff.py seed` fills it from today's sources.
+**Goal:** `scripts/production/staff.py` holds the showrunners, unit directors and workers of both machines in one file on natedev with stable ids, answers lookups by id, by name and by production/unit/role, and `staff.py seed` fills it from today's sources.
 
 **Spec:**
 
-1. **One module, one file.** New module `scripts/production/staff.py`. Its file is `~/.local/state/staff/staff.json`; the env var `STAFF_FILE` overrides the path (tests). One file per machine: a row lives in the file of the machine where its session runs. Readers on another machine reach it the way they reach that machine today (over ssh), in a later phase; this phase reads and writes the local file only.
+1. **One module, one file.** New module `scripts/production/staff.py`. Its file is `~/.local/state/staff/staff.json`; the env var `STAFF_FILE` overrides the path (tests). One file for both machines, on natedev, the owner machine. On the Mac, every `staff.py` read and write runs on natedev through `ssh -o BatchMode=yes -o ConnectTimeout=10 <remote.other_machine()> ~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py <verb> --json`, the call `roster.peer_snapshot` makes (`roster.py:1897-1900`). The Mac keeps no copy. When natedev cannot be reached, a Mac call returns `Unreadable("natedev not reached")` and writes nothing. `staff.owner_machine()` is `natedev`, set in `config/staff.toml` as `owner = "natedev"`.
 2. **File form.** `{"schema": 1, "rows": [<row>, ...]}`, rows sorted by `id`, written with `json.dumps(..., indent=2, sort_keys=True)` and a final newline, so the same content always gives the same bytes. Writes take `fcntl.flock` on `<file>.lock`, write a temp file in the same folder, `fsync`, then `os.replace`. Reads take no lock. A file that does not parse, or has another `schema`, gives `Unreadable(path, reason)` and no write overwrites it.
 3. **The row.** A frozen dataclass with `to_json()` and `from_json()` (no `Any`; parse with typed checks):
    ```python
@@ -136,10 +138,11 @@ Each item is my call under the decision criteria unless it names the user. A one
    name_form = "{production}-{unit}-{role}{n}"
    # Proposal, waiting for the user (the plan's questions list item 2).
    pane_label = "{role}{n}"
-   # Placeholder until the user answers the plan's questions list item 1. "refuse" is the only rule built.
-   long_names = "refuse"
+   # Placeholder until the user answers the plan's questions list item 1.
+   long_names = "hash"
+   owner = "natedev"
    ```
-   `staff.worker_name(production, unit, role, number) -> str | Refused` fills `name_form` and checks herdr's agent-name rule `^[a-z][a-z0-9_-]{0,31}$` on the exact result. A name over 32 characters, or with another character, is refused with the name and the rule; it is never cut short (`herdr._agent_name` at `herdr.py:3092` truncates silently, which can join two workers into one name). `staff.pane_label(row) -> str` fills `pane_label`.
+   `staff.worker_name(production, unit, role, number) -> str | Refused` fills `name_form` and checks herdr's agent-name rule `^[a-z][a-z0-9_-]{0,31}$` on the exact result. A name with another character is refused. A name over 32 characters follows `long_names`: `hash` (the placeholder) cuts the production and unit parts to fit and adds `-` and the first 4 hex characters of the SHA-256 of the full name; the code never passes a name that `herdr._agent_name` (`herdr.py:3092`) would cut, because that cut can join two workers into one name. `staff.pane_label(row) -> str` fills `pane_label`.
 8. **One machine name.** New `scripts/lib/machine.py` with `machine_name() -> str` (`socket.gethostname().split(".", 1)[0]`). Delete the copies at `scripts/message/roster.py:1829` and `scripts/production/stall_watch.py:623`; both call `machine.machine_name()`.
 9. **`staff.py seed`** makes the showrunner and unit rows match today's sources. A second run on the same sources leaves the file byte for byte the same.
    - Showrunners: `showrunners.registered_showrunners()` (`showrunners.py:216`) reads this machine's update timers. Each gives `ensure("showrunner", production=slug, unit="", role="showrunner", number=0, agent="claude", name=<runner["session"] or slug>)`, then `rename` when the running session's name differs, and `set_parent(id, showrunners.parent_of(slug))` (`:427`).
@@ -155,7 +158,7 @@ Each item is my call under the decision criteria unless it names the user. A one
 - `scripts/lib/machine.py` — new: `machine_name()`.
 - `scripts/message/roster.py` — `machine_name` at :1829 replaced by `machine.machine_name()`.
 - `scripts/production/stall_watch.py` — `machine_name` at :623 replaced by `machine.machine_name()`.
-- `scripts/production/test_staff.py` — new: the tests in the Acceptance gate.
+- `scripts/production/test_staff.py` — new: the tests in the Acceptance gate, with a fake `ssh` on `PATH` for the Mac path.
 - Read only: `scripts/production/showrunners.py`, `scripts/production/production_units.py`, `scripts/production/live_units.py` (the seed sources named above).
 
 **Workers:** `2 writers` — no test lane; the tests split from the module.
@@ -172,12 +175,13 @@ Each item is my call under the decision criteria unless it names the user. A one
   - `ensure` twice gives one row with the same id.
   - `rename` to a name another active row holds is refused, and the file is unchanged.
   - `by_id`, `by_name` and `find` by production, unit and role return the expected rows; a retired row is found only with `retired=True`.
-  - `worker_name("sdlc", "models", "impl", 1)` is `sdlc-models-impl1`; `worker_name("build-followups", "cargo-liner-style-names", "impl", 1)` is refused under `long_names = "refuse"`; a name with an upper-case letter is refused.
+  - `worker_name("sdlc", "models", "impl", 1)` is `sdlc-models-impl1`; `worker_name("build-followups", "cargo-liner-style-names", "impl", 1)` gives a name of 32 characters or fewer that ends in a 4-character hash under `long_names = "hash"`, and the same input gives the same name; a name with an upper-case letter is refused.
   - Two processes that call `ensure` with the same key at the same time give one row.
   - An exception raised before `os.replace` leaves the old file bytes.
+  - On a machine that is not the owner, `find` and `ensure` run the fake `ssh` command with the verb and `--json`, and a failed `ssh` gives `Unreadable` and no local file.
   - `seed` twice on fixture timers, parent files and a fixture production doc gives the same file bytes; a fixture doc that cannot be read leaves its rows and prints one stderr line.
 - The phase's full gate (Delegation Context → Test) green, run outside the build hold.
-- Behavior: `staff.py seed` then `staff.py show` on natedev lists the running showrunners and their units on this machine, each with an id; a second `seed` leaves `staff.json` byte for byte the same.
+- Behavior: `staff.py seed` on natedev and on the Mac, then `staff.py show` on either machine, lists both machines' showrunners and units; on natedev it lists the running showrunners and their units on this machine, each with an id; a second `seed` leaves `staff.json` byte for byte the same.
 
 ### Phase 2 — Staff record writers  · status: todo
 
@@ -185,7 +189,7 @@ Each item is my call under the decision criteria unless it names the user. A one
 
 **Goal:** every tool that adds, renames, moves or retires a showrunner or unit also writes the staff record, so the record stays current without `seed`.
 
-**Spec:** Each tool calls the `staff.py` write API after its own change succeeds, and a failed staff write fails the tool with the reason (the tool's own change stays; rerunning the tool, or `staff.py seed`, completes it). `add_showrunner.py` → `ensure` showrunner; `showrunners.py attach`/`detach` (:528, :557) → `set_parent`; `add_unit.py` and `resume_unit.py` → `ensure` unit; `retire_unit.py` → `retire` the unit and its workers; `rename_unit.py` and `rename.py` → `rename` (the id stays); `transfer_unit.py` → `move` the unit and its workers, then `rename` each worker to its new `worker_name`; `promote_unit.py` and `promote_showrunner.py` → `ensure` the new row and `retire` the old one. No reader changes in this phase.
+**Spec:** Each tool calls the `staff.py` write API after its own change succeeds, and a failed staff write fails the tool with the reason (the tool's own change stays; rerunning the tool, or `staff.py seed`, completes it). `add_showrunner.py` → `ensure` showrunner; `showrunners.py attach`/`detach` (:528, :557) → `set_parent`; `add_unit.py` and `resume_unit.py` → `ensure` unit; `retire_unit.py` → `retire` the unit and its workers; `rename_unit.py`, `rename.py`, `transfer_unit.py`, `promote_unit.py` and `promote_showrunner.py` call one function, `staff.rename_staff(production, unit, new_production, new_unit)` (`unit=""` for a whole production). In one locked write it moves and renames the unit row and every worker row under it to its new `worker_name`; the ids stay. From Phase 5 it also renames each worker's herdr agent and session through `worker_panes.py rename`. A promote tool `ensure`s the new row first and `retire`s the old one. No reader changes in this phase.
 
 **Files:** `scripts/production/add_showrunner.py`, `showrunners.py`, `add_unit.py`, `resume_unit.py`, `retire_unit.py`, `rename_unit.py`, `rename.py`, `transfer_unit.py`, `promote_unit.py`, `promote_showrunner.py`; their tests (`test_*.py` and `*_test_support.py` beside each); `scripts/production/test_staff.py` (shared fixture helper only, if two test files need it).
 
@@ -243,7 +247,7 @@ Each item is my call under the decision criteria unless it names the user. A one
 
 **Goal:** `worker_panes.py start-or-resume <name> <role>` starts or resumes a worker in its director's tab with the registry's settings, and `close` refuses a pane that still has work.
 
-**Spec:** `start-or-resume`: `staff.ensure` the worker row (key production/unit/role/number from the director's run); when the pane is open and its process arguments (cwd, sandbox, model, effort, service tier) equal the registry lookup, do nothing; when they differ, close it and resume; when no pane is open, split the column (first worker: the director pane, `right`, ratio 0.667; later ones: the lowest worker pane, `down`), start with `--resume <name>` (Claude) or `codex resume <name>` when a conversation of that name exists, else a new session named `<name>`, then `layout`. The account comes from the accounts code as today (Codex: the `workers` role). The pane env carries `UNIT_RUN_DIR`, `UNIT_TEAM_ROLE`, `TMPDIR` and the dev shell through `launch_prepared_agent`. `close` passes only `can_close`: dispatch lock free; the last turn ends with a `DONE` line whose pass is recorded complete; no input after it; state `idle` or `done`; no live detached run of the worker. Otherwise it keeps the pane and names the blocker. `layout`: under a per-tab lock, set every split in the worker column to an even share; it changes only panes whose agent name starts with the tab's `<production>-<unit>-`, leaves other panes as they are, and gives focus back where it was. `list`: `herdr agent list` joined with `staff.find`. `rename <id> <new name>`: resume by the old name under the new name, then `staff.rename`.
+**Spec:** `start-or-resume`: `staff.ensure` the worker row (key production/unit/role/number from the director's run); when the pane is open and its process arguments (cwd, sandbox, model, effort, service tier) equal the registry lookup, do nothing; when they differ, close it and resume; when no pane is open, split the column (first worker: the director pane, `right`, ratio 0.667; later ones: the lowest worker pane, `down`), start with `--resume <name>` (Claude) or `codex resume <name>` when a conversation of that name exists, else a new session named `<name>`, then `layout`. The account comes from the accounts code as today (Codex: the `workers` role). The pane env carries `UNIT_RUN_DIR`, `UNIT_TEAM_ROLE`, `TMPDIR` and the dev shell through `launch_prepared_agent`. `close` passes only `can_close`: dispatch lock free; the last turn ends with a `DONE` line whose pass is recorded complete; no input after it; state `idle` or `done`; no live detached run of the worker. Otherwise it keeps the pane and names the blocker. `layout`: under a per-tab lock, set every split in the worker column to an even share; it changes only panes whose agent name starts with the tab's `<production>-<unit>-`, leaves other panes as they are, and gives focus back where it was. `list`: `herdr agent list` joined with `staff.find`. `rename <id> <new name>`: resume by the old name under the new name, rename the herdr agent and the pane label, then `staff.rename`. `staff.rename_staff` (Phase 2) calls it for each worker of a renamed, moved or promoted unit or production, so no worker name goes stale.
 
 **Files:** `scripts/herdr/worker_panes.py` (new), `scripts/herdr/test_worker_panes.py` (new).
 
@@ -251,7 +255,7 @@ Each item is my call under the decision criteria unless it names the user. A one
 
 **State:** staff rows; panes; `~/.local/state/staff/locks/<id>.lock`.
 
-**Constraints from prior phases:** Phase 1 `staff.py`; Phase 3 `models_registry.py`; Phase 4 `SplitPane`, `split_ratio`, `pane_label` and the probe results.
+**Constraints from prior phases:** Phase 1 `staff.py`; model, effort, tier and sandbox come from the models unit's registry API (`RegistryRow` lookups), called by module whatever the file is named (`agents_registry.py` before Phase 3, `models_registry.py` after); Phase 4 `SplitPane`, `split_ratio`, `pane_label` and the probe results.
 
 **Acceptance gate:** tests: start, resume by name, settings change resumes, a second `start-or-resume` changes nothing, `close` refused with work left, `layout` twice gives the same ratios, a foreign pane untouched; basedpyright 0/0; full gate green.
 
@@ -369,7 +373,7 @@ Each item is my call under the decision criteria unless it names the user. A one
 
 **Goal:** every reader of who exists reads the staff record; live state still comes from herdr and session records.
 
-**Spec:** Move each reader in Reference → Staff record readers to `staff.find`/`by_name`/`by_id`; parent files move into `parent`; pane marks stay as the live link to a unit's pane. Add cross-machine reads where today's readers read the other machine.
+**Spec:** Move each reader in Reference → Staff record readers to `staff.find`/`by_name`/`by_id`; parent files move into `parent`; pane marks stay as the live link to a unit's pane. Readers on the Mac get both machines' rows through the one file on natedev.
 
 **Files:** Reference → Staff record readers.
 
@@ -387,7 +391,7 @@ Each item is my call under the decision criteria unless it names the user. A one
 
 **Goal:** the mesh, the review pool, the old worker records and `WORKER_TRANSPORT` are gone, no later than 7 days after the default switch.
 
-**Spec:** Run only after a check that no run folder pins `mesh` and no mesh process is alive. Delete: Reference → Cleanup list.
+**Spec:** Run only after a check that no run folder pins `mesh` and no mesh process is alive. Delete: Reference → Cleanup list. Then merge `implement.sh`, `review.sh` and `assign.sh` into one launcher, `scripts/direct/launch.py`, keeping the three command names as thin entry points for their arguments (decision 11).
 
 **Files:** Reference → Cleanup list.
 
@@ -443,7 +447,7 @@ Config: `config/agents.conf`, `config/README.md:7, 14, 15, 20`, `.gitignore:23-2
 
 ### Cleanup list (Phase 13)
 
-`codex_mesh.py` and its tests; `review_pool.py` and its state; the mesh parts of `workers.py` and the unit worker ledger; `mesh_roster.json`, `*.pending.json`, `mesh_*` run files; follow-claim code; `launch_friend.sh`, `end_friend.sh`; `[direct.options] codex_mesh`, `UNIT_CODEX_MESH`, `UNIT_COMPACT_ABOVE_TOKENS`, `WORKER_TRANSPORT`; shutdown's `CodexServer`, `codex_seats`, `PausedSeat`, `_CODEX_HEADLESS`, mesh pause and paused-workers note; accounts' server lines; display mesh code (`production_tree.py`, `process_table.py`, `waste_watch.py`, `hierarchies/*`, `shot_report/transcripts.py:1680`, `lint/tmp_sweep.py`); showrunner parent files once Phase 12 moved them; the Codex app-server homes; docs: rewrite `long-lived-workers.md`, remove `review-pool*.md`, update `herdr-adoption.md`, `session-roster.md`, `agent-registry.md`, `shutdown-and-restart.md`, `unit-board.md`, `usage-ledger.md`.
+the three launchers merged into one (decision 11); `codex_mesh.py` and its tests; `review_pool.py` and its state; the mesh parts of `workers.py` and the unit worker ledger; `mesh_roster.json`, `*.pending.json`, `mesh_*` run files; follow-claim code; `launch_friend.sh`, `end_friend.sh`; `[direct.options] codex_mesh`, `UNIT_CODEX_MESH`, `UNIT_COMPACT_ABOVE_TOKENS`, `WORKER_TRANSPORT`; shutdown's `CodexServer`, `codex_seats`, `PausedSeat`, `_CODEX_HEADLESS`, mesh pause and paused-workers note; accounts' server lines; display mesh code (`production_tree.py`, `process_table.py`, `waste_watch.py`, `hierarchies/*`, `shot_report/transcripts.py:1680`, `lint/tmp_sweep.py`); showrunner parent files once Phase 12 moved them; the Codex app-server homes; docs: rewrite `long-lived-workers.md`, remove `review-pool*.md`, update `herdr-adoption.md`, `session-roster.md`, `agent-registry.md`, `shutdown-and-restart.md`, `unit-board.md`, `usage-ledger.md`.
 
 ### Probe results (Phase 4 writes them)
 
