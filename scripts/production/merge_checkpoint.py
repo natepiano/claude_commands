@@ -464,17 +464,35 @@ def change_review_commits(request: MergeRequest) -> list[change_review.Commit]:
     return commits
 
 
+def checkpoint_step_record(checkout: Path, merge_head: str, step: str) -> Path:
+    """Completion belongs to this merge, not to a session's disposable scratch."""
+    path = good(git(checkout, "rev-parse", "--git-path", f"checkpoint-completed/{merge_head}/{step}"), step)
+    return checkout / path
+
+
 def record_changes(request: MergeRequest, commits: list[change_review.Commit], merge_head: str) -> None:
     """Add one row per visible change to the production's list, then name any merge still missing rows."""
     doc = change_review.list_path(request.production.doc)
     if doc is None:
         report("change review", "ok", "the production doc has no Change review line; no rows written")
         return
+    done = checkpoint_step_record(request.production.checkout, merge_head, "change-review")
+    if done.exists():
+        report("change review", "ok", "checkpoint changes already recorded")
+        return
     merged = good(git(request.production.checkout, "rev-parse", f"--short={change_review.SHORT}", merge_head), "push")
     try:
-        rows = change_review.append_rows(doc, change_review.visible(commits),
-                                         datetime.now(request.production.zone).date(), merged, request.production.doc,
-                                         owners=change_review.visible_owners(commits, request.production.doc))
+        # A stop after the list write but before the receipt must not add it twice.
+        changes = change_review.visible(commits)
+        existing = change_review.pending(doc) if doc.exists() else []
+        held = {row["Change"] for row in existing
+                if any(sha.startswith(merged) or merged.startswith(sha)
+                       for sha in cast(list[str], re.findall(r"\b[0-9a-f]{7,40}\b", row.get("Merged", ""))))}
+        rows = [] if changes and all(item.change in held for item in changes) else change_review.append_rows(
+            doc, changes, datetime.now(request.production.zone).date(), merged, request.production.doc,
+            owners=change_review.visible_owners(commits, request.production.doc))
+        done.parent.mkdir(parents=True, exist_ok=True)
+        done.touch()
         drifted = change_review.drift(request.production.checkout, request.production.merge_branch,
                                       change_review.read(doc), change_review.LANDED,
                                       change_review.foreign_units(request.production.doc))
@@ -1098,6 +1116,9 @@ def run(request: MergeRequest) -> int:
             merge_head = merge(request)
         else:
             merge_head = merged_checkpoint(request)
+            # Origin and last-for-unit already contain this checkpoint. Its merge
+            # parents retain the original incoming commits even after later merges.
+            commits = change_review.merge_commits(request.production.checkout, merge_head)
             # A run killed between its merge and its push left a merge nothing has tested.
             steps = ("scope", "conflicts", "other units", "merge")
             if isinstance(pushed, PushedTip):
@@ -1129,8 +1150,7 @@ def run(request: MergeRequest) -> int:
         record_pushed_merges(request.production, merge_head, request.commit, tip, phase_id=request.phase,
                              issue=str(request.unit.plan))
         notify_style(request.production.checkout, request.production.merge_branch, tip)
-        if isinstance(pushed, NotYetPushed):
-            record_changes(request, commits, merge_head)
+        record_changes(request, commits, merge_head)
         into(request.production.checkout, request.production.merge_branch,
              "the merge branch collects every unit's checkpoints", gate_names(request, first_code_merge))
         promote(request, tip)
@@ -1308,6 +1328,27 @@ def handoff_tests_pending_path(checkout: Path, checkpoint: str) -> Path:
     return checkout / path
 
 
+def promote_handoff(request: ChildHandoffRequest, merge_head: str, tip: str) -> None:
+    """Retry interrupted promotion; a push receipt is not a promotion receipt."""
+    if isinstance(request.promotion, production_doc.NoPromotion):
+        return
+    done = checkpoint_step_record(request.production.checkout, merge_head, "handoff-promotion")
+    if not done.exists():
+        promote(request, tip)
+        done.parent.mkdir(parents=True, exist_ok=True)
+        done.touch()
+
+
+def record_handoff_completion(request: ChildHandoffRequest, merge_head: str, tip: str) -> None:
+    entry = f"{request.child.slug} style hand-off ({request.checkpoint}) merged as {merge_head}; pushed at {tip}"
+    log = request.production.log
+    if log.exists() and entry in log.read_text(encoding="utf-8"):
+        return
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with log.open("a", encoding="utf-8") as output:
+        _ = output.write(f"- {datetime.now(request.production.zone):%H:%M %Z}: {entry}\n")
+
+
 def run_handoff(request: ChildHandoffRequest) -> int:
     checkout, branch, checkpoint = request.production.checkout, request.production.merge_branch, request.checkpoint
     delivery = request.delivery
@@ -1317,6 +1358,8 @@ def run_handoff(request: ChildHandoffRequest) -> int:
         tip = pushed.tip if isinstance(pushed, PushedTip) else delivery.merge_head
         record_pushed_merges(request.production, delivery.merge_head, checkpoint, tip,
                              phase_id="", issue=f"{request.child.slug} hand-off")
+        promote_handoff(request, delivery.merge_head, tip)
+        record_handoff_completion(request, delivery.merge_head, tip)
         finish_handoff(request, delivery.merge_head)
         return 0
     current = good(git(checkout, "branch", "--show-current"), "merge")
@@ -1357,12 +1400,11 @@ def run_handoff(request: ChildHandoffRequest) -> int:
     record_pushed_merges(request.production, merge_head, checkpoint, tip,
                          phase_id="", issue=f"{request.child.slug} hand-off")
     notify_style(checkout, branch, tip)
-    promote(request, tip)
+    if isinstance(request.promotion, production_doc.NoPromotion):
+        promote(request, tip)
+    promote_handoff(request, merge_head, tip)
+    record_handoff_completion(request, merge_head, tip)
     finish_handoff(request, merge_head)
-    request.production.log.parent.mkdir(parents=True, exist_ok=True)
-    with request.production.log.open("a", encoding="utf-8") as log:
-        _ = log.write(f"- {datetime.now(request.production.zone):%H:%M %Z}: {request.child.slug} style hand-off "
-                      + f"({checkpoint}) merged as {merge_head}; pushed at {tip}\n")
     print(f"hand-off {checkpoint[:7]} merged as {merge_head[:7]}", flush=True)
     return 0
 
