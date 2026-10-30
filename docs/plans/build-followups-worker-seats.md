@@ -33,7 +33,7 @@
   - `scripts/agents/agents_config.sh` — `_agents_validate_pair` at 297, `agents_resolve` at 330, `agents_resolve_print` at 494
   - `scripts/agents/sync_codex_catalog.sh` — writes `[codex.agents]`; incomplete-cache rule at ~261–279
   - `scripts/agents/agent_admin.sh` — backend of `/agent`; `commands/agent.md`
-  - `config/agents.conf` — `[codex.agents]`, `[claude.agents]`, `[direct.codex]`; the overlay `config/agents.local.conf` is gitignored and exists only in `~/.claude`
+  - `config/agents.conf` — `[codex.agents]`, `[claude.agents]`, `[direct.codex]`; the one registry on every machine, with no local overlay
   - `scripts/agents/agent_bg.sh` — named background Claude sessions
   - `scripts/direct/progress_history.py`, `end_session.sh`, `remove_workers.py`, `prepare_session.sh`, `phase_reservation.py`
   - `scripts/production/retire_unit.py`, `transfer_unit.py`, `rename_unit.py`, `merge_checkpoint.py`, `merge_gate.py` (`TEST_SUITES` at 63)

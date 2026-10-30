@@ -65,19 +65,17 @@ class LauncherWaitTests(unittest.TestCase):
         self.addCleanup(server.close)
         fixture_time = time.perf_counter()
         real_recv = socket.socket.recv
-        partial_read = False
-        first_read = threading.Event()
+        partial_read = threading.Event()
 
         def delayed_recv(connection: socket.socket, count: int, flags: int = 0) -> bytes:
-            nonlocal fixture_time, partial_read
+            nonlocal fixture_time
             received = real_recv(connection, count, flags)
-            if received and connection.getsockname()[1] == server.port and not partial_read:
-                partial_read = True
+            if received and connection.getsockname()[1] == server.port and not partial_read.is_set():
                 # Scheduling delay after the first real partial read. The old
                 # handshake budget expires, while the shared guard still has time.
                 fixture_time += 6
                 self.assertGreater(self.guard.remaining(), 6)
-                first_read.set()
+                partial_read.set()
             return received
 
         # The budget's default clock is a retained callable, so replace it at
@@ -90,16 +88,11 @@ class LauncherWaitTests(unittest.TestCase):
               socket.create_connection(("127.0.0.1", server.port)) as client):
             client.settimeout(self.guard.remaining())
             client.sendall(b"GET / HTTP/1.1\r\n")
-            # Wait for the actual first read before completing the handshake.
-            self.guard.event(first_read)
-            # A socket exchange keeps synchronization on the exercised path.
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                def finish() -> bytes:
-                    client.sendall(b"Host: fixture\r\n\r\n")
-                    return client.recv(4096)
-                response = self.guard.result(executor.submit(finish))
+            self.guard.event(partial_read)
+            client.sendall(b"Host: fixture\r\n\r\n")
+            response = client.recv(4096)
             self.assertIn(b"101 Switching Protocols", response)
-        self.assertTrue(partial_read)
+        self.assertTrue(partial_read.is_set())
 
     def test_socket_loop_count_still_bounds_repeated_handshake_work(self) -> None:
         budget = FixtureLoopBudget("handshake", max_calls=1)

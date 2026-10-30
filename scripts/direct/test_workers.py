@@ -194,6 +194,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         self.write_pool_roster({name: {
             "thread_id": mesh_fixture.THREAD_ID, "status": "done", "role": role,
             "model": "gpt-kept-sol", "effort": "xhigh", "family": "codex",
+            "turn_model": "gpt-kept-sol", "turn_effort": "xhigh",
             "codex_home": os.environ["CODEX_HOME"], "port": self.server.port,
             "cwd": str(self.session_dir.parent / "repository"),
         }})
@@ -201,7 +202,9 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
     def complete_assignment(self, name: str, *, role: Literal["impl", "test", "fix", "review"] = "impl") -> None:
         """Consume any dispatch reservation through a real, completed turn."""
         args = self.start_args()
+        args.name = ""
         args.to = name
+        args.model = args.effort = ""
         args.role = role
         args.message_file = str(self.session_dir / "prompt.txt")
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
@@ -1540,6 +1543,28 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
                             for request in self.methods("thread/resume")))
         self.assertEqual(self.methods("thread/start"), [])
 
+    def test_removed_run_adoption_keeps_the_latest_accepted_turn_settings(self) -> None:
+        self.open_worker(name="impl")
+        self.configure_new_worker()
+        self.assertEqual(self.resolve(self.session_dir), "impl")
+        self.complete_assignment("impl")
+        registry = Path(os.environ["AGENTS_CONFIG_FILE"])
+        _ = write_registry(registry, {"direct.codex": {"impl": "gpt-kept-sol:high"}},
+                           base_text=registry.read_text())
+        self.assertEqual(self.resolve(self.session_dir), "impl")
+        self.complete_assignment("impl")
+        submitted = cast(dict[str, object], self.methods("turn/start")[-1]["params"])
+        self.assertEqual((submitted["model"], submitted["effort"]), ("gpt-kept-sol", "high"))
+        with workers.ledger_for_run(self.session_dir).locked() as ledger:
+            self.assertEqual((ledger.workers["impl"].model, ledger.workers["impl"].effort),
+                             ("gpt-kept-sol", "high"))
+        destination = self.next_run("after-later-turn")
+        shutil.rmtree(self.session_dir)
+        self.assertEqual(self.resolve(destination), "impl")
+        record = cast(dict[str, object], json_object(destination / codex_mesh.ROSTER_FILE)["impl"])
+        self.assertEqual(record["thread_id"], mesh_fixture.THREAD_ID)
+        self.assertEqual((record["turn_model"], record["turn_effort"]), ("gpt-kept-sol", "high"))
+
     def test_queued_work_and_owed_continuations_exclude_same_run_allocation(self) -> None:
         self.configure_new_worker()
         for obstacle in ("continuation", "pending"):
@@ -1825,7 +1850,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         record = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
         worker = cast(dict[str, object], record["address-with-no-role-suffix"])
         self.assertEqual(worker["thread_id"], mesh_fixture.THREAD_ID)
-        self.assertEqual(worker["model"], "gpt-kept-sol")
+        self.assertEqual(worker["turn_model"], "gpt-kept-sol")
         self.assertEqual(self.methods("thread/start"), [])
 
     def resolve_identity(self, model: str, effort: str) -> str:
@@ -1839,38 +1864,28 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         self.assertEqual(len(result.stdout.strip().splitlines()), 1, result.stdout)
         return result.stdout.strip()
 
-    def test_explicit_model_and_effort_select_an_exact_idle_identity(self) -> None:
+    def test_turn_display_does_not_filter_an_idle_worker_for_a_requested_model(self) -> None:
         self.open_worker("keep-first")
         roster = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
         original = cast(dict[str, object], roster["keep-first"])
-        other = {**original, "thread_id": "other-thread", "model": "gpt-other-sol", "effort": "high"}
-        roster["select-this"] = other
+        roster["select-this"] = {**original, "thread_id": "other-thread",
+                                 "turn_model": "gpt-other-sol", "turn_effort": "high"}
         self.write_pool_roster(roster)
-
-        self.assertEqual(self.resolve_identity("gpt-other-sol", "high"), "select-this")
-
-        after = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
-        self.assertEqual(cast(dict[str, object], after["keep-first"]), original)
+        self.assertEqual(self.resolve_identity("gpt-other-sol", "high"), "keep-first")
+        after = cast(dict[str, object], json_object(self.session_dir / codex_mesh.ROSTER_FILE)["keep-first"])
+        self.assertEqual(after["thread_id"], original["thread_id"])
+        self.assertEqual((after["turn_model"], after["turn_effort"]), ("gpt-kept-sol", "xhigh"))
         self.assertEqual(self.methods("thread/start"), [])
-        with workers.ledger_for_run(self.session_dir).locked() as ledger:
-            self.assertEqual((ledger.workers["select-this"].model, ledger.workers["select-this"].effort),
-                             ("gpt-other-sol", "high"))
 
-    def test_an_effort_override_opens_another_worker_without_mutating_the_unit_identity(self) -> None:
+    def test_an_effort_override_reuses_an_idle_worker_without_rewriting_its_history(self) -> None:
         self.configure_new_worker()
         store = self.lifecycle_worker("impl")
-        original = json_object(self.session_dir / codex_mesh.ROSTER_FILE)["impl"]
-
         chosen = self.resolve_identity("gpt-kept-sol", "high")
-
-        self.assertEqual(chosen, "impl2")
-        self.assertEqual(json_object(self.session_dir / codex_mesh.ROSTER_FILE)["impl"], original)
+        self.assertEqual(chosen, "impl")
         with store.locked() as ledger:
-            self.assertEqual(ledger.workers["impl"].effort, "xhigh")
-            self.assertEqual(ledger.workers[chosen].effort, "high")
+            self.assertEqual(ledger.workers[chosen].effort, "xhigh")
             self.assertEqual(ledger.workers[chosen].model, "gpt-kept-sol")
-        params = cast(dict[str, object], self.methods("thread/start")[0]["params"])
-        self.assertEqual(params["model"], "gpt-kept-sol")
+        self.assertEqual(self.methods("thread/start"), [])
 
     def test_shown_context_follows_transfer_and_rename_while_the_address_stays_stable(self) -> None:
         _ = self.lifecycle_worker("w7")
