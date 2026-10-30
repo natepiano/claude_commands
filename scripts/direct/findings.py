@@ -67,6 +67,7 @@ from typing import TypedDict, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import unit_runs  # noqa: E402
 from scripts.history.rounds import phase_rounds  # noqa: E402
+from scripts.usage.agents_log import LENSES as REVIEW_LENSES  # noqa: E402
 
 # What history written before the rename records for a finding a worker caught.
 FORMER_WORKER = "delegate"
@@ -83,9 +84,6 @@ SEVERITIES = ("blocker", "minor", "nit")
 FIRST_ROUND_GATING = ("blocker", "minor")
 LATER_ROUND_GATING = ("blocker",)
 
-# Every lens a finding can name. A closed set for the reason review.sh closes
-# its own: a misspelt lens would be stored, and every count by lens would miss it.
-REVIEW_LENSES = ("adversary", "contract", "craft", "ux")
 # What `--lens` took when the broad review had two lenses; it means
 # adversary,contract, and the ledger keeps the word its callers already write.
 LEGACY_BOTH_LENS = "both"

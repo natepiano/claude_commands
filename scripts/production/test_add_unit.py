@@ -134,11 +134,11 @@ class AddUnitLaunchTests(AddUnitTestCase):
                 self.assertTrue(result.stderr.rstrip().endswith(ending), result.stderr)
                 self.assertEqual(closed.call_args_list, [] if typed else [call(SHARED, "w1:p1")])
 
-    def test_configured_tab_title_keeps_pane_session_and_attach_keys(self) -> None:
+    def test_job_name_configuration_does_not_change_tab_or_pane_session_name(self) -> None:
         with patch.object(names, "runtime_names", return_value=fixture_names(director="coordinator")):
             result = self.successful("alpha", "--plan", "docs/plans/given.md")
         calls = self.herdr_calls()
-        self.assertIn(["--session", SHARED, "tab", "rename", "w1:t1", "build-followups · alpha · coordinator"], calls)
+        self.assertIn(["--session", SHARED, "tab", "rename", "w1:t1", "alpha"], calls)
         self.assertIn(["--session", SHARED, "pane", "rename", "w1:p1", "alpha"], calls)
         start = next(row for row in calls if row[2:4] == ["agent", "start"])
         arguments = start[start.index("--") + 1:]
@@ -294,7 +294,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertEqual(self.opened()[:8], ["--session", SHARED, "workspace", "create", "--label", "director",
                                              "--cwd", str(worktree)])
         self.assertIn(["--session", SHARED, "tab", "rename", "w1:t1",
-                       "build-followups · alpha · unit director"], self.herdr_calls())
+                       "alpha"], self.herdr_calls())
         self.assertIn(["--session", SHARED, "pane", "rename", "w1:p1", "alpha"], self.herdr_calls())
         self.assertEqual({key: value for key, value in self.pane_environment().items()
                           if key.startswith(("SHOWRUNNER_", "CLAUDE_", "HERDR_")) or key == "ENABLE_TOOL_SEARCH"},
