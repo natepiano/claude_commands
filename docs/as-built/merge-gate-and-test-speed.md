@@ -32,7 +32,7 @@ remain only for the pending archive cleanup; they do not dispatch new reviews.
 
 ### The gate: `scripts/production/merge_gate.py`
 
-**Invocation.** `merge_gate.py --merge-branch B --unit-branch U --checkpoint C --previous-checkpoint P --unit NAME --phase LABEL [--production DOC] [--change-review LIST] [--repo/--checkout DIR] [--body TEXT] [--type-dirs DIR...] [--promote] [--promote-only] [--main-repo ~/.claude] [--ssh ssh] [--mac-host mac] [--mac-repo ~/.claude] [--settings-blob b3466859] [--memory-cap-mib 4096] [--full] [--nightly]`. The six merge flags are required unless `--tests-only`, `--promote-only` or `--nightly` is given. `--promote-only --merge-branch B` runs no merge and no tests: it only promotes the pushed `origin/B` to `~/.claude` main and the Mac, so a promoter that merged by other means still gets the Mac step. `--production` defaults to the calling showrunner's production, read from its update timer; a gate that finds neither is refused before the merge (2026-10-17: about 110 merges since 2026-10-16 ran without it and wrote no change-review rows). After the push it prints `Change review: N row(s) added to <list>: C25–C27`, then each row. `--type-dirs` (alias `--type-dir`) defaults to `scripts`. Any failure prints `REFUSED: <reason>` to stderr and exits 1. Typed boundary: `GateArguments(argparse.Namespace)`; each failure raises `GateRefused`.
+**Invocation.** `merge_gate.py --merge-branch B --unit-branch U --checkpoint C --previous-checkpoint P --unit NAME --phase LABEL [--production DOC] [--change-review LIST] [--repo/--checkout DIR] [--body TEXT] [--type-dirs DIR...] [--promote] [--promote-only] [--main-repo ~/.claude] [--ssh ssh] [--mac-host mac] [--mac-repo ~/.claude] [--settings-blob b3466859] [--memory-cap-mib 6144] [--full] [--nightly]`. The six merge flags are required unless `--tests-only`, `--promote-only` or `--nightly` is given. `--promote-only --merge-branch B` runs no merge and no tests: it only promotes the pushed `origin/B` to `~/.claude` main and the Mac, so a promoter that merged by other means still gets the Mac step. `--production` defaults to the calling showrunner's production, read from its update timer; a gate that finds neither is refused before the merge (2026-10-17: about 110 merges since 2026-10-16 ran without it and wrote no change-review rows). After the push it prints `Change review: N row(s) added to <list>: C25–C27`, then each row. `--type-dirs` (alias `--type-dir`) defaults to `scripts`. Any failure prints `REFUSED: <reason>` to stderr and exits 1. Typed boundary: `GateArguments(argparse.Namespace)`; each failure raises `GateRefused`.
 
 **Refusals before merging** (`merge_checkpoint`):
 - tracked uncommitted changes. Untracked files never block (`--untracked-files=no`), because each showrunner keeps a LOG there; a merge that would overwrite an untracked file fails and is aborted.
@@ -192,7 +192,7 @@ Every `UNIT_*` name above was `PLAN_DELEGATE_*` before the rename, and `UNIT_RUN
 
 | Item | Value |
 |---|---|
-| Memory cap | 4096 MiB (`DEFAULT_MEMORY_CAP_MIB`) |
+| Memory cap | 6144 MiB (`DEFAULT_MEMORY_CAP_MIB`) |
 | Initial per-job reservation | 96 MiB |
 | Memory sampling interval | 0.25 s or more; scheduler loop sleeps 0.05 s |
 | Fixture hang guards | 300 s (`wait_until`, `communicate_launcher`, script launches, follow tests) |
