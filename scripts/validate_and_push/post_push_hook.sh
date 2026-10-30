@@ -10,6 +10,8 @@ set -euo pipefail
 # triggers it. The push has already happened by the time this runs, so a failing
 # hook rolls nothing back; it prints how to rerun the hook by hand and exits
 # non-zero so the agent reports the failure instead of calling the push done.
+# Hooks must be safe to run more than once for one LANDED_SHA: a stop after a
+# successful hook but before its completion record is saved causes a retry.
 #
 # Usage: post_push_hook.sh <landed-branch> [<landed-sha>]
 
