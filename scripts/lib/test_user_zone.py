@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import override
 
 from scripts.lib.code_kind import is_test_code
+from scripts.lib import user_zone
 
 SCRIPT = Path(__file__).with_name("user_zone.py")
 PROBE = ("import sys; sys.path.insert(0, sys.argv[1]); import user_zone; from datetime import datetime, timezone; "
@@ -62,6 +63,28 @@ class UserZoneTests(unittest.TestCase):
         _ = self.conf.write_text("# a comment\nzone=Europe/Paris\n", encoding="utf-8")
         result = self.run_script()
         self.assertEqual((result.returncode, result.stdout), (0, "Europe/Paris\n"), result.stderr)
+
+    def test_stored_zone_reads_the_first_zone_line_and_reloads_edits(self) -> None:
+        self.assertEqual(user_zone.stored_zone(str(self.conf)), "")
+        _ = self.conf.write_text("# zone=ignored\nother=value\n", encoding="utf-8")
+        self.assertEqual(user_zone.stored_zone(str(self.conf)), "")
+        _ = self.conf.write_text("# comment\nzone= Europe/Paris \nzone=UTC\n", encoding="utf-8")
+        self.assertEqual(user_zone.stored_zone(str(self.conf)), "Europe/Paris")
+        _ = self.conf.write_text("zone=UTC\n", encoding="utf-8")
+        self.assertEqual(user_zone.stored_zone(str(self.conf)), "UTC")
+
+    def test_cli_import_budget_without_site(self) -> None:
+        _ = self.conf.write_text("zone=Europe/Paris\n", encoding="utf-8")
+        environment = {key: value for key, value in os.environ.items() if key != "USER_ZONE"}
+        environment["USER_ZONE_CONF"] = str(self.conf)
+        result = subprocess.run([sys.executable, "-S", "-X", "importtime", str(SCRIPT)],
+                                env=environment, capture_output=True, text=True, check=False, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "Europe/Paris\n")
+        imports = {line.rpartition("|")[2].strip() for line in result.stderr.splitlines()
+                   if line.startswith("import time:")}
+        self.assertTrue(imports, result.stderr)
+        self.assertNotIn("pathlib", imports)
 
     def test_no_file_and_no_zone_line_both_give_the_default(self) -> None:
         self.assertEqual(self.run_script().stdout, "America/New_York\n")

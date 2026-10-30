@@ -175,7 +175,7 @@ def current_finding(ledger: ledger_api.Ledger, finding: ledger_api.HeldFinding, 
     evidence = ledger.finding_site(finding, head)
     judged = ledger.judged_commit(finding)
     if not isinstance(evidence, ledger_api.UnchangedSite) or not isinstance(judged, ledger_api.JudgedCommit):
-        return bulk.Refusal(finding.finding_id, "changed since judged")
+        return bulk.Refusal(finding.finding_id, "changed since judged: site lineage is not unchanged or the judged commit is missing")
     path = ledger.repo / evidence.path
     if path.resolve() != path or not path.is_file() or path.suffix != ".rs":
         return bulk.Refusal(finding.finding_id, "finding path is not a regular Rust file")
@@ -184,7 +184,7 @@ def current_finding(ledger: ledger_api.Ledger, finding: ledger_api.HeldFinding, 
     source = sources.current[evidence.path]
     old = sources.judged_file(ledger.repo, judged.commit, finding.path)
     if old.code:
-        return bulk.Refusal(finding.finding_id, "changed since judged")
+        return bulk.Refusal(finding.finding_id, "changed since judged: the file cannot be read at the judged commit")
     old_lines = old.stdout.encode().splitlines(keepends=True)
     new_lines = source.encode().splitlines(keepends=True)
     old_line = finding.line
@@ -193,7 +193,7 @@ def current_finding(ledger: ledger_api.Ledger, finding: ledger_api.HeldFinding, 
         old_line = matches[0] if len(matches) == 1 else 0
     if (not 0 < old_line <= len(old_lines) or not 0 < evidence.line <= len(new_lines)
             or old_lines[old_line - 1] != new_lines[evidence.line - 1]):
-        return bulk.Refusal(finding.finding_id, "changed since judged")
+        return bulk.Refusal(finding.finding_id, "changed since judged: the judged line bytes differ from the current line")
     return replace(finding, path=evidence.path, line=evidence.line, text=source.splitlines()[evidence.line - 1])
 
 
@@ -210,7 +210,7 @@ def current_rename(ledger: ledger_api.Ledger, finding: ledger_api.HeldFinding, h
     if isinstance(scope, NoBindingScope):
         return bulk.Refusal(finding.finding_id, scope.reason)
     if source.count("\n", 0, scope.offset) + 1 != current.line:
-        return bulk.Refusal(finding.finding_id, "changed since judged")
+        return bulk.Refusal(finding.finding_id, "changed since judged: the declaration is not on the current line")
     return bulk.RenameFinding(finding.finding_id, current.path, pair)
 
 
@@ -343,34 +343,24 @@ class WorkspaceEdits:
 
 
 def plan_renames(repo: Path, ledger: ledger_api.Ledger, base: str, selected: Selection,
-                 server: bulk.RenameServer, available: Callable[[Path, str], None]) -> PlannedEdits:
+                 server: bulk.RenameServer, availability: PlanningFileAvailability) -> PlannedEdits:
     sources = RenameSources()
     refused: dict[str, str] = {}
     groups: dict[str, list[bulk.RenameFinding]] = defaultdict(list)
-    reservations: dict[str, str] = {}
     for finding in selected.findings:
         try:
             rename = current_rename(ledger, finding, base, sources)
             if isinstance(rename, bulk.Refusal):
                 refused[finding.finding_id] = rename.reason
             else:
-                if rename.path not in reservations:
-                    try:
-                        available(repo, rename.path)
-                    except (bulk.BulkRenameError, OSError) as error:
-                        reservations[rename.path] = str(error)
-                    else:
-                        reservations[rename.path] = ""
-                if reservations[rename.path]:
-                    refused[finding.finding_id] = reservations[rename.path]
-                else:
-                    groups[rename.path].append(rename)
+                groups[rename.path].append(rename)
         except (bulk.BulkRenameError, OSError, UnicodeError) as error:
             refused[finding.finding_id] = str(error)
     docs = bulk.repository_docs(repo)
     files: list[bulk.FileRenames] = []
     for path, findings in groups.items():
-        file = bulk.rename_file(server, repo / path, path, sources.current[path], tuple(findings), docs)
+        file = bulk.rename_file(server, repo / path, path, sources.current[path], tuple(findings), docs,
+                                check_files=availability.require)
         files.append(file)
         refused.update((item.finding_id, item.reason) for item in file.refusals)
         for document in file.related:
@@ -470,6 +460,69 @@ def plan_constants(repo: Path, ledger: ledger_api.Ledger, base: str, selected: S
 
 
 
+def dependent_files(dependencies: dict[str, frozenset[str]], paths: set[str]) -> set[str]:
+    """All files that must be kept or refused together, including transitive groups."""
+    reached = set(paths)
+    pending = list(paths)
+    while pending:
+        for path in dependencies.get(pending.pop(), frozenset()):
+            if path not in reached:
+                reached.add(path)
+                pending.append(path)
+    return reached
+
+
+class AvailableFile(Enum):
+    AVAILABLE = "available"
+
+
+@dataclass(frozen=True)
+class UnavailableFile:
+    reason: str
+
+
+class PlanningFileAvailability:
+    """One reservation answer per path during planning; the final guard checks afresh."""
+
+    def __init__(self, repo: Path, available: Callable[[Path, str], None]) -> None:
+        self.repo: Path = repo
+        self.available: Callable[[Path, str], None] = available
+        self.checked: dict[str, AvailableFile | UnavailableFile] = {}
+
+    def require(self, paths: tuple[str, ...]) -> None:
+        for path in paths:
+            if path not in self.checked:
+                try:
+                    self.available(self.repo, path)
+                    self.checked[path] = AvailableFile.AVAILABLE
+                except (bulk.BulkRenameError, OSError) as error:
+                    self.checked[path] = UnavailableFile(str(error))
+            answer = self.checked[path]
+            if isinstance(answer, UnavailableFile):
+                raise bulk.BulkRenameError(answer.reason)
+
+
+def available_constant_plan(plan: PlannedEdits, availability: PlanningFileAvailability) -> PlannedEdits:
+    """Constants have no analyzer overlays; refuse their atomic extraction groups."""
+    files = {file.path: file for file in plan.files}
+    dependencies = {file.path: file.dependencies for file in plan.files}
+    refused = {item.finding_id: item.reason for item in plan.refusals}
+    removed: set[str] = set()
+    for path in files:
+        try:
+            availability.require((path,))
+        except bulk.BulkRenameError as error:
+            group = dependent_files(dependencies, {path})
+            removed.update(group)
+            for member in group & files.keys():
+                for item in files[member].kept:
+                    _ = refused.setdefault(item.finding.finding_id, str(error))
+    return PlannedEdits(tuple(file for file in plan.files if file.path not in removed),
+                        tuple(bulk.Refusal(identity, reason) for identity, reason in refused.items()),
+                        tuple(proof for proof in plan.constant_proofs
+                              if not any(edit.path in removed for edit in proof.result.edits)))
+
+
 def diagnostic_files(repo: Path, result: CommandResult) -> set[str]:
     paths: set[str] = set()
     def spans(message: dict[str, object]) -> None:
@@ -514,15 +567,7 @@ def validate(workspace: WorkspaceEdits, runner: Runner, times: dict[str, float],
             errors: set[str] = set()
             for result in failures:
                 errors.update(diagnostic_files(workspace.repo, result))
-            remove = set(errors)
-            while True:
-                expanded = set(remove)
-                for path in remove:
-                    expanded.update(workspace.dependencies.get(path, frozenset()))
-                if expanded == remove:
-                    break
-                remove = expanded
-            remove &= kept
+            remove = dependent_files(workspace.dependencies, errors) & kept
             loop.update(errors=sorted(errors), reverted=sorted(remove))
             if not remove:
                 raise bulk.BulkRenameError("validation errors remain but no new edited file can be reverted")
@@ -647,12 +692,13 @@ def run_rule(repo: Path, rule: str, base_tree: str, ledger: ledger_api.Ledger,
     kept_findings: tuple[AppliedFinding, ...] = ()
     try:
         started = time.monotonic()
+        availability = PlanningFileAvailability(repo, available)
         with ExitStack() as stack:
             if definition.family == "names":
                 rename_server = stack.enter_context(bulk.RustAnalyzer(repo)) if isinstance(server, RenameService) else server
-                plan = plan_renames(repo, ledger, base, selected, rename_server, available)
+                plan = plan_renames(repo, ledger, base, selected, rename_server, availability)
             else:
-                plan = plan_constants(repo, ledger, base, selected)
+                plan = available_constant_plan(plan_constants(repo, ledger, base, selected), availability)
         refused.update((item.finding_id, item.reason) for item in plan.refusals)
         times["rename"] = time.monotonic() - started
         candidates = plan.files

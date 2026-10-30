@@ -1,0 +1,35 @@
+# Recorded continuous-writer claims. These dates come from git history, not events.
+# Add a [["source key".gaps]] table with from, to and reason for an interruption.
+# Issue history has no single continuous closure writer identified in this repo.
+
+[buildlog]
+since = "2026-10-02T12:28:36-04:00"
+evidence = "3630abb95f887dd8f39a2d6a16d8228b0abfbfb2 buildlog: a permanent, queryable record of every build, lint and test step; scripts/buildlog/record.py and index.py"
+
+["usage ledger"]
+since = "2026-10-12T04:00:53-04:00"
+evidence = "09a67a256e093111f61c786214c49ca785f66509 checkpoint(build-followups-usage-ledger): phase 4 — One store of every model turn; scripts/usage/collect.py"
+
+["phase history"]
+since = "2026-08-02T11:34:56-04:00"
+evidence = "cffcb418f365a3a2936a9404413859172a192e3e feat(delegate): record durable progress calibration; scripts/delegate/progress_history.py writes phase_started and phase_finished, now scripts/direct/progress_history.py"
+
+["wait history"]
+since = "2026-10-29T05:09:35-04:00"
+evidence = "9862e49a93e8c74a22f009e1e85450396db20828 checkpoint(sdlc-phases): phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt; scripts/direct/progress_history.py"
+
+["merge history"]
+since = "2026-10-06T21:05:51-04:00"
+evidence = "28c940c7f2d3aa8a1426f0aca6a47aaea7bef32d checkpoint(build-followups-enh-showrunner): phase 5 — One command merges a checkpoint, and every other showrunner step gets a script-or-not verdict; scripts/production/merge_checkpoint.py records merges in git"
+
+["notification history"]
+since = "2026-10-13T08:52:11-04:00"
+evidence = "dcad3ceb2b490b146a50db462f9a858e382dcef8 checkpoint(build-followups-message-clarity): phase 2 — The push reviewer; scripts/notify/review.py writes review.jsonl; pushover.jsonl writer began in f392af8b41370555d25a23c5779d187a4ae7d99e"
+
+["message history"]
+since = "2026-10-01T12:38:13-04:00"
+evidence = "c3ff21e5ff480c3f455bf50f99f9ca691eefddb1 message: one way for scripts to reach a session (send.py) and one home for the rules (/message); scripts/message/send.py writes log.jsonl"
+
+["merge receipts"]
+since = "2026-10-29T05:09:35-04:00"
+evidence = "9862e49a93e8c74a22f009e1e85450396db20828 checkpoint(sdlc-phases): phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt; scripts/direct/progress_history.py writes merge_receipts.jsonl"

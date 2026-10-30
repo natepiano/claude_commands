@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.whoami.note_file import note_name
 
 import io
@@ -15,7 +20,6 @@ import os
 import selectors
 import shlex
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
@@ -23,7 +27,6 @@ import urllib.request
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone, tzinfo
-from pathlib import Path
 from collections.abc import Callable, Generator, Iterator
 from typing import Literal, Self, TextIO, cast, final, override
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -35,9 +38,9 @@ from scripts.production import showrunners
 from scripts.agents import codex_mesh
 from scripts.message import roster
 from scripts.accounts import moves, worker_names
-import account
-import agent_accounts
-import usage_store
+from scripts.whoami import account
+from scripts.whoami import agent_accounts
+from scripts.whoami import usage_store
 import quota_alert
 from scripts.whoami import run_out
 

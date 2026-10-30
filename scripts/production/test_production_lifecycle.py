@@ -10,12 +10,14 @@ import os
 import sys
 import unittest
 from pathlib import Path
-from typing import final
+from typing import final, override
 from unittest import mock
 
 import fake_unit_host
 import production_lifecycle
 import showrunners
+import showrunner_tree
+import showrunner_parent
 from production_units import read_production
 from fake_unit_host import HostedUnit
 
@@ -49,10 +51,43 @@ class ProductionNameTests(unittest.TestCase):
 
 @final
 class LifecycleTests(LifecycleFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = self.staff.write_document({"schema": 1, "rows": []})
+        _ = self.enterContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.state / "notifier"))
+
+    @override
+    def reports_to(self, child: str, parent: str) -> Path:
+        path = super().reports_to(child, parent)
+        if "example" in (child, parent):
+            self.write(self.state / "notifier/showrunner-example/conf",
+                       f"TARGET=session:example-session\nCHECK=zsh /x/production_check.sh {self.doc}\n")
+        rows = {row.name: row for row in staff.find(kind="showrunner")}
+        parent_name = "old-showrunner" if parent == "example" else parent
+        child_name = "old-showrunner" if child == "example" else child
+        above = rows.get(parent_name)
+        if above is None:
+            above = staff.ensure("showrunner", name=parent_name)
+        below = rows.get(child_name)
+        if below is None:
+            _ = staff.ensure("showrunner", name=child_name, parent=above.id)
+        elif below.parent != above.id:
+            _ = staff.move(below.id, above.id)
+        return path
+
+    def test_wrap_child_check_follows_staff_parent_despite_stale_parent_file(self) -> None:
+        self.merged_units()
+        self.showrunner("kid", live=True)
+        _ = self.reports_to("kid", "example")
+        child = next(row for row in staff.find(kind="showrunner") if row.name == "kid")
+        _ = staff.move(child.id, None)
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assert_step(result, "ok")
+        self.assertEqual((self.state / "showrunner/kid/parent").read_text(), "example\n")
+
     def staff_tree(self) -> tuple[staff.StaffRow, staff.StaffRow, staff.StaffRow, staff.StaffRow]:
         self.merged_units()
-        self.write(self.state / "notifier/showrunner-example/conf",
-                   f"TARGET=session:example-session\nCHECK=zsh /x/production_check.sh {self.doc}\n")
         top = staff.ensure("showrunner", name="top")
         runner = staff.ensure("showrunner", name="old-showrunner", parent=top.id)
         alpha = staff.ensure("unit", name="alpha", parent=runner.id)
@@ -77,7 +112,7 @@ class LifecycleTests(LifecycleFixture):
             first = self.run_lifecycle("wrap", "--no-ci")
         self.assertEqual(first.returncode, 2, first.stdout + first.stderr)
         self.assertTrue((self.state / "showrunner/example/wrap_release.json").exists())
-        with mock.patch.object(showrunners, "edges_to_release", side_effect=AssertionError("capture read twice")):
+        with mock.patch.object(showrunner_tree, "edges_to_release", side_effect=AssertionError("capture read twice")):
             result = self.run_lifecycle("wrap", "--no-ci")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         for row in (runner, alpha, beta):
@@ -148,7 +183,7 @@ class LifecycleTests(LifecycleFixture):
         with mock.patch.object(staff, "retire", side_effect=interrupted):
             first = self.run_lifecycle("wrap", "--no-ci")
         self.assertEqual(first.returncode, 2, first.stdout + first.stderr)
-        with mock.patch.object(showrunners, "edges_to_release", side_effect=AssertionError("capture read twice")):
+        with mock.patch.object(showrunner_tree, "edges_to_release", side_effect=AssertionError("capture read twice")):
             result = self.run_lifecycle("wrap", "--no-ci")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(staff.by_id(permanent.id), permanent)
@@ -588,9 +623,9 @@ class LifecycleTests(LifecycleFixture):
             zone="America/New_York", doc=str(child_doc),
         )
         production = read_production(self.doc)
-        with (mock.patch.object(showrunners, "stored_children", return_value=("kid",)),
+        with (mock.patch.object(showrunner_tree, "stored_children", return_value=("kid",)),
               mock.patch.object(showrunners, "registered_showrunners", return_value=[child]),
-              mock.patch.object(showrunners, "detach") as detach,
+              mock.patch.object(showrunner_parent, "detach") as detach,
               mock.patch.object(showrunners, "tell_others", return_value=showrunners.NoticeDelivery()) as tell,
               contextlib.redirect_stdout(io.StringIO())):
             with self.assertRaises(production_lifecycle.LifecycleStop) as stopped:
@@ -943,6 +978,8 @@ class LifecycleTests(LifecycleFixture):
 
         self.assert_step(result, "ok")
         self.assertFalse(parent.exists())
+        child = next(row for row in staff.find(kind="showrunner") if row.name == "kid")
+        self.assertIsNone(child.parent)
         self.assertIn("children: ok — detached kid; now root; told kid", result.stdout)
         [sent] = self.sent()
         self.assertEqual(sent[sent.index("--to") + 1], f"uds:{self.root / 'kid.sock'}")

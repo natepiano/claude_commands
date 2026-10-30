@@ -60,6 +60,20 @@ class ResolveTests(unittest.TestCase):
         self.assertIn("no zone is named 'Seattle'; give the IANA zone of the place", str(refused.exception))
 
 
+class StoredZoneTests(unittest.TestCase):
+    def test_stored_uses_the_shared_reader_for_values_and_the_default(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        conf = root / "user_zone.conf"
+        for contents, expected in ((None, user_zone.DEFAULT_ZONE), ("# no setting\n", user_zone.DEFAULT_ZONE),
+                                   ("zone=\n", user_zone.DEFAULT_ZONE), ("zone= Europe/Paris \n", "Europe/Paris")):
+            with self.subTest(contents=contents):
+                if contents is not None:
+                    _ = conf.write_text(contents, encoding="utf-8")
+                with mock.patch.object(user_zone, "stored_zone", wraps=user_zone.stored_zone) as reader:
+                    self.assertEqual(zone.stored(conf), expected)
+                reader.assert_called_once_with(str(conf))
+
+
 @unittest.skipIf(platform.system() == "Darwin", "/zone set runs on natedev")
 class SetTests(unittest.TestCase):
     root: Path = Path()

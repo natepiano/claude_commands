@@ -27,11 +27,13 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 for dependency in ("whoami", "message", "notify", "production", "hooks", "lib", "herdr"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
-from account import Account
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.whoami.account import Account
 import conversation_pause
 import detached
 import herdr
-import note_file
+from scripts.whoami import note_file
 from inventory import Inventory, Session, inventory, last_tool_call
 from launch_permission import shutdown_state_root
 import launch_permission
@@ -1609,8 +1611,7 @@ def down(account: Account, here: bool = False, only: Iterable[str] = (), *,
          origin: accounts.MoveOrigin = HAND_ORIGIN, move_id: str = "",
          checkout_move: CheckoutMove | None = None) -> int:
     """Start local work immediately and ask the peer to conduct its own owners."""
-    from scripts.accounts import accounts
-    origin_arguments = accounts.move_origin_arguments(origin)
+    del origin
     ids = tuple(only)
     # A move never waits on cold keys: the session keeps its commits on the same machine.
     if not target and not _warm():
@@ -1673,19 +1674,6 @@ def down(account: Account, here: bool = False, only: Iterable[str] = (), *,
             for saved in added:
                 _ = store.withdraw_session(account.login, saved["session"]["session_id"], _restore_record)
         raise
-    if target:
-        from scripts.accounts import moves
-        for saved in added:
-            session = saved["session"]
-            request: moves.RequestedMove = {"kind": "requested", "at": saved["requested_at"],
-                "tool": "claude", "subject": session["session_id"] + ": " + session["name"],
-                "move_id": saved.get("move_id", saved["request_id"]), "request_id": saved["request_id"], "from": saved.get("source_label", account.label),
-                "to": target, "why": saved.get("why", why), "window": "unknown"}
-            fields = accounts.move_origin_fields(origin)
-            request["cause"], request["window"] = fields["cause"], fields["window"]
-            if "reset" in fields:
-                request["reset"] = fields["reset"]
-            moves.append_move(request)
     peer_ids = [session_id for session_id in ids if session_id not in local_ids]
     if not here and (not ids or peer_ids):
         arguments = ["down", account.login, "--here", "--request-id", identity]
@@ -1695,10 +1683,6 @@ def down(account: Account, here: bool = False, only: Iterable[str] = (), *,
             arguments.extend(("--only", ",".join(peer_ids)))
         if then == "restart":
             arguments.append("--restart")
-        if target:
-            arguments.extend(("--to", target, "--why", why or f"{account.label} is out of usage", *origin_arguments))
-            if move_id:
-                arguments.extend(("--move-id", move_id))
         if alerts == "none":
             arguments.append("--no-alert")
         status, output = run_remote(arguments)

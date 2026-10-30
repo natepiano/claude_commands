@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.lib.test_agents_registry import write_registry
 
 from scripts.lib import names
@@ -13,12 +18,10 @@ import json
 import os
 import shlex
 import subprocess
-import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import ClassVar, cast, override
 from types import ModuleType
 from collections.abc import Callable, Iterator
@@ -41,7 +44,7 @@ from scripts.accounts import accounts
 from scripts.whoami.note_file import NumberedAccountLabel, note_name, parse_account_label
 import herdr
 from scripts.herdr.fake_herdr import CommandResponse
-import usage_store
+from scripts.whoami import usage_store
 from test_support import ShutdownTestCase
 
 

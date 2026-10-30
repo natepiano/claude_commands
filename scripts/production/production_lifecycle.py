@@ -15,6 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import staff, staff_sources
 
 import showrunners
+import showrunner_tree
+import showrunner_parent
 import tidy_wrapped
 import unit_lookup
 from production_units import Production, read_production
@@ -364,10 +366,10 @@ def retire_reservations(worktree: Path) -> None:
             report("retire", "ok", f"released reservation {reservation.reservation_id} for {worktree}")
 
 
-def refuse_running_children(slug: str) -> RunningStyleChildren:
+def refuse_running_children(slug: str, record: staff.StaffSnapshot) -> RunningStyleChildren:
     """Hold a wrap for running product children; keep style children attached until retirement."""
     try:
-        children = showrunners.stored_children(slug)
+        children = showrunner_tree.stored_children(slug, record=record)
         styles: list[str] = []
         running: list[str] = []
         for child in showrunners.registered_showrunners():
@@ -387,10 +389,13 @@ def refuse_running_children(slug: str) -> RunningStyleChildren:
     return RunningStyleChildren(tuple(styles))
 
 
-def detach_style_children(slug: str, children: RunningStyleChildren) -> None:
+def detach_style_children(slug: str, children: RunningStyleChildren, record: staff.StaffSnapshot) -> None:
     for child in children.slugs:
         try:
-            _ = showrunners.detach(child)
+            member = staff_sources.member(staff_sources.ShowrunnerMember(child), record)
+            if isinstance(member, staff_sources.MemberFound):
+                _ = staff.move(member.row.id, None)
+            _ = showrunner_parent.detach(child, record=record)
         except (OSError, ValueError) as error:
             raise LifecycleStop("children", "failed", str(error)) from error
         text = (f"{slug} wrapped, so you are a root now: run style_sync.py resume and merge your own hand-offs "
@@ -403,19 +408,19 @@ def release_path(slug: str) -> Path:
     return showrunners.SHOWRUNNER_STATE_DIR / slug / "wrap_release.json"
 
 
-def save_release(slug: str, released: showrunners.WrapRelease) -> None:
+def save_release(slug: str, released: showrunner_tree.WrapRelease) -> None:
     path = release_path(slug)
     path.parent.mkdir(parents=True, exist_ok=True)
     write_text_atomic(path, json.dumps({
-        "former_parent": released.former_parent.parent if isinstance(released.former_parent, showrunners.ReportedTo) else None,
+        "former_parent": released.former_parent.parent if isinstance(released.former_parent, showrunner_tree.ReportedTo) else None,
         "former_children": released.former_children, "told": released.told,
     }, indent=2, sort_keys=True) + "\n")
 
 
-def capture_release(slug: str) -> showrunners.WrapRelease:
+def capture_release(slug: str) -> showrunner_tree.WrapRelease:
     path = release_path(slug)
     if not path.exists():
-        released = showrunners.edges_to_release(slug)
+        released = showrunner_tree.edges_to_release(slug)
         save_release(slug, released)
         return released
     value = cast(object, json.loads(path.read_text(encoding="utf-8")))
@@ -427,29 +432,29 @@ def capture_release(slug: str) -> showrunners.WrapRelease:
         raise ValueError(f"{path}: invalid release capture")
     if not all(isinstance(item, str) for item in [*cast(list[object], children), *cast(list[object], told)]):
         raise ValueError(f"{path}: release slugs must be strings")
-    return showrunners.WrapRelease(showrunners.ReportedTo(parent) if isinstance(parent, str) else showrunners.Root(),
+    return showrunner_tree.WrapRelease(showrunner_tree.ReportedTo(parent) if isinstance(parent, str) else showrunner_tree.Root(),
                                    tuple(cast(list[str], children)), tuple(cast(list[str], told)))
 
 
 def release_edges(slug: str) -> None:
     """Release captured edges and persist each completed notice before continuing."""
     released = capture_release(slug)
-    showrunners.release_edges(slug, released)
+    showrunner_tree.release_edges(slug, released)
     notices: dict[str, str] = {}
-    if isinstance(released.former_parent, showrunners.ReportedTo):
+    if isinstance(released.former_parent, showrunner_tree.ReportedTo):
         notices[released.former_parent.parent] = f"{slug} wrapped, so it no longer reports to you."
     for child in released.former_children:
         notices[child] = f"{slug} wrapped, so {child} reports to no one: it is a root now."
     messages: list[str] = []
     for target, text in notices.items():
         if target not in released.told:
-            told = showrunners.tell_others({target: text}, f"showrunner-tree:{slug if isinstance(released.former_parent, showrunners.ReportedTo) and target == released.former_parent.parent else target}")
+            told = showrunners.tell_others({target: text}, f"showrunner-tree:{slug if isinstance(released.former_parent, showrunner_tree.ReportedTo) and target == released.former_parent.parent else target}")
             if told.failed:
                 raise LifecycleStop("tree", "failed", "; ".join(told.lines))
             released = replace(released, told=(*released.told, target))
             save_release(slug, released)
             messages.extend(told.lines)
-    above = f"detached from {released.former_parent.parent}" if isinstance(released.former_parent, showrunners.ReportedTo) else ""
+    above = f"detached from {released.former_parent.parent}" if isinstance(released.former_parent, showrunner_tree.ReportedTo) else ""
     below = f"{', '.join(released.former_children)} now root{'' if len(released.former_children) == 1 else 's'}" if released.former_children else ""
     report("tree", "ok", "; ".join(part for part in (above, below, *messages) if part) or "no parent and no child showrunners")
 
@@ -506,14 +511,14 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
     status = doc_status(lines)
     if isinstance(status, ProductionPlanned):
         raise LifecycleStop("wrap", "held", "production must be running")
+    record = staff.initial_snapshot()
     style_children = RunningStyleChildren(())
     if isinstance(status, ProductionRunning):
-        style_children = refuse_running_children(production.slug)
+        style_children = refuse_running_children(production.slug, record)
     state = checkout_ready(production)
     if isinstance(state, PlanPending):
         raise LifecycleStop("wrap", "held", "merge branch does not exist")
     rows = units(lines, production)
-    record = staff.initial_snapshot()
     runner = staff_sources.member(staff_sources.ShowrunnerMember(production.slug), record)
     members = tuple(staff_sources.member(staff_sources.UnitMember(production.slug, row.name), record) for row in rows)
     tip = checked(production.checkout, "wrap", "rev-parse", "HEAD")
@@ -566,7 +571,7 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
                 report("retire", "ok", f"deleted origin/{unit.branch}")
             elif remote.returncode != 2:
                 raise LifecycleStop("retire", "failed", remote.stderr.strip() or f"ls-remote exited {remote.returncode}")
-        detach_style_children(production.slug, style_children)
+        detach_style_children(production.slug, style_children, record)
         _ = capture_release(production.slug)
         held = retire_wrap_rows(rows, record, members, runner) or held
         notifier = Path.home() / ".claude/scripts/message/notifier.sh"
