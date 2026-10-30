@@ -36,12 +36,6 @@ def caller() -> str:
             or f"user:{os.environ.get('USER', 'unknown')}")
 
 
-def refusal_text(refusal: memory_admit.UnmatchedWaiter) -> str:
-    escaped = "".join(character if character.isprintable() else json.dumps(character)[1:-1]
-                      for character in str(refusal))
-    return f"build queue: {escaped}"
-
-
 def default_columns() -> int:
     try:
         columns = int(os.environ.get("COLUMNS", ""))
@@ -79,21 +73,13 @@ def main() -> int:
     if words == ["bump"]:
         parser.error("bump needs a selector")
     try:
+        if words and words[0] == "bump":
+            memory_admit.bump_waiter(words[1], caller())
         reading = memory_admit.locked_queue_read()
         facts = head_facts.read_head_facts(reading)
         ids = [step.session_id for step in (*reading.view.running, *reading.view.waiting)]
         ids.extend(head_facts.session_ids(facts))
         labels = unit_labels.unit_labels_for(ids, os.environ)
-        if words and words[0] == "bump":
-            actor = caller()
-            try:
-                moved = memory_admit.bump_waiter(bump_selector(words[1], reading, labels), actor)
-            except memory_admit.UnmatchedWaiter as error:
-                print(refusal_text(error))
-                return 3
-            print(f"{field(actor)} moved {step_labels(moved, labels).session}: "
-                  + f"{field(moved.step)} in {field(moved.folder)} to the head; memory limits still apply")
-            return 0
         model = QueueModel(reading, labels, facts, head_facts.read_pace(reading.explanation.now), user_zone())
         if words:
             from scripts.build_queue.queue_card import render_selection
@@ -103,6 +89,9 @@ def main() -> int:
             lines = render_view(model, arguments.columns)
         print(json.dumps(json_form(lines, arguments.columns, reading.explanation.now),
                          ensure_ascii=False, separators=(",", ":")) if arguments.json else plain(lines))
+    except memory_admit.BumpOff as error:
+        print(f"build queue: {error}")
+        return 3
     except (OSError, ValueError) as error:
         print(f"build queue: {error}", file=sys.stderr)
         return 2

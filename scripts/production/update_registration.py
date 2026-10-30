@@ -32,6 +32,7 @@ else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
     from showrunner_footer import ReportItem, reports_path
 import showrunners
+import showrunner_tree
 from dailies_render import (UNREADABLE_LIST, InputError, plumbing, read_outstanding,
     DeferredUntil, Outstanding, OutstandingReminder, Ranking, ReviewedOutstandingQuestion,
     ReviewUnavailableOutstandingQuestion)
@@ -583,7 +584,7 @@ def open_lists(production: Production, below: bool = False) -> OpenLists:
     due: list[urgency.Entry[OpenItem]] = []
     deferred: list[OpenItem] = []
     unreadable: list[str] = []
-    for slug in showrunners.user_facing(production.slug, below):
+    for slug in showrunner_tree.user_facing(production.slug, below):
         try:
             items = read_outstanding(outstanding_file(slug))
         except (InputError, OSError, ValueError):
@@ -631,7 +632,7 @@ def mark_important(production: Production, words: str) -> None:
     exact: list[tuple[Path, str]] = []
     partial: list[tuple[Path, str]] = []
     # The item the user names may come from an all-below /next, so the lists below are searched too.
-    for slug in showrunners.user_facing(production.slug, below=True):
+    for slug in showrunner_tree.user_facing(production.slug, below=True):
         for item in read_outstanding(outstanding_file(slug)):
             full = item.text if isinstance(item, OutstandingReminder) else item.question
             if item.text == wanted:
@@ -707,7 +708,7 @@ def answer(production: Production, words: str) -> None:
     answered_exact: list[AnsweredItem] = []
     answered_partial: list[AnsweredItem] = []
     now = datetime.now(production.zone)
-    slugs = list(showrunners.user_facing(production.slug, below=True))
+    slugs = list(showrunner_tree.user_facing(production.slug, below=True))
     for slug in slugs:
         for item in read_outstanding(outstanding_file(slug)):
             full = item.text if isinstance(item, OutstandingReminder) else item.question

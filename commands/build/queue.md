@@ -10,4 +10,4 @@ Each running or waiting step takes one line, even in a narrow pane. `↑` marks 
 
 With `unit-board@nate-local`, the command opens the queue or card in a pane and refreshes it every 10 seconds. `close` closes it. Run `/reload-plugins` in sessions started before the mod change.
 
-Moving a step up is the user's, through `/showrunner:bump`. Never run `bump` for a session. Use `/build:status` for holds and target state.
+`bump <position|session|folder>` moves nothing and exits 3 with one stdout line and no stderr: `build queue: only the user can bump; bump is off until /showrunner:bump sets queue priority`. Waiting steps that fit keep room in queue order; a younger step held by that room shows `behind older step <label>`. Use `/build:status` for holds and target state.

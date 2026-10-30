@@ -217,6 +217,131 @@ class WorkingSetTests(unittest.TestCase):
                 with self.subTest(runtime=runtime, options=options):
                     self.assertEqual(working_set.classify((runtime, *options)), expected)
 
+    def test_node_redirect_warnings_names_the_script_for_both_value_forms(self) -> None:
+        script = "/opt/@anthropic-ai/claude-code/cli.js"
+        for options in (("--redirect-warnings", "/logs/warnings.log"),
+                        ("--redirect-warnings=/logs/warnings.log",)):
+            with self.subTest(options=options):
+                arguments = ("node", *options, script)
+                self.assertEqual(working_set.node_entry(arguments), script)
+                self.assertEqual(working_set.classify(arguments), "Claude sessions")
+
+    def test_node_helpers_render_script_owners_and_memory_from_one_entry_reading(self) -> None:
+        _ = self.process(701, ["node", "--redirect-warnings", "/logs/warnings.log",
+                                "/opt/service.js"], 1024, 128)
+        _ = self.process(702, ["nodejs", "--redirect-warnings=/logs/warnings.log",
+                                "/opt/service.js"], 2048, 256)
+        script = "scripts/build_targets/helper.js"
+        _ = self.process(703, ["node", script], 4096, 512)
+        _ = self.process(704, ["python3", script], 512, 64)
+
+        with mock.patch.object(working_set, "node_entry", wraps=working_set.node_entry) as entries:
+            report = self.report()
+        self.assertEqual(entries.call_count, 3)
+        text = working_set.render(report)
+
+        self.assertRegex(text, r"  /opt/service\.js \[unassigned\]\s+2\s+3\.0\s+0\.4")
+        self.assertRegex(text, r"  /home/test/\.claude/scripts/build_targets/helper\.js"
+                         + r" \[resources\]\s+1\s+4\.0\s+0\.5")
+        self.assertRegex(text, r"  /home/test/\.claude/scripts/build_targets/helper\.js"
+                         + r" \[resources\]\s+1\s+0\.5\s+0\.1")
+        self.assertNotIn("/logs/warnings.log", text)
+
+    def test_node_package_tasks_have_no_entry_script(self) -> None:
+        for runtime in ("node", "nodejs"):
+            for options in (("--run", "test"), ("--run=test",)):
+                with self.subTest(runtime=runtime, options=options):
+                    arguments = (runtime, *options, "--", "/opt/@openai/codex/bin/codex.js")
+                    self.assertEqual(working_set.node_entry(arguments), "")
+                    self.assertEqual(working_set.classify(arguments), "other")
+
+    def test_node_help_value_options_do_not_become_entry_scripts(self) -> None:
+        script = "/opt/@openai/codex/bin/codex.js"
+        cases = (
+            ("--allow-fs-read", "/work", script),
+            ("--allow-fs-write", "/output", script),
+            ("--build-snapshot-config", "snapshot.json", script),
+            ("-C", "development", script),
+            ("--conditions", "development", script),
+            ("--cpu-prof-dir", "/profiles", script),
+            ("--cpu-prof-interval", "1000", script),
+            ("--cpu-prof-name", "profile.cpuprofile", script),
+            ("--diagnostic-dir", "/diagnostics", script),
+            ("--disable-proto", "throw", script),
+            ("--disable-warning", "DEP0005", script),
+            ("--dns-result-order", "ipv4first", script),
+            ("--env-file", "settings.env", script),
+            ("--env-file-if-exists", "settings.env", script),
+            ("-e", "console.log('inline')", ""),
+            ("--eval", "console.log('inline')", ""),
+            ("--experimental-config-file", "node.json", script),
+            ("--experimental-loader", "loader.mjs", script),
+            ("--experimental-sea-config", "sea.json", script),
+            ("--experimental-test-tag-filter", "smoke", script),
+            ("--heap-prof-dir", "/profiles", script),
+            ("--heap-prof-interval", "524288", script),
+            ("--heap-prof-name", "heap.heapprofile", script),
+            ("--heapsnapshot-near-heap-limit", "2", script),
+            ("--heapsnapshot-signal", "SIGUSR2", script),
+            ("--icu-data-dir", "/icu", script),
+            ("--import", "setup.mjs", script),
+            ("--input-type", "module", script),
+            ("--debug-port", "9230", script),
+            ("--inspect-port", "9230", script),
+            ("--inspect-publish-uid", "stderr,http", script),
+            ("--loader", "loader.mjs", script),
+            ("--localstorage-file", "storage.db", script),
+            ("--max-http-header-size", "16384", script),
+            ("--max-old-space-size-percentage", "50", script),
+            ("--network-family-autoselection-attempt-timeout", "250", script),
+            ("--openssl-config", "openssl.cnf", script),
+            ("-p", "1 + 1", ""),
+            ("--print", "1 + 1", ""),
+            ("--redirect-warnings", "warnings.log", script),
+            ("--report-directory", "/reports", script),
+            ("--report-dir", "/reports", script),
+            ("--report-filename", "report.json", script),
+            ("--report-signal", "SIGUSR2", script),
+            ("-r", "setup.js", script),
+            ("--require", "setup.js", script),
+            ("--run", "start", ""),
+            ("--secure-heap", "4096", script),
+            ("--secure-heap-min", "2", script),
+            ("--snapshot-blob", "snapshot.blob", script),
+            ("--test-concurrency", "2", script),
+            ("--test-coverage-branches", "80", script),
+            ("--test-coverage-exclude", "vendor/*", script),
+            ("--test-coverage-functions", "80", script),
+            ("--test-coverage-include", "src/*", script),
+            ("--test-coverage-lines", "80", script),
+            ("--test-global-setup", "setup.mjs", script),
+            ("--experimental-test-isolation", "process", script),
+            ("--test-isolation", "process", script),
+            ("--test-name-pattern", "smoke", script),
+            ("--test-random-seed", "42", script),
+            ("--test-reporter", "spec", script),
+            ("--test-reporter-destination", "results.txt", script),
+            ("--test-rerun-failures", "failures.json", script),
+            ("--test-shard", "1/2", script),
+            ("--test-skip-pattern", "slow", script),
+            ("--test-timeout", "1000", script),
+            ("--title", "helper", script),
+            ("--tls-cipher-list", "DEFAULT", script),
+            ("--tls-keylog", "tls.keys", script),
+            ("--trace-event-categories", "node", script),
+            ("--trace-event-file-pattern", "trace-%pid.json", script),
+            ("--trace-require-module", "all", script),
+            ("--unhandled-rejections", "strict", script),
+            ("--use-largepages", "off", script),
+            ("--v8-pool-size", "4", script),
+            ("--watch-kill-signal", "SIGTERM", script),
+            ("--watch-path", "/work", script),
+        )
+        for runtime in ("node", "nodejs"):
+            for option, value, expected in cases:
+                with self.subTest(runtime=runtime, option=option):
+                    self.assertEqual(working_set.node_entry((runtime, option, value, script)), expected)
+
     def test_python_options_do_not_become_script_names(self) -> None:
         cases = (
             (("--check-hash-based-pycs", "always", "x.py"), "/work/x.py"),

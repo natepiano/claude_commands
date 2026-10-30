@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import completion_receipt, staff, staff_sources
 
 import showrunners
+import showrunner_tree
 from production_units import Production, read_production
 from production_units import Refusal
 import herdr
@@ -127,7 +128,7 @@ def checked(child: Production, caller: str, ending: EndingTab = NO_ENDING_TAB, s
         raise Refusal(f"this session runs no production, so it has nothing to attach {child.slug} to")
     if child.slug == caller:
         raise Refusal(f"{child.slug} is this session's own production")
-    if caller in showrunners.descendants_of(child.slug):
+    if caller in showrunner_tree.descendants_of(child.slug, record=staff.initial_snapshot()):
         raise Refusal(f"{caller} already reports to {child.slug}, directly or through others")
     try:
         taken = running(child.slug)
@@ -240,9 +241,6 @@ def ensure_staff_showrunner(child: Production, caller: str) -> staff.StaffRow:
             parent = staff_sources.MemberFound(staff.ensure("showrunner", name=showrunners.herdr_space(caller, str(doc))))
     row = (found.row if isinstance(found, staff_sources.MemberFound)
            else staff.ensure("showrunner", name=showrunners.herdr_space(child.slug, str(child.doc))))
-    if isinstance(parent, staff_sources.MemberFound) and showrunners.stored_parent(child.slug) == caller:
-        if row.parent != parent.row.id:
-            row = staff.move(row.id, parent.row.id)
     return row
 
 def _main(argv: list[str]) -> int:
@@ -337,8 +335,8 @@ def _main(argv: list[str]) -> int:
     if not appeared:
         print(f"{child.slug} has no running showrunner after {WAIT_S:g} s, so it is not attached. {later}")
         return 1
-    # A resumed child kept the parent it had: an edge is stored, and counts again once both ends have a timer.
-    if showrunners.parent_of(child.slug) == caller:
+    # A resumed child keeps the parent recorded for its stable staff id.
+    if showrunner_tree.parent_of(child.slug) == caller:
         print(f"{child.slug} already reports to {caller}")
         return 0
     return showrunners.main(["attach", child.slug, caller])

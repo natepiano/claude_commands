@@ -23,6 +23,7 @@ from typing import cast
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import change_review  # noqa: E402
 import showrunners  # noqa: E402
+import showrunner_tree
 import unit_move  # noqa: E402
 from rename_state import RenameRefused, read_json, write_json, write_text  # noqa: E402
 from unit_move import PathMove  # noqa: E402
@@ -140,7 +141,7 @@ def describe(old: str, new: str, old_doc: Path, new_doc: Path) -> list[str]:
     if rows:
         lines.append(f"4. change review {listed}: Production {old} -> {new} in {len(rows)} rows")
     lines.extend(f"4. Parent production {doc}: {old_doc} -> {new_doc}"
-                 for doc in _children_naming(old_doc, showrunners.children_of(old)))
+                 for doc in _children_naming(old_doc, showrunner_tree.children_of(old)))
     for move in (bevy_record(old, new), bevy_job(old, new)):
         if unit_move.exists(move.source):
             lines.append(f"4. bevy upgrade watch {move.source} -> {move.destination}")
@@ -173,7 +174,7 @@ def _move_pins(old: str, new: str) -> None:
 
 
 def _rewrite_children(new: str, old_doc: Path, new_doc: Path) -> None:
-    for doc in _children_naming(old_doc, showrunners.children_of(new)):
+    for doc in _children_naming(old_doc, showrunner_tree.children_of(new)):
         lines = doc.read_text(encoding="utf-8").splitlines(keepends=True)
         index = _parent_line(doc)
         if index is not None:

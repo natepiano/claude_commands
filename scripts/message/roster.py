@@ -37,7 +37,7 @@ from scripts.lib import names  # noqa: E402
 from scripts.lib.names import JobKey  # noqa: E402
 if TYPE_CHECKING:
     from ..accounts.role_map import role_map_command
-    from ..whoami import account, agent_accounts, note_file
+    from scripts.whoami import account, agent_accounts, note_file
 else:
     import importlib.util
     from scripts.accounts.role_map import role_map_command
@@ -56,9 +56,9 @@ else:
         loader.exec_module(module)
         return module
 
-    account = _lazy_module("account")
-    agent_accounts = _lazy_module("agent_accounts")
-    note_file = _lazy_module("note_file")
+    account = _lazy_module("scripts.whoami.account")
+    agent_accounts = _lazy_module("scripts.whoami.agent_accounts")
+    note_file = _lazy_module("scripts.whoami.note_file")
 from scripts.shutdown import remote as remote  # noqa: E402
 from sessions import SessionRecord, messaging_socket_exists  # noqa: E402
 
@@ -236,6 +236,11 @@ AccountAttribution = AccountLabel | AccountUnread | AccountAttributionUnavailabl
 
 
 @dataclass(frozen=True)
+class NotDaemonSession:
+    """This row has no local Codex daemon route."""
+
+
+@dataclass(frozen=True)
 class RosterEntry:
     machine: str
     kind: str
@@ -250,6 +255,7 @@ class RosterEntry:
     thread: CodexThread | NoCodexThread = NoCodexThread()
     session: ClaudeSession | NoClaudeSession = NoClaudeSession()
     account: AccountAttribution = AccountUnread("not read")
+    daemon: codex_daemon.CodexDaemon | NotDaemonSession = NotDaemonSession()
 
 
 @dataclass(frozen=True)
@@ -401,6 +407,7 @@ class SnapshotEntry(TypedDict):
     thread: dict[str, str]
     session: dict[str, str]
     account: NotRequired[dict[str, str]]
+    daemon: NotRequired[dict[str, str]]
 
 
 def _tagged_state(state: TaggedSnapshotState) -> dict[str, str]:
@@ -428,6 +435,8 @@ def _snapshot_entry(entry: RosterEntry) -> SnapshotEntry:
         showrunner=_tagged_state(entry.showrunner), director=_tagged_state(entry.director),
         assignment=_assignment_snapshot(entry.assignment), thread=_tagged_state(entry.thread),
         session=_tagged_state(entry.session), account=_tagged_state(entry.account),
+        daemon=({"home": str(entry.daemon.home), "socket": str(entry.daemon.socket)}
+                if isinstance(entry.daemon, codex_daemon.CodexDaemon) else {}),
     )
 
 
@@ -494,8 +503,8 @@ def _decode_state(value: object) -> SnapshotState:
 
 def _decode_entry(value: object) -> RosterEntry:
     values = _snapshot_object(value)
-    required = set(SnapshotEntry.__annotations__) - {"account"}
-    if not required <= set(values) or set(values) - required - {"account"}:
+    required = set(SnapshotEntry.__annotations__) - {"account", "daemon"}
+    if not required <= set(values) or set(values) - required - {"account", "daemon"}:
         raise ValueError("invalid snapshot entry fields")
     reach = _decode_state(values.get("reach"))
     showrunner = _decode_state(values.get("showrunner"))
@@ -505,6 +514,14 @@ def _decode_entry(value: object) -> RosterEntry:
     session = _decode_state(values.get("session"))
     attributed = (_decode_state(values["account"]) if "account" in values
                   else AccountAttributionUnavailable("peer sent no account"))
+    daemon: codex_daemon.CodexDaemon | NotDaemonSession = NotDaemonSession()
+    if "daemon" in values:
+        owner = _snapshot_object(values["daemon"])
+        if owner:
+            if set(owner) != {"home", "socket"}:
+                raise ValueError("invalid snapshot daemon fields")
+            daemon = codex_daemon.CodexDaemon(Path(_snapshot_string(owner, "home")),
+                                             Path(_snapshot_string(owner, "socket")))
     if not (isinstance(reach, Messageable | CannotReceiveMessages)
             and isinstance(showrunner, ShowrunnerRelationship)
             and isinstance(director, DirectorRelationship)
@@ -523,7 +540,7 @@ def _decode_entry(value: object) -> RosterEntry:
         role=role, name=_snapshot_string(values, "name"),
         status=_snapshot_string(values, "status"), cwd=_snapshot_string(values, "cwd"),
         reach=reach, showrunner=showrunner, director=director, assignment=assignment,
-        thread=thread, session=session, account=attributed,
+        thread=thread, session=session, account=attributed, daemon=daemon,
     )
 
 
@@ -1504,14 +1521,13 @@ def _local_roster(environment: Mapping[str, str]) -> Roster:
     durable_roles, durable_threads = _durable_roles(machine, claude, problems)
     unit_workers.extend(durable_roles)
     worker_threads.update(durable_threads)
-    daemon_socket = codex_daemon.daemon_socket(environment)
-    daemon = codex_daemon.loaded_sessions(daemon_socket)
-    daemon_home = daemon_socket.parent.parent
     codex_sessions: list[RosterEntry] = []
-    if isinstance(daemon, codex_daemon.DaemonUnreadable):
-        record_problem(problems, "Codex daemon", daemon.reason)
-    else:
-        codex_sessions = [
+    for result in codex_daemon.read_daemons(environment):
+        owner, daemon = result.owner, result.sessions
+        if isinstance(daemon, codex_daemon.DaemonUnreadable):
+            record_problem(problems, f"Codex daemon {agent_accounts.codex_home_display(owner.home)}", daemon.reason)
+            continue
+        codex_sessions.extend(
             RosterEntry(
                 machine=machine,
                 kind="codex",
@@ -1524,11 +1540,12 @@ def _local_roster(environment: Mapping[str, str]) -> Roster:
                 director=NoDirector(),
                 assignment=NotAWorker(),
                 thread=CodexThread(session.thread_id),
-                account=_codex_home_account(daemon_home),
+                account=_codex_home_account(owner.home),
+                daemon=owner,
             )
             for session in daemon
             if session.thread_id not in worker_threads
-        ]
+        )
     interactive = _herdr_codex_panes(machine)
     problems.extend(interactive.problems)
     entries = [*claude.values(), *unit_workers, *codex_sessions, *interactive.entries]

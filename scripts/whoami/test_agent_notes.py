@@ -1,7 +1,5 @@
 """Account attribution and stale-data behavior of the vault writer."""
 
-from scripts.whoami.note_file import note_name
-
 import asyncio
 import base64
 import io
@@ -19,22 +17,25 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Self, cast, override
 from unittest.mock import MagicMock, call, patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.whoami.note_file import note_name
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import agent_notes
-import note_file
-import session_table
-import account
-import agent_accounts
+from scripts.whoami import note_file
+from scripts.whoami import session_table
+from scripts.whoami import account
+from scripts.whoami import agent_accounts
 import codex_pacer
 import five_hour
 import quota_alert
-import usage_store
+from scripts.whoami import usage_store
 import whoami
-from agent_accounts import (ClaudeDirectorySource, CodexHomeSource, CodexRateLimits, Quota, Report,
+from scripts.whoami.agent_accounts import (ClaudeDirectorySource, CodexHomeSource, CodexRateLimits, Quota, Report,
                             codex_credits, reset_credits)
 from agent_notes import local_reset
-from note_file import Note, read_note
+from scripts.whoami.note_file import Note, read_note
 from scripts.accounts import accounts, refusal_watch, refusals, role_map
 from scripts.production import showrunners
 
