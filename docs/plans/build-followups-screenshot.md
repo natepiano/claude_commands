@@ -39,7 +39,7 @@ The user, via natedev, 2026-10-06 13:1x PDT: "create a long running unit directo
 
 ## Delegation Context
 
-- **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts. This plan builds the screenshot episode report (Phase 1), counts screenshot scripts run in later calls (Phase 2), records every `/hana_shot` call with failures and the kept shot (Phase 3), runs the report hourly with each change's effect (Phase 4), brings the Mac's transcripts up to date in a few hourly runs and fixes two report types (Phase 5), then proposes improvements (Phase 6). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-screenshot` on branch `build-followups-screenshot` (unit `screenshot-unit` of production `build-followups`).
+- **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts. This plan builds the screenshot episode report (Phase 1), counts screenshot scripts run in later calls (Phase 2), records every `/hana_shot` call with failures and the kept shot (Phase 3), runs the report hourly with each change's effect (Phase 4), brings the Mac's transcripts up to date in a few hourly runs and fixes two report types (Phase 5), then proposes improvements (Phase 6). Work in the worktree `/home/natepiano/worktrees/claude-natedev-screenshot` on branch `natedev-screenshot` (unit `screenshot-unit` of production `natedev`).
 - **Project started:** 2026-10-06T20:30:00+00:00
 - **Stack:** Python 3.13, standard library only.
 - **Layout:**
@@ -526,7 +526,7 @@ Unpriced (below every priced one):
 
 **Ruled out:** `LaunchState | None` plus a reason as the reader result (a three-state union instead); deleting temp records without reading them first (it can destroy the only pid record); killing a process group that no whole record identifies.
 
-### Phase 15 — The screenshot report's transcript tests pass in any temp folder · status: todo
+### Phase 15 — The screenshot report's transcript tests pass in any temp folder · status: done
 
 #### Work Order
 
