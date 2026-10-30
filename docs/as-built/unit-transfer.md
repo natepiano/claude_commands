@@ -1,5 +1,9 @@
 # Unit transfer (as built)
 
+Code reviews now use the unit's persistent `review` and `review2` workers
+through `assign.sh --role review`. Any pool maintenance paths described below
+remain only for the pending archive cleanup; they do not dispatch new reviews.
+
 `/showrunner:transfer_unit <unit> <to production doc>` (`commands/showrunner/transfer_unit.md`)
 moves one natedev unit director from one production to another. The giving showrunner runs it. The
 script is `scripts/production/transfer_unit.py`, with three actions: `plan`, `apply` and `verify`
@@ -53,7 +57,12 @@ script is `scripts/production/transfer_unit.py`, with three actions: `plan`, `ap
 
 apply works under the production lock in `unit_move` and saves the journal `transfer_unit.json` in
 the giving production's state folder before it changes anything. A rerun resumes at the step that
-refused. Each step except stop, relaunch and verify runs under both merge locks, taken in slug order,
+refused. The journal keeps the request and progress, but not the productions' checkout or doc
+paths. Resume and verify find the giving doc through its current update timer and read the
+receiving doc supplied on the command line, just as a fresh apply does. Both checkouts come from
+those docs. Old journals' stored locations are ignored, so a checkout move does not strand an
+open transfer; the receiving doc must still name the journal's receiving production.
+Each step except stop, relaunch and verify runs under both merge locks, taken in slug order,
 and runs the preflight again first. Stop is `rename_unit.stop_unit` through the shared
 `rename_unit.StopTarget` protocol: a transfer keeps the id, so the old and new ids are the same.
 

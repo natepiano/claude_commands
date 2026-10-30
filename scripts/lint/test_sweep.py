@@ -332,7 +332,7 @@ class SweepTests(SweepCase):
         scan, _ = scanned(target)
         total = sum(scan.blocks.values())
         remaining = dict(scan.links)
-        orphaned = sum(sweep.freed_by(group, scan, remaining) for group in scan.orphans)
+        orphaned = sum(sweep.freed_by(group, scan, remaining).bytes for group in scan.orphans)
         status, output = run_sweep(target, total - orphaned - 1, dry_run=True)
         self.assertEqual(status, 0)
         lines = output.splitlines()
@@ -346,7 +346,7 @@ class SweepTests(SweepCase):
         scan, _ = scanned(target)
         total = sum(scan.blocks.values())
         remaining = dict(scan.links)
-        orphaned = sum(sweep.freed_by(group, scan, remaining) for group in scan.orphans)
+        orphaned = sum(sweep.freed_by(group, scan, remaining).bytes for group in scan.orphans)
         # Removing app's unit, the least recently used, frees its file only
         # because its hard-linked copy in debug/ goes with it.
         status, output = run_sweep(target, total - orphaned - SIZE, dry_run=False)
@@ -731,7 +731,148 @@ class ProcessUseTests(SweepCase):
         self.assertEqual(self.uses(), {})
 
 
+class ReclamationTests(SweepCase):
+    def test_directory_swapped_for_symlink_is_not_followed_or_credited(self) -> None:
+        for nested in (False, True):
+            with self.subTest(nested=nested):
+                base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+                root = base / "target"
+                victim = root / "unit" if nested else root
+                original_output = write(victim / "original")
+                outside = write(base / "outside" / "keep")
+                saved = base / "saved-unit"
+                parent = victim.parent.stat()
+                original_lstat = os.lstat
+                swapped = False
+                def swap_after_check(path: str, *, dir_fd: int | None = None) -> os.stat_result:
+                    nonlocal swapped
+                    before = original_lstat(path, dir_fd=dir_fd)
+                    matches = path == str(victim)
+                    if dir_fd is not None and path == victim.name:
+                        opened_parent = os.fstat(dir_fd)
+                        matches = (opened_parent.st_dev, opened_parent.st_ino) == (parent.st_dev, parent.st_ino)
+                    if matches and not swapped:
+                        swapped = True
+                        _ = victim.rename(saved)
+                        victim.symlink_to(outside.parent, target_is_directory=True)
+                    return before
+                with mock.patch.object(os, "lstat", side_effect=swap_after_check), redirect_stderr(io.StringIO()):
+                    account = sweep.remove_entry(str(root))
+                self.assertTrue(swapped, "The replacement must occur between the check and directory open")
+                self.assertTrue(outside.exists(), "Deletion must not follow the replacement symlink")
+                self.assertTrue((saved / original_output.name).exists())
+                self.assertEqual(account.bytes, 0)
+                self.assertGreater(account.failures, 0)
+
+    def exercise(self, caller: str, case: str) -> None:
+        base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        roots = [base / name / "target" for name in ("oldest", "next", "newest")]
+        trees = [root / "debug" for root in roots]
+        outputs = [write(tree / "output") for tree in trees]
+        if case == "earlier link":
+            outputs[1].unlink()
+            os.link(outputs[0], outputs[1])
+        now = time.time()
+        groups = [sweep.Group("unit", str(tree), [str(output)], last_used=now - (3 - index) * DAY)
+                  for index, (tree, output) in enumerate(zip(trees, outputs))]
+        if case == "partial removal":
+            extra = write(trees[0] / "extra")
+            groups[0].entries.append(str(extra))
+        scan = sweep.Scan(groups=groups)
+        owners = {entry: group for group in groups for entry in group.entries}
+        for root in roots:
+            sweep.walk(str(root), None, owners, scan)
+        blocks = outputs[0].stat().st_blocks * 512
+        total = sum(scan.blocks.values())
+        if case in ("outside link", "dry run"):
+            os.link(outputs[0], base / "outside-target")
+        original_unlink = os.unlink
+        first_parent = outputs[0].parent.stat()
+        def unlink(path: str, *, dir_fd: int | None = None) -> None:
+            matches = path == str(outputs[0])
+            if dir_fd is not None and path == outputs[0].name:
+                matches = os.path.samestat(first_parent, os.fstat(dir_fd))
+            if case in ("failed removal", "partial removal") and matches:
+                raise PermissionError("fixture unlink refused")
+            original_unlink(path, dir_fd=dir_fd)
+        def order(group: sweep.Group) -> tuple[float, ...]:
+            return (group.last_used,)
+        with (mock.patch.object(os, "unlink", side_effect=unlink) as unlinks,
+              mock.patch.object(sweep, "build_hold_targets", return_value={}),
+              mock.patch.object(sweep, "process_uses", return_value={}),
+              redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
+            if caller == "budget":
+                left, failures, taken = sweep.shrink(scan, total, total - blocks // 2,
+                                                   case == "dry run", order)
+            else:
+                left, failures, taken = sweep.shrink_floor(
+                    scan, total, total - blocks // 2, case == "dry run",
+                    {str(tree): str(root) for tree, root in zip(trees, roots)},
+                    {str(root): [str(tree)] for root, tree in zip(roots, trees)}, {}, order, now)
+        self.assertEqual(left, total - blocks)
+        self.assertEqual(failures, int(case in ("failed removal", "partial removal")))
+        if case == "dry run":
+            unlinks.assert_not_called()
+            self.assertEqual([group for group, _ in taken], groups[:1])
+            self.assertTrue(all(output.exists() for output in outputs))
+            self.assertFalse(sweep.sweep_removals_path().exists())
+        elif case == "partial removal":
+            self.assertTrue(outputs[0].exists())
+            self.assertFalse((trees[0] / "extra").exists())
+            self.assertTrue(outputs[1].exists(), "The successful unlink covered the shortfall")
+            self.assertTrue(outputs[2].exists())
+        else:
+            self.assertEqual(outputs[0].exists(), case == "failed removal")
+            self.assertFalse(outputs[1].exists(), "The next candidate must cover the real shortfall")
+            self.assertTrue(outputs[2].exists(), "Stop once confirmed deletions cover the shortfall")
+            if case == "outside link":
+                self.assertTrue((base / "outside-target").exists())
+                self.assertEqual([size for _, size in taken], [0, blocks])
+
+    def test_link_added_outside_target_after_scan_does_not_cover_shortfall(self) -> None:
+        for caller in ("budget", "floor"):
+            with self.subTest(caller=caller):
+                self.exercise(caller, "outside link")
+
+    def test_earlier_unlink_in_same_pass_allows_last_link_to_free_blocks(self) -> None:
+        for caller in ("budget", "floor"):
+            with self.subTest(caller=caller):
+                self.exercise(caller, "earlier link")
+
+    def test_failed_unlink_does_not_cover_shortfall(self) -> None:
+        for caller in ("budget", "floor"):
+            with self.subTest(caller=caller):
+                self.exercise(caller, "failed removal")
+
+    def test_dry_run_uses_scan_estimate_without_unlinking_or_recording(self) -> None:
+        for caller in ("budget", "floor"):
+            with self.subTest(caller=caller):
+                self.exercise(caller, "dry run")
+
+    def test_partial_removal_credits_only_successful_unlinks(self) -> None:
+        for caller in ("budget", "floor"):
+            with self.subTest(caller=caller):
+                self.exercise(caller, "partial removal")
+
+
 class FloorTests(SweepCase):
+    def test_outside_link_leaves_floor_exhausted_and_sends_alert(self) -> None:
+        base = self.base()
+        _, output = cargo_target(base, "old", APP, time.time() - DAY)
+        original_scan = sweep.scan_floor_roots
+        def link_after_scan(roots: list[str], trees: dict[str, list[str]]) -> sweep.Scan:
+            scan = original_scan(roots, trees)
+            os.link(output, base / "outside-target")
+            return scan
+        with (mock.patch.object(sweep, "scan_floor_roots", side_effect=link_after_scan),
+              mock.patch.object(sweep, "send_floor_alert", return_value=True) as send):
+            status, _ = self.hold(base, 10 * GIB, [10 * GIB - SIZE, 10 * GIB - SIZE])
+        self.assertEqual(status, 0)
+        self.assertFalse(output.exists())
+        self.assertTrue((base / "outside-target").exists())
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV_AND_PHONE)
+
     def test_floor_removes_old_hard_links_in_order_and_keeps_newer_output(self) -> None:
         base = self.base()
         now = time.time()
@@ -779,7 +920,7 @@ class FloorTests(SweepCase):
         clock = [now]
         original_remove, original_release = sweep.remove, sweep.release
         releases: list[float] = []
-        def delete_at_known_time(groups: list[sweep.Group]) -> int:
+        def delete_at_known_time(groups: list[sweep.Group]) -> sweep.ConfirmedDeletion:
             clock[0] = now + (10 if groups[0].build_tree == str(first_tree) else 30)
             return original_remove(groups)
         def rebuild_after_release(held: list[int]) -> None:
@@ -817,8 +958,8 @@ class FloorTests(SweepCase):
         self.assertEqual(parallel.blocks, serial.blocks)
         self.assertEqual(parallel.links, serial.links)
         serial_links, parallel_links = dict(serial.links), dict(parallel.links)
-        self.assertEqual(sum(sweep.freed_by(group, parallel, parallel_links) for group in parallel.groups),
-                         sum(sweep.freed_by(group, serial, serial_links) for group in serial.groups))
+        self.assertEqual(sum(sweep.freed_by(group, parallel, parallel_links).bytes for group in parallel.groups),
+                         sum(sweep.freed_by(group, serial, serial_links).bytes for group in serial.groups))
 
     def test_floor_locks_only_one_target_after_candidate_choice_and_stops_at_shortfall(self) -> None:
         base = self.base()
@@ -1256,7 +1397,7 @@ class FloorTests(SweepCase):
         base = self.base()
         tree, output_file = cargo_target(base, "repo", APP, time.time() - DAY)
         before = sweep.directory_blocks(str(tree.parent))
-        with (mock.patch.object(sweep, "remove", return_value=1),
+        with (mock.patch.object(sweep, "remove", return_value=sweep.ConfirmedDeletion(0, 1)),
               mock.patch.object(sweep, "LARGE_REMOVAL_BYTES", 1),
               mock.patch.object(sweep, "send_floor_alert", return_value=False) as send):
             status, _ = self.hold(base, 10 * GIB, [9 * GIB, 9 * GIB])
@@ -1907,7 +2048,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         scan = sweep.scan_roots([str(base / "old" / "target"), str(base / "next" / "target")],
                                 [str(old_tree), str(next_tree)])
         old_group = next(group for group in scan.groups if group.build_tree == str(old_tree))
-        shortfall = sweep.freed_by(old_group, scan, dict(scan.links)) + 1
+        shortfall = sweep.freed_by(old_group, scan, dict(scan.links)).bytes + 1
         _, output = self.hold(base, 10 * GIB, [10 * GIB - shortfall, 10 * GIB])
         self.assertFalse(old.exists())
         self.assertFalse(first.exists())
@@ -1931,7 +2072,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         orphan_dep_info = dep_info(orphan)
         scan = sweep.scan_roots([str(base / "repo" / "target")], [str(tree)])
         remaining = dict(scan.links)
-        orphaned = sum(sweep.freed_by(group, scan, remaining) for group in scan.orphans)
+        orphaned = sum(sweep.freed_by(group, scan, remaining).bytes for group in scan.orphans)
         self.assertGreater(orphaned, 0)
 
         status, output = self.hold(base, 10 * GIB, [10 * GIB - orphaned, 10 * GIB])
@@ -1952,16 +2093,20 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         _, successful_output = cargo_target(base, "successful", DEMO, now - DAY)
         scan = sweep.scan_roots([str(base / name / "target") for name in ("failed", "successful")],
                                 [str(base / name / "target" / "debug") for name in ("failed", "successful")])
-        shortfall = sum(sweep.freed_by(group, scan, dict(scan.links)) for group in scan.groups)
-        original_rmtree = shutil.rmtree
+        shortfall = sum(sweep.freed_by(group, scan, dict(scan.links)).bytes for group in scan.groups)
+        original_rmdir = os.rmdir
+        failed_parent = (failed_tree / ".fingerprint").stat()
 
-        def fail_one_group(path: str) -> None:
-            if path == str(failed_tree / ".fingerprint" / f"failed-{APP}"):
+        def fail_one_group(path: str, *, dir_fd: int | None = None) -> None:
+            matches = path == str(failed_tree / ".fingerprint" / f"failed-{APP}")
+            if dir_fd is not None and path == f"failed-{APP}":
+                matches = os.path.samestat(failed_parent, os.fstat(dir_fd))
+            if matches:
                 raise OSError("test removal failure")
-            original_rmtree(path)
+            original_rmdir(path, dir_fd=dir_fd)
 
         errors = io.StringIO()
-        with mock.patch.object(shutil, "rmtree", side_effect=fail_one_group), redirect_stderr(errors):
+        with mock.patch.object(os, "rmdir", side_effect=fail_one_group), redirect_stderr(errors):
             status, output = self.hold(base, 10 * GIB, [10 * GIB - shortfall, 10 * GIB])
 
         self.assertEqual(status, 1)
@@ -2040,7 +2185,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
             os.utime(path, (now - DAY, now - DAY))
         self.write_build_hold(base, now - 60)
         with mock.patch.object(time, "time", return_value=now):
-            self.assertEqual(sweep.remove([sweep.Group("unit", str(tree), [str(removed)])]), 0)
+            self.assertEqual(sweep.remove([sweep.Group("unit", str(tree), [str(removed)])]).failures, 0)
             # A coarse filesystem can date the delete up to two seconds after the clock reading.
             os.utime(tree / "deps", (now + 2, now + 2))
             with redirect_stdout(io.StringIO()):
@@ -2064,7 +2209,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         _ = path.write_text(json.dumps({str(old_tree.parent): now - DAY - 1,
                                         str(base / "missing"): now - 60}))
         with mock.patch.object(time, "time", return_value=now):
-            self.assertEqual(sweep.remove([sweep.Group("unit", str(tree), [str(removed)])]), 0)
+            self.assertEqual(sweep.remove([sweep.Group("unit", str(tree), [str(removed)])]).failures, 0)
         self.assertEqual(json.loads(path.read_text()), {str(tree.parent): now})
         self.assertFalse(removed.exists())
 

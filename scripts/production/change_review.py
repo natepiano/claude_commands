@@ -5,10 +5,10 @@
     change_review.py append --repo R [--production DOC] [--list L] --merged M --checkpoint C --previous P --merge-branch B
     change_review.py drift --repo R --merge-branch B [--production DOC] [--list L] --since YYYY-MM-DD
     change_review.py add [--production DOC] [--list L] --change "<what changed for you>" --check "<how to try it>" --see "<what you see>" [--merged M] [--urgency user|blocks|soon|normal|later] [--due ISO] [--after C<n>] [--hold <folder> ...]
-    change_review.py edit [--production DOC] [--list L] --row C<n> --change "<what changed for you>" --check "<how to try it>" --see "<what you see>"
+    change_review.py edit [--production DOC] [--list L] --row ID --change "<what changed for you>" --check "<how to try it>" --see "<what you see>"
     change_review.py show [--production DOC] [--list L]
-    change_review.py verdict [--production DOC] [--list L] --row C<n> --verdict "<the user's words>"
-    change_review.py mark-important [--production DOC] [--list L] --row C<n>
+    change_review.py verdict [--production DOC] [--list L] --row ID --verdict "<the user's words>"
+    change_review.py mark-important [--production DOC] [--list L] --row ID
     change_review.py list-path [--production DOC]
     change_review.py showrunner [--production DOC]
     change_review.py backfill-production [--list L] [--write]
@@ -53,6 +53,11 @@ child production's rows go to its root's list. A production opts in with a `- **
 list; otherwise the line's path does. `list-path` prints the list and `showrunner` the name, each
 from the calling showrunner's update timer when no doc is given; add, show and verdict find the
 list the same way unless --list names one; edit does too. Every write names its production, the same way.
+For edit, verdict and mark-important, --row takes the ID /next printed: C434 selects the current
+list; production/C9 selects that production's named list. An explicit --list must match that name.
+With a production, show reads its current and earlier lists and keeps the same pin as /next.
+Rows in other lists carry their list name; current-list rows keep their plain IDs. Without a
+production, show --list reads every row in that explicit list.
 """
 from __future__ import annotations
 
@@ -63,8 +68,9 @@ import re
 import subprocess
 import sys
 from collections.abc import Callable, Collection, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
+from enum import Enum
 from pathlib import Path
 from typing import TypeVar, cast
 
@@ -585,18 +591,91 @@ def scope_list(doc: Path) -> Path:
         return production_list(str(showrunners.timer_docs().get(root, doc)))
 
 
-def scope_rows(path: Path, doc: Path, below: bool = False) -> list[dict[str, str]]:
-    """The rows still to review on `path`, the production's list (scope_list), that its showrunner shows.
+@dataclass(frozen=True)
+class ProductionReviewList:
+    path: Path
+    default_production: str
 
-    A row is the production's when its Production cell names the production, and a row without
-    one is its list's root's. Only the production's own rows are shown, and with `below` also the
-    rows of each production below it (user, 2026-10-27).
-    """
+
+@dataclass(frozen=True)
+class ScopedReviewEntry:
+    review_list: ProductionReviewList
+    entry: urgency.Entry[dict[str, str]]
+
+
+def scope_lists(path: Path, doc: Path, below: bool = False) -> tuple[ProductionReviewList, ...]:
+    """The current list and each scoped production's own earlier list, once per path."""
     import showrunners
 
-    root = showrunners.root_of(slug_of(doc))
+    lists = {path.absolute(): ProductionReviewList(path, showrunners.root_of(slug_of(doc)))}
+    for production in scope_docs(doc, below):
+        slug = slug_of(production)
+        earlier = list_file(slug)
+        if earlier.absolute() in lists or earlier.exists():
+            lists[earlier.absolute()] = ProductionReviewList(earlier, slug)
+    return tuple(lists.values())
+
+
+def scoped_review_entries(path: Path, doc: Path, below: bool = False) -> list[ScopedReviewEntry]:
+    """Read and rank each list independently; a bad list leaves the others in the queue."""
     scope = {slug_of(each) for each in scope_docs(doc, below)}
-    return [row for row in pending(path) if (row.get(PRODUCTION) or root) in scope]
+    entries: list[ScopedReviewEntry] = []
+    for review_list in scope_lists(path, doc, below):
+        try:
+            rows = [row for row in pending(review_list.path)
+                    if (row.get(PRODUCTION) or review_list.default_production) in scope]
+            ranked = row_entries(rows)
+        except (ChangeReviewError, OSError, UnicodeError) as error:
+            print(f"change review: {review_list.path}: {error}", file=sys.stderr)
+            continue
+        entries.extend(ScopedReviewEntry(review_list, entry) for entry in ranked)
+    return entries
+
+
+def scope_rows(path: Path, doc: Path, below: bool = False) -> list[dict[str, str]]:
+    """The production's open rows from its current list and its own earlier list.
+
+    With `below`, include each lower production's rows and earlier list too.
+    """
+    return [row.entry.item for row in scoped_review_entries(path, doc, below)]
+
+
+def scope_entries(path: Path, doc: Path, below: bool = False) -> list[urgency.Entry[dict[str, str]]]:
+    """Keep current-list IDs and pins; name other rows and their prerequisites with their list."""
+    entries: list[urgency.Entry[dict[str, str]]] = []
+    for scoped in scoped_review_entries(path, doc, below):
+        entry = scoped.entry
+        prefix = (f"{_owner(scoped.review_list.path)}/"
+                  if scoped.review_list.path.absolute() != path.absolute() else "")
+        key = prefix + entry.key
+        after = prefix + entry.after if entry.after and "/" not in entry.after else entry.after
+        entries.append(replace(entry, key=key, item=entry.item | {"#": key}, after=after))
+    return entries
+
+
+class WholeReviewList(Enum):
+    """An explicit list shown without a production filter."""
+
+    ALL_ROWS = "all rows"
+
+
+@dataclass(frozen=True)
+class ChangeQueue:
+    """The change rows a person can review and the name that keeps their pin and moved rows."""
+
+    name: str
+    entries: list[urgency.Entry[dict[str, str]]]
+
+
+def change_queue(path: Path, scope: Path | WholeReviewList, below: bool = False) -> ChangeQueue:
+    """The same change rows and pin for /next and change_review show."""
+    if isinstance(scope, WholeReviewList):
+        return ChangeQueue(queue(path), row_entries(pending(path)))
+    import showrunners
+
+    slug = slug_of(scope)
+    name = queue(path) if slug == showrunners.root_of(slug) else f"{queue(path)}-{slug}"
+    return ChangeQueue(urgency.scope_queue(name, below), scope_entries(path, scope, below))
 
 
 def row_production(production: Path) -> str:
@@ -1055,9 +1134,24 @@ def _visible(options: CommandLine) -> Visible:
     return Visible(_words("change", options.change), _words("check", options.check), _words("see", options.see))
 
 
-def _row_option(options: CommandLine) -> str:
-    """The row id --row names, such as C3."""
-    return _row_id("row", options.row)
+@dataclass(frozen=True)
+class ReviewRowTarget:
+    path: Path
+    row: str
+
+
+def _row_option(options: CommandLine) -> ReviewRowTarget:
+    """The list and local row ID selected by --row, as /next printed it."""
+    name, separator, row = options.row.strip().rpartition("/")
+    row = _row_id("row", row)
+    if not separator:
+        return ReviewRowTarget(_list(options), row)
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) is None:
+        raise ChangeReviewError(f"--row {options.row!r} is not a row id such as C3 or production/C3")
+    path = list_file(name)
+    if options.list and Path(options.list).expanduser().resolve() != path.resolve():
+        raise ChangeReviewError(f"--row {options.row} names {path}, which differs from --list {options.list}")
+    return ReviewRowTarget(path, row)
 
 
 def _row_id(name: str, value: str) -> str:
@@ -1089,26 +1183,30 @@ def _run(options: CommandLine) -> int:
             for line in hold_for_row(path, row, options.hold or []):
                 print(line)
         case "edit":
-            row, item = _row_option(options), _visible(options)
-            print(edit_row(_list(options), row, item, today(), production_doc(options.production)))
+            target, item = _row_option(options), _visible(options)
+            print(edit_row(target.path, target.row, item, today(), production_doc(options.production)))
         case "show":
             # One row only: the user asks for the next one when they want it (user, 2026-10-20).
-            path = _list(options)
-            waiting = pending(path)
-            shown = urgency.top(row_entries(waiting), queue(path))
-            print(describe(shown.item) + (f"\n\n{len(waiting) - 1} more to review" if len(waiting) > 1 else "")
+            if options.list and not options.production:
+                waiting = change_queue(_list(options), WholeReviewList.ALL_ROWS)
+            else:
+                doc = production_doc(options.production)
+                path = Path(options.list).expanduser() if options.list else scope_list(doc)
+                waiting = change_queue(path, doc)
+            shown = urgency.top(waiting.entries, waiting.name)
+            print(describe(shown.item) + (f"\n\n{len(waiting.entries) - 1} more to review" if len(waiting.entries) > 1 else "")
                   if shown is not None else "nothing to review")
         case "mark-important":
-            row = _row_option(options)
+            target = _row_option(options)
             now = datetime.now(user_zone()).replace(tzinfo=None)
-            print(mark_row(_list(options), row, now, production_doc(options.production)))
+            print(mark_row(target.path, target.row, now, production_doc(options.production)))
         case "verdict":
-            row = _row_option(options)
+            target = _row_option(options)
             verdict = _words("verdict", options.verdict)
-            path = _list(options)
-            merged = record_verdict(path, row, verdict, today(), production_doc(options.production))
+            merged = record_verdict(target.path, target.row, verdict, today(), production_doc(options.production))
+            row = options.row.strip()
             print(f"{row} landed" if lands(verdict) else f"{row} returns to its unit (merged {merged})")
-            for line in end_row_scratch(path, row):
+            for line in end_row_scratch(target.path, target.row):
                 print(line)
         case "list-path":
             print(production_list(options.production))

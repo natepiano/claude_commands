@@ -18,7 +18,6 @@
 - **Push:** git
 - **Promote:** ~/.claude, mac ~/.claude
 - **Capacity:** five units; `report.py` is shared, and whoever lands second resolves conflicts; its seats share natedev's build slots (steve)
-- **Review pool:** code (the user, 2026-10-16: "cargo-liner and natedev should have reviewers turned on also")
 - **Improvement queue:** ~/.local/state/plan-backlog/ledger.md
 - **Efficiency ledger:** ~/.local/state/nightly-review/ledger.md
 

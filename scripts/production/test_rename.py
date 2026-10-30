@@ -6,16 +6,139 @@ import json
 import os
 import shlex
 import unittest
+from collections.abc import Callable
 from typing import cast, final
 from unittest import mock
 
 from scripts.direct import workers
 from scripts.production import rename_test_support as support
+import rename
+from unit_move import PathMove
 from scripts.production.rename_test_support import CHECK_TIMER_HANDOFF, FAIL_GIT_MOVE_INDEX, FAIL_PLAN_REWRITE, NEW, OLD, UNITS
 
 
 @final
 class ProductionRenameTests(support.ProductionRenameFixture):
+    def interrupt_apply(self, count: int) -> rename.RenamePlan:
+        save = cast(Callable[[rename.RenamePlan, tuple[str, ...]], None], getattr(rename, "_save"))
+        stopped: list[rename.RenamePlan] = []
+
+        def interrupted(plan: rename.RenamePlan, completed: tuple[str, ...]) -> None:
+            save(plan, completed)
+            if len(completed) == count:
+                stopped.append(plan)
+                raise OSError("fixture interrupted apply")
+
+        with mock.patch.object(rename, "_save", side_effect=interrupted):
+            result = self.run_rename("apply")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("fixture interrupted apply", result.stderr)
+        self.assertEqual(self.completed_steps(), count)
+        return stopped[0]
+
+    def move_showrunner_checkout(self) -> None:
+        old = self.checkout
+        self.checkout = old.with_name("moved-checkout")
+        _ = old.rename(self.checkout)
+        self.doc = self.checkout / "docs/plans/old-production.md"
+        self.new_doc = self.doc.with_name("new-production.md")
+        _ = self.git("worktree", "repair")
+        for path in (self.doc, self.new_doc):
+            if path.exists():
+                self.write(path, path.read_text().replace(str(old), str(self.checkout)))
+        for conf in self.notifier.glob("showrunner-*/conf"):
+            self.write(conf, conf.read_text().replace(str(old), str(self.checkout)))
+        for unit in UNITS:
+            self.assertEqual(self.git("-C", str(self.worktrees / unit), "rev-parse", "--git-common-dir"),
+                             str(self.checkout / ".git"))
+        self.assertFalse(old.exists())
+
+    def assert_journal_has_no_current_locations(self) -> None:
+        journal = self.journal()
+        for key in ("checkout", "old_doc", "new_doc", "timer", "state", "stall", "review_pool"):
+            self.assertNotIn(key, journal)
+        self.assertEqual(journal["plans"], [f"docs/plans/{unit}.md" for unit in UNITS])
+        self.assertNotIn(str(self.root), json.dumps(journal))
+
+    def test_resume_before_doc_timer_steps_after_checkout_moves(self) -> None:
+        _ = self.interrupt_apply(0)
+        self.move_showrunner_checkout()
+        self.assert_success(self.run_rename("apply"))
+        self.assert_applied()
+        self.assert_journal_has_no_current_locations()
+
+    def test_resume_after_doc_timer_steps_after_checkout_moves(self) -> None:
+        _ = self.interrupt_apply(3)
+        self.move_showrunner_checkout()
+        self.assert_success(self.run_rename("apply"))
+        self.assert_applied()
+        self.assert_journal_has_no_current_locations()
+        self.assert_success(self.run_command("repair-workers", NEW, "--dry-run"))
+
+    def test_old_format_journal_ignores_stale_locations_between_doc_and_timer_steps(self) -> None:
+        plan = self.interrupt_apply(1)
+        journal = self.journal()
+        # The seven-step count is also an older supported journal representation.
+        del journal["completed"]
+        journal["step"] = 1
+
+        def move_record(move: PathMove) -> dict[str, str]:
+            return {"source": str(move.source), "destination": str(move.destination)}
+
+        journal.update(checkout=str(self.checkout), old_doc=str(self.doc), new_doc=str(self.new_doc),
+                       plans=[str(path) for path in plan.plans], timer=move_record(plan.timer),
+                       state=[move_record(move) for move in plan.state],
+                       stall=[move_record(move) for move in plan.stall], review_pool=move_record(plan.review_pool))
+        self.write(self.state / "new/rename.json", json.dumps(journal))
+        self.move_showrunner_checkout()
+        self.assert_success(self.run_rename("apply"))
+        self.assert_applied()
+        self.assert_journal_has_no_current_locations()
+
+    def test_resume_refuses_missing_expected_timer_even_when_other_slug_resolves(self) -> None:
+        _ = self.interrupt_apply(0)
+        old = self.notifier / "showrunner-old"
+        new = self.notifier / "showrunner-new"
+        _ = old.rename(new)
+        for other_exists in (True, False):
+            with self.subTest(other_timer_exists=other_exists):
+                if not other_exists:
+                    _ = new.rename(self.notifier / "unregistered")
+                result = self.run_rename("apply")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("rename old -> new at _rename_doc: expected old's update timer", result.stderr)
+                self.assertEqual(self.completed_steps(), 0)
+
+    def test_resume_after_timer_step_refuses_old_timer_as_substitute(self) -> None:
+        _ = self.interrupt_apply(3)
+        _ = (self.notifier / "showrunner-new").rename(self.notifier / "showrunner-old")
+        result = self.run_rename("apply")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("rename old -> new at _rename_showrunner_state: expected new's update timer", result.stderr)
+        self.assertEqual(self.completed_steps(), 3)
+
+    def test_unit_move_recovery_and_worker_repair_resolve_moved_showrunner_checkout(self) -> None:
+        self.prepare_unit_moves()
+        self.assert_success(self.run_rename("apply"))
+        with mock.patch.object(rename, "_move_unit_worktree", side_effect=OSError("fixture unit move interrupted")):
+            result = self.run_command("unit", NEW, "alpha-unit")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("fixture unit move interrupted", result.stderr)
+        # These unit worktrees use the conventional names, unlike the apply fixtures.
+        old = self.checkout
+        self.checkout = old.with_name("moved-checkout")
+        _ = old.rename(self.checkout)
+        self.doc = self.checkout / "docs/plans/old-production.md"
+        self.new_doc = self.doc.with_name("new-production.md")
+        _ = self.git("worktree", "repair")
+        self.write(self.new_doc, self.new_doc.read_text().replace(str(old), str(self.checkout)))
+        conf = self.notifier / "showrunner-new/conf"
+        self.write(conf, conf.read_text().replace(str(old), str(self.checkout)))
+        self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
+        self.assert_unit_moved("alpha-unit")
+        self.assert_success(self.run_command("repair-workers", NEW))
+        self.assertNotIn("new_doc", self.journal())
+
     def test_plan_ignores_as_built_paths_and_prose_in_plan_cells(self) -> None:
         text = self.doc.read_text()
         for unit, prose in zip(UNITS, (
