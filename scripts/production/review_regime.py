@@ -153,8 +153,11 @@ def add(arguments: argparse.Namespace) -> None:
     if row.hours() < 0:
         raise SystemExit("review_regime: --merged is before --started")
     # A unit that runs a second plan starts again at phase 1, so the plan is part of what names a row.
-    if any((existing.unit, existing.plan, existing.phase) == (row.unit, row.plan, row.phase) for existing in read_rows()):
-        raise SystemExit(f"review_regime: {row.unit} phase {row.phase} of {row.plan} already has a row")
+    for existing in read_rows():
+        if (existing.unit, existing.plan, existing.phase) == (row.unit, row.plan, row.phase):
+            print(f"kept {row.unit} phase {row.phase} of {row.plan}: "
+                  + f"a row exists from the merge at {existing.merged}; nothing added")
+            return
     LEDGER.parent.mkdir(parents=True, exist_ok=True)
     with LEDGER.open("a") as ledger:
         _ = ledger.write(json.dumps(asdict(row)) + "\n")

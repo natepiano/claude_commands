@@ -136,7 +136,7 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
   - `docs/typesafe.md` — new guide (Phase 7)
   - `pyrightconfig.json` — one execution-environment entry for `scripts/issue_score`
 - **Key files:**
-  - `~/rust/hanadocs/issues/*.md` — issues, read only; skip any with `style_rule:` in frontmatter, skip directories
+  - `~/rust/hanadocs/issues/*.md` — issues; `vault.load_scoring_issues()` scores open issues, style-rule issues included (the owning repository's rule text resolves through the feature-log registry); skip directories. Only `apply_labels.py` writes issue frontmatter, and only values the user approved
   - `~/rust/hanadocs/prioritization goals.md` — goal definitions, the goal Choice criteria
   - `~/rust/hanadocs/issue structure.md` — category definitions and the star rubric
   - `commands/issue.md` — the rubric levels for alignment, impact, urgency and effort (step 4)
@@ -276,96 +276,162 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 
 ### Phase 5 — `/issue` proposes with Jev  · status: done
 
-**Depends on:** Phase 4
+#### As-built
 
-#### Work Order
-
-**Goal:** a new issue's proposal line comes from Jev for every field in `JEV_FIELDS`, and the user still confirms in one reply.
-
-**Spec:**
-- `score_issues.py propose --project <short> --title <t> [--body-file <f>]` prints the one-line proposal in `/issue`'s format, as the Design shows. An unsure field shows its top two values. Effort is marked `(check)`. Urgency adds `possible 5` when that flag is set. Exit 0 on success. On an API failure it exits 2 with the error on stderr.
-- `commands/issue.md` step 4: run `propose` and use its line for the fields in `JEV_FIELDS`. The agent proposes the rest as today. On exit 2, say the call failed and propose every field the old way. The `Proposed ranking:` line of a unit's proposal uses the same output.
-
-**Files:**
-- `scripts/issue_score/score_issues.py` — the `propose` subcommand
-- `scripts/issue_score/test_score_issues.py` — propose tests
-- `commands/issue.md` — step 4 uses `propose`
-
-**Workers:** `1 writer + 1 tester` — `impl` owns `score_issues.py` and `commands/issue.md`; `test` covers the output format, the unsure display and exit 2 on a failed fixture.
-
-**Constraints from prior phases:**
-- `JEV_FIELDS` is goal, impact and alignment (the user's verdict, 2026-10-29). Category and area join it only if Phase 4 meets their target and the user approves; `propose` reads `JEV_FIELDS`, never a fixed list. Phase 4 result: area met its target (held-out error .091 at `Supported(0.90)`, 39% taken) and waits on the user's review of the drafted definitions; category failed (held-out error .15) and stays agent-proposed.
-- Area definitions: `propose` loads them with `vault.load_area_definitions()` and passes them to `questions.area_questions(areas, definitions)`; both that and `content_hash(issue, areas, definitions)` take them as required arguments, with `areas` from the global `vault.area_vocabulary`. A missing or empty definitions file raises `ValueError` naming the path; `propose` exits 2 with that message on stderr, and a test covers it.
-- An unsure Jev field is routed to the user: the line shows its top two values and the user picks in the same reply (the user's routing rule, 2026-10-29).
-- `propose --project <short>` converts the shorthand to the canonical project name (`hana_diegetic`) before `vault.build_state`, which raises on an unknown project; a test covers each shorthand and an unknown one.
-- Show the derived flags: `split`, `check` (effort), `possible_five` (urgency 4) and the derived `unfiled` fallback with its hint. A Choice pick of the real area `unfiled` is an ordinary value with no hint; tell them apart by the decision's origin, and a test covers both.
-- Alignment follows the final goal. The request asks `alignment_<goal>` for every goal, and `decide_answers` keeps only the winning goal's; `propose` keeps every goal's alignment answer. When goal is unsure, the line shows both goal candidates, each with its own alignment value, so the user's pick needs no second call. A named goal state (resolved goal, or unresolved first and second candidates) carries this, never an optional. A fixture with an unsure goal whose second candidate has a different alignment proves it.
-- Acceptance: the output for a fixture response is equal to a pinned expected text; the live check confirms only that the output is complete and usable, because a fresh response can differ from an earlier report row.
-
-**Acceptance gate:** the merge gate is green; basedpyright clean; the fixture output equals its pinned text; one live `propose` on a held-out issue's title and body prints a complete, usable line.
-
-### Phase 6 — reassess every open issue  · status: todo
-
-**Depends on:** Phase 4
-
-#### Work Order
-
-**Goal:** every open issue has a Jev proposal for each field in `JEV_FIELDS`, and the user reviews current values against Jev's and decides which to write.
-
-**Spec:**
-- `score` covers all open issues: rated, default-rated (Review decisions 1), unrated, and style issues.
-- Style issue state: title, project, each rule's name and its one-line summary (from `style_rule`, or each entry of `style_rules`), `style_crate`, and the finding count. A rule file that is missing gives a named outcome in the review file, never a silent empty summary.
-- `score_issues.py reassess <run-id>` writes a review file, `~/.local/state/issue-score/reports/<run-id>-reassess.md`. Each issue gets one row: its current value and Jev's value for each field, sure or unsure, sorted so the largest differences come first. Unrated and default-rated issues come in their own group.
-- Approval follows the user's routing rule (2026-10-29): decisions are rebuilt from the saved raw answers under the current policy. A `JEV_FIELDS` value for which `decide.is_sure()` holds is taken, unrated and default-rated issues first; every other value goes to the user, walked by `/prioritize` band. The review file shows the two groups apart, and shows the score >= 20 group's results on their own.
-- Unrated and default-rated issues: the agent proposes the missing agent-owned fields (category, area, urgency, effort) in the same review, as `/issue` does, so each issue gets a score and a band before band routing.
-- `apply_labels.py` writes approved values: a frontmatter edit of only the approved fields among the five rating fields, `category` and `area`. It refuses when the issue's content hash differs from the scored one, or when an approved field's current value differs from the value the review showed (`content_hash()` excludes labels). The watcher recomputes score and rank. The scorer itself never writes to the vault.
+- `score_issues.py propose --project <short> --title <t> [--body-file <f>]` runs `propose(project, title, body="", *, issues_dir, state_dir, model, area_definitions_path) -> str`. It reuses `_score_issue` and `decide_answers` unchanged. It exits 0 on success, and exits 2 with the error on stderr on `TypeSafeError`, `OSError` or `ValueError` (unknown shorthand, definitions-file error, API failure, unreadable body file).
+- The first output line has one top value per field (`_ranking_field`), with flags. An `Alternatives:` line follows when any field is unsure, with its top two values (`_proposal_field`).
+- Flags: `unsure`, `split`, `check` (effort), `possible 5` (urgency), `hint: <area>` (the derived `unfiled` fallback only, told apart from a real `unfiled` pick by the decision's origin), and `agent proposes` for each field not in `JEV_FIELDS`, which `propose` reads at call time.
+- `PROJECT_NAMES` maps the 18 `/issue` shorthands to canonical projects before `vault.build_state`.
+- `GoalState = ResolvedGoal | UnresolvedGoal` over `GoalCandidate(goal, alignment)`, built by `_proposal_goal(main, decisions)`. Each candidate carries the alignment from its own `alignment_<goal>` answer, so the user's pick of an unsure goal needs no second call.
+- `commands/issue.md` step 4 runs `propose` under `with-typesafe` and uses its values for `JEV_FIELDS`; the agent proposes the rest, and every field on exit 2. A unit proposal puts only the first line on `Proposed ranking:`, with unsure choices on `Alternatives:`.
 
 **Files:**
-- `scripts/issue_score/vault.py` — style issue state from rule fields
-- `scripts/issue_score/questions.py` — any question changes the reassess needs
-- `scripts/issue_score/score_issues.py` — the `reassess` subcommand
-- `scripts/issue_score/records.py` — persisted style inputs in run records
-- `scripts/issue_score/apply_labels.py` — the approved-field writer
-- `scripts/issue_score/test_reassess.py` — reassess tests
-- `scripts/issue_score/test_apply_labels.py` — writer tests
+- `scripts/issue_score/score_issues.py` — `propose`, `PROJECT_NAMES`, the goal state, the formatters, the `propose` subcommand
+- `scripts/issue_score/test_score_issues.py` — propose tests, including a `proposals_table.proposal_score` regression on the ranking line
+- `scripts/issue_score/fixtures/proposal_expected.txt` — the pinned two-line output
+- `scripts/issue_score/fixtures/proposal_unsure_goal.json` — an unsure goal whose two candidates have different alignments
+- `commands/issue.md` — step 4 and the unit-proposal line
 
-**Workers:** `1 writer + 1 tester` — `impl` owns `vault.py`, `questions.py`, `score_issues.py`, `records.py` and `apply_labels.py`; `test` owns `test_reassess.py` and `test_apply_labels.py` (style state, grouping, sort order; only approved fields change; a stale hash or a changed approved value refuses; threshold equality, structural uncertainty and stale saved certainty).
+**Binds later work:** **reassess every open issue** reuses `_proposal_goal`, `_proposal_field` and `_ranking_field` for its review rows. If area joins `JEV_FIELDS`, the pinned `(agent proposes)` text changes.
 
-**Constraints from prior phases:**
-- Read open, non-style issues through `vault.load_open_issues`; style issues get the formula state that this phase adds. `score` already covers rated, default-rated and unrated open non-style issues; the new scoring work is style inclusion only.
-- The cache key holds title, project, body, the area vocabulary and (from Phase 4) the area definitions. Add every new style input (rule summaries, `style_crate`, finding count) to it, with a test per input that a change misses the cache and that the definition-sensitive key is kept. `content_hash(issue, areas, definitions)` and `area_questions(areas, definitions)` take definitions as required arguments, loaded by `vault.load_area_definitions()`, which raises `ValueError` naming the path for a missing or empty file. A definition edit changes every issue's hash, so `apply_labels.py` refuses a run scored before the edit; its refusal says the hash changed and that a rescore is needed, and a test covers it.
-- The derived `unfiled` fallback and a Choice pick of the real area `unfiled` show as different outcomes in the review file; a test covers both.
-- Acceptance proves that only approved values change and that the scorer code stays read-only.
-- A partial run (failed lines or a budget stop) shows the failed and unscored issues in the review files, kept apart from each other, and never presents them as complete; a test proves it.
-- `proposal_issue.py stars` takes all five ranking values, not a subset, which is why this phase has its own writer.
+**Gotchas:**
+- `scripts/production/proposals_table.py` counts every star on a `Proposed ranking:` line. Alternative values there corrupt the queue score (16, or -inf on an unsure goal).
+- `PROJECT_NAMES` copies the shorthand table in `commands/issue.md`, and a test pins a third copy. A shorthand added only to `/issue` makes `propose` exit 2, so the agent proposes every field with no test failure.
+- `~/.claude` main runs `propose` with a loader that reads only the three-column area table. A two-column vault table makes every `/issue` call exit 2 until the loader that reads both forms reaches main.
 
-**Acceptance gate:** the merge gate is green; basedpyright clean; a full reassess run within budget; the user has the review file, and the values the user approved are written.
+**Ruled out:** unsure alternatives inline on the ranking line — they break the star count in `proposals_table.py`; changing `proposals_table.py` — another unit owns it.
 
-### Phase 7 — the TypeSafe guide for other sessions  · status: todo
+### Phase 6 — reassess every open issue  · status: done
+
+#### As-built
+
+- `score_issues.reassess(run_id, *, issues_dir, state_dir, area_definitions_path, rules_dirs, goals_path) -> Path` rebuilds decisions from a saved run's raw answers under the current policy. It writes only review files, and refuses a `state_dir` inside the vault. A field is taken when it is in `JEV_FIELDS` and `decide.is_sure()` holds; all other fields go to the user, by `/prioritize` band ("Score >= 20", "Score 10–19", "Score < 10"). Unrated and default-rated issues sort first, then rated issues by largest difference. The score >= 20 group gets its own field table. Failed and unscored issues show in separate lists, and the title says "(partial)".
+- Unrated and default-rated rows need agent values for every field not in `JEV_FIELDS`. `reassess` writes a blank form to `<run>-agent-proposals.json`. After the form is filled, a rerun gives each row a provisional score and band.
+- `apply_labels.apply_labels(approvals_path, *, issues_dir, area_definitions_path, rules_dirs) -> list[Path]` reads `{"review_path": "...-reassess.json", "approvals": [{"issue_path", "fields"}]}`. It checks all approvals before it writes, edits only the approved fields among `backlog_goal`, the four ratings, `category` and `area` (template formats), and writes each file atomically. Refusals exit 2 on stderr: not an open issue in the review, duplicate approval, invalid value, area definitions changed, content hash changed (rescore needed), approved field changed since review.
+- `vault.load_scoring_issues()` adds open style issues. `StyleInputs(rules, style_crate, finding_count)` holds a `RuleSummary(name, summary)` or `MissingStyleRule(name)` per `style_rule`/`style_rules` entry. Local rules resolve through `project_rule_roots()` (the feature-log registry), then `STYLE_RULES_DIRS`. These inputs are part of the cache key.
+- `vault.load_project_names()` reads each shorthand's project from `~/rust/hanadocs/home-base/issues - <short>.base`; `propose` refuses a shorthand with no base file.
+- `client._write_pending()` replaces the spend reservations file atomically (temp file, fsync, `os.replace`).
+
+**Files:**
+- `scripts/issue_score/score_issues.py` — `reassess` subcommand and review formatters; no `PROJECT_NAMES`
+- `scripts/issue_score/apply_labels.py` — approved-field writer
+- `scripts/issue_score/vault.py` — style inputs, both area table forms, `load_project_names`
+- `scripts/issue_score/records.py` — `ReviewRow`, `Reassessment`, `AgentProposals` and routing types
+- `scripts/issue_score/client.py` — atomic spend reservations write
+- `commands/issue.md` — step 4 Area bullet names the `area` column of `conf/issue-areas.md` or "unfiled"
+- `~/.local/state/issue-score/lessons.md` — the 116 -> 64 and 64 -> 62 area reruns (outside the repository)
+
+**Binds later work:**
+- `vault.load_area_definitions()` reads both `area | definition` and `area | definition | issues` tables (the `issues` cell is ignored) until "the TypeSafe guide for other sessions" rewrites the vault table to two columns and drops the three-column form and its `test_vault.py` case.
+- `THRESHOLDS["area"]` and `JEV_FIELDS` are unchanged; "area threshold from the user's answer; run the reassess" sets them.
+- `QUESTION_SET_VERSION` is "5" (area merge). A saved record with another version or hash goes to the failed list.
+- Project names have one source: the vault base files. Add no second copy.
+- `reassess` writes `reports/<run>-reassess.md`, `<run>-reassess.json` (the input `apply_labels` reads) and `<run>-agent-proposals.json`. The scorer never writes to the vault.
+
+**Gotchas:**
+- `reassess` uses the run's saved area vocabulary, not the live one, so an interrupted label batch still matches its review. A run with mixed vocabularies refuses.
+- An area definition edit changes every content hash; `apply_labels` then refuses until a rescore.
+- In the area table, a row whose column count differs from its header ends the table.
+
+### Phase 6b — area threshold from the user's answer; run the reassess  · status: todo
 
 **Depends on:** Phase 6
 
 #### Work Order
 
-**Goal:** `docs/typesafe.md` lets any session use TypeSafe here without this unit.
+**Goal:** the code matches the user's area answer (`THRESHOLDS["area"]` and `JEV_FIELDS`); then every open issue has a Jev proposal for each field in `JEV_FIELDS`, and the user reviews current values against Jev's and decides which to write. Split from Phase 6 on 2026-10-29 so Phase 6's answer-independent work runs first (showrunner agreed).
+
+**Pending decision: Jev proposes area at 0.95, or the agent keeps proposing it**
+
+Actual problem:
+After the user's area merge (116 -> 62 areas), the code's `THRESHOLDS["area"] = Supported(0.90)` in `scripts/issue_score/questions.py` no longer meets the routing rule on held-out (error .103). 0.95 meets it on both splits, at the limit on held-out. Which branch this phase builds decides `THRESHOLDS["area"]`, `JEV_FIELDS` and the reassess's taken group. Asked through the showrunner about 12:00 EDT, 2026-10-29.
+
+What exists now:
+- 62-area run `20261029T155801.891126Z-3015dbcf`: area accuracy .67 tune, .66 held-out. At 0.95: tune error .083, 30% taken; held-out error .100 (3 of 30 wrong), 27% taken. At 0.90: held-out error .103.
+- `JEV_FIELDS` = goal, impact, alignment. Category stays agent-proposed.
+
+What should change:
+- Yes: `THRESHOLDS["area"] = Supported(0.95)`; `area` joins `JEV_FIELDS`; the `JEV_FIELDS` pin in `test_questions.py` gains `area`; `fixtures/proposal_expected.txt` loses `(agent proposes)` on its two area entries.
+- No: `THRESHOLDS["area"] = Unsupported("the user kept area agent-proposed after the 62-area rerun")`, so the code matches the measurement; `JEV_FIELDS` is unchanged.
+- Both: Phase 6 already made the version bump, the `commands/issue.md` Area bullet and the `lessons.md` entries. This phase appends the user's answer to the 62-area `lessons.md` entry.
+
+Recommendation:
+Yes. Area passes the user's rule (at most 10% wrong on tune; held-out checked once) at 0.95 on both splits. About 70% of area answers still go to the user.
+
+**Spec:**
+- `THRESHOLDS["area"]` and `JEV_FIELDS` per the answer. The code comment above the area threshold states the 62-area measurement and run id.
+- Run the full reassess: a fresh version-5 `score --fresh` run over every open issue, then `score_issues.py reassess <run-id>`.
+- Readiness gate: `complete=True` proves only scoring coverage. Fill `<run>-agent-proposals.json` for every row that waits on agent values, and run `reassess` again until every row reaches band routing (`test_unrated_and_default_issues_require_agent_values_before_provisional_score_and_band` shows this step). Only then give the user the review file.
+- Record the user's approvals in an approvals file against that review's JSON snapshot, run `apply_labels.py`, then read back each written issue and check that its frontmatter holds the approved values.
+
+**Files:**
+- `scripts/issue_score/questions.py` — `THRESHOLDS["area"]`, `JEV_FIELDS`
+- `scripts/issue_score/test_questions.py`, `scripts/issue_score/test_decide.py`, `scripts/issue_score/fixtures/proposal_expected.txt` — the threshold and `JEV_FIELDS` pins
+- `scripts/issue_score/test_reassess.py`, `scripts/issue_score/test_score_issues.py` — area-agent expectations (yes only)
+- `scripts/issue_score/test_evaluate.py` — the configured-threshold pin
+- `~/.local/state/issue-score/lessons.md` — the user's answer (outside the repository)
+
+**Constraints from prior phases:**
+- These pins change by plan, and changing them is not weakening a test: `test_decide.py`'s expected area threshold .9 -> .95 (yes), or area leaves the `Supported` map and is asserted `Unsupported` (no); the comment above it (`test_decide.py:32`, "Phase 4 adds …") is rewritten to say what the policy is, with no phase history. The `test_questions.py` `JEV_FIELDS` set gains `area` (yes only).
+- Phase 6 made the version-5 bump, so version-5 cache entries can exist now. The full reassess run uses `score --fresh` with no further bump (about $0.20 for the vault; spend so far $1.48 of $20). Version-4 runs, `3015dbcf` included, are not reassess input.
+- `test_decide.py:280` fails under either answer and changes with it. With yes, the hardcoded area-agent expectations in `test_reassess.py` and `test_score_issues.py` change too. `test_evaluate.py:362` pins the old configured threshold: keep a case for the historical policy (a run recorded at 0.90 stays readable) and add a case for current-policy routing.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — `questions.py`, `lessons.md`
+- `test` — the test files and the fixture above
+- the unit director runs the live score, the reassess, the user review and `apply_labels.py`
+
+**Acceptance gate:** `THRESHOLDS["area"]` and `JEV_FIELDS` match the user's answer (pinned); the merge gate is green; basedpyright clean on `scripts/issue_score`. A full reassess run on version 5 is within budget. The user has the review file, and the values the user approved are written.
+
+
+### Phase 7 — the TypeSafe guide for other sessions  · status: done
+
+**Depends on:** Phase 6
+
+#### Work Order
+
+**Goal:** `docs/typesafe.md` lets any session use TypeSafe here without this unit, and the area table has its final two-column form.
 
 **Spec:** in STE, under 150 lines:
 - that live calls run as `with-typesafe <cmd>`, that the key is never read or printed, and the data rule (what may be sent);
 - how to reuse `scripts/issue_score/client.py`;
 - the `questions.py` pattern (all wording in one module, model pinned, payloads logged);
 - the skill's core rules, with links to the live docs;
-- the measured lessons from Phases 3, 4 and 6 (`lessons.md`);
+- the measured lessons from Phases 3, 4 and 6 (`lessons.md`), the area merge reruns included (116 -> 64 failed tune at every threshold; 62 areas met the rule at 0.95);
+- how `/issue` uses `score_issues.py propose`: a single-valued first line, unsure choices on an `Alternatives:` line, exit 2 when the agent must propose every field;
+- project names: the vault base files are the one source (`vault.load_project_names()`). A new base file adds a shorthand with no code change; a new canonical project also needs a `PROJECT_ABOUT` entry;
+- the reassess workflow: which artifact the operator reads (`<run>-reassess.md`), fills (`<run>-agent-proposals.json`, the approvals file) and keeps (`<run>-reassess.json`, the snapshot approvals are checked against); and each `apply_labels.py` refusal (stderr, exit 2) with its recovery: content or area definitions changed (rescore), a reviewed field changed since review, a duplicate approval, and an interrupted batch (run the same approvals again; written fields count as done);
 - the cost of a pass;
 - the instruction to ask `typesafe-unit` for anything not covered.
 
+Finish the area table, after the guide is written:
+- Remove the shorthand allowlist from `commands/issue.md`: it names the vault base files as the source and stops refusing a shorthand that has a base file.
+- First prove that the reassess phase's checkpoint is on origin/main: `git merge-base --is-ancestor bef8ccf4 origin/main` (merged as 6835f4f2 on 2026-10-30). If it is not, leave the table and the loader as they are, and post blocked. A two-column table read by a three-column-only loader makes every `/issue` call fall back.
+- Rewrite `~/rust/hanadocs/conf/issue-areas.md` as a two-column `area | definition` table. Keep each area and its definition text unchanged. The intro sentence that names the issues column points only at `[[issue areas.base]]` for counts. Commit and push with `git -C ~/rust/hanadocs`; never `cd` into the vault. Order matters: main's loader (since 6835f4f2) reads both forms, so the two-column table goes first. The table is pushed, and present in the vault on natedev and the Mac, before this phase's checkpoint brings the two-column-only loader to main. The checkpoint notice names the hanadocs commit.
+- Remove the three-column form from `vault.load_area_definitions()`: a three-column header then gives the no-definitions `ValueError` that names the path. Delete the one three-column case in `test_vault.py`, and add a case that the three-column header is refused. This removal is planned, not weakening a test.
+
 **Files:**
 - `docs/typesafe.md` — the TypeSafe guide for other sessions
+- `~/rust/hanadocs/conf/issue-areas.md` — the two-column area table (vault file)
+- `scripts/issue_score/vault.py` — the loader reads only the two-column form
+- `scripts/issue_score/test_vault.py` — the three-column case becomes a refusal case
 
-**Workers:** `1 writer`.
+Assertion-Change: `scripts/issue_score/test_vault.py::test_legacy_three_column_area_definitions_ignore_only_the_issues_cell` becomes `test_three_column_area_definition_header_is_refused_with_the_path_and_required_header` and expects a `ValueError` naming the path, because the loader drops the three-column form by plan.
+
+- `commands/issue.md` — no shorthand allowlist; the base files are the source
+- `scripts/issue_score/test_apply_labels.py` — a duplicate-approval case
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — `docs/typesafe.md`, `vault.py`, the vault table, `commands/issue.md`
+- `test` — `test_vault.py` (the two-column form reads; the three-column header is refused with a `ValueError` that names the path); `test_apply_labels.py` (a duplicate approval is refused); a walkthrough of the guide's reassess steps on the reassess and `apply_labels` fixtures
 
 **Constraints from prior phases:**
+- The area table lives at `vault.AREA_DEFINITIONS_PATH` (`~/rust/hanadocs/conf/issue-areas.md`). The user said `conf/` is "fine for now but not allowed" long term, so the guide names it as the current place, not a permanent one. Counts per area live in `~/rust/hanadocs/home-base/issue areas.base`.
+- The reassess phase leaves the loader reading both table forms, every test fixture in the two-column form, and one three-column case in `test_vault.py`.
+- `propose`'s single-valued first line exists for `scripts/production/proposals_table.py`, which counts every star on a `Proposed ranking:` line (unit-board-unit's file).
+- Every prompt for this phase carries, verbatim: "Do not weaken, delete or turn off an existing assertion or test to make a test pass. If one must change, post blocked with the test, the old assertion, the new assertion and why."
 - Explain partial runs: a failed line holds `{"issue_path","error"}`, and `score` exits 1.
 - Explain spend: `spend.jsonl` holds recorded spend; `spend.pending.json` holds reservations, which stay after a killed process (fail closed). `BudgetExceeded` can come while recorded spend is below $20; give the steps to tell reserved from recorded spend and to clear a stale reservation. Acceptance checks that an interrupted-run scenario gives the operator these steps.
 - Name the shared modules: `records.py` (run shapes, `STATE_DIR`), `questions.py`, `decide.py`, `evaluate.py`; explain that a complete scoring run and a complete comparison cohort are different checks (`compare --baseline`).
 
-**Acceptance gate:** the doc exists, every path it names exists, and the merge gate is green.
+**Acceptance gate:** the doc exists, and every path it names exists. The guide's reassess steps and refusal recoveries match a walkthrough on the fixtures, and a duplicate approval is refused in a test. `commands/issue.md` has no shorthand allowlist. The vault table has two columns, and `vault.load_area_definitions()` reads it with the same definitions as before. basedpyright is clean on `scripts/issue_score`, and the merge gate is green.

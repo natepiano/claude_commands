@@ -15,13 +15,18 @@ import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import NamedTuple, cast
+from typing import TYPE_CHECKING, NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
 import progress_history  # noqa: E402
 import tidy_wrapped  # noqa: E402
 import unit_lookup  # noqa: E402
+import herdr  # noqa: E402
+import pane_record  # noqa: E402
+if TYPE_CHECKING:
+    from scripts.shutdown import shutdown_record
 from rename_state import RenameRefused, read_json, write_json  # noqa: E402
 
 BERTH_KEY = "cargoBerthTarget"
@@ -285,6 +290,35 @@ def processes_inside(worktree: Path) -> list[int]:
         if cwd == root or cwd.startswith(f"{root}/"):
             found.append(int(entry.name))
     return sorted(found)
+
+
+class UnitPane(NamedTuple):
+    unit: str
+    place: herdr.HerdrPlace
+    shell: int
+
+
+def unit_pane(found: unit_lookup.MarkedUnit | None, _production: str) -> UnitPane | None:
+    """Find the unit's exact pane; an exec-launched Claude leaves no shell to close."""
+    if found is None:
+        return None
+    try:
+        shell = pane_record.pane_shell_pid(found.place)
+    except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+        raise RenameRefused(f"{found.unit}: cannot find its pane shell: {error}") from error
+    if isinstance(found.claude, unit_lookup.LiveClaude) and shell == found.claude.pid:
+        return None
+    return UnitPane(found.unit, found.place, shell)
+
+
+def close_unit_pane(pane: UnitPane | None, _saved: shutdown_record.SessionShutdown) -> None:
+    """Close the unit's exact session-qualified pane after the caller stops the unit."""
+    if pane is None:
+        return
+    try:
+        _ = herdr.Herdr(pane.place.session).run("pane", "close", pane.place.pane)
+    except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+        raise RenameRefused(f"{pane.unit}: pane close failed: {error}") from error
 
 
 def _darwin_processes_inside(worktree: Path) -> list[int]:

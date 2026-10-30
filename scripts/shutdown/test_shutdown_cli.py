@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from scripts.whoami.note_file import note_name
 
+from unit_staff_test_support import unit_host
+from scripts.production import staff_sources
 import io
 from datetime import datetime
 import json
@@ -67,7 +69,7 @@ def unit_session(session_id: str) -> inventory.UnitSession:
         run_dirs=[],
         codex_servers=[],
         timers=[],
-        host=inventory.UnitHost(
+        host=unit_host(
             kind="unit",
             production="demo",
             unit="alpha-unit",
@@ -898,6 +900,16 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         assert current is not None
         self.assertEqual(current["progress"], {"kind": "waiting"})
 
+    def test_follow_finishes_a_stopped_request_with_an_advisory_codex_pause_issue(self) -> None:
+        saved = session_shutdown(shutdown_store.SessionStopped(kind="stopped", at=OCTOBER))
+        saved["then"] = "stop"
+        saved["stop_issues"] = [shutdown_store.CodexServerLeftRunning(kind="codex server left running",
+            at=OCTOBER, run_dir="/owned/run", cause="stop not confirmed")]
+        self.assertTrue(shutdown_store.create_session(saved))
+        status, text = self.follow_request()
+        self.assertEqual(status, 0, text)
+        self.assertEqual(shutdown_store.find_session(LOGIN, "session-123"), saved)
+
     def test_follow_prints_each_new_step_once_and_waits_for_pending_restart(self) -> None:
         saved = session_shutdown(shutdown_store.SessionWaiting(kind="waiting"))
         saved["session"]["name"] = "Alpha"
@@ -942,6 +954,19 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertNotIn("unrelated", output)
         self.assertTrue(output.rstrip().endswith("all 1 back on claude3"), output)
 
+    def test_follow_failed_stops_reports_the_total_and_each_failed_owner_reason(self) -> None:
+        for identity, reason in (("first", "deadline exhausted"), ("second", "worker pause refused")):
+            saved = session_shutdown(shutdown_store.SessionStopFailed(kind="stop failed", at=OCTOBER, reason=reason), identity)
+            saved["session"]["name"] = identity + "-name"
+            saved["then"] = "stop"
+            self.assertTrue(shutdown_store.create_session(saved))
+        status, output = self.follow_request()
+        self.assertEqual(status, 1)
+        self.assertIn("0 of 2 stopped", output)
+        self.assertIn("first-name: deadline exhausted", output)
+        self.assertIn("second-name: worker pause refused", output)
+        self.assertNotIn("all 0 stopped", output)
+
     def test_follow_waits_for_every_session_and_reports_total_back_on_target(self) -> None:
         first = session_shutdown(shutdown_store.SessionRestarted(kind="restarted", at=OCTOBER), "first")
         second = session_shutdown(shutdown_store.SessionWaiting(kind="waiting"), "second")
@@ -982,7 +1007,8 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                     status, output = self.follow_request()
                 self.assertEqual(status, 0)
                 self.assertIn(f"alpha: {kind}", output)
-                self.assertIn("all 1 back on" if kind == "restarted" else "all 1 stopped", output)
+                total = "all 1 back on" if kind == "restarted" else "0 of 1 stopped" if kind == "already gone" else "all 1 stopped"
+                self.assertIn(total, output)
 
     def test_follow_keeps_trail_when_record_is_archived_between_polls(self) -> None:
         saved = session_shutdown(shutdown_store.SessionWaiting(kind="waiting"))
@@ -1609,8 +1635,11 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                 self.assertEqual(self.run_cli(LOGIN), (1, "", ""))
 
     def test_a_registering_account_hold_blocks_before_its_sessions_are_recorded(self) -> None:
+        _ = self.enterContext(patch.object(shutdown_store, "registration_process_start", return_value="fixture-process-start"))
         held = account_hold()
         held["registration"] = "in progress"
+        held["registration_owners"] = {held["request_id"]:
+            shutdown_store.RegistrationOwner(pid=4242, proc_start="fixture-process-start")}
         held["requested_by"] = shutdown_store.FromSession(kind="session", session_id="b1f5ca98-45aa-4604-8e2b-33ed0f071bb1")
         shutdown_store.set_account_hold(held)
         self.assertEqual(self.run_cli(LOGIN), (
@@ -2041,7 +2070,7 @@ class OnlySessionCliTests(ShutdownTestCase):
         def listed(_login: str) -> list[inventory.ListedSession]:
             return [inventory.ListedSession(owner["session_id"], owner["pid"], owner["proc_start"],
                 owner["name"], owner["kind"], self.root / ".claude", LOGIN,
-                owner["host"]["production"] if owner["kind"] == "unit" else "", "")
+                staff_sources.unit_parent(owner["host"]["unit"]).slug if owner["kind"] == "unit" else "", "")
                 for owner in self.owners]
         _ = self.enterContext(patch.object(shutdown, "listing", side_effect=listed))
         def observed(login: str, only: Iterable[str] = ()) -> inventory.Inventory:
@@ -2404,7 +2433,8 @@ class OnlySessionCliTests(ShutdownTestCase):
                 if state.exists():
                     shutil.rmtree(state)
                 before = self.save_three(progress)
-                with patch.object(restart_work, "_launch_session") as launch:
+                with (patch.object(restart_work, "_owner_liveness", return_value=restart_work.SessionLive()),
+                      patch.object(restart_work, "_launch_session") as launch):
                     status, output, error = self.action("restart", "Beta", "--no-alert")
                 self.assertEqual((status, error), (1, ""))
                 self.assertIn(f"Beta is {progress['kind']}, not stopped; nothing to restart\n", output)

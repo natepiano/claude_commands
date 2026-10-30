@@ -1,6 +1,6 @@
 # Usage ledger: token use by role and model, kept over time — Next
 
-> **Production:** natedev
+> **Production: sdlc** — unit `models-unit`; production doc `docs/plans/sdlc-production.md`
 
 ## Items to consider
 

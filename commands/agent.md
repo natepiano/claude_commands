@@ -12,7 +12,7 @@ Run:
 bash ~/.claude/scripts/agents/agent_admin.sh $ARGUMENTS
 ```
 
-**Always run `agent_admin.sh` with `dangerouslyDisableSandbox: true`** — edits rewrite `config/agents.local.conf` (this machine's rows over the committed `config/agents.conf`) and even `status` triggers the catalog freshness sync, both of which the sandbox denies (a sandboxed status emits a harmless-but-noisy mktemp warning).
+**Always run `agent_admin.sh` with `dangerouslyDisableSandbox: true`.** Edits atomically update shared `config/agents.conf`, then commit only that file as `config(agents): …` and push to origin. The writer fetches and fast-forwards before editing; a rejected push replays the row change, up to three tries. Unrelated work stays in place. Status can also publish catalog additions. There is no local override file.
 
 Relay the script's stdout and stderr exactly, except status output — see below. If it exits non-zero, stop; do not guess a correction.
 
@@ -21,6 +21,8 @@ Relay the script's stdout and stderr exactly, except status output — see below
 No arguments prints every function's active family and resolved rows (one `task=… family=… agent=… effort=… tier=…` line per row); `/agent <function>` prints that function's rows for **both** families — each carrying an extra `active=yes|no` field before `tier` — followed by a `# current family: X` comment line, with examples tuned to it. Both forms are followed by a blank line and the usage/examples block. **Always render the row lines as a markdown table** — never relay them raw. Use columns `task | family | word | agent | effort | tier` for the no-argument form, and `task | family | word | agent | effort | active | tier` for the `/agent <function>` form. Render the `# current family: X` line as plain text immediately after the table. `word` is the configured model-family word; `agent` is its current resolved slug. Rows naming a full slug omit `word`; use the slug in both columns. Codex words resolve to the highest visible version in `~/.codex/models_cache.json` with a known `[codex.agents]` effort row. Equal numeric versions use slug order. An unresolved word appears as `<word> (unresolved: <reason>)`; status keeps printing the remaining rows. Claude words remain CLI aliases that Claude resolves to the latest model. An empty effort field means the agent CLI default; `tier` is the codex speed tier — `inherit(<x>)` means no registry tier, so `~/.codex/config.toml` gives `<x>`, and `-` marks a claude row, which never takes one; `active=no` means the row is stored but dormant — switching the function's family is what makes it live. Relay the usage/examples block after the table in a code block, and any warnings or errors exactly as printed.
 
 `/agent skills` prints the unique list of configured skills (one per line, no usage block) — relay it as-is.
+
+Family resolution and catalog sync read the cache through `scripts/lib/codex_models_cache.py`. Missing, empty or malformed files retry for two seconds, then report `the models cache could not be read` with the path. `no Codex model` means a complete cache lacks the requested model.
 
 ## Functions assigned `caller`
 

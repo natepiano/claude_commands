@@ -2,6 +2,7 @@
 """Add one unit to a running production, with restartable launch steps."""
 from __future__ import annotations
 
+
 import argparse
 import json
 from collections.abc import Iterator
@@ -12,10 +13,13 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast, override
 from uuid import uuid4
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.production import staff, staff_sources
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS.parent))
@@ -33,6 +37,7 @@ from production_units import Production, Refusal, cell_value, plan_cell_is_retir
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from probe_session import PROBE_ENV  # noqa: E402
+from atomic_file import write_text_atomic
 
 if TYPE_CHECKING:
     import herdr
@@ -536,6 +541,8 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
     from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust, repository_trust_key
 
     handoff: NoSessionHandoff | RunningSessionHandoff = NoSessionHandoff()
+    resuming_opening = (isinstance(request.session, ResumedSession)
+                        and pending_opening(request.production, request.unit, request.session.session_id))
     if isinstance(request.session, ResumedSession):
         session_id = request.session.session_id
         observed = sessions.session_liveness(session_id)
@@ -545,7 +552,8 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
             if isinstance(observed, sessions.SessionNotLive):
                 raise Refusal(f"session {session_id} does not run; use --resume")
             handoff = attach_source(session_id, observed.pid)
-        elif isinstance(observed, sessions.LiveSessionProcess):
+        elif (isinstance(observed, sessions.LiveSessionProcess)
+              and not resuming_opening):
             raise Refusal(f"session {session_id} already runs as pid {observed.pid}; "
                           + f"to make it this unit, run add_unit with --attach {session_id}")
     production = request.production
@@ -577,7 +585,7 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
             if (isinstance(existing.state, RetiredUnitRow)
                     and isinstance(request.session.handoff, ResumeStoppedSession)):
                 request = replace(request, launch_kind=ResumeInStartFolderLaunch())
-            else:
+            elif not resuming_opening:
                 raise Refusal(f"unit {request.unit} resumes in {request.session.cwd}; its Units row names {existing.worktree}")
         request = replace(request, worktree=Path(existing.worktree), branch=existing.branch)
     launch = UnitLaunch(
@@ -749,7 +757,7 @@ def write_stub(request: UnitLaunch) -> None:
     stamp = datetime.now(request.production.zone).strftime("%Y-%m-%d %H:%M %Z")
     header = f"# {request.identity.session}\n\n> **Production: {request.production.slug}** — unit "
     source = f"`{request.identity.unit}`; production doc `{doc}`\n\n## Source\n\n{stamp}\n\n{request.plan.words}\n"
-    _ = path.write_text(header + source, encoding="utf-8")
+    write_text_atomic(path, header + source)
 
 
 def append_row(request: UnitLaunch, existing: NoUnitRow | ExistingUnitRow) -> None:
@@ -770,7 +778,7 @@ def append_row(request: UnitLaunch, existing: NoUnitRow | ExistingUnitRow) -> No
                 break
     else:
         lines.insert(insert_at, desired_row(request, headings))
-    _ = doc.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    write_text_atomic(doc, "\n".join(lines) + "\n")
 
 
 def remote_head(production: Production, branch: str) -> str:
@@ -825,7 +833,7 @@ def ensure_worktree(request: UnitLaunch) -> None:
         if not destination.exists():
             if _is_excluded_standing_plan(production, request.plan.path):
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                _ = destination.write_bytes((production.checkout / request.plan.path).read_bytes())
+                write_text_atomic(destination, (production.checkout / request.plan.path).read_text(encoding="utf-8"))
             else:
                 _ = git(production, "-C", str(worktree), "restore", f"--source={production.merge_branch}",
                         "--worktree", "--", request.plan.path.as_posix())
@@ -952,6 +960,12 @@ def launch_session(
         environment[PROBE_ENV] = "1"
     arguments.extend(["--remote-control", session_name, "-n", session_name, *flags])
     timeout_ms = int(request.timeout * 1000)
+    pending = opening_record(request.production, request.unit_id)
+    pending.parent.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(pending, json.dumps({
+        "session_id": session_id, "config_dir": str(selected.dir),
+        "prompt": prompt, "launched_at": datetime.now(UTC).isoformat(),
+    }) + "\n")
     host = herdr.shared_session()
     _ = herdr.start_server(host, timeout_ms)
     production = request.production
@@ -962,7 +976,62 @@ def launch_session(
     if isinstance(launched, herdr.nix_env.Refused):
         raise Refusal(launched.reason)
     outcome = launched.outcome
+    if isinstance(outcome, herdr.PromptSubmitted):
+        pending.unlink(missing_ok=True)
     return outcome if isinstance(outcome, (herdr.PromptSubmitted, herdr.PromptNotSubmitted)) else herdr.PromptNotSubmitted("launcher returned no submit proof")
+
+
+def opening_record(production: Production, unit: str) -> Path:
+    """Keep pending prompt work in the checkout's Git directory, outside tracked files."""
+    checkout = production.checkout
+    directory = checkout / ".git"
+    if directory.is_file():
+        pointer = directory.read_text(encoding="utf-8").strip()
+        if not pointer.startswith("gitdir: "):
+            raise Refusal(f"invalid Git directory pointer: {directory}")
+        directory = (checkout / pointer.removeprefix("gitdir: ")).resolve()
+    return directory / "add-unit-openings" / f"{unit}.json"
+
+
+def pending_opening(production: Production, unit: str, session_id: str) -> bool:
+    """Whether this unit still owes an opening to the named conversation."""
+    path = opening_record(production, unit)
+    if not path.exists():
+        return False
+    fields = cast(dict[str, str], json.loads(path.read_text(encoding="utf-8")))
+    return fields["session_id"] == session_id
+
+
+class NoPendingOpening(NamedTuple):
+    """No live conversation still needs this saved opening."""
+
+
+def finish_opening(request: UnitLaunch, marked: MarkedUnitFound) -> herdr.PromptSubmitOutcome | NoPendingOpening:
+    """Finish the opening for this live session, without starting a second session."""
+    import herdr
+
+    pending = opening_record(request.production, request.unit_id)
+    if not pending.exists():
+        return NoPendingOpening()
+    fields = cast(dict[str, str], json.loads(pending.read_text(encoding="utf-8")))
+    claude = marked.unit.claude
+    if not isinstance(claude, unit_lookup.LiveClaude) or claude.session_id != fields["session_id"]:
+        observed = sessions.session_liveness(fields["session_id"])
+        if isinstance(observed, sessions.SessionNotLive):
+            pending.unlink()
+            return NoPendingOpening()
+        if isinstance(observed, sessions.SessionLivenessUnknown):
+            raise Refusal(f"cannot tell whether pending session {fields['session_id']} runs: {observed.reason}")
+        raise Refusal("pending opening does not name the marked unit's live session")
+    transcript = herdr.SessionTranscript(Path(fields["config_dir"]), fields["session_id"])
+    at = datetime.fromisoformat(fields["launched_at"])
+    outcome = herdr.submitted_prompt(transcript, fields["prompt"], at)
+    if not isinstance(outcome, herdr.PromptSubmitted):
+        outcome = herdr.Herdr(marked.unit.place.session).submit_opening_prompt(
+            marked.unit.place.pane, herdr.OpeningPrompt(fields["prompt"], transcript), at, int(request.timeout * 1000))
+    if isinstance(outcome, herdr.PromptSubmitted):
+        pending.unlink(missing_ok=True)
+    return outcome
 
 
 def close_untyped_session(request: UnitLaunch, outcome: herdr.PromptNotSubmitted) -> str:
@@ -990,7 +1059,7 @@ def launch_environment() -> dict[str, str]:
     return {
         key: value
         for key, value in os.environ.items()
-        if not key.startswith("CLAUDE_")
+        if not key.startswith(("CLAUDE_", "STAFF_OPERATION_"))
     }
 
 
@@ -1213,7 +1282,19 @@ def set_autocompact(request: RequestedUnitLaunch, session_id: str, value: str, c
     print(f"{request.unit}: {setting} {verb} to session {session_id} at its next restart")
 
 
-def main(argv: list[str]) -> int:
+
+def ensure_staff_unit(production: Production, unit: str) -> staff.StaffRow:
+    """Keep member identities, ensuring missing rows on first add or resume."""
+    record = staff.initial_snapshot()
+    found = staff_sources.member(staff_sources.UnitMember(production.slug, unit), record)
+    if isinstance(found, staff_sources.MemberFound):
+        return found.row
+    parent = staff_sources.member(staff_sources.ShowrunnerMember(production.slug), record)
+    runner = (parent.row if isinstance(parent, staff_sources.MemberFound)
+              else staff.ensure("showrunner", name=showrunners.herdr_space(production.slug, str(production.doc))))
+    return staff.ensure("unit", name=unit_names.name(unit), parent=runner.id)
+
+def _main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     _ = parser.add_argument("--production", required=True)
     _ = parser.add_argument("name")
@@ -1245,7 +1326,8 @@ def main(argv: list[str]) -> int:
         explicit_autocompact = cast(str, args.autocompact)
         if (explicit_autocompact and isinstance(request.session, ResumedSession)
                 and isinstance(request.session.handoff, ResumeStoppedSession)
-                and isinstance(request.launch_kind, NewWorkLaunch) and registered_unit(request)):
+                and isinstance(request.launch_kind, NewWorkLaunch) and registered_unit(request)
+                and not pending_opening(request.production, request.unit, request.session.session_id)):
             # Setting a registered unit's window is not new work: no new-work check or launch applies.
             set_autocompact(request, request.session.session_id, explicit_autocompact, cast(bool, args.check))
             return 0
@@ -1274,6 +1356,7 @@ def main(argv: list[str]) -> int:
             if cast(bool, args.check):
                 return 0
             assert isinstance(source, RunningSessionHandoff)
+            _ = ensure_staff_unit(request.production, request.unit_id)
             saved = stop_for_attach(source)
             require_stopped_session(source)
             handoff = StoppedSessionHandoff(source, saved)
@@ -1298,6 +1381,7 @@ def main(argv: list[str]) -> int:
             if cast(bool, args.check):
                 return 0
             marked_unit = launched_unit(request)
+            stopped_tab: MarkedUnitFound | NoMarkedUnit = NoMarkedUnit()
             if (
                 isinstance(request.session, ResumedSession)
                 and isinstance(marked_unit, MarkedUnitFound)
@@ -1309,10 +1393,7 @@ def main(argv: list[str]) -> int:
                         + unit.claude.reason
                     )
                 if isinstance(unit.claude, unit_lookup.ClaudeNotRunning):
-                    try:
-                        herdr.close_agent(unit.place.session, unit.place.pane)
-                    except herdr.HerdrFailure as error:
-                        raise Refusal(f"cannot end session {unit.place.session}: {error}") from error
+                    stopped_tab = marked_unit
                     marked_unit = NoMarkedUnit()
             if isinstance(handoff, StoppedSessionHandoff) and isinstance(marked_unit, MarkedUnitFound):
                 raise Refusal(f"cannot attach {handoff.session_id}: unit tab already runs")
@@ -1324,6 +1405,13 @@ def main(argv: list[str]) -> int:
                 if isinstance(ready.plan_transition, BriefToPlanTransition):
                     raise Refusal(f"unit {request.identity.unit} runs its brief in session {marked_unit.unit.place.session}; "
                                   + f"end that session, then run {retry}")
+            _ = ensure_staff_unit(request.production, request.unit_id)
+            if isinstance(stopped_tab, MarkedUnitFound):
+                place = stopped_tab.unit.place
+                try:
+                    herdr.close_agent(place.session, place.pane)
+                except herdr.HerdrFailure as error:
+                    raise Refusal(f"cannot end session {place.session}: {error}") from error
             if cast(str, args.autocompact) and isinstance(request.session, ResumedSession):
                 autocompact.record(request.session.session_id, cast(str, args.autocompact))
             if not isinstance(request.launch_kind, ResumeInStartFolderLaunch):
@@ -1342,6 +1430,12 @@ def main(argv: list[str]) -> int:
                 outcome = launch_session(request, ready.director, prompt, unit_account, target=unit_account.label
                                if isinstance(request.session, ResumedSession) else "", model=resume_model,
                                autocompact_window=resume_autocompact)
+            elif opening_record(request.production, request.unit_id).exists():
+                recovered = finish_opening(request, marked_unit)
+                if not isinstance(recovered, NoPendingOpening):
+                    outcome = recovered
+                if isinstance(recovered, herdr.PromptNotSubmitted):
+                    raise Refusal(f"{request.identity.unit}: opening prompt not submitted: {recovered.reason}")
         if isinstance(request.launch_kind, UnitRestoreLaunch):
             print("restart-prompt-outcome: " + herdr.encode_prompt_outcome(outcome))
             if isinstance(outcome, herdr.PromptNotSubmitted):
@@ -1366,6 +1460,8 @@ def main(argv: list[str]) -> int:
     except herdr.AgentNotReady as error:
         print(f"add_unit: the session is not ready:\n{error.screen}", file=sys.stderr)
         return 1
+    except (staff.StaffRefused, staff.StaffUnreadable):
+        raise
     except Refusal as error:
         print(f"add_unit: {error}", file=sys.stderr)
         return 2
@@ -1373,6 +1469,13 @@ def main(argv: list[str]) -> int:
         detail = str(error)
         print(f"add_unit: {detail}", file=sys.stderr)
         return 1
+
+
+def main(argv: list[str]) -> int:
+    def run() -> int:
+        with staff.operation():
+            return _main(argv)
+    return staff.cli_result(run)
 
 
 if __name__ == "__main__":

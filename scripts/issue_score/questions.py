@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Literal, TypedDict
+from typing import Literal, NotRequired, TypedDict
 
 
 @dataclass(frozen=True)
@@ -23,7 +23,7 @@ class ReportOnly:
 
 ThresholdOutcome = Supported | Unsupported | ReportOnly
 
-QUESTION_SET_VERSION = "4"
+QUESTION_SET_VERSION = "5"
 MODEL = "jev-1.14.0"
 BUDGET_USD = 20.0
 INPUT_USD_PER_MILLION = 0.042
@@ -177,11 +177,31 @@ class ScoreQuestion(TypedDict):
 Question = NoulQuestion | ChoiceQuestion | ScoreQuestion
 
 
+class AvailableRule(TypedDict):
+    name: str
+    summary: str
+    status: Literal["available"]
+
+
+class UnavailableRule(TypedDict):
+    name: str
+    status: Literal["missing"]
+
+
+class StyleState(TypedDict):
+    style_rules: list[AvailableRule | UnavailableRule]
+    style_crate: str
+    finding_count: int
+
+
 class IssueDescription(TypedDict):
     title: str
     project: str
     project_about: str
     body: str
+    style_rules: NotRequired[list[AvailableRule | UnavailableRule]]
+    style_crate: NotRequired[str]
+    finding_count: NotRequired[int]
 
 
 class IssueState(TypedDict):

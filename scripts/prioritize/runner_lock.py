@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import os
+import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -52,7 +53,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         except BlockingIOError:
             return BUSY_EXIT
         os.fchmod(descriptor, 0o600)
-        owner = f"pid={os.getpid()}\n".encode("ascii")
+        started = subprocess.run(
+            ["ps", "-p", str(os.getpid()), "-o", "lstart="],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        owner = f"pid={os.getpid()} started={started}\n".encode("ascii")
         _ = os.ftruncate(descriptor, 0)
         _ = os.lseek(descriptor, 0, os.SEEK_SET)
         _ = os.write(descriptor, owner)

@@ -30,7 +30,7 @@ import style_footprint
 import style_ledger
 import style_rules
 from approved_renames import (ApprovedRename, BindingRename, BindingScope, NoAppliedCheck, RenameNotApplied,
-                              approved_rename, binding_rename, binding_scope)
+                              approved_rename, binding_rename, BindingScopeReader)
 from add_style import NoStyleProduction, StandingStyleProduction, standing_style_production
 from declarations import declaration_line
 from issues import Issue, frontmatter, open_issues, plain
@@ -330,7 +330,8 @@ class DecisionWriter:
         body = [f"# Style decision: {stem} in {crate}", "", f"Parent: {self.parent}", "",
                 f"Kind: {decision_kind(findings, self.definitions)}", f"Rule: {key.rule}",
                 f"Rule link: {self.linker.rule_url(key.rule)}",
-                f"Findings: {len(findings)}; files: {len({finding.path for finding in findings})}", ""]
+                f"Findings: {len(findings)}; files: {len({finding.path for finding in findings})}", "",
+                style_ledger.FINDING_REPLACEMENT_GUIDANCE, ""]
         seen: set[str] = set()
         for finding in sorted(findings, key=lambda item: (len(item.before) + len(item.after), item.path, item.line, item.finding_id)):
             if finding.path in seen:
@@ -466,6 +467,7 @@ class RankExemptions:
         self.ledger: style_ledger.Ledger = ledger
         self.tip: str = tip
         self.sources: dict[str, str] = {}
+        self.binding_scopes: dict[str, BindingScopeReader] = {}
         self.test_ranges: dict[str, tuple[tuple[int, int], ...]] = {}
         self.types: dict[str, list[style_ledger.HeldFinding]] = {}
         self.types_loaded: bool = False
@@ -493,8 +495,11 @@ class RankExemptions:
     def allows(self, finding: style_ledger.HeldFinding, family: rules.Family) -> bool:
         if family == "names":
             rename = binding_rename(finding.kind, finding.before, finding.after, finding.line, finding.text)
-            return (isinstance(rename, BindingRename)
-                    and isinstance(binding_scope(self.source(finding.path), rename), BindingScope))
+            if not isinstance(rename, BindingRename):
+                return False
+            if finding.path not in self.binding_scopes:
+                self.binding_scopes[finding.path] = BindingScopeReader(self.source(finding.path))
+            return isinstance(self.binding_scopes[finding.path].scope(rename), BindingScope)
         if family != "values" or PurePosixPath(finding.rule.partition(":")[2]).stem != "no-magic-values":
             return False
         if finding.path not in self.test_ranges:
@@ -568,6 +573,13 @@ def judged_at_current_file(ledger: style_ledger.Ledger, finding: style_ledger.He
     return isinstance(ledger.finding_site(finding, tip), style_ledger.UnchangedSite)
 
 
+def print_finding_waits(issue: Path, waits: Mapping[tuple[str, str], int]) -> None:
+    """One waiting line per file and unchanged reason, with the affected finding count."""
+    for (path, reason), count in sorted(waits.items()):
+        noun = "finding" if count == 1 else "findings"
+        print(f"waiting {issue}: {path} {reason} ({count} {noun})")
+
+
 def ranked_work(ledger: style_ledger.Ledger, cells: Iterable[style_ledger.Cell],
                 scopes: Mapping[rules.Family, PilotScope], *,
                 reader: ProposalGitReader | DefaultProposalReads = _DEFAULT_PROPOSAL_READS) -> RankedWork:
@@ -593,11 +605,15 @@ def ranked_work(ledger: style_ledger.Ledger, cells: Iterable[style_ledger.Cell],
         families: dict[str, rules.Family | None] = {rule.rule_id: rule.family for rule in rules.load_rules(ledger.repo)}
         tip = ledger.synced_commit()
         directories = reader.crate_directories(tip)
-        for finding in findings:
+        eligible = tuple(finding for finding in findings
+                         if (family := families.get(finding.rule.removesuffix("#uncovered"))) is not None
+                         and counts(family, crate_for(directories, finding.path)))
+        evidence = ledger.finding_sites((finding for finding in eligible if isinstance(finding.state, style_ledger.Unfiled)), tip)
+        for finding in eligible:
             family = families.get(finding.rule.removesuffix("#uncovered"))
             if family is not None and counts(family, crate_for(directories, finding.path)) and (
                     isinstance(finding.state, style_ledger.Filed)
-                    or judged_at_current_file(ledger, finding, tip)):
+                    or isinstance(evidence[finding.finding_id], style_ledger.UnchangedSite)):
                 work[finding.path].add(family)
     return RankedWork({path: frozenset(present) for path, present in work.items()})
 
@@ -1693,13 +1709,14 @@ def run_follow(writer: DecisionWriter, findings: Iterable[style_ledger.HeldFindi
             print(skip_line(issue, error))
             # The source proof cannot refresh a decision without its generated body. Keep the
             # changed-file wait visible for these findings, rather than silently losing that work.
+            waiting: Counter[tuple[str, str]] = Counter()
             for outcome in planned.outcomes:
                 if (isinstance(outcome, style_ledger.FindingSite)
                         and isinstance(outcome.finding.state, style_ledger.Filed)
                         and outcome.finding.state.proposal == issue):
                     finding = outcome.finding
-                    print(f"waiting {issue}: {finding.finding_id} {finding.path} changed since it was judged; "
-                          + "source follow could not refresh the decision")
+                    waiting[(finding.path, "changed since it was judged; source follow could not refresh the decision")] += 1
+            print_finding_waits(issue, waiting)
     refused = {outcome.finding.finding_id for outcome in planned.outcomes
                if isinstance(outcome.finding.state, style_ledger.Filed) and outcome.finding.state.proposal in skipped}
     # Built means approved and in the code, so the ledger builds a rename only when its decision is approved, reading

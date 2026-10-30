@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import io
 import json
+import multiprocessing
 import os
 import subprocess
 import sys
@@ -13,15 +14,25 @@ import unittest
 from collections.abc import MutableMapping
 from contextlib import redirect_stdout
 from pathlib import Path
+from multiprocessing.connection import Connection
 from typing import cast, final, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import resume_unit
+import add_unit
 import retire_unit
 import unit_lookup
 import unit_move
 from production_units import Production, read_production
 from shutdown_record import SessionShutdown
+
+from scripts.production.staff_test_support import CHECKOUT, PROCESS_TIMEOUT, StaffTestCase
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.production import staff
+
+RUN_COMMAND = retire_unit.run
 
 DIRECTOR = "11111111-1111-1111-1111-111111111111"
 
@@ -37,6 +48,7 @@ def git(where: Path, *arguments: str) -> str:
 
 @final
 class ResumeUnitTests(unittest.TestCase):
+    staff: StaffTestCase = StaffTestCase()
     root: Path = Path()
     checkout: Path = Path()
     worktree: Path = Path()
@@ -47,6 +59,9 @@ class ResumeUnitTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.staff = StaffTestCase()
+        self.staff.setUp()
+        self.addCleanup(self.staff.doCleanups)
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         origin = self.root / "origin.git"
         _ = subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
@@ -121,6 +136,113 @@ class ResumeUnitTests(unittest.TestCase):
         self.assertEqual(git(self.checkout, "log", "-1", "--format=%s"), "production(alpha): resume alpha-unit")
         self.assertIn("alpha-unit resumed", output)
 
+    def test_resume_unit_rerun(self) -> None:
+        original = add_unit.ensure_staff_unit
+        for after in (False, True):
+            def interrupted(production: Production, unit: str) -> staff.StaffRow:
+                if after:
+                    _ = original(production, unit)
+                raise RuntimeError("stopped at staff step")
+            with mock.patch.object(add_unit, "ensure_staff_unit", side_effect=interrupted):
+                with self.assertRaisesRegex(RuntimeError, "stopped at staff step"):
+                    _ = self.resume()
+            self.assertFalse(self.worktree.exists())
+        code, output = self.resume()
+        self.assertEqual(code, 0, output)
+        rows = staff.find(kind="unit")
+        self.assertEqual([row.name for row in rows], ["alpha"])
+        data, document = self.staff.staff_file.read_bytes(), self.doc.read_bytes()
+        code, output = self.resume()
+        self.assertEqual(code, 0, output)
+        self.assertIn("already resumed", output)
+        self.assertEqual((self.staff.staff_file.read_bytes(), self.doc.read_bytes()), (data, document))
+        self.assertEqual(len(self.calls), 1)
+
+    def test_retired_unit_receipt_cannot_complete_a_new_incarnation(self) -> None:
+        code, output = self.resume()
+        self.assertEqual(code, 0, output)
+        unit = staff.find(kind="unit")[0]
+        _ = staff.retire(unit.id)
+        replacement = staff.ensure("unit", name=unit.name, parent=unit.parent)
+        code, output = self.resume()
+        self.assertEqual(code, 1, output)
+        self.assertNotIn("already resumed", output)
+        self.assertEqual(staff.by_id(replacement.id), replacement)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_resume_child_joins_the_operation_until_the_retired_note_is_cleared(self) -> None:
+        source = self.staff.production("alpha", "alpha-unit")
+        source.unlink()
+        source.symlink_to(self.doc)
+        wrapper = self.root / "resume-launch.py"
+        # The inner launcher boundary supplies no live pane. Its public main and
+        # staff step are real, including the inherited operation lock.
+        write_text_atomic(wrapper, "\n".join([
+            "import sys", "from unittest.mock import patch",
+            f"sys.path.insert(0, {str(CHECKOUT / 'scripts/production')!r})",
+            f"sys.path.insert(0, {str(CHECKOUT)!r})",
+            "import add_unit", "from production_units import read_production",
+            "def launch(arguments):",
+            "    doc = arguments[arguments.index('--production') + 1]",
+            "    from pathlib import Path",
+            "    row = add_unit.ensure_staff_unit(read_production(Path(doc)), arguments[2])",
+            "    print(row.id)", "    return 0",
+            "with patch.object(add_unit, '_main', side_effect=launch):",
+            "    raise SystemExit(add_unit.main(sys.argv[1:]))", "",
+        ]))
+        context = multiprocessing.get_context("fork")
+        first, second = context.Pipe()
+        parent = cast(Connection, cast(object, first))
+        child = cast(Connection, cast(object, second))
+        original_unmark = resume_unit.unmark
+        def finish(unit: resume_unit.RetiredUnit) -> None:
+            child.send(staff.snapshot().find(kind="unit")[0].id)
+            _ = cast(object, child.recv())
+            original_unmark(unit)
+        def run() -> None:
+            parent.close()
+            try:
+                with mock.patch.object(retire_unit, "run", RUN_COMMAND), mock.patch.object(
+                        resume_unit, "ADD_UNIT", wrapper), mock.patch.object(resume_unit, "unmark", side_effect=finish):
+                    child.send(self.resume())
+            finally:
+                child.close()
+        process = context.Process(target=run)
+        seed: subprocess.Popen[str] | None = None
+        try:
+            with self.staff.lock_notice(self.staff.staff_file.parent / "operation.lock") as listener:
+                process.start()
+                child.close()
+                self.assertTrue(parent.poll(PROCESS_TIMEOUT), "nested add_unit did not join resume's lock")
+                staff_id = staff.StaffId(cast(str, parent.recv()))
+                self.assertIn("retired", self.row())
+                seed = self.staff.start_script(CHECKOUT / "scripts/production/staff_sources.py", "seed")
+                self.staff.assert_operation_blocks(seed, listener)
+                parent.send("finish")
+                self.assertTrue(parent.poll(PROCESS_TIMEOUT), "resume did not clear the retired note")
+                code, output = cast(tuple[int, str], parent.recv())
+                self.assertEqual(code, 0, output)
+                process.join(timeout=PROCESS_TIMEOUT)
+                self.assertEqual(process.exitcode, 0)
+                output, errors = seed.communicate(timeout=PROCESS_TIMEOUT)
+            self.assertEqual(seed.returncode, 0, output + errors)
+            self.assertNotIn("retired", self.row())
+            row = staff.by_id(staff_id)
+            self.assertIsNotNone(row)
+            assert row is not None
+            self.assertEqual((row.kind, row.name), ("unit", "alpha"))
+            self.assertEqual(staff.find(kind="unit"), [row])
+        finally:
+            parent.close()
+            child.close()
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=PROCESS_TIMEOUT)
+            process.close()
+            if seed is not None and seed.returncode is None:
+                seed.kill()
+                _ = seed.communicate(timeout=PROCESS_TIMEOUT)
+
     def test_resumes_the_recorded_session_in_a_worktree_made_from_the_merge_branch(self) -> None:
         self.assert_resumed(*self.resume())
 
@@ -145,6 +267,19 @@ class ResumeUnitTests(unittest.TestCase):
         # The units account moved since the retire: the transcript is under the other config dir.
         self.configs.reverse()
         self.assert_resumed(*self.resume())
+
+    def test_resume_finishes_its_commit_after_the_retired_note_was_removed(self) -> None:
+        with mock.patch.object(add_unit, "commit_paths", side_effect=OSError("commit stopped")):
+            code, output = self.resume()
+        self.assertEqual(code, 1, output)
+        self.assertNotIn("retired", self.row())
+        self.assertIn("retire alpha-unit", git(self.checkout, "log", "-1", "--format=%s"))
+        code, output = self.resume()
+        self.assertEqual(code, 0, output)
+        self.assertIn("alpha-unit resumed", output)
+        self.assertEqual(git(self.checkout, "log", "-1", "--format=%s"), "production(alpha): resume alpha-unit")
+        self.assertEqual(git(self.checkout, "status", "--porcelain"), "")
+        self.assertFalse(resume_unit.resume_record(read_production(self.doc), "alpha-unit").exists())
 
     def test_a_failed_launch_keeps_the_note_and_a_rerun_resumes(self) -> None:
         document = self.doc.read_bytes()

@@ -29,12 +29,13 @@ import sys
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Protocol, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
@@ -62,6 +63,7 @@ import unit_rename_sweep  # noqa: E402
 from rename_state import RenameRefused, read_json, write_json, write_text  # noqa: E402
 from unit_move import PathMove, git  # noqa: E402
 from user_zone import user_zone  # noqa: E402
+from scripts.production import staff, staff_sources
 
 if TYPE_CHECKING:
     from scripts.style import style_ledger
@@ -115,6 +117,11 @@ class StopTarget(Protocol):
     def worktree(self) -> Path: ...
 
 
+@dataclass(frozen=True)
+class UnboundStaffMember:
+    """A read-only unit description has not been bound to a staff identity."""
+
+
 @dataclass
 class UnitRename:
     slug: str
@@ -144,6 +151,7 @@ class UnitRename:
     old_session: str = ""
     # The id already is the new one, so only the session takes the new name: stop, record, relaunch, verify.
     id_matches: bool = False
+    staff_id: staff.StaffId | UnboundStaffMember = field(default_factory=UnboundStaffMember)
 
     @property
     def message(self) -> str:
@@ -154,7 +162,7 @@ class UnitRename:
         return Path(self.new_worktree if self.step >= step_number(_move_git) else self.old_worktree)
 
 
-REQUIRED = tuple(field.name for field in dataclasses.fields(UnitRename) if field.name not in ("step", "id_matches", *PROGRESS))
+REQUIRED = tuple(field.name for field in dataclasses.fields(UnitRename) if field.name not in ("step", "id_matches", "staff_id", *PROGRESS))
 LOCATION_FIELDS = ("doc", "checkout")
 
 
@@ -234,6 +242,13 @@ def _build(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
                       id_matches=id_matches)
 
 
+def _staff_id(slug: str, unit: str) -> staff.StaffId:
+    found = staff_sources.member(staff_sources.UnitMember(slug, unit), staff.snapshot())
+    if isinstance(found, staff_sources.NoSuchMember):
+        raise staff.StaffRefused(f"{slug}/{unit}: no matching unit staff row")
+    return found.row.id
+
+
 def _unit_of_session(slug: str, name: str, units: list[str]) -> str:
     """The one unit whose live or recorded Claude session is called `name`; empty when none is."""
     try:
@@ -305,6 +320,7 @@ def check_stoppable(rename: StopTarget) -> None:
         raise RenameRefused(f"{rename.new} already runs in session {new.place.session}")
     if old and isinstance(old.claude, unit_lookup.ClaudeUnknown):
         raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {old.claude.reason}")
+    pane = unit_move.unit_pane(old, rename.slug)
     if old and isinstance(old.claude, unit_lookup.LiveClaude):
         return
     inside = unit_move.processes_inside(rename.worktree())
@@ -312,6 +328,8 @@ def check_stoppable(rename: StopTarget) -> None:
     retained = _retained_command_sessions(rename.worktree())
     pids: list[int] = []
     for pid in inside:
+        if pane is not None and pid == pane.shell:
+            continue  # The guarded close, after the stop, must remove it.
         if pid in runs:
             continue
         try:
@@ -645,11 +663,11 @@ def run_shutdown(*arguments: str) -> None:
 
 
 def _unit_records(rename: StopTarget) -> list[SessionShutdown]:
-    """This production's shutdown records of the unit, under either id."""
-    return shutdown_records(rename.slug, (rename.old, rename.new))
+    """The journaled director remains the same when its staff name or parent moves."""
+    return shutdown_records(rename.slug, (rename.old, rename.new), session_id=rename.session_id)
 
 
-def shutdown_records(slug: str, units: tuple[str, ...]) -> list[SessionShutdown]:
+def shutdown_records(slug: str, units: tuple[str, ...], *, session_id: str = "") -> list[SessionShutdown]:
     try:
         saved = shutdown_record.all_session_records()
     except (shutdown_record.InvalidRecord, OSError) as error:
@@ -657,9 +675,26 @@ def shutdown_records(slug: str, units: tuple[str, ...]) -> list[SessionShutdown]
     found: list[SessionShutdown] = []
     for item in saved:
         host = item["session"]["host"]
-        if host["kind"] == "unit" and host["production"] == slug and host["unit"] in units:
+        if host["kind"] != "unit" or host["unit"] not in units:
+            continue
+        recorded_id = item["session"]["session_id"]
+        if (recorded_id == session_id if session_id else
+                staff_sources.unit_parent(host["unit"], recorded_id).slug == slug):
             found.append(item)
     return found
+
+
+def bind_stop_target(rename: StopTarget) -> None:
+    """Journal the director before changing the staff name or parent used to find it."""
+    records = _unit_records(rename)
+    if len(records) > 1:
+        raise RenameRefused(f"{rename.old} has {len(records)} shutdown records; settle them first")
+    if records:
+        rename.account, rename.session_id = records[0]["login"], records[0]["session"]["session_id"]
+    else:
+        marked = unit_lookup.marked_unit(rename.slug, rename.old)
+        if marked is not None and isinstance(marked.claude, unit_lookup.LiveClaude):
+            rename.session_id = marked.claude.session_id
 
 
 def stop_unit(rename: StopTarget, _save: Callable[[], None]) -> None:
@@ -668,20 +703,29 @@ def stop_unit(rename: StopTarget, _save: Callable[[], None]) -> None:
     A live process cannot change its env mark and the director's context holds the old paths, so a
     rename of a running unit is always a relaunch.
     """
+    # A resumed step rechecks whether its exact pane can be safely closed.
+    # Other processes are checked after the stop has settled its own run work.
+    _refuse_detached_worktree(rename)
+    try:
+        found = unit_lookup.marked_unit(rename.slug, rename.old)
+    except OSError as error:
+        raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {error}") from error
+    pane = unit_move.unit_pane(found, rename.slug)
     if not _unit_records(rename):
-        try:
-            found = unit_lookup.marked_unit(rename.slug, rename.old)
-        except OSError as error:
-            raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {error}") from error
         if found is None or isinstance(found.claude, unit_lookup.ClaudeNotRunning):
             _stop_runs(rename)
+            if pane is not None:
+                raise RenameRefused("pane close requires a completed clean stop record")
             return
         if isinstance(found.claude, unit_lookup.ClaudeUnknown):
             raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {found.claude.reason}")
         run_shutdown("down", "--only", found.claude.session_id)
     saved = _await_stopped(rename)
     rename.account, rename.session_id = saved["login"], saved["session"]["session_id"]
+    if shutdown_record.stop_incomplete(saved):
+        raise RenameRefused("unit stop has unresolved cleanup issues; settle it before closing its pane")
     _stop_runs(rename)
+    unit_move.close_unit_pane(pane, saved)
 
 
 def _refuse_detached_worktree(rename: StopTarget) -> None:
@@ -1151,12 +1195,18 @@ def _load(path: Path) -> UnitRename:
         raise RenameRefused(f"{path}: invalid unit rename journal")
     # A showrunner checkout can move while the rename is open. Ignore legacy locations.
     production = _production(cast(str, fields["slug"]))
+    fields = rename_state.migrate_staff_ids(path, fields, {
+        "staff_id": tuple(staff_sources.UnitMember(production.slug, cast(str, fields[name]))
+                          for name in ("old", "new")),
+    })
+    if not isinstance(fields.get("staff_id"), str) or not fields["staff_id"]:
+        raise RenameRefused(f"{path}: invalid unit rename staff identity")
     fields.update(doc=str(production.doc), checkout=str(production.checkout))
     merged, doc_commit, unit_tip, account, session_id, kept, old_session = (cast(str, fields.get(name, ""))
                                                                             for name in PROGRESS)
     return UnitRename(*(cast(str, fields[name]) for name in REQUIRED), step=step, merged=merged,
                       doc_commit=doc_commit, unit_tip=unit_tip, account=account, session_id=session_id, kept=kept,
-                      old_session=old_session, id_matches=id_matches)
+                      old_session=old_session, id_matches=id_matches, staff_id=staff.StaffId(cast(str, fields["staff_id"])))
 
 
 def _save(path: Path, rename: UnitRename) -> None:
@@ -1171,7 +1221,7 @@ def _save(path: Path, rename: UnitRename) -> None:
 
 def _resumed(path: Path, old: str, new: str) -> UnitRename | None:
     """The unfinished rename the journal holds, which must be this request; None without one."""
-    if not rename_state.unfinished(path):
+    if not path.exists():
         return None
     recorded = _load(path)
     try:
@@ -1179,6 +1229,8 @@ def _resumed(path: Path, old: str, new: str) -> UnitRename | None:
     except unit_names.BadName:
         same = False
     if not same:
+        if not rename_state.unfinished(path):
+            return None
         raise RenameRefused(f"the unfinished rename is {recorded.old} to {recorded.new}; resume it first with "
                             + f"rename_unit.py apply {recorded.slug} {recorded.old} {recorded.new}")
     return recorded
@@ -1206,6 +1258,17 @@ def plan(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
 
 
 def apply(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
+    with staff.operation():
+        return _apply(slug, old, new, scratch)
+
+
+def _rename_staff(rename: UnitRename) -> None:
+    if isinstance(rename.staff_id, UnboundStaffMember):
+        raise staff.StaffRefused(f"{rename.slug}/{rename.old}: no journaled staff identity")
+    _ = staff.rename(rename.staff_id, unit_names.name(rename.new))
+
+
+def _apply(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
     slug = showrunners.canonical_slug(slug)
     path = rename_state.unit_journal(slug)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1213,12 +1276,23 @@ def apply(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
         if rename_state.unfinished(rename_state.production_journal(slug)):
             raise RenameRefused(f"{slug}: finish the production rename first")
         rename = _resumed(path, old, new)
+        fresh = rename is None
         if rename is None:
             rename = _build(slug, old, new, scratch)
             with _merge_lock(rename):
                 _preflight(rename)
+            rename.staff_id = _staff_id(rename.slug, rename.old)
+            bind_stop_target(rename)
             # The request is saved before anything changes, so every later refusal resumes.
             _save(path, rename)
+        try:
+            _rename_staff(rename)
+        except staff.StaffRefused:
+            if fresh:
+                path.unlink(missing_ok=True)
+            raise
+        if rename.step == len(STEPS):
+            print("done; unchanged")
         for number in range(rename.step + 1, len(STEPS) + 1):
             step = STEPS[number - 1]
             if rename.id_matches and step.run not in NAME_STEPS:
@@ -1263,6 +1337,10 @@ def verify(slug: str, old: str, new: str) -> UnitRename:
 
 
 def main(argv: list[str]) -> int:
+    return staff.cli_result(lambda: _main(argv))
+
+
+def _main(argv: list[str]) -> int:
     from scripts.direct.workers import WorkerUnavailable
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0] if __doc__ else None)
     _ = parser.add_argument("action", choices=("plan", "apply", "verify"))
@@ -1278,6 +1356,8 @@ def main(argv: list[str]) -> int:
     try:
         rename = (plan(slug, old, new, scratch) if action == "plan" else apply(slug, old, new, scratch)
                   if action == "apply" else verify(slug, old, new))
+    except (staff.StaffRefused, staff.StaffNotFound, staff.StaffUnreadable):
+        raise
     except RenameWaiting as error:
         print(f"rename_unit: {error}", file=sys.stderr)
         return 2

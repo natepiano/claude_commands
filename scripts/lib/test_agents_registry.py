@@ -5,17 +5,29 @@ import argparse
 import os
 import pwd
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import final
 
 FIXTURE = Path(__file__).with_name("test_agents_registry.conf")
-NO_OVERRIDES: Mapping[str, Mapping[str, str | None]] = {}
 
 
-def registry_text(overrides: Mapping[str, Mapping[str, str | None]] = NO_OVERRIDES, *,
+@final
+@dataclass(frozen=True)
+class ExactRows:
+    """A section contains only these rows, without inheriting the baseline's rows."""
+
+    rows: Mapping[str, str | None]
+
+
+RegistryOverrides = Mapping[str, Mapping[str, str | None] | ExactRows]
+NO_OVERRIDES: RegistryOverrides = {}
+
+
+def registry_text(overrides: RegistryOverrides = NO_OVERRIDES, *,
                   replace_sections: Sequence[str] = (), base_text: str = "",
                   bare_rows: Sequence[str] = ()) -> str:
-    """Return the common registry with row overrides, omitting sections left empty."""
+    """Merge row overrides; ExactRows replaces one section, including assignments."""
     sections: dict[str, dict[str, str | None]] = {}
     section = ""
     for line in (base_text or FIXTURE.read_text(encoding="utf-8")).splitlines():
@@ -27,11 +39,13 @@ def registry_text(overrides: Mapping[str, Mapping[str, str | None]] = NO_OVERRID
             sections.setdefault(section, {})[key.strip()] = value
         elif line.strip() and not line.lstrip().startswith("#"):
             sections.setdefault(section, {})[line.strip()] = None
-    for section in replace_sections:
+    replaced = set(replace_sections)
+    replaced.update(section for section, rows in overrides.items() if isinstance(rows, ExactRows))
+    for section in replaced:
         sections[section] = {}
     for section, rows in overrides.items():
         target = sections.setdefault(section, {})
-        for key, value in rows.items():
+        for key, value in (rows.rows if isinstance(rows, ExactRows) else rows).items():
             if value is None:
                 _ = target.pop(key, None)
             else:
@@ -44,12 +58,12 @@ def registry_text(overrides: Mapping[str, Mapping[str, str | None]] = NO_OVERRID
                           for section, rows in sections.items() if rows) + "\n"
 
 
-def write_registry(path: Path, overrides: Mapping[str, Mapping[str, str | None]] = NO_OVERRIDES, *,
+def write_registry(path: Path, overrides: RegistryOverrides = NO_OVERRIDES, *,
                    replace_sections: Sequence[str] = (), update: bool = False, base_text: str = "",
                    bare_rows: Sequence[str] = ()) -> Path:
-    """Write a fixture registry, refusing the user's real registry or overlay."""
+    """Write a fixture registry, refusing the user's real agents.conf."""
     real_config = (Path(pwd.getpwuid(os.getuid()).pw_dir) / ".claude/config").resolve()
-    if path.resolve() in (real_config / "agents.conf", real_config / "agents.local.conf"):
+    if path.resolve() == real_config / "agents.conf":
         raise AssertionError(f"test registry must be temporary: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     base_text = path.read_text(encoding="utf-8") if update and path.exists() else base_text

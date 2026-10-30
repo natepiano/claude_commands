@@ -3,13 +3,10 @@
 
 Usage: transfer_unit.py plan|apply|verify <from slug> <unit> <to production doc> [--scratch <dir>]
 
-The giving showrunner runs it. The unit keeps its Claude session and conversation, its worktree,
-its branch and its unmerged commits. apply stops the unit through the shutdown path, as
-rename_unit does, commits its plan's Production header on the unit branch, commits the Units row
-into the receiving doc and out of the giving doc (the row is moved, not retired), moves the unit's
-state to the receiving slug, points its shutdown record at the receiving production, relaunches
-the same session and verifies. The relaunch sets the unit's marks from the receiving doc, and the
-relaunched session's first prompt names its new production doc, merge branch and showrunner.
+The giving showrunner runs it. The unit keeps its running session, worktree, branch and
+unmerged commits. apply moves its staff membership and live tab through staff_move, moves the
+Units row and associated state, then tells the unit and both showrunners. It never stops or
+relaunches a session.
 
 The doc commits are not pushed: each goes out with its showrunner's next merge push, as add_unit's
 row commit does. The unit takes the receiving merge branch at its own next merge.
@@ -21,21 +18,20 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
-import time
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, cast
+from typing import NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from production_units import Production, read_production  # noqa: E402
 import merge_checkpoint  # noqa: E402
-import pane_record  # noqa: E402
 import production_units  # noqa: E402
 import rename_state  # noqa: E402
 import rename_unit  # noqa: E402
@@ -47,14 +43,8 @@ import unit_lookup  # noqa: E402
 import unit_move  # noqa: E402
 import unit_names  # noqa: E402
 from rename_state import RenameRefused, read_json, write_json, write_text  # noqa: E402
-from rename_unit import shutdown_record  # noqa: E402
 from unit_move import PathMove, git  # noqa: E402
-
-if TYPE_CHECKING:
-    from scripts.shutdown.shutdown_record import SessionShutdown
-else:
-    # rename_unit puts the shutdown folder on the path.
-    from shutdown_record import SessionShutdown
+from scripts.production import staff, staff_sources, staff_move
 
 POOL = Path(__file__).resolve().parent.parent / "direct" / "review_pool.py"
 
@@ -75,31 +65,14 @@ class UnitTransfer:
     plan_cell: str
     tip: str
     scratch: str
+    staff_id: staff.StaffId
+    parent_staff_id: staff.StaffId
     step: int = 0
-    # Filled as the steps run: the three commits, and the shutdown record the unit relaunches from
-    # (empty when the unit was not running).
+    # Commit receipts and the unit's session address survive a partial source update.
     plan_commit: str = ""
     to_commit: str = ""
     from_commit: str = ""
-    account: str = ""
-    session_id: str = ""
-
-    # What rename_unit's stop steps read (rename_unit.StopTarget): a transfer keeps the unit's id.
-    @property
-    def slug(self) -> str:
-        return self.from_slug
-
-    @property
-    def old(self) -> str:
-        return self.unit
-
-    @property
-    def new(self) -> str:
-        return self.unit
-
-    @property
-    def id_matches(self) -> bool:
-        return True
+    unit_address: str = ""
 
     def worktree(self) -> Path:
         return Path(self.worktree_dir)
@@ -117,7 +90,7 @@ class UnitTransfer:
         return f"chore({self.from_slug}): transfer unit {self.unit} to {self.to_slug}"
 
 
-TEXT_FIELDS = tuple(field.name for field in fields(UnitTransfer) if field.name != "step")
+TEXT_FIELDS = tuple(field.name for field in fields(UnitTransfer) if field.name not in ("step", "staff_id", "parent_staff_id"))
 # The fields a fresh transfer fills; the rest start empty.
 REQUIRED = TEXT_FIELDS[:TEXT_FIELDS.index("plan_commit")]
 # These are current locations, not recovery state. Old journals may contain them.
@@ -184,10 +157,16 @@ def build(from_slug: str, given: str, to_doc: Path, scratch: Path) -> UnitTransf
                             + "moves a unit only between productions of one repository")
     if git(worktree, "branch", "--show-current") != branch:
         raise RenameRefused(f"{worktree} is not on {branch}")
+    record = staff.snapshot()
+    member = staff_sources.member(staff_sources.UnitMember(giving.slug, unit), record)
+    parent = staff_sources.member(staff_sources.ShowrunnerMember(receiving.slug), record)
+    if isinstance(member, staff_sources.NoSuchMember) or isinstance(parent, staff_sources.NoSuchMember):
+        raise staff.StaffRefused(f"{giving.slug}/{unit} to {receiving.slug}: no matching staff row")
     return UnitTransfer(giving.slug, receiving.slug, unit, str(giving.doc), str(receiving.doc),
                         str(giving.checkout), str(receiving.checkout), giving.merge_branch,
                         receiving.merge_branch, branch, str(worktree), row.get("Plan", ""),
-                        git(worktree, "rev-parse", "HEAD"), str(scratch))
+                        git(worktree, "rev-parse", "HEAD"), str(scratch), member.row.id, parent.row.id,
+                        unit_address=_unit_address(giving.slug, receiving.slug, unit, member.row.name))
 
 
 def _check_journals(transfer: UnitTransfer) -> None:
@@ -224,10 +203,9 @@ def _check_doc(checkout: Path, merge_branch: str, doc: Path, expected: str = "")
 
 
 def _check_ready(transfer: UnitTransfer) -> None:
-    """What a later step refuses, checked before the stop, so a refused transfer never stops the unit."""
+    """Check document and branch writes before moving staff membership or the live tab."""
     _check_doc(Path(transfer.to_checkout), transfer.to_merge_branch, Path(transfer.to_doc))
     _check_doc(Path(transfer.from_checkout), transfer.from_merge_branch, Path(transfer.from_doc))
-    rename_unit.check_stoppable(transfer)
     worktree = transfer.worktree()
     remote = unit_move.remote_tip(worktree, transfer.branch)
     if remote and subprocess.run(["git", "-C", str(worktree), "merge-base", "--is-ancestor", remote, transfer.tip],
@@ -245,11 +223,6 @@ def _commit_only(directory: Path, paths: list[Path], message: str) -> str:
 
 
 # The steps. Each takes the transfer and a save callback, and is safe to run again.
-
-
-def _stop(transfer: UnitTransfer, save: Callable[[], None]) -> None:
-    rename_unit.check_stoppable(transfer)
-    rename_unit.stop_unit(transfer, save)
 
 
 def _header(transfer: UnitTransfer) -> str:
@@ -393,7 +366,7 @@ def _commit_from(transfer: UnitTransfer, save: Callable[[], None]) -> None:
 
 def _move_state(transfer: UnitTransfer, _save: Callable[[], None]) -> None:
     """The stall-watch stretch moves to the receiving slug; the giving pool's reviewers retire, so
-    the receiving pool leases its own; the old pane entry goes, since the relaunch records a new one.
+    the receiving pool leases its own. The running pane keeps its launch record and identity.
     The unit's held design roles name the receiving production as holder, so they resume under it.
     The phase note follows on the unit's next refresh, and the giving showrunner's report state
     keeps its rows as history."""
@@ -412,62 +385,53 @@ def _move_state(transfer: UnitTransfer, _save: Callable[[], None]) -> None:
                               "--unit", transfer.unit], capture_output=True, text=True, check=False)
     if retired.returncode:
         raise RenameRefused(f"review pool: {(retired.stderr or retired.stdout).strip()}")
-    _ = pane_record.forget_unit(transfer.unit)
+
+
+def _unit_address(from_slug: str, to_slug: str, unit: str, name: str) -> str:
+    """Pin the session before its production's source row changes."""
+    for slug in (from_slug, to_slug):
+        found = unit_lookup.marked_units(slug).get(unit)
+        if found is not None and isinstance(found.claude, unit_lookup.LiveClaude):
+            return f"session:{found.claude.session_id}"
+    return name
 
 
 def moved_note(transfer: UnitTransfer) -> str:
-    """The line the relaunched unit reads first."""
-    address = f"~/.claude/scripts/lib/py ~/.claude/scripts/production/showrunners.py address {transfer.to_slug}"
-    return (f"While you were stopped the showrunner moved you to production {transfer.to_slug}: your production "
-            + f"doc is now {transfer.to_doc}, your merge branch is {transfer.to_merge_branch}, and your showrunner "
-            + f"is the {transfer.to_slug} showrunner, whose address `{address}` prints. Your worktree "
+    return (f"Message from {transfer.from_slug} showrunner: {transfer.unit} now belongs to {transfer.to_slug}.\n"
+            + f"Your production doc is now {transfer.to_doc}, your merge branch is {transfer.to_merge_branch}, "
+            + f"and your showrunner is the {transfer.to_slug} showrunner. Your worktree "
             + f"{transfer.worktree_dir}, your branch {transfer.branch} and its commits stay. Take "
             + f"origin/{transfer.to_merge_branch} at your next merge, and send checkpoints to the new showrunner.")
 
 
-def _restart_record(transfer: UnitTransfer, save: Callable[[], None]) -> None:
-    """Point the stopped unit's shutdown record at the receiving production. The relaunch reads its
-    doc, so the unit's marks name the receiving slug."""
-    if not transfer.session_id:
-        return
-    import herdr
-
-    stem = unit_names.stem(transfer.unit)
-    given = herdr.generated_session_name(f"{transfer.from_slug}-{stem}")
-
-    def change(saved: SessionShutdown) -> None:
-        host = saved["session"]["host"]
-        if host["kind"] != "unit" or host["unit"] != transfer.unit or host["production"] not in (
-                transfer.from_slug, transfer.to_slug):
-            raise RenameRefused(f"shutdown record {transfer.session_id} is not {transfer.unit}'s")
-        if saved["progress"]["kind"] not in rename_unit.STOPPED:
-            raise RenameRefused(f"{transfer.unit}'s shutdown record reads {saved['progress']['kind']}; settle it first")
-        host["production"] = transfer.to_slug
-        host["doc"] = transfer.to_doc
-        if host["session_name"] == given:
-            host["session_name"] = herdr.generated_session_name(f"{transfer.to_slug}-{stem}")
-        saved["renamed"] = moved_note(transfer)
-
-    try:
-        _ = shutdown_record.update_session(transfer.account, transfer.session_id, change)
-    except (shutdown_record.NoLiveRecord, shutdown_record.InvalidRecord, OSError) as error:
-        raise RenameRefused(f"{transfer.unit}'s shutdown record: {error}") from error
-    save()
+def _notice_key(transfer: UnitTransfer, recipient: str) -> str:
+    return f"unit-transfer:{transfer.staff_id}:{transfer.from_slug}:{transfer.to_slug}:{transfer.tip}:{recipient}"
 
 
-def _live(slug: str, unit: str) -> bool:
-    found = unit_lookup.marked_units(slug).get(unit)
-    return found is not None and isinstance(found.claude, unit_lookup.LiveClaude)
+def _notice_result(delivery: showrunners.NoticeDelivery) -> None:
+    if delivery.failed:
+        raise RenameRefused("; ".join(delivery.lines))
+    print("\n".join(delivery.lines))
 
 
-def _relaunch(transfer: UnitTransfer, _save: Callable[[], None]) -> None:
-    if not transfer.session_id:
-        return
-    rename_unit.run_shutdown("restart", "--only", transfer.session_id)
-    # Past the wait verify reports the unit as not running.
-    deadline = time.monotonic() + rename_unit.LIVE_WAIT_SECONDS
-    while not _live(transfer.to_slug, transfer.unit) and time.monotonic() < deadline:
-        time.sleep(rename_unit.POLL_SECONDS)
+def _tell_unit(transfer: UnitTransfer, _save: Callable[[], None]) -> None:
+    address = transfer.unit_address or _unit_address(transfer.from_slug, transfer.to_slug,
+                                                    transfer.unit, unit_names.name(transfer.unit))
+    _notice_result(showrunners.send_to_address(address, _notice_key(transfer, "unit"), moved_note(transfer),
+                                              recipient=transfer.unit, sender="transfer_unit"))
+
+
+def _tell_from(transfer: UnitTransfer, _save: Callable[[], None]) -> None:
+    _notice_result(showrunners.deliver(transfer.from_slug, _notice_key(transfer, "from"), _showrunner_note(transfer)))
+
+
+def _tell_to(transfer: UnitTransfer, _save: Callable[[], None]) -> None:
+    _notice_result(showrunners.deliver(transfer.to_slug, _notice_key(transfer, "to"), _showrunner_note(transfer)))
+
+
+def _showrunner_note(transfer: UnitTransfer) -> str:
+    return (f"Message from transfer_unit: {transfer.unit} moved from {transfer.from_slug} to {transfer.to_slug}.\n"
+            + f"Its Units row is now in {transfer.to_doc}; its session keeps running.")
 
 
 def _leased(slug: str, unit: str) -> list[str]:
@@ -494,18 +458,10 @@ def verify_failures(transfer: UnitTransfer) -> list[str]:
             failures.append(f"{path}: its Production header does not name {transfer.to_slug}")
     if stall_watch.stretch_path(transfer.from_slug, unit).exists():
         failures.append(f"stall-watch: the stretch is still under {transfer.from_slug}")
-    if transfer.session_id:
-        saved = shutdown_record.find_session(transfer.account, transfer.session_id)
-        if saved is not None and saved["session"]["host"]["kind"] == "unit" and (
-                saved["session"]["host"]["production"] != transfer.to_slug):
-            failures.append(f"shutdown record {transfer.session_id} does not name {transfer.to_slug}")
-        if not _live(transfer.to_slug, unit):
-            failures.append(f"{unit} is not running under {transfer.to_slug}; relaunch it with "
-                            + f"shutdown.py restart --here --only {transfer.session_id}")
-    holder = unit_lookup.marked_units(transfer.from_slug).get(unit)
-    if holder is not None and isinstance(holder.claude, (unit_lookup.LiveClaude, unit_lookup.ClaudeUnknown)):
-        failures.append(f"a session still carries the marks {transfer.from_slug} {unit}: "
-                        + unit_lookup.holder_text(holder))
+    record = staff.snapshot()
+    row = record.by_id(transfer.staff_id)
+    if row is None or row.parent != transfer.parent_staff_id:
+        failures.append(f"staff: {unit} is not under {transfer.to_slug}")
     if leased := _leased(transfer.from_slug, unit):
         failures.append(f"review pool {transfer.from_slug}: {', '.join(leased)} still leased to {unit}")
     from scripts.astra import design_roles
@@ -521,13 +477,8 @@ def _verify(transfer: UnitTransfer, _save: Callable[[], None]) -> None:
 class Step(NamedTuple):
     run: Callable[[UnitTransfer, Callable[[], None]], None]
     describe: Callable[[UnitTransfer], str]
-    # Whether the step runs under both merge locks. The steps that wait (stop, relaunch) and
-    # verify do not, so a merge gate is never held behind them.
+    # Messaging and verification do not hold the merge locks.
     locked: bool = True
-
-
-def _describe_stop(t: UnitTransfer) -> str:
-    return f"stop {t.unit} and its Codex workers through the shutdown path; its record carries the relaunch"
 
 
 def _describe_plans(t: UnitTransfer) -> str:
@@ -544,16 +495,19 @@ def _describe_from(t: UnitTransfer) -> str:
 
 def _describe_state(t: UnitTransfer) -> str:
     return (f"state: stall-watch stretch {t.from_slug} -> {t.to_slug}; held design roles' holder "
-            + f"{t.from_slug} -> {t.to_slug}; retire the {t.from_slug} reviewers; forget the old pane")
+            + f"{t.from_slug} -> {t.to_slug}; retire the {t.from_slug} reviewers")
 
 
-def _describe_record(t: UnitTransfer) -> str:
-    return (f"shutdown record: production {t.from_slug} -> {t.to_slug} and doc {t.to_doc}; the first prompt "
-            + "names the new production")
+def _describe_tell_unit(t: UnitTransfer) -> str:
+    return f"tell {t.unit} its new production, doc and merge branch"
 
 
-def _describe_relaunch(t: UnitTransfer) -> str:
-    return f"relaunch the same session in {t.worktree_dir} on {t.branch}"
+def _describe_tell_from(t: UnitTransfer) -> str:
+    return f"tell {t.from_slug} showrunner that {t.unit} moved to {t.to_slug}"
+
+
+def _describe_tell_to(t: UnitTransfer) -> str:
+    return f"tell {t.to_slug} showrunner that {t.unit} moved from {t.from_slug}"
 
 
 def _describe_verify(t: UnitTransfer) -> str:
@@ -561,13 +515,13 @@ def _describe_verify(t: UnitTransfer) -> str:
 
 
 STEPS = (
-    Step(_stop, _describe_stop, locked=False),
     Step(_commit_plans, _describe_plans),
     Step(_commit_to, _describe_to),
     Step(_commit_from, _describe_from),
     Step(_move_state, _describe_state),
-    Step(_restart_record, _describe_record),
-    Step(_relaunch, _describe_relaunch, locked=False),
+    Step(_tell_unit, _describe_tell_unit, locked=False),
+    Step(_tell_from, _describe_tell_from, locked=False),
+    Step(_tell_to, _describe_tell_to, locked=False),
     Step(_verify, _describe_verify, locked=False),
 )
 
@@ -578,10 +532,29 @@ def journal(slug: str) -> Path:
 
 def _load(path: Path, to_doc: Path) -> UnitTransfer:
     values = unit_move.json_object(read_json(path))
+    values = _migrate_journal(path, values)
+    return _load_fields(path, values, to_doc)
+
+
+def _migrate_journal(path: Path, values: dict[str, object]) -> dict[str, object]:
+    if not all(isinstance(values.get(name), str) and values[name] for name in ("from_slug", "to_slug", "unit")):
+        raise RenameRefused(f"{path}: invalid unit transfer identity")
+    return rename_state.migrate_staff_ids(path, values, {
+        "staff_id": tuple(staff_sources.UnitMember(cast(str, values[name]), cast(str, values["unit"]))
+                          for name in ("from_slug", "to_slug")),
+        "parent_staff_id": (staff_sources.ShowrunnerMember(cast(str, values["to_slug"])),),
+    })
+
+
+def _load_fields(path: Path, values: dict[str, object], to_doc: Path) -> UnitTransfer:
     step = values.get("step")
+    # The pre-live-move journal had stop/record/relaunch steps instead of notices.
+    if values.get("version", 1) == 1 and type(step) is int:
+        step = {0: 0, 1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 4, 7: 4, 8: len(STEPS)}.get(step, step)
     if (type(step) is not int
             or not all(isinstance(values.get(name, ""), str) for name in TEXT_FIELDS if name not in LOCATION_FIELDS)
-            or not all(values.get(name) for name in REQUIRED if name not in LOCATION_FIELDS)):
+            or not all(values.get(name) for name in REQUIRED if name not in LOCATION_FIELDS)
+            or not all(isinstance(values.get(name), str) and values[name] for name in ("staff_id", "parent_staff_id"))):
         raise RenameRefused(f"{path}: invalid unit transfer journal")
     receiving = read_production(to_doc.expanduser().resolve())
     if receiving.slug != values["to_slug"]:
@@ -590,6 +563,8 @@ def _load(path: Path, to_doc: Path) -> UnitTransfer:
     values.update(from_doc=str(giving.doc), from_checkout=str(giving.checkout),
                   to_doc=str(receiving.doc), to_checkout=str(receiving.checkout))
     return UnitTransfer(*(cast(str, values.get(name, "")) for name in TEXT_FIELDS[:len(REQUIRED)]), step=step,
+                        staff_id=staff.StaffId(cast(str, values["staff_id"])),
+                        parent_staff_id=staff.StaffId(cast(str, values["parent_staff_id"])),
                         **{name: cast(str, values.get(name, "")) for name in TEXT_FIELDS[len(REQUIRED):]})
 
 
@@ -597,18 +572,43 @@ def _save(path: Path, transfer: UnitTransfer) -> None:
     saved = cast(dict[str, object], asdict(transfer))
     for name in LOCATION_FIELDS:
         del saved[name]
-    write_json(path, {**saved, "done": transfer.step == len(STEPS)})
+    previous: list[dict[str, object]] = []
+    if path.exists():
+        current = unit_move.json_object(read_json(path))
+        previous = _completed_requests(current)
+        if current.get("done") is True and (current.get("unit"), current.get("to_slug")) != (transfer.unit, transfer.to_slug):
+            previous.append({key: value for key, value in current.items() if key != "completed_requests"})
+    if previous:
+        saved["completed_requests"] = previous
+    write_json(path, {**saved, "version": 2, "done": transfer.step == len(STEPS)})
+
+
+def _completed_requests(values: dict[str, object]) -> list[dict[str, object]]:
+    previous = values.get("completed_requests", [])
+    if not isinstance(previous, list):
+        raise RenameRefused("invalid completed transfer requests")
+    return [unit_move.json_object(item) for item in cast(list[object], previous)]
 
 
 def _resumed(path: Path, unit: str, to_doc: Path) -> UnitTransfer | None:
     """The unfinished transfer the journal holds, which must be this request; None without one."""
-    if not rename_state.unfinished(path):
+    if not path.exists():
         return None
-    recorded = _load(path, to_doc)
-    if recorded.unit not in (unit, unit_names.unit_id(unit)) or Path(recorded.to_doc) != to_doc.expanduser().resolve():
-        raise RenameRefused(f"the unfinished transfer is {recorded.unit} to {recorded.to_slug}; resume it first with "
-                            + f"transfer_unit.py apply {recorded.from_slug} {recorded.unit} {recorded.to_doc}")
-    return recorded
+    values = unit_move.json_object(read_json(path))
+    receiving = read_production(to_doc.expanduser().resolve())
+    candidates = [values, *_completed_requests(values)] if values.get("done") is True else [values]
+    for fields in candidates:
+        if fields.get("unit") in (unit, unit_names.unit_id(unit)) and fields.get("to_slug") == receiving.slug:
+            if fields is values:
+                fields = _migrate_journal(path, fields)
+            return _load_fields(path, fields, to_doc)
+    if values.get("done") is True:
+        return None
+    destination = _production(cast(str, values["to_slug"]))
+    command = shlex.join(["transfer_unit.py", "apply", cast(str, values["from_slug"]),
+                          cast(str, values["unit"]), str(destination.doc)])
+    raise RenameRefused(f"the unfinished transfer is {values.get('unit')} to {values.get('to_slug')}; "
+                        + f"resume it first with {command}")
 
 
 @contextmanager
@@ -621,8 +621,9 @@ def _merge_locks(transfer: UnitTransfer) -> Generator[None]:
 
 
 def describe(transfer: UnitTransfer) -> list[str]:
-    return [f"{number}. {step.describe(transfer)}{'  (done)' if number <= transfer.step else ''}"
-            for number, step in enumerate(STEPS, 1)]
+    return [f"1. move {transfer.unit}'s staff membership and live tab to {transfer.to_slug}",
+            *(f"{number + 1}. {step.describe(transfer)}{'  (done)' if number <= transfer.step else ''}"
+              for number, step in enumerate(STEPS, 1))]
 
 
 def plan(from_slug: str, unit: str, to_doc: Path, scratch: Path) -> UnitTransfer:
@@ -637,10 +638,25 @@ def plan(from_slug: str, unit: str, to_doc: Path, scratch: Path) -> UnitTransfer
 
 
 def apply(from_slug: str, unit: str, to_doc: Path, scratch: Path) -> UnitTransfer:
+    with staff.operation():
+        return _apply(from_slug, unit, to_doc, scratch)
+
+
+def _move_staff(transfer: UnitTransfer) -> None:
+    _ = staff_move.move_unit(transfer.from_slug, transfer.unit, transfer.to_slug,
+                             identity=staff_move.PinnedUnit(transfer.staff_id, transfer.parent_staff_id))
+
+
+def _apply(from_slug: str, unit: str, to_doc: Path, scratch: Path) -> UnitTransfer:
     path = journal(from_slug)
     path.parent.mkdir(parents=True, exist_ok=True)
     with unit_move.production_lock():
         transfer = _resumed(path, unit, to_doc)
+        if transfer is not None and transfer.step == len(STEPS):
+            print("done; unchanged")
+            return transfer
+        fresh = transfer is None
+        previous_journal = path.read_text(encoding="utf-8") if fresh and path.exists() else ""
         if transfer is None:
             transfer = build(from_slug, unit, to_doc, scratch)
             _check_journals(transfer)
@@ -649,6 +665,15 @@ def apply(from_slug: str, unit: str, to_doc: Path, scratch: Path) -> UnitTransfe
                 _check_ready(transfer)
             # The request is saved before anything changes, so every later refusal resumes.
             _save(path, transfer)
+        try:
+            _move_staff(transfer)
+        except staff.StaffRefused:
+            if fresh:
+                if previous_journal:
+                    write_text(path, previous_journal)
+                else:
+                    path.unlink(missing_ok=True)
+            raise
         for number in range(transfer.step + 1, len(STEPS) + 1):
             step = STEPS[number - 1]
             if step.locked:
@@ -679,6 +704,10 @@ def verify(from_slug: str, unit: str, to_doc: Path) -> UnitTransfer:
 
 
 def main(argv: list[str]) -> int:
+    return staff.cli_result(lambda: _main(argv))
+
+
+def _main(argv: list[str]) -> int:
     from scripts.direct.workers import WorkerUnavailable
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     _ = parser.add_argument("verb", choices=("plan", "apply", "verify"))
@@ -693,17 +722,14 @@ def main(argv: list[str]) -> int:
     try:
         transfer = (plan(from_slug, unit, to_doc, scratch) if verb == "plan" else apply(from_slug, unit, to_doc, scratch)
                     if verb == "apply" else verify(from_slug, unit, to_doc))
-    except rename_unit.RenameWaiting as error:
-        print(f"transfer_unit: {error}", file=sys.stderr)
-        return 2
+    except (staff.StaffRefused, staff.StaffNotFound, staff.StaffUnreadable):
+        raise
     except (RenameRefused, production_units.Refusal, unit_names.BadName, WorkerUnavailable, OSError, UnicodeError) as error:
         print(f"transfer_unit: refused: {error}", file=sys.stderr)
         return 1
     print("\n".join(describe(transfer)))
     if verb != "plan":
-        print(f"{transfer.unit} is now in {transfer.to_slug}" + (
-            f", relaunched in {transfer.worktree_dir}" if transfer.session_id
-            else f"; it was not running: launch it from {transfer.to_doc}"))
+        print(f"{transfer.unit} is now in {transfer.to_slug}")
     return 0
 
 

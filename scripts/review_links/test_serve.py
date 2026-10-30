@@ -220,6 +220,40 @@ class ReviewLinksServerTests(unittest.TestCase):
         (self.root / "index-alias.txt").symlink_to(self.root / ".index.json")
         self.assertEqual(self.request("/index-alias.txt").status, 404)
 
+    def test_private_files_in_any_letter_case_return_404(self) -> None:
+        private = "private source paths or incomplete bytes"
+        for folder in (self.root, self.root / "session"):
+            folder.mkdir(exist_ok=True)
+            for filename in (
+                ".index.json", ".INDEX.JSON", ".Index.Json",
+                ".index.lock", ".INDEX.LOCK", ".Index.Lock",
+                ".review-link-x", ".REVIEW-LINK-X", ".Review-Link-x",
+            ):
+                with self.subTest(folder=folder.name, filename=filename):
+                    _ = (folder / filename).write_text(private, encoding="utf-8")
+                    path = (folder / filename).relative_to(self.root).as_posix()
+                    for request_path in ("/" + path, "/" + path.replace(".", "%2e", 1)):
+                        reply = self.request(request_path)
+                        self.assertEqual(reply.status, 404)
+                        self.assertNotIn(private.encode("utf-8"), reply.body)
+        snapshot = self.root / "abc123"
+        snapshot.mkdir()
+        _ = (snapshot / "draft.txt").write_bytes(b"review content")
+        reply = self.request("/abc123/draft.txt")
+        self.assertEqual(reply.status, 200)
+        self.assertEqual(reply.body, b"review content")
+
+    def test_private_path_parts_are_blocked_before_symlink_resolution(self) -> None:
+        snapshot = self.root / "abc123"
+        snapshot.mkdir()
+        _ = (snapshot / "draft.txt").write_bytes(b"public snapshot through a private alias")
+        for name in (".INDEX.JSON", ".Index.Lock", ".Review-Link-x"):
+            (self.root / name).symlink_to(snapshot, target_is_directory=True)
+            for prefix in (name, "%2e" + name[1:]):
+                with self.subTest(prefix=prefix):
+                    self.assertEqual(self.request(f"/{prefix}/draft.txt").status, 404)
+        self.assertEqual(self.request("/abc123/draft.txt").status, 200)
+
 
 class SnapshotSweepTests(unittest.TestCase):
     root: Path = Path()

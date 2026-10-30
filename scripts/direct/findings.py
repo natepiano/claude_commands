@@ -1083,8 +1083,11 @@ def _close_route(args: argparse.Namespace) -> None:
     state = _read_state(session_dir, now, _arg_string(args, "phase"))
     source = _required_text(args, "from")
     parts = source.split(":")
-    if len(parts) != 3 or any(not part.strip() for part in parts):
-        raise SystemExit("--from must be <run id>:<phase instance id>:<finding id>")
+    if len(parts) != 3 or not parts[0].strip() or not parts[2].strip():
+        raise SystemExit(
+            "--from must be <run id>:<phase instance id>:<finding id> or <run id>::<finding id>; "
+            + "run id and finding id must not be empty"
+        )
     if _history_file(session_dir) is None:
         raise SystemExit("Start a recorded run before closing routed work")
     _append_event(session_dir, state, {

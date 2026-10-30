@@ -164,13 +164,20 @@ def _object(value: object) -> dict[str, object]:
     return cast(dict[str, object], value)
 
 
-def load_run(path: Path) -> RunJudgments:
+def load_run(path: Path, *, allow_partial_last_line: bool = False) -> RunJudgments:
     scored: dict[str, ScoredIssue] = {}
     failed: dict[str, str] = {}
-    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    lines = path.read_bytes().splitlines(keepends=True)
+    for number, line in enumerate(lines, 1):
         if not line.strip():
             continue
-        record = _object(cast(object, json.loads(line)))
+        try:
+            value = cast(object, json.loads(line))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            if allow_partial_last_line and number == len(lines) and not line.endswith((b"\n", b"\r")):
+                break
+            raise
+        record = _object(value)
         issue_path = record.get("issue_path")
         if not isinstance(issue_path, str):
             raise ValueError(f"{path}:{number}: run line has no issue_path")

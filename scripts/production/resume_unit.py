@@ -29,12 +29,16 @@ Exit 0 when the unit is resumed; 1 on a refusal or a failed step; 2 on usage.
 """
 from __future__ import annotations
 
+
 import argparse
 import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.production import completion_receipt, staff
 
 import add_unit
 import production_units
@@ -44,6 +48,7 @@ import unit_move
 import unit_names
 from production_units import Production
 from shutdown_record import InvalidRecord
+from atomic_file import write_text_atomic
 
 ADD_UNIT = Path(__file__).resolve().parent / "add_unit.py"
 RETIRED = re.compile(r"^\s*\(retired [^)]*\)\s*")
@@ -86,6 +91,11 @@ def find_unit(slug: str, given: str) -> RetiredUnit:
         raise Refused(f"{name}: expected one Units row, found {len(matching)}")
     row = matching[0]
     plan = row.get("Plan", "")
+    pending = resume_record(production, name)
+    if not production_units.plan_cell_is_retired(plan) and pending.exists():
+        retired_plan = pending.read_text(encoding="utf-8")
+        if RETIRED.sub("", retired_plan).strip() == plan.strip():
+            plan = retired_plan
     session = SESSION.match(plan)
     worktree = Path(production_units.cell_value(row.get("Worktree", ""))).expanduser()
     branch = production_units.cell_value(row.get("Branch", ""))
@@ -98,6 +108,15 @@ def find_unit(slug: str, given: str) -> RetiredUnit:
     return RetiredUnit(production, name, worktree, branch, production_units.cell_value(RETIRED.sub("", plan)),
                        session_id, retired,
                        RecordedStartFolder(Path(session[2]).expanduser()) if session and session[2] else UnrecordedStartFolder())
+
+
+def resume_record(production: Production, name: str) -> Path:
+    result = retire_unit.run(["git", "-C", str(production.checkout), "rev-parse", "--git-path",
+                              f"resume-units/{name}"])
+    if result.returncode:
+        raise Refused(f"cannot find the resume record: {retire_unit.failure(result)}")
+    path = Path(result.stdout.strip())
+    return path if path.is_absolute() else production.checkout / path
 
 
 def _git(unit: RetiredUnit, *arguments: str) -> str:
@@ -181,7 +200,7 @@ def make_worktree(unit: RetiredUnit) -> None:
 
 
 def launch(unit: RetiredUnit) -> None:
-    if is_running(unit):
+    if is_running(unit) and not add_unit.pending_opening(unit.production, unit.name, unit.session_id):
         return
     result = retire_unit.run(launch_command(unit))
     if result.stdout.strip():
@@ -194,6 +213,7 @@ def launch(unit: RetiredUnit) -> None:
 def unmark(unit: RetiredUnit) -> None:
     """Take the retired note out of the Units row's Plan cell and commit the doc on the merge branch."""
     doc = unit.production.doc
+    pending = resume_record(unit.production, unit.name)
     lines = doc.read_text(encoding="utf-8").split("\n")
     headings = production_units.unit_headings(lines)
     _, rows = production_units.unit_rows(lines)
@@ -201,10 +221,13 @@ def unmark(unit: RetiredUnit) -> None:
     for index, line in enumerate(lines):
         parts = line.split("|")
         if line in rows and production_units.cell_value(parts[headings.index("Unit") + 1].strip()) == unit.name:
+            if not pending.exists():
+                pending.parent.mkdir(parents=True, exist_ok=True)
+                write_text_atomic(pending, parts[plan_at].strip())
             parts[plan_at] = f" {RETIRED.sub('', parts[plan_at].strip())} "
             lines[index] = "|".join(parts)
             break
-    _ = doc.write_text("\n".join(lines), encoding="utf-8")
+    write_text_atomic(doc, "\n".join(lines))
     add_unit.commit_paths(unit.production, [doc], f"production({unit.production.slug}): resume {unit.name}")
     print(f"unmarked: the Units row, committed on {unit.production.merge_branch}")
 
@@ -229,15 +252,20 @@ def resume(unit: RetiredUnit) -> int:
     if refused:
         print("\n".join(f"refused: {reason}" for reason in refused))
         return 1
+    row = add_unit.ensure_staff_unit(unit.production, unit.name)
     if resume_folder(unit).resolve() == unit.worktree.resolve():
         make_worktree(unit)
     launch(unit)
     unmark(unit)
     print(f"{unit.name} resumed")
+    completed = resume_record(unit.production, unit.name).with_suffix(".done")
+    completion_receipt.write_receipt(completed, row.id, {"session_id": unit.session_id,
+                                                   "doc": str(unit.production.doc), "unit": unit.name})
+    resume_record(unit.production, unit.name).unlink(missing_ok=True)
     return 0
 
 
-def main(argv: list[str]) -> int:
+def _main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     _ = parser.add_argument("slug")
     _ = parser.add_argument("unit")
@@ -245,10 +273,26 @@ def main(argv: list[str]) -> int:
     options = parser.parse_args(argv)
     try:
         unit = find_unit(cast(str, options.slug), cast(str, options.unit))
+        completed = completion_receipt.read_receipt(resume_record(unit.production, unit.name).with_suffix(".done"),
+                                                staff.initial_snapshot())
+        if (not unit.retired and isinstance(completed, completion_receipt.OwnedReceipt)
+                and completed.owner.kind == "unit" and completed.fields.get("doc") == str(unit.production.doc)
+                and completed.fields.get("unit") == unit.name):
+            print(f"{unit.name} already resumed")
+            return 0
         return dry_run(unit) if cast(bool, options.dry_run) else resume(unit)
+    except (staff.StaffRefused, staff.StaffUnreadable):
+        raise
     except (Refused, retire_unit.Refused, production_units.Refusal, unit_names.BadName, InvalidRecord, OSError) as error:
         print(f"refused: {error}")
         return 1
+
+
+def main(argv: list[str]) -> int:
+    def run() -> int:
+        with staff.operation():
+            return _main(argv)
+    return staff.cli_result(run)
 
 
 if __name__ == "__main__":

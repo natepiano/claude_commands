@@ -158,7 +158,7 @@ Done when the trace on the same runs shows ≤ 2 s CPU of helper starts per step
 
 **Acceptance gate:** merge gate `--tests-only` green; basedpyright `0 errors, 0 warnings` on changed files and callers; a test shows `test hana --filter native_rate` with filtered history promised that history's p90, without history the floor rule, and an unfiltered run unchanged.
 
-### Phase 4 — Promise a fresh test run only its test memory  · status: todo
+### Phase 4 — Promise a fresh test run only its test memory  · status: done
 
 **Depends on:** Phase 3 (same function). Runs in Phase 3's worktree `/home/natepiano/worktrees/claude-build-followups-verify-memory`, branch `natedev-verify-memory`, after Phase 3's checkpoint.
 
@@ -273,7 +273,7 @@ Done when the trace on the same runs shows ≤ 2 s CPU of helper starts per step
 1. While verify.sh holds the cargo token, it renews the hold before each step and from a background loop while a step runs (well inside the hold), and stops renewing when it releases. Use `board.sh renew`; add `--pid` to `cmd_renew` so verify renews for its holder pid.
 2. The fix loop's "did the fixes change anything" check and the tree-changed notice use tree content only, not the hashes of verify.sh, invoke.sh or lint.conf. The pass-record key may keep them.
 3. `lint_failure_is_the_tree` never counts status 125, or any lost-token status, as the tree's lint failure.
-4. In `run_local_test`, the first memory-wait start (`BUILDLOG_MEM_WAIT_FROM`) carries through a call file to every later `run_nextest` as `BUILDLOG_MEM_WAIT_SINCE`, so a run whose Mac claim failed keeps its queue place.
+4. In `run_local_test`, the first memory-wait start (`BUILDLOG_MEM_WAIT_FROM`) carries through a call file to every later `run_nextest` as `BUILDLOG_MEM_WAIT_SINCE`, so a run whose Mac claim failed keeps its queue place. The recorded memory wait (`BUILDLOG_MEM_WAIT_S`, the build record's `mem_wait_s`) counts from that first start, so a run that rejoined 12 times records its whole wait, not the last part (builds, 2026-10-29, from resources-unit: widget's 4 h 34 min wait recorded 1428 s).
 5. board.sh `lock_stale_reason` never reclaims an expired hold while `holder_pid` is alive and its `owned` group record still matches; a dead holder is still freed.
 6. One decision point for the Mac: the memory wait's leave hook takes the Mac claim under `state.lock` (as `claim_once` does) and hands the held claim to the runner, instead of reading `free-now`. A step leaves the wait only when it already holds the Mac; a refused claim keeps waiting in place.
 7. Script hashes stay in the pass-record (cache) key, so a lint result does not survive a lint-script change (builds, 2026-10-29).
