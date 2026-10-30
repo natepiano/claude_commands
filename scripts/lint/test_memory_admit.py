@@ -1247,6 +1247,87 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
             self.assertEqual(gate.blocker_fields(gate.current_blocker(directory / "400-warmup.waiting")),
                              {"session_id": "holder", "session_name": "", "pool": "memory"})
 
+    def test_peak_charge_expires_at_1500_seconds_since_near_peak_use(self) -> None:
+        for age, expected_charge, expected_state in ((1499, 13, "hold"), (1500, 2, "admit")):
+            with self.subTest(age=age):
+                self.readings_for()
+                reservation = self.running(100, 12)
+                _ = reservation.with_suffix(".max").write_text(str(13 * GIB))
+                _ = reservation.with_suffix(".wave").write_text(f"{13 * GIB} {int(NOW.timestamp()) - age}")
+                self.readings[100] = gate.MeasuredMemory(2 * GIB)
+                result = self.admit_at()
+                self.assertEqual((result.decision.state, result.decision.charged),
+                                 (expected_state, expected_charge * GIB))
+                if isinstance(result.reservation, gate.Reserved):
+                    gate.release(result.reservation.path, 0, self.root)
+
+    def test_recent_near_peak_use_renews_an_old_peak_charge(self) -> None:
+        self.readings_for()
+        reservation = self.running(100, 12, age=4000)
+        maximum = reservation.with_suffix(".max")
+        _ = maximum.write_text(str(13 * GIB))
+        os.utime(maximum, (NOW.timestamp() - 3000, NOW.timestamp() - 3000))
+        _ = reservation.with_suffix(".wave").write_text(f"{13 * GIB} {int(NOW.timestamp()) - 10}")
+        self.readings[100] = gate.MeasuredMemory(2 * GIB)
+        result = self.admit_at()
+        self.assertEqual((result.decision.state, result.decision.charged), ("hold", 13 * GIB))
+
+    def test_unknown_near_peak_time_keeps_peak_charge(self) -> None:
+        self.readings_for()
+        reservation = self.running(100, 12)
+        _ = reservation.with_suffix(".max").write_text(str(13 * GIB))
+        near_peak = reservation.with_suffix(".wave")
+        self.readings[100] = gate.MeasuredMemory(2 * GIB)
+        for contents in (None, "", "bad", "-1", str(int(NOW.timestamp()) - 2000),
+                         f"{13 * GIB} -1", "directory"):
+            with self.subTest(contents=contents):
+                if contents == "directory":
+                    near_peak.unlink()
+                    near_peak.mkdir()
+                elif contents is not None:
+                    _ = near_peak.write_text(contents)
+                result = self.admit_at()
+                self.assertEqual((result.decision.state, result.decision.charged), ("hold", 13 * GIB))
+
+    def test_new_peak_keeps_charge_until_its_own_near_peak_record_is_published(self) -> None:
+        self.readings_for()
+        reservation = self.running(100, 12)
+        _ = reservation.with_suffix(".max").write_text("200")
+        self.readings[100] = gate.MeasuredMemory(1)
+        for record in (f"100 {int(NOW.timestamp()) - 2000}",
+                       f"200 {int(NOW.timestamp())}"):
+            with self.subTest(record=record):
+                _ = reservation.with_suffix(".wave").write_text(record)
+                result = self.admit_at()
+                self.assertEqual(result.decision.charged, 200)
+                if isinstance(result.reservation, gate.Reserved):
+                    gate.release(result.reservation.path, 0, self.root)
+
+    def test_release_and_dead_reservation_cleanup_remove_near_peak_time(self) -> None:
+        for cleanup in ("release", "dead_pid", "gone_tree"):
+            with self.subTest(cleanup=cleanup):
+                self.readings_for()
+                self.processes[100] = "100"
+                self.readings[100] = gate.MeasuredMemory(2 * GIB)
+                reservation = self.running(100, 12)
+                maximum = reservation.with_suffix(".max")
+                near_peak = reservation.with_suffix(".wave")
+                _ = maximum.write_text(str(13 * GIB))
+                _ = near_peak.write_text(str(int(NOW.timestamp())))
+                if cleanup == "release":
+                    gate.release(reservation, 0, self.root)
+                else:
+                    if cleanup == "dead_pid":
+                        del self.processes[100]
+                    else:
+                        self.readings[100] = gate.GoneMemory()
+                    result = self.admit_at()
+                    if isinstance(result.reservation, gate.Reserved):
+                        gate.release(result.reservation.path, 0, self.root)
+                self.assertFalse(reservation.exists())
+                self.assertFalse(maximum.exists())
+                self.assertFalse(near_peak.exists())
+
     def test_bad_peak_keeps_promise_and_current_memory(self) -> None:
         self.readings_for()
         reservation = self.running(100, 13)
