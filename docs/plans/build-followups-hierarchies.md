@@ -206,7 +206,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - `impl` — `measure.py`, `push_audit.py` and the doc
 - `test` — `test_measure.py` and `test_push_audit.py`: `compare` on fixtures with known before and after values, and the fixtures above
 
-**Constraints from prior phases:** shared log helpers live in `scripts/hierarchies/log_records.py`; `measure.py` imports `push_audit.py`, never the reverse; session names come only from `config/hierarchies/sessions.toml`. The wait records come from `progress_history.py waits` (phases-unit 820357a2; holder and origin fields from 49fd1b0f) through the Phase 4 loader and types. Phase 11's repair reads origin fields into `RecordedOrigin` / `OriginNotRecorded`; Phase 10 adds the unresolved-origin row and the holder history, and this review keeps that uncertainty visible. From Phase 8: `measure.py baseline` and `push_audit.py report` print a short summary by default and their tables under `--full`; `compare` prints the same way. From Phase 12 (c60f1809): `push_audit.py` classifies a delivery by the exception in force at its delivery time, so a `nate.adhoc` delivery after a failed check from 2026-10-29T03:05:59Z on is `Unapproved` and every other exception stays; the wait share is the union of completed known-kind waits of the Hana phases that finished in the window, divided by those phases' exact intervals, with waits matched by run id and phase instance id; production hand-offs with no phase print as their own row with n, outside the share; the `Hana wait` and `Hana wait holders` coverage rows count the same phase population. From Phase 13: `progress_history.py waits` reports a bad holder record as `MalformedHolder` with its reason; `measure.py` reads it as a holder not named and keeps the wait, and a `MalformedHolder` never counts as a named non-Hana holder. From Phase 15: `compare` prints its tables through `log_records.blocks`, so no line is wider than `PHONE_WIDTH` except a line that holds one word longer than it (a path, a hash), which stays whole. From Phase 13: `worker_owners.py end` keeps a pending cleanup record (`end-cleanup.json`) for each worker whose end saved `ended` but whose server cleanup did not finish; `report` counts them as `end_cleanup_pending`, and `end` output and `ends.jsonl` carry each outcome (`end cleanup finished`, `failed: exit N`, `kept: roster unreadable: …`, `dropped: …`). Live cleanup needs models-unit's `codex_mesh.py end --cleanup-only`.
+**Constraints from prior phases:** shared log helpers live in `scripts/hierarchies/log_records.py`; `measure.py` imports `push_audit.py`, never the reverse; session names come only from `config/hierarchies/sessions.toml`. The wait records come from `progress_history.py waits` (phases-unit 820357a2; holder and origin fields from 49fd1b0f) through the Phase 4 loader and types. Phase 11's repair reads origin fields into `RecordedOrigin` / `OriginNotRecorded`; Phase 10 adds the unresolved-origin row and the holder history, and this review keeps that uncertainty visible. From Phase 8: `measure.py baseline` and `push_audit.py report` print a short summary by default and their tables under `--full`; `compare` prints the same way. From Phase 12 (c60f1809): `push_audit.py` classifies a delivery by the exception in force at its delivery time, so a `nate.adhoc` delivery after a failed check from 2026-10-29T03:05:59Z on is `Unapproved` and every other exception stays; the wait share is the union of completed known-kind waits of the Hana phases that finished in the window, divided by those phases' exact intervals, with waits matched by run id and phase instance id; production hand-offs with no phase print as their own row with n, outside the share; the `Hana wait` and `Hana wait holders` coverage rows count the same phase population. From Phase 13: `progress_history.py waits` reports a bad holder record as `MalformedHolder` with its reason; `measure.py` reads it as a holder not named and keeps the wait, and a `MalformedHolder` never counts as a named non-Hana holder. From Phase 15: `compare` prints its tables through `log_records.blocks`, so no line is wider than `PHONE_WIDTH` except a line that holds one word longer than it (a path, a hash), which stays whole. From Phase 13: `worker_owners.py end` keeps a pending cleanup record (`end-cleanup.json`) for each worker whose end saved `ended` but whose server cleanup did not finish; `report` counts them as `end_cleanup_pending`, and `end` output and `ends.jsonl` carry each outcome (`end cleanup finished`, `failed: exit N`, `kept: roster unreadable: …`, `dropped: …`). Live cleanup needs models-unit's `codex_mesh.py end --cleanup-only`. From Phase 14 (97aa0200): `update_registration.py answer` keeps an answered record per item in `outstanding/<slug>.answered.jsonl` for 48 hours only; a later answer with the same text replaces the earlier record, a wrap removes the file, and a record holds the answer time but not the time the question was opened. So `pending_attention`'s "no answer history or answered_at" reason is now wrong: rewrite it to say the answer history kept is a 48-hour replay record, and add a fixture where recent answered records exist and the row still reports no 7-day or 28-day answer rate and no answer latency.
 
 **Acceptance gate:** unit tests green; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; Results holds real numbers for each step, judged on the measure and review point each of Phases 3–5 names. **Measure and review point:** this phase is the review point for Steps 1, 2 and 4. Step 4's keep-or-drop reads `worker_owners.py report` `end_cleanup_pending` and the cleanup outcomes in `ends.jsonl` beside the ownerless-worker count: a worker ended with its cleanup still pending is not released capacity. At phase end the unit director sends the showrunner the Results and the keep-or-drop list as one question for the user.
 
@@ -363,103 +363,50 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Gotchas:** the default reads `showrunners.timer_docs()`, so a production with no registered timer is not known and its commits stay checked.
 
-### Phase 13b — The scope check leaves out paths that came from an origin merge branch  · status: todo
+### Phase 13b — The scope check leaves out paths that came from an origin merge branch  · status: done
 
-**Depends on:** Phase 13a (done; `change_review.reviewed_merge_refs`). Runs before Phase 14's repairs on its own files; showrunner fix-first request 2026-10-29.
+#### As-built
 
-#### Work Order
-
-**Goal:** `merge_checkpoint.py`'s scope step holds only the unit's own outside paths; paths that came in with a merge of an origin merge branch the change-review step already skips are left out.
-
-**Hana link:** direct. performance's frame-cost checkpoint `a20f211eb3` (a merge of `init/catalyst`) was held on 585 such paths, and performance passed 585 `--also` flags to merge it.
-
-**Spec:**
-- One private helper in `merge_checkpoint.py` gives `origin/<merge branch>` then `change_review.reviewed_merge_refs(checkout, change_review.registered_productions)`, without duplicates: the list `unit_commits` uses. `change_review.py` is not edited (Phase 14 holds uncommitted edits there).
-- A path came from a ref when its content at the checkpoint equals its content at `git merge-base <ref> <checkpoint>`; one `git diff --name-only <base> <checkpoint> -- <paths>` per ref. A ref with no merge base or a git failure for one ref leaves out nothing for that ref.
-- A path the unit changed after the merge stays its own. `scope` checks only the unit's own paths for every commit kind; its ok line adds `; <M> came from origin merge branches` when M > 0. `other_units` keeps the full list.
+- The scope check in `merge_checkpoint.py` holds only the unit's own outside paths. `_origin_merge_refs` gives `origin/<merge branch>`, then every `change_review.reviewed_merge_refs` branch, without duplicates. This is the same list `unit_commits` uses.
+- `_unit_paths` leaves out a path when its content at the checkpoint equals its content at the merge base with one of those refs. A ref with no merge base, or a git failure for one ref, leaves out nothing for that ref. A branch whose production doc has no Change review line stays checked.
+- The filter runs before the kind rules, so code, shrink and as-built commits all use it. A path the unit changed after the merge stays its own and is held. `--also` still lets a named path through.
+- The `scope` ok line adds `; <M> came from origin merge branches` when M > 0. `other_units` keeps the full list.
 
 **Files:**
-- `scripts/production/merge_checkpoint.py` — the ref helper, the own-paths filter, `scope`'s ok line.
-- `scripts/production/test_merge_checkpoint.py` — rerun of a held merge of another production's branch passes; the unit's own outside path still held and `--also` passes it; a path changed after the merge held; a path from `origin/<own branch>` left out; a branch without a Change review line stays checked.
+- `scripts/production/merge_checkpoint.py` — `_origin_merge_refs`, `_unit_paths`, the scope filter and the ok line count.
+- `scripts/production/test_merge_checkpoint.py` — five tests: a rerun of a held merge of another production's branch passes; an own outside path is held and `--also` passes it; a path changed after the merge is held; an own-origin path is left out; a branch with no Change review line stays checked.
 
-**Workers:** `1 writer (writes the tests too)`
-- `impl2` — both files.
-
-**State:** none.
-
-**Constraints from prior phases:** Phase 13a: the ref list is `origin/<merge branch>` plus `reviewed_merge_refs`; a doc that cannot be read keeps its commits checked.
-
-**Acceptance gate:** `python3 -m unittest scripts.production.test_merge_checkpoint scripts.production.test_change_review` green; `basedpyright` on both files ends `0 errors, 0 warnings, 0 notes`. No unit merge gate: the showrunner's merge test is its gate. **Change-Review:** none — merge tooling only; the showrunner sees it on the next held merge.
+**Gotchas:** One `git diff --no-renames -z` runs per ref. `--no-renames` keeps a rename from hiding a path, and `-z` lets odd file names parse.
 
 ### Phase 14 — The change review list and the open-question list survive a stopped write, and a rerun of verdict or answer finishes its work  · status: done
-**Depends on:** Phases 9 and 11 (done). Its files do not overlap Phase 13's, so the two can run in either order.
 
-#### Work Order
+#### As-built
 
-**Goal:** a stop or failure at any line leaves the change review list and the open-question list whole; a rerun of `change_review.py verdict` ends the row's scratch folders and holds and prints what the first run printed; a rerun of `update_registration.py answer` prints who receives the answer.
-
-**Hana link:** indirect. Hana changes reach the user through these two lists; a lost row or a lost relay stops a Hana fix from returning to its unit.
-
-**Spec:**
-
-*One atomic write (rows `change_review.py:397`, `update_registration.py:584`):*
-- No shared helper exists in `scripts/lib` (checked 2026-10-29); scripts carry private copies (`style/style_plan.py atomic_write`, `production/review_pause.py write_record`, `hierarchies/worker_owners.py write_json`, `lib/scratch.py write_holds`). Add `scripts/lib/atomic_file.py` with `replace_text(path: Path, text: str) -> None`, modelled on `style_plan.atomic_write`. The private copies stay where they are; moving them is not in this phase (author's scope note).
-- `replace_text` writes a temporary file in `path.parent` named `.<path.name>.<pid>.tmp`, writes `text` as UTF-8, flushes, `os.fsync`s, gives it the mode of the existing `path` (0o644 when `path` is new), then `os.replace`s it onto `path`. On any exception it removes its own temporary file and raises again. Before it writes, it removes each `.<path.name>.<pid>.tmp` beside `path` whose pid is not a live process (`os.kill(pid, 0)` raises `ProcessLookupError`); a live pid's file stays. The name never matches the readers' patterns: `change-review - *.md` (`change_review.LISTS.glob`), `outstanding/*.json` and `outstanding/*.history.jsonl` (`notify/review.py`).
-- `change_review._edit` (line 397) writes through `atomic_file.replace_text(path, "".join(lines))`, still under the directory lock. When `write` leaves `lines` equal to the lines it read, `_edit` writes and commits nothing (no `date_modified` stamp, no empty commit).
-- In `update_registration.py`, every whole-file write of question and report state goes through `replace_text`: `mark_important` (the list, line 540), `ask` (line 584), `answer` (line 613), `replace_outstanding` (line 826), `record_question_history` (`<slug>.history.jsonl`) and `questions` (the reports file). `append_log` stays an append.
-- `record_question_history` adds no second registration for an item whose text and question it already retains, so a rerun of an `ask` stopped between the history write and the list write leaves one registration.
-
-*Verdict rerun (row `change_review.py:1206`):*
-- Today `record_verdict` moves the row to Reviewed and drops its Merged cell; when the command stops before `end_row_scratch`, a rerun is refused (`not on the list to review`), and the row's scratch folders and holds stay.
-- The Reviewed table gets a `Merged` column through `_add_column(path, lines, REVIEWED, "Merged")`; each new Reviewed row carries the To review row's Merged cell. Earlier Reviewed rows get an empty cell.
-- `record_verdict(...) -> VerdictRecorded | VerdictAlreadyRecorded | VerdictConflict`, each a frozen dataclass. `VerdictRecorded(merged: RecordedMerge | MergeNotRecorded)` is today's path; the first verdict and a repeat use the same union. When the row is not in To review but is in Reviewed, `write` changes nothing and returns `VerdictAlreadyRecorded(verdict, day, merged)` when the stored Verdict cell equals `_cell(verdict)`, else `VerdictConflict(recorded, day)`. `merged` is `RecordedMerge(text) | MergeNotRecorded()` (an earlier Reviewed row has no cell); no bare empty string means two things. A row in neither table is refused as today.
-- `_run` `verdict`: `VerdictAlreadyRecorded` prints `<row> already has this verdict (<day>); the list is unchanged`, then the first run's line (`<row> landed` or `<row> returns to its unit (merged <cell>)`, with `merged not recorded` for `MergeNotRecorded`), then the `end_row_scratch` lines; exit 0. `VerdictConflict` prints `change review: <row> has the verdict "<recorded>" from <day>; this verdict is not recorded` on stderr, runs `end_row_scratch` and prints its lines, exit 1: the row has a verdict either way, so its scratch ends.
-- `commands/change_review.md` → verdict: add that a rerun of the same verdict prints the same lines and ends the scratch folders, a different verdict for a reviewed row is refused, and Reviewed rows keep the Merged cell.
-
-*Answer rerun (row `update_registration.py:613`):*
-- Today `answer` removes the item and then prints the relay line; a stop between them leaves no record of who asked, and a rerun refuses (`0 open items match`).
-- New record file `outstanding/<slug>.answered.jsonl`, beside the list: one `AnsweredItem` TypedDict per line, `time` (ISO with the production's zone), `slug`, `text`, `question: NotRequired[str]` (the open item's question, so a rerun matches words in either), `asked_by: NotRequired[str]`. It keeps 48 hours, like the question history, and is written whole through `replace_text`; a new record for the same text replaces the older one.
-- `answer`, under the list's lock: (1) write the answered record; (2) rewrite the list without the item; then, after the lock, (3) print the relay line. Read `asked_by` at the JSON boundary into `UnitAsker(unit) | ShowrunnerAsker() | AskerNotRecorded(reason)`, never an empty string; one function `relay_line(production, slug, asker: <that union>) -> str` makes the line for both paths, and a legacy answered record with no `asked_by` replays as `AskerNotRecorded`.
-- When no open item matches, `answer` reads the answered records of the same lists (`showrunners.user_facing(production.slug, below=True)`) with the same exact-then-partial rule. One match prints `already answered <time as %a %b %d %H:%M>` and then that item's relay line, `report("answer", "ok", ...)`, exit 0. None or several: today's refusal.
-- A stop after (1) and before (2): the item is still open; the rerun removes it and writes its record again.
-- `tidy_wrapped.owned_paths` adds `outstanding/<slug>.answered.jsonl`, so a wrap removes it.
+- `atomic_file.replace_text(path: Path, text: str) -> None` writes `.<path.name>.<pid>.tmp` in `path.parent`, fsyncs it, keeps the mode of the existing file (0o644 when new), and `os.replace`s it onto `path`. On an exception it removes its own temporary file and raises again. Before each write it removes temporary files whose pid is not a live process. The name matches no reader glob. Older private copies (`style_plan.atomic_write`, `review_pause.write_record`, `worker_owners.write_json`, `scratch.write_holds`) stay.
+- `change_review._edit` writes through `replace_text` under the directory lock. When `write` changes no line, it writes nothing and stamps no date; it commits only a list that an earlier stopped run left uncommitted.
+- The Reviewed table has a `Merged` column; a new Reviewed row keeps the To review row's Merged cell, and older rows have an empty cell. `record_verdict` returns `VerdictRecorded | VerdictAlreadyRecorded | VerdictConflict` (frozen dataclasses); `merged` is `RecordedMerge(text) | MergeNotRecorded()`. A same-words rerun on a Reviewed row prints `already has this verdict (<day>)`, the first run's line, and the `end_row_scratch` lines, exit 0. Other words print the recorded verdict on stderr, still end the row's scratch, exit 1. A row in neither table is refused.
+- `update_registration.py` writes the list, the history and the reports file whole through `replace_text`; `append_log` stays an append. `record_question_history` adds no second registration for retained text and question.
+- `answer`, under the list's lock, writes `outstanding/<slug>.answered.jsonl` (`AnsweredItem`: `time`, `slug`, `text`, `question?`, `asked_by?`; 48 hours; a new record for the same text replaces the older one), then removes the item, then prints the relay line after the lock. `asked_by` becomes `UnitAsker | ShowrunnerAsker | AskerNotRecorded` at the JSON boundary; one `relay_line(production, slug, asker)` makes the line, and a below-production line reads the showrunner name from `config/names.toml`. Match order: exact open, exact answered, partial open, partial answered. An answered match prints `already answered <%a %b %d %H:%M>` and the relay line, exit 0.
+- `scratch.remove` keeps `.scratch-removing-<name>.json` beside the folder until the folder is gone; `folders()` and `task_of` read it, so verdict cleanup finds a folder whose removal stopped.
 
 **Files:**
-- `scripts/lib/atomic_file.py` — `replace_text` (new)
-- `scripts/production/change_review.py` — `_edit`, the Reviewed `Merged` column, `record_verdict` and its result types, `_run` `verdict`
-- `scripts/production/update_registration.py` — the writes above, `AnsweredItem`, `relay_line`, `answer`, `record_question_history`
-- `scripts/production/tidy_wrapped.py` — `owned_paths`
-- `commands/change_review.md` — verdict section
-- `scripts/lib/test_atomic_file.py` — tests for `replace_text` (new)
-- `scripts/production/test_change_review.py` — tests
-- `scripts/production/test_update_registration_answers.py` — tests
-- `scripts/production/test_update_registration_questions.py` — tests
-- `scripts/production/test_tidy_wrapped.py` — tests
-- `scripts/lib/scratch.py` — `remove` keeps a removal record beside the folder until the folder is gone, so verdict cleanup finds a folder whose removal stopped (repair)
-- `scripts/lib/test_scratch.py` — tests (repair)
-- `scripts/production/rename_state.py` — `rename_outstanding` takes the list path from `tidy_wrapped.outstanding_path` (repair)
-- `scripts/production/test_rename_state.py` — tests (repair)
+- `scripts/lib/atomic_file.py` — `replace_text`
+- `scripts/lib/scratch.py` — removal record beside the folder
+- `scripts/production/change_review.py` — `_edit`, Reviewed `Merged` column, `record_verdict` result types, `verdict` output
+- `scripts/production/update_registration.py` — atomic writes, `AnsweredItem`, asker union, `relay_line`, `answer` replay
+- `scripts/production/tidy_wrapped.py` — `outstanding_path`; `owned_paths` includes `<slug>.answered.jsonl`
+- `scripts/production/rename_state.py` — `rename_outstanding` takes the list path from `tidy_wrapped.outstanding_path`
+- `commands/change_review.md` — verdict rerun, conflict and Merged cell
+- tests beside each script (`test_atomic_file`, `test_scratch`, `test_change_review`, `test_update_registration_answers`, `test_update_registration_questions`, `test_tidy_wrapped`, `test_rename_state`)
 
-**Workers:** `1 writer + 1 tester`
-- `impl2` (opens as impl) — `atomic_file.py`, `change_review.py`, `update_registration.py`, `tidy_wrapped.py`, `commands/change_review.md`; no hub file
-- `test` — the test files above, beside each script, from this Spec. Each stop test calls the function in process, makes the named step raise (`KeyboardInterrupt` or `OSError`), then reruns the same command:
-  - `replace_text`: an `os.replace` that raises leaves `path` byte-for-byte unchanged and no temporary file; a temporary file of a dead pid is removed on the next write, a live pid's file stays; the mode of an existing file stays.
-  - Line 397: an `edit` and a `verdict` whose write raises leave the list byte-for-byte as before; the rerun lands the change once. An `_edit` whose `write` changes nothing leaves the file and git history unchanged.
-  - Line 1206: give a row a scratch folder and a hold (`SCRATCH_ROOT`, `SCRATCH_HOLDS` in a temporary folder), patch `end_row_scratch` to raise on the first `verdict`; the row is in Reviewed and the folder and hold stay. The rerun with the same words exits 0, prints `already has this verdict`, the first run's line with its merged cell and `removed <folder>`; the hold is gone and Reviewed has one row for it. A rerun with other words exits 1, leaves the list unchanged and still ends the scratch. Update `test_a_verdict_moves_the_row_to_the_top_of_reviewed` for the result type and the Merged cell.
-  - Line 584: an `ask`, a `mark-important` and a `questions` rewrite whose list write raises leave a list that `read_outstanding` reads with every earlier entry, and a unit-asked question kept; the rerun of `ask` files it once and the history holds one registration.
-  - Line 613: patch the list rewrite in `answer` to complete and then raise; the rerun prints `already answered ...` and `relay: to alpha-unit`, exit 0. A stop after the answered record and before the list rewrite: the rerun removes the item and prints the relay. Change the last assertion of `test_a_list_rewrite_keeps_a_filed_question_and_answer_names_the_unit`: a repeat `answer --item retry?` now exits 0 with the recovered relay. An answered record older than 48 hours is not matched. A legacy answered record without `asked_by` replays with the not-recorded relay line. A verdict on a new row without a merge and on an older Reviewed row without the Merged column gives `MergeNotRecorded` (`merged not recorded`).
-  - `tidy` removes `<slug>.answered.jsonl`.
+**Binds later work:** `outstanding/<slug>.answered.jsonl` is a 48-hour replay record for `answer`, not answer history; the four-week review must not read it as history.
 
-**State:** the change review lists in `~/rust/hanadocs/change-review/` (git-committed per write); `~/.local/state/showrunner/outstanding/<slug>.json`, `<slug>.history.jsonl` and the reports file; new `outstanding/<slug>.answered.jsonl` (48 hours; removed by a wrap); temporary `.<name>.<pid>.tmp` files, removed by their writer or by the next write once their pid is gone; scratch folders and holds that a verdict ends.
+**Gotchas:**
+- Callers index `tidy_wrapped.owned_paths` by position; take the list path from `outstanding_path`, never an index.
+- `roles_audit` refuses a fixed role display name in printed text; read shown names from `config/names.toml`.
+- A production or unit rename leaves `<slug>.answered.jsonl` under the old slug, so a rerun after a rename refuses.
 
-**Constraints from prior phases:** from Phase 9: `change_review.py edit|verdict|mark-important --row` takes the ID as `/next` prints it; `_row_option` returns `ReviewRowTarget(path, row)`, `C434` selects the current list and `sdlc/C9` selects `list_file("sdlc")`; a list-named ID that differs from `--list` is refused before any write; pins and moved-row state use the plain ID of a current-list row. From Phase 11: `change_queue(path, scope, below)` is the one change queue; `next_item.py` imports `change_review.py`, never the reverse; a pin set by `/next` is the row `/change_review show` shows; `scope_queue(name, below)` and `ALL_BELOW` live in `scripts/lib/urgency.py`, and `update_registration.py` calls `urgency.scope_queue`. Gotcha from Phase 11: the merge gate's basedpyright reports import cycles through function-local imports and a per-file check does not; `update_registration.py` imports `showrunner_footer.py`, so type-check the cycle files (`accounts.py`, `showrunner_footer.py`) or run the gate's basedpyright. Tests: `python3 -m unittest scripts.lib.test_atomic_file scripts.production.test_change_review scripts.production.test_update_registration_answers scripts.production.test_update_registration_questions scripts.production.test_tidy_wrapped`, and the whole lib suite (memory `run-lib-suite-in-gates`).
-
-Assertion-Change: scripts/production/test_change_review.py::ActionTest::test_a_verdict_for_a_row_not_to_review_is_refused — C70 leaves the refused cases: it is a Reviewed row, and a verdict on a Reviewed row is now a repeat (exit 0) or a conflict (exit 1 with the scratch ended), which the verdict rerun tests check.
-
-**Acceptance gate:** unit tests green, including the stop-and-rerun tests above; per-slot `basedpyright` on the changed files and the cycle files ends `0 errors, 0 warnings, 0 notes`; merge gate green. **Change-Review row:** one per visible change, each command run from `~/.claude` (never a worktree path), on a scratch list or scratch state folder made by `~/.claude/scripts/lib/py ~/.claude/scripts/lib/scratch.py new --until <tomorrow> --visible`, never the live list or `~/.local/state/showrunner`, and with a list name (`change-review - demo.md`) whose row tasks match no live row:
-- `change_review.py verdict` run twice with the same words: the second run prints `already has this verdict` and the first run's line, and the Reviewed row shows its Merged cell. Commands: `~/.claude/scripts/lib/py ~/.claude/scripts/production/change_review.py add --list "<folder>/change-review - demo.md" --merged <hash> --change <text> --check <text> --see <text>`, then `... verdict --list "<folder>/change-review - demo.md" --row C1 --verdict "works"` twice.
-- `update_registration.py answer` run twice: the second run prints `already answered <time>` and the same relay line. The unit director writes the exact commands with `SHOWRUNNER_STATE_DIR` set to the scratch folder.
-- The atomic writes change nothing a person sees, so they get no row.
+**Ruled out:** answer replay across a rename in this plan — rare, and the refusal is safe; it is a next item.
 
 ### Phase 15 — The push audit report and the full baseline measure read on a phone  · status: todo
 **Depends on:** Phase 13 (done; it changed `measure.py`). Its files do not overlap Phase 14's, so the two can run in either order. It runs before Phase 6, which prints `compare` in the same form.
