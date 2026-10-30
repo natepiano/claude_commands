@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_roles  # noqa: E402
-from scripts.guilds import astra_work, roles  # noqa: E402
+from scripts.astra import astra_work, design_roles  # noqa: E402
 
 MODEL = "gpt-6-astra"
 REASONING = "xhigh"
@@ -168,25 +168,25 @@ def run_review(label: str, review: Path, prompt: str, log: Path) -> int:
                     print(f"astra_review: could not release reviewer role: {error}", file=sys.stderr)
 
 
-def held_review(design: roles.HeldDesign, focus: str, work: astra_work.PhaseWork | astra_work.StandaloneWork) -> int:
+def held_review(design: design_roles.HeldDesign, focus: str, work: astra_work.PhaseWork | astra_work.StandaloneWork) -> int:
     reviewer = next(instance for instance in design.roles if instance.role == "reviewer")
-    if not isinstance(reviewer.lifecycle, (roles.RoleOpen, roles.RolePausedForMove)):
+    if not isinstance(reviewer.lifecycle, (design_roles.RoleOpen, design_roles.RolePausedForMove)):
         print(f"astra_review: held reviewer unavailable: {type(reviewer.lifecycle).__name__}", file=sys.stderr)
         return 1
     if isinstance(work, astra_work.PhaseWork):
-        if (not isinstance(design.binding, roles.DesignBoundToPhase)
+        if (not isinstance(design.binding, design_roles.DesignBoundToPhase)
                 or Path(design.binding.run_directory) != Path(work.run_directory)
                 or design.binding.phase != work.phase_id):
             print("astra_review: held reviewer needs an idle rebind to the supplied phase", file=sys.stderr)
             return 1
-    folder = roles.design_directory(design.placement.design_id)
+    folder = design_roles.design_directory(design.placement.design_id)
     request = folder / f"review-request-{os.getpid()}-{time.time_ns()}.txt"
     with request.open("x", encoding="utf-8") as output:
         _ = output.write(f"Review {design.document}.\nFocus: {focus}\n")
     try:
-        reply = roles.resume(design.placement.design_id + "/reviewer", request)
+        reply = design_roles.resume(design.placement.design_id + "/reviewer", request)
         if not reply.is_file():
-            raise roles.RoleRefused("held reviewer returned no saved reply")
+            raise design_roles.RoleRefused("held reviewer returned no saved reply")
         print(f"# {MODEL} review of {design.document} (held reviewer)\n")
         print(reply.read_text(encoding="utf-8").strip())
         print(f"\nSaved: {reply}")
@@ -225,7 +225,7 @@ def main(arguments: list[str]) -> int:
         return 2
     focus = " ".join(arguments[1:]).strip()
     try:
-        held = roles.held_document(document)
+        held = design_roles.held_document(document)
     except (OSError, ValueError) as error:
         print(f"astra_review: held reviewer unavailable: {error}", file=sys.stderr)
         return 1

@@ -87,7 +87,7 @@ from scripts.accounts.role_map import is_role_map_host, role_map_command, RoleMa
 from scripts.direct import plan_history
 from scripts.lib import nix_env, unit_runs
 from scripts.lib.probe_session import PROBE_ENV
-from scripts.guilds.roles import PhaseBoundDesigner, ReadOnlyReviewer, ThreadAccessPolicy
+from scripts.astra.design_roles import PhaseBoundDesigner, ReadOnlyReviewer, ThreadAccessPolicy
 from scripts.message import sessions, process_table
 from scripts.whoami import account
 from scripts.usage import agents_log
@@ -363,7 +363,7 @@ class ServerRecord(TypedDict):
     pid: int
     codex_home: NotRequired[str]
     auto_compact_tokens: NotRequired[int]
-    guild_context: NotRequired[dict[str, object]]
+    design_context: NotRequired[dict[str, object]]
     dev_shell_worktree: NotRequired[str]
 
 
@@ -1367,9 +1367,9 @@ def roster_access_policy(record: Mapping[str, object]) -> ThreadAccessPolicy | W
                                       _as_str(policy.get("launch_sandbox")) or WORKER_SANDBOX)
         if policy.get("kind") == "WorkerLaunchPolicy":
             return WorkerLaunchPolicy()
-        raise SystemExit("codex_mesh: invalid access policy; use roles.py recover for a held role")
+        raise SystemExit("codex_mesh: invalid access policy; use design_roles.py recover for a held role")
     if record.get("held_design_id"):
-        raise SystemExit("codex_mesh: held role has no access policy; use roles.py recover")
+        raise SystemExit("codex_mesh: held role has no access policy; use design_roles.py recover")
     if record.get("instructions_file"):
         return ReadOnlyReviewer()
     return WorkerLaunchPolicy()
@@ -1548,8 +1548,8 @@ def _worker_sandbox(args: argparse.Namespace, session_dir: str, name: str) -> st
 
 
 def _role_fence(record: dict[str, object]) -> None:
-    from scripts.guilds import roles
-    redirected = roles.transfer_route(_as_str(record.get("thread_id")), _as_str(record.get("held_design_id")))
+    from scripts.astra import design_roles
+    redirected = design_roles.transfer_route(_as_str(record.get("thread_id")), _as_str(record.get("held_design_id")))
     if record.get("transferring_role") or record.get("role_redirect") or redirected:
         raise SystemExit("codex_mesh: TransferringRole: use the destination holder route")
 
@@ -1562,8 +1562,8 @@ def _design_claim_lock(session_dir: str, name: str) -> Generator[None]:
     if not design_id:
         yield
         return
-    from scripts.guilds import roles
-    directory = roles.design_directory(design_id)
+    from scripts.astra import design_roles
+    directory = design_roles.design_directory(design_id)
     with (directory / "lock").open("a", encoding="utf-8") as design_lock:
         fcntl.flock(design_lock, fcntl.LOCK_EX)
         with _pending_file(session_dir, name):
@@ -1575,19 +1575,19 @@ def _validate_held_claim(name: str, entry: dict[str, object], thread_id: str) ->
     design_id = _as_str(entry.get("held_design_id"))
     if not design_id:
         return True
-    from scripts.guilds import roles
-    design = roles.read_design(design_id)
+    from scripts.astra import design_roles
+    design = design_roles.read_design(design_id)
     role = next((role for role in design.roles if role.name == name), None)
-    reach = roles.resolve_holder(design.holder)
+    reach = design_roles.resolve_holder(design.holder)
     generation = design.placement.generation
-    if (role is None or isinstance(role.lifecycle, (roles.RoleNotOpened, roles.RoleEnded, roles.RoleNeedsRecovery))
-            or role.lifecycle.thread_id != thread_id or not isinstance(reach, roles.HolderReach)
+    if (role is None or isinstance(role.lifecycle, (design_roles.RoleNotOpened, design_roles.RoleEnded, design_roles.RoleNeedsRecovery))
+            or role.lifecycle.thread_id != thread_id or not isinstance(reach, design_roles.HolderReach)
             or reach.session_id != os.environ.get("CLAUDE_CODE_SESSION_ID")
             or entry.get("authorized_generation") != generation
             or entry.get("authorized_holder") != reach.session_id
             or not entry.get("authorized_prompt")
             or role.assignment_claim != entry.get("authorized_prompt")
-            or (roles.design_directory(design_id) / "transition.json").exists()):
+            or (design_roles.design_directory(design_id) / "transition.json").exists()):
         return False
     entry["instructions_file"] = entry["authorized_prompt"]
     entry["access_policy"] = {"kind": "ReadOnlyReviewer"} if role.role == "reviewer" else {
@@ -2496,15 +2496,15 @@ def server_record_home(record: dict[str, object]) -> Path:
     return Path(recorded) if recorded else Path.home() / ".codex"
 
 
-def _guild_context(session_dir: str) -> dict[str, object]:
-    path = _session_path(session_dir, "guild_context.json")
+def _design_context(session_dir: str) -> dict[str, object]:
+    path = _session_path(session_dir, "design_context.json")
     if not path.exists():
         return {}
-    from scripts.guilds import roles
+    from scripts.astra import design_roles
     context = _read_json_object(path)
-    design = roles.read_design(_as_str(context.get("design_id")))
-    reach = roles.resolve_holder(design.holder)
-    if not isinstance(reach, roles.HolderReach):
+    design = design_roles.read_design(_as_str(context.get("design_id")))
+    reach = design_roles.resolve_holder(design.holder)
+    if not isinstance(reach, design_roles.HolderReach):
         raise SystemExit("RoleNeedsRecovery: holder session is unavailable")
     context.update({"generation": design.placement.generation, "holder_session": reach.session_id,
                     "binding": {"kind": type(design.binding).__name__, **asdict(design.binding)},
@@ -2643,12 +2643,12 @@ def ensure_server(session_dir: str, home: Path | None = None, cwd: str | None = 
     nothing of the kind -- see _retry_warranted.
     """
     selected_home = workers_home() if home is None else home
-    context = _guild_context(session_dir)
+    context = _design_context(session_dir)
     previous = _read_json_object(_session_path(session_dir, SERVER_FILE))
     if context and previous:
         pid = _as_int(previous.get("pid"))
         previous_home = server_record_home(previous)
-        if (previous.get("guild_context") != context or previous_home != selected_home
+        if (previous.get("design_context") != context or previous_home != selected_home
                 or previous.get("auto_compact_tokens") != AUTO_COMPACT_TOKENS
                 or (_pid_alive(pid) and _holds_old_sign_in(pid, previous_home))):
             _release_held_server(session_dir)
@@ -2710,14 +2710,14 @@ def _server_environment(session_dir: str, workers_home: Path) -> dict[str, str]:
     serves the turns of many units, so it keeps the caller's environment unchanged.
     """
     environment = {**os.environ, "CODEX_HOME": str(workers_home)}
-    context = _guild_context(session_dir)
+    context = _design_context(session_dir)
     if context:
         for key in tuple(environment):
-            if key.startswith(("UNIT_", "PLAN_DELEGATE_")) or key in ("CLAUDE_CODE_SESSION_ID", "GUILD_DESIGN_ID", "GUILD_BINDING_GENERATION"):
+            if key.startswith(("UNIT_", "PLAN_DELEGATE_")) or key in ("CLAUDE_CODE_SESSION_ID", "HELD_DESIGN_ID", "DESIGN_BINDING_GENERATION"):
                 del environment[key]
         environment["CLAUDE_CODE_SESSION_ID"] = _as_str(context.get("holder_session"))
-        environment["GUILD_DESIGN_ID"] = _as_str(context.get("design_id"))
-        environment["GUILD_BINDING_GENERATION"] = str(context.get("generation"))
+        environment["HELD_DESIGN_ID"] = _as_str(context.get("design_id"))
+        environment["DESIGN_BINDING_GENERATION"] = str(context.get("generation"))
         binding = _as_dict(context.get("binding"))
         if binding.get("kind") == "DesignBoundToPhase":
             _set_run(environment, _as_str(binding.get("run_directory")))
@@ -2756,7 +2756,7 @@ def _start_server(
                 # A worktree can choose build flags, but cannot choose the server's
                 # account, run, temporary folder or held-design identity.
                 protected = ("CODEX_HOME", "UNIT_RUN_DIR", "TMPDIR", "CLAUDE_CODE_SESSION_ID",
-                             "GUILD_DESIGN_ID", "GUILD_BINDING_GENERATION")
+                             "HELD_DESIGN_ID", "DESIGN_BINDING_GENERATION")
                 loaded_environment = dict(loaded.env)
                 for key in protected:
                     if key in environment:
@@ -2789,9 +2789,9 @@ def _start_server(
                                 "auto_compact_tokens": AUTO_COMPACT_TOKENS}
         if isinstance(dev_shell, WorktreeDevShell):
             served["dev_shell_worktree"] = str(dev_shell.worktree)
-        context = _guild_context(session_dir)
+        context = _design_context(session_dir)
         if context:
-            served["guild_context"] = context
+            served["design_context"] = context
         try:
             if isinstance(dev_shell, WorktreeDevShell):
                 _ = _session_path(session_dir, SERVER_START_FILE).write_text(json.dumps({
@@ -2816,8 +2816,8 @@ def _start_server(
                     _remember_server_dev_shell(session_dir, dev_shell)
                     _session_path(session_dir, FAILED_DEV_SHELL_FILE).unlink(missing_ok=True)
                 if context:
-                    from scripts.guilds import roles
-                    roles.refresh_census(_as_str(context.get("design_id")))
+                    from scripts.astra import design_roles
+                    design_roles.refresh_census(_as_str(context.get("design_id")))
                 _STARTED_SERVERS.add((chosen, process.pid))
                 _ = _start_watcher(session_dir, process.pid, chosen)
                 return chosen
@@ -3434,7 +3434,7 @@ def _follow_worker(args: argparse.Namespace) -> int:
         moving = bool(_attr(args, "account_move")) and isinstance(
             _read_account_move(session_dir, name, _as_str(record.get("thread_id"))), AccountMoveMarker)
         if not moving:
-            raise SystemExit("codex_mesh: held role assignment must come from roles.py")
+            raise SystemExit("codex_mesh: held role assignment must come from design_roles.py")
     display_name = unit_workers.shown_name(Path(session_dir), name)
     role = _worker_role(args)
     claim_pid = _as_int(_attr(args, "claim_pid"))
@@ -5494,11 +5494,11 @@ def command_send(args: argparse.Namespace) -> int:
     record = _lookup(session_dir, target)
     design_id = record.get("held_design_id")
     if design_id:
-        from scripts.guilds import roles
+        from scripts.astra import design_roles
         role = record.get("held_role")
         if role not in ("designer", "reviewer"):
             raise SystemExit("codex_mesh: unknown held role")
-        _ = roles.queue_message(design_id, role, _as_str(_attr(args, "source")) or "mesh send", _message_text(args))
+        _ = design_roles.queue_message(design_id, role, _as_str(_attr(args, "source")) or "mesh send", _message_text(args))
         print(f"queued for {target}; holder adds it to the next authorized assignment")
         return 0
     if record.get("status") == CAPACITY_EXHAUSTED:
@@ -5840,7 +5840,7 @@ def command_reopen(args: argparse.Namespace) -> int:
             return 2
     record = _lookup(session_dir, name)
     if record.get("held_design_id"):
-        raise SystemExit("codex_mesh: held roles recover through roles.py")
+        raise SystemExit("codex_mesh: held roles recover through design_roles.py")
     finished = _finished_run(session_dir)
     if finished:
         print(f"codex_mesh: run finished ({finished}); use progress_history.py start-phase to reactivate this run, "
@@ -5991,7 +5991,7 @@ def _worker_idle_reason_with_inbox(
     if record.get("adopted_to"):
         return f"already adopted to {record['adopted_to']}"
     if record.get("held_design_id"):
-        return "held roles transfer through roles.py"
+        return "held roles transfer through design_roles.py"
     if not paused and unit_workers.allocation_is_live(record) and not _finished_run(session_dir):
         return "worker is reserved for its next dispatch"
     if worker_launcher_attached(record):
@@ -6126,7 +6126,7 @@ def _pause_roster(session_dir: str) -> None:
         entry = _as_dict(value)
         _role_fence(entry)
         if entry.get("held_design_id"):
-            raise SystemExit("codex_mesh: raw stop --pause refuses held roles; use roles.py")
+            raise SystemExit("codex_mesh: raw stop --pause refuses held roles; use design_roles.py")
     path = _session_path(session_dir, ROSTER_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+", encoding="utf-8") as handle:
@@ -6201,7 +6201,7 @@ def command_stop(args: argparse.Namespace) -> int:
         entry = _as_dict(value)
         _role_fence(entry)
         if entry.get("held_design_id"):
-            raise SystemExit("codex_mesh: raw stop refuses held roles; use roles.py")
+            raise SystemExit("codex_mesh: raw stop refuses held roles; use design_roles.py")
     if _attr(args, "pause"):
         # Queue preservation may refuse a server that cannot answer. The work
         # remains owned and protected even when that server must stay alive.
@@ -7243,8 +7243,8 @@ def _server_ownership(
                 or (quiet is not None and quiet < SERVER_IDLE_SECS)
             ):
                 return CurrentRunServer(folder)
-        from scripts.guilds import roles
-        for folder in roles.durable_meshes():
+        from scripts.astra import design_roles
+        for folder in design_roles.durable_meshes():
             if _record_names_server(_read_json_object(folder / SERVER_FILE), pid, port) and any(
                 _as_dict(entry).get("held_design_id")
                 for entry in _read_json_object(folder / ROSTER_FILE).values()
@@ -7841,7 +7841,7 @@ def command_resume_account_move(args: argparse.Namespace) -> int:
         return 1
     summary = _session_path(session_dir, f"{name}.account-move-summary.txt")
     if record.get("held_design_id"):
-        from scripts.guilds import astra_work
+        from scripts.astra import astra_work
         header = astra_work.read_header(Path(_as_str(record.get("instructions_file"))))
         if (not isinstance(header, astra_work.AstraWork) or header.member != name
                 or not Path(header.reply_path).is_absolute()):
@@ -8064,8 +8064,8 @@ def retire_workers_servers(workers_home: Path, label: str, *, dry_run: bool = Fa
     notice_failures: dict[str, list[str]] = {}
     runs: list[WorkersRunMove | EndedWorkersRun] = []
     at = datetime.now().astimezone(user_zone()).strftime("%H:%M %Z")
-    from scripts.guilds import roles
-    durable = set(roles.durable_meshes())
+    from scripts.astra import design_roles
+    durable = set(design_roles.durable_meshes())
     folders = sorted({path.parent for root in SWEEP_ROOTS
                       for filename in (SERVER_FILE, RETIRED_FILE) for path in root.glob(f"*/{filename}")} | durable)
     for folder in folders:
@@ -8081,7 +8081,7 @@ def retire_workers_servers(workers_home: Path, label: str, *, dry_run: bool = Fa
                 continue
             holders = tuple(_marker_sessions(SWEEP_ROOTS, folder))
             if folder in durable:
-                context = _guild_context(str(folder))
+                context = _design_context(str(folder))
                 holders = (_as_str(context.get("holder_session")),)
             live = folder in durable or _run_is_live(folder, holders)
             current_port = current.get("port")
@@ -8153,19 +8153,19 @@ def command_prime(args: argparse.Namespace) -> int:
         existing = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
         _role_fence(existing)
         if existing.get("held_design_id"):
-            raise SystemExit("held role already has a thread; use roles.py resume")
+            raise SystemExit("held role already has a thread; use design_roles.py resume")
         held_design = _as_str(_attr(args, "held_design"))
         held_role = _as_str(_attr(args, "held_role"))
         if held_design:
-            from scripts.guilds import roles
-            design = roles.read_design(held_design)
+            from scripts.astra import design_roles
+            design = design_roles.read_design(held_design)
             instance = next((value for value in design.roles if value.name == name and value.role == held_role), None)
-            reach = roles.resolve_holder(design.holder)
-            if (instance is None or not isinstance(instance.lifecycle, roles.RoleNotOpened)
-                    or not instance.lifecycle.claim or not isinstance(reach, roles.HolderReach)
+            reach = design_roles.resolve_holder(design.holder)
+            if (instance is None or not isinstance(instance.lifecycle, design_roles.RoleNotOpened)
+                    or not instance.lifecycle.claim or not isinstance(reach, design_roles.HolderReach)
                     or reach.session_id != os.environ.get("CLAUDE_CODE_SESSION_ID")):
                 raise SystemExit("held thread creation lacks its holder's reserved claim")
-            claim = roles.design_directory(held_design) / f"{held_role}.creation-claimed"
+            claim = design_roles.design_directory(held_design) / f"{held_role}.creation-claimed"
             with claim.open("x", encoding="utf-8") as handle:
                 _ = handle.write(instance.lifecycle.claim)
         instructions_path = Path(_as_str(_attr(args, "instructions_file"))).resolve()
@@ -8203,7 +8203,7 @@ def command_prime(args: argparse.Namespace) -> int:
         record["effort"] = _as_str(_attr(args, "effort"))
         record["access_policy"] = {"kind": "ReadOnlyReviewer"}
         if held_design:
-            context = _read_json_object(_session_path(session_dir, "guild_context.json"))
+            context = _read_json_object(_session_path(session_dir, "design_context.json"))
             record.update({"held_design_id": held_design, "held_role": held_role,
                            "access_policy": {"kind": "ReadOnlyReviewer"} if held_role == "reviewer" else {
                                "kind": "PhaseBoundDesigner", "binding_generation": context.get("generation"),
@@ -8302,7 +8302,7 @@ def command_set_instructions(args: argparse.Namespace) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "to"))
     if _lookup(session_dir, name).get("held_design_id"):
-        raise SystemExit("codex_mesh: held-role set-instructions refused; use roles.py resume")
+        raise SystemExit("codex_mesh: held-role set-instructions refused; use design_roles.py resume")
     instructions = Path(_as_str(_attr(args, "instructions_file"))).resolve()
     if not instructions.is_file():
         print(f"codex_mesh: {name}: no instructions file at {instructions}", file=sys.stderr)

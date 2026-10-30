@@ -19,7 +19,7 @@ from collections.abc import Sequence
 from contextlib import ExitStack
 from types import SimpleNamespace
 
-from scripts.guilds import roles
+from scripts.astra import design_roles
 from scripts.direct import workers
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import fake_unit_host
@@ -569,28 +569,28 @@ class ProductionRenameFixture(unittest.TestCase):
         self.assertEqual(self.completed_steps(), 9)
         self.assertIs(self.journal()["done"], False)
 
-    def held_design(self, repository_id: str, checkout: Path, holder: roles.Holder) -> roles.HeldDesign:
+    def held_design(self, repository_id: str, checkout: Path, holder: design_roles.Holder) -> design_roles.HeldDesign:
         """A design `holder` holds, with an open designer whose roster entry runs in `checkout`."""
         with mock.patch.dict(os.environ, self.env):
-            roles.register_repository(repository_id, {"fixture-host": str(checkout)}, inventory_complete=True)
-            placement = roles.authority_request("reserve", {"repository_id": repository_id, "document": "design.md",
+            design_roles.register_repository(repository_id, {"fixture-host": str(checkout)}, inventory_complete=True)
+            placement = design_roles.authority_request("reserve", {"repository_id": repository_id, "document": "design.md",
                                                             "host": "fixture-host", "request_id": repository_id})
-            design = roles.HeldDesign(
-                roles.DesignPlacement(str(placement["design_id"]), "fixture-host", 1), repository_id, str(checkout),
-                str(checkout / "design.md"), "design", "2026-10-22T12:00:00+00:00", holder, roles.DesignUnbound(),
-                (roles.RoleInstance("designer", f"old-{repository_id}-astra-designer", roles.RoleOpen("designer-thread")),
-                 roles.RoleInstance("reviewer", f"old-{repository_id}-astra-reviewer", roles.RoleNotOpened())))
-            roles._save(design)  # pyright: ignore[reportPrivateUsage]
-            self.write(roles.mesh_directory(design.placement.design_id) / "mesh_roster.json", json.dumps(
+            design = design_roles.HeldDesign(
+                design_roles.DesignPlacement(str(placement["design_id"]), "fixture-host", 1), repository_id, str(checkout),
+                str(checkout / "design.md"), "design", "2026-10-22T12:00:00+00:00", holder, design_roles.DesignUnbound(),
+                (design_roles.RoleInstance("designer", f"old-{repository_id}-astra-designer", design_roles.RoleOpen("designer-thread")),
+                 design_roles.RoleInstance("reviewer", f"old-{repository_id}-astra-reviewer", design_roles.RoleNotOpened())))
+            design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
+            self.write(design_roles.mesh_directory(design.placement.design_id) / "mesh_roster.json", json.dumps(
                 {design.roles[0].name: {"thread_id": "designer-thread", "status": "done", "cwd": str(checkout)}}))
         return design
 
-    def read_held(self, design: roles.HeldDesign) -> tuple[roles.HeldDesign, str]:
+    def read_held(self, design: design_roles.HeldDesign) -> tuple[design_roles.HeldDesign, str]:
         """The design as saved now, and its designer's launch directory."""
         with mock.patch.dict(os.environ, self.env):
-            current = roles.read_design(design.placement.design_id)
+            current = design_roles.read_design(design.placement.design_id)
             roster = cast(dict[str, dict[str, str]], json.loads(
-                (roles.mesh_directory(design.placement.design_id) / "mesh_roster.json").read_text()))
+                (design_roles.mesh_directory(design.placement.design_id) / "mesh_roster.json").read_text()))
         return current, roster[design.roles[0].name]["cwd"]
 
     def seed_paused_unit_worker(self) -> Path:

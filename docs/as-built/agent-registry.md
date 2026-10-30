@@ -159,7 +159,7 @@ codex_mesh.py sweep  [--root <dir>] [--stop]
 `follow` takes `--cwd`, `--read-only` and `--image` for unit reviewers.
 `prime`, `fork` and `reset` remain for held designs and retained legacy state;
 `review-pool.md` records the earlier allocator. `prime --held-design --held-role` starts a held design role's
-thread for `scripts/guilds/roles.py`; held roles, their access policy and the
+thread for `scripts/astra/design_roles.py`; held roles, their access policy and the
 verbs that refuse them (`start`, `fork`, `reopen`, `set-instructions`, raw `stop`
 and `stop --pause`) are described in `long-lived-workers.md#lasting-roles`.
 
@@ -219,7 +219,7 @@ and the reap constants as module attributes.
 `send` and `steer` address a worker by mesh name through the roster file, which
 is why they work from an unrelated process — the unit director, or a peer
 worker. `send` to a held design role queues the text in the role store
-(`roles.queue_message`) and prints `queued for <name>; holder adds it to the next
+(`design_roles.queue_message`) and prints `queued for <name>; holder adds it to the next
 authorized assignment`. Otherwise `send` delivers only while a launcher is attached. To a `running` worker
 it calls `thread/queue/add`, and the message lands at the start of the target's
 **next** turn; to a `waiting_capacity` worker it stores the message in
@@ -235,7 +235,7 @@ a late message with nothing streaming it and nothing writing the summary.
 the `start` loop polls for, sets the worker's roster status to `ended`, and
 interrupts any live turn. Any other status, `ended` included, prints `<worker> is
 <status>; nothing to end` and exits 0, except that an `ended` held design role is
-ended again so `roles.py end` can confirm the thread release.
+ended again so `design_roles.py end` can confirm the thread release.
 
 `stop` sets every roster worker to `ended` (with `--pause`, a shutdown stop, every
 non-ended worker to the followable `paused` instead), SIGTERMs each recorded pid (SIGKILL
@@ -437,7 +437,7 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   thread. Only the unit director's `implement.sh --to <worker>` or
   `review.sh --to <worker>` (`codex_mesh.py follow`) starts its next turn,
   which receives held messages after its dispatch prompt
-  (a held design role is the exception: `implement.sh --to` refuses it, and only `roles.py resume` gives it a turn) —
+  (a held design role is the exception: `implement.sh --to` refuses it, and only `design_roles.py resume` gives it a turn) —
   `<PhaseMesh/>` in `docs/direct/write_prompt_contract.md` states this, and the register
   line's `reach=` field is what tells a peer which of the two it is addressing.
 - `/unit:direct` is itself implemented by `scripts/direct/*`, so any rename or signature change to those launchers must land together with the `commands/unit/direct.md` call-site edits in one change.
