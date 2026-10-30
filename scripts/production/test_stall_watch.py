@@ -690,6 +690,105 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         _ = self.tick(START + 60 + 1900)
         self.assertEqual([item["key"] for item in self.owner_messages()], ["rca-261006-1", "rca-261006-1-remind"])
 
+    def test_a_pending_case_retries_without_resending_the_delivered_prompt_alert(self) -> None:
+        transcript = self.projects / "project" / "sid-unit-one.jsonl"
+        _ = transcript.write_text(tool_call("Bash", DELETE_CALL, START - 60))
+        self.panes["unit-one"]["agent_status"] = "blocked"
+        self.panes["unit-one"]["pane"] = EDIT_PROMPT
+        with mock.patch.object(rca, "save", side_effect=OSError("case disk unavailable")):
+            failed = self.tick(START)
+        self.assertIn("rca: no case opened: OSError: case disk unavailable", failed.stderr)
+        prompt = cast(stall_watch.PromptWait, json.loads(self.prompt_state().read_text()))
+        self.assertTrue(prompt["alerted"])
+        self.assertIn("case_pending", prompt)
+        self.assertEqual(self.owner_messages(), [])
+        result = self.tick(START + 120)
+        self.assertIn("rca: opened 261006-1", result.stdout)
+        prompt = cast(stall_watch.PromptWait, json.loads(self.prompt_state().read_text()))
+        self.assertTrue(prompt["alerted"])
+        self.assertNotIn("case_pending", prompt)
+        case = self.root / "state/message/rca/261006-1.json"
+        self.assertTrue(case.exists())
+        saved = cast(dict[str, object], json.loads(case.read_text()))
+        self.assertEqual(saved["commands"], [DELETE_CALL["command"]])
+        self.assertEqual(saved["transcript"], str(transcript))
+        _ = self.tick(START + 180)
+        self.assertEqual([item["key"] for item in self.sent()], [PROMPT_KEY])
+        self.assertEqual([item["key"] for item in self.owner_messages()], ["rca-261006-1"])
+
+    def test_a_cleared_prompt_retires_its_alert_and_keeps_retrying_its_pending_case(self) -> None:
+        self.panes["unit-one"]["agent_status"] = "blocked"
+        self.panes["unit-one"]["pane"] = EDIT_PROMPT
+        _ = self.tick(START)
+        with mock.patch.object(rca, "save", side_effect=OSError("case disk unavailable")):
+            failed = self.tick(START + 60)
+            self.assertIn("rca: no case opened: OSError: case disk unavailable", failed.stderr)
+            prompt = cast(stall_watch.PromptWait, json.loads(self.prompt_state().read_text()))
+            self.assertTrue(prompt["alerted"])
+            self.assertIn("case_pending", prompt)
+            self.assertEqual(self.owner_messages(), [])
+            self.panes["unit-one"]["agent_status"] = "idle"
+            cleared = self.tick(START + 120)
+        self.assertIn("rca: no case opened: OSError: case disk unavailable", cleared.stderr)
+        self.assertEqual(self.sent()[1:], [RETIRE])
+        self.assertFalse(self.prompt_state().exists())
+        pending = list(self.state.glob("*.case.json"))
+        self.assertEqual(len(pending), 1)
+        prompt = cast(stall_watch.PromptWait, json.loads(pending[0].read_text()))
+        self.assertTrue(prompt["retiring"])
+        self.assertIn("case_pending", prompt)
+        self.assertEqual(self.owner_messages(), [])
+        result = self.tick(START + 180)
+        self.assertIn("rca: opened 261006-1", result.stdout)
+        self.assertTrue((self.root / "state/message/rca/261006-1.json").exists())
+        self.assertFalse(self.prompt_state().exists())
+        self.assertFalse(pending[0].exists())
+        _ = self.tick(START + 240)
+        self.assertEqual(self.sent()[1:], [RETIRE])
+        self.assertEqual([item["key"] for item in self.owner_messages()], ["rca-261006-1"])
+
+    def test_a_retired_alerts_pending_case_does_not_delay_a_new_prompt_alert(self) -> None:
+        self.panes["unit-one"]["agent_status"] = "blocked"
+        self.panes["unit-one"]["pane"] = EDIT_PROMPT
+        _ = self.tick(START)
+        with mock.patch.object(rca, "save", side_effect=OSError("case disk unavailable")):
+            failed = self.tick(START + 60)
+            self.assertIn("rca: no case opened: OSError: case disk unavailable", failed.stderr)
+            self.panes["unit-one"]["agent_status"] = "idle"
+            _ = self.tick(START + 120)
+            self.assertEqual(self.sent()[1:], [RETIRE])
+            self.assertFalse(self.prompt_state().exists())
+            old_cases = list(self.state.glob("*.case.json"))
+            self.assertEqual(len(old_cases), 1)
+            transcript = self.projects / "project" / "sid-unit-one.jsonl"
+            _ = transcript.write_text(tool_call("Bash", DELETE_CALL, START + 180))
+            self.panes["unit-one"]["agent_status"] = "blocked"
+            self.panes["unit-one"]["pane"] = BASH_PROMPT
+            _ = self.tick(START + 180)
+            _ = self.tick(START + 180 + stall_watch.PROMPT_ALERT_SECONDS - 1)
+            self.assertEqual(self.sent()[1:], [RETIRE])
+            retry = self.tick(START + 180 + stall_watch.PROMPT_ALERT_SECONDS)
+        self.assertIn("rca: no case opened: OSError: case disk unavailable", retry.stderr)
+        self.assertEqual([item["key"] for item in self.sent()], [PROMPT_KEY, PROMPT_KEY, PROMPT_KEY])
+        self.assertEqual(self.sent()[1], RETIRE)
+        self.assertEqual(self.sent()[2]["text-id"], "stall_watch.permission_prompt")
+        self.assertTrue(old_cases[0].exists())
+        current = cast(stall_watch.PromptWait, json.loads(self.prompt_state().read_text()))
+        self.assertTrue(current["alerted"])
+        self.assertFalse(current["retiring"])
+        self.assertIn("case_pending", current)
+        self.assertEqual(self.owner_messages(), [])
+        result = self.tick(START + 300)
+        self.assertIn("rca: opened", result.stdout)
+        self.assertFalse(old_cases[0].exists())
+        self.assertEqual(list(self.state.glob("*.case.json")), [])
+        current = cast(stall_watch.PromptWait, json.loads(self.prompt_state().read_text()))
+        self.assertTrue(current["alerted"])
+        self.assertNotIn("case_pending", current)
+        _ = self.tick(START + 360)
+        self.assertEqual([item["key"] for item in self.sent()], [PROMPT_KEY, PROMPT_KEY, PROMPT_KEY])
+        self.assertEqual(len(self.owner_messages()), 2)
+
     def test_a_helpers_pending_bash_call_names_its_command_cut_to_90_characters(self) -> None:
         import stall_watch
         import push_texts
