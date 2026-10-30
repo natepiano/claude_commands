@@ -312,7 +312,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Gotchas:** the merge gate's basedpyright reports import cycles through function-local imports, and a per-file type check does not. A change that moves an import must type-check the cycle files (`accounts.py`, `showrunner_footer.py`) or run the gate's basedpyright.
 
-### Phase 12 — The push audit judges each push by the exception in force when it went out, and the wait share counts one set of phases  · status: todo
+### Phase 12 — The push audit judges each push by the exception in force when it went out, and the wait share counts one set of phases  · status: done
 **Depends on:** Phase 4. Merge before the 2026-11-12 re-runs. Not at the same time as Phase 10 (both edit `measure.py`).
 
 #### Work Order
