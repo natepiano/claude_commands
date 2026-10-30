@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.test_agents_registry import write_registry
+
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
 
@@ -31,7 +33,7 @@ import conversation_pause
 import unit_lookup
 import sessions
 import inventory
-import record as shutdown_store
+import shutdown_record as shutdown_store
 import restart
 from herdr import HerdrPlace
 from production_units import Refusal, cell_value
@@ -312,13 +314,13 @@ class AddUnitTestCase(ShutdownTestCase):
 
     def write_agent_config(self, *, family: str = "claude", director: str = "opus:xhigh",
                            claude_set: bool = True) -> None:
-        claude_section = f"[production.claude]\ndirector={director}\n\n" if claude_set else ""
-        codex_section = "[production.codex]\ndirector=gpt-test:high\n\n" if family == "codex" else ""
-        content = (f"[assignments]\nproduction={family}\n\n"
-                   f"{claude_section}{codex_section}"
-                   "[codex.agents]\ngpt-test=low,medium,high\n\n"
-                   "[claude.agents]\nopus=low,medium,high,xhigh\nsonnet=low,medium,high,xhigh\n")
-        _ = self.agent_config.write_text(content, encoding="utf-8")
+        overrides: dict[str, dict[str, str | None]] = {
+            "assignments": {"production": family},
+            "production.claude": {"director": director if claude_set else None},
+        }
+        if family == "codex":
+            overrides["production.codex"] = {"director": "gpt-test:high"}
+        _ = write_registry(self.agent_config, overrides)
 
     def production_doc(self, merge_branch: str = "build-followups", *, session_column: bool = False) -> str:
         columns = ["Unit", "Plan", "Worktree", "Branch", *(["Session"] if session_column else []), "Port", "Owns"]

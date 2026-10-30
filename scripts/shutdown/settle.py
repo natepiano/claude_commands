@@ -34,8 +34,8 @@ import note_file
 from inventory import Inventory, Session, inventory, last_tool_call
 from launch_permission import shutdown_state_root
 import launch_permission
-import record as store
-from record import CheckoutMove, SessionShutdown, SessionStopIssue, TimerRestore, ShutdownContinuation, ReadinessCheck
+import shutdown_record as store
+from shutdown_record import CheckoutMove, SessionShutdown, SessionStopIssue, TimerRestore, ShutdownContinuation, ReadinessCheck
 from remote import other_machine, run_remote
 import showrunners
 import sessions
@@ -442,7 +442,7 @@ def merge_in_progress(session: Session) -> bool:
 def blocker(session: Session, *, moving: bool = False) -> ReadinessCheck:
     """Check whether outstanding work prevents this session from stopping.
 
-    A move keeps the checkout on this machine, so commits not yet pushed never hold it.
+    A move keeps the checkout and pauses Codex workers during owner cleanup.
     """
     checkout = session["checkout"]
     if (
@@ -455,7 +455,7 @@ def blocker(session: Session, *, moving: bool = False) -> ReadinessCheck:
         branch = head["name"] if head["kind"] == "branch" else head["commit"]
         return {"kind": "blocked", "reason": f"push {branch} first"}
     for server in session["codex_servers"]:
-        if server["busy_workers"]:
+        if not moving and server["busy_workers"]:
             return {
                 "kind": "blocked",
                 "reason": f"Codex worker {server['busy_workers'][0]} is still running",
@@ -675,7 +675,7 @@ def _settle_text(record: SessionShutdown, session: Session) -> str:
     )
     if session["kind"] == "unit":
         where = '"<phase N: the step you stopped in and what comes next>"'
-        started = "stop or end any worker or build you started, or name it in that line"
+        started = "stop any build you started, or name it in that line"
         ending = " and end your turn with `— blocked: shutdown requested by the user`"
     elif session["kind"] == "showrunner":
         where = '"<one line>"'
@@ -683,11 +683,13 @@ def _settle_text(record: SessionShutdown, session: Session) -> str:
         ending = " and end your turn"
     else:
         where = '"<what you were doing and what comes next>"'
-        started = "stop or name anything you started that keeps running"
+        started = "stop or name any build you started"
         ending = " and end your turn"
+    codex = ("Leave Codex workers running; the mover pauses them after this session exits." if target
+             else "If ready reports a running Codex worker, retry it when that turn finishes; start no new turns.")
     return first_line + "\n" + pause_confirmation_line(record) + "\n\n" + (
         f"Stop now, without finishing the step you are in, and start nothing new. Leave uncommitted work in place, "
-        f"{started}, then in this terminal run {command}{where}`{ending}. "
+        f"{started}. {codex} In this terminal run {command}{where}`{ending}. "
         f"You will be resumed {'on ' + target + ' ' if target else ''}with that line and continue from it."
     )
 
@@ -1030,7 +1032,7 @@ def _hold_details(owner: stop_work.FreshSession, progress: str, *, local_observa
     details: list[str] = []
     if session["status"] not in _STOPPABLE_STATUSES:
         details.append(session["status"])
-    if session["status"] != "busy" and any(server["busy_workers"] for server in session["codex_servers"]):
+    if not moving and session["status"] != "busy" and any(server["busy_workers"] for server in session["codex_servers"]):
         details.append("busy")
     if local_observation and progress != "held by usage limit" and _showing_form(session):
         details.append(SHOWING_FORM)
@@ -1043,8 +1045,9 @@ def _hold_details(owner: stop_work.FreshSession, progress: str, *, local_observa
             details.append(f"ahead {ahead} on {branch}")
     if local_observation and merge_in_progress(session):
         details.append("merge in progress")
-    for server in session["codex_servers"]:
-        details.extend(f"Codex worker {name} is still running" for name in server["busy_workers"])
+    if not moving:
+        for server in session["codex_servers"]:
+            details.extend(f"Codex worker {name} is still running" for name in server["busy_workers"])
     details.extend(f"Codex worker {worker['name']} is still running" for worker in owner["workers"]
                    if worker["status"] != "idle")
     return details
@@ -1177,8 +1180,12 @@ def ready(where: str) -> int:
     """Record this owner's next step without replacing its process identity."""
     session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     for saved in store.all_session_records():
-        if saved["session"]["session_id"] != session_id or saved["progress"]["kind"] not in {"waiting", "ready", "held by usage limit"}:
+        if saved["session"]["session_id"] != session_id:
             continue
+        if saved["progress"]["kind"] not in {"waiting", "ready", "held by usage limit"}:
+            print(f"ready has nothing to check: this session's shutdown is {saved['progress']['kind']}; "
+                  + f"in this terminal: {shutdown_command('status', saved['label'], '--here')}", file=sys.stderr)
+            return 1
         owner = stop_work.fresh_session(saved["session"], run_inventory(saved["login"]))
         if owner["kind"] != "matching session":
             print(f"this session is not in a fresh inventory of {saved['label']}: {owner['kind']}", file=sys.stderr)
@@ -1208,7 +1215,9 @@ def ready(where: str) -> int:
                 return 2
             print(f"ready for shutdown: {where}")
             return 0
-    print("no shutdown in progress for this session", file=sys.stderr)
+    print("no shutdown in progress for this session: no stop or move request is open; "
+          + "ready only answers a request, it does not start one. "
+          + f"In this terminal: {shutdown_command('status', '--here')}", file=sys.stderr)
     return 1
 
 
@@ -2046,7 +2055,7 @@ class _ModuleFingerprint:
 def _module_fingerprint() -> _ModuleFingerprint:
     directory = Path(__file__).parent
     modules: list[tuple[str, int, int]] = []
-    for name in ("shutdown.py", "settle.py", "stop.py", "record.py", "inventory.py", "restart.py"):
+    for name in ("shutdown.py", "settle.py", "stop.py", "shutdown_record.py", "inventory.py", "restart.py"):
         metadata = (directory / name).stat()
         modules.append((name, metadata.st_mtime_ns, metadata.st_size))
     return _ModuleFingerprint(tuple(modules))
