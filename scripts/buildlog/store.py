@@ -6,8 +6,8 @@ failed steps beside it under <host>/logs/<YYYY-MM>/. CI timings sit in ci/ the
 same way. index.py derives the SQLite index from these lines and can rebuild it
 from nothing. BUILDLOG_DIR moves the root, for tests.
 
-Many processes append at once (every lint step on the machine), so a record is
-one write() of one line to a file opened O_APPEND, under an exclusive flock.
+Many processes append at once (every lint step on the machine). Each append
+repairs an interrupted tail, writes its line and fsyncs under an exclusive flock.
 """
 
 from __future__ import annotations
@@ -17,8 +17,11 @@ import json
 import os
 import socket
 import traceback
+from collections.abc import Generator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import BinaryIO
 
 INDEX_NAME = "index.sqlite"
 CI_DIR = "ci"
@@ -57,17 +60,39 @@ def sample_file(host: str, epoch: float) -> Path:
     return root() / host / f"samples-{month(epoch)}.jsonl"
 
 
-def append_line(path: Path, record: object) -> None:
-    data = (json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written == 0:
+            raise OSError("build-log append made no progress")
+        view = view[written:]
+
+
+@contextmanager
+def locked_append(path: Path) -> Generator[BinaryIO]:
+    """Keep tail repair, any recovery scan and publication under one file lock."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
-    try:
+    fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
+    with os.fdopen(fd, "r+b", buffering=0) as handle:
         fcntl.flock(fd, fcntl.LOCK_EX)
-        view = memoryview(data)
-        while view:
-            view = view[os.write(fd, view) :]
-    finally:
-        os.close(fd)
+        if os.lseek(fd, 0, os.SEEK_END):
+            _ = os.lseek(fd, -1, os.SEEK_END)
+            if os.read(fd, 1) != b"\n":
+                _write_all(fd, b"\n")
+        yield handle
+        os.fsync(handle.fileno())
+
+
+def append_locked(handle: BinaryIO, record: object) -> None:
+    """Append one row while the caller owns locked_append's file lock."""
+    data = (json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
+    _write_all(handle.fileno(), data)
+
+
+def append_line(path: Path, record: object) -> None:
+    with locked_append(path) as handle:
+        append_locked(handle, record)
 
 
 def note_error(context: str) -> None:
