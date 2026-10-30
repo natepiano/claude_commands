@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -53,7 +53,8 @@ UnitIdentity = PinnedUnit | LocateUnit
 _LOCATE_UNIT = LocateUnit()
 
 
-def _place_tab(slug: str, unit: str, row: staff.StaffRow, workspace: str) -> TabMoved | TabAlreadyPlaced | NoLiveTab:
+def _place_tab(slug: str, unit: str, row: staff.StaffRow, workspace: str,
+               record: staff.StaffSnapshot) -> TabMoved | TabAlreadyPlaced | NoLiveTab:
     client = herdr.Herdr(herdr.shared_session())
     found = client.lookup(row.name)
     if isinstance(found, herdr.NoPane):
@@ -76,9 +77,12 @@ def _place_tab(slug: str, unit: str, row: staff.StaffRow, workspace: str) -> Tab
             client.result("tab", "list", "--workspace", workspace_id).get("tabs"), "herdr tab list")]
         if not any(item.get("tab_id") == tab and item.get("label") == row.name for item in tabs):
             _ = client.run("tab", "rename", tab, row.name)
-        return TabAlreadyPlaced(workspace)
-    _ = client.move_pane_to_workspace(found.pane_id, workspace, row.name)
-    return TabMoved(workspace)
+        placed = TabAlreadyPlaced(workspace)
+    else:
+        _ = client.move_pane_to_workspace(found.pane_id, workspace, row.name, record=record)
+        placed = TabMoved(workspace)
+    _ = client.sort_tabs(workspace_names={workspace}, record=record)
+    return placed
 
 
 def move_unit(slug: str, unit: str, new_showrunner: str, *, identity: UnitIdentity = _LOCATE_UNIT) -> UnitMoveResult:
@@ -105,7 +109,8 @@ def move_unit(slug: str, unit: str, new_showrunner: str, *, identity: UnitIdenti
             raise staff.StaffRefused(f"{new_showrunner}: no matching showrunner staff row")
         row = staff.move(found.row.id, parent.row.id)
         try:
-            tab = _place_tab(slug, unit, row, parent.row.name)
+            current = replace(record, rows=tuple(row if member.id == row.id else member for member in record.rows))
+            tab = _place_tab(slug, unit, row, parent.row.name, current)
         except (OSError, ValueError, herdr.HerdrFailure) as error:
             raise staff.StaffUnreadable(f"{slug}/{unit}: tab was not moved: {error}") from error
         return UnitMoveResult(row, found.row.parent != row.parent, tab)
