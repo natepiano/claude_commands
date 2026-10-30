@@ -2118,23 +2118,35 @@ def smallest_head_release(explanation: QueueExplanation) -> HeadAfterEnd:
     return all_ended
 
 
-def bump_waiter(selector: str, actor: str) -> WaitingStep:
+@dataclass(frozen=True)
+class WaiterRowSelector:
+    row_key: str
+    original_selector: str
+
+
+def bump_waiter(selector: str | WaiterRowSelector, actor: str) -> WaitingStep:
     directory = admission_dir(store.root())
     with (directory / "lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         view, ordered = read_queue(directory, process_table(Path(os.environ.get("BUILDLOG_PROC", "/proc"))), time.time())
         matches: list[int] = []
-        if selector.isdecimal():
+        if isinstance(selector, WaiterRowSelector):
+            matches = [position for position, item in enumerate(ordered)
+                       if item[0].name == selector.row_key]
+            original_selector = selector.original_selector
+        elif selector.isdecimal():
+            original_selector = selector
             position = int(selector) - 1
             if 0 <= position < len(view.waiting):
                 matches = [position]
         else:
+            original_selector = selector
             matches = [position for position, item in enumerate(view.waiting)
                        if selector in (item.session_id, item.session_name, item.folder, Path(item.folder).name)]
         if len(matches) != 1:
             labels = ", ".join(f"{position + 1}: {item.session_name or item.session_id or item.pid} {item.folder}"
                                for position, item in enumerate(view.waiting) if not matches or position in matches)
-            raise UnmatchedWaiter(f"{selector!r}: {'unknown' if not matches else 'ambiguous'} waiter; matches: {labels or 'none'}")
+            raise UnmatchedWaiter(f"{original_selector!r}: {'unknown' if not matches else 'ambiguous'} waiter; matches: {labels or 'none'}")
         position = matches[0]
         moved = view.waiting[position]
         path, row = ordered[position]

@@ -245,9 +245,9 @@ class Roots:
             for pair in listing(root):
                 if pair.is_dir(follow_symlinks=False):
                     for entry in listing(pair.path):
-                        if entry.name.startswith(".") and entry.name.endswith(scratch.REMOVAL_SUFFIX):
-                            copy = Path(pair.path) / entry.name[1:-len(scratch.REMOVAL_SUFFIX)]
-                            removal = scratch.copy_removal(copy)
+                        copy = scratch.removal_target(Path(entry.path))
+                        if copy is not None:
+                            removal = scratch.pending_removal(copy)
                             if isinstance(removal, scratch.Registered) or (
                                     isinstance(removal, scratch.NotRegistered) and not os.path.lexists(entry.path)):
                                 continue
@@ -292,7 +292,7 @@ class Roots:
             if isinstance(record, scratch.Registered):
                 return Limit(now - TASK_IDLE_SECONDS, TASK_OPEN)
         if root in self.copies:
-            if isinstance(scratch.copy_removal(Path(entry.path)), scratch.Registered):
+            if isinstance(scratch.pending_removal(Path(entry.path)), scratch.Registered):
                 return Limit(float("inf"), TASK_OPEN)
             record = scratch.task_of(Path(entry.path))
             landed = isinstance(record, scratch.Registered) and record.task.startswith("landed:")
@@ -1027,7 +1027,7 @@ def judge_entries(roots: Roots, now: float, proc: str) -> Iterator[KeptEntry | R
             if root in inner and size < SESSION_ENTRY_MIN_BYTES:
                 yield KeptEntry(entry.path, SMALL_IN_LIVE_SESSION)
                 continue
-            pending = root in roots.copies and isinstance(scratch.copy_removal(Path(entry.path)), scratch.Registered)
+            pending = root in roots.copies and isinstance(scratch.pending_removal(Path(entry.path)), scratch.Registered)
             git = GitWork.SAVED if pending else git_work(Path(entry.path))
             if git is not GitWork.SAVED:
                 yield KeptEntry(entry.path, git.value)
@@ -1046,7 +1046,7 @@ def remove_entry(entry: RemovableEntry, result: Sweep, dry_run: bool) -> bool:
             if not isinstance(state, scratch.Ended):
                 result.keep(entry.path, state.why if isinstance(state, scratch.Live) else state.reason)
                 return False
-            pending = isinstance(scratch.copy_removal(Path(entry.path)), scratch.Registered)
+            pending = isinstance(scratch.pending_removal(Path(entry.path)), scratch.Registered)
             git = GitWork.SAVED if pending else git_work(Path(entry.path))
             if git is not GitWork.SAVED:
                 result.keep(entry.path, git.value)
@@ -1059,7 +1059,7 @@ def remove_idle_entry(entry: RemovableEntry, result: Sweep, dry_run: bool) -> bo
         try:
             path = Path(entry.path)
             if scratch.copy_folder(path) == path.resolve():
-                scratch.remove_copy(path, lambda folder: delete_tree(str(folder)))
+                scratch.remove_marked(path, lambda folder: delete_tree(str(folder)))
             else:
                 delete_tree(entry.path)
         except OSError as error:

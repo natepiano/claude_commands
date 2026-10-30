@@ -195,8 +195,8 @@ def main_changes(ledger: style_ledger.Ledger, branch_point: str, tip: str) -> Ma
         else:
             return UnknownMainChanges("synced tip is not an ancestor of main")
         changes = subprocess.run(
-            ["git", "-C", str(repo), "-c", "diff.renameLimit=0", "log", "--format=", "--name-status", "-z",
-             "--no-ext-diff", "--no-textconv", "--no-relative", "-M", "-C", "--find-copies-harder",
+            ["git", "-C", str(repo), "log", "--format=", "--name-status", "-z",
+             "--no-ext-diff", "--no-textconv", "--no-relative", "--no-renames",
              "--diff-merges=first-parent", f"{tip}..{main}", "--"],
             capture_output=True, check=False,
         )
@@ -1701,7 +1701,8 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
     files.extend(f"- {style_ledger.widened_line(widened)}" for widened in ticket["widened"])
     authorization = (
         f"This ticket builds the approved proposal `{ticket['proposal']}`: its approved findings are this ticket's work. "
-        + "Read the issue for its sites and before/after changes. Hold every other non-mechanical finding. Package verification remains required."
+        + "Read the issue for its sites and before/after changes. " + style_ledger.FINDING_REPLACEMENT_GUIDANCE
+        + " Hold every other non-mechanical finding. Package verification remains required."
         if approved else "Every structure finding is held as a proposal, except a finding of a mechanical class below. "
         + "Apply only mechanical findings from other tickets."
     )
@@ -1779,6 +1780,7 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
                 "Note each window's findings before opening the next window, each distinct defect as its own finding "
                 + "(rule, path, line, text, kind, before and after); never stop at a window's first finding. "
                 + "A judge holds no finding and records no cell: it lists its findings in its summary.",
+                style_ledger.FINDING_REPLACEMENT_GUIDANCE,
             ] if two_judges else [
                 "Hold that window's findings before opening the next window. Hold each distinct defect as its own finding; "
                 + "never stop at a window's first finding.",
@@ -1814,7 +1816,7 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
              if approved_file_renames(held_findings) else "")
           + "Hold other findings: ") if approved else "Apply only mechanical fixes under ~/.claude/docs/style_production.md. Hold every other finding: ")
         + f"`style_ledger.py held add --ticket {ticket_id}` with the pinned rule blob, rule, site path, line and text, kind, before and after; "
-        + "record that cell with `record --verdict held`.",
+        + "record that cell with `record --verdict held`. " + style_ledger.FINDING_REPLACEMENT_GUIDANCE,
         *mechanical_class_lines(),
         "Hold a finding only when the cited rule's text requires the change.",
         f'Record other ideas with `style_ledger.py candidate --ticket {ticket_id} --site <path>:<line> --idea "<one line>"`.',

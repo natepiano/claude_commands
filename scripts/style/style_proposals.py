@@ -330,7 +330,8 @@ class DecisionWriter:
         body = [f"# Style decision: {stem} in {crate}", "", f"Parent: {self.parent}", "",
                 f"Kind: {decision_kind(findings, self.definitions)}", f"Rule: {key.rule}",
                 f"Rule link: {self.linker.rule_url(key.rule)}",
-                f"Findings: {len(findings)}; files: {len({finding.path for finding in findings})}", ""]
+                f"Findings: {len(findings)}; files: {len({finding.path for finding in findings})}", "",
+                style_ledger.FINDING_REPLACEMENT_GUIDANCE, ""]
         seen: set[str] = set()
         for finding in sorted(findings, key=lambda item: (len(item.before) + len(item.after), item.path, item.line, item.finding_id)):
             if finding.path in seen:
