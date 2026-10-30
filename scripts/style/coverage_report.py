@@ -172,7 +172,14 @@ def ticket_line(ticket: style_ledger.TicketRecord) -> str:
                       *(style_ledger.removed_line(removed) for removed in ticket["removed"])])
 
 
-def render_report(ledger: style_ledger.Ledger, rule: str = "", crate: str = "") -> str:
+@dataclass(frozen=True)
+class PreparedReport:
+    text: str
+    snapshot_path: Path
+    snapshot: ReportSnapshot
+
+
+def prepare_report(ledger: style_ledger.Ledger, rule: str = "", crate: str = "") -> PreparedReport:
     if rule and crate:
         raise style_ledger.LedgerError("choose --rule or --crate")
     repository_counts = ledger.rule_counts(style_ledger.WholeRepository())
@@ -247,8 +254,11 @@ def render_report(ledger: style_ledger.Ledger, rule: str = "", crate: str = "") 
         "rules": {row.rule_id: {"done": row.complete, "cells_total": row.total} for row in progress},
         "proposals": sorted(current_proposals), "files_by_day": dict(sorted(days.items())[-31:]),
     }
-    save_snapshot(snapshot_path, snapshot)
-    return "\n".join(lines) + "\n"
+    return PreparedReport("\n".join(lines) + "\n", snapshot_path, snapshot)
+
+
+def render_report(ledger: style_ledger.Ledger, rule: str = "", crate: str = "") -> str:
+    return prepare_report(ledger, rule, crate).text
 
 
 class ReportArguments(argparse.Namespace):
@@ -266,7 +276,9 @@ def main(argv: list[str]) -> int:
     arguments = parser.parse_args(argv, namespace=ReportArguments())
     try:
         with style_ledger.open_ledger(arguments.repo) as ledger:
-            print(render_report(ledger, arguments.rule, arguments.crate), end="")
+            report = prepare_report(ledger, arguments.rule, arguments.crate)
+            print(report.text, end="", flush=True)
+            save_snapshot(report.snapshot_path, report.snapshot)
     except (OSError, ValueError, sqlite3.Error) as error:
         print(f"coverage_report: {error}", file=sys.stderr)
         return 2

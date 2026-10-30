@@ -1351,6 +1351,39 @@ def removed_line(removed: RemovedCell) -> str:
     return f"{removed['rule']} {removed['path']}: {removed['state']}"
 
 
+@dataclass(frozen=True)
+class BatchOwner:
+    """The durable batch intent that exclusively owns a ticket claim."""
+
+    batch: str
+
+    def __post_init__(self) -> None:
+        if not self.batch:
+            raise ValueError("a batch owner requires a batch id")
+
+
+@dataclass(frozen=True)
+class UnbatchedTicket:
+    """An ordinary or legacy ticket has no batch recovery owner."""
+
+
+UNBATCHED_TICKET = UnbatchedTicket()
+
+
+@dataclass(frozen=True)
+class UnrestrictedTicketOwner:
+    """Ordinary ticket operations do not require a batch recovery owner."""
+
+
+_UNRESTRICTED_TICKET_OWNER = UnrestrictedTicketOwner()
+
+
+class TicketBatchMismatch(LedgerError):
+    def __init__(self, ticket: str, owner: BatchOwner | UnbatchedTicket) -> None:
+        description = f"batch {owner.batch}" if isinstance(owner, BatchOwner) else "no batch owner"
+        super().__init__(f"{ticket}: kept unchanged; ledger records {description}")
+
+
 class TicketRecord(TypedDict):
     id: str
     unit: str
@@ -2021,6 +2054,12 @@ MIGRATIONS = {
             ticket TEXT PRIMARY KEY, predecessor TEXT NOT NULL
         );
     """,
+    # Claim ownership is immutable and independent of checkpoint proof sharing.
+    28: """
+        CREATE TABLE IF NOT EXISTS ticket_batch_owners (
+            ticket TEXT PRIMARY KEY REFERENCES tickets(id), batch TEXT NOT NULL CHECK(batch <> '')
+        );
+    """,
 }
 
 
@@ -2342,6 +2381,7 @@ class Ledger:
         files: list[str], rules: list[str], rule: str = "", sites: list[dict[str, object]] | None = None,
         proposal: str = "", cells: tuple[tuple[str, str], ...] = (),
         finding_ids: tuple[str, ...] = (),
+        *, batch_owner: BatchOwner | UnbatchedTicket = UNBATCHED_TICKET,
     ) -> None:
         if kind == "listed" and (not rule or rule not in rules or rule.endswith("#uncovered")):
             raise LedgerError(f"{id}: listed ticket requires its canonical rule in rules")
@@ -2365,6 +2405,8 @@ class Ledger:
             exists = cast(list[tuple[str]], self._connection.execute("SELECT id FROM tickets WHERE id=?", (id,)).fetchall())
             if exists:
                 previous = self._ticket(id)
+                if self.ticket_batch_owner(id) != batch_owner:
+                    raise LedgerError(f"{id}: ticket already exists with a different batch owner")
                 if (previous["unit"], previous["kind"], previous["family"], previous["crate"], previous["files"], previous["rules"], previous["rule"], previous["sites"], previous["proposal"], previous["cells"], previous["finding_ids"]) != (unit, kind, family, crate, files, rules, rule, sites or [], proposal, [list(cell) for cell in cells], list(finding_ids)):
                     raise LedgerError(f"{id}: ticket already exists in state {previous['state']} with different fields")
                 return True
@@ -2416,12 +2458,22 @@ class Ledger:
                     (id, unit, kind, family, rule, crate, json.dumps(files), json.dumps(sites or []),
                      json.dumps(rules), json.dumps(pins, sort_keys=True), now, now, proposal, json.dumps(cells), json.dumps(finding_ids)),
                 )
+                if isinstance(batch_owner, BatchOwner):
+                    _ = self._connection.execute(
+                        "INSERT INTO ticket_batch_owners VALUES (?,?)", (id, batch_owner.batch),
+                    )
                 for finding_id in finding_ids:
                     _ = self._connection.execute(
                         "UPDATE held_findings SET build_ticket=?,updated_at=? WHERE finding_id=?", (id, now, finding_id),
                     )
 
         retry_on_change(attempt)
+
+    def ticket_batch_owner(self, id: str) -> BatchOwner | UnbatchedTicket:
+        rows = cast(list[tuple[str]], self._connection.execute(
+            "SELECT batch FROM ticket_batch_owners WHERE ticket=?", (id,),
+        ).fetchall())
+        return BatchOwner(rows[0][0]) if rows else UNBATCHED_TICKET
 
     def pinned_rule_texts(self, ticket_id: str) -> tuple[PinnedRuleText, ...]:
         ticket = self._ticket(ticket_id)
@@ -2978,7 +3030,9 @@ class Ledger:
         return False
 
     def _ticket_transition(self, id: str, target: TicketState, commit: str = "", branch: str = "",
-                           reservation: tuple[str, str] = ("", "")) -> tuple[FindingNotBuilt, ...]:
+                           reservation: tuple[str, str] = ("", ""), *,
+                           required_owner: BatchOwner | UnrestrictedTicketOwner = _UNRESTRICTED_TICKET_OWNER,
+                           ) -> tuple[FindingNotBuilt, ...]:
         """Move the ticket to target. A proposal merge returns each of its findings that stays filed.
 
         A checkpoint stores the reservation's run folder and phase in the same write as its state.
@@ -2990,6 +3044,10 @@ class Ledger:
         def arrived(ticket: TicketRecord) -> bool:
             """Whether the ticket is already at target; refuses a move its state does not allow."""
             nonlocal assignment_tip
+            if isinstance(required_owner, BatchOwner):
+                owner = self.ticket_batch_owner(id)
+                if owner != required_owner:
+                    raise TicketBatchMismatch(id, owner)
             if self._ticket_arrived(ticket, target, commit, branch, reservation):
                 return True
             if target == "checkpointed":
@@ -3426,6 +3484,19 @@ class Ledger:
     @_ticket_operation("drop")
     def ticket_drop(self, id: str) -> None:
         _ = self._ticket_transition(id, "dropped")
+
+    @_ticket_operation("recover")
+    def ticket_drop_batch(self, id: str, owner: BatchOwner) -> None:
+        """Release only this intent's claim, rechecking ownership under the transition write lock."""
+        exists = cast(list[tuple[str]], self._connection.execute("SELECT id FROM tickets WHERE id=?", (id,)).fetchall())
+        if not exists:
+            return
+        actual = self.ticket_batch_owner(id)
+        if actual != owner:
+            raise TicketBatchMismatch(id, actual)
+        if self._ticket(id)["state"] in FINAL_TICKET_STATES:
+            return
+        _ = self._ticket_transition(id, "dropped", required_owner=owner)
 
     def ticket_open(self, unit: str) -> tuple[TicketRecord, ...]:
         rows = cast(list[tuple[str]], self._connection.execute(
