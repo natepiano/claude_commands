@@ -1623,8 +1623,11 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                 self.assertEqual(self.run_cli(LOGIN), (1, "", ""))
 
     def test_a_registering_account_hold_blocks_before_its_sessions_are_recorded(self) -> None:
+        _ = self.enterContext(patch.object(shutdown_store, "registration_process_start", return_value="fixture-process-start"))
         held = account_hold()
         held["registration"] = "in progress"
+        held["registration_owners"] = {held["request_id"]:
+            shutdown_store.RegistrationOwner(pid=4242, proc_start="fixture-process-start")}
         held["requested_by"] = shutdown_store.FromSession(kind="session", session_id="b1f5ca98-45aa-4604-8e2b-33ed0f071bb1")
         shutdown_store.set_account_hold(held)
         self.assertEqual(self.run_cli(LOGIN), (

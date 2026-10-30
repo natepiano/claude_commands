@@ -206,6 +206,35 @@ def local_options(arguments: list[str]) -> send.Options:
 
 
 class SendTests(ShutdownTestCase):
+    def test_outcome_parser_preserves_first_header_payload_and_acknowledgement(self) -> None:
+        acknowledged = send.acknowledged_skip_reason("shutdown-fixture", "2026-10-30T12:00:00+00:00")
+        self.assertEqual(acknowledged, "key 'shutdown-fixture' acknowledged at 2026-10-30T12:00:00+00:00; `send.py reopen` to resume")
+        window = "key 'shutdown-fixture' last sent to Unit at 2026-10-30T12:00:00+00:00, inside its 60-minute window"
+        cases: tuple[tuple[str, send.Outcome, str, str, bool], ...] = (
+            ("SENT: to the user\n", "sent", "to the user", "", False),
+            ("SKIPPED: " + window + "\n", "skipped", window, "", False),
+            ("SKIPPED: " + acknowledged + "\n", "skipped", acknowledged, "", True),
+            ("KEPT: until silence ends\n", "kept", "until silence ends", "", False),
+            ("REPLACED: newer push\n", "replaced", "newer push", "", False),
+            ("QUEUED: recipient offline\n", "queued", "recipient offline", "", False),
+            ("HELD: review refused\n", "held", "review refused", "", False),
+            ("FAILED: transport failed\n", "failed", "transport failed", "", False),
+            ("REFUSED: action required\n", "refused", "action required", "", False),
+            ("reviewing draft\nunknown: progress\nSENT: delivered\n", "sent", "delivered", "", False),
+            ("SENT: rewritten:\nnew body\nFAILED: quoted earlier result\n\n", "sent", "rewritten:", "new body\nFAILED: quoted earlier result\n", False),
+            ("SENT", "sent", "", "", False),
+        )
+        for output, outcome, detail, payload, is_acknowledged in cases:
+            with self.subTest(output=output):
+                parsed = send.parse_outcome(output)
+                self.assertIsInstance(parsed, send.OutcomeHeader)
+                assert isinstance(parsed, send.OutcomeHeader)
+                self.assertEqual((parsed.outcome, parsed.detail, parsed.payload), (outcome, detail, payload))
+                self.assertEqual(send.is_acknowledged_skip(parsed.detail), is_acknowledged)
+        for output in ("", "reviewing draft\nunknown: still working\n", "sent: not a protocol header\n"):
+            with self.subTest(output=output):
+                self.assertIsInstance(send.parse_outcome(output), send.NoOutcomeHeader)
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root: Path = Path()
@@ -700,6 +729,52 @@ class SendTests(ShutdownTestCase):
         with mock.patch.object(send, "now", return_value=later):
             self.assertEqual(self.send("--key", "k", "--repeat-minutes", "30", "--text", "four").outcome, "sent")
         self.assertEqual([entry["outcome"] for entry in self.log()], ["sent", "skipped", "sent", "sent"])
+
+    def test_a_failed_keyed_session_send_retries_but_a_delivered_send_keeps_its_window(self) -> None:
+        options = local_options(["--to", "Recipient", "--from", "Sender", "--key", "result",
+                                 "--repeat-minutes", "30", "--text", "The unit is back."])
+        started = send.now()
+        self.outcome = send.Result("failed", "transport refused the message")
+        with mock.patch.object(send, "now", return_value=started):
+            self.assertEqual(send.send(options).outcome, "failed")
+        self.outcome = send.Result("sent", "delivered")
+        with mock.patch.object(send, "now", return_value=started + timedelta(seconds=1)):
+            self.assertEqual(send.send(options).outcome, "sent")
+        with mock.patch.object(send, "now", return_value=started + timedelta(seconds=2)):
+            self.assertEqual(send.send(options).outcome, "skipped")
+        self.assertEqual([message.text for message in self.relayed], [options.text, options.text])
+        self.assertEqual([entry["outcome"] for entry in self.log()], ["failed", "sent", "skipped"])
+
+    def test_a_queued_keyed_session_send_keeps_one_copy_and_its_window(self) -> None:
+        self.session("recipient", "Recipient")
+        options = local_options(["--to", "session:recipient", "--from", "Sender", "--key", "result",
+                                 "--repeat-minutes", "30", "--text", "The unit is back."])
+        started = send.now()
+        self.outcome = send.Result("queued", "relay unavailable")
+        with mock.patch.object(send, "now", return_value=started):
+            self.assertEqual(send.send(options).outcome, "queued")
+        self.outcome = send.Result("sent", "delivered")
+        with mock.patch.object(send, "now", return_value=started + timedelta(seconds=1)):
+            self.assertEqual(send.send(options).outcome, "skipped")
+        self.assertEqual(len(self.relayed), 1)
+        self.assertEqual(send.pending("session:recipient").count("The unit is back."), 1)
+        self.assertEqual(send.pending("session:recipient"), "")
+
+    def test_a_failed_send_does_not_clear_a_later_runs_window(self) -> None:
+        started = send.now()
+        options = local_options(["--to", "bogus", "--from", "Sender", "--key", "result",
+                                 "--repeat-minutes", "30", "--text", "The unit is back."])
+        def overlap(message: send.Message, timeout: float) -> send.Result:
+            del message, timeout
+            with (mock.patch.object(send, "now", return_value=started + timedelta(minutes=31)),
+                  mock.patch.object(send, "relay", return_value=send.Result("sent", "later delivery"))):
+                self.assertEqual(send.send(options).outcome, "sent")
+            return send.Result("failed", "earlier delivery failed")
+        with mock.patch.object(send, "now", return_value=started), mock.patch.object(send, "relay", overlap):
+            self.assertEqual(send.send(options).outcome, "failed")
+        with mock.patch.object(send, "now", return_value=started + timedelta(minutes=32)):
+            self.assertEqual(send.send(options).outcome, "skipped")
+        self.assertEqual([entry["outcome"] for entry in self.log()], ["sent", "failed", "skipped"])
 
     @staticmethod
     def emergency(*extra: str) -> list[str]:
