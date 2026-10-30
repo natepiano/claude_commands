@@ -31,6 +31,7 @@ from typing import TypedDict, cast
 from zoneinfo import ZoneInfo, available_timezones
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import user_zone  # noqa: E402
 
 MAC = "mac"
@@ -121,9 +122,7 @@ def write_zone(conf: Path, zone: str) -> None:
     written = [f"zone={zone}" if line.startswith("zone=") else line for line in lines]
     if written == lines and not any(line.startswith("zone=") for line in lines):
         written.append(f"zone={zone}")
-    temporary = conf.with_name(conf.name + ".tmp")
-    _ = temporary.write_text("\n".join(written) + "\n", encoding="utf-8")
-    _ = temporary.replace(conf)
+    write_text_atomic(conf, "\n".join(written) + "\n")
 
 
 def git(checkout: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -164,7 +163,7 @@ def _commit(checkout: Path, conf: Path, zone: str, before_text: str | None) -> s
         if before_text is None:
             conf.unlink(missing_ok=True)
         else:
-            _ = conf.write_text(before_text, encoding="utf-8")
+            write_text_atomic(conf, before_text)
         raise Refusal(f"git commit: {_first_line(committed)}; the zone is unchanged")
     return git(checkout, "rev-parse", "--short", "HEAD").stdout.strip()
 
@@ -266,9 +265,7 @@ def read_queue() -> QueuedChange | None:
 def queue(change: QueuedChange) -> None:
     path = queue_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    _ = temporary.write_text(json.dumps(change, indent=2) + "\n", encoding="utf-8")
-    _ = temporary.replace(path)
+    write_text_atomic(path, json.dumps(change, indent=2) + "\n")
 
 
 def drain(checkout: Path | None, *, pulled: bool) -> list[str]:
@@ -298,14 +295,18 @@ def set_zone(name: str) -> int:
     _ready(checkout)
     before = stored(conf)
     print(f"zone: {describe(zone)}")
-    if before == zone:
+    before_text = conf.read_text(encoding="utf-8") if conf.exists() else None
+    if before != zone:
+        print(f"was: {before}")
+        write_zone(conf, zone)
+    changed = git(checkout, "diff", "HEAD", "--", str(conf))
+    if changed.returncode:
+        raise Refusal(f"git diff: {_first_line(changed)}")
+    if changed.stdout:
+        commit = _commit(checkout, conf, zone, before_text)
+    else:
         print("was: the same; nothing to commit")
         commit = git(checkout, "rev-parse", "--short", "HEAD").stdout.strip()
-    else:
-        print(f"was: {before}")
-        before_text = conf.read_text(encoding="utf-8") if conf.exists() else None
-        write_zone(conf, zone)
-        commit = _commit(checkout, conf, zone, before_text)
     pushed, push_line = _push(checkout)
     print(f"main: {commit}, {push_line}")
     text = notice(zone, before, commit)

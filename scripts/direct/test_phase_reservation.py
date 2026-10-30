@@ -203,6 +203,26 @@ class PhaseStateTests(unittest.TestCase):
         self.assertEqual(self.run_verb("clear")[0], 2)
         self.assertEqual(self.state(), {"kind": phase_reservation.PENDING})
 
+    def test_restore_retries_after_release_marker_removal_was_interrupted(self) -> None:
+        _ = self.run_verb("enroll", "--board", "board_ready")
+        expected = self.state()
+        self.assertEqual(self.run_verb("clear", "--released", "b" * 40), (0, ""))
+        marker = self.phase_dir() / phase_reservation.RELEASED_FILE
+        self.assertTrue(marker.exists())
+        unlink = Path.unlink
+
+        def stop_removal(path: Path, missing_ok: bool = False) -> None:
+            if path == marker:
+                raise InterruptedError("marker removal stopped")
+            unlink(path, missing_ok=missing_ok)
+
+        with mock.patch.object(Path, "unlink", stop_removal), self.assertRaises(InterruptedError):
+            _ = phase_reservation.restore(self.phase_dir(), "34h")
+        _ = phase_reservation.restore(self.phase_dir(), "34h")
+        self.assertEqual(self.state(), expected)
+        self.assertFalse(marker.exists())
+        self.assertEqual([phase.phase for phase in phase_reservation.open_phases(self.session)], ["34h"])
+
     def test_a_finished_phase_reopens_with_its_kept_board_answer(self) -> None:
         _ = self.run_verb("enroll", "--board", "board_ready")
         self.assertEqual(self.run_verb("clear"), (0, ""))

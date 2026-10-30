@@ -12,8 +12,9 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import override
+from unittest import mock
 
-from scripts.lib import zone
+from scripts.lib import zone, user_zone
 
 SCRIPT = Path(__file__).with_name("zone.py")
 CONF_TEXT = "# The zone every time shown to the user is written in.\nzone=America/New_York\n"
@@ -168,6 +169,26 @@ class SetTests(unittest.TestCase):
         self.assertIn("zone: 'AST' is the label of", result.stderr)
         self.assertEqual((self.checkout / "config/user_zone.conf").read_text(encoding="utf-8"), CONF_TEXT)
         self.assertEqual(self.log("ssh.log") + self.log("broadcast.log"), [])
+
+    def test_set_retries_a_zone_written_before_its_commit(self) -> None:
+        conf = self.checkout / "config/user_zone.conf"
+        head = self.git(self.checkout, "rev-parse", "HEAD")
+        with mock.patch.dict(os.environ, self.env, clear=True), \
+                mock.patch.object(user_zone, "CONF", conf), \
+                mock.patch.object(zone, "_commit", side_effect=InterruptedError("before commit")), \
+                self.assertRaises(InterruptedError):
+            _ = zone.set_zone("Curacao")
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), head)
+        self.assertIn("zone=America/Curacao", conf.read_text())
+        retried = self.run_zone("set", "Curacao")
+        self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+        self.assertIn("mac: pulled", retried.stdout)
+        self.assertIn("broadcast: 2 sent", retried.stdout)
+        self.assertEqual(self.git(self.checkout, "show", "origin/main:config/user_zone.conf"),
+                         CONF_TEXT.replace("America/New_York", "America/Curacao"))
+        self.assertEqual(self.git(self.checkout, "log", "-1", "--format=%s").strip(),
+                         "user zone: America/Curacao (AST), set with /zone")
+        self.assertNotIn("config/user_zone.conf", self.git(self.checkout, "status", "--short"))
 
     def test_the_same_zone_again_makes_no_commit(self) -> None:
         head = self.git(self.checkout, "rev-parse", "HEAD")

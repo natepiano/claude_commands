@@ -660,6 +660,34 @@ class LifecycleTests(LifecycleFixture):
         self.assertIn(relative, moved)
         self.assertEqual(self.git("rev-parse", "HEAD"), self.git("rev-parse", "origin/production"))
 
+    def test_same_wrap_command_finishes_after_the_doc_was_moved(self) -> None:
+        self.running()
+        _ = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "1")
+        _ = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
+        kept = self.checkout / "productions/example-production.md"
+        kept.parent.mkdir()
+        _ = self.git("mv", str(self.doc), str(kept))
+        _ = self.git("commit", "-m", "keep the doc in productions/")
+        _ = self.git("push", "origin", "production")
+        self.doc = kept
+        real_checked = production_lifecycle.checked
+
+        def stop_at_commit(checkout: Path, step: str, *arguments: str) -> str:
+            if step == "wrap" and arguments[:1] == ("add",):
+                raise OSError("stopped after mv")
+            return real_checked(checkout, step, *arguments)
+
+        with mock.patch.object(production_lifecycle, "checked", stop_at_commit):
+            stopped = self.run_lifecycle("wrap", "--no-ci")
+        self.assertEqual(stopped.returncode, 2, stopped.stdout)
+        self.assertFalse(kept.exists())
+        finished = self.run_lifecycle("wrap", "--no-ci")
+        self.assert_step(finished, "ok")
+        self.assertIn("| Next | close herdr sessions |", finished.stdout)
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.git("rev-parse", "origin/production"))
+        self.assertIn("wrapped", (self.checkout / "archive/checkout/example/example-production.md").read_text())
+
     def test_wrap_names_herdr_sessions_for_close_out(self) -> None:
         self.merged_units()
         result = self.run_lifecycle("wrap", "--no-ci")
