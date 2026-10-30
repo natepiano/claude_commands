@@ -3,6 +3,11 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
 
@@ -15,7 +20,6 @@ from datetime import datetime, timezone, tzinfo
 import os
 import shlex
 import subprocess
-import sys
 import syslog
 import tempfile
 import threading
@@ -24,7 +28,6 @@ import unittest
 from collections.abc import Callable, Iterable, Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
-from pathlib import Path
 from typing import BinaryIO, Literal, TextIO, TypedDict, cast, final, override
 from unittest.mock import call, patch
 from zoneinfo import ZoneInfo
@@ -52,12 +55,12 @@ from scripts.message import send as message_send
 # The module settle imports by its own path entry: a separate object from the package import below.
 import showrunners as settle_showrunners
 import shutdown
-import account as account_reader
+from scripts.whoami import account as account_reader
 from scripts.accounts import accounts, moves, outage_alerts
 import quota_alert
 from scripts.production import showrunners
 from scripts.nix_env import heal
-from account import Account, UnknownAccountName, UnreadableAccount
+from scripts.whoami.account import Account, UnknownAccountName, UnreadableAccount
 from shutdown_record import SessionShutdown, SessionProgress, TimerRestore, Where
 
 LOGIN = "owner@example.com"

@@ -15,9 +15,11 @@ from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.accounts import accounts, outage_alerts, role_map
 from scripts.production import showrunners, staff_sources
-import account
+from scripts.whoami import account
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 for directory in ("production", "shutdown"):

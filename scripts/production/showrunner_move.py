@@ -30,14 +30,12 @@ sys.path.insert(0, str(ROOT / "scripts" / "shutdown"))
 sys.path.insert(0, str(ROOT / "scripts" / "message"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.accounts import accounts, moves  # noqa: E402
+from scripts.whoami import account, note_file
 
 if TYPE_CHECKING:
     from scripts.shutdown import shutdown_record
     from scripts.message import sessions
-    from scripts.whoami import account, note_file
 else:
-    import account
-    import note_file
     import shutdown_record
     import sessions
 

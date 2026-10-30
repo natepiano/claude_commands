@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.whoami.agent_accounts import KnownCodexAccount
-from agent_accounts import Report, observe_workers_home
+from scripts.whoami.agent_accounts import Report, observe_workers_home
 from scripts.whoami import account
 from quota_alert import (PROTOCOL, load_config, recipients, relay, showrunners_now,
                          CodexAlertPassReadings, ReadCurrentCodexReadings, READ_CURRENT_CODEX_READINGS,

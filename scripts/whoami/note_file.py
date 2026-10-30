@@ -4,17 +4,10 @@ from __future__ import annotations
 
 import re
 import os
-import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, Protocol
-
-# Package and sibling imports share the mapping and its relocation setting.
-if __name__ == "note_file":
-    _ = sys.modules.setdefault("scripts.whoami.note_file", sys.modules[__name__])
-elif __name__ == "scripts.whoami.note_file":
-    _ = sys.modules.setdefault("note_file", sys.modules[__name__])
 
 AGENTS_DIR = Path.home() / "rust" / "hanadocs" / "agents"
 _INITIAL_AGENTS_DIR = AGENTS_DIR

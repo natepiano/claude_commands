@@ -22,9 +22,11 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import Mock, patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from test_support import ShutdownTestCase, linux_process_fixture, empty_session_registry
 from test_stop import NOW_UTC, entry, machine_inventory, top_level, unit, showrunner, worker_session
-from account import Account
+from scripts.whoami.account import Account
 import inventory
 import herdr
 import launch_permission

@@ -27,11 +27,13 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 for dependency in ("whoami", "message", "notify", "production", "hooks", "lib", "herdr"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
-from account import Account
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.whoami.account import Account
 import conversation_pause
 import detached
 import herdr
-import note_file
+from scripts.whoami import note_file
 from inventory import Inventory, Session, inventory, last_tool_call
 from launch_permission import shutdown_state_root
 import launch_permission

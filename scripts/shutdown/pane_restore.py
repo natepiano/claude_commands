@@ -23,10 +23,12 @@ from typing import cast
 SCRIPTS = Path(__file__).resolve().parent.parent
 for dependency in ("whoami", "message", "herdr", "lib"):
     sys.path.insert(0, str(SCRIPTS / dependency))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import herdr  # noqa: E402
 import pane_record  # noqa: E402
 import sessions  # noqa: E402
-from account import named_account_environment  # noqa: E402
+from scripts.whoami.account import named_account_environment  # noqa: E402
 from shutdown_record import all_session_records  # noqa: E402
 
 START_TIMEOUT_MS = 90_000

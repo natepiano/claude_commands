@@ -1,6 +1,11 @@
 """A provider refusal moves only its live owner, once, through safe shutdown."""
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.whoami.note_file import note_name
 
 from scripts.production import staff_sources
@@ -10,14 +15,12 @@ import json
 import os
 import socket
 import subprocess
-import sys
 import tempfile
 import unittest
 from contextlib import AbstractContextManager, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from collections.abc import Generator, Iterator, Mapping
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone, tzinfo
-from pathlib import Path
 from importlib import import_module
 from typing import TYPE_CHECKING, Literal, Self, cast, final, override
 from unittest.mock import call, patch
@@ -26,9 +29,9 @@ from scripts.accounts import accounts, moves, next_moves, refusal_watch, refusal
 from scripts.production import showrunners
 from scripts.message import send as message_send
 from scripts.whoami import run_out
-import account
-import agent_accounts
-import usage_store
+from scripts.whoami import account
+from scripts.whoami import agent_accounts
+from scripts.whoami import usage_store
 import quota_alert
 
 send_no_room_notice = refusal_watch._notify_no_room  # pyright: ignore[reportPrivateUsage]

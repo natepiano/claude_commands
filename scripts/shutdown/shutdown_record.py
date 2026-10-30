@@ -22,6 +22,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, NotRequired, Protocol, TypedDict, cast, overload
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from session_types import Session, parse_session
 from session_types import (
     TimerRestore as TimerRestore,
@@ -40,8 +42,8 @@ from launch_permission import launch_barrier, shutdown_state_root
 for dependency in ("lib", "whoami"):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / dependency))
 from user_zone import user_zone  # noqa: E402
-from note_file import canonical_label, parse_account_label, NumberedAccountLabel
-from account import ResolvedHistoryLabel, HistoricalAccountUnresolved
+from scripts.whoami.note_file import canonical_label, parse_account_label, NumberedAccountLabel
+from scripts.whoami.account import ResolvedHistoryLabel, HistoricalAccountUnresolved
 
 CLAIM_STALE_SECONDS = 120
 CONDUCTOR_LOCK_RETRY_DELAYS = (0.05,) * 5
