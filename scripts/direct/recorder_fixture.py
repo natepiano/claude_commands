@@ -16,6 +16,22 @@ from scripts.lib import user_zone
 from scripts.production.cli_fixture import invoke_cli
 
 
+STUB_ATOMIC_JSON_WRITER = '''
+def write_json(path, value):
+    import json
+    import os
+    import tempfile
+    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=path.name + '.')
+    try:
+        with os.fdopen(descriptor, 'w') as output:
+            json.dump(value, output)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+'''
+
+
 def communicate_launcher(process: subprocess.Popen[str], timeout: float = 300) -> tuple[str, str]:
     """Reap a fixture's isolated launcher group before reporting a hang."""
     try:

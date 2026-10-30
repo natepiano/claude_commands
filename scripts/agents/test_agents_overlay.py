@@ -2,6 +2,8 @@
 """Tests for the agent registry's local overlay: readers merge it, writers store only it, migrate fills it."""
 from __future__ import annotations
 
+from scripts.lib.test_agents_registry import registry_text
+
 import os
 import subprocess
 import sys
@@ -15,20 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import agents_registry  # noqa: E402
 
 AGENTS = Path(__file__).resolve().parent
-DEFAULTS = """[assignments]
-direct=codex
-
-[direct.codex]
-impl=gpt-a:xhigh   # the committed row
-review=gpt-a:max
-
-[direct.options]
-codex_mesh=1
-
-[codex.agents]
-gpt-a=low,high,xhigh,max
-gpt-b=low,high,xhigh,max
-"""
+DEFAULTS = registry_text({'assignments': {'direct': 'codex'}, 'direct.codex': {'impl': 'gpt-a:xhigh   # the committed row', 'review': 'gpt-a:max'}, 'direct.options': {'codex_mesh': '1'}, 'codex.agents': {'gpt-a': 'low,high,xhigh,max', 'gpt-b': 'low,high,xhigh,max'}})
 
 
 @final
@@ -65,8 +54,11 @@ class OverlayTests(unittest.TestCase):
         return done.stdout
 
     def test_an_overlay_row_wins_and_an_overlay_only_row_and_section_are_read(self) -> None:
-        overlay = "[direct.codex]\nimpl=gpt-b:high\nfix=gpt-b:low\n\n[design_roles.codex]\ndesigner=gpt-b:xhigh\n"
-        _ = self.overlay.write_text(overlay + "\n[assignments]\ndesign_roles=codex\n", encoding="utf-8")
+        _ = self.overlay.write_text(registry_text({
+            "direct.codex": {"impl": "gpt-b:high", "fix": "gpt-b:low"},
+            "design_roles.codex": {"designer": "gpt-b:xhigh"},
+            "assignments": {"design_roles": "codex"},
+        }, base_text="[assignments]\n[direct.codex]\n[design_roles.codex]\n"), encoding="utf-8")
         self.assertEqual(self.resolve("direct.impl"), "gpt-b:high")
         self.assertEqual(self.resolve("direct.review"), "gpt-a:max")
         self.assertEqual(self.resolve("direct.fix"), "gpt-b:low")
