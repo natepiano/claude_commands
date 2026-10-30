@@ -265,59 +265,43 @@ including the details to make it clear
 
 #### As-built
 
-- Rebuild bins: `none` (0 crates); `edited crate (1–3 crates)` and `cascade (4–49 crates)` for warm steps only; `first build here (1–49 crates)` (`FIRST_BUILD_LABEL`) for the rest; `cold (50+ crates)`. `rebuild_bin(crates_compiled: int, warm: bool) -> str` serves `rebuild_timings`, `package_rebuild_rows` (warm edited-crate nextest steps, via `KnownCrateStep.is_warm`) and `profile_step_durations`. The Rebuilds `Source:` line says edited-crate and cascade rows count only steps whose folder had built the same target with the same features before. The package table's `Source:` line still says "nextest steps that compiled 1–3 crates"; "The package table's Source line says it counts only warm steps" corrects it.
+- Rebuild bins: `none` (0 crates); `edited crate (1–3 crates)` and `cascade (4–49 crates)` for warm steps only; `first build here (1–49 crates)` (`FIRST_BUILD_LABEL`) for the rest; `cold (50+ crates)`. `rebuild_bin(crates_compiled: int, warm: bool) -> str` serves `rebuild_timings`, `package_rebuild_rows` (warm edited-crate nextest steps, via `KnownCrateStep.is_warm`) and `profile_step_durations`. The Rebuilds `Source:` line says edited-crate and cascade rows count only steps whose folder had built the same target with the same features before.
 - `report.warm_step_clause() -> str` is the one warm rule, a SQL expression that `known_crate_steps` and `profile_step_durations` select. A step is warm when earlier finished steps (smaller `started_at_us`, `finished_s` not null) on the same `host`, `target_folder` and `build_base`, over all indexed history, together cover each item of its `build_items`. `--bins`, `--tests`, `--examples`, `--benches` cover their named members; `--all-targets` covers every item but `--doc`, and also covers `[]`; else only `[]` covers `[]`. A step with a null key is never warm.
-- Step rows: `compiled_crate_names` from `parse.log_facts` (one name per counted line, in log order; length equals `crates_compiled`). `record.py` writes `target_dir` (`CARGO_TARGET_DIR` resolved against `cwd`, else `TARGET_DIR_UNSET = "unset"`) and `repo_identity` (one `memory_admit.git_identity(argv, cwd)` key, else `UNKNOWN_IDENTITY = "unknown"`), never null. `test_phase_fields` no longer copies the phase context's `repo_identity`; the sidecar keeps admission's value.
-- Index `SCHEMA_VERSION = 24` rebuilds once from the source logs. New step columns: `compiled_crate_names`, `target_dir` and `repo_identity` (`TEXT NOT NULL`, `"unknown"` before 4f), `target_folder` (an absolute `target_dir`, else `worktree`, else `cwd`), `build_base`, `build_items`, `started_at_us` (UTC epoch microseconds). Index `steps_build_history (host, target_folder, build_base, started_at_us)`.
+- Step rows: `compiled_crate_names` from `parse.log_facts` (one name per counted line, in log order; length equals `crates_compiled`). `record.py` writes `target_dir` (`CARGO_TARGET_DIR` resolved against `cwd`, else `TARGET_DIR_UNSET = "unset"`) and `repo_identity` (one `memory_admit.git_identity(argv, cwd)` key, else `store.UNKNOWN_IDENTITY = "unknown"`), never null. `test_phase_fields` no longer copies the phase context's `repo_identity`; the sidecar keeps admission's value.
+- Index `SCHEMA_VERSION = 25` rebuilds once from the source logs (4f set 24; the merge with builds' `test_build_key` step column set 25). 4f step columns: `compiled_crate_names`, `target_dir` and `repo_identity` (`TEXT NOT NULL`, `"unknown"` before 4f), `target_folder` (an absolute `target_dir`, else `worktree`, else `cwd`), `build_base`, `build_items`, `started_at_us` (UTC epoch microseconds). Index `steps_build_history (host, target_folder, build_base, started_at_us)`.
 - `index.build_keys(argv: list[str]) -> CargoBuildKey | NonCargoBuild` is the one argv key function. `base` is sorted JSON of command (`nextest run` = `test`), profile, the sorted `--target` set, workspace, packages, excludes, features (split on commas and spaces), `all_features`, `no_default_features`. `items` is the sorted target-selector list; `[]` is cargo's default. Run options (`-E`, `--test-threads`, `--target-dir`, …) and words after `--` are dropped. A non-cargo step has null keys.
 
 **Files:**
 - `scripts/buildlog/parse.py`, `record.py`, `index.py`, `report.py` — the names above
 - `scripts/buildlog/test_parse.py`, `test_index.py`, `test_report.py`, `test_test_phase_peak.py` — field values, hana argv keys, the warm rule and its three callers
 
-**Binds later work:** `report.warm_step_clause()` and `rebuild_bin(crates_compiled, warm)` stay as they are. resources-unit's sweep (`scripts/lint/sweep.py`) reads step-row `target_dir` and `repo_identity`: the wire values `"unset"` and `"unknown"` and the names `record.TARGET_DIR_UNSET` and `record.UNKNOWN_IDENTITY` are its contract.
+**Binds later work:** `report.warm_step_clause()` and `rebuild_bin(crates_compiled, warm)` stay as they are. resources-unit's sweep (`scripts/lint/sweep.py`) reads step-row `target_dir` and `repo_identity`: the wire values `"unset"` and `"unknown"` and the names `record.TARGET_DIR_UNSET` and `store.UNKNOWN_IDENTITY` are its contract.
 
 **Gotchas:**
 - Never order step rows by the `started_at` text: the log mixes `.mmmZ`, `.ffffff+00:00` and `+00:00` endings. Use `started_at_us`.
-- `index.py` imports `record`, which imports `memory_admit`, so every index reader loads it. A change to `git_identity`, `RepositoryIdentity`, `UnknownRepository` or `test_threads` can break the recorder on every build step.
-- `target_folder` is the recorded path. A symlinked `target/`, a `.cargo/config` `target-dir` or a `--target-dir` argument reads as the worktree; a sweep that deleted output is not seen (comment at `warm_step_clause`). Each gives `first build here`, never a false warm.
+- `index.py` must never import `record` again. Of the buildlog modules it imports only `store` and `parse`. builds' `scripts/lint/memory_admit.py` imports `index` at load, and `record.py` imports `memory_admit`, so an `index` → `record` import closes the cycle `record` → `memory_admit` → `index` → `record`.
+- `record.py` imports `memory_admit`, so a change to `git_identity`, `RepositoryIdentity`, `UnknownRepository` or `test_threads` can break the recorder on every build step.
+- `target_folder` is the recorded path. A symlinked `target/` or a `.cargo/config` `target-dir` reads as the worktree, so the step misses shared history and reads `first build here`. The two cases that can give a false warm are under "The package table's Source line says it counts only warm steps".
 - History before 4f has `target_folder` = worktree, so a `CARGO_TARGET_DIR` folder reads `first build here` until it builds once with the new recorder.
-- `index.py` writes `UNKNOWN_IDENTITY` for a missing `target_dir` too.
+- `index.py` writes `store.UNKNOWN_IDENTITY` for a missing `target_dir` too.
 - The warm clause takes about 8 s over all steps with no host or kind filter; filter first. Each power-profile change in the last 7 days adds about 0.3 s to the report.
 
 **Ruled out:** a copy of `git_identity` in the recorder; the phase context as a second `repo_identity` source; a reader for `compiled_crate_names` before a consumer exists.
 
 ### Phase 5 — The package table's Source line says it counts only warm steps  · status: done
 
-**Depends on:** none
+#### As-built
 
-#### Work Order
-
-**Goal:** the `/build:report` package table's `Source:` line names the steps the table counts: warm edited-crate nextest steps.
-
-**Spec:**
-- Defect from 4f (phase review, 2026-10-30): since 4f, `package_rebuild_rows` counts only warm nextest steps in the edited-crate bin. The table's `Source:` line in `rebuilds_section` still says "nextest steps that compiled 1–3 crates", which names more steps than the table counts.
-- New text of that line: `f"Source: warm nextest steps that compiled {EDITED_CRATE_MIN_CRATES}–{EDITED_CRATE_MAX_CRATES} crates (the edited-crate row), by the first package(…) in the test filter; p50 and p95 are of compile time."`
-- No other change to the report.
-- `docs/as-built/build-followups.md`, Rebuilds **Layout** (architect review of 4f): the bins table has five bins in `REBUILD_LABELS` order, not four; quote the Rebuilds `Source:` line and the package table's `Source:` line exactly as `report.py` prints them after this phase, and say the package table counts only warm steps.
-- Same doc, a short as-built paragraph for the step fields 4f records and indexes: `compiled_crate_names`; `target_dir` (absolute path or `"unset"`); `repo_identity` (the `memory_admit.git_identity` key or `"unknown"`); the index columns `target_folder`, `build_base`, `build_items` and `started_at_us`. Its known limits, each giving `first build here` and never a false warm: rows written before 4f read `"unknown"`; a symlinked `target/` or a `.cargo/config` `target-dir` reads as the worktree; a sweep that deleted output is not seen. Take every name and value from the code, not from this list.
-- The director corrected three as-built lines that 4f made wrong; this phase's checkpoint commits them: `docs/as-built/build-followups.md` (the Rebuilds bins list and the `rebuild_bin(crates_compiled, warm)` bins table with `first build here`), `docs/as-built/buildlog-memory-stalls.md` (`SCHEMA_VERSION = 24`).
+- `rebuilds_section` prints the package table's `Source:` line as `f"Source: warm nextest steps that compiled {EDITED_CRATE_MIN_CRATES}–{EDITED_CRATE_MAX_CRATES} crates (the edited-crate row), by the first package(…) in the test filter; p50 and p95 are of compile time."`. The line names the steps that `package_rebuild_rows` counts: warm edited-crate nextest steps. No other report text changes.
+- `docs/as-built/build-followups.md`: the Rebuilds **Layout** lists the five bins in `REBUILD_LABELS` order and quotes both `Source:` lines as `report.py` prints them. Its "Recorded build identity" paragraph gives the 4f step fields, the index columns and their limits.
 
 **Files:**
-- `scripts/buildlog/report.py` — the package table's `Source:` line
-- `scripts/buildlog/test_report.py` — a check on that line
-- `docs/as-built/build-followups.md` — the director's bins edits are in the tree; impl adds the Layout and step-field text above
-- `docs/as-built/buildlog-memory-stalls.md` — director edit, already in the tree
+- `scripts/buildlog/report.py` — the package table's `Source:` line in `rebuilds_section`
+- `scripts/buildlog/test_report.py` — `test_nextest_rebuilds_show_packages_top_five_and_empty_cold_bin` checks that the line starts with `Source: warm nextest steps`
+- `docs/as-built/build-followups.md` — the bins, the warm rule, both `Source:` lines, the recorded build identity
+- `docs/as-built/buildlog-memory-stalls.md` — the index schema version
 
-**Workers:** 1 writer + 1 tester
-- `impl` — `report.py` and `docs/as-built/build-followups.md`
-- `test` — `test_report.py`: in `test_nextest_rebuilds_show_packages_top_five_and_empty_cold_bin`, assert the package table's `Source:` line starts with `Source: warm nextest steps`; it must fail on the old text
-
-**State:** none.
-
-**Constraints from prior phases:** the warm rule is `report.warm_step_clause()` and `rebuild_bin(crates_compiled, warm)` (4f); do not change either.
-
-**Acceptance gate:** `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY PYTHONPATH=scripts/buildlog python3 -m unittest scripts.buildlog.test_report` from the worktree root green, with the new assertion failing on the old text; basedpyright on `scripts/buildlog/report.py scripts/buildlog/test_report.py` `0 errors, 0 warnings, 0 notes`; live: `python3 scripts/buildlog/cli.py report` from the worktree root (the `buildlog` wrapper runs the installed copy, not the worktree's) prints the new `Source:` line under the package table.
+**Gotchas:** the warm rule can give a false warm in two known cases. A sweep that deletes a folder's output after a build writes no build-log row, so the next step in that folder can still read warm (comment at `report.warm_step_clause`). A `--target-dir` argument reads as the worktree, so a step that builds into another folder shares the worktree's history and can read warm.
 
 ### Phase 6 — A cut-short row no longer leaves bad JSON in the build log  · status: todo
 
@@ -328,26 +312,71 @@ including the details to make it clear
 **Goal:** after any failed append, the build log's month file holds only whole rows, so every reader parses each line.
 
 **Spec:**
-- Defect (showrunner, from resources' Phase 4 review, 2026-10-30): `store._write_all` writes a row in a loop of `os.write` calls. When one write is short and the next fails (a full disk, for example), part of the row stays in the file with no newline. Since 4b, `locked_append` then writes a `\n` after that part, so the part becomes a line of its own that is not JSON; readers such as `record.read_rebuild_evidence` fail on it.
+- Defect (showrunner, from resources' Phase 4 review, 2026-10-30): `store._write_all` writes a row in a loop of `os.write` calls. When one write is short and the next fails (a full disk, for example), part of the row stays in the file with no newline. Since 4b, `locked_append` then writes a `\n` after that part, so the part becomes a line of its own that is not JSON; readers such as `sweep.read_rebuild_steps` (`scripts/lint/sweep.py:2207`, resources-unit's file) fail on it: it calls `json.loads` on each newline-terminated line and does not catch `ValueError`. Resources' uncommitted work renames it `read_rebuild_evidence`, which reads through `sweep.build_log_rows` and behaves the same way.
 - Showrunner's ruling: under the append lock, before it writes, the appender cuts an unfinished tail back to the last newline, then writes the row.
 - In `store.locked_append`, replace the `\n` repair with that cut: read only the last byte when it is `\n` (the usual case); otherwise find the last `\n` by reading back from the end, and `os.ftruncate` the file to just after it, or to 0 when the file has no `\n`. The cut runs under the same `flock`, before the caller's write.
+- `record.step` takes `month_offset` from the same `store` function instead of `st_size` (Constraints).
 - A row counts as written only when its newline lands, so a whole JSON object with no newline after it is cut too. A step row lost this way is published again by 4b's recovery (`record._resume_step_line`), which scans for its id; other rows stay lost, as they were before.
-- No reader changes. Old damage is removed once instead (showrunner, 2026-10-30): count the lines that do not parse in each live month file under `~/.local/state/buildlog/`. In each file a reader still reads that has any, remove those lines once, after a backup copy beside the file named so that no reader's glob matches it (check every glob in `scripts/buildlog/`). Rewrite the file in place under its `flock` (truncate, then write the kept lines; same inode): never rename a new file over it, because an appender waiting on the lock holds the old inode. Skip and report a file that a pending 4b step record names (its `month_offset` would move). Make the index read each rewritten file again through its existing path, and name that path. For a host folder that `sync.py` brings from the Mac, check how sync writes it first: when the next sync would bring the bad lines back, report that file and leave it unchanged. This is a one-time live step, not new repository code; save its output (each file, lines removed, backup path) to the phase folder for the notice.
-- Update the module docstring (`store.py` line 10) and every as-built line that says the appender separates an interrupted tail; take every name from the code.
+- No reader changes. Old damage is removed once instead (showrunner, 2026-10-30): count the lines that do not parse in each live month file under `~/.local/state/buildlog/`. In each file a reader still reads that has any, remove those lines once, after a backup copy beside the file named so that no reader's glob matches it. The month-file globs after the phase-start merge are `index.py:844` and `record.py:1007` (`*/*.jsonl`), `ci.py:135` (`ci/*.jsonl`) and `scripts/lint/sweep.py:2209` (`natedev/????-??.jsonl`); a name that continues after `.jsonl` matches none of them. Run `git grep -n 'glob(' -- scripts` again before the run. Rewrite the file in place under its `flock` (truncate, then write the kept lines; same inode): never rename a new file over it, because an appender waiting on the lock holds the old inode. Skip and report a file that a pending 4b step record names (its `month_offset` would move): the records are `record.pending_steps_root()/*.json`, and each names its month file through its row's `host` and `started_at` (`record._step_month_file`). The index reads each rewritten file again through its existing path: `index.update()` calls `read_file` (`index.py:784-795`), which forgets a file and reads it from 0 when the file is smaller than its stored offset or the bytes before that offset (`marks`) changed. Name that path in the output. `sync.py` pulls the Mac's host folders with `rsync -rt` (`sync.py:235-246`), which replaces a changed file by rename, so the next sync brings the Mac's bad lines back. Report each bad file in a Mac host folder and leave it unchanged. This is a one-time live step, not new repository code; save its output (each file, lines removed, backup path) to the phase folder for the notice.
+- Update the module docstring (`store.py` lines 9–10). No as-built doc names the `\n` repair; `docs/as-built/buildlog-memory-stalls.md:46` says `store.append_line` "writes one line under a flock with `O_APPEND`": add there that it first cuts an unfinished tail back to the last newline. Take every name from the code.
+- The checkpoint notice names resources-unit as also-affected: the cut can move the file end below a size offset taken over an unfinished tail. Their uncommitted `TrimTake.log_offset` (`scripts/lint/sweep.py:1081` in their worktree) is such an offset, and `build_log_rows` (line 1133 there) then raises `ValueError` on a row fragment. Offer them the one `store` function from Constraints.
+- The director corrected `docs/as-built/build-targets.md:127` (`rebuild_bin(crates_compiled, warm)`, with `warm` from `warm_step_clause()`), which 4f made wrong; this phase's checkpoint commits it. The phase-start merge of builds at 31eaac9c kept both new step columns (`started_at_us`, `test_build_key`) and set `SCHEMA_VERSION = 25`; that merge commit carries the schema lines in `docs/as-built/build-memory-admission.md:168` and `docs/as-built/buildlog-memory-stalls.md:17`.
 
 **Files:**
-- `scripts/buildlog/store.py` — the cut in `locked_append`, the docstring
+- `scripts/buildlog/store.py` — the end-of-last-whole-row function, the cut in `locked_append`, the module docstring
+- `scripts/buildlog/record.py` — `month_offset` from that function (line 849)
 - `scripts/buildlog/test_store.py` — the new test and the changed assertion
-- `docs/as-built/` — each doc that describes the tail repair (find them with `git grep`)
+- `scripts/buildlog/test_record_rerun.py` — the offset rerun test
+- `docs/as-built/buildlog-memory-stalls.md` — line 46, the cut
+- `docs/as-built/build-memory-admission.md`, `docs/as-built/build-targets.md` — director edits, already in the tree
 
 **Workers:** 1 writer + 1 tester
-- `impl` — `store.py`, the as-built docs, and the one-time live removal after its code passes
-- `test` — `test_store.py`: a test that cuts a write short: `os.write` writes a few bytes of a row, then raises `OSError`; `append_line` raises; the next `append_line` leaves the file as the old rows plus the new row, and every line parses as JSON. Also a file with no newline at all is cut to empty. It must fail on the old code.
+- `impl` — `store.py`, `record.py`'s `month_offset` capture, `docs/as-built/buildlog-memory-stalls.md`, and the one-time live removal after its code passes
+- `test` — `test_store.py`: a test that cuts a write short: `os.write` writes a few bytes of a row, then raises `OSError`; `append_line` raises; the next `append_line` leaves the file as the old rows plus the new row, and every line parses as JSON. Also a file with no newline at all is cut to empty. It must fail on the old code. And `test_record_rerun.py`: the month file ends in an unfinished tail when `record.step` starts; the row write lands, then the save fails (for example `os.fsync` raises); the rerun leaves the row in the file once. It must fail with the cut in place and `month_offset` still from `st_size`.
 
-**Assertion-Change:** `scripts/buildlog/test_store.py` `test_append_separates_an_interrupted_tail_before_the_next_row` — old: `self.assertEqual(path.read_bytes(), tail + b'\n{"id":"next"}\n')` for both tails; new: the file is `b'{"id":"next"}\n'` for both tails, because the ruling cuts every unfinished tail. Rename the test for the new behavior. `test_append_reads_only_the_tail_byte_and_keeps_the_lock_through_fsync` stays as it is: its file ends in `\n`, so the cut still reads one byte.
+**Assertion-Change:** `scripts/buildlog/test_store.py` `test_append_separates_an_interrupted_tail_before_the_next_row` — old: `self.assertEqual(path.read_bytes(), tail + b'\n{"id":"next"}\n')` for both tails; new: the file is `b'{"id":"next"}\n'` for both tails, because the ruling cuts every unfinished tail. Rename the test for the new behavior. `test_append_reads_only_the_tail_byte_and_keeps_the_lock_through_fsync` stays as it is: its file ends in `\n`, so the cut still reads one byte with `os.read(fd, 1)`. The test patches `os.read` and asserts `read_sizes == [1]`.
 
-**State:** the month file's tail: a cut under the exclusive lock, before the write. A rerun after a failed append cuts the same tail again and writes once. The one-time removal: a second run finds no bad line and changes nothing, and never overwrites an existing backup.
+**State:** the month file's tail: a cut under the exclusive lock, before the write. A pending step's `month_offset`: the end of the last whole row at record time; a cut never moves below it. A rerun after a failed append cuts the same tail again and writes once. The one-time removal: a second run finds no bad line and changes nothing, and never overwrites an existing backup.
 
-**Constraints from prior phases:** 4b's recovery scan (`record._resume_step_line`) reads from `month_offset` under `locked_append` and skips lines that do not parse; the cut must leave its offset reading valid (a cut never goes below the last whole row).
+**Constraints from prior phases:** 4b's recovery scan (`record._resume_step_line`, `record.py:682-697`) seeks to `month_offset` under `locked_append` and skips lines that do not parse. Today `record.step` sets `month_offset` to the month file's `st_size` (`record.py:849`), outside the month file's lock, so it can sit inside an unfinished tail. The cut would then put the next row before `month_offset`, and a rerun after that row landed would miss it and append it again. So `month_offset` must be the end of the last whole row: the byte after the last `\n` at or before the size, or 0. A cut removes only bytes after the last `\n`, so bytes up to that point never change and the capture needs no lock. One `store` function finds the end of the last whole row; the cut and the `month_offset` capture both call it. No second backward read in `record.py`, and no copy of `head_facts._backward_lines`' block loop (`scripts/build_queue/head_facts.py:111`).
 
-**Acceptance gate:** `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY PYTHONPATH=scripts/buildlog python3 -m unittest scripts.buildlog.test_store scripts.buildlog.test_record scripts.buildlog.test_record_rerun scripts.buildlog.test_recorder_health` from the worktree root green, with the new test failing on the old code; basedpyright on `scripts/buildlog/store.py scripts/buildlog/test_store.py` `0 errors, 0 warnings, 0 notes`; live: the one-time removal above ran, with a backup per changed file, and a second count finds no bad line in any file a reader reads; `python3 scripts/buildlog/cli.py report` from the worktree root runs clean.
+**Acceptance gate:** `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY PYTHONPATH=scripts/buildlog python3 -m unittest scripts.buildlog.test_store scripts.buildlog.test_record scripts.buildlog.test_record_rerun scripts.buildlog.test_recorder_health` from the worktree root green, with the new `test_store` tests failing on the old code and the offset test failing on the cut with `st_size` capture; basedpyright on `scripts/buildlog/store.py scripts/buildlog/record.py scripts/buildlog/test_store.py scripts/buildlog/test_record_rerun.py` `0 errors, 0 warnings, 0 notes`; live: the one-time removal above ran, with a backup per changed file, and a second count finds no bad line in any file a reader reads; `python3 scripts/buildlog/cli.py report` from the worktree root runs clean.
+
+### Phase 7 — The build report shows how much memory running builds really hold, hour by hour  · status: todo
+
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `/build:report` gives the true average memory that running builds held in each hour of the last 24 hours, from 60 s readings of current use, not from step peaks.
+
+**Spec:**
+- User, 2026-10-30: asked for the average real memory use of running builds per hour. The only answer the log could give summed step peaks, and one hour came to 56 GiB, above the 44 GiB cap of `builds.slice`. The 60 s `memory_snapshot` rows hold only `memory.peak` (the peak since the slice started), so no true reading exists.
+- Accuracy first (user, 2026-10-30: "we keep making mistakes - undercounting, double counting"). In `memory.slice_state` (`scripts/buildlog/memory.py`), store each reading as the kernel gives it, under its own name, and derive nothing at write time:
+  - `current_bytes` from `memory.current`: the slice's whole charge, the same number `memory.max` enforces. It already includes every child cgroup (each step's scope) and file cache and kernel memory. This is the one "held" total; never add child cgroups, `memory.stat` lines or swap to it.
+  - `swap_current_bytes` from `memory.swap.current`; kept apart, never added to `current_bytes`.
+  - From `memory.stat`, these lines as named fields in a `stat` record: `anon`, `file`, `kernel`, `shmem`, `file_mapped`, `file_dirty`, `file_writeback`, `active_file`, `inactive_file`, `slab`, `sock`. `shmem` is part of `file`, so never add the two; `inactive_file` is the cache the kernel frees first. A line the kernel does not print is stored as absent, never 0.
+  - `max_bytes` at that instant (already read as `max`); `builds` and `ci` slices stay separate, never summed.
+  Use the existing typed slice record and its one reader of slice files; add no second reader.
+- In the report's Memory pressure section, add one line from the samples of the last 24 hours: `Build memory held (60 s samples, last 24 h): average <x> GiB (`anon` <y> GiB, `file` <z> GiB, of which `inactive_file` <v> GiB) of the <cap> GiB cap; busiest hour <HH:00> at <w> GiB.` The hour uses the user's zone, as other report times do. With no sample that has `current_bytes`, the line reads `Build memory held: no readings yet.`
+- Add a command that prints the hour-by-hour table on demand, in the existing `cli.py` (columns: hour, average GiB held, processes, file cache, samples). Times in the user's zone.
+- Averages are the mean of the readings in each hour, with the reading count shown; a missing reading is skipped, never 0. Rows written before this phase have no `current_bytes`; they count as no reading. Step `peak_mem_bytes` is never used for this line.
+- Update `docs/as-built/buildlog-memory-stalls.md` (the snapshot fields, the new line and the command).
+
+**Files:**
+- `scripts/buildlog/memory.py` — the new slice fields
+- `scripts/buildlog/report.py` — the new line
+- `scripts/buildlog/cli.py` — the hourly command
+- `scripts/buildlog/test_sample.py` — slice field tests
+- `scripts/buildlog/test_report.py` — line tests
+- `docs/as-built/buildlog-memory-stalls.md` — the fields, line and command
+
+**Workers:** 1 writer + 1 tester
+- `impl` — `memory.py`, `report.py`, `cli.py`, the as-built doc
+- `test` — `test_sample.py`: the fields come from a fake slice folder; `test_report.py`: the line with readings, with only old rows (`no readings yet`), and an average that never exceeds the cap for a fixture within it
+
+**State:** none.
+
+**Constraints from prior phases:** samples reach `index.sqlite` table `memory_snapshots` (`slices` JSON); read them from there, through the existing query path.
+
+**Acceptance gate:** `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY PYTHONPATH=scripts/buildlog python3 -m unittest scripts.buildlog.test_sample scripts.buildlog.test_report` from the worktree root green; basedpyright on the five Python files `0 errors, 0 warnings, 0 notes`; live cross-check: read `memory.current` and `memory.stat` by hand in the folder `memory.builds_path()` returns at one instant beside one sample run, and show that the stored values equal the files, that `anon + file + kernel` is within 5% of `current_bytes` (report the gap), and that no stored `current_bytes` exceeds `max_bytes`; live: after the installed sampler writes a row with `current_bytes` (or one `python3 scripts/buildlog/cli.py` sample run from the worktree), `python3 scripts/buildlog/cli.py report` prints the new line and the hourly command prints a row per hour with readings.
