@@ -29,6 +29,114 @@ from ledger_test_support import (LedgerTestCase, LedgerStatus)
 
 @final
 class StyleLedgerTicketsTests(LedgerTestCase):
+    def test_batch_owner_migration_reruns_after_process_loss_before_version_write(self) -> None:
+        ledger, rule, finding = self.site_fixture()
+        ledger.ticket_add("legacy-1", "legacy", "read", "names", ".", [finding.path], [rule])
+        with closing(sqlite3.connect(ledger.database)) as older_reader:
+            _ = older_reader.execute("DROP TABLE ticket_batch_owners")
+            _ = older_reader.execute("UPDATE schema_version SET version=27")
+            older_reader.commit()
+            before = list(older_reader.iterdump())
+            tickets = older_reader.execute("SELECT * FROM tickets").fetchall()
+            connect = sqlite3.connect
+
+            def migrating(database: Path, *, timeout: float) -> sqlite3.Connection:
+                connection = connect(database, timeout=timeout)
+
+                def stop(statement: str) -> None:
+                    # CREATE TABLE has executed, but neither it nor the version is committed.
+                    if statement == "DELETE FROM schema_version":
+                        os._exit(73)
+
+                connection.set_trace_callback(stop)
+                return connection
+
+            child = os.fork()
+            if child == 0:
+                try:
+                    with mock.patch.object(sqlite3, "connect", migrating):
+                        with style_ledger.Ledger(self.repo, ledger.database):
+                            pass
+                finally:
+                    os._exit(74)
+            _, status = os.waitpid(child, 0)
+            self.assertEqual(os.waitstatus_to_exitcode(status), 73)
+            self.assertEqual(list(older_reader.iterdump()), before)
+            with style_ledger.Ledger(self.repo, ledger.database) as upgraded:
+                self.assertEqual(upgraded.ticket_batch_owner("legacy-1"), style_ledger.UNBATCHED_TICKET)
+            # The pre-upgrade reader's queries still work; no existing table changed shape or data.
+            self.assertEqual(older_reader.execute("SELECT * FROM tickets").fetchall(), tickets)
+            self.assertEqual(older_reader.execute("SELECT version FROM schema_version").fetchone(),
+                             (max(style_ledger.MIGRATIONS),))
+
+    def test_batch_claim_owner_and_finding_claim_commit_or_roll_back_together(self) -> None:
+        ledger, rule, finding = self.site_fixture()
+        owner = style_ledger.BatchOwner("durable-intent")
+        for target in ("ticket_batch_owners", "held_findings"):
+            with self.subTest(fault=target):
+                event = "INSERT" if target == "ticket_batch_owners" else "UPDATE"
+                with closing(sqlite3.connect(ledger.database)) as connection:
+                    _ = connection.execute(
+                        f"CREATE TRIGGER stop_claim BEFORE {event} ON {target} "
+                        + "BEGIN SELECT RAISE(ABORT, 'claim fault'); END",
+                    )
+                    connection.commit()
+                before = self.ledger_contents(ledger)
+                with self.assertRaisesRegex(sqlite3.IntegrityError, "claim fault"):
+                    ledger.ticket_add("batch-1", "batch", "proposal", "names", ".", [finding.path], [rule],
+                                      proposal=str(self.root / "decision.md"), finding_ids=(finding.finding_id,),
+                                      batch_owner=owner)
+                self.assertEqual(self.ledger_contents(ledger), before)
+                with closing(sqlite3.connect(ledger.database)) as connection:
+                    _ = connection.execute("DROP TRIGGER stop_claim")
+                    connection.commit()
+        ledger.ticket_add("batch-1", "batch", "proposal", "names", ".", [finding.path], [rule],
+                          proposal=str(self.root / "decision.md"), finding_ids=(finding.finding_id,), batch_owner=owner)
+        with style_ledger.Ledger(self.repo, ledger.database) as reader:
+            self.assertEqual(reader.ticket_batch_owner("batch-1"), owner)
+            self.assertEqual(reader.named_held((finding.finding_id,))[0].build_ticket, style_ledger.BuildTicket("batch-1"))
+
+    def test_repeated_claim_cannot_replace_or_remove_its_batch_owner(self) -> None:
+        ledger, rule, finding = self.site_fixture()
+        owner = style_ledger.BatchOwner("original-intent")
+        for requested in (owner, owner, style_ledger.BatchOwner("another-intent"), style_ledger.UNBATCHED_TICKET):
+            with self.subTest(requested=requested):
+                before = self.ledger_contents(ledger)
+
+                def add() -> None:
+                    ledger.ticket_add("batch-1", "batch", "proposal", "names", ".", [finding.path], [rule],
+                                      proposal=str(self.root / "decision.md"), finding_ids=(finding.finding_id,),
+                                      batch_owner=requested)
+
+                if requested == owner:
+                    add()
+                else:
+                    with self.assertRaisesRegex(style_ledger.LedgerError, "different batch owner"):
+                        add()
+                    self.assertEqual(self.ledger_contents(ledger), before)
+                self.assertEqual(ledger.ticket_batch_owner("batch-1"), owner)
+
+    def test_batch_recovery_keeps_unbatched_and_foreign_claims(self) -> None:
+        ledger, rule, finding = self.site_fixture()
+        recovery_owner = style_ledger.BatchOwner("recovering-intent")
+        for number, actual in enumerate((style_ledger.UNBATCHED_TICKET, style_ledger.BatchOwner("foreign-intent")), 1):
+            with self.subTest(owner=actual):
+                ticket = f"batch-{number}"
+                ledger.ticket_add(ticket, "batch", "proposal", "names", ".", [finding.path], [rule],
+                                  proposal=str(self.root / "decision.md"), finding_ids=(finding.finding_id,),
+                                  batch_owner=actual)
+                before = self.ledger_contents(ledger)
+                with self.assertRaises(style_ledger.TicketBatchMismatch):
+                    ledger.ticket_drop_batch(ticket, recovery_owner)
+                self.assertEqual(self.ledger_contents(ledger), before)
+                ledger.ticket_drop(ticket)
+        ledger.ticket_add("batch-3", "batch", "proposal", "names", ".", [finding.path], [rule],
+                          proposal=str(self.root / "decision.md"), finding_ids=(finding.finding_id,),
+                          batch_owner=recovery_owner)
+        ledger.ticket_drop_batch("batch-3", recovery_owner)
+        self.assertEqual(ledger.proposal_tickets()[-1]["state"], "dropped")
+        self.assertEqual(ledger.named_held((finding.finding_id,))[0].build_ticket, style_ledger.NoBuildTicket())
+
     def test_rule_hash_launch_failures_keep_ticket_context_and_cause(self) -> None:
         rule = self.rule("probe")
         ledger = self.ledger()

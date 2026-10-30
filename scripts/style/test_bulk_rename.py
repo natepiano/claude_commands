@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import traceback
 import unittest
 from collections.abc import Callable
 from contextlib import closing, nullcontext
@@ -609,7 +610,84 @@ class ValidationTests(CargoProjectTests):
         self.assertEqual(bulk.verification_packages(self.repo, "last"), ("last",))
 
 
+def stop_process(command: Callable[[], object]) -> None:
+    """A fault point exits the child; cleanup handlers cannot mask process loss."""
+    child = os.fork()
+    if child == 0:
+        try:
+            _ = command()
+        except BaseException:
+            traceback.print_exc()
+        finally:
+            os._exit(74)
+    _, status = os.waitpid(child, 0)
+    if os.waitstatus_to_exitcode(status) != 73:
+        raise AssertionError(f"fault point was not reached: {status}")
+
+
+def stop_after_edit(path: Path, command: Callable[[], object]) -> None:
+    """Lose the child process immediately after a named write, without exception cleanup."""
+    def execute() -> None:
+        write_text, write_bytes = Path.write_text, Path.write_bytes
+
+        def text(target: Path, content: str) -> int:
+            result = write_text(target, content)
+            if target == path:
+                os._exit(73)
+            return result
+
+        def data(target: Path, content: bytes) -> int:
+            result = write_bytes(target, content)
+            if target == path:
+                os._exit(73)
+            return result
+
+        with mock.patch.object(Path, "write_text", text), mock.patch.object(Path, "write_bytes", data):
+            _ = command()
+    stop_process(execute)
+
+
 class LedgerTests(CargoProjectTests):
+    def test_review_keeps_refusals_after_process_loss_on_ledger_release(self) -> None:
+        ledger = self.ledger()
+        kept, refused = self.ticket(ledger)
+        server = ScriptedServer(lambda text, offset, new: word_edits(text, "old", new))
+        release = style_ledger.Ledger.bulk_release
+
+        def stopped(instance: style_ledger.Ledger, ticket: str,
+                    reasons: dict[str, str]) -> tuple[style_ledger.BulkRefusal, ...]:
+            _ = release(instance, ticket, reasons)
+            os._exit(73)
+
+        with (mock.patch.object(bulk, "RustAnalyzer", return_value=nullcontext(server)),
+              mock.patch.object(shutil, "which", return_value="rust-analyzer"),
+              mock.patch.object(bulk, "verification_packages", return_value=("bulk_sample",)),
+              mock.patch.object(bulk, "check_available"), mock.patch.object(bulk, "command")):
+            with mock.patch.object(style_ledger.Ledger, "bulk_release", stopped):
+                stop_process(lambda: bulk.run_batch(self.repo, "names-1"))
+            self.assertEqual([row.finding_id for row in ledger.bulk_refusals("names-1")], [refused])
+            with mock.patch("builtins.print") as output:
+                review = bulk.run_batch(self.repo, "names-1")
+        payload = bulk.object_fields(cast(object, json.loads(review.read_text())))
+        self.assertEqual(payload["kept"], [kept])
+        self.assertEqual(payload["refusals"], [dict(finding_id=refused, reason=ledger.bulk_refusals("names-1")[0].reason)])
+        output.assert_called_once_with(f"bulk rename: 1 kept, 1 refused, 0 macro edits; review {review}")
+
+    def test_batch_reruns_after_process_loss_on_first_edit(self) -> None:
+        ledger = self.ledger()
+        kept, _ = self.ticket(ledger)
+        server = ScriptedServer(lambda text, offset, new: word_edits(text, "old", new))
+        with (mock.patch.object(bulk, "RustAnalyzer", return_value=nullcontext(server)),
+              mock.patch.object(shutil, "which", return_value="rust-analyzer"),
+              mock.patch.object(bulk, "verification_packages", return_value=("bulk_sample",)),
+              mock.patch.object(bulk, "check_available"), mock.patch.object(bulk, "command")):
+            stop_after_edit(self.repo / "src/lib.rs", lambda: bulk.run_batch(self.repo, "names-1"))
+            self.assertIn("let number", (self.repo / "src/lib.rs").read_text())
+            review = bulk.run_batch(self.repo, "names-1")
+        payload = bulk.object_fields(cast(object, json.loads(review.read_text())))
+        self.assertEqual(payload["kept"], [kept])
+        self.assertIn("let number", (self.repo / "src/lib.rs").read_text())
+
     def test_migration_and_per_finding_release_are_atomic_idempotent_and_leave_decisions_filed(self) -> None:
         ledger = self.ledger()
         kept, refused = self.ticket(ledger)
