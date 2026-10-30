@@ -464,6 +464,7 @@ class CodexSessionRecipient:
     address: str
     thread_id: str
     name: str
+    daemon: codex_daemon.CodexDaemon
 
 
 SessionRecipient = ClaudeRecipient | CodexWorkerRecipient | CodexSessionRecipient
@@ -1237,10 +1238,13 @@ def _messageable_recipient(entry: roster.RosterEntry) -> SessionRecipient:
             usage_error(f"{address} is not assigned to a Codex worker")
         return CodexWorkerRecipient(address, entry.name, entry.assignment.session_dir)
     if address.startswith("codex:"):
+        if not isinstance(entry.daemon, codex_daemon.CodexDaemon):
+            usage_error(f"{address} has no owning Codex daemon")
         return CodexSessionRecipient(
             address,
             address.removeprefix("codex:"),
             entry.name,
+            entry.daemon,
         )
     return ClaudeRecipient(address)
 
@@ -1261,7 +1265,9 @@ def _ambiguous_name(name: str, entries: list[roster.RosterEntry]) -> NoReturn:
             if isinstance(entry.reach, roster.Messageable)
             else f"(cannot take messages: {entry.reach.reason})"
         )
-        lines.append(f"  {recipient} ({entry.role})")
+        account = f", {entry.account.label}" if isinstance(entry.account, roster.AccountLabel) else ""
+        owner = (f", {entry.daemon.home}" if isinstance(entry.daemon, codex_daemon.CodexDaemon) else "")
+        lines.append(f"  {recipient} ({entry.role}{account}{owner})")
     usage_error("\n".join(lines))
 
 
@@ -1274,7 +1280,9 @@ def _recipient_matches(to: str, entries: list[roster.RosterEntry]) -> list[roste
     return [entry for entry in entries if entry.name == to]
 
 
-def _matched_recipient(to: str, matches: list[roster.RosterEntry]) -> SessionRecipient:
+def _matched_recipient(
+    to: str, matches: list[roster.RosterEntry], destination: LocalOnly | NamedMachine,
+) -> SessionRecipient | RemoteDelivery:
     import roster
 
     if len(matches) > 1:
@@ -1282,6 +1290,8 @@ def _matched_recipient(to: str, matches: list[roster.RosterEntry]) -> SessionRec
     entry = matches[0]
     if isinstance(entry.reach, roster.CannotReceiveMessages):
         _cannot_receive_message(entry)
+    if isinstance(destination, NamedMachine):
+        return RemoteDelivery(destination.host, entry.reach.address)
     return _messageable_recipient(entry)
 
 
@@ -1303,7 +1313,7 @@ def resolve_recipient(
     _print_roster_problems(result.problems)
     matches = _recipient_matches(to, result.entries)
     if matches:
-        return _matched_recipient(to, matches)
+        return _matched_recipient(to, matches, LocalOnly())
     addressed = to.startswith(("session:", "worker:", "codex:"))
     if isinstance(scope, LocalThenPeer):
         if result.problems and not addressed:
@@ -1312,14 +1322,17 @@ def resolve_recipient(
         _print_roster_problems(peer.problems)
         matches = _recipient_matches(to, peer.entries)
         if matches:
-            recipient = _matched_recipient(to, matches)
-            return RemoteDelivery(roster.remote.other_machine(), recipient.address)
+            return _matched_recipient(to, matches, NamedMachine(roster.remote.other_machine()))
         if peer.problems:
             return RecipientLookupFailed("; ".join(peer.problems))
     if to.startswith("worker:"):
         usage_error(f"no roster session has address {to}")
     if to.startswith("codex:"):
-        return CodexSessionRecipient(to, to.removeprefix("codex:"), to.removeprefix("codex:"))
+        from scripts.whoami.agent_accounts import codex_home_display
+
+        checked = ", ".join(codex_home_display(daemon.home) for daemon in codex_daemon.daemons(os.environ))
+        return RecipientLookupFailed(
+            f"no live Codex daemon has thread {to.removeprefix('codex:')} loaded; checked {checked}")
     return ClaudeRecipient(to)
 
 
@@ -1504,7 +1517,7 @@ def codex_session(
     recipient: CodexSessionRecipient,
     timeout: float,
 ) -> Result:
-    queued = codex_daemon.queue(recipient.thread_id, agent_text(message), timeout=timeout)
+    queued = codex_daemon.queue(recipient.daemon, recipient.thread_id, agent_text(message), timeout=timeout)
     if isinstance(queued, codex_daemon.Queued):
         return Result("sent", f"queued on Codex session {recipient.name}")
     if isinstance(queued, codex_daemon.QueueTimedOut):

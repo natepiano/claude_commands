@@ -6,7 +6,6 @@ from __future__ import annotations
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
 
-import base64
 import io
 import json
 import os
@@ -16,7 +15,8 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
+from collections.abc import Mapping
+from contextlib import AbstractContextManager, ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
@@ -31,6 +31,7 @@ sys.path.insert(0, str(SCRIPTS / "production"))
 sys.path.insert(0, str(SCRIPTS / "direct"))
 
 import codex_daemon
+from codex_test_support import FakeDaemon, receive_frame, reply, write_codex_account
 import process_table
 import remove_workers
 import roster
@@ -1805,6 +1806,66 @@ class RosterTests(unittest.TestCase):
         self.assertTrue(errors[0].startswith("could not read: "))
         self.assertIn("daemon closed mid-call", errors[0])
 
+    def test_stalled_accounts_share_one_deadline_and_keep_the_healthy_daemons_rows(self) -> None:
+        read_times: list[float] = []
+        read_daemons = codex_daemon.read_daemons
+
+        def timed_read_daemons(environment: Mapping[str, str]) -> list[codex_daemon.DaemonRead]:
+            started = time.monotonic()
+            found = read_daemons(environment)
+            read_times.append(time.monotonic() - started)
+            return found
+
+        def stalled(connection: socket.socket) -> None:
+            self.assertEqual(receive_frame(connection)["method"], "initialize")
+            connection.settimeout(2)
+            self.assertEqual(connection.recv(1), b"")
+
+        def healthy(connection: socket.socket) -> None:
+            request = receive_frame(connection)
+            self.assertEqual(request["method"], "initialize")
+            reply(connection, request, {})
+            self.assertEqual(receive_frame(connection)["method"], "initialized")
+            request = receive_frame(connection)
+            self.assertEqual(request["method"], "thread/loaded/list")
+            reply(connection, request, {"data": ["healthy-thread"]})
+            request = receive_frame(connection)
+            self.assertEqual(request["method"], "thread/read")
+            reply(connection, request, {"thread": {
+                "id": "healthy-thread", "name": "Healthy account", "cwd": str(self.root),
+                "status": {"type": "idle"},
+            }})
+
+        with short_socket_directory() as directory, ExitStack() as daemons:
+            home = Path(directory)
+            notes = home / "notes"
+            homes = [home / ".codex", *(home / f".codex{number}" for number in range(1, 5))]
+            for number, account_home in enumerate(homes):
+                write_codex_account(account_home, notes, f"codex{number + 1}")
+                control = account_home / "app-server-control"
+                control.mkdir()
+                _ = daemons.enter_context(FakeDaemon(
+                    control / "app-server-control.sock", healthy if account_home == homes[-1] else stalled,
+                ))
+            with mock.patch.dict(os.environ, {
+                "HOME": str(home), "AGENT_NOTES_DIR": str(notes), "ROSTER_CODEX_SOCKET": "",
+            }), mock.patch.object(codex_daemon, "TIMEOUT_SECONDS", 0.3), \
+                    mock.patch.object(codex_daemon, "read_daemons", new=timed_read_daemons):
+                found = roster.roster(os.environ, roster.ThisMachine())
+            self.assertEqual(len(read_times), 1)
+            elapsed = read_times[0]
+            self.assertLess(elapsed, 0.9, "account timeouts must share one discovery budget")
+            entries = [entry for entry in found.entries if entry.name == "Healthy account"]
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0].thread, roster.CodexThread("healthy-thread"))
+            self.assertEqual(entries[0].daemon, codex_daemon.CodexDaemon(
+                homes[-1], homes[-1] / "app-server-control/app-server-control.sock"))
+            self.assertEqual(entries[0].account, roster.AccountLabel("codex5"))
+            self.assertEqual(found.problems, [
+                f"Codex daemon ~/{account_home.name}: timed out after 0.3 s"
+                for account_home in homes[:-1]
+            ])
+
     def test_unreadable_process_table_is_a_problem_not_a_crash(self) -> None:
         failure = subprocess.CalledProcessError(2, ["ps"])
         with mock.patch.object(process_table, "snapshot", side_effect=failure), \
@@ -1836,13 +1897,12 @@ class RosterTests(unittest.TestCase):
         os.environ["AGENT_NOTES_DIR"] = str(notes)
         self.environment["AGENT_NOTES_DIR"] = str(notes)
         login = f"{tool}{number}@example.invalid"
-        _ = (notes / f"{tool}{number}.md").write_text(f"---\nlogin: {login}\n---\n")
         home = self.home / (f".codex{number}" if tool == "codex" and number != 2 else ".codex" if tool == "codex" else f".claude{number}")
         home.mkdir(exist_ok=True)
         if tool == "codex":
-            claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
-            _ = (home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
+            write_codex_account(home, notes, f"{tool}{number}")
         else:
+            _ = (notes / f"{tool}{number}.md").write_text(f"---\nlogin: {login}\n---\n")
             _ = (home / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": login}}))
         return home
 
@@ -1930,9 +1990,11 @@ class RosterTests(unittest.TestCase):
     def test_daemon_rows_use_the_home_holding_the_socket(self) -> None:
         home = self.account_note(1)
         _ = self.account_note(2)
-        with mock.patch.object(codex_daemon, "daemon_socket", return_value=home / "app-server-control" / "daemon.sock"):
+        path = home / "app-server-control" / "daemon.sock"
+        with mock.patch.dict(os.environ, {"ROSTER_CODEX_SOCKET": str(path)}):
             entry = self._entries()["Codex window"]
         self.assertEqual(entry.account, roster.AccountLabel("codex1"))
+        self.assertEqual(entry.daemon, codex_daemon.CodexDaemon(home, path))
 
     def test_reviewers_require_a_readable_environment_before_using_the_default_home(self) -> None:
         _ = self.account_note(1)
@@ -2024,7 +2086,8 @@ class RosterTests(unittest.TestCase):
                     director=roster.UnderDirector("unit", "base", "session:base"),
                     assignment=roster.WorkerAssignment("impl", "/remote/run")),
             replace(base, kind="codex", session=roster.NoClaudeSession(), thread=roster.CodexThread("daemon"),
-                    reach=roster.Messageable("codex:daemon")),
+                    reach=roster.Messageable("codex:daemon"),
+                    daemon=codex_daemon.CodexDaemon(Path("/remote/.codex2"), Path("/remote/.codex2/socket"))),
             replace(base, kind="codex", role="worker", session=roster.NoClaudeSession(),
                     reach=roster.CannotReceiveMessages("between turns; no unit director is running"),
                     assignment=roster.WorkerAssignment("test", "/remote/no-thread")),
