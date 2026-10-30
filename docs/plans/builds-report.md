@@ -27,6 +27,12 @@ this question comes up so often - i need an instantaneous way to answer it
 
 the build log has no brp-launch rows after 2026-10-15T18:59Z (411 rows from 09-09 to 10-15), and none of those rows carries mem_wait_s. Find why app launches stopped being recorded, and restore the rows with their memory wait. If the cause is in resources' launch hook, send me the cause and I'll route it. I need those numbers to judge whether launches lose time in the memory queue.
 
+2026-10-29 22:0x EDT (the user, relayed by the showrunner, who named it `build-why`)
+
+i need a command that i can run at the cli - that tells me exactly what is going on - clearly with the running and the first one waiting (what it needs) and how many arein line - different than the build:queue - something that runs fast and tells me why the current one is waiting showing the me analysis that we have done so far
+
+including the details to make it clear
+
 ## Delegation Context
 
 - **Project:** `~/.claude` — the build log, the build queue view and the unit-board Claude Code mod.
@@ -37,7 +43,7 @@ the build log has no brp-launch rows after 2026-10-15T18:59Z (411 rows from 09-0
 - **Test lanes:** `scripts/buildlog/test_*.py`, `scripts/build_queue/test_build_queue.py`, `mods/unit-board/tests/`.
 - **Test:** `python3 -m unittest <module>` from the worktree root for Python; the mod's test command as its as-built (`docs/as-built/unit-board.md`) names it.
 - **Lint:** `basedpyright <the slot's own Python files>`; footer must read `0 errors, 0 warnings, 0 notes`.
-- **Ownership:** `mods/unit-board/` belongs to natedev's unit-board-unit; the user asked report-unit for this change and allowed shared code (21:00 EDT). The showrunner approved Phases 1 and 2 side by side and told natedev. `scripts/lint/memory_admit.py` is resources-unit's: never edit it (showrunner, 21:10 EDT). `scripts/hana_shot/hana_shot.py` is screenshot-unit's: edit it only through cargo-berth, and the checkpoint notice names it.
+- **Ownership:** `mods/unit-board/` belongs to natedev's unit-board-unit; the user asked report-unit for this change and allowed shared code (21:00 EDT). The showrunner approved Phases 1 and 2 side by side and told natedev. `scripts/lint/memory_admit.py` is resources-unit's: no edit in Phases 1, 2 and 4 (showrunner, 21:10 EDT); Phase 3 adds its read-only explain function and the waiter's need-source fields (showrunner, 22:0x EDT), and its notice names resources as also-touches, tested against origin/builds-resources. `scripts/hana_shot/hana_shot.py` is screenshot-unit's: edit it only through cargo-berth, and the checkpoint notice names it.
 - **Invariants:** build-log `.jsonl` files are appended and never edited (`store.py` docstring). Shown names are separate short names; only copy folders join showrunner and unit.
 
 ## Phases
@@ -55,6 +61,7 @@ the build log has no brp-launch rows after 2026-10-15T18:59Z (411 rows from 09-0
 - Shared code: the accounts pane lifecycle in `hooks/register.tsx` (open, loading, one run per tick, busy guard, 10 s timer, reload restart from `$.ui.panes()`, close, fixed failure reason) becomes one table-pane helper. `/accounts-board` and `/build:queue` both use it; `/accounts-board` behaves exactly as before.
 - `commands/build/queue.md` keeps its frontmatter; its body still runs the script, so a session without the mod still gets the tables, and names `/reload-plugins` for a session started before the mod change.
 - Assertion-Change: `scripts/build_queue/test_build_queue.py` — `test_budget_reason_names_charged_builds_and_the_limit`, `test_memory_reason_names_free_memory_and_earlyoom_reserve` and `test_unavailable_reading_does_not_claim_zero_free_memory` select only table rows (lines that start with `| `), because the head line now holds the same reason text. Each assertion string stays the same.
+- Assertion-Change: `scripts/build_queue/test_build_queue.py` — `test_bump_shared_shown_label_is_ambiguous_even_when_recorded_name_is_unique` and `test_bump_passes_selector_and_caller_and_reports_ambiguous_match` expect exit 3 with the refusal on stdout (was exit 2 on stderr): a selector refusal has its own exit code so the mod forwards only it, never an operational error. Each refusal text check stays.
 
 **Files:**
 - `scripts/build_queue/build_queue.py` — `--json`, head line
@@ -107,7 +114,55 @@ the build log has no brp-launch rows after 2026-10-15T18:59Z (411 rows from 09-0
 
 **Acceptance gate:** the new test stops the update where the rewrite ran (an exception raised after the first record is indexed), reruns it, and checks that every record is in the index under its new field names, the source bytes are unchanged, and a second rerun adds nothing; an old-name and a new-name record give the same row. `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py' -t .` green from the worktree root (or the module list it runs in the merge gate); basedpyright 0/0/0 on the changed files.
 
-### Phase 3 — App launches reach the build log again, with their memory wait  · status: todo
+### Phase 3 — build-why says at once why the first waiting step waits, from admission's own numbers  · status: todo
+
+#### Work Order
+
+**Goal:** `build-why` at the command line prints in under 1 s what runs, what waits first and why, with each check's arithmetic, from one read-only explain record in `memory_admit.py` that admission's own functions fill.
+
+**Spec:**
+- One decision point. Add one read-only function to `scripts/lint/memory_admit.py`, `explain_queue() -> QueueExplanation`, that takes the shared admission lock as `queue_view()` (memory_admit.py:1525) does. It fills every number with admission's own functions on the same pass: `reservation_memory`/`step_memory` (or `reservation_lifetime` once resources' Phase 14 lands: never a copy of the "pid start time matches" check, so an orphaned step the queue still charges stays in the list), `build_charge`, `growth_headroom`, `decide`, `head_priority`, `head_window`, `queue_decision`, `read_meminfo`, `recovery_pressure`. `read_queue` (memory_admit.py:1465) and `explain_queue` build from one shared internal pass, so the two cannot disagree; `queue_view()` returns the same `QueueView` as now. No second calculation of any rule. Every number in the record is a typed field in bytes or epoch seconds; text is made only by the caller.
+- `QueueExplanation` (frozen dataclasses, one variant per case, per `~/.claude/docs/type_design.md`):
+  - host: available, total, earlyoom reserve (5% of total, as `decide`), build budget, pressure (`NoPressureHold` or `MemoryPressure` with its recovery spacing time), reading unavailable as its own variant.
+  - running: per step the identity as `RunningStep` has it, admitted time, promise (`need`), measured bytes, charged (`build_charge`), and a `ChargeBasis` variant naming the `build_charge` term that sets the charge: promise with no reading yet; ramp promise (inside `RAMP_SECONDS` of admission); peak so far (observed peak, with the time of that peak where the tree records it); peak decayed (the 25-min decay and the old-sampler rule from resources' Phase 12 patches B and C on origin/builds, with their times); peak file unreadable (promise kept); using now. One variant per rule the merged tree has; a rule resources adds later (Phase 15 test-phase peak) adds its variant when it lands; whoever lands second resolves it.
+  - totals: charged and using now over all running steps, and the promise not yet used (`growth_headroom` sum).
+  - head: no waiter, or the first waiter in `waiter_order` with its identity, wait start, need, need source (below), and its decision from `queue_decision` on the same inputs; the budget check (charged, need, head need, budget, pass or fail, and the charge it starts at: budget − need − head need); the free check (free, need, earlyoom reserve, promise not yet used, head need, threshold, pass or fail); the order rule from `head_window` (`StrictUntil` or `BackfillUntil` with its deadline), whether `head_priority` gives the head priority, and its bump (`bump_order` < 0 or `holds_younger`, with `priority_since`).
+  - line: the waiters behind the head; for each, whether `decide` with no head need admits it under both checks now; and their count, largest and smallest need, oldest wait start.
+- The waiter row records where its need came from, at estimate time, in `check` (memory_admit.py:1227-1236). New `Waiter` fields: `need_source` (`ExpectedPeak.source`: measured / buildlog / pooled / fallback), `need_runs` (`ExpectedPeak.count`), `test_threads` (the width `test_threads(argv)` reads, or null). The window is `HISTORY_DAYS`; test scope, package and filters are on the row already. A row without `need_source` (written before this change) reads as "source not recorded". `explain_queue` never opens the build-log index or any SQLite file.
+- `scripts/build_queue/build_why.py` (new, run as `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_why.py`; natedev adds the `build-why` PATH wrapper after main): prints `explain_queue()` in plain words, a unit on every number (GiB with one decimal, minutes, HH:MM in the user's zone as `build_queue.py` does), with Showrunner and Unit names from `build_queue.py`'s roster labels. Sections, in order:
+  1. Header: time; free of total memory; build charges of the 21.0 GiB budget; the pressure hold or recovery spacing, if any; load (`/proc/loadavg`, the 1-min value of the core count).
+  2. Running: one line per step: Showrunner, Unit, session, step, age, charged, using now, and why it is charged that much (the `ChargeBasis` in words: `compiling, peak so far 10.8 GiB`, `peak decayed at 21:40`, `old-sampler rule: peak drops 25 min after its last new peak`, `promise: no reading yet`). Then `Total: charged X GiB, using Y GiB`.
+  3. First in line: Showrunner, Unit, session, step, wait in minutes, need, and where the need comes from (for example `measured process-memory p90 of 7 runs, last 14 days, filtered tests (pkg, 2 filters), width 8`, `build-log peak × 0.65 of 12 runs`, `pooled over all repos, 31 runs`, `fallback: fewer than 5 runs`, `source not recorded`).
+  4. The two checks, each with its arithmetic and result: `Build budget: charged 18.1 + need 11.8 = 29.9 GiB > 21.0 GiB: blocked; starts when charged falls to 9.2 GiB` and `Free memory: free 16.3 GiB < need 11.8 + earlyoom 3.0 + promise not yet used 5.5 = 20.3 GiB: blocked`. A head need term appears only when it is non-zero. Pressure, when it holds, is its own line.
+  5. Order rule: `strict until HH:MM: younger steps wait` or `backfill until HH:MM: younger steps that fit may start`, and any bump (`bumped by position at HH:MM`).
+  6. The line: `N waiting behind it; M would fit now under both checks; needs from A to B GiB; oldest wait W min`.
+  7. Last line: `Waiting because: <the failing checks, the order rule if it binds>. Frees when: <the fewest running steps, largest charge first, whose end brings the failing check to pass, by how much>` — for the budget, the drop needed is charged + need + head need − budget; for free memory, threshold − free. With no waiter: `Nothing waits.`
+  A read failure prints one fixed line, `build-why: the admission state could not be read.`, and exits 2; never a traceback.
+- `build_queue.py`'s head line (Phase 1) prints from the same `QueueExplanation` fields, never its own copy of the budget arithmetic. Write this change only after Phase 1's checkpoint commit (both phases edit `build_queue.py`).
+- Fast: under 1 s on natedev with tonight's queue size: reads only the admission state files, `/proc`, `/proc/meminfo` and `/proc/loadavg`.
+
+**Files:**
+- `scripts/lint/memory_admit.py` — `explain_queue`, `QueueExplanation` and its variants, the shared pass with `read_queue`, the waiter's need-source fields (owner resources-unit; showrunner allowed this change 2026-10-29 22:0x)
+- `scripts/build_queue/build_why.py` — new: the command
+- `scripts/build_queue/build_queue.py` — head line from `QueueExplanation` (after Phase 1's checkpoint)
+- `scripts/build_queue/test_build_why.py` — new: fixture from tonight's 21:51 case; output and verdict checks
+- `scripts/lint/test_memory_admit.py` — new tests only: waiter need-source fields; `explain_queue` equals `read_queue`'s decision on the same files; no SQLite opened
+- `docs/as-built/build-memory-admission.md` — the explain record and the waiter's need-source fields
+- `commands/build/queue.md` — one line naming `build-why`
+
+**Workers:** 1 writer + 1 tester.
+- `impl2` — `memory_admit.py`, `build_why.py`, `build_queue.py`, the as-built and `queue.md`; hub: `memory_admit.py` (both test files import its types)
+- `test2` — `test_build_why.py` and the new `test_memory_admit.py` tests, from this Spec. Fixture: tonight's 21:51 case as admission state files plus fake `/proc` and meminfo (as `test_build_queue.py` and `test_memory_admit.py` build them): running widget, demo, organon and frame-cost; inspectors at the head; numbers so the head shows charged 18.1 GiB, need 11.8 GiB, free 16.3 GiB, earlyoom 3.0 GiB, promise not yet used 5.5 GiB. Checks: `build_why.py`'s verdict for the head equals `memory_admit.read_queue`'s head reason and `queue_decision` state on the same files; each section's numbers; an old waiter row without `need_source`; `sqlite3.connect` patched to fail does not change the output; a read failure prints the fixed line and exits 2.
+
+**State:** new fields in each `*.waiting` row (written by `check`; readers ignore unknown fields)
+
+**Depends on:** Phase 1 for the `build_queue.py` head line only; the rest runs beside it.
+
+**Constraints from prior phases:** Phase 1: `build_queue.py --json` and the head line exist; the mod pane reads `--json`, so the head line's JSON field keeps its shape. Merge origin/builds first: it carries resources' Phase 12 patches B and C (peak decay) in `memory_admit.py`. Resources' Phase 14 (in review 22:0x) adds `reservation_lifetime(row, owner_live)` and keeps every signature; Phase 15 adds a test-phase peak estimate source. Also-touches resources: trial-merge and test against origin/builds-resources before the notice.
+
+**Acceptance gate:** `python3 -m unittest scripts.build_queue.test_build_why scripts.build_queue.test_build_queue scripts.lint.test_memory_admit` green (prefix `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY`); basedpyright 0/0/0 on the changed Python files. Live: `build_why.py` on natedev finishes under 1 s, and its head verdict matches `/build:queue` run at the same time.
+
+### Phase 4 — App launches reach the build log again, with their memory wait  · status: todo
 
 #### Work Order
 
@@ -117,6 +172,7 @@ the build log has no brp-launch rows after 2026-10-15T18:59Z (411 rows from 09-0
 - Known: `scripts/buildlog/launches.py` collects launches only from `mcp__brp__brp_launch` tool results in Claude transcripts. Since 10-16 only 12 transcripts hold such a call; launches go through `/hana_shot` (`scripts/hana_shot/hana_shot.py`) and `verify.sh build`. No row ever had `mem_wait_s`.
 - First confirm the cause against the live tree and log. Then record each launch where it happens, as one append-only row through the build-log recorder, carrying the admission wait from the memory queue's own record. Both the `hana_shot.py` path and the `verify.sh build` path write it. Backfill from 10-15 onward where stored records allow it, and report the count.
 - A cause in resources' launch hook goes to the showrunner with evidence; it is not fixed here.
+- screenshot-unit's atomic launch record in `hana_shot.py` (near line 2078) is on main 9b6e2102. Merge origin/main through origin/builds first. The build-log row is built on top of that record: when the record holds what the row needs, read it and add no second write. The merge waits for the end of tonight's no-merge hold (the showrunner names its start and end). The notice names screenshot-unit (natedev) as also-touches for `hana_shot.py`, tested against origin/main.
 
 **Files:**
 - `scripts/buildlog/launches.py` — launch rows from the launch paths, backfill
