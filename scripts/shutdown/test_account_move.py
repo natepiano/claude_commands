@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.production import staff_sources
 import io
 import json
 import os
@@ -157,9 +158,9 @@ class AccountMoveTests(ShutdownTestCase):
             proc_start=item["proc_start"], name=item["name"], kind=item["kind"],
             config_dir=Path(item.get("config_dir", str(accounts.account_dir("claude1")))), login=report["login"],
             production=item["production"] if item["kind"] == "showrunner" else
-                item["host"]["production"] if item["host"]["kind"] == "unit" else "",
+                staff_sources.unit_parent(item["host"]["unit"]).slug if item["host"]["kind"] == "unit" else "",
             doc=item["doc"] if item["kind"] == "showrunner" else
-                item["host"]["doc"] if item["host"]["kind"] == "unit" else "")
+                staff_sources.unit_parent(item["host"]["unit"]).doc if item["host"]["kind"] == "unit" else "")
             for item in report["sessions"]]
 
     def current_listing(self, login: str | None = None, **options: object) -> list[inventory.ListedSession]:
@@ -582,7 +583,7 @@ class AccountMoveTests(ShutdownTestCase):
                   session_id=director["session_id"], pid=director["pid"],
                   proc_start=director["proc_start"], name=director["name"], kind="unit",
                   config_dir=Path(director["config_dir"]), login=report["login"],
-                  production=director["host"]["production"], doc=director["host"]["doc"],
+                  production=staff_sources.unit_parent(director["host"]["unit"]).slug, doc=staff_sources.unit_parent(director["host"]["unit"]).doc,
               )]),
               patch.object(settle, "inventory", return_value=report),
               patch.object(settle, "run_inventory", return_value=report),

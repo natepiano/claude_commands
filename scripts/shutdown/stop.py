@@ -31,6 +31,7 @@ import sessions
 import inventory
 import herdr
 import relaunch
+from scripts.production import staff_sources
 import unit_lookup
 from inventory import (Inventory, Session, ShutdownProcess, ProcessObservation, ProcessIdentity,
     ProcessLive, ProcessGone, ProcessUnknown, shutdown_identity, shutdown_processes, terminal_kind, live_supervisor, codex_seats)
@@ -477,7 +478,8 @@ def _stop_unit_session(
         # The shared session holds every production: close only the tab of the pane that carries this unit's marks.
         client = herdr.Herdr(name)
         try:
-            marked = unit_lookup.marked_unit(host["production"], host["unit"])
+            parent = staff_sources.unit_parent(host["unit"], session["session_id"])
+            marked = unit_lookup.marked_unit(parent.slug, host["unit"])
             if marked is not None and marked.place.session == name:
                 claim.check_effect()
                 client.close_tab_of(marked.place.pane)

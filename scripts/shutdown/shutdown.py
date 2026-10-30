@@ -194,7 +194,7 @@ def _selected_account(requested: str | None) -> Account:
 def _host_text(host: Host) -> str:
     match host["kind"]:
         case "unit":
-            return f"unit {host['production']}/{host['unit']} (herdr {host['session_name']})"
+            return f"unit {host['unit']} (herdr {host['session_name']})"
         case "legacy tmux" | "legacy tmux unit":
             return f"{host['kind']} {host['session_name']} (manual recovery)"
         case "herdr":

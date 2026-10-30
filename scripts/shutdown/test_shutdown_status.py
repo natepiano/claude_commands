@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from scripts.whoami.note_file import note_name
 
+from unit_staff_test_support import legacy_unit_host
 import io
 import json
 import os
@@ -571,7 +572,7 @@ else:
         _ = group_file.write_text(json.dumps({"units": "claude3", "showrunners": "claude3"}))
         saved = session_shutdown(name="old unit")
         saved["session"] = cast(inventory.UnitSession, cast(object, {**saved["session"], "kind": "unit",
-            "host": inventory.LegacyTmuxUnitHost(kind="legacy tmux unit", production="demo", unit="old",
+            "host": legacy_unit_host(kind="legacy tmux unit", production="demo", unit="old",
                 doc="/tmp/demo.md", session_name="old-destination")}))
         saved["progress"] = record_store.SessionStopped(kind="stopped", at=saved["requested_at"])
         self.assertTrue(record_store.create_session(saved))

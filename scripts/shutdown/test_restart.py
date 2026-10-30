@@ -6,6 +6,7 @@ from __future__ import annotations
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
 
+from unit_staff_test_support import unit_host, legacy_unit_host
 import copy
 import io
 from types import SimpleNamespace
@@ -210,7 +211,7 @@ def unit(
     return inventory.UnitSession(
         **common_session(session_id, run_dirs=run_dirs),
         kind="unit",
-        host=inventory.UnitHost(
+        host=unit_host(
             kind="unit",
             production="demo",
             unit=f"{session_id}-unit",
@@ -1674,8 +1675,8 @@ class RestartTests(ShutdownTestCase):
     def test_every_unit_restarts_in_the_shared_session_a_legacy_tmux_one_by_its_units_row_plan(self) -> None:
         recorded = unit("own-session-unit", session_name="own-session")
         legacy = unit("legacy-unit")
-        legacy["host"] = inventory.LegacyTmuxUnitHost(kind="legacy tmux unit", production="demo",
-            unit="legacy-unit", doc=legacy["host"]["doc"], session_name="legacy-tmux")
+        legacy["host"] = legacy_unit_host(kind="legacy tmux unit", production="demo",
+            unit="legacy-unit", doc="/tmp/demo production.md", session_name="legacy-tmux")
         for owner in (recorded, legacy):
             with self.subTest(host=owner["host"]["kind"]), \
                     patch.object(restart, "_units_row_plan", return_value="docs/plans/demo-unit.md"):
@@ -2588,7 +2589,7 @@ class RestartTests(ShutdownTestCase):
     def test_legacy_hosts_launch_and_only_unconfirmed_leftovers_stay_manual(self) -> None:
         legacy = top_level("legacy", host=inventory.LegacyTmuxHost(kind="legacy tmux", session_name="old:name"))
         old_unit = unit("legacy-unit")
-        old_unit["host"] = inventory.LegacyTmuxUnitHost(kind="legacy tmux unit", production="demo",
+        old_unit["host"] = legacy_unit_host(kind="legacy tmux unit", production="demo",
             unit="old", doc="/tmp/old.md", session_name="old-unit")
         leftover = entry(top_level("leftover", host=inventory.HerdrHost(kind="herdr", herdr_session="new", pane_id="w1:p1", presentation="detached")))
         leftover["stop_issues"] = [shutdown_record.LegacyTmuxSessionLeftRunning(kind="legacy tmux session left running",
@@ -2625,7 +2626,7 @@ class RestartTests(ShutdownTestCase):
     def test_manual_resume_selects_the_current_group_account(self) -> None:
         self.configure_groups(units="claude3")
         owner = unit("old-unit")
-        owner["host"] = inventory.LegacyTmuxUnitHost(kind="legacy tmux unit", production="demo",
+        owner["host"] = legacy_unit_host(kind="legacy tmux unit", production="demo",
             unit="old", doc="/tmp/old.md", session_name="old-unit")
         command = restart.legacy_resume_command(entry(owner))
         self.assertIn("exec claude3 --resume old-unit", command)

@@ -436,8 +436,7 @@ def moved_note(transfer: UnitTransfer) -> str:
 
 
 def _restart_record(transfer: UnitTransfer, save: Callable[[], None]) -> None:
-    """Point the stopped unit's shutdown record at the receiving production. The relaunch reads its
-    doc, so the unit's marks name the receiving slug."""
+    """Record the relaunch note; staff supplies its current parent at restart."""
     if not transfer.session_id:
         return
     import herdr
@@ -447,13 +446,10 @@ def _restart_record(transfer: UnitTransfer, save: Callable[[], None]) -> None:
 
     def change(saved: SessionShutdown) -> None:
         host = saved["session"]["host"]
-        if host["kind"] != "unit" or host["unit"] != transfer.unit or host["production"] not in (
-                transfer.from_slug, transfer.to_slug):
+        if host["kind"] != "unit" or host["unit"] != transfer.unit:
             raise RenameRefused(f"shutdown record {transfer.session_id} is not {transfer.unit}'s")
         if saved["progress"]["kind"] not in rename_unit.STOPPED:
             raise RenameRefused(f"{transfer.unit}'s shutdown record reads {saved['progress']['kind']}; settle it first")
-        host["production"] = transfer.to_slug
-        host["doc"] = transfer.to_doc
         if host["session_name"] == given:
             host["session_name"] = herdr.generated_session_name(f"{transfer.to_slug}-{stem}")
         saved["renamed"] = moved_note(transfer)
@@ -507,7 +503,7 @@ def verify_failures(transfer: UnitTransfer) -> list[str]:
     if transfer.session_id:
         saved = shutdown_record.find_session(transfer.account, transfer.session_id)
         if saved is not None and saved["session"]["host"]["kind"] == "unit" and (
-                saved["session"]["host"]["production"] != transfer.to_slug):
+                staff_sources.unit_parent(unit, transfer.session_id).slug != transfer.to_slug):
             failures.append(f"shutdown record {transfer.session_id} does not name {transfer.to_slug}")
         if not _live(transfer.to_slug, unit):
             failures.append(f"{unit} is not running under {transfer.to_slug}; relaunch it with "
@@ -558,7 +554,7 @@ def _describe_state(t: UnitTransfer) -> str:
 
 
 def _describe_record(t: UnitTransfer) -> str:
-    return (f"shutdown record: production {t.from_slug} -> {t.to_slug} and doc {t.to_doc}; the first prompt "
+    return (f"shutdown record: retain {t.unit}; staff supplies parent {t.to_slug} at relaunch; the first prompt "
             + "names the new production")
 
 
@@ -713,6 +709,7 @@ def _apply(from_slug: str, unit: str, to_doc: Path, scratch: Path) -> UnitTransf
             with _merge_locks(transfer):
                 preflight(transfer)
                 _check_ready(transfer)
+            rename_unit.bind_stop_target(transfer)
             # The request is saved before anything changes, so every later refusal resumes.
             _save(path, transfer)
         try:

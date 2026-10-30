@@ -37,6 +37,7 @@ import launch_permission
 import shutdown_record as store
 from shutdown_record import CheckoutMove, SessionShutdown, SessionStopIssue, TimerRestore, ShutdownContinuation, ReadinessCheck
 from remote import other_machine, run_remote
+from scripts.production import staff_sources
 import showrunners
 import sessions
 import stop as stop_work
@@ -1817,7 +1818,7 @@ def _unit_showrunner(saved: SessionShutdown) -> str:
     if session["kind"] != "unit" or host["kind"] != "unit":
         return ""
     try:
-        return showrunners.current_name(showrunners.production_slug(host["doc"]))
+        return showrunners.current_name(staff_sources.unit_parent(host["unit"], session["session_id"]).slug)
     except (OSError, ValueError):
         return ""
 
@@ -1974,7 +1975,7 @@ def _holdout_host(saved: SessionShutdown) -> str:
     if host["kind"] == "legacy tmux" or host["kind"] == "legacy tmux unit":
         return f"legacy host {host['session_name']}"
     if host["kind"] == "unit":
-        return f"unit {host['production']}/{host['unit']}"
+        return f"unit {host['unit']}"
     if host["kind"] == "ghostty" or host["kind"] == "zed":
         desktop = host["desktop"]
         window = "Ghostty window" if host["kind"] == "ghostty" else "Zed window"

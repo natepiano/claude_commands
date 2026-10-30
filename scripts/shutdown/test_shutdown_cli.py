@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from scripts.whoami.note_file import note_name
 
+from unit_staff_test_support import unit_host
+from scripts.production import staff_sources
 import io
 from datetime import datetime
 import json
@@ -67,7 +69,7 @@ def unit_session(session_id: str) -> inventory.UnitSession:
         run_dirs=[],
         codex_servers=[],
         timers=[],
-        host=inventory.UnitHost(
+        host=unit_host(
             kind="unit",
             production="demo",
             unit="alpha-unit",
@@ -2065,7 +2067,7 @@ class OnlySessionCliTests(ShutdownTestCase):
         def listed(_login: str) -> list[inventory.ListedSession]:
             return [inventory.ListedSession(owner["session_id"], owner["pid"], owner["proc_start"],
                 owner["name"], owner["kind"], self.root / ".claude", LOGIN,
-                owner["host"]["production"] if owner["kind"] == "unit" else "", "")
+                staff_sources.unit_parent(owner["host"]["unit"]).slug if owner["kind"] == "unit" else "", "")
                 for owner in self.owners]
         _ = self.enterContext(patch.object(shutdown, "listing", side_effect=listed))
         def observed(login: str, only: Iterable[str] = ()) -> inventory.Inventory:

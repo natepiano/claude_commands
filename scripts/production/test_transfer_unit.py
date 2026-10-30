@@ -16,7 +16,7 @@ from contextlib import ExitStack
 
 from scripts.astra import design_roles
 from scripts.direct import workers
-from scripts.production import staff
+from scripts.production import staff, staff_sources
 from scripts.production.rename_test_support import legacy_staff_journal, stop_at_staff_write
 from scripts.production.rename_rerun_test_support import final_files, saved_fixture
 from scripts.production.staff_test_support import SOURCES_SCRIPT, PROCESS_TIMEOUT
@@ -230,7 +230,7 @@ class UnitTransferTests(UnitTransferFixture):
         for name in ("from_doc", "to_doc", "from_checkout", "to_checkout"):
             self.assertNotIn(name, saved)
 
-    def test_a_stopped_unit_relaunches_from_a_record_that_names_the_receiving_production(self) -> None:
+    def test_a_stopped_unit_relaunches_using_its_receiving_staff_parent(self) -> None:
         log = self.seed_record()
         result = self.transfer("apply")
         # The fake restart starts nothing, so verify finds the unit not running and holds the journal open.
@@ -241,8 +241,11 @@ class UnitTransferTests(UnitTransferFixture):
         saved = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
         host = cast(dict[str, object], cast(dict[str, object], saved["session"])["host"])
         receiving = self.receiving / "docs/plans/other-production.md"
-        self.assertEqual((host["production"], host["doc"], host["unit"], host["session_name"]),
-                         ("other", str(receiving), "alpha-unit", "other-alpha"))
+        self.assertEqual((host["unit"], host["session_name"]), ("alpha-unit", "other-alpha"))
+        self.assertNotIn("production", host)
+        self.assertNotIn("doc", host)
+        self.assertEqual(staff_sources.unit_parent("alpha-unit", "sid-alpha"),
+                         staff_sources.UnitProduction("other", str(receiving)))
         note = cast(str, saved["renamed"])
         self.assertIn(f"moved you to production other: your production doc is now {receiving}", note)
         self.assertIn(f"Your worktree {self.unit}, your branch demo-alpha and its commits stay.", note)
