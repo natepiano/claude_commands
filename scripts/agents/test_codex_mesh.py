@@ -45,7 +45,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from types import SimpleNamespace
 from collections.abc import Generator, Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Callable, Literal, TextIO, TypedDict, cast, final, override
 from unittest.mock import MagicMock, patch
 
@@ -134,33 +134,80 @@ class FixtureLoopBudget:
     name: str
     seconds: float = 120.0
     max_calls: int = 2_000
-    started: float = dataclasses.field(default_factory=time.perf_counter)
+    clock: Callable[[], float] = time.perf_counter
+    started: float = dataclasses.field(init=False)
     calls: int = 0
+
+    def __post_init__(self) -> None:
+        self.started = self.clock()
 
     def check(self) -> float:
         self.calls += 1
         if self.calls > self.max_calls:
             raise AssertionError(f"{self.name}: exceeded {self.max_calls} fixture calls")
-        remaining = self.seconds - (time.perf_counter() - self.started)
+        remaining = self.seconds - (self.clock() - self.started)
         if remaining <= 0:
-            raise AssertionError(f"{self.name}: exceeded {self.seconds}s real-time fixture deadline")
+            raise AssertionError(f"{self.name}: exceeded {self.seconds}s fixture deadline")
         return remaining
 
 
 @dataclasses.dataclass
 class LifecycleTestClock:
-    """Keep real registry subprocess time outside scripted lifecycle deadlines."""
+    """Use one registry-free clock for worker deadlines and submission readiness."""
 
     registry_seconds: float = 0.0
+    registry_calls: int = 0
+    registry_started: float = 0.0
+    lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+
+    def registry_elapsed(self) -> float:
+        with self.lock:
+            running = time.perf_counter() - self.registry_started if self.registry_calls else 0.0
+            return self.registry_seconds + running
 
     def time(self) -> float:
-        return time.time() - self.registry_seconds
+        return time.time() - self.registry_elapsed()
 
     def monotonic(self) -> float:
-        return time.monotonic() - self.registry_seconds
+        return time.monotonic() - self.registry_elapsed()
 
     def sleep(self, seconds: float) -> None:
         time.sleep(seconds)
+
+    def registry_resolution[**P, R](self, resolve: Callable[P, R]) -> Callable[P, R]:
+        @functools.wraps(resolve)
+        def measured(*args: P.args, **kwargs: P.kwargs) -> R:
+            with self.lock:
+                if not self.registry_calls:
+                    self.registry_started = time.perf_counter()
+                self.registry_calls += 1
+            try:
+                return resolve(*args, **kwargs)
+            finally:
+                with self.lock:
+                    self.registry_calls -= 1
+                    if not self.registry_calls:
+                        self.registry_seconds += time.perf_counter() - self.registry_started
+
+        return measured
+
+    def wait_for_submission(self, ready: threading.Event, *, timeout: float) -> bool:
+        """Keep the existing readiness bound, excluding real registry setup only."""
+        deadline = self.monotonic() + timeout
+        budget = FixtureLoopBudget("submission readiness")
+        while not ready.is_set():
+            remaining = deadline - self.monotonic()
+            if remaining <= 0:
+                return ready.is_set()
+            _ = ready.wait(timeout=min(remaining, budget.check()))
+        return True
+
+    def result[T](self, future: Future[T], *, timeout: float) -> T:
+        ready = threading.Event()
+        future.add_done_callback(lambda _future: ready.set())
+        if not self.wait_for_submission(ready, timeout=timeout):
+            raise TimeoutError("worker did not finish within its lifecycle deadline")
+        return future.result()
 
 
 def bounded_fixture[**P, R](callback: Callable[P, R]) -> Callable[P, R]:
@@ -594,6 +641,7 @@ class MeshCommandFixture(unittest.TestCase):
     elapsed: float  # pyright: ignore[reportUninitializedInstanceVariable]
     start_args_timeout: float  # pyright: ignore[reportUninitializedInstanceVariable]
     loop_budget: FixtureLoopBudget  # pyright: ignore[reportUninitializedInstanceVariable]
+    lifecycle_clock: LifecycleTestClock  # pyright: ignore[reportUninitializedInstanceVariable]
     patches: contextlib.ExitStack  # pyright: ignore[reportUninitializedInstanceVariable]
 
     @override
@@ -607,18 +655,12 @@ class MeshCommandFixture(unittest.TestCase):
         self.home.mkdir()
         self.patches = contextlib.ExitStack()
         self.addCleanup(self.patches.close)
-        clock = LifecycleTestClock()
-        resolve = codex_mesh._turn_model_effort  # pyright: ignore[reportPrivateUsage]
-
-        def resolve_registry(args: argparse.Namespace) -> tuple[str, str]:
-            started = time.perf_counter()
-            try:
-                return resolve(args)
-            finally:
-                clock.registry_seconds += time.perf_counter() - started
-
+        clock = self.lifecycle_clock = LifecycleTestClock()
         _ = self.patches.enter_context(patch.object(codex_mesh, "time", clock))
-        _ = self.patches.enter_context(patch.object(codex_mesh, "_turn_model_effort", resolve_registry))
+        _ = self.patches.enter_context(patch.object(codex_mesh, "_turn_model_effort",
+            clock.registry_resolution(codex_mesh._turn_model_effort)))  # pyright: ignore[reportPrivateUsage]
+        _ = self.patches.enter_context(patch.object(codex_mesh, "_turn_service_tier",
+            clock.registry_resolution(codex_mesh._turn_service_tier)))  # pyright: ignore[reportPrivateUsage]
         _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {
             "HOME": str(self.home), "CODEX_HOME": str(self.home / ".codex"),
             "AGENT_NOTES_DIR": str(self.home),
@@ -1345,6 +1387,114 @@ class WorkerShownNameTests(MeshCommandFixture):
                     _ = codex_mesh.main([*command, "--help"])
                 self.assertEqual(ended.exception.code, 0)
                 self.assertNotRegex(output.getvalue().lower(), r"\bseats?\b")
+
+
+@final
+class LifecycleClockTests(unittest.TestCase):
+    def test_registry_time_is_excluded_during_resolution_and_after_failure(self) -> None:
+        ticks = [1000.0]
+        clock = LifecycleTestClock()
+
+        def resolve() -> None:
+            ticks[0] += 10
+            self.assertEqual(clock.time(), 1000)
+            self.assertEqual(clock.monotonic(), 1000)
+            raise ValueError("resolver failed")
+
+        with (patch.object(time, "time", new=lambda: ticks[0]),
+              patch.object(time, "monotonic", new=lambda: ticks[0]),
+              patch.object(time, "perf_counter", new=lambda: ticks[0])):
+            with self.assertRaisesRegex(ValueError, "resolver failed"):
+                clock.registry_resolution(resolve)()
+            ticks[0] += 1
+            self.assertEqual(clock.time(), 1001)
+            self.assertEqual(clock.monotonic(), 1001)
+
+    def test_readiness_excludes_registry_time_but_still_expires_without_an_event(self) -> None:
+        for delayed in (False, True):
+            with self.subTest(delayed=delayed):
+                ticks = [1000.0]
+                clock = LifecycleTestClock()
+                ready = threading.Event()
+                waits: list[float | None] = []
+
+                def resolve() -> None:
+                    ticks[0] += 10
+
+                def wait(timeout: float | None = None) -> bool:
+                    waits.append(timeout)
+                    if delayed and len(waits) == 1:
+                        clock.registry_resolution(resolve)()
+                    else:
+                        ticks[0] += 1
+                        if delayed:
+                            ready.set()
+                    return ready.is_set()
+
+                with (patch.object(time, "monotonic", new=lambda: ticks[0]),
+                      patch.object(time, "perf_counter", new=lambda: ticks[0]),
+                      patch.object(ready, "wait", new=wait)):
+                    self.assertEqual(clock.wait_for_submission(ready, timeout=1), delayed)
+                self.assertEqual(waits, [1, 1] if delayed else [1])
+
+    def test_result_wait_excludes_registry_time_and_preserves_task_errors(self) -> None:
+        for completed in (False, True):
+            with self.subTest(completed=completed):
+                ticks = [1000.0]
+                clock = LifecycleTestClock()
+                ready = threading.Event()
+                future = Future[int]()
+                waits: list[float | None] = []
+
+                def resolve() -> None:
+                    ticks[0] += 10
+
+                def wait(timeout: float | None = None) -> bool:
+                    waits.append(timeout)
+                    if len(waits) == 1:
+                        clock.registry_resolution(resolve)()
+                    else:
+                        ticks[0] += 1
+                        if completed:
+                            future.set_result(17)
+                    return ready.is_set()
+
+                with (patch.object(time, "monotonic", new=lambda: ticks[0]),
+                      patch.object(time, "perf_counter", new=lambda: ticks[0]),
+                      patch.object(threading, "Event", new=lambda: ready),
+                      patch.object(ready, "wait", new=wait)):
+                    if completed:
+                        self.assertEqual(clock.result(future, timeout=1), 17)
+                    else:
+                        with self.assertRaises(TimeoutError):
+                            _ = clock.result(future, timeout=1)
+                self.assertEqual(waits, [1, 1])
+        failed = Future[int]()
+        failed.set_exception(ValueError("worker assertion"))
+        with self.assertRaisesRegex(ValueError, "worker assertion"):
+            _ = LifecycleTestClock().result(failed, timeout=1)
+
+    def test_callback_budget_uses_the_lifecycle_clock_and_retains_its_limits(self) -> None:
+        ticks = [1000.0]
+        clock = LifecycleTestClock()
+        with (patch.object(time, "monotonic", new=lambda: ticks[0]),
+              patch.object(time, "perf_counter", new=lambda: ticks[0])):
+            budget = FixtureLoopBudget("callback", seconds=3, clock=clock.monotonic)
+
+            def resolve() -> None:
+                ticks[0] += 10
+                self.assertEqual(budget.check(), 3)
+
+            clock.registry_resolution(resolve)()
+            ticks[0] += 2
+            self.assertEqual(budget.check(), 1)
+            ticks[0] += 1
+            with self.assertRaisesRegex(AssertionError, "fixture deadline"):
+                _ = budget.check()
+            bounded = FixtureLoopBudget("callback count", max_calls=1, clock=clock.monotonic)
+            _ = bounded.check()
+            with self.assertRaisesRegex(AssertionError, "fixture calls"):
+                _ = bounded.check()
 
 
 class FixtureHomeSafetyTests(unittest.TestCase):
@@ -8244,7 +8394,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(self.run_follow)
             try:
-                self.assertTrue(self.server.held_turn_ready.wait(timeout=4))
+                self.assertTrue(self.lifecycle_clock.wait_for_submission(self.server.held_turn_ready, timeout=4))
                 # A recovering handoff can fence an old launcher after its
                 # original idle precondition was checked. Only ownership
                 # changes, so the watcher must observe adopted_to itself.
@@ -8665,7 +8815,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
             return frame
 
         def observed_finish(stream: codex_mesh.TurnStream) -> codex_mesh.RunOutcome:
-            self.assertLess(time.time(), stream.deadline, "run finished at its hang guard")
+            self.assertLess(self.lifecycle_clock.time(), stream.deadline, "run finished at its hang guard")
             return finish_stream(stream)
 
         with (
@@ -8699,7 +8849,8 @@ class FollowEventRegressionTests(MeshCommandFixture):
         checked = threading.Event()
         frame_handler = codex_mesh._on_frame  # pyright: ignore[reportPrivateUsage]
         quiet = codex_mesh._on_quiet_poll  # pyright: ignore[reportPrivateUsage]
-        budget = FixtureLoopBudget("new detached run discovery", seconds=6, max_calls=24)
+        budget = FixtureLoopBudget("new detached run discovery", seconds=6, max_calls=24,
+                                   clock=self.lifecycle_clock.monotonic)
         run = self.session_dir / codex_mesh.DETACHED_RUNS_DIR / "new.json"
         run.parent.mkdir()
 
@@ -8711,7 +8862,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
             item = _as_test_dict(_as_test_dict(frame.get("params")).get("item"))
             if item.get("type") == "agentMessage" and not created.is_set():
                 self.assertFalse(stream.runs.last_observed.live)
-                self.assertGreater(stream.runs.next_check, time.monotonic())
+                self.assertGreater(stream.runs.next_check, self.lifecycle_clock.monotonic())
                 _ = run.write_text(json.dumps({"worker": "worker", "status": "running", "pid": os.getpid()}))
                 pending = self.session_dir / "worker.pending.json"
                 _ = pending.write_text(pending.read_text() + "\n")
@@ -8738,7 +8889,12 @@ class FollowEventRegressionTests(MeshCommandFixture):
             future = executor.submit(self.run_follow)
             try:
                 # Submission/setup time is separate from the file-wake bound below.
-                self.assertTrue(created.wait(timeout=3), "answer never started the run fixture")
+                submitted = self.lifecycle_clock.wait_for_submission(created, timeout=3)
+                if not submitted and future.done():
+                    self.assertEqual(future.result(), (0, ""), "follow exited before the answer")
+                self.assertTrue(submitted,
+                                f"answer never started the run fixture; requests={self.server.requests!r}; " +
+                                f"server errors={self.server.errors!r}")
                 self.assertTrue(checked.wait(timeout=1), "file event never checked the new run")
                 self.assertFalse(future.done(), "launcher abandoned a detached run created after its scan")
                 inbox = _as_test_dict(cast(object, json.loads((self.session_dir / "worker.pending.json").read_text())))
@@ -8751,7 +8907,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
                     with contextlib.redirect_stdout(io.StringIO()):
                         _ = codex_mesh.command_send(argparse.Namespace(session_dir=str(self.session_dir),
                             to="worker", message="detached run result", message_file=""))
-            code, errors = future.result(timeout=3)
+            code, errors = self.lifecycle_clock.result(future, timeout=3)
         self.assertEqual((code, errors), (0, ""))
         # A full-history read queues a notice that kept the idle check from
         # ever reaching delivery.
@@ -8797,7 +8953,8 @@ class FollowEventRegressionTests(MeshCommandFixture):
               ThreadPoolExecutor(max_workers=1) as executor):
             future = executor.submit(self.run_follow)
             try:
-                self.assertTrue(held_on_run.wait(timeout=5), "launcher never waited on the live run")
+                self.assertTrue(self.lifecycle_clock.wait_for_submission(held_on_run, timeout=5),
+                                "launcher never waited on the live run")
                 self.server.hold_turn_completion = True
                 self.server.answer_requests_during_held_turn = True
                 self.server.held_turn_completes_successfully = True
@@ -8805,7 +8962,8 @@ class FollowEventRegressionTests(MeshCommandFixture):
                 held = codex_mesh.hold_message(str(self.session_dir), "worker", "detached run result",
                                                without_launcher=False)
                 self.assertIsInstance(held, codex_mesh.HeldForLauncher)
-                self.assertTrue(self.server.held_turn_ready.wait(timeout=5), "the held result opened no turn")
+                self.assertTrue(self.lifecycle_clock.wait_for_submission(self.server.held_turn_ready, timeout=5),
+                                "the held result opened no turn")
                 self.assertTrue(polled_result_turn.wait(timeout=5), "no lifecycle check ran on the result turn")
                 self.assertNotIn(codex_mesh.StreamStep.FINISH, steps)
                 self.assertFalse(future.done(), "launcher left the result turn before its completion")
@@ -8949,7 +9107,8 @@ class FollowEventRegressionTests(MeshCommandFixture):
         ):
             future = executor.submit(follow)
             try:
-                self.assertTrue(ready.wait(timeout=5), "follower never consumed the stream")
+                self.assertTrue(self.lifecycle_clock.wait_for_submission(ready, timeout=5),
+                                "follower never consumed the stream")
                 self.assertTrue(self.server.held_turn_ready.wait(timeout=1))
                 # Allow only startup events during the first second. A 1s
                 # polling regression must then wake during the next two.
@@ -9102,7 +9261,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
               ThreadPoolExecutor(max_workers=1) as executor):
             future = executor.submit(self.run_follow)
             try:
-                self.assertTrue(self.server.held_turn_ready.wait(timeout=5))
+                self.assertTrue(self.lifecycle_clock.wait_for_submission(self.server.held_turn_ready, timeout=5))
                 self.assertTrue(answer_consumed.wait(timeout=5))
                 # The server is idle, but its turn/completed notice is lost.
                 self.live_turn = ""
