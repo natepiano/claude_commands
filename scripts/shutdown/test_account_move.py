@@ -554,8 +554,8 @@ class AccountMoveTests(ShutdownTestCase):
                 code = shutdown.main(command[2:])
             return subprocess.CompletedProcess(command, code, output.getvalue(), "")
 
-        def delivered(to: str, first: str, text: str, *, key: str = "") -> settle.MessageDelivery:
-            _ = key
+        def delivered(to: str, first: str, text: str, *, key: str = "", repeat_minutes: int = 0) -> settle.MessageDelivery:
+            _ = key, repeat_minutes
             events.append(first)
             if to == "session:director":
                 self.assertTrue(first.startswith("Pause for move: claude1 → claude3 (checkpoint move, "))

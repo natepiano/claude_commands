@@ -52,6 +52,11 @@ MEMORY_GATE = Path(__file__).with_name("memory_gate.sh")
 HANA = gate.RepositoryIdentity("https://example.org/nate/hana", "hana", "hana")
 
 
+def buildlog_rows(root: Path) -> list[dict[str, object]]:
+    return [cast(dict[str, object], json.loads(line)) for path in root.glob("*/*.jsonl")
+            for line in path.read_text().splitlines()]
+
+
 def setUpModule() -> None:
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
     _ = (root / "meminfo").write_text("MemTotal: 67108864 kB\nMemAvailable: 67108864 kB\n")
@@ -1318,6 +1323,198 @@ class MemoryQueueFixture(unittest.TestCase):
                           root=self.root, now=NOW,
                           profile=gate.StepProfile("test", "nextest", "test", gate.ExpectedPeak(int(need * GIB), "measured", 5)))
 
+
+
+class AdmitHeadTests(MemoryQueueFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        environment = fake_memory_readings(self.root)
+        environment.update({"BUILDLOG_MEMINFO": str(self.meminfo), "BUILDLOG_BUILD_BUDGET_GIB": "21",
+                            "CLAUDE_CODE_SESSION_ID": "showrunner-id", "CODEX_THREAD_ID": ""})
+        _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
+        _ = self.enterContext(patch.object(time, "time", return_value=NOW.timestamp()))
+        # One boundary replaces every real showrunner-state lookup.
+        _ = self.enterContext(patch.object(gate, "showrunner_is_registered", return_value=True, create=True))
+        _ = self.meminfo.write_text(f"MemAvailable: {23 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
+
+    @property
+    def override_path(self) -> Path:
+        return self.root / "admission/admit-head.json"
+
+    def waiting_head(self) -> Path:
+        path = self.head(12)
+        row = cast(gate.Waiter, json.loads(path.read_text()))
+        row.update(session_id="head-session", session_name="head-unit", step="nextest", folder=str(self.root / "tree"))
+        _ = path.write_text(json.dumps(row))
+        return path
+
+    def set_head(self, why: str = "") -> str:
+        output = io.StringIO()
+        arguments = ["memory_admit.py", "admit-head"] + (["--why", why] if why else [])
+        with patch.object(sys, "argv", arguments), redirect_stdout(output):
+            gate.main()
+        return output.getvalue()
+
+    def events(self) -> list[dict[str, object]]:
+        return [row for row in buildlog_rows(self.root) if row.get("kind") == "head_admission"]
+
+    def bump_younger_waiter(self) -> Path:
+        younger = self.root / "admission/400-warmup.waiting"
+        row = cast(gate.Waiter, json.loads(younger.read_text()))
+        row["bump_order"] = -1
+        _ = younger.write_text(json.dumps(row))
+        return younger
+
+    def test_showrunner_sets_one_record_for_the_current_head(self) -> None:
+        path = self.waiting_head()
+        self.assertIn("head-unit", self.set_head("free memory checked"))
+        row = cast(dict[str, object], json.loads(self.override_path.read_text()))
+        self.assertEqual((row["waiter"], row["pid"], row["start_time"]), (path.name, 300, "head"))
+        self.assertEqual((row["why"], row["set_by"]), ("free memory checked", "showrunner-id"))
+
+    def test_non_showrunner_is_refused_without_writing_a_record(self) -> None:
+        _ = self.waiting_head()
+        for session in ("worker-id", ""):
+            with self.subTest(session=session), patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": session}), \
+                 patch.object(gate, "showrunner_is_registered", return_value=False), \
+                 contextlib.redirect_stderr(io.StringIO()) as errors:
+                with self.assertRaises(SystemExit) as stopped:
+                    _ = self.set_head()
+                self.assertNotEqual(stopped.exception.code, 0)
+                self.assertIn("showrunner", errors.getvalue())
+                self.assertNotIn("Traceback", errors.getvalue())
+                self.assertFalse(self.override_path.exists())
+                self.assertEqual(self.events(), [])
+
+    def test_codex_caller_cannot_use_an_inherited_showrunner_session(self) -> None:
+        _ = self.waiting_head()
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": "worker-thread"}), \
+             patch.object(gate, "showrunner_is_registered", return_value=True) as lookup, \
+             contextlib.redirect_stderr(io.StringIO()) as errors:
+            with self.assertRaises(SystemExit) as stopped:
+                _ = self.set_head()
+        self.assertNotEqual(stopped.exception.code, 0)
+        self.assertIn("showrunner", errors.getvalue())
+        lookup.assert_not_called()
+        self.assertFalse(self.override_path.exists())
+        self.assertEqual(self.events(), [])
+
+    def test_nothing_waiting_is_refused_without_a_record_or_log_row(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            with self.assertRaises(SystemExit) as stopped:
+                _ = self.set_head()
+        self.assertNotEqual(stopped.exception.code, 0)
+        self.assertIn("nothing waits", errors.getvalue())
+        self.assertFalse(self.override_path.exists())
+        self.assertEqual(self.events(), [])
+
+    def test_new_call_replaces_the_previous_record(self) -> None:
+        _ = self.waiting_head()
+        _ = self.set_head("first")
+        _ = self.set_head("replacement")
+        row = cast(dict[str, object], json.loads(self.override_path.read_text()))
+        self.assertEqual(row["why"], "replacement")
+        self.assertEqual(len(list(self.override_path.parent.glob("admit-head*"))), 1)
+        self.assertEqual([row["action"] for row in self.events()], ["set", "set"])
+
+    def test_record_selects_the_first_waiter_in_queue_order(self) -> None:
+        _ = self.waiting_head()
+        _ = self.check(need=12, free=0)
+        younger = self.bump_younger_waiter()
+        _ = self.set_head()
+        self.assertEqual(json.loads(self.override_path.read_text())["waiter"], younger.name)
+
+    def test_head_starts_above_budget_when_free_memory_covers_need_and_reserve(self) -> None:
+        _ = self.running(100, 20, age=30)
+        _ = self.waiting_head()
+        self.assertEqual(self.check(pid=300, need=12, free=15).decision.state, "hold")
+        _ = self.set_head()
+        with patch.object(gate, "read_meminfo", wraps=gate.read_meminfo) as reading:
+            result = self.check(pid=300, need=12, free=15)
+        self.assertEqual(reading.call_count, 1)
+        self.assertEqual(result.decision.state, "admit")
+        self.assertGreater(result.decision.charged + result.peak.bytes, result.decision.budget)
+        self.assertEqual(result.decision.budget, 21 * GIB)
+        self.assertIsInstance(result.reservation, gate.Reserved)
+
+    def test_head_keeps_waiting_and_keeps_record_when_free_memory_does_not_cover_reserve(self) -> None:
+        _ = self.running(100, 20, age=30)
+        _ = self.waiting_head()
+        _ = self.set_head()
+        result = self.check(pid=300, need=12, free=14)
+        self.assertEqual(result.decision.state, "hold")
+        self.assertTrue(self.override_path.exists())
+        self.assertEqual([row["action"] for row in self.events()], ["set"])
+
+    def test_admission_deletes_record_and_writes_both_buildlog_rows(self) -> None:
+        _ = self.running(100, 20, age=30)
+        waiter = self.waiting_head()
+        _ = self.set_head("user asked")
+        result = self.check(pid=300, need=12, free=23)
+        self.assertEqual(result.decision.state, "admit")
+        self.assertFalse(waiter.exists())
+        self.assertFalse(self.override_path.exists())
+        rows = self.events()
+        self.assertEqual([row["action"] for row in rows], ["set", "admitted"])
+        for row in rows:
+            self.assertEqual((row["unit"], row["step"], row["need"], row["free"], row["reserve"], row["why"], row["set_by"]),
+                             ("head-unit", "nextest", 12 * GIB, 23 * GIB, 3 * GIB, "user asked", "showrunner-id"))
+            self.assertEqual(row["v"], 1)
+            self.assertTrue(row["id"])
+            self.assertEqual(row["host"], store.host_name())
+            self.assertEqual(row["at"], store.utc_iso(NOW.timestamp()))
+
+    def test_record_lapses_on_next_locked_pass_when_waiter_leaves(self) -> None:
+        _ = self.running(100, 20, age=30)
+        waiter = self.waiting_head()
+        _ = self.set_head()
+        waiter.unlink()
+        result = self.check(need=12, free=23)
+        self.assertEqual(result.decision.state, "hold")
+        self.assertFalse(self.override_path.exists())
+        self.assertEqual([row["action"] for row in self.events()], ["set", "lapsed"])
+
+    def test_record_for_a_dead_or_reused_waiter_never_admits_the_new_head(self) -> None:
+        _ = self.running(100, 20, age=30)
+        _ = self.waiting_head()
+        _ = self.set_head()
+        self.processes[300] = "new-process"
+        result = self.check(pid=300, need=12, free=23)
+        self.assertEqual(result.decision.state, "hold")
+        self.assertFalse(self.override_path.exists())
+        self.assertEqual([row["action"] for row in self.events()], ["set", "lapsed"])
+
+    def test_override_does_not_follow_a_bump_or_admit_another_waiter(self) -> None:
+        _ = self.running(100, 20, age=30)
+        _ = self.waiting_head()
+        _ = self.set_head()
+        _ = self.check(need=12, free=0)
+        _ = self.bump_younger_waiter()
+        self.assertEqual(self.check(need=12, free=23).decision.state, "hold")
+        self.assertEqual(self.check(pid=300, need=12, free=23).decision.state, "hold")
+        self.assertTrue(self.override_path.exists())
+        self.assertEqual([row["action"] for row in self.events()], ["set"])
+
+    def test_override_keeps_the_pressure_guard(self) -> None:
+        _ = self.running(100, 20, age=30)
+        _ = self.waiting_head()
+        _ = self.set_head()
+        _ = Path(os.environ["BUILDLOG_MEMORY_PRESSURE"]).write_text("full avg10=11.0 total=0\n")
+        self.assertEqual(self.check(pid=300, need=12, free=40).decision.state, "hold")
+        self.assertTrue(self.override_path.exists())
+
+    def test_stopped_record_replacement_keeps_previous_row_and_can_be_rerun(self) -> None:
+        _ = self.waiting_head()
+        _ = self.set_head("first")
+        before = self.override_path.read_bytes()
+        with patch.object(os, "replace", side_effect=OSError("stopped before rename")):
+            with self.assertRaises(OSError):
+                _ = self.set_head("second")
+        self.assertEqual(self.override_path.read_bytes(), before)
+        self.assertEqual(len(self.events()), 1)
+        _ = self.set_head("second")
+        self.assertEqual(json.loads(self.override_path.read_text())["why"], "second")
 
 
 class CurrentBlockerTests(MemoryQueueFixture):
@@ -2722,8 +2919,7 @@ class QueueApiTests(MemoryQueueFixture):
     def test_bump_writes_one_row_in_the_private_hold_event_log(self) -> None:
         _ = self.queue()
         _ = gate.bump_waiter("2", "actor-id")
-        rows = [cast(dict[str, object], json.loads(line)) for path in self.root.glob("*/*.jsonl")
-                for line in path.read_text().splitlines()]
+        rows = buildlog_rows(self.root)
         self.assertEqual(len(rows), 1)
         row = rows[0]
         self.assertEqual({key: row[key] for key in ("kind", "actor", "session", "step", "folder", "old_position", "at")},
