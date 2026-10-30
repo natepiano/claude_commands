@@ -60,6 +60,7 @@ i need changes to verify
 3. **One `cargo metadata` parse per run.** `MEMBER_PY`, `EXAMPLE_FEATURES_PY`, `TEST_TARGETS_PY`, `BUILD_TARGETS_PY`, `UNTESTED_EXAMPLES_PY` and the `workspace_root` read at 2777 each start Python and parse the same metadata JSON. Replace them with one helper module `scripts/direct/verify_metadata.py` that reads the metadata once and prints every value the run needs as `NAME=value` lines (shell-quoted with `shlex.quote`), which `verify.sh` reads with one `eval` or a `while read` loop. Each old `-c` constant goes away. Edge: a verb that needs no metadata (`doc` early exits, the query path at line 183) must not start the new helper.
 4. **Slow imports in this unit's helpers.** For `final_pass.py`, `step_record.py` and `local_release_wait.py`: where `-X importtime` shows a module import over 30 ms that only some subcommands need, move the import into that subcommand. For helpers owned by other units (`record.py`, `mac_idle.py`, `build_targets.py`, `progress_history.py`): write the measured cost and the proposed fix into the phase report and the checkpoint notice for the showrunner to route; do not edit them.
 5. **Merge repeated per-step calls** only where the trace shows two calls of this unit's helpers always run back to back with no shell work between them (candidate: `step_record.py state` then `remove`); give the helper one subcommand that does both.
+6. builds 2026-10-29 (hana's showrunner, organon 21:4x EDT): `token_wait_note` reads `locks/cargo.d/holder` with `read -r holder < … || holder=""`. The holder file has no trailing newline (`w74`), so `read` returns 1 after it fills `holder`, and the `||` clears it: the log says "it came free just now" while w74 holds the lock. Keep the value `read` fills when it returns non-zero at end of file (check every `read` of a board file in verify.sh for the same form). Test: a holder file `w74` with no newline gives "w74 holds it".
 
 Done when the trace on the same runs shows ≤ 2 s CPU of helper starts per step. If the floor sits above 2 s only because of other units' helpers, the phase ends with this unit's share removed and the rest named per owner.
 
@@ -79,6 +80,18 @@ Done when the trace on the same runs shows ≤ 2 s CPU of helper starts per step
 **Constraints from prior phases:** none. Merge `origin/natedev` before dispatch so phases-unit's `TOKEN_WAITED` fix is in the tree.
 
 **Acceptance gate:** merge gate `--tests-only` green on a tree merged with `origin/natedev`; basedpyright `0 errors, 0 warnings` on `scripts/direct scripts/mac_test` and every caller module; `bash -n` clean; the before/after trace table in the phase report shows ≤ 2 s CPU of helper starts per step for this unit's share, with the other owners' remaining cost named.
+
+### Phase 1b — Refuse a step with a failing exit, and read a process start on the Mac  · status: todo
+
+**Origin:** builds showrunner order 2026-10-30 03:5x EDT, a wrong-result defect from hana (trunk P170 board, 02:53 EDT). Runs in this worktree right after Phase 1, which owns the same files; ahead of Phase 7.
+
+**Defect:** on the Mac, `verify.sh`'s step recorder (`step_record.py process_start`) reads `/proc/<pid>/stat`, which Darwin does not have. The step is refused, but the wrapper exits 0, so the failure reads as a pass.
+
+**Fix:** (1) a refused step exits non-zero on every host, at the one place the wrapper turns a refusal into its exit status. (2) Process start comes from one shared helper in `scripts/lib/` that works on Linux (`/proc/<pid>/stat` field 22) and Darwin (`ps -o lstart=` under `LC_ALL=C TZ=UTC`, based on `message/sessions.py process_start`'s tested form) with one return type. `scripts/lib/` belongs to natedev: builds approved the path as outside this unit's Owns (03:5x); the checkpoint notice names it in its also-touches line. `step_record.py` and the inline readers in `scripts/direct/verify.sh` and `scripts/direct/board.sh` use it; no second copy. The other copies (`message/sessions.py`, `build_hold/build_hold.py`, `lint/memory_admit.py`, `lint/tmp_sweep.py`, `production/retire_unit.py`) go to their owners through builds after 1b merges: build_hold, memory_admit and tmp_sweep to resources; sessions.py and retire_unit.py to natedev.
+
+**Files:** `scripts/lib/process_start.py` (new), its test, `scripts/direct/step_record.py`, `scripts/direct/verify.sh`, `scripts/direct/board.sh`, `scripts/direct/test_step_record.py`.
+
+**Acceptance gate:** a test for each fix: a refused step makes `verify.sh` exit non-zero (a fake process root with no `stat`); the helper reads a start on Darwin (faked `sys.platform` and `ps`) and on Linux, and both reads agree with the record's stale check. basedpyright 0/0/0 on changed files; the merge gate passes. Hana is told when it lands.
 
 ### Phase 2 — Cancel a test or lint run when the tree changes under it  · status: done
 
@@ -158,7 +171,7 @@ Done when the trace on the same runs shows ≤ 2 s CPU of helper starts per step
 
 **Acceptance gate:** merge gate `--tests-only` green; basedpyright `0 errors, 0 warnings` on changed files and callers; a test shows `test hana --filter native_rate` with filtered history promised that history's p90, without history the floor rule, and an unfiltered run unchanged.
 
-### Phase 4 — Promise a fresh test run only its test memory  · status: todo
+### Phase 4 — Promise a fresh test run only its test memory  · status: done
 
 **Depends on:** Phase 3 (same function). Runs in Phase 3's worktree `/home/natepiano/worktrees/claude-build-followups-verify-memory`, branch `natedev-verify-memory`, after Phase 3's checkpoint.
 
@@ -258,6 +271,45 @@ Done when the trace on the same runs shows ≤ 2 s CPU of helper starts per step
 
 **Acceptance gate (showrunner bump):** basedpyright `0 errors, 0 warnings` on changed files; the guard and hook test files pass; tests show a merge whose other parent removed assertions passes, our own removal on a merge still blocks, and the hook and the guard return the same answer for a staged commit with a ruling in its `-F` file.
 
+### Phase 6a — Take the newer of the upstream base and the production merge-branch base  · status: done
+
+**Origin:** showrunner bump 2026-10-29 19:5x, ticket 108 from cargo-liner-style-names-unit. Branch `natedev-verify-base` from origin/builds, worktree `claude-build-followups-verify-base`; lands ahead of the open phases.
+
+**Defect:** `default_base` takes `merge-base HEAD @{upstream}`. In a style unit worktree `@{upstream}` is the unit's own pushed branch, while refill fast-forwards the worktree to `style/main`. Commits that came in from `style/main` then count as the unit's change, and lint fails on six `assert_eq!` that values-unit phase 77 (b1408dc8) removed in cargo-mend `fixes/facade_redirect/module_aliases.rs:223-282`.
+
+**Fix (ruling):** for every unit, with no style-only branch in the code, the base is the newer of `merge-base HEAD @{upstream}` and `merge-base HEAD origin/<merge branch>`. The merge branch comes from the production doc's `Merge branch` field (`production_units.production_field`), for the production whose Units table lists this worktree (or, failing that, this branch). No production match or no such remote ref leaves the upstream base alone. An explicit `--base` / `VERIFY_ASSERTION_BASE` still wins.
+
+**Files:** `scripts/direct/assertion_guard.py`, `scripts/direct/test_assertion_guard.py`, `docs/as-built/phase-checks.md` (its guard row still says "origin's default branch").
+
+**Acceptance gate:** basedpyright `0 errors, 0 warnings` on changed files; the guard tests pass, with one that reproduces ticket 108 (upstream behind, worktree fast-forwarded to the merge branch, the merge branch's removed assertions do not block, our own still do); the merge gate passes.
+
+### Phase 6b — Pair an assertion whose literal became a named constant, and read no test start inside a string literal  · status: done
+
+#### As-built
+
+Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
+
+- The assertion guard pairs a removed literal assertion with its replacement when the literal became a bare `const` name in the same file. The `const` has one literal value and one binding in that file. The guard reads each side's file at that side's own git revision, never the working tree.
+- A pair needs an exact `&str` / `&'static str` string (plain or raw), `char` or `bool` literal, or an unsigned number with a type the guard can prove (a suffix, or the default `i32` / `f64`). A range endpoint in the second argument of a trusted `matches!` also pairs.
+- All other forms stay as written and still report `removed`: statics, imported and qualified names, composed constants (`concat!`, arithmetic, a `const` set to another `const`), byte strings, signed numbers, and names inside nested macros.
+- The guard fails closed. When it cannot be certain of a binding, it refuses to pair and blocks: non-ASCII code, `r#` identifiers, `extern crate … as`, incomplete macro paths, trusted macro names that are imported or bound again, `macro_use`, item and statement macros (`include!`), and `#[path]` / `cfg_attr(path)` modules. A glob import (`use x::*`), seen or not, can only refuse a pair.
+- The test-owner scan skips text inside string literals (plain, raw, byte, Python triple-quoted) and comments, so `pub fn` text in a fixture string does not start a test.
+- The production merge-branch match skips Units rows marked retired or removed.
+- Real cargo-liner commits: 7a4fb6b8 pairs all 14 former removals (0 blocking); b1408dc8 pairs all 6; 2520c27d has 0 blocking removals and 2 nonblocking notes for values inside a nested `vec!`.
+
+**Files:**
+- `scripts/direct/assertion_guard.py` — constant table, binding census, refusal rules, literal-aware test-owner scan.
+- `scripts/direct/assertion_guard_test_support.py` — shared fixture repo helpers.
+- `scripts/direct/test_assertion_guard_revisions.py` — pairing across git revisions, refusals, glob census.
+- `scripts/direct/test_assertion_guard_strings.py` — string and comment skips, macro and byte-string refusals.
+- `docs/as-built/phase-checks.md` — the guard row lists the forms that pair and the forms that refuse.
+
+**Binds later work:** the "Pair a literal with an imported crate constant" follow-up in `docs/plans/natedev-verify-next.md` takes the imported and exotic forms that refuse here. Four tests carry Assertion-Change lines for the narrower pairing: `test_literal_constants_pair_across_git_revisions`, `test_constants_composed_of_literals_pair_without_resolving_runtime_calls`, `test_imported_constants_use_each_sides_revision`, `test_visible_and_unknown_globs_take_part_in_file_binding_census`.
+
+**Gotchas:** a pair that the guard cannot prove must block, not pass; every new form needs a refusal test first. Shadowing in Rust (function-local `mod`, inner `use`, type aliases, generic parameters, `include!`) makes a bare name mean a different value, so the census counts every binding of the name in the file.
+
+**Ruled out:** evaluating `concat!` or arithmetic in a `const` — a constant pairs only when its value is one literal.
+
 ### Phase 7 — Keep the cargo token through a long lint, and keep a run's queue place when the Mac is taken  · status: todo
 
 **Depends on:** none. Urgent, ahead of Phases 1, 2 and 4. Runs in `/home/natepiano/worktrees/claude-build-followups-verify-guard`, branch `natedev-verify-token` (from origin/natedev d41fbd8c).
@@ -273,7 +325,7 @@ Done when the trace on the same runs shows ≤ 2 s CPU of helper starts per step
 1. While verify.sh holds the cargo token, it renews the hold before each step and from a background loop while a step runs (well inside the hold), and stops renewing when it releases. Use `board.sh renew`; add `--pid` to `cmd_renew` so verify renews for its holder pid.
 2. The fix loop's "did the fixes change anything" check and the tree-changed notice use tree content only, not the hashes of verify.sh, invoke.sh or lint.conf. The pass-record key may keep them.
 3. `lint_failure_is_the_tree` never counts status 125, or any lost-token status, as the tree's lint failure.
-4. In `run_local_test`, the first memory-wait start (`BUILDLOG_MEM_WAIT_FROM`) carries through a call file to every later `run_nextest` as `BUILDLOG_MEM_WAIT_SINCE`, so a run whose Mac claim failed keeps its queue place.
+4. In `run_local_test`, the first memory-wait start (`BUILDLOG_MEM_WAIT_FROM`) carries through a call file to every later `run_nextest` as `BUILDLOG_MEM_WAIT_SINCE`, so a run whose Mac claim failed keeps its queue place. The recorded memory wait (`BUILDLOG_MEM_WAIT_S`, the build record's `mem_wait_s`) counts from that first start, so a run that rejoined 12 times records its whole wait, not the last part (builds, 2026-10-29, from resources-unit: widget's 4 h 34 min wait recorded 1428 s).
 5. board.sh `lock_stale_reason` never reclaims an expired hold while `holder_pid` is alive and its `owned` group record still matches; a dead holder is still freed.
 6. One decision point for the Mac: the memory wait's leave hook takes the Mac claim under `state.lock` (as `claim_once` does) and hands the held claim to the runner, instead of reading `free-now`. A step leaves the wait only when it already holds the Mac; a refused claim keeps waiting in place.
 7. Script hashes stay in the pass-record (cache) key, so a lint result does not survive a lint-script change (builds, 2026-10-29).
@@ -311,7 +363,7 @@ Done when the trace on the same runs shows ≤ 2 s CPU of helper starts per step
 **Files:**
 - `scripts/direct/verify.sh` — holder lookup and the two calls
 - `scripts/direct/test_verify_wait_holder.py` — new
-- `scripts/lint/memory_admit.py` — read only here: resources-unit adds `memory_admit.py blocker --waiter <file>` (`current_blocker`), JSON `{session_id, session_name, pool}` | `{unit}` | `{}`, and the same object in `check` output; on builds-resources by 17:00 EDT
+- `scripts/lint/memory_admit.py` — read only here: resources-unit's 45e60cc9 on builds-resources (merged to builds by the showrunner before this phase). `python3 scripts/lint/memory_admit.py blocker --waiter <waiter file>` prints one JSON line `{"session_id","session_name","pool":"memory"}`, or `{"unit"}` when only a systemd unit is known, or `{}`; exit 2 when the waiter file is gone. On the existing `check` poll, `BUILDLOG_MEM_BLOCKER=1` adds the same JSON as pipe field 16 (field 19 with `BUILDLOG_MEM_DETAIL=1`); a `|` in a name comes escaped. Use the `check` field inside the memory wait loop (no extra process per poll); without the opt-in the output is unchanged
 
 **Workers:** 1 writer + 1 tester.
 
