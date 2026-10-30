@@ -1,4 +1,5 @@
 """Script phone texts and named cases reviewed before delivery."""
+from gpu_xid import XID_MEANINGS
 from push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText, SessionTemplate
 
 # Codex usage destination: https://learn.chatgpt.com/docs/pricing (read 2026-10-14).
@@ -242,6 +243,15 @@ ENTRIES = (
         (PushExample("typical", {"free": "149", "shortfall": "151"}),
          PushExample("no_free_space", {"free": "0", "shortfall": "300"})),
         purpose="Cleanup did not free enough disk on natedev. Delete your files."),
+    # GPU watch examples use the Xid codes in the user's 2026-10-30 alert request.
+    PushText("nixos.gpu_stopped", "gpu", "decision", "natedev GPU stopped",
+        ActionTemplate("Restart natedev to bring the GPU back."),
+        "The GPU stopped at {time}. Both displays are dark. "
+        + "The cause is a known bug in the NVIDIA firmware. "
+        + "The kernel reported Xid {xid}: {meaning}.",
+        (PushExample("xid_79_night", {"xid": "79", "meaning": XID_MEANINGS["79"], "time": "02:17 EDT"}),
+         PushExample("xid_119", {"xid": "119", "meaning": XID_MEANINGS["119"], "time": "14:05 EDT"})),
+        purpose="natedev's GPU stopped, and both displays are dark."),
     # Current ups.nix: low-runtime shutdown at five minutes or 30% charge.
     PushText("nixos.ups_battery", "ups", "blocked", "Power outage threatens open work",
         ActionTemplate("Save your open work on the natedev computer now."),

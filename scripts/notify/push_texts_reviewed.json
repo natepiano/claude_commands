@@ -134,6 +134,18 @@
       "time": "2026-10-14T04:26:23.159330-04:00"
     }
   },
+  "nixos.gpu_stopped": {
+    "xid_119": {
+      "reviewer": "opus",
+      "sha256": "f66636a19338e55ae340c760b0ac4c6e0637ec1c8dcf9dffa45362501a3ce4e6",
+      "time": "2026-10-30T12:11:27.097632-04:00"
+    },
+    "xid_79_night": {
+      "reviewer": "opus",
+      "sha256": "f66636a19338e55ae340c760b0ac4c6e0637ec1c8dcf9dffa45362501a3ce4e6",
+      "time": "2026-10-30T12:11:19.862988-04:00"
+    }
+  },
   "nixos.ups_battery": {
     "shutdown_threshold": {
       "reviewer": "opus",
