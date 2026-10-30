@@ -7,6 +7,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.guilds import roles
 from scripts.direct import workers  # noqa: E402
 
+import add_unit
 import retire_unit
 import unit_lookup
 import unit_move
@@ -307,6 +309,44 @@ class RetireUnitTests(unittest.TestCase):
         self.assertFalse(self.worktree.exists())
         self.assertEqual(git(self.checkout, "branch", "--list", "alpha-branch"), "")
         self.assertEqual(git(self.checkout, "ls-remote", "--heads", "origin", "alpha-branch"), "")
+
+    def test_rerun_commits_the_retired_note_before_removing_the_worktree(self) -> None:
+        snapshot = Path(self.enterContext(tempfile.TemporaryDirectory())) / "before"
+        _ = shutil.copytree(self.root, snapshot)
+        claude, marked = list(self.claude), self.marked
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        expected_tree = git(self.checkout, "rev-parse", "HEAD^{tree}")
+        expected_doc = self.doc.read_text()
+        shutil.rmtree(self.root)
+        _ = shutil.copytree(snapshot, self.root)
+        self.claude, self.marked, self.calls = claude, marked, []
+        before = git(self.checkout, "rev-parse", "HEAD")
+
+        with mock.patch.object(add_unit, "commit_paths",
+                               side_effect=OSError("fixture stop after retired note")) as commit:
+            code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertIn("fixture stop after retired note", output)
+        commit.assert_called_once()
+        self.assertEqual(self.doc.read_text(), expected_doc)
+        self.assertEqual(git(self.checkout, "rev-parse", "HEAD"), before)
+        self.assertTrue(self.worktree.is_dir())
+        self.assertEqual(git(self.checkout, "branch", "--list", "--format=%(refname:short)", "alpha-branch"), "alpha-branch")
+
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(git(self.checkout, "rev-parse", "HEAD^{tree}"), expected_tree)
+        self.assertEqual(git(self.checkout, "status", "--porcelain"), "")
+        self.assertEqual(git(self.checkout, "log", "-1", "--format=%s"), "production(alpha): retire alpha-unit")
+        self.assertEqual(self.doc.read_text(), expected_doc)
+        self.assertFalse(self.worktree.exists())
+        self.assertEqual(git(self.checkout, "branch", "--list", "alpha-branch"), "")
+        self.assertEqual(git(self.checkout, "ls-remote", "--heads", "origin", "alpha-branch"), "")
+        head = git(self.checkout, "rev-parse", "HEAD")
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(git(self.checkout, "rev-parse", "HEAD"), head)
 
     def test_role_cleanup_refusal_keeps_the_unit_row_worktree_and_branch(self) -> None:
         before = self.doc.read_bytes()
