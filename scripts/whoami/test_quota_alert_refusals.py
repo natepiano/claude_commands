@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.test_agents_registry import write_registry
+
 import os
 import unittest
 from datetime import timedelta
@@ -46,7 +48,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         self.assertIsNone(quota_alert.notice(lambda: "natedev"))
 
     def test_failed_refusal_push_retries_on_the_next_refusal_then_stops(self) -> None:
-        _ = quota_alert.REGISTRY.write_text(REGISTRY.replace("impl=opus:high", "impl=opus:ultra"))
+        _ = write_registry(quota_alert.REGISTRY, {"direct.claude": {"impl": "opus:ultra"}}, base_text=REGISTRY)
         notes: Notes = [self.note("codex1.md", "active", "0")]
         _ = self.alert(notes, self.now)
         self.pushed.clear()
@@ -61,7 +63,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
 
     def test_a_refused_switch_still_alerts_and_says_why(self) -> None:
         registry = quota_alert.REGISTRY
-        _ = registry.write_text(REGISTRY.replace("impl=opus:high", "impl=opus:ultra"))
+        _ = write_registry(registry, {"direct.claude": {"impl": "opus:ultra"}}, base_text=REGISTRY)
         notes: Notes = [self.note("codex1.md", "active", "0")]
         _ = self.alert(notes, self.now)
         self.pushed.clear()
@@ -81,7 +83,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
             failed = state.get("refusal_notices", {})[str(self.root / ".codex")].get("switch_failed")
         self.assertIsInstance(failed, str)
         # A registry fixed mid-episode is not switched by the next run.
-        _ = registry.write_text(REGISTRY)
+        _ = write_registry(registry, base_text=REGISTRY)
         _ = self.alert(notes, self.now + timedelta(minutes=60))
         self.assertEqual(self.assignments()["direct"], "codex")
 
