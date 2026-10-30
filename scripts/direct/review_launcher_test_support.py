@@ -401,6 +401,7 @@ class ReviewLauncherFixture(unittest.TestCase):
         production = self.root / "scripts" / "production"
         production.mkdir(parents=True)
         _ = shutil.copy2(DIRECT_DIR.parent / "production" / "showrunners.py", production / "showrunners.py")
+        _ = shutil.copy2(DIRECT_DIR.parent / "production" / "production_doc.py", production / "production_doc.py")
         # The wrapper reaches python3 through ../lib/py, resolved from its own
         # directory.
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "py", lib / "py")
