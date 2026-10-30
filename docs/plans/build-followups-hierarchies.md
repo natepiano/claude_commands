@@ -206,7 +206,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - `impl` — `measure.py`, `push_audit.py` and the doc
 - `test` — `test_measure.py` and `test_push_audit.py`: `compare` on fixtures with known before and after values, and the fixtures above
 
-**Constraints from prior phases:** shared log helpers live in `scripts/hierarchies/log_records.py`; `measure.py` imports `push_audit.py`, never the reverse; session names come only from `config/hierarchies/sessions.toml`. The wait records come from `progress_history.py waits` (phases-unit 820357a2; holder and origin fields from 49fd1b0f) through the Phase 4 loader and types. Phase 11's repair reads origin fields into `RecordedOrigin` / `OriginNotRecorded`; Phase 10 adds the unresolved-origin row and the holder history, and this review keeps that uncertainty visible. From Phase 8: `measure.py baseline` and `push_audit.py report` print a short summary by default and their tables under `--full`; `compare` prints the same way.
+**Constraints from prior phases:** shared log helpers live in `scripts/hierarchies/log_records.py`; `measure.py` imports `push_audit.py`, never the reverse; session names come only from `config/hierarchies/sessions.toml`. The wait records come from `progress_history.py waits` (phases-unit 820357a2; holder and origin fields from 49fd1b0f) through the Phase 4 loader and types. Phase 11's repair reads origin fields into `RecordedOrigin` / `OriginNotRecorded`; Phase 10 adds the unresolved-origin row and the holder history, and this review keeps that uncertainty visible. From Phase 8: `measure.py baseline` and `push_audit.py report` print a short summary by default and their tables under `--full`; `compare` prints the same way. From Phase 12 (c60f1809): `push_audit.py` classifies a delivery by the exception in force at its delivery time, so a `nate.adhoc` delivery after a failed check from 2026-10-29T03:05:59Z on is `Unapproved` and every other exception stays; the wait share is the union of completed known-kind waits of the Hana phases that finished in the window, divided by those phases' exact intervals, with waits matched by run id and phase instance id; production hand-offs with no phase print as their own row with n, outside the share; the `Hana wait` and `Hana wait holders` coverage rows count the same phase population.
 
 **Acceptance gate:** unit tests green; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; Results holds real numbers for each step, judged on the measure and review point each of Phases 3–5 names. **Measure and review point:** this phase is the review point for Steps 1, 2 and 4. At phase end the unit director sends the showrunner the Results and the keep-or-drop list as one question for the user.
 
@@ -312,31 +312,23 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Gotchas:** the merge gate's basedpyright reports import cycles through function-local imports, and a per-file type check does not. A change that moves an import must type-check the cycle files (`accounts.py`, `showrunner_footer.py`) or run the gate's basedpyright.
 
-### Phase 12 — The push audit judges each push by the exception in force when it went out, and the wait share counts one set of phases  · status: todo
-**Depends on:** Phase 4. Merge before the 2026-11-12 re-runs. Not at the same time as Phase 10 (both edit `measure.py`).
+### Phase 12 — The push audit judges each push by the exception in force when it went out, and the wait share counts one set of phases  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** the 2026-11-12 push-audit re-run counts unapproved pushes correctly, and the wait-share row is a share of one phase population.
-
-**Hana link:** direct. Phase 6 keeps or drops trial steps on these two numbers.
-
-**Spec:**
-- Exception at delivery time: `push_audit.classify()` returns `ApprovedRegisteredText` for any recorded text id, also a normal-priority `nate.adhoc` delivery after its exception ended. Classify each delivery by the exception in force at its delivery time (the policy's effective boundary is the messaging-unit c73a2d02 merge); keep recorded exception evidence apart from approval. Fixtures: a send before the boundary, one after it, and a held one.
-- Wait share: `wait_share_row` sums waits picked by their start time, production hand-offs with no phase included, over phases picked by their finish time, so a wait can add minutes whose phase adds no time, and overlapping waits count the same phase time more than once. Count only waits of the phases in the denominator, count the union of a phase's overlapping waits once, and print hand-offs with no phase as their own row with n. Fixtures: a phase across the window boundary, two waits at the same time in one phase, a hand-off with no phase.
+- `push_audit.classify()` judges each delivery by the exception in force at its delivery time. `AGENT_TEXT_EXCEPTION_ENDED` is 2026-10-29T03:05:59Z, when the `dde7ec2e` merge put messaging policy c73a2d02 in force. A `nate.adhoc` push delivered at or after it is `Unapproved`, and its path ends `; nate.adhoc exception ended 2026-10-29T03:05:59Z`. Earlier `nate.adhoc` pushes, priority 2 pushes and every other registered text keep their exception. A held push is not a delivery. A recorded text id is evidence; it is not approval by itself.
+- `PhaseCompletion` holds `phase: WaitPhaseInstance | WaitPhaseNotRecorded` and `started: log_records.RecordedTime`, with no defaults. `read_phases` joins each `phase_finished` to its `phase_started` record by run id and phase instance id, and takes the origin fields and `phase_started_at` from it. With no start record, `started` is the finish time minus `phase_elapsed_seconds`. A negative elapsed time rejects the row.
+- `completed_hana_phases(events, window)` selects Hana phases that finished in the window with a recorded duration, one per `phase_completion_key` (the phase instance, else the identity). `Hana phases done`, `Hana phase time` and the share use this one key.
+- `wait_share_row(history, window, phases)` divides the union of each selected phase's completed known-kind waits, clipped to the phase interval (`phase_wait_seconds`), by the sum of the exact phase intervals. Overlapping waits in one phase count once; the same time in two phases counts in each. The share cannot pass 100%. A selected phase with no instance or no coverage record makes the share `(partial)`.
+- When a selected phase started before the window, `read_wait_history(root, window, problems, prefixes, phases)` makes a second `progress_history.py waits` read from the earliest such start to the window end. For those phases it takes the `phases`, `waits` and `missing` rows from that read.
+- `hana_wait_rows` prints production hand-offs with no phase as `Hana wait / production handoffs without a phase` with n (and an unknown-ended row when some are open). They stay out of the share.
+- `wait_coverage_counts(history, window, phases)` counts a missing-kind wait that started in the window or belongs to a selected phase. The `Hana wait` and `Hana wait holders` coverage rows get the same phase population, so their counts agree.
 
 **Files:**
-- `scripts/hierarchies/push_audit.py`, `scripts/hierarchies/test_push_audit.py` — `classify`
-- `scripts/hierarchies/measure.py`, `scripts/hierarchies/test_measure.py` — `wait_share_row`
+- `scripts/hierarchies/push_audit.py` — `AGENT_TEXT_EXCEPTION_ENDED`, `classify`
+- `scripts/hierarchies/measure.py` — `PhaseCompletion`, `phase_completion_key`, `completed_hana_phases`, `phase_interval_start`, `phase_wait_seconds`, `wait_share_row`, the two-read `read_wait_history`, the start-record join in `read_phases`, the hand-off rows
+- `scripts/hierarchies/test_push_audit.py`, `scripts/hierarchies/test_measure.py` — boundary, held and later-delivery pushes; overlapping waits, a phase across the window start, a phase-free hand-off, and real-supplier runs with a retired worktree
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — `push_audit.py` and `measure.py`
-- `test` — `test_push_audit.py` and `test_measure.py`: the fixtures above
+**Binds later work:** the four-week review compares push counts and the wait share by these rules: a `nate.adhoc` delivery after a failed check from 2026-10-29T03:05:59Z on is `Unapproved`, and the share is the per-phase union of completed known-kind waits over exact phase intervals, with hand-offs on their own row.
 
-**Constraints from prior phases:** `measure.py` imports `push_audit.py`, never the reverse; shared log helpers live in `scripts/hierarchies/log_records.py`; session names come only from `config/hierarchies/sessions.toml`; `measure.py baseline` and `push_audit.py report` print a short summary and their tables under `--full`. From Phase 11: `PhaseOrigin` fields are `RecordedOrigin | OriginNotRecorded`; from Phase 10: the unresolved-origin row stays visible in the wait share; with incomplete coverage the share and each wait total end in `(partial)`, the counts print once as `Hana wait / coverage / <name>` rows (`HistoryNotRecorded`, `UncertainCoverage`, `WaitKindNotRecorded`, `attribution_miss_n`, `source_problem_n`, `unresolved_origin_n`), missing-history rows group by reason, and `flow_table` wraps Value cells at 60 characters, so tests select rows by name; `WaitCauseNotRecorded` is now `WaitKindNotRecorded`. The policy boundary is the merge of c73a2d02, `dde7ec2e` at 2026-10-29T03:05:59Z. Tests: `python3 -m unittest scripts.hierarchies.test_push_audit scripts.hierarchies.test_measure`.
-
-**Spec additions (architect review after Phase 11):**
-- `PhaseCompletion` keeps the run id and phase instance id, so waits match their phase; load the earlier history a phase in the window needs, since the supplier filters waits by start time; join each phase's origin from its `phase_started` record (the supplier does not copy origin fields to `phase_finished`). The boundary test runs through the real supplier reader, with a retired worktree.
-- Test a delivery exactly at the boundary, and a review before it whose delivery follows it.
-
-**Acceptance gate:** unit tests green, with the fixtures above; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; live on natedev, `push_audit.py report` and `measure.py baseline --full` over the Baseline window print the corrected rows, and both commands over a window after the boundary (2026-10-29T03:05:59Z) show the revoked exception applied. **Change-Review row:** one per command, with the full command.
+**Gotchas:** the supplier selects waits by start time and does not copy origin fields to `phase_finished`. This is why the second read and the start-record join exist. Both supplier reads scan the same files, so `ignored_n` and `wait_without_id_n` take the larger value of the two, never the sum.
