@@ -426,33 +426,14 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 **Gotchas:** a test that searches the output for a cell's text must search for words, because a cell can wrap. Read rows with `read_report_blocks`; never write a second parser in a test file.
 
 ### Phase 16 — A second merge of the same phase keeps its review row, and the record step reports ok  · status: done
-**Depends on:** none of the waiting phases. Its files do not overlap Phase 15's or Phase 6's.
 
-#### Work Order
+#### As-built
 
-**Goal:** when a unit merges a phase a second time (a repair after the phase merged), `merge_checkpoint.py`'s record step reports `ok`, keeps the one review-ledger row from the first merge, and writes the production log line. A rerun of `review_regime.py add` for a unit, plan and phase that already has a row exits 0 and changes nothing.
-
-**Hana link:** indirect. A stopped record step holds every unit's repair merge until the showrunner repairs the ledger by hand, so Hana work waits behind it.
-
-**Spec:**
-- Today `review_regime.add` raises `SystemExit("review_regime: <unit> phase <N> of <plan> already has a row")` when a row with the same `(unit, plan, phase)` exists (`review_regime.py:156-157`). `merge_checkpoint.record` runs `add` on every code merge and stops with `record: failed` on a non-zero exit (`merge_checkpoint.py:1008-1026`). Seen 2026-10-30: cargo-liner-style's repair of its phase 69 (f3fb76f4, merged as 7a2f2fdd) stopped there.
-- `review_regime.add`: when a row with the same `(unit, plan, phase)` exists, write nothing, print one line `kept <unit> phase <N> of <plan>: a row exists from the merge at <existing merged>; nothing added`, and return normally (exit 0). The first row is the one the regime trial counts, so a phase never counts twice. All other checks before it (UTC offsets, `--merged` before `--started`) keep their refusals.
-- A row with no plan (written before plans were recorded) still never matches a row that has a plan, as today.
-- `merge_checkpoint.record`: when `add` exits 0, the record step's ok detail carries `add`'s stdout line before the existing text, for example `record: ok — kept alpha-unit phase 3 of docs/plans/x.md: a row exists from the merge at …; nothing added; review ledger and production log updated`. When `add` printed an `added …` line, the detail keeps today's text. A non-zero exit still stops with `record: failed`, as today.
-- The production log line is written for the second merge as for any merge; the existing "checkpoint already recorded" check (same unit, phase, commit and merge head) does not change.
+- `review_regime.add`: when a row with the same `(unit, plan, phase)` exists, it writes nothing, prints `kept <unit> phase <N> of <plan>: a row exists from the merge at <existing merged>; nothing added` and returns (exit 0). The first row is the one the regime trial counts. The UTC-offset and `--merged` before `--started` refusals stay. A planless old row still matches no row that has a plan.
+- `merge_checkpoint.record`: when `add` prints a `kept …` line, the `record: ok` detail starts with it, then `; review ledger and production log updated`. The production log line is written for the second merge as for any merge. A non-zero `add` still stops with `record: failed`; the "checkpoint already recorded" check is unchanged.
 
 **Files:**
-- `scripts/production/review_regime.py` — `add` keeps the existing row and exits 0
-- `scripts/production/merge_checkpoint.py` — `record` shows `add`'s line in its ok detail
-- `scripts/production/test_review_regime.py` — tests
-- `scripts/production/test_merge_checkpoint.py` — tests (or `test_merge_checkpoint_history.py` when the second-merge case fits there)
-
-**Workers:** `1 writer + 1 tester`
-- `impl2` — `review_regime.py`, `merge_checkpoint.py`
-- `test` — the test files. `test_review_regime.py`: `test_the_same_unit_plan_and_phase_is_refused` becomes a test that a second `add` for the same unit, plan and phase returns, prints the `kept` line, and leaves the ledger with the first row only, byte for byte (an `Assertion-Change:` line names it); a second plan's phase 1 still adds its own row; a planless old row still blocks nothing. Merge checkpoint: one unit's phase merged, then a repair commit of the same phase merged with the review step running the real `review_regime.py` against a ledger in the test's home (set `MERGE_CHECKPOINT_REVIEW_REGIME`); the second run exits 0, prints `record: ok` with the `kept` line, the ledger holds one row, and the production log holds two merge lines. A failing `add` still stops the record step.
-
-**State:** `~/.claude/data/review_regime.jsonl` (append only; this phase removes the refusal that stopped a second append, and writes nothing new). The production log as today.
-
-**Constraints from prior phases:** From Phase 13b: the scope filter and the record step stay as they are apart from the ok detail. Tests: `python3 -m unittest scripts.production.test_review_regime scripts.production.test_merge_checkpoint scripts.production.test_merge_checkpoint_history`. Callers to type-check and test: `ci_points.py` and `dailies_input` only run `report` and `watch`, which do not change.
-
-**Acceptance gate:** unit tests green; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green. **Change-Review row:** what changed: a repair merge of a phase that merged before no longer stops at the record step | how to try it: on natedev from `~/.claude`, `~/.claude/scripts/lib/py ~/.claude/scripts/production/review_regime.py add` with the unit, plan and phase of a row already in the ledger (see `review_regime.py report`), using a scratch `HOME` | what you see: one `kept … nothing added` line, exit 0, and the ledger unchanged.
+- `scripts/production/review_regime.py`, `scripts/production/merge_checkpoint.py`.
+- `scripts/production/test_review_regime.py` — a second add keeps the first row byte for byte and exits 0 (was `test_the_same_unit_plan_and_phase_is_refused`).
+- `scripts/production/test_merge_checkpoint_history.py` — a merge, then a repair merge of the same phase with the real `review_regime.py` and a test `HOME`: `record: ok` with the kept line, one ledger row, two log lines; a rerun prints "checkpoint already recorded".
+- `scripts/production/test_merge_checkpoint.py` — a failing add after a first merge stops record and keeps the first log line; a retry records the repair once.
