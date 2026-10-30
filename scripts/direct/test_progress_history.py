@@ -2093,6 +2093,28 @@ print('two homes isolated; recorder lock retained; caller restored')
             self.assertTrue(attribution["reason"])
             self.assertTrue(attribution["candidates"])
 
+    def test_uncertain_coverage_counts_repeated_reasons_in_first_seen_order(self) -> None:
+        session = self.covered_wait_phase("repeated-uncertainty")
+        _ = (session / "mesh_roster.json").write_text(json.dumps({
+            "unit-impl": {"thread_id": "impl-thread"},
+            "unit-test": {"thread_id": "test-thread"},
+        }))
+        wait_ids = [self.run_command(
+            "start-wait", "--session-dir", str(session), "--worker-thread-id", thread,
+            "--owner-session", thread, "--kind", "WaitingForMemoryOrSlot", at=1020 + index,
+        ) for index, thread in enumerate(("impl-thread", "test-thread", *("impl-thread",) * 4))]
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1030)))
+        phase, = cast(list[dict[str, object]], report["phases"])
+        self.assertEqual(phase["state"], "UncertainCoverage")
+        self.assertEqual(phase["reason"], "worker unit-impl has 0 active pass matches (5 times); "
+                         + "worker unit-test has 0 active pass matches")
+        self.assertEqual(phase["attribution_miss_ids"], wait_ids)
+        missing = cast(list[dict[str, object]], report["missing"])
+        expected_candidates = [candidate for wait in missing
+                               for candidate in cast(list[object], cast(dict[str, object], wait["wait_attribution"])["candidates"])]
+        self.assertEqual(len(expected_candidates), 6)
+        self.assertEqual(phase["candidates"], expected_candidates)
+
     def test_checkpoint_identity_survives_reopening_runs_and_active_later_instances(self) -> None:
         for across_runs in (False, True):
             for active_later in (False, True):
@@ -2415,6 +2437,121 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual(holders[1]["epoch"], 1040)
         self.assertEqual(holders[1]["holder"], {"state": "NamedHolder", "resource_kind": "account", "resource": "account-a",
                                              "holder": {"state": "SessionHolder", "session_id": "session-a"}})
+
+    def assert_terminal_holder_is_classified(self, terminal_type: str) -> None:
+        for keep_start in (False, True):
+            with self.subTest(terminal_type=terminal_type, keep_start=keep_start):
+                name = f"terminal-holder-{terminal_type}-{keep_start}"
+                session = self.covered_wait_phase(name)
+                wait_id = self.run_command("start-wait", "--session-dir", str(session),
+                    "--kind", "WaitingForQuotaRefusal", "--holder-resource-kind", "account",
+                    "--holder-resource", "account-a", "--holder-session", "session-a", at=1020)
+                if terminal_type == "wait_unclosed":
+                    _ = self.run_command("finish-phase", "--session-dir", str(session), "--status", "completed", at=1030)
+                else:
+                    _ = self.run_command("finish-wait", "--session-dir", str(session), "--wait-id", wait_id, at=1030)
+                events = [event for event in self.read_events(name)
+                          if keep_start or event.get("event_type") != "wait_started"]
+                terminal, = [event for event in events if event.get("event_type") == terminal_type]
+                terminal["holder"] = []
+                path = self.history_dir / "runs" / f"{name}.jsonl"
+                _ = path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+                report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
+                wait, = cast(list[dict[str, object]], report["waits"])
+                holders = cast(list[dict[str, object]], wait["holders"])
+                self.assertEqual(holders[-1], {"at": "1970-01-01T00:17:10.000+00:00", "epoch": 1030,
+                    "holder": {"state": "MalformedHolder", "reason": "holder must be an object", "raw_value": []}})
+                self.assertEqual(len(holders), 2 if keep_start else 1)
+                if not keep_start:
+                    del terminal["holder"]
+                    _ = path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+                    report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
+                    wait, = cast(list[dict[str, object]], report["waits"])
+                    observation, = cast(list[dict[str, object]], wait["holders"])
+                    self.assertEqual(observation["holder"],
+                        {"state": "HolderNotNamed", "reason": "recorded before holders"})
+
+    def test_finished_wait_keeps_its_malformed_holder_with_or_without_a_start_row(self) -> None:
+        self.assert_terminal_holder_is_classified("wait_finished")
+
+    def test_unclosed_wait_keeps_its_malformed_holder_with_or_without_a_start_row(self) -> None:
+        self.assert_terminal_holder_is_classified("wait_unclosed")
+
+    def test_nonobject_holder_is_malformed_and_keeps_its_stored_value(self) -> None:
+        for index, raw in enumerate(([], None, "session-a", 12)):
+            with self.subTest(raw=raw):
+                name = f"nonobject-holder-{index}"
+                session = self.covered_wait_phase(name)
+                wait_id = self.run_command("start-wait", "--session-dir", str(session),
+                                           "--kind", "WaitingForQuotaRefusal", at=1020)
+                events = self.read_events(name)
+                for event in events:
+                    if event.get("wait_id") == wait_id:
+                        event["holder"] = raw
+                path = self.history_dir / "runs" / f"{name}.jsonl"
+                _ = path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+                report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1030)))
+                wait = next(wait for wait in cast(list[dict[str, object]], report["waits"]) if wait["wait_id"] == wait_id)
+                observation, = cast(list[dict[str, object]], wait["holders"])
+                self.assertEqual(observation["holder"], {"state": "MalformedHolder",
+                    "reason": "holder must be an object", "raw_value": raw})
+
+    def test_unparseable_holder_is_malformed_and_keeps_its_stored_fields(self) -> None:
+        raw_records: tuple[dict[str, object], ...] = (
+            {"state": "UnknownHolder", "session_id": "session-a"},
+            {"state": "HolderNotNamed", "reason": ""},
+            {"state": "NamedHolder", "resource_kind": "account", "resource": "account-a",
+             "holder": {"state": "SessionHolder", "session_id": ""}},
+        )
+        for index, raw in enumerate(raw_records):
+            with self.subTest(raw=raw):
+                name = f"unparseable-holder-{index}"
+                session = self.covered_wait_phase(name)
+                wait_id = self.run_command("start-wait", "--session-dir", str(session),
+                                           "--kind", "WaitingForQuotaRefusal", at=1020)
+                events = self.read_events(name)
+                for event in events:
+                    if event.get("wait_id") == wait_id:
+                        event["holder"] = raw
+                path = self.history_dir / "runs" / f"{name}.jsonl"
+                _ = path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+                report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1030)))
+                wait, = cast(list[dict[str, object]], report["waits"])
+                observation, = cast(list[dict[str, object]], wait["holders"])
+                holder = cast(dict[str, object], observation["holder"])
+                self.assertEqual(holder["state"], "MalformedHolder")
+                self.assertEqual(holder["raw_value"], raw)
+                self.assertTrue(holder["reason"])
+
+    def test_unknown_holder_and_owner_fields_remain_visible_as_malformed(self) -> None:
+        named: dict[str, object] = {"state": "NamedHolder", "resource_kind": "account", "resource": "account-a",
+                                    "holder": {"state": "SessionHolder", "session_id": "session-a"}}
+        raw_records: tuple[dict[str, object], ...] = (
+            {**named, "unexpected": {"kept": [1, 2]}},
+            {**named, "holder": {"state": "SessionHolder", "session_id": "session-a", "unexpected": 1}},
+            {**named, "holder": {"state": "UnitHolder", "unit": "unit-a", "unexpected": 1}},
+            {"state": "HolderNotNamed", "reason": "producer named no holder", "unexpected": 1},
+        )
+        for index, raw in enumerate(raw_records):
+            with self.subTest(raw=raw):
+                name = f"unknown-holder-fields-{index}"
+                session = self.covered_wait_phase(name)
+                wait_id = self.run_command("start-wait", "--session-dir", str(session),
+                                           "--kind", "WaitingForQuotaRefusal", at=1020)
+                events = self.read_events(name)
+                for event in events:
+                    if event.get("wait_id") == wait_id:
+                        event["holder"] = raw
+                path = self.history_dir / "runs" / f"{name}.jsonl"
+                _ = path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+                _ = self.run_command("finish-wait", "--session-dir", str(session), "--wait-id", wait_id, at=1025)
+                report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1030)))
+                wait, = cast(list[dict[str, object]], report["waits"])
+                observation, = cast(list[dict[str, object]], wait["holders"])
+                holder = cast(dict[str, object], observation["holder"])
+                self.assertEqual(holder["state"], "MalformedHolder")
+                self.assertEqual(holder["raw_value"], raw)
+                self.assertIn("unexpected", str(holder["reason"]))
 
     def test_each_wait_kind_records_its_cause_owner_phase_and_actual_end(self) -> None:
         session = self.covered_wait_phase("wait-kinds")
@@ -2769,6 +2906,95 @@ with patch.object(fcntl, "flock", admission):
         report = cast(dict[str, object], json.loads(self.run_command("waits", at=1040)))
         phase, = cast(list[dict[str, object]], report["phases"])
         self.assertEqual(phase["plan_doc"], {"state": "NotRecorded", "reason": "phase has no plan document"})
+
+    def test_production_doc_paths_report_the_heading_name_instead_of_the_path(self) -> None:
+        name = "phase-production-doc-path"
+        session, worktree, plan = self.phase_source_fixture(name)
+        production_doc = worktree / "docs" / "hana" / "tool-based-ui-production.md"
+        production_doc.parent.mkdir(parents=True)
+        _ = production_doc.write_text("# Production — tool-based-ui\n", encoding="utf-8")
+        for index, reference in enumerate((str(production_doc.relative_to(worktree)), str(production_doc))):
+            with self.subTest(reference=reference):
+                _ = plan.write_text(f"> **Production:** {reference} — unit geometry-material-unit, branch widgets\n",
+                                    encoding="utf-8")
+                _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", str(index + 1),
+                                     "--phase-title", "Production document", at=1010 + index)
+                report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
+                phase = cast(list[dict[str, object]], report["phases"])[-1]
+                self.assertEqual(phase["production"], {"state": "Recorded", "value": "tool-based-ui"})
+                started = [event for event in self.read_events(name) if event["event_type"] == "phase_started"][-1]
+                self.assertEqual(started["production"], phase["production"])
+                self.assertEqual(started["unit"], {"state": "Recorded", "value": "geometry-material-unit"})
+
+    def test_stored_production_doc_paths_resolve_for_plain_and_tagged_metadata(self) -> None:
+        name = "phase-stored-production-doc-path"
+        session, worktree, plan = self.phase_source_fixture(name)
+        _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "6",
+                             "--phase-title", "Stored production document", at=1010)
+        production_doc = worktree / "docs" / "hana" / "production.md"
+        production_doc.parent.mkdir(parents=True)
+        events = self.read_events(name)
+        started = next(event for event in events if event["event_type"] == "phase_started")
+        history = self.history_dir / "runs" / f"{name}.jsonl"
+        # A stored document reference must not depend on a surviving plan header.
+        plan.unlink()
+        for reference in (str(production_doc.relative_to(worktree)), str(production_doc)):
+            for tagged in (False, True):
+                with self.subTest(reference=reference, tagged=tagged):
+                    started["production"] = {"state": "Recorded", "value": reference} if tagged else reference
+                    _ = history.write_text("\n".join(json.dumps(event) for event in events))
+                    _ = production_doc.write_text("# Production — tool-based-ui\n", encoding="utf-8")
+                    report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
+                    phase, = cast(list[dict[str, object]], report["phases"])
+                    self.assertEqual(phase["production"], {"state": "Recorded", "value": "tool-based-ui"})
+                    production_doc.unlink()
+                    report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
+                    phase, = cast(list[dict[str, object]], report["phases"])
+                    production = cast(dict[str, object], phase["production"])
+                    self.assertEqual(production["state"], "NotRecorded")
+                    self.assertIn("production document cannot be read:", str(production["reason"]))
+                    self.assertEqual(self.read_events(name), events)
+
+    def test_unreadable_or_unnamed_production_docs_report_missing_metadata_with_a_reason(self) -> None:
+        name = "phase-production-doc-unavailable"
+        session, worktree, plan = self.phase_source_fixture(name)
+        production_doc = worktree / "production.md"
+        _ = plan.write_text("> **Production:** production.md — unit geometry-material-unit, branch widgets\n",
+                            encoding="utf-8")
+        cases = (("missing", "production document cannot be read:"),
+                 ("invalid UTF-8", "production document cannot be read:"),
+                 ("no heading", "production doc lacks its name"),
+                 ("empty name", "production document heading names no production"))
+        for index, (state, reason) in enumerate(cases):
+            with self.subTest(state=state):
+                if state == "invalid UTF-8":
+                    _ = production_doc.write_bytes(b"\xff")
+                elif state == "no heading":
+                    _ = production_doc.write_text("# A document without a production heading\n", encoding="utf-8")
+                elif state == "empty name":
+                    _ = production_doc.write_text("# Production — \n", encoding="utf-8")
+                _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", str(index + 1),
+                                     "--phase-title", "Unavailable production document", at=1010 + index)
+                report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
+                phase = cast(list[dict[str, object]], report["phases"])[-1]
+                production = cast(dict[str, object], phase["production"])
+                self.assertEqual(production["state"], "NotRecorded")
+                self.assertIn(reason, str(production["reason"]))
+                started = [event for event in self.read_events(name) if event["event_type"] == "phase_started"][-1]
+                self.assertEqual(started["production"], production)
+                self.assertEqual(started["unit"], {"state": "Recorded", "value": "geometry-material-unit"})
+
+    def test_plain_production_names_do_not_require_a_production_doc(self) -> None:
+        name = "phase-production-plain-name"
+        session, worktree, plan = self.phase_source_fixture(name)
+        _ = plan.write_text("> **Production:** tool-based-ui — unit geometry-material-unit, branch widgets\n",
+                            encoding="utf-8")
+        self.assertFalse((worktree / "tool-based-ui").exists())
+        _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "6",
+                             "--phase-title", "Plain production name", at=1010)
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
+        phase, = cast(list[dict[str, object]], report["phases"])
+        self.assertEqual(phase["production"], {"state": "Recorded", "value": "tool-based-ui"})
 
     def test_new_phases_record_production_without_requiring_a_unit_header(self) -> None:
         name = "phase-bare-production-new"
@@ -7462,6 +7688,63 @@ class PublicPhaseHelperTests(unittest.TestCase):
             [(phase["depends_on"], phase["blocked_by"]) for phase in phases],
             [([], ""), (["1", "4"], "G3"), (None, "")],
         )
+
+    def test_plan_dependencies_read_only_named_local_phase_spans(self) -> None:
+        cases: tuple[tuple[str, list[str]], ...] = (
+            (
+                "the checkpoints of Phases 3, 4 and 5, and the three review records: "
+                + "the Phase 3 and Phase 5 re-runs, which the unit director runs on "
+                + "2026-11-12 (two weeks after both merged into sdlc as 3c5dea67 on "
+                + "2026-10-29) and records in the design doc under Steps 1 and 4",
+                ["3", "4", "5"],
+            ),
+            (
+                "phases-unit Phase 11 (the wait-holder field and the phase origin fields) "
+                + "merged into sdlc; sdlc said 2026-10-29 its ETA is 19:00 EDT.",
+                [],
+            ),
+            ("Phase 7; postmaster-unit's reply record (main abc8344f)", ["7"]),
+            ("Phase 19 (numbering only)", ["19"]),
+            ("Phase 10b, Phase 11", ["10b", "11"]),
+            ("none", []),
+        )
+        plan = self.root / "dependencies.md"
+        for depends, expected in cases:
+            with self.subTest(depends=depends):
+                _ = plan.write_text(
+                    "### Phase 6 — Consumer  · status: todo\n"
+                    + f"**Depends on:** {depends}\n",
+                    encoding="utf-8",
+                )
+                self.assertEqual(plan_history.plan_phases(plan)[0]["depends_on"], expected)
+
+    def test_plan_dependencies_accept_either_case_and_keep_first_seen_order(self) -> None:
+        plan = self.root / "dependencies.md"
+        _ = plan.write_text(
+            "### Phase 6 — Consumer  · status: todo\n"
+            + "**Depends on:** phases 4, 3 AND 5; PHASE 10b; phase 4\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            plan_history.plan_phases(plan)[0]["depends_on"], ["4", "3", "5", "10b"]
+        )
+
+    def test_plan_dependencies_skip_other_unit_spans_but_keep_local_references(self) -> None:
+        plan = self.root / "dependencies.md"
+        for external in (
+            "phases-unit Phase 11",
+            "models-unit's phase 4",
+            "models-unit’s Phases 4, 5 and 6",
+        ):
+            with self.subTest(external=external):
+                _ = plan.write_text(
+                    "### Phase 6 — Consumer  · status: todo\n"
+                    + f"**Depends on:** Phase 7; {external}; Phase 19\n",
+                    encoding="utf-8",
+                )
+                self.assertEqual(
+                    plan_history.plan_phases(plan)[0]["depends_on"], ["7", "19"]
+                )
 
     def test_plan_phases_preserves_descriptive_parentheticals(self) -> None:
         plan = self.root / "plan.md"

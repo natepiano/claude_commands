@@ -1079,7 +1079,8 @@ def main(arguments: list[str]) -> int:
             result = source_check(cast(Path, args.root).resolve())
             for issue in result.issues:
                 print(issue)
-            print(f"role words in sentences: {len(result.sentences)} (list with --prose)")
+            hint = "" if cast(bool, args.prose) else " (list with --prose)"
+            print(f"role words in sentences: {len(result.sentences)}{hint}")
             if cast(bool, args.prose):
                 for use in result.sentences:
                     print(f"{use.path}:{use.line}: {use.name!r}")

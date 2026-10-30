@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Literal, TypedDict, cast, final, override
 
+from git_process import GitReadFailed, run_git
+
 import style_rules
 from candidate_generators import CandidatesSpec
 
@@ -417,9 +419,7 @@ def _rule_from_text(path: Path, origin: RuleOrigin, rule_root: Path, reach: Repo
 
 def _load_rule(path: Path, origin: RuleOrigin, rule_root: Path, reach: RepoReach | MemberReach) -> Rule:
     text = path.read_bytes()
-    blob = subprocess.run(
-        ["git", "hash-object", "--stdin"], input=text, check=True, capture_output=True,
-    ).stdout.decode().strip()
+    blob = run_git(("git", "hash-object", "--stdin"), input=text).stdout.decode().strip()
     return _rule_from_text(path, origin, rule_root, reach, text, blob)
 
 
@@ -553,7 +553,7 @@ def main() -> None:
     args = parser.parse_args(namespace=ListArguments())
     try:
         rules = load_rules(Path(args.repo) if args.repo else None)
-    except (RuleValidationError, OSError, subprocess.CalledProcessError) as error:
+    except (RuleValidationError, OSError, GitReadFailed) as error:
         parser.exit(2, f"rules: {error}\n")
     rows: list[RuleListing] = [
         {
