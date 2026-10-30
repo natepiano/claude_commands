@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""What each installed cargo-berth hook wrapper does on its own."""
+"""Check each installed cargo-berth hook wrapper after an install."""
 
 from __future__ import annotations
 
