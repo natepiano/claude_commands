@@ -479,6 +479,9 @@ class CheckoutMove(TypedDict):
 
 
 class SessionShutdown(TypedDict):
+    # A machine-wide bounded stop owns this request instead of the account conductor.
+    stop_deadline: NotRequired[str]
+    force_stop_note: NotRequired[str]
     move_id: NotRequired[str]
     login: str
     label: str
@@ -552,8 +555,16 @@ _FINISHED_PROGRESS = frozenset({"restarted", "stop failed", "restart failed", "m
 _STOPPED_PROGRESS = frozenset({"stopped", "already gone", "process identity lost"})
 
 
+def bounded_attempt_finished(saved: SessionShutdown) -> bool:
+    """A bounded failure is terminal until explicitly retried, never a legacy stop."""
+    return "stop_deadline" in saved and (saved["progress"]["kind"] in _FINISHED_PROGRESS
+        or saved["progress"]["kind"] in _STOPPED_PROGRESS and saved["then"] == "stop")
+
+
 def shutdown_finished(saved: SessionShutdown) -> bool:
-    """The conductor's done rule: a forced stop still retries, and a restart request restarts its stopped session."""
+    """Bounded failures end their attempt; legacy force retries and restart continuations remain."""
+    if bounded_attempt_finished(saved):
+        return True
     if saved["force"] == "now" and stop_incomplete(saved):
         return False
     progress = saved["progress"]["kind"]
@@ -1235,10 +1246,10 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
             raise InvalidRecord(f"{worker_place}.owner must identify this session")
         parsed_workers.append(parsed)
     values["workers"] = parsed_workers
-    for field in ("alerted_at", "form_alerted_at", "reasked_at"):
+    for field in ("alerted_at", "form_alerted_at", "reasked_at", "stop_deadline"):
         if field in values:
             _ = _utc_time(values[field], f"{place}.{field}")
-    for field in ("restore_alerted", "showrunner_told"):
+    for field in ("restore_alerted", "showrunner_told", "force_stop_note"):
         if field in values:
             _ = _string(values[field], f"{place}.{field}")
     return cast(SessionShutdown, cast(object, values))
@@ -1472,8 +1483,19 @@ def create_session(record: SessionShutdown) -> bool:
     with launch_barrier():
         with _session_store_lock(checked["login"], create=True) as directory:
             existing = _session_records_in_directory(directory, checked["login"])
-            if any(item["session"]["session_id"] == checked["session"]["session_id"] for item in existing):
-                return False
+            previous = next((item for item in existing
+                             if item["session"]["session_id"] == checked["session"]["session_id"]), None)
+            if previous is not None:
+                if not finished_stop_request(previous):
+                    return False
+                history = directory / "history"
+                _ = _record_directory(history, create=True)
+                old = directory / "sessions" / _session_filename(previous["session"]["session_id"])
+                target = history / f"{previous['requested_at']}-{previous['request_id']}-{old.name}"
+                # A repeated request id must not replace its earlier history either.
+                while _lstat(target) is not None:
+                    target = target.with_name("old-" + target.name)
+                os.replace(old, target)
             sessions = directory / "sessions"
             _ = _record_directory(sessions, create=True)
             path = sessions / _session_filename(checked["session"]["session_id"])
@@ -1481,6 +1503,20 @@ def create_session(record: SessionShutdown) -> bool:
                 raise InvalidRecord(f"{path} is used by a different session id")
             _write_record(path, checked)
     return True
+
+
+def finished_stop_request(saved: SessionShutdown) -> bool:
+    """Only completed shutdowns can be replaced by a fresh live-session snapshot."""
+    return saved["progress"]["kind"] in {
+        "stopped", "restarted", "restart failed", "already gone", "process identity lost",
+        "manual restart",
+    }
+
+
+def request_matches_process(saved: SessionShutdown, live: Session) -> bool:
+    stored = saved["session"]
+    return (stored["pid"] == live["pid"] and bool(stored["proc_start"])
+            and stored["proc_start"] == live["proc_start"])
 
 
 def update_session(
