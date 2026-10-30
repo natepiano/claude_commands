@@ -339,7 +339,7 @@ Inserted 2026-10-30 (user, via the showrunners). The readers switch runs in four
 
 **Acceptance:** a test moves a unit and a showrunner in the record, leaves a Units table and a parent file that still name the old parent, then shows that `seed`, `parent_of`, `children_of` and `production_tree.py --json` follow the record. A `production_tree.py --json` byte comparison before and after on one fixture tree.
 
-### Phase 3e — Tab reader for stop and resume  · status: todo
+### Phase 3e — Tab reader for stop and resume  · status: done
 
 **Depends on:** Phase 3b
 

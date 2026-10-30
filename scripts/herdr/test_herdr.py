@@ -1039,6 +1039,12 @@ class HerdrTests(unittest.TestCase):
     def configure_herdr(self, arguments: list[str], stdout: str = "", code: int = 0, stderr: str = "") -> None:
         self.configure(["--session", "fixture", *arguments], stdout, code, stderr)
 
+    def configure_tab_start(self, pane: str, label: str, session_id: str) -> list[str]:
+        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
+            {"pane_id": pane, "label": label}]}}))
+        return ["agent", "start", label, "--kind", "claude", "--pane", pane,
+                "--", "--session-id", session_id]
+
     def process(self, pid: int, parent: int, arguments: list[str], environment: dict[str, str]) -> Path:
         process = self.proc / str(pid)
         process.mkdir()
@@ -1829,6 +1835,129 @@ class HerdrTests(unittest.TestCase):
         self.configure_herdr(["pane", "list"], "[]")
         with self.assertRaises(herdr.HerdrFailure):
             _ = self.herdr.panes()
+
+    def test_session_of_keeps_the_conversation_workspace_and_pane_after_claude_exits(self) -> None:
+        pane, session_id = "w1:p2", "71356b6b-bf7b-4996-b27e-49da9f90b719"
+        start = self.configure_tab_start(pane, "alpha", session_id)
+        self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
+            {"workspace_id": "w1", "label": "production"}]}}))
+        running = self.root / "claude-running"
+        self.responses[" ".join(["--session", "fixture", *start])] = {
+            "stdout": "{}", "code": 0, "write_files": {str(running): "4242"}}
+        self.responses["--session fixture agent stop alpha"] = {
+            "stdout": "{}", "code": 0, "require_paths": [str(running)], "remove_paths": [str(running)]}
+        self.configure([], "")
+        client = self.herdr
+        self.assertEqual(client.session_of("alpha"), herdr.TabSession(pane, "alpha", "production", None))
+        _ = client.run(*start)
+        self.assertTrue(running.exists())
+        expected = herdr.TabSession(pane, "alpha", "production", session_id)
+        self.assertEqual(client.session_of("alpha"), expected)
+        _ = client.run("agent", "stop", "alpha")
+        self.assertFalse(running.exists())
+        self.assertEqual(client.session_of("alpha"), expected)
+        raw = herdr.json_object(herdr.json_items(client.result("pane", "list")["panes"], "panes")[0], "pane")
+        self.assertEqual(raw["workspace_id"], "w1")
+        self.assertEqual(raw["agent_session"], {"agent": "claude", "kind": "id",
+                                               "source": "herdr:claude", "value": session_id})
+
+    def test_a_failed_agent_start_does_not_supply_a_pane_conversation(self) -> None:
+        start = self.configure_tab_start("w1:p2", "alpha", "71356b6b-bf7b-4996-b27e-49da9f90b719")
+        self.configure_herdr(start, code=1, stderr="agent failed to start")
+        with self.assertRaisesRegex(herdr.HerdrFailure, "agent failed to start"):
+            _ = self.herdr.run(*start)
+        self.assertEqual(self.herdr.panes(), [{"pane_id": "w1:p2", "label": "alpha",
+                                               "workspace_id": "w1", "session_id": None}])
+
+    def test_an_agent_start_with_a_missing_required_path_does_not_supply_a_conversation(self) -> None:
+        start = self.configure_tab_start("w1:p2", "alpha", "71356b6b-bf7b-4996-b27e-49da9f90b719")
+        self.responses[" ".join(["--session", "fixture", *start])] = {
+            "stdout": "{}", "code": 0, "require_paths": [str(self.root / "missing")]}
+        self.configure([], "")
+        result = self.run_fake(self.herdr.argv(*start))
+        self.assertEqual(result.returncode, 98)
+        self.assertIn("fixture required path missing", result.stderr)
+        self.assertEqual(self.herdr.session_of("alpha"), herdr.TabSession("w1:p2", "alpha", "", None))
+
+    def test_tab_sessions_reads_panes_once_and_joins_workspace_labels_once(self) -> None:
+        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
+            {"pane_id": "w1:p2", "workspace_id": "w2", "label": "alpha",
+             "agent_session": {"agent": "claude", "kind": "id", "source": "herdr:claude", "value": "sid-alpha"}},
+            {"pane_id": "w2:p1", "workspace_id": "w1", "label": "beta", "agent_session": None}]}}))
+        self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
+            {"workspace_id": "w1", "label": "first"}, {"workspace_id": "w2", "label": "second"}]}}))
+        client = self.herdr
+        with patch.object(client, "panes", wraps=client.panes) as read_panes:
+            self.assertEqual(client.tab_sessions(), [herdr.TabSession("w1:p2", "alpha", "second", "sid-alpha"),
+                                                     herdr.TabSession("w2:p1", "beta", "first", None)])
+        read_panes.assert_called_once_with()
+        self.assertEqual(self.commands(), [["--session", "fixture", "pane", "list"],
+                                           ["--session", "fixture", "workspace", "list"]])
+
+    def test_tab_sessions_omits_panes_without_a_label(self) -> None:
+        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
+            {"pane_id": "w1:p1"}, {"pane_id": "w1:p2", "label": None},
+            {"pane_id": "w1:p3", "label": "named"}]}}))
+        self.assertEqual(self.herdr.tab_sessions(), [herdr.TabSession("w1:p3", "named", "", None)])
+
+    def test_tab_sessions_keeps_panes_with_missing_or_unlabelled_workspaces(self) -> None:
+        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
+            {"pane_id": "w1:p1", "label": "missing"}, {"pane_id": "w2:p1", "label": "unlabelled"}]}}))
+        self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
+            {"workspace_id": "w2", "label": None}]}}))
+        self.assertEqual(self.herdr.tab_sessions(), [herdr.TabSession("w1:p1", "missing", "", None),
+                                                     herdr.TabSession("w2:p1", "unlabelled", "", None)])
+
+    def test_session_of_and_lookup_share_exact_label_and_ambiguity_rules(self) -> None:
+        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
+            {"pane_id": "w1:p1", "label": "alpha"}, {"pane_id": "w1:p2", "label": "alpha-extra"},
+            {"pane_id": "w2:p1", "label": "duplicate"}, {"pane_id": "w3:p1", "label": "duplicate"},
+            {"pane_id": "w1:p3", "label": ""}, {"pane_id": "w1:p4", "label": None}]}}))
+        client = self.herdr
+        cases = [("alpha", herdr.PaneFound("w1:p1"), herdr.TabSession("w1:p1", "alpha", "", None)),
+                 ("", herdr.PaneFound("w1:p3"), herdr.TabSession("w1:p3", "", "", None)),
+                 ("Alpha", herdr.NoPane("Alpha"), herdr.NoPane("Alpha")),
+                 ("alph", herdr.NoPane("alph"), herdr.NoPane("alph")),
+                 ("missing", herdr.NoPane("missing"), herdr.NoPane("missing")),
+                 ("duplicate", herdr.SeveralPanes("duplicate", 2), herdr.SeveralPanes("duplicate", 2))]
+        for label, pane, tab in cases:
+            with self.subTest(label=label):
+                self.assertEqual(client.lookup(label), pane)
+                self.assertEqual(client.session_of(label), tab)
+
+    def test_panes_reads_session_values_and_allows_absent_conversations(self) -> None:
+        sessions: tuple[object, ...] = (None, {}, {"value": None}, {"value": "sid-alpha"})
+        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
+            {"pane_id": f"w1:p{index}", "workspace_id": "w2", "label": "alpha", "agent_session": session}
+            for index, session in enumerate(sessions)]}}))
+        self.assertEqual(self.herdr.panes(), [
+            {"pane_id": f"w1:p{index}", "workspace_id": "w2", "label": "alpha", "session_id": session_id}
+            for index, session_id in enumerate((None, None, None, "sid-alpha"))])
+
+    def test_panes_rejects_invalid_workspace_ids(self) -> None:
+        client = self.herdr
+        workspaces: tuple[object, ...] = (None, 3, True, [], {})
+        for workspace in workspaces:
+            with self.subTest(workspace=workspace), patch.object(client, "result", return_value={"panes": [
+                    {"pane_id": "w1:p1", "label": "alpha", "workspace_id": workspace}]}):
+                with self.assertRaisesRegex(herdr.HerdrFailure, "herdr pane workspace id: expected text"):
+                    _ = client.panes()
+
+    def test_panes_rejects_invalid_conversation_objects_and_values(self) -> None:
+        client = self.herdr
+        sessions: tuple[object, ...] = ("sid-alpha", 3, True, [], {"value": 3}, {"value": False}, {"value": []}, {"value": {}})
+        for session in sessions:
+            with self.subTest(session=session), patch.object(client, "result", return_value={"panes": [
+                    {"pane_id": "w1:p1", "label": "alpha", "workspace_id": "w1", "agent_session": session}]}):
+                with self.assertRaisesRegex(herdr.HerdrFailure, "herdr pane agent session"):
+                    _ = client.panes()
+
+    def test_tab_sessions_rejects_invalid_workspace_labels(self) -> None:
+        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": []}}))
+        self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
+            {"workspace_id": "w1", "label": 3}]}}))
+        with self.assertRaisesRegex(herdr.HerdrFailure, "herdr workspace label: expected text"):
+            _ = self.herdr.tab_sessions()
 
     def test_session_list_keeps_running_only(self) -> None:
         rows: list[herdr.SessionEntry] = [

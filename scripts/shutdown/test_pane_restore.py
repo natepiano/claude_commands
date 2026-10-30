@@ -44,7 +44,10 @@ class FakeClient:
         raise AssertionError(arguments)
 
     def panes(self) -> list[herdr.PaneIdentity]:
-        return [{"pane_id": str(row["pane_id"]), "label": cast(str | None, row.get("label"))} for row in self.rows]
+        return [{"pane_id": str(row["pane_id"]), "label": cast(str | None, row.get("label")),
+                 "workspace_id": str(row["pane_id"]).split(":", 1)[0],
+                 "session_id": cast(dict[str, str], row.get("agent_session") or {}).get("value")}
+                for row in self.rows]
 
     def pane_activity(self, pane: str) -> herdr.PaneAtShell | herdr.PaneRunning:
         _ = pane

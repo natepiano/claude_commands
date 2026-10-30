@@ -45,6 +45,10 @@ ORIGINAL_CHECKED = add_showrunner.checked
 START_SHOWRUNNER = add_showrunner.main
 
 
+def pane_identity(pane: str, label: str) -> herdr.PaneIdentity:
+    return herdr.PaneIdentity(pane_id=pane, label=label, workspace_id=pane.split(":", 1)[0], session_id=None)
+
+
 def setUpModule() -> None:
     """The retired row's date is in the user's zone; the zone setting must not change these tests."""
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
@@ -315,7 +319,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         with (mock.patch.object(showrunners, "current_name", return_value=""),
               mock.patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(5151)),
               mock.patch.object(herdr, "herdr_place_of", return_value=place),
-              mock.patch.object(herdr.Herdr, "panes", return_value=[herdr.PaneIdentity(pane_id=place.pane, label="child")]),
+              mock.patch.object(herdr.Herdr, "panes", return_value=[pane_identity(place.pane, "child")]),
               mock.patch.object(herdr, "submitted_prompt", return_value=submitted),
               mock.patch.object(herdr.Herdr, "submit_opening_prompt") as prompt,
               mock.patch.object(add_showrunner, "showrunner_appeared", return_value=True) as appeared,
@@ -720,14 +724,14 @@ class PromoteShowrunnerTests(unittest.TestCase):
 
     def test_the_childs_check_lets_the_units_own_tab_carry_its_name(self) -> None:
         ending_place = herdr.HerdrPlace("agents", PANE)
-        child = self.child_with_open_tabs([{"pane_id": ending_place.pane, "label": "builds"}])
+        child = self.child_with_open_tabs([pane_identity(ending_place.pane, "builds")])
         ORIGINAL_CHECKED(child, "parent", ending=add_showrunner.EndingUnitTab(ending_place.pane),
                          config_dir=self.unit_account.dir)
 
     def test_the_childs_check_refuses_another_same_named_tab_beside_the_ending_unit(self) -> None:
         child = self.child_with_open_tabs([
-            {"pane_id": PANE, "label": "builds"},
-            {"pane_id": "w8:p2", "label": "builds"},
+            pane_identity(PANE, "builds"),
+            pane_identity("w8:p2", "builds"),
         ])
         with self.assertRaisesRegex(Refusal, "^a tab named builds is already open in herdr session agents$"):
             ORIGINAL_CHECKED(child, "parent", ending=add_showrunner.EndingUnitTab(PANE),
