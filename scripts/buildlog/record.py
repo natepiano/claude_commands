@@ -8,7 +8,9 @@ port_lint.py writes its own call records through write_call() here.
       epoch seconds; TTY is 1 when a terminal watched the step (no log is
       captured then); LOG is the step's output handed off by run(), PEAK the
       file the cgroup scope wrote memory.peak and memory.pressure to. Either may be empty. Both
-      are deleted here. BUILDLOG_TREE_START is the tree key `key` printed
+      are deleted only after the row is durable. A pending step preserves
+      the original row and sources for collect() to finish after a failed
+      save. BUILDLOG_TREE_START is the tree key `key` printed
       before the step; the key taken here, after it, decides tree_key and
       tree_changed.
   record.py key ARGV...
@@ -57,7 +59,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -76,6 +78,8 @@ GIT_TIMEOUT_S = 5
 RUSTC_TIMEOUT_S = 10
 LEDGER = Path.home() / ".local/state/verify/events.jsonl"
 LAUNCH_LOCK_NAME = "launches.lock"
+# Adding or renaming a host requires updating the folders carried by sync.
+SYNC_HOSTS = ("natedev", "Mac", "Nates-MacBook-Pro-2023")
 
 
 class GitFacts(TypedDict):
@@ -115,6 +119,32 @@ class InvalidLaunchState:
 class PublishedLaunch:
     added: bool
     unknown_worktree: bool
+
+
+@dataclass(frozen=True)
+class NoHeldLog:
+    pass
+
+
+@dataclass(frozen=True)
+class NoPeakFile:
+    pass
+
+
+@dataclass(frozen=True)
+class PendingStep:
+    """The original event and its sources, retained until publication and cleanup finish."""
+
+    row_key: str
+    row: dict[str, object]
+    held_log: Path | NoHeldLog
+    peak_file: Path | NoPeakFile
+    month_offset: int
+
+
+@dataclass(frozen=True)
+class PublishedStep:
+    added: bool
 
 
 def hana_launch_record(fields: Mapping[str, object], directory: str) -> LaunchStep | InvalidLaunchState:
@@ -195,8 +225,7 @@ def pending_launches_root() -> Path:
     return store.root() / "pending-launches"
 
 
-def _save_pending_launch(row: LaunchStep) -> Path:
-    path = pending_launches_root() / _launch_row_path(row).with_suffix(".json").name
+def _save_pending_record(path: Path, fields: Mapping[str, object]) -> Path:
     if path.exists():
         return path
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -204,7 +233,7 @@ def _save_pending_launch(row: LaunchStep) -> Path:
     temporary_path = Path(temporary.name)
     try:
         with temporary:
-            json.dump(row, temporary, separators=(",", ":"))
+            json.dump(dict(fields), temporary, separators=(",", ":"))
             temporary.flush()
             os.fsync(temporary.fileno())
         os.replace(temporary_path, path)
@@ -212,6 +241,14 @@ def _save_pending_launch(row: LaunchStep) -> Path:
     finally:
         temporary_path.unlink(missing_ok=True)
     return path
+
+
+def _pending_launch_path(row: LaunchStep) -> Path:
+    return pending_launches_root() / _launch_row_path(row).with_suffix(".json").name
+
+
+def _save_pending_launch(row: LaunchStep) -> Path:
+    return _save_pending_record(_pending_launch_path(row), row)
 
 
 def finish_pending_launch(path: Path) -> PublishedLaunch:
@@ -242,7 +279,12 @@ def launch(state_path: Path, worktree: Path) -> bool:
         store.root().mkdir(parents=True, exist_ok=True)
         with (store.root() / LAUNCH_LOCK_NAME).open("a+b") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            return finish_pending_launch(_save_pending_launch(row)).added
+            try:
+                return finish_pending_launch(_save_pending_launch(row)).added
+            except Exception:  # noqa: BLE001 -- retain the pending retry and report its error
+                pending = _pending_launch_path(row)
+                store.note_error(f"pending record {pending}" if pending.is_file() else f"launch {state_path}")
+                return False
     except Exception:  # noqa: BLE001 -- a recorder never fails its caller
         store.note_error(f"launch {state_path}")
         return False
@@ -418,15 +460,131 @@ def sent_tree_key() -> SentTreeKey | NoSentTreeKey:
     return NoSentTreeKey()
 
 
+def _log_relative_path(host: str, epoch: float, record_id: str) -> str:
+    return f"{host}/{store.LOGS_DIR}/{store.month(epoch)}/{record_id}.log.gz"
+
+
 def keep_log(data: bytes, host: str, epoch: float, record_id: str) -> str:
-    relative = f"{host}/{store.LOGS_DIR}/{store.month(epoch)}/{record_id}.log.gz"
+    relative = _log_relative_path(host, epoch, record_id)
     target = store.root() / relative
+    if target.is_file():
+        _sync_directory(target.parent)
+        return relative
     target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.with_name(target.name + f".{os.getpid()}.tmp")
-    with gzip.open(partial, "wb") as handle:
-        _ = handle.write(data)
-    _ = partial.replace(target)
+    try:
+        with partial.open("wb") as handle:
+            with gzip.GzipFile(fileobj=handle, mode="wb") as compressed:
+                _ = compressed.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(partial, target)
+        _sync_directory(target.parent)
+    finally:
+        partial.unlink(missing_ok=True)
     return relative
+
+
+def pending_steps_root() -> Path:
+    return store.root() / "pending-steps"
+
+
+def _save_pending_step(pending: PendingStep) -> Path:
+    return _save_pending_record(pending_steps_root() / f"{pending.row_key}.json", {
+        "row_key": pending.row_key, "row": pending.row,
+        "held_log": str(pending.held_log) if isinstance(pending.held_log, Path) else None,
+        "peak_file": str(pending.peak_file) if isinstance(pending.peak_file, Path) else None,
+        "month_offset": pending.month_offset,
+    })
+
+
+def _read_pending_step(path: Path) -> PendingStep:
+    loaded = cast(object, json.loads(path.read_text()))
+    if not isinstance(loaded, dict):
+        raise ValueError("pending step is not an object")
+    fields = cast(dict[str, object], loaded)
+    row_key, row = fields.get("row_key"), fields.get("row")
+    if not isinstance(row_key, str) or not isinstance(row, dict):
+        raise ValueError("pending step has no row identity")
+    row = cast(dict[str, object], row)
+    if (row.get("kind") != "step" or row.get("step") == "launch"
+            or not all(isinstance(row.get(key), str) for key in ("host", "id", "started_at"))):
+        raise ValueError("pending record is not a build step")
+    held, peak = fields.get("held_log"), fields.get("peak_file")
+    if ((held is not None and not isinstance(held, str))
+            or (peak is not None and not isinstance(peak, str))):
+        raise ValueError("pending step has invalid source paths")
+    month_offset = fields.get("month_offset")
+    if not isinstance(month_offset, int) or isinstance(month_offset, bool) or month_offset < 0:
+        raise ValueError("pending step has no valid month offset")
+    return PendingStep(row_key, row, Path(held) if isinstance(held, str) else NoHeldLog(),
+                       Path(peak) if isinstance(peak, str) else NoPeakFile(), month_offset)
+
+
+def _step_month_file(row: Mapping[str, object]) -> Path:
+    return store.host_file(str(row["host"]), datetime.fromisoformat(str(row["started_at"])).timestamp())
+
+
+def write_step_line(pending: PendingStep) -> bool:
+    path = _step_month_file(pending.row)
+    store.append_line(path, pending.row)
+    _sync_directory(path.parent)
+    return True
+
+
+def _resume_step_line(pending: PendingStep) -> bool:
+    """Only a recovery reads the monthly suffix that may contain its original row."""
+    path = _step_month_file(pending.row)
+    added = True
+    with store.locked_append(path) as handle:
+        _ = handle.seek(pending.month_offset)
+        for line in handle:
+            try:
+                row = cast(object, json.loads(line))
+            except ValueError:
+                continue
+            if isinstance(row, dict) and cast(dict[str, object], row).get("id") == pending.row["id"]:
+                added = False
+                break
+        if added:
+            store.append_locked(handle, pending.row)
+    _sync_directory(path.parent)
+    return added
+
+
+def _delete_step_sources(held: Path | NoHeldLog, peak: Path | NoPeakFile) -> None:
+    for path in (held, peak):
+        if isinstance(path, Path):
+            path.unlink(missing_ok=True)
+            if path.parent.is_dir():
+                _sync_directory(path.parent)
+
+
+def _finish_step(path: Path, pending: PendingStep, publish: Callable[[PendingStep], bool]) -> PublishedStep:
+    row = pending.row
+    saved_log = row.get("log")
+    if isinstance(saved_log, str):
+        if not (store.root() / saved_log).is_file():
+            if not isinstance(pending.held_log, Path):
+                raise OSError("failed step has no held log to save")
+            started = datetime.fromisoformat(str(row["started_at"])).timestamp()
+            _ = keep_log(pending.held_log.read_bytes(), str(row["host"]), started, str(row["id"]))
+        if not (store.root() / saved_log).is_file():
+            raise OSError("failed step log was not saved")
+        _sync_directory((store.root() / saved_log).parent)
+    added = publish(pending)
+    _delete_step_sources(pending.held_log, pending.peak_file)
+    os.utime(path, None)
+    with path.open("rb") as handle:
+        os.fsync(handle.fileno())
+    os.replace(path, path.with_suffix(".done"))
+    _sync_directory(path.parent)
+    return PublishedStep(added)
+
+
+def finish_pending_step(path: Path) -> PublishedStep:
+    """Finish the saved context and sources, then retain proof of completion."""
+    return _finish_step(path, _read_pending_step(path), _resume_step_line)
 
 
 def step(args: list[str]) -> None:
@@ -435,13 +593,32 @@ def step(args: list[str]) -> None:
 
     status_text, start_text, end_text, tty_text, held, peak = args[:6]
     argv = args[6:]
+    host = store.host_name()
+    cwd = os.getcwd()
+    row_key = hashlib.sha256(json.dumps([host, cwd, args], separators=(",", ":")).encode()).hexdigest()
+    pending_path = pending_steps_root() / f"{row_key}.json"
+    done_path = pending_path.with_suffix(".done")
+    held_log = Path(held).absolute() if held else NoHeldLog()
+    peak_file = Path(peak).absolute() if peak else NoPeakFile()
+    store.root().mkdir(parents=True, exist_ok=True)
     try:
-        start = float(start_text)
-        end = float(end_text) if end_text else time.time()
+        with (store.root() / LAUNCH_LOCK_NAME).open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if pending_path.exists():
+                _ = finish_pending_step(pending_path)
+                return
+            if (held or peak) and done_path.exists():
+                return
+        try:
+            start = float(start_text)
+            end = float(end_text) if end_text else time.time()
+            status = int(status_text)
+            started_at, ended_at = store.utc_iso(start), store.utc_iso(end)
+        except (ValueError, OverflowError, OSError):
+            store.note_error(f"record.py step {' '.join(args)[:500]}")
+            _delete_step_sources(held_log, peak_file)
+            return
         tty = tty_text == "1"
-        status = int(status_text)
-        host = store.host_name()
-        cwd = os.getcwd()
         directory = git_directory(argv, cwd)
         tree = tree_facts(os.environ.get("BUILDLOG_TREE_START"), treekey.tree_key(directory))
         step_caller = caller(tty)
@@ -459,7 +636,7 @@ def step(args: list[str]) -> None:
             except Exception:  # noqa: BLE001 -- a parser bug loses the facts, never the record
                 store.note_error(f"parse {name} {held}")
             if status != 0:
-                log = keep_log(data, host, start, record_id)
+                log = _log_relative_path(host, start, record_id)
         memory = peak_and_stall(peak)
         step_slice = "none" if not peak else "builds" if Path(peak).is_file() else "fallback"
         record: dict[str, object] = {
@@ -467,8 +644,8 @@ def step(args: list[str]) -> None:
             "v": RECORD_VERSION,
             "id": record_id,
             "host": host,
-            "started_at": store.utc_iso(start),
-            "ended_at": store.utc_iso(end),
+            "started_at": started_at,
+            "ended_at": ended_at,
             "duration_s": round(end - start, 3),
             "mem_wait_s": int(os.environ.get("BUILDLOG_MEM_WAIT_S", "0")),
             "slice": step_slice,
@@ -489,14 +666,22 @@ def step(args: list[str]) -> None:
             **facts,
             "log": log,
         }
-        store.append_line(store.host_file(host, start), record)
-    finally:
-        for leftover in (held, peak):
-            if leftover:
-                try:
-                    os.unlink(leftover)
-                except OSError:
-                    pass
+        with (store.root() / LAUNCH_LOCK_NAME).open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if pending_path.exists():
+                _ = finish_pending_step(pending_path)
+                return
+            if (held or peak) and done_path.exists():
+                return
+            month_file = store.host_file(host, start)
+            month_offset = month_file.stat().st_size if month_file.exists() else 0
+            pending = PendingStep(row_key, record, held_log, peak_file, month_offset)
+            _ = _finish_step(_save_pending_step(pending), pending, write_step_line)
+    except Exception:  # noqa: BLE001 -- retain every source needed for a retry
+        if pending_path.is_file():
+            store.note_error(f"pending record {pending_path}")
+        else:
+            store.note_error(f"record.py step {' '.join(args)[:500]}")
 
 
 def optional_int(text: str) -> int | None:

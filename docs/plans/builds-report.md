@@ -161,7 +161,7 @@ including the details to make it clear
 
 **Ruled out:** a second waiter identity (the row file name is the key); session id alone (several waiters share one).
 
-### Phase 4b — A failed step's record survives a failed save, and a rerun finishes it  · status: todo
+### Phase 4b — A failed step's record survives a failed save, and a rerun finishes it  · status: done
 
 #### Work Order
 
@@ -175,6 +175,7 @@ including the details to make it clear
 
 **Files:**
 - `scripts/buildlog/record.py` — save, then delete; a rerun finishes a half-done record
+- `scripts/buildlog/sync.py` — the pull carries only the folders `record.py` names (the host folders); every other folder stays local (review finding, showrunner ruling 2026-10-30)
 - `scripts/buildlog/launches.py` — `collect()` counts what it could not publish
 - `scripts/buildlog/report.py` — the unpublished/errors line
 - `scripts/buildlog/test_record_rerun.py` — a stop at each point, then a rerun; a failed pending save, a publish that keeps failing, then recovery; a clean log prints no line
@@ -224,3 +225,30 @@ including the details to make it clear
 **Constraints from prior phases:** Phase 2: the index never rewrites a source log.
 
 **Acceptance gate:** the buildlog and `scripts/lint/test_invoke_scope.py` tests green; basedpyright 0/0/0. Live: one filtered `verify.sh test` step gets a `test_phase_peak_bytes` value, and the notice states the sampler's CPU cost per step.
+
+### Phase 4d — Recorder health covers both hosts  · status: todo
+
+#### Work Order
+
+**Goal:** `/build:report` on either host shows the recorder health line for both hosts: records not published yet and recorder errors since the report day's local midnight, summed over natedev and the Mac.
+
+**Spec:**
+- Why (phase 4b contract review, showrunner ruling 2026-10-30 "4d"): the 4b health line reads only the local `errors.log` and pending folders, and sync carries neither, so a failed Mac save or publish never shows on natedev.
+- Each host's `launches.collect()` writes a small health file into its own host folder (the folder sync already carries): pending count and the recorder-error timestamps the report needs. Atomic write (temp + rename).
+- The report sums the local counts and each peer host folder's health file. A peer whose file is absent or older than its last sync shows as unknown, never as 0.
+- One place reads and one place writes the health file; the 4b health function uses it for the local host too.
+
+**Files:**
+- `scripts/buildlog/launches.py` — write the host health file in `collect()`
+- `scripts/buildlog/report.py` — sum health over hosts
+- `scripts/buildlog/test_recorder_health.py` — Mac failure shows on natedev, absent peer file shows unknown, clean hosts add no line
+
+**Workers:** 1 writer + 1 tester.
+- `impl2` — `launches.py`, `report.py`
+- `test2` — `test_recorder_health.py`
+
+**State:** the host health file
+
+**Depends on:** Phase 4b (health line, sync allow-list).
+
+**Acceptance gate:** the buildlog tests green; basedpyright 0/0/0. Live: after a sync, natedev's report counts a Mac recorder error written for the test.

@@ -102,6 +102,70 @@ class SyncTests(unittest.TestCase):
         self.assertIn('echo "rc=$?"', self.commands[0][-1])
         self.assertIs(self.status()["ok"], True)
 
+    def assert_host_pull(self, host: str) -> list[str]:
+        self.responses = [
+            subprocess.CompletedProcess(["ssh"], 0, stdout="rc=0\n", stderr=""),
+            subprocess.CompletedProcess(["rsync"], 0, stdout="", stderr=""),
+        ]
+        with mock.patch.object(store, "host_name", return_value=host):
+            self.assertEqual(sync.sync(), 0)
+        pull = self.commands[-1]
+        self.assertEqual(pull[0], "rsync")
+        self.assertEqual(pull[-2:], ["test-mac:.local/state/buildlog/", f"{self.root}/"])
+        return [argument for argument in pull if argument.startswith(("--include=", "--exclude="))]
+
+    def test_pull_includes_whole_known_host_subtrees_without_monthly_files(self) -> None:
+        filters = self.assert_host_pull("natedev")
+        self.assertEqual([rule for rule in filters if rule.startswith("--include=")], [
+            "--include=/Mac/***", "--include=/Nates-MacBook-Pro-2023/***",
+        ])
+        # Whole subtrees include launch-only and sample-only hosts and nested
+        # saved logs; no monthly-file discovery or extension filter is involved.
+        self.assertEqual(filters[-1], "--exclude=*")
+        self.assertNotIn("--include=/natedev/***", filters)
+
+    def test_peer_admission_and_pending_files_are_excluded_at_every_depth(self) -> None:
+        filters = self.assert_host_pull("natedev")
+        for folder, peer_file in (
+            ("admission", "admission/anon_peaks.jsonl"),
+            ("pending-launches", "pending-launches/launch.json"),
+            ("pending-steps", "pending-steps/step.json"),
+        ):
+            with self.subTest(peer_file=peer_file):
+                # An unanchored directory exclusion matches both peer_file and
+                # Mac/peer_file, before the anchored host subtree includes.
+                exclusion = f"--exclude={folder}/"
+                self.assertIn(exclusion, filters)
+                self.assertLess(filters.index(exclusion), filters.index("--include=/Mac/***"))
+        self.assertNotIn("--include=/*/", filters)
+        self.assertEqual(filters[-1], "--exclude=*")
+
+    def test_pull_excludes_unknown_folders_and_the_current_host(self) -> None:
+        filters = self.assert_host_pull("Mac")
+        self.assertEqual([rule for rule in filters if rule.startswith("--include=")], [
+            "--include=/natedev/***", "--include=/Nates-MacBook-Pro-2023/***",
+        ])
+        self.assertEqual(filters[-1], "--exclude=*")
+
+    def test_only_natedev_pushes_ci_and_no_host_pulls_it(self) -> None:
+        (self.root / store.CI_DIR).mkdir(parents=True)
+        for host in ("natedev", "Mac"):
+            with self.subTest(host=host):
+                self.commands = []
+                self.responses = [
+                    subprocess.CompletedProcess(["ssh"], 0, stdout="rc=0\n", stderr=""),
+                    subprocess.CompletedProcess(["rsync"], 0, stdout="", stderr=""),
+                ]
+                if host == "natedev":
+                    self.responses.append(subprocess.CompletedProcess(["rsync"], 0, stdout="", stderr=""))
+                with mock.patch.object(store, "host_name", return_value=host):
+                    self.assertEqual(sync.sync(), 0)
+                pushes = [command for command in self.commands if command[-1] == "test-mac:.local/state/buildlog/"]
+                self.assertEqual(len(pushes), 1 if host == "natedev" else 0)
+                if pushes:
+                    self.assertIn(str(self.root / store.CI_DIR), pushes[0])
+                self.assertNotIn("--include=/ci/***", self.commands[-1])
+
     def test_ssh_255_is_peer_unavailable(self) -> None:
         self.responses = [subprocess.CompletedProcess(["ssh"], 255, stdout="", stderr="unreachable")]
 

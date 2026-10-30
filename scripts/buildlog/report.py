@@ -21,6 +21,8 @@ import holds
 import index
 import disk
 import memory
+import record
+import store
 import sync
 import rust_release
 from mac_outcome import (
@@ -477,6 +479,10 @@ def wait_seconds(value: object) -> float:
 
 def call_time(value: object) -> datetime:
     return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+def local_time(at: str) -> str:
+    return call_time(at).astimezone(user_zone()).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 def token_holders(rows: list[Row]) -> list[TokenHolder]:
@@ -1050,9 +1056,6 @@ def power_profile_section(connection: sqlite3.Connection, day: str) -> list[str]
     changes = [change for change in profile_changes(connection) if call_time(change.at) < end]
     if not changes:
         return []
-
-    def local_time(at: str) -> str:
-        return call_time(at).astimezone(zone).strftime("%Y-%m-%d %H:%M:%S %Z")
 
     latest = changes[-1]
     lines = ["### Power profile", "", f"Profile now: {latest.profile}, since {local_time(latest.at)}.", ""]
@@ -1861,6 +1864,34 @@ def launches_section(connection: sqlite3.Connection, day: str) -> list[str]:
         *table(["Launch path", "Launches", "mem_wait_s recorded", "mem_wait_s total", "mem_wait_s max"], body), ""]
 
 
+def recorder_health_lines(day: str) -> list[str]:
+    """Show outstanding retries and errors; recovered pending errors stay only in the audit log."""
+    since = datetime.combine(date.fromisoformat(day), datetime.min.time(), user_zone())
+    pending = sum(1 for root in (record.pending_launches_root(), record.pending_steps_root())
+                  for path in root.glob("*.json") if path.is_file())
+    errors = 0
+    try:
+        with (store.root() / store.ERRORS_NAME).open() as handle:
+            for line in handle:
+                timestamp, separator, context = line.rstrip("\n").partition(" ")
+                if not separator:
+                    continue
+                try:
+                    instant = datetime.fromisoformat(timestamp)
+                except ValueError:
+                    continue
+                if instant.tzinfo is None or instant < since:
+                    continue
+                if context.startswith("pending record ") and not Path(context.removeprefix("pending record ")).is_file():
+                    continue
+                errors += 1
+    except FileNotFoundError:
+        pass
+    if not pending and not errors:
+        return []
+    return [f"{pending} records not published yet; {errors} recorder errors since {local_time(since.isoformat())}"]
+
+
 def report(connection: sqlite3.Connection, day: str) -> str:
     found = kinds(connection, day)
     hosts = cast(
@@ -1874,6 +1905,7 @@ def report(connection: sqlite3.Connection, day: str) -> str:
     )
     test_calls = reported_mac_calls(connection, day)
     lines = [f"## Builds, {date.fromisoformat(day).strftime('%A %Y-%m-%d')}", ""]
+    lines += recorder_health_lines(day)
     waits = daily_waits(connection, day)
     copies = daily_mac_copies(connection, day, test_calls)
     lines += lead_block(connection, day, test_calls, waits, copies)
