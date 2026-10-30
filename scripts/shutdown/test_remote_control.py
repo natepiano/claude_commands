@@ -19,7 +19,7 @@ import remote_control
 import herdr
 import sessions
 import session_pane
-import settle
+import restart_support
 import detached
 from push_texts import RenderedPush
 from herdr import HerdrPlace
@@ -91,7 +91,7 @@ class RemoteControlTests(ShutdownTestCase):
         })))
         _ = self.enterContext(patch.object(Path, "home", return_value=self.root))
         _ = self.enterContext(patch.object(sessions, "process_start", return_value="original"))
-        _ = self.enterContext(patch.object(settle, "local_machine", return_value="natedev"))
+        _ = self.enterContext(patch.object(restart_support, "local_machine", return_value="natedev"))
         self.clock = FakeClock()
         self.write()
         _ = self.enterContext(patch.object(session_pane, "record_place", side_effect=self.find_place))
@@ -119,7 +119,7 @@ class RemoteControlTests(ShutdownTestCase):
 
     def run_fix(self) -> tuple[remote_control.RemoteControlOutcome, str, list[RenderedPush]]:
         output = io.StringIO()
-        with patch.object(settle, "alert_user") as alert, redirect_stdout(output):
+        with patch.object(restart_support, "alert_user") as alert, redirect_stdout(output):
             outcome = remote_control.fix("owner", 321, "original", "trunk unit", "Owner", clock=self.clock)
         lines = output.getvalue().splitlines()
         self.assertEqual(len(lines), 1, output.getvalue())

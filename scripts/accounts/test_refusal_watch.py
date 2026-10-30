@@ -38,14 +38,14 @@ deliver_notice_jobs = quota_alert.deliver_and_record
 
 if TYPE_CHECKING:
     from scripts.shutdown.unit_staff_test_support import isolated_parents, unit_host
-    from scripts.shutdown import inventory, launch_permission, shutdown_record, settle
+    from scripts.shutdown import inventory, launch_permission, shutdown_record, restart_support
     from scripts.message import sessions
 else:
     from unit_staff_test_support import isolated_parents, unit_host
     launch_permission = import_module("launch_permission")
     inventory = import_module("inventory")
     shutdown_record = import_module("shutdown_record")
-    settle = import_module("settle")
+    restart_support = import_module("restart_support")
     sessions = import_module("sessions")
 
 
@@ -1147,7 +1147,7 @@ class RefusalWatchTests(unittest.TestCase):
         with (patch.object(accounts, "placement", side_effect=AssertionError("wait chose an account")),
               patch.object(accounts, "pick", side_effect=AssertionError("wait picked an account")),
               patch.object(accounts, "set_group_account", side_effect=AssertionError("wait selected an account")),
-              patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as delivery):
+              patch.object(restart_support, "send_message", return_value=restart_support.MessageSent(kind="sent")) as delivery):
             _ = self.cli()
             _ = self.cli()
         delivery.assert_called_once_with("session:refused-unit", "Quota wait ended", "Continue where you stopped.",
@@ -1172,7 +1172,7 @@ class RefusalWatchTests(unittest.TestCase):
                 with (patch.object(accounts, "placement", side_effect=AssertionError("pending head placed an account")),
                       patch.object(accounts, "pick", side_effect=AssertionError("pending head picked an account")),
                       patch.object(accounts, "set_group_account", side_effect=AssertionError("pending head selected an account")),
-                      patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as delivery):
+                      patch.object(restart_support, "send_message", return_value=restart_support.MessageSent(kind="sent")) as delivery):
                     WatchTime.at = NOW
                     _ = self.cli()
                     _ = self.cli()
@@ -2319,7 +2319,7 @@ class RefusalWatchTests(unittest.TestCase):
         WatchTime.at = NOW + timedelta(minutes=19)
         # Other is not live on the continuation tick; its proof file must survive.
         self.live = [live for live in self.live if live["sessionId"] == "probe"]
-        with patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as delivery:
+        with patch.object(restart_support, "send_message", return_value=restart_support.MessageSent(kind="sent")) as delivery:
             _ = self.cli()
             _ = self.cli()
         delivery.assert_called_once()
@@ -2463,7 +2463,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.owner("unit", host="unit")
         _ = self.transcript("unit")
         original = accounts.move_sessions
-        def requested(ids: tuple[str, ...], target: str, *, why: str) -> tuple[stop_resume.Resumed | accounts.SessionMoveRefused, ...]:
+        def requested(ids: tuple[str, ...], target: str, *, why: str) -> tuple[stop_resume.Resumed | stop_resume.MoveHandedOff | accounts.SessionMoveRefused, ...]:
             self.assertEqual(stored_group_labels(path)["units"], target)
             return original(ids, target, why=why)
         with patch.object(accounts, "move_sessions", side_effect=requested):
@@ -2973,7 +2973,7 @@ class RefusalWatchTests(unittest.TestCase):
         WatchTime.at = reset
         with (patch.object(accounts, "pick", side_effect=AssertionError("waited session chose another account")),
               patch.object(accounts, "move_sessions", side_effect=AssertionError("waited session moved")),
-              patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as delivery):
+              patch.object(restart_support, "send_message", return_value=restart_support.MessageSent(kind="sent")) as delivery):
             _, output, _ = self.cli()
             _ = self.cli()
         self.assertIn("continued on its current account", output)
@@ -3014,7 +3014,7 @@ class RefusalWatchTests(unittest.TestCase):
               patch.object(accounts, "placement", wraps=accounts.placement) as placement,
               patch.object(accounts, "pick", wraps=accounts.pick) as pick,
               patch.object(accounts, "move_sessions", side_effect=AssertionError("wait moved")),
-              patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as delivery):
+              patch.object(restart_support, "send_message", return_value=restart_support.MessageSent(kind="sent")) as delivery):
             code, output, error = self.cli()
             _ = self.cli()
         self.assertEqual((code, error), (0, ""))
@@ -3077,7 +3077,7 @@ class RefusalWatchTests(unittest.TestCase):
               patch.object(accounts, "placement", wraps=accounts.placement) as placement,
               patch.object(accounts, "pick", wraps=accounts.pick) as pick,
               patch.object(accounts, "move_sessions", side_effect=AssertionError("wait moved")),
-              patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as delivery):
+              patch.object(restart_support, "send_message", return_value=restart_support.MessageSent(kind="sent")) as delivery):
             code, _, error = self.cli()
             self.assertEqual((code, error), (0, ""))
             self.assertEqual(moves.read_moves(), [no_room, waited])
@@ -3114,7 +3114,7 @@ class RefusalWatchTests(unittest.TestCase):
         waited, = moves.read_moves()
         self.assertEqual(waited["kind"], "waited")
         WatchTime.at = reset
-        with patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as first_delivery:
+        with patch.object(restart_support, "send_message", return_value=restart_support.MessageSent(kind="sent")) as first_delivery:
             _ = self.cli()
         first_delivery.assert_called_once_with("session:same-reset", "Quota wait ended", "Continue where you stopped.",
             key="quota-continue-same-reset-refusal-one")
@@ -3123,7 +3123,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.reading(SOURCE_LOGIN, 80, five=0, at=WatchTime.at, five_reset=reset)
         _ = self.transcript("same-reset", "You've hit your session limit", at=WatchTime.at, entry_id="refusal-two")
         with (patch.object(accounts, "pick", wraps=accounts.pick) as pick,
-              patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as delivery):
+              patch.object(restart_support, "send_message", return_value=restart_support.MessageSent(kind="sent")) as delivery):
             code, output, error = self.cli()
         self.assertEqual((code, error), (0, ""))
         delivery.assert_not_called()
@@ -3152,7 +3152,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(held["reset"], reset.isoformat())
         WatchTime.at = reset
         self.reading(TARGET_LOGIN, 1, at=reset, reset=reset + timedelta(days=1))
-        with patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as delivery:
+        with patch.object(restart_support, "send_message", return_value=restart_support.MessageSent(kind="sent")) as delivery:
             _ = self.cli()
             _ = self.cli()
         delivery.assert_called_once_with("session:refused", "Quota wait ended", "Continue where you stopped.",
@@ -3202,9 +3202,9 @@ class RefusalWatchTests(unittest.TestCase):
         self.reading(SOURCE_LOGIN, 80, five=0, five_reset=reset)
         _ = self.cli()
         WatchTime.at = reset
-        with patch.object(settle, "send_message", side_effect=[
-            RuntimeError("socket unavailable\nextra detail"), settle.MessageQueued(kind="queued", reason="socket still closed"),
-            settle.MessageSent(kind="sent")]) as delivery:
+        with patch.object(restart_support, "send_message", side_effect=[
+            RuntimeError("socket unavailable\nextra detail"), restart_support.MessageQueued(kind="queued", reason="socket still closed"),
+            restart_support.MessageSent(kind="sent")]) as delivery:
             _, output, _ = self.cli()
             self.assertEqual(output.splitlines(), ["owner refused: continuation not delivered: socket unavailable"])
             _, output, _ = self.cli()

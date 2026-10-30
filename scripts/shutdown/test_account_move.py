@@ -24,7 +24,6 @@ from scripts.whoami.note_file import note_name
 import inventory
 import shutdown_record
 import sessions
-import settle
 import showrunners
 import launch_permission
 from importlib import import_module
@@ -81,7 +80,6 @@ class AccountMoveTests(ShutdownTestCase):
         at = datetime.now(timezone.utc)
         _ = self.enterContext(patch.object(refusals, "stored_reading", return_value=refusals.FreshReading(
             refusals.ReadingWindow(80, refusals.NoResetKnown(), at), refusals.NoWindow(), "")))
-        _ = self.enterContext(patch.object(settle, "prompt_state", return_value=settle.TakesPrompts("room")))
 
 
     def test_target_shutdown_hold_refuses_group_and_single_move_before_any_write(self) -> None:
@@ -187,7 +185,7 @@ class AccountMoveTests(ShutdownTestCase):
         with (
             patch.object(subprocess, "run") as process,
             patch.object(os, "execvpe") as launch,
-            patch.object(settle, "begin") as begin,
+            patch.object(stop_resume, "move_sessions") as move,
         ):
             result, output, error = self.cli(session, target)
         self.assertNotEqual(result, 0)
@@ -198,7 +196,7 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertEqual(dict(os.environ), environment)
         process.assert_not_called()
         launch.assert_not_called()
-        begin.assert_not_called()
+        move.assert_not_called()
 
 
     def test_move_refuses_a_session_absent_from_this_machines_live_registry_without_change(self) -> None:
@@ -267,7 +265,7 @@ class AccountMoveTests(ShutdownTestCase):
         with (
             patch.object(subprocess, "run") as process,
             patch.object(os, "execvpe") as launch,
-            patch.object(settle, "begin") as begin,
+            patch.object(stop_resume, "move_sessions") as move,
             redirect_stdout(output), redirect_stderr(error),
         ):
             self.assertEqual(accounts.main(["swap", "unit", "claude3"]), 1)
@@ -277,7 +275,7 @@ class AccountMoveTests(ShutdownTestCase):
             + "select and move the group with accounts.py move units <claudeN>\n")
         process.assert_not_called()
         launch.assert_not_called()
-        begin.assert_not_called()
+        move.assert_not_called()
         self.assertEqual(self.disk_state(), before)
 
 

@@ -311,7 +311,7 @@ def unit_pane(found: unit_lookup.MarkedUnit | None, _production: str) -> UnitPan
     return UnitPane(found.unit, found.place, shell)
 
 
-def close_unit_pane(pane: UnitPane | None, _saved: shutdown_record.SessionShutdown) -> None:
+def close_unit_pane(pane: UnitPane | None, _saved: shutdown_record.SessionShutdown | None = None) -> None:
     """Close the unit's exact session-qualified pane after the caller stops the unit."""
     if pane is None:
         return

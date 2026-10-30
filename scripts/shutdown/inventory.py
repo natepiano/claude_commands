@@ -2072,3 +2072,58 @@ def codex_liveness(entry: SnapshotCodexSession) -> CodexLive | CodexGone | Codex
         except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
             failure = str(error)
     return CodexLivenessUnknown(failure) if failure else CodexGone()
+
+
+class MatchingSession(TypedDict):
+    kind: Literal["matching session"]
+    session: Session
+    workers: list[Session]
+
+
+class SessionAbsent(TypedDict):
+    kind: Literal["session absent"]
+
+
+class SessionIdentityLost(TypedDict):
+    kind: Literal["session identity lost"]
+
+
+class SessionAccountUnreadable(TypedDict):
+    kind: Literal["session account unreadable"]
+
+
+FreshSession = (
+    MatchingSession | SessionAbsent | SessionIdentityLost | SessionAccountUnreadable
+)
+
+
+def fresh_session(stored: Session, report: Inventory) -> FreshSession:
+    session_id = stored["session_id"]
+    occurrences = [item for item in report["sessions"] if item["session_id"] == session_id]
+    if any(item["pid"] != stored["pid"] or item["proc_start"] != stored["proc_start"]
+           for item in occurrences):
+        return {"kind": "session identity lost"}
+    current = next(iter(occurrences), None)
+    if current is not None:
+        return {
+            "kind": "matching session", "session": current,
+            "workers": [
+                item for item in report["sessions"]
+                if item["kind"] == "worker"
+                and item["owner"]["kind"] == "director"
+                and item["owner"]["session_id"] == session_id
+            ],
+        }
+    reason = next(
+        (
+            item["reason"]
+            for item in report["unattributed"]
+            if item["pid"] == stored["pid"]
+        ),
+        "",
+    )
+    if reason == "process start mismatch":
+        return {"kind": "session identity lost"}
+    if reason == "account unreadable":
+        return {"kind": "session account unreadable"}
+    return {"kind": "session absent"}

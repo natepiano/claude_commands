@@ -219,18 +219,14 @@ def _held(source: RecoverySource, *, dry_run: bool) -> bool:
 
 
 def _restart(label: str, identity: str, source: str) -> str:
-    """Return a short failure, or empty text after a successful restart command."""
-    try:
-        child = subprocess.run([sys.executable, str(SCRIPTS / "shutdown/shutdown.py"),
-            "restart", label, "--here", "--only", identity, "--no-alert"],
-            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=180, check=False,
-            env={**os.environ, "UNIT_WATCHDOG_SESSION": identity, "UNIT_WATCHDOG_SOURCE": source})
-    except (OSError, subprocess.SubprocessError) as error:
-        return str(error)
-    # Command output can contain session text. Keep it out of notes and pushes.
-    if any(line.endswith(" no longer exists; restore dropped") for line in child.stdout.splitlines()):
-        return "session folder no longer exists; restore dropped"
-    return "" if child.returncode == 0 else f"restart on {label} exited {child.returncode}"
+    """Resume a stopped unit through the one session resume API."""
+    del source
+    from scripts.shutdown import stop_resume
+
+    result = stop_resume.resume(identity, why="unit watchdog recovery", to=label)
+    if isinstance(result, stop_resume.Resumed):
+        return ""
+    return result.reason if isinstance(result, stop_resume.ResumeFailed) else f"{identity}: no local tab"
 
 
 def _finish_recovery(label: str, identity: str, result: Path, source: str) -> None:
@@ -308,7 +304,7 @@ def _alert_failure(source: RecoverySource, outage: DownOutage, cause: str) -> No
         if not isinstance(claimed, outage_alerts.AlertClaim):
             return
         try:
-            _ = shutdown_record.claim_restore_alert(saved, restart.settle.not_back_text(saved))
+            _ = shutdown_record.claim_restore_alert(saved, restart.restart_support.not_back_text(saved))
             if isinstance(quota_alert.tell_user(restart.move_failed_push(saved)), quota_alert.PushSent):
                 outage_alerts.delivered(claimed)
                 outage["alerted"] = True

@@ -749,7 +749,7 @@ def _set_transition(state: WatchState, session_id: str, entry_id: str, transitio
 
 def _continue_session(session_id: str, entry_id: str) -> ContinuationDelivered | ContinuationNotDelivered:
     # Shutdown imports this watcher for its hold and cancellation; resolve its delivery boundary at use.
-    messenger = cast(LiveSessionMessenger, cast(object, import_module("settle")))
+    messenger = cast(LiveSessionMessenger, cast(object, import_module("restart_support")))
     try:
         delivery = messenger.send_message(f"session:{session_id}", "Quota wait ended", "Continue where you stopped.",
             key=f"quota-continue-{session_id}-{entry_id}")

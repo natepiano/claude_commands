@@ -5,7 +5,7 @@ Usage: rename_unit.py plan|apply|verify <slug> <old> <new> [--scratch <showrunne
 
 `<old>` is the unit's Units id, or its stem; `<new>` takes an id or a stem and becomes
 `<stem>-unit`, as add_unit names a unit. apply saves the request before it changes anything, pauses
-the unit and its Codex workers through the shutdown path (`down`, then `now`), stops its runs'
+the unit through stop_resume, pauses its Codex workers, stops its runs'
 app-servers and keeps each paused worker's detached runs (it refuses while one works inside the
 worktree), merges the merge branch into the unit, moves the branch and
 worktree (unit_move), commits `chore(<slug>): rename unit <old> to <new>` on the merge branch, which
@@ -30,7 +30,7 @@ import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Protocol, cast
 
@@ -38,7 +38,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "herdr"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "style"))
@@ -80,15 +79,7 @@ EDITED_COLUMNS = {"## Hub files": ("Owner unit", "Other units that touch it"), "
 PROGRESS = ("merged", "doc_commit", "unit_tip", "account", "session_id", "kept", "old_session")
 SHUTDOWN = Path(os.environ.get("RENAME_UNIT_SHUTDOWN") or Path(__file__).resolve().parent.parent / "shutdown/shutdown.py")
 STOPPED = frozenset({"stopped", "already gone", "process identity lost"})
-STOPPING = frozenset({"waiting", "reaping", "ready", "stopping", "held by usage limit", "passive worker ready"})
-# The kinds `shutdown.py now` forces: a rename stops the unit and its Codex workers at once, not at
-# their next idle (user, 2026-10-20).
-FORCEABLE = frozenset({"waiting", "reaping", "ready", "held by usage limit"})
-# How long apply waits for the unit to stop, and for the relaunched unit to come up live.
-STOP_WAIT_SECONDS = float(os.environ.get("RENAME_UNIT_STOP_WAIT") or 3600)
 LIVE_WAIT_SECONDS = float(os.environ.get("RENAME_UNIT_LIVE_WAIT") or 180)
-# A stop request that has written no shutdown record by then has failed.
-RECORD_WAIT_SECONDS = 120.0
 # A run supervisor passes SIGTERM to its command and exits when that ends: a lint seen
 # 2026-10-20 took longer than retire_unit's 10 s.
 RUN_STOP_WAIT_SECONDS = 120.0
@@ -698,7 +689,7 @@ def bind_stop_target(rename: StopTarget) -> None:
 
 
 def stop_unit(rename: StopTarget, _save: Callable[[], None]) -> None:
-    """Stop the unit through the shutdown path, so its record carries the relaunch, and wait for it.
+    """Stop the unit Claude through the shared API before moving its files.
 
     A live process cannot change its env mark and the director's context holds the old paths, so a
     rename of a running unit is always a relaunch.
@@ -711,21 +702,29 @@ def stop_unit(rename: StopTarget, _save: Callable[[], None]) -> None:
     except OSError as error:
         raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {error}") from error
     pane = unit_move.unit_pane(found, rename.slug)
-    if not _unit_records(rename):
-        if found is None or isinstance(found.claude, unit_lookup.ClaudeNotRunning):
-            _stop_runs(rename)
-            if pane is not None:
-                raise RenameRefused("pane close requires a completed clean stop record")
-            return
-        if isinstance(found.claude, unit_lookup.ClaudeUnknown):
-            raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {found.claude.reason}")
-        run_shutdown("down", "--only", found.claude.session_id)
-    saved = _await_stopped(rename)
-    rename.account, rename.session_id = saved["login"], saved["session"]["session_id"]
-    if shutdown_record.stop_incomplete(saved):
-        raise RenameRefused("unit stop has unresolved cleanup issues; settle it before closing its pane")
+    from scripts.shutdown import stop_resume
+    records = _unit_records(rename)
+    if len(records) > 1:
+        raise RenameRefused(f"{rename.old} has {len(records)} shutdown records; settle them first")
+    identity = found.claude.session_id if found is not None and isinstance(found.claude, unit_lookup.LiveClaude) else rename.session_id
+    if found is not None and isinstance(found.claude, unit_lookup.ClaudeUnknown):
+        raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {found.claude.reason}")
+    if not identity and len(records) == 1:
+        identity = records[0]["session"]["session_id"]
+    if identity:
+        result = stop_resume.stop(identity)
+        if not isinstance(result, (stop_resume.Stopped, stop_resume.NotRunning)):
+            reason = result.reason if isinstance(result, stop_resume.StopFailed) else "no local session tab"
+            raise RenameRefused(f"{rename.old}: stop refused: {reason}")
+        rename.session_id = identity
+        if records:
+            rename.account = records[0]["login"]
+            for saved in records:
+                _ = shutdown_record.update_session(saved["login"], identity,
+                    lambda current: current.update(progress=shutdown_record.SessionStopped(
+                        kind="stopped", at=datetime.now(UTC).isoformat(timespec="seconds"))))
     _stop_runs(rename)
-    unit_move.close_unit_pane(pane, saved)
+    unit_move.close_unit_pane(pane)
 
 
 def _refuse_detached_worktree(rename: StopTarget) -> None:
@@ -787,40 +786,6 @@ def _stop_runs(rename: StopTarget) -> None:
         raise RenameRefused("; ".join(left))
 
 
-def _await_stopped(rename: StopTarget) -> SessionShutdown:
-    """The unit's shutdown record once it reads stopped. The stop is waited for here, so one apply
-    does the whole rename (user, 2026-10-18). A stop that waits for an idle or ready mark is forced
-    with `shutdown.py now`, once for each kind it reads."""
-    started = time.monotonic()
-    shown = forced = ""
-    while True:
-        records = _unit_records(rename)
-        if len(records) > 1:
-            raise RenameRefused(f"{rename.old} has {len(records)} shutdown records; settle them first")
-        waited = time.monotonic() - started
-        if not records and waited >= RECORD_WAIT_SECONDS:
-            raise RenameRefused(f"the shutdown path wrote no record for {rename.old}; settle the stop first")
-        progress = records[0]["progress"]["kind"] if records else "stopping"
-        if records and records[0]["then"] == "restart":
-            raise RenameRefused(f"a shutdown will restart {rename.old}; rename once it is back")
-        if progress in STOPPED:
-            return records[0]
-        if progress in FORCEABLE and progress != forced:
-            run_shutdown("now", "--only", records[0]["session"]["session_id"])
-            forced = progress
-        if progress not in STOPPING:
-            raise RenameRefused(f"{rename.old}'s shutdown record reads {progress}; settle it first")
-        if waited >= STOP_WAIT_SECONDS:
-            raise RenameWaiting(f"{rename.old} is still {progress} after {_minutes(STOP_WAIT_SECONDS)}; "
-                                + "rerun apply once it has stopped")
-        if progress != shown:
-            print(f"stop: waiting — {rename.old} is {progress}", flush=True)
-            shown = progress
-        time.sleep(POLL_SECONDS)
-
-
-def _minutes(seconds: float) -> str:
-    return f"{round(seconds / 60)} min" if seconds >= 60 else f"{round(seconds)} s"
 
 
 def _moved(path: str, old: str, new: str) -> str:
@@ -889,6 +854,8 @@ def _restart_record(rename: UnitRename, save: Callable[[], None]) -> None:
     """
     if not rename.session_id:
         return
+    if shutdown_record.find_session(rename.account, rename.session_id) is None:
+        return
     new_stem = unit_names.stem(rename.new)
 
     def change(saved: SessionShutdown) -> None:
@@ -916,7 +883,15 @@ def _restart_record(rename: UnitRename, save: Callable[[], None]) -> None:
 def _relaunch(rename: UnitRename, _save: Callable[[], None]) -> None:
     if rename.session_id:
         # Restart also resumes its own partial worker/timer restores on a retry.
-        run_shutdown("restart", "--only", rename.session_id)
+        if shutdown_record.find_session(rename.account, rename.session_id) is not None:
+            run_shutdown("restart", "--only", rename.session_id)
+        else:
+            result = subprocess.run([sys.executable, str(Path(add_unit.__file__)),
+                "--production", rename.doc, rename.new, "--resume", rename.session_id,
+                "--cwd", rename.new_worktree, "--session-name", unit_names.stem(rename.new)],
+                capture_output=True, text=True, check=False)
+            if result.returncode:
+                raise RenameRefused((result.stderr or result.stdout).strip())
         _await_live(rename)
 
 

@@ -43,7 +43,6 @@ if TYPE_CHECKING:
     import herdr
     import launch_permission
     from scripts.accounts.accounts import ClaudeLaunchAccount
-    from shutdown_record import SessionShutdown
 
 
 class ProductionPlanRequired(NamedTuple):
@@ -128,10 +127,9 @@ class RunningSessionHandoff(NamedTuple):
 
 
 class StoppedSessionHandoff(NamedTuple):
-    """The shutdown record confirms a stop and both old identity and registry are clear."""
+    """The session stop completed; its old identity and registry are clear."""
 
     source: RunningSessionHandoff
-    record: SessionShutdown
 
     @property
     def session_id(self) -> str:
@@ -680,36 +678,13 @@ def attach_source(session_id: str, pid: int) -> RunningSessionHandoff:
     return RunningSessionHandoff(session_id, pid, proc_start, login)
 
 
-def run_attach_shutdown(arguments: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
-    """The only stop boundary: the ordinary shutdown command, with its bounded follower."""
-    return subprocess.run([sys.executable, str(SCRIPTS / "shutdown/shutdown.py"), *arguments],
-                          env=launch_environment(), capture_output=True, text=True, check=False, timeout=timeout)
+def stop_for_attach(handoff: RunningSessionHandoff) -> None:
+    from scripts.shutdown import stop_resume
 
-
-def stop_for_attach(handoff: RunningSessionHandoff) -> SessionShutdown:
-    import restart
-    import settle
-    from shutdown_record import session_records
-
-    identity = str(uuid4())
-    cancel = settle.shutdown_command("cancel", handoff.login, "--here", "--only", handoff.session_id)
-    try:
-        down = run_attach_shutdown(["down", handoff.login, "--here", "--only", handoff.session_id,
-                                    "--request-id", identity], restart.SESSION_WAIT_SECONDS)
-        if down.returncode != 0:
-            raise Refusal(down.stderr.strip() or down.stdout.strip() or "shutdown down failed")
-        followed = run_attach_shutdown(["follow", handoff.login, "--request", identity],
-                                      settle.NOT_ANSWERING_AFTER.total_seconds() + settle.SETTLE_INTERVAL_SECONDS)
-        if followed.returncode != 0:
-            raise Refusal(followed.stderr.strip() or followed.stdout.strip() or "shutdown follow failed")
-        records = [saved for saved in session_records(handoff.login)
-                   if saved["session"]["session_id"] == handoff.session_id and saved["request_id"] == identity]
-        if (len(records) != 1 or records[0]["progress"]["kind"] not in {"stopped", "already gone"}
-                or records[0]["stop_issues"]):
-            raise Refusal("shutdown record does not confirm a completed stop")
-        return records[0]
-    except (OSError, ValueError, subprocess.SubprocessError, Refusal) as error:
-        raise Refusal(f"attach stop did not finish for {handoff.session_id}: {error}; to cancel: {cancel}") from error
+    result = stop_resume.stop(handoff.session_id)
+    if not isinstance(result, (stop_resume.Stopped, stop_resume.NotRunning)):
+        reason = result.reason if isinstance(result, stop_resume.StopFailed) else "no local session tab"
+        raise Refusal(f"attach stop did not finish for {handoff.session_id}: {reason}")
 
 
 def require_stopped_session(handoff: RunningSessionHandoff) -> None:
@@ -736,14 +711,16 @@ def attached_pid(handoff: RunningSessionHandoff) -> int:
 
 def finish_attach(handoff: StoppedSessionHandoff,
                   selected: ClaudeLaunchAccount, outcome: herdr.PromptSubmitOutcome, timeout: float) -> int:
+    del selected
     import restart
+    import herdr
 
-    _ = restart.wait_for_confirmation(frozenset({handoff.session_id}), timeout)
-    checked = restart.finish_attached_session(handoff.record, selected.label, outcome)
-    pid = attached_pid(handoff.source)
-    if checked.remaining or len(checked.finished) != 1:
-        raise Refusal(f"attached {handoff.session_id} runs as pid {pid}, but its shutdown record did not finish")
-    return pid
+    if isinstance(outcome, herdr.PromptNotSubmitted):
+        raise Refusal(f"ATTACH UNPROVEN for {handoff.session_id}: {outcome.reason}")
+    confirmed = restart.wait_for_confirmation(frozenset({handoff.session_id}), timeout)
+    if handoff.session_id not in confirmed.live_ids:
+        raise Refusal(f"ATTACH UNPROVEN for {handoff.session_id}: session did not return")
+    return attached_pid(handoff.source)
 
 
 def write_stub(request: UnitLaunch) -> None:
@@ -1357,9 +1334,9 @@ def _main(argv: list[str]) -> int:
                 return 0
             assert isinstance(source, RunningSessionHandoff)
             _ = ensure_staff_unit(request.production, request.unit_id)
-            saved = stop_for_attach(source)
+            stop_for_attach(source)
             require_stopped_session(source)
-            handoff = StoppedSessionHandoff(source, saved)
+            handoff = StoppedSessionHandoff(source)
             request = replace(request, session=request.session._replace(handoff=ResumeStoppedSession()))
 
         outcome = herdr.PromptNotSubmitted("restore reused a session without submit proof")

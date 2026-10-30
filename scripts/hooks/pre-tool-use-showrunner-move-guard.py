@@ -2,7 +2,7 @@
 """Refuse a showrunner's hand paths for stopping or moving a Claude session; name /showrunner:move.
 
 A session is a showrunner's when an update timer is addressed to its session id. In one, a Bash
-call is refused when it sends `/exit` into a pane through tmux or herdr, runs `shutdown.py now`,
+call is refused when it sends `/exit` into a pane through tmux or herdr ,
 kills a Claude process, or resumes `claude` with a CLAUDE_CONFIG_DIR of its own. Every other call,
 and every call in any other session, passes. A broken hook never blocks a call.
 """
@@ -24,7 +24,6 @@ else:
 SKILL = ("Move or stop a session with /showrunner:move: it pauses the session first, proves the account it "
          "comes back on and tells its showrunner. ")
 EXIT_REFUSAL = SKILL + "Sending /exit into another session's pane stops it in the middle of its turn."
-NOW_REFUSAL = SKILL + "shutdown.py now stops a working session without asking it to pause."
 KILL_REFUSAL = SKILL + "Killing a Claude process ends its turn and leaves no record to bring it back."
 RESUME_REFUSAL = SKILL + "A hand-launched claude --resume with CLAUDE_CONFIG_DIR is never checked for its account."
 SEGMENT_BREAK = re.compile(r"&&|\|\||[;|&\n]")
@@ -96,9 +95,6 @@ def refusal(command: str, proc: Path | None = None) -> str:
         program = Path(words[0]).name
         if program in {"tmux", "herdr"} and any(word.strip().startswith("/exit") for word in words[1:]):
             return EXIT_REFUSAL
-        if any(Path(word).name == "shutdown.py" and words[index + 1:index + 2] == ["now"]
-               for index, word in enumerate(words)):
-            return NOW_REFUSAL
         if _kills_claude(words, segment, proc):
             return KILL_REFUSAL
         if program == "claude" and setting_dir and RESUME_FLAGS.intersection(words[1:]):

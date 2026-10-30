@@ -125,27 +125,13 @@ and after the environment read so a reused pid never becomes a restart target.
 Run `heal.py sweep`, or restrict it with `--only <session id>`. For each broken
 session it checks this machine's build-target hold state, then requires `idle`
 or `shell`. Unreadable hold state also prevents restart. It calls `ensure(cwd)`
-before requesting `shutdown.py down <account> --here --only <id>` without a
-restart continuation, using the account resolved from the config directory.
-`down` hands off to a detached conductor; its exit does not prove a stop.
-The healer saves a pending restart and uses the conductor's typed shutdown
-record to confirm the exact process stopped, without waiting in a loop. It
-persists `stop_request_sent: false` before calling `down`, then saves `true`
-after `down` exits 0. A rerun with no shutdown record and an unsent request
-resends through the same request function only if the original pid and start
-still match. If that process is gone or its pid was reused, the pending stop is
-cleared, logged and alerted; no relaunch follows. Sent requests keep waiting
-for the conductor. Older journals without the mark are treated as sent.
-The healer rechecks holds before stopping and before the separate
-`shutdown.py restart <saved account> --only <id> --here` launch. A hold between these steps
-keeps the restart pending. Each sweep processes pending recoveries first,
-including sessions that have left the live registry, then new broken sessions.
-After release, it proves the environment again when the stop is complete, then
-checks the hold. It passes that loaded environment to the restart process with
-`NIX_HEAL_PREPARED_SESSION` and `NIX_HEAL_PREPARED_DIRECTORY`. The restart requires
-the same session, resolved cwd, and nix proof, applies the target account and its
-variable removals, and consumes this handoff without another load. The markers
-remain in that consuming process. Herdr's child-environment filter strips them
+before calling `stop_resume.stop` for that session. Its existing journal keeps a
+pending recovery across a hold. Process liveness proves the original generation
+has ended; shutdown records do not decide stop completion. It rechecks the hold
+and the environment before `stop_resume.resume`. Account exec loads the shell
+through the normal account launch path. Pending recoveries run before new broken
+sessions, including sessions that have left the live registry.
+
 from server starts, pane overlays and agent-start CLI processes, including explicit
 environment overrides. Later panes cannot inherit another session's proof from
 the server. Unit restores through `add_unit` consume the same handoff

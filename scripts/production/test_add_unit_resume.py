@@ -21,8 +21,7 @@ import production_units
 import launch_permission
 import unit_lookup
 import sessions
-import shutdown_record as shutdown_store
-import restart
+from scripts.shutdown import stop_resume
 import herdr
 from herdr import HerdrPlace
 from production_units import cell_value, live_unit_table, plan_cell_is_retired, retired_units
@@ -208,7 +207,7 @@ class AddUnitResumeTests(AddUnitTestCase):
     def test_attach_stops_then_launches_once_with_unit_marks_and_finishes(self) -> None:
         prior, trace = self.prepare_attach()
         result = self.successful("alpha", "--permanent", "--attach", "session-123", "--cwd", str(prior))
-        self.assertEqual(trace, ["down", "follow", "launch", "finish"])
+        self.assertEqual(trace, ["stop", "launch"])
         starts = [row for row in self.herdr_calls() if row[2:4] == ["agent", "start"]]
         self.assertEqual(len(starts), 1)
         arguments = self.agent_arguments()
@@ -242,7 +241,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         for liveness, reason in ((sessions.SessionNotLive(), "session session-123 does not run; use --resume"),
                                  (sessions.SessionLivenessUnknown("registry permission denied"), "registry permission denied")):
             with (self.subTest(reason=reason), patch.object(sessions, "session_liveness", return_value=liveness),
-                  patch.object(add_unit, "run_attach_shutdown") as shutdown):
+                  patch.object(stop_resume, "stop") as shutdown):
                 result = self.cli("alpha", "--standby", "--attach", "session-123", "--cwd", str(prior))
                 self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
                 self.assertIn(reason, result.stderr)
@@ -257,29 +256,14 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assertIn("units account is held", result.stderr)
         self.assertEqual(trace, [])
 
-    def test_attach_timeout_leaves_shutdown_state_and_prints_cancel(self) -> None:
-        prior, trace = self.prepare_attach(stop_progress="waiting", timeout=True)
-        result = self.cli("alpha", "--permanent", "--attach", "session-123", "--cwd", str(prior))
-        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertEqual(trace, ["down", "follow"])
-        self.assertIn("cancel owner@example.com --here --only session-123", result.stderr)
-        with patch.dict(os.environ, self.env):
-            self.assertEqual(shutdown_store.session_records("owner@example.com")[0]["progress"]["kind"], "waiting")
 
-    def test_attach_requires_stopped_record_even_when_follower_returns_success(self) -> None:
-        prior, trace = self.prepare_attach(stop_progress="waiting")
-        result = self.cli("alpha", "--permanent", "--attach", "session-123", "--cwd", str(prior))
-        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertIn("record does not confirm a completed stop", result.stderr)
-        self.assertIn("cancel owner@example.com --here --only session-123", result.stderr)
-        self.assertEqual(trace, ["down", "follow"])
 
     def test_attach_refuses_process_still_registered_after_stop(self) -> None:
         prior, trace = self.prepare_attach(after_stop=(303,))
         result = self.cli("alpha", "--permanent", "--attach", "session-123", "--cwd", str(prior))
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertIn("processes still run after shutdown; pids found: [303]", result.stderr)
-        self.assertEqual(trace, ["down", "follow"])
+        self.assertEqual(trace, ["stop"])
 
     def test_attach_checks_old_pid_even_after_registry_record_disappears(self) -> None:
         prior, trace = self.prepare_attach()
@@ -287,25 +271,14 @@ class AddUnitResumeTests(AddUnitTestCase):
             result = self.cli("alpha", "--permanent", "--attach", "session-123", "--cwd", str(prior))
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertIn(f"pids found: [{os.getpid()}]", result.stderr)
-        self.assertEqual(trace, ["down", "follow"])
+        self.assertEqual(trace, ["stop"])
 
-    def test_attach_refuses_unfinished_shutdown_record_after_launch(self) -> None:
-        prior, trace = self.prepare_attach()
-        def unfinished(records: list[shutdown_store.SessionShutdown]) -> restart.TargetCheck:
-            return restart.TargetCheck(records, [])
-
-        with patch.object(restart, "clear_running_on_target", side_effect=unfinished):
-            result = self.cli("alpha", "--permanent", "--attach", "session-123", "--cwd", str(prior))
-        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertEqual(trace, ["down", "follow", "launch"])
-        self.assertIn("shutdown record did not finish", result.stderr)
-        self.assertNotIn("attached session-123 as", result.stdout)
 
     def test_attach_reports_duplicate_processes_after_launch_without_touching_them(self) -> None:
         prior, trace = self.prepare_attach(after_launch=(202, 303))
         result = self.cli("alpha", "--plan", "docs/plans/given.md", "--attach", "session-123", "--cwd", str(prior))
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertEqual(trace, ["down", "follow", "launch", "finish"])
+        self.assertEqual(trace, ["stop", "launch"])
         self.assertIn("ATTACH UNPROVEN", result.stderr)
         self.assertIn("pids found: [202, 303]", result.stderr)
         self.assertNotIn("attached session-123 as", result.stdout)

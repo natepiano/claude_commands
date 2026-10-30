@@ -9,7 +9,7 @@ The `Project started` line the /unit:direct recorder adds to a plan, alone in it
 uncommitted work: no person wrote it. Then it stops what the unit owns. It finds each thing by its own record, never by a name pattern:
 
 - the marked director and each session recorded by the worktree's runs, wherever it works, stop
-  through `shutdown.py down`, which asks it to pause and stops it at its ready mark, and its
+  through `stop_resume.stop`, which ends its Claude process, and its
   restore is then forgotten, so no restart brings it back;
 - each run of the worktree that has an app-server stops it and ends its Codex workers
   (`codex_mesh.py stop`);
@@ -68,8 +68,10 @@ if TYPE_CHECKING:
     from scripts.message import sessions
     from scripts.message.sessions import SessionRecord
     from scripts.shutdown import shutdown_record
+    from scripts.shutdown import stop_resume
 else:
     import shutdown_record
+    from scripts.shutdown import stop_resume
     import sessions
     from sessions import SessionRecord
 
@@ -551,7 +553,7 @@ def dry_run(unit: Unit) -> int:
     for reason in refused:
         print(f"refused: {reason}")
     found = gather(unit)
-    lines = ([f"would stop: {describe_session(item)}, through shutdown down" for item in found.claude]
+    lines = ([f"would stop: {describe_session(item)}, through stop_resume.stop" for item in found.claude]
              + [f"would stop: {describe_run(item)}" for item in found.runs]
              + [f"would leave running: reviewer {item.name}: it is reviewing" if item.busy
                 else f"would retire: reviewer {item.name}" for item in found.reviewers]
@@ -569,53 +571,31 @@ def dry_run(unit: Unit) -> int:
 
 
 def stop_sessions(unit: Unit, found: Found, wait_minutes: float, known_ids: frozenset[str], *, forget: bool = True) -> list[str]:
-    """Stop the unit's Claude sessions through the shutdown path; what still runs comes back."""
+    """End each unit Claude through the single stop API, then forget its old restore."""
+    del wait_minutes
     try:
         saved = unit_shutdowns(unit, known_ids | {item["sessionId"] for item in found.claude})
     except (shutdown_record.InvalidRecord, OSError) as error:
         return [f"shutdown records unreadable: {error}"]
-    pending = {item["session"]["session_id"] for item in saved}
-    targets = list(found.claude)
-    for item in saved:
-        owner = item["session"]
-        if not any(target["sessionId"] == owner["session_id"] for target in targets):
-            targets.append(SessionRecord(pid=owner["pid"], sessionId=owner["session_id"], name=owner["name"],
-                                         messagingSocketPath="", updatedAt=0, tmux="", formerNames=[]))
-    if not targets:
-        return []
-    ids_found = [item["sessionId"] for item in targets]
-    ids = [session_id for session_id in ids_found if session_id not in pending]
-    if ids:
-        started = run([sys.executable, str(SHUTDOWN), "down", "--here", "--only", ",".join(ids)])
-        if started.returncode:
-            return [f"{describe_session(item)}: shutdown down refused: {failure(started)}" for item in targets]
-    deadline = time.monotonic() + wait_minutes * 60
-    while True:
-        live = {item["sessionId"] for item in claude_sessions(unit.worktree, frozenset(ids_found))}
-        try:
-            records = [item for item in shutdown_record.all_session_records() if item["session"]["session_id"] in ids_found]
-        except (shutdown_record.InvalidRecord, OSError) as error:
-            return [f"shutdown records unreadable: {error}"]
-        unfinished = {item["session"]["session_id"] for item in records if not shutdown_record.shutdown_finished(item)}
-        still = [item for item in targets if item["sessionId"] in live | unfinished]
-        if not still or time.monotonic() >= deadline:
-            break
-        time.sleep(POLL_SECONDS)
-    left = [f"{describe_session(item)}: still stopping after {wait_minutes:g} minutes" for item in still]
-    failed = {item["session"]["session_id"] for item in records if shutdown_record.stop_incomplete(item)}
-    for item in targets:
-        if item not in still:
-            if item["sessionId"] in failed:
-                left.append(f"{describe_session(item)}: shutdown failed; its restore stays")
+    identities = list(dict.fromkeys([item["sessionId"] for item in found.claude]
+                                   + [item["session"]["session_id"] for item in saved] + sorted(known_ids)))
+    failures: list[str] = []
+    for identity in identities:
+        outcome = stop_resume.stop(identity)
+        if isinstance(outcome, stop_resume.StopFailed):
+            failures.append(f"{identity}: stop refused: {outcome.reason}")
+            continue
+        if isinstance(outcome, stop_resume.SessionNotFound):
+            if not isinstance(sessions.session_liveness(identity), sessions.SessionNotLive):
+                failures.append(f"{identity}: no local tab; stop refused")
                 continue
-            if not forget:
-                continue
-            forgot = run([sys.executable, str(SHUTDOWN), "forget", item["sessionId"]])
+        if forget:
+            forgot = run([sys.executable, str(SHUTDOWN), "forget", identity])
             if forgot.returncode:
-                left.append(f"{describe_session(item)}: its restore stays: {failure(forgot)}")
-            else:
-                print(f"stopped: {describe_session(item)}")
-    return left
+                failures.append(f"{identity}: its restore stays: {failure(forgot)}")
+                continue
+        print(f"stopped: {identity}")
+    return failures
 
 
 def terminate(pids: list[int], what: dict[int, str], wait: float | None = None) -> list[str]:
@@ -771,19 +751,12 @@ def retire(unit: Unit, wait_minutes: float) -> int:
             if pane is None or pid != pane.shell))
         left = stop_rest(unit, cleanup)
         if not left and pane is not None:
-            records = unit_shutdowns(unit, frozenset(ids))
-            candidates = [item for item in records if item["session"]["kind"] == "unit"
-                and item["session"]["host"]["unit"] == unit.name
-                and item["session"]["session_id"] == session_id]
-            if len(candidates) != 1:
-                left.append("pane close requires exactly one completed clean director stop record")
+            try:
+                unit_move.close_unit_pane(pane)
+            except ValueError as error:
+                left.append(str(error))
             else:
-                try:
-                    unit_move.close_unit_pane(pane, candidates[0])
-                except ValueError as error:
-                    left.append(str(error))
-                else:
-                    left = stop_sessions(unit, remaining, 0, frozenset(ids))
+                left = stop_sessions(unit, remaining, 0, frozenset(ids))
     if left:
         print("\n".join(f"left running: {reason}" for reason in left))
         print(f"{unit.name} is not retired: rerun once these stop")

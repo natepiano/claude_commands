@@ -18,16 +18,17 @@ from zoneinfo import ZoneInfo
 from scripts.accounts import accounts, next_moves, outage_alerts, refusal_watch, role_map, unit_watchdog
 from scripts.accounts import test_refusal_watch as fixtures
 from scripts.production import showrunners
+from scripts.shutdown import stop_resume
 from scripts.notify.push_texts import RenderedPush
 
 if TYPE_CHECKING:
-    from scripts.shutdown import shutdown_record, inventory, launch_permission, restart, settle
+    from scripts.shutdown import shutdown_record, inventory, launch_permission, restart, restart_support
     from scripts.herdr import herdr
     from scripts.message import sessions
     from scripts.production import unit_lookup
 else:
     shutdown_record = import_module("shutdown_record")
-    settle = import_module("settle")
+    restart_support = import_module("restart_support")
     restart = import_module("restart")
     herdr = import_module("herdr")
     inventory = import_module("inventory")
@@ -78,6 +79,7 @@ class UnitWatchdogTests(unittest.TestCase):
         _ = self.enterContext(patch.object(showrunners, "tell", side_effect=self.tell))
         _ = self.enterContext(patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()))
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=self.command))
+        _ = self.enterContext(patch.object(stop_resume, "resume", side_effect=self.resume))
         _ = self.enterContext(patch.object(herdr, "herdr_binary", return_value="/nonexistent/herdr"))
         _ = self.enterContext(patch.object(herdr.Herdr, "agents", return_value=[]))
         _ = self.enterContext(patch.object(restart, "_prepare_restore_server"))
@@ -148,10 +150,8 @@ class UnitWatchdogTests(unittest.TestCase):
             self.assertIn("--user", argv)
             self.pending.append(argv)
             return subprocess.CompletedProcess(argv, 0, "", "")
-        self.assertTrue(any(part.endswith("/shutdown.py") for part in argv), argv)
-        self.assertEqual(argv[2], "restart")
-        self.assertIn("--here", argv)
-        self.assertIn("--no-alert", argv)
+        self.assertEqual(argv[1], "stop_resume")
+        self.assertEqual(argv[2], "resume")
         self.commands.append(argv)
         label = argv[3]
         if label in self.refused:
@@ -164,6 +164,13 @@ class UnitWatchdogTests(unittest.TestCase):
                 current["progress"] = shutdown_record.SessionRestarted(kind="restarted", at=NOW.isoformat())
             _ = shutdown_record.update_session(saved["login"], identity, restored)
         return subprocess.CompletedProcess(argv, 0, "fixture restarted", "")
+
+    def resume(self, identity: str, *, why: str, to: str | None = None) -> stop_resume.Resumed | stop_resume.ResumeFailed:
+        self.assertEqual(why, "unit watchdog recovery")
+        assert to is not None
+        outcome = self.command(["shared-api", "stop_resume", "resume", to, "--only", identity])
+        return (stop_resume.Resumed(identity, "fixture-pane", to) if outcome.returncode == 0
+                else stop_resume.ResumeFailed(identity, outcome.stderr))
 
     def complete_jobs(self) -> None:
         if self.finish_jobs:
@@ -610,21 +617,10 @@ class UnitWatchdogTests(unittest.TestCase):
         command = self.pending[0]
         offset = command.index("--recover")
 
-        def restart_command(argv: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
-            self.assertIn("--no-alert", argv)
-            output = io.StringIO()
-            with redirect_stdout(output):
-                status = restart.up(saved["login"], only=(saved["session"]["session_id"],))
-            self.assertIn("no longer exists; restore the folder", output.getvalue())
-            return subprocess.CompletedProcess(argv, status, output.getvalue(), "")
-
-        with patch.object(subprocess, "run", side_effect=restart_command):
+        failure = self.retained_record_failure(saved)
+        with patch.object(stop_resume, "resume", return_value=failure):
             unit_watchdog._finish_recovery(command[offset + 1], command[offset + 2],  # pyright: ignore[reportPrivateUsage]
                 Path(command[offset + 3]), command[offset + 4])
-        retained = shutdown_record.find_session(saved["login"], saved["session"]["session_id"])
-        assert retained is not None
-        self.assertEqual(retained["progress"]["kind"], "restart failed")
-        self.assertEqual(shutdown_record.all_snapshots()[0]["sessions"], [])
         result = Path(command[offset + 3])
         finished = result.read_text()
         result.unlink()
@@ -661,25 +657,22 @@ class UnitWatchdogTests(unittest.TestCase):
             _ = restart.relaunch_session(saved, dry_run=False, desktop_state=restart.DesktopLaunchState())
         self.assertEqual(launch.call_count, 2)
 
+    def retained_record_failure(self, saved: shutdown_record.SessionShutdown) -> stop_resume.ResumeFailed:
+        # Legacy recovery owns the record. The watchdog only observes its outcome.
+        output = io.StringIO()
+        with redirect_stdout(output):
+            _ = restart.up(saved["login"], only=(saved["session"]["session_id"],))
+        return stop_resume.ResumeFailed(saved["session"]["session_id"], output.getvalue())
+
     def fail_pending_restore_with_missing_folder(self, saved: shutdown_record.SessionShutdown) -> None:
         command = self.pending[-1]
         offset = command.index("--recover")
         Path(saved["session"]["cwd"]).rmdir()
 
-        def restart_command(argv: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
-            self.assertIn("--no-alert", argv)
-            output = io.StringIO()
-            with redirect_stdout(output):
-                status = restart.up(saved["login"], only=(saved["session"]["session_id"],))
-            self.assertIn("no longer exists; restore the folder", output.getvalue())
-            return subprocess.CompletedProcess(argv, status, output.getvalue(), "")
-
-        with patch.object(subprocess, "run", side_effect=restart_command):
+        failure = self.retained_record_failure(saved)
+        with patch.object(stop_resume, "resume", return_value=failure):
             unit_watchdog._finish_recovery(command[offset + 1], command[offset + 2],  # pyright: ignore[reportPrivateUsage]
                 Path(command[offset + 3]), command[offset + 4])
-        retained = shutdown_record.find_session(saved["login"], saved["session"]["session_id"])
-        assert retained is not None
-        self.assertEqual(retained["progress"]["kind"], "restart failed")
 
     def test_clear_removes_only_claims_before_the_live_observation(self) -> None:
         for delivered in (False, True):
@@ -794,7 +787,7 @@ class UnitWatchdogTests(unittest.TestCase):
               patch.object(herdr, "prompt_recipient_process", side_effect=recipient),
               patch.object(sessions, "remote_control", return_value="active"),
               patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()) as phone,
-              patch.object(settle, "run_notifier", side_effect=slow_timer)):
+              patch.object(restart_support, "run_notifier", side_effect=slow_timer)):
             launched = [restart.relaunch_session(saved, dry_run=False,
                 desktop_state=restart.DesktopLaunchState()) for saved in (alpha, beta)]
             if conductor:
@@ -803,7 +796,7 @@ class UnitWatchdogTests(unittest.TestCase):
                     assert progress["kind"] == "restarting"
                     restart.confirm_entry(saved, progress["at"], True, observed_at=time.time())
                 for saved in launched:
-                    self.assertTrue(settle._archive_finished(saved))  # pyright: ignore[reportPrivateUsage]
+                    self.assertTrue(restart_support.archive_finished(saved))
             else:
                 restart._confirm_entries(launched)  # pyright: ignore[reportPrivateUsage]
             self.assertIsNone(shutdown_record.find_session(alpha["login"], "alpha"))
@@ -867,13 +860,13 @@ class UnitWatchdogTests(unittest.TestCase):
                 _ = shutdown_record.update_session(saved["login"], "alpha", lambda current: current.update(
                     alerts=saved["alerts"], progress=saved["progress"]))
                 with (patch.object(restart, "restart_failed_liveness", return_value=restart.SessionNotLive()),
-                      patch.object(settle, "run_remote", return_value=(0, "[]")),
-                      patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")),
-                      patch.object(settle, "tell_showrunners_outcome"),
-                      patch.object(settle, "_deliver_message", return_value=settle.MessageSent(kind="sent")) as report_phone,
+                      patch.object(restart_support, "run_remote", return_value=(0, "[]")),
+                      patch.object(restart_support, "send_message", return_value=restart_support.MessageSent(kind="sent")),
+                      patch.object(restart_support, "tell_showrunners_outcome"),
+                      patch.object(restart_support, "_deliver_message", return_value=restart_support.MessageSent(kind="sent")) as report_phone,
                       patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()) as watchdog_phone,
                       redirect_stdout(io.StringIO())):
-                    settle.report_stop([saved])
+                    restart_support.report_stop([saved])
                     report_phone.assert_called_once()
                     if archived:
                         self.fail_pending_restore_with_missing_folder(saved)
@@ -896,13 +889,13 @@ class UnitWatchdogTests(unittest.TestCase):
         _ = shutdown_record.update_session(saved["login"], "alpha", lambda current: current.update(
                     alerts=saved["alerts"], progress=saved["progress"]))
         with (patch.object(restart, "restart_failed_liveness", return_value=restart.SessionNotLive()),
-              patch.object(settle, "run_remote", return_value=(0, "[]")),
-              patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")),
-              patch.object(settle, "tell_showrunners_outcome"),
-              patch.object(settle, "_deliver_message", side_effect=RuntimeError("fixture push failed")),
+              patch.object(restart_support, "run_remote", return_value=(0, "[]")),
+              patch.object(restart_support, "send_message", return_value=restart_support.MessageSent(kind="sent")),
+              patch.object(restart_support, "tell_showrunners_outcome"),
+              patch.object(restart_support, "_deliver_message", side_effect=RuntimeError("fixture push failed")),
               patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()) as phone,
               redirect_stdout(io.StringIO())):
-            settle.report_stop([saved])
+            restart_support.report_stop([saved])
             _ = self.pass_at(8)
             _ = self.pass_at(14)
             phone.assert_called_once()
@@ -1206,7 +1199,7 @@ class UnitWatchdogTests(unittest.TestCase):
 
     def test_watchdog_live_observation_clears_move_alert_for_the_next_outage(self) -> None:
         saved = self.moved_outage()
-        restart.settle.mark_not_back_pushed(saved)
+        restart.restart_support.mark_not_back_pushed(saved)
         _ = self.pass_at(0)
         _ = self.pass_at(2)
         self.revive("alpha", "claude4")

@@ -33,7 +33,6 @@ import conversation_pause
 import unit_lookup
 import sessions
 import inventory
-import shutdown_record as shutdown_store
 import restart
 from herdr import HerdrPlace
 from production_units import Refusal, cell_value
@@ -42,7 +41,7 @@ from scripts.whoami.note_file import NumberedAccountLabel, note_name, parse_acco
 import herdr
 from scripts.herdr.fake_herdr import CommandResponse
 import usage_store
-from test_support import ShutdownTestCase
+from test_support import registry_confirmation, ShutdownTestCase
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -745,7 +744,7 @@ class AddUnitTestCase(ShutdownTestCase):
         }))
 
     def prepare_attach(self, *, after_stop: tuple[int, ...] = (), after_launch: tuple[int, ...] = (202,),
-                       stop_progress: str = "stopped", timeout: bool = False) -> tuple[Path, list[str]]:
+                       timeout: bool = False) -> tuple[Path, list[str]]:
         prior = self.root / "prior-session"
         prior.mkdir()
         started = sessions.process_start(os.getpid())
@@ -769,43 +768,27 @@ class AddUnitTestCase(ShutdownTestCase):
             return launch_session(request, director, prompt, selected, target=target, model=model,
                                   autocompact_window=autocompact_window)
 
-        def shutdown(arguments: list[str], within: float) -> subprocess.CompletedProcess[str]:
+        from scripts.shutdown import stop_resume
+        def stop(identity: str) -> stop_resume.Stopped | stop_resume.StopFailed:
             nonlocal stopped
-            self.assertGreater(within, 0)
+            self.assertEqual(identity, "session-123")
             self.assert_no_launch_change(document, head)
             self.assertEqual([row for row in self.herdr_calls() if row[2:4] == ["agent", "start"]], [])
-            trace.append(arguments[0])
-            if arguments[0] == "down":
-                self.assertEqual(arguments[:6], ["down", "owner@example.com", "--here", "--only", "session-123", "--request-id"])
-                self.write_shutdown_record(self.shutdown_record("down", progress={"kind": stop_progress,
-                                                                                 "at": "2026-10-28T20:00:00+00:00"}))
-                _ = shutdown_store.migrate("owner@example.com")
-                def select_request(saved: shutdown_store.SessionShutdown) -> None:
-                    saved["request_id"] = arguments[6]
-                    saved["hold"] = "session"
-                _ = shutdown_store.update_session("owner@example.com", "session-123", select_request)
-                (Path(self.env["NOTIFIER_SESSIONS_DIR"]) / f"{os.getpid()}.json").unlink()
-                stopped = True
-            else:
-                self.assertEqual(arguments[:3], ["follow", "owner@example.com", "--request"])
-                if timeout:
-                    raise subprocess.TimeoutExpired(arguments, within)
-            return subprocess.CompletedProcess(arguments, 0, "", "")
+            trace.append("stop")
+            if timeout:
+                return stop_resume.StopFailed(identity, "fixture stop failed")
+            (Path(self.env["NOTIFIER_SESSIONS_DIR"]) / f"{os.getpid()}.json").unlink()
+            stopped = True
+            return stop_resume.Stopped(identity, os.getpid())
 
         def processes(_identity: str) -> sessions.SessionProcesses:
             return sessions.SessionProcesses(after_launch if launched else after_stop if stopped else (os.getpid(),))
 
-        def finish(records: list[shutdown_store.SessionShutdown]) -> restart.TargetCheck:
-            trace.append("finish")
-            self.assertTrue(launched)
-            return restart.TargetCheck([], records)
-
-        _ = self.enterContext(patch.object(add_unit, "run_attach_shutdown", side_effect=shutdown))
+        _ = self.enterContext(patch.object(stop_resume, "stop", side_effect=stop))
         _ = self.enterContext(patch.object(add_unit, "launch_session", side_effect=launch))
         _ = self.enterContext(patch.object(sessions, "session_processes", side_effect=processes))
         _ = self.enterContext(patch.object(sessions, "process_liveness", return_value=sessions.SessionNotLive()))
-        _ = self.enterContext(patch.object(restart, "wait_for_confirmation", return_value=restart.RegistryConfirmation()))
-        _ = self.enterContext(patch.object(restart, "clear_running_on_target", side_effect=finish))
+        _ = self.enterContext(patch.object(restart, "wait_for_confirmation", return_value=registry_confirmation(frozenset({"session-123"}))))
         return prior, trace
 
     def persist_herdr_unit(self, name: str, cwd: Path) -> None:

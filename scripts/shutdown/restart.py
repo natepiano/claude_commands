@@ -104,7 +104,6 @@ from sessions import (  # noqa: E402
     SessionLivenessUnknown as SessionLivenessUnknown,
 )
 import remote_control  # noqa: E402
-import stop as stop_work  # noqa: E402
 from push_texts import RenderedPush, render  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 
@@ -141,7 +140,7 @@ class ShutdownServices(Protocol):
     def mark_not_back_pushed(self, saved: SessionShutdown) -> None: ...
 
 
-settle = cast(ShutdownServices, cast(object, import_module("settle")))
+restart_support = cast(ShutdownServices, cast(object, import_module("restart_support")))
 
 
 ADD_UNIT = SCRIPTS / "production" / "add_unit.py"
@@ -286,7 +285,7 @@ def _recover_incomplete_shutdown(
             pass
     # The session's Claude process is gone, so its stop is done. An unconfirmed
     # worker pause or cleanup never holds the restart: every thread can resume.
-    gone: SessionProgress = {"kind": "already gone", "at": settle.record_time()}
+    gone: SessionProgress = {"kind": "already gone", "at": restart_support.record_time()}
     if dry_run:
         return {**saved, "progress": gone}
 
@@ -1396,7 +1395,7 @@ def _message_key(record: SessionShutdown, session_id: str) -> str:
 def _retire(record: SessionShutdown, *, dry_run: bool) -> None:
     session_id = record["session"]["session_id"]
     _ = _run(
-        settle.retire_command(record["login"], session_id),
+        restart_support.retire_command(record["login"], session_id),
         dry_run=dry_run,
     )
 
@@ -1422,7 +1421,7 @@ def _send_restart_note(
         ]
         _display(argv)
         return {"kind": "sent"}
-    return settle.send_message(
+    return restart_support.send_message(
         f"session:{session_id}",
         f"{record['label']} restarted",
         note,
@@ -1493,7 +1492,7 @@ def _restore_timers(
         if timer["was_enabled"]:
             if dry_run:
                 override = os.environ.get("SHUTDOWN_NOTIFIER")
-                notifier = [override] if override else ["zsh", str(settle.NOTIFIER)]
+                notifier = [override] if override else ["zsh", str(restart_support.NOTIFIER)]
                 _display([*notifier, "start", timer["instance"]])
             else:
                 undo_errors: list[Exception] = []
@@ -1512,7 +1511,7 @@ def _restore_timers(
                     if not same_attempt and stopping and covers_resumed:
                         current["timers"] = recovery_store.merge_timer_restores(current["timers"], [timer])
                         try:
-                            settle.run_notifier("stop", timer["instance"])
+                            restart_support.run_notifier("stop", timer["instance"])
                         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
                             # update_session publishes only after this callback
                             # returns. Keep the intent even if undoing start fails.
@@ -1522,7 +1521,7 @@ def _restore_timers(
                     if claim_error:
                         raise ValueError(claim_error)
                     try:
-                        settle.run_notifier("start", timer["instance"])
+                        restart_support.run_notifier("start", timer["instance"])
                     finally:
                         # A stop can snapshot this timer before start enables it.
                         # Check and undo that late enable under the record lock.
@@ -1684,7 +1683,7 @@ def clear_running_on_target(records: list[SessionShutdown]) -> TargetCheck:
     for record in records:
         if (recovery_store.legacy_tmux_leftovers(record)
                 or record["progress"]["kind"] not in NOT_BACK_PROGRESS
-                or record["machine"].casefold() != settle.local_machine().casefold()):
+                or record["machine"].casefold() != restart_support.local_machine().casefold()):
             remaining.append(record)
             continue
         observed_at = time.time()
@@ -1726,7 +1725,7 @@ def finish_attached_session(saved: SessionShutdown, target: str, outcome: herdr.
         if target != current["label"]:
             current["target"] = target
             current["source_label"] = current["label"]
-        current["progress"] = SessionRestartFailed(kind="restart failed", at=settle.record_time(),
+        current["progress"] = SessionRestartFailed(kind="restart failed", at=restart_support.record_time(),
                                                   reason="unit attach awaits live confirmation")
 
     current = update_session(saved["login"], saved["session"]["session_id"], await_confirmation)
@@ -1747,7 +1746,7 @@ def _finish_timer_restore(record: SessionShutdown, timers: list[TimerRestore], *
             if expected["kind"] != "restarting":
                 if expected["kind"] not in RESTARTABLE_PROGRESS:
                     return
-                current["progress"] = SessionRestarting(kind="restarting", at=settle.record_time(),
+                current["progress"] = SessionRestarting(kind="restarting", at=restart_support.record_time(),
                     prior=expected)
             claimed = True
 
@@ -1762,9 +1761,9 @@ def _finish_timer_restore(record: SessionShutdown, timers: list[TimerRestore], *
     if dry_run:
         return True
     _clear_assumed_refusal(record["session"]["session_id"])
-    progress: SessionProgress = (SessionRestoredTimersPending(kind="timers pending", at=settle.record_time(),
+    progress: SessionProgress = (SessionRestoredTimersPending(kind="timers pending", at=restart_support.record_time(),
                                 timers=list(failures)) if failures else
-                                SessionRestarted(kind="restarted", at=settle.record_time()))
+                                SessionRestarted(kind="restarted", at=restart_support.record_time()))
     try:
         return _set_entry_progress(record, progress)
     except (OSError, ValueError, UnreadableAccount) as error:
@@ -1792,7 +1791,7 @@ def mark_restart_failed(
     *,
     trust_command: str = "",
 ) -> None:
-    progress = SessionRestartFailed(kind="restart failed", at=settle.record_time(), reason=reason)
+    progress = SessionRestartFailed(kind="restart failed", at=restart_support.record_time(), reason=reason)
     if trust_command:
         progress["trust_command"] = trust_command
     _ = _set_entry_progress(record, progress)
@@ -1836,7 +1835,7 @@ def _restart_note_delivered(
                 f"restart note not delivered: {_error_reason(error)}",
             )
         return False
-    if settle.message_was_delivered(delivery):
+    if restart_support.message_was_delivered(delivery):
         return True
     if not dry_run:
         mark_restart_failed(
@@ -1991,7 +1990,7 @@ def drop_restore_without_folder(record: SessionShutdown, *, dry_run: bool) -> bo
     folder = record["session"]["cwd"]
     if record["progress"]["kind"] == "restarted" or _folder_exists(folder):
         return False
-    command = settle.shutdown_command("restart", record["login"], "--here", "--only", record["session"]["session_id"])
+    command = restart_support.shutdown_command("restart", record["login"], "--here", "--only", record["session"]["session_id"])
     reason = f"folder {folder} no longer exists; restore the folder, then in a terminal on {record['machine']}: {command}"
     progress_line("failed", record["session"]["name"], reason)
     if not dry_run:
@@ -2031,7 +2030,7 @@ def _try_source_fallback(saved: SessionShutdown, error: BaseException,
     reason = _error_reason(error)
     _retarget_move_claim(saved, source)
     line = f"{saved['session']['name']} came back on {source}: {target} refused ({reason})"
-    note = restart_note(saved, saved["progress"].get("at", settle.record_time())) + " " + line
+    note = restart_note(saved, saved["progress"].get("at", restart_support.record_time())) + " " + line
     try:
         from scripts.accounts import accounts
 
@@ -2075,7 +2074,7 @@ def _try_source_fallback(saved: SessionShutdown, error: BaseException,
                 if isinstance(claimed, outage_alerts.AlertClaim):
                     sent = False
                     try:
-                        _ = recovery_store.claim_restore_alert(saved, settle.not_back_text(saved))
+                        _ = recovery_store.claim_restore_alert(saved, restart_support.not_back_text(saved))
                         sent = isinstance(quota_alert.tell_user(move_failed_push(saved)), quota_alert.PushSent)
                         if sent:
                             outage_alerts.delivered(claimed)
@@ -2091,17 +2090,17 @@ def _try_source_fallback(saved: SessionShutdown, error: BaseException,
     _ = update_session(saved["login"], saved["session"]["session_id"], remember)
     saved.setdefault("restart_issues", []).append(line)
     print(line)
-    confirm_entry(saved, saved["progress"].get("at", settle.record_time()), True, observed_at=confirmation.observed_at)
+    confirm_entry(saved, saved["progress"].get("at", restart_support.record_time()), True, observed_at=confirmation.observed_at)
     return SourceFallbackSettled()
 
 
 def _tell_source_fallback(saved: SessionShutdown) -> None:
     lines = [line for line in saved.get("restart_issues", []) if " came back on " in line]
-    if not lines or not settle.showrunner_was_told(saved):
+    if not lines or not restart_support.showrunner_was_told(saved):
         return
-    showrunner = settle._unit_showrunner(saved)  # pyright: ignore[reportPrivateUsage]
+    showrunner = restart_support._unit_showrunner(saved)  # pyright: ignore[reportPrivateUsage]
     if showrunner:
-        _ = settle.send_showrunner_line(saved, settle.SHOWRUNNER_TOLD_BACK, showrunner, lines[-1], lines[-1])
+        _ = restart_support.send_showrunner_line(saved, restart_support.SHOWRUNNER_TOLD_BACK, showrunner, lines[-1], lines[-1])
 
 
 def _host_needs_manual_restart(host: Host) -> bool:
@@ -2460,7 +2459,7 @@ def _watchdog_expected_request(saved: SessionShutdown) -> RecoverySourceAuthoriz
 
 def _claim_relaunch(record: SessionShutdown) -> tuple[SessionShutdown, bool]:
     claimed = False
-    at = settle.record_time()
+    at = restart_support.record_time()
     watchdog = os.environ.get("UNIT_WATCHDOG_SESSION") == record["session"]["session_id"]
 
     def claim(current: SessionShutdown) -> None:
@@ -2522,23 +2521,12 @@ def relaunch_session(
             print(f"{record['session']['name']}: recovery refused: {observed.reason}")
             return record
     if dry_run:
-        _ = launch_entry(record, settle.record_time(), desktop_state, dry_run=True)
+        _ = launch_entry(record, restart_support.record_time(), desktop_state, dry_run=True)
         return record
     if record["progress"]["kind"] != "restarting" and _unfinished_cleanup(record) and not recovery_store.legacy_tmux_leftovers(record) and record["session"]["session_id"] not in _live_session_ids():
-        try:
-            cleaned = stop_work.stop_session(record)
-        except Exception as error:
-            mark_restart_failed(record, _error_reason(error))
-            return record
-        if cleaned["request_id"] != record["request_id"]:
-            return record
-        record = cleaned
-        if record["progress"]["kind"] == "stopping":
-            return record
-        if _unfinished_cleanup(record):
-            command = settle.shutdown_command("restart", record["login"], "--here", "--only", record["session"]["session_id"])
-            mark_restart_failed(record, f"owner cleanup not confirmed; in a terminal on {record['machine']}: {command}")
-            return record
+        command = restart_support.shutdown_command("restart", record["login"], "--here", "--only", record["session"]["session_id"])
+        mark_restart_failed(record, f"owner cleanup not confirmed; in a terminal on {record['machine']}: {command}")
+        return record
     try:
         current, claimed = _claim_relaunch(record)
     except NoLiveRecord:
@@ -2555,7 +2543,7 @@ def relaunch_session(
             progress = changing["progress"]
             if changing["request_id"] == current["request_id"] and progress["kind"] == "restarting" and progress["at"] == claim["at"]:
                 progress["prior"] = SessionRestoredTimersPending(
-                    kind="timers pending", at=settle.record_time(),
+                    kind="timers pending", at=restart_support.record_time(),
                     timers=[PendingTimer(instance=timer["instance"], reason="not yet restored after relaunch") for timer in changing["timers"]],
                 )
         current = update_session(current["login"], current["session"]["session_id"], reset_pending)
@@ -2621,7 +2609,7 @@ def _acknowledge_restored_snapshots(identity: str) -> None:
 def snapshot_source(last_seen: str) -> str:
     taken = datetime.fromisoformat(last_seen)
     age = int((datetime.now(timezone.utc) - taken).total_seconds())
-    return "from snapshot taken " + taken.astimezone(user_zone()).strftime("%Y-%m-%d %H:%M:%S %Z") + f" ({settle.elapsed_text(age)} ago)"
+    return "from snapshot taken " + taken.astimezone(user_zone()).strftime("%Y-%m-%d %H:%M:%S %Z") + f" ({restart_support.elapsed_text(age)} ago)"
 
 
 @dataclass(frozen=True)
@@ -2945,7 +2933,7 @@ def _restore_launches(records: list[SessionShutdown], state: DesktopLaunchState,
         else:
             detail = (progress["reason"] if progress["kind"] == "restart failed" else
                       progress["command"] if progress["kind"] == "manual restart" else progress["kind"])
-            command = settle.shutdown_command("restart", saved["login"], "--here", "--only", saved["session"]["session_id"])
+            command = restart_support.shutdown_command("restart", saved["login"], "--here", "--only", saved["session"]["session_id"])
             progress_line("failed", saved["session"]["name"], f"{detail}; in a terminal on {saved['machine']}: {command}")
 
     def launch_codex(snapshot: RecoverySnapshot, entry: SnapshotCodexSession) -> SessionLaunched | FailedSessionRestart:
@@ -2958,7 +2946,7 @@ def _restore_launches(records: list[SessionShutdown], state: DesktopLaunchState,
             launched = _launch_codex_snapshot(snapshot, entry, state, dry_run=False)
         except Exception as error:
             reason = _error_reason(error)
-            command = settle.shutdown_command("restart", snapshot["login"], "--here", "--only", entry["session"]["session_id"])
+            command = restart_support.shutdown_command("restart", snapshot["login"], "--here", "--only", entry["session"]["session_id"])
             progress_line("failed", name, f"{reason}; in a terminal on {snapshot['machine']}: {command}")
             return FailedSessionRestart(name, reason)
         progress_line("back", name, f"{time.monotonic() - started_at:.1f} s")
@@ -3224,12 +3212,12 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
             print(f"{record['machine']}: {record['session']['name']} is already running on {record.get('target') or record['label']}")
     refused: list[RestartRefusal] = []
     local_ids = {saved["session"]["session_id"] for saved in all_records} | snapshot_ids
-    for identity, name in settle.unrecorded_local_sessions(login, tuple(item for item in ids if item not in snapshot_ids), all_records).items():
+    for identity, name in restart_support.unrecorded_local_sessions(login, tuple(item for item in ids if item not in snapshot_ids), all_records).items():
         local_ids.add(identity)
         refusal = RestartNoShutdown(kind="no shutdown", session_id=identity, name=name)
         refused.append(refusal)
         print(refusal_line(refusal))
-    at = datetime.fromisoformat(settle.record_time())
+    at = datetime.fromisoformat(restart_support.record_time())
     for saved in records:
         if ids and saved["progress"]["kind"] in {"waiting", "ready", "held by usage limit", "reaping", "stopping"}:
             refusal = RestartNotStopped(kind="not stopped", session_id=saved["session"]["session_id"],
@@ -3254,7 +3242,7 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
                 origin = saved["requested_by"]
                 reason = ("session stopped itself" if origin["kind"] == "session"
                           and origin["session_id"] == saved["session"]["session_id"] else "single-session stop")
-                command = settle.shutdown_command("restart", saved["login"], "--here", "--only",
+                command = restart_support.shutdown_command("restart", saved["login"], "--here", "--only",
                                                   saved["session"]["session_id"])
                 print(f"{saved['session']['name']}: skipped: {reason}; to restore it: {command}")
             else:
@@ -3280,7 +3268,7 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
         eligible = [record for record in eligible if record["session"]["session_id"] not in dropped]
         records = [record for record in records if record["session"]["session_id"] not in dropped]
     label = eligible[0]["label"] if eligible else hold_outcome.hold["label"] if isinstance(hold_outcome, AccountHeld) else "all accounts" if all_accounts else login
-    machine = eligible[0]["machine"] if eligible else hold_outcome.hold["machine"] if isinstance(hold_outcome, AccountHeld) else settle.local_machine()
+    machine = eligible[0]["machine"] if eligible else hold_outcome.hold["machine"] if isinstance(hold_outcome, AccountHeld) else restart_support.local_machine()
     if not eligible and not codex_entries:
         if not ids and not dry_run and isinstance(hold_outcome, AccountHeld) and not any(
             item["request_id"] == hold_outcome.hold["request_id"] for item in all_records
@@ -3321,7 +3309,7 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
         launches = _restore_launches(eligible, state, ids, codex_entries, server=server)
         attempted, codex_restarted = launches.records, launches.codex_restarted
         recovery_failures.extend(launches.codex_failures)
-        settle.tell_showrunners_outcome([*finished, *attempted])
+        restart_support.tell_showrunners_outcome([*finished, *attempted])
         remaining = _read_all_restore_sources().records if all_accounts else session_records(login)
         if isinstance(hold_outcome, AccountHeld) and not any(item["request_id"] == hold_outcome.hold["request_id"] for item in remaining):
             finished_requests = tuple(item["request_id"] for item in attempted if item["progress"]["kind"] == "restarted")
@@ -3382,8 +3370,8 @@ def up_result(login: str, dry_run: bool = False, only: Iterable[str] = (), *,
             if notify and result.status == "partial":
                 _notify_local_restart(login, result, ids, identities)
         except (InvalidRecord, OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
-            print(f"{settle.local_machine()}: restart failed: {error}")
-            result = MachineRestartResult(settle.local_machine(), login, "partial", failed=1)
+            print(f"{restart_support.local_machine()}: restart failed: {error}")
+            result = MachineRestartResult(restart_support.local_machine(), login, "partial", failed=1)
     return PeerRestartResult(machine=result.machine, label=result.label,
         outcome="partial" if result.failed else result.status,
         lines=output.getvalue().splitlines(), no_remote_control=[], refused=list(result.refused))
@@ -3433,7 +3421,7 @@ def up(login: str, dry_run: bool = False, only: Iterable[str] = ()) -> int:
         result = _up(login, dry_run, only)
         return result.exit_status
     except (InvalidRecord, OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
-        print(f"{settle.local_machine()}: restart failed: {error}")
+        print(f"{restart_support.local_machine()}: restart failed: {error}")
         return 1
 
 
@@ -3555,7 +3543,7 @@ def _not_back_records(login: str, ids: tuple[str, ...]) -> list[SessionShutdown]
     except (InvalidRecord, OSError, ValueError):
         return []
     return [saved for saved in records
-            if saved["machine"] == settle.local_machine()
+            if saved["machine"] == restart_support.local_machine()
             and saved["progress"]["kind"] in {"restart failed", "manual restart"}
             and (not ids or saved["session"]["session_id"] in ids)
             and not restart_failed_session_running(saved)]
@@ -3564,13 +3552,13 @@ def _not_back_records(login: str, ids: tuple[str, ...]) -> list[SessionShutdown]
 def _pushed_not_back(login: str, ids: tuple[str, ...]) -> set[str]:
     """Names of this machine's sessions whose unchanged not-back state was already pushed."""
     return {saved["session"]["name"] for saved in _not_back_records(login, ids)
-            if saved.get("restore_alerted") == settle.not_back_text(saved)}
+            if saved.get("restore_alerted") == restart_support.not_back_text(saved)}
 
 
 def _mark_pushed_not_back(login: str, ids: tuple[str, ...], names: set[str]) -> None:
     for saved in _not_back_records(login, ids):
         if saved["session"]["name"] in names:
-            settle.mark_not_back_pushed(saved)
+            restart_support.mark_not_back_pushed(saved)
 
 
 def move_failed_push(saved: SessionShutdown) -> RenderedPush:
@@ -3613,7 +3601,7 @@ def restart_outage_pushes(label: str, failures: Sequence[FailedSessionRestart], 
 def _cause_pushes(label: str, cause: str, names: list[str], *, machine: str) -> list[SessionOutagePush]:
     """Split one cause's sessions across pushes that each fit the phone limits."""
     def named_push(group: list[str]) -> RenderedPush:
-        stopped = settle.stopped_sessions_text(len(group)) + " (" + ", ".join(group) + ")"
+        stopped = restart_support.stopped_sessions_text(len(group)) + " (" + ", ".join(group) + ")"
         return render("shutdown.restart_failed", account=json.dumps(label), stopped=stopped, machine=machine,
                       cause=cause)
 
@@ -3706,9 +3694,9 @@ def send_failure_pushes(
 
 def _local_alert_sources(login: str) -> dict[str, str]:
     identities = {saved["session"]["name"]: saved["session"]["session_id"] for saved in session_records(login)
-                  if saved["machine"].casefold() == settle.local_machine().casefold()}
+                  if saved["machine"].casefold() == restart_support.local_machine().casefold()}
     for snapshot in all_snapshots():
-        if snapshot["login"].casefold() == login.casefold() and snapshot["machine"].casefold() == settle.local_machine().casefold():
+        if snapshot["login"].casefold() == login.casefold() and snapshot["machine"].casefold() == restart_support.local_machine().casefold():
             identities.update({entry["session"]["name"]: entry["session"]["session_id"]
                                for entry in snapshot["sessions"] if entry["agent"] == "claude"})
     return identities
@@ -3730,11 +3718,11 @@ def _notify_local_restart(login: str, result: MachineRestartResult, ids: tuple[s
     moved = {saved["session"]["name"]: saved for saved in observed if saved.get("target")
              and saved["requested_by"]["kind"] != "snapshot"}
     sent = send_failure_pushes(result.label, failed, machine=result.machine, identities=identities,
-                               moved=moved, send=settle.alert_user)
+                               moved=moved, send=restart_support.alert_user)
     for name in manual:
         identity = identities.get(name, "")
         with outage_alerts.reserve((identity,) if identity else ()) as claims:
-            if claims and settle.alert_user(render("shutdown.manual_restart", session=name, machine=result.machine)):
+            if claims and restart_support.alert_user(render("shutdown.manual_restart", session=name, machine=result.machine)):
                 outage_alerts.delivered(claims[identity])
                 sent.add(name)
     _mark_pushed_not_back(login, ids, sent)
@@ -3744,7 +3732,7 @@ def _notify_local_restart(login: str, result: MachineRestartResult, ids: tuple[s
         machines = ([result.machine] if unknown or (result.status == "partial" and not failed and not manual) else [])
         if unreached:
             machines.append(unreached)
-        _ = settle.alert_user(render("shutdown.restart_incomplete", account=json.dumps(result.label),
+        _ = restart_support.alert_user(render("shutdown.restart_incomplete", account=json.dumps(result.label),
                                      machine=" and ".join(machines)))
 
 
@@ -3790,7 +3778,7 @@ def restart(
     ) as error:
         print(f"shutdown: restart failed: {error}", file=sys.stderr)
         local = MachineRestartResult(
-            settle.local_machine(),
+            restart_support.local_machine(),
             selected.label,
             "partial",
             failed=1,
@@ -3830,7 +3818,7 @@ def restart(
         if isinstance(alerts, NeverAlert):
             retry.append("--no-alert")
         print(f"restart incomplete: {other_machine()} not reached; when it is back, "
-            + f"in a terminal on {other_machine()}: {settle.shutdown_command(*retry)}")
+            + f"in a terminal on {other_machine()}: {restart_support.shutdown_command(*retry)}")
     bring_back = local.status == "partial" or peer["outcome"] == "partial" or not_reached
     if notify and bring_back:
         try:
