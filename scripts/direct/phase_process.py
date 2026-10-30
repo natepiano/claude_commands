@@ -1260,6 +1260,9 @@ def measure_plan_churn(plans: Sequence[PlanHistory], events: Sequence[Event], wi
 
 
 def duration(seconds: float) -> str:
+    """Use seconds through 1,000 s, minutes below 2 h, then hours."""
+    if abs(seconds) >= 7200:
+        return f"{seconds / 3600:.1f} h"
     return f"{seconds / 60:.1f} min" if abs(seconds) > 1000 else f"{seconds:.1f}s"
 
 
@@ -1307,6 +1310,32 @@ def distribution_row(name: str, values: Sequence[float], absent: int,
     summary = summarize(name, values, 0)
     return (name, str(summary.n), formatter(summary.median), formatter(summary.p90),
             formatter(summary.total), str(absent))
+
+
+def trial_count(value: float) -> str:
+    if value < 1_000:
+        return count(value)
+    for scale, suffix, precision in ((1_000, "K", 0), (1_000_000, "M", 1),
+                                     (1_000_000_000, "B", 1)):
+        scaled = value / scale
+        if round(scaled, precision) < 1_000:
+            return f"{scaled:.{precision}f}{suffix}"
+    return f"{value / 1_000_000_000_000:.1f}T"
+
+
+def render_trial_measures(measures: Sequence[tuple[str, Sequence[float], int]]) -> None:
+    # The report already states the window. Keep these headings on the phone.
+    print("\nTrial measures — eligible phases, natedev only")
+    print("Director tokens: phase plus gap; compactions: phase")
+    columns = ("measure", "n phases", "median", "p90", "total")
+    rows = [distribution_row(name, values, absent, trial_count)[:-1] for name, values, absent in measures]
+    widths = [max(len(row[index]) for row in [columns, *rows]) for index in range(len(columns))]
+    for row in [columns, *rows]:
+        print("  ".join(cell.ljust(width) if index == 0 else cell.rjust(width)
+                        for index, (cell, width) in enumerate(zip(row, widths))))
+    for name, _, absent in measures:
+        if absent:
+            print(f"not recorded: {name} n={absent}")
 
 
 def item_rows(items: Sequence[RankedItem], formatters: Sequence[Callable[[float], str]]) -> list[tuple[str, ...]]:
@@ -1620,11 +1649,12 @@ def render_trial(trials: Sequence[TrialPhase], measures: Sequence[TrialMeasures]
     for name in ("NoFollowingPhase", "SharedDirector"):
         _ = exclusions.setdefault(name, 0)
     print("Phase-plus-gap exclusions (states can overlap): " + "; ".join(f"{name} n={n}" for name, n in sorted(exclusions.items())))
-    table("Trial measures — eligible phases, natedev only", ("measure", "n phases", "median", "p90", "total", "not recorded"),
-          [distribution_row("weighted director tokens, phase plus gap", weighted, len(rows) - len(weighted), count),
-           distribution_row("raw input including caches, phase plus gap", [float(cost.raw_input) for cost in tokens], len(rows) - len(tokens), count),
-           distribution_row("raw output, phase plus gap", [float(cost.output) for cost in tokens], len(rows) - len(tokens), count),
-           distribution_row("compactions per phase", [float(reload.compactions) for reload in reloads], len(rows) - len(reloads), count)], window)
+    render_trial_measures([
+        ("weighted tokens", weighted, len(rows) - len(weighted)),
+        ("raw input with caches", [float(cost.raw_input) for cost in tokens], len(rows) - len(tokens)),
+        ("raw output", [float(cost.output) for cost in tokens], len(rows) - len(tokens)),
+        ("compactions", [float(reload.compactions) for reload in reloads], len(rows) - len(reloads)),
+    ])
     table("Context size after reload — raw input including caches", ("measure", "n reloads", "median", "p90", "total", "not recorded"),
           [distribution_row("first request after contract Read result", sizes, len(contexts) - len(sizes), count)], window)
     print(f"Reload states: NoCompaction n={sum(isinstance(reload.contexts, NoCompaction) for reload in reloads)} phases; "
@@ -1655,6 +1685,19 @@ def render_trial(trials: Sequence[TrialPhase], measures: Sequence[TrialMeasures]
                 str(row.tokens.output) if isinstance(row.tokens, TrialTokens) else "—",
                 str(row.reloads.compactions) if isinstance(row.reloads, PhaseReloads) else missing(row.reloads),
                 str(row.reloads.contexts) if isinstance(row.reloads, PhaseReloads) else "—") for row in rows], window)
+
+
+def render_trial_phase_time(events: Sequence[Event], trials: Sequence[TrialPhase], window: Window) -> None:
+    """Use the eligible trial sample even when its usage or transcript is missing."""
+    units = {event.run: str(event.record.get("unit") or event.record.get("worktree") or
+                            event.branch or event.run) for event in events if event.kind == "run_started"}
+    seconds: dict[str, list[float]] = defaultdict(list)
+    for trial in trials:
+        if isinstance(trial.interval, PhaseWithGap):
+            seconds[units.get(trial.phase.run, trial.phase.run)].append(trial.phase.end - trial.phase.start)
+    table("Trial phase time per unit — eligible start-selected phases, natedev only",
+          ("unit", "n phases", "median", "p90", "total", "not recorded"),
+          [distribution_row(unit, values, 0, duration) for unit, values in sorted(seconds.items())], window)
 
 
 def main() -> int:
@@ -1708,9 +1751,11 @@ def main() -> int:
         render_baseline(events, window, usage, contract, plans, problems)
         render_trial_phase_exclusions(events, window)
         render_trial(trials, measures, window, exposure_filter)
+        render_trial_phase_time(events, eligible, window)
     elif detail == "trial":
         render_trial_phase_exclusions(events, window)
         render_trial(trials, measures, window, exposure_filter, True)
+        render_trial_phase_time(events, eligible, window)
     else:
         render_detail(detail, events, window, usage, contract, plans)
     return 0

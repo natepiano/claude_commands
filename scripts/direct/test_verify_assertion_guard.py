@@ -46,6 +46,9 @@ invoke_mend() { echo 'fixture: mend'; }
 fmt_cargo() { :; }
 invoke_clippy_fix() { :; }
 invoke_clippy() { :; }
+start_tree_watch() { :; }
+finish_tree_watch() { :; }
+stop_tree_watch() { :; }
 tree_key() { echo fixed-tree; }
 taplo() { :; }
 run() { "$@"; }
@@ -110,7 +113,29 @@ case lint in
                     self.assertLess(lines.index("style-lint: assertion guard passed"), lines.index("fixture: mend"))
 
     def test_lint_fails_closed_when_guard_cannot_resolve_base(self) -> None:
-        _ = self.git("update-ref", "-d", "refs/remotes/origin/main")
+        _ = self.git("remote", "remove", "origin")
+        result = self.lint("--workspace", "--check")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+        self.assertIn("VERIFY_ASSERTION_BASE", result.stderr)
+        self.assertNotIn("fixture: mend", result.stdout)
+
+    def test_lint_passes_explicit_base_to_guard_in_all_modes(self) -> None:
+        # Upstream contains the stronger assertion. An explicit base at the new
+        # assertion should let lint proceed; dropping --base would block it.
+        _ = self.git("add", "src/lib.rs")
+        _ = self.git("commit", "-q", "-m", "branch assertion change")
+        _ = self.git("tag", "assertion-base")
+        self.environment["VERIFY_ASSERTION_BASE"] = "assertion-base"
+        for arguments in (("sample",), ("--workspace",), ("--workspace", "--check")):
+            with self.subTest(arguments=arguments):
+                result = self.lint(*arguments, member_cwd=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("assertion guard: no removed or weaker assertions", result.stdout)
+                self.assertIn("fixture: mend", result.stdout)
+
+    def test_invalid_explicit_base_is_not_silently_replaced_with_upstream(self) -> None:
+        self.environment["VERIFY_ASSERTION_BASE"] = "missing-assertion-base"
         result = self.lint("--workspace", "--check")
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)

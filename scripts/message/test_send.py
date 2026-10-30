@@ -22,7 +22,11 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.socket_test_support import short_socket_directory
 import send
+from scripts.lib import names
+from scripts.lib.test_names import fixture_names
 import rca
 import review
 import push_texts
@@ -51,6 +55,30 @@ INIT: dict[str, object] = {"type": "system", "subtype": "init", "permissionMode"
 
 
 class RelayAccountTests(unittest.TestCase):
+    def test_relay_delivers_captured_sender_display_and_checks_that_payload_verbatim(self) -> None:
+        original = "Message from sender-address: Preview\n\nbody"
+        displayed = "Message from sender-address: Preview\nShown sender: sdlc · roles · worker test\n\nbody"
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".claude").mkdir()
+            _ = (home / ".claude.json").write_text(json.dumps({
+                "oauthAccount": {"emailAddress": "fixture@example.invalid"}}))
+            for delivered, status in ((displayed, "verbatim"), (original, "NOT VERBATIM")):
+                with (
+                    self.subTest(status=status),
+                    mock.patch.dict(os.environ, {"HOME": str(home)}, clear=True),
+                    mock.patch.object(send, "claude_binary", return_value="claude"),
+                    mock.patch.object(send, "STATE", home / "message-state"),
+                    mock.patch.object(send, "run", return_value=(0, stream(INIT, call(delivered), answer(OK)), "")) as launch,
+                ):
+                    result = send.relay(send.Message("uds:/recipient", "sender-address", "Preview", original, None,
+                                                    "sdlc · roles · worker test"), 10)
+                self.assertEqual(result.outcome, "sent")
+                self.assertIn(f"; {status};", result.detail)
+                command = cast(list[str], launch.call_args.args[0])
+                self.assertEqual(command[command.index("-n") + 1], "sender-address")
+                self.assertIn(displayed, cast(str, launch.call_args.args[1]))
+
     def test_relay_before_cutover_keeps_home_login_without_requiring_numbered_folders(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -134,8 +162,9 @@ class SendTests(ShutdownTestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(mock.patch.object(names, "load_names", return_value=fixture_names()))
         super().setUp()
-        directory = tempfile.TemporaryDirectory()
+        directory = short_socket_directory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         # No test opens a real rca.py case: it would write the machine's cases and message its owner.
@@ -254,6 +283,35 @@ class SendTests(ShutdownTestCase):
         entry = self.log()[0]
         self.assertEqual((entry["via"], entry["postmaster"], entry["seconds"], entry["text"]), ("postmaster", "delivered", 0.125, "body"))
 
+    def test_postmaster_shows_sender_job_and_keeps_reply_and_log_identity(self) -> None:
+        clock = self.postmaster_clock()
+        self.session("recipient", "Recipient")
+        self.session("worker", "Postmaster")
+        self.session("sender", "fixed-sender-address")
+        self.postmaster_heartbeat(clock)
+        texts: list[str] = []
+        self.postmaster_mod(clock, texts)
+        sender = roster.RosterEntry(
+            machine="fixture", kind="claude", role="worker", name="fixed-sender-address", status="working",
+            reach=roster.Messageable("session:sender"), cwd="/fixture",
+            showrunner=roster.UnderShowrunner("sdlc", "runner", "session:runner"),
+            director=roster.UnderDirector("roles-unit", "director", "session:director"),
+            assignment=roster.WorkerAssignment("test", "/fixture/run", "test", "test"),
+            session=roster.ClaudeSession("sender"),
+        )
+        with mock.patch.object(roster, "roster", return_value=roster.Roster([sender], [])):
+            result = send.send(local_options(["--to", "session:recipient", "--from", "fixed-sender-address",
+                                               "--summary", "Question", "--text", "body"]))
+        self.assertEqual(result.outcome, "sent")
+        self.assertEqual(len(texts), 1)
+        self.assertIn("sdlc · roles · worker test", texts[0])
+        self.assertRegex(texts[0], r"^Message from fixed-sender-address via postmaster: Question \[[a-f0-9]{8}\]")
+        self.assertIn("body", texts[0])
+        logged = self.log()[0]
+        self.assertEqual(logged["from"], "fixed-sender-address")
+        self.assertEqual(logged["to"], "session:recipient")
+        self.assertEqual(self.relayed, [])
+
     def test_postmaster_hash_mismatch_is_reported_as_not_verbatim(self) -> None:
         clock = self.postmaster_clock()
         self.session("recipient", "Recipient")
@@ -263,6 +321,166 @@ class SendTests(ShutdownTestCase):
         result = send.send(local_options(["--to", "session:recipient", "--from", "Sender", "--text", "body"]))
         self.assertEqual(result, send.Result("sent", "postmaster; NOT VERBATIM; session:recipient"))
         self.assertEqual(self.relayed, [])
+
+    def sender_entry(self, production: str = "sdlc") -> roster.RosterEntry:
+        return roster.RosterEntry(
+            machine="fixture", kind="claude", role="worker", name="sender-address", status="working",
+            reach=roster.Messageable("session:sender"), cwd="/fixture",
+            showrunner=roster.UnderShowrunner(production, "runner", "session:runner"),
+            director=roster.UnderDirector("roles-unit", "director", "session:director"),
+            assignment=roster.WorkerAssignment("test", "/fixture/run", "test", "test"),
+            session=roster.ClaudeSession("sender"),
+        )
+
+    def test_name_config_rename_changes_new_senders_but_keeps_queued_and_forwarded_display(self) -> None:
+        options = local_options(["--to", "session:absent", "--from", "sender-address", "--text", "before rename"])
+        with mock.patch.object(roster, "roster", return_value=roster.Roster([self.sender_entry()], [])):
+            self.assertEqual(send.send(options).outcome, "queued")
+            with mock.patch.object(names, "runtime_names", return_value=fixture_names(worker="builder")):
+                newer = local_options(["--to", "session:absent", "--from", "sender-address", "--text", "after rename"])
+                self.assertEqual(send.send(newer).outcome, "queued")
+        queued = send.read_queue(send.queue_for("session:absent"))
+        self.assertEqual([row.get("shown_sender") for row in queued],
+                         ["sdlc · roles · worker test", "sdlc · roles · builder test"])
+        self.assertEqual([row["from"] for row in queued], ["sender-address", "sender-address"])
+        self.session("absent", "Returned recipient")
+        with mock.patch.object(names, "runtime_names", side_effect=AssertionError("replay must keep the captured display")):
+            replay = send.pending("session:absent")
+        self.assertIn("Shown sender: sdlc · roles · worker test", replay)
+        self.assertIn("Shown sender: sdlc · roles · builder test", replay)
+        received = send.parse(["--here", "--to", "codex:remote-thread", "--from", "sender-address",
+                               "--forwarded-shown-sender", "sdlc · roles · worker test", "--summary", "Preview", "--text", "body"])
+        with mock.patch.object(names, "runtime_names", side_effect=AssertionError("receiver must not apply its names")), \
+                mock.patch.object(codex_daemon, "queue", return_value=codex_daemon.Queued()) as queue:
+            self.assertEqual(send.send(received).outcome, "sent")
+        queue.assert_called_once_with("remote-thread", "body\nShown sender: sdlc · roles · worker test", timeout=send.TIMEOUT)
+
+    def test_queued_sender_display_survives_roster_changes_and_legacy_records_use_raw_sender(self) -> None:
+        queued_at = datetime(2026, 10, 20, tzinfo=timezone.utc)
+        with mock.patch.object(roster, "roster", return_value=roster.Roster([self.sender_entry()], [])) as read_roster:
+            for keyed in (False, True):
+                options = local_options([
+                    "--to", "session:absent", "--from", "sender-address", "--text", "Preview\nbody",
+                    *(["--key", "message-key"] if keyed else []),
+                ])
+                with mock.patch.object(send, "now", return_value=queued_at + timedelta(seconds=int(keyed))):
+                    self.assertEqual(send.send(options).outcome, "queued")
+            self.assertEqual(read_roster.call_count, 2)
+        path = send.queue_for("session:absent")
+        queued = send.read_queue(path)
+        self.assertEqual([entry["from"] for entry in queued], ["sender-address", "sender-address"])
+        self.assertEqual([entry.get("shown_sender") for entry in queued], ["sdlc · roles · worker test"] * 2)
+        legacy = dict(queued[0])
+        del legacy["shown_sender"]
+        legacy["text"] = "legacy body"
+        with path.open("a", encoding="utf-8") as target:
+            _ = target.write(json.dumps(legacy) + "\n")
+        self.session("absent", "Returned recipient")
+        with mock.patch.object(roster, "roster", side_effect=AssertionError("replay must not resolve the sender")):
+            replay = send.pending("session:absent")
+        self.assertEqual(replay.count("Shown sender: sdlc · roles · worker test"), 2)
+        self.assertRegex(replay, r"(?:\A|\n\n)Queued message \d+ of 3, from sender-address at "
+                         + r"[^\n]+:\nlegacy body(?:\n\n|\Z)")
+        self.assertEqual([entry["from"] for entry in self.log()], ["sender-address", "sender-address"])
+
+    def test_mesh_and_daemon_payloads_show_sender_without_changing_address_thread_or_log(self) -> None:
+        original = "Message from sender-address: Preview\n\nbody"
+        expected = "Message from sender-address: Preview\nShown sender: sdlc · roles · worker test\n\nbody"
+        with (
+            mock.patch.object(roster, "roster", return_value=roster.Roster([self.sender_entry()], [])),
+            mock.patch.object(send, "run", return_value=(0, "sent", "")) as launch,
+            mock.patch.object(codex_daemon, "queue", return_value=codex_daemon.Queued()) as queue,
+        ):
+            self.assertEqual(send.send(local_options([
+                "--to", "mesh-address", "--codex", "--session-dir", "/fixture/run",
+                "--from", "sender-address", "--text", original,
+            ])).outcome, "sent")
+            self.assertEqual(send.send(local_options([
+                "--to", "codex:thread-address", "--from", "sender-address", "--text", original,
+            ])).outcome, "sent")
+        command = cast(list[str], launch.call_args.args[0])
+        self.assertEqual(command[command.index("--to") + 1], "mesh-address")
+        self.assertEqual(command[command.index("--session-dir") + 1], "/fixture/run")
+        self.assertEqual(command[command.index("--message") + 1], expected)
+        queue.assert_called_once_with("thread-address", expected, timeout=send.TIMEOUT)
+        self.assertEqual([(row["from"], row["to"], row["text"]) for row in self.log()], [
+            ("sender-address", "mesh-address", original), ("sender-address", "codex:thread-address", original),
+        ])
+
+    def test_relay_fallback_preserves_shown_sender_when_session_address_becomes_socket(self) -> None:
+        self.session("recipient", "Recipient")
+        with mock.patch.object(roster, "roster", return_value=roster.Roster([self.sender_entry()], [])) as read_roster:
+            self.assertEqual(send.send(local_options([
+                "--to", "session:recipient", "--from", "sender-address", "--summary", "Preview",
+                "--text", "Message from sender-address: Preview\n\nbody",
+            ])).outcome, "sent")
+        read_roster.assert_called_once()
+        relayed = self.relayed[0]
+        self.assertEqual(relayed.to, f"uds:{self.root / 'recipient.sock'}")
+        self.assertEqual(relayed.sender, "sender-address")
+        prompt = send.relay_prompt(relayed)
+        self.assertIn("----- BEGIN MESSAGE -----\nMessage from sender-address: Preview\n"
+                      + "Shown sender: sdlc · roles · worker test\n\nbody\n----- END MESSAGE -----", prompt)
+        self.assertEqual(self.log()[0]["from"], "sender-address")
+
+    def test_remote_forwarding_keeps_sending_machine_display_despite_receiver_name_collision(self) -> None:
+        original = "Message from sender-address: Preview\n\nbody"
+        for sender_rows, display in (
+            ([self.sender_entry()], "sdlc · roles · worker test"),
+            ([], "sender-address"),
+            ([self.sender_entry(), self.sender_entry("ambiguous")], "sender-address"),
+        ):
+            with self.subTest(display=display, matches=len(sender_rows)):
+                with (
+                    mock.patch.object(roster, "roster", return_value=roster.Roster(sender_rows, [])) as source_read,
+                    mock.patch.object(send, "run", return_value=(0, "SENT: forwarded\n", "")) as ssh,
+                ):
+                    self.assertEqual(send.send(send.parse([
+                        "--machine", "mac", "--to", "codex:remote-thread", "--from", "sender-address",
+                        "--key", "reply-key", "--text", original,
+                    ])).outcome, "sent")
+                source_read.assert_called_once()
+                command = cast(list[str], ssh.call_args.args[0])
+                forwarded = shlex.split(command[-1])
+                arguments = forwarded[forwarded.index("--here"):]
+                self.assertEqual(arguments[arguments.index("--from") + 1], "sender-address")
+                self.assertEqual(arguments[arguments.index("--forwarded-shown-sender") + 1], display)
+                self.assertEqual(ssh.call_args.args[1], original)
+                received = send.parse([*arguments, "--text", original])
+                with (
+                    mock.patch.object(roster, "roster", return_value=roster.Roster([self.sender_entry("wrong-host")], [])),
+                    mock.patch.object(send, "sender_shown_name", side_effect=AssertionError("receiver must not resolve sender")),
+                    mock.patch.object(codex_daemon, "queue", return_value=codex_daemon.Queued()) as queue,
+                ):
+                    self.assertEqual(send.send(received).outcome, "sent")
+                expected = (original if display == "sender-address" else
+                            "Message from sender-address: Preview\nShown sender: sdlc · roles · worker test\n\nbody")
+                queue.assert_called_once_with("remote-thread", expected, timeout=send.TIMEOUT)
+                logged = self.log()[-1]
+                self.assertEqual((logged["from"], logged["to"], logged["key"], logged["text"]),
+                                 ("sender-address", "codex:remote-thread", "reply-key", original))
+
+    def test_forwarded_postmaster_display_does_not_read_receiver_roster_for_sender(self) -> None:
+        clock = self.postmaster_clock()
+        self.session("recipient", "Recipient")
+        self.session("worker", "Postmaster")
+        self.postmaster_heartbeat(clock)
+        texts: list[str] = []
+        self.postmaster_mod(clock, texts)
+        with mock.patch.object(roster, "roster", side_effect=AssertionError("explicit socket needs no receiver roster")):
+            result = send.send(send.parse([
+                "--here", "--to", f"uds:{self.root / 'recipient.sock'}", "--from", "sender-address",
+                "--forwarded-shown-sender", "sdlc · roles · worker test", "--summary", "Preview", "--text", "body",
+            ]))
+        self.assertEqual(result.outcome, "sent")
+        self.assertRegex(texts[0], r"^Message from sender-address via postmaster: Preview \[[a-f0-9]{8}\]\n"
+                         + r"Shown sender: sdlc · roles · worker test\n\nbody$")
+
+    def test_forwarded_sender_display_requires_local_delivery_and_nonempty_text(self) -> None:
+        for arguments in (["--forwarded-shown-sender", "display"],
+                          ["--here", "--forwarded-shown-sender", ""]):
+            with self.subTest(arguments=arguments), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                _ = send.parse(["--to", "codex:thread", "--from", "sender-address", "--text", "body", *arguments])
 
     def test_each_postmaster_miss_relays_once_with_unchanged_message_and_reason(self) -> None:
         self.session("recipient", "Recipient")
@@ -799,7 +1017,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
 
         self.session("id-1", "recipient")
         recipient = roster.RosterEntry(
-            "machine", "claude", "top-level", "recipient", "running",
+            "machine", "claude", "freestanding", "recipient", "running",
             roster.Messageable("session:id-1"), "/work", roster.NoShowrunner(),
             roster.NoDirector(), roster.NotAWorker(),
         )
@@ -920,7 +1138,21 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertIn("latest stop result", pending)
 
     def test_real_cancel_and_restart_senders_retire_old_settle_instructions(self) -> None:
-        real_send = Path(__file__).resolve().parent / "send.py"
+        # The subprocess needs its own roster fixture; parent patches do not cross exec.
+        real_send = self.root / "real-send.py"
+        _ = real_send.write_text(
+            f"#!{sys.executable}\n"
+            + "import sys\n"
+            + f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
+            + "import roster, send\n"
+            + "from scripts.lib import names\nfrom scripts.lib.test_names import fixture_names\n"
+            + "names.load_names = lambda: fixture_names()\n"
+            + "roster.roster = lambda environment, scope: roster.Roster([], [])\n"
+            + "roster.peer_roster = lambda environment: roster.Roster([], [])\n"
+            + "raise SystemExit(send.main(sys.argv[1:]))\n",
+            encoding="utf-8",
+        )
+        real_send.chmod(0o755)
         child_state = self.root / "child-state"
 
         def shutdown_fixture(session_id: str) -> shutdown_record.SessionShutdown:
@@ -984,7 +1216,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     def test_unique_claude_roster_name_delivers_to_its_session_address(self) -> None:
         self.session("id-1", "recipient")
         recipient = roster.RosterEntry(
-            "machine", "claude", "top-level", "recipient", "running",
+            "machine", "claude", "freestanding", "recipient", "running",
             roster.Messageable("session:id-1"), "/work", roster.NoShowrunner(),
             roster.NoDirector(), roster.NotAWorker(),
         )
@@ -1127,7 +1359,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     def test_ambiguous_name_describes_a_recipient_that_cannot_take_messages(self) -> None:
         entries = [
             roster.RosterEntry(
-                "machine", "claude", "top-level", "duplicate", "running",
+                "machine", "claude", "freestanding", "duplicate", "running",
                 roster.Messageable("session:messageable"), "/work", roster.NoShowrunner(),
                 roster.NoDirector(), roster.NotAWorker(),
             ),
@@ -1152,7 +1384,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             ])
 
         self.assertEqual(raised.exception.code, 2)
-        self.assertIn("  session:messageable (top-level)\n", errors.getvalue())
+        self.assertIn("  session:messageable (freestanding)\n", errors.getvalue())
         self.assertIn(
             "  (cannot take messages: blind reviewer) (worker)\n",
             errors.getvalue(),
@@ -1332,7 +1564,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             ("worker", 1),
             ("codex:thread-one", 1),
             ("session:claude-one", 1),
-            (f"uds:{self.root / 'claude.sock'}", 0),
+            (f"uds:{self.root / 'claude.sock'}", 1),
             ("user", 0),
         ):
             with self.subTest(recipient=recipient):
@@ -2565,7 +2797,7 @@ class PeerSendTests(ShutdownTestCase):
         ):
             for remote in (False, True):
                 with self.subTest(role=role, remote=remote):
-                    row = roster.RosterEntry("mac" if remote else "natedev", kind, role, "recipient", "waiting",
+                    row = roster.RosterEntry("mac" if remote else "natedev", kind, cast(roster.Role, role), "recipient", "waiting",
                         roster.CannotReceiveMessages(reason), "/fixture", roster.NoShowrunner(), relationship,
                         roster.WorkerAssignment("review", "/run") if role == "worker" else roster.NotAWorker())
                     self.local = roster.Roster([] if remote else [row], [])

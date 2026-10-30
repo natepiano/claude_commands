@@ -251,45 +251,30 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 
 ### Phase 4 — area and category definitions; route unsure answers to the user  · status: done
 
-**Depends on:** Phase 3
+#### As-built
 
-#### Work Order
-
-**Goal:** category and area answers that are at most 10% wrong where Jev is sure, with every unsure answer routed to the user, measured on the tune split and checked once on held-out.
-
-**Spec:**
-- Area definitions: one line per area of the global vocabulary, drafted by the unit director from the area's open issues. They live in `~/rust/hanadocs/conf/issue-areas.md` (outside `issues/`, which the prioritize and dailies scripts scan), a table `area | definition | issues`; this unit owns that one vault path and commits only it to hanadocs main (pull --rebase first, never `-a`). The lines are marked as drafts the user can correct. `vault.py` reads the file read-only; an area with no line keeps today's option text.
-- `area_questions` takes the definitions and uses each one as that area's option criteria. The definitions go in the cache key, with a test that a changed line misses the cache.
-- Experiment: the defined-area options keep the production option keys and change only their text, so the existing variant file expresses them, beside the category variants; no new experiment code. The unit director runs the tune-split experiment before dispatch, and the writer applies only adopted wording.
-- The unit director sharpens the feature, enhancement and research definitions in `CATEGORIES`, and runs both variants on the tune split through `compare --baseline`. A variant is adopted only when it gains on the tune split; each adoption increments `QUESTION_SET_VERSION`.
-- Routing (the user's rule, 2026-10-29): per field, the threshold is the lowest top-answer probability whose taken answers are at most 10% wrong on the tune split. The risk-coverage report names, per field, the share taken and the share routed to the user. A field with no such threshold stays `Unsupported` and agent-proposed.
-- Score held-out once after tuning. Send the category and area held-out results to the showrunner. The user reviews the drafted definitions only for a field that passes; `JEV_FIELDS` changes only on the user's verdict.
-- Record the result in `~/.local/state/issue-score/lessons.md`.
+- `~/rust/hanadocs/conf/issue-areas.md` holds one draft definition line for each of the 116 areas in the global vocabulary, as a table `area | definition | issues`. The definitions are drafts that the user can correct. The file is outside `issues/`, which the prioritize and dailies scripts scan.
+- `vault.load_area_definitions()` reads the file read-only. It accepts the table with or without outer pipes. A missing file, or a file with no usable definitions, raises `ValueError` that names the path. An area with no line keeps the name-only option text.
+- `area_questions(areas, definitions)` uses each definition as the option criteria of that area, and keeps the production option keys. `content_hash(issue, areas, definitions)` puts the definitions in the cache key. Both functions take the definitions as required arguments.
+- `THRESHOLDS["area"]` is `Supported(0.90)` and `QUESTION_SET_VERSION` is "4". Category stays `Supported(0.90)` with the Phase 3 criteria, and stays agent-proposed.
+- The risk-coverage report names, for each field, the share taken (sure) and the share routed to the user (unsure).
+- Tune split: area accuracy .51 -> .67; at 0.90 the error is .083 and 38% is taken. Held-out run `20261029T125753.317576Z-3ac444e7` against the v3 held-out run `20261027T113121.673734Z-77e4d5ef`: area accuracy .49 -> .67; at 0.90 the error is .091, with 39% taken and 61% routed to the user. Category error at 0.90 is .15.
 
 **Files:**
-- `scripts/issue_score/vault.py` — read the area definitions file
-- `scripts/issue_score/questions.py` — defined area options; sharper category criteria; thresholds; version
-- `scripts/issue_score/evaluate.py` — share taken and share routed in the risk-coverage report
-- `scripts/issue_score/score_issues.py` — pass the definitions to the area request
-- `scripts/issue_score/test_vault.py` — definitions file tests
-- `scripts/issue_score/test_questions.py` — option text, fallback and version tests
-- `scripts/issue_score/test_evaluate.py` — taken and routed shares
-- `scripts/issue_score/test_score_issues.py` — a changed definition misses the cache
-- `scripts/issue_score/test_decide.py` — configured threshold policy after adoption
+- `~/rust/hanadocs/conf/issue-areas.md` — draft area definitions (vault file)
+- `scripts/issue_score/vault.py` — `AREA_DEFINITIONS_PATH`, `load_area_definitions`
+- `scripts/issue_score/questions.py` — defined area options, area threshold, version
+- `scripts/issue_score/score_issues.py` — loads the definitions for scoring; definitions in `content_hash`
+- `scripts/issue_score/evaluate.py` — taken and routed shares in the risk-coverage report
+- `scripts/issue_score/experiment.py` — states its definitions explicitly
 
-**Workers:** `1 writer + 1 tester` — the unit director drafts the definitions and runs the experiments; `impl` owns `vault.py`, `questions.py`, `evaluate.py` and `score_issues.py`; `test` owns the five test files, and updates the measured-wording fixture only for an adopted change.
+**Binds later work:** **`/issue` proposes with Jev** and **reassess every open issue** load the definitions with `vault.load_area_definitions()` and pass them to `area_questions` and `content_hash`. A definition edit changes the hash of every issue, so a run scored before the edit is stale. Area joins `JEV_FIELDS` only after the user approves the drafted definitions.
 
-**Constraints from prior phases:**
-- `JEV_FIELDS` is goal, impact and alignment (the user's verdict after the blind test, 2026-10-29). Phase 3 held-out: category at 0.90 failed (error .15); area was `Unsupported`.
-- The area vocabulary is global: `vault.area_vocabulary` builds one sorted list from all open non-style issues, and `experiment.build_questions` requires a variant to keep the production option set. Definitions change only option text; a per-project vocabulary is out of scope.
-- Keep the Phase 3 rules: one cohort through `compare --baseline`, one sure rule shared by `decide.py` and `evaluate.py`, the threshold outcome type (`Supported`, `Unsupported`, `ReportOnly`), a cache hit recomputed under the current policy, the repeat check with `--fresh`, and the derived `unfiled` fallback told apart from a Choice pick of `unfiled` by origin.
-- Tune-split experiment (2026-10-29, 317 issues, same cohort as production): area with definitions as option text raised accuracy from .51 to .67, and 0.90 is the lowest threshold with taken answers at most 10% wrong (error .083; 38% taken, 62% routed to the user). Adopt it: `area` becomes `Supported(0.90)` and `QUESTION_SET_VERSION` becomes "4". The broad-instruction variant met the target only at exactly .100 and is not adopted. Sharper feature, enhancement and research definitions lowered category accuracy (.74 to .71) and are not adopted; `CATEGORIES` and the category threshold stay as they are, because category's held-out set was already spent at 0.90.
-- No prompt gymnastics: a definition describes the area from its issues, never names a test issue, and gains no clause per failure.
-- Live calls run as `with-typesafe <cmd>`; the key is never read or printed. Total live spend so far is about $0.40 of the $20 budget.
+**Gotchas:** `THRESHOLDS["area"]` is calibrated on the defined options. Scoring with name-only options takes answers under an uncalibrated wording, so the loader fails loudly and never falls back to an empty mapping.
 
-**Acceptance gate:** the merge gate is green; basedpyright clean; the tune-split comparison and the held-out result for category and area are reported to the showrunner; the thresholds and the version in `questions.py` match what was adopted.
+**Ruled out:** sharper feature, enhancement and research criteria in `CATEGORIES` — they lowered category accuracy on the tune split (.74 -> .71).
 
-### Phase 5 — `/issue` proposes with Jev  · status: todo
+### Phase 5 — `/issue` proposes with Jev  · status: done
 
 **Depends on:** Phase 4
 
@@ -309,7 +294,8 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 **Workers:** `1 writer + 1 tester` — `impl` owns `score_issues.py` and `commands/issue.md`; `test` covers the output format, the unsure display and exit 2 on a failed fixture.
 
 **Constraints from prior phases:**
-- `JEV_FIELDS` is goal, impact and alignment (the user's verdict, 2026-10-29). Category and area join it only if Phase 4 meets their target and the user approves; `propose` reads `JEV_FIELDS`, never a fixed list.
+- `JEV_FIELDS` is goal, impact and alignment (the user's verdict, 2026-10-29). Category and area join it only if Phase 4 meets their target and the user approves; `propose` reads `JEV_FIELDS`, never a fixed list. Phase 4 result: area met its target (held-out error .091 at `Supported(0.90)`, 39% taken) and waits on the user's review of the drafted definitions; category failed (held-out error .15) and stays agent-proposed.
+- Area definitions: `propose` loads them with `vault.load_area_definitions()` and passes them to `questions.area_questions(areas, definitions)`; both that and `content_hash(issue, areas, definitions)` take them as required arguments, with `areas` from the global `vault.area_vocabulary`. A missing or empty definitions file raises `ValueError` naming the path; `propose` exits 2 with that message on stderr, and a test covers it.
 - An unsure Jev field is routed to the user: the line shows its top two values and the user picks in the same reply (the user's routing rule, 2026-10-29).
 - `propose --project <short>` converts the shorthand to the canonical project name (`hana_diegetic`) before `vault.build_state`, which raises on an unknown project; a test covers each shorthand and an unknown one.
 - Show the derived flags: `split`, `check` (effort), `possible_five` (urgency 4) and the derived `unfiled` fallback with its hint. A Choice pick of the real area `unfiled` is an ordinary value with no hint; tell them apart by the decision's origin, and a test covers both.
@@ -347,7 +333,7 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 
 **Constraints from prior phases:**
 - Read open, non-style issues through `vault.load_open_issues`; style issues get the formula state that this phase adds. `score` already covers rated, default-rated and unrated open non-style issues; the new scoring work is style inclusion only.
-- The cache key holds title, project, body, the area vocabulary and (from Phase 4) the area definitions. Add every new style input (rule summaries, `style_crate`, finding count) to it, with a test per input that a change misses the cache and that the definition-sensitive key is kept.
+- The cache key holds title, project, body, the area vocabulary and (from Phase 4) the area definitions. Add every new style input (rule summaries, `style_crate`, finding count) to it, with a test per input that a change misses the cache and that the definition-sensitive key is kept. `content_hash(issue, areas, definitions)` and `area_questions(areas, definitions)` take definitions as required arguments, loaded by `vault.load_area_definitions()`, which raises `ValueError` naming the path for a missing or empty file. A definition edit changes every issue's hash, so `apply_labels.py` refuses a run scored before the edit; its refusal says the hash changed and that a rescore is needed, and a test covers it.
 - The derived `unfiled` fallback and a Choice pick of the real area `unfiled` show as different outcomes in the review file; a test covers both.
 - Acceptance proves that only approved values change and that the scorer code stays read-only.
 - A partial run (failed lines or a budget stop) shows the failed and unscored issues in the review files, kept apart from each other, and never presents them as complete; a test proves it.

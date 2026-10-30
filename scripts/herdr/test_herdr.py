@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+
 import json
 import io
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
@@ -93,6 +94,7 @@ class WaitingAgentCLI:
 SCOPE_PROBE = ["--user", "--scope", "--quiet", "--collect", "--", "true"]
 REAL_SUBMIT_OPENING_PROMPT = herdr.Herdr.submit_opening_prompt
 REAL_LOAD_FACTOR = herdr.load_factor
+PROCESS_SESSIONS = herdr._process_sessions  # pyright: ignore[reportPrivateUsage]
 REQUIRE_SHARED = herdr._require_shared  # pyright: ignore[reportPrivateUsage]
 
 
@@ -3042,6 +3044,20 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(herdr.herdr_place_of(13), herdr.HerdrPlace("fixture", "native"))
         self.assertEqual([row.pid for row in herdr.herdr_processes() if row.command == "claude"], [13])
 
+    def test_linux_deleted_cwd_preserves_the_process_marks_and_place(self) -> None:
+        server = self.process(10, 1, ["/fixture/herdr", "server"], {})
+        self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)
+        self.socket_fd(server, 100)
+        marks = {"SHOWRUNNER_UNIT": "prod", "SHOWRUNNER_UNIT_ID": "unit"}
+        process = self.process(12, 10, ["/bin/claude"], {**marks, "HERDR_PANE_ID": "pane-1"})
+        (process / "cwd").unlink()
+        (process / "cwd").symlink_to(self.root / "deleted-directory")
+        rows = herdr.herdr_processes()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0].pid, rows[0].command, rows[0].place, rows[0].marks),
+                         (12, "claude", herdr.HerdrPlace("fixture", "pane-1"), marks))
+        self.assertIsInstance(rows[0].working_directory, herdr.UnreadableCwd)
+
     def test_process_place_named_default_and_nonherdr(self) -> None:
         server = self.process(10, 1, ["/fixture/herdr", "--session", "fixture", "server"], {})
         self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)
@@ -3158,6 +3174,150 @@ class HerdrTests(unittest.TestCase):
         with self.assertRaisesRegex(herdr.HerdrFailure, "session fixture.*cannot read listening sockets"):
             _ = herdr.server_environment("fixture")
 
+    def test_process_snapshot_serves_roster_units_inventory_and_codex_from_one_scan(self) -> None:
+        from scripts.message import roster
+        from scripts.shutdown import inventory
+
+        server = self.process(10, 1, ["/fixture/herdr", "server"], {})
+        self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)
+        self.socket_fd(server, 100)
+        _ = self.process(12, 10, ["/bin/claude"], {
+            "HERDR_PANE_ID": "pane-unit", "SHOWRUNNER_UNIT": "production", "SHOWRUNNER_UNIT_ID": "unit",
+        })
+        _ = self.process(13, 10, ["/bin/codex"], {"HERDR_PANE_ID": "pane-codex"})
+        import unit_lookup as lookup
+
+        def current_slug(slug: str) -> str:
+            return slug
+        live = lookup.LiveClaude("Unit", "session-unit", "/fixture/socket", 12)
+        with (patch.object(herdr, "live_sessions", return_value=[{"name": "fixture"}]),
+              patch.object(herdr.Herdr, "agents", return_value=[{
+                  "agent": "codex", "pane_id": "pane-codex", "agent_status": "idle",
+              }]),
+              patch.object(lookup, "_claudes", return_value=(
+                  {12: live}, lookup.UnreadAt({}, lookup.RecordsRead()))),
+              patch.object(lookup, "_lookup_slug", side_effect=current_slug),
+              patch.object(roster, "_process_account", return_value=roster.AccountLabel("codex2")),
+              patch.object(herdr, "_process_sessions", wraps=PROCESS_SESSIONS) as scans):
+            def read_callers() -> tuple[object, object, object]:
+                return (roster._every_marked_unit(), inventory._unit_sessions((  # pyright: ignore[reportPrivateUsage]
+                    inventory.ShowrunnerRegistration("runner", "production", str(self.root / "production.md")),
+                )), roster._herdr_codex_panes("fixture"))  # pyright: ignore[reportPrivateUsage]
+
+            expected = read_callers()
+            self.assertEqual(scans.call_count, 3)
+            scans.reset_mock()
+            with herdr.process_snapshot():
+                observed = read_callers()
+            self.assertEqual(scans.call_count, 1)
+        self.assertEqual(observed, expected)
+        self.assertIn("session-unit", cast(dict[str, object], observed[1]))
+        self.assertEqual(cast(roster.Roster, observed[2]).entries[0].account, roster.AccountLabel("codex2"))
+
+    def test_process_reads_outside_scope_and_after_scope_exit_are_fresh(self) -> None:
+        with patch.object(herdr, "_process_sessions", wraps=PROCESS_SESSIONS) as scans:
+            self.assertEqual(herdr.herdr_processes(), [])
+            self.assertEqual(herdr.herdr_processes(), [])
+            self.assertEqual(scans.call_count, 2)
+            with herdr.process_snapshot():
+                self.assertEqual(herdr.herdr_processes(), [])
+                with herdr.process_snapshot():
+                    self.assertEqual(herdr.herdr_processes(), [])
+            self.assertEqual(scans.call_count, 3)
+            self.assertEqual(herdr.herdr_processes(), [])
+            with herdr.process_snapshot():
+                self.assertEqual(herdr.herdr_processes(), [])
+            self.assertEqual(scans.call_count, 5)
+
+    def test_process_snapshot_isolates_mutable_results_and_next_scope_sees_changes(self) -> None:
+        server = self.process(10, 1, ["/fixture/herdr", "server"], {})
+        self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)
+        self.socket_fd(server, 100)
+        process = self.process(12, 10, ["/bin/claude"], {"HERDR_PANE_ID": "pane-unit", "SHOWRUNNER_UNIT_ID": "first"})
+        with herdr.process_snapshot():
+            rows = herdr.herdr_processes()
+            expected = herdr.herdr_processes()
+            rows[0].marks["SHOWRUNNER_UNIT_ID"] = "caller change"
+            rows.clear()
+            _ = process.joinpath("environ").write_bytes(b"HERDR_PANE_ID=pane-unit\0SHOWRUNNER_UNIT_ID=second\0")
+            self.assertEqual(herdr.herdr_processes(), expected)
+        with herdr.process_snapshot():
+            self.assertEqual(herdr.herdr_processes()[0].marks["SHOWRUNNER_UNIT_ID"], "second")
+
+    def test_process_snapshot_does_not_change_scan_failure_or_retry(self) -> None:
+        with (patch.object(herdr, "_process_sessions", side_effect=[herdr.HerdrFailure("fixture scan failed"), {}]) as scans,
+              herdr.process_snapshot()):
+            with self.assertRaisesRegex(herdr.HerdrFailure, "fixture scan failed"):
+                _ = herdr.herdr_processes()
+            self.assertEqual(herdr.herdr_processes(), [])
+            self.assertEqual(herdr.herdr_processes(), [])
+            self.assertEqual(scans.call_count, 2)
+        with patch.object(herdr, "_proc_root", return_value=self.root / "missing") as roots:
+            with herdr.process_snapshot():
+                self.assertEqual(herdr.herdr_processes(), [])
+                self.assertEqual(herdr.herdr_processes(), [])
+            self.assertEqual(roots.call_count, 1)
+
+    def test_action_reads_retire_report_snapshots_and_ignore_nested_report_scopes(self) -> None:
+        with patch.object(herdr, "_process_sessions", wraps=PROCESS_SESSIONS) as scans:
+            with herdr.process_snapshot():
+                _ = herdr.herdr_processes()
+                _ = herdr.herdr_processes()
+                self.assertEqual(scans.call_count, 1)
+                with herdr.process_action():
+                    with herdr.process_snapshot():
+                        _ = herdr.herdr_processes()
+                        _ = herdr.herdr_processes()
+                self.assertEqual(scans.call_count, 3)
+                _ = herdr.herdr_processes()
+                self.assertEqual(scans.call_count, 4)
+
+    def test_action_retires_nested_snapshot_in_a_copied_context(self) -> None:
+        from contextvars import copy_context
+
+        with patch.object(herdr, "_process_sessions", wraps=PROCESS_SESSIONS) as scans:
+            with herdr.process_snapshot():
+                _ = herdr.herdr_processes()
+                copied = copy_context()
+                nested = herdr.process_snapshot()
+                copied.run(nested.__enter__)
+                try:
+                    _ = copied.run(herdr.herdr_processes)
+                    self.assertEqual(scans.call_count, 1)
+                    with herdr.process_action():
+                        _ = herdr.herdr_processes()
+                    _ = copied.run(herdr.herdr_processes)
+                    self.assertEqual(scans.call_count, 3)
+                finally:
+                    _ = copied.run(nested.__exit__, None, None, None)
+
+    def test_copied_context_scans_fresh_after_snapshot_scope_closes(self) -> None:
+        from contextvars import copy_context
+
+        with patch.object(herdr, "_process_sessions", wraps=PROCESS_SESSIONS) as scans:
+            with herdr.process_snapshot():
+                self.assertEqual(herdr.herdr_processes(), [])
+                copied = copy_context()
+                self.assertEqual(copied.run(herdr.herdr_processes), [])
+                self.assertEqual(scans.call_count, 1)
+            self.assertEqual(copied.run(herdr.herdr_processes), [])
+            self.assertEqual(scans.call_count, 2)
+
+    def test_process_snapshot_is_released_on_error_and_not_shared_with_another_thread(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with patch.object(herdr, "_process_sessions", wraps=PROCESS_SESSIONS) as scans:
+            with self.assertRaisesRegex(ValueError, "fixture scope failed"):
+                with herdr.process_snapshot():
+                    _ = herdr.herdr_processes()
+                    with ThreadPoolExecutor(max_workers=1) as pool:
+                        self.assertEqual(pool.submit(herdr.herdr_processes).result(), [])
+                    _ = herdr.herdr_processes()
+                    self.assertEqual(scans.call_count, 2)
+                    raise ValueError("fixture scope failed")
+            _ = herdr.herdr_processes()
+            self.assertEqual(scans.call_count, 3)
+
     def test_processes_skip_unreadable_and_limit_marks(self) -> None:
         server = self.process(10, 1, ["/fixture/herdr", "--session", "fixture", "server"], {})
         self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)
@@ -3168,7 +3328,7 @@ class HerdrTests(unittest.TestCase):
         unreadable.joinpath("environ").mkdir()
         self.assertEqual(herdr.herdr_processes(), [herdr.HerdrProcess(12, herdr.HerdrPlace("fixture", "pane-1"), {"SHOWRUNNER_UNIT": "prod", "SHOWRUNNER_UNIT_ID": "unit"}, "claude", str(self.root))])
 
-    def test_ancestry_loop_and_vanished_cwd_are_skipped(self) -> None:
+    def test_ancestry_loop_is_skipped_and_vanished_cwd_keeps_placement(self) -> None:
         _ = self.process(10, 11, ["/bin/sh"], {"HERDR_PANE_ID": "pane-1"})
         _ = self.process(11, 10, ["/bin/sh"], {})
         self.assertEqual(herdr.herdr_place_of(10), herdr.NotInHerdr())
@@ -3177,7 +3337,10 @@ class HerdrTests(unittest.TestCase):
         self.socket_fd(server, 100)
         process = self.process(21, 20, ["/bin/sleep"], {"HERDR_PANE_ID": "pane-2"})
         process.joinpath("cwd").unlink()
-        self.assertEqual(herdr.herdr_processes(), [])
+        rows = herdr.herdr_processes()
+        self.assertEqual([(row.pid, row.place) for row in rows],
+                         [(21, herdr.HerdrPlace("default", "pane-2"))])
+        self.assertIsInstance(rows[0].working_directory, herdr.UnreadableCwd)
 
     def test_trust_ignores_inherited_git_repository_and_configuration(self) -> None:
         requested = self.root / "requested"
@@ -3437,6 +3600,27 @@ class LayoutHerdr(herdr.Herdr):
         return "{}"
 
 
+class TitledLayoutHerdr(LayoutHerdr):
+    """Record tab and pane renames through the real layout code."""
+
+    @override
+    def result(self, *arguments: str) -> dict[str, object]:
+        if arguments[:2] == ("agent", "list"):
+            return {"agents": []}
+        if arguments[:2] == ("pane", "list"):
+            return {"panes": [{"pane_id": tab["pane_id"], "tab_id": tab["tab_id"],
+                               "workspace_id": tab["workspace_id"],
+                               "label": tab.get("pane_label", tab["label"])} for tab in self.tabs]}
+        return super().result(*arguments)
+
+    @override
+    def run(self, *arguments: str) -> str:
+        if arguments[:2] == ("pane", "rename"):
+            next(tab for tab in self.tabs if tab["pane_id"] == arguments[2])["pane_label"] = arguments[3]
+            return "{}"
+        return super().run(*arguments)
+
+
 @final
 class SavedLayoutTests(unittest.TestCase):
     """A restart puts every session back in its saved workspace and tab, in the saved order (user, 2026-10-21)."""
@@ -3468,6 +3652,40 @@ class SavedLayoutTests(unittest.TestCase):
             for title in titles:
                 _ = client.open_tab(space, title, "/repo", {})
         return client
+
+    def test_session_names_restore_saved_tab_order_and_resolve_each_pane(self) -> None:
+        old = TitledLayoutHerdr()
+        for key in ("sdlc", "zulu", "alpha"):
+            _ = old.open_tab("sdlc", key, "/repo", {})
+        order = [tab["pane_label"] for tab in old.tabs]
+        self.assertEqual([tab["name"] for tab in herdr.saved_layout("fixture")["workspaces"][0]["tabs"]], order)
+
+        fresh = TitledLayoutHerdr()
+        for key in reversed(order):
+            _ = fresh.open_tab("sdlc", key, "/repo", {})
+        self.assertEqual([tab["pane_label"] for tab in fresh.tabs], order)
+        for tab in fresh.tabs:
+            key = tab["pane_label"]
+            self.assertEqual(fresh.lookup(key), herdr.PaneFound(tab["pane_id"]))
+            self.assertEqual(fresh.lookup(tab["label"]), herdr.PaneFound(tab["pane_id"]))
+            self.assertEqual(tab["label"], key)
+            self.assertTrue(herdr.attach_hint("sdlc", key).endswith("tab " + key))
+        self.assertEqual([tab["name"] for tab in herdr.saved_layout("fixture")["workspaces"][0]["tabs"]], order)
+
+    def test_showrunner_unit_director_and_plain_tabs_and_panes_take_the_session_name(self) -> None:
+        client = TitledLayoutHerdr()
+        cases: tuple[tuple[str, str, dict[str, str]], ...] = (
+            ("control", "control", {}),
+            ("control", "roles", {"SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "roles-unit"}),
+            ("ad-hoc", "scratch", {}))
+        for space, name, environment in cases:
+            with self.subTest(session=name):
+                pane = client.open_tab(space, name, "/repo", environment)
+                tab = next(tab for tab in client.tabs if tab["pane_id"] == pane)
+                self.assertEqual(tab["label"], name)
+                self.assertEqual(tab["pane_label"], name)
+                for added in (" · ", "sdlc", "showrunner", "unit director"):
+                    self.assertNotIn(added, tab["label"])
 
     def test_a_reboot_restart_in_any_order_brings_back_every_workspace_and_tab_in_place(self) -> None:
         self.assertEqual(self.running().layout(), self.BEFORE)

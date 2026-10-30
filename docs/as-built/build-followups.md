@@ -31,6 +31,7 @@ Agents' test builds linked far more than the tests they ran, and the daily build
 3. `### Rebuilds`, always present: compile and other time by rebuild bin (none, edited crate, cascade, cold), nextest's compile against test time, and edited-crate nextest rebuilds by package (Rebuilds section below)
 4. `### <kind>` for each kind seen that day (`KIND_ORDER` first), one row per caller by run count, the scratch row among them
 5. `### Memory pressure`, always present: memory waits, the sccache, unsliced-step and memory-kill lines, the stall table and the sample line (`docs/as-built/buildlog-memory-stalls.md`, `docs/as-built/build-memory-admission.md`)
+   - `### CPU and disk pressure`, always present: one line per sampled host with CPU and IO stall shares and CPU idle and iowait shares, or `CPU and IO samples: none.` (`docs/as-built/buildlog-memory-stalls.md`)
 6. `### Agent calls (verify.sh)`
 7. `### Test builds (temporary)`, only on a day with a measured `verify.sh test` call
    - `### Power profile`, once any natedev sample carries a profile: the current profile, then like-with-like step timings before and after each profile change in the last 7 days (`docs/as-built/build-targets.md`, "What the reports read")

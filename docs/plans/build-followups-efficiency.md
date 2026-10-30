@@ -103,3 +103,18 @@ Showrunner of build-followups, 2026-10-28 (measured by builds-unit):
 **Tests** (`scripts/lib/test_nix_env.py`, real `git`): a `git worktree add` of a repo below the fake `~/rust`, made outside the trusted roots, is approved and loads; a plain `git clone` outside the roots is not approved; a hand-written `.git` file that points at a trusted repo's real worktree entry, from another folder, is not approved; a worktree of a repo outside the roots is not approved.
 
 **Acceptance:** `python3 -m unittest scripts.lib.test_nix_env scripts.lib.test_nix_env_launches scripts.lib.test_nix_env_integration` passes from the repo root; basedpyright clean on the changed files; `docs/as-built/nix-shell-launch.md` states the rule.
+
+### Phase 10 — Rerun repairs a stopped berth_fix launch and a stopped heal restart  · status: done
+
+**Source:** showrunner of natedev, 2026-10-29: the efficiency-unit rows of the rerun sweep (`docs/plans/sdlc-rerun-sweep.md`, main 4dfc4dce). Each row is a stop or a failure that leaves state a rerun does not repair.
+
+**Defects and fixes:**
+1. `scripts/berth_fix/launch.sh:107` — the new session id is saved before Claude starts. If the launch stops before Claude starts (for example the environment check fails), the rerun uses `-r` for a conversation that was never made. Fix: use `-r <id>` only when the recorded conversation's transcript exists in the account's project history (`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/<encoded worktree>/<id>.jsonl`); otherwise start again with `--session-id <same id>`.
+2. `scripts/berth_fix/launch.sh:116` — a stop after `git worktree move` and before the project-history move leaves the history at the old path; the rerun returns early because the new worktree exists. Fix: the history move is its own step that each launch runs, whether or not the worktree exists, and it uses the same account project folder as fix 1.
+3. `scripts/nix_env/heal.py:472` — a stop after the pending stop is saved and before `shutdown.py down` runs leaves a pending stop with no shutdown record; every later sweep waits at line 365 with no end. Fix: the pending stop records when its request was sent. A resumed pending stop with no sent mark and no shutdown record sends the request again while the same process (pid and start time) is alive; if that process is gone, it clears the pending stop and alerts. No pending stop waits with no end.
+
+**Tests:** each fix has a test that stops at the named line (a failure injected there) and then reruns, and proves the rerun repairs the state: `scripts/lib/test_nix_env_launches.py` or the existing berth_fix launch tests for 1 and 2, `scripts/nix_env/test_heal.py` for 3.
+
+**Acceptance:** the touched test modules and their callers' suites pass; basedpyright clean on changed Python files.
+
+**Residual (review, minor follow-up):** if `shutdown.py down` itself stops after `settle.begin()` writes the shutdown record and before its conductor starts, the heal stop keeps `stop_request_sent: false` with a record present, and a rerun of `down` skips the existing record (`settle.py:819`, an accounts-unit row of the same sweep). The repair belongs in settle's rerun of an unfinished record, not in heal.

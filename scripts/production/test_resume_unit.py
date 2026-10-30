@@ -20,7 +20,7 @@ import resume_unit
 import retire_unit
 import unit_lookup
 import unit_move
-from add_unit import Production, read_production
+from production_units import Production, read_production
 from record import SessionShutdown
 
 DIRECTOR = "11111111-1111-1111-1111-111111111111"

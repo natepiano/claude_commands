@@ -1,5 +1,8 @@
 # Review pool
 
+The pool no longer takes reviews. Unit directors use `assign.sh --role review`.
+The code and historical procedures below remain until the next phase removes them.
+
 ## What it is
 
 Each production has its own pool of long-lived, read-only Codex reviewers. A unit that needs a review calls a script, which hands it a reviewer at once. Each unit has a permanent reviewer per type: its first review forks one from the type's template, and every later review resumes that same thread, so the reviewer keeps building context about the unit's work across phases and plans. When every reviewer of the unit is busy, the pool forks the unit's newest reviewer, and the fork stays as the unit's second reviewer. A reviewer ends only when its unit is retired, `migrate` finds its unit gone, or the pool stops. A second reviewer type judges screenshots; it runs in shadow beside the Claude design-check helper until the user adopts it.
@@ -11,15 +14,15 @@ Each production has its own pool of long-lived, read-only Codex reviewers. A uni
 | File | Role |
 | --- | --- |
 | `scripts/direct/review_pool.py` | The pool CLI: templates, reviewers, unit leases, re-pointing, retire, migrate, stop, and the standing prompt each template is primed from |
-| `scripts/direct/review.sh` | The review launcher; its `--pool` path allocates, runs and records one review turn |
+| `scripts/direct/review.sh` | Uses unit reviewers; legacy code flags are ignored and UI flags refuse |
 | `scripts/direct/review_pool_report.py` | The cost and quality report over turn records, and `--shadow` |
 | `scripts/agents/codex_mesh.py` | The Codex mesh; `prime`, `fork`, `set-instructions` and three `follow` flags exist for the pool |
-| `config/review_pool/code.md` | Standing instructions of the code reviewer |
+| `config/review/code.md` | Standing instructions of the code reviewer |
 | `config/review_pool/ui.md` | Standing instructions of the UI reviewer |
 | `commands/unit/direct.md` | The unit director's side: pool form of each review launch, <UXReview/> |
 | `docs/direct/dual_review.md` | Pool prompt opening, pool launch call, cancel through the slot file |
 | `docs/direct/phase_end.md` | States that a pooled reviewer belongs to the unit and stays at phase end |
-| `docs/production_format.md` | Words, the `**Review pool:**` line, `retire` before a unit is marked retired, <ProductionUnit/> items 3 and 16 |
+| `docs/production_format.md` | Defines unit-owned reviewers and the unit lifecycle |
 | `commands/showrunner/produce.md` | `retire` for a retired unit, `stop` at wrap |
 
 ### State
@@ -148,7 +151,7 @@ A `--pool` launch and a `--to` launch each write one new file per attempt, inclu
 
 ### Prompts
 
-A reviewer's standing instructions come from its template, or from its latest re-point, and reach every turn of its thread. `config/review_pool/code.md` holds the role line, the Three Gods sentence, `type_design.md` verbatim and the Rust style guide's rule headings with each rule's file path. `config/review_pool/ui.md` holds the UI reviewer's whole procedure: the role line, the Three Gods sentence, the UX checklist with each rule file's name, the judging steps (shrink each shot, check that the shots cover every state the context names, propose canonical candidates only for empty slots, measure contrast and text size with `measure_text.py`, normalise sizes to a 1440×900 window, confirm each defect against the rule's included text) and the report format (`Verdict: pass | defects`, the `| Shot | Rule | Defect | Fix |` table, canonical candidates). It tells the reviewer not to load command or rule files; the rule texts come with the standing prompt (Review unit director and review memory). Neither file holds review memory.
+A reviewer's standing instructions come from its template, or from its latest re-point, and reach every turn of its thread. `config/review/code.md` holds the role line, the Three Gods sentence, `type_design.md` verbatim and the Rust style guide's rule headings with each rule's file path. `config/review_pool/ui.md` holds the UI reviewer's whole procedure: the role line, the Three Gods sentence, the UX checklist with each rule file's name, the judging steps (shrink each shot, check that the shots cover every state the context names, propose canonical candidates only for empty slots, measure contrast and text size with `measure_text.py`, normalise sizes to a 1440×900 window, confirm each defect against the rule's included text) and the report format (`Verdict: pass | defects`, the `| Shot | Rule | Defect | Fix |` table, canonical candidates). It tells the reviewer not to load command or rule files; the rule texts come with the standing prompt (Review unit director and review memory). Neither file holds review memory.
 
 On every design check the unit director writes two prompts (<UXReview/> step 3): `${SESSION_DIR}/ux_prompt_<pass>_helper.md`, the Claude helper's prompt that points at `commands/ux_eval.md`, and `ux_prompt_<pass>_pool.md`, which opens "Judge these shots by your standing instructions, which hold the rules and the report format:" and carries the shots, scale, context and production rules. The pool is launched with the pool file, so a pooled UI turn reads no rule or command file; it may still read `measure_text.py`'s source for its flags.
 
@@ -156,7 +159,7 @@ A pool code review prompt opens with the pooled-reviewer line (unit, phase, `Re-
 
 ### Priming
 
-No unit runs the pool, and no file holds review memory. Each permanent reviewer keeps its own thread of the reviews it did (user, 2026-10-19: "each individual reviewer needs to manage it's own reviews"). `review_pool.standing_prompt` builds a type's prompt on every allocate, from `REVIEW_POOL_CONFIG` (default `config/review_pool/`):
+No unit runs the pool, and no file holds review memory. Each permanent reviewer keeps its own thread of the reviews it did (user, 2026-10-19: "each individual reviewer needs to manage it's own reviews"). `review_pool.standing_prompt` builds a type's prompt on every allocate. Each type has a default base file: `code` uses `config/review/code.md`; `ui` uses `config/review_pool/ui.md`. A non-empty `REVIEW_POOL_CONFIG` replaces the folder for both types, so the base file is `<REVIEW_POOL_CONFIG>/<type>.md`. The prompt contains:
 
 - `code`: `code.md`.
 - `ui`, in order:
@@ -256,7 +259,7 @@ A rule stated with its mechanism above is not repeated here.
 **Numbers**
 
 - The prompt cache is per thread. First request after a new fork: 12,372 uncached / 11,392 cached / 8 output = 12,982 weighted tokens; on a thread that already held the prompt, 212 / 23,552 / 9 = 1,435. A fork took 0.189 s. This is one measured pair (2026-10-12, Codex CLI 0.162.1, `gpt-6.1-sol` weights uncached 1, cached 0.05, output 5; the run is recorded in `docs/as-built/review-pool-probes.md`), not a standing guarantee of cache behavior.
-- `config/review_pool/code.md` stays under 7 KB. `ui.md` holds the whole judging procedure and measures 8,376 bytes; `standing/ui.md` adds every rule's full text.
+- `config/review/code.md` stays under 7 KB. `ui.md` holds the whole judging procedure and measures 8,376 bytes; `standing/ui.md` adds every rule's full text.
 - A pooled UI turn with the rules in its standing prompt (2026-10-13: scratch pool, hana guide, 30 rules, one stored shot) read neither `ux_eval.md` nor a rule file, `--shadow` gave `pool missed defects: 0`, and it cost 79,903 weighted tokens in 6 requests against 102,264 in 8 for a turn that read them.
 
 **Mesh**
@@ -303,7 +306,7 @@ A reason given beside its mechanism above is not repeated here.
 - **Names are never reused.** A process still attached to a retired thread can point a reused name back at it.
 - **A failed `stop` keeps the `stopping` marker.** Clearing it would leave no later `stop` able to reach the ended lifetime's server.
 - **The launcher leaves its pass open on a signal.** If it closed the pass, the unit director's cancel call would fail on a closed pass.
-- **The pool prompt says `As in your standing instructions.` and names no file.** A reviewer holds the text it was last pointed at, which `config/review_pool/code.md` may no longer match.
+- **The pool prompt says `As in your standing instructions.` and names no file.** A reviewer holds the text it was last pointed at, which `config/review/code.md` may no longer match.
 - **Cost comes from the usage store.** It already holds every request with its model, time and compactions for both machines, so reading rollout files through `scripts/usage/rollouts.py` was ruled out.
 - **The pooled UI reviewer's standing prompt holds the rule texts.** A prompt that names `commands/ux_eval.md` and the rule files has them read again on every turn; with the texts standing, the turn reads none and cost about 22% fewer weighted tokens (Numbers).
 - **Design decisions come from the production's repository, never from the guide.** It is the file the helper's `ux_eval.md` reads; taking it from the guide would make the helper and the pool judge against different exceptions.
@@ -328,7 +331,7 @@ A reason given beside its mechanism above is not repeated here.
 ## Tests
 
 - `scripts/direct/test_review_pool.py` (56 tests) runs the pool CLI as subprocesses against a stub mesh named by `REVIEW_POOL_MESH`: primes and re-pointing (idle reviewers at prime, a busy one at its next allocate, a refused re-point keeping the old hash), allocation across phases of one unit, forks from the unit's reviewer and the template fallback, name issue, `release --thread-id` and the replaced-thread lease count, `retire`, `migrate` on a copy of the tool-based-ui layout, an old `split` key, `end-lease` ending nothing and `health` gone, dead reservations, `stop` and its recovery, a stop that lands during a prime, fork or retire, priming on allocate from the base prompt and the UX rules, and the adoption marker. `UIStandingPromptTests` pins `ui.md`'s verdict line, its table header and `measure_text.py`, and the absence of the old instructions to follow `ux_eval.md` and read a rule's full text.
-- `scripts/direct/test_review_launcher.py` (65 tests) covers `review.sh`: the pool path with no reset, the prompt sent as written on a first turn, the slot file, turn records of both launch paths and all four statuses, signals, a replaced thread, the tree check, the argument refusals, shots for `ui`, the `ux` row count, no pass for lens `ux`, and the assigned and fresh paths.
+- `scripts/direct/test_review_launcher.py` and its `_delivery`, `_records`, `_ux`, `_pool` and `_trees` modules (74 tests, sharing `review_launcher_test_support.py`) cover `review.sh`: the pool path with no reset, the prompt sent as written on a first turn, the slot file, turn records of both launch paths and all four statuses, signals, a replaced thread, the tree check, the argument refusals, shots for `ui`, the `ux` row count, no pass for lens `ux`, and the assigned and fresh paths.
 - `scripts/direct/test_review_pool_report.py` (73 tests) runs the report as subprocesses. `populate_usage_store` collects fixture rollouts into a fixture store, and `USAGE_STATE_DIR` points the script at it. It covers request attribution, every incomplete reason, compaction counts, outcome lines, records of both launch paths counted together, the quality table with merge holds, each merge-hold match case and the `merge holds unmatched` warning, plan normalization, Mac rows and histories, an absent and an unreadable store, the Mac source warning, and `--shadow` with its `Machine:` line. These tests call the collector's `SCHEMA`, `migrate_store`, `read_file`, `save_measurement` and `RoleResolver`; a rename in `scripts/usage/collect.py` breaks them. The fixtures prefix the collector's request key with the file path.
 - `scripts/agents/test_codex_mesh.py`, with a fake app-server, covers `prime`, `fork`, `set-instructions`, `reset`, the three `follow` flags, and standing instructions restored on resume, fork, compact and a replaced thread.
 - `scripts/production/test_review_unit_phase.py` (3 tests): the standing phase reads as `1 of 1`, running; a resume adds no run and no phase; shutdown finishes the run while the plan heading stays `todo`.

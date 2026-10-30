@@ -59,7 +59,7 @@ import unit_lookup  # noqa: E402
 import unit_move  # noqa: E402
 import unit_names  # noqa: E402
 import unit_runs  # noqa: E402
-from add_unit import Production  # noqa: E402
+from production_units import Production, read_production  # noqa: E402
 
 if TYPE_CHECKING:
     from scripts.message import sessions
@@ -156,7 +156,7 @@ def production_of(slug: str) -> Production:
     checked = showrunners.checked_doc(showrunners.NOTIFIER_STATE_DIR / f"showrunner-{slug}")
     if isinstance(checked, showrunners.NoCheckedDoc):
         raise Refused(f"{slug} has no readable update timer: {checked.reason}")
-    return add_unit.read_production(checked.path)
+    return read_production(checked.path)
 
 
 def find_unit(slug: str, given: str) -> Unit:
@@ -318,8 +318,9 @@ def run_processes(worktree: Path, inside: list[int]) -> dict[int, str]:
 
     A run's detached command (mesh_runs.py supervise) is found by its record, which holds the
     supervisor's pid and is in the supervisor's arguments; an app-server by its run's
-    mesh_server.json; an app-server's idle-stop watcher by the run folder in its arguments. Each
-    leads its own session, so its children go with it.
+    mesh_server.json; a live server's idle-stop watcher by its mesh entry point and run folder
+    arguments. A dead server's watcher needs no matching run history: its own kill -0 rule would
+    end it at its next wake. Each leads its own session, so its children go with it.
     """
     runs = runs_of(worktree)
     leaders = {item.pid: f"app-server {item.pid} of run {item.run.name}" for item in mesh_runs(runs)}
@@ -333,9 +334,19 @@ def run_processes(worktree: Path, inside: list[int]) -> dict[int, str]:
     folders = {str(folder.resolve()): folder.name for folder in runs}
     for pid in inside:
         words = command_line(pid)
-        named = [folders[word] for word in words if word in folders]
-        if words[:2] == ["sh", "-c"] and named and any("idle-stop" in word for word in words):
-            leaders[pid] = f"app-server watcher {pid} of run {named[0]}"
+        if (len(words) < 7 or Path(words[0]).name != "sh" or words[1] != "-c"
+                or "idle-stop" not in words[2] or Path(words[3]).resolve() != MESH.resolve()):
+            continue
+        try:
+            server = int(words[4])
+        except ValueError:
+            continue
+        if server <= 0:
+            continue
+        if not _alive(server):
+            leaders[pid] = f"app-server watcher {pid} of dead server {server}"
+        elif (folder := str(Path(words[6]).resolve())) in folders:
+            leaders[pid] = f"app-server watcher {pid} of run {folders[folder]}"
     return {pid: f"process {pid} ({_command_name(pid)}) of the {leaders[leader]}"
             for pid in inside if (leader := _session_of(pid)) in leaders}
 
@@ -661,20 +672,21 @@ def stop_rest(unit: Unit, found: Found) -> list[str]:
 def mark_retired(unit: Unit, director: DirectorSession | NoDirectorSession) -> None:
     """Put the retired note in front of the Units row's Plan cell and commit the doc on the merge branch."""
     doc = unit.production.doc
-    lines = doc.read_text(encoding="utf-8").split("\n")
-    headings = production_units.unit_headings(lines)
-    _, rows = production_units.unit_rows(lines)
-    plan_at = headings.index("Plan") + 1
-    note = retired_note(unit, director)
-    for index, line in enumerate(lines):
-        parts = line.split("|")
-        if line in rows and production_units.cell_value(parts[headings.index("Unit") + 1].strip()) == unit.name:
-            parts[plan_at] = f" {note} {parts[plan_at].strip()} "
-            lines[index] = "|".join(parts)
-            break
-    _ = doc.write_text("\n".join(lines), encoding="utf-8")
+    if not unit.retired:
+        lines = doc.read_text(encoding="utf-8").split("\n")
+        headings = production_units.unit_headings(lines)
+        _, rows = production_units.unit_rows(lines)
+        plan_at = headings.index("Plan") + 1
+        note = retired_note(unit, director)
+        for index, line in enumerate(lines):
+            parts = line.split("|")
+            if line in rows and production_units.cell_value(parts[headings.index("Unit") + 1].strip()) == unit.name:
+                parts[plan_at] = f" {note} {parts[plan_at].strip()} "
+                lines[index] = "|".join(parts)
+                break
+        _ = doc.write_text("\n".join(lines), encoding="utf-8")
     add_unit.commit_paths(unit.production, [doc], f"production({unit.production.slug}): retire {unit.name}")
-    print(f"marked: the Units row {note}, committed on {unit.production.merge_branch}")
+    print(f"marked: the retired Units row, committed on {unit.production.merge_branch}")
 
 
 def remove(unit: Unit) -> list[str]:
@@ -742,9 +754,9 @@ def retire(unit: Unit, wait_minutes: float) -> int:
         print("\n".join(f"left running: {reason}" for reason in left))
         print(f"{unit.name} is not retired: rerun once these stop")
         return 1
-    from scripts.guilds import roles
+    from scripts.astra import design_roles
     try:
-        roles.end_holder(unit.production.slug, unit.name)
+        design_roles.end_holder(unit.production.slug, unit.name)
     except (OSError, ValueError, SystemExit) as error:
         print(f"{unit.name} is not retired: held role cleanup: {error}")
         return 1
@@ -756,8 +768,8 @@ def retire(unit: Unit, wait_minutes: float) -> int:
         print("\n".join(f"left running: {reason}" for reason in left))
         print(f"{unit.name} is not retired: rerun once these stop")
         return 1
-    if not unit.retired:
-        mark_retired(unit, director)
+    # The note may have reached disk before its commit; finish it before removal.
+    mark_retired(unit, director)
     failed = remove(unit)
     print("\n".join(f"not removed: {reason}" for reason in failed) if failed else f"{unit.name} retired")
     return 1 if failed else 0

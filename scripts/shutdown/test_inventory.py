@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import ClassVar, cast, final, override
 from unittest.mock import patch
 
+from scripts.lib.socket_test_support import short_socket_directory
 from test_support import ShutdownTestCase, linux_process_fixture
 from test_restart import entry, top_level
 import record
@@ -98,6 +99,25 @@ class TranscriptReadCounter(io.BufferedReader):
         value = super().readline(size)
         self.bytes_read += len(value)
         return value
+
+
+class InventoryImportTests(unittest.TestCase):
+    def test_package_inventory_imports_without_shutdown_on_search_path(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        result = subprocess.run(
+            [sys.executable, "-I", "-c", """
+import sys
+from pathlib import Path
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root))
+assert str(root / "scripts/shutdown") not in sys.path
+from scripts.shutdown import inventory
+assert inventory.codex_seats([]) == []
+""", str(root)],
+            cwd=root / "scripts" / "herdr",
+            capture_output=True, text=True, check=False, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 @final
@@ -533,7 +553,7 @@ class InventoryTests(ShutdownTestCase):
         )
 
         self.director_pid = os.getpid()
-        socket_path = self.root / "director.sock"
+        socket_path = Path(self.enterContext(short_socket_directory())) / "director.sock"
         self.live_socket.close()
         self.live_socket = socket.socket(socket.AF_UNIX)
         self.live_socket.bind(str(socket_path))
