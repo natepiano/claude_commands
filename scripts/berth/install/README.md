@@ -41,6 +41,8 @@ The command builds `cargo-berth`, installs it in
 `${CARGO_HOME:-$HOME/.cargo}/bin`, and restores the preceding engine if
 publication fails.
 
+After an install, run `cd ~/.claude/scripts && python3 -m unittest berth.tests.check_installed_hooks`.
+
 ## Registration
 
 Register the three absolute paths once, in `~/.claude/settings.json`:

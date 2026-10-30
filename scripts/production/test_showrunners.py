@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import json
-import io
-from contextlib import redirect_stdout
+from dataclasses import FrozenInstanceError
 import os
 import re
 import shlex
@@ -28,6 +27,9 @@ import showrunners
 from sessions import SessionRecord
 from fake_unit_host import HostedUnit
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.production import staff
+from scripts.production.staff_test_support import StaffTestCase
+from scripts.production.rename_test_support import bind_staff_fixture
 
 
 SCRIPT = Path(__file__).with_name("showrunners.py")
@@ -39,7 +41,7 @@ def setUpModule() -> None:
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
 
-class ShowrunnerRegistryTests(unittest.TestCase):
+class ShowrunnerFixture(StaffTestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root: Path = Path()
@@ -56,7 +58,7 @@ class ShowrunnerRegistryTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        super().setUp()
         self.config = self.root / "config" / "showrunners.json"
         self.config.parent.mkdir()
         self.notifier = self.root / "notifier"
@@ -90,59 +92,7 @@ for record in records:
         raise SystemExit(0)
 raise SystemExit(1)
 """)
-
-    def test_adoption_retries_a_partial_file_or_directory_copy(self) -> None:
-        for name, directory in (("unit_status", True), ("showrunner_state.json", False)):
-            with self.subTest(name=name), mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", self.state):
-                scratch = self.root / f"scratch-{name}"
-                scratch.mkdir()
-                source = scratch / name
-                if directory:
-                    source.mkdir()
-                    _ = (source / "first").write_text("first state")
-                    _ = (source / "last").write_text("last state")
-                else:
-                    _ = source.write_text('{"complete": true}\n')
-
-                def interrupted_copy(source: Path, destination: Path) -> None:
-                    if source.is_dir():
-                        destination.mkdir()
-                        _ = (destination / "first").write_text("partial")
-                    else:
-                        _ = destination.write_text("partial")
-                    raise InterruptedError("copy stopped")
-
-                with mock.patch.object(shutil, "copytree" if directory else "copy2",
-                                       side_effect=interrupted_copy), self.assertRaises(InterruptedError):
-                    _ = showrunners.copy_session_state(name, scratch)
-                copied = showrunners.copy_session_state(name, scratch)
-                self.assertEqual(copied, [name])
-                target = showrunners.session_state_dir(name) / name
-                if directory:
-                    self.assertEqual({p.name: p.read_bytes() for p in target.iterdir()},
-                                     {p.name: p.read_bytes() for p in source.iterdir()})
-                else:
-                    self.assertEqual(target.read_bytes(), source.read_bytes())
-                self.assertEqual(sorted(p.name for p in target.parent.iterdir()), [name])
-                self.assertEqual(showrunners.copy_session_state(name, scratch), [])
-
-    def test_attach_retries_routing_notices_after_the_parent_was_saved(self) -> None:
-        self.showrunner("top")
-        self.showrunner("mid")
-        with mock.patch.dict(os.environ, self.environment()), \
-                mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", self.state), \
-                mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier), \
-                mock.patch.object(showrunners, "registered_showrunners", return_value=[]), \
-                mock.patch.object(showrunners, "tell_others", side_effect=RuntimeError("before notices")), \
-                redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
-            _ = showrunners.main(["attach", "mid", "top"])
-        self.assertEqual((self.state / "mid/parent").read_text(), "top\n")
-        self.assertEqual(self.successful("attach", "mid", "top").splitlines(),
-                         ["mid now reports to top", "told mid", "told top"])
-        notices = self.messages()
-        self.assertEqual(len(notices), 2)
-        self.assertIn("send it each item for the user", notices[0][1])
-        self.assertIn("never a unit", notices[1][1])
+        bind_staff_fixture(self, self.environment(), {})
 
     def close_processes(self) -> None:
         for child in self.children:
@@ -192,7 +142,9 @@ raise SystemExit(1)
                 "TEST_SENT": str(self.sent), "CLAUDE_CODE_SESSION_ID": caller,
                 **fake_unit_host.environment(self.root), "HERDR_PANE_ID": pane}
 
-    def cli(self, *args: str, pane: str = "", caller: str = "") -> subprocess.CompletedProcess[str]:
+    @override
+    def cli(self, *args: str, pane: str = "", caller: str = "", code: int = 0) -> subprocess.CompletedProcess[str]:
+        del code
         return subprocess.run([sys.executable, str(SCRIPT), *args], env=self.environment(pane, caller),
                               capture_output=True, text=True, check=False)
 
@@ -201,9 +153,9 @@ raise SystemExit(1)
         self.assertEqual(result.returncode, 0, (args, result.stdout, result.stderr))
         return result.stdout
 
-    def refused(self, *args: str, caller: str = "") -> str:
+    def refused(self, *args: str, caller: str = "", code: int = 1) -> str:
         result = self.cli(*args, caller=caller)
-        self.assertEqual(result.returncode, 1, (args, result.stdout, result.stderr))
+        self.assertEqual(result.returncode, code, (args, result.stdout, result.stderr))
         self.assertEqual(result.stdout, "")
         return result.stderr
 
@@ -217,6 +169,7 @@ raise SystemExit(1)
                                encoding="utf-8")
         if running:
             _ = self.record(name or slug, f"{slug}-id")
+        _ = staff.ensure("showrunner", name=slug)
 
     def messages(self) -> list[tuple[str, str]]:
         """Each message sent, as the socket it went to and its text."""
@@ -230,11 +183,56 @@ raise SystemExit(1)
         (self.state / child).mkdir(parents=True, exist_ok=True)
         _ = (self.state / child / "parent").write_text(f"{parent}\n")
 
+    def recorded_parent(self, child: str, parent: str) -> None:
+        """Prepare authoritative edges alongside the legacy files still written by tools."""
+        record = staff.initial_snapshot()
+        parent_row = record.by_path(parent) or staff.ensure("showrunner", name=parent)
+        child_row = record.by_path(child) or staff.ensure("showrunner", name=child)
+        _ = staff.move(child_row.id, parent_row.id)
+        self.stored_parent(child, parent)
+
     def unit_session(self, unit: str, pane: str) -> None:
         """Give the production `show` one marked herdr pane."""
         marks = {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": unit}
         self.hosted_units.append(HostedUnit(f"label-of-{unit}", pane, marks))
         fake_unit_host.write(self.environment(), self.hosted_units)
+
+
+class ShowrunnerRegistryTests(ShowrunnerFixture):
+    def test_adoption_retries_a_partial_file_or_directory_copy(self) -> None:
+        for name, directory in (("unit_status", True), ("showrunner_state.json", False)):
+            with self.subTest(name=name), mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", self.state):
+                scratch = self.root / f"scratch-{name}"
+                scratch.mkdir()
+                source = scratch / name
+                if directory:
+                    source.mkdir()
+                    _ = (source / "first").write_text("first state")
+                    _ = (source / "last").write_text("last state")
+                else:
+                    _ = source.write_text('{"complete": true}\n')
+
+                def interrupted_copy(source: Path, destination: Path) -> None:
+                    if source.is_dir():
+                        destination.mkdir()
+                        _ = (destination / "first").write_text("partial")
+                    else:
+                        _ = destination.write_text("partial")
+                    raise InterruptedError("copy stopped")
+
+                with mock.patch.object(shutil, "copytree" if directory else "copy2",
+                                       side_effect=interrupted_copy), self.assertRaises(InterruptedError):
+                    _ = showrunners.copy_session_state(name, scratch)
+                copied = showrunners.copy_session_state(name, scratch)
+                self.assertEqual(copied, [name])
+                target = showrunners.session_state_dir(name) / name
+                if directory:
+                    self.assertEqual({p.name: p.read_bytes() for p in target.iterdir()},
+                                     {p.name: p.read_bytes() for p in source.iterdir()})
+                else:
+                    self.assertEqual(target.read_bytes(), source.read_bytes())
+                self.assertEqual(sorted(p.name for p in target.parent.iterdir()), [name])
+                self.assertEqual(showrunners.copy_session_state(name, scratch), [])
 
     def test_checked_doc_reads_absolute_path_after_check_script(self) -> None:
         directory = self.notifier / "showrunner-check"
@@ -269,6 +267,16 @@ raise SystemExit(1)
         self.assertEqual([(runner["session"], runner["socket"]) for runner in absent], [("", ""), ("", "")])
         sockets.assert_not_called()
         names.assert_not_called()
+
+    def test_an_unreadable_timer_conf_refuses_registry_discovery_beside_a_good_timer(self) -> None:
+        self.instance("showrunner-a-good", target="session:good-id", doc=self.doc)
+        self.instance("showrunner-z-bad", target="session:bad-id", doc=self.root / "bad-production.md")
+        conf = self.notifier / "showrunner-z-bad" / "conf"
+        conf.unlink()
+        conf.mkdir()
+        with self.assertRaises(IsADirectoryError) as raised:
+            _ = showrunners.registered_showrunners(self.notifier, known_sessions={})
+        self.assertIn(str(conf), str(raised.exception))
 
     def test_checked_doc_refuses_missing_check_line(self) -> None:
         directory = self.notifier / "showrunner-check"
@@ -321,13 +329,6 @@ raise SystemExit(1)
               mock.patch.object(showrunners, "SESSIONS", self.sessions_script)):
             self.assertEqual(showrunners.current_address("old"), address)
             self.assertEqual(showrunners.current_name("old"), "new-name")
-
-    def test_attach_refuses_a_running_showrunner_not_named_for_its_production(self) -> None:
-        self.showrunner("top")
-        self.showrunner("mid", name="mid-name")
-        stderr = self.refused("attach", "mid", "top")
-        self.assertIn("production mid has showrunner mid-name", stderr)
-        self.assertFalse((self.state / "mid/parent").exists())
 
     def test_named_accepts_a_live_session_name_and_a_former_production_slug(self) -> None:
         self.showrunner("new", formerly=("old",), name="new-name")
@@ -470,157 +471,34 @@ raise SystemExit(1)
                 with self.assertRaisesRegex(ValueError, re.escape(str(self.config))):
                     _ = showrunners.load_settings_from(self.config)
 
-    def test_attach_stores_the_parent_and_every_lookup_reads_it(self) -> None:
-        self.showrunner("top")
-        self.showrunner("mid")
-        self.showrunner("leaf", running=False)
-        attached = self.successful("attach", "mid", "top")
-        self.assertEqual(attached.splitlines(), ["mid now reports to top", "told mid", "told top"])
-        self.assertEqual((self.state / "mid" / "parent").read_text(), "top\n")
-        deeper = self.successful("attach", "leaf", "mid")
-        self.assertEqual(deeper.splitlines(),
-                         ["leaf now reports to mid", "leaf is not running: tell it when it starts", "told mid"])
-        self.assertEqual(self.successful("parent", "leaf"), "mid\n")
-        self.assertEqual(self.successful("parent", "top"), "")
-        self.assertEqual(self.successful("children", "top"), "mid\n")
-        self.assertEqual(self.successful("children", "leaf"), "")
-        self.assertEqual([self.successful("root", slug) for slug in ("top", "mid", "leaf")], ["top\n"] * 3)
-        self.assertEqual(self.successful("tree").splitlines(),
-                         ["top\ttop", "  mid\tmid", "    leaf\t<not running>"])
-        sockets = [socket for socket, _ in self.messages()]
-        self.assertEqual(sockets, [f"uds:{self.root / f'{slug}-id.sock'}" for slug in ("mid", "top", "mid")])
-        to_child, to_parent, to_leafs_parent = (text for _, text in self.messages())
-        self.assertIn("mid now reports to top. The root is top: send it each item for the user.", to_child)
-        self.assertIn("never a unit: it has no Units row", to_parent)
-        self.assertIn("leaf now reports to mid. It is a child showrunner", to_leafs_parent)
+    def test_delivery_result_tracks_failed_targets_and_preserves_output_lines(self) -> None:
+        def address(slug: str) -> str:
+            return "session:" + slug
 
-    def test_tree_commands_accept_former_slugs_and_answer_with_current_slugs(self) -> None:
-        self.showrunner("top", running=False, formerly=("old-top",))
-        self.showrunner("leaf", running=False, formerly=("old-leaf",))
-        self.stored_parent("leaf", "top")
-        for arguments, expected in ((("parent", "old-leaf"), "top\n"),
-                                    (("children", "old-top"), "leaf\n"),
-                                    (("root", "old-leaf"), "top\n")):
-            with self.subTest(arguments=arguments):
-                self.assertEqual(self.successful(*arguments), expected)
+        with mock.patch.object(showrunners, "own_slug", return_value="self"), \
+                mock.patch.object(showrunners, "current_address", side_effect=address), \
+                mock.patch.object(showrunners, "send_to_address", wraps=showrunners.send_to_address) as sender, \
+                mock.patch.object(subprocess, "run", side_effect=[
+                    subprocess.CompletedProcess([], 0, "", ""), subprocess.CompletedProcess([], 3, "", "offline")]):
+            delivery = showrunners.tell_others({"self": "skip", "top": "hello", "mid": "hello"}, "notice")
+        self.assertEqual(list(delivery.lines), ["told top", "could not tell mid: offline"])
+        self.assertEqual(delivery.failed, ("mid",))
+        self.assertEqual(sender.call_args_list, [mock.call("session:top", "notice", "hello", recipient="top"),
+                                                 mock.call("session:mid", "notice", "hello", recipient="mid")])
+        with self.assertRaises(FrozenInstanceError):
+            setattr(delivery, "lines", ())
+        with self.assertRaises(FrozenInstanceError):
+            setattr(delivery, "failed", ())
 
-    def test_attach_and_detach_former_slugs_use_the_current_state_directory(self) -> None:
-        self.showrunner("top", running=False, formerly=("old-top",))
-        self.showrunner("leaf", running=False, formerly=("old-leaf",))
-        with (mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
-              mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", self.state)):
-            showrunners.attach("old-leaf", "old-top")
-            self.assertEqual((self.state / "leaf" / "parent").read_text(), "top\n")
-            self.assertFalse((self.state / "old-leaf").exists())
-            self.assertEqual(showrunners.detach("old-leaf"), "top")
-            self.assertFalse((self.state / "leaf" / "parent").exists())
-
-    def test_attach_with_no_parent_named_takes_the_callers_production_and_sends_the_caller_nothing(self) -> None:
-        self.showrunner("top")
-        self.showrunner("mid")
-        attached = self.successful("attach", "mid", caller="top-id")
-        self.assertEqual(attached.splitlines(), ["mid now reports to top", "told mid"])
-        self.assertEqual([socket for socket, _ in self.messages()], [f"uds:{self.root / 'mid-id.sock'}"])
-        self.assertIn("name the parent: this session runs no production", self.refused("attach", "top"))
-
-    def test_attach_refuses_and_names_the_cause_and_stores_nothing(self) -> None:
-        self.showrunner("top")
-        self.showrunner("mid")
-        self.showrunner("leaf")
-        self.assertIn("gone has no update timer", self.refused("attach", "mid", "gone"))
-        self.assertIn("mid cannot report to itself", self.refused("attach", "mid", "mid"))
-        self.assertFalse(self.state.exists())
-        _ = self.successful("attach", "mid", "top")
-        _ = self.successful("attach", "leaf", "mid")
-        # A child two levels down is told the top of the whole tree, not its own parent.
-        self.assertIn("leaf now reports to mid. The root is top:", self.messages()[2][1])
-        self.assertIn("mid already reports to top; detach it first", self.refused("attach", "mid", "leaf"))
-        self.assertIn("leaf already reports to top, directly or through others", self.refused("attach", "top", "leaf"))
-        self.assertEqual(sorted(path.parent.name for path in self.state.glob("*/parent")), ["leaf", "mid"])
-        self.assertEqual(len(self.messages()), 4)
-
-    def test_detach_removes_the_edge_tells_both_and_refuses_a_child_with_none(self) -> None:
-        self.showrunner("top")
-        self.showrunner("mid")
-        _ = self.successful("attach", "mid", "top")
-        detached = self.successful("detach", "mid")
-        self.assertEqual(detached.splitlines(), ["mid no longer reports to top", "told mid", "told top"])
-        self.assertFalse((self.state / "mid" / "parent").exists())
-        self.assertEqual(self.successful("root", "mid"), "mid\n")
-        self.assertIn("mid is a root again", self.messages()[-1][1])
-        self.assertIn("mid reports to no one", self.refused("detach", "mid"))
-
-    def test_a_message_that_could_not_be_sent_is_said_and_the_edge_stands(self) -> None:
-        self.showrunner("top")
-        self.showrunner("mid")
-        failing = {**self.environment(), "TEST_SEND_EXIT": "3"}
-        result = subprocess.run([sys.executable, str(SCRIPT), "attach", "mid", "top"], env=failing,
-                                capture_output=True, text=True, check=False)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), ["mid now reports to top", "could not tell mid: send.py exited 3",
-                                                      "could not tell top: send.py exited 3"])
-        self.assertEqual(self.successful("parent", "mid"), "top\n")
-
-    def test_an_edge_to_a_production_with_no_timer_counts_for_nothing(self) -> None:
-        self.showrunner("top")
-        self.showrunner("mid")
-        self.stored_parent("mid", "wrapped")
-        self.assertEqual(self.successful("parent", "mid"), "")
-        self.assertEqual(self.successful("root", "mid"), "mid\n")
-        self.assertEqual(self.successful("tree").splitlines(), ["mid\tmid", "top\ttop"])
-        # The dead edge does not hold the child: it attaches again without a detach.
-        _ = self.successful("attach", "mid", "top")
-        self.assertEqual(self.successful("parent", "mid"), "top\n")
-
-    def test_a_cycle_written_by_hand_makes_each_of_its_members_a_root(self) -> None:
-        for slug in ("one", "two", "under"):
-            self.showrunner(slug, running=False)
-        self.stored_parent("one", "two")
-        self.stored_parent("two", "one")
-        self.stored_parent("under", "one")
-        self.assertEqual([self.successful("root", slug) for slug in ("one", "two", "under")],
-                         ["one\n", "two\n", "one\n"])
-        self.assertEqual(self.successful("tree").splitlines(),
-                         ["one\t<not running>", "  under\t<not running>", "two\t<not running>"])
-
-    def test_a_lookup_refuses_a_production_with_no_timer(self) -> None:
-        self.showrunner("top")
-        for lookup in ("children", "root"):
-            self.assertIn("gone has no update timer", self.refused(lookup, "gone"))
-
-    def test_a_showrunner_faces_its_own_production_and_with_below_every_level_under_it(self) -> None:
-        self.stored_parent("mid", "top")
-        self.stored_parent("other", "top")
-        self.stored_parent("leaf", "mid")
-        known = {"top", "mid", "other", "leaf", "alone"}
-        with (mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", self.state),
-              mock.patch.object(showrunners, "timer_slugs", return_value=known)):
-            self.assertEqual([showrunners.root_of(slug) for slug in ("top", "mid", "leaf", "alone")],
-                             ["top", "top", "top", "alone"])
-            self.assertEqual(showrunners.descendants_of("mid"), ["leaf"])
-            for slug in ("top", "mid", "leaf", "alone"):
-                self.assertEqual(showrunners.user_facing(slug), [slug])
-            self.assertEqual(showrunners.user_facing("top", below=True), ["top", "mid", "other", "leaf"])
-            self.assertEqual(showrunners.user_facing("mid", below=True), ["mid", "leaf"])
-            self.assertEqual(showrunners.user_facing("leaf", below=True), ["leaf"])
-
-    def test_what_all_must_hear_once_goes_to_the_highest_running_showrunner_of_each_tree(self) -> None:
-        def runner(slug: str, *, running: bool) -> showrunners.Showrunner:
-            return showrunners.Showrunner(session=slug if running else "", socket=f"/{slug}.sock" if running else "",
-                                          slug=slug, zone="UTC", doc="/d")
-
-        self.stored_parent("mid", "top")
-        self.stored_parent("leaf", "mid")
-        self.stored_parent("orphan", "down")
-        with mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", self.state):
-            every = [runner(slug, running=True) for slug in ("top", "mid", "leaf", "alone")]
-            self.assertEqual([one["slug"] for one in showrunners.highest_running(every)], ["top", "alone"])
-            # With the root down, the showrunner nearest it hears, and nothing below that one does.
-            below = [runner("top", running=False), runner("mid", running=True), runner("leaf", running=True),
-                     runner("down", running=False), runner("orphan", running=True)]
-            self.assertEqual([one["slug"] for one in showrunners.highest_running(below)], ["mid", "orphan"])
-            self.assertEqual(showrunners.highest_running([]), [])
-
+    def test_public_address_sender_preserves_recipient_sender_key_and_text(self) -> None:
+        with mock.patch.dict(os.environ, self.environment()), \
+                mock.patch.object(showrunners, "SEND", self.send_script):
+            delivery = showrunners.send_to_address("session:unit-id", "transfer-key", "new production\nkeep running",
+                                                   recipient="alpha-unit", sender="transfer_unit")
+        self.assertEqual(delivery, showrunners.NoticeDelivery(("told alpha-unit",)))
+        sent = [json.loads(line) for line in self.sent.read_text().splitlines()]
+        self.assertEqual(sent, [["--to", "session:unit-id", "--from", "transfer_unit", "--key", "transfer-key",
+                                 "--text", "new production\nkeep running"]])
 
 
 class HerdrNameTests(unittest.TestCase):

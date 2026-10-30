@@ -6,7 +6,6 @@ from __future__ import annotations
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
 
-import base64
 import io
 import json
 import os
@@ -16,7 +15,8 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
+from collections.abc import Mapping
+from contextlib import AbstractContextManager, ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
@@ -31,6 +31,7 @@ sys.path.insert(0, str(SCRIPTS / "production"))
 sys.path.insert(0, str(SCRIPTS / "direct"))
 
 import codex_daemon
+from codex_test_support import FakeDaemon, receive_frame, reply, write_codex_account
 import process_table
 import remove_workers
 import roster
@@ -1805,6 +1806,66 @@ class RosterTests(unittest.TestCase):
         self.assertTrue(errors[0].startswith("could not read: "))
         self.assertIn("daemon closed mid-call", errors[0])
 
+    def test_stalled_accounts_share_one_deadline_and_keep_the_healthy_daemons_rows(self) -> None:
+        read_times: list[float] = []
+        read_daemons = codex_daemon.read_daemons
+
+        def timed_read_daemons(environment: Mapping[str, str]) -> list[codex_daemon.DaemonRead]:
+            started = time.monotonic()
+            found = read_daemons(environment)
+            read_times.append(time.monotonic() - started)
+            return found
+
+        def stalled(connection: socket.socket) -> None:
+            self.assertEqual(receive_frame(connection)["method"], "initialize")
+            connection.settimeout(2)
+            self.assertEqual(connection.recv(1), b"")
+
+        def healthy(connection: socket.socket) -> None:
+            request = receive_frame(connection)
+            self.assertEqual(request["method"], "initialize")
+            reply(connection, request, {})
+            self.assertEqual(receive_frame(connection)["method"], "initialized")
+            request = receive_frame(connection)
+            self.assertEqual(request["method"], "thread/loaded/list")
+            reply(connection, request, {"data": ["healthy-thread"]})
+            request = receive_frame(connection)
+            self.assertEqual(request["method"], "thread/read")
+            reply(connection, request, {"thread": {
+                "id": "healthy-thread", "name": "Healthy account", "cwd": str(self.root),
+                "status": {"type": "idle"},
+            }})
+
+        with short_socket_directory() as directory, ExitStack() as daemons:
+            home = Path(directory)
+            notes = home / "notes"
+            homes = [home / ".codex", *(home / f".codex{number}" for number in range(1, 5))]
+            for number, account_home in enumerate(homes):
+                write_codex_account(account_home, notes, f"codex{number + 1}")
+                control = account_home / "app-server-control"
+                control.mkdir()
+                _ = daemons.enter_context(FakeDaemon(
+                    control / "app-server-control.sock", healthy if account_home == homes[-1] else stalled,
+                ))
+            with mock.patch.dict(os.environ, {
+                "HOME": str(home), "AGENT_NOTES_DIR": str(notes), "ROSTER_CODEX_SOCKET": "",
+            }), mock.patch.object(codex_daemon, "TIMEOUT_SECONDS", 0.3), \
+                    mock.patch.object(codex_daemon, "read_daemons", new=timed_read_daemons):
+                found = roster.roster(os.environ, roster.ThisMachine())
+            self.assertEqual(len(read_times), 1)
+            elapsed = read_times[0]
+            self.assertLess(elapsed, 0.9, "account timeouts must share one discovery budget")
+            entries = [entry for entry in found.entries if entry.name == "Healthy account"]
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0].thread, roster.CodexThread("healthy-thread"))
+            self.assertEqual(entries[0].daemon, codex_daemon.CodexDaemon(
+                homes[-1], homes[-1] / "app-server-control/app-server-control.sock"))
+            self.assertEqual(entries[0].account, roster.AccountLabel("codex5"))
+            self.assertEqual(found.problems, [
+                f"Codex daemon ~/{account_home.name}: timed out after 0.3 s"
+                for account_home in homes[:-1]
+            ])
+
     def test_unreadable_process_table_is_a_problem_not_a_crash(self) -> None:
         failure = subprocess.CalledProcessError(2, ["ps"])
         with mock.patch.object(process_table, "snapshot", side_effect=failure), \
@@ -1836,13 +1897,12 @@ class RosterTests(unittest.TestCase):
         os.environ["AGENT_NOTES_DIR"] = str(notes)
         self.environment["AGENT_NOTES_DIR"] = str(notes)
         login = f"{tool}{number}@example.invalid"
-        _ = (notes / f"{tool}{number}.md").write_text(f"---\nlogin: {login}\n---\n")
         home = self.home / (f".codex{number}" if tool == "codex" and number != 2 else ".codex" if tool == "codex" else f".claude{number}")
         home.mkdir(exist_ok=True)
         if tool == "codex":
-            claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
-            _ = (home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
+            write_codex_account(home, notes, f"{tool}{number}")
         else:
+            _ = (notes / f"{tool}{number}.md").write_text(f"---\nlogin: {login}\n---\n")
             _ = (home / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": login}}))
         return home
 
@@ -1930,9 +1990,11 @@ class RosterTests(unittest.TestCase):
     def test_daemon_rows_use_the_home_holding_the_socket(self) -> None:
         home = self.account_note(1)
         _ = self.account_note(2)
-        with mock.patch.object(codex_daemon, "daemon_socket", return_value=home / "app-server-control" / "daemon.sock"):
+        path = home / "app-server-control" / "daemon.sock"
+        with mock.patch.dict(os.environ, {"ROSTER_CODEX_SOCKET": str(path)}):
             entry = self._entries()["Codex window"]
         self.assertEqual(entry.account, roster.AccountLabel("codex1"))
+        self.assertEqual(entry.daemon, codex_daemon.CodexDaemon(home, path))
 
     def test_reviewers_require_a_readable_environment_before_using_the_default_home(self) -> None:
         _ = self.account_note(1)
@@ -2024,7 +2086,8 @@ class RosterTests(unittest.TestCase):
                     director=roster.UnderDirector("unit", "base", "session:base"),
                     assignment=roster.WorkerAssignment("impl", "/remote/run")),
             replace(base, kind="codex", session=roster.NoClaudeSession(), thread=roster.CodexThread("daemon"),
-                    reach=roster.Messageable("codex:daemon")),
+                    reach=roster.Messageable("codex:daemon"),
+                    daemon=codex_daemon.CodexDaemon(Path("/remote/.codex2"), Path("/remote/.codex2/socket"))),
             replace(base, kind="codex", role="worker", session=roster.NoClaudeSession(),
                     reach=roster.CannotReceiveMessages("between turns; no unit director is running"),
                     assignment=roster.WorkerAssignment("test", "/remote/no-thread")),
@@ -2105,6 +2168,120 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(director.role, "unit director")
         self.assertTrue(any("unit hosts for alpha were not read" in problem for problem in result.problems))
         self.assertEqual(self.ssh_calls(), [])
+
+
+class CodexHolderLabelsTests(unittest.TestCase):
+    root: Path = Path()
+    runs: Path = Path()
+    registry: Path = Path()
+    environment: dict[str, str] = {}
+    thread: str = "01a1775e-0fcd-7842-a664-436a33f9007b"
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.runs = self.root / "runs"
+        self.registry = self.root / "sessions"
+        notifier = self.root / "notifier"
+        for directory in (self.runs / "active", self.registry, notifier, self.root / "home"):
+            directory.mkdir(parents=True)
+        self.environment = {
+            **os.environ, "HOME": str(self.root / "home"),
+            "NOTIFIER_SESSIONS_DIR": str(self.registry), "NOTIFIER_STATE_DIR": str(notifier),
+            "ROSTER_RUN_ROOT": str(self.runs), "HERDR_PROC": str(self.root / "proc"),
+            "HERDR_BIN": str(SCRIPTS / "herdr/fake_herdr.py"),
+            "ROSTER_CODEX_SOCKET": str(self.root / "no-daemon.sock"),
+            "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
+            "REVIEW_POOL_STATE": str(self.root / "review-pool"),
+            "FAKE_HERDR_RESPONSES": str(self.root / "herdr.json"),
+            "FAKE_HERDR_LOG": str(self.root / "herdr.log"),
+        }
+        environment_patch = cast(AbstractContextManager[object], mock.patch.dict(os.environ, self.environment, clear=True))
+        _ = self.enterContext(environment_patch)
+        _ = self.enterContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", notifier))
+        # Both registry records are live processes, with real start identities.
+        # Only their declared unit marks and run metadata come from fixture files.
+        for pid, sid, name in ((os.getppid(), "holder-director", "report-director"),
+                               (os.getpid(), "holder-runner", "builds-runner")):
+            start = sessions.process_start(pid)
+            self.assertIsNotNone(start)
+            _ = (self.registry / f"{pid}.json").write_text(json.dumps({
+                "pid": pid, "sessionId": sid, "name": name, "procStart": start,
+                "messagingSocketPath": "", "updatedAt": 1, "cwd": str(self.root / name),
+            }))
+        self.process(991099, 0, ["herdr", "--session", "native", "server"])
+        self.process(os.getppid(), 991099, ["claude"],
+                     "HERDR_PANE_ID=w1:p1\0SHOWRUNNER_UNIT=builds\0SHOWRUNNER_UNIT_ID=report-unit\0")
+        self.process(os.getpid(), 0, ["claude"])
+        herdr_listener(self.root / "proc", 991099, "native", os.environ)
+        _ = (self.root / "herdr.json").write_text(json.dumps({
+            "--session default session list --json": {"code": 0, "stdout": json.dumps({
+                "sessions": [{"name": "native", "running": True, "default": False,
+                              "session_dir": "/fixture", "socket_path": "/fixture/socket"}],
+            })},
+            "--session native agent list": {"code": 0, "stdout": '{"ok": true, "result": {"agents": []}}'},
+        }))
+        doc = self.root / "production.md"
+        _ = doc.write_text("## Units\n| Unit | Plan | Worktree | Branch | Port | Owns |\n"
+                           + "| --- | --- | --- | --- | --- | --- |\n"
+                           + f"| report-unit | plan.md | {self.root / 'report-director'} | report | — | — |\n")
+        timer = notifier / "showrunner-builds"
+        timer.mkdir()
+        _ = (timer / "conf").write_text(f"TARGET=session:holder-runner\nCHECK=zsh /scripts/production_check.sh {doc}\n")
+        run = self.runs / "run-00"
+        self.mesh(run, {"report-test2": {"thread_id": self.thread, "status": "running"}})
+        _ = (self.runs / "active/holder-director").write_text(str(run) + "\n")
+
+    def process(self, pid: int, parent: int, argv: list[str], environment: str = "") -> None:
+        directory = self.root / "proc" / str(pid)
+        directory.mkdir(parents=True)
+        _ = (directory / "stat").write_text(f"{pid} (fixture) S {parent} 0 0")
+        _ = (directory / "cmdline").write_bytes("\0".join(argv).encode())
+        _ = (directory / "environ").write_bytes(environment.encode())
+        (directory / "cwd").symlink_to(self.root)
+
+    def mesh(self, run: Path, workers: dict[str, dict[str, object]]) -> None:
+        run.mkdir(parents=True, exist_ok=True)
+        _ = (run / "mesh_roster.json").write_text(json.dumps(workers))
+
+    def test_codex_thread_labels_equal_full_roster_without_mocking_readers(self) -> None:
+        full = roster.unit_labels(roster.roster(self.environment, roster.ThisMachine()).entries)
+        fast = roster.unit_labels_for([self.thread, "holder-director", "unknown-thread", "report-test2"], self.environment)
+        self.assertEqual(fast, {sid: full[sid] for sid in (self.thread, "holder-director")})
+        self.assertEqual(fast[self.thread], roster.UnitLabels("report-test2", "builds", "report"))
+        self.assertEqual(fast["holder-director"], roster.UnitLabels("report-director", "builds", "report"))
+
+    def test_twenty_run_lookup_is_well_inside_the_cli_budget(self) -> None:
+        wanted = [self.thread]
+        expected = {self.thread: roster.UnitLabels("report-test2", "builds", "report")}
+        for number in range(1, 20):
+            run = self.runs / f"run-{number:02}"
+            thread = f"01a1775e-0fcd-7842-a664-{number:012}"
+            name = f"report-test-{number}"
+            self.mesh(run, {name: {"thread_id": thread, "status": "done"}})
+            (run / "heartbeat.log").touch()
+            _ = (run / "progress_history_state.json").write_text(json.dumps({"production": "builds", "unit": "report-unit"}))
+            wanted.append(thread)
+            expected[thread] = roster.UnitLabels(name, "builds", "report")
+        started = time.perf_counter()
+        labels = roster.unit_labels_for([*wanted, "unknown-thread"], self.environment)
+        elapsed = time.perf_counter() - started
+        self.assertEqual(labels, expected)
+        self.assertLess(elapsed, 0.2, f"20-run label lookup took {elapsed:.3f} seconds")
+
+    def test_retired_and_redirected_workers_and_stale_runs_are_not_holders(self) -> None:
+        records: dict[str, dict[str, object]] = {
+            "report-test2": {"thread_id": self.thread, "status": "done"},
+            "ended": {"thread_id": "ended-thread", "status": "ended"},
+            "moved": {"thread_id": "moved-thread", "role_redirect": {"name": "elsewhere"}},
+            "moving": {"thread_id": "moving-thread", "transferring_role": {"name": "elsewhere"}},
+            "held": {"thread_id": "held-thread", "held_design_id": "fixture-design"},
+        }
+        self.mesh(self.runs / "run-00", records)
+        self.mesh(self.runs / "stale", {"stale": {"thread_id": "stale-thread", "status": "running"}})
+        self.assertEqual(roster.unit_labels_for(
+            [self.thread, "ended-thread", "moved-thread", "moving-thread", "held-thread", "stale-thread"],
+            self.environment), {self.thread: roster.UnitLabels("report-test2", "builds", "report")})
 
 
 class UnitLabelsTests(unittest.TestCase):

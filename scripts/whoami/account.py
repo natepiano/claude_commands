@@ -21,12 +21,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.whoami.agent_accounts import claude_config_dir, claude_config_value, claude_on_disk, codex_email_on_disk, codex_home  # noqa: E402
 from scripts.whoami import note_file  # noqa: E402
 
-# Package and sibling callers share process readers and identity outcomes.
-if __name__ == "account":
-    _ = sys.modules.setdefault("scripts.whoami.account", sys.modules[__name__])
-elif __name__ == "scripts.whoami.account":
-    _ = sys.modules.setdefault("account", sys.modules[__name__])
-
 
 @dataclass(frozen=True)
 class Account:

@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.lib.test_agents_registry import write_registry
 
 from scripts.lib import names
@@ -13,12 +18,10 @@ import json
 import os
 import shlex
 import subprocess
-import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import ClassVar, cast, override
 from types import ModuleType
 from collections.abc import Callable, Iterator
@@ -41,7 +44,7 @@ from scripts.accounts import accounts
 from scripts.whoami.note_file import NumberedAccountLabel, note_name, parse_account_label
 import herdr
 from scripts.herdr.fake_herdr import CommandResponse
-import usage_store
+from scripts.whoami import usage_store
 from test_support import ShutdownTestCase
 
 
@@ -93,7 +96,10 @@ def configure_test_zone() -> None:
     unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
 
+from scripts.production.staff_test_support import StaffTestCase
+
 class AddUnitTestCase(ShutdownTestCase):
+    staff: StaffTestCase = StaffTestCase()
     seed: ClassVar[ImmutableGitSeed]
 
     @classmethod
@@ -130,6 +136,9 @@ class AddUnitTestCase(ShutdownTestCase):
 
     @override
     def setUp(self) -> None:
+        self.staff = StaffTestCase()
+        self.staff.setUp()
+        self.addCleanup(self.staff.doCleanups)
         super().setUp()
         _ = self.enterContext(patch.object(names, "load_names", return_value=fixture_names()))
         # These CLI fixtures prove launcher plumbing; transcript proof is exercised
@@ -200,6 +209,8 @@ class AddUnitTestCase(ShutdownTestCase):
                     "CODEX_CONFIG_FILE": str(codex_config),
                     "CODEX_MODELS_CACHE_FILE": str(codex_cache),
                     "CODEX_CATALOG_SYNC_STATE_FILE": str(sync_state)}
+        self.env["STAFF_FILE"] = str(self.staff.staff_file)
+        self.env["HERDR_PANE_RECORD_DIR"] = str(self.staff.source_root / "panes")
         self.herdr_overrides = {}
         fake_path = self.bin / "fake-herdr"
         source = (SCRIPT.parents[1] / "herdr/fake_herdr.py").read_text()

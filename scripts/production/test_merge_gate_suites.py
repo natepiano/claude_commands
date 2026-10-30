@@ -11,19 +11,75 @@ from pathlib import Path
 from typing import cast, final
 from unittest import mock
 from scripts.production import merge_gate
-from scripts.production.merge_gate_test_support import gate_suites
+from scripts.production.merge_gate_test_support import SUITE_MODULE, gate_suites
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 
 
 @final
 class MergeGateSuitesTests(GateSuitesFixture):
-    @gate_suites("hooks", "notify")
-    def test_missing_suite_refuses_instead_of_silently_shrinking_gate(self) -> None:
-        (self.checkout / "scripts" / "notify" / "test_first.py").unlink()
+    def test_recovery_suites_include_their_real_regression_modules(self) -> None:
+        repo = Path(__file__).resolve().parents[2]
+        found = {(suite, merge_gate.test_module_name(repo, suite, path))
+                 for suite, path in merge_gate.discover_test_modules(repo)}
+        self.assertTrue({
+            ("release", "test_release.py"), ("claude_to_codex", "test_sync.py"),
+            ("new_rust_project", "test_rust_generate.py"), ("validate_and_push", "test_rerun.py"),
+            ("exclude", "test_exclude.py"), ("prioritize", "tests/test_renumber.py"),
+            ("prioritize", "tests/test_run_watcher.py"),
+        }.issubset(found), found)
+
+    @gate_suites("prioritize")
+    def test_a_nested_suite_module_runs_and_retries_at_its_discovered_path(self) -> None:
+        flat = self.checkout / "scripts/prioritize/test_first.py"
+        nested = flat.parent / "tests/test_first.py"
+        # The shared job fixture finds its suite from the checkout path.
+        self.write(nested, SUITE_MODULE)
+        flat.unlink()
+        self.write(self.state / "signal-prioritize", "once")
+        result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Rerun alone: prioritize/tests/test_first.py passed", result.stdout)
+        self.assertEqual(len([row for row in self.module_events() if row["event"] == "start"]), 2)
+
+    @gate_suites("types")
+    def test_a_suite_named_types_runs_tests_and_reports_them_apart_from_the_type_check(self) -> None:
+        module = self.checkout / "scripts/types/test_first.py"
+        _ = module.rename(module.with_name("test_x.py"))
+        self.write(self.state / "signal-types", "once")
+        with mock.patch.dict(os.environ, self.environment), contextlib.redirect_stdout(io.StringIO()) as output:
+            run = merge_gate.run_suites(self.checkout, type_dirs=("scripts",), full=True)
+        report = output.getvalue()
+        self.assertTrue(run.passed, report)
+        self.assertCountEqual([(job.kind, job.suite, job.module, job.returncode) for job in run.jobs], [
+            (merge_gate.GateJobKind.TEST_MODULE, "types", "test_x.py", 0),
+            (merge_gate.GateJobKind.TYPE_CHECK, "types", "basedpyright", 0),
+        ])
+        self.assertEqual([(row["suite"], row["module"], row["event"]) for row in self.module_events()], [
+            ("types", "test_x.py", "start"), ("types", "test_x.py", "start"), ("types", "test_x.py", "finish"),
+        ])
+        self.assertIn("Rerun alone: types/test_x.py passed", report)
+        self.assertRegex(report, r"(?m)^types: OK \d+\.\d+s$")
+        self.assertIn("basedpyright: OK", report)
+        self.assertEqual(len([call for call in self.calls() if call["tool"] == "basedpyright"]), 1)
+        self.assertIn("types/test_x.py", merge_gate.read_measures(self.state / "runner/module_seconds.json"))
+
+    def test_a_test_file_directly_under_scripts_is_refused_before_jobs_start(self) -> None:
+        self.write(self.checkout / "scripts/test_x.py", SUITE_MODULE)
         result = self.run_gate("--tests-only")
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("notify", result.stdout + result.stderr)
+        self.assertIn("test module must be in a suite folder under scripts/: test_x.py", result.stderr)
         self.assertEqual(self.module_events(), [])
+        self.assertFalse(any(call["tool"] == "basedpyright" for call in self.calls()))
+
+    @gate_suites("hooks", "notify")
+    def test_folder_with_its_last_module_deleted_is_not_a_suite(self) -> None:
+        (self.checkout / "scripts" / "notify" / "test_first.py").unlink()
+        result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        starts = [(row["suite"], row["module"]) for row in self.module_events() if row["event"] == "start"]
+        self.assertEqual(starts, [("hooks", "test_first.py")])
+        self.assertRegex(result.stdout, r"(?m)^hooks: OK \d+\.\d+s$")
+        self.assertNotRegex(result.stdout, r"(?m)^notify:")
 
     def test_modules_preserve_the_callers_pythonpath(self) -> None:
         caller_path = self.root / "caller-pythonpath"
@@ -84,7 +140,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
         scripts = self.checkout / "scripts"
         modules = [*((suite, scripts / suite / "test_first.py") for suite in self.suites),
                    ("lib", scripts / "lib" / "test_second.py")]
-        ordered = merge_gate.module_order(modules, timings)
+        ordered = merge_gate.module_order(modules, timings, self.checkout)
         self.assertEqual([(suite, path.name) for suite, path in ordered[:2]],
                          [("lib", "test_second.py"), ("direct", "test_first.py")])
         result = self.run_gate("--tests-only")

@@ -184,27 +184,21 @@ if [[ "${1:-}" == final-pass || ( "${1:-}" == --session-dir && "${3:-}" == final
     exec "$VERIFY_QUERY_DIR/../lib/py" "$VERIFY_QUERY_DIR/final_pass.py" query "$VERIFY_QUERY_DIR/verify.sh" "$@"
 fi
 if [[ -n "${TMPDIR:-}" && ! -d "$TMPDIR" ]]; then mkdir -p -- "$TMPDIR"; fi
-# Ask the shared helper which envrc applies, before tool setup or record access.
-# With no envrc, ensure returns the unchanged env without invoking direnv.
-if [[ -z "${IN_NIX_SHELL:-}" ]]; then
-    if [[ -n "${VERIFY_NIX_ENV_REEXEC:-}" ]]; then
+# Load the environment once through the shared helper, before tool setup or records.
+if [[ -n "${VERIFY_NIX_ENV_REEXEC:-}" ]]; then
+    if [[ -n "${IN_NIX_SHELL:-}" ]]; then
+        printf '%s\n' 'verify.sh: not in the nix shell; re-running under nix_env.py exec' >&2
+    elif [[ -n "${NIX_ENV_ENVRC:-}" ]]; then
         printf '%s\n' 'verify.sh: nix_env.py re-exec still has no nix shell (IN_NIX_SHELL unset)' >&2
         exit 1
     fi
+elif [[ -z "${IN_NIX_SHELL:-}" ]]; then
     VERIFY_NIX_SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
     [[ "$VERIFY_NIX_SCRIPT_DIR" != "${BASH_SOURCE[0]}" ]] || VERIFY_NIX_SCRIPT_DIR=.
     VERIFY_NIX_SCRIPT_DIR="$(cd -- "$VERIFY_NIX_SCRIPT_DIR" && pwd -P)"
-    VERIFY_NIX_ENV_JSON="$("$VERIFY_NIX_SCRIPT_DIR/../lib/py" \
-        "$VERIFY_NIX_SCRIPT_DIR/../lib/nix_env.py" ensure "$PWD")"
-    if "$VERIFY_NIX_SCRIPT_DIR/../lib/py" -c \
-        'import json, sys; sys.exit(0 if json.load(sys.stdin).get("IN_NIX_SHELL") else 1)' \
-        <<< "$VERIFY_NIX_ENV_JSON"; then
-        printf '%s\n' 'verify.sh: not in the nix shell; re-running under nix_env.py exec' >&2
-        export VERIFY_NIX_ENV_REEXEC=1
-        exec "$VERIFY_NIX_SCRIPT_DIR/../lib/py" "$VERIFY_NIX_SCRIPT_DIR/../lib/nix_env.py" \
-            exec "$VERIFY_NIX_SCRIPT_DIR/${BASH_SOURCE[0]##*/}" "$@"
-    fi
-    unset VERIFY_NIX_ENV_JSON VERIFY_NIX_SCRIPT_DIR
+    export VERIFY_NIX_ENV_REEXEC=1
+    exec "${VERIFY_NIX_SCRIPT_DIR%/*}/lib/py" -S "${VERIFY_NIX_SCRIPT_DIR%/*}/lib/nix_env.py" \
+        exec "$VERIFY_NIX_SCRIPT_DIR/${BASH_SOURCE[0]##*/}" "$@"
 fi
 unset VERIFY_NIX_ENV_REEXEC
 
@@ -859,6 +853,21 @@ if [[ "${1:-}" == "--session-dir" ]]; then
     fi
 fi
 
+# One list feeds both the guard invocation and its cache inputs. The identity
+# check also deduplicates two spellings of the same existing folder.
+assertion_rulings_args() {
+    ASSERTION_RULINGS_ARGS=()
+    local folder previous=""
+    for folder in "${UNIT_SESSION_DIR:-}" "${UNIT_RUN_DIR:-}"; do
+        [[ -n "$folder" ]] || continue
+        if [[ "$folder" != "$previous" && ( -z "$previous" || ! "$folder" -ef "$previous" ) ]]; then
+            ASSERTION_RULINGS_ARGS+=(--rulings "$folder")
+            previous="$folder"
+        fi
+    done
+}
+assertion_rulings_args
+
 # A Codex mesh worker's command dies with its turn, and a worker that waits on
 # one spends a model call per wait. So a worker's call detaches: mesh_runs.py
 # runs this same call under a supervisor outside the worker's process group,
@@ -1085,8 +1094,9 @@ fi
 
 tree_key() {
     local words=("$CMD" "${ARGS[@]}") names=() name scope=() key_options=("$@")
-    if [[ "$CMD" == lint && ${#ARGS[@]} -eq 1 ]]; then
-        words=(lint)
+    if [[ "$CMD" == lint ]]; then
+        scope=(--assertion-guard "$ASSERTION_GUARD_SCRIPT" ${ASSERTION_RULINGS_ARGS[@]+"${ASSERTION_RULINGS_ARGS[@]}"})
+        if [[ ${#ARGS[@]} -eq 1 ]]; then words=(lint); fi
     elif [[ "${FILTER_RUN}" -eq 1 ]]; then
         # The filter names go last, sorted, each once (see the header).
         words=("$CMD")
@@ -1108,6 +1118,7 @@ tree_key() {
         # Keyed on the package's own build, read from the call's metadata.
         scope=(--package "${ARGS[0]}")
     fi
+    VERIFY_TEST_BUILD_INPUTS_FILE="${HOLD_WAIT_DIR:+$HOLD_WAIT_DIR/test-build-inputs}" \
     "$PY" "$TREE_WATCH_SCRIPT" --key ${key_options[@]+"${key_options[@]}"} ${scope[@]+"${scope[@]}"} "${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh" \
         "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}" -- "${words[@]}" \
         <<< "${GATE_METADATA}" 2>/dev/null || true
@@ -2007,7 +2018,7 @@ build_seconds() {
 # or when the tree has changed since that verdict.
 # The time in the user's zone setting, with its label; UTC (labeled) when the setting cannot be read.
 user_clock() {
-    TZ="$(python3 "$(dirname "${BASH_SOURCE[0]}")/../lib/user_zone.py" 2>/dev/null)" date '+%Y-%m-%d %H:%M:%S %Z'
+    TZ="$(python3 -S "$(dirname "${BASH_SOURCE[0]}")/../lib/user_zone.py" 2>/dev/null)" date '+%Y-%m-%d %H:%M:%S %Z'
 }
 
 cache_record() {
@@ -2653,6 +2664,24 @@ buildlog_wait_for_memory() {
 # leaves the hold wait for the Mac (status LINT_LEFT_QUEUE_STATUS) does not. The
 # hold time stays in the hold wait record; only the time to take the token
 # again counts as token wait. With no hold present, nothing is given back.
+refresh_test_build_inputs() {
+    # Admission and the recorder must see the inputs after a hold, just as
+    # buildlog_begin takes its source key after that wait.
+    rm -f "$HOLD_WAIT_DIR/test-build-inputs"
+    VERDICT_KEY="$(VERIFY_COMPUTE_TEST_BUILD=1 tree_key)"
+    export BUILDLOG_TEST_BUILD_KEY="" BUILDLOG_TEST_TARGET_DIR=""
+    if [[ -f "$HOLD_WAIT_DIR/test-build-inputs" ]]; then
+        { IFS= read -r BUILDLOG_TEST_BUILD_KEY; IFS= read -r BUILDLOG_TEST_TARGET_DIR; } \
+            < "$HOLD_WAIT_DIR/test-build-inputs"
+    fi
+    # A hold can also arrive during memory admission, after buildlog_begin.
+    if [[ -n "${BUILDLOG_START:-}" ]]; then
+        BUILDLOG_TREE="$("$PY" "$BUILDLOG_RECORD" key 2>/dev/null)" || BUILDLOG_TREE=""
+    fi
+    TEST_BUILD_INPUTS_READY=1
+}
+TEST_BUILD_INPUTS_READY=0
+
 eval "$(declare -f build_hold_wait_local | sed '1s/build_hold_wait_local/build_hold_wait_local_only/')"
 build_hold_wait_local() {
     local status=0
@@ -2665,7 +2694,9 @@ build_hold_wait_local() {
     if [[ "${TOKEN_HELD:-0}" -ne 1 ]]; then
         build_hold_wait_local_only "$@" || status=$?
         phase_wait_finish hold
-        return "$status"
+        if [[ "${status:-0}" -ne 0 ]]; then return "$status"; fi
+        if [[ "$TEST_BUILD_INPUTS_READY" == 1 ]]; then refresh_test_build_inputs; fi
+        return 0
     fi
     if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then
         : > "${TOKEN_WAIT_FILE}.given_back"
@@ -2678,6 +2709,7 @@ build_hold_wait_local() {
     if (( TOKEN_WAITED > 0 )) && [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
         printf '%s\n' "$TOKEN_WAITED" >> "$TOKEN_WAIT_FILE"
     fi
+    if [[ "$TEST_BUILD_INPUTS_READY" == 1 ]]; then refresh_test_build_inputs; fi
     return "$status"
 }
 
@@ -2692,10 +2724,14 @@ fi
 RUN_STARTED=${SECONDS}
 MEM_KILL_FILE="$(mktemp)"
 TOKEN_WAIT_FILE="$(mktemp)"
+if [[ "$CMD" == test ]]; then
+    # The common path calculates once; a later hold refreshes after its wait.
+    refresh_test_build_inputs
+fi
 if [[ -n "${CACHE_DIR}" ]] && mkdir -p "${CACHE_DIR}"; then
     # Taken now, after the token and hold waits: an edit made while this call
     # waited is part of the tree it runs on.
-    VERDICT_KEY="$(tree_key)"
+    if [[ "$CMD" != test ]]; then VERDICT_KEY="$(tree_key)"; fi
     RUN_LOG="${CACHE_DIR}/run.$$.log"
     : > "${RUN_LOG}"
     exec > >(tee -a "${RUN_LOG}") 2> >(tee -a "${RUN_LOG}" >&2)
@@ -2833,10 +2869,7 @@ case "$CMD" in
         fi
         [[ $# -eq 0 ]] || { usage; exit 2; }
         ASSERTION_REPO="${WORKSPACE_ROOT:-$(git rev-parse --show-toplevel)}"
-        ASSERTION_ARGS=(--repo "$ASSERTION_REPO")
-        if [[ -n "${UNIT_SESSION_DIR:-}" ]]; then
-            ASSERTION_ARGS+=(--rulings "$UNIT_SESSION_DIR")
-        fi
+        ASSERTION_ARGS=(--repo "$ASSERTION_REPO" ${ASSERTION_RULINGS_ARGS[@]+"${ASSERTION_RULINGS_ARGS[@]}"})
         if [[ -n "${VERIFY_ASSERTION_BASE:-}" ]]; then
             ASSERTION_ARGS+=(--base "$VERIFY_ASSERTION_BASE")
         fi

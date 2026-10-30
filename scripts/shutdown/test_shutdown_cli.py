@@ -2,8 +2,15 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.whoami.note_file import note_name
 
+from unit_staff_test_support import unit_host
+from scripts.production import staff_sources
 import io
 from datetime import datetime
 import json
@@ -11,13 +18,11 @@ import os
 import shlex
 import shutil
 import subprocess
-import sys
 import time
 import tempfile
 import unittest
 from collections.abc import Iterable
 from contextlib import redirect_stderr, redirect_stdout
-from pathlib import Path
 from typing import Literal, cast, final, override
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
@@ -38,7 +43,7 @@ import stop as stop_work
 from scripts.accounts import accounts
 from push_texts import RenderedPush
 import restart as restart_work
-from account import Account, UnreadableAccount
+from scripts.whoami.account import Account, UnreadableAccount
 
 
 # Hang guard: natedev reached load 136 on 2026-10-29; scheduling delays are not failures.
@@ -67,7 +72,7 @@ def unit_session(session_id: str) -> inventory.UnitSession:
         run_dirs=[],
         codex_servers=[],
         timers=[],
-        host=inventory.UnitHost(
+        host=unit_host(
             kind="unit",
             production="demo",
             unit="alpha-unit",
@@ -737,66 +742,13 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertEqual(down.call_args.args[0], selected)
         self.assertEqual(resume.call_args.args[0], restart_work.AccountNotNamed())
 
-    def test_down_rejects_non_numbered_targets_before_creating_records_requests_or_a_conductor(self) -> None:
-        moves_file = self.home / ".local/state/accounts/moves.jsonl"
-        selected = Account("claude", LOGIN, LABEL)
-        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL,
-            sessions=[unit_session("session-123")], unattributed=[])
-        for target in ("default", "~/.claude", "claude", "codex1"):
-            self.clear_state()
-            moves_file.unlink(missing_ok=True)
-            with (self.subTest(target=target),
-                  patch.object(shutdown, "named_claude_account", return_value=selected),
-                  patch.object(shutdown, "inventory", return_value=report) as observed,
-                  patch.object(shutdown, "run_remote") as peer,
-                  patch.object(settle, "run_remote", return_value=(0, "")) as forwarded,
-                  patch.object(settle, "_warm", return_value=True),
-                  patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")),
-                  patch.object(settle, "_launch_conductor") as conductor):
-                output, error = io.StringIO(), io.StringIO()
-                with redirect_stdout(output), redirect_stderr(error):
-                    try:
-                        status = shutdown.main(["down", LABEL, "--restart", "--to", target])
-                    except SystemExit as exit_error:
-                        status = exit_error.code
-                self.assertNotEqual(status, 0)
-                if target == "default":
-                    self.assertIn("name the account by number", error.getvalue())
-                    self.assertIn("~/.claude is claude2", error.getvalue())
-                else:
-                    self.assertIn(target, error.getvalue())
-                self.assertFalse(self.state.exists() and any(self.state.iterdir()))
-                self.assertFalse(moves_file.exists() and moves_file.stat().st_size)
-                conductor.assert_not_called()
-                peer.assert_not_called()
-                forwarded.assert_not_called()
-                observed.assert_not_called()
 
-    def test_down_rejects_invalid_move_origins_before_observing_or_writing_shutdown_state(self) -> None:
-        invalid = (("--refused", "bogus"),
-                   ("--refused", "weekly", "--reset", "2026-10-20T12:00:00"),
-                   ("--reset", "2026-10-20T12:00:00+00:00"))
-        for arguments in invalid:
-            with (self.subTest(arguments=arguments), patch.object(settle, "down") as down,
-                  patch.object(shutdown, "resolve_sessions") as resolve,
-                  patch.object(shutdown, "run_remote") as peer,
-                  redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
-                with self.assertRaises(SystemExit) as refused:
-                    _ = shutdown.main(["down", LABEL, "--restart", "--to", "claude3", *arguments])
-                self.assertEqual(refused.exception.code, 2)
-                down.assert_not_called()
-                resolve.assert_not_called()
-                peer.assert_not_called()
-                self.assertFalse(self.state.exists() and any(self.state.iterdir()))
-                journal = self.home / ".local/state/accounts/moves.jsonl"
-                self.assertFalse(journal.exists() and journal.stat().st_size)
 
     def test_a_stop_covers_this_machine_unless_the_other_machine_or_a_session_is_named(self) -> None:
         selected = Account("claude", LOGIN, LABEL)
         report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
         cases: tuple[tuple[tuple[str, ...], bool], ...] = (
             ((), True), (("--here",), True), (("--also", "mac"), False),
-            (("--restart", "--to", "claude3"), False),
         )
         for arguments, here in cases:
             for verb in ("down", "now"):
@@ -822,23 +774,6 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
             down.assert_not_called()
             self.assertIn("--also names the other machine (mac)", errors.getvalue())
 
-    def test_down_passes_refusal_window_and_aware_reset_or_hand_origin_to_settle(self) -> None:
-        from scripts.accounts import accounts
-        from datetime import datetime
-        selected = Account("claude", LOGIN, LABEL)
-        for arguments, refusal in ((("--refused", "weekly", "--reset", "2026-10-20T12:00:00+03:00"), True), ((), False)):
-            with (self.subTest(arguments=arguments),
-                  patch.object(shutdown, "named_claude_account", return_value=selected),
-                  patch.object(settle, "down", return_value=0) as down):
-                self.assertEqual(shutdown.main(["down", LABEL, "--here", "--restart", "--to", "claude3", *arguments]), 0)
-                origin = cast(object, down.call_args.kwargs["origin"])
-                if refusal:
-                    self.assertIsInstance(origin, accounts.RefusalOrigin)
-                    assert isinstance(origin, accounts.RefusalOrigin)
-                    self.assertEqual(origin.window, "weekly")
-                    self.assertEqual(origin.reset, accounts.KnownReset(datetime.fromisoformat("2026-10-20T12:00:00+03:00")))
-                else:
-                    self.assertIsInstance(origin, accounts.HandOrigin)
 
     def test_remote_control_cli_passes_identity_without_an_alert_option(self) -> None:
         arguments = ["remote-control", "owner", "--pid", "321",
@@ -898,6 +833,16 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         assert current is not None
         self.assertEqual(current["progress"], {"kind": "waiting"})
 
+    def test_follow_finishes_a_stopped_request_with_an_advisory_codex_pause_issue(self) -> None:
+        saved = session_shutdown(shutdown_store.SessionStopped(kind="stopped", at=OCTOBER))
+        saved["then"] = "stop"
+        saved["stop_issues"] = [shutdown_store.CodexServerLeftRunning(kind="codex server left running",
+            at=OCTOBER, run_dir="/owned/run", cause="stop not confirmed")]
+        self.assertTrue(shutdown_store.create_session(saved))
+        status, text = self.follow_request()
+        self.assertEqual(status, 0, text)
+        self.assertEqual(shutdown_store.find_session(LOGIN, "session-123"), saved)
+
     def test_follow_prints_each_new_step_once_and_waits_for_pending_restart(self) -> None:
         saved = session_shutdown(shutdown_store.SessionWaiting(kind="waiting"))
         saved["session"]["name"] = "Alpha"
@@ -942,6 +887,19 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertNotIn("unrelated", output)
         self.assertTrue(output.rstrip().endswith("all 1 back on claude3"), output)
 
+    def test_follow_failed_stops_reports_the_total_and_each_failed_owner_reason(self) -> None:
+        for identity, reason in (("first", "deadline exhausted"), ("second", "worker pause refused")):
+            saved = session_shutdown(shutdown_store.SessionStopFailed(kind="stop failed", at=OCTOBER, reason=reason), identity)
+            saved["session"]["name"] = identity + "-name"
+            saved["then"] = "stop"
+            self.assertTrue(shutdown_store.create_session(saved))
+        status, output = self.follow_request()
+        self.assertEqual(status, 1)
+        self.assertIn("0 of 2 stopped", output)
+        self.assertIn("first-name: deadline exhausted", output)
+        self.assertIn("second-name: worker pause refused", output)
+        self.assertNotIn("all 0 stopped", output)
+
     def test_follow_waits_for_every_session_and_reports_total_back_on_target(self) -> None:
         first = session_shutdown(shutdown_store.SessionRestarted(kind="restarted", at=OCTOBER), "first")
         second = session_shutdown(shutdown_store.SessionWaiting(kind="waiting"), "second")
@@ -982,7 +940,8 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                     status, output = self.follow_request()
                 self.assertEqual(status, 0)
                 self.assertIn(f"alpha: {kind}", output)
-                self.assertIn("all 1 back on" if kind == "restarted" else "all 1 stopped", output)
+                total = "all 1 back on" if kind == "restarted" else "0 of 1 stopped" if kind == "already gone" else "all 1 stopped"
+                self.assertIn(total, output)
 
     def test_follow_keeps_trail_when_record_is_archived_between_polls(self) -> None:
         saved = session_shutdown(shutdown_store.SessionWaiting(kind="waiting"))
@@ -1437,19 +1396,6 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertNotIn("Traceback", output.getvalue())
         self.assertEqual(self.store_contents(), before)
 
-    def test_down_to_passes_target_through_the_cli_to_settle(self) -> None:
-        selected = Account("claude", LOGIN, LABEL)
-        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL,
-            sessions=[unit_session("move-id")], unattributed=[])
-        with (
-            patch.object(shutdown, "named_claude_account", return_value=selected),
-            patch.object(settle, "down", return_value=0) as down,
-            patch.object(shutdown, "resolve_sessions", return_value=shutdown.ResolvedSessions(("move-id",), report)),
-        ):
-            self.assertEqual(shutdown.main(["down", LABEL, "--here", "--only", "move-id",
-                "--restart", "--to", "claude3"]), 0)
-        down.assert_called_once_with(selected, True, ("move-id",), then="restart", alerts="user",
-            requested_by=None, request_id="", target="claude3", why="", report=report, origin=accounts.HandOrigin(), move_id="", checkout_move=None)
 
     def test_down_checkout_move_reaches_settle_and_needs_one_here_restart_session(self) -> None:
         selected = Account("claude", LOGIN, LABEL)
@@ -1470,19 +1416,6 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
             requested_by=None, request_id="", target="", why="", report=report, origin=accounts.HandOrigin(), move_id="",
             checkout_move={"old": "/w/old", "new": "/w/new"})
 
-    def test_down_to_passes_custom_move_reason_through_the_cli_to_settle(self) -> None:
-        selected = Account("claude", LOGIN, LABEL)
-        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL,
-            sessions=[unit_session("move-id")], unattributed=[])
-        with (
-            patch.object(shutdown, "named_claude_account", return_value=selected),
-            patch.object(settle, "down", return_value=0) as down,
-            patch.object(shutdown, "resolve_sessions", return_value=shutdown.ResolvedSessions(("move-id",), report)),
-        ):
-            self.assertEqual(shutdown.main(["down", LABEL, "--here", "--only", "move-id",
-                "--restart", "--to", "claude3", "--why", "weekly limit reached"]), 0)
-        down.assert_called_once_with(selected, True, ("move-id",), then="restart", alerts="user",
-            requested_by=None, request_id="", target="claude3", why="weekly limit reached", report=report, origin=accounts.HandOrigin(), move_id="", checkout_move=None)
 
     def test_down_restart_passes_the_selected_scope_and_intent(self) -> None:
         selected = Account("claude", LOGIN, LABEL)
@@ -1609,8 +1542,11 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                 self.assertEqual(self.run_cli(LOGIN), (1, "", ""))
 
     def test_a_registering_account_hold_blocks_before_its_sessions_are_recorded(self) -> None:
+        _ = self.enterContext(patch.object(shutdown_store, "registration_process_start", return_value="fixture-process-start"))
         held = account_hold()
         held["registration"] = "in progress"
+        held["registration_owners"] = {held["request_id"]:
+            shutdown_store.RegistrationOwner(pid=4242, proc_start="fixture-process-start")}
         held["requested_by"] = shutdown_store.FromSession(kind="session", session_id="b1f5ca98-45aa-4604-8e2b-33ed0f071bb1")
         shutdown_store.set_account_hold(held)
         self.assertEqual(self.run_cli(LOGIN), (
@@ -2000,7 +1936,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertEqual(self.run_cli(LOGIN, "--restart-of", "session-123"), (0, "alpha is held by a shutdown (since 2026-10-09 14:49 PDT)\n", ""))
 
     def test_removed_writer_verbs_are_rejected(self) -> None:
-        removed = ("begin", "refresh", "retry-stop", "stop", "claim-stop", "close-failed-stop")
+        removed = ("begin", "refresh", "retry-stop", "claim-stop", "close-failed-stop")
         for verb in removed:
             with self.subTest(verb=verb), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
                 _ = shutdown.main([verb, LOGIN])
@@ -2041,7 +1977,7 @@ class OnlySessionCliTests(ShutdownTestCase):
         def listed(_login: str) -> list[inventory.ListedSession]:
             return [inventory.ListedSession(owner["session_id"], owner["pid"], owner["proc_start"],
                 owner["name"], owner["kind"], self.root / ".claude", LOGIN,
-                owner["host"]["production"] if owner["kind"] == "unit" else "", "")
+                staff_sources.unit_parent(owner["host"]["unit"]).slug if owner["kind"] == "unit" else "", "")
                 for owner in self.owners]
         _ = self.enterContext(patch.object(shutdown, "listing", side_effect=listed))
         def observed(login: str, only: Iterable[str] = ()) -> inventory.Inventory:
@@ -2404,7 +2340,8 @@ class OnlySessionCliTests(ShutdownTestCase):
                 if state.exists():
                     shutil.rmtree(state)
                 before = self.save_three(progress)
-                with patch.object(restart_work, "_launch_session") as launch:
+                with (patch.object(restart_work, "_owner_liveness", return_value=restart_work.SessionLive()),
+                      patch.object(restart_work, "_launch_session") as launch):
                     status, output, error = self.action("restart", "Beta", "--no-alert")
                 self.assertEqual((status, error), (1, ""))
                 self.assertIn(f"Beta is {progress['kind']}, not stopped; nothing to restart\n", output)

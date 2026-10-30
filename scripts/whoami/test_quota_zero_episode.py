@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.lib.test_agents_registry import write_registry
-
+import sys
 import io
 import json
 import os
@@ -14,12 +13,15 @@ from pathlib import Path
 from typing import cast
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.test_agents_registry import write_registry
+
 from scripts.whoami import quota_alert_test_support as support
 import quota_alert
 from push_texts import RenderedPush, render
 from scripts.whoami import agent_accounts
-from agent_accounts import ClaudeAccountsInUse, Quota
-import usage_store
+from scripts.whoami.agent_accounts import ClaudeAccountsInUse, Quota
+from scripts.whoami import usage_store
 from scripts.accounts import accounts, moves, next_moves, refusals, role_map
 from user_action import ActionRequired
 
@@ -120,7 +122,9 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
 
     def test_uncertain_registry_switch_keeps_the_named_route_until_the_weekly_reset(self) -> None:
         for failed_step in ("edit", "confirmation"):
-            with self.subTest(failed_step=failed_step):
+            with (self.subTest(failed_step=failed_step),
+                  mock.patch.object(quota_alert, "STATE", self.root / f"{failed_step}-alerts.json"),
+                  mock.patch.object(quota_alert, "REGISTRY", self.root / f"{failed_step}-agents.conf")):
                 _ = write_registry(quota_alert.REGISTRY, base_text=REGISTRY)
                 owner = self.readings(self.now).selected_account
                 assert isinstance(owner, agent_accounts.KnownCodexAccount)

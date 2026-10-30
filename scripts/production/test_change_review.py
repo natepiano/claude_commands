@@ -21,6 +21,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import change_review
 import showrunners
+import showrunner_tree
 from change_review import Invisible, Malformed, Visible
 
 # Importable once change_review has put scripts/lib on the path.
@@ -155,7 +156,7 @@ class ListTest(unittest.TestCase):
             return names.get(slug, "")
 
         with (mock.patch.object(showrunners, "canonical_slug", side_effect=str),
-              mock.patch.object(showrunners, "root_of", return_value="build-followups") as root,
+              mock.patch.object(showrunner_tree, "root_of", return_value="build-followups") as root,
               mock.patch.object(showrunners, "current_name", side_effect=name_of)):
             self.assertEqual(change_review.showrunner_of(Path("/p/child-production.md")), "natedev")
             root.assert_called_once_with("child")
@@ -172,8 +173,6 @@ class AttachedListTest(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        import showrunners
-
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
@@ -190,7 +189,7 @@ class AttachedListTest(unittest.TestCase):
             "| C9 | Earlier child | Check earlier | 2026-10-02 | |\n" +
             "| C11 | Dependent child | Check dependent | 2026-10-03 | blocks, after C9 |\n")
         _ = self.enterContext(mock.patch.object(change_review, "LISTS", self.root))
-        _ = self.enterContext(mock.patch.object(showrunners, "root_of", return_value="parent"))
+        _ = self.enterContext(mock.patch.object(showrunner_tree, "root_of", return_value="parent"))
 
     def test_columnless_earlier_rows_belong_to_the_attached_production_without_list_edits(self) -> None:
         before = {path: path.read_bytes() for path in (self.current, self.earlier)}
@@ -477,10 +476,102 @@ class ActionTest(unittest.TestCase):
                              "--see", "C", "--after", "later")[0], 1)
 
     def test_a_verdict_moves_the_row_to_the_top_of_reviewed(self) -> None:
-        self.assertEqual(change_review.record_verdict(self.path, "C76", "Works, thanks", date(2026, 10, 15), PRODUCTION), "2026-10-14")
+        self.assertEqual(change_review.record_verdict(self.path, "C76", "Works, thanks", date(2026, 10, 15), PRODUCTION),
+                         change_review.VerdictRecorded(change_review.RecordedMerge("2026-10-14")))
         text = self.path.read_text(encoding="utf-8")
-        self.assertNotIn("| C76 | Panels keep shields | 2026-10-14", text)
-        self.assertIn("| --- | --- | --- | --- |\n| C76 | Panels keep shields | Works, thanks | 2026-10-15 |\n| C70 |", text)
+        self.assertNotIn("| C76 | Panels keep shields | 2026-10-14", text.split("## Reviewed")[0])
+        self.assertIn("| # | Change | Verdict | Date | Merged |", text)
+        self.assertIn("| --- | --- | --- | --- | --- |\n| C76 | Panels keep shields | Works, thanks | 2026-10-15 | 2026-10-14 |\n| C70 |", text)
+
+    def test_edit_and_verdict_replacement_failures_keep_the_list_and_rerun_once(self) -> None:
+        for action in ("edit", "verdict"):
+            with self.subTest(action=action):
+                _ = self.path.write_text(LIST, encoding="utf-8")
+                before = self.path.read_bytes()
+                options = (("--change", "Updated panels", "--check", "Open the panel", "--see", "Updated shield")
+                           if action == "edit" else ("--verdict", "works"))
+                command = (action, "--production", DOC, "--list", str(self.path), "--row", "C76", *options)
+                real_replace = os.replace
+
+                def interrupted(source: Path, destination: Path) -> None:
+                    if Path(destination) == self.path:
+                        raise OSError("list replacement stopped")
+                    real_replace(source, destination)
+
+                with mock.patch.object(os, "replace", side_effect=interrupted):
+                    code, _, error = run(*command)
+                self.assertEqual(code, 1)
+                self.assertIn("list replacement stopped", error)
+                self.assertEqual(self.path.read_bytes(), before)
+                self.assertEqual(run(*command)[0], 0)
+                self.assertEqual(self.path.read_text().count("| C76 |"), 1)
+                self.assertEqual([row["#"] for row in change_review.pending(self.path)],
+                                 ["C76", "C77"] if action == "edit" else ["C77"])
+
+    def test_verdict_rerun_finishes_scratch_and_replays_merged_result(self) -> None:
+        for verdict in ("works", "still missing the shield"):
+            with self.subTest(verdict=verdict), mock.patch.dict(os.environ, {
+                scratch.ROOT_ENV: str(self.path.parent / "scratch"),
+                scratch.HOLDS_ENV: str(self.path.parent / "holds.json"),
+            }):
+                _ = self.path.write_text(LIST, encoding="utf-8")
+                task = f"row:{self.path.stem}-C76"
+                folder = scratch.new(task, "verdict")
+                _ = change_review.hold_for_row(self.path, "C76", [str(folder)])
+                command = ("verdict", "--production", DOC, "--list", str(self.path), "--row", "C76", "--verdict", verdict)
+                with mock.patch.object(change_review, "end_row_scratch", side_effect=KeyboardInterrupt):
+                    with self.assertRaises(KeyboardInterrupt):
+                        _ = run(*command)
+                self.assertTrue(folder.is_dir())
+                self.assertIn(os.path.realpath(folder), scratch.holds())
+                self.assertNotIn("C76", [row["#"] for row in change_review.pending(self.path)])
+                before = self.path.read_bytes()
+                code, output, error = run(*command)
+                self.assertEqual((code, error), (0, ""))
+                self.assertIn("C76 already has this verdict (", output)
+                self.assertIn("C76 landed\n" if verdict == "works" else
+                              "C76 returns to its unit (merged 2026-10-14)\n", output)
+                self.assertIn(f"removed {folder}\n", output)
+                self.assertFalse(folder.exists())
+                self.assertNotIn(os.path.realpath(folder), scratch.holds())
+                self.assertEqual(self.path.read_bytes(), before)
+                self.assertEqual(self.path.read_text().split("## Reviewed")[1].count("| C76 |"), 1)
+
+    def test_conflicting_verdict_keeps_reviewed_row_and_finishes_scratch(self) -> None:
+        with mock.patch.dict(os.environ, {scratch.ROOT_ENV: str(self.path.parent / "scratch"),
+                                          scratch.HOLDS_ENV: str(self.path.parent / "holds.json")}):
+            folder = scratch.new(f"row:{self.path.stem}-C76", "conflict")
+            _ = change_review.hold_for_row(self.path, "C76", [str(folder)])
+            with mock.patch.object(change_review, "end_row_scratch", side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    _ = run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C76", "--verdict", "works")
+            before = self.path.read_bytes()
+            code, output, error = run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C76", "--verdict", "still broken")
+            self.assertEqual(code, 1)
+            self.assertIn('C76 has the verdict "works" from ', error)
+            self.assertIn("this verdict is not recorded", error)
+            self.assertIn(f"removed {folder}", output)
+            self.assertEqual(self.path.read_bytes(), before)
+            self.assertFalse(folder.exists())
+            self.assertNotIn(os.path.realpath(folder), scratch.holds())
+
+    def test_missing_merge_is_explicit_for_new_and_earlier_reviewed_rows(self) -> None:
+        _ = self.path.write_text(LIST.replace("Panels keep shields | 2026-10-14", "Panels keep shields |"))
+        recorded = change_review.record_verdict(self.path, "C76", "not yet", date(2026, 10, 15), PRODUCTION)
+        self.assertEqual(recorded, change_review.VerdictRecorded(change_review.MergeNotRecorded()))
+        repeated = change_review.record_verdict(self.path, "C76", "not yet", date(2026, 10, 16), PRODUCTION)
+        self.assertIsInstance(repeated, change_review.VerdictAlreadyRecorded)
+        if isinstance(repeated, change_review.VerdictAlreadyRecorded):
+            self.assertIsInstance(repeated.merged, change_review.MergeNotRecorded)
+        code, output, error = run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C76", "--verdict", "not yet")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("C76 returns to its unit (merged not recorded)", output)
+        _ = self.path.write_text(LIST)
+        earlier = change_review.record_verdict(self.path, "C70", "works", date(2026, 10, 16), PRODUCTION)
+        self.assertIsInstance(earlier, change_review.VerdictAlreadyRecorded)
+        if isinstance(earlier, change_review.VerdictAlreadyRecorded):
+            self.assertIsInstance(earlier.merged, change_review.MergeNotRecorded)
+        self.assertEqual(self.path.read_text(), LIST)
 
     def test_works_or_fine_lands_and_any_other_verdict_returns_to_the_unit(self) -> None:
         self.assertEqual(run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C76", "--verdict", "fine"),
@@ -509,7 +600,7 @@ class ActionTest(unittest.TestCase):
         self.assertTrue(kept.is_dir())
 
     def test_a_verdict_for_a_row_not_to_review_is_refused(self) -> None:
-        for row in ("C70", "C99", "76"):
+        for row in ("C99", "76"):
             code, output, error = run("verdict", "--production", DOC, "--list", str(self.path), "--row", row, "--verdict", "works")
             self.assertEqual((code, output), (1, ""), row)
             self.assertEqual(len(error.splitlines()), 1, row)
@@ -661,6 +752,33 @@ class CommitTest(unittest.TestCase):
                          (0, "C1 landed\n", ""))
         self.assertEqual(self.last(), ("change-review: hana verdict C1", ["change-review/change-review - hana.md"]))
         self.assertIn("| C1 | A | works |", self.git("show", "HEAD:change-review/change-review - hana.md"))
+
+    def test_unchanged_edit_keeps_list_bytes_timestamp_and_git_history(self) -> None:
+        _ = change_review.append_rows(self.path, [GRID], date(2026, 10, 15), "216c4e1d", PRODUCTION)
+        before = self.path.read_bytes(), self.path.stat().st_mtime_ns, self.git("rev-parse", "HEAD")
+        _ = change_review._edit(self.path, PRODUCTION, date(2026, 10, 20),  # pyright: ignore[reportPrivateUsage]
+                               lambda lines: len(lines), lambda count: f"unchanged {count}")
+        self.assertEqual((self.path.read_bytes(), self.path.stat().st_mtime_ns, self.git("rev-parse", "HEAD")), before)
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_verdict_rerun_commits_the_list_saved_before_the_first_commit_stopped(self) -> None:
+        _ = change_review.append_rows(self.path, [GRID], date(2026, 10, 15), "216c4e1d", PRODUCTION)
+        previous = self.git("rev-parse", "HEAD")
+        with (mock.patch.object(change_review, "_commit", side_effect=KeyboardInterrupt),
+              self.assertRaises(KeyboardInterrupt)):
+            _ = run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C1", "--verdict", "works")
+        saved = self.path.read_bytes(), self.path.stat().st_mtime_ns
+        self.assertNotEqual(self.git("status", "--porcelain", "--", str(self.path)), "")
+        self.assertEqual(self.git("rev-parse", "HEAD"), previous)
+        code, printed, error = run("verdict", "--production", DOC, "--list", str(self.path),
+                                   "--row", "C1", "--verdict", "works")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("already has this verdict", printed)
+        self.assertEqual((self.path.read_bytes(), self.path.stat().st_mtime_ns), saved)
+        self.assertNotEqual(self.git("rev-parse", "HEAD"), previous)
+        self.assertEqual(self.git("rev-list", "--count", f"{previous}..HEAD"), "1")
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertIn("| C1 | " + GRID.change + " | works |", self.git("show", "HEAD:change-review/change-review - hana.md"))
 
     def test_an_edit_commits_the_list(self) -> None:
         _ = run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B", "--see", "C")

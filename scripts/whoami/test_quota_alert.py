@@ -2,22 +2,26 @@
 
 from __future__ import annotations
 
+import sys
 import fcntl
 import json
 import os
 import subprocess
 import unittest
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from datetime import datetime, timedelta
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.whoami import quota_alert_test_support as support
 import quota_alert
 from scripts.whoami import agent_accounts
-from agent_accounts import Quota, Report
-import usage_store
+from scripts.whoami.agent_accounts import Quota, Report
+from scripts.whoami import usage_store
 from agent_notes import local_reset
-from scripts.accounts import accounts, next_moves
+from scripts.accounts import accounts, moves, next_moves, role_map
 from user_action import ActionRequired
 from scripts.whoami.quota_alert_test_support import Notes, REAL_RECIPIENTS, REAL_TELL_USER, REGISTRY as REGISTRY, running
 
@@ -284,6 +288,293 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         self.assertEqual(self.sent, [])
         self.assertEqual(len(self.noted), 1)
         self.assertIsNone(quota_alert.notice(lambda: "natedev"))
+
+
+class QuotaAlertRerunTests(support.CodexRerunFixture):
+    def partially_restore(self) -> None:
+        owner = self.readings(self.now).selected_account
+        assert isinstance(owner, agent_accounts.KnownCodexAccount)
+        with mock.patch.object(accounts, "pick", return_value=accounts.NoAccountWithRoom(accounts.NoResetKnown(), ())):
+            _ = quota_alert.blocked([self.note(1)], owner, self.now, codex_readings=self.readings(self.now))
+
+        def fail_one(editor: str, *arguments: str) -> str | None:
+            if arguments == ("module_review", "codex"):
+                return "fixture registry locked"
+            return self.edit_assignments(editor, *arguments)
+
+        with mock.patch.object(quota_alert, "edit_registry", side_effect=fail_one):
+            _ = self.alert(self.now + timedelta(minutes=1), left=90)
+        self.assertEqual(self.read_assignments()["direct"], "codex")
+        self.assertEqual(self.read_assignments()["module_review"], "claude")
+
+    def test_queued_claude_switch_keeps_failed_restore_keys_until_the_next_recovery(self) -> None:
+        class Killed(BaseException):
+            pass
+
+        self.partially_restore()
+        _ = next_moves.add_next_move("workers", 1, "claude")
+        later = self.now + timedelta(minutes=2)
+        with mock.patch.object(quota_alert, "_record_claude_switch", side_effect=Killed()):
+            with self.assertRaises(Killed):
+                _ = self.alert(later, left=0)
+        _ = self.alert(later + timedelta(seconds=1), left=0)
+        with quota_alert.state_file() as state:
+            fallback = state["fallback"]
+            assert isinstance(fallback, quota_alert.AccountCodexQuotaFallback)
+            self.assertEqual(set(fallback.moved), {"direct", "module_review"})
+        _ = self.alert(self.now + timedelta(days=4), left=90)
+        self.assertEqual({self.read_assignments()[key] for key in ("direct", "module_review")}, {"codex"})
+        with quota_alert.state_file() as state:
+            self.assertIsInstance(state["fallback"], quota_alert.NoCodexQuotaFallback)
+
+    def test_repeat_refusal_switches_keys_restored_before_a_partial_failure(self) -> None:
+        class Killed(BaseException):
+            pass
+
+        self.partially_restore()
+        later = self.now + timedelta(minutes=2)
+        owner = self.readings(later).selected_account
+        assert isinstance(owner, agent_accounts.KnownCodexAccount)
+        with mock.patch.object(accounts, "pick", return_value=accounts.NoAccountWithRoom(accounts.NoResetKnown(), ())):
+            with mock.patch.object(quota_alert, "_record_claude_switch", side_effect=Killed()):
+                with self.assertRaises(Killed):
+                    _ = quota_alert.blocked([self.note(1)], owner, later, codex_readings=self.readings(later))
+            _ = quota_alert.blocked([self.note(1)], owner, later, codex_readings=self.readings(later))
+        self.assertEqual(self.read_assignments()["direct"], "claude")
+        with quota_alert.state_file() as state:
+            fallback = state["fallback"]
+            assert isinstance(fallback, quota_alert.AccountCodexQuotaFallback)
+            self.assertEqual(set(fallback.moved), {"direct", "module_review"})
+        _ = self.alert(later + timedelta(minutes=1), left=90)
+        self.assertEqual({self.read_assignments()[key] for key in ("direct", "module_review")}, {"codex"})
+
+    def test_restoration_reports_survive_a_stop_or_failed_journal_append(self) -> None:
+        class Killed(BaseException):
+            pass
+
+        for index, fault in enumerate((Killed(), OSError("fixture journal unavailable"))):
+            with self.subTest(fault=type(fault).__name__):
+                at = self.now + timedelta(minutes=3 * index)
+                owner = self.readings(at).selected_account
+                assert isinstance(owner, agent_accounts.KnownCodexAccount)
+                with mock.patch.object(accounts, "pick", return_value=accounts.NoAccountWithRoom(accounts.NoResetKnown(), ())):
+                    _ = quota_alert.blocked([self.note(1)], owner, at, codex_readings=self.readings(at))
+                before = len([row for row in moves.read_journal() if row["kind"] == "routed back"])
+                later = at + timedelta(minutes=1)
+                with mock.patch.object(moves, "append_routing", side_effect=fault):
+                    try:
+                        _ = self.alert(later, left=90)
+                    except (Killed, OSError):
+                        pass
+                self.assertEqual(self.read_assignments()["direct"], "codex")
+                _ = self.alert(later + timedelta(seconds=1), left=90)
+                rows = [row for row in moves.read_journal() if row["kind"] == "routed back"]
+                self.assertEqual(len(rows), before + 1)
+                shown = quota_alert.notice(lambda: quota_alert.OWNER)
+                assert shown is not None
+                self.assertIn("Codex recovered", shown)
+                self.assertIn("direct, module_review", shown)
+                _ = self.alert(later + timedelta(seconds=2), left=90)
+                self.assertEqual(len([row for row in moves.read_journal() if row["kind"] == "routed back"]), before + 1)
+                self.assertIsNone(quota_alert.notice(lambda: quota_alert.OWNER))
+
+    def test_restoration_notice_is_saved_once_after_an_interrupted_successful_append(self) -> None:
+        class Killed(BaseException):
+            pass
+
+        owner = self.readings(self.now).selected_account
+        assert isinstance(owner, agent_accounts.KnownCodexAccount)
+        with mock.patch.object(accounts, "pick", return_value=accounts.NoAccountWithRoom(accounts.NoResetKnown(), ())):
+            _ = quota_alert.blocked([self.note(1)], owner, self.now, codex_readings=self.readings(self.now))
+        _ = quota_alert.notice(lambda: quota_alert.OWNER)
+        append = moves.append_routing
+
+        def append_then_stop(row: moves.RoutingEntry) -> None:
+            append(row)
+            raise Killed()
+
+        later = self.now + timedelta(minutes=1)
+        with mock.patch.object(moves, "append_routing", side_effect=append_then_stop):
+            with self.assertRaises(Killed):
+                _ = self.alert(later, left=90)
+        self.assertEqual(len([row for row in moves.read_journal() if row["kind"] == "routed back"]), 1)
+        self.assertIsNone(quota_alert.notice(lambda: quota_alert.OWNER))
+        _ = self.alert(later + timedelta(seconds=1), left=90)
+        shown = quota_alert.notice(lambda: quota_alert.OWNER)
+        assert shown is not None
+        self.assertEqual(shown.count("Codex recovered"), 1)
+        _ = self.alert(later + timedelta(seconds=2), left=90)
+        self.assertIsNone(quota_alert.notice(lambda: quota_alert.OWNER))
+        self.assertEqual(len([row for row in moves.read_journal() if row["kind"] == "routed back"]), 1)
+
+    def test_pending_switch_is_recovered_only_by_the_switching_pass_and_tells_owner_once(self) -> None:
+        class Killed(BaseException):
+            pass
+
+        _ = next_moves.add_next_move("workers", 1, "claude")
+        edited = False
+
+        def edit_then_stop_on_read(editor: str, *arguments: str) -> str | None:
+            nonlocal edited
+            result = self.edit_assignments(editor, *arguments)
+            edited = True
+            return result
+
+        def read_until_edit() -> dict[str, str]:
+            if edited:
+                raise Killed()
+            return self.read_assignments()
+
+        with (mock.patch.object(quota_alert, "edit_registry", side_effect=edit_then_stop_on_read),
+              mock.patch.object(quota_alert, "registry_assignments", side_effect=read_until_edit)):
+            with self.assertRaises(Killed):
+                _ = self.alert(left=0)
+        before = quota_alert.STATE.read_bytes()
+        with (mock.patch.object(quota_alert, "registry_assignments", side_effect=AssertionError("a state read must not switch")),
+              mock.patch.object(moves, "append_routing", side_effect=AssertionError("a state read must not journal"))):
+            with quota_alert.state_file() as state:
+                self.assertIn("pending_switch", state)
+            self.assertIsNone(quota_alert.notice(lambda: quota_alert.OWNER))
+        self.assertEqual(quota_alert.STATE.read_bytes(), before)
+        _ = self.alert(self.now + timedelta(seconds=1), left=0)
+        shown = quota_alert.notice(lambda: quota_alert.OWNER)
+        assert shown is not None
+        self.assertIn("direct, module_review moved to Claude", shown)
+        _ = self.alert(self.now + timedelta(seconds=2), left=0)
+        self.assertIsNone(quota_alert.notice(lambda: quota_alert.OWNER))
+        self.assertEqual(len([row for row in moves.read_journal() if row["kind"] == "routed to claude"]), 1)
+
+    def test_old_workers_requests_share_one_role_read_per_pass(self) -> None:
+        stamp = self.now.isoformat()
+        for index in range(3):
+            moves.append_move(moves.RequestedMove(kind="requested", at=stamp, tool="codex", subject="workers",
+                move_id=f"old-{index}", cause="auto", why=f"auto: entry-{index}",
+                **{"from": "codex2", "to": "codex3"}, window="weekly"))
+        with mock.patch.object(role_map, "read_role_map", wraps=role_map.read_role_map) as read_role:
+            _ = quota_alert.run_workers_next_moves(self.readings(self.now), self.now)
+        self.assertEqual(read_role.call_count, 1)
+
+    def test_stopped_claude_switch_recovers_fallback_and_journals_once(self) -> None:
+        class Killed(BaseException):
+            pass
+
+        note = self.note(1)
+        owner = self.readings(self.now).selected_account
+        assert isinstance(owner, agent_accounts.KnownCodexAccount)
+        stamp = self.now.isoformat(timespec="seconds")
+        hold = quota_alert.ScheduledMoveHold(self.now + timedelta(days=2))
+        destination = next_moves.ClaudeWorkersTarget("claude4")
+        changed = False
+
+        def edit_then_stop_on_read(editor: str, *arguments: str) -> str | None:
+            nonlocal changed
+            result = self.edit_assignments(editor, *arguments)
+            changed = True
+            return result
+
+        def read_until_edit() -> dict[str, str]:
+            if changed:
+                raise Killed()
+            return self.read_assignments()
+
+        with (mock.patch.object(quota_alert, "edit_registry", side_effect=edit_then_stop_on_read),
+              mock.patch.object(quota_alert, "registry_assignments", side_effect=read_until_edit)):
+            with self.assertRaises(Killed), quota_alert.state_file() as state:
+                _ = quota_alert.switch_to_claude(state, note, stamp, owner, hold=hold,
+                    why="auto: rerun-entry", claude_account=destination)
+        self.assertEqual(self.read_assignments()["direct"], "claude")
+        with quota_alert.state_file() as state:
+            _ = quota_alert.switch_to_claude(state, note, (self.now + timedelta(minutes=1)).isoformat(),
+                owner, hold=hold, why="auto: rerun-entry", claude_account=destination)
+        with quota_alert.state_file() as state:
+            fallback = state["fallback"]
+            self.assertIsInstance(fallback, quota_alert.AccountCodexQuotaFallback)
+            assert isinstance(fallback, quota_alert.AccountCodexQuotaFallback)
+            self.assertEqual((fallback.owner, fallback.at, fallback.moved, fallback.hold),
+                             (owner, stamp, ("direct", "module_review"), hold))
+            self.assertEqual(fallback.claude_account, destination)
+            _ = quota_alert.switch_to_claude(state, note, stamp, owner, hold=hold,
+                why="auto: rerun-entry", claude_account=destination)
+        routing = [row for row in moves.read_journal() if row["kind"] == "routed to claude"]
+        self.assertEqual(len(routing), 1)
+        self.assertEqual((routing[0]["fallback_at"], routing[0]["moved"], routing[0]["why"]),
+                         (stamp, ["direct", "module_review"], "auto: rerun-entry"))
+        self.assertEqual(routing[0].get("claude_account"), "claude4")
+        self.assertEqual(self.read_assignments()["ask_a_friend"], "caller")
+
+    def test_failed_restore_keeps_only_failed_keys_for_the_next_pass(self) -> None:
+        class Killed(BaseException):
+            pass
+
+        owner = self.readings(self.now).selected_account
+        assert isinstance(owner, agent_accounts.KnownCodexAccount)
+        stamp = self.now.isoformat(timespec="seconds")
+        with quota_alert.state_file() as state:
+            _ = quota_alert.switch_to_claude(state, self.note(1), stamp, owner)
+        later = self.now + timedelta(hours=1)
+        readings = self.readings(later, left=100)
+
+        def fail_one(editor: str, *arguments: str) -> str | None:
+            if arguments == ("module_review", "codex"):
+                return "fixture registry locked"
+            return self.edit_assignments(editor, *arguments)
+
+        with mock.patch.object(quota_alert, "edit_registry", side_effect=fail_one):
+            with quota_alert.state_file() as state:
+                _ = quota_alert.switch_back(state, later, readings)
+        with quota_alert.state_file() as state:
+            fallback = state["fallback"]
+            self.assertIsInstance(fallback, quota_alert.AccountCodexQuotaFallback)
+            assert isinstance(fallback, quota_alert.AccountCodexQuotaFallback)
+            self.assertEqual((fallback.at, fallback.moved), (stamp, ("module_review",)))
+        self.assertEqual(self.read_assignments()["direct"], "codex")
+        self.assertEqual(self.read_assignments()["module_review"], "claude")
+        with mock.patch.object(quota_alert, "registry_assignments", side_effect=Killed()):
+            with self.assertRaises(Killed), quota_alert.state_file() as state:
+                _ = quota_alert.switch_back(state, later + timedelta(seconds=1), readings)
+        with mock.patch.object(quota_alert, "edit_registry", side_effect=self.edit_assignments) as edit:
+            with quota_alert.state_file() as state:
+                _ = quota_alert.switch_back(state, later + timedelta(minutes=1), readings)
+        edit.assert_called_once_with("agents_set_assignment", "module_review", "codex")
+        with quota_alert.state_file() as state:
+            self.assertIsInstance(state["fallback"], quota_alert.NoCodexQuotaFallback)
+        self.assertEqual(self.read_assignments()["module_review"], "codex")
+        routing = [row for row in moves.read_journal()
+                   if row["kind"] == "routing not restored" or row["kind"] == "routed back"]
+        self.assertEqual([row["kind"] for row in routing], ["routing not restored", "routed back"])
+        self.assertEqual([row["fallback_at"] for row in routing], [stamp, stamp])
+
+    def test_stopped_workers_request_retries_same_move_before_consuming_queue(self) -> None:
+        class Killed(BaseException):
+            pass
+
+        head = next_moves.add_next_move("workers", 1, "codex3")
+        readings = self.readings(self.now, left=1, spare_accounts=((3, 80, "0"),))
+        with mock.patch.object(accounts, "swap", side_effect=Killed()):
+            with self.assertRaises(Killed):
+                _ = quota_alert.run_workers_next_moves(readings, self.now)
+        requested = [row for row in moves.read_moves() if row["kind"] == "requested"]
+        self.assertEqual(len(requested), 1)
+        original_move_id = requested[0]["move_id"]
+        self.assertEqual(role_map.read_role_map().workers, "codex1")
+        self.assertEqual(next_moves.read_next_moves(), (head,))
+
+        def swap_after_request(group: str, target: str, *, why: str, cause: str) -> list[str]:
+            self.assertEqual(next_moves.read_next_moves(), (head,))
+            self.assertEqual((group, target, why, cause), ("workers", "codex3", f"auto: {head.id}", "auto"))
+            accounts.set_role("workers", target)
+            return []
+
+        with mock.patch.object(accounts, "swap", side_effect=swap_after_request) as swap:
+            returned = quota_alert.run_workers_next_moves(readings, self.now + timedelta(seconds=1))
+        swap.assert_called_once()
+        self.assertEqual(returned.workers, accounts.CodexWorkersAccount("codex3", self.root / ".codex3"))
+        self.assertEqual(role_map.read_role_map().workers, "codex3")
+        self.assertEqual(next_moves.read_next_moves(), ())
+        requested = [row for row in moves.read_moves() if row["kind"] == "requested"]
+        self.assertEqual({row["move_id"] for row in requested}, {original_move_id})
+        with mock.patch.object(accounts, "swap", side_effect=AssertionError("finished move repeated")):
+            _ = quota_alert.run_workers_next_moves(returned, self.now + timedelta(seconds=2))
 
 
 if __name__ == "__main__":

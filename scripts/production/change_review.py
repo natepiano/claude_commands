@@ -75,6 +75,7 @@ from pathlib import Path
 from typing import TypeVar, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from atomic_file import write_text_atomic  # noqa: E402
 import scratch  # noqa: E402
 import urgency  # noqa: E402
 from user_zone import user_zone  # noqa: E402
@@ -432,9 +433,12 @@ def _edit(path: Path, production: Path, day: date, write: Callable[[list[str]], 
         text = path.read_text(encoding="utf-8") if path.exists() else skeleton(path, production, day)
         lines = text.splitlines(keepends=True)
         result = write(lines)
+        if lines == text.splitlines(keepends=True):
+            _commit(path, what(result))
+            return result
         _sort(path, lines)
         _stamp(path, lines, production, day)
-        _ = path.write_text("".join(lines), encoding="utf-8")
+        write_text_atomic(path, "".join(lines))
         _commit(path, what(result))
         return result
     finally:
@@ -455,6 +459,8 @@ def _commit(path: Path, what: str) -> None:
                               capture_output=True, text=True, check=False)
 
     if git("rev-parse", "--is-inside-work-tree").stdout.strip() != "true":
+        return
+    if not git("status", "--porcelain", "--", path.name).stdout.strip():
         return
     steps = [] if git("ls-files", "--", path.name).stdout.strip() else [["add", "--intent-to-add", "--", path.name]]
     steps.append(["commit", "--quiet", "--only", "-m", f"change-review: {_owner(path)} {what}", "--", path.name])
@@ -620,9 +626,10 @@ def pending(path: Path) -> list[dict[str, str]]:
 def scope_list(doc: Path) -> Path:
     """The list that takes the production's rows: the one its Change review line names, else its root's."""
     import showrunners
+    import showrunner_tree
 
     slug = slug_of(doc)
-    root = showrunners.root_of(slug)
+    root = showrunner_tree.root_of(slug)
     try:
         return production_list(str(doc))
     except ChangeReviewError:
@@ -645,9 +652,9 @@ class ScopedReviewEntry:
 
 def scope_lists(path: Path, doc: Path, below: bool = False) -> tuple[ProductionReviewList, ...]:
     """The current list and each scoped production's own earlier list, once per path."""
-    import showrunners
+    import showrunner_tree
 
-    lists = {path.absolute(): ProductionReviewList(path, showrunners.root_of(slug_of(doc)))}
+    lists = {path.absolute(): ProductionReviewList(path, showrunner_tree.root_of(slug_of(doc)))}
     for production in scope_docs(doc, below):
         slug = slug_of(production)
         earlier = list_file(slug)
@@ -711,10 +718,10 @@ def change_queue(path: Path, scope: Path | WholeReviewList, below: bool = False)
     """The same change rows and pin for /next and change_review show."""
     if isinstance(scope, WholeReviewList):
         return ChangeQueue(queue(path), row_entries(pending(path)))
-    import showrunners
+    import showrunner_tree
 
     slug = slug_of(scope)
-    name = queue(path) if slug == showrunners.root_of(slug) else f"{queue(path)}-{slug}"
+    name = queue(path) if slug == showrunner_tree.root_of(slug) else f"{queue(path)}-{slug}"
     return ChangeQueue(urgency.scope_queue(name, below), scope_entries(path, scope, below))
 
 
@@ -873,13 +880,13 @@ def trace(row: dict[str, str], tree: Tree) -> Path | str:
 
 def list_tree(path: Path, docs: Iterable[Path]) -> Tree:
     """The productions whose root keeps the list `path`, with every production below each root."""
-    import showrunners
+    import showrunner_tree
 
     owned: list[Path] = []
     for doc in docs:
         slug = slug_of(doc)
         try:
-            if showrunners.root_of(slug) != slug or list_path(doc) != path:
+            if showrunner_tree.root_of(slug) != slug or list_path(doc) != path:
                 continue
         except OSError:
             continue
@@ -997,16 +1004,62 @@ def mark_row(path: Path, row: str, now: datetime, production: Path) -> str:
     return _edit(path, production, now.date(), write, lambda _: f"mark {row} important")
 
 
-def record_verdict(path: Path, row: str, verdict: str, day: date, production: Path) -> str:
-    """Move `row` from To review to the top of the Reviewed table; return its Merged cell."""
+@dataclass(frozen=True)
+class RecordedMerge:
+    text: str
 
-    def write(lines: list[str]) -> str:
-        columns, index = _to_review(path, lines, row)
+
+@dataclass(frozen=True)
+class MergeNotRecorded:
+    pass
+
+
+@dataclass(frozen=True)
+class VerdictRecorded:
+    merged: RecordedMerge | MergeNotRecorded
+
+
+@dataclass(frozen=True)
+class VerdictAlreadyRecorded:
+    verdict: str
+    day: str
+    merged: RecordedMerge | MergeNotRecorded
+
+
+@dataclass(frozen=True)
+class VerdictConflict:
+    recorded: str
+    day: str
+
+
+def row_merge(cells: dict[str, str]) -> RecordedMerge | MergeNotRecorded:
+    text = _plain(cells.get("Merged", ""))
+    return RecordedMerge(text) if text else MergeNotRecorded()
+
+
+def record_verdict(path: Path, row: str, verdict: str, day: date,
+                   production: Path) -> VerdictRecorded | VerdictAlreadyRecorded | VerdictConflict:
+    """Record a verdict once, retaining its merge and the outcome of an earlier write."""
+
+    def write(lines: list[str]) -> VerdictRecorded | VerdictAlreadyRecorded | VerdictConflict:
+        columns, first, end = _table(path, lines, SECTION)
+        index = next((index for index in range(first, end) if lines[index].startswith(f"| {row} |")), None)
+        if index is None:
+            reviewed, first, end = _table(path, lines, REVIEWED)
+            index = next((index for index in range(first, end) if lines[index].startswith(f"| {row} |")), None)
+            if index is None:
+                raise ChangeReviewError(f"{row} is not on the list to review")
+            cells = dict(zip(reviewed, _cells(lines[index])))
+            if cells.get("Verdict", "") == _cell(verdict):
+                return VerdictAlreadyRecorded(verdict, _plain(cells.get("Date", "")), row_merge(cells))
+            return VerdictConflict(_plain(cells.get("Verdict", "")), _plain(cells.get("Date", "")))
         cells = dict(zip(columns, _cells(lines.pop(index))))
+        _add_column(path, lines, REVIEWED, "Merged")
         reviewed, top, _ = _table(path, lines, REVIEWED)
         _insert(lines, top, [_row(path, reviewed, {"#": row, "Change": cells.get("Change", ""),
-                                                   "Verdict": _cell(verdict), "Date": day.isoformat()})])
-        return _plain(cells.get("Merged", ""))
+                                                   "Verdict": _cell(verdict), "Date": day.isoformat(),
+                                                   "Merged": cells.get("Merged", "")})])
+        return VerdictRecorded(row_merge(cells))
 
     return _edit(path, production, day, write, lambda _: f"verdict {row}")
 
@@ -1054,9 +1107,10 @@ def showrunner_of(doc: Path) -> str:
     name as it is now, never the production slug, so it is read only while that showrunner runs.
     """
     import showrunners
+    import showrunner_tree
 
     try:
-        root = showrunners.root_of(showrunners.canonical_slug(showrunners.production_slug(str(doc))))
+        root = showrunner_tree.root_of(showrunners.canonical_slug(showrunners.production_slug(str(doc))))
     except ValueError as error:
         raise ChangeReviewError(str(error)) from None
     name = showrunners.current_name(root)
@@ -1113,10 +1167,11 @@ def foreign_units(production: Path) -> set[str]:
     Empty when the productions cannot be read: drift then counts every checkpoint.
     """
     import showrunners
+    import showrunner_tree
 
     try:
         docs = list(showrunners.timer_docs().values())
-        root = showrunners.root_of(slug_of(production))
+        root = showrunner_tree.root_of(slug_of(production))
         top = next((doc for doc in docs if slug_of(doc) == root), production)
         return set(unit_branches(docs)) - set(unit_branches(owner_docs(top)))
     except (OSError, ValueError, Refusal):
@@ -1243,11 +1298,20 @@ def _run(options: CommandLine) -> int:
         case "verdict":
             target = _row_option(options)
             verdict = _words("verdict", options.verdict)
-            merged = record_verdict(target.path, target.row, verdict, today(), production_doc(options.production))
+            result = record_verdict(target.path, target.row, verdict, today(), production_doc(options.production))
             row = options.row.strip()
-            print(f"{row} landed" if lands(verdict) else f"{row} returns to its unit (merged {merged})")
+            if isinstance(result, VerdictConflict):
+                print(f'change review: {row} has the verdict "{result.recorded}" from {result.day}; '
+                      + 'this verdict is not recorded', file=sys.stderr)
+            else:
+                if isinstance(result, VerdictAlreadyRecorded):
+                    print(f"{row} already has this verdict ({result.day}); the list is unchanged")
+                merged = result.merged.text if isinstance(result.merged, RecordedMerge) else "not recorded"
+                print(f"{row} landed" if lands(verdict) else f"{row} returns to its unit (merged {merged})")
             for line in end_row_scratch(target.path, target.row):
                 print(line)
+            if isinstance(result, VerdictConflict):
+                return 1
         case "list-path":
             print(production_list(options.production))
         case "showrunner":

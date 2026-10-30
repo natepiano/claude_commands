@@ -11,8 +11,12 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.accounts import accounts, refusals
-import usage_store
+from scripts.whoami import usage_store
 
 
 WEEKLY_REFUSAL_WINDOW = refusals.KnownWindow("weekly")

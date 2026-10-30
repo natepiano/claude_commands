@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import traceback
 import unittest
 from collections.abc import Callable
 from contextlib import closing, nullcontext
@@ -38,8 +39,10 @@ class ScriptedServer:
         self.changes: list[str] = []
         self.opened: str = ""
         self.documents: dict[Path, str] = {}
+        self.sources: bulk.RunSourceIndex = bulk.RunSourceIndex(self)
 
     def open(self, path: Path, text: str) -> None:
+        self.sources.update(path, text)
         if path in self.documents:
             self.change(path, text)
         else:
@@ -47,6 +50,7 @@ class ScriptedServer:
             self.documents[path] = text
 
     def change(self, path: Path, text: str) -> None:
+        self.sources.update(path, text)
         self.documents[path] = text
         self.changes.append(text)
 
@@ -140,6 +144,54 @@ class CargoProjectTests(unittest.TestCase):
 
 
 class RenameTests(CargoProjectTests):
+    def test_f009_several_globs_and_proof_share_one_coverage_walk(self) -> None:
+        source = ''.join(f"mod provider{i} {{}} use provider{i}::*;\n" for i in range(5))
+        source += "fn f() { let old = 1; consume(old); }\n"
+        server = ScriptedServer(lambda text, offset, new: word_edits(text, "old", new))
+        with mock.patch.object(bulk, "crate_source_coverage", wraps=bulk.crate_source_coverage) as walk:
+            result = self.rename(source, (self.finding(source, line=6),), server)
+        self.assertEqual(result.refusals, ())
+        self.assertEqual(walk.call_count, 1)
+
+    def test_f007_index_reads_once_and_tracks_accepted_and_rolled_back_edits(self) -> None:
+        root, child = self.repo / "src/lib.rs", self.repo / "src/child.rs"
+        source = "mod child; fn f() { let old = 1; consume(old); }\n"
+        other = "fn f() { let other = 2; consume(other); }\n"
+        _ = root.write_text(source)
+        _ = child.write_text(other)
+        server = ScriptedServer(lambda text, offset, new: word_edits(text, "old" if new == "number" else "other", new))
+        read_text = Path.read_text
+        reads: list[Path] = []
+        def read(path: Path, *_args: object, **_kwargs: object) -> str:
+            reads.append(path)
+            return read_text(path)  # All indexed sources use the same UTF-8 text boundary.
+        with mock.patch.object(Path, "read_text", read), mock.patch.object(
+                bulk, "crate_source_coverage", wraps=bulk.crate_source_coverage) as walk:
+            self.assertEqual(bulk.crate_name_documents(server, root, "number"), ())
+            edit = {"changes": {child.as_uri(): [{"range": {"start": {"line": 0, "character": 0},
+                                                             "end": {"line": 0, "character": 0}}, "newText": "// note\n"}]}}
+            with mock.patch.object(Path, "read_bytes", side_effect=AssertionError("WorkspaceEdit reread indexed source")):
+                workspace = bulk.workspace_edits(edit, root, source, 1,
+                                                  read_source=lambda path: server.sources.read(path).source)
+            self.assertEqual(workspace.documents[0].source, other)
+            accepted = self.rename(source, (self.finding(source, line=1),), server)
+            self.assertEqual(accepted.refusals, ())
+            self.assertEqual({doc.path for doc in bulk.crate_name_documents(server, root, "number")}, {root})
+            definitions = server.definitions
+            def refuse(path: Path, text: str, offsets: tuple[int, ...]) -> tuple[bulk.DefinitionResolution, ...]:
+                if "count" in text:
+                    return tuple(bulk.DefinitionUnavailable("test rollback") for _ in offsets)
+                return definitions(path, text, offsets)
+            with mock.patch.object(server, "definitions", side_effect=refuse):
+                rolled_back = bulk.rename_file(server, child, "src/child.rs", other,
+                                               (self.finding(other, "other", "count", 1),))
+            self.assertIn("test rollback", rolled_back.refusals[0].reason)
+            self.assertEqual(server.documents[child], other)
+            self.assertEqual(bulk.crate_name_documents(server, root, "count"), ())
+            self.assertIn("number", bulk.crate_name_documents(server, root, "number")[0].source)
+        self.assertEqual((reads.count(root), reads.count(child)), (1, 1))
+        self.assertEqual(walk.call_count, 1)
+
     def test_direct_call_and_multiple_bindings_use_the_refactor(self) -> None:
         source = "fn f() { let first = 1; let second = consume(first); }\n"
         findings = (self.finding(source, "first", "first_number", 1, "first"),
@@ -424,8 +476,41 @@ class SourceCoverageTests(CargoProjectTests):
         self.assertFalse(bulk.module_exports(server, root, source, module, "number", set()))
         self.assertTrue(bulk.module_exports(server, root, source, module, "replacement", set()))
 
+    def test_f008_twice_loaded_unrelated_glob_provider_needs_no_instance_query(self) -> None:
+        root = self.repo / "src/lib.rs"
+        source = '#[path="shared.rs"] mod first; #[path="shared.rs"] mod second; use first::*; fn old() {}'
+        _ = self.write_modules({"src/lib.rs": source, "src/shared.rs": "pub fn unrelated() {}"})
+        server = self.server()
+        module = bulk.glob_modules(bulk.BindingText(source))[0]
+        try:
+            self.assertFalse(bulk.module_exports(server, root, source, module, "number", set()))
+            self.assertTrue(bulk.module_exports(server, root, source, module, "unrelated", set()))
+        except bulk.BulkRenameError as error:
+            self.fail(str(error))
+
 
 class ProtocolTests(CargoProjectTests):
+    def test_f006_non_shorthand_multi_target_stays_unresolved(self) -> None:
+        source = "fn f() {} fn g() {}"
+        root = self.repo / "src/lib.rs"
+        server = ScriptedServer(lambda text, offset, new: ())
+        server.open(root, source)
+        rows = [{"uri": root.as_uri(), "range": {"start": bulk.lsp_position(source, point),
+                                                   "end": bulk.lsp_position(source, point + 1)}}
+                for point in (source.index("f()"), source.index("g()"))]
+        result = bulk.definition_result(rows, server.sources, source, source.index("f()"))
+        self.assertIsInstance(result, bulk.DefinitionUnavailable)
+        self.assertIn("ambiguous definition", cast(bulk.DefinitionUnavailable, result).reason)
+        source = ("macro_rules! fields { () => { struct R { number: usize } } }\n"
+                  + "fn f() { let number = 1; let _ = R { number }; }")
+        server.open(root, source)
+        rows = [{"uri": root.as_uri(), "range": {"start": bulk.lsp_position(source, point),
+                                                   "end": bulk.lsp_position(source, point + len("number"))}}
+                for point in (source.index("number"), source.index("number", source.index("fn f")))]
+        result = bulk.definition_result(rows, server.sources, source, source.rindex("number"))
+        self.assertIsInstance(result, bulk.DefinitionUnavailable)
+        self.assertIn("ambiguous definition", cast(bulk.DefinitionUnavailable, result).reason)
+
     def test_stdio_handshake_enables_build_scripts_and_proc_macros_and_prepares_each_rename(self) -> None:
         folder = self.root / "bin"
         folder.mkdir()
@@ -609,7 +694,84 @@ class ValidationTests(CargoProjectTests):
         self.assertEqual(bulk.verification_packages(self.repo, "last"), ("last",))
 
 
+def stop_process(command: Callable[[], object]) -> None:
+    """A fault point exits the child; cleanup handlers cannot mask process loss."""
+    child = os.fork()
+    if child == 0:
+        try:
+            _ = command()
+        except BaseException:
+            traceback.print_exc()
+        finally:
+            os._exit(74)
+    _, status = os.waitpid(child, 0)
+    if os.waitstatus_to_exitcode(status) != 73:
+        raise AssertionError(f"fault point was not reached: {status}")
+
+
+def stop_after_edit(path: Path, command: Callable[[], object]) -> None:
+    """Lose the child process immediately after a named write, without exception cleanup."""
+    def execute() -> None:
+        write_text, write_bytes = Path.write_text, Path.write_bytes
+
+        def text(target: Path, content: str) -> int:
+            result = write_text(target, content)
+            if target == path:
+                os._exit(73)
+            return result
+
+        def data(target: Path, content: bytes) -> int:
+            result = write_bytes(target, content)
+            if target == path:
+                os._exit(73)
+            return result
+
+        with mock.patch.object(Path, "write_text", text), mock.patch.object(Path, "write_bytes", data):
+            _ = command()
+    stop_process(execute)
+
+
 class LedgerTests(CargoProjectTests):
+    def test_review_keeps_refusals_after_process_loss_on_ledger_release(self) -> None:
+        ledger = self.ledger()
+        kept, refused = self.ticket(ledger)
+        server = ScriptedServer(lambda text, offset, new: word_edits(text, "old", new))
+        release = style_ledger.Ledger.bulk_release
+
+        def stopped(instance: style_ledger.Ledger, ticket: str,
+                    reasons: dict[str, str]) -> tuple[style_ledger.BulkRefusal, ...]:
+            _ = release(instance, ticket, reasons)
+            os._exit(73)
+
+        with (mock.patch.object(bulk, "RustAnalyzer", return_value=nullcontext(server)),
+              mock.patch.object(shutil, "which", return_value="rust-analyzer"),
+              mock.patch.object(bulk, "verification_packages", return_value=("bulk_sample",)),
+              mock.patch.object(bulk, "check_available"), mock.patch.object(bulk, "command")):
+            with mock.patch.object(style_ledger.Ledger, "bulk_release", stopped):
+                stop_process(lambda: bulk.run_batch(self.repo, "names-1"))
+            self.assertEqual([row.finding_id for row in ledger.bulk_refusals("names-1")], [refused])
+            with mock.patch("builtins.print") as output:
+                review = bulk.run_batch(self.repo, "names-1")
+        payload = bulk.object_fields(cast(object, json.loads(review.read_text())))
+        self.assertEqual(payload["kept"], [kept])
+        self.assertEqual(payload["refusals"], [dict(finding_id=refused, reason=ledger.bulk_refusals("names-1")[0].reason)])
+        output.assert_called_once_with(f"bulk rename: 1 kept, 1 refused, 0 macro edits; review {review}")
+
+    def test_batch_reruns_after_process_loss_on_first_edit(self) -> None:
+        ledger = self.ledger()
+        kept, _ = self.ticket(ledger)
+        server = ScriptedServer(lambda text, offset, new: word_edits(text, "old", new))
+        with (mock.patch.object(bulk, "RustAnalyzer", return_value=nullcontext(server)),
+              mock.patch.object(shutil, "which", return_value="rust-analyzer"),
+              mock.patch.object(bulk, "verification_packages", return_value=("bulk_sample",)),
+              mock.patch.object(bulk, "check_available"), mock.patch.object(bulk, "command")):
+            stop_after_edit(self.repo / "src/lib.rs", lambda: bulk.run_batch(self.repo, "names-1"))
+            self.assertIn("let number", (self.repo / "src/lib.rs").read_text())
+            review = bulk.run_batch(self.repo, "names-1")
+        payload = bulk.object_fields(cast(object, json.loads(review.read_text())))
+        self.assertEqual(payload["kept"], [kept])
+        self.assertIn("let number", (self.repo / "src/lib.rs").read_text())
+
     def test_migration_and_per_finding_release_are_atomic_idempotent_and_leave_decisions_filed(self) -> None:
         ledger = self.ledger()
         kept, refused = self.ticket(ledger)
@@ -716,6 +878,50 @@ class RustAnalyzerTests(CargoProjectTests):
     @override
     def set_up_tools(self) -> None:
         """Keep the caller's PATH, CARGO_HOME and RUSTUP_HOME."""
+
+    def test_real_f006_shorthand_preserves_both_targets_and_detects_either_capture(self) -> None:
+        source = ("struct Pair { old: usize }\nstruct R { number: usize }\n"
+                  + "fn f() { let number = 1; let _ = R { number }; let _ = Pair { old: number }; }\n")
+        root = self.repo / "src/lib.rs"
+        _ = root.write_text(source)
+        with bulk.RustAnalyzer(self.repo, timeout=120) as analyzer:
+            definitions = analyzer.definitions
+            pairs: list[bulk.FieldShorthandTargets] = []
+            changed_role = ""
+            def answers(path: Path, text: str, offsets: tuple[int, ...]) -> tuple[bulk.DefinitionResolution, ...]:
+                result = list(definitions(path, text, offsets))
+                for i, answer in enumerate(result):
+                    if isinstance(answer, bulk.FieldShorthandTargets):
+                        pairs.append(answer)
+                        if changed_role and "struct Pair { number" in text:
+                            result[i] = (replace(answer, field=replace(answer.field, end=(99, 0))) if changed_role == "field"
+                                         else replace(answer, binding=replace(answer.binding, end=(99, 0))))
+                return tuple(result)
+            with mock.patch.object(analyzer, "definitions", side_effect=answers):
+                result = bulk.rename_file(analyzer, root, "src/lib.rs", source, (self.finding(source, line=1),))
+                self.assertEqual(result.refusals, ())
+                self.assertIn("Pair { number }", result.edited)
+                self.assertEqual(len(pairs), 3)
+                self.assertEqual(pairs[0], pairs[1])
+                self.assertEqual(pairs[1].binding, pairs[2].binding)
+                self.assertNotEqual(pairs[1].field, pairs[2].field)
+                for changed_role in ("field", "binding"):
+                    analyzer.open(root, source)
+                    captured = bulk.rename_file(analyzer, root, "src/lib.rs", source, (self.finding(source, line=1),))
+                    self.assertEqual(captured.kept, ())
+                    self.assertIn("capture 'number'", captured.refusals[0].reason)
+                    self.assertEqual(analyzer.documents[root], source)
+
+    def test_real_f008_twice_loaded_unrelated_glob_allows_rename(self) -> None:
+        source = ('#[path="shared.rs"] mod first; #[path="shared.rs"] mod second;\n'
+                  + 'use first::*; fn f() { let old = 1; consume(old); }\nfn consume(_: usize) {}\n')
+        _ = (self.repo / "src/lib.rs").write_text(source)
+        _ = (self.repo / "src/shared.rs").write_text("pub fn unrelated() {}\n")
+        with bulk.RustAnalyzer(self.repo, timeout=120) as analyzer:
+            result = bulk.rename_file(analyzer, self.repo / "src/lib.rs", "src/lib.rs", source,
+                                      (self.finding(source),))
+        self.assertEqual(result.refusals, ())
+        self.assertIn("consume(number)", result.edited)
 
     def test_real_lsp_renames_all_site_kinds_shorthand_captures_and_shadowing_then_cargo_checks(self) -> None:
         source = '''struct Record { value: usize }

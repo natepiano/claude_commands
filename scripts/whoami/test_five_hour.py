@@ -1,21 +1,26 @@
 """Claude session warnings, Codex log markers and legacy notice cleanup."""
 from __future__ import annotations
 
+import sys
 import tempfile
 import subprocess
 import os
 import base64
 import json
+import hashlib
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-import agent_accounts
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.whoami import agent_accounts
+from scripts.whoami import note_file
 from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
 import five_hour
-from agent_accounts import CodexHomeSource, CodexRateLimits, Quota, Report
+from scripts.whoami.agent_accounts import CodexHomeSource, CodexRateLimits, Quota, Report
 from scripts.accounts import accounts, role_map
 
 import escalate  # five_hour puts scripts/message on the path
@@ -30,10 +35,16 @@ CONFIG = cast(Config, cast(object, {
     "threshold_percent": 2, "repeat_minutes": 30, "stall_minutes": 5, "faults_to": "hana", "always": ["natedev"],
 }))
 SHOWRUNNERS = [Showrunner(session="hana", socket="/hana.sock", slug="show", zone="America/Los_Angeles", doc="")]
+CLAUDE_LOGIN = "claude-fixture@example.invalid"
+
+
+def claude_notice_key(login: str = CLAUDE_LOGIN) -> str:
+    return "five-hour-claude-" + hashlib.sha256(login.casefold().encode()).hexdigest()[:24]
 
 
 def report(tool: str, used: float | None) -> Report:
-    return Report(tool, five_hour=None if used is None else Quota("5-hour", used, RESETS))
+    return Report(tool, email=CLAUDE_LOGIN if tool == "Claude" else None,
+                  five_hour=None if used is None else Quota("5-hour", used, RESETS))
 
 
 class WatchTests(unittest.TestCase):
@@ -44,6 +55,8 @@ class WatchTests(unittest.TestCase):
     def setUp(self) -> None:
         self.sent = []
         self.state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.state), "AGENT_NOTES_DIR": str(self.state)})))
+        _ = self.enterContext(patch.object(note_file, "AGENTS_DIR", self.state))
 
         def relay(recipient: str, text: str, key: str | None) -> str | None:
             self.sent.append((recipient, text, key))
@@ -64,6 +77,9 @@ class WatchTests(unittest.TestCase):
                                        (five_hour, "STATE", self.state / "notices")):
             _ = self.enterContext(patch.object(module, name, stand_in))
 
+    def successful_relay(self, recipient: str, text: str, key: str | None) -> None:
+        self.sent.append((recipient, text, key))
+
     def watch(self, reports: list[Report]) -> list[str]:
         home = self.state / ".codex"
         identity = KnownCodexAccount(home, "fixture@example.invalid", "codex1")
@@ -77,7 +93,58 @@ class WatchTests(unittest.TestCase):
             tuple(quota_alert.CodexHomeReading(home, live, now) for live in reports if live.tool == "Codex"))
         return five_hour.watch(reports, codex_readings=readings)
 
-    def test_a_low_window_tells_the_alert_list_once_without_a_phone_hold(self) -> None:
+    def test_claude_accounts_keep_independent_low_spells_across_passes_and_recovery(self) -> None:
+        low = Report("Claude", email="low@example.invalid", five_hour=Quota("5-hour", 82, RESETS))
+        high = Report("Claude", email="high@example.invalid", five_hour=Quota("5-hour", 40, RESETS))
+        for label, login in (("claude3", low.email), ("claude4", high.email)):
+            _ = (self.state / f"{label}.md").write_text(f"---\nlogin: {login}\n---\n", encoding="utf-8")
+        with patch.object(five_hour, "relay", side_effect=self.successful_relay):
+            for login in ("low@example.invalid", "LOW@example.invalid", "low@example.invalid"):
+                low.email = login
+                lines = self.watch([low, high])
+                self.assertFalse(any("back above" in line for line in lines))
+                self.assertEqual(five_hour.notice_path(claude_notice_key(login)).read_text(), "claude3")
+            self.assertCountEqual([(recipient, key) for recipient, _, key in self.sent],
+                                  [("natedev", "5-hour claude3"), ("hana", "5-hour claude3")])
+            self.assertTrue(all(text.startswith("5-hour limit: claude3 has 18% of its 5-hour limit left;")
+                                for _, text, _ in self.sent))
+            self.assertFalse(five_hour.notice_path(claude_notice_key("high@example.invalid")).exists())
+            low.five_hour = Quota("5-hour", 40, RESETS)
+            self.assertEqual(self.watch([low, high]), ["5-hour limit: claude3 is back above 20%"])
+            self.assertEqual(self.watch([low, high]), [])
+            self.assertFalse(five_hour.notice_path(claude_notice_key("low@example.invalid")).exists())
+            low.five_hour = Quota("5-hour", 82, RESETS)
+            self.assertEqual(self.watch([low, high]),
+                             ["5-hour limit: claude3 18% left -> natedev", "5-hour limit: claude3 18% left -> hana"])
+            self.assertEqual(self.watch([low, high]), [])
+        self.assertCountEqual([(recipient, key) for recipient, _, key in self.sent],
+                              [("natedev", "5-hour claude3"), ("hana", "5-hour claude3")] * 2)
+        self.assertEqual(five_hour.notice_path(claude_notice_key("low@example.invalid")).read_text(), "claude3")
+
+    def test_claude_notice_without_a_matching_note_never_discloses_the_login(self) -> None:
+        unknown = report("Claude", 82)
+        with patch.object(five_hour, "relay", side_effect=self.successful_relay):
+            lines = self.watch([unknown])
+        self.assertEqual(lines, ["5-hour limit: Claude 18% left -> natedev", "5-hour limit: Claude 18% left -> hana"])
+        self.assertTrue(all(text.startswith("5-hour limit: Claude has 18%") for _, text, _ in self.sent))
+        self.assertEqual([key for _, _, key in self.sent], ["5-hour Claude", "5-hour Claude"])
+        unknown.five_hour = Quota("5-hour", 40, RESETS)
+        lines += self.watch([unknown])
+        self.assertEqual(lines[-1], "5-hour limit: Claude is back above 20%")
+        for text in [*lines, *(text for _, text, _ in self.sent), *(key or "" for _, _, key in self.sent)]:
+            self.assertNotIn(CLAUDE_LOGIN, text)
+
+    def test_claude_report_without_a_login_leaves_notice_state_untouched(self) -> None:
+        with patch.object(five_hour, "relay", side_effect=self.successful_relay):
+            _ = self.watch([report("Claude", 82)])
+        before = {path.name: path.read_bytes() for path in five_hour.STATE.iterdir()}
+        self.sent.clear()
+        for used in (82, 40):
+            self.assertEqual(self.watch([Report("Claude", five_hour=Quota("5-hour", used, RESETS))]), [])
+        self.assertEqual(self.sent, [])
+        self.assertEqual({path.name: path.read_bytes() for path in five_hour.STATE.iterdir()}, before)
+
+    def test_a_low_window_retries_failed_relays_without_a_phone_hold(self) -> None:
         with patch.object(escalate, "hold", side_effect=AssertionError("phone hold")):
             lines = self.watch([report("Claude", 82.4), report("Codex", 10)])
         self.assertEqual(lines, ["5-hour limit: Claude 18% left -> natedev",
@@ -88,10 +155,148 @@ class WatchTests(unittest.TestCase):
                          "5-hour limit: Claude has 18% of its 5-hour limit left; it resets at 14:20 PDT.\n"
                          + "Tell the user in one line and change nothing else.\n"
                          + f"Protocol: {quota_alert.PROTOCOL}")
-        self.assertIsInstance(escalate.read(escalate.held_path("five-hour-claude")), escalate.NoHeld)
-        self.assertEqual(five_hour.notice_path("five-hour-claude").read_text(), "Claude")
+        self.assertIsInstance(escalate.read(escalate.held_path(claude_notice_key())), escalate.NoHeld)
+        self.assertFalse(five_hour.notice_path(claude_notice_key()).exists())
+        with patch.object(five_hour, "relay", side_effect=self.successful_relay):
+            retried = self.watch([report("Claude", 90)])
+        self.assertEqual(retried, ["5-hour limit: Claude 10% left -> hana"])
+        self.assertEqual([name for name, _, _ in self.sent], ["natedev", "hana", "hana"])
+        self.assertEqual(len(self.sent), 3)
+        self.assertEqual(five_hour.notice_path(claude_notice_key()).read_text(), "Claude")
         self.assertEqual(self.watch([report("Claude", 90)]), [])
+        self.assertEqual(len(self.sent), 3)
+
+    def test_recovery_during_relay_rearms_the_next_low_spell(self) -> None:
+        recoveries: list[list[str]] = []
+
+        def relay(recipient: str, text: str, key: str | None) -> None:
+            self.successful_relay(recipient, text, key)
+            recoveries.append(self.watch([report("Claude", 3)]))
+
+        with (patch.object(five_hour, "recipients", return_value=["natedev"]),
+              patch.object(five_hour, "relay", side_effect=relay)):
+            self.assertEqual(self.watch([report("Claude", 90)]),
+                             ["5-hour limit: Claude 10% left -> natedev"])
+        self.assertEqual(len(recoveries), 1)
+        self.assertFalse(five_hour.notice_path(claude_notice_key()).exists())
+        with (patch.object(five_hour, "recipients", return_value=["natedev"]),
+              patch.object(five_hour, "relay", side_effect=self.successful_relay)):
+            self.assertEqual(self.watch([report("Claude", 90)]),
+                             ["5-hour limit: Claude 10% left -> natedev"])
+            self.assertEqual(self.watch([report("Claude", 90)]), [])
+        self.assertEqual([name for name, _, _ in self.sent], ["natedev", "natedev"])
+        self.assertEqual(five_hour.notice_path(claude_notice_key()).read_text(), "Claude")
+
+    def test_repeated_failed_relay_retries_only_the_recipient_still_owed(self) -> None:
+        for _ in range(3):
+            _ = self.watch([report("Claude", 90)])
+        self.assertEqual([name for name, _, _ in self.sent], ["natedev", "hana", "hana", "hana"])
+        self.assertFalse(five_hour.notice_path(claude_notice_key()).exists())
+        with patch.object(five_hour, "relay", side_effect=self.successful_relay):
+            self.assertEqual(self.watch([report("Claude", 90)]), ["5-hour limit: Claude 10% left -> hana"])
+        self.assertEqual([name for name, _, _ in self.sent], ["natedev", "hana", "hana", "hana", "hana"])
+        self.assertEqual(self.watch([report("Claude", 90)]), [])
+        self.assertEqual(five_hour.notice_path(claude_notice_key()).read_text(), "Claude")
+
+    def test_partial_delivery_survives_a_stopped_pass_without_a_second_copy(self) -> None:
+        class Killed(BaseException):
+            pass
+
+        def relay(recipient: str, text: str, key: str | None) -> None:
+            if recipient == "hana":
+                raise Killed()
+            self.successful_relay(recipient, text, key)
+
+        with patch.object(five_hour, "relay", side_effect=relay):
+            with self.assertRaises(Killed):
+                _ = self.watch([report("Claude", 90)])
+        self.assertEqual([name for name, _, _ in self.sent], ["natedev"])
+        self.assertFalse(five_hour.notice_path(claude_notice_key()).exists())
+        with patch.object(five_hour, "relay", side_effect=self.successful_relay):
+            self.assertEqual(self.watch([report("Claude", 90)]), ["5-hour limit: Claude 10% left -> hana"])
+        self.assertEqual([name for name, _, _ in self.sent], ["natedev", "hana"])
+        self.assertEqual(five_hour.notice_path(claude_notice_key()).read_text(), "Claude")
+
+    def test_recovery_clears_partial_delivery_for_the_next_low_spell(self) -> None:
+        _ = self.watch([report("Claude", 90)])
+        self.assertEqual(self.watch([report("Claude", 3)]), ["5-hour limit: Claude is back above 20%"])
+        with patch.object(five_hour, "relay", side_effect=self.successful_relay):
+            self.assertEqual(self.watch([report("Claude", 90)]),
+                             ["5-hour limit: Claude 10% left -> natedev", "5-hour limit: Claude 10% left -> hana"])
+        self.assertEqual([name for name, _, _ in self.sent], ["natedev", "hana", "natedev", "hana"])
+        self.assertEqual(five_hour.notice_path(claude_notice_key()).read_text(), "Claude")
+
+    def test_interrupted_recovery_ends_the_previous_spell_after_a_stopped_finish(self) -> None:
+        class Killed(BaseException):
+            pass
+
+        unlink = Path.unlink
+        for stop_before in ("notice", "delivery"):
+            with (self.subTest(stop_before=stop_before),
+                  patch.object(five_hour, "STATE", self.state / stop_before),
+                  patch.object(five_hour, "relay", side_effect=self.successful_relay)):
+                self.sent.clear()
+                marker = five_hour.notice_path(claude_notice_key())
+                pending = five_hour.delivery_path(claude_notice_key())
+
+                def stop_after_sent_marker(path: Path, missing_ok: bool = False) -> None:
+                    if path == pending:
+                        raise Killed()
+                    unlink(path, missing_ok=missing_ok)
+
+                with patch.object(Path, "unlink", new=stop_after_sent_marker):
+                    with self.assertRaises(Killed):
+                        _ = self.watch([report("Claude", 90)])
+                self.assertEqual(marker.read_text(), "Claude")
+                self.assertTrue(pending.exists())
+                self.assertCountEqual([name for name, _, _ in self.sent], ["natedev", "hana"])
+                self.assertEqual(self.watch([report("Claude", 90)]), [])
+
+                def stop_recovery_cleanup(path: Path, missing_ok: bool = False) -> None:
+                    if path == (marker if stop_before == "notice" else pending):
+                        raise Killed()
+                    unlink(path, missing_ok=missing_ok)
+
+                with patch.object(Path, "unlink", new=stop_recovery_cleanup):
+                    with self.assertRaises(Killed):
+                        _ = self.watch([report("Claude", 3)])
+                self.sent.clear()
+                self.assertEqual(self.watch([report("Claude", 90)]),
+                                 ["5-hour limit: Claude 10% left -> natedev", "5-hour limit: Claude 10% left -> hana"])
+                self.assertEqual(self.watch([report("Claude", 90)]), [])
+                self.assertCountEqual([name for name, _, _ in self.sent], ["natedev", "hana"])
+                self.assertEqual(marker.read_text(), "Claude")
+                self.assertFalse(pending.exists())
+
+    def test_stopped_claim_is_retried_and_then_marked_sent(self) -> None:
+        class Killed(BaseException):
+            pass
+
+        with patch.object(five_hour, "ThreadPoolExecutor", side_effect=Killed):
+            with self.assertRaises(Killed):
+                _ = self.watch([report("Claude", 90)])
+        self.assertEqual(self.sent, [])
+        self.assertFalse(five_hour.notice_path(claude_notice_key()).exists())
+        with patch.object(five_hour, "relay", side_effect=self.successful_relay):
+            self.assertEqual(len(self.watch([report("Claude", 90)])), 2)
+            self.assertEqual(self.watch([report("Claude", 90)]), [])
         self.assertEqual(len(self.sent), 2)
+        self.assertEqual(five_hour.notice_path(claude_notice_key()).read_text(), "Claude")
+
+    def test_an_active_claim_excludes_a_concurrent_pass(self) -> None:
+        concurrent: list[list[str]] = []
+
+        def relay(recipient: str, text: str, key: str | None) -> None:
+            self.sent.append((recipient, text, key))
+            concurrent.append(self.watch([report("Claude", 90)]))
+
+        with (patch.object(five_hour, "recipients", return_value=["natedev"]),
+              patch.object(five_hour, "relay", side_effect=relay)):
+            self.assertEqual(self.watch([report("Claude", 90)]),
+                             ["5-hour limit: Claude 10% left -> natedev"])
+        self.assertEqual(concurrent, [[]])
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(five_hour.notice_path(claude_notice_key()).read_text(), "Claude")
 
     def test_codex_low_spell_logs_once_without_relay_then_rearms_after_recovery(self) -> None:
         first = self.watch([report("Codex", 95)])
@@ -111,10 +316,10 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(self.sent, [])
 
     def test_old_phone_hold_closes_once_on_recovery(self) -> None:
-        _ = escalate.hold("five-hour-claude", escalate.SessionPush("Claude", "Usage low", NoActionRequired(), "note"))
+        _ = escalate.hold(claude_notice_key(), escalate.SessionPush("Claude", "Usage low", NoActionRequired(), "note"))
         self.assertEqual(self.watch([report("Claude", 3)]), ["5-hour limit: Claude is back above 20%"])
         self.assertEqual(self.watch([report("Claude", 3)]), [])
-        self.assertIsInstance(escalate.read(escalate.held_path("five-hour-claude")), escalate.NoHeld)
+        self.assertIsInstance(escalate.read(escalate.held_path(claude_notice_key())), escalate.NoHeld)
         self.assertEqual(self.sent, [])
 
     def test_recovery_clears_the_warning_record_and_the_next_low_spell_is_new(self) -> None:
@@ -126,10 +331,33 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(self.sent, [])
 
     def test_no_reading_changes_nothing(self) -> None:
-        _ = self.watch([report("Claude", 99)])
+        with patch.object(five_hour, "relay", return_value=None):
+            _ = self.watch([report("Claude", 99)])
         self.assertEqual(self.watch([report("Claude", None), Report("Codex", problem="Not logged in")]), [])
-        self.assertTrue(five_hour.notice_path("five-hour-claude").exists())
+        self.assertTrue(five_hour.notice_path(claude_notice_key()).exists())
 
+
+class OutgoingNoticeTests(unittest.TestCase):
+    marker: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(patch.object(five_hour, "STATE", root))
+        self.marker = root / "five-hour-codex-outgoing.notice"
+        _ = self.marker.write_text("codex1", encoding="utf-8")
+
+    def test_failed_retire_keeps_the_notice_until_all_recipients_retire(self) -> None:
+        failed = subprocess.CompletedProcess([], 1, "", "retire failed")
+        succeeded = subprocess.CompletedProcess([], 0, "", "")
+        with patch.object(subprocess, "run", side_effect=[failed, succeeded]) as retire:
+            five_hour.cancel_outgoing_notices("five-hour-codex-current", ["first", "second"])
+        self.assertEqual(retire.call_count, 2)
+        self.assertEqual(self.marker.read_text(), "codex1")
+        with patch.object(subprocess, "run", return_value=succeeded) as retire:
+            five_hour.cancel_outgoing_notices("five-hour-codex-current", ["first", "second"])
+        self.assertEqual([call.args[0][4] for call in retire.call_args_list], ["first", "second"])
+        self.assertFalse(self.marker.exists())
 
 class AccountHoldTests(unittest.TestCase):
     root: Path = Path()
@@ -221,6 +449,26 @@ class AccountHoldTests(unittest.TestCase):
         self.assertEqual(self.sent, [])
         self.assertTrue(before)
         self.assertEqual({path.name: path.read_text() for path in five_hour.STATE.glob("*.notice")}, before)
+
+    def test_stop_after_failed_retirement_retries_outgoing_notice_on_rerun(self) -> None:
+        class Killed(BaseException):
+            pass
+
+        a = self.readings(1)
+        _ = five_hour.watch([], codex_readings=a)
+        markers = list(five_hour.STATE.glob("five-hour-codex-*.notice"))
+        self.assertEqual(len(markers), 1)
+        b = self.readings(2, None)
+        with (patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "failed")),
+              patch.object(escalate, "close", side_effect=Killed)):
+            with self.assertRaises(Killed):
+                _ = five_hour.watch([], codex_readings=b)
+        self.assertEqual(markers[0].read_text(), "codex1")
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as retire:
+            self.assertEqual(five_hour.watch([], codex_readings=b), [])
+        self.assertEqual(retire.call_count, 2)
+        self.assertTrue(all(call.args[0][-1] == "5-hour codex1" for call in retire.call_args_list))
+        self.assertFalse(markers[0].exists())
 
     def test_spare_used_up_window_is_not_relayed_or_held(self) -> None:
         a = self.readings(1, 10)

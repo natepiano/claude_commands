@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Callable, Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -440,6 +440,7 @@ def read_role_map() -> RoleMap:
         elif isinstance(_role_map_source.get(), StoredRoleMap):
             result, stamp = _cached_role_map()
             result = replace(result, provenance=ExplicitStoredRoleMap(stamp))
+            _map_observer.get()(result.provenance)
         else:
             try:
                 result = decode_role_map(ssh_role_map(("role-map-read",)))
@@ -447,6 +448,7 @@ def read_role_map() -> RoleMap:
                 result, stamp = _cached_role_map()
                 provenance = CachedAfterFetchFailure(stamp, str(error))
                 result = replace(result, provenance=provenance)
+                _map_observer.get()(provenance)
                 print(cached_map_warning(provenance), file=sys.stderr)
             else:
                 saved_map = CachedRoleMap(at=datetime.now(timezone.utc).isoformat(),
@@ -466,6 +468,23 @@ def observed_map_provenance() -> RoleMapProvenance:
     """Return the provenance of the same memoized read used by this command."""
     scope = _command_map.get()
     return scope.value.provenance if isinstance(scope, CommandRoleMap) and isinstance(scope.value, RoleMap) else CurrentRoleMap()
+
+
+@contextmanager
+def observe_map_reads(observer: Callable[[RoleMapProvenance], None]) -> Generator[None]:
+    token = _map_observer.set(observer)
+    try:
+        yield
+    finally:
+        _map_observer.reset(token)
+
+
+def _ignore_map_read(_provenance: RoleMapProvenance) -> None:
+    pass
+
+
+_map_observer: ContextVar[Callable[[RoleMapProvenance], None]] = ContextVar(
+    "map_observer", default=_ignore_map_read)
 
 
 def cached_map_warning(provenance: CachedAfterFetchFailure) -> str:
@@ -519,6 +538,29 @@ def _groups_lock() -> Generator[None]:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def _role_history_entry(change: RoleMapChange) -> RoleHistoryEntry:
+    row = RoleHistoryEntry(at=change.at, label=change.label, why=change.why)
+    if change.role == "workers":
+        row["role"] = "workers"
+        row["account_label"] = change.label
+    else:
+        row["group"] = change.role
+    if change.move_id:
+        row["move_id"] = change.move_id
+    row["cause"] = change.cause
+    row["window"] = change.window
+    if change.reset:
+        row["reset"] = change.reset
+    return row
+
+
+def _recover_locked_role_history(history: Path) -> None:
+    if history.with_name(f".{history.name}.workers").exists():
+        with history.open("r+", encoding="utf-8") as source:
+            fcntl.flock(source.fileno(), fcntl.LOCK_EX)
+            _ = worker_names.migrate_locked_journal(source, history)
+
+
 def write_role_map(change: RoleMapChange | WorkersClaudeRouteChange) -> None:
     change = decode_role_map_change(json.dumps(_change_document(change)))
     if isinstance(change, WorkersClaudeRouteChange):
@@ -537,10 +579,7 @@ def write_role_map(change: RoleMapChange | WorkersClaudeRouteChange) -> None:
                 try:
                     previous = path.read_text(encoding="utf-8") if path.exists() else ""
                     values = _object(path) if previous else {}
-                    if history.with_name(f".{history.name}.workers").exists():
-                        with history.open("r+", encoding="utf-8") as source:
-                            fcntl.flock(source.fileno(), fcntl.LOCK_EX)
-                            _ = worker_names.migrate_locked_journal(source, history)
+                    _recover_locked_role_history(history)
                     size = history.stat().st_size if history.exists() else -1
                     if change.role == "workers":
                         values = worker_names.configuration(values)
@@ -552,18 +591,7 @@ def write_role_map(change: RoleMapChange | WorkersClaudeRouteChange) -> None:
                         if change.reset:
                             selection["reset"] = change.reset
                         values[change.role] = selection
-                    row = RoleHistoryEntry(at=change.at, label=change.label, why=change.why)
-                    if change.role == "workers":
-                        row["role"] = "workers"
-                        row["account_label"] = change.label
-                    else:
-                        row["group"] = change.role
-                    if change.move_id:
-                        row["move_id"] = change.move_id
-                    row["cause"] = change.cause
-                    row["window"] = change.window
-                    if change.reset:
-                        row["reset"] = change.reset
+                    row = _role_history_entry(change)
                     try:
                         _atomic_write(path, json.dumps(values, sort_keys=True) + "\n")
                         history.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -662,6 +690,14 @@ def recorded_auto_moves(path: Path) -> RecordedAutoMoves | UnreadableAutoMoveHis
     """Recorded choices consume their entries even if log removal was interrupted."""
     try:
         worker_names.recover_pending_journal(path, role_history=True)
+    except (OSError, ValueError) as error:
+        print(f"account moves: cannot read recorded auto moves: {error}")
+        return UnreadableAutoMoveHistory()
+    return _read_recorded_auto_moves(path)
+
+
+def _read_recorded_auto_moves(path: Path) -> RecordedAutoMoves | UnreadableAutoMoveHistory:
+    try:
         text = path.read_bytes()
         lines = text.splitlines(keepends=True)
     except FileNotFoundError:
@@ -690,3 +726,50 @@ def recorded_auto_moves(path: Path) -> RecordedAutoMoves | UnreadableAutoMoveHis
         print(f"account moves: cannot read recorded auto moves: {error}")
         return UnreadableAutoMoveHistory()
     return RecordedAutoMoves(frozenset(consumed))
+
+
+@dataclass(frozen=True)
+class AutoMoveTarget:
+    entry_id: str
+    group: Literal["units", "showrunners"]
+    label: str
+
+
+def repair_selected_auto_moves(entries: tuple[AutoMoveTarget, ...], now: datetime, *,
+                               dry_run: bool = False) -> RecordedAutoMoves | UnreadableAutoMoveHistory:
+    """Keep replay evidence for choices saved before their history append."""
+    history = groups_file().with_name("roles.jsonl")
+    try:
+        with (nullcontext() if dry_run else _groups_lock()), (nullcontext() if dry_run else worker_names.roles_lock()):
+            if dry_run:
+                recorded = recorded_auto_moves(history)
+            else:
+                _recover_locked_role_history(history)
+                recorded = _read_recorded_auto_moves(history)
+            if isinstance(recorded, UnreadableAutoMoveHistory):
+                return recorded
+            path = groups_file()
+            selections = _groups(_object(path)) if path.exists() else StoredGroupSelections()
+            consumed = set(recorded.entry_ids)
+            missing: list[RoleHistoryEntry] = []
+            for entry in entries:
+                selected = selections.get("units") if entry.group == "units" else selections.get("showrunners")
+                if (selected is None or isinstance(selected, str) or selected["cause"] != "auto"
+                        or selected.get("why") != "auto: " + entry.entry_id
+                        or selected["label"] != entry.label):
+                    continue
+                if entry.entry_id not in consumed:
+                    missing.append(_role_history_entry(RoleMapChange(entry.group, selected["label"],
+                        "auto: " + entry.entry_id, now.isoformat(), selected["move_id"], "auto",
+                        selected["window"], selected.get("reset", ""))))
+                consumed.add(entry.entry_id)
+            if missing and not dry_run:
+                descriptor = os.open(history, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
+                with os.fdopen(descriptor, "a", encoding="utf-8") as output:
+                    fcntl.flock(output.fileno(), fcntl.LOCK_EX)
+                    for row in missing:
+                        append_journal_line(output.fileno(), json.dumps(row, sort_keys=True), valid_row=lambda _row: True)
+            return RecordedAutoMoves(frozenset(consumed))
+    except (OSError, ValueError) as error:
+        print(f"account moves: cannot read recorded auto moves: {error}")
+        return UnreadableAutoMoveHistory()

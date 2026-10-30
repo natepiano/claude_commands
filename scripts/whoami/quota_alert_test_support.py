@@ -2,10 +2,6 @@
 
 from __future__ import annotations
 
-from scripts.lib.test_agents_registry import ExactRows, registry_text, write_registry
-
-from scripts.whoami.note_file import note_name
-
 import io
 import base64
 import json
@@ -22,19 +18,23 @@ from pathlib import Path
 from typing import ClassVar, cast, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.test_agents_registry import ExactRows, registry_text, write_registry
+from scripts.whoami.note_file import note_name
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import quota_alert
 from push_texts import RenderedPush
 from scripts.whoami import agent_accounts
-from agent_accounts import ClaudeAccountsInUse, CodexHomeSource, Quota, Report
+from scripts.whoami.agent_accounts import ClaudeAccountsInUse, CodexHomeSource, Quota, Report
 import agent_notes
-import session_table
-import note_file
-import account
-import usage_store
+from scripts.whoami import session_table
+from scripts.whoami import note_file
+from scripts.whoami import account
+from scripts.whoami import usage_store
 from agent_notes import local_reset
-from note_file import read_note
+from scripts.whoami.note_file import read_note
 from scripts.accounts import accounts, moves, next_moves, role_map
 from scripts.production import showrunners
 
@@ -267,7 +267,7 @@ class QuotaReminderFixture(unittest.TestCase):
             return_value=account.Account("claude", identity.login, identity.label)))
 
     def stored_room(self, login: str, left: float, days: float) -> None:
-        import usage_store
+        from scripts.whoami import usage_store
         saved = usage_store.load()
         saved[usage_store.key("Claude", login)] = usage_store.StoredUsage(weekly=usage_store.StoredWindow(
             left=left, at=datetime.now(timezone.utc).isoformat(),
@@ -481,3 +481,32 @@ class CodexZeroEpisodeFixture(unittest.TestCase):
         self.assertFalse(any(row["kind"] == "requested" for row in moves.read_moves()))
         self.assertEqual(accounts.role_account("workers").label, "codex1")
         self.assertEqual(next_moves.read_next_moves(), (head,))
+
+
+class CodexRerunFixture(CodexZeroEpisodeFixture):
+    """Persist fake assignments while the real alert state and journal survive a stop."""
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = (self.root / "rerun-assignments.json").write_text(json.dumps({
+            "direct": "codex", "module_review": "codex", "cli": "claude", "ask_a_friend": "caller"}))
+        _ = self.enterContext(mock.patch.object(quota_alert, "registry_assignments", side_effect=self.read_assignments))
+        _ = self.enterContext(mock.patch.object(quota_alert, "edit_registry", side_effect=self.edit_assignments))
+        _ = self.enterContext(mock.patch.object(accounts, "check_codex_target", return_value=
+            accounts.SelectableCodexAccount(self.root / ".codex3", "account3@example.invalid", "codex3")))
+
+    def read_assignments(self) -> dict[str, str]:
+        return cast(dict[str, str], json.loads((self.root / "rerun-assignments.json").read_text()))
+
+    def edit_assignments(self, editor: str, *arguments: str) -> str | None:
+        assignments = self.read_assignments()
+        if editor == "agents_set_all_assignments":
+            assignments = {key: arguments[0] if family in ("codex", "claude") else family
+                           for key, family in assignments.items()}
+        elif editor == "agents_set_assignment":
+            assignments[arguments[0]] = arguments[1]
+        else:
+            raise AssertionError("unexpected registry editor")
+        _ = (self.root / "rerun-assignments.json").write_text(json.dumps(assignments))
+        return None

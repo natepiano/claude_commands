@@ -24,6 +24,9 @@ import showrunners as showrunners
 import dailies_render as dailies_render
 from production_units import read_production as read_production
 from scripts.production.cli_fixture import invoke_cli
+from scripts.production.staff_test_support import (
+    fixture_showrunner_name, isolated_staff_file, showrunner_launch, showrunner_relationship,
+)
 
 if TYPE_CHECKING:
     from scripts.notify import review as review
@@ -101,10 +104,13 @@ class RegistrationFixture(unittest.TestCase):
         cls.fixture_snapshot = cls.fixture_root.with_name("snapshot")
         cls.command_snapshot = cls.fixture_root.with_name("command")
         builder = cls()
-        builder.bind_fixture(cls.fixture_root)
-        builder.build_fixture()
-        if cls.needs_command_copy:
-            builder.build_command_copy(cls.command_snapshot)
+        try:
+            builder.bind_fixture(cls.fixture_root)
+            builder.build_fixture()
+            if cls.needs_command_copy:
+                builder.build_command_copy(cls.command_snapshot)
+        finally:
+            builder.doCleanups()
         _ = shutil.copytree(cls.fixture_root, cls.fixture_snapshot)
         shutil.rmtree(cls.fixture_root)
 
@@ -127,7 +133,9 @@ class RegistrationFixture(unittest.TestCase):
                     "NOTIFIER_STATE_DIR": str(self.state / "notifier"), "SHOWRUNNERS_CONFIG": str(self.config),
                     "USAGE_STATE_DIR": str(self.state / "usage"),
                     "MAC_TEST_STATE_DIR": str(self.state / "mac-test"), "NEXT_STATE_DIR": str(self.state / "next"),
-                    "CLAUDE_CODE_SESSION_ID": "current-session-id", "NOTIFIER_SESSIONS_DIR": str(self.state / "sessions")}
+                    "CLAUDE_CODE_SESSION_ID": "current-session-id", "NOTIFIER_SESSIONS_DIR": str(self.state / "sessions"),
+                    "HERDR_PANE_RECORD_DIR": str(self.state / "pane-records"), "HERDR_SESSION": "agents"}
+        _ = self.enterContext(isolated_staff_file(self.state / "staff/staff.json", self.env))
 
     def build_fixture(self) -> None:
         self.root.mkdir()
@@ -167,6 +175,7 @@ class RegistrationFixture(unittest.TestCase):
             f"| `alpha-unit` | `docs/alpha.md` | `{alpha}` | `alpha` | — | — |",
             "", "## Gates", "",
         )), encoding="utf-8")
+        _ = showrunner_relationship(fixture_showrunner_name("example", self.doc))
         _ = self.git("add", ".")
         _ = self.git("commit", "-m", "initial")
 
@@ -212,7 +221,7 @@ class RegistrationFixture(unittest.TestCase):
 
     def build_command_copy(self, tree: Path) -> None:
         _ = shutil.copytree(SCRIPT.parent, tree / "scripts/production")
-        for name in ("build_hold", "build_targets", "buildlog", "direct", "herdr", "lib", "lint", "mac_test", "message", "usage", "whoami"):
+        for name in ("build_hold", "build_targets", "buildlog", "direct", "herdr", "lib", "lint", "mac_test", "message", "shutdown", "usage", "whoami"):
             _ = shutil.copytree(SCRIPT.parent.parent / name, tree / "scripts" / name)
         hooks = tree / "scripts/hooks"
         hooks.mkdir(parents=True)
@@ -222,8 +231,8 @@ class RegistrationFixture(unittest.TestCase):
         _ = shutil.copy2(SCRIPT.parents[2] / "commands/showrunner/produce.md", template)
 
     def copied_command(self) -> Path:
-        tree = self.root / "command-copy"
-        _ = shutil.copytree(self.command_snapshot, tree)
+        tree = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="command-copy-", dir=self.root)))
+        _ = shutil.copytree(self.command_snapshot, tree, dirs_exist_ok=True)
         return tree / "scripts/production/update_registration.py"
 
     def run_copy(self, script: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -260,11 +269,11 @@ class RegistrationFixture(unittest.TestCase):
         instance.mkdir(parents=True)
         _ = (instance / "conf").write_text(
             f"TARGET=session:{slug}-session\nCHECK=zsh /x/production_check.sh {self.doc}\n", encoding="utf-8")
+        row = showrunner_relationship(fixture_showrunner_name(slug, self.doc))
+        showrunner_launch(row, f"{slug}-session", self.env)
 
     def attach(self, child: str, parent: str) -> None:
-        edge = self.state / "showrunner" / child / "parent"
-        edge.parent.mkdir(parents=True, exist_ok=True)
-        _ = edge.write_text(parent + "\n", encoding="utf-8")
+        _ = showrunner_relationship(fixture_showrunner_name(child, self.doc), fixture_showrunner_name(parent, self.doc))
 
     def write_open_for(self, slug: str, *items: dict[str, str]) -> None:
         _ = self.outstanding().with_name(f"{slug}.json").write_text(json.dumps(list(items)), encoding="utf-8")

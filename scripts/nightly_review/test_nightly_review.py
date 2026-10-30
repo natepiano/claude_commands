@@ -14,8 +14,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import nightly_review
-import account
+from scripts.whoami import account
 from scripts.accounts import accounts
 from scripts.production import showrunners
 # `messages` reads the message review from its own folder, as the timer does.

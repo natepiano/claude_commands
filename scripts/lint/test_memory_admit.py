@@ -21,7 +21,7 @@ import contextlib
 from contextlib import closing, redirect_stdout
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TextIO, cast, override
+from typing import Protocol, TextIO, cast, override
 from unittest import mock
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -33,12 +33,28 @@ import nextest_budget as budget
 from memory_test_support import fake_memory_readings
 store = gate.store
 
+
+class BuildStepRecorder(Protocol):
+    store: gate.BuildLogStore
+
+    def step(self, arguments: list[str]) -> None: ...
+
+
+buildlog_record = cast(BuildStepRecorder, cast(object, gate.record))
+
 GIB = gate.GIB
 NOW = datetime(2026, 10, 6, 22, 0, tzinfo=UTC)
 HISTORY_AT = NOW - timedelta(seconds=1)
+FRESH_HISTORY_AT = NOW - timedelta(minutes=5)
+LAST_TEST_BUILD_AT = NOW - timedelta(minutes=1)
 INVOKE = Path(__file__).with_name("invoke.sh")
 MEMORY_GATE = Path(__file__).with_name("memory_gate.sh")
 HANA = gate.RepositoryIdentity("https://example.org/nate/hana", "hana", "hana")
+
+
+def buildlog_rows(root: Path) -> list[dict[str, object]]:
+    return [cast(dict[str, object], json.loads(line)) for path in root.glob("*/*.jsonl")
+            for line in path.read_text().splitlines()]
 
 
 def setUpModule() -> None:
@@ -503,6 +519,381 @@ class FilteredPromiseTests(unittest.TestCase):
         )
 
 
+class FreshTestPromiseTests(unittest.TestCase):
+    root: Path = Path()
+    worktree: Path = Path()
+    state: Path = Path()
+    sample_id: int = 0
+    host: str = "test-host"
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.worktree = self.root / "checkout"
+        (self.worktree / "target").mkdir(parents=True)
+        self.state = self.root / "sweep-state"
+        self.state.mkdir()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"LINT_SWEEP_STATE_DIR": str(self.state)})))
+        (self.root / "admission").mkdir()
+        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+            _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
+                           + "ended_at TEXT, peak_mem_bytes INTEGER, argv TEXT, call_id TEXT, "
+                           + "worktree TEXT, tree_key TEXT, status INTEGER, tests_run INTEGER, "
+                           + "crates_compiled INTEGER, sweep_freed_bytes INTEGER)")
+        self.sample_id = 0
+        self.samples([12 * GIB] * 10, scope="full", crates=1)
+        self.samples([10 * GIB] * 10, crates=1)
+
+    def samples(self, peaks: list[int], *, package: str = "hana", scope: gate.TestScope = "filtered",
+                filters: tuple[str, ...] = ("native_rate",), crates: int | None = 0,
+                host: str = "test-host", at: datetime = FRESH_HISTORY_AT,
+                status: int = 0, tests_run: int = 1, measured: bool = True) -> None:
+        expression = f"package({package})"
+        if scope == "filtered":
+            selection = " | ".join(f"test({name})" for name in filters)
+            expression += " & " + (selection if len(filters) == 1 else f"({selection})")
+        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db, \
+                (self.root / "admission/anon_peaks.jsonl").open("a") as output:
+            for peak in peaks:
+                self.sample_id += 1
+                call = f"call-{self.sample_id}"
+                timestamp = store.utc_iso(at.timestamp())
+                _ = db.execute("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                               (host, "hana", "nextest", timestamp, timestamp, 20 * GIB,
+                                json.dumps(["cargo", "nextest", "run", "-E", expression]), call,
+                                "/another/history-worktree", "historical-key", status, tests_run, crates, 0))
+                if measured:
+                    _ = output.write(json.dumps({
+                        "host": host, "repo": "hana", "repo_identity": HANA.key, "step": "nextest",
+                        "package": package, "test_scope": scope, "filters": list(filters),
+                        "ended_at": timestamp, "anon_peak_bytes": peak, "call_id": call,
+                    }) + "\n")
+
+    def previous_build(self, *, key: str = "current-key", worktree: str = "", package: str = "hana",
+                       scope: gate.TestScope = "filtered", status: int = 0, tests_run: int = 1,
+                       at: datetime = LAST_TEST_BUILD_AT, finished: bool = True,
+                       indexed: bool = True, recorded_build_key: bool = True) -> None:
+        expression = f"package({package})" + (" & test(other_filter)" if scope == "filtered" else "")
+        timestamp = store.utc_iso(at.timestamp())
+        arguments = ["cargo", "nextest", "run", "-E", expression]
+        if indexed:
+            with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+                _ = db.execute("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                               (self.host, "hana", "nextest", timestamp, timestamp if finished else None, None,
+                                json.dumps(arguments), "last-build", worktree or str(self.worktree),
+                                key, status, tests_run, 3, 0))
+        record: dict[str, object] = {
+            "kind": "step", "host": self.host, "repo": "hana", "step": "nextest",
+            "started_at": timestamp, "ended_at": timestamp if finished else None,
+            "argv": arguments, "worktree": worktree or str(self.worktree), "tree_key": key,
+            "status": status, "tests_run": tests_run, "crates_compiled": 3,
+        }
+        if recorded_build_key:
+            record["test_build_key"] = key
+        self.append_step(record, at)
+
+    def append_step(self, record: dict[str, object], at: datetime) -> None:
+        store.append_line(self.root / self.host / f"{at:%Y-%m}.jsonl", record)
+
+    def index_current_prefix(self) -> Path:
+        path = self.root / self.host / f"{NOW:%Y-%m}.jsonl"
+        offset = path.stat().st_size
+        with path.open("rb") as handle:
+            marks = gate.file_marks.marks(handle, offset)
+        source = path.relative_to(self.root).as_posix()
+        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+            _ = db.execute("ALTER TABLE steps ADD COLUMN test_build_key TEXT")
+            _ = db.execute("ALTER TABLE steps ADD COLUMN src TEXT")
+            _ = db.execute("UPDATE steps SET test_build_key = tree_key, src = ? WHERE worktree = ?",
+                           (source, str(self.worktree)))
+            _ = db.execute("CREATE TABLE files(path TEXT PRIMARY KEY, offset INTEGER, marks TEXT)")
+            _ = db.execute("INSERT INTO files VALUES (?, ?, ?)", (source, offset, marks))
+        return path
+
+    def fresh(self, *, key: str = "current-key", scope: gate.TestScope = "filtered",
+              target_dir: str = "target") -> bool:
+        return gate.is_fresh_test(self.root, self.host, str(self.worktree), "hana", scope, key, NOW,
+                                  target_dir=target_dir)
+
+    def promise(self, *, key: str = "current-key", scope: gate.TestScope = "filtered",
+                filters: tuple[str, ...] = ("native_rate",)) -> gate.ExpectedPeak:
+        return gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, scope=scope,
+                                  package="hana", filters=filters, fresh=self.fresh(key=key, scope=scope))
+
+    def test_same_tree_native_rate_run_uses_zero_compile_anon_p90_joined_by_call(self) -> None:
+        self.samples([number * GIB // 4 for number in range(1, 11)])
+        self.samples([11 * GIB] * 10, crates=2)
+        self.previous_build()
+        self.assertTrue(self.fresh())
+        self.assertEqual(self.promise(), gate.ExpectedPeak(9 * GIB // 4, "measured", 10))
+
+    def test_fresh_exact_filter_set_is_sorted_and_precedes_broader_package_history(self) -> None:
+        self.samples([2 * GIB], filters=("render", "native_rate"))
+        self.samples([8 * GIB] * 10, filters=("other",))
+        self.previous_build()
+        self.assertEqual(self.promise(filters=("native_rate", "render")),
+                         gate.ExpectedPeak(2 * GIB, "measured", 1))
+
+    def test_fresh_unseen_filters_use_only_fresh_same_package_and_scope(self) -> None:
+        self.samples([2 * GIB], filters=("render",))
+        self.samples([8 * GIB] * 10, package="hana-ui")
+        self.samples([9 * GIB] * 10, scope="full")
+        self.previous_build()
+        self.assertEqual(self.promise(), gate.ExpectedPeak(2 * GIB, "measured", 1))
+
+    def test_fresh_promise_has_the_fixed_floor(self) -> None:
+        self.samples([GIB // 4])
+        self.previous_build()
+        self.assertEqual(self.promise().bytes, gate.FILTERED_FLOOR)
+
+    def test_fresh_full_suite_uses_its_own_zero_compile_history(self) -> None:
+        self.samples([3 * GIB], scope="full")
+        self.samples([GIB], scope="filtered")
+        self.previous_build(scope="full")
+        self.assertEqual(self.promise(scope="full"), gate.ExpectedPeak(3 * GIB, "measured", 1))
+
+    def test_fresh_without_zero_compile_history_keeps_compile_promise(self) -> None:
+        self.previous_build()
+        self.assertTrue(self.fresh())
+        self.assertEqual(self.promise(), gate.ExpectedPeak(10 * GIB, "measured", 10))
+
+    def test_fresh_index_peak_is_scaled_when_no_joined_anon_measurement_exists(self) -> None:
+        self.samples([GIB], measured=False)
+        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+            _ = db.execute("UPDATE steps SET peak_mem_bytes = ? WHERE crates_compiled = 0", (4 * GIB,))
+        self.previous_build()
+        self.assertEqual(self.promise(), gate.ExpectedPeak(int(4 * GIB * gate.ANON_SHARE), "buildlog", 1))
+
+    def test_missing_prior_step_cannot_use_fresh_history(self) -> None:
+        self.samples([2 * GIB])
+        self.assertFalse(self.fresh())
+        self.assertEqual(self.promise().bytes, 10 * GIB)
+
+    def test_other_worktree_cannot_prove_this_target_is_built(self) -> None:
+        self.samples([2 * GIB])
+        self.previous_build(worktree=str(self.root / "other-checkout"))
+        self.assertFalse(self.fresh())
+        self.assertEqual(self.promise().bytes, 10 * GIB)
+
+    def test_other_package_or_scope_cannot_prove_this_test_build_is_fresh(self) -> None:
+        self.samples([2 * GIB])
+        self.previous_build(package="hana-ui")
+        self.previous_build(scope="full")
+        self.assertFalse(self.fresh())
+        self.assertEqual(self.promise().bytes, 10 * GIB)
+
+    def test_changed_or_missing_current_tree_key_keeps_compile_promise(self) -> None:
+        self.samples([2 * GIB])
+        self.previous_build()
+        for key in ("different-key", ""):
+            with self.subTest(key=key):
+                self.assertFalse(self.fresh(key=key))
+                self.assertEqual(self.promise(key=key).bytes, 10 * GIB)
+
+    def test_latest_finished_build_overrides_older_matching_tree_key(self) -> None:
+        self.samples([2 * GIB])
+        self.previous_build(at=NOW - timedelta(minutes=2))
+        self.previous_build(key="newer-different-key")
+        self.assertFalse(self.fresh())
+        self.assertEqual(self.promise().bytes, 10 * GIB)
+
+    def test_compile_failure_without_tests_cannot_prove_freshness(self) -> None:
+        self.samples([2 * GIB])
+        self.previous_build(status=101, tests_run=0)
+        self.assertFalse(self.fresh())
+        self.assertEqual(self.promise().bytes, 10 * GIB)
+
+    def test_failed_tests_still_prove_the_test_targets_were_built(self) -> None:
+        self.samples([2 * GIB])
+        self.previous_build(status=100, tests_run=1)
+        self.assertTrue(self.fresh())
+        self.assertEqual(self.promise().bytes, 2 * GIB)
+
+    def test_successful_empty_selection_still_proves_the_test_targets_were_built(self) -> None:
+        self.samples([2 * GIB])
+        self.previous_build(status=0, tests_run=0)
+        self.assertTrue(self.fresh())
+        self.assertEqual(self.promise().bytes, 2 * GIB)
+
+    def test_unfinished_step_does_not_replace_the_last_finished_build(self) -> None:
+        self.previous_build()
+        self.previous_build(key="unfinished-other-key", at=NOW - timedelta(seconds=30), finished=False)
+        self.assertTrue(self.fresh())
+
+    def test_source_only_legacy_step_cannot_prove_the_build_inputs_are_fresh(self) -> None:
+        self.samples([2 * GIB])
+        self.previous_build(recorded_build_key=False)
+        self.assertFalse(self.fresh())
+        self.assertEqual(self.promise().bytes, 10 * GIB)
+
+    def test_recorder_preserves_build_input_key_only_when_source_stays_unchanged(self) -> None:
+        path = self.root / self.host / f"{NOW:%Y-%m}.jsonl"
+        for seconds, ending_source, expected_fresh in ((30, "same-source", True), (20, "edited-source", False)):
+            with self.subTest(source=ending_source), patch.dict(os.environ, {
+                    "BUILDLOG_TREE_START": "same-source", "BUILDLOG_TEST_BUILD_KEY": "current-key"}), \
+                    patch.object(buildlog_record, "git_directory", return_value=str(self.worktree)), \
+                    patch.object(buildlog_record, "git_facts", return_value={"worktree": str(self.worktree)}), \
+                    patch("treekey.tree_key", return_value=ending_source), \
+                    patch.object(buildlog_record, "rustc_version", return_value="rustc fixture"), \
+                    patch.object(buildlog_record.store, "host_name", return_value=self.host), \
+                    patch.object(buildlog_record.store, "host_file", return_value=path):
+                ended = NOW.timestamp() - seconds
+                buildlog_record.step(["0", str(ended - 5), str(ended), "1", "", "",
+                                      "cargo", "nextest", "run", "-E", "package(hana) & test(native_rate)"])
+                row = cast(dict[str, object], json.loads(path.read_text().splitlines()[-1]))
+                self.assertEqual(row.get("test_build_key"), "current-key" if expected_fresh else None)
+                self.assertEqual(self.fresh(), expected_fresh)
+
+    def test_newer_unindexed_step_overrides_the_indexed_matching_build(self) -> None:
+        self.samples([2 * GIB])
+        self.previous_build(at=NOW - timedelta(minutes=2))
+        self.assertTrue(self.fresh())
+        self.previous_build(key="different-build-inputs", indexed=False)
+        self.assertFalse(self.fresh())
+        self.assertEqual(self.promise().bytes, 10 * GIB)
+
+    def test_validated_index_prefix_still_reads_newer_finished_build_in_jsonl_tail(self) -> None:
+        self.samples([2 * GIB])
+        self.previous_build(at=NOW - timedelta(minutes=2))
+        _ = self.index_current_prefix()
+        self.assertTrue(self.fresh())
+        self.previous_build(key="different-build-inputs", indexed=False)
+        self.assertFalse(self.fresh())
+        self.assertEqual(self.promise().bytes, 10 * GIB)
+
+    def test_replaced_log_invalidates_previously_matching_index_prefix(self) -> None:
+        self.previous_build()
+        path = self.index_current_prefix()
+        self.assertTrue(self.fresh())
+        original = path.read_text()
+        replaced = original.replace('"test_build_key":"current-key"',
+                                    '"test_build_key":"altered-key"')
+        self.assertNotEqual(replaced, original)
+        self.assertEqual(len(replaced), len(original))
+        _ = path.write_text(replaced)
+        self.assertFalse(self.fresh())
+
+    def test_incomplete_tail_after_validated_index_prefix_refuses_freshness(self) -> None:
+        self.previous_build()
+        path = self.index_current_prefix()
+        self.assertTrue(self.fresh())
+        with path.open("a") as log:
+            _ = log.write('{"kind": "step"')
+        self.assertFalse(self.fresh())
+
+    def test_unreadable_current_history_cannot_trust_the_matching_index(self) -> None:
+        self.previous_build()
+        self.assertTrue(self.fresh())
+        with (self.root / self.host / f"{NOW:%Y-%m}.jsonl").open("a") as log:
+            _ = log.write("{incomplete record\n")
+        self.assertFalse(self.fresh())
+
+    def test_unknown_resolved_target_directory_cannot_prove_freshness(self) -> None:
+        self.previous_build()
+        self.assertTrue(self.fresh())
+        self.assertFalse(self.fresh(target_dir=""))
+
+    def test_sweep_of_cargo_configured_target_invalidates_the_build(self) -> None:
+        configured = self.worktree / "configured-target"
+        configured.mkdir()
+        cargo = self.worktree / ".cargo"
+        cargo.mkdir()
+        _ = (cargo / "config.toml").write_text('[build]\ntarget-dir = "configured-target"\n')
+        self.previous_build()
+        self.assertTrue(self.fresh(target_dir=str(configured)))
+        _ = (self.state / "target-deletes.json").write_text(json.dumps({
+            str(configured): (NOW - timedelta(seconds=30)).timestamp(),
+        }))
+        self.assertFalse(self.fresh(target_dir=str(configured)))
+
+    def test_admission_uses_the_resolved_target_and_build_key_passed_by_verify(self) -> None:
+        configured = self.worktree / "cargo-config-target"
+        configured.mkdir()
+        self.samples([2 * GIB])
+        self.previous_build()
+        meminfo = self.root / "meminfo"
+        _ = meminfo.write_text("MemAvailable: 67108864 kB\n")
+        arguments = ["cargo", "nextest", "run", "-E", "package(hana) & test(native_rate)"]
+        with patch.dict(os.environ, {
+                "BUILDLOG_TEST_BUILD_KEY": "current-key", "BUILDLOG_TREE": "source-only-key",
+                "BUILDLOG_TEST_TARGET_DIR": str(configured),
+                "CARGO_TARGET_DIR": str(self.worktree / "target")}), \
+                patch.object(gate, "git_identity", return_value=(HANA, "checkout")), \
+                patch.object(gate.store, "host_name", return_value=self.host), \
+                patch.object(gate.record, "git_directory", return_value=str(self.worktree)), \
+                patch.object(gate.record, "git_facts", return_value={"worktree": str(self.worktree)}), \
+                patch.object(gate, "process_start_time", return_value=None):
+            fresh = gate.check(meminfo, 400, "", arguments, root=self.root, now=NOW)
+            self.assertEqual(fresh.peak.bytes, 2 * GIB)
+            _ = (self.state / "target-deletes.json").write_text(json.dumps({
+                str(configured): (NOW - timedelta(seconds=30)).timestamp(),
+            }))
+            swept = gate.check(meminfo, 400, "", arguments, root=self.root, now=NOW)
+            self.assertEqual(swept.peak.bytes, 10 * GIB)
+
+    def test_custom_target_deletion_invalidates_its_build(self) -> None:
+        custom = self.worktree / "custom-target"
+        custom.mkdir()
+        self.previous_build()
+        self.assertTrue(self.fresh(target_dir="custom-target"))
+        _ = (self.state / "target-deletes.json").write_text(json.dumps({
+            str(custom): (NOW - timedelta(seconds=30)).timestamp(),
+        }))
+        self.assertFalse(self.fresh(target_dir="custom-target"))
+
+    def test_corrupt_sweep_state_keeps_compile_promise(self) -> None:
+        self.samples([2 * GIB])
+        self.previous_build()
+        _ = (self.state / "target-deletes.json").write_text("not json")
+        self.assertFalse(self.fresh())
+        self.assertEqual(self.promise().bytes, 10 * GIB)
+
+    def test_unknown_compile_count_and_compile_failures_are_not_fresh_history(self) -> None:
+        self.samples([GIB], crates=None)
+        self.samples([GIB], status=101, tests_run=0)
+        self.previous_build()
+        self.assertEqual(self.promise().bytes, 10 * GIB)
+
+    def test_target_deletion_since_build_forces_compile_promise(self) -> None:
+        self.samples([2 * GIB])
+        self.previous_build()
+        _ = (self.state / "target-deletes.json").write_text(json.dumps({
+            str(self.worktree / "target"): (NOW - timedelta(seconds=30)).timestamp(),
+        }))
+        self.assertFalse(self.fresh())
+        self.assertEqual(self.promise().bytes, 10 * GIB)
+
+    def test_deletion_before_build_or_in_other_target_does_not_invalidate_it(self) -> None:
+        self.samples([2 * GIB])
+        self.previous_build()
+        _ = (self.state / "target-deletes.json").write_text(json.dumps({
+            str(self.worktree / "target"): (NOW - timedelta(minutes=2)).timestamp(),
+            str(self.root / "other-target"): NOW.timestamp(),
+        }))
+        self.assertTrue(self.fresh())
+        self.assertEqual(self.promise().bytes, 2 * GIB)
+
+    def test_logged_disk_sweep_since_build_forces_compile_promise(self) -> None:
+        self.samples([2 * GIB])
+        self.previous_build()
+        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+            _ = db.execute("INSERT INTO steps(host, worktree, step, started_at, sweep_freed_bytes) "
+                           + "VALUES (?, ?, 'sweep', ?, ?)",
+                           (self.host, str(self.worktree), store.utc_iso((NOW - timedelta(seconds=30)).timestamp()), GIB))
+        self.append_step({"kind": "step", "host": self.host, "worktree": str(self.worktree),
+                          "step": "sweep", "started_at": store.utc_iso((NOW - timedelta(seconds=30)).timestamp()),
+                          "sweep_freed_bytes": GIB}, NOW)
+        self.assertFalse(self.fresh())
+        self.assertEqual(self.promise().bytes, 10 * GIB)
+
+    def test_missing_target_and_expired_sweep_evidence_force_compile_promise(self) -> None:
+        self.previous_build(at=NOW - timedelta(days=2))
+        self.assertFalse(self.fresh())
+        self.previous_build()
+        (self.worktree / "target").rmdir()
+        self.assertFalse(self.fresh())
+
+
 class RepositoryHistoryTests(unittest.TestCase):
     root: Path = Path()
     admission: Path = Path()
@@ -932,6 +1323,198 @@ class MemoryQueueFixture(unittest.TestCase):
                           root=self.root, now=NOW,
                           profile=gate.StepProfile("test", "nextest", "test", gate.ExpectedPeak(int(need * GIB), "measured", 5)))
 
+
+
+class AdmitHeadTests(MemoryQueueFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        environment = fake_memory_readings(self.root)
+        environment.update({"BUILDLOG_MEMINFO": str(self.meminfo), "BUILDLOG_BUILD_BUDGET_GIB": "21",
+                            "CLAUDE_CODE_SESSION_ID": "showrunner-id", "CODEX_THREAD_ID": ""})
+        _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
+        _ = self.enterContext(patch.object(time, "time", return_value=NOW.timestamp()))
+        # One boundary replaces every real showrunner-state lookup.
+        _ = self.enterContext(patch.object(gate, "showrunner_is_registered", return_value=True, create=True))
+        _ = self.meminfo.write_text(f"MemAvailable: {23 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
+
+    @property
+    def override_path(self) -> Path:
+        return self.root / "admission/admit-head.json"
+
+    def waiting_head(self) -> Path:
+        path = self.head(12)
+        row = cast(gate.Waiter, json.loads(path.read_text()))
+        row.update(session_id="head-session", session_name="head-unit", step="nextest", folder=str(self.root / "tree"))
+        _ = path.write_text(json.dumps(row))
+        return path
+
+    def set_head(self, why: str = "") -> str:
+        output = io.StringIO()
+        arguments = ["memory_admit.py", "admit-head"] + (["--why", why] if why else [])
+        with patch.object(sys, "argv", arguments), redirect_stdout(output):
+            gate.main()
+        return output.getvalue()
+
+    def events(self) -> list[dict[str, object]]:
+        return [row for row in buildlog_rows(self.root) if row.get("kind") == "head_admission"]
+
+    def bump_younger_waiter(self) -> Path:
+        younger = self.root / "admission/400-warmup.waiting"
+        row = cast(gate.Waiter, json.loads(younger.read_text()))
+        row["bump_order"] = -1
+        _ = younger.write_text(json.dumps(row))
+        return younger
+
+    def test_showrunner_sets_one_record_for_the_current_head(self) -> None:
+        path = self.waiting_head()
+        self.assertIn("head-unit", self.set_head("free memory checked"))
+        row = cast(dict[str, object], json.loads(self.override_path.read_text()))
+        self.assertEqual((row["waiter"], row["pid"], row["start_time"]), (path.name, 300, "head"))
+        self.assertEqual((row["why"], row["set_by"]), ("free memory checked", "showrunner-id"))
+
+    def test_non_showrunner_is_refused_without_writing_a_record(self) -> None:
+        _ = self.waiting_head()
+        for session in ("worker-id", ""):
+            with self.subTest(session=session), patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": session}), \
+                 patch.object(gate, "showrunner_is_registered", return_value=False), \
+                 contextlib.redirect_stderr(io.StringIO()) as errors:
+                with self.assertRaises(SystemExit) as stopped:
+                    _ = self.set_head()
+                self.assertNotEqual(stopped.exception.code, 0)
+                self.assertIn("showrunner", errors.getvalue())
+                self.assertNotIn("Traceback", errors.getvalue())
+                self.assertFalse(self.override_path.exists())
+                self.assertEqual(self.events(), [])
+
+    def test_codex_caller_cannot_use_an_inherited_showrunner_session(self) -> None:
+        _ = self.waiting_head()
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": "worker-thread"}), \
+             patch.object(gate, "showrunner_is_registered", return_value=True) as lookup, \
+             contextlib.redirect_stderr(io.StringIO()) as errors:
+            with self.assertRaises(SystemExit) as stopped:
+                _ = self.set_head()
+        self.assertNotEqual(stopped.exception.code, 0)
+        self.assertIn("showrunner", errors.getvalue())
+        lookup.assert_not_called()
+        self.assertFalse(self.override_path.exists())
+        self.assertEqual(self.events(), [])
+
+    def test_nothing_waiting_is_refused_without_a_record_or_log_row(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            with self.assertRaises(SystemExit) as stopped:
+                _ = self.set_head()
+        self.assertNotEqual(stopped.exception.code, 0)
+        self.assertIn("nothing waits", errors.getvalue())
+        self.assertFalse(self.override_path.exists())
+        self.assertEqual(self.events(), [])
+
+    def test_new_call_replaces_the_previous_record(self) -> None:
+        _ = self.waiting_head()
+        _ = self.set_head("first")
+        _ = self.set_head("replacement")
+        row = cast(dict[str, object], json.loads(self.override_path.read_text()))
+        self.assertEqual(row["why"], "replacement")
+        self.assertEqual(len(list(self.override_path.parent.glob("admit-head*"))), 1)
+        self.assertEqual([row["action"] for row in self.events()], ["set", "set"])
+
+    def test_record_selects_the_first_waiter_in_queue_order(self) -> None:
+        _ = self.waiting_head()
+        _ = self.check(need=12, free=0)
+        younger = self.bump_younger_waiter()
+        _ = self.set_head()
+        self.assertEqual(json.loads(self.override_path.read_text())["waiter"], younger.name)
+
+    def test_head_starts_above_budget_when_free_memory_covers_need_and_reserve(self) -> None:
+        _ = self.running(100, 20, age=30)
+        _ = self.waiting_head()
+        self.assertEqual(self.check(pid=300, need=12, free=15).decision.state, "hold")
+        _ = self.set_head()
+        with patch.object(gate, "read_meminfo", wraps=gate.read_meminfo) as reading:
+            result = self.check(pid=300, need=12, free=15)
+        self.assertEqual(reading.call_count, 1)
+        self.assertEqual(result.decision.state, "admit")
+        self.assertGreater(result.decision.charged + result.peak.bytes, result.decision.budget)
+        self.assertEqual(result.decision.budget, 21 * GIB)
+        self.assertIsInstance(result.reservation, gate.Reserved)
+
+    def test_head_keeps_waiting_and_keeps_record_when_free_memory_does_not_cover_reserve(self) -> None:
+        _ = self.running(100, 20, age=30)
+        _ = self.waiting_head()
+        _ = self.set_head()
+        result = self.check(pid=300, need=12, free=14)
+        self.assertEqual(result.decision.state, "hold")
+        self.assertTrue(self.override_path.exists())
+        self.assertEqual([row["action"] for row in self.events()], ["set"])
+
+    def test_admission_deletes_record_and_writes_both_buildlog_rows(self) -> None:
+        _ = self.running(100, 20, age=30)
+        waiter = self.waiting_head()
+        _ = self.set_head("user asked")
+        result = self.check(pid=300, need=12, free=23)
+        self.assertEqual(result.decision.state, "admit")
+        self.assertFalse(waiter.exists())
+        self.assertFalse(self.override_path.exists())
+        rows = self.events()
+        self.assertEqual([row["action"] for row in rows], ["set", "admitted"])
+        for row in rows:
+            self.assertEqual((row["unit"], row["step"], row["need"], row["free"], row["reserve"], row["why"], row["set_by"]),
+                             ("head-unit", "nextest", 12 * GIB, 23 * GIB, 3 * GIB, "user asked", "showrunner-id"))
+            self.assertEqual(row["v"], 1)
+            self.assertTrue(row["id"])
+            self.assertEqual(row["host"], store.host_name())
+            self.assertEqual(row["at"], store.utc_iso(NOW.timestamp()))
+
+    def test_record_lapses_on_next_locked_pass_when_waiter_leaves(self) -> None:
+        _ = self.running(100, 20, age=30)
+        waiter = self.waiting_head()
+        _ = self.set_head()
+        waiter.unlink()
+        result = self.check(need=12, free=23)
+        self.assertEqual(result.decision.state, "hold")
+        self.assertFalse(self.override_path.exists())
+        self.assertEqual([row["action"] for row in self.events()], ["set", "lapsed"])
+
+    def test_record_for_a_dead_or_reused_waiter_never_admits_the_new_head(self) -> None:
+        _ = self.running(100, 20, age=30)
+        _ = self.waiting_head()
+        _ = self.set_head()
+        self.processes[300] = "new-process"
+        result = self.check(pid=300, need=12, free=23)
+        self.assertEqual(result.decision.state, "hold")
+        self.assertFalse(self.override_path.exists())
+        self.assertEqual([row["action"] for row in self.events()], ["set", "lapsed"])
+
+    def test_override_does_not_follow_a_bump_or_admit_another_waiter(self) -> None:
+        _ = self.running(100, 20, age=30)
+        _ = self.waiting_head()
+        _ = self.set_head()
+        _ = self.check(need=12, free=0)
+        _ = self.bump_younger_waiter()
+        self.assertEqual(self.check(need=12, free=23).decision.state, "hold")
+        self.assertEqual(self.check(pid=300, need=12, free=23).decision.state, "hold")
+        self.assertTrue(self.override_path.exists())
+        self.assertEqual([row["action"] for row in self.events()], ["set"])
+
+    def test_override_keeps_the_pressure_guard(self) -> None:
+        _ = self.running(100, 20, age=30)
+        _ = self.waiting_head()
+        _ = self.set_head()
+        _ = Path(os.environ["BUILDLOG_MEMORY_PRESSURE"]).write_text("full avg10=11.0 total=0\n")
+        self.assertEqual(self.check(pid=300, need=12, free=40).decision.state, "hold")
+        self.assertTrue(self.override_path.exists())
+
+    def test_stopped_record_replacement_keeps_previous_row_and_can_be_rerun(self) -> None:
+        _ = self.waiting_head()
+        _ = self.set_head("first")
+        before = self.override_path.read_bytes()
+        with patch.object(os, "replace", side_effect=OSError("stopped before rename")):
+            with self.assertRaises(OSError):
+                _ = self.set_head("second")
+        self.assertEqual(self.override_path.read_bytes(), before)
+        self.assertEqual(len(self.events()), 1)
+        _ = self.set_head("second")
+        self.assertEqual(json.loads(self.override_path.read_text())["why"], "second")
 
 
 class CurrentBlockerTests(MemoryQueueFixture):
@@ -2336,8 +2919,7 @@ class QueueApiTests(MemoryQueueFixture):
     def test_bump_writes_one_row_in_the_private_hold_event_log(self) -> None:
         _ = self.queue()
         _ = gate.bump_waiter("2", "actor-id")
-        rows = [cast(dict[str, object], json.loads(line)) for path in self.root.glob("*/*.jsonl")
-                for line in path.read_text().splitlines()]
+        rows = buildlog_rows(self.root)
         self.assertEqual(len(rows), 1)
         row = rows[0]
         self.assertEqual({key: row[key] for key in ("kind", "actor", "session", "step", "folder", "old_position", "at")},
@@ -3107,6 +3689,222 @@ class QueueLeaveTests(unittest.TestCase):
         self.assertEqual(ran_args.read_text().split()[:4], ["nextest", "run", "--test-threads", str(shared)])
         self.assertEqual(json.loads(reservation.read_text())["test_threads"], shared)
         self.assertEqual(sorted(path.name for path in markers.iterdir()), ["lock", "other.run"])
+
+
+class WaiterNeedSourceTests(MemoryQueueFixture):
+    def test_held_waiter_persists_the_estimate_source_count_and_requested_width(self) -> None:
+        _ = self.meminfo.write_text(f"MemAvailable: 0 kB\nMemTotal: {60 * GIB // 1024} kB\n")
+        argv = ["cargo", "nextest", "run", "-E", "package(hana) & (test(one) | test(two))",
+                "--test-threads", "8"]
+        for peak in (gate.ExpectedPeak(12 * GIB, "measured", 7), gate.ExpectedPeak(12 * GIB, "buildlog", 12),
+                     gate.ExpectedPeak(12 * GIB, "pooled", 31), gate.ExpectedPeak(12 * GIB, "fallback", 0)):
+            with self.subTest(source=peak.source):
+                result = gate.check(self.meminfo, 400, "", argv, root=self.root, now=NOW,
+                                    profile=gate.StepProfile("hana", "nextest", "tree", peak, HANA, "filtered"))
+                self.assertEqual(result.decision.state, "hold")
+                row = cast(dict[str, object], json.loads(
+                    (self.root / "admission/400-warmup.waiting").read_text()))
+                self.assertEqual(row["need_source"], peak.source)
+                self.assertEqual(row["need_runs"], peak.count)
+                self.assertEqual(row["test_threads"], 8)
+                self.assertEqual(row["need"], peak.bytes)
+                self.assertEqual(row["test_scope"], "filtered")
+                self.assertEqual(row["package"], "hana")
+                self.assertEqual(row["filters"], ["one", "two"])
+                self.assertEqual(row["estimated_at"], NOW.timestamp())
+
+    def test_waiter_without_an_explicit_width_records_a_null_width(self) -> None:
+        _ = self.meminfo.write_text(f"MemAvailable: 0 kB\nMemTotal: {60 * GIB // 1024} kB\n")
+        result = gate.check(self.meminfo, 400, "", ["cargo", "clippy"], root=self.root, now=NOW,
+                            profile=gate.StepProfile("hana", "clippy", "tree",
+                                                     gate.ExpectedPeak(GIB, "measured", 9), HANA))
+        self.assertEqual(result.decision.state, "hold")
+        row = cast(dict[str, object], json.loads((self.root / "admission/400-warmup.waiting").read_text()))
+        self.assertIn("test_threads", row)
+        self.assertIsNone(row["test_threads"])
+        self.assertEqual((row["need_source"], row["need_runs"]), ("measured", 9))
+
+
+class QueueExplanationTests(MemoryQueueFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.enterContext(patch.dict(os.environ, {
+            "BUILDLOG_MEMINFO": str(self.meminfo), "BUILDLOG_BUILD_BUDGET_GIB": "21",
+            "BUILDLOG_MEMORY_PRESSURE": str(self.root / "pressure"),
+        }))
+        _ = self.enterContext(patch.object(time, "time", return_value=NOW.timestamp()))
+        _ = self.meminfo.write_text(f"MemAvailable: {16 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
+        _ = (self.root / "pressure").write_text("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+
+    def waiting(self, pid: int, need: int, minutes: int, **fields: object) -> Path:
+        row: dict[str, object] = {
+            "pid": pid, "start_time": self.processes[pid], "need": need,
+            "since": NOW.timestamp() - minutes * 60, "session_id": f"session-{pid}",
+            "session_name": f"worker-{pid}", "step": "nextest", "folder": f"/tmp/tree-{pid}",
+            **fields,
+        }
+        path = gate.admission_dir(self.root) / f"{pid}.waiting"
+        _ = path.write_text(json.dumps(row))
+        return path
+
+    def test_explain_matches_read_queue_and_admission_on_the_same_files(self) -> None:
+        _ = self.running(100, 6, age=30)
+        _ = self.running(200, 4, age=30)
+        _ = self.waiting(300, 12 * GIB, 20, need_source="measured", need_runs=7, test_threads=8,
+                         test_scope="filtered", package="hana", filters=["one", "two"],
+                         bump_order=-1, priority_since=NOW.timestamp() - 120)
+        _ = self.waiting(400, GIB, 5)
+        self.processes[500] = "fifth"
+        _ = self.waiting(500, 9 * GIB, 3)
+        directory = self.root / "admission"
+        _ = (directory / "lock").touch()
+        processes = gate.process_table(self.root / "proc")
+        view, ordered = gate.read_queue(directory, processes, NOW.timestamp())
+        reason = view.waiting[0].reason
+        if not isinstance(reason, gate.HeadAdmissionStatus):
+            self.fail(f"expected admission status, got {reason}")
+
+        before = {path.name: path.read_bytes() for path in directory.iterdir()}
+        with patch("sqlite3.connect", side_effect=AssertionError("SQLite is outside the explain read path")), \
+             patch.object(gate, "process_table", wraps=gate.process_table) as table, \
+             patch.object(gate, "read_meminfo", wraps=gate.read_meminfo) as host_read, \
+             patch.object(gate, "reservation_memory", wraps=gate.reservation_memory) as memory_read, \
+             patch.object(fcntl, "flock", wraps=fcntl.flock) as lock:
+            explanation = gate.explain_queue()
+        self.assertEqual(table.call_count, 1)
+        self.assertEqual(host_read.call_count, 1)
+        self.assertEqual(memory_read.call_count, 2)
+        self.assertEqual([call.args[1] for call in lock.call_args_list], [fcntl.LOCK_SH])
+        self.assertEqual({path.name: path.read_bytes() for path in directory.iterdir()}, before)
+        head, host = explanation.head, explanation.host
+        if not isinstance(head, gate.HeadExplanation) or not isinstance(host, gate.HostAvailable):
+            self.fail(f"expected readable host and head, got {explanation}")
+        if not isinstance(host.total, int):
+            self.fail("fixture must have a total memory reading")
+        self.assertEqual(head.waiter, view.waiting[0])
+        self.assertEqual(head.decision, reason.decision)
+        memories = [step.measured for step in view.running]
+        priority = gate.head_priority([row for _, row in ordered], view.available, host.total, memories, NOW.timestamp())
+        self.assertEqual(head.decision, gate.queue_decision(
+            view.available, host.total, ordered[0][1], memories, priority, host.pressure))
+        self.assertEqual(head.decision.state, "hold")
+        self.assertEqual((host.available, host.total, host.reserve, host.budget),
+                         (16 * GIB, 60 * GIB, 3 * GIB, 21 * GIB))
+        self.assertEqual((explanation.totals.charged, explanation.totals.measured, explanation.totals.growth),
+                         (10 * GIB, 3 * GIB, 7 * GIB))
+        self.assertEqual((head.budget.charged, head.budget.need, head.budget.head_need, head.budget.budget,
+                          head.budget.starts_at, head.budget.passes),
+                         (10 * GIB, 12 * GIB, 0, 21 * GIB, 9 * GIB, False))
+        self.assertEqual((head.free.available, head.free.need, head.free.reserve, head.free.growth,
+                          head.free.head_need, head.free.threshold, head.free.passes),
+                         (16 * GIB, 12 * GIB, 3 * GIB, 7 * GIB, 0, 22 * GIB, False))
+        self.assertEqual(head.order, gate.head_window(ordered[0][1], NOW.timestamp()))
+        self.assertTrue(head.has_priority)
+        self.assertEqual(head.bump, gate.QueueBump(NOW.timestamp() - 120, True, False))
+        self.assertEqual(head.need_source, gate.RecordedNeed(
+            "measured", 7, gate.HISTORY_DAYS, "filtered", "hana", ("one", "two"), 8))
+        self.assertEqual((explanation.line.count, explanation.line.fitting, explanation.line.smallest_need,
+                          explanation.line.largest_need, explanation.line.oldest_since),
+                         (2, 1, GIB, 9 * GIB, NOW.timestamp() - 300))
+        self.assertEqual([step.waiter for step in explanation.line.steps], list(view.waiting[1:]))
+        for step in explanation.line.steps:
+            self.assertEqual(step.fits_now, gate.decide(host.available, 60 * GIB, step.waiter.need,
+                                                       memories, pressure=host.pressure).state == "admit")
+        self.assertEqual([(step.promise, step.measured, step.charged, step.admitted_at)
+                          for step in explanation.running],
+                         [(6 * GIB, GIB, 6 * GIB, NOW.timestamp() - 30),
+                          (4 * GIB, 2 * GIB, 4 * GIB, NOW.timestamp() - 30)])
+        self.assertTrue(all(isinstance(step.basis, gate.RampPromise) for step in explanation.running))
+
+    def test_old_waiter_without_source_has_an_explicit_unrecorded_variant(self) -> None:
+        path = self.waiting(300, 12 * GIB, 20)
+        before = path.read_bytes()
+        head = gate.explain_queue().head
+        if not isinstance(head, gate.HeadExplanation):
+            self.fail(f"expected head, got {head}")
+        self.assertIsInstance(head.need_source, gate.NeedSourceNotRecorded)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_missing_host_reading_and_empty_queue_use_their_domain_variants(self) -> None:
+        path = self.waiting(300, 12 * GIB, 20)
+        self.meminfo.unlink()
+        explanation = gate.explain_queue()
+        self.assertIsInstance(explanation.host, gate.ReadingUnavailable)
+        if not isinstance(explanation.head, gate.HeadExplanation):
+            self.fail(f"expected head, got {explanation.head}")
+        self.assertIsInstance(explanation.head.waiter.reason, gate.ReadingUnavailable)
+        path.unlink()
+        empty = gate.explain_queue()
+        self.assertIsInstance(empty.head, gate.NoWaiter)
+        self.assertEqual((empty.line.count, empty.line.steps), (0, ()))
+
+    def test_peak_charge_basis_uses_the_same_charge_as_admission_for_each_rule(self) -> None:
+        self.readings[100] = gate.MeasuredMemory(GIB)
+        path = self.running(100, 8, age=300)
+        cases = (
+            ("using", "", None, gate.UsingNow, GIB),
+            ("peak", str(5 * GIB), int(NOW.timestamp() - 30), gate.PeakSoFar, 5 * GIB),
+            ("decayed", str(5 * GIB), int(NOW.timestamp() - 1600), gate.PeakDecayed, GIB),
+            ("unreadable", "not a byte count", None, gate.PeakFileUnreadable, 8 * GIB),
+        )
+        for label, peak, recorded_at, expected_basis, expected_charge in cases:
+            with self.subTest(rule=label):
+                path.with_suffix(".max").unlink(missing_ok=True)
+                path.with_suffix(".wave").unlink(missing_ok=True)
+                if peak:
+                    _ = path.with_suffix(".max").write_text(peak)
+                if recorded_at is not None:
+                    _ = path.with_suffix(".wave").write_text(f"{peak} {recorded_at}")
+                explanation = gate.explain_queue()
+                self.assertEqual(len(explanation.running), 1)
+                running = explanation.running[0]
+                self.assertEqual(running.charged, expected_charge)
+                self.assertEqual(running.charged, gate.build_charge(running.step.measured))
+                self.assertIsInstance(running.basis, expected_basis)
+
+    def test_old_sampler_decay_uses_peak_file_publication_time(self) -> None:
+        path = self.running(100, 8, age=300)
+        _ = path.with_suffix(".max").write_text(str(5 * GIB))
+        old_peak_at = NOW.timestamp() - 1600
+        os.utime(path.with_suffix(".max"), (old_peak_at, old_peak_at))
+        running = gate.explain_queue().running[0]
+        if not isinstance(running.basis, gate.PeakDecayed):
+            self.fail(f"expected old-sampler decay, got {running.basis}")
+        self.assertTrue(running.basis.old_sampler)
+        self.assertEqual(running.basis.decayed_at, old_peak_at + gate.PEAK_DECAY_SECONDS)
+        self.assertEqual((running.promise, running.charged), (8 * GIB, GIB))
+
+    def test_no_reading_yet_names_the_promised_charge(self) -> None:
+        self.readings[100] = gate.MeasuredMemory(0)
+        _ = self.running(100, 8, age=30)
+        running = gate.explain_queue().running[0]
+        self.assertIsInstance(running.basis, gate.PromiseNoReading)
+        self.assertEqual((running.promise, running.measured, running.charged), (8 * GIB, 0, 8 * GIB))
+
+    def test_pressure_and_recovery_spacing_match_the_head_decision_without_writing(self) -> None:
+        _ = self.waiting(300, GIB, 20)
+        directory = self.root / "admission"
+        _ = (self.root / "pressure").write_text("full avg10=11.00 avg60=0.00 avg300=0.00 total=0\n")
+        explanation = gate.explain_queue()
+        if not isinstance(explanation.host, gate.HostAvailable) or not isinstance(explanation.head, gate.HeadExplanation):
+            self.fail(f"expected readable explanation, got {explanation}")
+        self.assertEqual(explanation.host.pressure, gate.MemoryPressure(11))
+        self.assertEqual(explanation.head.decision.state, "hold")
+        self.assertEqual(explanation.head.decision.pressure, explanation.host.pressure)
+        self.assertFalse((directory / "pressure-recovery").exists())
+
+        _ = (self.root / "pressure").write_text("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+        record = directory / "pressure-recovery"
+        _ = record.write_text(json.dumps({"state": "recovering", "ends_at": NOW.timestamp() + 100,
+                                         "next_start_at": NOW.timestamp() + 30}))
+        before = record.read_bytes()
+        recovery = gate.explain_queue()
+        if not isinstance(recovery.host, gate.HostAvailable) or not isinstance(recovery.head, gate.HeadExplanation):
+            self.fail(f"expected recovery explanation, got {recovery}")
+        self.assertEqual(recovery.host.pressure, gate.MemoryPressure(0, next_start_at=NOW.timestamp() + 30))
+        self.assertEqual(recovery.head.decision.state, "hold")
+        self.assertEqual(record.read_bytes(), before)
 
 
 if __name__ == "__main__":

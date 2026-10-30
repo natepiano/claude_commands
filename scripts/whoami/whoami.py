@@ -8,8 +8,10 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from account import label_for
-from agent_accounts import (ClaudeAccountsInUse, CodexHomeSource, Quota, Report,
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.whoami.account import label_for
+from scripts.whoami.agent_accounts import (ClaudeAccountsInUse, CodexHomeSource, Quota, Report,
                             codex_home_display, codex_homes, codex_report_in_use, live_reports,
                             observe_workers_home as resolve_workers_home, NoWorkersHome)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
@@ -66,7 +68,6 @@ def render(report: Report, selection: ClaudeAccountsInUse, workers_home: Path | 
 
 
 async def main() -> None:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.accounts import accounts
 
     selection = accounts.claude_account_selection()

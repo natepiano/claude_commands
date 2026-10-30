@@ -41,7 +41,7 @@ from scripts.lib import names  # noqa: E402
 from scripts.lib.names import JobKey  # noqa: E402
 if TYPE_CHECKING:
     from ..accounts.role_map import role_map_command
-    from ..whoami import account, agent_accounts, note_file
+    from scripts.whoami import account, agent_accounts, note_file
 else:
     import importlib.util
     from scripts.accounts.role_map import role_map_command
@@ -60,9 +60,9 @@ else:
         loader.exec_module(module)
         return module
 
-    account = _lazy_module("account")
-    agent_accounts = _lazy_module("agent_accounts")
-    note_file = _lazy_module("note_file")
+    account = _lazy_module("scripts.whoami.account")
+    agent_accounts = _lazy_module("scripts.whoami.agent_accounts")
+    note_file = _lazy_module("scripts.whoami.note_file")
 from scripts.shutdown import remote as remote  # noqa: E402
 from sessions import SessionRecord, messaging_socket_exists, running_sessions  # noqa: E402
 
@@ -257,6 +257,11 @@ AccountAttribution = AccountLabel | AccountUnread | AccountAttributionUnavailabl
 
 
 @dataclass(frozen=True)
+class NotDaemonSession:
+    """This row has no local Codex daemon route."""
+
+
+@dataclass(frozen=True)
 class RosterEntry:
     machine: str
     kind: str
@@ -271,6 +276,7 @@ class RosterEntry:
     thread: CodexThread | NoCodexThread = NoCodexThread()
     session: ClaudeSession | NoClaudeSession = NoClaudeSession()
     account: AccountAttribution = AccountUnread("not read")
+    daemon: codex_daemon.CodexDaemon | NotDaemonSession = NotDaemonSession()
 
 
 @dataclass(frozen=True)
@@ -451,6 +457,7 @@ class SnapshotEntry(TypedDict):
     thread: dict[str, str]
     session: dict[str, str]
     account: NotRequired[dict[str, str]]
+    daemon: NotRequired[dict[str, str]]
 
 
 def _tagged_state(state: TaggedSnapshotState) -> dict[str, str]:
@@ -478,6 +485,8 @@ def _snapshot_entry(entry: RosterEntry) -> SnapshotEntry:
         showrunner=_tagged_state(entry.showrunner), director=_tagged_state(entry.director),
         assignment=_assignment_snapshot(entry.assignment), thread=_tagged_state(entry.thread),
         session=_tagged_state(entry.session), account=_tagged_state(entry.account),
+        daemon=({"home": str(entry.daemon.home), "socket": str(entry.daemon.socket)}
+                if isinstance(entry.daemon, codex_daemon.CodexDaemon) else {}),
     )
 
 
@@ -544,8 +553,8 @@ def _decode_state(value: object) -> SnapshotState:
 
 def _decode_entry(value: object) -> RosterEntry:
     values = _snapshot_object(value)
-    required = set(SnapshotEntry.__annotations__) - {"account"}
-    if not required <= set(values) or set(values) - required - {"account"}:
+    required = set(SnapshotEntry.__annotations__) - {"account", "daemon"}
+    if not required <= set(values) or set(values) - required - {"account", "daemon"}:
         raise ValueError("invalid snapshot entry fields")
     reach = _decode_state(values.get("reach"))
     showrunner = _decode_state(values.get("showrunner"))
@@ -555,6 +564,14 @@ def _decode_entry(value: object) -> RosterEntry:
     session = _decode_state(values.get("session"))
     attributed = (_decode_state(values["account"]) if "account" in values
                   else AccountAttributionUnavailable("peer sent no account"))
+    daemon: codex_daemon.CodexDaemon | NotDaemonSession = NotDaemonSession()
+    if "daemon" in values:
+        owner = _snapshot_object(values["daemon"])
+        if owner:
+            if set(owner) != {"home", "socket"}:
+                raise ValueError("invalid snapshot daemon fields")
+            daemon = codex_daemon.CodexDaemon(Path(_snapshot_string(owner, "home")),
+                                             Path(_snapshot_string(owner, "socket")))
     if not (isinstance(reach, Messageable | CannotReceiveMessages)
             and isinstance(showrunner, ShowrunnerRelationship)
             and isinstance(director, DirectorRelationship)
@@ -573,7 +590,7 @@ def _decode_entry(value: object) -> RosterEntry:
         role=role, name=_snapshot_string(values, "name"),
         status=_snapshot_string(values, "status"), cwd=_snapshot_string(values, "cwd"),
         reach=reach, showrunner=showrunner, director=director, assignment=assignment,
-        thread=thread, session=session, account=attributed,
+        thread=thread, session=session, account=attributed, daemon=daemon,
     )
 
 
@@ -1035,14 +1052,12 @@ def _production_places(
 
 
 def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) -> dict[str, UnitLabels]:
-    """Resolve known Claude holders without a process scan, meshes or account reads."""
+    """Resolve Claude and Codex holders from files, without process scans, mesh calls or account reads."""
     wanted = set(session_ids)
     if not wanted:
         return {}
     try:
         records = _newest_sessions()
-        if not any(record["sessionId"] in wanted for record in records):
-            return {}
         problems: list[str] = []
         registered = _registered_showrunners(environment, problems,
                                             known_sessions={record["sessionId"]: record for record in records})
@@ -1068,6 +1083,7 @@ def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) 
                     unit = place.director.unit
                 director = UnderDirector(unit, names[owner], f"session:{owner}")
             labels[session_id] = _unit_labels(names[session_id], showrunner, director)
+        labels.update(_codex_unit_labels(wanted - labels.keys(), environment, records, places, problems))
         return labels
     except Exception:
         return {}
@@ -1299,14 +1315,19 @@ def _pid_alive(pid: int) -> bool:
 
 def _stopped_run_place(run: Path) -> _RunPlace:
     """Keep a worker's recorded unit without claiming that its director is live."""
-    from scripts.direct.progress_history import ProductionUnitIdentity, resolve_production_unit
-
     try:
         state = _read_object(run / unit_runs.STATE_FILE)
     except (OSError, UnicodeError, ValueError):
         return _RunPlace(NoDirector(), NoShowrunner(), "")
-    identity = resolve_production_unit(state)
     cwd = _as_string(state.get("working_dir"))
+    production, unit = _as_string(state.get("production")), _as_string(state.get("unit"))
+    if production and unit:
+        return _RunPlace(UnitWithoutRunningDirector(unit), ProductionWithoutRunningShowrunner(production), cwd)
+    # Older runs may keep their identity only in the plan. Import the history
+    # reader for that fallback, not for every lookup of recorded labels.
+    from scripts.direct.progress_history import ProductionUnitIdentity, resolve_production_unit
+
+    identity = resolve_production_unit(state)
     if isinstance(identity, ProductionUnitIdentity):
         return _RunPlace(UnitWithoutRunningDirector(identity.unit),
                          ProductionWithoutRunningShowrunner(identity.production), cwd)
@@ -1355,6 +1376,54 @@ def _mesh_records(run: _LiveRun, problems: list[str]) -> dict[str, _MeshWorker]:
         if isinstance(value, dict):
             records[name] = cast("_MeshWorker", cast("object", value))
     return records
+
+
+def _listed_mesh_worker(record: _MeshWorker) -> bool:
+    return not (record.get("status") == "ended" or record.get("transferring_role")
+                or record.get("role_redirect") or record.get("held_design_id"))
+
+
+def _codex_unit_labels(
+    wanted: set[str], environment: Mapping[str, str], records: list[SessionRecord],
+    places: Mapping[str, _ProductionPlace], problems: list[str],
+) -> dict[str, UnitLabels]:
+    if not wanted:
+        return {}
+    roots = unit_runs.run_roots(environment.get("ROSTER_RUN_ROOT"))
+    matches: dict[Path, dict[str, str]] = {}
+    # Check requested thread IDs before discovering live runs. Claude-only
+    # lookups and unknown IDs need no live-run discovery or account data.
+    for root in roots:
+        try:
+            paths = sorted(root.glob("*/mesh_roster.json"))
+        except OSError as error:
+            _problem(problems, f"Codex rosters in {root}", error)
+            continue
+        for path in paths:
+            run = _LiveRun(path.parent, _NoRunningDirector())
+            workers = {
+                thread: name for name, record in sorted(_mesh_records(run, problems).items())
+                if (thread := _as_string(record.get("thread_id"))) and thread in wanted and _listed_mesh_worker(record)
+            }
+            if workers:
+                matches[path.parent.resolve()] = workers
+    if not matches:
+        return {}
+    names = {record["sessionId"]: record["name"] for record in records}
+    labels: dict[str, UnitLabels] = {}
+    for run in _live_runs(roots, set(names), problems):
+        if run.path not in matches:
+            continue
+        if isinstance(run.director, _DirectorSession) and run.director.session_id in names:
+            place = places.get(run.director.session_id)
+            showrunner: ShowrunnerRelationship = place.showrunner if place is not None else NoShowrunner()
+            director: DirectorRelationship = place.director if place is not None else NoDirector()
+        else:
+            stopped = _stopped_run_place(run.path)
+            showrunner, director = stopped.showrunner, stopped.director
+        for thread, name in matches[run.path].items():
+            labels[thread] = _unit_labels(name, showrunner, director)
+    return labels
 
 
 
@@ -1658,7 +1727,7 @@ def _unit_workers(
         place = _run_place(run, claude_entries, production_places)
         for name, record in sorted(_mesh_records(run, problems).items()):
             status = _as_string(record.get("status"))
-            if status == "ended" or record.get("transferring_role") or record.get("role_redirect") or record.get("held_design_id"):
+            if not _listed_mesh_worker(record):
                 continue
             thread_id = _as_string(record.get("thread_id"))
             if thread_id:
@@ -1857,14 +1926,13 @@ def _local_roster(environment: Mapping[str, str]) -> Roster:
     durable_roles, durable_threads = _durable_roles(machine, claude, problems)
     unit_workers.extend(durable_roles)
     worker_threads.update(durable_threads)
-    daemon_socket = codex_daemon.daemon_socket(environment)
-    daemon = codex_daemon.loaded_sessions(daemon_socket)
-    daemon_home = daemon_socket.parent.parent
     codex_sessions: list[RosterEntry] = []
-    if isinstance(daemon, codex_daemon.DaemonUnreadable):
-        _problem(problems, "Codex daemon", daemon.reason)
-    else:
-        codex_sessions = [
+    for result in codex_daemon.read_daemons(environment):
+        owner, daemon = result.owner, result.sessions
+        if isinstance(daemon, codex_daemon.DaemonUnreadable):
+            _problem(problems, f"Codex daemon {agent_accounts.codex_home_display(owner.home)}", daemon.reason)
+            continue
+        codex_sessions.extend(
             RosterEntry(
                 machine=machine,
                 kind="codex",
@@ -1877,11 +1945,12 @@ def _local_roster(environment: Mapping[str, str]) -> Roster:
                 director=NoDirector(),
                 assignment=NotAWorker(),
                 thread=CodexThread(session.thread_id),
-                account=_codex_home_account(daemon_home),
+                account=_codex_home_account(owner.home),
+                daemon=owner,
             )
             for session in daemon
             if session.thread_id not in worker_threads
-        ]
+        )
     interactive = _herdr_codex_panes(machine)
     problems.extend(interactive.problems)
     entries = [*claude.values(), *unit_workers, *codex_sessions, *interactive.entries]

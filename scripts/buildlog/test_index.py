@@ -18,6 +18,8 @@ from unittest import mock
 
 import index
 import parse
+from record import TARGET_DIR_UNSET
+from store import UNKNOWN_IDENTITY
 
 CLI = Path(__file__).with_name("cli.py")
 TESTDATA = Path(__file__).with_name("testdata")
@@ -228,19 +230,209 @@ class IndexTests(unittest.TestCase):
     def ids(self) -> list[object]:
         return [row[0] for row in self.rows("SELECT id FROM steps ORDER BY id")]
 
-    def test_first_index_read_migrates_worker_fields_and_preserves_incomplete_appends(self) -> None:
+    def cargo_build_rows(self, *commands: list[str]) -> list[tuple[object, ...]]:
+        self.write(self.host_file, *(step(f"build-{number:03}", argv=argv) for number, argv in enumerate(commands)))
+        self.assertEqual(index.update(), len(commands))
+        return self.rows("SELECT build_base, build_items FROM steps ORDER BY id")
+
+    def test_hana_filter_and_runtime_arguments_do_not_change_the_cargo_build(self) -> None:
+        first, second = self.cargo_build_rows(
+            ["cargo", "nextest", "run", "--workspace", "--bin", "hana", "-E", "package(hana)",
+             "--test-threads", "2", "--no-fail-fast", "--retries", "2", "-j", "8", "--message-format", "json"],
+            ["cargo", "test", "--all", "--bin=hana", "-E", "package(other)",
+             "--test-threads=4", "--retries=3", "-j16", "--message-format=short", "--", "--features", "ignored"],
+        )
+        self.assertIsInstance(first[0], str)
+        self.assertEqual(first, second)
+        self.assertNotEqual(json.loads(cast(str, first[1])), [])
+
+    def test_packages_features_profiles_and_target_are_normalized_together(self) -> None:
+        first, second, third = self.cargo_build_rows(
+            ["cargo", "nextest", "run", "-p", "hana", "-p", "bridge", "--exclude", "z", "--exclude", "a",
+             "--features", "hana/dynamic_linking,trace", "-F", "serde, ui", "--release", "--target", "x86_64-unknown-linux-gnu", "--bin", "hana"],
+            ["env", "RUSTC_WRAPPER=", "/nix/store/tool/bin/cargo", "+nightly", "test", "--package=bridge", "--package", "hana",
+             "--exclude=a", "--exclude=z", "-F", "ui", "--features=trace,serde", "--features", "hana/dynamic_linking",
+             "--profile", "release", "--target=x86_64-unknown-linux-gnu", "--bin=hana"],
+            ["cargo", "nextest", "run", "--package", "bridge", "-p", "hana", "--exclude", "a", "--exclude", "z",
+             "--features", "ui serde trace hana/dynamic_linking", "--cargo-profile=release",
+             "--target", "x86_64-unknown-linux-gnu", "--bin", "hana"],
+        )
+        self.assertIsInstance(first[0], str)
+        self.assertEqual(first, second)
+        self.assertEqual(first, third)
+
+    def test_each_build_input_changes_base_but_selectors_do_not(self) -> None:
+        commands = [
+            ["cargo", "nextest", "run", "--workspace", "--lib"],
+            ["cargo", "nextest", "run", "--workspace", "--tests"],
+            ["cargo", "check", "--workspace", "--lib"],
+            ["cargo", "nextest", "run", "--workspace", "--lib", "--release"],
+            ["cargo", "nextest", "run", "--workspace", "--lib", "--profile", "ci"],
+            ["cargo", "nextest", "run", "--workspace", "--lib", "--target", "aarch64-unknown-linux-gnu"],
+            ["cargo", "nextest", "run", "-p", "hana", "--lib"],
+            ["cargo", "nextest", "run", "--workspace", "--lib", "--exclude", "hana"],
+            ["cargo", "nextest", "run", "--workspace", "--lib", "--features", "hana/dynamic_linking"],
+            ["cargo", "nextest", "run", "--workspace", "--lib", "--all-features"],
+            ["cargo", "nextest", "run", "--workspace", "--lib", "--no-default-features"],
+        ]
+        rows = self.cargo_build_rows(*commands)
+        self.assertEqual(rows[0][0], rows[1][0])
+        self.assertNotEqual(rows[0][1], rows[1][1])
+        for command, row in zip(commands[2:], rows[2:], strict=True):
+            with self.subTest(argv=command):
+                self.assertIsInstance(row[0], str)
+                self.assertNotEqual(row[0], rows[0][0])
+        self.assertEqual(len({row[0] for row in rows[2:]}), len(rows) - 2)
+
+    def test_repeated_targets_form_a_sorted_set_in_the_cargo_build_key(self) -> None:
+        prefix = ["cargo", "nextest", "run", "--workspace", "--bin", "hana"]
+        first, reordered, last_only, different_pair, default = self.cargo_build_rows(
+            [*prefix, "--target", "aarch64-unknown-linux-gnu", "--target", "x86_64-unknown-linux-gnu"],
+            [*prefix, "--target=x86_64-unknown-linux-gnu", "--target=aarch64-unknown-linux-gnu",
+             "--target", "x86_64-unknown-linux-gnu"],
+            [*prefix, "--target", "x86_64-unknown-linux-gnu"],
+            [*prefix, "--target", "wasm32-unknown-unknown", "--target", "x86_64-unknown-linux-gnu"],
+            prefix,
+        )
+        self.assertIsInstance(first[0], str)
+        self.assertEqual(first, reordered)
+        self.assertEqual(len({first[0], last_only[0], different_pair[0], default[0]}), 4)
+        self.assertEqual(json.loads(cast(str, first[0]))["target"],
+                         ["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"])
+        self.assertEqual(json.loads(cast(str, default[0]))["target"], [])
+        for row in (last_only, different_pair, default):
+            self.assertEqual(row[1], first[1])
+
+    def test_hana_lib_and_multiple_test_items_survive_filter_and_feature_options(self) -> None:
+        first, second, third = self.cargo_build_rows(
+            ["cargo", "nextest", "run", "--lib", "--test", "a", "--test", "b", "-E", "package(hana)", "--features", "hana/dynamic_linking"],
+            ["cargo", "test", "--test=b", "--lib", "--test=a", "--features=hana/dynamic_linking"],
+            ["cargo", "nextest", "run", "--workspace", "--tests"],
+        )
+        self.assertEqual(first, second)
+        items = cast(list[str], json.loads(cast(str, first[1])))
+        self.assertEqual(items, ["--lib", "--test a", "--test b"])
+        self.assertNotEqual(first[0], third[0])
+        self.assertNotEqual(first[1], third[1])
+
+    def test_all_cargo_target_selectors_are_items_and_inline_values_are_equivalent(self) -> None:
+        first, second, default = self.cargo_build_rows(
+            ["cargo", "test", "--lib", "--bin", "hana", "--bins", "--test", "a", "--tests", "--example", "demo",
+             "--examples", "--bench", "speed", "--benches", "--all-targets", "--doc"],
+            ["cargo", "test", "--doc", "--all-targets", "--benches", "--bench=speed", "--examples", "--example=demo",
+             "--tests", "--test=a", "--bins", "--bin=hana", "--lib"],
+            ["cargo", "test"],
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(first[0], default[0])
+        items = cast(list[str], json.loads(cast(str, first[1])))
+        self.assertEqual(items, [
+            "--all-targets", "--bench speed", "--benches", "--bin hana", "--bins", "--doc", "--example demo",
+            "--examples", "--lib", "--test a", "--tests",
+        ])
+        self.assertEqual(json.loads(cast(str, default[1])), [])
+
+    def test_non_cargo_steps_have_no_build_identity(self) -> None:
+        for base, items in self.cargo_build_rows(
+            ["python3", "scripts/lint/sweep.py", "--workspace", "--tests"],
+            ["taplo", "fmt"],
+        ):
+            self.assertIsNone(base)
+            self.assertIsNone(items)
+
+    def test_step_build_columns_preserve_names_and_choose_the_recorded_target_folder(self) -> None:
+        self.write(
+            self.host_file,
+            step("target", target_dir="/shared/target", repo_identity="https://example.com/hana",
+                 compiled_crate_names=["hana", "dependency", "hana"], crates_compiled=3),
+            step("worktree", target_dir=None, compiled_crate_names=[], crates_compiled=0),
+            step("cwd", worktree=None, cwd="/r/subdirectory"),
+            step("unset", target_dir=TARGET_DIR_UNSET, repo_identity="git-root:fixture-root"),
+            step("unknown", target_dir=UNKNOWN_IDENTITY, repo_identity=UNKNOWN_IDENTITY, worktree=None, cwd="/r/unknown"),
+            step("null", target_dir=None, repo_identity=None),
+        )
+        original = self.host_file.read_bytes()
+        self.assertEqual(index.update(), 6)
+        rows = self.rows("SELECT id, compiled_crate_names, target_dir, repo_identity, target_folder FROM steps ORDER BY id")
+        decoded = [(identifier, json.loads(cast(str, names)) if names is not None else None, target_dir, repository, folder)
+                   for identifier, names, target_dir, repository, folder in rows]
+        self.assertEqual(decoded, [
+            ("cwd", None, UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, "/r/subdirectory"),
+            ("null", None, UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, "/r/feature"),
+            ("target", ["hana", "dependency", "hana"], "/shared/target", "https://example.com/hana", "/shared/target"),
+            ("unknown", None, UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, "/r/unknown"),
+            ("unset", None, TARGET_DIR_UNSET, "git-root:fixture-root", "/r/feature"),
+            ("worktree", [], UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, "/r/feature"),
+        ])
+        columns = [(column[1], column[2], column[3]) for column in self.rows("PRAGMA table_info(steps)")
+                   if column[1] in ("target_dir", "repo_identity")]
+        self.assertCountEqual(columns, [("target_dir", "TEXT", 1), ("repo_identity", "TEXT", 1)])
+        self.assertEqual(self.host_file.read_bytes(), original)
+
+    def test_schema_twenty_three_rebuilds_history_build_keys_without_rewriting_logs(self) -> None:
+        self.write(self.host_file, step("legacy", seat="impl", argv=["cargo", "nextest", "run", "--workspace", "--bin", "hana"]))
+        original = self.host_file.read_bytes()
+        with closing(sqlite3.connect(index.index_path())) as connection:
+            connection.execute("CREATE TABLE steps (id TEXT)").close()
+            connection.execute("PRAGMA user_version = 23").close()
+            connection.commit()
+        self.assertEqual(index.update(), 1)
+        self.assertGreater(index.SCHEMA_VERSION, 23)
+        self.assertEqual(self.rows("PRAGMA user_version"), [(index.SCHEMA_VERSION,)])
+        row = self.rows("SELECT worker, compiled_crate_names, target_dir, repo_identity, target_folder, build_base, build_items FROM steps")[0]
+        self.assertEqual(row[:5], ("impl", None, UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, "/r/feature"))
+        self.assertIsInstance(row[5], str)
+        self.assertNotEqual(json.loads(cast(str, row[6])), [])
+        self.assertEqual(self.host_file.read_bytes(), original)
+
+    def test_warm_history_lookup_has_the_folder_base_time_index(self) -> None:
+        self.write(self.host_file, step("history"))
+        self.assertEqual(index.update(), 1)
+        indexed_columns = [
+            [column[2] for column in self.rows(f'PRAGMA index_info("{name}")')]
+            for name, in self.rows("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'steps'")
+        ]
+        self.assertIn(["host", "target_folder", "build_base", "started_at_us"], indexed_columns)
+        base, started_at_us = self.rows("SELECT build_base, started_at_us FROM steps")[0]
+        plan = str(self.rows(
+            "EXPLAIN QUERY PLAN SELECT id FROM steps WHERE host = ? AND target_folder = ?"
+            + " AND build_base = ? AND started_at_us < ?",
+            "natedev", "/r/feature", base, started_at_us,
+        ))
+        self.assertIn("steps_build_history", plan)
+        self.assertIn("started_at_us<?", plan)
+
+    def test_indexed_start_instants_preserve_microseconds_and_normalize_offsets(self) -> None:
+        self.write(
+            self.host_file,
+            step("whole", started_at="1970-01-01T00:00:00Z"),
+            step("fractional-zero", started_at="1970-01-01T00:00:00.000000Z"),
+            step("fraction", started_at="1970-01-01T00:00:00.123456Z"),
+            step("offset", started_at="1970-01-01T01:00:00.123456+01:00"),
+            step("next-microsecond", started_at="1970-01-01T00:00:00.123457Z"),
+            step("before-epoch", started_at="1969-12-31T23:59:59.999999Z"),
+        )
+        original = self.host_file.read_bytes()
+        self.assertEqual(index.update(), 6)
+        self.assertEqual(self.rows("SELECT id, started_at_us FROM steps ORDER BY id"), [
+            ("before-epoch", -1), ("fraction", 123456), ("fractional-zero", 0),
+            ("next-microsecond", 123457), ("offset", 123456), ("whole", 0),
+        ])
+        self.assertEqual(self.host_file.read_bytes(), original)
+
+    def test_first_index_read_maps_worker_fields_and_leaves_source_unchanged(self) -> None:
         partial = encode(step("pending", worker="next"))[:20]
         self.write(self.host_file, step("old-step", seat="impl", delegate_session="run-1"),
                    call("old-call", seat="test"))
         with self.host_file.open("ab") as output:
             _ = output.write(partial)
+        original = self.host_file.read_bytes()
         self.assertEqual(index.update(), 2)
         self.assertEqual(self.rows("SELECT worker FROM steps"), [("impl",)])
         self.assertEqual(self.rows("SELECT worker FROM calls"), [("test",)])
         rewritten = self.host_file.read_bytes()
         self.assertEqual(self.rows("SELECT unit_session FROM steps"), [("run-1",)])
-        self.assertNotIn(b'"seat"', rewritten)
-        self.assertNotIn(b'"delegate_session"', rewritten)
+        self.assertEqual(rewritten, original)
         self.assertTrue(rewritten.endswith(partial))
         modified = self.host_file.stat().st_mtime_ns
         self.assertEqual(index.update(), 0)
@@ -380,7 +572,7 @@ class IndexTests(unittest.TestCase):
             _ = connection.execute("DELETE FROM samples")
             connection.commit()
         self.assertEqual(index.update(), 1)
-        self.assertEqual(self.rows("PRAGMA user_version"), [(23,)])
+        self.assertEqual(self.rows("PRAGMA user_version"), [(index.SCHEMA_VERSION,)])
         self.assertEqual(self.rows(
             "SELECT cpu_stall_some_us, cpu_stall_full_us, io_stall_some_us, io_stall_full_us,"
             + " cpu_idle_ticks, cpu_iowait_ticks, cpu_total_ticks FROM samples"),
@@ -631,7 +823,7 @@ class IndexTests(unittest.TestCase):
                 ("old", None, None, None, None),
             ],
         )
-        self.assertEqual(index.SCHEMA_VERSION, 23)
+        self.assertGreater(index.SCHEMA_VERSION, 23)
 
     def test_copy_call_fields_reach_index_and_old_records_read_as_null(self) -> None:
         self.write(
@@ -700,7 +892,7 @@ class IndexTests(unittest.TestCase):
     def test_steps_call_index_is_built_and_used(self) -> None:
         self.write(self.host_file, step("step", call_id="call"))
         _ = index.update()
-        self.assertEqual(self.rows("PRAGMA index_info(steps_call)"), [(0, 23, "call_id")])
+        self.assertEqual(self.rows("PRAGMA index_info(steps_call)"), [(0, 28, "call_id")])
         self.assertIn("steps_call", str(self.rows("EXPLAIN QUERY PLAN SELECT id FROM steps WHERE call_id = ?", "call")))
 
     def test_queue_bump_reaches_query_rebuild_and_schema(self) -> None:

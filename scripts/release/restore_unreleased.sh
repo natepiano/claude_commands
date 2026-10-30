@@ -43,6 +43,11 @@ for FILE in "${FILES[@]}"; do
     echo "  Skipping $FILE (not found)"
     continue
   fi
+  if grep -qxF '## [Unreleased]' "$FILE"; then
+    rm -f "$FILE".portbak
+    echo "  $FILE → [Unreleased] already present"
+    continue
+  fi
   # A literal backslash-newline in the replacement is the one form both BSD
   # and GNU sed accept; GNU alone expands \n, so BSD would emit a literal n.
   sed -i.portbak "s/## \[$VERSION\] - $TODAY/## [Unreleased]\\
@@ -55,7 +60,9 @@ done
 echo ""
 echo "  Staging and committing..."
 git add "${FILES[@]}"
-git commit -m "chore: restore [Unreleased] sections after v$VERSION"
+if ! git diff --cached --quiet -- "${FILES[@]}"; then
+  git commit --only -m "chore: restore [Unreleased] sections after v$VERSION" -- "${FILES[@]}"
+fi
 git push origin "$BASE_BRANCH"
 
 echo ""

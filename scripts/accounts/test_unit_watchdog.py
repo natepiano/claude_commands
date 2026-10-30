@@ -15,6 +15,10 @@ from typing import TYPE_CHECKING, Literal, cast, final, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.accounts import accounts, next_moves, outage_alerts, refusal_watch, role_map, unit_watchdog
 from scripts.accounts import test_refusal_watch as fixtures
 from scripts.production import showrunners
@@ -35,7 +39,7 @@ else:
     launch_permission = import_module("launch_permission")
     unit_lookup = import_module("unit_lookup")
 import quota_alert
-import agent_accounts
+from scripts.whoami import agent_accounts
 NOW = fixtures.NOW
 
 
@@ -149,14 +153,6 @@ class UnitWatchdogTests(unittest.TestCase):
             self.pending.append(argv)
             return subprocess.CompletedProcess(argv, 0, "", "")
         self.assertTrue(any(part.endswith("/shutdown.py") for part in argv), argv)
-        if "down" in argv:
-            result = self.fixture.down(argv, **options)
-            for saved in shutdown_record.all_session_records():
-                def stopped(current: shutdown_record.SessionShutdown) -> None:
-                    current["progress"] = shutdown_record.SessionStopped(kind="stopped", at=NOW.isoformat())
-                _ = shutdown_record.update_session(saved["login"], saved["session"]["session_id"], stopped)
-                self.die(saved["session"]["session_id"])
-            return result
         self.assertEqual(argv[2], "restart")
         self.assertIn("--here", argv)
         self.assertIn("--no-alert", argv)
@@ -259,7 +255,7 @@ class UnitWatchdogTests(unittest.TestCase):
             self.assertEqual(refusal_watch.run(NOW), [])
             self.assertEqual(scans.call_count, 1)
         self.assertEqual(self.pending, [])
-        self.assertEqual(self.fixture.commands, [])
+        self.assertEqual(self.fixture.moves.calls, [])
 
     def test_live_report_without_fresh_confirmation_keeps_recovery_evidence(self) -> None:
         _ = self.add_unit("unit")
@@ -487,7 +483,7 @@ class UnitWatchdogTests(unittest.TestCase):
         notices = [job.text for batch in self.fixture.head_deliveries for job in batch if "cleared a finished" in job.text]
         self.assertEqual(len(notices), 1)
         self.assertIn("session b1f5ca98", notices[0])
-        self.assertEqual(len(self.commands), 3)
+        self.assertEqual(len(self.fixture.moves.calls), 3)
 
     def hold(self, label: str, *, terminal: bool) -> shutdown_record.AccountHold:
         identity = accounts.account_identity(accounts.account_dir(label))
@@ -506,7 +502,7 @@ class UnitWatchdogTests(unittest.TestCase):
         with patch.object(launch_permission, "launch_permission", return_value=launch_permission.BlockedByShutdown("claude2 is held")):
             lines = refusal_watch.run(NOW)
         self.assertTrue(any("claude2 is held" in line for line in lines))
-        self.assertEqual(self.fixture.commands, [])
+        self.assertEqual(self.fixture.moves.calls, [])
         self.assertEqual(accounts.group_accounts().get("units"), "claude4")
         self.die("alpha")
         _ = self.pass_at(2)
@@ -575,26 +571,6 @@ class UnitWatchdogTests(unittest.TestCase):
             _ = self.pass_at(14)
             _ = self.pass_at(16)
             self.assertEqual(phone.call_count, 2)
-
-    def test_move_record_owns_its_phone_alert_and_restart_uses_its_login(self) -> None:
-        _ = self.fixture.groups(units="claude4")
-        _ = self.add_unit("alpha")
-        self.fixture.reading("four@example.invalid", 1)
-        self.fixture.next_entries(self.fixture.low_rule("moved"))
-        _ = refusal_watch.run(NOW)
-        self.refused.update(("claude4", "claude2"))
-        for saved in shutdown_record.all_session_records():
-            def alerted(current: shutdown_record.SessionShutdown) -> None:
-                current["restore_alerted"] = "fixture worker sent move_failed"
-            _ = shutdown_record.update_session(saved["login"], saved["session"]["session_id"], alerted)
-            claimed = outage_alerts.claim(saved["session"]["session_id"])
-            assert isinstance(claimed, outage_alerts.AlertClaim)
-            outage_alerts.delivered(claimed)
-        with patch.object(quota_alert, "tell_user") as phone:
-            for minute in (2, 4, 6, 8):
-                _ = self.pass_at(minute)
-        self.assertEqual([argv[3] for argv in self.commands], ["claude4"] * 3)
-        phone.assert_not_called()
 
     def test_pending_detached_restarts_do_not_wait_or_start_duplicate_commands(self) -> None:
         self.finish_jobs = False

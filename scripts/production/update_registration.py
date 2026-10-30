@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from collections.abc import Generator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, cast
 
 from production_units import Production, read_production
@@ -31,16 +32,20 @@ else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
     from showrunner_footer import ReportItem, reports_path
 import showrunners
+import showrunner_tree
 from dailies_render import (UNREADABLE_LIST, InputError, plumbing, read_outstanding,
     DeferredUntil, Outstanding, OutstandingReminder, Ranking, ReviewedOutstandingQuestion,
     ReviewUnavailableOutstandingQuestion)
 import urgency
+from atomic_file import write_text_atomic
 
 if TYPE_CHECKING:
     from ..usage import agents_log
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.usage import agents_log
+
+from scripts.lib import names
 
 
 class InstancePresent(NamedTuple):
@@ -70,6 +75,113 @@ class QuestionRegistration(TypedDict):
     text: str
     reviewed: NotRequired[str]
     question: NotRequired[str]
+
+
+class AnsweredItem(TypedDict):
+    time: str
+    slug: str
+    text: str
+    question: NotRequired[str]
+    asked_by: NotRequired[str]
+
+
+@dataclass(frozen=True)
+class UnitAsker:
+    unit: str
+
+
+@dataclass(frozen=True)
+class ShowrunnerAsker:
+    pass
+
+
+@dataclass(frozen=True)
+class AskerNotRecorded:
+    reason: str
+
+
+@dataclass(frozen=True)
+class OpenItemWithoutAsker:
+    pass
+
+
+QuestionAsker = UnitAsker | ShowrunnerAsker | AskerNotRecorded | OpenItemWithoutAsker
+
+
+def question_asker(fields: OutstandingItem | AnsweredItem,
+                   missing: OpenItemWithoutAsker | AskerNotRecorded) -> QuestionAsker:
+    name = fields.get("asked_by")
+    if not isinstance(name, str) or not name.strip():
+        return missing
+    return ShowrunnerAsker() if name == SHOWRUNNER_ASKER else UnitAsker(name)
+
+
+def relay_line(production: Production, slug: str, asker: QuestionAsker) -> str:
+    owner = "this production" if slug == production.slug else f"{slug}, below this production"
+    if isinstance(asker, OpenItemWithoutAsker):
+        return f"relay: none; the item belongs to {owner}"
+    if isinstance(asker, AskerNotRecorded):
+        return f"relay: none; {asker.reason}; the item belongs to {owner}"
+    if slug != production.slug:
+        if isinstance(asker, UnitAsker):
+            name = asker.unit
+        else:
+            loaded = names.runtime_names()
+            name = loaded.job("showrunner") if isinstance(loaded, names.Names) else "requesting role (display name unavailable)"
+        return f"relay: to the showrunner of {slug}, for {name}"
+    if isinstance(asker, ShowrunnerAsker):
+        return "relay: none; this showrunner asked it"
+    return f"relay: to {asker.unit}"
+
+
+def answered_items(outstanding: Path, now: datetime) -> list[AnsweredItem]:
+    """Read the retained answers, converting JSON fields before replaying them."""
+    history = outstanding.with_suffix(".answered.jsonl")
+    if not history.exists():
+        return []
+    retained: list[AnsweredItem] = []
+    for line in history.read_text(encoding="utf-8").splitlines():
+        try:
+            value = cast(object, json.loads(line))
+            if not isinstance(value, dict):
+                continue
+            fields = cast(dict[str, object], value)
+            stamp, slug, text = fields.get("time"), fields.get("slug"), fields.get("text")
+            if not isinstance(stamp, str) or not isinstance(slug, str) or not isinstance(text, str):
+                continue
+            dated = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            if dated.tzinfo is None or dated < now - timedelta(hours=48):
+                continue
+            entry = AnsweredItem(time=stamp, slug=slug, text=text)
+            question = fields.get("question")
+            if isinstance(question, str):
+                entry["question"] = question
+            asker = fields.get("asked_by")
+            if isinstance(asker, str) and asker.strip():
+                entry["asked_by"] = asker
+            retained.append(entry)
+        except ValueError:
+            continue
+    return retained
+
+
+def record_answer(outstanding: Path, slug: str, item: OutstandingItem, now: datetime) -> None:
+    retained = [entry for entry in answered_items(outstanding, now) if entry["text"] != item["text"]]
+    entry = AnsweredItem(time=now.isoformat(), slug=slug, text=item["text"])
+    if "question" in item:
+        entry["question"] = item["question"]
+    if "asked_by" in item:
+        entry["asked_by"] = item["asked_by"]
+    write_text_atomic(outstanding.with_suffix(".answered.jsonl"),
+                      "".join(json.dumps(saved) + "\n" for saved in [*retained, entry]))
+
+
+def replay_answer(production: Production, item: AnsweredItem) -> None:
+    dated = datetime.fromisoformat(item["time"].replace("Z", "+00:00"))
+    print(f"already answered {dated:%a %b %d %H:%M}")
+    print(relay_line(production, item["slug"],
+                     question_asker(item, AskerNotRecorded("asked_by not recorded in answered record"))))
+    report("answer", "ok", f"{item['slug']}: {item['text']}")
 
 
 class UnitJudgment(NamedTuple):
@@ -472,7 +584,7 @@ def open_lists(production: Production, below: bool = False) -> OpenLists:
     due: list[urgency.Entry[OpenItem]] = []
     deferred: list[OpenItem] = []
     unreadable: list[str] = []
-    for slug in showrunners.user_facing(production.slug, below):
+    for slug in showrunner_tree.user_facing(production.slug, below):
         try:
             items = read_outstanding(outstanding_file(slug))
         except (InputError, OSError, ValueError):
@@ -520,7 +632,7 @@ def mark_important(production: Production, words: str) -> None:
     exact: list[tuple[Path, str]] = []
     partial: list[tuple[Path, str]] = []
     # The item the user names may come from an all-below /next, so the lists below are searched too.
-    for slug in showrunners.user_facing(production.slug, below=True):
+    for slug in showrunner_tree.user_facing(production.slug, below=True):
         for item in read_outstanding(outstanding_file(slug)):
             full = item.text if isinstance(item, OutstandingReminder) else item.question
             if item.text == wanted:
@@ -537,7 +649,7 @@ def mark_important(production: Production, words: str) -> None:
         for key in ("urgency", "due", "marked"):
             _ = entry.pop(key, None)
         entry.update(urgency.fields(urgency.mark(datetime.now(production.zone).replace(tzinfo=None))))
-        _ = path.write_text(json.dumps(entries) + "\n", encoding="utf-8")
+        write_text_atomic(path, json.dumps(entries) + "\n")
     report("mark-important", "ok", text)
 
 
@@ -581,7 +693,7 @@ def ask(production: Production, text: str, question: str, unit: str, rank: Ranki
         if any(stored["text"] == text for stored in entries):
             raise RegistrationFailure("ask", f"{text}: an item with this text is already open")
         record_question_history(outstanding, [entry], now)
-        _ = outstanding.write_text(json.dumps([*entries, entry]) + "\n", encoding="utf-8")
+        write_text_atomic(outstanding, json.dumps([*entries, entry]) + "\n")
     filed = accepted.reviewed if isinstance(accepted, ReviewedQuestion) else question
     print("filed question: " + filed)
     report("ask", "ok", f"{text}: on the open-questions list of {production.slug}, not shown to the user")
@@ -593,34 +705,41 @@ def answer(production: Production, words: str) -> None:
     wanted = words.strip()
     exact: list[tuple[str, str]] = []
     partial: list[tuple[str, str]] = []
-    for slug in showrunners.user_facing(production.slug, below=True):
+    answered_exact: list[AnsweredItem] = []
+    answered_partial: list[AnsweredItem] = []
+    now = datetime.now(production.zone)
+    slugs = list(showrunner_tree.user_facing(production.slug, below=True))
+    for slug in slugs:
         for item in read_outstanding(outstanding_file(slug)):
             full = item.text if isinstance(item, OutstandingReminder) else item.question
             if item.text == wanted:
                 exact.append((slug, item.text))
             elif wanted and (wanted in item.text or wanted in full):
                 partial.append((slug, item.text))
-    found = exact or partial
+        for saved in answered_items(outstanding_file(slug), now):
+            if saved["slug"] != slug:
+                continue
+            if saved["text"] == wanted:
+                answered_exact.append(saved)
+            elif wanted and (wanted in saved["text"] or wanted in saved.get("question", "")):
+                answered_partial.append(saved)
+    found = exact or answered_exact or partial or answered_partial
     if len(found) != 1:
         raise RegistrationFailure("answer", f"{len(found)} open items match {wanted!r}; name one by its text")
-    slug, text = found[0]
+    selected = found[0]
+    if not isinstance(selected, tuple):
+        replay_answer(production, selected)
+        return
+    slug, text = selected
     path = outstanding_file(slug)
     with outstanding_lock(path):
         entries = stored_entries(path)
         removed = next((entry for entry in entries if entry["text"] == text), None)
         if removed is None:
             raise RegistrationFailure("answer", f"{text}: no longer open in {slug}")
-        _ = path.write_text(json.dumps([entry for entry in entries if entry["text"] != text]) + "\n", encoding="utf-8")
-    asker = removed.get("asked_by", "")
-    owner = "this production" if slug == production.slug else f"{slug}, below this production"
-    if not asker:
-        print(f"relay: none; the item belongs to {owner}")
-    elif slug != production.slug:
-        print(f"relay: to the showrunner of {slug}, for {asker}")
-    elif asker == SHOWRUNNER_ASKER:
-        print("relay: none; this showrunner asked it")
-    else:
-        print(f"relay: to {asker}")
+        record_answer(path, slug, removed, datetime.now(production.zone))
+        write_text_atomic(path, json.dumps([entry for entry in entries if entry["text"] != text]) + "\n")
+    print(relay_line(production, slug, question_asker(removed, OpenItemWithoutAsker())))
     report("answer", "ok", f"{slug}: {text}")
 
 
@@ -687,13 +806,16 @@ def record_question_history(outstanding: Path, items: list[OutstandingItem], now
             except ValueError:
                 continue
     for item in items:
+        if any(entry["text"] == item["text"] and entry.get("question") == item.get("question")
+               for entry in retained):
+            continue
         entry = QuestionRegistration(time=now.isoformat(), text=item["text"])
         if "question" in item:
             entry["question"] = item["question"]
         if "reviewed" in item:
             entry["reviewed"] = item["reviewed"]
         retained.append(entry)
-    _ = history.write_text("".join(json.dumps(item) + "\n" for item in retained), encoding="utf-8")
+    write_text_atomic(history, "".join(json.dumps(item) + "\n" for item in retained))
 
 
 def store_ranking(entry: OutstandingItem, rank: Ranking) -> None:
@@ -763,8 +885,7 @@ def questions(production: Production, path: Path | None) -> None:
             replace_outstanding(production, outstanding, state.outstanding)
     if isinstance(state.reports, ReplaceReports):
         reports = reports_path(production.slug)
-        reports.parent.mkdir(parents=True, exist_ok=True)
-        _ = reports.write_text(json.dumps(list(state.reports.items)) + "\n", encoding="utf-8")
+        write_text_atomic(reports, json.dumps(list(state.reports.items)) + "\n")
     report("questions", "ok", "recorded")
 
 
@@ -823,7 +944,7 @@ def replace_outstanding(production: Production, outstanding: Path, replacement: 
             entries.append(stored)
             report("questions", "kept", f"{stored['text']}: asked by {asker}; it leaves only through `answer`")
     record_question_history(outstanding, [entry for entry in entries if entry["text"] not in previous], now)
-    _ = outstanding.write_text(json.dumps(entries) + "\n", encoding="utf-8")
+    write_text_atomic(outstanding, json.dumps(entries) + "\n")
     for item in pending:
         accepted_text = item.reviewed if isinstance(item, ReviewedQuestion) else item.question
         print("reviewed question: " + accepted_text)

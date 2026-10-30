@@ -2,25 +2,29 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from unit_staff_test_support import unit_host
 import copy
 import io
 import json
 import os
 import signal
 import subprocess
-import sys
 import tempfile
 import threading
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from collections.abc import Callable
 from typing import Literal, cast, final, override
-from unittest.mock import patch
+from unittest.mock import call, patch
 
-from test_support import linux_process_fixture, ShutdownTestCase
-from account import Account
+from test_support import linux_process_fixture, ShutdownTestCase, empty_session_registry
+from scripts.whoami.account import Account
 import inventory
 import herdr
 from fake_herdr import CommandResponse
@@ -158,7 +162,7 @@ def unit(
             codex_servers=codex_servers,
         ),
         kind="unit",
-        host=inventory.UnitHost(
+        host=unit_host(
             kind="unit",
             production="demo",
             unit=session_id,
@@ -235,17 +239,20 @@ class _HeldClaim:
     def check(self) -> None:
         pass
 
+    check_effect = check
 
-class SharedHerdrStopTests(unittest.TestCase):
+
+class SharedHerdrStopTests(ShutdownTestCase):
     def test_a_unit_in_the_shared_session_closes_only_the_tab_of_its_marked_pane(self) -> None:
         session = cast(inventory.Session, cast(object, {
-            "kind": "unit", "name": "review",
-            "host": {"kind": "unit", "production": "prod", "unit": "review-unit", "session_name": "agents"}}))
+            "kind": "unit", "name": "review", "session_id": "review-session",
+            "host": unit_host(kind="unit", production="prod", unit="review-unit", doc="/prod.md",
+                              session_name="agents", session_host="herdr", plan=inventory.NoRunRecord(kind="no run record"))}))
         claim = cast(stop.StopClaim, cast(object, _HeldClaim()))
         marked = unit_lookup.MarkedUnit("review-unit", unit_lookup.ClaudeNotRunning(), herdr.HerdrPlace("agents", "w3:pE"))
         cases: list[tuple[unit_lookup.MarkedUnit | None, list[herdr.PaneIdentity], int, int]] = [
             (marked, [], 1, 0),
-            (marked, [{"pane_id": "w3:pE", "label": "prod-review"}], 1, 1),
+            (marked, [{"pane_id": "w3:pE", "label": "prod-review", "workspace_id": "w3", "session_id": None}], 1, 1),
             (None, [], 0, 0),
         ]
         for found, panes, closes, issues in cases:
@@ -279,6 +286,7 @@ class StopTests(ShutdownTestCase):
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
         })))
         del environment
+        empty_session_registry(self, self.root / "sessions")
         self.herdr_replies([])
         _ = self.enterContext(patch.object(settle, "record_time", return_value=NOW))
 
@@ -526,7 +534,8 @@ class StopTests(ShutdownTestCase):
                 is_alive=lambda _pid: False, session_record_exists=lambda _pid: False,
                 clock=lambda: NOW_UTC, codex_mesh=lambda _args: 0,
                  sleep=lambda _seconds: None)
-        read.assert_called_once_with(LOGIN, only=frozenset({owner["session_id"]}), refresh_desktops=False)
+        self.assertEqual(read.call_args_list, [call(LOGIN, only=frozenset({owner["session_id"]}),
+            refresh_desktops=False)] * 5)
         self.assertEqual(signals, [(101, signal.SIGTERM)])
         self.assertEqual(finished["progress"]["kind"], "stopped")
 
@@ -643,6 +652,16 @@ class StopTests(ShutdownTestCase):
         changed['pid'] = 201
         self.assertEqual(stop.fresh_session(owner, machine_inventory([changed])), {'kind': 'session identity lost'})
         self.assertEqual(owner['pid'], 101)
+
+    def test_fresh_session_rejects_any_resumed_occurrence_even_beside_the_recorded_process(self) -> None:
+        owner = top_level("owner", 101)
+        resumed = copy.deepcopy(owner)
+        resumed.update(pid=501, proc_start="200")
+        reports: tuple[list[inventory.Session], ...] = ([owner, resumed], [resumed, owner])
+        for rows in reports:
+            with self.subTest(pids=[row["pid"] for row in rows]):
+                self.assertEqual(stop.fresh_session(owner, machine_inventory(rows)),
+                                 {"kind": "session identity lost"})
 
     def test_busy_worker_holds_its_owner_until_it_is_idle_and_is_never_signalled(self) -> None:
         saved = entry(top_level('owner', 101))
@@ -933,6 +952,7 @@ class StopTests(ShutdownTestCase):
         report = stop.stop_session(saved,
             kill=lambda _pid, _sent: self.fail("stopped owner signalled"),
             is_alive=lambda _pid: False, clock=lambda: NOW_UTC,
+            fresh_inventory=lambda _login, _only: machine_inventory([]),
             codex_mesh=lambda _args: self.fail("unexpected Codex cleanup"))
         self.assertEqual(report["stop_issues"], [])
         self.assertEqual(self.herdr_commands()[0], ["--session", "unit-host", "server", "stop"])
@@ -1046,10 +1066,11 @@ class StopTests(ShutdownTestCase):
     def test_process_identity_changed_before_second_signal_is_not_signalled_again(self) -> None:
         stored = top_level('reused', 101)
         changed = top_level('reused', 202)
-        inventories = FreshInventorySequence([machine_inventory([stored]), machine_inventory([changed]), machine_inventory([])])
         self.create(records_for_test([entry(stored)]))
         killed: list[int] = []
-        report = stop.stop_session(self.stored_record(), kill=lambda pid, _signal: killed.append(pid), is_alive=lambda _pid: True, fresh_inventory=inventories, clock=lambda: NOW_UTC, codex_mesh=lambda _arguments: 0,  sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
+        # Resume after the first effect, rather than after a particular number
+        # of safety reads: intermediate capture checks must still see the owner.
+        report = stop.stop_session(self.stored_record(), kill=lambda pid, _signal: killed.append(pid), is_alive=lambda _pid: True, fresh_inventory=lambda _login, _scope: machine_inventory([changed if killed else stored]), clock=lambda: NOW_UTC, codex_mesh=lambda _arguments: 0,  sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
         self.assertEqual(killed, [101])
         self.assertEqual(report['progress']['kind'], 'process identity lost')
         self.assertNotEqual(report['progress']['kind'], 'stopping')
@@ -1139,17 +1160,65 @@ class StopTests(ShutdownTestCase):
         self.assertEqual(first_codex, [["stop", "--pause", "--session-dir", run] for run in runs])
         calls: list[list[str]] = []
         self.herdr_replies([])
+        second_inventory = FreshInventorySequence([machine_inventory([])])
         second = stop.stop_session(
             first, kill=lambda _pid, _sent: self.fail("a stopped owner was signalled"),
             is_alive=lambda _pid: False,
-            fresh_inventory=lambda _login, _only: self.fail("cleanup retry inspected the owner"),
+            fresh_inventory=second_inventory,
             clock=lambda: NOW_UTC + timedelta(seconds=1),
             codex_mesh=lambda args: calls.append(args) or 0,
 
         )
+        # Admission, both sides of capture, pause, host cleanup and completion.
+        self.assertEqual(second_inventory.calls, 6)
         self.assertEqual(calls, [["stop", "--pause", "--session-dir", runs[1]]])
         self.assertEqual(second["progress"], first["progress"])
         self.assertEqual(second["stop_issues"], [])
+
+    def test_cleanup_retry_does_not_adopt_a_resumed_owner(self) -> None:
+        for prior in (shutdown_record.SessionStopped(kind="stopped", at=NOW),
+                      shutdown_record.SessionStopFailed(kind="stop failed", at=NOW, reason="cleanup refused")):
+            with self.subTest(progress=prior["kind"]):
+                saved = entry(unit("retry", 101, session_name="unit-host", session_host="herdr",
+                    run_dirs=[str(self.root / "pending")]))
+                saved["progress"] = prior
+                saved["stop_issues"] = [shutdown_record.UnitSessionLeftRunning(kind="unit session left running",
+                    at=NOW, host="herdr", session_name="unit-host", cause="stop not confirmed")]
+                self.create([saved])
+                resumed = copy.deepcopy(saved["session"])
+                resumed.update(pid=202, proc_start="new process")
+                with patch.object(herdr, "stop_session") as stop_host:
+                    report = stop.stop_session(saved,
+                        kill=lambda _pid, _sent: self.fail("resumed owner signalled"),
+                        fresh_inventory=lambda _login, _only: machine_inventory([resumed]),
+                        clock=lambda: NOW_UTC,
+                        codex_mesh=lambda _args: self.fail("resumed worker cleanup attempted"))
+                stop_host.assert_not_called()
+                self.assertEqual(report["progress"]["kind"], "process identity lost")
+                self.assertEqual(report["session"], saved["session"])
+
+    def test_resume_during_worker_capture_prevents_legacy_pause_cleanup_and_signals(self) -> None:
+        saved = entry(unit("owner", 101, session_name="unit-host", run_dirs=[str(self.root / "run")]))
+        self.create([saved])
+        resumed = copy.deepcopy(saved["session"])
+        resumed.update(pid=202, proc_start="resumed start")
+        captured = False
+        def capture(_session: inventory.Session) -> list[shutdown_record.PausedSeat]:
+            nonlocal captured
+            captured = True
+            return []
+        with (patch.object(stop, "_capture_codex_seats", side_effect=capture),
+              patch.object(herdr, "stop_session") as stop_host):
+            result = stop.stop_session(saved,
+                kill=lambda _pid, _sent: self.fail("resumed generation reached a signal"),
+                is_alive=lambda _pid: False,
+                fresh_inventory=lambda _login, _only: machine_inventory([resumed if captured else saved["session"]]),
+                clock=lambda: NOW_UTC,
+                codex_mesh=lambda _args: self.fail("resumed generation reached worker pause"))
+        stop_host.assert_not_called()
+        self.assertTrue(captured)
+        self.assertEqual(result["progress"]["kind"], "process identity lost")
+        self.assertEqual(result["session"], saved["session"])
 
     def test_deleted_server_record_does_not_hide_a_surviving_server_pid(self) -> None:
         run_dir = self.root / 'live-server'
@@ -1569,13 +1638,13 @@ class StopTests(ShutdownTestCase):
         saved = entry(top_level("owner", 101))
         self.create([saved])
         replacement = shutdown_record.SessionRestarting(kind="restarting", at=NOW, prior=shutdown_record.SessionStopped(kind="stopped", at=NOW))
-        inventories = 0
+        replaced = False
         signals: list[int] = []
 
         def report(_login: str, _only: frozenset[str]) -> inventory.Inventory:
-            nonlocal inventories
-            inventories += 1
-            if inventories == 2:
+            nonlocal replaced
+            if signals and not replaced:
+                replaced = True
                 def replace(current: shutdown_record.SessionShutdown) -> None:
                     current["progress"] = replacement
                 _ = shutdown_record.update_session(LOGIN, "owner", replace)

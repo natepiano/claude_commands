@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
 import unittest
 from scripts.direct import review_launcher_test_support as support
 from scripts.direct.review_launcher_test_support import DIRECT_DIR as DIRECT_DIR
 from pathlib import Path
 from scripts.direct.review_launcher_test_support import ProgressState as ProgressState
-from scripts.direct.review_launcher_test_support import TEST_HANG_GUARD_SECS as TEST_HANG_GUARD_SECS
 from typing import cast, override
 import json
 import signal
@@ -482,7 +483,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
             1,
         ), encoding="utf-8")
         result = subprocess.run(self.pool_command(session), env=self.pool_fixture(),
-                                capture_output=True, text=True, check=False, timeout=300)
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((session / "review_status_contract").read_text().strip(), "reviewed")
         records = self.turn_records(session)
