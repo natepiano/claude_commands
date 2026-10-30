@@ -81,7 +81,7 @@ class StylePlanTests(StylePlanFixture):
 
     def test_an_approved_lower_rank_finding_at_a_changed_file_builds_once_the_judgment_of_that_file_holds_it_again(self) -> None:
         issue, finding, output = self.approved_then_changed()
-        self.assertIn(f"waiting {issue}: {finding.finding_id} {finding.path} changed since it was judged", output)
+        self.assertIn(f"waiting {issue}: {finding.path} changed since it was judged (1 finding)", output)
         self.assertEqual(self.ledger().proposal_tickets(), ())
         self.rejudge(finding, holds=True)
         _ = self.refill_decisions()

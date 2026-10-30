@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import unittest
+from io import StringIO
 from unittest import mock
 from collections.abc import Sequence
-from contextlib import closing
+from contextlib import closing, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from typing import cast, override
@@ -16,7 +18,7 @@ import bulk_run as run
 import bulk_rename as bulk
 import rules
 import style_ledger as ledger_api
-from test_bulk_rename import CargoProjectTests, ScriptedServer, word_edits
+from test_bulk_rename import CargoProjectTests, ScriptedServer, word_edits, stop_after_edit, stop_process
 
 
 class FakeRunner:
@@ -67,6 +69,104 @@ class WorkspaceRunTests(CargoProjectTests):
     tree: str = ""
     runner: FakeRunner = FakeRunner()
     server: ScriptedServer = ScriptedServer(lambda text, offset, new: word_edits(text, "old", new))
+
+    def test_recovery_preserves_another_users_ticket_after_plan_record(self) -> None:
+        ledger, definition, findings = self.setup_findings()
+        self.addCleanup(ledger.close)
+        begin = bulk.BatchIntent.begin
+
+        def stopped(intent: bulk.BatchIntent, files: tuple[bulk.FileRenames, ...],
+                    tickets: Sequence[str] = (), identities: Sequence[str] = ()) -> None:
+            begin(intent, files, tickets, identities)
+            os._exit(73)
+
+        # Lose the process after the durable plan, before any ticket claim.
+        with mock.patch.object(bulk.BatchIntent, "begin", stopped):
+            stop_process(lambda: self.execute(ledger, definition))
+        intent_path = Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "style-batch-intent.json"))
+        record = bulk.object_fields(cast(object, json.loads(intent_path.read_text())))
+        planned = cast(list[str], record["tickets"])
+        ticket = planned[0]
+        finding = findings[0]
+        self.assertIsInstance(finding.state, ledger_api.Filed)
+        assert isinstance(finding.state, ledger_api.Filed)
+        # An independent ledger connection takes the still-unreserved ID.
+        other = ledger_api.Ledger(self.repo, ledger.database)
+        self.addCleanup(other.close)
+        other.ticket_add(ticket, ticket.rsplit("-", 1)[0], "proposal", "names", ".",
+                         [finding.path], [finding.rule], proposal=str(finding.state.proposal),
+                         finding_ids=(finding.finding_id,))
+        before = next(item for item in other.proposal_tickets() if item["id"] == ticket)
+        output = StringIO()
+        with redirect_stdout(output):
+            _ = self.execute(ledger, definition)
+        after = next(item for item in other.proposal_tickets() if item["id"] == ticket)
+        self.assertEqual(after, before)
+        self.assertEqual(other.named_held((finding.finding_id,))[0].build_ticket, ledger_api.BuildTicket(ticket))
+        self.assertIn(ticket, output.getvalue())
+
+    def test_recovery_names_another_users_read_ticket_after_plan_record(self) -> None:
+        ledger, definition, findings = self.setup_findings()
+        self.addCleanup(ledger.close)
+        begin = bulk.BatchIntent.begin
+
+        def stopped(intent: bulk.BatchIntent, files: tuple[bulk.FileRenames, ...],
+                    tickets: Sequence[str] = (), identities: Sequence[str] = ()) -> None:
+            begin(intent, files, tickets, identities)
+            os._exit(73)
+
+        with mock.patch.object(bulk.BatchIntent, "begin", stopped):
+            stop_process(lambda: self.execute(ledger, definition))
+        intent_path = Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "style-batch-intent.json"))
+        record = bulk.object_fields(cast(object, json.loads(intent_path.read_text())))
+        ticket = cast(list[str], record["tickets"])[0]
+        unit = ticket.rsplit("-", 1)[0]
+        with ledger_api.Ledger(self.repo, ledger.database) as other:
+            other.ticket_add(ticket, unit, "read", "names", ".", [findings[0].path], [definition.rule_id])
+            before = other.queued_tickets(unit)[0]
+            output = StringIO()
+            with redirect_stdout(output):
+                _ = self.execute(ledger, definition)
+            self.assertEqual(other.queued_tickets(unit)[0], before)
+            self.assertIn(ticket, output.getvalue())
+
+    def test_workspace_recovers_claim_committed_before_analysis(self) -> None:
+        ledger, definition, findings = self.setup_findings()
+        self.addCleanup(ledger.close)
+        add = ledger_api.Ledger.ticket_add
+
+        def stopped(instance: ledger_api.Ledger, ticket: str, unit: str, kind: ledger_api.TicketKind,
+                    family: str, crate: str, files: list[str], rule_ids: list[str], *,
+                    proposal: str, finding_ids: tuple[str, ...],
+                    batch_owner: ledger_api.BatchOwner | ledger_api.UnbatchedTicket) -> None:
+            # The fault is after ticket_add's commit, before claim() can record its return.
+            add(instance, ticket, unit, kind, family, crate, files, rule_ids,
+                proposal=proposal, finding_ids=finding_ids, batch_owner=batch_owner)
+            os._exit(73)
+
+        with mock.patch.object(ledger_api.Ledger, "ticket_add", stopped):
+            stop_process(lambda: self.execute(ledger, definition))
+        interrupted = {ticket["id"] for ticket in ledger.proposal_tickets()
+                       if ticket["state"] not in ledger_api.FINAL_TICKET_STATES}
+        self.assertTrue(interrupted)
+        report = self.execute(ledger, definition)
+        self.assertEqual(report["applied"], len(findings))
+        self.assertTrue(all(ticket["state"] in ledger_api.FINAL_TICKET_STATES
+                            for ticket in ledger.proposal_tickets() if ticket["id"] in interrupted))
+        self.assertTrue(all(ticket["checkpoint"] for ticket in ledger.proposal_tickets()
+                            if ticket["state"] not in ledger_api.FINAL_TICKET_STATES))
+
+    def test_workspace_reruns_after_process_loss_on_first_edit(self) -> None:
+        ledger, definition, findings = self.setup_findings()
+        self.addCleanup(ledger.close)
+        stop_after_edit(self.repo / "src/lib.rs", lambda: self.execute(ledger, definition))
+        self.assertTrue(ledger.proposal_tickets())
+        report = self.execute(ledger, definition)
+        self.assertEqual(report["applied"], len(findings))
+        self.assertEqual(report["refused"], 0)
+        self.assertEqual(report["reverted"], 0)
+        self.assertTrue(all(ticket["checkpoint"] for ticket in ledger.proposal_tickets()
+                            if ticket["id"] in cast(list[str], report["tickets"])))
 
     @override
     def setUp(self) -> None:
