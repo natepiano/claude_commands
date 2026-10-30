@@ -1840,7 +1840,12 @@ class Herdr:
         _ = self.run("pane", "send-keys", pane, *keys)
 
     def close_pane(self, pane: str) -> None:
-        _ = self.run("pane", "close", pane)
+        """Close one pane; a pane already gone is the closed state this asks for."""
+        try:
+            _ = self.run("pane", "close", pane)
+        except HerdrFailure as error:
+            if error.code != "pane_not_found":
+                raise
 
     def agents(self) -> list[AgentOccupant]:
         result = self.result("agent", "list")
