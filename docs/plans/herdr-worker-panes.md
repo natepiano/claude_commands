@@ -22,6 +22,7 @@ Written by herdr-unit on 2026-10-29 for the sdlc showrunner, from the user's req
 ## Delegation Context
 
 - **Project:** `~/.claude` scripts — the agent tooling. This plan adds the staff record, moves unit workers from `codex_mesh` app-server threads to herdr panes, and renames the model registry.
+- **Project started:** 2026-10-30T06:38:57.873+00:00
 - **Stack:** Python 3.11+ through the `scripts/lib/py` shim, bash, `unittest`, basedpyright; herdr 0.9.5 CLI; the interactive Claude Code and Codex CLIs.
 - **Layout:**
   - `scripts/production/` — production tools: `showrunners.py`, `production_units.py`, `production_lifecycle.py`, `live_units.py`, `unit_lookup.py`, `add_unit.py`, `add_showrunner.py`, `retire_unit.py`, `rename_unit.py`, `transfer_unit.py`, `rename.py`, `promote_*.py`, `resume_unit.py`, `production_tree.py`, `broadcast.py`, `codex_winddown.py`; the new `staff.py` and `staff_sources.py`
@@ -102,7 +103,7 @@ Each item is my call under the decision criteria unless it names the user. A one
 
 **Critical path.** Phase 5 waits on the models unit, and no other phase needs it: pane work reads model and effort through the registry API under either file name. The director runs Phases 6-19 when Phase 5 is still blocked, and runs Phase 5 when the models unit lands. The critical path is Phase 1 → 2 → 3 → 4 → 7 → 8 → 9 → 10 → 11 → 14 → 15 → 18 → 19: no worker pane opens before the writers keep the unit rows current (Phase 3) and every director pane carries its `STAFF_ID` (Phase 4). Phase 6 runs beside Phases 1-4 and lands before Phase 7. Phases 12 and 13 run beside Phases 10 and 11. Phases 16 and 17 run beside the path after Phases 3 and 4. Phase 15 also needs questions items 1(c) and 1(e).
 
-### Phase 1 — The staff record  · status: todo
+### Phase 1 — The staff record  · status: done
 
 **Depends on:** none
 
@@ -127,7 +128,7 @@ Each item is my call under the decision criteria unless it names the user. A one
        parent: StaffId | None   # worker -> its unit, unit -> its showrunner, showrunner -> its parent showrunner or None
    ```
    The id is 12 characters of lower-case letters and digits led by `s`, so it matches herdr's agent-name rule `^[a-z][a-z0-9_-]{0,31}$` and herdr never cuts it (`herdr._agent_name`, `herdr.py:3094`). It is a worker's herdr agent name and its session name. A worker's role is the part of its name before the number (item 7); the row stores it nowhere else. The parent chain gives a worker's unit and showrunner, so the row stores neither. A retired member has no row (item 6).
-4. **Rules every write checks**, under the lock, on the rows it would write. The graph: a worker's parent is a unit row, a unit's parent is a showrunner row, a showrunner's parent is `None` or a showrunner row, and no parent chain loops. The names: a unit or worker `name` is unique among rows of its kind with the same `parent` (so `impl1` exists under many units), and a showrunner `name` is unique among showrunners. The kind is part of the name rule, so a promote can add the new showrunner row before it removes the unit row of the same name. A write that breaks a rule raises `StaffRefused(reason)` and writes nothing.
+4. **Rules every write checks**, under the lock, on the rows it would write. The graph: a worker's parent is a unit row, a unit's parent is a showrunner row, a showrunner's parent is `None` or a showrunner row, and no parent chain loops. The names: a unit or worker `name` is unique among rows of its kind with the same `parent` (so `impl1` exists under many units), and a showrunner `name` is unique among showrunners. The kind is part of the name rule, so a promote can add the new showrunner row before it removes the unit row of the same name. A short name may not have the id form (`s` and 11 lower-case letters or digits), so `get <id or path>` always has one answer. A write that breaks a rule raises `StaffRefused(reason)` and writes nothing.
 5. **Read API.** Each read raises `StaffUnreadable`, a subclass of `OSError` (other unreadable sources here raise `OSError`, `showrunners.registered_showrunners` :216), when the file cannot be read.
    ```python
    # staff.py
@@ -142,12 +143,13 @@ Each item is my call under the decision criteria unless it names the user. A one
    - `move(staff_id, new_parent) -> StaffRow`: a transfer moves a unit to another showrunner; an attach or a detach moves a showrunner under another one, or to `None`. A worker is refused. The same parent returns the row unchanged. Only `parent` changes; the rows under it follow through the id.
    - `retire(staff_id) -> StaffRow | None`: removes the row in one write. A unit goes with its worker rows. A showrunner moves its child showrunners to `None`, and is refused while a unit row is under it. A second call finds no row, returns `None` and changes nothing.
 7. **Worker names.** `WorkerName.parse(name)` takes a role and a positive number, for example `impl1`; any other form is refused. `WorkerRole` is a `StrEnum` of the roles, named as the model registry names them: `impl`, `test`, `fix`, `review` (`[direct.*]`) and `designer`, `reviewer` (`[design_roles.*]`). The director picks the number: `impl1`, then `impl2` for a second implementer. The name is set once, when the row is made, and it is the pane label. An ask-a-friend pane is not staff (Phase 12).
-8. **CLI.** `staff.py show [--kind K] [--under <id or path>] [--json]` prints one aligned row per staff row (id, kind, path), sorted by path; the path is the row's short names from its showrunner down (`sdlc/models/impl1`). `staff.py get <id or path> [--json]` exits 1 when not found. The write verbs `staff.py ensure|rename|move|retire --json` are the Mac transport (item 1): the Python API on the Mac calls them over ssh, and no instruction tells a person to run them. Phase 2 adds the `apply-seed` verb. A call that changes nothing says `unchanged` on stderr. Exit codes: 0 done, 1 not found, 2 refused or unreadable, with the reason on stderr.
+8. **CLI.** `staff.py show [--kind K] [--under <id or path>] [--json]` prints one aligned row per staff row (id, kind, path), sorted by path; the path is the row's short names from its showrunner down (`sdlc/models/impl1`). A showrunner's path is its own name, also under another showrunner; a path walks showrunner, unit, worker, so each path names one row. `staff.py get <id or path> [--json]` exits 1 when not found. The write verbs `staff.py ensure|rename|move|retire --json` are the Mac transport (item 1): the Python API on the Mac calls them over ssh, and no instruction tells a person to run them. The transport passes each name as one `--name=<value>` word and a new parent as `--parent=<id|none>`. On the Mac every read takes one `show --json` snapshot and applies the same filters natedev applies. Phase 2 adds the `apply-seed` verb. A call that changes nothing says `unchanged` on stderr. Exit codes: 0 done, 1 not found, 2 refused or unreadable, with the reason on stderr.
 9. **Scope note (author's call).** This phase reads no source. Phase 2 adds the sources (`staff_sources.py`) and `seed`.
 
 **Files:**
 - `scripts/production/staff.py` — new: the row, `WorkerName`, `WorkerRole`, the rules, the read and write API, `OWNER_MACHINE`, the exceptions, the CLI.
 - `scripts/production/test_staff.py` — new: the tests in the Acceptance gate, with a fake `ssh` on `PATH` for the Mac path.
+- `scripts/lib/durable.py` — new: `write_text` (temp file in the same folder, `fsync`, `os.replace`, folder `fsync`) and `sync_folder`, the one durable text writer.
 - `scripts/shutdown/remote.py` — read only: `other_machine()` (:25).
 
 **Workers:** `2 writers` — no test lane; the tests split from the module.
