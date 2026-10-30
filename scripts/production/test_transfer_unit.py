@@ -11,9 +11,16 @@ import unittest
 from pathlib import Path
 from typing import cast, final
 from unittest import mock
+from collections.abc import Callable
+from contextlib import ExitStack
 
 from scripts.astra import design_roles
 from scripts.direct import workers
+from scripts.production import staff, staff_move
+from scripts.production.rename_test_support import legacy_staff_journal, stop_at_staff_write
+from scripts.production.rename_rerun_test_support import final_files, saved_fixture
+from scripts.production.staff_test_support import SOURCES_SCRIPT, PROCESS_TIMEOUT
+from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production.transfer_unit_test_support import (
     UnitTransferFixture, SCRIPT, TEST_HANG_GUARD_SECS,
 )
@@ -25,6 +32,252 @@ import fake_unit_host
 
 @final
 class UnitTransferTests(UnitTransferFixture):
+    def test_transfer_moves_the_running_tab_and_sends_three_notices_without_launch_commands(self) -> None:
+        pid = self.running_unit()
+        log = self.seed_record()
+        process = self.root / "proc" / str(pid)
+        before_process = {path.name: path.read_bytes() for path in process.iterdir() if path.is_file()}
+        row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
+        parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "other")
+        self.assert_ok(self.transfer("apply"))
+        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", row.name, parent.id))
+        self.assertNotIn("alpha-unit", (self.giving / "docs/plans/demo-production.md").read_text())
+        self.assertIn("alpha-unit", (self.receiving / "docs/plans/other-production.md").read_text())
+        calls = fake_unit_host.calls(self.env)
+        moves = [command for command in calls if command[2:4] == ["pane", "move"]]
+        self.assertEqual(moves, [["--session", "agents", "pane", "move", "w1:p1", "--new-tab", "--workspace", "w2"]])
+        self.assertIn(["--session", "agents", "tab", "rename", "w2:t1", "alpha"], calls)
+        messages = self.messages()
+        self.assertEqual([command[command.index("--to") + 1] for command in messages],
+                         ["session:sid-alpha", self.showrunner_addresses["demo"], self.showrunner_addresses["other"]])
+        self.assertTrue(all("alpha-unit" in command[command.index("--text") + 1] for command in messages))
+        self.assertFalse(log.exists(), "transfer ran a shutdown command")
+        self.assertFalse(any(command[2:4] in (["agent", "start"], ["pane", "close"], ["tab", "create"])
+                             for command in calls), calls)
+        self.assertFalse(any("shutdown.py" in word or "launch_agent" in word for command in self.commands
+                             for word in command), self.commands)
+        self.assertEqual({path.name: path.read_bytes() for path in process.iterdir() if path.is_file()}, before_process)
+        before = final_files(self.root)
+        self.assert_ok(self.transfer("apply"))
+        self.assertEqual(final_files(self.root), before)
+        self.assertEqual(self.messages(), messages)
+        self.assertEqual(fake_unit_host.calls(self.env), calls)
+
+    def test_transfer_completes_when_the_receiving_showrunner_is_not_running(self) -> None:
+        self.remove_showrunner_session("other-showrunner")
+        completed = self.transfer("apply")
+        self.assert_ok(completed)
+        self.assertEqual(completed.stdout.splitlines().count("other is not running: tell it when it starts"), 1)
+        self.assertEqual(len(self.messages()), 2)
+        self.assertEqual(self.messages()[-1][self.messages()[-1].index("--to") + 1], self.showrunner_addresses["demo"])
+        self.assert_ok(self.transfer("verify"))
+        before = final_files(self.root)
+        self.assert_ok(self.transfer("apply"))
+        self.assertEqual(final_files(self.root), before)
+
+    def test_failed_showrunner_notice_retries_at_its_current_address_with_the_same_key(self) -> None:
+        self.env["TRANSFER_SEND_FAIL_TO"] = self.showrunner_addresses["other"]
+        failed = self.transfer("apply")
+        self.assert_refused(failed, "could not tell other: fixture recipient unavailable")
+        attempts = self.messages()
+        self.assertEqual(len(attempts), 3)
+        path = self.root / "state/showrunner/demo/transfer_unit.json"
+        saved = cast(dict[str, object], json.loads(path.read_text()))
+        self.assertEqual(saved["step"], next(index for index, step in enumerate(transfer_unit.STEPS)
+                                             if step.run.__name__ == "_tell_to"))
+        self.assertNotIn("from_address", saved)
+        self.assertNotIn("to_address", saved)
+        del self.env["TRANSFER_SEND_FAIL_TO"]
+        self.remove_showrunner_session("other-showrunner")
+        address = self.running_showrunner("other", "other-showrunner")
+        self.assertNotEqual(address, self.showrunner_addresses["other"])
+        self.assert_ok(self.transfer("apply"))
+        retried = self.messages()
+        self.assertEqual(retried[:3], attempts)
+        self.assertEqual(len(retried), 4)
+        self.assertEqual(retried[-1][retried[-1].index("--to") + 1], address)
+        self.assertEqual(retried[-1][retried[-1].index("--key") + 1], attempts[-1][attempts[-1].index("--key") + 1])
+        self.assert_ok(self.transfer("verify"))
+
+    def test_unfinished_transfer_refusal_names_its_exact_resume_command(self) -> None:
+        _ = self.pause_before_source_commit()
+        before = final_files(self.root)
+        refused = self.transfer("apply", "beta-unit", self.giving / "docs/plans/demo-production.md")
+        command = f"transfer_unit.py apply demo alpha-unit {self.receiving / 'docs/plans/other-production.md'}"
+        self.assert_refused(refused, f"the unfinished transfer is alpha-unit to other; resume it first with {command}")
+        self.assertEqual(final_files(self.root), before)
+
+    def test_completed_transfer_allows_another_destination_and_its_own_rerun(self) -> None:
+        self.assert_ok(self.transfer("apply"))
+        self.add_transfer_unit("beta")
+        third = self.add_destination("third")
+        self.assert_ok(self.transfer("apply", "beta-unit", third))
+        before = final_files(self.root)
+        repeated = self.transfer("apply")
+        self.assert_ok(repeated)
+        self.assertIn("done", repeated.stdout)
+        self.assertEqual(final_files(self.root), before)
+        rows = staff.snapshot()
+        alpha, beta = rows.by_path("other/alpha"), rows.by_path("third/beta")
+        assert alpha is not None and beta is not None
+        self.assertEqual(alpha.name, "alpha")
+        self.assertEqual(beta.name, "beta")
+
+    def test_legacy_journal_resumes_after_the_destination_row_changed(self) -> None:
+        path = self.pause_before_source_commit()
+        legacy_staff_journal(path)
+        self.assert_transfer_resumed(path)
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        self.assertTrue(fields["staff_id"])
+        self.assertTrue(fields["parent_staff_id"])
+
+    def test_completed_legacy_journal_migrates_once_and_reports_done(self) -> None:
+        self.assert_ok(self.transfer("apply"))
+        expected = final_files(self.root)
+        legacy_staff_journal(self.root / "state/showrunner/demo/transfer_unit.json")
+        finished = self.transfer("apply")
+        self.assert_ok(finished)
+        self.assertIn("done", finished.stdout)
+        self.assertEqual(final_files(self.root), expected)
+
+    def test_shutdown_transfer_journal_resumes_before_removing_the_source_row(self) -> None:
+        path = self.pause_before_source_commit()
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        del fields["version"]
+        fields.update(step=3, account="owner@example.com", session_id="sid-alpha")
+        self.write(path, json.dumps(fields))
+        shutdown_log = self.seed_record()
+        self.assert_transfer_resumed(path)
+        self.assertEqual(len(self.messages()), 3)
+        self.assertFalse(shutdown_log.exists())
+
+    def test_retry_keeps_the_journaled_unit_when_its_old_name_is_reused(self) -> None:
+        path = self.pause_before_source_commit()
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        staff_id = staff.StaffId(cast(str, fields["staff_id"]))
+        renamed = staff.rename(staff_id, "panes")
+        parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "demo")
+        replacement = staff.ensure("unit", name="alpha", parent=parent.id)
+        self.assert_transfer_resumed(path)
+        record = staff.snapshot()
+        self.assertEqual(record.by_id(staff_id), renamed)
+        self.assertEqual(record.by_id(replacement.id), replacement)
+
+    def test_completed_shutdown_transfer_reports_done_without_new_notices(self) -> None:
+        self.assert_ok(self.transfer("apply"))
+        path = self.root / "state/showrunner/demo/transfer_unit.json"
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        del fields["version"]
+        fields.update(account="owner@example.com", session_id="sid-alpha")
+        self.write(path, json.dumps(fields))
+        before = final_files(self.root)
+        repeated = self.transfer("apply")
+        self.assert_ok(repeated)
+        self.assertIn("done", repeated.stdout)
+        self.assertEqual(final_files(self.root), before)
+
+    def test_transfer_keeps_staff_ids_and_workers(self) -> None:
+        row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
+        parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "other")
+        worker = staff.ensure("worker", name="impl1", parent=row.id)
+        self.assert_ok(self.transfer("apply"))
+        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "alpha", parent.id))
+        self.assertEqual(staff.snapshot().by_id(worker.id), worker)
+        saved = cast(dict[str, object], json.loads((self.root / "state/showrunner/demo/transfer_unit.json").read_text()))
+        self.assertEqual(saved["staff_id"], row.id)
+
+    def test_taken_staff_name_refuses_before_sources_change(self) -> None:
+        parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "other")
+        _ = staff.ensure("unit", name="alpha", parent=parent.id)
+        before = final_files(self.root)
+        failed = self.transfer("apply")
+        self.assertEqual(failed.returncode, 2, failed.stderr)
+        self.assertIn("StaffRefused", failed.stderr)
+        self.assertEqual(final_files(self.root), before)
+        self.assertEqual(self.messages(), [])
+
+    def test_refused_later_request_preserves_the_completed_request_receipt(self) -> None:
+        self.assert_ok(self.transfer("apply"))
+        self.add_transfer_unit("beta")
+        third = self.add_destination("third")
+        parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "third")
+        _ = staff.ensure("unit", name="beta", parent=parent.id)
+        before = final_files(self.root)
+        messages = self.messages()
+        refused = self.transfer("apply", "beta-unit", third)
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertEqual(final_files(self.root), before)
+        self.assertEqual(self.messages(), messages)
+        repeated = self.transfer("apply")
+        self.assert_ok(repeated)
+        self.assertIn("done", repeated.stdout)
+        self.assertEqual(final_files(self.root), before)
+
+    def test_missing_staff_member_refuses_before_sources_change(self) -> None:
+        row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
+        _ = staff.retire(row.id)
+        before = final_files(self.root)
+        failed = self.transfer("apply")
+        self.assertEqual(failed.returncode, 2, failed.stderr)
+        self.assertEqual(final_files(self.root), before)
+        self.assertEqual(self.messages(), [])
+
+    def test_refused_live_move_leaves_every_doc_and_message_unchanged(self) -> None:
+        before = {path: path.read_bytes() for path in self.root.rglob("*.md")}
+        with mock.patch.object(staff_move, "move_unit",
+                               side_effect=staff.StaffRefused("live tab is not uniquely identified")):
+            refused = self.transfer("apply")
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertIn("live tab is not uniquely identified", refused.stderr)
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+        self.assertEqual(self.messages(), [])
+
+    def test_transfer_unit_rerun(self) -> None:
+        self.env.update(GIT_AUTHOR_DATE="2026-10-29T12:00:00Z", GIT_COMMITTER_DATE="2026-10-29T12:00:00Z")
+        with saved_fixture(self.root) as restore:
+            self.assert_ok(self.transfer("apply"))
+            self.assertEqual(len(self.messages()), 3)
+            expected = final_files(self.root)
+            for after in (False, True):
+                with self.subTest(after=after):
+                    restore()
+                    with stop_at_staff_write("move", after=after):
+                        failed = self.transfer("apply")
+                    self.assertNotEqual(failed.returncode, 0)
+                    self.assertIn("stopped at staff step", failed.stderr)
+                    self.assert_ok(self.transfer("apply"))
+                    self.assertEqual(final_files(self.root), expected)
+                    finished = self.transfer("apply")
+                    self.assert_ok(finished)
+                    self.assertIn("done", finished.stdout)
+                    self.assertEqual(final_files(self.root), expected)
+                    self.assertEqual(len(self.messages()), 3)
+
+    def test_seed_waits_between_staff_move_and_units_update(self) -> None:
+        row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
+        parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "other")
+        commit_to = cast(Callable[[transfer_unit.UnitTransfer, Callable[[], None]], None], getattr(transfer_unit, "_commit_to"))
+        pending: list[subprocess.Popen[str]] = []
+
+        lock = self.staff_file.parent / "operation.lock"
+        with short_socket_directory() as directory, ExitStack() as contexts:
+            with mock.patch.object(self, "root", Path(directory)):
+                listener = contexts.enter_context(self.lock_notice(lock))
+            def pause(transfer: transfer_unit.UnitTransfer, save: Callable[[], None]) -> None:
+                self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "alpha", parent.id))
+                process = self.start_script(SOURCES_SCRIPT, "seed")
+                pending.append(process)
+                self.assert_operation_blocks(process, listener)
+                commit_to(transfer, save)
+
+            steps = tuple(step._replace(run=pause) if step.run is commit_to else step for step in transfer_unit.STEPS)
+            notices = {name: os.environ[name] for name in ("STAFF_TEST_LOCK_NOTICE", "STAFF_TEST_LOCK_TARGET")}
+            with mock.patch.object(transfer_unit, "STEPS", steps), mock.patch.dict(self.env, notices):
+                self.assert_ok(self.transfer("apply"))
+            output, errors = pending[0].communicate(timeout=PROCESS_TIMEOUT)
+        self.assertEqual(pending[0].returncode, 0, output + errors)
+        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "alpha", parent.id))
+
     def test_rerun_finishes_each_uncommitted_document_write(self) -> None:
         snapshot = Path(self.enterContext(tempfile.TemporaryDirectory())) / "before"
         _ = shutil.copytree(self.root, snapshot)
@@ -77,14 +330,14 @@ class UnitTransferTests(UnitTransferFixture):
         self.moved_unit_with_leftover_marks()
         self.assert_ok(self.transfer("verify"))
 
-    def test_verify_names_the_live_holder_of_a_former_mark(self) -> None:
+    def test_verify_allows_a_running_session_to_keep_its_original_marks(self) -> None:
         self.moved_unit_with_leftover_marks()
         pid = self.live_pid()
         old = fake_showrunner.write_session(self.root / "state/sessions", "old", "sid-old", pid)
         self.addCleanup(old.close)
         fake_unit_host.place_process(self.env, pid, "w3:p3Y")
-        self.assert_refused(self.transfer("verify"),
-                            f"a session still carries the marks demo alpha-unit: pid {pid} (claude) in herdr:old:w3:p3Y")
+        self.assert_ok(self.transfer("verify"))
+        self.assertIsNotNone(staff.snapshot().by_path("other/alpha"))
 
     def test_resume_looks_up_the_moved_giving_checkout(self) -> None:
         path = self.pause_before_source_commit()
@@ -111,29 +364,30 @@ class UnitTransferTests(UnitTransferFixture):
         for name in ("from_doc", "to_doc", "from_checkout", "to_checkout"):
             self.assertNotIn(name, saved)
 
-    def test_a_stopped_unit_relaunches_from_a_record_that_names_the_receiving_production(self) -> None:
+    def test_transfer_keeps_a_stopped_record_and_never_restarts_it(self) -> None:
         log = self.seed_record()
-        result = self.transfer("apply")
-        # The fake restart starts nothing, so verify finds the unit not running and holds the journal open.
-        self.assert_refused(result, "alpha-unit is not running under other")
-        self.assertEqual([json.loads(line) for line in log.read_text().splitlines()],
-                         [["restart", "--only", "sid-alpha", "--here"]])
         path = self.root / "home/.local/state/shutdown/owner@example.com/sessions/sid-alpha.json"
-        saved = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
-        host = cast(dict[str, object], cast(dict[str, object], saved["session"])["host"])
+        before = path.read_bytes()
+        result = self.transfer("apply")
+        self.assert_ok(result)
+        self.assertFalse(log.exists(), "transfer ran a stop or restart command")
+        self.assertEqual(path.read_bytes(), before)
         receiving = self.receiving / "docs/plans/other-production.md"
-        self.assertEqual((host["production"], host["doc"], host["unit"], host["session_name"]),
-                         ("other", str(receiving), "alpha-unit", "other-alpha"))
-        note = cast(str, saved["renamed"])
-        self.assertIn(f"moved you to production other: your production doc is now {receiving}", note)
+        notice = self.messages()[0]
+        note = notice[notice.index("--text") + 1]
+        self.assertIn(f"Your production doc is now {receiving}", note)
         self.assertIn(f"Your worktree {self.unit}, your branch demo-alpha and its commits stay.", note)
 
     def test_plan_lists_the_steps_and_changes_nothing(self) -> None:
         before = self.git("rev-parse", "demo", "other", "demo-alpha")
         result = self.transfer("plan")
         self.assert_ok(result)
-        self.assertIn("stop alpha-unit and its Codex workers through the shutdown path", result.stdout)
-        self.assertIn("8. verify: alpha-unit shows under other and nowhere under demo", result.stdout)
+        self.assertIn("move alpha-unit's staff membership and live tab to other", result.stdout)
+        self.assertIn("tell alpha-unit its new production, doc and merge branch", result.stdout)
+        self.assertIn("tell demo showrunner", result.stdout)
+        self.assertIn("tell other showrunner", result.stdout)
+        self.assertIn("9. verify: alpha-unit shows under other and nowhere under demo", result.stdout)
+        self.assertEqual(self.messages(), [])
         self.assertEqual(self.git("rev-parse", "demo", "other", "demo-alpha"), before)
 
     def test_worker_migration_conflict_prints_a_refusal_without_a_traceback(self) -> None:

@@ -120,7 +120,7 @@ class StaffSourcesTests(StaffTestCase):
         self.assertIsNotNone(staff.by_path("laptop/laptop"))
         self.assertIsNone(staff.by_path("owner-only"))
         self.assertEqual({row.name for row in staff.find()}, {"laptop"})
-        self.assertEqual(self.ssh_commands(), [["show", "--json"], ["apply-seed", "--json"]])
+        self.assertEqual(self.ssh_commands(), [["show", "--snapshot", "--json"], ["apply-seed", "--json"]])
         self.assertTrue((self.staff_file.parent / "operation.lock").exists())
         self.assertNotEqual((self.staff_file.parent / "operation.lock").stat().st_ino, (self.mac_file.parent / "operation.lock").stat().st_ino)
 
@@ -439,6 +439,13 @@ class StaffSourcesTests(StaffTestCase):
                 staff_sources.seed()
         self.assertIs(raised.exception, failure)
         self.assertFalse(self.staff_file.exists())
+
+    def test_seed_uses_the_same_initial_record_read_as_the_writers(self) -> None:
+        _ = self.production("sdlc")
+        with mock.patch.object(staff, "initial_snapshot", wraps=staff.initial_snapshot) as initial:
+            _ = self.seed()
+        initial.assert_called_once_with()
+        self.assertEqual([row.name for row in staff.snapshot().rows], ["sdlc"])
 
 
 if __name__ == "__main__":

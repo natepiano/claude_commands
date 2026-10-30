@@ -354,7 +354,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 **Spec:** the director runs it with the user.
 
 1. `accounts.py check claude1`. It passed on 2026-10-15: `~/.claude1` was set up and logged in before "Live proof of the moves", whose moves restarted sessions there. Only if it fails, the user repairs it per the guide's "Log out and in" (`accounts.py setup claude1` when the folder is missing, then `/login`), and `check` passes again.
-2. The showrunner reaches each unit by message. Then `send.py` across machines and accounts: a unit on the units account and a session on the Mac each reach the other, and each reply comes back.
+2. The showrunner reaches each unit by message. Then `send.py` across machines and accounts: a unit on the units account and a session on the Mac each reach the other, and each reply comes back. Run it on the tree after the Phase 99 remerge (natedev with shutdown-unit phase 5 and the Phase 99 fixes). Only a matching reply received by the sender counts as receipt: a `QUEUED` or `SKIPPED` outcome, or a sent marker in a record, is not evidence.
 
 **Files:**
 
@@ -362,7 +362,16 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 
 **Workers:** nothing splits: the unit director runs both checks with the user.
 
-**Acceptance gate:** `accounts.py check claude1` passes; every message in item 2 and its reply arrive; the results are written here.
+**Who proves Phase 99's outcomes (plan review 2026-10-30):**
+
+| Outcome | What the user or showrunner sees | Owner and proof |
+| --- | --- | --- |
+| A showrunner line stays pending until sent, active or archived | The showrunner gets one stopping line and one outcome line; a failed send is retried | Phase 100 keeps the archived-replay and queued-fallback tests; this phase proves the showrunner receives the lines |
+| A registration is retired when its owner is gone | Launches stay blocked by a live registration and are unblocked after abandoned work ends | Phase 100's shutdown gate keeps the abandoned-registration and legacy-registration tests |
+| The timer snapshot is saved before the stop | Cancel or restart restores the timers the user had | Phase 96's checkpoint waits for both snapshot publication orders to pass; Phase 100 keeps the interrupted-stop cancel test |
+| A failed keyed send gives back its repeat window; a queued or delivered send keeps it | A caller can retry a failure with no duplicate of a kept send | Phase 100's message gate keeps the failed-send retry, queued-copy and later-run tests |
+
+**Acceptance gate:** `accounts.py check claude1` passes; every message in item 2 and its matching reply arrive, on the tree after the Phase 99 remerge; the results are written here.
 
 #### Results so far (2026-10-11)
 
@@ -2748,7 +2757,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 ### Phase 96 — A stopped account setup, group move or wait is finished by its rerun  · status: todo
 
-**Depends on:** Phase 94e (order only; it edits `scripts/accounts/accounts.py` too)
+**Depends on:** Phase 94e (order only; it edits `scripts/accounts/accounts.py` too). Its checkpoint also waits for shutdown-unit's phase 5 (`natedev-shutdown` 1731b830) and the Phase 99 remerge: the combined tree keeps both the merged timer restore intent and Phase 99's snapshot-before-stop, and passes `test_restart.py` `test_target_stop_inherits_timer_intent_in_both_snapshot_publication_orders`, the `test_settle.py` interrupted-stop/cancel guard, and the shutdown, accounts and message suites. Dispatch does not wait (showrunner, 2026-10-30: start phase 96 now; it edits `scripts/accounts` only).
 
 #### Work Order
 
@@ -2756,7 +2765,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Spec:**
 - **Seed file (`accounts.py:843` in the sweep).** `_seed_config(destination)` (`scripts/accounts/accounts.py:858`) opens `<dir>/.claude.json` with `O_CREAT | O_EXCL` (line 869), then writes the JSON. A stop between the two leaves an empty or partial file, and a setup rerun returns at `if destination.exists(): return []` (line 863), so the seed never happens. Change: write the seed to a private temporary file (mode 0600) in the same folder, flush and `fsync` it, then publish it with `os.link(temporary, destination)` and remove the temporary file. A `FileExistsError` from the link keeps the existing file, as today. A rerun removes a leftover temporary seed file of this name form before it seeds. An existing `.claude.json` of zero bytes is an interrupted seed: the rerun seeds it again. Any other existing file stays untouched (it can hold a login).
-- **Group move history (`role_map.py:531` in the sweep).** `role_map.write_role_map` (`scripts/accounts/role_map.py:522`) writes the group selection (`_atomic_write`, line 564), then appends the `roles.jsonl` row (line 569). A stop between them leaves a selection with `cause` `auto` and `why` `auto: <entry id>` but no history row. `role_map.recorded_auto_moves` (line 657) reads only `roles.jsonl`, so `refusal_watch._run_auto_moves_locked` (`scripts/accounts/refusal_watch.py:1202`) does not consume the entry; the head then reaches `if selection.account == rule.to:` (line 1256) and is recorded blocked as `TargetIsCurrentAccount`, and the queue stops. Change: one `role_map` function returns the entry ids that the current stored group selections record (`cause == "auto"`, `why == "auto: <entry id>"`, label equal to the entry's target) and appends each missing `roles.jsonl` row once, with the fields `write_role_map` writes, under `_groups_lock()` and `worker_names.roles_lock()`. `_run_auto_moves_locked` adds those ids to `consumed`.
+- **Group move history (`role_map.py:531` in the sweep).** `role_map.write_role_map` (`scripts/accounts/role_map.py:522`) writes the group selection (`_atomic_write`, line 564), then appends the `roles.jsonl` row (line 569). A stop between them leaves a selection with `cause` `auto` and `why` `auto: <entry id>` but no history row. `role_map.recorded_auto_moves` (line 657) reads only `roles.jsonl`, so `refusal_watch._run_auto_moves_locked` (`scripts/accounts/refusal_watch.py:1202`) does not consume the entry; the head then reaches `if selection.account == rule.to:` (line 1256) and is recorded blocked as `TargetIsCurrentAccount`, and the queue stops. Change: one `role_map` function returns the entry ids that the current stored group selections record (`cause == "auto"`, `why == "auto: <entry id>"`, label equal to the entry's target) and appends each missing `roles.jsonl` row once, with the fields `write_role_map` writes, under `_groups_lock()` and `worker_names.roles_lock()`. `StoredGroupSelection` (`role_map.py:43`) has no `at`, while `RoleHistoryEntry` (`role_map.py:184`) needs one: the repaired row's `at` is the repair time, and a test pins that rule. `_run_auto_moves_locked` adds those ids to `consumed`.
 - **Five-hour wait (`refusal_watch.py:949`).** The refusal pass appends a `WaitedMove` journal row (`moves.append_move`, line 949), then sets the `waited` transition (`_set_transition`, line 953); the watch state is saved later in the pass. A stop between them leaves the row and no state. On rerun the `not any(... entry["kind"] == "waited" and entry["reset"] == wait_reset.at.isoformat() ...)` check skips both, so `waited` is never set and after the reset the continuation path (line 923, `previous["state"] == "waited"`) is not taken: an ungrouped session can move instead of continuing. Change: when the matching `waited` row exists and the session's state is not `waited` for this refusal entry, set the transition with that row's `move_id`. Append no second row.
 - No other behavior changes.
 
@@ -2805,47 +2814,32 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - A zero-count pass skips each unit that a newer pass changed (projection re-read under the lock), and the owed notice is checked again before it is sent.
 - Tests: `test_five_hour.py` (retry per recipient; Assertion-Change on the renamed low-window test, send count 3), `test_codex_winddown.py` (stop-and-rerun, stale-pass cases).
 
-### Phase 99 — A stopped `down` or `now` is finished by its rerun  · status: todo
+### Phase 99 — A stopped `down` or `now` is finished by its rerun  · status: done
 
-**Depends on:** Phase 95 (order only); also waits until herdr-unit's phase 3 has merged into natedev, because herdr edits `scripts/shutdown/settle.py` now. The showrunner says when.
+#### As-built
 
-**Also touches:** shutdown-unit (`scripts/shutdown`).
-
-#### Work Order
-
-**Goal:** Five `scripts/shutdown/settle.py` paths that stop at one line leave shutdown records that a rerun does not repair today; after this phase a rerun of `down`, `now` or the outcome report finishes the work. Rows from the rerun sweep (`~/.claude/docs/plans/sdlc-rerun-sweep.md`, accounts-unit) plus one showrunner row (line 819). Line numbers are at `5ad6542f`; herdr-unit's phase 3 moves them, so find each by its function and code text.
-
-**Spec:**
-- **Account hold registration (`settle.py:786`).** `begin` registers the account hold request (`store.register_account_hold_request`, line 786) and completes it at the end (`store.complete_account_hold_registration(login, request_id)`, line 848). A stop between them leaves a pending request id. A `down` rerun makes a new request id and completes only that one, so `release_finished_account_hold` keeps blocking launches after the work ends. Change: a rerun of `begin` for the same login completes (or withdraws) every pending registration whose owner is gone — its request has no live session record, or its registering process is not running (pid and process start time). Name the owner check in the code; never trust the stored id alone.
-- **Record before the conductor (`settle.py:819`, showrunner row).** `begin` writes each session's record (`store.create_session(saved)`, line 819). If `down` stops after a record is written and before the conductor starts, a rerun prints `already in progress` for that record and skips it, and no conductor ever runs it. Change: a rerun treats a record of this login whose conductor is not running (no live conductor process for it) as its own and starts the conductor for it.
-- **Timer stop before the record update (`settle.py:833`).** `save_timers` (line 830) stops the notifier timers inside `store.update_session` (line 836) before the changed record is written. A stop there leaves the record with `timers=[]` and the timers stopped; `begin` then skips the record as in progress, so cancel or restart cannot restore them. Change: write the timer snapshot to the record before any timer is stopped, and stop the timers only after that write; a rerun stops any timer in the snapshot that still runs.
-- **Stored stopped status (`settle.py:1217`).** `now` (line 1201) skips a record whose `progress.kind` is not waiting, ready, held or reaping (line 1217), and `down` skips an existing record at line 819, without checking the live session. A session resumed outside shutdown after a successful stop stays running. Change: before skipping a stopped record, check the live session (pid and process start time); a live session with a finished stop record gets a new stop, and its old record is closed.
-- **Showrunner line marked before it is sent (`settle.py:1568`).** `_reserve_showrunner_line` (line 1562) saves `showrunner_told` (line 1568) before `tell_showrunner_stopping` sends it (`send_message`, line 1590). A stop, or a failed send, leaves the mark, and a repeated stop or outcome report skips the message. Change: the mark is a claim until the send succeeds, then sent; a claim whose send did not succeed is sent again by the next stop or outcome report, at most once per line.
-- No other behavior changes.
+- Each account hold registration names its owner (`RegistrationOwner`: pid and process start time). A rerun of `begin` calls `store.repair_abandoned_hold_registrations(login)`, which completes or withdraws each pending registration whose owner is gone. A legacy registration with no owner releases when its last session finishes.
+- `save_timers` writes the timer snapshot to the record before it stops any timer. A rerun stops each timer from the snapshot that still runs, so cancel or restart can restore them.
+- Each showrunner line is a claim on the request record in `showrunner_lines` (`ShowrunnerLinePending`, then `ShowrunnerLineSent`). `settle.send_showrunner_line` is the one path: it claims the line, calls `send_message`, and marks the line sent only when the send returns `sent`. The next stop or outcome report sends a pending claim again, once per line. Back and stopping lines key by request and line kind; a failure line also keys by its text. `showrunner_was_told` still reads the old `showrunner_told` field.
+- The `restart.py` source fallback sends its showrunner line through `settle.send_showrunner_line`.
+- In `send.py`, a keyed send that failed, was refused or was held does not keep the repeat window. A delivered or queued send keeps it.
+- Tests guard two behaviors that already held: `down` starts the conductor after every `begin`, and `now` reads the live sessions while `store.create_session` moves a finished stop record aside for a new stop.
 
 **Files:**
-- `scripts/shutdown/settle.py` — `begin`, `save_timers`, `now`, `_reserve_showrunner_line`, `tell_showrunner_stopping`, `tell_showrunners_outcome`.
-- `scripts/shutdown/shutdown_record.py` — the `store` module of settle; changed only if a pending-registration or claim reader belongs there.
-- `scripts/shutdown/test_settle.py` — one stop-and-rerun test per row.
+- `scripts/shutdown/settle.py` — `begin`, `save_timers`, `now`, `send_showrunner_line`, `showrunner_was_told`, `tell_showrunner_stopping`, `tell_showrunners_outcome`.
+- `scripts/shutdown/shutdown_record.py` — registration owners, `registration_owner_running`, `repair_abandoned_hold_registrations`, the `ShowrunnerLine` record types.
+- `scripts/shutdown/restart.py` — source fallback through the shared claim-and-send path.
+- `scripts/message/send.py` — repeat window only for a delivered or queued keyed send.
+- `scripts/shutdown/test_settle.py`, `scripts/shutdown/test_restart.py`, `scripts/message/test_send.py` — stop-and-rerun tests (a test-local `Killed(BaseException)` raised after the named call, then the same verb again) and send-window tests.
+- `scripts/shutdown/test_account_move.py`, `test_shutdown_cli.py`, `test_shutdown_record.py` — fixture setup only (a stub keyword, live registration owners).
 
-**Workers:** 1 writer + 1 tester.
-- `impl` — `settle.py` (and `record.py` if needed).
-- `test` — the five tests from the Spec alone in `test_settle.py`; each fails before the change.
+**Gotchas:** The timer snapshot reaches the record before any timer stops; shutdown-unit's `store.merge_timer_restores` must keep that order when the two meet. A showrunner line stays pending until `send_message` returns `sent`. Open defect: `ShowrunnerLineSent` is also recorded when `send.py` only queued or skipped the line.
 
-**State:** account hold registrations, `SessionShutdown` records (`timers`, `progress`, `showrunner_told`) and notifier timers (scratch shutdown state in tests).
-
-**Constraints from prior phases:**
-- Tests use a scratch `HOME` and `SHUTDOWN_STATE_DIR` set before import, and stub inventory, timers, herdr and `send_message`; they never touch live sessions, timers, `~/.local/state`, ssh or herdr.
-- Stop model: patch the call right after the named line to raise a test-local `class Killed(BaseException)`; catch it; run the same verb again with no patch; assert the state is repaired (no pending registration blocks launches; the conductor runs the record; the timers are restored on cancel; the resumed session is stopped; the showrunner line is sent once).
-- Phase 95: `settle.failed_prompt_screen_lines` and `report_stop` show the saved screen; `scripts/accounts/test_unit_watchdog.py` calls `settle.report_stop`, so the gate runs the accounts suite too.
-- Merge origin/natedev (with herdr-unit's phase 3) before the work starts and before the gate.
-- Merge timing: no checkpoint merge during the natedev build hold, 00:05–03:05 EDT (showrunner, 2026-10-29). While any natedev build hold is in force, run no tests, gates or type checks unless this unit holds it; check `build_hold.py status` first.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py'` and the same for `scripts/accounts` pass with a scratch HOME set before import; `basedpyright` on the changed Python files reads `0 errors, 0 warnings, 0 notes`; each stop-and-rerun test fails on the code before the change.
+**Ruled out:** trusting a stored registration id alone, without its owner check; marking a showrunner line sent before the send returns.
 
 ### Phase 100 — All consumers import shared whoami modules by one name  · status: todo
 
-**Depends on:** Phase 94d, Phase 94e, Phase 96, Phase 97, Phase 98 (order only; each edits files whose imports this phase changes)
+**Depends on:** Phase 94d, Phase 94e, Phase 96, Phase 97, Phase 98 (order only; each edits files whose imports this phase changes), and the completed Phase 99 remerge: natedev with shutdown-unit phase 5 merged in, the `settle.py` timer save fixed on it, and its new hash merged by the showrunner
 
 **Also touches:** the herdr, shutdown, message, production and agents owners.
 
@@ -2858,12 +2852,12 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - Change every bare import of the six modules (`import <module>`, `from <module> import …`, also inside functions) to the package form. Bare-import consumers found at planning:
   - `scripts/whoami`: `five_hour.py`, `quota_alert.py`, `codex_pacer.py`, `agent_notes.py`, `run_out.py`, `session_table.py`, `whoami.py`, `profile_notes_pass.py` (added by Phase 94b; also string imports `import_module("<module>")` of three of the six).
   - `scripts/accounts`: `accounts.py`, `new_account.py`, `refusal_watch.py`, `refusals.py`, `unit_watchdog.py`.
-  - `scripts/shutdown`: `inventory.py`, `pane_record.py`, `pane_restore.py`, `record.py`, `restart.py`, `settle.py`, `shutdown.py`.
+  - `scripts/shutdown`: `inventory.py`, `pane_record.py`, `pane_restore.py`, `shutdown_record.py`, `restart.py`, `settle.py`, `shutdown.py`.
   - `scripts/production`: `cli_fixture.py`, `dailies_render.py`, `showrunner_move.py`.
   - `scripts/message/roster.py`; `scripts/nightly_review/nightly_review.py` (not in the next-items entry; found at planning).
   - The test files and test support files listed under Files, in `scripts/whoami`, `scripts/accounts`, `scripts/shutdown`, `scripts/production` and `scripts/nightly_review` (28 test files and 2 support files at `5ad6542f`).
   - `scripts/agents/agent_exec.sh`: its inline Python puts only `scripts/whoami` on `sys.path` and runs `from agent_accounts import workers_home`. It puts the repository root (`$script_dir/../..`) on `sys.path` and imports `scripts.whoami.agent_accounts`.
-- The repository root must be on `sys.path` before the first `scripts.` import of each consumer. Today many consumers get the root only as a side effect of a bare `import account` or `import agent_accounts` (`account.py:19` and `agent_accounts.py:46` insert `parents[2]`); `settle.py:42` and `restart.py:28` already import `scripts.accounts` through that side effect. After the change the package import must find the root first. Each consumer file that has no module-level root insert adds `sys.path.insert(0, str(Path(__file__).resolve().parents[2]))` before its first `scripts.` import. Found at planning: `scripts/whoami/whoami.py` (its root insert is inside a function, line 69), `run_out.py`, `session_table.py`; `scripts/accounts/refusals.py`, `unit_watchdog.py`; `scripts/production/dailies_render.py`, `cli_fixture.py`; `scripts/shutdown/inventory.py`, `pane_record.py`, `pane_restore.py`, `record.py`, `restart.py`, `settle.py`, `shutdown.py`.
+- The repository root must be on `sys.path` before the first `scripts.` import of each consumer. Today many consumers get the root only as a side effect of a bare `import account` or `import agent_accounts` (`account.py:19` and `agent_accounts.py:46` insert `parents[2]`); `settle.py:42` and `restart.py:28` already import `scripts.accounts` through that side effect. After the change the package import must find the root first. Each consumer file that has no module-level root insert adds `sys.path.insert(0, str(Path(__file__).resolve().parents[2]))` before its first `scripts.` import. Found at planning: `scripts/whoami/whoami.py` (its root insert is inside a function, line 69), `run_out.py`, `session_table.py`; `scripts/accounts/refusals.py`, `unit_watchdog.py`; `scripts/production/dailies_render.py`, `cli_fixture.py`; `scripts/shutdown/inventory.py`, `pane_record.py`, `pane_restore.py`, `shutdown_record.py`, `restart.py`, `settle.py`, `shutdown.py`.
 - Remove the `if __name__ == "<module>": … elif __name__ == "scripts.whoami.<module>": …` block from each of the six modules.
 - Other whoami modules (`quota_alert`, `five_hour`, `codex_pacer`, `agent_notes`) keep their current import names; `scripts/lib/nix_env.py` keeps its own two-name block. Both are out of scope.
 - No other behavior changes.
@@ -2875,22 +2869,23 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `scripts/shutdown/inventory.py`, `scripts/shutdown/pane_record.py`, `scripts/shutdown/pane_restore.py`, `scripts/shutdown/shutdown_record.py`, `scripts/shutdown/restart.py`, `scripts/shutdown/settle.py`, `scripts/shutdown/shutdown.py` — consumers.
 - `scripts/production/cli_fixture.py`, `scripts/production/dailies_render.py`, `scripts/production/showrunner_move.py` — consumers.
 - `scripts/message/roster.py`, `scripts/nightly_review/nightly_review.py` — consumers.
-- `scripts/whoami/test_agent_notes.py`, `scripts/whoami/test_codex_alert_accounts.py`, `scripts/whoami/test_codex_homes.py`, `scripts/whoami/test_codex_pacer.py`, `scripts/whoami/test_five_hour.py`, `scripts/whoami/test_note_file.py`, `scripts/whoami/test_quota_alert.py`, `scripts/whoami/test_run_out.py`, `scripts/whoami/test_session_table.py`, `scripts/whoami/test_usage_store.py`, `scripts/whoami/test_quota_zero_episode.py` — tests.
+- `scripts/whoami/test_agent_notes.py`, `scripts/whoami/test_codex_alert_accounts.py`, `scripts/whoami/test_codex_homes.py`, `scripts/whoami/test_codex_pacer.py`, `scripts/whoami/test_five_hour.py`, `scripts/whoami/test_note_file.py`, `scripts/whoami/test_quota_alert.py`, `scripts/whoami/test_run_out.py`, `scripts/whoami/test_session_table.py`, `scripts/whoami/test_usage_store.py`, `scripts/whoami/test_quota_zero_episode.py`, `scripts/whoami/test_quota_alert_claude.py` (`from agent_accounts import …`, line 14) — tests.
 - `scripts/whoami/quota_alert_test_support.py` — test support: bare imports of `agent_accounts`, `session_table`, `note_file`, `account` and `usage_store` (lines 27–34) and `import usage_store` inside a function (line 275).
 - `scripts/accounts/test_accounts.py`, `scripts/accounts/test_cutover_home.py`, `scripts/accounts/test_new_account.py`, `scripts/accounts/test_refusals.py`, `scripts/accounts/test_refusal_watch.py`, `scripts/accounts/test_unit_watchdog.py` — tests.
-- `scripts/shutdown/test_account_move.py`, `scripts/shutdown/test_inventory.py`, `scripts/shutdown/test_pane_record.py`, `scripts/shutdown/test_restart.py`, `scripts/shutdown/test_settle.py`, `scripts/shutdown/test_shutdown_cli.py`, `scripts/shutdown/test_shutdown_status.py`, `scripts/shutdown/test_stop.py` — tests.
+- `scripts/shutdown/test_account_move.py`, `scripts/shutdown/test_inventory.py`, `scripts/shutdown/test_pane_record.py`, `scripts/shutdown/test_restart.py`, `scripts/shutdown/test_settle.py`, `scripts/shutdown/test_shutdown_cli.py`, `scripts/shutdown/test_shutdown_status.py`, `scripts/shutdown/test_stop.py`, `scripts/shutdown/test_bounded_stop.py` (`from account import Account`, line 27) — tests.
 - `scripts/production/test_add_showrunner.py`, `scripts/production/add_unit_test_support.py`, `scripts/nightly_review/test_nightly_review.py` — tests; the support file has `import usage_store` at line 39.
 - `scripts/whoami/profile_notes_pass.py` — consumer: `import usage_store` and `from agent_accounts import …` inside a function, and `import_module("usage_store")`, `import_module("run_out")`, `import_module("agent_accounts")` in `load_pass` and `patch_list`.
 - `scripts/agents/agent_exec.sh` — the inline Python import.
 - `scripts/agents/codex_mesh.py`, `scripts/herdr/herdr_sessions.py` — already package form; read to confirm, change only a bare import found.
 
-**Workers:** 2 writers, split by directory (no file in both).
+**Workers:** 2 writers, split by directory (no file in both). Both lanes freeze their files before the shared acceptance run, so the run tests one tree.
 - `whoami` — `scripts/whoami` modules and tests, the six registration blocks.
 - `consumers` — `scripts/accounts`, `scripts/shutdown`, `scripts/production`, `scripts/message`, `scripts/nightly_review`, `scripts/agents`, `scripts/herdr`, and their tests.
 
 **Constraints from prior phases:** Tests sit beside the code (Delegation Context); after this phase they import the six modules by the package name, the same object the code uses. Tests never touch live dirs: `HOME`, `AGENT_NOTES_DIR` and the patched `note_file.AGENTS_DIR` point at scratch folders. No `Any`, no file-level ignores.
 - Phase 94c: `scripts/accounts/accounts.py` now also calls `agent_accounts.usage_store_warning_line` and reads `agent_accounts.UsageClaimFailed`, `UsageSaveFailed` and `Report.store_warnings`; type identity of these classes depends on the one module object. `scripts/accounts/role_map.py` has no bare import of the six modules.
-- Phases 96–99 edit `accounts.py`, `role_map.py`, `refusal_watch.py`, `quota_alert.py`, `five_hour.py` and `settle.py` bodies. This phase does not wait for the `settle.py` phase (it waits on herdr-unit): both edit `settle.py` in different regions (imports here; `begin`, `now` and `_reserve_showrunner_line` there). Whichever runs second merges origin/natedev first. herdr-unit also edits `settle.py` now; merge origin/natedev before the work starts and before the gate.
+- Phases 96–99 edit `accounts.py`, `role_map.py`, `refusal_watch.py`, `quota_alert.py`, `five_hour.py` and `settle.py` bodies. Phase 99 changes `settle.py` `begin`, `now`, the timer save and `send_showrunner_line`, and `scripts/message/send.py`; this phase starts only after its remerge (Depends on) and changes imports only. herdr-unit also edits `settle.py`; merge origin/natedev before the work starts and before the gate.
+- Phase 99 behavior this phase keeps (plan review 2026-10-30). The shutdown and message gates must still pass these tests unchanged: `test_settle.py` `test_archived_restart_reports_back_after_retrying_its_stopping_line`, `test_rerun_down_releases_abandoned_account_registration`, `test_legacy_registration_releases_when_its_last_session_finishes` and `test_rerun_down_keeps_timer_snapshot_for_cancel_after_stop`; `test_restart.py` `test_outcome_replays_a_queued_fallback_without_a_second_back_line`; `test_send.py` `test_a_failed_keyed_session_send_retries_but_a_delivered_send_keeps_its_window` and its queued-copy and later-run tests. Phase 7 proves that the showrunner receives the lines.
 - The `grep` in the acceptance gate found these bare-import files at `5ad6542f`; rerun it at the start to catch files added since.
 - Merge timing: no checkpoint merge during the natedev build hold, 00:05–03:05 EDT (showrunner, 2026-10-29). While any natedev build hold is in force, run no tests, gates or type checks unless this unit holds it; check `build_hold.py status` first.
 

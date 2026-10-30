@@ -441,6 +441,52 @@ class RestartTests(ShutdownTestCase):
         self.create([saved])
         return saved
 
+    def test_source_fallback_retries_queued_showrunner_line_then_reports_it_once(self) -> None:
+        class Killed(BaseException):
+            pass
+
+        saved = entry(unit("queued-source-fallback"))
+        line = "queued-source-fallback came back on claude2: claude3 refused"
+        saved.update(target=LABEL, source_label=LABEL, showrunner_told="stopping", restart_issues=[line])
+        self.create([saved])
+        with patch.object(settle, "_unit_showrunner", return_value="fixture-runner"):
+            with patch.object(settle, "send_message", side_effect=Killed):
+                with self.assertRaises(Killed):
+                    restart._tell_source_fallback(saved)  # pyright: ignore[reportPrivateUsage]
+            with patch.object(settle, "send_message", return_value=settle.MessageQueued(
+                kind="queued", reason="fixture recipient unavailable")) as queued:
+                restart._tell_source_fallback(saved)  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(queued.call_count, 1)
+            with patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as retry:
+                for _ in range(2):
+                    current = shutdown_record.find_session(LOGIN, saved["session"]["session_id"])
+                    assert current is not None
+                    restart._tell_source_fallback(current)  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual([item.args[1:3] for item in retry.call_args_list], [(line, line)])
+
+    def test_outcome_replays_a_queued_fallback_without_a_second_back_line(self) -> None:
+        class Killed(BaseException):
+            pass
+
+        saved = entry(unit("queued-fallback-outcome"))
+        line = "queued-fallback-outcome came back on claude2: claude3 refused"
+        saved.update(target=LABEL, source_label=LABEL, showrunner_told="stopping", restart_issues=[line],
+                     progress=shutdown_record.SessionRestarted(kind="restarted", at=RESTARTED))
+        self.create([saved])
+        with patch.object(settle, "_unit_showrunner", return_value="fixture-runner"):
+            with patch.object(settle, "send_message", side_effect=Killed):
+                with self.assertRaises(Killed):
+                    restart._tell_source_fallback(saved)  # pyright: ignore[reportPrivateUsage]
+            with patch.object(settle, "send_message", return_value=settle.MessageQueued(
+                kind="queued", reason="fixture recipient unavailable")) as queued:
+                settle.tell_showrunners_outcome(shutdown_record.session_records(LOGIN))
+            self.assertEqual([call.args[1:3] for call in queued.call_args_list], [(line, line)])
+            with patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as retry:
+                settle.tell_showrunners_outcome(shutdown_record.session_records(LOGIN))
+                settle.tell_showrunners_outcome(shutdown_record.session_records(LOGIN))
+            self.assertEqual([call.args[1:3] for call in retry.call_args_list], [(line, line)])
+            self.assertEqual(queued.call_args.kwargs["key"], retry.call_args.kwargs["key"])
+
     def test_moved_unit_uses_source_after_exception_failed_outcome_or_confirmation_timeout(self) -> None:
         for failure in ("exception", "outcome", "confirmation"):
             with self.subTest(failure=failure):
@@ -2701,6 +2747,24 @@ class RestartTests(ShutdownTestCase):
         started.assert_not_called()
         acknowledge.assert_not_called()
 
+    def test_stopping_record_whose_claude_is_gone_restarts_without_the_stop_path(self) -> None:
+        stuck: list[shutdown_record.SessionProgress] = [
+            shutdown_record.SessionStopping(kind="stopping", at=STOPPED),
+            shutdown_record.SessionStopFailed(kind="stop failed", at=STOPPED, reason="shutdown deadline exhausted")]
+        for state in stuck:
+            with self.subTest(progress=state["kind"]):
+                owner = top_level(f"gone-{len(state['kind'])}", cwd=str(self.root))
+                saved = entry(owner, state=state)
+                self.create([saved])
+                with (patch.object(restart, "_owner_liveness", return_value=restart.SessionNotLive()),
+                      patch.object(stop_work, "stop_session", side_effect=AssertionError("no stop retry"))):
+                    recovered = restart._recover_incomplete_shutdown(saved, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+                assert not isinstance(recovered, (restart.IncompleteShutdownRefused, restart.IncompleteShutdownStillLive))
+                self.assertEqual(recovered["progress"]["kind"], "already gone")
+                stored = shutdown_record.find_session(LOGIN, owner["session_id"])
+                assert stored is not None
+                self.assertEqual(stored["progress"]["kind"], "already gone")
+
     def test_heal_waits_for_the_conductors_matching_completed_stop_record(self) -> None:
         owner = top_level("heal-owner", cwd=str(self.root))
         saved = entry(owner, state=shutdown_record.SessionStopping(kind="stopping", at=STOPPED))
@@ -4457,7 +4521,7 @@ class RestartTests(ShutdownTestCase):
         def send(argv: list[str], *, input: str, capture_output: bool, text: bool, check: bool, timeout: int) -> subprocess.CompletedProcess[str]:
             del capture_output, text, check, timeout
             sent.append((argv, input))
-            return subprocess.CompletedProcess(argv, 0, '', '')
+            return subprocess.CompletedProcess(argv, 0, 'SENT: fixture\n', '')
         output = io.StringIO()
         with patch.object(restart, 'named_claude_account', return_value=self.account), patch.object(restart, '_up', return_value=restart.MachineRestartResult('natedev', LABEL, 'nothing')), patch.object(restart, 'run_remote', return_value=(2, '')), patch.object(restart, 'other_machine', return_value='Mac'), patch.object(settle, '_send_command', return_value=['fake-send']), patch.object(subprocess, 'run', send), redirect_stdout(output):
             self.assertEqual(restart.restart(restart.AccountNamed(LABEL), dry_run=False, alerts=restart.AlertWhenNotBack()), 0)
@@ -4866,17 +4930,13 @@ class RestartTests(ShutdownTestCase):
                       else restart.up(LOGIN, only=only))
         return result, launches
 
-    def test_dead_owner_in_stopping_finishes_cleanup_before_restore_and_keeps_intent(self) -> None:
+    def test_dead_owner_in_stopping_restores_without_the_stop_path_and_keeps_intent(self) -> None:
         saved = entry(top_level("crashed", host=inventory.HerdrHost(kind="herdr", herdr_session="crashed", pane_id="w1:p1", presentation="detached")),
                       state=shutdown_record.SessionStopping(kind="stopping", at=STOPPED))
         saved["target"] = "claude3"
         saved["where"] = shutdown_record.WhereSaid(kind="said", at=STOPPED, text="resume the repair")
         saved["timers"] = [TimerRestore(instance="timer", was_enabled=True)]
         self.create([saved])
-        def cleanup(current: SessionShutdown) -> SessionShutdown:
-            self.assertEqual(current["progress"]["kind"], "stopping")
-            return shutdown_record.update_session(LOGIN, "crashed", lambda changing: changing.update(
-                progress=shutdown_record.SessionAlreadyGone(kind="already gone", at=RESTARTED)))
         launched: list[SessionShutdown] = []
         def launch(current: SessionShutdown, _note: str, _desktop: restart.DesktopLaunchState, *,
                    dry_run: bool, source_fallback: bool = False) -> restart.SessionLaunched:
@@ -4886,7 +4946,7 @@ class RestartTests(ShutdownTestCase):
             return restart.SessionLaunched(SUBMITTED_PROMPT)
         with (patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
               patch.object(restart, "_process_liveness", return_value=restart.SessionNotLive()),
-              patch.object(stop_work, "stop_session", side_effect=cleanup) as stop,
+              patch.object(stop_work, "stop_session") as stop,
               patch.object(restore_permission, "launch_permission", return_value=restore_permission.AllowedByShutdownState()),
               patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()) as phone,
               patch.object(restart, "_retire"),
@@ -4895,7 +4955,7 @@ class RestartTests(ShutdownTestCase):
               patch.object(restart, "wait_for_confirmation", return_value=restart.RegistryConfirmation()),
               redirect_stdout(io.StringIO())):
             _ = restart.up(LOGIN)
-        stop.assert_called_once()
+        stop.assert_not_called()
         self.assertEqual(len(launched), 2)
         self.assertEqual(launched[1].get("target"), LABEL)
         self.assertEqual((launched[1]["timers"], launched[1]["where"], launched[1]["request_id"]),
@@ -5054,14 +5114,24 @@ class RestartTests(ShutdownTestCase):
         launch.assert_called_once()
 
     def test_showrunner_snapshot_admission_checks_the_configured_launch_account_hold(self) -> None:
+        _ = self.enterContext(patch.object(shutdown_record, "registration_process_start", return_value="fixture-process-start"))
         self.configure_groups(showrunners="claude3")
         _ = self.recovery([showrunner("held-group")])
         shutdown_record.set_account_hold(shutdown_record.AccountHold(login="third@example.invalid", label="claude3", machine="natedev",
             requested_at=STOPPED, request_id="target-hold", requested_by=shutdown_record.FromTerminal(kind="terminal"), then="stop",
-            registration="in progress"))
+            registration="in progress", registration_owners={"target-hold":
+                shutdown_record.RegistrationOwner(pid=4242, proc_start="fixture-process-start")}))
+
+        def admission(command: list[str], *, env: dict[str, str], **_options: object) -> subprocess.CompletedProcess[str]:
+            output, error = io.StringIO(), io.StringIO()
+            with patch.dict(os.environ, env, clear=True), redirect_stdout(output), redirect_stderr(error):
+                status = shutdown.main(command[2:])
+            return subprocess.CompletedProcess(command, status, output.getvalue(), error.getvalue())
+
         with (patch.object(restart, "_owner_liveness", return_value=restart.SessionNotLive()),
               patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
               patch.object(restart, "_live_session_ids", return_value=frozenset()),
+              patch.object(subprocess, "run", side_effect=admission),
               patch.object(restart, "_retire"), patch.object(restart, "_launch_session") as launch,
               redirect_stdout(io.StringIO()) as output):
             self.assertEqual(restart.up(LOGIN), 1)
@@ -6939,7 +7009,7 @@ class RestartTests(ShutdownTestCase):
 
                 def update(login: str, session_id: str,
                            change: Callable[[SessionShutdown], None]) -> SessionShutdown:
-                    if change.__name__ == "save_timers":
+                    if isinstance(change, shutdown_record.PersistSessionThenAct):
                         snapshot_captured.set()
                         if not publish_snapshot.wait(HANG_GUARD_SECONDS):
                             raise AssertionError("source restore did not reconcile its late enable")
