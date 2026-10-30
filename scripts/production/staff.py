@@ -15,8 +15,9 @@ from collections.abc import Callable, Generator, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from enum import StrEnum
+from importlib import import_module
 from pathlib import Path
-from typing import Literal, NewType, TypeVar, cast
+from typing import Literal, NewType, Protocol, TypeVar, cast
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -715,11 +716,16 @@ def _paths(rows: list[StaffRow]) -> dict[StaffId, str]:
     return paths
 
 
+class _MoveCommand(Protocol):
+    def __call__(self, target: str, new_showrunner: str, *, json_output: bool = False) -> int: ...
+
+
 class _Arguments(argparse.Namespace):
     verb: str = ""
     kind: Kind | None = None
     under: str | None = None
     target: str = ""
+    destination: str | None = None
     name: str = ""
     parent: str | None = None
     json: bool = False
@@ -743,9 +749,10 @@ def _parser() -> argparse.ArgumentParser:
     rename_parser = verbs.add_parser("rename", help=argparse.SUPPRESS)
     _ = rename_parser.add_argument("target")
     _ = rename_parser.add_argument("--name", required=True)
-    move_parser = verbs.add_parser("move", help=argparse.SUPPRESS)
-    _ = move_parser.add_argument("target")
-    _ = move_parser.add_argument("--parent", required=True)
+    move_parser = verbs.add_parser("move", help="move a unit and its live tab to another showrunner")
+    _ = move_parser.add_argument("target", help="<showrunner slug>/<unit>")
+    _ = move_parser.add_argument("destination", nargs="?", help="new showrunner slug")
+    _ = move_parser.add_argument("--parent", help=argparse.SUPPRESS)
     retire_parser = verbs.add_parser("retire", help=argparse.SUPPRESS)
     _ = retire_parser.add_argument("target")
     apply_parser = verbs.add_parser("apply-seed", help=argparse.SUPPRESS)
@@ -783,6 +790,14 @@ def _mutate(arguments: _Arguments) -> StaffRow | StaffSnapshot | tuple[StaffId, 
 
 
 def _main(arguments: _Arguments) -> int:
+    if arguments.verb == "move":
+        if arguments.destination is not None:
+            if arguments.parent is not None:
+                raise StaffRefused("move takes a showrunner slug or --parent, not both")
+            move_command = cast(_MoveCommand, import_module("scripts.production.staff_move").cli_move)
+            return move_command(arguments.target, arguments.destination, json_output=arguments.json)
+        if arguments.parent is None:
+            raise StaffRefused("move needs <showrunner slug>/<unit> <new showrunner slug>")
     if arguments.verb == "show":
         if arguments.snapshot:
             record = snapshot()

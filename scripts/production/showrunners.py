@@ -683,27 +683,34 @@ class NoticeDelivery:
     failed: tuple[str, ...] = ()
 
 
-def _deliver(slug: str, key: str, text: str) -> NoticeDelivery:
+def send_to_address(address: str, key: str, text: str, *, recipient: str,
+                    sender: str = "showrunners") -> NoticeDelivery:
+    """Send to a known session address with the same report as production notices."""
+    sent = subprocess.run([sys.executable, str(SEND), "--to", address, "--from", sender, "--key", key,
+                           "--text", text], capture_output=True, text=True, check=False)
+    if sent.returncode != 0:
+        return NoticeDelivery((f"could not tell {recipient}: {sent.stderr.strip() or f'send.py exited {sent.returncode}'}",),
+                              failed=(recipient,))
+    return NoticeDelivery((f"told {recipient}",))
+
+
+def deliver(slug: str, key: str, text: str) -> NoticeDelivery:
+    """Resolve a production's current address and report whether its notice failed."""
     address = current_address(slug)
     if not address:
         return NoticeDelivery((f"{slug} is not running: tell it when it starts",))
-    sent = subprocess.run([sys.executable, str(SEND), "--to", address, "--from", "showrunners", "--key", key,
-                           "--text", text], capture_output=True, text=True, check=False)
-    if sent.returncode != 0:
-        return NoticeDelivery((f"could not tell {slug}: {sent.stderr.strip() or f'send.py exited {sent.returncode}'}",),
-                              failed=(slug,))
-    return NoticeDelivery((f"told {slug}",))
+    return send_to_address(address, key, text, recipient=slug)
 
 
 def tell(slug: str, key: str, text: str) -> str:
     """Send one line and preserve the existing human-readable delivery report."""
-    return _deliver(slug, key, text).lines[0]
+    return deliver(slug, key, text).lines[0]
 
 
 def tell_others(texts: dict[str, str], key: str) -> NoticeDelivery:
     """Tell each production its line, but for the one this session runs, which reads the command's own output."""
     own = own_slug()
-    deliveries = [_deliver(slug, key, text) for slug, text in texts.items() if slug != own]
+    deliveries = [deliver(slug, key, text) for slug, text in texts.items() if slug != own]
     return NoticeDelivery(tuple(line for delivery in deliveries for line in delivery.lines),
                           failed=tuple(slug for delivery in deliveries for slug in delivery.failed))
 
