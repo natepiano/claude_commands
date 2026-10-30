@@ -18,6 +18,8 @@ remain only for the pending archive cleanup; they do not dispatch new reviews.
 
 **Dev-feature verification tests.** `test_verify_dev_features.py` covers feature merging and malformed values, `test_verify_dev_features_defaults.py` covers absent and empty settings, and `test_verify_dev_features_execution.py` covers nextest and final. Each module restores a class-level private workspace and tool seed through `verify_dev_features_test_support.py` and the existing example-workspace fixture. The seed declares its supplied toolchain and 64 GiB build budget, keeping host Nix discovery and memory admission budgets outside feature composition. Tests still run the real Bash check, nextest and final routes and assert exact Cargo arguments; malformed-value variants retain the real embedded parser. Existing consumers of the support functions keep their original behavior.
 
+**Production lifecycle tests.** `test_production_lifecycle.py` restores a private Git origin, checkout and tool seed at the same paths for each test. `production_lifecycle_test_support.py` invokes the real lifecycle CLI in-process with its environment, working directory and import-time state restored for each call. Git pushes, rejection hooks, linked worktrees and external commands still run as real processes; a CLI parity case compares subprocess status and output. No production behavior, timing bound or original assertion is replaced.
+
 ## How it works
 
 ### The gate: `scripts/production/merge_gate.py`
