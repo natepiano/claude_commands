@@ -692,7 +692,7 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 
 **Ruled out:** at-most-once notices (a lost notice is worse than a repeated one); one receipt per release (the count grows without bound).
 
-### Phase 23 — Hold status names unsent release notices  · status: todo
+### Phase 23 — Hold status names unsent release notices  · status: done
 **Depends on:** Phase 22 (same file, `scripts/build_hold/build_hold.py`). Runs beside Phase 16 (no shared files). Merge `origin/builds` first.
 
 **Approved:** resources-unit 2026-10-30, follow-up of Phase 22 (architect review: status hides an unfinished release); builds showrunner told.
