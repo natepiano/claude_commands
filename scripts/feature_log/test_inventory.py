@@ -681,6 +681,48 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(same, listed)
         self.assertEqual(self.list_ids(self.cli(arguments + ["--limit", "0"])), [])
 
+    def test_an_interrupted_claim_can_be_resumed_released_and_reassigned_on_rerun(self) -> None:
+        _ = self.collect()
+        arguments = ["next", "--project", "cargo-liner", "--pool", "commits", "--kind", "commit",
+                     "--claim", "alpha", "--limit", "1"]
+        replace = os.replace
+
+        def stop_after_save(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+            replace(source, destination)
+            raise KeyboardInterrupt("stopped after saving claims")
+
+        with patch.object(os, "replace", side_effect=stop_after_save):
+            with self.assertRaises(KeyboardInterrupt):
+                _ = self.cli(arguments)
+        claimed = self.list_ids(self.cli(arguments))
+        self.assertEqual(claimed, ["cargo-liner:commit:" + self.base_sha])
+        self.assertEqual(self.record_after(claimed[0])["claim"], {"state": "claimed", "worker": "alpha"})
+        release = ["release", "--project", "cargo-liner", "--worker", "alpha"]
+        with patch.object(os, "replace", side_effect=stop_after_save):
+            with self.assertRaises(KeyboardInterrupt):
+                _ = self.cli(release)
+        self.assertEqual(self.cli(release), CliResult(0, "", ""))
+        self.assertEqual(self.record_after(claimed[0])["claim"], {"state": "unclaimed"})
+        reassigned = self.list_ids(self.cli([*arguments[:-3], "beta", "--limit", "1"]))
+        self.assertEqual(reassigned, claimed)
+        self.assertEqual(self.record_after(claimed[0])["claim"], {"state": "claimed", "worker": "beta"})
+
+    def test_release_only_clears_the_named_workers_undisposed_claims(self) -> None:
+        _ = self.collect()
+        arguments = ["next", "--project", "cargo-liner", "--pool", "commits", "--kind", "commit"]
+        claimed = self.list_ids(self.cli([*arguments, "--claim", "alpha", "--limit", "2"]))
+        other, = self.list_ids(self.cli([*arguments, "--claim", "beta", "--limit", "1"]))
+        self.assertEqual(self.cli(["mark", claimed[0], "--worker", "alpha", "--as", "internal",
+                                   "--reason", "Implementation work"]).status, 0)
+        result = self.cli(["release", "--project", "cargo-liner", "--worker", "alpha"])
+        self.assertEqual(result, CliResult(0, claimed[1] + "\n", ""))
+        self.assertEqual(self.record_after(claimed[0])["claim"], {"state": "claimed", "worker": "alpha"})
+        self.assertEqual(self.record_after(claimed[1])["claim"], {"state": "unclaimed"})
+        self.assertEqual(self.record_after(other)["claim"], {"state": "claimed", "worker": "beta"})
+        before = self.ledger_path().read_bytes()
+        self.assert_refusal(["release", "--project", "cargo-liner", "--worker", " "], "nonempty worker")
+        self.assertEqual(self.ledger_path().read_bytes(), before)
+
     def test_next_path_prefixes_are_a_union_and_sha_sources_match_none(self) -> None:
         _ = self.collect()
         arguments = ["next", "--project", "cargo-liner", "--pool", "structured", "--limit", "0"]
