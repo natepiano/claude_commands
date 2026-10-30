@@ -2738,52 +2738,13 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Depends on:** Phase 94c (order only)
 
-#### Work Order
+#### As-built
 
-**Goal:** Phase 94c made each account problem one line in the form `subject: what is wrong; cause; step`. Its merge still infers which symptom comes from which cause. Routed from the Phase 94c repair round 4 Astra review (`/tmp/claude/astra/20261029T204639Z-1214987/review.md`, items 2-6): a symptom names its source cause where the source is observed, and the merge never infers it.
-
-**Spec:**
-- Direct observations make a full cause identity: the fault, its account or home, and its exact file or object. A derived symptom carries an explicit reference to the direct cause that made it. The merge drops a derived symptom only when its referenced cause is present; an unlinked symptom stays visible. No fallback to kind, account or text.
-- Usage failures (`_bind_usage_cause`, `_read_failure_problem` in `scripts/accounts/accounts.py`): carry a source only when the usage producer knows it. A generic `ERROR` (for example HTTP 503: `claude_live`'s `urllib.error.HTTPError` branch, `scripts/whoami/agent_accounts.py:836`, maps every code but 401 and 429 to `ERROR`) and independent 401, 429 and stale-token failures stay their own lines. A home's startup failure and a shared login's service refusal stay separate.
-- Role availability (`_bind_role_cause`): "units is on claude2, which is not set up" binds to claude2's account-state cause. One line names the cause and lists the affected roles. Unmapped roles and an unavailable role map stay independent. Update `scripts/accounts/test_role_map.py:641`, which expects separate role lines (Assertion-Change).
-- A malformed or unreadable `.claude.json` gives no "mcpServers differ" line: `_mcp_server_names` keeps an unreadable result, and only two read configurations are compared.
-- Producer pairings, each proved by a test through the real producers, binding, merge and both renderers (terminal and `--json`): directory/identity checks to account state (malformed JSON, invalid `oauthAccount`, linked identity, inaccessible folder, ordinary logout); account note to unnoted-home advice to role note error; role selection to account availability (two roles on one missing account; roles on different accounts); Codex startup failure to usage unavailable (with a good reading elsewhere, and with a service refusal); test sign-in suppression (one test login in two homes, role note error, independent linked file); unnoted `~/.codex` and the legacy-home hint; duplicate login across inventory rows (both producers, reversed order, three homes). Each test asserts the full problem set. Tests do not build cause keys by hand to prove a pairing.
-- The mcpServers check compares each account with the settings Claude really reads for `~/.claude`, not a stale `~/.claude.json`. User, 2026-10-29: `~/.claude.json` lists `brp`, but `claude mcp list` in `~/.claude` shows no `brp`, so the board's four `mcpServers: - brp` lines were false alarms. Find the file Claude reads and test the comparison against it.
-- A failed status command loses no diagnostic (routed from Phase 94c; design review /tmp/claude/astra/20261030T012157Z-1453375/review.md). Phase 94c keeps raw held stderr through a read or render failure, but not the typed problems: a usage final-save failure followed by a render failure, or by a `group_accounts()` read failure, is lost. Rule: the command owns every observed diagnostic until output succeeds. Extend `StatusCommandWarnings` into `StatusDiagnostics`, owned before reading starts; register each typed problem and raw diagnostic when it is observed, before further work that can fail. Renderers take a snapshot. On failure: restore stderr; print the retained typed problems in collection order with the single-problem formatter; print the remaining raw diagnostics in capture order; print the final error last. Drop a raw counterpart only when its information was printed; keep unmatched raw text; do not print twice what a terminal already got; a later good save is not reported as unsaved. Claim and save warnings keep `warning.reason` (`usage_store_warning_line`, `scripts/whoami/agent_accounts.py:368`, drops it today). Tests: each diagnostic (cached map, stored map, usage claim failure, unrecovered per-read save failure, final-save failure) with a later read failure (injected after the diagnostic, before `_read_status` returns) and with a render failure, table and JSON. Assert empty stdout, the full subject, cause and time on stderr, and the final error last. Add mixed typed and raw warnings, renderer warnings, a recovered save, terminal delivery, and two commands in sequence (no repeat, no leak). Include the reported Codex case (good reading, `PermissionError` on the final save, render failure).
-- Keep each line's facts, times and commands; no other behavior changes.
-
-**Files:**
-- `scripts/accounts/accounts.py` — the source reference, the merge, the usage and role bindings, `_mcp_server_names`, `StatusDiagnostics`.
-- `scripts/whoami/agent_accounts.py` — claim and save warnings keep their reason.
-- `scripts/accounts/role_map.py` — read: `observed_map_provenance`, `cached_map_warning` (the raw counterpart of the cached-map problem); change only if its delivery needs a mark.
-- `scripts/accounts/test_accounts.py`, `scripts/accounts/test_role_map.py` — the pairing tests.
-- `scripts/whoami/test_agent_accounts.py` — the claim and finish store-error tests expect `warning.reason` (repair round 1).
-
-**Assertion-Change** (accepted at review pass 1; each follows the Spec):
-- `scripts/whoami/test_agent_accounts.py::SharedUsageReadTests::test_a_claim_store_error_still_returns_the_live_read` and `::test_a_finish_store_error_keeps_the_good_live_report` — the expected warning text gains its `warning.reason`.
-- `scripts/accounts/test_accounts.py::AccountsTests::test_exec_refuses_wrong_login_and_status_keeps_the_actual_identity` — the line form drops the `* ` prefix (94c line form).
-- `scripts/accounts/test_accounts.py` `assert_mcp_status_streams` (`test_piped_status_keeps_mcp_problem_in_table_and_json`, `test_piped_status_suppresses_nested_account_notes`, `test_terminal_status_keeps_nested_account_notes`), `test_status_detail_shows_unclassified_entries_and_mcp_difference`, `StatusProblemCauseTests::test_independent_configuration_problems_each_keep_their_repair` — the MCP baseline is the file Claude reads for `~/.claude`, and the step names it.
-- `scripts/accounts/test_accounts.py::AccountsTests::test_status_explains_empty_account_rows_in_the_table_and_json_without_login_addresses` — `check()` no longer carries the state source, so the test clears readiness problems instead; its assertions stay.
-- `scripts/accounts/test_accounts.py::PickerTests::test_unnoted_claude_home_is_displayed_but_never_selected_or_a_destination` and `::test_legacy_group_for_an_unnoted_home_is_display_only_and_cannot_launch` — the unnoted-home cause names its note path and the setup step.
-- `scripts/accounts/test_accounts.py::StatusProblemCauseTests::test_reserved_login_reports_the_test_file_and_write_time_without_account_steps` and `::test_unnoted_legacy_login_merges_read_failure_and_keeps_both_repairs` — an independent usage failure stays its own line.
-- `scripts/accounts/test_role_map.py::RoleMapTests::test_status_refuses_an_unavailable_remote_map_unless_stored` and `::test_stored_status_uses_cached_group_assignments_and_workers_instead_of_local_selections` — role availability binds to the account-state cause; observed account problems print before the final error.
-- Rejected: `StatusProblemCauseTests::test_duplicate_identity_keeps_independent_rate_limit_and_its_times` must still assert which accounts the one duplicate-login line names.
-- `scripts/accounts/test_accounts.py::StatusProblemCauseTests::test_account_state_merge_uses_the_cause_after_wording_changes` — its summary input carries an explicit source observed by readiness, since an unlinked summary no longer merges (repair round 1).
-- Rejected: `test_test_signin_with_malformed_or_unreadable_note_has_only_delete_advice` keeps a check that the real producer's diagnostic is an `UnreadableAccountNote`.
-
-**Workers:** 1 writer, no split.
-- `impl` — all files.
-
-**Constraints from prior phases:** Phase 94c's line form and test-login rules stay. Tests use a scratch `HOME`, `AGENT_NOTES_DIR` and Codex homes; never a live home, `~/.local/state`, usage stores, ssh or real sessions. Never run `accounts.py status` against the live home.
-- What 94c built (`scripts/accounts/accounts.py`): `StatusProblem(subject, wrong, cause: ProblemCause | NoSeparateCause, step: ProblemStep | NoUserStep, footnote, origin, state_source)`; `ProblemCause.key: ProblemCauseKey | OwnProblemCause`; `ProblemCauseKey(kind, account, location)`; `render_status_problem` is the one formatter; `merge_status_problems` (line 4488) drops a problem whose `state_source: ObservedStateCause` key is a direct cause, then keeps one per key and dedupes equal lines. `_bind_usage_cause` (4531) and `_bind_role_cause` (4548) still pick the cause by kind lists; this phase replaces them with source references. `StatusCommandWarnings` (4669) and `_status_command_warnings` hold raw stderr only; `read_status` (4685) redirects non-tty stderr and drops lines in `StatusReading.represented_stderr`; `main`'s status branch replays `read_stderr` on failure.
-- `check()` returns `AccountInspectionProblems`, a `list[str]` subclass that carries `state_source`, and `account_statuses` reads it by `isinstance`. Replace this side channel with the source reference: `account_statuses` takes the readiness value directly and `check()` returns a `list[str]` again (Type Design Contract).
-- brp moved to local (project) scope on 2026-10-28 in every natedev account home; the Mac was not changed (memory `brp-mcp-local-scope`). Top-level `mcpServers` is then not the comparison Claude makes.
-- Merge timing: no checkpoint merge during the natedev build hold, 00:05–03:05 EDT (showrunner, 2026-10-29). While any natedev build hold is in force, run no tests, gates or type checks unless this unit holds it; check `build_hold.py status` first.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/accounts -p 'test_*.py'` passes with a scratch HOME set before import (820 tests, about 2 minutes); `basedpyright` on the changed Python files reads `0 errors, 0 warnings, 0 notes`.
-
-**Gotchas:**
-- Attempts log `attempts-account-problem-merge` (memory): every round that set one key form for all producers failed; derived symptoms must carry their source.
+- `scripts/accounts/accounts.py`: a derived account problem carries a reference to the direct cause that made it; the merge drops it only when that cause is present, and an unlinked problem stays visible. No kind, account or text fallback.
+- Usage failures link to a cause only when the usage reader knows it; a generic error, 401, 429 and stale token keep their own lines. Roles on a missing account become one line that names the account cause and lists `affected roles:`.
+- An unreadable `.claude.json` gives no mcpServers line. The mcpServers check compares each account with `~/.claude.json` (the file Claude reads for `~/.claude`), project by project: global servers plus each project's own.
+- `StatusDiagnostics` owns every observed problem until output succeeds: on failure it prints the typed problems, then the remaining raw warnings, then the error. Store warnings keep `warning.reason` (`scripts/whoami/agent_accounts.py`). `check()` returns a plain list.
+- Tests: producer pairing tests in `test_accounts.py` and `test_role_map.py`; Assertion-Change lines in checkpoint b8c75d3c.
 
 ### Phase 96 — A stopped account setup, group move or wait is finished by its rerun  · status: todo
 
@@ -2836,38 +2797,13 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Depends on:** Phase 95 (order only)
 
-#### Work Order
+#### As-built
 
-**Goal:** Four markers are saved before the notice they stand for is sent, so a stop or a failed send leaves a marker that stops every retry. After this phase a marker means "sent", and a rerun sends what is owed. Rows from the rerun sweep (`~/.claude/docs/plans/sdlc-rerun-sweep.md`, two-accounts-unit; both files are the same at sdlc `097b1a0d` and `5ad6542f`).
-
-**Spec:**
-- **Five-hour warning (`five_hour.py:92`).** `watch` (`scripts/whoami/five_hour.py:47`) creates the marker `STATE/<key>.notice` with `open("x")` (line 92), then relays the Claude warning to each recipient (`relay`, line 105). A stop, or a relay that returns a problem, leaves the marker; later passes skip it at lines 94–95 until usage recovers. Change: the marker becomes sent only after every relay succeeds. While the relays run it is a claim, and a claim that its pass did not finish (stopped, or a relay failed) is retried by the next pass. Two concurrent passes still send at most once: the claim has an owner check or an expiry (rerun lens question 5). The Codex branch (no relay) keeps its marker as today.
-- **Cancel outgoing warnings (`five_hour.py:44`).** `cancel_outgoing_notices` (line 34) runs `send.py retire` per recipient and ignores the result, then deletes the notice file (line 44). A failed retire loses the only record of what to cancel. Change: delete the file only when every retire exits 0; keep it otherwise, so the next pass retries.
-- **Quiet alert (`codex_winddown.py:233`).** `announce_quiet` (`scripts/production/codex_winddown.py:226`) creates `STATE/QUIET` (line 233), then sends the reset alert. A failed send already removes the marker (lines 248–253); a stop between the touch and the send leaves it, and later counts return at lines 234–235. Change: the same claim-then-sent rule as the five-hour warning.
-- **At-zero notice (`codex_winddown.py:217`).** `refresh` (line 209) deletes a finished unit's projection (line 217) and saves it before it sends `AT_ZERO` (line 222); `broadcast.send` returns `""` when sent, else its error, and the result is ignored. Change: a finished unit's projection becomes a named owed state (for example `ZeroNoticeOwed`) that stays saved until its send returns `""`; a later count retries it.
-- No other behavior changes.
-
-**Files:**
-- `scripts/whoami/five_hour.py` — the claim and sent marker; the kept cancel file.
-- `scripts/production/codex_winddown.py` — the quiet claim; the owed at-zero state.
-- `scripts/whoami/test_five_hour.py`, `scripts/production/test_codex_winddown.py` — one stop-and-rerun test per row, and one failed-send test per send.
-
-**Assertion-Change** (accepted at review pass 1): `scripts/whoami/test_five_hour.py::WatchTests::test_a_low_window_tells_the_alert_list_once_without_a_phone_hold`, renamed `test_a_low_window_retries_failed_relays_without_a_phone_hold` — after a failed relay no sent marker exists and the next pass relays again; the retry relays only to the recipient that failed, so the send count is 3, not 4; the sent marker and the empty later pass are asserted after the successful retry. `WatchTests::test_no_reading_changes_nothing` — the relay succeeds, so the unchanged marker assertion is about a sent warning.
-
-**Repair round 1:** a retry relays only to the recipients that did not get the warning; a recipient that already got it gets no second copy.
-
-**Workers:** 2 writers, split by file (no file in both).
-- `impl` — `scripts/whoami/five_hour.py`, `scripts/whoami/test_five_hour.py`.
-- `test` opens as impl — `scripts/production/codex_winddown.py`, `scripts/production/test_codex_winddown.py`.
-
-**State:** `.notice` markers and the `QUIET` marker under each script's `STATE` folder; the wind-down projections file (scratch folders in tests).
-
-**Constraints from prior phases:**
-- Tests use scratch state folders set before import and stub `relay`, `broadcast.send` and the `send.py retire` subprocess; they never send a real message or touch a live home, `~/.local/state`, ssh, herdr or real sessions.
-- Stop model: patch the call right after the named line to raise a test-local `class Killed(BaseException)`; catch it; run the same pass again with no patch; assert the notice is sent once and the marker then reads sent. A failed-send test asserts the next pass sends again.
-- Merge timing: no checkpoint merge during the natedev build hold, 00:05–03:05 EDT (showrunner, 2026-10-29). While any natedev build hold is in force, run no tests, gates or type checks unless this unit holds it; check `build_hold.py status` first.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/whoami -p 'test_*.py'` and the same for `scripts/production` pass; `basedpyright` on the changed Python files reads `0 errors, 0 warnings, 0 notes`; each stop-and-rerun test fails on the code before the change.
+- `scripts/whoami/five_hour.py`: the five-hour warning is a claim while it relays and becomes sent only when every recipient got it. A delivery record keeps the recipients that got it, so a retry relays only to the rest.
+- Recovery saves an ended spell before it removes the marker or the record, so an old record never serves a new low spell. The cancel file is deleted only when every retire succeeds.
+- `scripts/production/codex_winddown.py`: the quiet alert uses a generation that each running count bumps, so a pass that read an older count never writes sent. A finished unit's zero notice is the owed state `ZeroNoticeOwed` until its send succeeds; a finished resumed group stays finished.
+- A zero-count pass skips each unit that a newer pass changed (projection re-read under the lock), and the owed notice is checked again before it is sent.
+- Tests: `test_five_hour.py` (retry per recipient; Assertion-Change on the renamed low-window test, send count 3), `test_codex_winddown.py` (stop-and-rerun, stale-pass cases).
 
 ### Phase 99 — A stopped `down` or `now` is finished by its rerun  · status: todo
 
