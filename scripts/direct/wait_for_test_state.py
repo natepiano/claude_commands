@@ -13,7 +13,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.direct.local_release_wait import IntervalReleasePolling, local_release_waiter
-from scripts.direct.recorder_fixture import TEST_HANG_GUARD_SECS
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 def wait_until(ready: Callable[[], bool], directory: Path, timeout: float = TEST_HANG_GUARD_SECS,

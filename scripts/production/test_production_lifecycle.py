@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import contextlib
+from dataclasses import replace
 import io
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -18,7 +20,7 @@ from production_units import read_production
 from fake_unit_host import HostedUnit
 
 
-from scripts.production import production_doc
+from scripts.production import production_doc, staff
 from scripts.production.production_lifecycle_test_support import LifecycleFixture, SCRIPT
 
 
@@ -47,6 +49,163 @@ class ProductionNameTests(unittest.TestCase):
 
 @final
 class LifecycleTests(LifecycleFixture):
+    def staff_tree(self) -> tuple[staff.StaffRow, staff.StaffRow, staff.StaffRow, staff.StaffRow]:
+        self.merged_units()
+        self.write(self.state / "notifier/showrunner-example/conf",
+                   f"TARGET=session:example-session\nCHECK=zsh /x/production_check.sh {self.doc}\n")
+        top = staff.ensure("showrunner", name="top")
+        runner = staff.ensure("showrunner", name="old-showrunner", parent=top.id)
+        alpha = staff.ensure("unit", name="alpha", parent=runner.id)
+        beta = staff.ensure("unit", name="beta", parent=runner.id)
+        child = staff.ensure("showrunner", name="kid", parent=runner.id)
+        for slug in ("top", "kid"):
+            self.showrunner(slug, live=slug == "top")
+        _ = self.reports_to("example", "top")
+        _ = self.reports_to("kid", "example")
+        return runner, alpha, beta, child
+
+    def finish_interrupted_wrap(self, retire_showrunner: bool) -> None:
+        runner, alpha, beta, child = self.staff_tree()
+        target = runner.id if retire_showrunner else alpha.id
+        original = staff.retire
+        def interrupted(staff_id: staff.StaffId) -> staff.StaffRow | None:
+            row = original(staff_id)
+            if staff_id == target:
+                raise OSError("stopped after staff retirement")
+            return row
+        with mock.patch.object(staff, "retire", side_effect=interrupted):
+            first = self.run_lifecycle("wrap", "--no-ci")
+        self.assertEqual(first.returncode, 2, first.stdout + first.stderr)
+        self.assertTrue((self.state / "showrunner/example/wrap_release.json").exists())
+        with mock.patch.object(showrunners, "edges_to_release", side_effect=AssertionError("capture read twice")):
+            result = self.run_lifecycle("wrap", "--no-ci")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for row in (runner, alpha, beta):
+            self.assertIsNone(staff.by_id(row.id))
+        self.assertEqual(staff.by_id(child.id), replace(child, parent=None))
+        self.assertEqual(len(self.sent()), 1)
+        data, document = self.staff.staff_file.read_bytes(), self.doc.read_bytes()
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.staff.staff_file.read_bytes(), self.doc.read_bytes()), (data, document))
+        self.assertEqual(len(self.sent()), 1)
+
+    def test_wrap_rerun(self) -> None:
+        self.finish_interrupted_wrap(False)
+
+    def test_wrap_rerun_after_showrunner_retirement_keeps_the_release_capture(self) -> None:
+        self.finish_interrupted_wrap(True)
+
+    def test_wrap_with_workers_retires_pending_ids_on_an_already_wrapped_retry(self) -> None:
+        runner, alpha, beta, child = self.staff_tree()
+        worker = staff.ensure("worker", name="impl1", parent=alpha.id)
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(worker.id, result.stdout)
+        self.assertEqual(staff.by_id(alpha.id), alpha)
+        self.assertEqual(staff.by_id(worker.id), worker)
+        self.assertIsNone(staff.by_id(beta.id))
+        self.assertEqual(staff.by_id(child.id), replace(child, parent=None))
+        self.assertEqual(staff.snapshot().pending_retire, tuple(sorted((runner.id, alpha.id))))
+        self.assertIn("wrapped", self.doc.read_text())
+        _ = staff.retire(worker.id)
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIsNone(staff.by_id(alpha.id))
+        self.assertIsNone(staff.by_id(runner.id))
+        self.assertEqual(staff.snapshot().pending_retire, ())
+
+    def permanent_staff_tree(self) -> tuple[staff.StaffRow, staff.StaffRow, staff.StaffRow, staff.StaffRow, staff.StaffRow]:
+        runner, alpha, beta, child = self.staff_tree()
+        permanent = staff.ensure("unit", name="nightly", parent=runner.id)
+        text = self.doc.read_text().replace("## Close-out", "| nightly-unit | permanent | /not-here | nightly | — | — | — |\n\n## Close-out")
+        self.write(self.doc, text)
+        _ = self.git("add", str(self.doc))
+        _ = self.git("commit", "-m", "record permanent unit")
+        return runner, alpha, beta, child, permanent
+
+    def test_permanent_wrap_keeps_unit_and_showrunner_but_roots_every_showrunner_edge(self) -> None:
+        runner, alpha, beta, child, permanent = self.permanent_staff_tree()
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(permanent.name, result.stdout)
+        self.assertIn(runner.name, result.stdout)
+        self.assertEqual(staff.by_id(permanent.id), permanent)
+        self.assertIsNone(staff.by_id(alpha.id))
+        self.assertIsNone(staff.by_id(beta.id))
+        self.assertEqual(staff.by_id(runner.id), replace(runner, parent=None))
+        self.assertEqual(staff.by_id(child.id), replace(child, parent=None))
+        self.assertEqual(staff.snapshot().pending_retire, ())
+
+    def test_permanent_wrap_rerun_reads_the_capture_after_unit_retirement(self) -> None:
+        runner, alpha, beta, child, permanent = self.permanent_staff_tree()
+        original = staff.retire
+        def interrupted(staff_id: staff.StaffId) -> staff.StaffRow | None:
+            row = original(staff_id)
+            if staff_id == alpha.id:
+                raise OSError("stopped after staff retirement")
+            return row
+        with mock.patch.object(staff, "retire", side_effect=interrupted):
+            first = self.run_lifecycle("wrap", "--no-ci")
+        self.assertEqual(first.returncode, 2, first.stdout + first.stderr)
+        with mock.patch.object(showrunners, "edges_to_release", side_effect=AssertionError("capture read twice")):
+            result = self.run_lifecycle("wrap", "--no-ci")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(staff.by_id(permanent.id), permanent)
+        self.assertEqual(staff.by_id(runner.id), replace(runner, parent=None))
+        self.assertEqual(staff.by_id(child.id), replace(child, parent=None))
+        self.assertIsNone(staff.by_id(beta.id))
+        self.assertEqual(len(self.sent()), 1)
+        before = self.staff.staff_file.read_bytes(), self.doc.read_bytes()
+        self.assertEqual(self.run_lifecycle("wrap", "--no-ci").returncode, 0)
+        self.assertEqual((self.staff.staff_file.read_bytes(), self.doc.read_bytes()), before)
+        self.assertEqual(len(self.sent()), 1)
+
+    def test_wrap_release_retry_does_not_repeat_a_persisted_notice(self) -> None:
+        self.assert_release_notice_retry(reported_failure=False)
+
+    def test_wrap_release_keeps_failed_delivery_out_of_the_capture(self) -> None:
+        self.assert_release_notice_retry(reported_failure=True)
+
+    def test_wrap_uses_delivery_status_even_when_the_line_has_no_failure_prefix(self) -> None:
+        _ = self.staff_tree()
+        with (mock.patch.dict(os.environ, self.env),
+              mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", self.state / "showrunner"),
+              mock.patch.object(showrunners, "tell_others",
+                                return_value=showrunners.NoticeDelivery(("delivery unavailable",), failed=("top",))),
+              contextlib.redirect_stdout(io.StringIO())):
+            _ = production_lifecycle.capture_release("example")
+            with self.assertRaisesRegex(production_lifecycle.LifecycleStop, "delivery unavailable"):
+                production_lifecycle.release_edges("example")
+            self.assertEqual(production_lifecycle.capture_release("example").told, ())
+
+    def assert_release_notice_retry(self, *, reported_failure: bool) -> None:
+        _ = self.staff_tree()
+        calls: list[str] = []
+        def tell(texts: dict[str, str], key: str) -> showrunners.NoticeDelivery:
+            target, = texts
+            self.assertEqual(key, f"showrunner-tree:{'example' if target == 'top' else target}")
+            calls.append(target)
+            if target == "kid" and calls.count("kid") == 1:
+                if reported_failure:
+                    return showrunners.NoticeDelivery(("could not tell kid: unavailable",), failed=("kid",))
+                raise OSError("second notice failed")
+            return showrunners.NoticeDelivery((f"told {target}",))
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(
+                showrunners, "SHOWRUNNER_STATE_DIR", self.state / "showrunner"), mock.patch.object(
+                showrunners, "tell_others", side_effect=tell), contextlib.redirect_stdout(io.StringIO()):
+            _ = production_lifecycle.capture_release("example")
+            error = production_lifecycle.LifecycleStop if reported_failure else OSError
+            reason = "could not tell kid: unavailable" if reported_failure else "second notice failed"
+            with self.assertRaisesRegex(error, reason):
+                production_lifecycle.release_edges("example")
+            self.assertEqual(production_lifecycle.capture_release("example").told, ("top",))
+            production_lifecycle.release_edges("example")
+            production_lifecycle.release_edges("example")
+        self.assertEqual(calls, ["top", "kid", "kid"])
+        self.assertFalse((self.state / "showrunner/example/parent").exists())
+        self.assertFalse((self.state / "showrunner/kid/parent").exists())
+
     def test_in_process_cli_matches_process_output_and_status(self) -> None:
         for arguments in (("load", "--no-ci", "--resume"), ("wrap", "--no-ci"),
                           ("promote-main", "--no-ci", "--ci-green", "abc")):
@@ -432,10 +591,10 @@ class LifecycleTests(LifecycleFixture):
         with (mock.patch.object(showrunners, "stored_children", return_value=("kid",)),
               mock.patch.object(showrunners, "registered_showrunners", return_value=[child]),
               mock.patch.object(showrunners, "detach") as detach,
-              mock.patch.object(showrunners, "tell_others", return_value=[]) as tell,
+              mock.patch.object(showrunners, "tell_others", return_value=showrunners.NoticeDelivery()) as tell,
               contextlib.redirect_stdout(io.StringIO())):
             with self.assertRaises(production_lifecycle.LifecycleStop) as stopped:
-                production_lifecycle.wrap(production, self.doc.read_text().splitlines(), True,
+                _ = production_lifecycle.wrap(production, self.doc.read_text().splitlines(), True,
                                           production_lifecycle.VerdictMissing(),
                                           production_lifecycle.VerdictMissing(), ())
             detach.assert_not_called()

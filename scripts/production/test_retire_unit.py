@@ -29,7 +29,7 @@ import unit_lookup
 import unit_move
 from herdr import HerdrPlace
 from production_units import Production, read_production
-from scripts.production.unit_operation_test_support import PaneShellFixture, assert_pane_shell_refused
+from scripts.production.fake_unit_host import PaneShellFixture, stopped_record
 
 if TYPE_CHECKING:
     from scripts.message import sessions
@@ -41,6 +41,9 @@ else:
     import shutdown_record
     import sessions
     from sessions import SessionRecord
+
+from scripts.production.staff_test_support import StaffTestCase
+from scripts.production import staff
 
 DIRECTOR = "11111111-1111-1111-1111-111111111111"
 # The fixture replaces the lookup; a test of the lookup itself puts it back.
@@ -64,6 +67,7 @@ def session(session_id: str, name: str, pid: int) -> SessionRecord:
 
 @final
 class RetireUnitTests(unittest.TestCase):
+    staff: StaffTestCase = StaffTestCase()
     root: Path = Path()
     checkout: Path = Path()
     worktree: Path = Path()
@@ -78,6 +82,9 @@ class RetireUnitTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.staff = StaffTestCase()
+        self.staff.setUp()
+        self.addCleanup(self.staff.doCleanups)
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         origin = self.root / "origin.git"
         _ = subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
@@ -122,6 +129,9 @@ class RetireUnitTests(unittest.TestCase):
         self.records = []
         self.claude = [session(DIRECTOR, "alpha", 4101), session(SEAT, "alpha-seat", 4102)]
         self.pool_lines = "code-1\tcode\talpha-unit:1\tidle\t3\ncode-2\tcode\tbeta-unit:1\tidle\t1\n"
+        self.staff.register_production("alpha", self.doc)
+        parent = staff.ensure("showrunner", name="alpha")
+        _ = staff.ensure("unit", name="alpha", parent=parent.id)
         production = read_production(self.doc)
 
         def production_of(_slug: str) -> Production:
@@ -210,24 +220,126 @@ class RetireUnitTests(unittest.TestCase):
     def stops(self) -> list[list[str]]:
         return [call for call in self.calls if call[:2] != ["review_pool.py", "status"]]
 
-    def pane_shell_refused(self, *, live: bool) -> None:
-        pane = PaneShellFixture(self, self.worktree, self.root / "pane-proc", live=live, slug="alpha")
-
-        def invoke() -> subprocess.CompletedProcess[str]:
+    def pane_shell_completes(self, *, live: bool) -> None:
+        pane = PaneShellFixture(self, self.worktree, self.root / "proc", live=live, slug="alpha")
+        pane.found = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.LiveClaude(
+            "alpha", DIRECTOR, "socket", pane.director) if live else unit_lookup.ClaudeNotRunning(), pane.place)
+        saved = stopped_record(self.root, self.worktree)
+        saved["session"]["session_id"] = DIRECTOR
+        host = saved["session"]["host"]
+        assert host["kind"] == "unit"
+        self.records = []
+        self.claude = [session(DIRECTOR,"alpha",pane.director)] if live else []
+        self.enterContext(mock.patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / "shutdown")}))
+        def clean_stop() -> None:
+            pane.stopped()
+            self.claude = []
+            self.assertTrue(shutdown_record.create_session(saved))
+            self.records = [saved]
+        original = self.fake_run
+        def run(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+            result = original(argv,cwd)
+            if str(retire_unit.SHUTDOWN) in argv and "down" in argv:
+                clean_stop()
+            return result
+        if not live:
+            clean_stop()
+        with mock.patch.object(retire_unit, "run", side_effect=run):
             code, output = self.retire("--wait-minutes", "0")
-            return subprocess.CompletedProcess(["retire"], code, output, "")
+        self.assertEqual(code, 0, output)
+        self.assertEqual(pane.close_calls(), [["--session","agents","pane","close","w1:p1"]])
+        self.assertFalse(self.worktree.exists())
+        self.assertIn("retired", self.doc.read_text())
+        self.assertEqual(sum(call[:2] == ["shutdown.py","down"] for call in self.calls), int(live))
 
-        before = self.doc.read_bytes()
-        assert_pane_shell_refused(self, pane, invoke)
-        self.assertEqual(self.calls, [], "preflight must not run any shutdown or cleanup command")
-        self.assertEqual(self.doc.read_bytes(), before)
-        self.assertTrue(self.worktree.is_dir())
+    def test_live_director_in_pane_shell_stops_closes_and_retires(self) -> None:
+        self.pane_shell_completes(live=True)
 
-    def test_live_director_in_pane_shell_refuses_before_stop(self) -> None:
-        self.pane_shell_refused(live=True)
+    def staff_unit(self) -> tuple[staff.StaffRow, staff.StaffRow]:
+        runner = staff.ensure("showrunner", name="tools")
+        unit = staff.ensure("unit", name="panes", parent=runner.id)
+        self.staff.pane("w1:p1", session_id=DIRECTOR, environment={
+            "STAFF_ID": unit.id, "SHOWRUNNER_UNIT": "alpha", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
+        return runner, unit
 
-    def test_exited_directors_pane_shell_refuses_before_stop(self) -> None:
-        self.pane_shell_refused(live=False)
+    def test_retire_unit_keeps_staff_workers_and_reports_each_one(self) -> None:
+        runner, unit = self.staff_unit()
+        worker = staff.ensure("worker", name="impl1", parent=unit.id)
+        code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertIn(worker.id, output)
+        self.assertIn(worker.name, output)
+        self.assertEqual(staff.by_id(unit.id), unit)
+        self.assertEqual(staff.by_id(worker.id), worker)
+        self.assertEqual(staff.by_id(runner.id), runner)
+        self.assertFalse(self.worktree.exists())
+
+    def test_retire_unit_rerun(self) -> None:
+        runner, unit = self.staff_unit()
+        original = staff.retire
+        for after in (False, True):
+            def interrupted(staff_id: staff.StaffId) -> staff.StaffRow | None:
+                if after:
+                    _ = original(staff_id)
+                raise RuntimeError("stopped at staff retirement")
+            with mock.patch.object(staff, "retire", side_effect=interrupted):
+                with self.assertRaisesRegex(RuntimeError, "stopped at staff retirement"):
+                    _ = self.retire()
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertIsNone(staff.by_id(unit.id))
+        self.assertEqual(staff.by_id(runner.id), runner)
+        data, document = self.staff.staff_file.read_bytes(), self.doc.read_bytes()
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertEqual((self.staff.staff_file.read_bytes(), self.doc.read_bytes()), (data, document))
+
+    def test_exited_directors_pane_shell_closes_and_retires(self) -> None:
+        self.pane_shell_completes(live=False)
+
+    def test_unowned_cwd_visitor_or_other_units_shell_blocks_without_signals(self) -> None:
+        for marked_pane in (False,True):
+            for visitor_unit in ("", "beta-unit"):
+                with self.subTest(marked_pane=marked_pane, visitor_unit=visitor_unit):
+                    self.claude = []
+                    self.marked = None
+                    unit = retire_unit.find_unit("alpha", "alpha")
+                    self.records = []
+                    pane = PaneShellFixture(self, self.worktree, self.root / "visitor-proc", live=False, slug="alpha")
+                    pane.add_occupant(991551, unit=visitor_unit, marked=bool(visitor_unit))
+                    if not marked_pane:
+                        pane.found = None
+                    before = self.doc.read_bytes()
+                    with (mock.patch.object(retire_unit, "terminate", return_value=[]) as signals,
+                          mock.patch.object(retire_unit, "_alive", return_value=True)):
+                        remaining = retire_unit.gather(unit)
+                        left = retire_unit.stop_rest(unit, remaining)
+                    self.assertTrue(any("991551" in line for line in left), left)
+                    self.assertFalse(any(991551 in call.args[0] for call in signals.call_args_list), "cwd is no stop authority")
+                    self.assertEqual(self.doc.read_bytes(), before)
+                    self.assertTrue(self.worktree.is_dir())
+                    self.assertEqual(pane.close_calls(), [])
+                    with mock.patch.object(retire_unit, "terminate", return_value=[]) as signals:
+                        code, output = self.retire("--wait-minutes", "0")
+                    self.assertEqual(code, 1, output)
+                    self.assertFalse(any(991551 in call.args[0] for call in signals.call_args_list))
+                    self.assertEqual(self.doc.read_bytes(), before)
+                    self.assertTrue(self.worktree.is_dir())
+                    self.assertEqual(pane.close_calls(), [])
+
+    def test_registered_claude_in_the_checkout_is_not_owned_by_cwd(self) -> None:
+        visitor = session("33333333-3333-3333-3333-333333333333", "visitor", 991551)
+        with (mock.patch.object(sessions, "live_sessions", return_value=[visitor]),
+              mock.patch.object(unit_move, "processes_inside", return_value=[991551])):
+            self.assertEqual(CLAUDE_SESSIONS(self.worktree, frozenset()), ())
+
+    def test_process_gone_after_owned_cleanup_does_not_remain_a_cwd_blocker(self) -> None:
+        unit = retire_unit.find_unit("alpha", "alpha")
+        found = retire_unit.Found((), (), (), (), (), (), (991551,))
+        with (mock.patch.object(unit_move, "processes_inside", return_value=[]),
+              mock.patch.object(retire_unit, "terminate", return_value=[]) as signals):
+            self.assertEqual(retire_unit.stop_rest(unit, found), [])
+        self.assertFalse(any(991551 in call.args[0] for call in signals.call_args_list))
 
     def test_refuses_uncommitted_work_and_an_unmerged_checkpoint_and_changes_nothing(self) -> None:
         _ = (self.worktree / "late.txt").write_text("late\n", encoding="utf-8")
