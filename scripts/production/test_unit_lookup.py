@@ -9,7 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import override
+from typing import cast, override
 from unittest import mock
 
 # Hang guards allow for load 136 on natedev (2026-10-29).
@@ -22,6 +22,7 @@ import fake_unit_host
 import showrunners
 import unit_lookup
 import herdr
+import sessions
 from fake_herdr import herdr_listener
 from fake_unit_host import HostedUnit
 from sessions import SessionRecord
@@ -88,17 +89,22 @@ class UnitLookupTests(unittest.TestCase):
         self.process(os.getpid(), 991000, ["claude"], HERDR_PANE_ID=pane,
                      SHOWRUNNER_UNIT="show", SHOWRUNNER_UNIT_ID=unit)
 
-    def claude(self, name: str, pane: str, *, updated: int = 1, session_id: str = "") -> None:
+    def claude(self, name: str, pane: str, *, updated: int = 1, session_id: str = "", pid: int | None = None) -> None:
         """Record a live Claude in `pane`: this test process stands in for it."""
+        pid = os.getpid() if pid is None else pid
         if pane:
-            fake_unit_host.place_process(self.environment, os.getpid(), pane)
+            fake_unit_host.place_process(self.environment, pid, pane)
         path = Path(self.enterContext(short_socket_directory())) / f"{name}-{updated}.sock"
         held = socket.socket(socket.AF_UNIX)
         held.bind(str(path))
         self.addCleanup(held.close)
         _ = (self.records / f"{name}-{updated}.json").write_text(json.dumps({
-            "pid": os.getpid(), "sessionId": session_id or f"id-{name}", "name": name,
+            "pid": pid, "sessionId": session_id or f"id-{name}", "name": name,
             "messagingSocketPath": str(path), "updatedAt": updated, "tmux": f"label-at-start:@1.{pane}" if pane else ""}))
+
+    def live_hosts(self, *panes: str) -> None:
+        for pane in panes:
+            self.claude(pane, pane, pid=fake_unit_host.live_pid(self))
 
     def run_script(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         environment = self.environment
@@ -134,14 +140,49 @@ class UnitLookupTests(unittest.TestCase):
                 self.assertEqual(listed.stdout.split("\t")[:6],
                                  ["trunk-unit", "herdr:still-old:w4:p1", "still-old", "live", "still-old", "id-still-old"])
 
+    def test_grouping_resolves_former_slugs_without_discovering_processes(self) -> None:
+        self.renamed_production()
+        unit = unit_lookup.MarkedUnit("trunk-unit", LiveClaude("report", "report-id", "/fixture.sock", 123),
+                                      herdr.HerdrPlace("old-pane", "w4:p1"))
+        with mock.patch.object(herdr, "herdr_processes", side_effect=AssertionError("no process scan")) as scan:
+            found = unit_lookup.group_marked_units(iter([("old", unit)]))
+        self.assertEqual(found.units, {"new": {"trunk-unit": unit}})
+        self.assertEqual(found.faults, {})
+        scan.assert_not_called()
+
+    def test_grouping_reports_duplicate_alias_marks_and_retains_unambiguous_units(self) -> None:
+        self.renamed_production()
+        before = unit_lookup.MarkedUnit("trunk-unit", LiveClaude("before", "before-id", "/before.sock", 123),
+                                        herdr.HerdrPlace("before", "w4:p1"))
+        after = unit_lookup.MarkedUnit("trunk-unit", LiveClaude("after", "after-id", "/after.sock", 124),
+                                       herdr.HerdrPlace("after", "w5:p1"))
+        other = unit_lookup.MarkedUnit("other-unit", ClaudeNotRunning(), herdr.HerdrPlace("other", "w6:p1"))
+        found = unit_lookup.group_marked_units([("old", before), ("new", after), ("new", other)])
+        self.assertEqual(found.units, {"new": {"other-unit": other}})
+        holders = "pid 123 (claude) in herdr:before:w4:p1 and pid 124 (claude) in herdr:after:w5:p1"
+        self.assertEqual(found.faults, {
+            "new": {"trunk-unit": f"trunk-unit: its mark is on herdr sessions {holders}"},
+        })
+
+    def test_grouping_prefers_live_claude_over_inherited_child_marks(self) -> None:
+        self.renamed_production()
+        director = unit_lookup.MarkedUnit("trunk-unit", LiveClaude("report", "report-id", "/report.sock", 123),
+                                          herdr.HerdrPlace("director", "w4:p1"))
+        detached = unit_lookup.MarkedUnit("trunk-unit", ClaudeNotRunning(), herdr.HerdrPlace("build", "w5:p1"))
+        found = unit_lookup.group_marked_units([("old", detached), ("new", director)])
+        self.assertEqual(found.units, {"new": {"trunk-unit": director}})
+        self.assertEqual(found.faults, {})
+
 
     def test_former_and_current_marks_cannot_hide_duplicate_unit_sessions(self) -> None:
         self.renamed_production()
         self.hosts({"$1": marked("before", "w4:p1", "trunk-unit", slug="old"),
                                      "$2": marked("after", "w5:p1", "trunk-unit", slug="new")})
+        self.live_hosts("w4:p1", "w5:p1")
         found = unit_lookup.every_marked_unit()
         self.assertEqual(found.units, {"new": {}})
-        self.assertEqual(found.faults["new"]["trunk-unit"], "trunk-unit: its mark is on herdr sessions after and before")
+        self.assertIn("herdr:after:w5:p1", found.faults["new"]["trunk-unit"])
+        self.assertIn("herdr:before:w4:p1", found.faults["new"]["trunk-unit"])
         for slug in ("old", "new"):
             with self.subTest(slug=slug):
                 with self.assertRaisesRegex(OSError, "trunk-unit: its mark is on herdr sessions"):
@@ -160,6 +201,7 @@ class UnitLookupTests(unittest.TestCase):
             "$2": marked("second", "w5:p1", "second-unit", slug="old"),
             "$3": marked("third", "w6:p1", "third-unit", slug="old"),
         })
+        self.live_hosts("w4:p1", "w5:p1", "w6:p1")
         with mock.patch.object(showrunners, "checked_doc", wraps=showrunners.checked_doc) as reads:
             for expected_reads in (1, 2):
                 found = unit_lookup.every_marked_unit()
@@ -169,6 +211,7 @@ class UnitLookupTests(unittest.TestCase):
     def test_current_production_discovery_keeps_an_existing_timer_read_budget(self) -> None:
         self.renamed_production()
         self.hosts({"$1": marked("current", "w4:p1", "trunk-unit", slug="new")})
+        self.claude("current", "w4:p1")
         with mock.patch.object(showrunners, "checked_doc", wraps=showrunners.checked_doc) as reads:
             checked = showrunners.checked_doc(self.root / "notifier/showrunner-new")
             self.assertIsInstance(checked, showrunners.CheckedDoc)
@@ -179,6 +222,7 @@ class UnitLookupTests(unittest.TestCase):
     def test_current_production_lookup_does_not_read_timer_docs(self) -> None:
         self.renamed_production()
         self.hosts({"$1": marked("current", "w4:p1", "trunk-unit", slug="new")})
+        self.claude("current", "w4:p1")
         with mock.patch.object(showrunners, "checked_doc", wraps=showrunners.checked_doc) as reads:
             found = unit_lookup.marked_units("new")
             self.assertEqual(found["trunk-unit"].place, herdr.HerdrPlace("current", "w4:p1"))
@@ -187,6 +231,7 @@ class UnitLookupTests(unittest.TestCase):
     def test_herdr_marks_are_grouped_under_the_current_production(self) -> None:
         self.renamed_production()
         self.herdr_session()
+        self.claude("current", "")
         environment = self.root / "proc" / str(os.getpid()) / "environ"
         _ = environment.write_bytes(b"HERDR_PANE_ID=w1:p1\0SHOWRUNNER_UNIT=old\0SHOWRUNNER_UNIT_ID=trunk-unit")
         self.assertEqual(list(unit_lookup.every_marked_unit().units), ["new"])
@@ -269,9 +314,23 @@ class UnitLookupTests(unittest.TestCase):
 
     def test_two_sessions_carrying_one_units_mark_are_an_error(self) -> None:
         self.hosts({"$1": marked("trunk", "w4:p1", "trunk-unit"), "$2": marked("copy", "w5:p1", "trunk-unit")})
-        with self.assertRaisesRegex(OSError, "trunk-unit: its mark is on herdr sessions"):
+        self.live_hosts("w4:p1", "w5:p1")
+        with self.assertRaisesRegex(OSError, "trunk-unit: its mark is on herdr sessions") as caught:
             _ = unit_lookup.marked_units("show")
+        for process in herdr.herdr_processes():
+            if process.command == "claude":
+                self.assertIn(f"pid {process.pid} (claude) in {unit_lookup.place_text(process.place)}", str(caught.exception))
 
+
+    def test_two_live_claudes_with_the_same_mark_in_one_pane_are_an_error(self) -> None:
+        self.hosts({"trunk": marked("trunk", "w4:p1", "trunk-unit")})
+        self.claude("first", "w4:p1")
+        pid = fake_unit_host.live_pid(self)
+        self.claude("second", "w4:p1", pid=pid, updated=2)
+        with self.assertRaisesRegex(OSError, "trunk-unit: its mark is on") as caught:
+            _ = unit_lookup.marked_units("show")
+        for holder in (os.getpid(), pid):
+            self.assertIn(f"pid {holder} (claude) in herdr:trunk:w4:p1", str(caught.exception))
 
     def test_the_command_prints_the_pane_and_tells_absent_from_cannot_tell(self) -> None:
         self.hosts({"$1": marked("trunk", "w4:p1", "trunk-unit")})
@@ -341,6 +400,7 @@ class UnitLookupTests(unittest.TestCase):
 
     def test_discovery_needs_only_herdr_when_path_has_no_session_tools(self) -> None:
         self.herdr_session()
+        self.claude("current", "")
         run = subprocess.run
         with mock.patch("shutil.which", return_value=None), mock.patch.object(subprocess, "run", wraps=run) as commands:
             found = unit_lookup.every_marked_unit()
@@ -364,6 +424,67 @@ class UnitLookupTests(unittest.TestCase):
         self.assertEqual(unit.place, herdr.HerdrPlace("agents", "w2:pS"))
         self.assertIsInstance(unit.claude, LiveClaude)
 
+    def test_leftover_marks_after_a_move_are_not_unit_sessions(self) -> None:
+        self.hosts({"old": marked("old", "w3:p3Y", "old-unit", slug="former"),
+                    "new": marked("new", "w4:p1", "new-unit")})
+        self.claude("new", "w4:p1")
+        for pid, argv in ((991030, ["python3", "-m", "unittest"]),
+                          (991031, ["cargo", "test"]), (991032, ["codex", "app-server"])):
+            self.process(pid, 991000, argv, HERDR_PANE_ID="w3:p3Y",
+                         SHOWRUNNER_UNIT="former", SHOWRUNNER_UNIT_ID="old-unit")
+        found = unit_lookup.every_marked_unit()
+        self.assertEqual(found.faults, {})
+        self.assertEqual({slug: list(units) for slug, units in found.units.items()},
+                         {"former": ["old-unit"], "show": ["new-unit"]})
+        self.assertIsInstance(found.units["former"]["old-unit"].claude, ClaudeNotRunning)
+        self.assertIsInstance(found.units["show"]["new-unit"].claude, LiveClaude)
+
+    def test_shell_marks_cannot_borrow_an_unmarked_claude_in_the_same_pane(self) -> None:
+        self.hosts({"old": marked("old", "w4:p1", "old-unit")})
+        self.claude("unmarked", "w4:p1")
+        _ = (self.root / "proc" / str(os.getpid()) / "environ").write_bytes(b"HERDR_PANE_ID=w4:p1")
+        found = unit_lookup.marked_units("show")["old-unit"]
+        self.assertIsInstance(found.claude, ClaudeNotRunning)
+        self.assertEqual(found.place, herdr.HerdrPlace("old", "w4:p1"))
+
+    def test_exited_claude_leaves_its_shell_pane_available_for_recovery(self) -> None:
+        self.hosts({"trunk": marked("trunk", "w4:p1", "trunk-unit")})
+        self.claude("trunk", "w4:p1")
+        self.assertIsInstance(unit_lookup.marked_units("show")["trunk-unit"].claude, LiveClaude)
+        (self.records / "trunk-1.json").unlink()
+        found = unit_lookup.marked_units("show")["trunk-unit"]
+        self.assertIsInstance(found.claude, ClaudeNotRunning)
+        self.assertEqual(found.place, herdr.HerdrPlace("trunk", "w4:p1"))
+
+    def test_live_claude_wins_over_leftover_marks_on_another_pane(self) -> None:
+        self.hosts({"old": marked("old", "w3:p3Y", "trunk-unit"),
+                    "new": marked("new", "w4:p1", "trunk-unit")})
+        self.claude("new", "w4:p1")
+        found = unit_lookup.every_marked_unit()
+        self.assertEqual(found.faults, {})
+        self.assertEqual(list(found.units["show"]), ["trunk-unit"])
+        self.assertIsInstance(found.units["show"]["trunk-unit"].claude, LiveClaude)
+        self.assertEqual(found.units["show"]["trunk-unit"].place, herdr.HerdrPlace("new", "w4:p1"))
+
+    def test_a_running_registered_claude_without_a_socket_remains_unknown(self) -> None:
+        self.hosts({"trunk": marked("trunk", "w4:p1", "trunk-unit")})
+        self.claude("trunk", "w4:p1")
+        record = self.records / "trunk-1.json"
+        data = cast(dict[str, object], json.loads(record.read_text()))
+        data["procStart"] = sessions.process_start(os.getpid())
+        data["messagingSocketPath"] = ""
+        _ = record.write_text(json.dumps(data))
+        found = unit_lookup.marked_units("show")["trunk-unit"]
+        self.assertIsInstance(found.claude, ClaudeUnknown)
+
+    def test_unknown_duplicate_marks_still_refuse(self) -> None:
+        self.hosts({"old": marked("old", "w3:p3Y", "trunk-unit"),
+                    "new": marked("new", "w4:p1", "trunk-unit")})
+        self.claude("new", "w4:p1")
+        _ = (self.records / "broken.json").write_text("{")
+        with self.assertRaisesRegex(OSError, "herdr:old:w3:p3Y"):
+            _ = unit_lookup.marked_units("show")
+
     def test_one_duplicate_mark_leaves_out_only_its_own_unit(self) -> None:
         self.hosts({
             "first": marked("first", "w1:p1", "one-unit"),
@@ -372,10 +493,14 @@ class UnitLookupTests(unittest.TestCase):
             "two": marked("two", "w5:p1", "two-unit"),
             "other": marked("other", "w3:p1", "other-unit", slug="other"),
         })
+        self.live_hosts("w1:p1", "w2:p1", "w4:p1", "w5:p1", "w3:p1")
         found = unit_lookup.every_marked_unit()
         self.assertEqual({slug: list(units) for slug, units in found.units.items()},
                          {"show": ["two-unit"], "other": ["other-unit"]})
-        self.assertEqual(found.faults, {"show": {"one-unit": "one-unit: its mark is on herdr sessions copy and first and third"}})
+        self.assertEqual(set(found.faults), {"show"})
+        self.assertEqual(set(found.faults["show"]), {"one-unit"})
+        for place in ("copy:w2:p1", "first:w1:p1", "third:w4:p1"):
+            self.assertIn(f"herdr:{place}", found.faults["show"]["one-unit"])
         self.assertEqual(found.production_fault("other"), "")
         two = unit_lookup.marked_unit("show", "two-unit")
         self.assertEqual(two.place if two else None, herdr.HerdrPlace("two", "w5:p1"))

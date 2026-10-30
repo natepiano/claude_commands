@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -21,8 +21,9 @@ sys.path.insert(0, str(MESSAGE.parent / "herdr"))
 sys.path.insert(0, str(MESSAGE.parents[1]))
 import herdr  # noqa: E402
 import showrunners  # noqa: E402
+import sessions  # noqa: E402
 from herdr import HerdrPlace  # noqa: E402
-from sessions import UnreadableSessionRecord, live_session, read_session  # noqa: E402
+from sessions import SessionRecord, UnreadableSessionRecord, live_session, read_session  # noqa: E402
 from showrunners import canonical_slug  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
 
@@ -65,10 +66,19 @@ class MarkedUnit:
     unit: str
     claude: Claude
     place: Place
+    pid: int = 0
+    command: str = ""
 
 
 def place_text(place: Place) -> str:
     return f"herdr:{place.session}:{place.pane}"
+
+
+def holder_text(unit: MarkedUnit) -> str:
+    """Identify the process whose marks caused a refusal, including uncertain holders."""
+    pid = unit.pid or (unit.claude.pid if isinstance(unit.claude, LiveClaude) else 0)
+    command = unit.command or ("claude" if isinstance(unit.claude, LiveClaude) else "unknown")
+    return f"pid {pid} ({command}) in {place_text(unit.place)}"
 
 
 class MarkedProductions(NamedTuple):
@@ -216,8 +226,8 @@ class UnreadAt(NamedTuple):
     unplaced: RecordsRead | RecordsPartlyUnread
 
 
-def _claudes(processes: list[herdr.HerdrProcess]) -> tuple[dict[HerdrPlace, LiveClaude], UnreadAt]:
-    """Newest live Claude per herdr pane, and the panes whose record could not be read.
+def _claudes(processes: list[herdr.HerdrProcess]) -> tuple[dict[int, LiveClaude], UnreadAt]:
+    """Newest live Claude record per pid, and the panes whose record could not be read.
 
     Claude names each record after its pid. A record that cannot be read for a pid that no longer runs,
     or whose file was removed after the listing, is a session that has exited: during an account move
@@ -228,7 +238,7 @@ def _claudes(processes: list[herdr.HerdrProcess]) -> tuple[dict[HerdrPlace, Live
         paths = sorted(path for path in sessions_dir().iterdir() if path.suffix == ".json")
     except OSError as error:
         return {}, UnreadAt({}, RecordsPartlyUnread(f"cannot list session records: {error}"))
-    newest: dict[HerdrPlace, tuple[int, LiveClaude]] = {}
+    newest: dict[int, tuple[int, LiveClaude]] = {}
     unread: dict[HerdrPlace, str] = {}
     unplaced: RecordsRead | RecordsPartlyUnread = RecordsRead()
     for path in paths:
@@ -247,39 +257,53 @@ def _claudes(processes: list[herdr.HerdrProcess]) -> tuple[dict[HerdrPlace, Live
                     unread[place] = f"the session record of pid {pid} could not be read"
                 continue
         if not live_session(record):
+            # A running registered Claude with no messaging socket cannot be
+            # called absent. Preserve the existing fail-closed unknown state.
+            if sessions.running_session(record):
+                place = _place_of(record["pid"], places)
+                if place is not None:
+                    unread[place] = f"the live session of pid {record['pid']} has no messaging socket"
             continue
         place = _place_of(record["pid"], places)
         if place is None:
             continue
-        if place not in newest or record["updatedAt"] > newest[place][0]:
-            newest[place] = (record["updatedAt"], LiveClaude(record["name"], record["sessionId"],
+        if record["pid"] not in newest or record["updatedAt"] > newest[record["pid"]][0]:
+            newest[record["pid"]] = (record["updatedAt"], LiveClaude(record["name"], record["sessionId"],
                                                            record["messagingSocketPath"], record["pid"]))
-    return {place: claude for place, (_, claude) in newest.items()}, UnreadAt(unread, unplaced)
+    return {pid: claude for pid, (_, claude) in newest.items()}, UnreadAt(unread, unplaced)
 
 
-def _herdr_marked(claudes: dict[HerdrPlace, LiveClaude], unread: UnreadAt,
+def _herdr_marked(claudes: dict[int, LiveClaude], unread: UnreadAt,
                   processes: list[herdr.HerdrProcess]) -> Iterable[tuple[str, MarkedUnit]]:
-    """Each running herdr pane carrying both marks, once per place."""
+    """Join live Claude by PID, retaining stopped panes and unknown evidence."""
     running = {session["name"] for session in herdr.live_sessions()}
-    seen: set[HerdrPlace] = set()
+    unknown_seen: set[tuple[HerdrPlace, str, str]] = set()
+    live_marks = {(process.place, process.marks.get(PRODUCTION_MARK), process.marks.get(UNIT_MARK))
+                  for process in processes if process.pid in claudes}
     for process in processes:
         place = process.place
-        if place.session not in running or place in seen:
+        if place.session not in running:
             continue
         slug, unit = process.marks.get(PRODUCTION_MARK, ""), process.marks.get(UNIT_MARK, "")
         if not slug or not unit:
             continue
-        seen.add(place)
         claude: Claude
-        if place in claudes:
-            claude = claudes[place]
+        if process.pid in claudes:
+            claude = claudes[process.pid]
         elif place in unread.places:
             claude = ClaudeUnknown(unread.places[place])
         elif isinstance(unread.unplaced, RecordsPartlyUnread):
+            if (place, slug, unit) in live_marks:
+                continue
             claude = ClaudeUnknown(unread.unplaced.reason)
         else:
             claude = ClaudeNotRunning()
-        yield slug, MarkedUnit(unit, claude, place)
+        if isinstance(claude, ClaudeUnknown):
+            key = (place, slug, unit)
+            if key in unknown_seen:
+                continue
+            unknown_seen.add(key)
+        yield slug, MarkedUnit(unit, claude, place, process.pid, process.command)
 
 
 def _lookup_slug(slug: str) -> str:
@@ -287,17 +311,6 @@ def _lookup_slug(slug: str) -> str:
     if (showrunners.NOTIFIER_STATE_DIR / f"showrunner-{slug}").is_dir():
         return slug
     return canonical_slug(slug)
-
-
-def _claude_places(places: list[MarkedUnit]) -> list[MarkedUnit]:
-    """The unit's places that may hold its Claude, when one does; else every place.
-
-    The marks are environment variables, so every child process inherits them. A detached run, such as
-    a worker's build that mesh_runs supervises, stays in the herdr service's cgroup with the unit's marks
-    and a pane id that can be out of date. Such a process is not a second session of the unit.
-    """
-    with_claude = [place for place in places if not isinstance(place.claude, ClaudeNotRunning)]
-    return with_claude or places
 
 
 def every_marked_unit() -> MarkedProductions:
@@ -308,6 +321,11 @@ def every_marked_unit() -> MarkedProductions:
         marked = list(_herdr_marked(claudes, unread, processes))
     except herdr.HerdrFailure as error:
         raise OSError(str(error)) from error
+    return group_marked_units(marked)
+
+
+def group_marked_units(marked: Iterable[tuple[str, MarkedUnit]]) -> MarkedProductions:
+    """Resolve current production slugs and refuse units marked in more than one place."""
     found: dict[str, dict[str, list[MarkedUnit]]] = {}
     current_slugs: dict[str, str] = {}
     for slug, unit in marked:
@@ -317,13 +335,49 @@ def every_marked_unit() -> MarkedProductions:
     units: dict[str, dict[str, MarkedUnit]] = {}
     faults: dict[str, dict[str, str]] = {}
     for slug, production in found.items():
-        production = {name: _claude_places(places) for name, places in production.items()}
-        units[slug] = {name: places[0] for name, places in production.items() if len(places) == 1}
+        units[slug] = {}
         for name, places in production.items():
-            if len(places) > 1:
-                sessions = " and ".join(sorted(place.place.session for place in places))
+            # Inherited marks preserve a stopped pane for recovery, but cannot
+            # compete with a live Claude or unresolved session for ownership.
+            holders = [place for place in places if isinstance(place.claude, (LiveClaude, ClaudeUnknown))]
+            if len(holders) > 1:
+                sessions = " and ".join(sorted(holder_text(place) for place in holders))
                 faults.setdefault(slug, {})[name] = f"{name}: its mark is on herdr sessions {sessions}"
+            else:
+                units[slug][name] = holders[0] if holders else places[0]
     return MarkedProductions(units, faults)
+
+
+def session_unit_marks(
+    records: list[SessionRecord], environment: Mapping[str, str],
+) -> tuple[MarkedProductions, dict[str, str]]:
+    """Read unit marks only for known session PIDs, without enumerating processes."""
+    marked: list[tuple[str, MarkedUnit]] = []
+    directors: dict[str, str] = {}
+    known = {record["sessionId"] for record in records}
+    proc = Path(environment.get("HERDR_PROC", "/proc"))
+    for record in records:
+        try:
+            # Herdr's Linux environment reader is private; keep this PID-only IO here.
+            raw = (proc / str(record["pid"]) / "environ").read_bytes()
+            values = dict(item.split("=", 1) for item in raw.decode(errors="replace").split("\0")
+                          if "=" in item)
+        except OSError:
+            continue
+        owner = values.get("CLAUDE_CODE_SESSION_ID", "")
+        if owner in known and owner != record["sessionId"]:
+            directors[record["sessionId"]] = owner
+            continue
+        slug = values.get(PRODUCTION_MARK, "")
+        unit = values.get(UNIT_MARK, "")
+        if slug and unit:
+            unit_mark = MarkedUnit(
+                unit, LiveClaude(record["name"], record["sessionId"],
+                                 record["messagingSocketPath"], record["pid"]),
+                herdr.HerdrPlace(values.get("HERDR_SESSION", ""), values.get("HERDR_PANE_ID", "")),
+            )
+            marked.append((slug, unit_mark))
+    return group_marked_units(marked), directors
 
 
 def marked_units(slug: str) -> dict[str, MarkedUnit]:

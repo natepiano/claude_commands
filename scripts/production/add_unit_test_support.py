@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from scripts.lib import names
+from scripts.lib.test_names import fixture_names
+
 import argparse
 import io
 import json
@@ -126,6 +129,7 @@ class AddUnitTestCase(ShutdownTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = self.enterContext(patch.object(names, "load_names", return_value=fixture_names()))
         # These CLI fixtures prove launcher plumbing; transcript proof is exercised
         # through the real submit method in PromptSubmissionTests.
         def submitted(client: herdr.Herdr, pane: str, opening: herdr.OpeningPrompt,
@@ -635,7 +639,10 @@ class AddUnitTestCase(ShutdownTestCase):
         launched = (marked if already_marked else unit_lookup.MarkedUnit("alpha-unit", claude, HerdrPlace(SHARED, "w1:p1")))
         ready = add_unit.ReadyToLaunch(
             request,
-            add_unit.NoUnitRow(),
+            # A rerun or restore reuses a row. Only a fresh launch has no row.
+            add_unit.ExistingUnitRow("docs/plans/given.md", str(request.worktree), request.branch,
+                                     "—", "—", add_unit.ActiveUnitRow())
+            if already_marked or isinstance(launch_kind, add_unit.UnitRestoreLaunch) else add_unit.NoUnitRow(),
             add_unit.DirectorAgent("opus", add_unit.DefaultEffort()),
         )
         commands: list[list[str]] = []

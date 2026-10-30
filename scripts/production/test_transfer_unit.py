@@ -1,177 +1,115 @@
-"""Move one unit between two disposable productions of one repository, against a local bare origin and isolated state."""
-
+"""Transfer units between disposable productions with real Git worktrees."""
 from __future__ import annotations
 
-import hashlib
 import json
 import os
-import shlex
+import shutil
+import tempfile
 import subprocess
 import sys
-import tempfile
 import unittest
 from pathlib import Path
-from typing import cast, final, override
+from typing import cast, final
 from unittest import mock
 
-from scripts.guilds import roles
+from scripts.astra import design_roles
 from scripts.direct import workers
-
-SCRIPT = Path(__file__).with_name("transfer_unit.py")
+from scripts.production.transfer_unit_test_support import (
+    UnitTransferFixture, SCRIPT, TEST_HANG_GUARD_SECS,
+)
+import transfer_unit
+from rename_state import write_text
+import fake_showrunner
+import fake_unit_host
 
 
 @final
-class UnitTransferTests(unittest.TestCase):
-    def __init__(self, methodName: str = "runTest") -> None:
-        super().__init__(methodName)
-        self.root = Path()
-        self.rust = Path()
-        self.giving = Path()
-        self.receiving = Path()
-        self.unit = Path()
-        self.env: dict[str, str] = {}
+class UnitTransferTests(UnitTransferFixture):
+    def test_rerun_finishes_each_uncommitted_document_write(self) -> None:
+        snapshot = Path(self.enterContext(tempfile.TemporaryDirectory())) / "before"
+        _ = shutil.copytree(self.root, snapshot)
+        self.assert_ok(self.transfer("apply"))
+        checkouts = (self.giving, self.receiving, self.unit)
+        expected_trees = [self.git("rev-parse", "HEAD^{tree}", cwd=path) for path in checkouts]
+        documents = (self.receiving / "docs/plans/other-production.md",
+                     self.giving / "docs/plans/demo-production.md")
+        expected_docs = [path.read_text() for path in documents]
+        for document in documents:
+            with self.subTest(document=document.name):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(snapshot, self.root)
 
-    @override
-    def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        home = self.root / "home"
-        self.rust = home / "rust"
-        self.giving = self.rust / "claude-demo-trunk"
-        self.receiving = self.rust / "claude-other-trunk"
-        self.unit = self.rust / "claude-demo-alpha"
-        config = home / ".claude"
-        for path in (self.giving, config, self.root / "state/sessions"):
-            path.mkdir(parents=True)
-        self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-        self.env.update({
-            "UNIT_WORKERS_STATE": str(self.root / "state/unit-workers"),
-            "RETIRE_UNIT_RUN_ROOT": str(self.root / "runs"),
-            "HOME": str(home), "CLAUDE_CONFIG_DIR": str(config),
-            "XDG_CONFIG_HOME": str(home / ".config"), "XDG_STATE_HOME": str(self.root / "state"),
-            "NOTIFIER_STATE_DIR": str(self.root / "state/notifier"),
-            "NOTIFIER_SESSIONS_DIR": str(self.root / "state/sessions"),
-            "SHOWRUNNER_STATE_DIR": str(self.root / "state/showrunner"),
-            "STALL_WATCH_STATE_DIR": str(self.root / "state/stall-watch"),
-            "RENAME_UNIT_STOP_WAIT": "0", "RENAME_UNIT_LIVE_WAIT": "0",
-            "REVIEW_POOL_STATE": str(self.root / "state/review-pool"),
-            "SHOWRUNNERS_CONFIG": str(config / "showrunners.json"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
-            "UNIT_HISTORY_DIR": str(self.root / "history"),
-            "PROGRESS_SESSION_ROOTS": str(self.root / "sessions"),
-            "PHASE_TABLE_VAULT": str(self.root / "vault/showrunners"),
-            "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
-            "HERDR_PROC": str(self.root / "proc"),
-            "HERDR_PLATFORM": "linux",
-            "FAKE_HERDR_LOG": str(self.root / "herdr.jsonl"),
-            "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
-            "CLAUDE_CODE_SESSION_ID": "", "USER_ZONE": "UTC", "UNIT_SYNC_WRITES": "0",
-            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0",
-        })
-        self.write(self.root / "herdr-responses.json",
-                   json.dumps({"default": {"stdout": '{"sessions": []}', "code": 0}}))
-        origin = self.root / "origin.git"
-        _ = self.git("init", "--bare", str(origin))
-        _ = self.git("init", "-b", "demo")
-        for key, value in (("user.name", "Unit Transfer Test"), ("user.email", "transfer@example.invalid"),
-                           ("gc.auto", "0"), ("maintenance.auto", "false")):
-            _ = self.git("config", key, value)
-        _ = self.git("remote", "add", "origin", str(origin))
-        self.write(self.giving / "docs/plans/demo-production.md", self.production_doc(
-            "demo", self.giving, "| Unit | Plan | Worktree | Branch |", "| --- | --- | --- | --- |",
-            f"| alpha-unit | docs/plans/alpha.md | `{self.unit}` | demo-alpha |",
-            f"| beta-unit | docs/plans/beta.md | `{self.rust / 'claude-demo-beta'}` | demo-beta |"))
-        self.write(self.giving / "docs/plans/other-production.md", self.production_doc(
-            "other", self.receiving, "| Unit | Plan | Worktree | Branch | Port | Owns |",
-            "| --- | --- | --- | --- | --- | --- |", "| gamma-unit | docs/plans/gamma.md | `/x` | other-gamma | — | — |"))
-        self.write(self.giving / "docs/plans/alpha.md",
-                   "# alpha\n\n> **Production: demo** — unit `alpha-unit`; production doc "
-                   + "`docs/plans/demo-production.md`\n\nalpha prose stays.\n")
-        _ = self.git("add", ".")
-        _ = self.git("commit", "-m", "fixture")
-        _ = self.git("push", "-u", "origin", "demo")
-        _ = self.git("branch", "other")
-        _ = self.git("push", "origin", "other")
-        _ = self.git("worktree", "add", str(self.receiving), "other")
-        _ = self.git("worktree", "add", "-b", "demo-alpha", str(self.unit), "demo")
-        _ = self.git("push", "origin", "demo-alpha")
-        self.write(self.root / "state/notifier/showrunner-demo/conf",
-                   "EVERY=15\nTARGET=session:test-showrunner\nCHECK="
-                   + shlex.join(["zsh", "/scripts/production_check.sh",
-                                 str(self.giving / "docs/plans/demo-production.md")]) + "\n")
-        self.write(self.stall_path("demo", "alpha-unit"), '{"stretch": 17}\n')
-        # A reviewer with no thread retires without a Codex call.
-        self.write(self.root / "state/review-pool/demo/pool.json", json.dumps({"generation": 1, "reviewers": {
-            "r1": {"type": "codex", "thread_id": "", "prime_hash": "h", "lease": {"unit": "alpha-unit", "ordinal": 3},
-                   "busy_pid": None, "reviews": 2}}}))
+                def stop_after_write(path: Path, text: str) -> None:
+                    write_text(path, text)
+                    if path == document:
+                        raise OSError("fixture stop after document write")
 
-    def production_doc(self, slug: str, checkout: Path, *table: str) -> str:
-        return "\n".join(["# Production — " + slug, "", "## Production Context", "",
-                          f"- **Merge branch:** `{slug}`", f"- **Showrunner checkout:** `{checkout}`",
-                          "- **Log:** `production.log`", "", "## Units", "", *table, "",
-                          "## Production rules", "", "Rules.", ""])
+                with mock.patch.object(transfer_unit, "write_text", wraps=stop_after_write) as writes:
+                    self.assert_refused(self.transfer("apply"), "fixture stop after document write")
+                self.assertEqual(sum(call.args[0] == document for call in writes.call_args_list), 1)
+                self.assertNotEqual(self.git("status", "--porcelain", "--", str(document),
+                                             cwd=document.parents[2]), "")
+                # Recovery must not absorb an unrelated worktree or index edit.
+                expected = document.read_text()
+                head = self.git("rev-parse", "HEAD", cwd=document.parents[2])
+                self.write(document, expected + "unrelated edit\n")
+                self.assert_refused(self.transfer("apply"), f"{document} has uncommitted changes")
+                _ = self.git("add", str(document), cwd=document.parents[2])
+                self.write(document, expected)
+                self.assert_refused(self.transfer("apply"), f"{document} has uncommitted changes")
+                self.assertEqual(self.git("rev-parse", "HEAD", cwd=document.parents[2]), head)
+                self.assertIn("unrelated edit", self.git("diff", "--cached", cwd=document.parents[2]))
+                _ = self.git("reset", "HEAD", "--", str(document), cwd=document.parents[2])
+                if document == documents[0]:
+                    # A failed commit may already have staged the intended edit.
+                    _ = self.git("add", str(document), cwd=document.parents[2])
+                self.assert_transfer_resumed(self.root / "state/showrunner/demo/transfer_unit.json")
+                self.assertEqual([self.git("rev-parse", "HEAD^{tree}", cwd=path) for path in checkouts],
+                                 expected_trees)
+                self.assertEqual([path.read_text() for path in documents], expected_docs)
+                for checkout in checkouts:
+                    self.assertEqual(self.git("status", "--porcelain", cwd=checkout), "")
+                tips = [self.git("rev-parse", "HEAD", cwd=path) for path in checkouts]
+                self.assert_ok(self.transfer("verify"))
+                self.assertEqual([self.git("rev-parse", "HEAD", cwd=path) for path in checkouts], tips)
 
-    def write(self, path: Path, content: str) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _ = path.write_text(content, encoding="utf-8")
+    def test_verify_ignores_leftover_process_marks(self) -> None:
+        self.moved_unit_with_leftover_marks()
+        self.assert_ok(self.transfer("verify"))
 
-    def git(self, *arguments: str, cwd: Path | None = None) -> str:
-        result = subprocess.run(["git", *arguments], cwd=cwd or self.giving, env=self.env,
-                                capture_output=True, text=True, check=False)
-        self.assertEqual(result.returncode, 0, (arguments, result.stdout, result.stderr))
-        return result.stdout.strip()
+    def test_verify_names_the_live_holder_of_a_former_mark(self) -> None:
+        self.moved_unit_with_leftover_marks()
+        pid = self.live_pid()
+        old = fake_showrunner.write_session(self.root / "state/sessions", "old", "sid-old", pid)
+        self.addCleanup(old.close)
+        fake_unit_host.place_process(self.env, pid, "w3:p3Y")
+        self.assert_refused(self.transfer("verify"),
+                            f"a session still carries the marks demo alpha-unit: pid {pid} (claude) in herdr:old:w3:p3Y")
 
-    def stall_path(self, slug: str, unit: str) -> Path:
-        digest = hashlib.sha256(f"{slug}\0{unit}".encode()).hexdigest()
-        return self.root / "state/stall-watch" / f"{digest}.json"
+    def test_resume_looks_up_the_moved_giving_checkout(self) -> None:
+        path = self.pause_before_source_commit()
+        self.move_giving_checkout()
+        self.assert_transfer_resumed(path)
 
-    def transfer(self, verb: str, unit: str = "alpha-unit", to: Path | None = None) -> subprocess.CompletedProcess[str]:
-        to_doc = to or self.receiving / "docs/plans/other-production.md"
-        return subprocess.run([sys.executable, str(SCRIPT), verb, "demo", unit, str(to_doc),
-                               "--scratch", str(self.root / "scratch")], cwd=self.giving, env=self.env,
-                              capture_output=True, text=True, check=False, timeout=120)
-
-    def assert_ok(self, result: subprocess.CompletedProcess[str]) -> None:
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
-    def assert_refused(self, result: subprocess.CompletedProcess[str], text: str) -> None:
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn(text, result.stderr)
-
-    def seed_record(self) -> Path:
-        """A stopped unit's shutdown record, as `shutdown.py down` leaves it, and a shutdown stub that logs calls."""
-        home = self.root / "home"
-        session: dict[str, object] = {
-            "session_id": "sid-alpha", "config_dir": str(home / ".claude"), "pid": 4242, "proc_start": "1",
-            "name": "alpha", "cwd": str(self.unit), "status": "idle", "updated_at": 0, "probe": False,
-            "model": {"kind": "no reply yet"},
-            "checkout": {"kind": "git", "path": str(self.unit), "head": {"kind": "branch", "name": "demo-alpha"},
-                         "upstream": {"kind": "tracking", "ahead": 0}, "dirty": []},
-            "run_dirs": [], "codex_servers": [], "timers": [], "kind": "unit",
-            "host": {"kind": "unit", "production": "demo", "unit": "alpha-unit",
-                     "doc": str(self.giving / "docs/plans/demo-production.md"), "session_name": "demo-alpha",
-                     "session_host": "herdr", "plan": {"kind": "plan", "path": f"{self.unit}/docs/plans/alpha.md"}}}
-        saved: dict[str, object] = {
-            "login": "owner@example.com", "label": "claude2", "machine": "natedev",
-            "requested_at": "2026-10-09T21:49:10+00:00", "request_id": "request",
-            "requested_by": {"kind": "terminal"}, "hold": "session", "then": "stop", "force": "wait for ready",
-            "alerts": "none", "probe": False, "session": session, "workers": [], "timers": [],
-            "settle_message": {"kind": "not sent"}, "where": {"kind": "not said"},
-            "progress": {"kind": "stopped", "at": "2026-10-09T21:50:00+00:00"}, "stop_issues": [], "trail": [],
-            "codex_seats": []}
-        script = ("import json, sys; sys.path.insert(0, sys.argv[1]); import record; "
-                  + "assert record.create_session(json.loads(sys.stdin.read()))")
-        created = subprocess.run([sys.executable, "-c", script, str(SCRIPT.parents[1] / "shutdown")],
-                                 input=json.dumps(saved), env=self.env, capture_output=True, text=True,
-                                 check=False, timeout=60)
-        self.assertEqual(created.returncode, 0, created.stderr)
-        log = self.root / "shutdown-calls.jsonl"
-        stub = self.root / "fake_shutdown.py"
-        self.write(stub, "import json, os, sys\nwith open(os.environ['RENAME_UNIT_SHUTDOWN_LOG'], 'a') as log:\n"
-                   + "    _ = log.write(json.dumps(sys.argv[1:]) + '\\n')\n")
-        self.env["RENAME_UNIT_SHUTDOWN"] = str(stub)
-        self.env["RENAME_UNIT_SHUTDOWN_LOG"] = str(log)
-        return log
+    def test_old_journal_ignores_stale_locations_for_both_productions(self) -> None:
+        path = self.pause_before_source_commit()
+        saved = cast(dict[str, object], json.loads(path.read_text()))
+        saved.update(from_doc=str(self.giving / "docs/plans/demo-production.md"), from_checkout=str(self.giving),
+                     to_doc=str(self.receiving / "docs/plans/other-production.md"), to_checkout=str(self.receiving))
+        self.write(path, json.dumps(saved))
+        self.move_giving_checkout()
+        old = self.receiving
+        self.receiving = old.with_name("claude-other-relocated")
+        _ = self.git("worktree", "move", str(old), str(self.receiving))
+        doc = self.receiving / "docs/plans/other-production.md"
+        self.write(doc, doc.read_text().replace(str(old), str(self.receiving)))
+        _ = self.git("add", str(doc), cwd=self.receiving)
+        _ = self.git("commit", "-m", "relocate receiving checkout", cwd=self.receiving)
+        self.assertFalse(old.exists())
+        self.assert_transfer_resumed(path)
+        saved = cast(dict[str, object], json.loads(path.read_text()))
+        for name in ("from_doc", "to_doc", "from_checkout", "to_checkout"):
+            self.assertNotIn(name, saved)
 
     def test_a_stopped_unit_relaunches_from_a_record_that_names_the_receiving_production(self) -> None:
         log = self.seed_record()
@@ -201,7 +139,7 @@ class UnitTransferTests(unittest.TestCase):
     def test_worker_migration_conflict_prints_a_refusal_without_a_traceback(self) -> None:
         result = subprocess.run([sys.executable, "-c", 'import runpy, sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[2]))\nfrom scripts.direct import workers\ndef unavailable(*args, **kwargs):\n    raise workers.WorkerUnavailable("worker ownership changed; rerun apply")\nworkers.move_unit = unavailable\nworkers.rename_unit = unavailable\nworkers.end_unit = unavailable\nsys.argv = sys.argv[1:]\nsys.path.insert(0, str(Path(sys.argv[0]).parent))\nrunpy.run_path(sys.argv[0], run_name="__main__")\n', str(SCRIPT), "apply", "demo", "alpha-unit",
             str(self.receiving / "docs/plans/other-production.md"), "--scratch", str(self.root / "scratch")],
-            cwd=self.giving, env=self.env, capture_output=True, text=True, timeout=120, check=False)
+            cwd=self.giving, env=self.env, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("worker ownership changed; rerun apply", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
@@ -228,7 +166,7 @@ class UnitTransferTests(unittest.TestCase):
             self.write(record, json.dumps({"worker": "w7", "status": "running", "pid": command.pid, "cwd": str(self.unit)}))
             self.assert_ok(self.transfer("apply"))
             self.assertIsNone(command.poll(), "transfer ended the paused worker's detached command")
-            _output, errors = command.communicate(timeout=5)
+            _output, errors = command.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(command.returncode, 0, errors.decode())
             self.assertEqual((self.unit / "command-finished").read_text(), str(self.unit))
             self.assertTrue(record.exists())
@@ -264,29 +202,29 @@ class UnitTransferTests(unittest.TestCase):
         self.assert_ok(self.transfer("verify"))
 
     def test_a_held_role_moves_to_the_receiving_holder_and_keeps_its_thread_and_paths(self) -> None:
-        config = self.root / "guilds.conf"
+        config = self.root / "design_roles.conf"
         self.write(config, "[ownership]\nhost=fixture-host\n")
-        self.env.update({"GUILD_CONFIG_FILE": str(config), "GUILD_ROLES_HOST": "fixture-host",
-                         "GUILD_ROLES_STATE": str(self.root / "state/guilds/roles"),
-                         "GUILD_OWNERSHIP_STATE": str(self.root / "state/guilds/ownership")})
+        self.env.update({"DESIGN_ROLES_CONFIG": str(config), "DESIGN_ROLES_HOST": "fixture-host",
+                         "DESIGN_ROLES_STATE": str(self.root / "state/astra/design-roles"),
+                         "DESIGN_OWNERSHIP_STATE": str(self.root / "state/astra/design-ownership")})
         document = str(self.unit / "docs/plans/alpha.md")
         with mock.patch.dict(os.environ, self.env):
-            roles.register_repository("fixture-repo", {"fixture-host": str(self.unit)}, inventory_complete=True)
-            placement = roles.authority_request("reserve", {"repository_id": "fixture-repo",
+            design_roles.register_repository("fixture-repo", {"fixture-host": str(self.unit)}, inventory_complete=True)
+            placement = design_roles.authority_request("reserve", {"repository_id": "fixture-repo",
                 "document": "docs/plans/alpha.md", "host": "fixture-host", "request_id": "transfer-fixture"})
-            design = roles.HeldDesign(roles.DesignPlacement(str(placement["design_id"]), "fixture-host", 1),
+            design = design_roles.HeldDesign(design_roles.DesignPlacement(str(placement["design_id"]), "fixture-host", 1),
                 "fixture-repo", str(self.unit), document, "design", "2026-10-22T12:00:00+00:00",
-                roles.UnitHolder("demo", "alpha-unit"), roles.DesignUnbound(),
-                (roles.RoleInstance("designer", "demo-design-astra-designer", roles.RoleOpen("designer-thread")),
-                 roles.RoleInstance("reviewer", "demo-design-astra-reviewer", roles.RoleNotOpened())))
-            roles._save(design)  # pyright: ignore[reportPrivateUsage]
-            mesh = roles.mesh_directory(design.placement.design_id)
+                design_roles.UnitHolder("demo", "alpha-unit"), design_roles.DesignUnbound(),
+                (design_roles.RoleInstance("designer", "demo-design-astra-designer", design_roles.RoleOpen("designer-thread")),
+                 design_roles.RoleInstance("reviewer", "demo-design-astra-reviewer", design_roles.RoleNotOpened())))
+            design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
+            mesh = design_roles.mesh_directory(design.placement.design_id)
         self.write(mesh / "mesh_roster.json", json.dumps({"demo-design-astra-designer": {
             "thread_id": "designer-thread", "status": "done", "cwd": str(self.unit)}}))
         self.assert_ok(self.transfer("apply"))
         with mock.patch.dict(os.environ, self.env):
-            moved = roles.read_design(design.placement.design_id)
-        self.assertEqual(moved.holder, roles.UnitHolder("other", "alpha-unit"))
+            moved = design_roles.read_design(design.placement.design_id)
+        self.assertEqual(moved.holder, design_roles.UnitHolder("other", "alpha-unit"))
         self.assertEqual((moved.repository, moved.document, moved.roles), (design.repository, design.document, design.roles))
         self.assertEqual(moved.placement.generation, 2)
         roster = cast(dict[str, dict[str, str]], json.loads((mesh / "mesh_roster.json").read_text(encoding="utf-8")))

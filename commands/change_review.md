@@ -75,9 +75,10 @@ To rewrite a row still to review, such as one that lacks where to try it or
 what the person sees:
 
 ```sh
-… edit <production> --row C<n> --change "<what changed for you>" --check "<how to try it>" --see "<what you see>"
+… edit <production> --row <id> --change "<what changed for you>" --check "<how to try it>" --see "<what you see>"
 ```
 
+Pass the ID as `/next` shows it, such as `C434` or `sdlc/C9`.
 The row keeps its id, its Merged cell and its place. It prints the new row.
 
 ## show
@@ -94,7 +95,8 @@ until the user asks for it (user, 2026-10-20).
 
 The list keeps the order of `/next` (`commands/next.md`): the row `show`
 printed stays first until its verdict. When the user calls a row important,
-run `mark-important <production> --row C<n>`.
+run `mark-important <production> --row <id>`, with the ID as `/next` shows it,
+such as `C434` or `sdlc/C9`.
 
 ## A folder for the user to try
 
@@ -119,9 +121,10 @@ feature-log step of `/showrunner:produce` → `<CloseChangeReview/>`; a failure
 there leaves the row open. Then:
 
 ```sh
-… verdict <production> --row C<n> --verdict "<the user's words>"
+… verdict <production> --row <id> --verdict "<the user's words>"
 ```
 
+Pass the ID as `/next` shows it, such as `C434` or `sdlc/C9`.
 It moves the row to `## Reviewed` with the verdict and today's date, and prints
 `C<n> landed` or `C<n> returns to its unit (merged …)`. Either way it removes
 the row's scratch folders and prints `removed <path>` for each. Send a returning row,

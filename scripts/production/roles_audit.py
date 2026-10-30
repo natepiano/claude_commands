@@ -24,12 +24,14 @@ import tomllib
 import tokenize
 from typing import Literal, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import production_units
 import showrunners
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from code_kind import is_test_code  # noqa: E402
 from user_zone import user_zone, user_zone_name  # noqa: E402
+from scripts.lib import names as display_names  # noqa: E402
 
 TermKind = Literal["role", "document", "step", "record"]
 NOT_RECORDED = "not recorded"
@@ -68,12 +70,16 @@ class LiveFile:
     path: str
     text: str
     source_lines: tuple[int, ...] = ()  # Physical source line for each prose character.
+    printed_text: str = ""
+    printed_lines: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
 class SourceProse:
     text: str
     source_lines: tuple[int, ...]  # Physical source line for each prose character.
+    printed_text: str = ""
+    printed_lines: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -93,11 +99,27 @@ class DefinitionFinding:
 
 
 @dataclass(frozen=True)
+class CurrentName:
+    """The live name that replaces a retired one."""
+    name: str
+
+
+@dataclass(frozen=True)
+class NoCurrentName:
+    """The term itself is retired: the thing it named is gone."""
+
+
+@dataclass(frozen=True)
 class RetiredUse:
     path: str
     line: int
     name: str
-    replacement: str
+    replacement: CurrentName | NoCurrentName
+
+    def hint(self) -> str:
+        if isinstance(self.replacement, NoCurrentName):
+            return f"{self.path}:{self.line}: retired {self.name!r}; no current name replaces it"
+        return f"{self.path}:{self.line}: retired {self.name!r}; use {self.replacement.name!r}"
 
 
 @dataclass(frozen=True)
@@ -158,7 +180,7 @@ class SenderContacts:
 
 
 @dataclass(frozen=True)
-class WrongPartyCounts:
+class SentContactCoverage:
     senders: tuple[SenderContacts, ...]
     window_records: int
     sent_records: int
@@ -282,6 +304,7 @@ def check_retired(terms: tuple[Term, ...], files: tuple[LiveFile, ...]) -> tuple
         if not term.retired:
             continue
         retired = {name.casefold() for name in term.retired}
+        replacement = NoCurrentName() if term.name.casefold() in retired else CurrentName(term.name)
         pattern = forms_pattern(tuple(name for _, name in term_forms(term)))
         for file in files:
             text = file.text
@@ -295,18 +318,111 @@ def check_retired(terms: tuple[Term, ...], files: tuple[LiveFile, ...]) -> tuple
                 for match in pattern.finditer(without_paths(line, term.kept)):
                     if match.group().casefold() in retired:
                         source_line = file.source_lines[offset + match.start()] if file.source_lines else number
-                        findings.append(RetiredUse(file.path, source_line, match.group(), term.name))
+                        findings.append(RetiredUse(file.path, source_line, match.group(), replacement))
                 offset += len(line) + 1
     return tuple(findings)
 
 
-def check_sources(root: Path, *, full_extraction: bool = False) -> tuple[str, ...]:
+def display_terms(loaded: display_names.Names) -> tuple[Term, ...]:
+    return tuple(Term(history[0], "role", ("config/names.toml",), tuple(history[1:]),
+                      retired=tuple(history[1:]))
+                 for group in (loaded.jobs, loaded.audiences)
+                 for history in group.values() if len(history) > 1)
+
+
+@dataclass(frozen=True)
+class DisplayLabel:
+    path: str
+    line: int
+    name: str
+
+
+@dataclass(frozen=True)
+class SentenceRoleWord:
+    path: str
+    line: int
+    name: str
+
+
+@dataclass(frozen=True)
+class UnreadSource:
+    path: str
+    reason: str
+
+    def warning(self) -> str:
+        return f"{self.path}: {self.reason}"
+
+
+@dataclass(frozen=True)
+class LiveSources:
+    files: tuple[LiveFile, ...]
+    unread_sources: tuple[UnreadSource, ...]
+
+
+@dataclass(frozen=True)
+class SourceCheck:
+    issues: tuple[str, ...]
+    sentences: tuple[SentenceRoleWord, ...]
+    labels: tuple[DisplayLabel, ...]
+    unread_sources: tuple[UnreadSource, ...]
+
+
+def check_fixed_display(loaded: display_names.Names, files: tuple[LiveFile, ...]) -> tuple[DisplayLabel | SentenceRoleWord, ...]:
+    """Classify output labels separately from role words inside sentences."""
+    current = forms_pattern(loaded.current())
+    findings: list[DisplayLabel | SentenceRoleWord] = []
+    for file in files:
+        if not file.path.startswith("scripts/"):
+            continue
+        offset = 0
+        for line in file.printed_text.split("\n"):
+            for match in current.finditer(line):
+                number = file.printed_lines[offset + match.start()] if file.printed_lines else 1
+                # A whole literal or a complete shown-name/status column is a label.
+                # Other words in that segment make it sentence prose.
+                left = re.split(r"[·|\t]|\s[-—]\s", line[:match.start()])[-1].strip()
+                right = re.split(r"[·|\t]|\s[-—]\s", line[match.end():])[0].strip()
+                if not left and (not right or right.isdecimal() or right == "\ufffc"):
+                    findings.append(DisplayLabel(file.path, number, match.group()))
+                else:
+                    findings.append(SentenceRoleWord(file.path, number, match.group()))
+            offset += len(line) + 1
+    return tuple(findings)
+
+
+def source_check(root: Path, *, full_extraction: bool = False) -> SourceCheck:
     """Read repository sources, without production records, memory or message logs."""
     terms = parse_terms((root / "scripts/production/role_terms.toml").read_text(encoding="utf-8"))
-    retired_forms = () if full_extraction else tuple(name for term in terms for name in term.retired)
-    files, issues = read_live_files(root, retired_forms=retired_forms)
+    loaded = display_names.load_names(root / "config/names.toml")
+    if not isinstance(loaded, display_names.Names):
+        return SourceCheck((display_names.error_text(loaded, root / "config/names.toml"),), (), (), ())
+    forms = (*tuple(name for term in terms for name in term.retired), *loaded.retired())
+    sources = read_live_sources(root, retired_forms=() if full_extraction else forms,
+                               fixed_forms=() if full_extraction else loaded.current())
+    return check_live_sources(terms, loaded, sources)
+
+
+def check_live_sources(terms: tuple[Term, ...], loaded: display_names.Names, sources: LiveSources) -> SourceCheck:
+    """Check findings and coverage from the same source read."""
+    histories = display_terms(loaded)
+    files = sources.files
     uses = check_retired(terms, files)
-    return (*issues, *(f"{use.path}:{use.line}: retired {use.name!r}; use {use.replacement!r}" for use in uses))
+    # Stored keys and snapshots keep their values. Display retirement concerns output.
+    display_files = tuple(LiveFile(file.path, file.printed_text, file.printed_lines)
+                          if file.path.startswith("scripts/") else file for file in files)
+    uses += check_retired(histories, display_files)
+    classified = check_fixed_display(loaded, files)
+    return SourceCheck(
+        (*(source.warning() for source in sources.unread_sources),
+         *(use.hint() for use in uses),
+         *(f"{use.path}:{use.line}: fixed display name {use.name!r}; read config/names.toml"
+           for use in classified if isinstance(use, DisplayLabel))),
+        tuple(use for use in classified if isinstance(use, SentenceRoleWord)),
+        tuple(use for use in classified if isinstance(use, DisplayLabel)), sources.unread_sources)
+
+
+def check_sources(root: Path, *, full_extraction: bool = False) -> tuple[str, ...]:
+    return source_check(root, full_extraction=full_extraction).issues
 
 
 def measure_definitions(terms: tuple[Term, ...], files: tuple[LiveFile, ...]) -> tuple[DefinitionFinding, ...]:
@@ -379,7 +495,7 @@ def parse_messages(text: str) -> MessageSource:
     return MessageSource(tuple(records), invalid, "read")
 
 
-def measure_wrong_party(records: tuple[MessageRecord, ...], window: AuditWindow) -> WrongPartyCounts:
+def measure_sent_contacts(records: tuple[MessageRecord, ...], window: AuditWindow) -> SentContactCoverage:
     selected = [record for record in records if window.since <= record.at < window.until]
     local = [record for record in selected if record.machine == "natedev" and record.outcome == "sent"]
     groups: dict[str, list[MessageRecord]] = defaultdict(list)
@@ -403,7 +519,7 @@ def measure_wrong_party(records: tuple[MessageRecord, ...], window: AuditWindow)
                 elif record.recipient_role == NOT_RECORDED:
                     unknown_role += 1
         counts.append(SenderContacts(sender, user, other, unknown_role, unknown_production, len(messages)))
-    return WrongPartyCounts(tuple(counts), len(selected), len(local),
+    return SentContactCoverage(tuple(counts), len(selected), len(local),
                             sum(record.machine not in ("natedev", NOT_RECORDED) for record in selected),
                             sum(record.machine == NOT_RECORDED for record in selected))
 
@@ -462,6 +578,7 @@ def python_prose(text: str) -> SourceProse:
     encoded_lines = tuple(match.group().encode() for match in re.finditer(r".*?(?:\r\n|\r|\n|$)", text))
     excluded: set[int] = set()
     outputs: set[int] = set()
+    printed_roots: list[ast.AST] = []
     scopes: dict[int, ast.AST] = {}
     parents: dict[int, ast.AST] = {}
     values: dict[tuple[int, str], list[ast.AST]] = defaultdict(list)
@@ -525,11 +642,13 @@ def python_prose(text: str) -> SourceProse:
             name = target.id if isinstance(target, ast.Name) else target.attr if isinstance(target, ast.Attribute) else ""
             if name in ("print", "input", "exit", "error", "usage_error", "write", "warn", "warning") or name.endswith("Error"):
                 outputs.update(id(child) for arg in node.args for child in ast.walk(arg))
+                printed_roots.extend(node.args)
             if name in ("run", "Popen", "Path", "compile"):
                 excluded.update(id(child) for arg in node.args for child in ast.walk(arg))
             for keyword in node.keywords:
                 if keyword.arg in ("help", "description", "epilog"):
                     outputs.update(id(child) for child in ast.walk(keyword.value))
+                    printed_roots.append(keyword.value)
     # Follow lexical bindings. Helper call arguments are not followed into parameters.
     references = [node for node in nodes if isinstance(node, ast.Name) and id(node) in outputs]
     visited: set[tuple[int, str]] = set()
@@ -547,18 +666,133 @@ def python_prose(text: str) -> SourceProse:
                 outputs.add(id(child))
                 if isinstance(child, ast.Name):
                     references.append(child)
+    # Output values have a narrower flow than lexical prose. Record construction,
+    # serialization, lookups and comparisons do not turn their keys into labels.
+    output_roots = tuple(printed_roots)
+    printed_outputs: set[int] = set()
+    printed_bindings: set[tuple[int, str]] = set()
+    while printed_roots:
+        expression = printed_roots.pop()
+        if id(expression) in printed_outputs:
+            continue
+        printed_outputs.add(id(expression))
+        if isinstance(expression, ast.Name):
+            scope = scopes.get(id(expression), tree)
+            while (id(scope), expression.id) not in values and id(scope) in parents:
+                scope = parents[id(scope)]
+            binding = (id(scope), expression.id)
+            if binding not in printed_bindings:
+                printed_bindings.add(binding)
+                printed_roots.extend(values.get(binding, []))
+        elif isinstance(expression, (ast.JoinedStr, ast.FormattedValue, ast.BinOp)):
+            printed_roots.extend(ast.iter_child_nodes(expression))
+        elif isinstance(expression, ast.IfExp):
+            # Each possible output has its own label or sentence context. The
+            # condition only selects a branch; its compared keys are not output.
+            printed_roots.extend((expression.body, expression.orelse))
+        elif isinstance(expression, (ast.List, ast.Tuple, ast.Set)):
+            printed_roots.extend(expression.elts)
+        elif isinstance(expression, ast.Call):
+            target = expression.func
+            if isinstance(target, ast.Name):
+                # Local helpers contribute their returns, not their input contracts.
+                printed_roots.append(target)
+                if target.id in ("str", "repr", "sorted"):
+                    printed_roots.extend(expression.args)
+            elif isinstance(target, ast.Attribute) and target.attr in (
+                    "join", "format", "strip", "lstrip", "rstrip", "lower", "upper", "casefold"):
+                printed_roots.append(target.value)
+                printed_roots.extend(expression.args)
     strings: list[str] = []
     source_lines: list[int] = []
+    printed: list[str] = []
+    printed_lines: list[int] = []
+
+    def fragments(expression: ast.AST) -> tuple[str, tuple[int, ...]]:
+        if isinstance(expression, ast.Constant) and isinstance(expression.value, str):
+            return expression.value, python_literal_lines(expression, encoded_lines, expression.value)
+        if isinstance(expression, ast.JoinedStr):
+            parts = [fragments(part) for part in expression.values]
+        elif isinstance(expression, ast.BinOp) and isinstance(expression.op, ast.Add):
+            parts = [fragments(expression.left), fragments(expression.right)]
+        else:
+            return "\ufffc", (expression.lineno if isinstance(expression, ast.expr) else 1,)
+        return "".join(part[0] for part in parts), tuple(line for part in parts for line in part[1])
+
+    def conditional_fragments(
+        expression: ast.AST, bindings: frozenset[tuple[int, str]],
+    ) -> tuple[list[tuple[str, tuple[int, ...]]], set[int]]:
+        """Keep each branch inside the context in which its value is printed."""
+        if isinstance(expression, ast.IfExp):
+            branches = [conditional_fragments(branch, bindings)
+                        for branch in (expression.body, expression.orelse)]
+            return ([part for branch in branches for part in branch[0]],
+                    {id(child) for child in ast.walk(expression)}
+                    | {node for branch in branches for node in branch[1]})
+        if isinstance(expression, ast.Name):
+            scope = scopes.get(id(expression), tree)
+            while (id(scope), expression.id) not in values and id(scope) in parents:
+                scope = parents[id(scope)]
+            binding = (id(scope), expression.id)
+            if binding not in bindings:
+                branches = [conditional_fragments(value, bindings | {binding})
+                            for value in values.get(binding, [])]
+                handled = {node for branch in branches for node in branch[1]}
+                if handled:
+                    return [part for branch in branches for part in branch[0]], handled | {id(expression)}
+        if isinstance(expression, ast.JoinedStr):
+            children = expression.values
+        elif isinstance(expression, ast.FormattedValue):
+            children = [expression.value]
+        elif isinstance(expression, ast.BinOp) and isinstance(expression.op, ast.Add):
+            children = [expression.left, expression.right]
+        else:
+            return [fragments(expression)], set()
+        branches = [conditional_fragments(child, bindings) for child in children]
+        handled = {node for branch in branches for node in branch[1]}
+        if not handled:
+            return [fragments(expression)], set()
+        combinations: list[tuple[str, tuple[int, ...]]] = [("", ())]
+        for branch in branches:
+            combinations = [(prefix + suffix, before + after)
+                            for prefix, before in combinations for suffix, after in branch[0]]
+        return combinations, handled | {id(child) for child in ast.walk(expression)}
+
+    # Emit an entire string expression once, preserving sentence and column
+    # context across both concatenated literals and formatted values.
+    composite_parts: set[int] = set()
+    for expression in output_roots:
+        variants, handled = conditional_fragments(expression, frozenset())
+        if not handled:
+            continue
+        composite_parts.update(handled)
+        for value, locations in variants:
+            if printed:
+                printed_lines.append(locations[0] if locations else 1)
+            printed.append(value)
+            printed_lines.extend(locations)
     for node in nodes:
+        if (isinstance(node, ast.JoinedStr) or (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add))) and id(node) in printed_outputs and id(node) not in composite_parts:
+            composite_parts.update(id(child) for child in ast.walk(node) if child is not node)
+            value, locations = fragments(node)
+            if printed:
+                printed_lines.append(node.lineno)
+            printed.append(value)
+            printed_lines.extend(locations)
         if not isinstance(node, ast.Constant) or not isinstance(node.value, str) or id(node) in excluded:
             continue
         value = node.value
+        if id(node) in printed_outputs and id(node) not in composite_parts:
+            if printed:
+                printed_lines.append(node.lineno)
+            printed.append(value)
+            printed_lines.extend(python_literal_lines(node, encoded_lines, value))
         if id(node) in outputs or re.search(r"[A-Za-z][ ,:;!?—]+[A-Za-z]", value):
             if strings:
                 source_lines.append(node.lineno)
             strings.append(value)
             source_lines.extend(python_literal_lines(node, encoded_lines, value))
-    return SourceProse("\n".join(strings), tuple(source_lines))
+    return SourceProse("\n".join(strings), tuple(source_lines), "\n".join(printed), tuple(printed_lines))
 
 
 def shell_prose(text: str) -> SourceProse:
@@ -593,7 +827,7 @@ def shell_prose(text: str) -> SourceProse:
         # Consume input bodies even for non-output commands: their text is not shell code.
         for heredoc in re.finditer(r"<<(-?)[ \t]*(['\"]?)([A-Za-z_]\w*)\2", line):
             prefix = line[:heredoc.start()]
-            printed = re.search(r"(?:^|[;&|()])\s*cat\b[^;&|]*$", prefix) is not None
+            printed = re.search(r"(?:^|[;&|()])\s*cat\b(?:[^;&|]|[012]?>&[12])*$", prefix) is not None
             strip_tabs = heredoc.group(1) == "-"
             delimiter = heredoc.group(3)
             for body_number, body_line in lines:
@@ -605,10 +839,14 @@ def shell_prose(text: str) -> SourceProse:
                         source_lines.append(body_number)
                     strings.append(body)
                     source_lines.extend([body_number] * len(body))
-    return SourceProse("\n".join(strings), tuple(source_lines))
+    return SourceProse("\n".join(strings), tuple(source_lines), "\n".join(strings), tuple(source_lines))
 
 
-def extraction_candidate(text: str, python: bool, retired: re.Pattern[str]) -> bool:
+NO_FIXED_FORMS: frozenset[str] = frozenset()
+
+
+def extraction_candidate(text: str, python: bool, retired: re.Pattern[str],
+                         fixed: frozenset[str] = NO_FIXED_FORMS) -> bool:
     """Select raw matches and every Python constant that can decode or join into one.
 
     Shell extraction only removes quotes or leading tabs and joins with newlines;
@@ -619,13 +857,17 @@ def extraction_candidate(text: str, python: bool, retired: re.Pattern[str]) -> b
     if retired.search(text) is not None:
         return True
     if not python:
-        return False
+        return any(name in text.casefold() for name in fixed)
     pending: list[ast.AST] = [ast.parse(text)]
     while pending:
         node = pending.pop()
         if isinstance(node, ast.Constant):
-            if isinstance(node.value, str) and retired.search(node.value) is not None:
+            if isinstance(node.value, str) and (retired.search(node.value) is not None
+                                               or any(name in node.value.casefold() for name in fixed)):
                 return True
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            # Separate literals or dynamic operands can form a display label.
+            return True
         elif not isinstance(node, ast.Name):
             # Constants and identifiers have no contributing child constants.
             pending.extend(ast.iter_child_nodes(node))
@@ -633,30 +875,30 @@ def extraction_candidate(text: str, python: bool, retired: re.Pattern[str]) -> b
 
 
 def read_live_file(root: Path, retired: re.Pattern[str], select_candidates: bool,
-                   path: Path) -> tuple[tuple[LiveFile, ...], tuple[str, ...]]:
+                   path: Path, *, fixed: frozenset[str] = NO_FIXED_FORMS) -> LiveSources:
     """Read and extract one source without changing the order of scan results."""
     relative = path.relative_to(root)
     script = relative.parts[0] == "scripts"
     try:
         text = path.read_text(encoding="utf-8")
         python = script and (path.suffix == ".py" or "python" in text.partition("\n")[0])
-        if select_candidates and not extraction_candidate(text, python, retired):
-            return (), ()
+        if select_candidates and not extraction_candidate(text, python, retired, fixed):
+            return LiveSources((), ())
         if script:
             prose = python_prose(text) if python else shell_prose(text)
-            return (LiveFile(relative.as_posix(), prose.text, prose.source_lines),), ()
-        return (LiveFile(relative.as_posix(), text),), ()
+            return LiveSources((LiveFile(relative.as_posix(), prose.text, prose.source_lines, prose.printed_text, prose.printed_lines),), ())
+        return LiveSources((LiveFile(relative.as_posix(), text),), ())
     except (OSError, UnicodeError, SyntaxError) as error:
-        return (), (f"{relative}: {error}",)
+        return LiveSources((), (UnreadSource(relative.as_posix(), str(error)),))
 
 
-def read_live_files(root: Path, *, retired_forms: tuple[str, ...] = ()) -> tuple[tuple[LiveFile, ...], tuple[str, ...]]:
+def read_live_sources(root: Path, *, retired_forms: tuple[str, ...] = (), fixed_forms: tuple[str, ...] = ()) -> LiveSources:
     paths: set[Path] = {root / "CLAUDE.md"} if (root / "CLAUDE.md").is_file() else set()
     for folder in ("commands", "docs", "skills", "scripts"):
         paths.update(path for path in (root / folder).rglob("*") if path.is_file())
     selected: list[Path] = []
     # No word boundaries: even a raw match inside an identifier selects extraction.
-    retired = re.compile("|".join(re.escape(name) for name in retired_forms), re.IGNORECASE)
+    retired = re.compile("|".join(re.escape(name) for name in retired_forms) if retired_forms else r"(?!)", re.IGNORECASE)
     for path in sorted(paths):
         relative = path.relative_to(root)
         if any(part.startswith(".") or part in ("__pycache__", "fixtures", "node_modules") for part in relative.parts):
@@ -669,16 +911,22 @@ def read_live_files(root: Path, *, retired_forms: tuple[str, ...] = ()) -> tuple
         if not script and path.suffix not in (".md", ".txt"):
             continue
         selected.append(path)
-    read = partial(read_live_file, root, retired, bool(retired_forms))
+    read = partial(read_live_file, root, retired, bool(retired_forms or fixed_forms),
+                   fixed=frozenset(name.casefold() for name in fixed_forms))
     # Parsing and extraction are CPU-bound. Keep small roots and baseline serial;
     # map preserves sorted source order even when workers finish out of order.
-    if retired_forms and len(selected) >= 64:
+    if (retired_forms or fixed_forms) and len(selected) >= 64:
         with ProcessPoolExecutor(max_workers=8) as pool:
             results = tuple(pool.map(read, selected, chunksize=4))
     else:
         results = tuple(map(read, selected))
-    return (tuple(file for result in results for file in result[0]),
-            tuple(issue for result in results for issue in result[1]))
+    return LiveSources(tuple(file for result in results for file in result.files),
+                       tuple(source for result in results for source in result.unread_sources))
+
+
+def read_live_files(root: Path, *, retired_forms: tuple[str, ...] = (), fixed_forms: tuple[str, ...] = ()) -> tuple[tuple[LiveFile, ...], tuple[str, ...]]:
+    sources = read_live_sources(root, retired_forms=retired_forms, fixed_forms=fixed_forms)
+    return sources.files, tuple(source.warning() for source in sources.unread_sources)
 
 
 def table(title: str, headings: tuple[str, ...], rows: list[tuple[str, ...]]) -> str:
@@ -689,14 +937,55 @@ def table(title: str, headings: tuple[str, ...], rows: list[tuple[str, ...]]) ->
 
 
 def report(terms: tuple[Term, ...], files: tuple[LiveFile, ...], productions: tuple[ProductionNames, ...],
-           source: MessageSource, window: AuditWindow, issues: tuple[str, ...]) -> str:
+           source: MessageSource, window: AuditWindow, issues: tuple[str, ...], *,
+           source_result: SourceCheck, unread_production_docs: tuple[UnreadSource, ...], tables: bool = False) -> str:
     names = measure_names(terms, files)
     definitions = measure_definitions(terms, files)
     production_names = measure_production_names(productions)
-    contacts = measure_wrong_party(source.records, window)
+    contacts = measure_sent_contacts(source.records, window)
     total = sum(row.hits for row in names)
     other = sum(row.hits for row in names if row.form == "other")
-    live = f"live: n={len(files)} files"
+    live_gap = f"; n={len(source_result.unread_sources)} sources not read" if source_result.unread_sources else ""
+    production_gap = f"; n={len(unread_production_docs)} sources not read" if unread_production_docs else ""
+    live = f"live: n={len(files)} files{live_gap}"
+    share = f"{other / total:.1%}" if total else "no matches"
+    worst = sorted((row for row in names if row.form == "other" and row.hits),
+                   key=lambda row: (-row.hits, row.name.casefold(), row.term.casefold()))[:5]
+    worst_text = "; ".join(f"{row.name!r} n={row.hits} ({row.term})" for row in worst) or "none"
+    summary = [f"Other names: {other} / {total} ({share}; {live}).",
+               f"Most used other names: {worst_text} ({live}).",
+               f"Definitions: n={len(definitions)} findings across n={len(terms)} terms{live_gap}.",
+               f"Unit and session names: n={len(production_names)} findings across n={len(productions)} production docs (including retired units){production_gap}.",
+               f"Fixed display labels: n={len(source_result.labels)} to fix{live_gap}; role words in sentences: n={len(source_result.sentences)} (information only; {live}).",
+               f"Files: {LIVE_SET} (n={len(files)}{live_gap}).",
+               f"Message window: {window.label()} (natedev only)."]
+    contact_summary: list[str] = []
+    if source.status == "read":
+        contact_summary.append(f"Sent contacts: n={contacts.sent_records} sent / n={contacts.window_records} window records; "
+                               + f"other machines excluded n={contacts.other_machine_records}; "
+                               + f"machine unknown (n={contacts.machine_unknown}); invalid log lines n={source.invalid_lines}.")
+        contact_summary.append(f"Director contacts: to user n={sum(row.to_user for row in contacts.senders)} recorded; "
+                               + f"to other showrunners n={sum(row.to_other_showrunner for row in contacts.senders)} recorded; "
+                               + f"role unknown (n={sum(row.role_unknown for row in contacts.senders)}); "
+                               + f"production unknown (n={sum(row.production_unknown for row in contacts.senders)}). Request intent is not recorded.")
+    else:
+        contact_summary.append(f"Sent contacts: unknown (n={contacts.window_records}); message log {source.status}.")
+    summary.extend(contact_summary)
+    for finding in definitions:
+        if finding.status == "no defined_in":
+            summary.append(f"Definition: {finding.term!r} has no declared definition.")
+        else:
+            summary.append(f"Definition: {finding.term!r} has definitions in {', '.join(finding.files)}.")
+    for finding in production_names:
+        if finding.kind == "unit format":
+            summary.append(f"Name: {finding.name!r} has an invalid unit format in {', '.join(finding.productions)}.")
+        else:
+            summary.append(f"Name: {finding.name!r} is shared by {', '.join(finding.productions)}.")
+    summary.extend(f"Warning: {issue}" for issue in dict.fromkeys(issues))
+    summary.extend(f"Fix: {issue}" for issue in source_result.issues if issue not in issues)
+    short = "\n".join(summary)
+    if not tables:
+        return short
     definition_set = f"live + declared: n={len(terms)} terms"
     docs = f"productions: n={len(productions)} docs"
     name_rows = [(row.term, row.name, row.form, str(row.hits), str(len(row.files)), live) for row in names]
@@ -706,10 +995,11 @@ def report(terms: tuple[Term, ...], files: tuple[LiveFile, ...], productions: tu
     production_rows = [(row.kind, row.name, "; ".join(row.productions), "; ".join(row.docs), str(len(row.docs)), docs)
                        for row in production_names]
     contact_rows = [(row.sender, str(row.to_user), str(row.to_other_showrunner),
-                     f"{NOT_RECORDED}: {row.role_unknown}" if row.role_unknown else "0",
-                     f"{NOT_RECORDED}: {row.production_unknown}" if row.production_unknown else "0",
-                     str(row.n), "window") for row in contacts.senders]
-    return "\n\n".join([
+                     f"unknown (n={row.role_unknown})" if row.role_unknown else "0",
+                     f"unknown (n={row.production_unknown})" if row.production_unknown else "0",
+                     str(row.n), "window") for row in contacts.senders
+                    if row.to_user or row.to_other_showrunner]
+    return short + "\n\n" + "\n\n".join([
         f"Roles baseline\nRoot file set: {LIVE_SET}\nWindow: {window.label()}\n"
         + "Static script strings; no execution or expansion. Tests and fixtures excluded.\n"
         + "Python references use lexical scope; helper call arguments are not followed into parameters.\n"
@@ -725,17 +1015,15 @@ def report(terms: tuple[Term, ...], files: tuple[LiveFile, ...], productions: tu
         table("Unit and session names — natedev only; all Units rows, including retired rows",
               ("Finding", "Name", "Productions", "Files", "Docs (n)", "File set"),
               production_rows or [("none", "none", "none", "none", "0", docs)]),
-        table("Wrong-party asks — natedev only; sent contacts, request intent not recorded",
+        table("Sent contacts — natedev only; request intent not recorded",
               ("Sender", "Director to user (n)", "Director to other showrunner (n)", "Role unknown (n)",
                "Production unknown (n)", "Sent (n)", "Window"),
-              contact_rows or [("none", "0", "0", "0", "0", "0", "window")]),
+              contact_rows),
         f"Message window: {window.label()}\nSource: ~/.local/state/message/log.jsonl ({source.status})\n"
-        + f"Window records n={contacts.window_records}; natedev sent n={contacts.sent_records}; "
-        + f"other-machine records excluded n={contacts.other_machine_records}; machine {NOT_RECORDED} n={contacts.machine_unknown}; "
-        + f"invalid lines in whole log n={source.invalid_lines}.\n"
+        + "\n".join(contact_summary) + "\n"
         + f"Role source: {ROLE_SOURCE}. Historical role/production fields are {NOT_RECORDED} in the current log schema.\n"
         + "Current names cannot prove past roles.\n"
-        + "Recorded zeroes cover only known roles. Unknown counts do not prove absence of wrong-party asks.",
+        + "Recorded zeroes cover only known roles. Unknown counts do not prove absence of sent contacts.",
         table("Source issues", ("Source issue", "Issues (n)"), [(issue, "1") for issue in issues] or [("none", "0")]),
     ])
 
@@ -749,16 +1037,23 @@ def audit_window(since: str, until: str, now: datetime) -> AuditWindow:
     return AuditWindow(start, end)
 
 
-def baseline(root: Path, window: AuditWindow) -> str:
+def baseline(root: Path, window: AuditWindow, *, tables: bool = False) -> str:
     terms = parse_terms((root / "scripts/production/role_terms.toml").read_text(encoding="utf-8"))
-    files, file_issues = read_live_files(root)
-    issues = list(file_issues)
+    loaded = display_names.load_names(root / "config/names.toml")
+    if not isinstance(loaded, display_names.Names):
+        raise ValueError(display_names.error_text(loaded, root / "config/names.toml"))
+    sources = read_live_sources(root)
+    source_result = check_live_sources(terms, loaded, sources)
+    terms += display_terms(loaded)
+    issues = [source.warning() for source in sources.unread_sources]
     productions: list[ProductionNames] = []
+    unread_production_docs: list[UnreadSource] = []
     # This is the same timer/doc reader as `showrunners.py list`, without session/socket probes.
     for slug, doc in sorted(showrunners.timer_docs().items()):
         try:
             productions.append(parse_production(slug, str(doc), doc.read_text(encoding="utf-8")))
         except (OSError, UnicodeError, production_units.Refusal) as error:
+            unread_production_docs.append(UnreadSource(str(doc), str(error)))
             issues.append(f"{doc}: {error}")
     path = Path.home() / ".local/state/message/log.jsonl"
     try:
@@ -766,7 +1061,8 @@ def baseline(root: Path, window: AuditWindow) -> str:
     except (OSError, UnicodeError) as error:
         source = MessageSource((), 0, f"unavailable: {error}")
         issues.append(f"{path}: {error}")
-    return f"Repository: {root}\n" + report(terms, files, tuple(productions), source, window, tuple(issues))
+    return report(terms, sources.files, tuple(productions), source, window, tuple(issues),
+                  tables=tables, source_result=source_result, unread_production_docs=tuple(unread_production_docs))
 
 
 def main(arguments: list[str]) -> int:
@@ -775,15 +1071,22 @@ def main(arguments: list[str]) -> int:
     _ = parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
     _ = parser.add_argument("--since", default="", help="first local date, YYYY-MM-DD")
     _ = parser.add_argument("--until", default="", help="last local date, inclusive, YYYY-MM-DD")
+    _ = parser.add_argument("--prose", action="store_true", help="list role words in output sentences")
+    _ = parser.add_argument("--tables", action="store_true", help="show the full baseline tables")
     args = parser.parse_args(arguments)
     try:
         if cast(str, args.action) == "check":
-            issues = check_sources(cast(Path, args.root).resolve())
-            for issue in issues:
+            result = source_check(cast(Path, args.root).resolve())
+            for issue in result.issues:
                 print(issue)
-            return int(bool(issues))
+            hint = "" if cast(bool, args.prose) else " (list with --prose)"
+            print(f"role words in sentences: {len(result.sentences)}{hint}")
+            if cast(bool, args.prose):
+                for use in result.sentences:
+                    print(f"{use.path}:{use.line}: {use.name!r}")
+            return int(bool(result.issues))
         window = audit_window(cast(str, args.since), cast(str, args.until), datetime.now(timezone.utc))
-        print(baseline(cast(Path, args.root).resolve(), window))
+        print(baseline(cast(Path, args.root).resolve(), window, tables=cast(bool, args.tables)))
     except (OSError, ValueError) as error:
         print(f"roles_audit: {error}", file=sys.stderr)
         return 1

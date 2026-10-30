@@ -4,6 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import atexit
+import hashlib
+import re
+import threading
 import fnmatch
 import json
 import posixpath
@@ -11,10 +15,10 @@ import subprocess
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Literal, TypedDict, cast
+from typing import BinaryIO, Literal, TypedDict, cast, final, override
 
 import style_rules
-from candidate_generators import CandidatesSpec, CandidatesSpecError, read_candidates_spec
+from candidate_generators import CandidatesSpec
 
 Tier = Literal["A", "B", "C", "D", "E"]
 Family = Literal["names", "values", "types", "modules"]
@@ -90,8 +94,200 @@ class Rule:
     candidates: CandidatesSpec | None
     pre_filter: str | None
     blob: str
+    body_identity: str
+    judgment_identity: str
     origin: RuleOrigin
     approval: RuleApproval
+
+
+@dataclass(frozen=True)
+class RuleText:
+    """One immutable rule snapshot, shared by the existing file-oriented metadata readers."""
+
+    path: Path
+    text: str
+
+    def read_text(self) -> str:
+        return self.text
+
+    @override
+    def __str__(self) -> str:
+        return str(self.path)
+
+
+def _body_identity(text: bytes) -> str:
+    """Hash the exact bytes after a complete frontmatter block; unreadable text has no identity."""
+    try:
+        _ = text.decode("utf-8")
+    except UnicodeDecodeError:
+        return ""
+    lines = text.splitlines(keepends=True)
+    if lines and lines[0].strip() == b"---":
+        for index, line in enumerate(lines[1:], 1):
+            if line.strip() == b"---":
+                return hashlib.sha256(b"".join(lines[index + 1:])).hexdigest()
+        return ""
+    return hashlib.sha256(text).hexdigest()
+
+
+# These are deletion patterns, not a metadata parser. Unmatched lines stay exact.
+_ADMIN_COMMENT = rb"(?: #[^\r\n]*)?"
+_ADMIN_ITEM = rb"[a-z0-9_-]+"
+_ADMIN_LINE = re.compile(
+    rb"(?:approval: always|tags: \[" + _ADMIN_ITEM + rb"(?:, " + _ADMIN_ITEM + rb")*\]"
+    + rb"|date_(?:created|modified): (?P<quote>['\"]?)\[\[[0-9]{4}-[0-9]{2}-[0-9]{2}\]\](?P=quote))"
+    + _ADMIN_COMMENT
+)
+_ADMIN_TAGS_BLOCK = re.compile(rb"tags:" + _ADMIN_COMMENT)
+_ADMIN_TAG_ITEM = re.compile(rb"(?:  )?- " + _ADMIN_ITEM + _ADMIN_COMMENT)
+
+
+def _judgment_identity(text: bytes) -> str:
+    """Fingerprint validated body and frontmatter bytes after canonical admin deletion."""
+    lines = text.splitlines(keepends=True)
+    if text.decode("utf-8").splitlines(keepends=True) != [line.decode("utf-8") for line in lines]:
+        # A separator only in an unchanged body also makes judgments stale.
+        return ""
+    frontmatter: list[bytes] = []
+    body = text
+    if lines and lines[0].rstrip(b"\r\n") == b"---":
+        for index, line in enumerate(lines[1:], 1):
+            if line.rstrip(b"\r\n") == b"---":
+                frontmatter = lines[1:index]
+                body = b"".join(lines[index + 1:])
+                break
+        else:
+            raise ValueError("unterminated frontmatter")
+    retained: list[bytes] = []
+    index = 0
+    while index < len(frontmatter):
+        line = frontmatter[index]
+        content = line.removesuffix(b"\n").removesuffix(b"\r")
+        if _ADMIN_TAGS_BLOCK.fullmatch(content):
+            end = index + 1
+            trivia: list[bytes] = []
+            removable = True
+            while end < len(frontmatter):
+                item = frontmatter[end]
+                stripped = item.decode("utf-8").strip()
+                if not stripped or stripped.startswith("#"):
+                    trivia.append(item)
+                elif stripped.startswith("- "):
+                    if not _ADMIN_TAG_ITEM.fullmatch(item.removesuffix(b"\n").removesuffix(b"\r")):
+                        removable = False
+                else:
+                    break
+                end += 1
+            # Validated list ownership crosses trivia and ends at the next key.
+            retained.extend(trivia if removable else frontmatter[index:end])
+            index = end
+            continue
+        if not _ADMIN_LINE.fullmatch(content):
+            retained.append(line)
+        index += 1
+    header = b"".join(retained)
+    # Length-prefix the header so bytes cannot move between header and body.
+    return hashlib.sha256(len(header).to_bytes(8, "big") + header + body).hexdigest()
+
+
+@final
+class ValidatedRuleHistory:
+    """Validated judgment identities, read through one batch process for this rule repository."""
+
+    def __init__(self, repo: Path) -> None:
+        self.identities: dict[tuple[str, RuleOrigin], str] = {}
+        self.lock = threading.Lock()
+        self.process: subprocess.Popen[bytes] = subprocess.Popen(
+            ["git", "-C", str(repo), "cat-file", "--batch"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        _ = atexit.register(self.close)
+
+    def close(self) -> None:
+        if self.process.stdin is not None and not self.process.stdin.closed:
+            self.process.stdin.close()
+        if self.process.stdout is not None and not self.process.stdout.closed:
+            self.process.stdout.close()
+        _ = self.process.wait()
+
+    def identity(self, blob: str, rule: Rule) -> str:
+        if not re.fullmatch(r"[0-9a-f]{40}", blob):
+            return ""
+        key = (blob, rule.origin)
+        with self.lock:
+            if key not in self.identities:
+                identity = ""
+                try:
+                    assert self.process.stdin is not None and self.process.stdout is not None
+                    requests = cast(BinaryIO, self.process.stdin)
+                    responses = cast(BinaryIO, self.process.stdout)
+                    _ = requests.write(blob.encode() + b"\n")
+                    requests.flush()
+                    header = responses.readline().split()
+                    if len(header) == 3:
+                        content = responses.read(int(header[2]))
+                        separator = responses.read(1)
+                        if header[1] == b"blob" and len(content) == int(header[2]) and separator == b"\n":
+                            identity = _rule_from_text(
+                                rule.path, rule.origin, rule.path.parent, rule.reach, content, blob,
+                            ).judgment_identity
+                except (OSError, ValueError):
+                    pass
+                self.identities[key] = identity
+            return self.identities[key]
+
+
+@dataclass(frozen=True)
+class RuleRepositoryIdentity:
+    """The Git directory and object store currently installed at a rule repository."""
+
+    common_dir: Path
+    object_store_identity: tuple[int, int]
+
+    @classmethod
+    def at(cls, repo: Path) -> RuleRepositoryIdentity:
+        git_dir = repo / ".git"
+        if git_dir.is_file():
+            marker = git_dir.read_text().strip()
+            if not marker.startswith("gitdir: "):
+                raise OSError("unreadable Git directory marker")
+            git_dir = repo / marker.removeprefix("gitdir: ")
+        git_dir = git_dir.resolve(strict=True)
+        common = git_dir / "commondir"
+        common_dir = (git_dir / common.read_text().strip()).resolve(strict=True) if common.is_file() else git_dir
+        objects = (common_dir / "objects").resolve(strict=True)
+        object_stat = objects.stat()
+        return cls(common_dir, (object_stat.st_dev, object_stat.st_ino))
+
+
+_RULE_BODIES: dict[RuleRepositoryIdentity, ValidatedRuleHistory] = {}
+_RULE_BODIES_LOCK = threading.Lock()
+
+
+def judged_text_unchanged(judged_blob: str, rule: Rule, *, compared_blob: str = "") -> bool:
+    """Whether validated snapshots differ only in canonical administrative lines.
+
+    compared_blob compares two historical pins without changing either pin's provenance.
+    Only approval, tags, date_created and date_modified are administrative.
+    A batch reader and validated identities are shared for the life of this run.
+    """
+    current = compared_blob or rule.blob
+    if judged_blob == current == rule.blob:
+        return bool(rule.judgment_identity)
+    repo = next((parent for parent in rule.path.parents if (parent / ".git").exists()), None)
+    if repo is None:
+        return False
+    try:
+        repository = RuleRepositoryIdentity.at(repo)
+        with _RULE_BODIES_LOCK:
+            if repository not in _RULE_BODIES:
+                _RULE_BODIES[repository] = ValidatedRuleHistory(repo)
+            history = _RULE_BODIES[repository]
+        old = rule.judgment_identity if judged_blob == rule.blob else history.identity(judged_blob, rule)
+        body = rule.judgment_identity if current == rule.blob else history.identity(current, rule)
+        return bool(old and body and old == body and repository == RuleRepositoryIdentity.at(repo))
+    except OSError:
+        return False
 
 
 class RuleValidationError(ValueError):
@@ -101,26 +297,60 @@ class RuleValidationError(ValueError):
         super().__init__(f"{path}: {reason}")
 
 
-def _scalar(metadata: dict[str, list[str]], key: str, path: Path, default: str = "") -> str:
-    values = metadata.get(key)
-    if values is None:
+def _scalar(metadata: style_rules.RuleFrontmatter, key: str, path: Path, default: str = "") -> str:
+    if key not in metadata.fields:
         return default
-    if len(values) != 1 or not values[0].strip():
+    value = metadata.fields[key]
+    if not isinstance(value, str) or not value.strip():
         raise RuleValidationError(path, f"{key} must be a nonempty scalar")
-    return values[0]
+    return value
 
 
-def _load_rule(path: Path, origin: RuleOrigin, rule_root: Path, reach: RepoReach | MemberReach) -> Rule:
-    metadata = style_rules.parse_frontmatter(path)
+def _candidate_spec(metadata: style_rules.RuleFrontmatter, path: Path) -> CandidatesSpec | None:
+    if "candidates" not in metadata.fields:
+        return None
+    block = metadata.fields["candidates"]
+    if not isinstance(block, dict):
+        raise RuleValidationError(path, "candidates must be a mapping")
+    candidates = style_rules.RuleFrontmatter(dict(block))
+    kind = _scalar(candidates, "kind", path)
+    if not kind:
+        raise RuleValidationError(path, "candidates.kind is required")
+    surface: Literal["whole", "partial", "unclassified"] = "unclassified"
+    declared = _scalar(candidates, "surface", path)
+    if "surface" in block and declared not in ("whole", "partial"):
+        raise RuleValidationError(path, "candidates.surface must be whole or partial")
+    if declared in ("whole", "partial"):
+        surface = declared
+    uncovered = _scalar(candidates, "uncovered", path)
+    if surface == "partial" and not uncovered:
+        raise RuleValidationError(path, "partial candidates.surface requires uncovered")
+    return CandidatesSpec(
+        kind=kind, origin=str(path), surface=surface, uncovered=uncovered,
+        pattern=_scalar(candidates, "pattern", path),
+        exclude_pattern=_scalar(candidates, "exclude_pattern", path),
+        field_type_pattern=_scalar(candidates, "field_type_pattern", path),
+        globs=tuple(candidates["globs"]), paths=tuple(candidates["paths"]),
+        paths_exempt=tuple(candidates["paths_exempt"]), structs=tuple(candidates["structs"]),
+    )
+
+
+def _rule_from_text(path: Path, origin: RuleOrigin, rule_root: Path, reach: RepoReach | MemberReach,
+                    text: bytes, blob: str) -> Rule:
+    decoded = text.decode("utf-8")
+    # These existing readers only use read_text and str(path). Adapt the immutable
+    # snapshot at their Path API boundary, so history and loading cannot diverge.
+    source = cast(Path, cast(object, RuleText(path, decoded)))
     try:
-        candidates = read_candidates_spec(path)
-    except CandidatesSpecError as error:
+        metadata = style_rules.parse_frontmatter(source)
+    except ValueError as error:
         raise RuleValidationError(path, str(error)) from error
+    candidates = _candidate_spec(metadata, path)
 
     tier: Tier | Literal["unclassified"] = "unclassified"
     family: Family | None = None
     input_scope: InputScope = "crate"
-    has_classification = any(key in metadata for key in ("tier", "family", "input_scope"))
+    has_classification = any(key in metadata.fields for key in ("tier", "family", "input_scope"))
     if origin == "local" or has_classification:
         declared_tier = _scalar(metadata, "tier", path)
         if declared_tier not in ("A", "B", "C", "D", "E"):
@@ -159,16 +389,13 @@ def _load_rule(path: Path, origin: RuleOrigin, rule_root: Path, reach: RepoReach
             raise RuleValidationError(path, "approval always requires a family")
         approval = AlwaysApproved(family)
 
-    pre_filter = style_rules.read_pre_filter(path) or None
+    pre_filter_value = metadata.fields.get("pre_filter", "")
+    if not isinstance(pre_filter_value, str):
+        raise RuleValidationError(path, "pre_filter must be a scalar")
+    pre_filter = pre_filter_value or None
     if tier == "B" and candidates is None and pre_filter is None:
         raise RuleValidationError(path, "tier B requires candidates or pre_filter")
 
-    blob = subprocess.run(
-        ["git", "hash-object", "--", str(path)],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
     return Rule(
         rule_id=f"{origin}:{path.relative_to(rule_root).as_posix()}",
         reach=reach,
@@ -181,9 +408,19 @@ def _load_rule(path: Path, origin: RuleOrigin, rule_root: Path, reach: RepoReach
         candidates=candidates,
         pre_filter=pre_filter,
         blob=blob,
+        body_identity=_body_identity(text),
+        judgment_identity=_judgment_identity(text),
         origin=origin,
         approval=approval,
     )
+
+
+def _load_rule(path: Path, origin: RuleOrigin, rule_root: Path, reach: RepoReach | MemberReach) -> Rule:
+    text = path.read_bytes()
+    blob = subprocess.run(
+        ["git", "hash-object", "--stdin"], input=text, check=True, capture_output=True,
+    ).stdout.decode().strip()
+    return _rule_from_text(path, origin, rule_root, reach, text, blob)
 
 
 def _table(value: object) -> dict[str, object]:

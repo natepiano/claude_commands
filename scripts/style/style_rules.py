@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -83,52 +84,155 @@ def _extract_wikilink(raw: str) -> str:
     return ""
 
 
-def parse_frontmatter(path: Path) -> dict[str, list[str]]:
-    tags: list[str] = []
-    see_also: list[str] = []
-    metadata = {"tags": tags, "see_also": see_also}
-    lines = path.read_text().splitlines()
-    if not lines or lines[0].strip() != "---":
-        return metadata
-    current_key = ""
-    for line in lines[1:]:
-        stripped = line.strip()
-        if stripped == "---":
-            break
-        if not stripped:
-            continue
-        if stripped.startswith("-") and current_key:
-            value = stripped.lstrip("-").strip()
-            if current_key == "tags":
-                tags.append(value)
-            elif current_key == "see_also":
-                extracted = _extract_wikilink(value)
-                if extracted:
-                    see_also.append(extracted)
-            continue
-        if ":" not in stripped:
-            current_key = ""
-            continue
-        key, _, value = stripped.partition(":")
-        key = key.strip()
-        value = value.strip()
-        if line == line.lstrip() and key in ("tier", "family", "input_scope", "mechanism", "mode", "approval"):
-            if len(value) >= 2 and value[0] in ("'", '"') and value[-1] == value[0]:
-                value = value[1:-1]
-            metadata[key] = [value]
-        if key == "tags":
-            current_key = "tags" if not value else ""
-        elif key == "see_also":
-            if value:
-                extracted = _extract_wikilink(value)
-                if extracted:
-                    see_also.append(extracted)
-                current_key = ""
-            else:
-                current_key = "see_also"
+def _quoted_frontmatter(value: str) -> tuple[str, str]:
+    quote = value[0]
+    index = 1
+    while index < len(value):
+        if quote == '"' and value[index] == "\\":
+            index += 2
+        elif value[index] == quote:
+            if quote == "'" and value[index:index + 2] == "''":
+                index += 2
+                continue
+            raw = value[:index + 1]
+            decoded = cast(str, json.loads(raw)) if quote == '"' else raw[1:-1].replace("''", "'")
+            return decoded, value[index + 1:]
         else:
-            current_key = ""
-    return metadata
+            index += 1
+    raise ValueError("unclosed frontmatter quote")
+
+
+# Closed grammar: scalar strings, flat lists of scalar strings, and one mapping
+# under candidates. No general YAML coercion or implicit continuation is supported.
+MetadataValue = str | list[str]
+MetadataFields = dict[str, MetadataValue | dict[str, MetadataValue]]
+_YAML_INDICATORS = "-?:,[]{}#&*!|>'\"%@`"
+
+
+def _frontmatter_scalar(raw: str) -> str:
+    value = raw.strip()
+    if not value:
+        raise ValueError("missing frontmatter scalar")
+    if value[0] in ("'", '"'):
+        decoded, tail = _quoted_frontmatter(value)
+        if tail.strip() and not re.match(r"[ \t]+#", tail):
+            raise ValueError("unexpected text after frontmatter quote")
+        return decoded
+    value = re.split(r"[ \t]+#", value, maxsplit=1)[0].rstrip()
+    if not value or value[0] in _YAML_INDICATORS or ": " in value or "\t" in value:
+        raise ValueError("invalid frontmatter plain scalar")
+    return value
+
+
+def _frontmatter_value(raw: str) -> MetadataValue:
+    value = raw.strip()
+    if not value.startswith("["):
+        return _frontmatter_scalar(value)
+    items: list[str] = []
+    tail = value[1:].lstrip()
+    while not tail.startswith("]"):
+        if not tail or tail.startswith("#"):
+            raise ValueError("unterminated frontmatter inline list")
+        if tail[0] in ("'", '"'):
+            item, tail = _quoted_frontmatter(tail)
+        else:
+            match = re.match(r"[^,\]]+", tail)
+            if match is None:
+                raise ValueError("missing frontmatter list item")
+            raw_item = match.group()
+            if "[" in raw_item or re.search(r"[ \t]+#", raw_item):
+                raise ValueError("invalid or unterminated frontmatter inline list")
+            item = _frontmatter_scalar(raw_item)
+            tail = tail[len(raw_item):]
+        items.append(item)
+        tail = tail.lstrip()
+        if tail.startswith(","):
+            tail = tail[1:].lstrip()
+            if tail.startswith("]"):
+                raise ValueError("missing frontmatter list item")
+        elif not tail.startswith("]"):
+            raise ValueError("unterminated frontmatter inline list")
+    tail = tail[1:]
+    if tail.strip() and not re.match(r"[ \t]+#", tail):
+        raise ValueError("unexpected text after frontmatter inline list")
+    return items
+
+
+@dataclass(frozen=True)
+class RuleFrontmatter:
+    """All parsed fields, retaining scalar/list shape and unknown keys for comparison."""
+
+    fields: MetadataFields
+
+    def __getitem__(self, key: str) -> list[str]:
+        """The catalog's existing multi-value view; link extraction belongs to consumers."""
+        value = self.fields.get(key, [])
+        if isinstance(value, dict):
+            raise ValueError(f"{key} is a mapping, not scalar values")
+        return [value] if isinstance(value, str) else value
+
+
+def parse_frontmatter(path: Path) -> RuleFrontmatter:
+    """Parse only column-zero keys, block lists, and a candidates mapping.
+
+    Values are closed quoted strings, flat inline lists, or plain scalars that
+    start without a YAML indicator. Blank lines and full-line comments are allowed.
+    All other structures, duplicate keys, BOMs and tab indentation are errors.
+    Delimiters must occupy their own unindented line. Bodies are not interpreted.
+    """
+    lines = path.read_text().splitlines()
+    fields: MetadataFields = {}
+    if lines and (lines[0].startswith("\ufeff") or (lines[0].strip() == "---" and lines[0] != "---")):
+        raise ValueError(f"{path}: invalid frontmatter opening delimiter or BOM")
+    if not lines or lines[0] != "---":
+        return RuleFrontmatter(fields)
+    block_key = ""
+    block_indent = -1
+    for number, line in enumerate(lines[1:], 2):
+        try:
+            stripped = line.strip()
+            indent = len(line) - len(line.lstrip())
+            if "\ufeff" in line:
+                raise ValueError("BOM in frontmatter")
+            if "\t" in line[:indent]:
+                raise ValueError("tab indentation in frontmatter")
+            if stripped == "---":
+                if line != "---":
+                    raise ValueError("indented or padded frontmatter delimiter")
+                return RuleFrontmatter(fields)
+            if not stripped or stripped.startswith("#"):
+                continue
+            entry = re.fullmatch(r"([A-Za-z_][A-Za-z_0-9-]*):(?:[ \t]+(.*)|())", stripped)
+            if indent == 0 and entry:
+                key, raw = entry.group(1), (entry.group(2) or "").strip()
+                if key in fields:
+                    raise ValueError(f"duplicate frontmatter key: {key}")
+                block_key, block_indent = "", -1
+                if not raw or raw.startswith("#"):
+                    fields[key] = {} if key == "candidates" else []
+                    block_key = key
+                else:
+                    fields[key] = _frontmatter_value(raw)
+                continue
+            if not block_key:
+                raise ValueError("line outside a frontmatter block or invalid indentation")
+            if block_indent == -1:
+                block_indent = indent
+            if indent != block_indent:
+                raise ValueError("inconsistent frontmatter block indentation")
+            block = fields[block_key]
+            if isinstance(block, dict) and indent > 0 and entry:
+                key, raw = entry.group(1), entry.group(2) or ""
+                if key in block:
+                    raise ValueError(f"duplicate candidates key: {key}")
+                block[key] = _frontmatter_value(raw)
+            elif isinstance(block, list) and stripped.startswith("- "):
+                block.append(_frontmatter_scalar(stripped[2:]))
+            else:
+                raise ValueError("unsupported frontmatter block entry or indentation")
+        except ValueError as error:
+            raise ValueError(f"{path}:{number}: {error}") from error
+    raise ValueError(f"{path}: unterminated frontmatter")
 
 
 def extract_title(path: Path) -> str:
@@ -144,22 +248,10 @@ def read_pre_filter(path: Path) -> str:
     Returns the regex string, or empty string when absent. Strips surrounding
     quotes (single or double) so the value can be passed directly to ripgrep.
     """
-    lines = path.read_text().splitlines()
-    if not lines or lines[0].strip() != "---":
-        return ""
-    for line in lines[1:]:
-        stripped = line.strip()
-        if stripped == "---":
-            break
-        if not line.startswith("pre_filter:"):
-            continue
-        value = stripped.split(":", 1)[1].strip()
-        if (value.startswith("'") and value.endswith("'")) or (
-            value.startswith('"') and value.endswith('"')
-        ):
-            value = value[1:-1]
-        return value
-    return ""
+    value = parse_frontmatter(path).fields.get("pre_filter", "")
+    if not isinstance(value, str):
+        raise ValueError(f"{path}: pre_filter must be a scalar")
+    return value
 
 
 def list_style_files(project_root: Path) -> list[Path]:
@@ -189,7 +281,7 @@ def build_units_from_files(
     for index, style_file in enumerate(style_files, start=1):
         frontmatter = parse_frontmatter(style_file)
         tags = set(frontmatter["tags"])
-        see_also_stems = list(frontmatter["see_also"])
+        see_also_stems = [link for value in frontmatter["see_also"] if (link := _extract_wikilink(value))]
         guideline_id = normalize_guideline_id(str(style_file), project_root)
         see_also_ids: list[str] = []
         for stem in see_also_stems:

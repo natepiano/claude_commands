@@ -15,8 +15,7 @@
 - **Push:** git
 - **Promote:** ~/.claude, mac ~/.claude
 - **Capacity:** natedev has 32 cores and 60 GB of memory; four units. The work is mostly documents and Python scripts, so the load is low. Its seats share natedev's build slots with build-followups.
-- **Change review:** `~/rust/hanadocs/change-review/change-review - sdlc.md` — sdlc is a top-level showrunner, so the list is its own; the file is made on its first row
-- **Review pool:** code
+- **Change review:** `~/rust/hanadocs/change-review/change-review - natedev.md` — sdlc reports to natedev, so new rows go to the root list with Production `sdlc`; rows before 2026-10-29 stay in `change-review - sdlc.md`
 - **Proposals:** `~/rust/hanadocs/issues`
 
 ## Units
@@ -36,13 +35,11 @@ Scope of each unit:
 - **fix-rounds-unit** — finds the phases with the most repair rounds and studies the highest counts first to measure the effect. Then it proposes changes that limit repair rounds and still meet the coding goals ("so we know how to stop ourselves and still get the work done").
 - **roles-unit** — the responsibilities of showrunners, unit directors and workers, and the names of things. It works with hierarchies-unit (build-followups) and does not do the same work.
 
-### Guild heads
+### Held design roles
 
-As built (`docs/as-built/guilds.md`; the user's G1b and G7 in Review decisions):
-
-- Each guild head is a unit director with the guild's exact ID, `designers`, `reviewers`, `showrunners` or `units`, under the `guilds` production on natedev (`docs/plans/guilds-production.md`). The heads are not units of sdlc. The guilds showrunner reports to sdlc in the showrunner tree (G1c); its herdr space stays top level.
-- Goddess names are on hold. `astra-designer` and `astra-reviewer` name only the per-design Astra roles and their census edges, not the heads.
-- guild-process-unit owns process changes, not head operations. A head sends a process proposal through the guilds showrunner to sdlc for guild-process-unit.
+`scripts/astra/design_roles.py` keeps one held designer and reviewer per design.
+State is in `~/.local/state/astra/design-roles/` and `~/.local/state/astra/design-ownership/`.
+`/unit:direct` and `/showrunner:produce` use these roles; see [long-lived workers](../as-built/long-lived-workers.md#lasting-roles).
 
 ## Hub files
 

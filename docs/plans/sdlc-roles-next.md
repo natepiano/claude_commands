@@ -2,8 +2,16 @@
 
 ## Items to consider
 
-- [ ] **The name count also reads the warning text that shell scripts print to stderr through heredocs**
-  - Target: `scripts/production/roles_audit.py` (shell output extraction)
-  - Why needed: `cat >&2 <<EOF` bodies are skipped, so shell name counts are lower bounds
-  - Completion condition: fixtures prove stderr `cat` heredocs count in Names and their retired uses report their physical source lines in `check`, while non-output heredocs stay excluded; record any changed lexical denominator apart from the Phase 4 scan speed-up
-  - Revealed by: Phase 1
+- [ ] **A push to the user's phone shows who sent it as production · unit · job**
+  - Owner: messaging-unit (showrunner, 2026-10-28)
+  - Target: `scripts/notify/pushover.py`, `scripts/message/send.py`
+  - Why needed: `send.py` passes the address as `pushover.py --source`, which also supplies the displayed sender; the push does not receive the R5b shown name
+  - Completion condition: a user push shows the sender's shown name (`production · unit · job`) in a display field, while silence and dedupe still key on the address; the push texts pass their text review
+  - Revealed by: Phase 5
+
+- [ ] **The unit board and cargo-liner show each session's job from the shared names file, and an empty job cell gives its reason**
+  - Owner: the unit-board owner and cargo-liner (showrunner, 2026-10-29: it sends them the contract and done-test when phase 6 merges)
+  - Target: the unit board's job column, cargo-liner's job column
+  - Why needed: both read session names, not the roster's `job.display`, so a configured display rename does not reach them
+  - Completion condition: each owner has a fixture test that a configured display rename changes the job column without changing session identity, and that unrecorded and unreadable assignments show `job.reason`
+  - Revealed by: Phase 6

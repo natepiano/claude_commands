@@ -5,11 +5,12 @@ from __future__ import annotations
 
 import json
 import os
+import select
+import socket
 import sqlite3
 import subprocess
 import sys
 import threading
-import time
 from collections.abc import Iterable
 from contextlib import closing
 from pathlib import Path
@@ -76,16 +77,22 @@ def stream_kind(value: object) -> StreamKind:
 
 
 def observe_role_snapshot(configuration: SshConfiguration) -> CommittedRoleSnapshot:
-    deadline = time.monotonic() + TEST_HANG_GUARD_SECS
-    while time.monotonic() < deadline:
-        with closing(sqlite3.connect(f"file:{configuration['database']}?mode=ro", uri=True)) as database:
-            rows = cast(list[tuple[int, str, str]], database.execute(
-                "SELECT problems, state, read_at FROM role_log_sources WHERE machine = 'mac'").fetchall())
-        if rows and rows[0][2] != configuration["previous_role_read_at"]:
-            problems, state, read_at = rows[0]
-            return {"problems": problems, "state": state, "read_at": read_at}
-        time.sleep(0.01)
-    raise RuntimeError("fixture never observes the committed role snapshot")
+    # The local record iterator signals after the consumer processes the
+    # attribution marker. Inspect through a separate connection as before.
+    descriptor = os.open(os.environ["USAGE_TEST_ROLE_COMMIT_EVENT"], os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        ready, _, _ = select.select([descriptor], [], [], TEST_HANG_GUARD_SECS)
+        if not ready or os.read(descriptor, 1) != b"1":
+            raise RuntimeError("fixture never observes the committed role snapshot")
+    finally:
+        os.close(descriptor)
+    with closing(sqlite3.connect(f"file:{configuration['database']}?mode=ro", uri=True)) as database:
+        rows = cast(list[tuple[int, str, str]], database.execute(
+            "SELECT problems, state, read_at FROM role_log_sources WHERE machine = 'mac'").fetchall())
+    if not rows or rows[0][2] == configuration["previous_role_read_at"]:
+        raise RuntimeError("fixture observes an uncommitted role snapshot")
+    problems, state, read_at = rows[0]
+    return {"problems": problems, "state": state, "read_at": read_at}
 
 
 def save_stream_report(path: Path, report: StreamReport) -> None:
@@ -121,11 +128,11 @@ def main() -> int:
         if behavior == "wait_for_release":
             marker = Path(configuration["report"])
             _ = marker.with_suffix(".waiting").write_bytes(b"")
-            deadline = time.monotonic() + TEST_HANG_GUARD_SECS
-            while not marker.with_suffix(".release").exists():
-                if time.monotonic() >= deadline:
+            with socket.create_connection(("127.0.0.1", int(os.environ["USAGE_TEST_WAIT_PORT"])),
+                                          timeout=TEST_HANG_GUARD_SECS) as event:
+                event.sendall(b"waiting")
+                if event.recv(1) != b"1":
                     raise RuntimeError("fixture pass was never released")
-                time.sleep(0.01)
         if behavior in ("unreachable", "early_disconnect"):
             print("\nfixture SSH is unreachable\nsecond fixture diagnostic", file=sys.stderr)
             return 255

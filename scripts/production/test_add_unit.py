@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from scripts.lib import names
+from scripts.lib.test_names import fixture_names
+
 import io
 import json
 import os
@@ -35,6 +38,50 @@ def setUpModule() -> None:
 
 @final
 class AddUnitLaunchTests(AddUnitTestCase):
+    def test_new_row_with_a_running_marked_unit_refuses_before_any_write(self) -> None:
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        document = self.doc.read_bytes()
+        repository = self.repository_state()
+        head = self.git("rev-parse", "build-followups")
+        plans = {path: path.read_bytes() for path in self.plan.parent.iterdir() if path.is_file()}
+        marked = unit_lookup.MarkedUnit("alpha-unit",
+            unit_lookup.LiveClaude("alpha", "running-id", "/fixture/socket", 4242),
+            HerdrPlace("running-host", "w1:p1"))
+        modes = (("--plan", "docs/plans/given.md"), ("--brief", "Write the missing plan."),
+                 ("--standby",), ("--permanent",))
+        for mode in modes:
+            launches = ((),) if mode[0] == "--brief" else (
+                (), ("--resume", "session-123", "--cwd", str(prior), "--autocompact", "200k"))
+            for flags in launches:
+                with self.subTest(mode=mode, flags=flags):
+                    arguments = ["--production", str(self.doc), "alpha", *mode, *flags]
+                    with (patch.object(add_unit, "launched_unit", return_value=add_unit.MarkedUnitFound(marked)),
+                          patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
+                          patch.object(add_unit, "launch_session") as launched,
+                          patch.object(add_unit, "wait_for_remote_control", return_value=marked) as waited,
+                          patch.object(herdr, "close_agent") as closed):
+                        result = self.cli("alpha", *mode, *flags)
+
+                    self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+                    self.assertEqual(result.stderr,
+                        "add_unit: unit alpha-unit already runs in session running-host but has no Units row; "
+                        + "end that session, then run " + shlex.join(["add_unit.py", *arguments]) + "\n")
+                    self.assertEqual(self.doc.read_bytes(), document)
+                    self.assertEqual(self.git("rev-parse", "build-followups"), head)
+                    self.assertEqual(self.repository_state(), repository)
+                    self.assertEqual({path: path.read_bytes() for path in self.plan.parent.iterdir()
+                                      if path.is_file()}, plans)
+                    self.assertFalse((self.root / "project-alpha").exists())
+                    self.assertEqual(self.git("branch", "--list", "build-followups-alpha"), "")
+                    self.assertFalse((Path(self.env["HOME"]) / ".local/state/unit-launch").exists())
+                    self.assertFalse(self.log.exists())
+                    self.assertFalse(self.config.exists())
+                    self.assertEqual(self.servers_started(), [])
+                    launched.assert_not_called()
+                    waited.assert_not_called()
+                    closed.assert_not_called()
+
     def test_missing_production_doc_refuses_with_a_nonzero_exit_before_any_launch(self) -> None:
         document = self.doc.read_text()
         head = self.git("rev-parse", "HEAD")
@@ -87,6 +134,18 @@ class AddUnitLaunchTests(AddUnitTestCase):
                 self.assertTrue(result.stderr.rstrip().endswith(ending), result.stderr)
                 self.assertEqual(closed.call_args_list, [] if typed else [call(SHARED, "w1:p1")])
 
+    def test_job_name_configuration_does_not_change_tab_or_pane_session_name(self) -> None:
+        with patch.object(names, "runtime_names", return_value=fixture_names(director="coordinator")):
+            result = self.successful("alpha", "--plan", "docs/plans/given.md")
+        calls = self.herdr_calls()
+        self.assertIn(["--session", SHARED, "tab", "rename", "w1:t1", "alpha"], calls)
+        self.assertIn(["--session", SHARED, "pane", "rename", "w1:p1", "alpha"], calls)
+        start = next(row for row in calls if row[2:4] == ["agent", "start"])
+        arguments = start[start.index("--") + 1:]
+        self.assertEqual(arguments[arguments.index("-n") + 1], "alpha")
+        self.assertIn("tab alpha", result.stdout)
+        self.assertNotIn("tab build-followups ·", result.stdout)
+
     def test_unit_launch_passes_a_typed_opening_prompt_once(self) -> None:
         with patch.object(herdr, "start_agent", wraps=herdr.start_agent) as start:
             result = self.successful("alpha", "--plan", "docs/plans/given.md")
@@ -96,6 +155,12 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertIsInstance(opening, herdr.OpeningPrompt)
         assert isinstance(opening, herdr.OpeningPrompt)
         self.assertEqual(opening.text, "/unit:direct docs/plans/given.md")
+        self.assertIn(self.unit_row(), self.doc.read_text())
+        self.assertEqual(self.git("log", "-1", "--format=%s", "build-followups"),
+                         "production(build-followups): add unit alpha-unit (plan)")
+        self.assertEqual(self.git("rev-parse", "build-followups-alpha"),
+                         self.git("rev-parse", "build-followups"))
+        self.assertEqual((self.root / "project-alpha/docs/plans/given.md").read_bytes(), self.plan.read_bytes())
 
     def test_server_start_timeout_exits_one_with_its_text_instead_of_a_traceback(self) -> None:
         timeout = subprocess.TimeoutExpired("fixture server start", 10)
@@ -228,7 +293,9 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertEqual(self.servers_started(), [["--user", "start", "herdr-agents.service"]])
         self.assertEqual(self.opened()[:8], ["--session", SHARED, "workspace", "create", "--label", "director",
                                              "--cwd", str(worktree)])
-        self.assertIn(["--session", SHARED, "tab", "rename", "w1:t1", "alpha"], self.herdr_calls())
+        self.assertIn(["--session", SHARED, "tab", "rename", "w1:t1",
+                       "alpha"], self.herdr_calls())
+        self.assertIn(["--session", SHARED, "pane", "rename", "w1:p1", "alpha"], self.herdr_calls())
         self.assertEqual({key: value for key, value in self.pane_environment().items()
                           if key.startswith(("SHOWRUNNER_", "CLAUDE_", "HERDR_")) or key == "ENABLE_TOOL_SEARCH"},
                          {"SHOWRUNNER_UNIT": "build-followups",
