@@ -8,7 +8,7 @@
 
 | Check | Runs in | Over |
 | --- | --- | --- |
-| assertion guard (`scripts/direct/assertion_guard.py`) | the first stage of every `verify.sh lint`, and the checkpoint commit hook | `.rs` and `.py` changes from the merge base with origin's default branch |
+| assertion guard (`scripts/direct/assertion_guard.py`) | the first stage of every `verify.sh lint`, and the checkpoint commit hook | `.rs` and `.py` changes from the newer upstream/production merge-branch base (nearest remote without upstream); commit parents in the hook |
 | cargo mend `--fix` | the workers' last `verify.sh lint` | the workspace |
 | fmt (nightly) | the same `lint` | the named package plus every member that differs from HEAD |
 | taplo fmt `--check` | the same `lint` | the workspace TOML, run from the cargo workspace root |
