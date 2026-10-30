@@ -2702,17 +2702,22 @@ class RestartTests(ShutdownTestCase):
         acknowledge.assert_not_called()
 
     def test_stopping_record_whose_claude_is_gone_restarts_without_the_stop_path(self) -> None:
-        owner = top_level("gone-owner", cwd=str(self.root))
-        saved = entry(owner, state=shutdown_record.SessionStopping(kind="stopping", at=STOPPED))
-        self.create([saved])
-        with (patch.object(restart, "_owner_liveness", return_value=restart.SessionNotLive()),
-              patch.object(stop_work, "stop_session", side_effect=AssertionError("no stop retry"))):
-            recovered = restart._recover_incomplete_shutdown(saved, dry_run=False)  # pyright: ignore[reportPrivateUsage]
-        assert not isinstance(recovered, (restart.IncompleteShutdownRefused, restart.IncompleteShutdownStillLive))
-        self.assertEqual(recovered["progress"]["kind"], "already gone")
-        stored = shutdown_record.find_session(LOGIN, owner["session_id"])
-        assert stored is not None
-        self.assertEqual(stored["progress"]["kind"], "already gone")
+        stuck: list[shutdown_record.SessionProgress] = [
+            shutdown_record.SessionStopping(kind="stopping", at=STOPPED),
+            shutdown_record.SessionStopFailed(kind="stop failed", at=STOPPED, reason="shutdown deadline exhausted")]
+        for state in stuck:
+            with self.subTest(progress=state["kind"]):
+                owner = top_level(f"gone-{len(state['kind'])}", cwd=str(self.root))
+                saved = entry(owner, state=state)
+                self.create([saved])
+                with (patch.object(restart, "_owner_liveness", return_value=restart.SessionNotLive()),
+                      patch.object(stop_work, "stop_session", side_effect=AssertionError("no stop retry"))):
+                    recovered = restart._recover_incomplete_shutdown(saved, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+                assert not isinstance(recovered, (restart.IncompleteShutdownRefused, restart.IncompleteShutdownStillLive))
+                self.assertEqual(recovered["progress"]["kind"], "already gone")
+                stored = shutdown_record.find_session(LOGIN, owner["session_id"])
+                assert stored is not None
+                self.assertEqual(stored["progress"]["kind"], "already gone")
 
     def test_heal_waits_for_the_conductors_matching_completed_stop_record(self) -> None:
         owner = top_level("heal-owner", cwd=str(self.root))
