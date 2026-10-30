@@ -15,6 +15,7 @@ stopped and the promotion did not finish, with what to run printed; 2 on a refus
 """
 from __future__ import annotations
 
+
 import argparse
 import json
 import os
@@ -23,8 +24,12 @@ import subprocess
 import sys
 import time
 from datetime import UTC, datetime
+from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple, cast
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.production import completion_receipt, staff, staff_sources
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
@@ -271,7 +276,7 @@ def restore_line(promotion: Promotion) -> str:
         "--resume", promotion.claude.session_id, "--cwd", str(promotion.worktree)])
 
 
-def main(argv: list[str]) -> int:
+def _main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Promote a running unit to the showrunner of its own production.")
     _ = parser.add_argument("unit")
     _ = parser.add_argument("--production", required=True, type=Path, help="the child's production doc")
@@ -279,7 +284,23 @@ def main(argv: list[str]) -> int:
     _ = parser.add_argument("--effort", required=True, help="pass your own effort level")
     _ = parser.add_argument("--check", action="store_true", help="run every refusal and stop nothing")
     args = parser.parse_args(argv)
+    record = staff.initial_snapshot()
     try:
+        parent_doc = showrunners.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
+        if parent_doc is not None:
+            parent = read_production(parent_doc)
+            unit_name = cast(str, args.unit)
+            unit_name = unit_name if unit_name.replace("_", "-").endswith("-unit") else f"{unit_name}-unit"
+            completed = promotion_record(parent, unit_name).with_suffix(".done.json")
+            receipt = completion_receipt.read_receipt(completed, record)
+            if isinstance(receipt, completion_receipt.OwnedReceipt):
+                child_doc = receipt.fields.get("child_doc")
+                if (receipt.owner.kind == "showrunner" and isinstance(child_doc, str)
+                        and Path(child_doc).resolve() == cast(Path, args.production).expanduser().resolve()
+                        and isinstance(staff_sources.member(staff_sources.UnitMember(parent.slug, unit_name), record),
+                                       staff_sources.NoSuchMember)):
+                    print(f"{unit_name} already promoted")
+                    return 0
         promotion = checked(cast(str, args.unit), cast(Path, args.production))
         pending = promotion_record(promotion.parent, promotion.unit)
         target_directory = (Path(cast(dict[str, str], json.loads(pending.read_text(encoding="utf-8")))["target"])
@@ -293,6 +314,13 @@ def main(argv: list[str]) -> int:
         print(f"check: ok — would stop {unit} (herdr {promotion.marked.place.session}), resume it as the showrunner of "
               + f"{slug} in {promotion.worktree} under {promotion.parent.slug}, and retire its row; {moved}")
         return 0
+    old_member = staff_sources.member(staff_sources.UnitMember(promotion.parent.slug, promotion.unit), record)
+    new_member = staff_sources.member(staff_sources.ShowrunnerMember(slug), record)
+    parent_member = staff_sources.member(staff_sources.ShowrunnerMember(promotion.parent.slug), record)
+    if isinstance(parent_member, staff_sources.NoSuchMember):
+        _ = staff.ensure("showrunner", name=showrunners.herdr_space(promotion.parent.slug, str(promotion.parent.doc)))
+    if isinstance(new_member, staff_sources.NoSuchMember):
+        new_member = staff_sources.MemberFound(staff.ensure("showrunner", name=showrunners.herdr_space(slug, str(promotion.child.doc))))
     was_pending = pending.exists()
     if not was_pending:
         save_promotion(promotion, target_directory)
@@ -329,6 +357,8 @@ def main(argv: list[str]) -> int:
                 started = add_showrunner.main(["--production", str(promotion.child.doc), "--model", cast(str, args.model),
                                                "--effort", cast(str, args.effort), "--resume", promotion.claude.session_id,
                                                "--cwd", str(promotion.worktree), "--config-dir", str(target_directory)])
+    except (staff.StaffRefused, staff.StaffUnreadable):
+        raise
     except (Refusal, OSError, herdr.HerdrFailure) as error:
         print(f"promote_showrunner: {error}", file=sys.stderr)
         return 1
@@ -337,12 +367,28 @@ def main(argv: list[str]) -> int:
               + f"Bring it back as the unit it was with: {restore_line(promotion)}")
         return 1
     result = finish(promotion, started, moved)
-    if result == 0:
+    if isinstance(old_member, staff_sources.MemberFound):
+        workers = staff.find(kind="worker", parent=old_member.row.id)
+        for worker in workers:
+            print(f"kept worker {worker.id} {worker.name} under {old_member.row.name}")
+        if workers:
+            return 1
+        if result.unit_retired:
+            _ = staff.retire(old_member.row.id)
+    if result.exit_code == 0:
+        fields = cast(dict[str, object], json.loads(pending.read_text(encoding="utf-8")))
+        completion_receipt.write_receipt(pending.with_suffix(".done.json"), new_member.row.id, fields)
         pending.unlink(missing_ok=True)
-    return result
+    return result.exit_code
 
 
-def finish(promotion: Promotion, started: int, moved: str) -> int:
+@dataclass(frozen=True)
+class PromotionProgress:
+    unit_retired: bool
+    exit_code: int
+
+
+def finish(promotion: Promotion, started: int, moved: str) -> PromotionProgress:
     """Retire the Units row of a unit that now runs as the child's session, and say what is still owed.
 
     A session open without a proven prompt is no longer the unit either, so its row is retired too.
@@ -357,12 +403,19 @@ def finish(promotion: Promotion, started: int, moved: str) -> int:
         print(f"{unit} is open as the session {slug}, but its showrunner prompt is not proven to have run; {row}. "
               + f"Look at it with `{herdr.attach_hint(showrunners.herdr_space(slug, str(promotion.child.doc)), slug)}`; unless it runs the production, type: "
               + f"/showrunner:produce {promotion.child.doc} resume")
-        return 1
+        return PromotionProgress(retired, 1)
     if not retired:
         print(f"{unit} now runs as the showrunner of {slug}, but {row}")
-        return 1
+        return PromotionProgress(False, 1)
     print(f"{unit} is now the showrunner of {slug}; {moved}")
-    return started
+    return PromotionProgress(True, started)
+
+
+def main(argv: list[str]) -> int:
+    def run() -> int:
+        with staff.operation():
+            return _main(argv)
+    return staff.cli_result(run)
 
 
 if __name__ == "__main__":

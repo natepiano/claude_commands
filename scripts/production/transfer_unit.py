@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -32,6 +33,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 from production_units import Production, read_production  # noqa: E402
 import merge_checkpoint  # noqa: E402
@@ -49,6 +51,7 @@ import unit_names  # noqa: E402
 from rename_state import RenameRefused, read_json, write_json, write_text  # noqa: E402
 from rename_unit import shutdown_record  # noqa: E402
 from unit_move import PathMove, git  # noqa: E402
+from scripts.production import staff, staff_sources
 
 if TYPE_CHECKING:
     from scripts.shutdown.shutdown_record import SessionShutdown
@@ -75,6 +78,8 @@ class UnitTransfer:
     plan_cell: str
     tip: str
     scratch: str
+    staff_id: staff.StaffId
+    parent_staff_id: staff.StaffId
     step: int = 0
     # Filled as the steps run: the three commits, and the shutdown record the unit relaunches from
     # (empty when the unit was not running).
@@ -117,7 +122,7 @@ class UnitTransfer:
         return f"chore({self.from_slug}): transfer unit {self.unit} to {self.to_slug}"
 
 
-TEXT_FIELDS = tuple(field.name for field in fields(UnitTransfer) if field.name != "step")
+TEXT_FIELDS = tuple(field.name for field in fields(UnitTransfer) if field.name not in ("step", "staff_id", "parent_staff_id"))
 # The fields a fresh transfer fills; the rest start empty.
 REQUIRED = TEXT_FIELDS[:TEXT_FIELDS.index("plan_commit")]
 # These are current locations, not recovery state. Old journals may contain them.
@@ -184,10 +189,15 @@ def build(from_slug: str, given: str, to_doc: Path, scratch: Path) -> UnitTransf
                             + "moves a unit only between productions of one repository")
     if git(worktree, "branch", "--show-current") != branch:
         raise RenameRefused(f"{worktree} is not on {branch}")
+    record = staff.snapshot()
+    member = staff_sources.member(staff_sources.UnitMember(giving.slug, unit), record)
+    parent = staff_sources.member(staff_sources.ShowrunnerMember(receiving.slug), record)
+    if isinstance(member, staff_sources.NoSuchMember) or isinstance(parent, staff_sources.NoSuchMember):
+        raise staff.StaffRefused(f"{giving.slug}/{unit} to {receiving.slug}: no matching staff row")
     return UnitTransfer(giving.slug, receiving.slug, unit, str(giving.doc), str(receiving.doc),
                         str(giving.checkout), str(receiving.checkout), giving.merge_branch,
                         receiving.merge_branch, branch, str(worktree), row.get("Plan", ""),
-                        git(worktree, "rev-parse", "HEAD"), str(scratch))
+                        git(worktree, "rev-parse", "HEAD"), str(scratch), member.row.id, parent.row.id)
 
 
 def _check_journals(transfer: UnitTransfer) -> None:
@@ -578,10 +588,26 @@ def journal(slug: str) -> Path:
 
 def _load(path: Path, to_doc: Path) -> UnitTransfer:
     values = unit_move.json_object(read_json(path))
+    values = _migrate_journal(path, values)
+    return _load_fields(path, values, to_doc)
+
+
+def _migrate_journal(path: Path, values: dict[str, object]) -> dict[str, object]:
+    if not all(isinstance(values.get(name), str) and values[name] for name in ("from_slug", "to_slug", "unit")):
+        raise RenameRefused(f"{path}: invalid unit transfer identity")
+    return rename_state.migrate_staff_ids(path, values, {
+        "staff_id": tuple(staff_sources.UnitMember(cast(str, values[name]), cast(str, values["unit"]))
+                          for name in ("from_slug", "to_slug")),
+        "parent_staff_id": (staff_sources.ShowrunnerMember(cast(str, values["to_slug"])),),
+    })
+
+
+def _load_fields(path: Path, values: dict[str, object], to_doc: Path) -> UnitTransfer:
     step = values.get("step")
     if (type(step) is not int
             or not all(isinstance(values.get(name, ""), str) for name in TEXT_FIELDS if name not in LOCATION_FIELDS)
-            or not all(values.get(name) for name in REQUIRED if name not in LOCATION_FIELDS)):
+            or not all(values.get(name) for name in REQUIRED if name not in LOCATION_FIELDS)
+            or not all(isinstance(values.get(name), str) and values[name] for name in ("staff_id", "parent_staff_id"))):
         raise RenameRefused(f"{path}: invalid unit transfer journal")
     receiving = read_production(to_doc.expanduser().resolve())
     if receiving.slug != values["to_slug"]:
@@ -590,6 +616,8 @@ def _load(path: Path, to_doc: Path) -> UnitTransfer:
     values.update(from_doc=str(giving.doc), from_checkout=str(giving.checkout),
                   to_doc=str(receiving.doc), to_checkout=str(receiving.checkout))
     return UnitTransfer(*(cast(str, values.get(name, "")) for name in TEXT_FIELDS[:len(REQUIRED)]), step=step,
+                        staff_id=staff.StaffId(cast(str, values["staff_id"])),
+                        parent_staff_id=staff.StaffId(cast(str, values["parent_staff_id"])),
                         **{name: cast(str, values.get(name, "")) for name in TEXT_FIELDS[len(REQUIRED):]})
 
 
@@ -597,18 +625,43 @@ def _save(path: Path, transfer: UnitTransfer) -> None:
     saved = cast(dict[str, object], asdict(transfer))
     for name in LOCATION_FIELDS:
         del saved[name]
+    previous: list[dict[str, object]] = []
+    if path.exists():
+        current = unit_move.json_object(read_json(path))
+        previous = _completed_requests(current)
+        if current.get("done") is True and (current.get("unit"), current.get("to_slug")) != (transfer.unit, transfer.to_slug):
+            previous.append({key: value for key, value in current.items() if key != "completed_requests"})
+    if previous:
+        saved["completed_requests"] = previous
     write_json(path, {**saved, "done": transfer.step == len(STEPS)})
+
+
+def _completed_requests(values: dict[str, object]) -> list[dict[str, object]]:
+    previous = values.get("completed_requests", [])
+    if not isinstance(previous, list):
+        raise RenameRefused("invalid completed transfer requests")
+    return [unit_move.json_object(item) for item in cast(list[object], previous)]
 
 
 def _resumed(path: Path, unit: str, to_doc: Path) -> UnitTransfer | None:
     """The unfinished transfer the journal holds, which must be this request; None without one."""
-    if not rename_state.unfinished(path):
+    if not path.exists():
         return None
-    recorded = _load(path, to_doc)
-    if recorded.unit not in (unit, unit_names.unit_id(unit)) or Path(recorded.to_doc) != to_doc.expanduser().resolve():
-        raise RenameRefused(f"the unfinished transfer is {recorded.unit} to {recorded.to_slug}; resume it first with "
-                            + f"transfer_unit.py apply {recorded.from_slug} {recorded.unit} {recorded.to_doc}")
-    return recorded
+    values = unit_move.json_object(read_json(path))
+    receiving = read_production(to_doc.expanduser().resolve())
+    candidates = [values, *_completed_requests(values)] if values.get("done") is True else [values]
+    for fields in candidates:
+        if fields.get("unit") in (unit, unit_names.unit_id(unit)) and fields.get("to_slug") == receiving.slug:
+            if fields is values:
+                fields = _migrate_journal(path, fields)
+            return _load_fields(path, fields, to_doc)
+    if values.get("done") is True:
+        return None
+    destination = _production(cast(str, values["to_slug"]))
+    command = shlex.join(["transfer_unit.py", "apply", cast(str, values["from_slug"]),
+                          cast(str, values["unit"]), str(destination.doc)])
+    raise RenameRefused(f"the unfinished transfer is {values.get('unit')} to {values.get('to_slug')}; "
+                        + f"resume it first with {command}")
 
 
 @contextmanager
@@ -637,10 +690,23 @@ def plan(from_slug: str, unit: str, to_doc: Path, scratch: Path) -> UnitTransfer
 
 
 def apply(from_slug: str, unit: str, to_doc: Path, scratch: Path) -> UnitTransfer:
+    with staff.operation():
+        return _apply(from_slug, unit, to_doc, scratch)
+
+
+def _move_staff(transfer: UnitTransfer) -> None:
+    _ = staff.move(transfer.staff_id, transfer.parent_staff_id)
+
+
+def _apply(from_slug: str, unit: str, to_doc: Path, scratch: Path) -> UnitTransfer:
     path = journal(from_slug)
     path.parent.mkdir(parents=True, exist_ok=True)
     with unit_move.production_lock():
         transfer = _resumed(path, unit, to_doc)
+        if transfer is not None and transfer.step == len(STEPS):
+            print("done; unchanged")
+            return transfer
+        fresh = transfer is None
         if transfer is None:
             transfer = build(from_slug, unit, to_doc, scratch)
             _check_journals(transfer)
@@ -649,6 +715,12 @@ def apply(from_slug: str, unit: str, to_doc: Path, scratch: Path) -> UnitTransfe
                 _check_ready(transfer)
             # The request is saved before anything changes, so every later refusal resumes.
             _save(path, transfer)
+        try:
+            _move_staff(transfer)
+        except staff.StaffRefused:
+            if fresh:
+                path.unlink(missing_ok=True)
+            raise
         for number in range(transfer.step + 1, len(STEPS) + 1):
             step = STEPS[number - 1]
             if step.locked:
@@ -679,6 +751,10 @@ def verify(from_slug: str, unit: str, to_doc: Path) -> UnitTransfer:
 
 
 def main(argv: list[str]) -> int:
+    return staff.cli_result(lambda: _main(argv))
+
+
+def _main(argv: list[str]) -> int:
     from scripts.direct.workers import WorkerUnavailable
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     _ = parser.add_argument("verb", choices=("plan", "apply", "verify"))
@@ -693,6 +769,8 @@ def main(argv: list[str]) -> int:
     try:
         transfer = (plan(from_slug, unit, to_doc, scratch) if verb == "plan" else apply(from_slug, unit, to_doc, scratch)
                     if verb == "apply" else verify(from_slug, unit, to_doc))
+    except (staff.StaffRefused, staff.StaffNotFound, staff.StaffUnreadable):
+        raise
     except rename_unit.RenameWaiting as error:
         print(f"transfer_unit: {error}", file=sys.stderr)
         return 2

@@ -15,7 +15,7 @@ import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import NamedTuple, cast
+from typing import TYPE_CHECKING, NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
@@ -25,6 +25,8 @@ import tidy_wrapped  # noqa: E402
 import unit_lookup  # noqa: E402
 import herdr  # noqa: E402
 import pane_record  # noqa: E402
+if TYPE_CHECKING:
+    from scripts.shutdown import shutdown_record
 from rename_state import RenameRefused, read_json, write_json  # noqa: E402
 
 BERTH_KEY = "cargoBerthTarget"
@@ -290,35 +292,33 @@ def processes_inside(worktree: Path) -> list[int]:
     return sorted(found)
 
 
-def pane_shell_refusal(found: unit_lookup.MarkedUnit | None, worktree: Path) -> str:
-    """A pane-shell unit cannot move until the follow-up implements pane cleanup.
+class UnitPane(NamedTuple):
+    unit: str
+    place: herdr.HerdrPlace
+    shell: int
 
-    The exact marked pane supplies its shell identity. For a live Claude that
-    shell must be its parent; after Claude exits, its cwd makes it a blocker.
-    No process is excluded, stopped or closed here.
-    """
+
+def unit_pane(found: unit_lookup.MarkedUnit | None, _production: str) -> UnitPane | None:
+    """Find the unit's exact pane; an exec-launched Claude leaves no shell to close."""
     if found is None:
-        return ""
-    if isinstance(found.claude, unit_lookup.ClaudeUnknown):
-        raise RenameRefused(f"{found.unit}: cannot tell whether Claude is running: {found.claude.reason}")
+        return None
     try:
-        info = herdr.json_object(herdr.Herdr(found.place.session).result(
-            "pane", "process-info", "--pane", found.place.pane).get("process_info"), "unit pane process info")
-        shell = info.get("shell_pid")
-        if isinstance(shell, bool) or not isinstance(shell, int) or shell <= 0:
-            raise RenameRefused("unit pane process info: expected a positive shell_pid")
-        if isinstance(found.claude, unit_lookup.LiveClaude):
-            if found.claude.pid == shell:
-                # The launched process replaced the original shell with exec.
-                return ""
-            if pane_record.process_parent(found.claude.pid) != shell:
-                return ""
-        elif shell not in processes_inside(worktree):
-            return ""
-    except (herdr.HerdrFailure, OSError, ValueError, IndexError, subprocess.SubprocessError) as error:
-        raise RenameRefused(f"{found.unit}: cannot read its pane shell: {error}") from error
-    return (f"{found.unit}'s Claude runs in pane shell {shell} ({unit_lookup.place_text(found.place)}); "
-            "a pane-shell unit cannot move yet (follow-up phase)")
+        shell = pane_record.pane_shell_pid(found.place)
+    except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+        raise RenameRefused(f"{found.unit}: cannot find its pane shell: {error}") from error
+    if isinstance(found.claude, unit_lookup.LiveClaude) and shell == found.claude.pid:
+        return None
+    return UnitPane(found.unit, found.place, shell)
+
+
+def close_unit_pane(pane: UnitPane | None, _saved: shutdown_record.SessionShutdown) -> None:
+    """Close the unit's exact session-qualified pane after the caller stops the unit."""
+    if pane is None:
+        return
+    try:
+        _ = herdr.Herdr(pane.place.session).run("pane", "close", pane.place.pane)
+    except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+        raise RenameRefused(f"{pane.unit}: pane close failed: {error}") from error
 
 
 def _darwin_processes_inside(worktree: Path) -> list[int]:

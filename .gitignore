@@ -20,9 +20,6 @@
 /config/showrunners.lock
 /config/accounts.json
 /config/accounts.lock
-# This machine's agent rows over config/agents.conf (scripts/agents/agents_overlay.sh).
-/config/agents.local.conf
-/config/agents.local.conf.*
 /config/agents.conf.*
 !docs/
 !docs/**

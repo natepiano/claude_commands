@@ -104,6 +104,7 @@ STEP_COLUMNS: list[Column] = [
     ("mend_s", "REAL", "mend's own analysis time"),
     ("sweep_freed_bytes", "INTEGER", "bytes lint sweep removed"),
     ("log", "TEXT", "gzipped output of a failed step, relative to the root"),
+    ("test_build_key", "TEXT", "verify test Cargo build-input key, excluding nextest run-only selection; NULL for older or changed builds"),
 ]
 
 TEST_COLUMNS: list[Column] = [

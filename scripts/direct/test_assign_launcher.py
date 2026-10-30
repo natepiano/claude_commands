@@ -75,7 +75,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
             "UNIT_HISTORY_DIR": str(self.history),
             "UNIT_ACTIVE_DIR": str(self.session_dir.parent / "active"),
             "UNIT_CONFIG": str(ROOT / "config/direct.conf"),
-            "AGENTS_CONFIG_FILE": str(self.registry),
+            "AGENTS_CONFIG_FILE": str(self.registry), "AGENTS_CONFIG_PUBLISH": "0",
             "CODEX_CATALOG_SYNC_STATE_FILE": str(checkpoint),
             "NOTIFIER_SESSIONS_DIR": str(self.session_dir.parent / "sessions"),
             "SHUTDOWN_STATE_DIR": str(self.session_dir.parent / "shutdown"),
@@ -239,7 +239,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         self.assertEqual(self.turn_starts, 2)
         self.assertEqual(read_object(self.session_dir / "phases/7/dispatch_2_paths.json")["worker"], name)
 
-    def test_explicit_turn_settings_reuse_the_named_worker_without_changing_its_identity(self) -> None:
+    def test_explicit_turn_settings_reuse_the_named_worker_without_rewriting_its_identity(self) -> None:
         _ = self.successful()
         name, original = next(iter(self.assignment_records().items()))
         identity_path = next(path for path in self.session_dir.glob("impl_worker_*.json")
@@ -251,9 +251,12 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
                 _ = self.successful("implement", "--to", name, *options)
                 turn = cast(dict[str, object], self.methods("turn/start")[-1]["params"])
                 self.assertEqual((turn["model"], turn["effort"]), expected)
-                self.assertEqual(self.assignment_records()[name]["thread_id"], original["thread_id"])
+                record = self.assignment_records()[name]
+                self.assertEqual((record["turn_model"], record["turn_effort"]), expected)
+                self.assertEqual(record["thread_id"], original["thread_id"])
                 self.assertEqual(identity_path.read_bytes(), identity)
         self.assertEqual(self.turn_starts, 3)
+        self.assertEqual(len(self.methods("thread/start")), 1)
 
     def test_new_worker_uses_its_requested_address_and_full_access_sandbox(self) -> None:
         _ = self.successful("test", "--new-worker", "address-without-role")
@@ -262,17 +265,29 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         self.assertEqual(cast(dict[str, object], self.methods("thread/start")[0]["params"])["sandbox"],
                          "danger-full-access")
 
-    def test_model_override_selects_another_worker_and_preserves_the_first_workers_identity(self) -> None:
+    def test_turn_display_fields_never_choose_the_next_named_dispatch_model_or_effort(self) -> None:
+        _ = self.successful("implement")
+        name = next(iter(self.assignment_records()))
+        record = self.assignment_records()[name]
+        record.update({"turn_model": "gpt-other-sol", "turn_effort": "max"})
+        roster = self.assignment_records()
+        roster[name] = record
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(roster))
+        _ = self.successful("implement", "--to", name)
+        turn = cast("dict[str, object]", self.methods("turn/start")[-1]["params"])
+        self.assertEqual((turn["model"], turn["effort"]), ("gpt-kept-sol", "high"))
+
+    def test_a_model_override_reuses_an_idle_worker_and_updates_only_its_turn_display(self) -> None:
         _ = self.successful()
         name, before = next(iter(self.assignment_records().items()))
-        self.next_thread_id = "override-thread"
         _ = self.successful("implement", "--model", "gpt-other-sol:high")
         roster = self.assignment_records()
-        self.assertEqual((roster[name]["thread_id"], roster[name]["model"], roster[name]["effort"]),
-                         (before["thread_id"], before["model"], before["effort"]))
-        others = [record for address, record in roster.items() if address != name]
-        self.assertEqual(len(others), 1, roster)
-        self.assertEqual((others[0]["model"], others[0]["effort"]), ("gpt-other-sol", "high"))
+        self.assertEqual(set(roster), {name})
+        self.assertEqual(roster[name]["thread_id"], before["thread_id"])
+        self.assertEqual((roster[name]["turn_model"], roster[name]["turn_effort"]), ("gpt-other-sol", "high"))
+        turn = cast(dict[str, object], self.methods("turn/start")[-1]["params"])
+        self.assertEqual((turn["model"], turn["effort"]), ("gpt-other-sol", "high"))
+        self.assertEqual(len(self.methods("thread/start")), 1)
 
     def test_review_assignments_resume_the_same_read_only_reviewer_across_phases(self) -> None:
         _ = self.successful("review", "--lens", "contract", "--pass", "1")
@@ -431,7 +446,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         self.assertIn(f"mesh={name};", registrations[-1])
         self.assertFalse((self.session_dir / "impl_claim_impl.json").exists())
 
-    def test_a_saved_identity_model_does_not_override_the_current_registry(self) -> None:
+    def test_a_saved_identity_model_is_history_while_the_turn_uses_the_registry(self) -> None:
         _ = self.successful()
         name = next(iter(self.assignment_records()))
         identity_path = next(path for path in self.session_dir.glob("impl_worker_*.json")
@@ -445,11 +460,11 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         self.assertEqual(read_object(identity_path)["model"], "gpt-other-sol")
         self.assertEqual(self.turn_starts, 2)
 
-    def test_a_legacy_roster_without_a_model_uses_the_current_registry_after_it_changes(self) -> None:
+    def test_a_legacy_roster_without_a_model_uses_registry_changes_on_the_same_thread(self) -> None:
         _ = self.successful()
         name, record = next(iter(self.assignment_records().items()))
         original_thread = record["thread_id"]
-        del record["model"]
+        _ = record.pop("model", None)
         self.write_pool_roster({name: record})
         _ = write_registry(self.registry, {"direct.codex": {"impl": "gpt-other-sol:high"}}, update=True)
         _ = self.successful("implement", "--to", name)
@@ -457,10 +472,9 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         self.assertEqual(turn["model"], "gpt-other-sol")
         self.assertEqual(self.assignment_records()[name]["thread_id"], original_thread)
         self.assertEqual(len(self.methods("thread/start")), 1)
-        _ = self.successful("implement", "--to", name, "--model", "gpt-other-sol")
+        _ = self.successful("implement", "--to", name, "--model", "gpt-kept-sol")
         turn = cast(dict[str, object], self.methods("turn/start")[-1]["params"])
-        self.assertEqual((turn["model"], turn["effort"]), ("gpt-other-sol", "high"))
-        self.assertEqual(self.assignment_records()[name]["thread_id"], original_thread)
+        self.assertEqual(turn["model"], "gpt-kept-sol")
         self.assertEqual(self.turn_starts, 3)
 
     def test_two_implementation_workers_have_distinct_board_slot_keys(self) -> None:
@@ -689,6 +703,21 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         result = self.launch()
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertEqual(self.turn_starts, 1)
+
+    def observe_follow_settlement(self, settled: Path, transport_override: str = "") -> Path:
+        """Observe the real follow returning, rather than waiting for an arbitrary interval."""
+        script = self.prepare_launcher()[0]
+        _ = script.with_suffix(".py").write_text(
+            "from pathlib import Path\nfrom scripts.direct import assign\n" +
+            transport_override +
+            "real_follow = assign.Dispatch.follow\n" +
+            "def follow(dispatch, command, shown, log):\n" +
+            "    result = real_follow(dispatch, command, shown, log)\n" +
+            f"    Path({str(settled)!r}).touch()\n" +
+            "    return result\n" +
+            "assign.Dispatch.follow = follow\n" +
+            "raise SystemExit(assign.main())\n")
+        return script
 
     def review_after_stage_one(self, *, adopt: bool) -> tuple[subprocess.CompletedProcess[str], Path]:
         """Change delivery ownership only after the first follower has released its turn."""
@@ -967,7 +996,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         self.assertFalse(any(event.get("event_type") == "pass_finished" and event.get("status") == "completed"
                              for event in self.events()))
 
-    def test_a_review_launcher_follow_uses_its_roster_model_instead_of_the_implementation_anchor(self) -> None:
+    def test_a_review_launcher_follow_uses_the_current_review_row_instead_of_history(self) -> None:
         _ = write_registry(self.registry, {"direct.codex": {"review": "gpt-other-sol:high"}}, update=True)
         for arguments in (["init", "-q"], ["add", "plan.md"],
                           ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
@@ -985,7 +1014,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
 
         review("--slot", "review", "1")
         name, record = next(iter(self.assignment_records().items()))
-        self.assertEqual(record["model"], "gpt-other-sol")
+        self.assertEqual(record["turn_model"], "gpt-other-sol")
         identity_path = next(path for path in self.session_dir.glob("impl_worker_*.json")
                              if read_object(path).get("name") == name)
         identity = read_object(identity_path)
@@ -1075,18 +1104,3 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         self.assertEqual(len(self.methods("turn/start")), 1)
         self.assertFalse(any(event.get("event_type") == "pass_finished" and
                              event.get("status") == "completed" for event in self.events()))
-
-    def observe_follow_settlement(self, settled: Path, transport_override: str = "") -> Path:
-        """Observe the real follow returning, rather than waiting for an arbitrary interval."""
-        script = self.prepare_launcher()[0]
-        _ = script.with_suffix(".py").write_text(
-            "from pathlib import Path\nfrom scripts.direct import assign\n" +
-            transport_override +
-            "real_follow = assign.Dispatch.follow\n" +
-            "def follow(dispatch, command, shown, log):\n" +
-            "    result = real_follow(dispatch, command, shown, log)\n" +
-            f"    Path({str(settled)!r}).touch()\n" +
-            "    return result\n" +
-            "assign.Dispatch.follow = follow\n" +
-            "raise SystemExit(assign.main())\n")
-        return script

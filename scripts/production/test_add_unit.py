@@ -36,8 +36,31 @@ def setUpModule() -> None:
     configure_test_zone()
 
 
+from scripts.production import staff
+
 @final
 class AddUnitLaunchTests(AddUnitTestCase):
+    def test_add_unit_rerun(self) -> None:
+        original = add_unit.ensure_staff_unit
+        for after in (False, True):
+            def interrupted(production: production_units.Production, unit: str) -> staff.StaffRow:
+                if after:
+                    _ = original(production, unit)
+                raise RuntimeError("stopped at staff step")
+            with patch.object(add_unit, "ensure_staff_unit", side_effect=interrupted):
+                stopped = self.cli("alpha", "--plan", "docs/plans/given.md")
+            self.assertEqual(stopped.returncode, 1, stopped.stderr)
+            self.assertNotIn("| alpha-unit |", self.doc.read_text())
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        record = staff.snapshot()
+        units = record.find(kind="unit")
+        self.assertEqual(len(units), 1)
+        self.assertEqual(units[0].name, "alpha")
+        document, data, head = self.doc.read_bytes(), self.staff.staff_file.read_bytes(), self.git("rev-parse", "HEAD")
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        self.assertEqual((self.doc.read_bytes(), self.staff.staff_file.read_bytes(), self.git("rev-parse", "HEAD")),
+                         (document, data, head))
+
     def test_new_row_with_a_running_marked_unit_refuses_before_any_write(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()
