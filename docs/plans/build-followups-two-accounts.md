@@ -2856,7 +2856,7 @@ A rerun of a stopped `accounts.py setup`, group move or five-hour wait finishes 
 - A module loaded under a second name is a second object: its patches miss the code's object (writes can reach live dirs), and the failure shows as a failing `isinstance`, not an import error.
 - A multi-name import (`import dailies_render, showrunners, note_file`) escapes a `^(import|from) <module>` grep; the multi-name grep catches it.
 
-### Phase 100b — Every consumer imports the showrunner registry by one name  · status: todo
+### Phase 100b — Every consumer imports the showrunner registry by one name  · status: done
 
 **Depends on:** Phase 100 (order only: both change imports in `settle.py`, `restart.py`, `inventory.py`, `cli_fixture.py`, `roster.py` and their tests)
 

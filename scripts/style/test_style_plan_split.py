@@ -13,6 +13,8 @@ import unittest
 from contextlib import chdir, closing, nullcontext, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import cast, final
 from unittest import mock
 
@@ -21,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import approved_renames
 import declarations
 import style_plan
-import showrunners
+from scripts.production import showrunners
 from scripts.build_hold import build_hold
 import live_units
 import unit_lookup

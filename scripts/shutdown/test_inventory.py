@@ -30,7 +30,7 @@ import unit_runs
 from scripts.whoami import account
 import herdr
 import sessions
-import showrunners
+from scripts.production import showrunners
 import unit_lookup
 import restart
 import shutdown

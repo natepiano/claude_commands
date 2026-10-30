@@ -13,6 +13,8 @@ import unittest
 from contextlib import chdir, nullcontext
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from datetime import datetime, timezone
 from typing import TypedDict, cast, override
 from unittest.mock import MagicMock, Mock, patch
@@ -21,7 +23,7 @@ import herdr
 import herdr_sessions
 from fake_herdr import CommandResponse
 from sessions import SessionRecord, UnreadableSessionRecord, read_session
-import showrunners
+from scripts.production import showrunners
 from scripts.shutdown import launch_permission
 from scripts.accounts import accounts
 

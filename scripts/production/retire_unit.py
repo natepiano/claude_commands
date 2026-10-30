@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.production import staff, staff_sources
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -57,7 +58,7 @@ import add_unit  # noqa: E402
 import berth_board  # noqa: E402
 import production_units  # noqa: E402
 import progress_history  # noqa: E402
-import showrunners  # noqa: E402
+from scripts.production import showrunners  # noqa: E402
 import unit_lookup  # noqa: E402
 import unit_move  # noqa: E402
 import unit_names  # noqa: E402

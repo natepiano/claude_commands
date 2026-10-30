@@ -17,6 +17,8 @@ from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from types import FrameType, MappingProxyType
 from typing import Literal, cast
 
@@ -26,7 +28,7 @@ sys.path.insert(0, str(SCRIPTS / "lib"))
 
 from add_style import NoStyleProduction, standing_style_production
 from production_units import Refusal
-import showrunners
+from scripts.production import showrunners
 import style_ledger
 import scratch
 

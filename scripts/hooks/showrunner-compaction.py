@@ -19,11 +19,13 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import TypedDict, cast
 
 PRODUCTION = Path(__file__).resolve().parent.parent / "production"
 sys.path.insert(0, str(PRODUCTION))
-import showrunners  # noqa: E402
+from scripts.production import showrunners  # noqa: E402
 
 UPDATE_REGISTRATION = Path(os.environ.get("SHOWRUNNER_UPDATE_REGISTRATION") or PRODUCTION / "update_registration.py")
 LOG_TIMEOUT_SECONDS = 30
