@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import runpy
@@ -30,6 +31,7 @@ import fake_unit_host
 from fake_unit_host import HostedUnit
 import fake_herdr
 import stall_watch
+import context_usage
 import rca
 from cli_fixture import invoke_cli
 
@@ -690,6 +692,105 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         _ = self.tick(START + 60 + 1900)
         self.assertEqual([item["key"] for item in self.owner_messages()], ["rca-261006-1", "rca-261006-1-remind"])
 
+    def test_a_pending_case_retries_without_resending_the_delivered_prompt_alert(self) -> None:
+        transcript = self.projects / "project" / "sid-unit-one.jsonl"
+        _ = transcript.write_text(tool_call("Bash", DELETE_CALL, START - 60))
+        self.panes["unit-one"]["agent_status"] = "blocked"
+        self.panes["unit-one"]["pane"] = EDIT_PROMPT
+        with mock.patch.object(rca, "save", side_effect=OSError("case disk unavailable")):
+            failed = self.tick(START)
+        self.assertIn("rca: no case opened: OSError: case disk unavailable", failed.stderr)
+        prompt = cast(stall_watch.PromptWait, json.loads(self.prompt_state().read_text()))
+        self.assertTrue(prompt["alerted"])
+        self.assertIn("case_pending", prompt)
+        self.assertEqual(self.owner_messages(), [])
+        result = self.tick(START + 120)
+        self.assertIn("rca: opened 261006-1", result.stdout)
+        prompt = cast(stall_watch.PromptWait, json.loads(self.prompt_state().read_text()))
+        self.assertTrue(prompt["alerted"])
+        self.assertNotIn("case_pending", prompt)
+        case = self.root / "state/message/rca/261006-1.json"
+        self.assertTrue(case.exists())
+        saved = cast(dict[str, object], json.loads(case.read_text()))
+        self.assertEqual(saved["commands"], [DELETE_CALL["command"]])
+        self.assertEqual(saved["transcript"], str(transcript))
+        _ = self.tick(START + 180)
+        self.assertEqual([item["key"] for item in self.sent()], [PROMPT_KEY])
+        self.assertEqual([item["key"] for item in self.owner_messages()], ["rca-261006-1"])
+
+    def test_a_cleared_prompt_retires_its_alert_and_keeps_retrying_its_pending_case(self) -> None:
+        self.panes["unit-one"]["agent_status"] = "blocked"
+        self.panes["unit-one"]["pane"] = EDIT_PROMPT
+        _ = self.tick(START)
+        with mock.patch.object(rca, "save", side_effect=OSError("case disk unavailable")):
+            failed = self.tick(START + 60)
+            self.assertIn("rca: no case opened: OSError: case disk unavailable", failed.stderr)
+            prompt = cast(stall_watch.PromptWait, json.loads(self.prompt_state().read_text()))
+            self.assertTrue(prompt["alerted"])
+            self.assertIn("case_pending", prompt)
+            self.assertEqual(self.owner_messages(), [])
+            self.panes["unit-one"]["agent_status"] = "idle"
+            cleared = self.tick(START + 120)
+        self.assertIn("rca: no case opened: OSError: case disk unavailable", cleared.stderr)
+        self.assertEqual(self.sent()[1:], [RETIRE])
+        self.assertFalse(self.prompt_state().exists())
+        pending = list(self.state.glob("*.case.json"))
+        self.assertEqual(len(pending), 1)
+        prompt = cast(stall_watch.PromptWait, json.loads(pending[0].read_text()))
+        self.assertTrue(prompt["retiring"])
+        self.assertIn("case_pending", prompt)
+        self.assertEqual(self.owner_messages(), [])
+        result = self.tick(START + 180)
+        self.assertIn("rca: opened 261006-1", result.stdout)
+        self.assertTrue((self.root / "state/message/rca/261006-1.json").exists())
+        self.assertFalse(self.prompt_state().exists())
+        self.assertFalse(pending[0].exists())
+        _ = self.tick(START + 240)
+        self.assertEqual(self.sent()[1:], [RETIRE])
+        self.assertEqual([item["key"] for item in self.owner_messages()], ["rca-261006-1"])
+
+    def test_a_retired_alerts_pending_case_does_not_delay_a_new_prompt_alert(self) -> None:
+        self.panes["unit-one"]["agent_status"] = "blocked"
+        self.panes["unit-one"]["pane"] = EDIT_PROMPT
+        _ = self.tick(START)
+        with mock.patch.object(rca, "save", side_effect=OSError("case disk unavailable")):
+            failed = self.tick(START + 60)
+            self.assertIn("rca: no case opened: OSError: case disk unavailable", failed.stderr)
+            self.panes["unit-one"]["agent_status"] = "idle"
+            _ = self.tick(START + 120)
+            self.assertEqual(self.sent()[1:], [RETIRE])
+            self.assertFalse(self.prompt_state().exists())
+            old_cases = list(self.state.glob("*.case.json"))
+            self.assertEqual(len(old_cases), 1)
+            transcript = self.projects / "project" / "sid-unit-one.jsonl"
+            _ = transcript.write_text(tool_call("Bash", DELETE_CALL, START + 180))
+            self.panes["unit-one"]["agent_status"] = "blocked"
+            self.panes["unit-one"]["pane"] = BASH_PROMPT
+            _ = self.tick(START + 180)
+            _ = self.tick(START + 180 + stall_watch.PROMPT_ALERT_SECONDS - 1)
+            self.assertEqual(self.sent()[1:], [RETIRE])
+            retry = self.tick(START + 180 + stall_watch.PROMPT_ALERT_SECONDS)
+        self.assertIn("rca: no case opened: OSError: case disk unavailable", retry.stderr)
+        self.assertEqual([item["key"] for item in self.sent()], [PROMPT_KEY, PROMPT_KEY, PROMPT_KEY])
+        self.assertEqual(self.sent()[1], RETIRE)
+        self.assertEqual(self.sent()[2]["text-id"], "stall_watch.permission_prompt")
+        self.assertTrue(old_cases[0].exists())
+        current = cast(stall_watch.PromptWait, json.loads(self.prompt_state().read_text()))
+        self.assertTrue(current["alerted"])
+        self.assertFalse(current["retiring"])
+        self.assertIn("case_pending", current)
+        self.assertEqual(self.owner_messages(), [])
+        result = self.tick(START + 300)
+        self.assertIn("rca: opened", result.stdout)
+        self.assertFalse(old_cases[0].exists())
+        self.assertEqual(list(self.state.glob("*.case.json")), [])
+        current = cast(stall_watch.PromptWait, json.loads(self.prompt_state().read_text()))
+        self.assertTrue(current["alerted"])
+        self.assertNotIn("case_pending", current)
+        _ = self.tick(START + 360)
+        self.assertEqual([item["key"] for item in self.sent()], [PROMPT_KEY, PROMPT_KEY, PROMPT_KEY])
+        self.assertEqual(len(self.owner_messages()), 2)
+
     def test_a_helpers_pending_bash_call_names_its_command_cut_to_90_characters(self) -> None:
         import stall_watch
         import push_texts
@@ -731,6 +832,143 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                 self.send_log.unlink()
                 for path in self.state.glob("*.json"):
                     path.unlink()
+
+    def write_context_usage(self, tokens: int, *, window: int = 300_000) -> None:
+        """A local model registry, configured window and last billed context; no real settings."""
+        registry = self.root / "agents.conf"
+        _ = registry.write_text(f"[claude.context]\ndefault={window}\n")
+        self.environment.update(AGENTS_CONFIG_FILE=str(registry), CLAUDE_CODE_AUTO_COMPACT_WINDOW="400k")
+        transcript = self.projects / "project" / "sid-unit-one.jsonl"
+        entries = [{"type": "assistant", "message": {"model": "claude-test-1", "usage": usage}}
+                   for usage in ({"input_tokens": 400_000},
+                                 {"input_tokens": tokens // 3, "cache_creation_input_tokens": tokens // 3,
+                                  "cache_read_input_tokens": tokens - 2 * (tokens // 3),
+                                  "output_tokens": 400_000})]
+        _ = transcript.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
+        os.utime(transcript, (START - 3600, START - 3600))
+
+    def test_an_idle_waiting_unit_near_compaction_is_bumped_and_told_once(self) -> None:
+        self.configure({"showrunner": ["unit-one"]}, stall_minutes=10)
+        blocked = "— blocked: my context is full; it compacts on the next turn"
+        window = 283_800
+        trigger = context_usage.trigger_tokens(window)
+        threshold = context_usage.handoff_threshold(window)
+        self.assertEqual(trigger, 250_800)
+        # The shared boundary, the real accounts reading, the trigger and over it; every waiting kind.
+        for status, tokens in [(blocked, tokens) for tokens in (threshold, 245_621, trigger, trigger + 1)] + [
+                (f"— {kind}: waiting", threshold) for kind in ("done", "gate", "decision")] + [
+                ("— holding: until 18:00", threshold)]:
+            with self.subTest(status=status, tokens=tokens):
+                pane = f"● {status}\n"
+                self.panes["unit-one"]["pane"] = pane
+                self.write_context_usage(tokens, window=window)
+                self.state.mkdir(exist_ok=True)
+                path = self.state / stall_watch.stretch_path("showrunner", "unit-one").name
+                stretch = stall_watch.Stretch(pane_hash=hashlib.sha256(pane.strip().encode()).hexdigest(), since=START - 601,
+                    bump_sent=False, tell_sent=False, reported_status="")
+                _ = path.write_text(json.dumps(stretch))
+                self.assertEqual(self.tick(START).returncode, 0)
+                self.assertEqual(len(self.sent()), 2)
+                self.assertEqual(self.tick(START + 600).returncode, 0)
+                sent = self.sent()
+                self.assertEqual(len(sent), 2)
+                bump, = [item for item in sent if item["key"].endswith(":bump")]
+                tell, = [item for item in sent if item["key"].endswith(":tell")]
+                self.assertEqual(bump["key"].rsplit(":", 1)[-1], "bump")
+                self.assertIn("sid-unit-one.sock", bump["to"])
+                self.assertEqual(tell["key"].rsplit(":", 1)[-1], "tell")
+                self.assertIn("show-id.sock", tell["to"])
+                self.assertIn(f"Last status: {status}", tell["text"])
+                saved = cast(stall_watch.Stretch, json.loads(path.read_text()))
+                self.assertEqual(saved["since"], START - 601)
+                self.assertEqual(saved["reported_status"], status)
+                self.assertTrue(saved["bump_sent"])
+                self.assertTrue(saved["tell_sent"])
+                self.send_log.unlink()
+                path.unlink()
+
+    def test_a_waiting_unit_below_compaction_stays_quiet_and_resets_its_stretch(self) -> None:
+        self.configure({"showrunner": ["unit-one"]}, stall_minutes=10)
+        pane = "● — blocked: my context is full; it compacts on the next turn\n"
+        self.panes["unit-one"]["pane"] = pane
+        window = 283_800
+        self.write_context_usage(context_usage.handoff_threshold(window) - 1, window=window)
+        self.state.mkdir(exist_ok=True)
+        path = self.state / stall_watch.stretch_path("showrunner", "unit-one").name
+        stretch = stall_watch.Stretch(pane_hash=hashlib.sha256(pane.strip().encode()).hexdigest(), since=START - 601,
+                                      bump_sent=False, tell_sent=False, reported_status="")
+        _ = path.write_text(json.dumps(stretch))
+        for at in (START, START + 600):
+            self.assertEqual(self.tick(at).returncode, 0)
+            self.assertEqual(self.sent(), [])
+            path, = self.state.glob("*.json")
+            stretch = cast(stall_watch.Stretch, json.loads(path.read_text()))
+            self.assertEqual(stretch["since"], at)
+            self.assertFalse(stretch["bump_sent"])
+            self.assertFalse(stretch["tell_sent"])
+            self.assertEqual(stretch["reported_status"], "")
+
+    def test_a_compacted_waiting_unit_does_not_wake_from_its_discarded_usage(self) -> None:
+        self.panes["unit-one"]["pane"] = "— blocked: my context is full; it compacts on the next turn\n"
+        self.write_context_usage(context_usage.trigger_tokens(300_000))
+        transcript = self.projects / "project" / "sid-unit-one.jsonl"
+        with transcript.open("a") as file:
+            _ = file.write(json.dumps({"type": "system", "compactMetadata": {"postTokens": 1000}}) + "\n")
+        os.utime(transcript, (START - 3600, START - 3600))
+        for at in (START, START + 600):
+            self.assertEqual(self.tick(at).returncode, 0)
+            self.assertEqual(self.sent(), [])
+            path, = self.state.glob("*.json")
+            stretch = cast(stall_watch.Stretch, json.loads(path.read_text()))
+            self.assertEqual(stretch["since"], at)
+
+    def test_one_line_blocked_reply_supersedes_older_holding_with_either_bullet(self) -> None:
+        for bullet in ("●", "⏺"):
+            with self.subTest(bullet=bullet):
+                self.panes["unit-one"]["pane"] = (
+                    "  — holding: waiting on the Codex writer for ticket 49\n"
+                    + f"{bullet} — blocked: waiting on the showrunner: sync\n")
+                for at in (START, START + 300, START + 600):
+                    self.assertEqual(self.tick(at).returncode, 0)
+                    self.assertEqual(self.sent(), [])
+                    path, = self.state.glob("*.json")
+                    stretch = cast(stall_watch.Stretch, json.loads(path.read_text()))
+                    self.assertEqual(stretch["since"], at)
+                    self.assertFalse(stretch["bump_sent"])
+                    self.assertFalse(stretch["tell_sent"])
+                    self.assertEqual(stretch["reported_status"], "")
+
+    def test_one_line_holding_reply_resets_reported_stretch_and_tells_without_bullet(self) -> None:
+        old = "— holding: waiting on the Codex writer for ticket 49"
+        self.panes["unit-one"]["pane"] = f"  {old}\n"
+        self.assertEqual(self.tick(START).returncode, 0)
+        self.assertEqual(self.tick(START + 300).returncode, 0)
+        self.assertEqual(len(self.sent()), 2)
+        path, = self.state.glob("*.json")
+        stretch = cast(stall_watch.Stretch, json.loads(path.read_text()))
+        self.assertEqual(stretch["reported_status"], old)
+        status = "— holding: ready for next task"
+        self.panes["unit-one"]["pane"] += f"● {status}\n"
+        self.assertEqual(self.tick(START + 301).returncode, 0)
+        stretch = cast(stall_watch.Stretch, json.loads(path.read_text()))
+        self.assertEqual(stretch["since"], START + 301)
+        self.assertFalse(stretch["bump_sent"])
+        self.assertFalse(stretch["tell_sent"])
+        self.assertEqual(stretch["reported_status"], "")
+        self.assertEqual(self.tick(START + 600).returncode, 0)
+        self.assertEqual(len(self.sent()), 2)
+        self.assertEqual(self.tick(START + 601).returncode, 0)
+        self.assertEqual(len(self.sent()), 4)
+        tell = next(item for item in self.sent()[2:] if item["key"].endswith(":tell"))
+        self.assertTrue(tell["text"].endswith(f"Last status: {status}"))
+        self.assertNotIn("●", tell["text"])
+        stretch = cast(stall_watch.Stretch, json.loads(path.read_text()))
+        self.assertEqual(stretch["reported_status"], status)
+
+    def test_turn_end_words_inside_sentences_do_not_match(self) -> None:
+        for line in ("● I was holding: on the user", "※ recap: the unit said — holding: on the user"):
+            with self.subTest(line=line):
+                self.assertIsNone(stall_watch.TURN_END.search(line))
 
     def test_gate_turn_end_waits_until_a_later_holding_status_stalls(self) -> None:
         self.configure({"showrunner": ["unit-one"]}, stall_minutes=10)

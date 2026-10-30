@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -12,11 +13,39 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 
+import fake_showrunner
+import fake_unit_host
+
 from scripts.production.rename_unit_test_support import UnitRenameFixture
 
 
 @final
 class UnitRenameSessionsTests(UnitRenameFixture):
+
+    def moved_unit_with_leftover_marks(self) -> None:
+        _ = self.seed_record()
+        self.assert_refused(self.rename("apply"), "gamma-unit is not running")
+        fake_unit_host.write(self.env, [
+            fake_unit_host.HostedUnit("old", "w3:p3Y", {"SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"}),
+            fake_unit_host.HostedUnit("moved", "w4:p1", {"SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "gamma-unit"}, label="gamma")])
+        held = fake_showrunner.write_session(self.root / "state/sessions", "gamma", "sid-alpha")
+        self.addCleanup(held.close)
+        fake_unit_host.place_process(self.env, os.getpid(), "w4:p1")
+        fake_unit_host.process(self.env, 991030, 991000, ["python3", "-m", "unittest"],
+                               {"HERDR_PANE_ID": "w3:p3Y", "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
+
+    def test_verify_ignores_leftover_process_marks(self) -> None:
+        self.moved_unit_with_leftover_marks()
+        self.assert_ok(self.rename("verify"))
+
+    def test_verify_names_the_live_holder_of_a_former_mark(self) -> None:
+        self.moved_unit_with_leftover_marks()
+        pid = fake_unit_host.live_pid(self)
+        old = fake_showrunner.write_session(self.root / "state/sessions", "old", "sid-old", pid)
+        self.addCleanup(old.close)
+        fake_unit_host.place_process(self.env, pid, "w3:p3Y")
+        self.assert_refused(self.rename("verify"),
+                            f"a session still carries the mark alpha-unit: pid {pid} (claude) in herdr:old:w3:p3Y")
 
     def test_a_stopped_unit_relaunches_from_its_rewritten_record(self) -> None:
         log = self.seed_record()

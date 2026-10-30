@@ -49,6 +49,7 @@ if [[ -n "${TEST_WORKER_STARTED:-}" ]]; then : > "$TEST_WORKER_STARTED"; fi
 """
 
 STUB_MESH = """#!/usr/bin/env python3
+import fcntl
 import json
 import os
 import pathlib
@@ -73,6 +74,14 @@ if verb in ('start', 'compact', 'can-follow', 'follow'):
 
 name = option('--name') if verb == 'start' else option('--to')
 entry = roster.get(name, {})
+
+def save_entry():
+    with (session / 'fixture_workers.lock').open('a+') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        current = json.loads(roster_path.read_text()) if roster_path.exists() else {}
+        current[name] = entry
+        roster_path.write_text(json.dumps(current))
+
 if verb == 'start':
     entry = {
         'thread_id': 'thread-' + name,
@@ -95,19 +104,22 @@ elif verb == 'compact':
     before = entry.get('context_tokens', 0)
     entry['context_tokens'] = ('not_measured_since_compaction'
                               if (session / 'compact_reports_zero').exists() else 12000)
-    roster_path.write_text(json.dumps(roster))
+    save_entry()
     if (session / 'compact_reports_zero').exists():
         print(f'compacted {name}: {before} tokens, size not measured until its next turn')
     else:
         print(f'compacted {name}: {before} -> 12000 tokens')
 elif verb == 'can-follow':
-    if entry.get('status') not in ('done', 'failed', 'paused'):
+    same_claim = (entry.get('status') == 'starting'
+                  and entry.get('launcher_pid') == int(option('--claim-pid')))
+    if not same_claim and entry.get('status') not in ('done', 'failed', 'paused'):
         print(f'codex_mesh: {name}: worker is busy or not followable; follow refused',
               file=sys.stderr)
         sys.exit(2)
-    entry['previous_status'] = entry['status']
-    if 'role' in entry:
-        entry['previous_role'] = entry['role']
+    if not same_claim:
+        entry['previous_status'] = entry['status']
+        if 'role' in entry:
+            entry['previous_role'] = entry['role']
     entry['status'] = 'starting'
     entry['role'] = option('--role')
     entry['launcher_pid'] = int(option('--claim-pid'))
@@ -130,6 +142,9 @@ elif verb == 'follow':
     entry['status'] = 'running'
     entry['role'] = option('--role')
     entry['task'] = option('--task')
+    save_entry()
+    if os.environ.get('TEST_WORKER_STARTED'):
+        pathlib.Path(os.environ['TEST_WORKER_STARTED']).touch()
     pathlib.Path(session / 'follow_message.txt').write_text(
         pathlib.Path(option('--message-file')).read_text()
     )
@@ -160,14 +175,59 @@ elif verb == 'follow':
     if os.environ.get('STUB_REPLACEMENT_THREAD'):
         entry['thread_id'] = os.environ['STUB_REPLACEMENT_THREAD']
     if os.environ.get('STUB_TURN_FAILURE'):
+        entry['status'] = 'failed'
+        save_entry()
         sys.exit(1)
 else:
     sys.exit(2)
-roster[name] = entry
-roster_path.write_text(json.dumps(roster))
+save_entry()
 if verb == 'follow' and os.environ.get('STUB_REVIEW_DONE_FILE'):
     pathlib.Path(os.environ['STUB_REVIEW_DONE_FILE']).touch()
 """
+
+
+STUB_WORKERS = r'''#!/usr/bin/env python3
+import fcntl
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+run = Path(sys.argv[sys.argv.index("--session-dir") + 1])
+state = json.loads((run / "progress_history_state.json").read_text())
+cwd = state["working_dir"]
+name = subprocess.check_output(["bash", str(Path(__file__).with_name("worker_name.sh")), cwd, "review", "review"], text=True).strip()
+owner_pid = int(sys.argv[sys.argv.index("--owner-pid") + 1])
+
+def occupied(record):
+    pid = record.get("launcher_pid", 0)
+    if pid:
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            pass
+    return record.get("status") not in ("done", "failed", "paused", "starting")
+
+with (run / "fixture_workers.lock").open("a+") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    path = run / "mesh_roster.json"
+    records = json.loads(path.read_text()) if path.exists() else {}
+    base = name
+    number = 1
+    while name in records and occupied(records[name]):
+        number += 1
+        name = f"{base}{number}"
+    if name not in records:
+        records[name] = {"thread_id": "thread-" + name, "status": "done", "role": "review", "context_tokens": 0}
+    entry = records[name]
+    entry.update({"previous_status": entry.get("previous_status", entry["status"]),
+                  "previous_role": entry.get("role", "review"),
+                  "status": "starting", "launcher_pid": owner_pid})
+    path.write_text(json.dumps(records))
+    print(name)
+'''
 
 
 STUB_POOL = r'''#!/usr/bin/env python3
@@ -341,6 +401,7 @@ class ReviewLauncherFixture(unittest.TestCase):
         production = self.root / "scripts" / "production"
         production.mkdir(parents=True)
         _ = shutil.copy2(DIRECT_DIR.parent / "production" / "showrunners.py", production / "showrunners.py")
+        _ = shutil.copy2(DIRECT_DIR.parent / "production" / "production_doc.py", production / "production_doc.py")
         # The wrapper reaches python3 through ../lib/py, resolved from its own
         # directory.
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "py", lib / "py")
@@ -373,6 +434,7 @@ class ReviewLauncherFixture(unittest.TestCase):
         _ = mesh.write_text(STUB_MESH, encoding="utf-8")
         mesh.chmod(0o755)
         _ = (direct_dir / "review_pool.py").write_text(STUB_POOL, encoding="utf-8")
+        _ = (direct_dir / "workers.py").write_text(STUB_WORKERS, encoding="utf-8")
         return direct_dir / "review.sh"
 
     def environment(self) -> dict[str, str]:

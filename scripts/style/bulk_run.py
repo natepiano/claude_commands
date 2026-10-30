@@ -92,7 +92,7 @@ def select(ledger: ledger_api.Ledger, definition: rules.Rule) -> Selection:
             reason = "held by another open ticket"
         elif finding.path in busy:
             reason = "file held by another open ticket"
-        elif finding.rule_blob != definition.blob:
+        elif not rules.judged_text_unchanged(finding.rule_blob, definition):
             reason = "rule changed since judged"
         else:
             proposal = finding.state.proposal

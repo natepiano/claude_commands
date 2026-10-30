@@ -111,6 +111,93 @@ class BuildScopeTests(unittest.TestCase):
         self.assertEqual(result.stdout, "ran\n")
         self.assertEqual(result.stderr, "")
 
+    def test_sampler_records_near_peak_use_with_rate_limit_and_atomic_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scope = root / "scope"
+            scope.mkdir()
+            sidecar = root / "scope-path"
+            _ = sidecar.write_text(str(scope) + "\n")
+            maximum = root / "step.max"
+            near_peak = root / "step.wave"
+            _ = near_peak.write_text("900\n")
+            program = INVOKE.read_text().split("buildlog_sample_anon() {", 1)[1].split("\n}\n", 1)[0]
+            program = "buildlog_sample_anon() {" + program + '''
+}
+times=(1000 1059 1060 1120 1121 1122 1182 1183)
+values=(100 50 50 49 50 200 99 100)
+index=0
+date() { printf "%s\\n" "${times[index]}"; }
+sleep() {
+    printf "%s:%s\\n" "$(cat "$maximum_path")" "$(cat "$near_peak_path")"
+    index=$((index + 1))
+    (( index < ${#times[@]} )) || exit 0
+    printf "anon %s\\n" "${values[index]}" > "$scope_path/memory.stat"
+}
+maximum_path=$2
+near_peak_path=${2%.max}.wave
+scope_path=$3
+printf "anon %s\\n" "${values[index]}" > "$scope_path/memory.stat"
+buildlog_sample_anon "$1" "$2" "$$"
+'''
+            with near_peak.open() as old_snapshot:
+                result = subprocess.run(["bash", "-c", program, "sampler-test", str(sidecar),
+                                         str(maximum), str(scope)], capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(), [
+                    "100:100 1000", "100:100 1000", "100:100 1060", "100:100 1060", "100:100 1121",
+                    "200:200 1122", "200:200 1122", "200:200 1183"])
+                self.assertEqual(old_snapshot.read(), "900\n")
+
+    def test_sampler_keeps_new_peak_when_wave_publish_and_cleanup_fail(self) -> None:
+        for fail_first_peak in (False, True):
+            with self.subTest(fail_first_peak=fail_first_peak), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                scope = root / "scope"
+                scope.mkdir()
+                sidecar = root / "scope-path"
+                _ = sidecar.write_text(str(scope) + "\n")
+                maximum = root / "step.max"
+                _ = maximum.write_text("100\n")
+                _ = maximum.with_suffix(".wave").write_text("100 1\n")
+                program = INVOKE.read_text().split("buildlog_sample_anon() {", 1)[1].split("\n}\n", 1)[0]
+                program = "set -e\nbuildlog_sample_anon() {" + program + r'''
+}
+values=(100 200 200 0)
+index=0
+date() { if (( index == 0 )); then printf '1\n'; else printf '3000\n'; fi; }
+mv() {
+    if [[ "$3" == *.wave && "$index" != 0 ]]; then return 1; fi
+    if [[ "$3" == *.max && "$index" == 1 && "$fail_first_peak" == 1 ]]; then return 1; fi
+    command mv "$@"
+    if [[ "$index" == 2 ]]; then
+        printf 'between:%s:%s\n' "$(cat "$maximum_path")" "$(cat "${maximum_path%.max}.wave")"
+    fi
+}
+rm() { return 1; }
+sleep() {
+    printf '%s\n' "$(cat "$maximum_path")"
+    index=$((index + 1))
+    (( index < ${#values[@]} )) || exit 0
+    printf 'anon %s\n' "${values[index]}" > "$scope_path/memory.stat"
+}
+maximum_path=$2
+scope_path=$3
+fail_first_peak=$4
+if [[ "$fail_first_peak" == 0 ]]; then values=(100 200 0); fi
+printf 'anon 100\n' > "$scope_path/memory.stat"
+buildlog_sample_anon "$1" "$2" "$$"
+'''
+                result = subprocess.run(["bash", "-c", program, "sampler-test", str(sidecar),
+                                         str(maximum), str(scope), str(int(fail_first_peak))],
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                expected = (["100", "100", "between:200:100 1", "200", "200"] if fail_first_peak
+                            else ["100", "200", "200"])
+                self.assertEqual(result.stdout.splitlines(), expected)
+                self.assertEqual(maximum.read_text(), "200\n")
+                self.assertEqual(maximum.with_suffix(".wave").read_text(), "100 1\n")
+
     def test_sampler_exits_when_its_parent_shell_dies(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

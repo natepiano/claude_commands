@@ -21,6 +21,7 @@ import showrunners
 import unit_lookup
 from herdr import HerdrPlace
 import unit_runs
+import roster
 
 RUNNER, CHILD_RUNNER, GONE_RUNNER = "sid-runner", "sid-child-runner", "sid-gone-runner"
 DIRECTOR, OLD_DIRECTOR, ORPHAN = "sid-director", "sid-old-director", "sid-orphan"
@@ -57,8 +58,8 @@ class ProductionTreeTests(unittest.TestCase):
         _ = (state / "child" / "parent").write_text("main\n")
         _ = cast(object, self.enterContext(mock.patch.dict(
             os.environ, {"ASTRA_ROLES_STATE": str(self.root / "astra-roles"),
-                         "GUILD_ROLES_STATE": str(self.root / "guild-roles"),
-                         "GUILD_OWNERSHIP_STATE": str(self.root / "guild-ownership")})))
+                         "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
+                         "DESIGN_OWNERSHIP_STATE": str(self.root / "design-ownership")})))
         for patch in (
             mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", notifier),
             mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", state),
@@ -184,7 +185,7 @@ class ProductionTreeTests(unittest.TestCase):
     def test_every_kind_of_edge_between_running_sessions(self) -> None:
         _ = self.run_folder("unit", DIRECTOR, {
             "a-impl": {"thread_id": "thread-impl", "role": "impl", "status": "running"},
-            "a-test": {"thread_id": "thread-test", "status": "idle"},
+            "a-test": {"thread_id": "thread-test", "role": "test", "status": "idle"},
             "a-review": {"thread_id": "thread-review", "role": "review", "status": "ended"},
         })
         _ = self.run_folder("delegate", OLD_DIRECTOR, {
@@ -201,6 +202,26 @@ class ProductionTreeTests(unittest.TestCase):
             {"manager": DIRECTOR, "member": "thread-test", "role": "test"},
             {"manager": OLD_DIRECTOR, "member": "thread-fix", "role": "fix"},
         ])
+
+    def test_record_assignment_wins_over_a_conflicting_name_suffix(self) -> None:
+        _ = self.run_folder("unit", DIRECTOR, {
+            "project-impl": {"thread_id": "thread-review", "role": "review", "status": "done"},
+            "no-job-in-name": {"thread_id": "thread-test", "role": "test", "status": "idle"},
+        })
+        self.assertCountEqual(production_tree.worker_edges({DIRECTOR}), [
+            {"manager": DIRECTOR, "member": "thread-review", "role": "review"},
+            {"manager": DIRECTOR, "member": "thread-test", "role": "test"},
+        ])
+
+    def test_legacy_and_bad_assignments_never_gain_a_role_from_the_name(self) -> None:
+        _ = self.run_folder("unit", DIRECTOR, {
+            "legacy-impl": {"thread_id": "thread-old", "status": "idle"},
+            "invalid-review": {"thread_id": "thread-bad", "status": "idle", "role": "designer"},
+        })
+        self.assertEqual(production_tree.worker_edges({DIRECTOR}), [])
+        self.assertEqual(production_tree._worker_role({}), roster.AssignmentUnrecorded())  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(production_tree._worker_role({"role": "designer"}),  # pyright: ignore[reportPrivateUsage]
+                         roster.AssignmentUnreadable("designer"))
 
     def test_each_leased_pool_reviewer_reports_to_its_running_unit_director(self) -> None:
         pool = self.root / "review-pool" / "main" / "pool.json"

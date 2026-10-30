@@ -5,16 +5,19 @@ from pathlib import Path
 
 
 def fake_memory_readings(root: Path, *, available_kib: int = 67108864,
-                         total_kib: int = 67108864, full_avg10: float = 0.0) -> dict[str, str]:
+                         total_kib: int = 67108864, full_avg10: float = 0.0,
+                         swap_total_kib: int = 0, swap_free_kib: int = 0, some_avg10: float = 0.0) -> dict[str, str]:
     meminfo = root / "meminfo"
     pressure = root / "pressure"
-    _ = meminfo.write_text(f"MemTotal: {total_kib} kB\nMemAvailable: {available_kib} kB\n")
+    _ = meminfo.write_text(f"MemTotal: {total_kib} kB\nMemAvailable: {available_kib} kB\n"
+                          + f"SwapTotal: {swap_total_kib} kB\nSwapFree: {swap_free_kib} kB\n")
     _ = pressure.write_text(
-        "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+        f"some avg10={some_avg10} avg60=0.00 avg300=0.00 total=0\n"
         + f"full avg10={full_avg10} avg60=0.00 avg300=0.00 total=0\n"
     )
     return {
         "BUILDLOG_MEMINFO": str(meminfo),
+        "BUILDLOG_BUILDS_CGROUP": str(root / "builds.slice"),
         "BUILDLOG_MEMORY_PRESSURE": str(pressure),
         "BUILDLOG_LIVE_MEMORY_TRIPWIRE": os.environ.get("BUILDLOG_LIVE_MEMORY_TRIPWIRE",
                                                          str(root / "live-memory-reads.jsonl")),

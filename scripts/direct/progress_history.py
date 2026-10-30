@@ -32,6 +32,7 @@ from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
 from scripts.lib import agents_registry, unit_runs  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
+from scripts.production import production_doc  # noqa: E402
 
 
 SCHEMA_VERSION = 1
@@ -107,6 +108,8 @@ WAIT_KINDS = (
     "WaitingForQuotaRefusal", "WaitingForMemoryOrSlot", "WaitingForMergeGate",
     "WaitingForUser", "WaitingForSupplier", "ReadyWithoutCapacity",
 )
+
+HOLDER_WAIT_KINDS = ("WaitingForQuotaRefusal", "WaitingForMemoryOrSlot", "ReadyWithoutCapacity")
 
 
 class AgentIdentity(TypedDict):
@@ -1477,6 +1480,10 @@ def _start_phase(args: argparse.Namespace) -> None:
     state["pending_calibration"] = None
     _write_state(session_dir, state)
     event = _event(state, "phase_started", started_at)
+    source = _phase_source_identity(state)
+    event.update(production=_phase_metadata_fields(source.production),
+                 unit=_phase_metadata_fields(source.unit),
+                 repository=_phase_metadata_fields(source.repository))
     event["contract_revision"] = _contract_revision()
     event["wait_coverage"] = {"state": "Recorded", "version": 1}
     if started_at != now:
@@ -4775,6 +4782,162 @@ def _waits_by_id(events: list[dict[str, object]]) -> dict[str, dict[str, object]
 
 
 @dataclass(frozen=True)
+class SessionHolder:
+    session_id: str
+
+    def __post_init__(self) -> None:
+        if not self.session_id.strip():
+            raise ValueError("holder session must not be blank")
+
+
+@dataclass(frozen=True)
+class UnitHolder:
+    unit: str
+
+    def __post_init__(self) -> None:
+        if not self.unit.strip():
+            raise ValueError("holder unit must not be blank")
+
+
+@dataclass(frozen=True)
+class HolderNotNamed:
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not self.reason.strip():
+            raise ValueError("unnamed holder needs a reason")
+
+
+@dataclass(frozen=True)
+class MalformedHolder:
+    raw_value: object
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not self.reason.strip():
+            raise ValueError("malformed holder needs a reason")
+
+    def to_fields(self) -> dict[str, object]:
+        return {"state": "MalformedHolder", "reason": self.reason, "raw_value": self.raw_value}
+
+
+def _validate_holder_schema(fields: dict[str, object], allowed: set[str], state: str) -> None:
+    unknown = fields.keys() - allowed
+    if unknown:
+        raise ValueError(f"{state} has unknown fields: {', '.join(sorted(unknown))}")
+
+
+@dataclass(frozen=True)
+class NamedHolder:
+    resource_kind: Literal["account", "slot", "memory"]
+    resource: str
+    holder: SessionHolder | UnitHolder
+
+    def __post_init__(self) -> None:
+        if self.resource_kind not in ("account", "slot", "memory") or not self.resource.strip():
+            raise ValueError("holder needs a resource kind and a nonblank resource")
+
+    @classmethod
+    def from_fields(cls, fields: dict[str, object]) -> NamedHolder:
+        _validate_holder_schema(fields, {"state", "resource_kind", "resource", "holder"}, "NamedHolder")
+        kind = fields.get("resource_kind")
+        resource = fields.get("resource")
+        holder = _object_dict(fields.get("holder")) or {}
+        if (fields.get("state") != "NamedHolder" or not isinstance(resource, str)
+                or kind not in ("account", "slot", "memory")):
+            raise ValueError("invalid named holder fields")
+        if holder.get("state") == "SessionHolder":
+            _validate_holder_schema(holder, {"state", "session_id"}, "SessionHolder")
+            owner = SessionHolder(_string(holder.get("session_id")))
+        elif holder.get("state") == "UnitHolder":
+            _validate_holder_schema(holder, {"state", "unit"}, "UnitHolder")
+            owner = UnitHolder(_string(holder.get("unit")))
+        else:
+            raise ValueError("holder must name a session or unit")
+        # Narrow the wire value to the domain's three resource kinds.
+        if kind == "account":
+            return cls("account", resource, owner)
+        if kind == "slot":
+            return cls("slot", resource, owner)
+        return cls("memory", resource, owner)
+
+
+def _holder_from_fields(fields: dict[str, object]) -> NamedHolder | HolderNotNamed:
+    if fields.get("state") == "HolderNotNamed":
+        _validate_holder_schema(fields, {"state", "reason"}, "HolderNotNamed")
+        return HolderNotNamed(_string(fields.get("reason")))
+    return NamedHolder.from_fields(fields)
+
+
+def _holder_fields(holder: NamedHolder | HolderNotNamed) -> dict[str, object]:
+    if isinstance(holder, HolderNotNamed):
+        return {"state": "HolderNotNamed", "reason": holder.reason}
+    owner = ({"state": "SessionHolder", "session_id": holder.holder.session_id}
+             if isinstance(holder.holder, SessionHolder) else
+             {"state": "UnitHolder", "unit": holder.holder.unit})
+    return {"state": "NamedHolder", "resource_kind": holder.resource_kind,
+            "resource": holder.resource, "holder": owner}
+
+
+def _refuse_holder(message: str) -> NoReturn:
+    print(message, file=sys.stderr)
+    raise SystemExit(2)
+
+
+def _holder_from_args(args: argparse.Namespace, kind: str) -> NamedHolder | HolderNotNamed:
+    flags = ("holder_resource_kind", "holder_resource", "holder_session", "holder_unit")
+    supplied = {flag for flag in flags if hasattr(args, flag)}
+    if not supplied:
+        return HolderNotNamed("producer named no holder")
+    if kind not in HOLDER_WAIT_KINDS:
+        _refuse_holder(f"{kind} does not accept holder flags")
+    if supplied not in ({"holder_resource_kind", "holder_resource", "holder_session"},
+                         {"holder_resource_kind", "holder_resource", "holder_unit"}):
+        _refuse_holder("holder flags require a resource kind, resource and exactly one session or unit")
+    owner = ({"state": "SessionHolder", "session_id": _arg_string(args, "holder_session")}
+             if "holder_session" in supplied else
+             {"state": "UnitHolder", "unit": _arg_string(args, "holder_unit")})
+    try:
+        return NamedHolder.from_fields({"state": "NamedHolder",
+            "resource_kind": _arg_string(args, "holder_resource_kind"),
+            "resource": _arg_string(args, "holder_resource"), "holder": owner})
+    except ValueError as error:
+        _refuse_holder(str(error))
+
+
+def _wait_holder(args: argparse.Namespace) -> None:
+    if os.environ.get(PROBE_ENV) == "1":
+        return
+    state = _read_state(_session_dir(args))
+    wait_id = _arg_string(args, "wait_id")
+    events = _run_events(state)
+    wait = _waits_by_id(events).get(wait_id)
+    if wait is None or wait.get("event_type") != "wait_started":
+        _refuse_holder(f"Wait {wait_id} is not open in this run")
+    kind = _string(wait.get("wait_kind"))
+    if kind not in HOLDER_WAIT_KINDS:
+        _refuse_holder(f"{kind} does not accept holders")
+    holder = _holder_from_args(args, kind)
+    now = plan_history.now_epoch()
+    last_seen = max((_number(event.get("timestamp_epoch")) for event in events
+                     if event.get("wait_id") == wait_id), default=_number(wait.get("wait_started_epoch")))
+    if now < last_seen:
+        _refuse_holder("Cannot record a holder before the wait or its last holder observation")
+    event = dict(wait)
+    event.update(event_id=str(uuid.uuid4()), event_type="wait_holder_seen",
+                 timestamp=_iso_time(now), timestamp_epoch=now, holder=_holder_fields(holder))
+    _append_event(state, event)
+
+
+def _add_holder_arguments(parser: argparse.ArgumentParser) -> None:
+    _ = parser.add_argument("--holder-resource-kind", choices=("account", "slot", "memory"), default=argparse.SUPPRESS)
+    _ = parser.add_argument("--holder-resource", default=argparse.SUPPRESS)
+    owner = parser.add_mutually_exclusive_group()
+    _ = owner.add_argument("--holder-session", default=argparse.SUPPRESS)
+    _ = owner.add_argument("--holder-unit", default=argparse.SUPPRESS)
+
+
+@dataclass(frozen=True)
 class WaitPhaseResolved:
     phase: dict[str, object]
 
@@ -4846,6 +5009,131 @@ def resolve_production_unit(state: Mapping[str, object]) -> ProductionUnitIdenti
     if not production or not unit:
         return ProductionNotRecorded("run and plan have no production and unit identity")
     return ProductionUnitIdentity(production, unit)
+
+
+@dataclass(frozen=True)
+class RecordedPhaseMetadata:
+    value: str
+
+    def __post_init__(self) -> None:
+        if not self.value.strip():
+            raise ValueError("recorded phase metadata must not be blank")
+
+
+@dataclass(frozen=True)
+class PhaseMetadataNotRecorded:
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not self.reason.strip():
+            raise ValueError("missing phase metadata needs a reason")
+
+
+@dataclass(frozen=True)
+class PhaseSourceIdentity:
+    production: RecordedPhaseMetadata | PhaseMetadataNotRecorded
+    unit: RecordedPhaseMetadata | PhaseMetadataNotRecorded
+    repository: RecordedPhaseMetadata | PhaseMetadataNotRecorded
+
+
+def _phase_metadata_fields(value: RecordedPhaseMetadata | PhaseMetadataNotRecorded) -> dict[str, str]:
+    if isinstance(value, RecordedPhaseMetadata):
+        return {"state": "Recorded", "value": value.value}
+    return {"state": "NotRecorded", "reason": value.reason}
+
+
+def _recorded_phase_metadata(value: object, reason: str) -> RecordedPhaseMetadata | PhaseMetadataNotRecorded:
+    # Accept earlier string metadata as well as the tagged event fields.
+    if isinstance(value, str) and value.strip():
+        return RecordedPhaseMetadata(value)
+    fields = _object_dict(value) or {}
+    if fields.get("state") == "Recorded" and _string(fields.get("value")).strip():
+        return RecordedPhaseMetadata(_string(fields.get("value")))
+    if fields.get("state") == "NotRecorded" and _string(fields.get("reason")).strip():
+        return PhaseMetadataNotRecorded(_string(fields.get("reason")))
+    return PhaseMetadataNotRecorded(reason)
+
+
+def _phase_repository(working_dir: str) -> RecordedPhaseMetadata | PhaseMetadataNotRecorded:
+    if not working_dir:
+        return PhaseMetadataNotRecorded("phase has no working directory")
+    worktree = Path(working_dir).expanduser()
+    if not worktree.is_dir():
+        return PhaseMetadataNotRecorded("phase working directory is unavailable")
+    for directory in (worktree, *worktree.parents):
+        marker = directory / ".git"
+        if marker.is_dir():
+            return RecordedPhaseMetadata(directory.name)
+        if not marker.is_file():
+            continue
+        try:
+            location = marker.read_text(encoding="utf-8").strip()
+            if not location.startswith("gitdir:") or not location.removeprefix("gitdir:").strip():
+                break
+            git_directory = (directory / location.removeprefix("gitdir:").strip()).resolve()
+            common = (git_directory / "commondir").read_text(encoding="utf-8").strip()
+            if not common:
+                break
+            repository = (git_directory / common).resolve()
+            if not repository.is_dir():
+                break
+            return RecordedPhaseMetadata(repository.parent.name if repository.name == ".git" else repository.name)
+        except (OSError, ValueError):
+            break
+    return PhaseMetadataNotRecorded("repository common directory is unavailable")
+
+
+def _phase_production_name(production: str, working_dir: str) -> RecordedPhaseMetadata | PhaseMetadataNotRecorded:
+    reference = production.strip("`")
+    if "/" not in reference and Path(reference).suffix.lower() != ".md":
+        return _recorded_phase_metadata(production, "phase plan header names no production")
+    document = Path(working_dir).expanduser() / Path(reference).expanduser()
+    try:
+        lines = document.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as error:
+        return PhaseMetadataNotRecorded(f"production document cannot be read: {error}")
+    name = production_doc.production_name(lines)
+    if isinstance(name, production_doc.ProductionNameNotRecorded):
+        return PhaseMetadataNotRecorded(name.reason)
+    return _recorded_phase_metadata(name.value, "production document heading names no production")
+
+
+def _phase_plan_names(state: Mapping[str, object]) -> tuple[
+    RecordedPhaseMetadata | PhaseMetadataNotRecorded, RecordedPhaseMetadata | PhaseMetadataNotRecorded
+]:
+    working_dir = _string(state.get("working_dir"))
+    plan = _string(state.get("project_plan_doc")) or _string(state.get("plan_doc"))
+    if not working_dir or not plan:
+        missing = PhaseMetadataNotRecorded("phase has no working directory or plan document")
+        return missing, missing
+    try:
+        content = (Path(working_dir).expanduser() / plan).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        missing = PhaseMetadataNotRecorded(f"phase plan cannot be read: {error}")
+        return missing, missing
+    header = re.search(r'^> \*\*Production:(?:[ \t]+(.+?)\*\*([^\r\n]*)|\*\*[ \t]+([^\r\n]*))',
+                       content, re.MULTILINE)
+    if header is None:
+        missing = PhaseMetadataNotRecorded("phase plan has no production header")
+        return missing, missing
+    text = (header.group(1) + header.group(2)) if header.group(1) is not None else header.group(3)
+    production = re.split(r" — | \(", text, maxsplit=1)[0].strip()
+    unit = re.search(r'(?:^| — )unit[ \t]+(?:`([^`]+)`|([^,;\s]+))', text)
+    return (_phase_production_name(production, working_dir),
+            _recorded_phase_metadata((unit.group(1) or unit.group(2)).strip() if unit else "",
+                                     "phase plan header names no unit"))
+
+
+def _phase_source_identity(state: Mapping[str, object]) -> PhaseSourceIdentity:
+    production = _recorded_phase_metadata(state.get("production"), "run names no production")
+    unit = _recorded_phase_metadata(state.get("unit"), "run names no unit")
+    if isinstance(production, PhaseMetadataNotRecorded) or isinstance(unit, PhaseMetadataNotRecorded):
+        plan_production, plan_unit = _phase_plan_names(state)
+        if isinstance(production, PhaseMetadataNotRecorded):
+            production = plan_production
+        if isinstance(unit, PhaseMetadataNotRecorded):
+            unit = plan_unit
+    return PhaseSourceIdentity(production, unit, _phase_repository(_string(state.get("working_dir"))))
 
 
 def _phase_identity(state: dict[str, object], phase: dict[str, object]) -> dict[str, object]:
@@ -4944,6 +5232,7 @@ def _start_wait(args: argparse.Namespace) -> None:
 
 
 def _record_wait(state: dict[str, object], args: argparse.Namespace) -> str:
+    holder = _holder_from_args(args, _arg_string(args, "kind"))
     resolution = _wait_phase(state, args)
     owner = _arg_string(args, "owner_session") or _string((_object_dict(state.get("main_agent")) or {}).get("session_id"))
     missing_reason = _optional_arg(args, "missing_reason")
@@ -4961,7 +5250,8 @@ def _record_wait(state: dict[str, object], args: argparse.Namespace) -> str:
                   "wait_reason": _arg_string(args, "reason"),
                   "unit": _arg_string(args, "unit") or _string(state.get("worktree")),
                   "owner_session": owner, "wait_started_at": _iso_time(now),
-                  "wait_started_epoch": now, "wait_end": {"state": "Open"}})
+                  "wait_started_epoch": now, "wait_end": {"state": "Open"},
+                  "holder": _holder_fields(holder)})
     if hasattr(args, "expected_supplier"):
         event["expected_supplier"] = cast(object, args.expected_supplier)
     if isinstance(resolution, ResolvedWorkerPass):
@@ -5465,6 +5755,37 @@ def _attribution_candidates(wait: dict[str, object]) -> list[dict[str, object]]:
     return [record for item in cast(list[object], value) if (record := _object_dict(item)) is not None] if isinstance(value, list) else []
 
 
+def _wait_holder_history(events: list[dict[str, object]]) -> dict[tuple[str, str], list[dict[str, object]]]:
+    histories: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for event in events:
+        event_type = event.get("event_type")
+        terminal = event_type in ("wait_finished", "wait_unclosed")
+        if event_type not in ("wait_started", "wait_not_recorded", "wait_holder_seen") and not terminal:
+            continue
+        if terminal and "holder" not in event:
+            continue
+        raw_value = event.get("holder")
+        fields = _object_dict(raw_value)
+        if "holder" not in event:
+            holder_fields = _holder_fields(HolderNotNamed("recorded before holders"))
+        elif fields is None:
+            holder_fields = MalformedHolder(raw_value, "holder must be an object").to_fields()
+        else:
+            try:
+                holder_fields = _holder_fields(_holder_from_fields(fields))
+            except ValueError as error:
+                holder_fields = MalformedHolder(raw_value, f"invalid holder record: {error}").to_fields()
+        key = (_string(event.get("run_id")), _string(event.get("wait_id")))
+        history = histories.setdefault(key, [])
+        # Terminal rows copy the start holder, not later holder observations.
+        # Keep new terminal evidence without repeating a copied observation.
+        if terminal and any(observation["holder"] == holder_fields for observation in history):
+            continue
+        epoch = _number(event.get("timestamp_epoch"))
+        history.append({"at": _iso_time(epoch), "epoch": epoch, "holder": holder_fields})
+    return histories
+
+
 def _read_waits(args: argparse.Namespace) -> None:
     since, until = _history_window(args)
     session = _arg_string(args, "session_dir")
@@ -5478,7 +5799,18 @@ def _read_waits(args: argparse.Namespace) -> None:
     else:
         events, ignored = _load_events()
         events.extend(_external_wait_events())
-    records = list(_waits_by_id(events).values())
+    without_id = [event for event in events
+                  if event.get("event_type") in ("wait_started", "wait_finished", "wait_unclosed", "wait_not_recorded")
+                  and not _string(event.get("wait_id"))]
+    ignored += len(without_id)
+    histories = _wait_holder_history(events)
+    records: list[dict[str, object]] = []
+    for wait in _waits_by_id(events).values():
+        key = (_string(wait.get("run_id")), _string(wait.get("wait_id")))
+        epoch = _number(wait.get("wait_started_epoch"))
+        holders = histories.get(key, [{"at": _iso_time(epoch), "epoch": epoch,
+                                      "holder": _holder_fields(HolderNotNamed("recorded before holders"))}])
+        records.append({**wait, "holders": holders})
     selected = [wait for wait in records if since <= _number(wait.get("wait_started_epoch")) < until]
     missing = [wait for wait in selected if wait.get("event_type") == "wait_not_recorded"]
     waits = [wait for wait in selected if wait.get("event_type") != "wait_not_recorded"]
@@ -5487,6 +5819,7 @@ def _read_waits(args: argparse.Namespace) -> None:
     handoffs = [wait for wait in waits if (_object_dict(wait.get("wait_attribution")) or {}).get("state") == "ProductionHandoff"]
     phases: list[dict[str, object]] = []
     old_phase_n = 0
+    sources: dict[str, PhaseSourceIdentity] = {}
     for event in events:
         if event.get("event_type") != "phase_started" or not since <= _number(event.get("timestamp_epoch")) < until:
             continue
@@ -5494,6 +5827,8 @@ def _read_waits(args: argparse.Namespace) -> None:
                (event.get("run_id"), event.get("phase_instance_id"))]
         own_missing = [wait for wait in missing if (wait.get("run_id"), wait.get("phase_instance_id")) ==
                        (event.get("run_id"), event.get("phase_instance_id"))]
+        own_without_id = sum((row.get("run_id"), row.get("phase_instance_id")) ==
+                             (event.get("run_id"), event.get("phase_instance_id")) for row in without_id)
         recorded = (_object_dict(event.get("wait_coverage")) or {}).get("state") == "Recorded"
         own_uncertain = [wait for wait in uncertain if any(
             (candidate.get("run_id"), candidate.get("phase_instance_id")) ==
@@ -5503,6 +5838,21 @@ def _read_waits(args: argparse.Namespace) -> None:
                                     "phase_instance_id": event.get("phase_instance_id"),
                                     "unit": event.get("worktree"),
                                     "state": "Covered" if recorded and not own_missing else "HistoryNotRecorded"}
+        plan = _string(event.get("project_plan_doc")) or _string(event.get("plan_doc"))
+        phase["plan_doc"] = _phase_metadata_fields(_recorded_phase_metadata(plan, "phase has no plan document"))
+        if "production" not in event or "repository" not in event:
+            run_id = _string(event.get("run_id"))
+            if run_id not in sources:
+                sources[run_id] = _phase_source_identity(event)
+            source = sources[run_id]
+            phase["production"] = _phase_metadata_fields(source.production)
+            phase["repository"] = _phase_metadata_fields(source.repository)
+        for field in ("production", "repository"):
+            if field in event:
+                metadata = _recorded_phase_metadata(event[field], f"phase has no {field}")
+                if field == "production" and isinstance(metadata, RecordedPhaseMetadata):
+                    metadata = _phase_production_name(metadata.value, _string(event.get("working_dir")))
+                phase[field] = _phase_metadata_fields(metadata)
         if own_missing:
             phase.update(reason="wait emission has a missing record", wait_missing_n=len(own_missing),
                          recorded_wait_n=len(own))
@@ -5520,6 +5870,12 @@ def _read_waits(args: argparse.Namespace) -> None:
                                           for wait in own_uncertain),
                          candidates=[candidate for wait in own_uncertain for candidate in _attribution_candidates(wait)],
                          attribution_miss_ids=[wait["wait_id"] for wait in own_uncertain])
+        if own_without_id:
+            _ = phase.pop("wait_n", None)
+            phase.update(state="HistoryNotRecorded", wait_without_id_n=own_without_id,
+                         recorded_wait_n=len(own))
+            if not own_missing:
+                phase["reason"] = "wait record has no wait id"
         phases.append(phase)
     print(json.dumps({"since": _iso_time(since), "until": _iso_time(until),
                       "selection": "phase starts and wait starts in [since, until)",
@@ -5530,7 +5886,8 @@ def _read_waits(args: argparse.Namespace) -> None:
                       "attribution_miss_n": len(uncertain),
                       "uncertain_phase_n": sum(phase["state"] == "UncertainCoverage" for phase in phases),
                       "production_handoff_n": len(handoffs), "handoffs": handoffs,
-                      "ignored_n": ignored, "phases": phases, "waits": waits, "missing": missing}, sort_keys=True))
+                      "ignored_n": ignored, "wait_without_id_n": len(without_id),
+                      "phases": phases, "waits": waits, "missing": missing}, sort_keys=True))
 
 
 def _read_receipts(args: argparse.Namespace) -> None:
@@ -5685,14 +6042,27 @@ def _finding_lenses(event: dict[str, object]) -> set[str]:
     return {part.strip() for part in lens.split(",") if part.strip()}
 
 
-def _raised_code_findings(session_dir: Path, instance_id: str) -> int | None:
+@dataclass(frozen=True)
+class NoRecordedCodeReview:
+    """No finished code review records this phase's raised count."""
+
+
+@dataclass(frozen=True)
+class RecordedCodeFindings:
+    count: int
+
+
+CodeReviewEvidence = NoRecordedCodeReview | RecordedCodeFindings
+
+
+def _raised_code_findings(session_dir: Path, instance_id: str) -> CodeReviewEvidence:
     """The code findings the phase's reviewers raised, from review.sh's turn records.
 
     Sums `raised` over the phase's finished (`reviewed`) code-review turns, as
-    review_pool_report.py's `Raised` does. None when the phase has no such turn:
-    a solo review writes no record.
+    historical and current review records do. No record differs from a
+    recorded review that raised zero findings.
     """
-    raised: int | None = None
+    evidence: CodeReviewEvidence = NoRecordedCodeReview()
     root = plan_history.history_root() / "review_turns" / session_dir.name
     for path in sorted(root.glob("*.json")):
         try:
@@ -5706,8 +6076,9 @@ def _raised_code_findings(session_dir: Path, instance_id: str) -> int | None:
             or _string(record.get("kind")) == "ux"
         ):
             continue
-        raised = (raised or 0) + _integer(record.get("raised"))
-    return raised
+        count = evidence.count if isinstance(evidence, RecordedCodeFindings) else 0
+        evidence = RecordedCodeFindings(count + _integer(record.get("raised")))
+    return evidence
 
 
 def _review_trial(args: argparse.Namespace) -> None:
@@ -5794,8 +6165,8 @@ def _review_trial(args: argparse.Namespace) -> None:
         if _integer(event.get("fix_pass")) in ux_rounds
     )
     raised = _raised_code_findings(session_dir, instance_id)
-    if raised is not None:
-        code_findings = raised
+    if isinstance(raised, RecordedCodeFindings):
+        code_findings = raised.count
     print(
         f"review trial: ux {ux_findings} findings, code {code_findings} findings, "
         + f"review-worker minutes {(review_seconds + 30) // 60}, "
@@ -5881,7 +6252,14 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = start_wait.add_argument("--owner-session", default="")
     _ = start_wait.add_argument("--unit", default="")
     _ = start_wait.add_argument("--probe", action="store_true")
+    _add_holder_arguments(start_wait)
     start_wait.set_defaults(handler=_start_wait)
+
+    wait_holder = subparsers.add_parser("wait-holder")
+    _ = wait_holder.add_argument("--session-dir", required=True)
+    _ = wait_holder.add_argument("--wait-id", required=True)
+    _add_holder_arguments(wait_holder)
+    wait_holder.set_defaults(handler=_wait_holder)
 
     finish_wait = subparsers.add_parser("finish-wait")
     _ = finish_wait.add_argument("--session-dir", required=True)

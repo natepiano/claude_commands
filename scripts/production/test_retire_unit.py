@@ -7,6 +7,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -18,9 +19,10 @@ from typing import TYPE_CHECKING, Literal, cast, final, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from scripts.guilds import roles
+from scripts.astra import design_roles
 from scripts.direct import workers  # noqa: E402
 
+import add_unit
 import retire_unit
 import unit_lookup
 import unit_move
@@ -141,8 +143,8 @@ class RetireUnitTests(unittest.TestCase):
         self.enterContext(mock.patch.dict(os.environ, {"RETIRE_UNIT_RUN_ROOT": str(runs),
                                                        "UNIT_WORKERS_STATE": str(self.root / "unit-workers"),
                                                        "BUILD_HOLD_DIR": str(holds),
-                                                       "GUILD_ROLES_STATE": str(self.root / "guild-roles"),
-                                                       "GUILD_OWNERSHIP_STATE": str(self.root / "guild-ownership")}))
+                                                       "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
+                                                       "DESIGN_OWNERSHIP_STATE": str(self.root / "design-ownership")}))
         _ = self.enterContext(mock.patch.object(retire_unit, "MAC_CLAIMS", self.root / "claims"))
         _ = self.enterContext(mock.patch.object(retire_unit, "production_of", production_of))
         _ = self.enterContext(mock.patch.object(retire_unit, "run", self.fake_run))
@@ -308,9 +310,47 @@ class RetireUnitTests(unittest.TestCase):
         self.assertEqual(git(self.checkout, "branch", "--list", "alpha-branch"), "")
         self.assertEqual(git(self.checkout, "ls-remote", "--heads", "origin", "alpha-branch"), "")
 
+    def test_rerun_commits_the_retired_note_before_removing_the_worktree(self) -> None:
+        snapshot = Path(self.enterContext(tempfile.TemporaryDirectory())) / "before"
+        _ = shutil.copytree(self.root, snapshot)
+        claude, marked = list(self.claude), self.marked
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        expected_tree = git(self.checkout, "rev-parse", "HEAD^{tree}")
+        expected_doc = self.doc.read_text()
+        shutil.rmtree(self.root)
+        _ = shutil.copytree(snapshot, self.root)
+        self.claude, self.marked, self.calls = claude, marked, []
+        before = git(self.checkout, "rev-parse", "HEAD")
+
+        with mock.patch.object(add_unit, "commit_paths",
+                               side_effect=OSError("fixture stop after retired note")) as commit:
+            code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertIn("fixture stop after retired note", output)
+        commit.assert_called_once()
+        self.assertEqual(self.doc.read_text(), expected_doc)
+        self.assertEqual(git(self.checkout, "rev-parse", "HEAD"), before)
+        self.assertTrue(self.worktree.is_dir())
+        self.assertEqual(git(self.checkout, "branch", "--list", "--format=%(refname:short)", "alpha-branch"), "alpha-branch")
+
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(git(self.checkout, "rev-parse", "HEAD^{tree}"), expected_tree)
+        self.assertEqual(git(self.checkout, "status", "--porcelain"), "")
+        self.assertEqual(git(self.checkout, "log", "-1", "--format=%s"), "production(alpha): retire alpha-unit")
+        self.assertEqual(self.doc.read_text(), expected_doc)
+        self.assertFalse(self.worktree.exists())
+        self.assertEqual(git(self.checkout, "branch", "--list", "alpha-branch"), "")
+        self.assertEqual(git(self.checkout, "ls-remote", "--heads", "origin", "alpha-branch"), "")
+        head = git(self.checkout, "rev-parse", "HEAD")
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(git(self.checkout, "rev-parse", "HEAD"), head)
+
     def test_role_cleanup_refusal_keeps_the_unit_row_worktree_and_branch(self) -> None:
         before = self.doc.read_bytes()
-        with mock.patch.object(roles, "end_holder", side_effect=roles.RoleRefused("designer turn is still running")):
+        with mock.patch.object(design_roles, "end_holder", side_effect=design_roles.RoleRefused("designer turn is still running")):
             code, output = self.retire()
         self.assertEqual(code, 1, output)
         self.assertIn("held role cleanup", output)
@@ -406,7 +446,7 @@ class RetireUnitTests(unittest.TestCase):
                 def return_director(_slug: str, _unit: str) -> None:
                     self.marked = unit_lookup.MarkedUnit("alpha-unit",
                         unit_lookup.LiveClaude("alpha", DIRECTOR, "/nonexistent.sock", 5101), HerdrPlace("alpha", "w1:p1"))
-                with mock.patch.object(roles, "end_holder", side_effect=return_director):
+                with mock.patch.object(design_roles, "end_holder", side_effect=return_director):
                     code, output = self.retire()
                 self.assertEqual(code, 1, output)
                 self.assertIn(f"left running: marked session {DIRECTOR}, pid 5101", output)
@@ -464,7 +504,7 @@ class RetireUnitTests(unittest.TestCase):
         before = self.doc.read_bytes()
         def pending_stop(_slug: str, _unit: str) -> None:
             self.records = [self.shutdown_state("stopping")]
-        with mock.patch.object(roles, "end_holder", side_effect=pending_stop):
+        with mock.patch.object(design_roles, "end_holder", side_effect=pending_stop):
             code, output = self.retire()
         self.assertEqual(code, 1, output)
         self.assertIn(f"session {DIRECTOR}, pid 4101: shutdown stopping", output)
@@ -475,7 +515,7 @@ class RetireUnitTests(unittest.TestCase):
         before = self.doc.read_bytes()
         def relaunch(_slug: str, _unit: str) -> None:
             self.claude = [session(SEAT, "returned-worker", 5202)]
-        with mock.patch.object(roles, "end_holder", side_effect=relaunch):
+        with mock.patch.object(design_roles, "end_holder", side_effect=relaunch):
             code, output = self.retire()
         self.assertEqual(code, 1, output)
         self.assertIn(f"session {SEAT}, pid 5202", output)

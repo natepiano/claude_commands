@@ -41,7 +41,7 @@ The roster joins records that each name one part of the picture. A session's rol
 
 | Mesh roster | `<run>/mesh_roster.json`, `<run>/mesh_server.json` | Codex workers: `thread_id`, `status`, `role`, `lens`, `launcher_pid`, `cwd`; server `pid` |
 
-| Held role store | `~/.local/state/guilds/roles/<design id>/design.json` and its `mesh/mesh_roster.json` (`roles.state_root()`, `GUILD_ROLES_STATE`) | held Astra designers and reviewers: holder, lifecycle, thread, mesh entry |
+| Held role store | `~/.local/state/astra/design-roles/<design id>/design.json` and its `mesh/mesh_roster.json` (`design_roles.state_root()`, `DESIGN_ROLES_STATE`) | held Astra designers and reviewers: holder, lifecycle, thread, mesh entry |
 
 | Review state | `<run>/review_status[_<lens>]`, `<run>/review_pid[_<lens>]` | running blind reviewers |
 
@@ -60,7 +60,7 @@ Claude rows come from `sessions.running_sessions()`, one per `sessionId` (newest
 Codex rows:
 
 - **worker** — each mesh entry of a live run whose status is not `ended` and whose server pid or `launcher_pid` is alive. Slot role from the record's `role`: `review (<lens>)` for a `review` role with a lens, `no role` when absent, `role unknown` when unrecognized. Status reads `done` → `idle`, `waiting_capacity` → `waiting for capacity`, `capacity_exhausted` → `out of capacity`, others as stored. cwd from the record, else the agent process's `--cwd`, else the director's cwd. Director and showrunner links come from the run; a heartbeat-only run gives `NoDirector` / `NoShowrunner`.
-- **held Astra role** (`_durable_roles`) — each open held role in the held role store (`docs/as-built/long-lived-workers.md#lasting-roles`), skipping a role not opened or ended and a thread fenced by an adoption (`transferring_role`, `role_redirect`, `roles.transfer_route`). Role `astra-designer` or `astra-reviewer`, name the instance name, status the mesh entry's, else the lifecycle name; cwd the design's checkout. A unit holder gives `UnderDirector`; a showrunner holder gives `UnderShowrunner` and `NoDirector`. Its account reads `AccountUnread("serving home not read")`.
+- **held Astra role** (`_durable_roles`) — each open held role in the held role store (`docs/as-built/long-lived-workers.md#lasting-roles`), skipping a role not opened or ended and a thread fenced by an adoption (`transferring_role`, `role_redirect`, `design_roles.transfer_route`). Role `astra-designer` or `astra-reviewer`, name the instance name, status the mesh entry's, else the lifecycle name; cwd the design's checkout. A unit holder gives `UnderDirector`; a showrunner holder gives `UnderShowrunner` and `NoDirector`. Its account reads `AccountUnread("serving home not read")`.
 - **blind reviewer** — `review_status[_<lens>]` reads `reviewing` with a live `review_pid[_<lens>]`. Kind is `codex` for a `codex exec` descendant of that pid, else `claude` for a `claude` descendant, else `codex`. Named `<lens> reviewer` or `blind reviewer`, slot role `review (<lens>)` or `review`.
 - **freestanding** — each daemon thread that is not a worker's or held role's thread (such a thread is listed once, as the worker or held role).
 
@@ -80,6 +80,17 @@ Codex rows:
 - `SenderIdentity = CodexThread | ClaudeSession | NoSession` from `sender_identity(environment)`: `CODEX_THREAD_ID` first, then `CLAUDE_CODE_SESSION_ID`. `is_sender(entry, identity)` matches a Codex row's `thread` or any row's `session`; `NoSession` matches nothing.
 - `is_top_level(entry)`: a Claude row that is not a worker and not a unit director `UnderShowrunner`.
 - `cannot_receive_message_text(entry)`: the one refusal text for `send.py` and `broadcast.py`, `<name> cannot take messages (<reason>)` plus a tail: a worker `UnderDirector` gets `; contact its unit director <name> or wait`, a worker with `NoDirector` none, a socketless Claude session `; wait for it to open its messaging socket, then read the roster again and send again`.
+
+### Unit labels (`roster.py`)
+
+`roster.py` holds the one rule that names a session's showrunner and unit for build views and copy folders. Callers never derive these names themselves.
+
+- `UnitLabels(session, showrunner="—", unit="—")` is frozen, and each field is whitespace-collapsed. Showrunner is the production slug and unit is the unit id without its `-unit` suffix, read through `_production_of` and `_unit_of`, the same helpers `shown_name` uses through `_production(entry)` and `_unit(entry)`; `_short_unit` is the one place that strips `-unit`. A production with no running showrunner still names its slug. These are the short names herdr shows (production `builds`, unit `report-unit` gives `builds`, `report`), never a session name. `—` marks a missing part.
+- `unit_labels(entries) -> dict[str, UnitLabels]` keys a full roster's entries by Claude session id and Codex thread id. `/build:queue` uses it (`docs/as-built/build-memory-admission.md`, "Queue API").
+- `unit_labels_for(session_ids, environment) -> dict[str, UnitLabels]` is the fast path for known Claude session ids. It reads the session records, the showrunner registry through `showrunners.registered_showrunners(known_sessions=...)`, and unit marks through `unit_lookup.session_unit_marks(records, environment)`, which reads only each record's `/proc/<pid>/environ` (`HERDR_PROC` replaces `/proc`). It never reads the process table, Codex meshes or accounts. A session whose `CLAUDE_CODE_SESSION_ID` names another known session resolves under that director and takes its production and unit. Unknown ids are left out, and any error returns `{}`. `/build:status` uses it (`docs/as-built/build-targets.md`).
+- Both paths group marks through `unit_lookup.group_marked_units`, the one slug-rename and duplicate-mark rule; a test pins that both paths give the same labels.
+- `UnitLabels.folder_name() -> str` names the copies folder `/tmp/claude/copies/<showrunner>-<unit>/<phase>-<purpose>`: showrunner `hana`, unit `lfo` gives `hana-lfo`. A unit name equal to the showrunner name, or one that starts with the showrunner name and `-`, is the folder name alone (`cargo-liner-style` + `cargo-liner-style-types` gives `cargo-liner-style-types`). The prefix rule needs the hyphen: `hana` + `hanami` gives `hana-hanami`. A `—` part is left out with its hyphen (`builds`, `lfo`); with both parts `—` the session name is the folder name. A caller looks up labels with `unit_labels_for([<session id from build_hold.owning_session()>], environment)`, so a Codex worker resolves to its unit director. No caller uses `folder_name` yet.
+- Imports: `roster.py` imports `scripts.shutdown.remote` by package and does not put `scripts/shutdown` on `sys.path`; `account`, `agent_accounts` and `note_file` load lazily, so a label-only caller does not load account discovery. `scripts/shutdown/inventory.py` appends its own folder after existing `sys.path` entries for its sibling imports.
 
 ### `roster.py` command
 
@@ -104,7 +115,7 @@ send.py ack KEY | reopen KEY | pending [NAME] | retire --to ADDRESS --from SENDE
 
 The argparse boundary builds `RecipientSelection = RosterLookup(to) | MeshWorker(session_dir, worker)` and `RecipientResolutionScope = LocalOnly | LocalThenPeer | NamedMachine(host)`: `--here` is `LocalOnly`, `--machine HOST` is `NamedMachine`, neither is `LocalThenPeer`; the two together are a usage error. `Options.action: MessageUserAction = UserAction | NoUserRecipient`.
 
-Routes (`resolve_recipient(to, scope) -> DeliveryRoute`):
+Routes (`resolve_recipient(to: str, scope: RecipientResolutionScope, observed: roster.Roster) -> DeliveryRoute`). `observed` holds the roster already read for this send:
 
 | `--to` | Route |
 |---|---|
@@ -273,7 +284,7 @@ broadcast.py [--here] --from NAME (--all TEXT | --showrunners TEXT | --units TEX
 - Delivery is `send.py --to <address> --from <sender> --here --text ...` per `Messageable` row, 24 at once (`AT_ONCE`), never with action flags. A recipient gone since the roster read is a failed delivery here. A `CannotReceiveMessages` row prints `send.py`'s refusal line and is neither sent nor a failure.
 - Without `--here`, `ssh <other machine> env -u CODEX_THREAD_ID -u CLAUDE_CODE_SESSION_ID [BROADCAST_SEND=...] BROADCAST_CLOSING_MACHINES=... broadcast.py --here --from <sender> <same groups>` runs in parallel (120 s timeout); its lines print under `<host>: `. The replay spells an all-workers group `--all-workers` (accepted by `main`, absent from `USAGE`) so it does not inherit an earlier `--of`. ssh exit 255, a timeout, or a nonzero exit with no `NOT sent` line yields `<host>: NOT sent: <why>`.
 - `--of` is resolved once across both machines before any delivery: one director gives its machine and address; several give exit 2 with `<target> matches more than one unit director:` and their addresses; none gives `unknown unit <target>; known units:`. If the other machine is not reached, `--of` sends nothing: one `NOT sent` line, exit 1. `--of` without a following `--workers` is a usage error.
-- Output: `<name> - <role> - sent | no live session: <reason> | NOT sent: <why>`, `<group> - none on this machine` per machine for a group with no member besides the sender, then `<N> sent in <S> s` and the closing line. Exit 0 when nothing is `NOT sent`, 1 otherwise, 2 for usage. Roster problems print as `broadcast: roster: <problem>` and the rest sends.
+- Output: `<shown name> [<address>] - <outcome>[: <detail>]`. The outcomes are `sent`, `no live session` and `NOT sent`. The address appears in brackets only when it differs from the shown name. The shown name includes the job, so there is no role column. A group with no member besides the sender prints `<group> - none on this machine` on each machine. The report ends with `<N> sent in <S> s` and the closing line. Exit 0 when nothing is `NOT sent`, 1 otherwise, 2 for usage. Roster problems print as `broadcast: roster: <problem>`; delivery to the other rows continues.
 - Library API: `broadcast(sender, texts: Mapping[BroadcastGroup, str], *, scope=ALL_MACHINES) -> list[Delivery]` runs the same orchestration as the command; `report(deliveries) -> bool`; `send(session, sender, text, *options) -> str` (empty on success). `codex_winddown.announce()` calls `broadcast.broadcast(sender, {Showrunners(): ..., UnitDirectors(): ...})` and `broadcast.report`.
 
 Callers: `/announce` (`--all`), `/unit:announce` (`--units`), `/showrunner:announce` (`--showrunners`), each on both machines, and `/codex_winddown`.
@@ -340,7 +351,7 @@ Senders:
 
 ### Key files
 
-- `scripts/message/roster.py` — the roster, both machines, `RosterSnapshot`, refusal text
+- `scripts/message/roster.py` — the roster, both machines, `RosterSnapshot`, refusal text, unit labels
 - `scripts/message/sessions.py` — session registry readers, process-start reader
 - `scripts/message/process_table.py` — the shared process table
 - `scripts/message/codex_daemon.py` — daemon reader and `queue`
@@ -443,6 +454,10 @@ Senders:
 - When `process_start` returns `None` (malformed stat, `ps` failure), a record with a `procStart` is not running until its start reads again, socket or not.
 - The macOS `ps -o lstart=` path is covered in tests only with a faked `ps`.
 - `codex_winddown.start()` keeps the first record per name, so it depends on `sessions.live_sessions()` listing the newest first.
+
+**Imports**
+- `roster.py`'s module-level `sys.path` edits reach every importer: a change there must also run the herdr and shutdown folder suites.
+- buildlog and shutdown each have a `record.py`; with `scripts/shutdown` ahead on `sys.path`, `import record` loads the wrong one. This is why `roster.py` imports shutdown's `remote` by package.
 
 **Tests**
 - `PROCESS_TABLE_PS` is read at import: a test that sets it reloads `process_table` or patches `process_table.PS`.

@@ -24,12 +24,16 @@ with three actions: `plan`, `apply` and `verify`.
 
 apply works under the production lock in `unit_move`, which `rename.py` also takes. It saves the
 journal `rename_unit.json` before changing anything, and checks the showrunner checkout before
-each step. The preflight, each step's checks, and every step except stop, relaunch and verify
+each step. The journal omits the production doc and checkout paths: resume and verify resolve
+them through the current update timer, ignoring those fields in older journals. The unit's old
+and new worktree paths remain recorded because they describe the rename itself.
+The preflight, each step's checks, and every step except stop, relaunch and verify
 (`Step.locked`) run under the merge lock, `merge_checkpoint.merge_lock(checkout, slug)`: an flock
 on `<git common dir>/showrunner-merge-<slug>.lock`, which `merge_checkpoint.py` holds for a
 whole gate run, unit checkpoints and `--from-child` hand-offs alike. A rename that finds a gate
 running prints `merge lock: waiting — …` and waits, and a gate waits for the step. The steps that
-wait do not hold the lock, so no gate waits behind a stop. Every step except the first and the last also checks that the unit is stopped. The
+wait do not hold the lock, so no gate waits behind a stop. Every step except the first and the last also checks that the unit is stopped;
+relaunch alone accepts the journal's session already live under the new id. The
 steps:
 
 1. **Stop.** A running unit is not a refusal: plan lists this step, and apply stops the unit
@@ -81,7 +85,10 @@ steps:
    A `Kind: style` production reads the Plan cell under `docs/style-production/units/`, keeps the
    filename, and updates the header in both the showrunner checkout and unit worktree. Its doc
    and plans stay git-excluded; `--allow-empty` records the rename subject even without a tracked
-   change. The journal records the commit's hash, so a retry only pushes it.
+   change. If a stop follows a doc or plan write, the pending step accepts only
+   files exactly equal to its transformations of HEAD; unrelated contents, paths
+   or mode changes still refuse. It finishes the remaining writes and commit.
+   The journal records the commit's hash, so a retry only pushes it.
 6. **Merge rename.** The unit branch takes the rename commit.
 7. **State.** These move to the new id:
    - the six showrunner state files (`rename_state.SCRATCH_FILES`) in `showrunners.session_state_dir(<slug>)`, or in the `--scratch` directory when one is given;
@@ -98,7 +105,7 @@ steps:
    - the newest run record and the recorder state;
    - this production's open proposal issues and phase notes (`phase_table.owned_notes`).
    - the herdr pane record drops the old unit's entries (`pane_record.forget_unit`), in each session's file. The relaunched unit records its new pane at SessionStart; an old entry would resume the old name.
-   - each held design role of the unit (`roles.rename_holder`, `docs/as-built/long-lived-workers.md#lasting-roles`): with the role idle, the ownership authority moves the checkout and advances the generation, and the holder, checkout, document and binding paths, `guild_context.json` and the roster `cwd` take the new names. A failure raises `RenameRefused`, and the journal retries the step.
+   - each held design role of the unit (`design_roles.rename_holder`, `docs/as-built/long-lived-workers.md#lasting-roles`): with the role idle, the ownership authority moves the checkout and advances the generation, and the holder, checkout, document and binding paths, `design_context.json` and the roster `cwd` take the new names. A failure raises `RenameRefused`, and the journal retries the step.
    Style productions also call `Ledger.rename_unit` with their Repository: queued, assigned and
    checkpointed tickets and sync waits take the new unit id; ticket ids and closed rows stay. It
    refuses a target that owns current rows or maps to another family, and a repeat moves nothing.
@@ -123,6 +130,10 @@ steps:
     waits for the new id to carry a live Claude mark (`_await_live`, `LIVE_WAIT_SECONDS`,
     `RENAME_UNIT_LIVE_WAIT`, default 180), so verify does not run before the unit is up. The rename
     claim (`rename_state.rename_claim`) refuses add_unit for both ids until step 9 is done.
+    If the restart succeeded before this step was saved, apply accepts only that
+    session id under the new unit id and retries restart's own recovery before
+    verification; it does not stop the restored workers. Another live session
+    or an unreadable session mark still refuses.
 11. **Verify** (below).
 
 A unit that was not running has no record, so steps 9 and 10 do nothing for it.
@@ -136,7 +147,7 @@ A unit that was not running has no record, so steps 9 and 10 do nothing for it.
   - the transcript folders, the stall stretch and the newest run;
   - proposals and phase notes;
   - the shutdown record and the live session's mark;
-  - held design roles (`roles.rename_failures`): no old holder, no old checkout in a live field or roster `cwd`, no stale `guild_context.json`.
+  - held design roles (`design_roles.rename_failures`): no old holder, no old checkout in a live field or roster `cwd`, no stale `design_context.json`.
 - **Control.** The old id must still be in the merge-branch subjects. If the matcher finds nothing
   in history, it is broken.
 - **Sweep.** `unit_rename_sweep.sweep` runs `rg -F` for the old id, branch and worktree path, then
@@ -153,7 +164,7 @@ A unit that was not running has no record, so steps 9 and 10 do nothing for it.
   So are the pause hook's scheduled prompts (`conversation-pause/scheduled-prompts/`): they are copies
   of queued prompt texts, such as the relaunch prompt with its rename note, and the hook matches each
   incoming prompt to them exactly, so a rewrite would break the match. In the held role store
-  (`guilds/roles/`), `prompts/`, `replies/`, `adoption.json` and `transfer.json` are history, and role
+  (`astra/design-roles/`), `prompts/`, `replies/`, `adoption.json` and `transfer.json` are history, and role
   `name` and `aliases` in `design.json` and the entry names and `aliases` in a role mesh roster are identity, not live names. A hit outside the history classes fails and names its file. Shutdown paths print as `(masked)`.
   Three owner-maintained records also keep their original names: `herdr-panes/` contains launch
   snapshots (apply drops the old director's entries; SessionStart rewrites other panes, and
