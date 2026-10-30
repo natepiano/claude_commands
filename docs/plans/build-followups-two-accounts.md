@@ -2679,7 +2679,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - A `py` wrapper row in the child table: the wrapper writes its interpreter cache.
 - `ssh -F /dev/null`: it drops the configured `mac` host mapping.
 
-### Phase 94c — Each account problem says what is wrong, why, and what to do  · status: todo
+### Phase 94c — Each account problem says what is wrong, why, and what to do  · status: done
 
 **Depends on:** Phase 94b (order only)
 
@@ -2695,11 +2695,13 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - The fixture leak itself (`select_fixture_workers(Path.home())` in `scripts/agents/test_codex_mesh.py`) is out of scope: the showrunner gave it to shutdown-unit, which owns that file now.
 - The fake file in the live `~/.codex` is removed only with the user's yes; it is not part of the code change.
 - `docs/accounts.md` shows the new line form and the test-login line.
+- Machine callers (showrunner, 2026-10-29, from a cargo-liner user report): the mcpServers note (`~/.claudeN: mcpServers: - brp`) is not written to stderr when stderr is not a tty, so a parent such as cargo-handler gets no stray lines over its tiles. Test: run the CLI as a child with piped stderr.
 - No other behavior changes.
 
 **Files:**
 - `scripts/accounts/accounts.py` — the problem type, the render function, the merging and the test-login cause.
 - `scripts/accounts/test_accounts.py`, `scripts/accounts/test_cutover_home.py` — each problem's line; the merged `~/.codex` case; the test-login case for each reserved domain; a real login keeps its cutover and note steps.
+- `scripts/accounts/test_role_map.py`, `scripts/accounts/test_refusal_watch.py` — the status-text assertions that pin the old problem lines (found by the first full suite run).
 - `docs/accounts.md` — the problem lines (lines 40, 42, 166, 202 and 264 show problem texts today).
 
 **Workers:** 1 writer, no split.
@@ -2718,6 +2720,39 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 **Gotchas:**
 - Problem texts have had long review loops before (`attempts-*-text` memories). Pin the form in one render function and test the parts, not each word.
 - `_account_state_notes` drops its line when a `status.problems` string starts with `accounts: <path> is missing` (also `is not a directory`, `is a link`, `is not logged in`, `accounts: could not read|inspect <path>:`). New words break this match with no error. The same-cause merge reads the typed cause, never the text.
+
+**Assertion changes (ruled by the director):** each expected problem text changed to the new line form; the full audit is in the phase's repair summaries. Negative checks look for the new words (`unclassified entries`, `mcpServers differ`, `still holds a login`). Substring checks became full-line checks.
+- Assertion-Change: scripts/accounts/test_accounts.py::test_status_notes_each_missing_group_and_uses_roles_for_configured_groups — the problem line has the new form (subject; what is wrong; cause; step) with the same facts, times and commands
+- Assertion-Change: scripts/accounts/test_accounts.py::test_exec_refuses_wrong_login_and_status_keeps_the_actual_identity — the problem line has the new form (subject; what is wrong; cause; step) with the same facts, times and commands
+- Assertion-Change: scripts/accounts/test_accounts.py::test_status_reports_unreadable_notes_without_erasing_other_account_identities — the problem line has the new form (subject; what is wrong; cause; step) with the same facts, times and commands
+- Assertion-Change: scripts/accounts/test_accounts.py::test_status_describes_accounts_without_creating_any — the problem line has the new form (subject; what is wrong; cause; step) with the same facts, times and commands
+- Assertion-Change: scripts/accounts/test_accounts.py::test_mac_status_describes_accounts_without_creating_any — the problem line has the new form (subject; what is wrong; cause; step) with the same facts, times and commands
+- Assertion-Change: scripts/accounts/test_accounts.py::assert_status_describes_accounts_without_creating_any — the problem line has the new form (subject; what is wrong; cause; step) with the same facts, times and commands
+- Assertion-Change: scripts/accounts/test_accounts.py::test_status_reports_an_account_directory_link_without_inspecting_it — the problem line has the new form (subject; what is wrong; cause; step) with the same facts, times and commands
+- Assertion-Change: scripts/accounts/test_accounts.py::test_status_detail_shows_unclassified_entries_and_mcp_difference — the problem line has the new form (subject; what is wrong; cause; step) with the same facts, times and commands
+- Assertion-Change: scripts/accounts/test_accounts.py::test_unknown_claude_and_codex_entries_show_only_with_detail — the problem line has the new form (subject; what is wrong; cause; step) with the same facts, times and commands
+- Assertion-Change: scripts/accounts/test_accounts.py::test_codex_unknown_entry_does_not_block_check_and_is_only_shown_in_detail — the problem line has the new form (subject; what is wrong; cause; step) with the same facts, times and commands
+- Assertion-Change: scripts/accounts/test_accounts.py::test_status_explains_empty_account_rows_in_the_table_and_json_without_login_addresses — the problem line has the new form (subject; what is wrong; cause; step) with the same facts, times and commands
+- Assertion-Change: scripts/accounts/test_accounts.py::test_status_keeps_existing_folder_and_sign_in_reasons_without_duplicate_notes — the problem line has the new form (subject; what is wrong; cause; step) with the same facts, times and commands
+- Assertion-Change: scripts/accounts/test_accounts.py::test_status_detail_prints_codex_check_problems_below_the_table — the problem line has the new form (subject; what is wrong; cause; step) with the same facts, times and commands
+- Assertion-Change: scripts/accounts/test_accounts.py::test_expired_login_note_names_the_failed_probe_in_table_and_json — the problem line has the new form (subject; what is wrong; cause; step) with the same facts, times and commands
+- Assertion-Change: scripts/accounts/test_accounts.py::test_failed_read_causes_show_old_date_star_and_one_footnote_until_a_good_read — the problem line has the new form (subject; what is wrong; cause; step) with the same facts, times and commands
+- Assertion-Change: scripts/accounts/test_accounts.py::test_usage_failure_notes_name_the_service_and_retry_time_in_table_and_json — the problem line has the new form (subject; what is wrong; cause; step) with the same facts, times and commands
+- Assertion-Change: scripts/accounts/test_accounts.py::test_a_held_refresh_keeps_the_stored_reading_and_failure_note — the problem line has the new form (subject; what is wrong; cause; step) with the same facts, times and commands
+- Assertion-Change: scripts/accounts/test_accounts.py::test_first_identity_failure_after_upgrade_marks_the_old_reading — the problem line has the new form (subject; what is wrong; cause; step) with the same facts, times and commands
+- Assertion-Change: scripts/accounts/test_accounts.py::test_failure_from_the_first_of_two_directories_marks_their_shared_login — the problem line has the new form (subject; what is wrong; cause; step) with the same facts, times and commands
+- Assertion-Change: scripts/accounts/test_accounts.py::test_failed_codex_start_keeps_its_last_good_read_time_and_shows_a_footnote — the problem line has the new form (subject; what is wrong; cause; step) with the same facts, times and commands
+- Assertion-Change: scripts/accounts/test_accounts.py::test_unnoted_claude_home_is_displayed_but_never_selected_or_a_destination — the problem line has the new form (subject; what is wrong; cause; step) with the same facts, times and commands
+- Assertion-Change: scripts/accounts/test_accounts.py::test_legacy_group_for_an_unnoted_home_is_display_only_and_cannot_launch — the problem line has the new form (subject; what is wrong; cause; step) with the same facts, times and commands
+- Assertion-Change: scripts/accounts/test_accounts.py::test_unnoted_codex_home_is_displayed_but_never_picked_or_assigned_to_workers — the problem line has the new form (subject; what is wrong; cause; step) with the same facts, times and commands
+- Assertion-Change: scripts/accounts/test_cutover_home.py::test_status_names_legacy_login_only_until_cutover_and_omits_signed_out_default_row — the problem line has the new form (subject; what is wrong; cause; step) with the same facts, times and commands
+- Assertion-Change: scripts/accounts/test_role_map.py::test_status_refuses_an_unavailable_remote_map_unless_stored — the problem line has the new form (subject; what is wrong; cause; step) with the same facts, times and commands
+- Assertion-Change: scripts/accounts/test_role_map.py::test_stored_status_without_usable_remote_cache_has_empty_roles_and_the_role_problem — the problem line has the new form (subject; what is wrong; cause; step) with the same facts, times and commands
+- Assertion-Change: scripts/accounts/test_role_map.py::test_stored_status_uses_cached_group_assignments_and_workers_instead_of_local_selections — the problem line has the new form (subject; what is wrong; cause; step) with the same facts, times and commands
+- Assertion-Change: scripts/accounts/test_role_map.py::test_status_keeps_its_table_and_prints_the_same_missing_setup_and_login_refusals — the problem line has the new form (subject; what is wrong; cause; step) with the same facts, times and commands
+- Assertion-Change: scripts/accounts/test_refusal_watch.py::test_status_without_group_file_does_not_infer_live_members_accounts — the problem line has the new form (subject; what is wrong; cause; step) with the same facts, times and commands
+- Assertion-Change: scripts/accounts/test_role_map.py::test_named_workers_route_reaches_a_mac_launch_and_its_offline_cache — the cache advisory names the real fetch failure ("natedev fetch failed: <reason>") in place of "natedev unreachable"
+- Assertion-Change: scripts/accounts/test_role_map.py::test_unreachable_natedev_uses_cached_map_and_names_cache_time_in_users_zone — the cache advisory names the real fetch failure ("natedev fetch failed: <reason>") in place of "natedev unreachable"; the exact line and zoned time stay
 
 ### Phase 94d — The watchdog keeps recovery evidence until a fresh check confirms the unit  · status: todo
 
@@ -2750,6 +2785,39 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - Type Design Contract: a finished result that is read but not yet deleted needs a name that says so (for example, `RecoveryFinished` carrying its result path), not a flag.
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/accounts -p 'test_*.py'` and the same for `scripts/whoami` pass; `basedpyright` on the changed files reads `0 errors, 0 warnings, 0 notes`.
+
+### Phase 94e — Each derived account problem names the cause it comes from  · status: todo
+
+**Depends on:** Phase 94c (order only)
+
+#### Work Order
+
+**Goal:** Phase 94c made each account problem one line in the form `subject: what is wrong; cause; step`. Its merge still infers which symptom comes from which cause. Routed from the Phase 94c repair round 4 Astra review (`/tmp/claude/astra/20261029T204639Z-1214987/review.md`, items 2-6): a symptom names its source cause where the source is observed, and the merge never infers it.
+
+**Spec:**
+- Direct observations make a full cause identity: the fault, its account or home, and its exact file or object. A derived symptom carries an explicit reference to the direct cause that made it. The merge drops a derived symptom only when its referenced cause is present; an unlinked symptom stays visible. No fallback to kind, account or text.
+- Usage failures (`_bind_usage_cause`, `_read_failure_problem` in `scripts/accounts/accounts.py`): carry a source only when the usage producer knows it. A generic `ERROR` (for example HTTP 503, `scripts/whoami/agent_accounts.py:815`) and independent 401, 429 and stale-token failures stay their own lines. A home's startup failure and a shared login's service refusal stay separate.
+- Role availability (`_bind_role_cause`): "units is on claude2, which is not set up" binds to claude2's account-state cause. One line names the cause and lists the affected roles. Unmapped roles and an unavailable role map stay independent. Update `scripts/accounts/test_role_map.py:641`, which expects separate role lines (Assertion-Change).
+- A malformed or unreadable `.claude.json` gives no "mcpServers differ" line: `_mcp_server_names` keeps an unreadable result, and only two read configurations are compared.
+- Producer pairings, each proved by a test through the real producers, binding, merge and both renderers (terminal and `--json`): directory/identity checks to account state (malformed JSON, invalid `oauthAccount`, linked identity, inaccessible folder, ordinary logout); account note to unnoted-home advice to role note error; role selection to account availability (two roles on one missing account; roles on different accounts); Codex startup failure to usage unavailable (with a good reading elsewhere, and with a service refusal); test sign-in suppression (one test login in two homes, role note error, independent linked file); unnoted `~/.codex` and the legacy-home hint; duplicate login across inventory rows (both producers, reversed order, three homes). Each test asserts the full problem set. Tests do not build cause keys by hand to prove a pairing.
+- The mcpServers check compares each account with the settings Claude really reads for `~/.claude`, not a stale `~/.claude.json`. User, 2026-10-29: `~/.claude.json` lists `brp`, but `claude mcp list` in `~/.claude` shows no `brp`, so the board's four `mcpServers: - brp` lines were false alarms. Find the file Claude reads and test the comparison against it.
+- A failed status command loses no diagnostic (routed from Phase 94c; design review /tmp/claude/astra/20261030T012157Z-1453375/review.md). Phase 94c keeps raw held stderr through a read or render failure, but not the typed problems: a usage final-save failure followed by a render failure, or by a `group_accounts()` read failure, is lost. Rule: the command owns every observed diagnostic until output succeeds. Extend `StatusCommandWarnings` into `StatusDiagnostics`, owned before reading starts; register each typed problem and raw diagnostic when it is observed, before further work that can fail. Renderers take a snapshot. On failure: restore stderr; print the retained typed problems in collection order with the single-problem formatter; print the remaining raw diagnostics in capture order; print the final error last. Drop a raw counterpart only when its information was printed; keep unmatched raw text; do not print twice what a terminal already got; a later good save is not reported as unsaved. Claim and save warnings keep `warning.reason` (`scripts/whoami/agent_accounts.py:367`). Tests: each diagnostic (cached map, stored map, usage claim failure, unrecovered per-read save failure, final-save failure) with a later read failure (injected after the diagnostic, before `_read_status` returns) and with a render failure, table and JSON. Assert empty stdout, the full subject, cause and time on stderr, and the final error last. Add mixed typed and raw warnings, renderer warnings, a recovered save, terminal delivery, and two commands in sequence (no repeat, no leak). Include the reported Codex case (good reading, `PermissionError` on the final save, render failure).
+- Keep each line's facts, times and commands; no other behavior changes.
+
+**Files:**
+- `scripts/accounts/accounts.py` — the source reference, the merge, the usage and role bindings, `_mcp_server_names`, `StatusDiagnostics`.
+- `scripts/whoami/agent_accounts.py` — claim and save warnings keep their reason.
+- `scripts/accounts/test_accounts.py`, `scripts/accounts/test_role_map.py` — the pairing tests.
+
+**Workers:** 1 writer, no split.
+- `impl` — all files.
+
+**Constraints from prior phases:** Phase 94c's line form and test-login rules stay. Tests use a scratch `HOME`, `AGENT_NOTES_DIR` and Codex homes; never a live home, `~/.local/state`, usage stores, ssh or real sessions. Never run `accounts.py status` against the live home.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/accounts -p 'test_*.py'` passes with a scratch HOME set before import; `basedpyright` on the changed Python files reads `0 errors, 0 warnings, 0 notes`.
+
+**Gotchas:**
+- Attempts log `attempts-account-problem-merge` (memory): every round that set one key form for all producers failed; derived symptoms must carry their source.
 
 ### Phase 96 — All consumers import shared whoami modules by one name  · status: todo
 
