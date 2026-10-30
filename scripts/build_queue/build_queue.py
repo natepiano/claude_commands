@@ -243,15 +243,17 @@ def render_queue(reading: memory_admit.QueueRead, zone: ZoneInfo,
     return lines
 
 
-def bump_selector(selector: str, view: memory_admit.QueueView, labels: Mapping[str, roster.UnitLabels]) -> str:
-    matches = [(position, step) for position, step in enumerate(view.waiting, 1)
+def bump_selector(selector: str, reading: memory_admit.QueueRead,
+                  labels: Mapping[str, roster.UnitLabels]) -> str | memory_admit.WaiterRowSelector:
+    matches = [(position, step) for position, step in enumerate(reading.view.waiting, 1)
                if step_labels(step, labels).session == selector]
     if len(matches) > 1:
         descriptions = ", ".join(f"{position}: {step_labels(step, labels).session} {step.folder}"
                                  for position, step in matches)
         raise memory_admit.UnmatchedWaiter(f"{selector!r}: ambiguous waiter; matches: {descriptions}")
     if matches:
-        return str(matches[0][0])
+        position = matches[0][0] - 1
+        return memory_admit.WaiterRowSelector(reading.ordered[position][0].name, selector)
     return selector
 
 
@@ -275,12 +277,11 @@ def main() -> int:
     arguments = parser.parse_args(namespace=QueueArguments())
     try:
         reading, sessions = read_queue_and_roster()
-        view = reading.view
         if arguments.command == "bump":
             actor = caller()
             labels = roster.unit_labels(sessions.entries)
             try:
-                moved = memory_admit.bump_waiter(bump_selector(arguments.selector, view, labels), actor)
+                moved = memory_admit.bump_waiter(bump_selector(arguments.selector, reading, labels), actor)
             except memory_admit.UnmatchedWaiter as error:
                 print(refusal_text(error))
                 return 3

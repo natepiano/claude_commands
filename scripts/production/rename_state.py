@@ -178,7 +178,7 @@ def reword_showrunner_lists(path: Path, words: Words) -> bool:
 def rename_outstanding(slug: str, words: Words) -> bool:
     """Reword OUTSTANDING as `open_for_user` is reworded, so the next `questions` run finds each item
     stored and asks no new review."""
-    path = tidy_wrapped.owned_paths(slug)[2]
+    path = tidy_wrapped.outstanding_path(slug)
     try:
         return _rename_json(path, lambda value: _reword_items(value, ("text", "question", "reviewed"), words))
     except (OSError, ValueError) as error:

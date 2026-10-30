@@ -58,8 +58,43 @@ class ProjectionAnswerOwed:
     """The unit has been asked for a completion projection but has not answered."""
 
 
-Projection = CompletionExpectedAt | CompletionUnmeasured | ProjectionAnswerOwed
-_StoredProjection = float | Literal["unmeasured"] | None
+@dataclass(frozen=True)
+class ProjectionNotRequested:
+    """No projection has been requested for the next group of agents."""
+
+
+@dataclass(frozen=True)
+class QuietCountObservation:
+    """An agent count and the quiet generation in which it was observed."""
+
+    running: int
+    generation: int
+
+
+@dataclass(frozen=True)
+class QuietNoticeState:
+    """The current quiet generation and whether its notice was sent."""
+
+    generation: int
+    sent: bool
+
+
+ActiveProjection = CompletionExpectedAt | CompletionUnmeasured | ProjectionAnswerOwed
+
+
+@dataclass(frozen=True)
+class ZeroNoticeOwed:
+    """A finished group's notice is owed, independent of the next group's projection."""
+
+    resumed_projection: ActiveProjection | ProjectionNotRequested = ProjectionNotRequested()
+
+
+Projection = ActiveProjection | ZeroNoticeOwed
+_StoredActiveProjection = float | Literal["unmeasured"] | None
+_StoredProjection = (
+    _StoredActiveProjection | Literal["zero-notice-owed"]
+    | dict[Literal["zero-notice-owed"], _StoredActiveProjection]
+)
 
 WIND_DOWN = (
     "Codex wind-down, from the user (/codex_winddown start in {sender}, {time}): let every running"
@@ -126,6 +161,16 @@ def listed(session: str, units: list[str], counts: Mapping[str, int]) -> dict[st
     return rows
 
 
+def _read_active_projection(answer: object) -> ActiveProjection | ProjectionNotRequested:
+    if answer is None:
+        return ProjectionAnswerOwed()
+    if answer == UNMEASURED:
+        return CompletionUnmeasured()
+    if isinstance(answer, (int, float)) and not isinstance(answer, bool):
+        return CompletionExpectedAt(float(answer))
+    return ProjectionNotRequested()
+
+
 def read_projections() -> dict[str, Projection]:
     try:
         raw = cast(object, json.loads((STATE / PROJECTIONS).read_text(encoding="utf-8")))
@@ -133,16 +178,19 @@ def read_projections() -> dict[str, Projection]:
         return {}
     kept: dict[str, Projection] = {}
     for unit, answer in (cast(dict[str, object], raw) if isinstance(raw, dict) else {}).items():
-        if answer is None:
-            kept[unit] = ProjectionAnswerOwed()
-        elif answer == UNMEASURED:
-            kept[unit] = CompletionUnmeasured()
-        elif isinstance(answer, (int, float)) and not isinstance(answer, bool):
-            kept[unit] = CompletionExpectedAt(float(answer))
+        if answer == "zero-notice-owed":
+            kept[unit] = ZeroNoticeOwed()
+        elif isinstance(answer, dict) and "zero-notice-owed" in answer:
+            resumed = _read_active_projection(cast(dict[str, object], answer)["zero-notice-owed"])
+            kept[unit] = ZeroNoticeOwed(resumed)
+        else:
+            active = _read_active_projection(cast(object, answer))
+            if not isinstance(active, ProjectionNotRequested):
+                kept[unit] = active
     return kept
 
 
-def _stored_projection(projection: Projection) -> _StoredProjection:
+def _stored_active_projection(projection: ActiveProjection) -> _StoredActiveProjection:
     match projection:
         case CompletionExpectedAt(epoch_seconds):
             return epoch_seconds
@@ -150,6 +198,19 @@ def _stored_projection(projection: Projection) -> _StoredProjection:
             return UNMEASURED
         case ProjectionAnswerOwed():
             return None
+
+
+def _stored_projection(projection: Projection) -> _StoredProjection:
+    if isinstance(projection, ZeroNoticeOwed):
+        if isinstance(projection.resumed_projection, ProjectionNotRequested):
+            return "zero-notice-owed"
+        return {"zero-notice-owed": _stored_active_projection(projection.resumed_projection)}
+    return _stored_active_projection(projection)
+
+
+def _record_projection(saved: dict[str, Projection], unit: str, answer: ActiveProjection) -> None:
+    previous = saved.get(unit)
+    saved[unit] = ZeroNoticeOwed(answer) if isinstance(previous, ZeroNoticeOwed) else answer
 
 
 @contextmanager
@@ -169,10 +230,12 @@ def projections() -> Generator[dict[str, Projection]]:
 def projected(unit: str, held: Mapping[str, Projection], now: float) -> str:
     if unit not in held:
         return "ETA Unmeasured"
-    match held[unit]:
+    projection = held[unit]
+    active = projection.resumed_projection if isinstance(projection, ZeroNoticeOwed) else projection
+    match active:
         case ProjectionAnswerOwed():
             return "asked, answer owed"
-        case CompletionUnmeasured():
+        case CompletionUnmeasured() | ProjectionNotRequested():
             return "ETA Unmeasured"
         case CompletionExpectedAt(epoch_seconds) if epoch_seconds <= now:
             return "ETA Unmeasured"
@@ -194,11 +257,15 @@ def clock(zone: str) -> str:
 def needs_asking(unit: str, held: Mapping[str, Projection], now: float) -> bool:
     if unit not in held:
         return True
-    match held[unit]:
+    projection = held[unit]
+    active = projection.resumed_projection if isinstance(projection, ZeroNoticeOwed) else projection
+    match active:
         case CompletionExpectedAt(epoch_seconds):
             return epoch_seconds <= now
         case CompletionUnmeasured() | ProjectionAnswerOwed():
             return False
+        case ProjectionNotRequested():
+            return True
 
 
 def ask(showrunner: str, unit: str, agents: int) -> bool:
@@ -212,44 +279,129 @@ def refresh(showrunner: str, units: list[str], rows: Mapping[str, int], now: flo
     asked = [unit for unit in units
              if rows[unit] and needs_asking(unit, held, now) and ask(showrunner, unit, rows[unit])]
     with projections() as saved:
-        finished = [unit for unit in units if not rows[unit] and unit in saved]
-        for unit in finished:
-            del saved[unit]
-        for unit in asked:
-            saved[unit] = ProjectionAnswerOwed()
+        owed: dict[str, ZeroNoticeOwed] = {}
+        for unit in units:
+            if saved.get(unit) != held.get(unit):
+                continue
+            if not rows[unit] and unit in saved:
+                saved[unit] = ZeroNoticeOwed()
+            elif unit in asked:
+                _record_projection(saved, unit, ProjectionAnswerOwed())
+            notice = saved.get(unit)
+            if isinstance(notice, ZeroNoticeOwed):
+                owed[unit] = notice
         current = dict(saved)
-    for unit in finished:
-        _ = broadcast.send(unit, showrunner, AT_ZERO.format(showrunner=showrunner))
+    for unit, observed_notice in owed.items():
+        with projections() as saved:
+            notice = saved.get(unit)
+            if (isinstance(notice, ZeroNoticeOwed)
+                    and notice == observed_notice
+                    and not broadcast.send(unit, showrunner, AT_ZERO.format(showrunner=showrunner))):
+                if isinstance(notice.resumed_projection, ProjectionNotRequested):
+                    del saved[unit]
+                else:
+                    saved[unit] = notice.resumed_projection
+            current = dict(saved)
     return current
 
 
-def announce_quiet(running: int) -> None:
-    """Tell the user once when a wind-down has no Codex agent left on the machine; a later agent re-arms it."""
-    if running or not instances():
-        (STATE / QUIET).unlink(missing_ok=True)
-        return
-    try:
-        STATE.mkdir(parents=True, exist_ok=True)
-        (STATE / QUIET).touch(exist_ok=False)
-    except FileExistsError:
-        return
-    machine = socket.gethostname()
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
-    from push_texts import render, user_send_argv
-    import review
+@contextmanager
+def quiet_notice_state() -> Generator[QuietNoticeState]:
+    """Serialize count observations and quiet marker changes, without holding a send."""
+    STATE.mkdir(parents=True, exist_ok=True)
+    with (STATE / f"{QUIET}.state.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            generation, status = (STATE / f"{QUIET}.state").read_text(encoding="utf-8").split()
+            state = QuietNoticeState(int(generation), sent=status == "sent")
+        except FileNotFoundError:
+            try:
+                sent = (STATE / QUIET).read_text(encoding="utf-8") == "sent\n"
+            except FileNotFoundError:
+                sent = False
+            state = QuietNoticeState(0, sent)
+        yield state
 
-    push = render("codex.reset_ready", machine=machine)
-    command = user_send_argv(push)
-    command[1] = str(broadcast.SEND)
-    try:
-        done = subprocess.run(command, capture_output=True, text=True, check=False,
-                              timeout=review.user_send_seconds() + 15)
-        if done.returncode:
+
+def _save_quiet_notice_state(state: QuietNoticeState) -> None:
+    """Save the state while the caller holds the quiet state lock."""
+    temporary = STATE / f"{QUIET}.state.tmp"
+    _ = temporary.write_text(f"{state.generation} {'sent' if state.sent else 'owed'}\n", encoding="utf-8")
+    _ = temporary.replace(STATE / f"{QUIET}.state")
+
+
+def _cancel_quiet_notice(state: QuietNoticeState) -> QuietNoticeState:
+    """Invalidate earlier observations while the caller holds the quiet state lock."""
+    cancelled = QuietNoticeState(state.generation + 1, sent=False)
+    _save_quiet_notice_state(cancelled)
+    (STATE / QUIET).unlink(missing_ok=True)
+    return cancelled
+
+
+def _observe_quiet_count(running: int, state: QuietNoticeState) -> QuietCountObservation:
+    """Record the count while the caller holds the quiet state lock."""
+    if running:
+        state = _cancel_quiet_notice(state)
+    return QuietCountObservation(running, state.generation)
+
+
+def _finish_quiet_notice(observation: QuietCountObservation, sent: bool) -> None:
+    with quiet_notice_state() as state:
+        if observation.generation != state.generation:
+            return
+        _save_quiet_notice_state(QuietNoticeState(state.generation, sent))
+        if sent:
+            _ = (STATE / QUIET).write_text("sent\n", encoding="utf-8")
+        else:
             (STATE / QUIET).unlink(missing_ok=True)
-            print(f"codex wind-down: reset alert failed: {done.stdout.strip() or done.stderr.strip()}", file=sys.stderr)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        (STATE / QUIET).unlink(missing_ok=True)
-        print(f"codex wind-down: reset alert failed: {error}", file=sys.stderr)
+
+
+def announce_quiet(running: int | QuietCountObservation) -> None:
+    """Tell the user once when a wind-down has no Codex agent left on the machine; a later agent re-arms it."""
+    if isinstance(running, QuietCountObservation):
+        observation = running
+    else:
+        with quiet_notice_state() as state:
+            observation = _observe_quiet_count(running, state)
+    if observation.running:
+        return
+    notice = STATE / QUIET
+    if not instances():
+        with quiet_notice_state() as state:
+            _ = _cancel_quiet_notice(state)
+        return
+    with (STATE / f"{QUIET}.lock").open("a") as delivery_lock:
+        try:
+            fcntl.flock(delivery_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        with quiet_notice_state() as state:
+            if observation.generation != state.generation:
+                return
+            if state.sent:
+                _ = notice.write_text("sent\n", encoding="utf-8")
+                return
+        machine = socket.gethostname()
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
+        from push_texts import render, user_send_argv
+        import review
+
+        push = render("codex.reset_ready", machine=machine)
+        command = user_send_argv(push)
+        command[1] = str(broadcast.SEND)
+        with quiet_notice_state() as state:
+            if observation.generation != state.generation:
+                return
+            _ = notice.write_text("claim\n", encoding="utf-8")
+        try:
+            done = subprocess.run(command, capture_output=True, text=True, check=False,
+                                  timeout=review.user_send_seconds() + 15)
+            _finish_quiet_notice(observation, sent=not done.returncode)
+            if done.returncode:
+                print(f"codex wind-down: reset alert failed: {done.stdout.strip() or done.stderr.strip()}", file=sys.stderr)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            _finish_quiet_notice(observation, sent=False)
+            print(f"codex wind-down: reset alert failed: {error}", file=sys.stderr)
 
 
 def count(session: str) -> int:
@@ -258,10 +410,13 @@ def count(session: str) -> int:
     except ValueError as error:
         print(error, file=sys.stderr)
         return 1
-    units, counts = live_unit_names(runner), current_counts()
+    units = live_unit_names(runner)
+    with quiet_notice_state() as state:
+        counts = current_counts()
+        observation = _observe_quiet_count(counts.total(), state)
     rows = listed(session, units, counts)
     held = refresh(session, units, rows, time.time())
-    announce_quiet(counts.total())
+    announce_quiet(observation)
     print(render(f"Codex agents, {clock(runner['zone'])}", rows, held, time.time()))
     return 0
 
@@ -271,11 +426,12 @@ def record_eta(unit: str, answer: str) -> int:
         print(USAGE, file=sys.stderr)
         return 2
     with projections() as held:
-        held[unit] = (
+        answer_projection = (
             CompletionUnmeasured()
             if answer == UNMEASURED
             else CompletionExpectedAt(time.time() + 60 * int(answer))
         )
+        _record_projection(held, unit, answer_projection)
     print(f"{unit}: recorded")
     return 0
 
@@ -322,8 +478,9 @@ def start_count(record: SessionRecord) -> bool:
 
 def start(sender: str) -> int:
     STATE.mkdir(parents=True, exist_ok=True)
-    for name in (PROJECTIONS, QUIET):
-        (STATE / name).unlink(missing_ok=True)
+    (STATE / PROJECTIONS).unlink(missing_ok=True)
+    with quiet_notice_state() as state:
+        _ = _cancel_quiet_notice(state)
     every = announce(sender, WIND_DOWN, UNIT_WIND_DOWN)
     live: dict[str, SessionRecord] = {}
     for record in live_sessions():
@@ -352,8 +509,9 @@ def clear(sender: str) -> int:
         (STATE / f"{name}.txt").unlink(missing_ok=True)
         every = every and done.returncode == 0
         print(f"{name.removeprefix(INSTANCE)}: {'count stopped' if done.returncode == 0 else 'count NOT stopped'}")
-    for name in (PROJECTIONS, QUIET):
-        (STATE / name).unlink(missing_ok=True)
+    (STATE / PROJECTIONS).unlink(missing_ok=True)
+    with quiet_notice_state() as state:
+        _ = _cancel_quiet_notice(state)
     return 0 if announce(sender, ALL_CLEAR, UNIT_CLEAR) and every else 1
 
 

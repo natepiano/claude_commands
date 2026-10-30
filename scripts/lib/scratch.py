@@ -64,6 +64,7 @@ VISIBLE_ROOT_ENV = "SCRATCH_VISIBLE_ROOT"
 DEFAULT_ROOT = "/tmp/claude/scratch"
 DEFAULT_VISIBLE_ROOT = "~/rust/repro"
 RECORD = ".scratch.json"
+REMOVAL_RECORD_PREFIX = ".scratch-removing-"
 HOLDS_ENV = "SCRATCH_HOLDS"
 DEFAULT_HOLDS = "~/.local/state/scratch/holds.json"
 TASK = re.compile(r"(?P<kind>run|phase|row|gate|until):(?P<name>[A-Za-z0-9][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_.-]+)?)")
@@ -203,9 +204,18 @@ def adopt(source: Path, task: str, word: str = "", visible: bool = False, now: f
     return path
 
 
+def removal_record(path: Path) -> Path:
+    return path.with_name(f"{REMOVAL_RECORD_PREFIX}{path.name}.json")
+
+
+def folder_record(path: Path) -> Path:
+    record = path / RECORD
+    return record if record.is_file() else removal_record(path)
+
+
 def task_of(path: Path) -> str | None:
     try:
-        raw = cast(object, json.loads((path / RECORD).read_text(encoding="utf-8")))
+        raw = cast(object, json.loads(folder_record(path).read_text(encoding="utf-8")))
     except (OSError, UnicodeError, ValueError):
         return None
     task = cast(dict[str, object], raw).get("task") if isinstance(raw, dict) else None
@@ -213,17 +223,23 @@ def task_of(path: Path) -> str | None:
 
 
 def folders() -> list[Folder]:
-    """Every recorded scratch folder in both roots."""
+    """Every recorded scratch folder, including interrupted removals, in both roots."""
     found: list[Folder] = []
     for base in (root(), visible_root()):
         try:
             entries = sorted(base.iterdir())
         except OSError:
             continue
-        for path in entries:
-            task = task_of(path) if path.is_dir() and not path.is_symlink() else None
+        paths = {path for path in entries if path.is_dir() and not path.is_symlink()}
+        for entry in entries:
+            if entry.is_file() and entry.name.startswith(REMOVAL_RECORD_PREFIX) and entry.name.endswith(".json"):
+                name = entry.name[len(REMOVAL_RECORD_PREFIX):-len(".json")]
+                if name:
+                    paths.add(base / name)
+        for path in sorted(paths):
+            task = task_of(path) if not path.is_symlink() else None
             if task is not None:
-                found.append(Folder(path, task, (path / RECORD).stat().st_mtime))
+                found.append(Folder(path, task, folder_record(path).stat().st_mtime))
     return found
 
 
@@ -240,11 +256,20 @@ def renew(path: Path, now: float | None = None) -> None:
 
 def remove(path: Path) -> None:
     """Remove one folder; a linked git worktree through its source repo first."""
+    pending = removal_record(path)
+    if (path / RECORD).is_file() and not pending.exists():
+        os.link(path / RECORD, pending)
     if (path / ".git").is_file():
         _ = subprocess.run(["git", "-C", str(path), "worktree", "remove", "--force", str(path)],
                            capture_output=True, check=False)
     if os.path.lexists(path):
-        shutil.rmtree(path)
+        for child in sorted(path.iterdir(), key=lambda child: (child.name == RECORD, child.name)):
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        path.rmdir()
+    pending.unlink(missing_ok=True)
 
 
 def holds_file() -> Path:

@@ -555,18 +555,18 @@ def render(report: AuditReport) -> str:
     totals.append(log_records.MeasureRow("all senders", incomplete + f"after failed check {len(report.entries)}; " +
                                     "; ".join(f"{kind.__name__} {overall[kind]}" for kind in CLASSIFICATIONS),
                                     sum(report.pushes_by_showrunner.values()), report.window.label, source))
-    output = [log_records.table("Sends after failed text checks (n = 1 per delivered push)", details),
-              log_records.table("Totals per showrunner (current ownership; historical ownership may be missing)", totals),
-              "Neither notification log records a key. Text identity comes from the delivery footer or matched review."]
+    output = [log_records.blocks("Sends after failed text checks (n = 1 per delivered push)", details),
+              log_records.blocks("Totals per showrunner (current ownership; historical ownership may be missing)", totals),
+              log_records.wrap_text("Neither notification log records a key. Text identity comes from the delivery footer or matched review.")]
     if report.problems:
-        output.append(log_records.table("Source problems (counts can be incomplete)",
+        output.append(log_records.blocks("Source problems (counts can be incomplete)",
                                     log_records.source_problem_rows(report.problems, report.window)))
     return "\n\n".join(output)
 
 
 def report_summary(report: AuditReport, full: bool = False) -> str:
     counts = Counter(type(entry.classification) for entry in report.entries)
-    return "\n".join([
+    return "\n".join(log_records.wrap_text(line) for line in [
         f"Window: {report.window.label}.",
         f"Pushes: {len(report.delivered_pushes)} delivered; {len(report.entries)} after a failed text check.",
         "; ".join(f"{kind.__name__}: {counts[kind]}" for kind in CLASSIFICATIONS) + ".",

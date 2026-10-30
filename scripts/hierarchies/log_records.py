@@ -12,6 +12,7 @@ from typing import cast
 from scripts.lib.user_zone import user_zone
 
 JsonObject = dict[str, object]
+PHONE_WIDTH = 50
 
 
 class TimeNotRecorded(Enum):
@@ -110,12 +111,49 @@ def source_problem_rows(problems: Sequence[SourceProblem], window: Window) -> li
     return [MeasureRow("source unavailable", problem.reason, 0, window.label, problem.source) for problem in problems]
 
 
-def table(title: str, rows: Sequence[MeasureRow]) -> str:
-    headings = ("Measure", "Value", "n", "Window", "Source")
-    cells = [headings, *((row.measure, row.value, str(row.n), row.window, row.source) for row in rows)]
-    widths = [max(len(cell[index]) for cell in cells) for index in range(5)]
-    lines = ["  ".join(value.ljust(widths[index]) for index, value in enumerate(row)).rstrip() for row in cells]
-    return title + "\n" + "\n".join(lines)
+def wrap_text(text: str, *, initial_indent: str = "", subsequent_indent: str = "") -> str:
+    """Wrap at spaces, keeping each word whole on its line."""
+    lines: list[str] = []
+    line = initial_indent
+    for word in text.split():
+        separator = " " if line.strip() else ""
+        if line.strip() and len(line) + len(separator) + len(word) > PHONE_WIDTH:
+            lines.append(line)
+            line = subsequent_indent
+            separator = ""
+        if not line.strip() and len(line) + len(word) > PHONE_WIDTH:
+            lines.append(word)
+            line = subsequent_indent
+        else:
+            line += separator + word
+    if line.strip():
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def blocks(title: str, rows: Sequence[MeasureRow]) -> str:
+    heading = [wrap_text(title)]
+    if not rows:
+        return "\n".join([*heading, "none"])
+    shared_window = all(row.window == rows[0].window for row in rows)
+    shared_source = all(row.source == rows[0].source for row in rows)
+    if shared_window:
+        heading.append(wrap_text("Window: " + rows[0].window, subsequent_indent="    "))
+    if shared_source:
+        heading.append(wrap_text("Source: " + rows[0].source, subsequent_indent="    "))
+    output = ["\n".join(heading)]
+    for row in rows:
+        fields = [("value", row.value), ("n", str(row.n))]
+        if not shared_window:
+            fields.append(("window", row.window))
+        if not shared_source:
+            fields.append(("source", row.source))
+        output.append("\n".join([
+            wrap_text(row.measure),
+            *(wrap_text(f"{label}: {value}", initial_indent="  ", subsequent_indent="    ")
+              for label, value in fields),
+        ]))
+    return "\n\n".join(output)
 
 
 def window_bounds(since_text: str, until_text: str, now: datetime) -> Window:

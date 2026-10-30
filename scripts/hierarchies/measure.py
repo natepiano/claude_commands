@@ -27,7 +27,6 @@ import re
 import sqlite3
 import subprocess
 from statistics import median
-from textwrap import wrap
 import sys
 from typing import cast
 
@@ -1708,7 +1707,7 @@ def baseline_summary(
     values = {row.measure: row.value for row in (*flow_rows, *attention_rows)}
     start, end = window.since.astimezone(user_zone()), window.until.astimezone(user_zone())
     start_format = "%Y-%m-%d %H:%M" if start.tzname() == end.tzname() else "%Y-%m-%d %H:%M %Z"
-    return "\n".join([
+    return "\n".join(log_records.wrap_text(line) for line in [
         f"Window: {start.strftime(start_format)} to {end:%Y-%m-%d %H:%M %Z} (end excluded).",
         f"Hana: {values['Hana merges / origin/init/catalyst']} merges to origin/init/catalyst; "
         + f"{values['goal 1 Hana-project issues closed']} Hana-project issues closed.",
@@ -1718,18 +1717,6 @@ def baseline_summary(
         + f"{values['phone pushes after failed review']} after a failed text check.",
         f"Source problems: {len(problem_rows)}." + ("" if full else " Use --full to print the tables."),
     ])
-
-
-def flow_table(rows: Sequence[log_records.MeasureRow]) -> str:
-    cells = [("Measure", "Value", "n", "Window", "Source")]
-    for row in rows:
-        values = wrap(row.value, width=60, break_on_hyphens=False) or [""]
-        cells.append((row.measure, values[0], str(row.n), row.window, row.source))
-        cells.extend(("", value, "", "", "") for value in values[1:])
-    widths = [max(len(cell[index]) for cell in cells) for index in range(5)]
-    lines = ["  ".join(value.ljust(widths[index]) for index, value in enumerate(cell)).rstrip() for cell in cells]
-    title = "Flow to Hana main (recorded phase/issue completion; local-ref merge commits)"
-    return title + "\n" + "\n".join(lines)
 
 
 def render(sources: BaselineSources, window: log_records.Window, now: datetime, full: bool = False) -> str:
@@ -1749,13 +1736,13 @@ def render(sources: BaselineSources, window: log_records.Window, now: datetime, 
     coverage_rows = rank_coverage(sources.issue_records, sources.rankings, sources.units, snapshot)
     groups = [
         summary,
-        log_records.table("Capacity on Hana", capacity_rows),
-        flow_table(flow_rows),
-        log_records.table("User attention", attention_rows),
-        log_records.table("Rank coverage", coverage_rows),
+        log_records.blocks("Capacity on Hana", capacity_rows),
+        log_records.blocks("Flow to Hana main (recorded phase/issue completion; local-ref merge commits)", flow_rows),
+        log_records.blocks("User attention", attention_rows),
+        log_records.blocks("Rank coverage", coverage_rows),
     ]
     if problem_rows:
-        groups.append(log_records.table("Source problems (dependent counts can be incomplete)", problem_rows))
+        groups.append(log_records.blocks("Source problems (dependent counts can be incomplete)", problem_rows))
     return "\n\n".join(groups)
 
 

@@ -2824,39 +2824,15 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Depends on:** Phase 95 (order only)
 
-#### Work Order
+#### As-built
 
-**Goal:** Three `scripts/whoami/quota_alert.py` paths that stop at one line, or fail in one step, leave state that a rerun does not repair today; after this phase each rerun finishes the work. Rows from the rerun sweep (`~/.claude/docs/plans/sdlc-rerun-sweep.md`, accounts-unit; this file is the same at sdlc `097b1a0d` and `5ad6542f`).
+- `PendingClaudeSwitch` (`scripts/whoami/quota_alert.py`) is saved in state before `switch_to_claude` edits the registry. A later switching pass that finds it completes the switch from the registry, writes the routing row once and tells the owner once.
+- Switch-back keeps a fallback that holds only the keys that failed to restore; a later pass retries them, and a newer switch keeps the keys still owed.
+- `RestorationOutcomeOwed`: the restore journal row and notice are saved as an owed outcome before the fallback is cleared, so a stop or a failed append is finished by the rerun.
+- A refusal reads the registry before it treats work as already on Claude. A workers queue entry is consumed only when the workers role names its target or a later row of its move exists; the role is read once per pass. `state_file()` only reads and saves state.
+- Tests: `scripts/whoami/test_quota_alert.py` (stop-and-rerun cases on `CodexRerunFixture` in `quota_alert_test_support.py`); `test_codex_alert_accounts.py::test_failed_restoration_is_attempted_and_reported_once` follows the retry (Assertion-Change); `test_quota_zero_episode.py` isolates state per subtest.
 
-**Spec:**
-- **Switch to Claude (`quota_alert.py:795`).** `switch_to_claude` (line 767) edits the registry (`edit_registry("agents_set_all_assignments", "claude")`, line 795); only after it returns does it put `AccountCodexQuotaFallback(owner, stamp, moved, hold, claude_account)` in `state["fallback"]` (line 819), and the caller's `state_file()` scope writes the state on exit. A stop after the edit leaves the assignments on Claude with no fallback: a retry finds nothing on Codex and returns `NoWorkOnCodex`, so no pass ever moves them back. Change: before the registry edit, save a pending switch to the state file — a named type (for example `PendingClaudeSwitch`) with the owner, time, assignment keys on Codex, hold and Claude account. A later pass that finds a pending switch completes it from the registry: the keys now on Claude become the fallback's `moved`, the routing journal row is written once, and the pending switch is cleared. A failed edit clears it as today.
-- **Switch back (`quota_alert.py:901`).** `switch_back` (line 834) sets `state["fallback"] = NoCodexQuotaFallback()` (line 901) before it restores each assignment (`edit_registry("agents_set_assignment", key, "codex")`, line 913). A failed restore is recorded in `RoutingNotRestored` but the fallback is gone, so later `switch_back` calls return at once and never retry. Change: keep a fallback that holds only the failed keys; clear it only when no key failed. A later pass retries the failed keys.
-- **Workers queue entry (`quota_alert.py:1276`).** `_workers_next_move_pass` (line 1164) appends the `requested` workers move (`moves.append_move(request)`, line 1276), then runs `accounts.swap("workers", …)` (line 1278). A stop between them leaves an unfailed `requested` row; on rerun the recorded entry ids treat it as consumed and lines 1191–1197 remove the queue entry with no move. Change: a `requested` row consumes its entry only when the workers role already names its target account (`role_map.read_role_map().workers == <to>`) or a later row of the same `move_id` exists. Otherwise the rerun runs the swap again under the same `move_id`.
-- No other behavior changes.
-
-**Files:**
-- `scripts/whoami/quota_alert.py` — the pending switch, the kept failed keys, the consumption check.
-- `scripts/whoami/test_quota_alert.py` — one stop-and-rerun test per row; `scripts/whoami/quota_alert_test_support.py` holds the shared fixtures.
-- `scripts/whoami/test_codex_alert_accounts.py` — the failed-restore test expects the retry (repair round 1).
-- `scripts/whoami/test_quota_zero_episode.py` — each subcase of the uncertain-switch test starts from its own state, so a pending switch from one subcase is not recovered in the next; no assertion changes (repair round 1).
-
-**Assertion-Change** (accepted at review pass 1): `scripts/whoami/test_codex_alert_accounts.py::CodexAccountAlertTests::test_failed_restoration_is_attempted_and_reported_once` — a failed restore key is kept and retried by the next pass, so the attempt count follows the retry; the failure is still reported once.
-
-**Workers:** 1 writer + 1 tester.
-- `impl` — `quota_alert.py`.
-- `test` — the three tests from the Spec alone in `test_quota_alert.py`; each fails before the change.
-
-**State:** the quota alert state file (`switch`, `pending_routing`), the agent registry assignments, the moves journal and the next-moves log (scratch copies in tests).
-
-**Constraints from prior phases:**
-- Tests use a scratch `HOME`, `AGENT_NOTES_DIR` and state dirs set before import, and stub `edit_registry`, `registry_assignments` and `accounts.swap`; they never touch a live home, `~/.local/state`, usage stores, ssh, herdr or real sessions.
-- Stop model: patch the call right after the named line to raise a test-local `class Killed(BaseException)`; catch it; run the same pass again with no patch; assert the repaired state (fallback recorded with the moved keys; failed keys retried and then cleared; the swap runs and the queue entry goes only after it).
-- `state_file()` (line 560) holds an exclusive `flock` on a new open of its lock file; a second `state_file()` inside a caller's scope blocks. Save the pending switch through one function that `state_file()`'s exit write also uses, not a nested `state_file()`.
-- Merge timing: no checkpoint merge during the natedev build hold, 00:05–03:05 EDT (showrunner, 2026-10-29). While any natedev build hold is in force, run no tests, gates or type checks unless this unit holds it; check `build_hold.py status` first.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/whoami -p 'test_*.py'` and the same for `scripts/accounts` pass with a scratch HOME set before import; `basedpyright` on the changed Python files reads `0 errors, 0 warnings, 0 notes`; each stop-and-rerun test fails on the code before the change.
-
-### Phase 98 — A notice marked before it is sent is retried until it is sent  · status: todo
+### Phase 98 — A notice marked before it is sent is retried until it is sent  · status: done
 
 **Depends on:** Phase 95 (order only)
 

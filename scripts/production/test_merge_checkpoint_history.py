@@ -25,6 +25,38 @@ def setUpModule() -> None:
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
+    def test_a_repair_merge_keeps_the_phase_review_row_and_logs_both_merges(self) -> None:
+        self.env["MERGE_CHECKPOINT_REVIEW_REGIME"] = str(Path(__file__).with_name("review_regime.py"))
+        ledger = Path(self.env["HOME"]) / ".claude/data/review_regime.jsonl"
+        code = self.checkpoint()
+        first = self.run_checkpoint(code)
+        self.assertEqual(first.process.returncode, 0, first.process.stderr + first.process.stdout)
+        self.assertIn("record: ok — review ledger and production log updated\n", first.process.stdout)
+        first_row = ledger.read_bytes()
+        self.assertEqual(len(first_row.splitlines()), 1)
+        first_merge = self.git("rev-parse", "HEAD")
+        first_merged_at = self.git("show", "-s", "--format=%cI", first_merge)
+
+        repair = self.checkpoint(content="alpha repaired\n", subject="repair alpha phase two")
+        second = self.run_checkpoint(repair)
+        self.assertEqual(second.process.returncode, 0, second.process.stderr + second.process.stdout)
+        self.assertIn("record: ok — kept alpha-unit phase 2 of docs/plans/alpha.md: "
+                      + f"a row exists from the merge at {first_merged_at}; nothing added; "
+                      + "review ledger and production log updated\n", second.process.stdout)
+        self.assertEqual(ledger.read_bytes(), first_row)
+        repair_merge = self.git("rev-parse", "HEAD")
+        self.assertNotEqual(repair_merge, first_merge)
+        lines = self.log.read_text().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn(f"alpha-unit phase 2 ({code}) merged as {first_merge}; ", lines[0])
+        self.assertIn(f"alpha-unit phase 2 ({repair}) merged as {repair_merge}; ", lines[1])
+
+        repeated = self.run_checkpoint(repair)
+        self.assertEqual(repeated.process.returncode, 0, repeated.process.stderr + repeated.process.stdout)
+        self.assertIn("record: ok — checkpoint already recorded\n", repeated.process.stdout)
+        self.assertEqual(self.log.read_text().splitlines(), lines)
+        self.assertEqual(ledger.read_bytes(), first_row)
+
     def test_shrink_merges_only_plan_and_next_items_after_code_checkpoint(self) -> None:
         code = self.checkpoint()
         first = self.run_checkpoint(code)

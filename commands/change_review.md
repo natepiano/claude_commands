@@ -125,12 +125,16 @@ there leaves the row open. Then:
 ```
 
 Pass the ID as `/next` shows it, such as `C434` or `sdlc/C9`.
-It moves the row to `## Reviewed` with the verdict and today's date, and prints
+It moves the row to `## Reviewed` with the verdict, today's date and its Merged cell, and prints
 `C<n> landed` or `C<n> returns to its unit (merged …)`. Either way it removes
 the row's scratch folders and prints `removed <path>` for each. Send a returning row,
 its change and the user's words to the unit that made it: the merge commit it
 names gives the checkpoint, and so the unit. A change outside a unit goes back
 to the session that added it. The fix comes back as a new row.
+
+Rerunning the same verdict prints `already has this verdict`, the first run's
+line and the scratch removal lines. A different verdict for a Reviewed row is
+refused; it still ends the row's scratch folders.
 
 ## Never a question
 

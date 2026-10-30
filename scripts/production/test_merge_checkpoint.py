@@ -336,6 +336,34 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                             ("--ux-repair-minutes", "1")):
             self.assertEqual(review[0][review[0].index(flag) + 1], value)
 
+    def test_a_failed_repair_review_add_keeps_the_first_log_until_a_retry_succeeds(self) -> None:
+        first = self.run_checkpoint(self.checkpoint())
+        self.assertEqual(first.process.returncode, 0, first.process.stderr + first.process.stdout)
+        first_log = self.log.read_bytes()
+        sha = self.checkpoint(content="alpha repair\n", subject="repair alpha")
+        failure = self.state / "fail-review_regime.py"
+        failure.touch()
+
+        failed = self.run_checkpoint(sha)
+        self.assertEqual(failed.process.returncode, 1, failed.process.stdout + failed.process.stderr)
+        self.assertIn("record: failed", failed.process.stdout)
+        self.assertNotIn("record: ok", failed.process.stdout)
+        self.assertEqual(self.log.read_bytes(), first_log)
+        pushed = self.git("rev-parse", "refs/heads/production", cwd=self.origin)
+        self.assertNotEqual(pushed, failed.before)
+        self.assertEqual(len(self.events("review_regime.py")), 2)
+
+        failure.unlink()
+        resumed = self.run_checkpoint(sha)
+        self.assertEqual(resumed.process.returncode, 0, resumed.process.stderr + resumed.process.stdout)
+        self.assertIn("record: ok — review ledger and production log updated\n", resumed.process.stdout)
+        self.assertEqual(self.git("rev-parse", "HEAD"), pushed)
+        self.assertEqual(len(self.events("review_regime.py")), 3)
+        lines = self.log.read_text().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[0], first_log.decode().strip())
+        self.assertIn(f"alpha-unit phase 2 ({sha}) merged as {pushed}; ", lines[1])
+
 
 @final
 class TestPassedTests(unittest.TestCase):

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 import unittest
 import unittest.mock
 from pathlib import Path
 from typing import cast, override
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import rename_state
 import tidy_wrapped
@@ -132,6 +135,20 @@ class RenameStateTests(unittest.TestCase):
         _ = path.write_text("{not json\n")
         with self.assertRaisesRegex(rename_state.RenameRefused, "eta_seen.json"):
             _ = rename_state.rename_scratch("old", "new", self.scratch)
+
+    def test_outstanding_rename_keeps_answered_jsonl_records_unchanged(self) -> None:
+        path = self.root / "outstanding/demo.json"
+        path.parent.mkdir()
+        _ = path.write_text(json.dumps([{"text": "old-unit asks", "question": "Ship old-unit?"}]))
+        answered = path.with_suffix(".answered.jsonl")
+        _ = answered.write_text("".join(json.dumps({"text": text, "asked_by": "old-unit"}) + "\n"
+                                        for text in ("first answer", "second answer")))
+        before = answered.read_bytes()
+        with unittest.mock.patch.object(tidy_wrapped, "STATE_DIR", self.root):
+            self.assertTrue(rename_state.rename_outstanding("demo", (("old-unit", "new-unit"),)))
+            self.assertFalse(rename_state.rename_outstanding("demo", (("old-unit", "new-unit"),)))
+        self.assertEqual(json.loads(path.read_text()), [{"text": "new-unit asks", "question": "Ship new-unit?"}])
+        self.assertEqual(answered.read_bytes(), before)
 
 
 if __name__ == "__main__":

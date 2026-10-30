@@ -57,6 +57,7 @@ CALLER_LABELS = {
     "alias": "terminal",
     "validate_ci": "push gate",
     "brp-launch": "example launches (brp)",
+    "hana-shot": "app launches (hana_shot)",
     "unknown": "unknown",
 }
 OUTCOME_ORDER = ["ran", "failed", "interrupted", "cancelled", "reused", "replayed", "superseded", "deferred"]
@@ -1833,6 +1834,33 @@ def lead_block(
     return [*lines, ""] if lines else []
 
 
+def launches_section(connection: sqlite3.Connection, day: str) -> list[str]:
+    rows = fetch(connection,
+        "SELECT caller, step, count(*), count(mem_wait_s), sum(mem_wait_s), max(mem_wait_s) FROM steps"
+        + f" WHERE {ON_DAY} AND (step = 'launch' OR caller = 'brp-launch') GROUP BY caller, step ORDER BY caller, step", day)
+    lines = ["### App launches", "",
+        "Source: recorded process starts and legacy BRP build-and-launch results. App launches take no memory admission; their null mem_wait_s means no admission.", ""]
+    if not rows:
+        return [*lines, "Launches: 0.", ""]
+    body: list[list[str]] = []
+    for caller, step, total, measured, wait, longest in rows:
+        wait_cells = ["no admission"] * 3 if step == "launch" else [
+            count(measured), seconds(wait) if measured else "not recorded", seconds(longest) if measured else "not recorded",
+        ]
+        body.append([CALLER_LABELS.get(str(caller), str(caller)), count(total), *wait_cells])
+    total = sum(cast(int, row[2]) for row in rows)
+    no_admission = sum(cast(int, row[2]) for row in rows if row[1] == "launch")
+    measured = sum(cast(int, row[3]) for row in rows if row[1] != "launch")
+    summary = f"Launches: {total}"
+    if no_admission:
+        summary += f"; no admission: {no_admission}"
+    if total > no_admission:
+        legacy = "legacy " if no_admission else ""
+        summary += f"; {legacy}mem_wait_s recorded for {measured}, not recorded for {total - no_admission - measured}"
+    return [*lines, summary + ".", "",
+        *table(["Launch path", "Launches", "mem_wait_s recorded", "mem_wait_s total", "mem_wait_s max"], body), ""]
+
+
 def report(connection: sqlite3.Connection, day: str) -> str:
     found = kinds(connection, day)
     hosts = cast(
@@ -1851,6 +1879,7 @@ def report(connection: sqlite3.Connection, day: str) -> str:
     lines += lead_block(connection, day, test_calls, waits, copies)
     lines += waiting_lines(waits)
     lines += rebuilds_section(connection, day)
+    lines += launches_section(connection, day)
     for kind in found:
         lines += kind_section(connection, day, kind, hosts)
     lines += memory_pressure_section(connection, day, hosts)
