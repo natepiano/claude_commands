@@ -49,6 +49,7 @@ class NestedSyntax(Enum):
     VARIANTS = auto()
     ARMS = auto()
     CONTINUATION = auto()
+    PARAMETERS = auto()
 
 
 class SourceSites:
@@ -167,7 +168,8 @@ class SourceSites:
                         return refuse_body()
                     if item.kind in {"mod", "impl", "trait", "extern"} and words[cursor] == "{" and close == last - 1:
                         return visit(cursor + 1, close, identity) or refuse_body()
-                    syntax = NestedSyntax.CONTINUATION
+                    syntax = (NestedSyntax.PARAMETERS if item.kind == "fn" and words[cursor] == "("
+                              else NestedSyntax.CONTINUATION)
                     if words[cursor] == "{":
                         syntax = (NestedSyntax.FIELDS if item.kind in {"struct", "union"}
                                   else NestedSyntax.VARIANTS if item.kind == "enum" else NestedSyntax.STATEMENTS)
@@ -210,19 +212,27 @@ class SourceSites:
             return (spans[start].token.kind in {"literal", "identifier"}
                     or word in {"{", "(", "[", ";", "&", "&&", "*", "!", "-", "|", "||", ".", "::"})
 
-        def starts_item(cursor: int, end: int) -> bool:
+        def starts_item(cursor: int, end: int, parameter_type: bool = False) -> bool:
             word = words[cursor]
             following = words[cursor + 1:cursor + 2]
+            if word == "impl" and parameter_type:
+                return False  # An argument-position impl Trait is a type bound.
             if word == "const" and following in (("{",), ("move",), ("|",), ("||",)):
                 return False
             if word in {"union", "macro_rules"}:
                 return following == ("!",) if word == "macro_rules" else (
                     cursor + 1 < end and spans[cursor + 1].token.kind == "identifier")
-            # A function pointer has no declared name; every named fn is an item.
-            return word in item_keywords and not (word == "fn" and following == ("(",))
+            # A function pointer has no declared name, including after its ABI.
+            # Reuse the qualifier scan; never consume a named fn or extern item.
+            if word in {"fn", "extern"}:
+                keyword, _ = style_footprint.item_prefix(words, ends, cursor)
+                if words[keyword:keyword + 2] == ("fn", "("):
+                    return False
+            return word in item_keywords
 
         def nested(start: int, end: int, owner: tuple[str, ...], syntax: NestedSyntax) -> bool:
             cursor, segment = start, start
+            parameter_type, impl_bound = False, False
             at_item = syntax in {NestedSyntax.STATEMENTS, NestedSyntax.ARMS}
             at_field = syntax in {NestedSyntax.FIELDS, NestedSyntax.VARIANTS}
             while cursor < end:
@@ -260,7 +270,7 @@ class SourceSites:
                     continue
                 keyword, _ = style_footprint.item_prefix(words, ends, cursor) if at_item else (cursor, "")
                 word = words[keyword] if keyword < end else ""
-                if at_item and keyword < end and starts_item(keyword, end):
+                if at_item and keyword < end and starts_item(keyword, end, parameter_type):
                     if not item_prefix_is_closed(cursor, keyword):
                         return False
                     body = word not in {"type", "const", "static", "use"} and not (
@@ -273,7 +283,7 @@ class SourceSites:
                         return False
                     cursor = segment = last
                     at_item = True
-                elif starts_item(cursor, end):
+                elif starts_item(cursor, end, parameter_type):
                     # Every unrecorded item keyword refuses, even after an expression
                     # operator, closure prefix, generic argument or opaque group.
                     return False
@@ -283,6 +293,8 @@ class SourceSites:
                     close = ends.get(cursor)
                     if close is None or close >= end:
                         return False
+                    if words[cursor] == "{" and impl_bound:
+                        return False  # A bound has no body; never hide an impl item here.
                     child = NestedSyntax.CONTINUATION
                     block = words[cursor] == "{"
                     if block:
@@ -318,6 +330,13 @@ class SourceSites:
                         segment = cursor
                 else:
                     word = words[cursor]
+                    if syntax == NestedSyntax.PARAMETERS:
+                        if word == ":":
+                            parameter_type = True
+                        elif word in {",", "="}:
+                            parameter_type = False
+                        elif word == "impl" and parameter_type:
+                            impl_bound = True
                     if word == ";":
                         at_item = syntax == NestedSyntax.STATEMENTS
                         segment = cursor + 1

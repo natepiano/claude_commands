@@ -500,7 +500,8 @@ class StaffTests(StaffTestCase):
         self.assertFalse(local_file.parent.exists())
         self.assertEqual(staff.by_path("sdlc/registry/impl1"), worker)
         commands = self.ssh_commands()
-        self.assertEqual(commands[:len(reads) + 1], [["show", "--json"]] * (len(reads) + 1))
+        self.assertEqual(commands[:len(reads) + 1],
+                         [["show", "--snapshot", "--json"]] * len(reads) + [["show", "--json"]])
         self.assertEqual([command[0] for command in commands[len(reads) + 1:]], ["ensure", "rename", "move", "retire", "show"])
 
     def test_mac_preserves_names_that_begin_with_a_dash(self) -> None:
@@ -521,7 +522,7 @@ class StaffTests(StaffTestCase):
         with self.machine("mac"):
             self.assertEqual(staff.by_id(showrunner.id), showrunner)
         self.assertFalse(local_file.parent.exists())
-        self.assertEqual(self.ssh_commands(), [["show", "--json"]])
+        self.assertEqual(self.ssh_commands(), [["show", "--snapshot", "--json"]])
 
     def test_remote_errors_keep_application_reasons_and_identify_ssh_failures(self) -> None:
         _ = self.tree()
@@ -573,7 +574,7 @@ class StaffTests(StaffTestCase):
             self.assertIsNone(record.by_id(MISSING_ID))
             self.assertIsNone(record.by_path("sdlc/missing"))
             self.assertEqual(record.find(kind="worker", parent=unit.id), [worker])
-            self.assertEqual(self.ssh_commands(), [["show", "--json"]])
+            self.assertEqual(self.ssh_commands(), [["show", "--snapshot", "--json"]])
             self.assertFalse(self.mac_file.exists())
         _ = staff.rename(unit.id, "panes")
         self.assertEqual(record.by_path("sdlc/models"), unit)
@@ -588,7 +589,7 @@ class StaffTests(StaffTestCase):
         with self.machine("mac"), mock.patch.dict(os.environ, {"STAFF_TEST_SSH_FAIL": "1"}):
             with self.assertRaisesRegex(staff.StaffUnreadable, "^natedev not reached$"):
                 _ = staff.snapshot()
-        self.assertEqual(self.ssh_commands(), [["show", "--json"]])
+        self.assertEqual(self.ssh_commands(), [["show", "--snapshot", "--json"]])
         self.assertFalse(self.mac_file.exists())
         self.assertEqual(self.staff_file.read_bytes(), before)
 
@@ -638,9 +639,115 @@ class StaffTests(StaffTestCase):
             with self.subTest(machine=machine), self.machine(machine):
                 with self.assertRaises(staff.StaffAbsent):
                     _ = staff.snapshot()
-        self.assertEqual(self.ssh_commands(), [["show", "--json"]])
+        self.assertEqual(self.ssh_commands(), [["show", "--snapshot", "--json"]])
         self.assertFalse(self.staff_file.exists())
         self.assertFalse(self.mac_file.exists())
+
+    def test_operation_joins_inherited_descriptor_and_keeps_the_outer_lock(self) -> None:
+        with staff.operation():
+            with staff.operation():
+                _ = staff.ensure("showrunner", name="outer")
+            child = subprocess.run([sys.executable, "-c",
+                "from scripts.production import staff; " +
+                "exec(\"with staff.operation():\\n staff.ensure('showrunner', name='child')\")"],
+                cwd=CHECKOUT, pass_fds=staff.operation_fds(), capture_output=True,
+                text=True, timeout=PROCESS_TIMEOUT, check=False)
+            self.assertEqual(child.returncode, 0, child.stderr)
+            with self.lock_notice(self.staff_file.parent / "operation.lock") as listener:
+                seed = self.start_script(STAFF_SCRIPT, "ensure", "showrunner", "--name=after")
+                self.assert_operation_blocks(seed, listener)
+        output, errors = seed.communicate(timeout=PROCESS_TIMEOUT)
+        self.assertEqual(seed.returncode, 0, output + errors)
+        self.assertEqual({row.name for row in staff.snapshot().rows}, {"outer", "child", "after"})
+
+    def test_operation_joins_a_valid_inherited_lock_after_its_owner_exits(self) -> None:
+        path = self.staff_file.parent / "operation.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as inherited:
+            exited = subprocess.Popen([sys.executable, "-c",
+                "import fcntl, sys; fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX)", str(inherited.fileno())],
+                pass_fds=(inherited.fileno(),))
+            self.assertEqual(exited.wait(timeout=PROCESS_TIMEOUT), 0)
+            environment = {**os.environ, "STAFF_OPERATION_FD": str(inherited.fileno())}
+            child = subprocess.run([sys.executable, "-c",
+                "from scripts.production import staff; " +
+                "exec(\"with staff.operation():\\n staff.ensure('showrunner', name='orphan')\")"],
+                cwd=CHECKOUT, env=environment, pass_fds=(inherited.fileno(),), capture_output=True,
+                text=True, timeout=3, check=False)
+        self.assertEqual(child.returncode, 0, child.stderr)
+        self.assertEqual([row.name for row in staff.find()], ["orphan"])
+
+    def test_seed_result_preserves_pending_retirement_on_owner_and_mac(self) -> None:
+        runner, unit, _worker = self.tree()
+        staff.defer_retire((runner.id, unit.id))
+        before = self.staff_file.read_bytes()
+        for machine in ("natedev", "mac"):
+            with self.subTest(machine=machine), self.machine(machine):
+                result = staff.apply_seed(staff.SeedInput(()))
+                self.assertEqual(result.pending_retire, tuple(sorted((runner.id, unit.id))))
+                self.assertEqual(result, staff.snapshot())
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def assert_invalid_operation_descriptor_blocks(self, wrong_file: bool) -> None:
+        with staff.operation():
+            path = self.root / "wrong-lock" if wrong_file else self.staff_file.parent / "operation.lock"
+            with path.open("a") as unlocked, self.lock_notice(self.staff_file.parent / "operation.lock") as listener:
+                environment = {**os.environ, "STAFF_OPERATION_FD": str(unlocked.fileno())}
+                program = (
+                    "from scripts.production.staff_test_support import observe_operation_lock; "
+                    "observe_operation_lock(); from scripts.production import staff; "
+                    "exec(\"with staff.operation():\\n staff.ensure('showrunner', name='fallback')\")")
+                child = subprocess.Popen([sys.executable, "-c", program], cwd=CHECKOUT,
+                    env=environment, pass_fds=(unlocked.fileno(),), stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True)
+                self.assert_operation_blocks(child, listener)
+        output, errors = child.communicate(timeout=PROCESS_TIMEOUT)
+        self.assertEqual(child.returncode, 0, output + errors)
+        self.assertEqual(len(staff.find(kind="showrunner")), 1)
+
+    def test_operation_rejects_an_inherited_descriptor_for_another_file(self) -> None:
+        self.assert_invalid_operation_descriptor_blocks(True)
+
+    def test_operation_rejects_an_unlocked_inherited_descriptor(self) -> None:
+        self.assert_invalid_operation_descriptor_blocks(False)
+
+    def test_pending_retirement_waits_for_workers_then_retires_units_before_showrunners(self) -> None:
+        runner, unit, worker = self.tree()
+        child = staff.ensure("showrunner", name="child", parent=runner.id)
+        staff.defer_retire((runner.id, unit.id))
+        original = self.staff_file.read_bytes()
+        staff.defer_retire((unit.id, runner.id))
+        self.assertEqual(self.staff_file.read_bytes(), original)
+        self.assertEqual(staff.retire_pending(), tuple(sorted((runner.id, unit.id))))
+        self.assertEqual(self.staff_file.read_bytes(), original)
+        _ = staff.rename(unit.id, "panes")
+        self.assertEqual(staff.snapshot().pending_retire, tuple(sorted((runner.id, unit.id))))
+        _ = staff.retire(worker.id)
+        self.assertEqual(staff.retire_pending(), ())
+        self.assertIsNone(staff.by_id(unit.id))
+        self.assertIsNone(staff.by_id(runner.id))
+        self.assertEqual(staff.by_id(child.id), replace(child, parent=None))
+        completed = self.staff_file.read_bytes()
+        self.assertEqual(staff.retire_pending(), ())
+        self.assertEqual(self.staff_file.read_bytes(), completed)
+
+    def test_pending_retirement_round_trips_over_mac_transport(self) -> None:
+        runner, unit, worker = self.tree()
+        with self.machine("mac"):
+            staff.defer_retire((runner.id, unit.id))
+            self.assertEqual(staff.snapshot().pending_retire, tuple(sorted((runner.id, unit.id))))
+            self.assertEqual(staff.retire_pending(), tuple(sorted((runner.id, unit.id))))
+            _ = staff.retire(worker.id)
+            self.assertEqual(staff.retire_pending(), ())
+        self.assertFalse(self.mac_file.exists())
+        self.assertEqual(staff.snapshot().rows, ())
+
+    def test_pending_retirement_drops_ids_already_retired(self) -> None:
+        runner = staff.ensure("showrunner", name="gone")
+        staff.defer_retire((runner.id,))
+        _ = staff.retire(runner.id)
+        self.assertEqual(staff.retire_pending(), ())
+        self.assertEqual(staff.snapshot().pending_retire, ())
 
 
 if __name__ == "__main__":
