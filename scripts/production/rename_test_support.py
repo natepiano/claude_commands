@@ -348,6 +348,8 @@ class ProductionRenameFixture(StaffTestCase):
         self.bind_fixture(self.fixture_root)
         self.old_tip = self.fixture_tip
         bind_staff_fixture(self, self.env, {OLD: UNITS})
+        production = next(row for row in staff.find(kind="showrunner") if row.name == OLD)
+        _ = staff.ensure("showrunner", name="child", parent=production.id)
 
     def bind_fixture(self, root: Path) -> None:
         self.root = root

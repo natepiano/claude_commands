@@ -14,6 +14,7 @@ from typing import cast
 from unittest import mock
 
 from scripts.production.update_registration_test_support import RegistrationFixture, registration, showrunners, dailies_render, read_production, review
+import showrunner_tree
 
 from scripts.production.update_registration_test_support import setUpModule as setUpModule
 
@@ -124,7 +125,7 @@ class RegistrationTests(RegistrationFixture):
         self.assertEqual(rows[1]["review_unavailable"], "timeout")
         self.assertNotIn("reviewed", rows[1])
         with (mock.patch.dict(os.environ, self.env),
-              mock.patch.object(showrunners, "user_facing", return_value=["example"]),
+              mock.patch.object(showrunner_tree, "user_facing", return_value=["example"]),
               redirect_stdout(io.StringIO()) as output):
             registration.open_items(read_production(self.doc))
         self.assertIn(full, output.getvalue())

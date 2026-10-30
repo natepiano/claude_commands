@@ -4,7 +4,7 @@
 
 ## What it is
 
-One roster lists every session of interest on natedev and the Mac: Claude showrunners, unit directors, workers and freestanding sessions; Codex workers with their unit director and showrunner; and the user's own Codex windows on the shared Codex daemon. `scripts/message/roster.py` only lists. The existing senders take their recipients from it: `send.py` reaches any one listed session by address or unique name, on either machine, and `broadcast.py` reaches groups (showrunners, unit directors, workers, a unit's workers, agents, top-level sessions, everyone) on both machines. Each kind of session lists its own kind natively where it can and uses the roster for the rest; the instruction texts say which tool to use. Every message to the user passes one gate, `scripts/notify/pushover.py`, which refuses a message that neither states the user's action (`--action`) nor says none is needed (`--no-action`). A headless reviewer then checks each push for clarity before it is posted (`docs/as-built/message-clarity.md`). Shutdown tests run under a guard that fails a test, instead of sending, when it reaches a real send.
+One roster lists every session of interest on natedev and the Mac: Claude showrunners, unit directors, workers and freestanding sessions; Codex workers with their unit director and showrunner; and the user's own Codex windows across account daemons. `scripts/message/roster.py` only lists. The existing senders take their recipients from it: `send.py` reaches any one listed session by address or unique name, on either machine, and `broadcast.py` reaches groups (showrunners, unit directors, workers, a unit's workers, agents, top-level sessions, everyone) on both machines. Each kind of session lists its own kind natively where it can and uses the roster for the rest; the instruction texts say which tool to use. Every message to the user passes one gate, `scripts/notify/pushover.py`, which refuses a message that neither states the user's action (`--action`) nor says none is needed (`--no-action`). A headless reviewer then checks each push for clarity before it is posted (`docs/as-built/message-clarity.md`). Shutdown tests run under a guard that fails a test, instead of sending, when it reaches a real send.
 
 ### Data flow
 
@@ -14,7 +14,7 @@ other machine: ssh roster.py --here --snapshot ──►├─► Roster(entries
                 (AllMachines only)                │
                                                   ├─► roster.py           text | --json
                                                   ├─► send.py             one recipient ──► postmaster | relay | codex_mesh send
-                                                  │                                         | codex queue | pushover.py
+                                                  │                                         | thread/queue/add | pushover.py
                                                   │                                         | ssh send.py --here
                                                   ├─► broadcast.py        groups ──► send.py --to <address> --here per row
                                                   │                                  + ssh broadcast.py --here
@@ -45,7 +45,7 @@ The roster joins records that each name one part of the picture. A session's rol
 
 | Review state | `<run>/review_status[_<lens>]`, `<run>/review_pid[_<lens>]` | running blind reviewers |
 
-| Codex daemon | `~/.codex/app-server-control/app-server-control.sock` (`ROSTER_CODEX_SOCKET`) | loaded threads: id, name, cwd, status |
+| Codex account daemons | each account home from `agent_accounts.codex_homes`, at `<home>/app-server-control/app-server-control.sock` (`ROSTER_CODEX_SOCKET` replaces the list for tests) | loaded threads: id, name, cwd, status, owning daemon |
 
 | Process table | `ps -eo pid=,ppid=,comm=,args=` (`PROCESS_TABLE_PS`) | Codex agent processes, reviewer descendants, worker `--cwd` |
 
@@ -125,17 +125,17 @@ Routes (`resolve_recipient(to: str, scope: RecipientResolutionScope, observed: r
 | any form, `--machine HOST` | `ssh HOST send.py --here ...` with no local roster read |
 | `session:<id>` | Claude delivery; resolved to the live session's `uds:` socket first; postmaster first when available, else relay; no live session → `QUEUED` |
 | `worker:<run>/<worker>` | that row's `codex_mesh.py send --session-dir <run dir> --to <worker>` |
-| `codex:<thread>` | `codex_daemon.queue(thread_id, text, timeout)`: `codex queue --thread <id> --message <text>` |
+| `codex:<thread>` | the loaded roster row carries its account daemon; `codex_daemon.queue(daemon, thread_id, text, timeout)` calls `thread/queue/add` on that socket. An unloaded thread fails (exit 3), naming the homes checked; multiple owners are ambiguous (exit 2), listing their accounts |
 | bare name | roster rows with that `name`; one `Messageable` sends by its address |
 | `--codex --session-dir DIR` | `MeshWorker`: `codex_mesh.py send` directly, no roster read |
 
 Resolution for `session:`, `worker:`, `codex:` and bare names reads this machine's roster once (problems print as `send.py: roster: <problem>`). Address forms match `Messageable` addresses; names match any row. `send.py` imports `roster` only on that path, so acknowledgements (`ack`, `reopen`, `pending`, `retire`), `uds:` sockets and `--machine` sends start without it.
 
 - A match here sends here; the other machine is not asked.
-- Several matching rows: exit 2, `<name> matches <N> sessions:` with each address (or its `cannot take messages` reason) and role.
+- Several matching rows: exit 2, `<name> matches <N> sessions:` with each address (or its `cannot take messages` reason) and role; Codex daemon rows also name their account and home.
 - One `CannotReceiveMessages` row: exit 2 with `cannot_receive_message_text`.
 - No match under `LocalThenPeer`: the other machine's roster is read. One `Messageable` row there sends through `ssh` with its address; ambiguity and `cannot take messages` apply to its rows too; a miss while it reports problems is `FAILED` with those problems. A bare name absent from a local roster that had problems asks no one: exit 2, `absence of <name> here is not proven; use an address or --machine`.
-- A clean miss: `session:` queues here (exit 1), `codex:` queues to this machine's daemon, `worker:` exits 2 with `no roster session has address <address>`, a bare name goes to the Claude relay by name.
+- A clean miss: `session:` queues here (exit 1), `codex:` fails with `no live Codex daemon has thread <id> loaded; checked <homes>`, `worker:` exits 2 with `no roster session has address <address>`, a bare name goes to the Claude relay by name.
 
 Every ssh send runs `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/message/send.py" --here ...` with the text on stdin. `remote()` reads the outcome word from the last stdout line there, prefixing the detail `on <host>: `; a run that prints no outcome line (usage errors, `cannot take messages`, ambiguity, `no roster session has address`, which go to stderr) returns `FAILED: ssh <host>: <reason>`. Action flags are forwarded only for `--to user`.
 
@@ -312,9 +312,10 @@ Reads the `ThisMachine` roster and runs no ssh. It prints `<name>\tuds:<socket p
 
 ### `codex_daemon.py`
 
-- `daemon_socket(environment) -> Path`: `ROSTER_CODEX_SOCKET`, else `~/.codex/app-server-control/app-server-control.sock` (on the Mac a symlink into `/private/tmp/codex-daemon-501/`).
+- `daemons(environment) -> list[CodexDaemon]`: each `CodexDaemon(home, socket)` comes from `agent_accounts.codex_homes(agent_accounts.observe_workers_home())`, using `<home>/app-server-control/app-server-control.sock`. `ROSTER_CODEX_SOCKET` replaces the whole list with one endpoint whose home is its socket's `parent.parent`. The caller's `CODEX_HOME` does not select a route. Missing sockets are quiet; an existing socket that fails to answer produces a problem naming its home. Each freestanding roster row carries the typed owner and the account from `_codex_home_account(owner.home)`; snapshots preserve that owner.
 - `loaded_sessions(socket_path) -> list[DaemonSession] | DaemonUnreadable`: an HTTP upgrade to a WebSocket on the Unix socket, JSON-RPC `initialize`, the `initialized` notification, `thread/loaded/list` (paged by `cursor` / `nextCursor`), then `thread/read {threadId, includeTurns: false}` per id. `DaemonSession(thread_id, name, cwd, status)`; name falls back to the id, status to `unknown`. One 5 s deadline covers the whole exchange (`_OperationDeadline`, `_clock = time.monotonic`). No socket file → `[]`; a repeated `nextCursor` or any failure → `DaemonUnreadable(reason)`, which the roster reports as a problem.
-- `queue(thread_id, text, timeout=QUEUE_TIMEOUT_SECONDS) -> Queued | QueueFailed | QueueTimedOut` runs `codex queue --thread <id> --message <text>`; `send.py` prints `SENT:` or `FAILED:`, with no fallback.
+- `read_daemons(environment) -> list[DaemonRead]`: reads all account sockets concurrently under one shared 5 s deadline, within the peer roster's 20 s timeout. Each result carries its owner and either loaded sessions or its own failure; results stay in account-list order, so a stalled account does not hide a healthy account's rows. Standalone `loaded_sessions` calls start their own deadline; this reader passes the shared deadline through the same socket exchange.
+- `queue(daemon, thread_id, text, timeout=QUEUE_TIMEOUT_SECONDS) -> Queued | QueueFailed | QueueTimedOut` uses `_queue_socket` for JSON-RPC `thread/queue/add` through the recipient's owning daemon. `send.py` prints `SENT:` only after the daemon answers; an unloaded thread or queue failure prints `FAILED:` and writes no offline queue. One thread loaded in two daemons has two rows and is refused as ambiguous.
 
 ### Messages to the user
 
@@ -450,7 +451,7 @@ Senders:
 - Routes accumulate by recipient socket. A later script message does not remove an earlier sender's route; replies cannot be assigned to a single message while several routes are live.
 
 **Codex daemon**
-- An ephemeral daemon thread refuses `codex queue` (-32600) and cannot be archived; live checks start threads with `ephemeral: false`.
+- An ephemeral daemon thread refuses `thread/queue/add` (-32600) and cannot be archived; live checks start threads with `ephemeral: false`.
 - `thread/read` does not show a queued message; `thread/turns/list` does once the turn starts.
 - `thread/list` returns every saved thread, finished workers' included, as `notLoaded`; only `thread/loaded/list` shows what is live. `codex agents` is interactive and shows only daemon sessions, not workers.
 
@@ -500,7 +501,7 @@ Senders:
 
 - **Native for your own kind, the roster for the other.** Claude lists Claude with ListAgents and messages it with SendMessage. Codex has no scriptable list (`codex agents` is interactive and does not show workers), so Codex sessions use the roster and `send.py`. The roster lists every kind anyway: a Codex caller needs Claude rows, and a Claude caller needs a worker's unit director and showrunner.
 
-- **The user's Codex windows are sessions of interest.** They list as freestanding Codex sessions, `send.py` reaches them through `codex queue`, and `--agents` counts them.
+- **The user's Codex windows are sessions of interest.** They list as freestanding Codex sessions from every account daemon. `send.py` reaches a loaded thread through its owning daemon's control socket; an unloaded thread fails, and `--agents` counts the loaded sessions.
 
 - **Both machines by default.** Units run on both machines, so `roster.py` and `broadcast.py` cover both; `--here` limits them. A machine that does not answer is one line, and the rest still prints.
 

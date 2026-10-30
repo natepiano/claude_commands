@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read the shared Codex daemon's live sessions and queue a message to one."""
+"""Read each account's live Codex daemon and queue through its control socket."""
 
 from __future__ import annotations
 
@@ -8,9 +8,9 @@ import json
 import os
 import socket
 import struct
-import subprocess
 import time
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast, final
@@ -18,6 +18,12 @@ from typing import cast, final
 TIMEOUT_SECONDS = 5.0
 QUEUE_TIMEOUT_SECONDS = 30
 _clock = time.monotonic
+
+
+@dataclass(frozen=True)
+class CodexDaemon:
+    home: Path
+    socket: Path
 
 
 @dataclass(frozen=True)
@@ -31,6 +37,12 @@ class DaemonSession:
 @dataclass(frozen=True)
 class DaemonUnreadable:
     reason: str
+
+
+@dataclass(frozen=True)
+class DaemonRead:
+    owner: CodexDaemon
+    sessions: list[DaemonSession] | DaemonUnreadable
 
 
 @dataclass(frozen=True)
@@ -71,20 +83,35 @@ class _OperationDeadline:
         return remaining
 
 
-def daemon_socket(environment: Mapping[str, str]) -> Path:
+@dataclass(frozen=True)
+class _StartReadDeadline:
+    """A standalone daemon read starts its own discovery budget."""
+
+
+_START_READ_DEADLINE = _StartReadDeadline()
+
+
+def daemons(environment: Mapping[str, str]) -> list[CodexDaemon]:
+    """Use the account registry; a test socket replaces the entire discovery set."""
     configured = environment.get("ROSTER_CODEX_SOCKET")
     if configured:
-        return Path(configured).expanduser()
-    home = _daemon_home(environment)
-    return home / "app-server-control/app-server-control.sock"
+        path = Path(configured).expanduser()
+        return [CodexDaemon(path.parent.parent, path)]
+    from scripts.whoami import agent_accounts
+
+    return [CodexDaemon(home, home / "app-server-control/app-server-control.sock")
+            for home in agent_accounts.codex_homes(agent_accounts.observe_workers_home())]
 
 
-def _daemon_home(environment: Mapping[str, str]) -> Path:
-    """The freestanding daemon's home, independent of the `workers` account role."""
-    configured = environment.get("CODEX_HOME")
-    if configured:
-        return Path(configured).expanduser()
-    return Path(environment.get("HOME", str(Path.home()))).expanduser() / ".codex"
+def read_daemons(environment: Mapping[str, str]) -> list[DaemonRead]:
+    """Read every account concurrently within one discovery budget, in registry order."""
+    owners = daemons(environment)
+    if not owners:
+        return []
+    deadline = _OperationDeadline.starting_now(TIMEOUT_SECONDS)
+    with ThreadPoolExecutor(max_workers=len(owners)) as readers:
+        pending = [readers.submit(loaded_sessions, owner.socket, deadline=deadline) for owner in owners]
+        return [DaemonRead(owner, result.result()) for owner, result in zip(owners, pending)]
 
 
 def _as_dict(value: object) -> dict[str, object]:
@@ -108,25 +135,29 @@ class _WebSocket:
     def __init__(self, path: Path, deadline: _OperationDeadline) -> None:
         self._deadline = deadline
         self._socket = socket.socket(socket.AF_UNIX)
-        self._prepare_operation()
-        self._socket.connect(str(path))
-        key = base64.b64encode(os.urandom(16)).decode("ascii")
-        self._send_bytes(
-            (
-                "GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
-                f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
-                "Sec-WebSocket-Version: 13\r\n\r\n"
-            ).encode("ascii")
-        )
-        response = bytearray()
-        while not response.endswith(b"\r\n\r\n"):
-            if len(response) >= 64 * 1024:
-                raise ConnectionError("WebSocket handshake was too large")
-            response.extend(self._receive_exact(1))
-        first_line = bytes(response).split(b"\r\n", 1)[0]
-        if not first_line.startswith(b"HTTP/1.1 101 "):
-            detail = first_line.decode("utf-8", errors="replace")
-            raise ConnectionError(f"WebSocket upgrade was refused: {detail}")
+        try:
+            self._prepare_operation()
+            self._socket.connect(str(path))
+            key = base64.b64encode(os.urandom(16)).decode("ascii")
+            self._send_bytes(
+                (
+                    "GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
+                    f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+                    "Sec-WebSocket-Version: 13\r\n\r\n"
+                ).encode("ascii")
+            )
+            response = bytearray()
+            while not response.endswith(b"\r\n\r\n"):
+                if len(response) >= 64 * 1024:
+                    raise ConnectionError("WebSocket handshake was too large")
+                response.extend(self._receive_exact(1))
+            first_line = bytes(response).split(b"\r\n", 1)[0]
+            if not first_line.startswith(b"HTTP/1.1 101 "):
+                detail = first_line.decode("utf-8", errors="replace")
+                raise ConnectionError(f"WebSocket upgrade was refused: {detail}")
+        except BaseException:
+            self._socket.close()
+            raise
 
     def close(self) -> None:
         self._socket.close()
@@ -268,8 +299,13 @@ def _read_thread(client: _DaemonClient, thread_id: str) -> DaemonSession:
     )
 
 
-def loaded_sessions(socket_path: Path) -> list[DaemonSession] | DaemonUnreadable:
-    deadline = _OperationDeadline.starting_now(TIMEOUT_SECONDS)
+def loaded_sessions(
+    socket_path: Path,
+    *,
+    deadline: _OperationDeadline | _StartReadDeadline = _START_READ_DEADLINE,
+) -> list[DaemonSession] | DaemonUnreadable:
+    if isinstance(deadline, _StartReadDeadline):
+        deadline = _OperationDeadline.starting_now(TIMEOUT_SECONDS)
     if not socket_path.exists():
         return []
     client: _DaemonClient | None = None
@@ -322,28 +358,10 @@ def _queue_socket(socket_path: Path, thread_id: str, text: str, timeout: float) 
 
 
 def queue(
+    daemon: CodexDaemon,
     thread_id: str,
     text: str,
     timeout: float = QUEUE_TIMEOUT_SECONDS,
 ) -> QueueResult:
-    """Queue through the process home, or the exact socket used for discovery."""
-    if os.environ.get("ROSTER_CODEX_SOCKET"):
-        return _queue_socket(daemon_socket(os.environ), thread_id, text, timeout)
-    try:
-        completed = subprocess.run(
-            ["codex", "queue", "--thread", thread_id, "--message", text],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-            env={**os.environ, "CODEX_HOME": str(_daemon_home(os.environ))},
-        )
-    except subprocess.TimeoutExpired:
-        return QueueTimedOut(timeout)
-    except OSError as error:
-        reason = str(error).splitlines()[0] if str(error).splitlines() else type(error).__name__
-        return QueueFailed(reason)
-    if completed.returncode == 0:
-        return Queued()
-    reason = next((line.strip() for line in completed.stderr.splitlines() if line.strip()), "")
-    return QueueFailed(reason or f"exit {completed.returncode}")
+    """Queue only through the live daemon that supplied the recipient's row."""
+    return _queue_socket(daemon.socket, thread_id, text, timeout)

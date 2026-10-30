@@ -11,6 +11,7 @@ import re
 from pathlib import Path
 
 import showrunners
+import showrunner_tree
 from issues import Issue, open_issues
 # Callers such as rename_unit read the tag here.
 from issues import PROPOSAL_TAG as PROPOSAL_TAG
@@ -57,7 +58,7 @@ def owner_docs(doc: Path) -> list[Path]:
         return [doc]
     slug = slug_of(doc)
     docs = showrunners.timer_docs()
-    below = (docs[child] for child in showrunners.descendants_of(slug) if child in docs)
+    below = (docs[child] for child in showrunner_tree.descendants_of(slug) if child in docs)
     return [doc, *below]
 
 

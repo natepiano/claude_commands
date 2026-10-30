@@ -27,6 +27,7 @@ from production_units import read_production
 from production_units import production_field
 from scripts.accounts.accounts import NamedAccount
 from scripts.herdr import herdr
+from scripts.production.staff_test_support import fixture_showrunner_name, isolated_staff_file, showrunner_relationship
 
 SCRIPT = Path(add_style.__file__)
 STUB = '''import json
@@ -34,6 +35,9 @@ import os
 import shlex
 import sys
 from pathlib import Path
+
+sys.path.insert(0, os.environ["STYLE_TEST_CHECKOUT"])
+from scripts.production.staff_test_support import fixture_showrunner_name, showrunner_relationship
 
 arguments = sys.argv[1:]
 name = Path(sys.argv[0]).name
@@ -64,12 +68,15 @@ elif name == "launch.py":
     parent = state / slug / "parent"
     parent.parent.mkdir(parents=True, exist_ok=True)
     parent.write_text(os.environ["TEST_PARENT_SLUG"] + "\\n")
+    showrunner_relationship(fixture_showrunner_name(slug, doc), os.environ["TEST_PARENT_SLUG"])
 elif arguments[0] == "detach":
     (state / arguments[1] / "parent").unlink()
+    showrunner_relationship(arguments[1])
 elif arguments[0] == "attach":
     parent = state / arguments[1] / "parent"
     parent.parent.mkdir(parents=True, exist_ok=True)
     parent.write_text(arguments[2] + "\\n")
+    showrunner_relationship(arguments[1], arguments[2])
 else:
     raise SystemExit(2)
 '''
@@ -156,7 +163,9 @@ class AddStyleTests(unittest.TestCase):
             "TEST_PARENT_SLUG": "parent",
             "TEST_LIVE_SESSIONS": str(self.root / "live-sessions"),
             "TEST_STYLE_SYNC": str(self.root / "style_sync.py"),
+            "STYLE_TEST_CHECKOUT": str(SCRIPT.parents[2]),
         }
+        _ = self.enterContext(isolated_staff_file(self.root / "staff/staff.json", self.env))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.env)))
         _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", rule_root))
         self.parent = self.parent_doc("parent")
@@ -182,6 +191,7 @@ class AddStyleTests(unittest.TestCase):
         timer = self.root / "notifier" / f"showrunner-{slug}" / "conf"
         timer.parent.mkdir(parents=True, exist_ok=True)
         _ = timer.write_text(f"TARGET=session:{slug}\nCHECK=zsh /x/production_check.sh {shlex.quote(str(path))}\n")
+        _ = showrunner_relationship(fixture_showrunner_name(slug, path))
         return path
 
     def run_bootstrap(self, *arguments: str, parent: Path | None = None, success: bool = True) -> subprocess.CompletedProcess[str]:
