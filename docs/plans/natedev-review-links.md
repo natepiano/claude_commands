@@ -78,7 +78,7 @@ The user asks any session, on natedev or on the Mac, for a link to an output (a 
 - `tailscale serve`, HTTPS, and access from outside the tailnet.
 - A live view of a file that changes. Each link is a snapshot; a new version gets a new link.
 
-## Phase 4 — Rerun-safe detection rules and review-links start
+## Phase 4 — Rerun-safe detection rules and review-links start  · status: done
 
 The shutdown items first routed here (record locks F032, restore timers at restart.py 1458, 2397 and 1470, the round 8 Astra items 1-3, owner items F2 and F3) moved to shutdown-unit on 2026-10-29 (showrunner, on the user's call). Handover files: ~/.local/state/herdr-unit/handover-2026-10-29/.
 
