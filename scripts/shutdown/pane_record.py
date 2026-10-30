@@ -73,13 +73,43 @@ def record_path(session: str) -> Path:
     return RECORD_DIR / f"{session}.json"
 
 
+def _read_entries(session: str) -> dict[str, object]:
+    path = record_path(session)
+    try:
+        value = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return {}
+    except ValueError as error:
+        raise ValueError(f"{path}: {error}") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"{path}: pane records must be an object")
+    return cast(dict[str, object], value)
+
+
+def read_strict(session: str) -> dict[str, PaneLaunch]:
+    """Read validated launch evidence; only an absent file means there are no entries."""
+    entries = _read_entries(session)
+    for pane_id, value in entries.items():
+        location = f"{record_path(session)}: pane {pane_id}"
+        if not isinstance(value, dict):
+            raise ValueError(f"{location}: launch must be an object")
+        launch = cast(dict[str, object], value)
+        environment = launch.get("environment")
+        if (not isinstance(launch.get("session_id"), str)
+                or not isinstance(launch.get("written_at"), str)
+                or not isinstance(environment, dict)
+                or not all(isinstance(name, str) and isinstance(setting, str)
+                           for name, setting in cast(dict[object, object], environment).items())):
+            raise ValueError(f"{location}: expected session_id and written_at strings and a string environment")
+    return cast(dict[str, PaneLaunch], entries)
+
+
 def read(session: str) -> dict[str, PaneLaunch]:
     """The session's entries by pane id; an absent or unreadable file reads as none."""
     try:
-        value = cast(object, json.loads(record_path(session).read_text(encoding="utf-8")))
+        return cast(dict[str, PaneLaunch], _read_entries(session))
     except (OSError, ValueError):
         return {}
-    return cast(dict[str, PaneLaunch], value) if isinstance(value, dict) else {}
 
 
 @contextmanager

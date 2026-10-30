@@ -139,7 +139,7 @@ Each item is my call under the decision criteria unless it names the user. A one
 
 **Ruled out:** a second writer module (`scripts/lib/durable.py` was removed); a copy of the record on the Mac; Mac reads that send `get` or filters over ssh; a positional destination for `move`.
 
-### Phase 2 — Staff record sources and seed  · status: todo
+### Phase 2 — Staff record sources and seed  · status: done
 
 **Depends on:** Phase 1
 
