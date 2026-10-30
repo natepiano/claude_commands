@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.whoami.note_file import note_name
 
 import inventory
-import record
+import shutdown_record
 import sessions
 import settle
 import shutdown
@@ -65,7 +65,7 @@ class AccountMoveTests(ShutdownTestCase):
         saved["source_label"] = "claude1"
         sentence = "Your Codex workers are paused, not ended; a message lists the command that resumes each."
         self.assertNotIn(sentence, restart.restart_note(saved, saved["requested_at"]))
-        saved["codex_seats"] = [record.PausedSeat(run_dir="/run", seat="impl", role="impl", thread_id="private-thread", turn_live=True, launcher_command=[])]
+        saved["codex_seats"] = [shutdown_record.PausedSeat(run_dir="/run", seat="impl", role="impl", thread_id="private-thread", turn_live=True, launcher_command=[])]
         note = restart.restart_note(saved, saved["requested_at"])
         self.assertEqual(note.count(sentence), 1)
         self.assertIn("message/send.py pending", note)
@@ -270,8 +270,8 @@ class AccountMoveTests(ShutdownTestCase):
         saved["source_label"] = "claude1"
         saved["target"] = command[command.index("--to") + 1]
         saved["why"] = command[command.index("--why") + 1]
-        saved["progress"] = record.SessionWaiting(kind="waiting")
-        self.assertTrue(record.create_session(saved))
+        saved["progress"] = shutdown_record.SessionWaiting(kind="waiting")
+        self.assertTrue(shutdown_record.create_session(saved))
         return subprocess.CompletedProcess(command, 0, "", "")
 
     def assert_move_to_the_home_number(self, target: str) -> None:
@@ -295,7 +295,7 @@ class AccountMoveTests(ShutdownTestCase):
         saved = entry(self.owner)
         saved["login"] = "current@example.invalid"
         saved["label"] = "claude1"
-        self.assertTrue(record.create_session(saved))
+        self.assertTrue(shutdown_record.create_session(saved))
         self.refuses_without_change("kept name already has a shutdown in progress")
 
     def test_move_by_name_starts_only_its_id_on_its_process_account(self) -> None:
@@ -308,7 +308,7 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertEqual(tuple(arguments[2:12]), ("down", "claude1", "--here", "--only", "move-id",
             "--restart", "--to", "claude3", "--why", "claude1 is out of usage"))
         self.assertEqual(arguments[12], "--move-id")
-        saved = record.find_session("current@example.invalid", "move-id")
+        saved = shutdown_record.find_session("current@example.invalid", "move-id")
         self.assertIsNotNone(saved)
         self.assertNotEqual(self.disk_state(), before)
 
@@ -352,7 +352,7 @@ class AccountMoveTests(ShutdownTestCase):
                     saved = entry(showrunner(member.session_id))
                     saved["login"], saved["label"] = member.login, command[3]
                     saved["target"] = command[command.index("--to") + 1]
-                    self.assertTrue(record.create_session(saved))
+                    self.assertTrue(shutdown_record.create_session(saved))
             return subprocess.CompletedProcess(command, 0, "", "")
 
         for flags in ((), ("--no-alert",)):
@@ -434,14 +434,14 @@ class AccountMoveTests(ShutdownTestCase):
         saved = entry(top_level("other-id"))
         saved["login"] = "current@example.invalid"
         saved["label"] = "claude1"
-        self.assertTrue(record.create_session(saved))
+        self.assertTrue(shutdown_record.create_session(saved))
         before = self.disk_state()
         with patch.object(subprocess, "run", side_effect=self.start_one) as process:
             result, output, error = self.cli()
             self.assertEqual((result, error), (0, ""))
             self.assertIn("to move them back", output)
         process.assert_called_once()
-        self.assertEqual(record.find_session("current@example.invalid", "other-id"), saved)
+        self.assertEqual(shutdown_record.find_session("current@example.invalid", "other-id"), saved)
         self.assertNotEqual(self.disk_state(), before)
 
     def test_retired_unit_swap_refuses_before_role_history_shutdown_or_process_changes(self) -> None:
@@ -451,7 +451,7 @@ class AccountMoveTests(ShutdownTestCase):
         saved = entry(self.owner)
         saved["login"] = "current@example.invalid"
         saved["label"] = "claude1"
-        self.assertTrue(record.create_session(saved))
+        self.assertTrue(shutdown_record.create_session(saved))
         before = self.disk_state()
         output, error = io.StringIO(), io.StringIO()
         with (
@@ -503,8 +503,8 @@ class AccountMoveTests(ShutdownTestCase):
             saved["source_label"] = report["label"]
             saved["target"] = command[command.index("--to") + 1]
             saved["why"] = command[command.index("--why") + 1]
-            saved["progress"] = record.SessionWaiting(kind="waiting")
-            self.assertTrue(record.create_session(saved))
+            saved["progress"] = shutdown_record.SessionWaiting(kind="waiting")
+            self.assertTrue(shutdown_record.create_session(saved))
         return subprocess.CompletedProcess(command, 0, "", "")
 
     def batch_cli(self, *, target: str = "claude3", dry_run: bool = False) -> tuple[int, str, str]:
@@ -561,8 +561,8 @@ class AccountMoveTests(ShutdownTestCase):
                 self.assertIn("shutdown.py ready --where", text)
             return {"kind": "sent"}
 
-        def stopped(saved: record.SessionShutdown, *, idle_reason: stop_work.IdleStopReason = "not an idle stop",
-                    forced: bool = False) -> record.SessionShutdown:
+        def stopped(saved: shutdown_record.SessionShutdown, *, idle_reason: stop_work.IdleStopReason = "not an idle stop",
+                    forced: bool = False) -> shutdown_record.SessionShutdown:
             self.assertEqual(idle_reason, "not an idle stop")
             self.assertFalse(forced)
             events.append("stop")
@@ -603,20 +603,20 @@ class AccountMoveTests(ShutdownTestCase):
             self.assertEqual(tuple(commands[0][2:]), ("down", "claude1", "--here", "--only", "director",
                 "--restart", "--to", "claude3", "--why", "checkpoint move", "--move-id",
                 cast(accounts.GroupTransition, accounts.group_transition("units")).move_id))
-            saved = record.session_records(report["login"])[0]
+            saved = shutdown_record.session_records(report["login"])[0]
             self.assertEqual(saved["force"], "wait for ready")
             observed = stop_work.fresh_session(saved["session"], report)
             self.assertIsInstance(settle.next_step(saved, observed, [saved], datetime.now(timezone.utc)),
                                   settle.SendSettleMessage)
             settle._send_settle_message(saved)  # pyright: ignore[reportPrivateUsage]
-            saved = record.session_records(report["login"])[0]
+            saved = shutdown_record.session_records(report["login"])[0]
             self.assertNotIsInstance(settle.next_step(saved, observed, [saved], datetime.now(timezone.utc)),
                                      settle.StopSession)
             stop.assert_not_called()
             director["status"] = "idle"
             with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "director"}):
                 self.assertEqual(shutdown.main(["ready", "--where", "finish the checkpoint"]), 0)
-            saved = record.session_records(report["login"])[0]
+            saved = shutdown_record.session_records(report["login"])[0]
             self.assertIsInstance(settle.next_step(saved, observed, [saved], datetime.now(timezone.utc)),
                                   settle.StopSession)
             _ = settle._stop_after_telling(saved, settle.StopSession())  # pyright: ignore[reportPrivateUsage]
@@ -672,7 +672,7 @@ class AccountMoveTests(ShutdownTestCase):
                 saved["label"] = source
                 saved["request_id"] = "request-" + source
                 saved["target"] = "claude3"
-                self.assertTrue(record.create_session(saved))
+                self.assertTrue(shutdown_record.create_session(saved))
             return subprocess.CompletedProcess(command, 0, "started " + source + "\n", "")
         def follow(login: str, request_id: str) -> int:
             events.append(("follow", login, request_id))
@@ -725,7 +725,7 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertEqual(events, [("down", "claude1", "sr-one"), ("down", "claude2", "sr-two"),
             ("follow", "current@example.invalid", "request-claude1")])
         self.assertNotIn("request-claude2: all", output)
-        self.assertIsNotNone(record.find_session("default@example.invalid", "sr-two"))
+        self.assertIsNotNone(shutdown_record.find_session("default@example.invalid", "sr-two"))
 
     def test_follow_uses_the_source_login_that_started_shutdown_after_listing_changes(self) -> None:
         original = self.current_listing()[0]
@@ -738,7 +738,7 @@ class AccountMoveTests(ShutdownTestCase):
             saved["source_label"] = "claude2"
             saved["request_id"] = "request-from-new-source"
             saved["target"] = "claude3"
-            self.assertTrue(record.create_session(saved))
+            self.assertTrue(shutdown_record.create_session(saved))
             return subprocess.CompletedProcess(command, 0, "started on claude2\n", "")
         output = io.StringIO()
         with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}),
@@ -749,7 +749,7 @@ class AccountMoveTests(ShutdownTestCase):
             result = accounts.main(["move", original.session_id, "claude3"])
         self.assertEqual(result, 0)
         follow.assert_called_once_with(moved.login, "request-from-new-source")
-        self.assertIsNotNone(record.find_session(moved.login, original.session_id))
+        self.assertIsNotNone(shutdown_record.find_session(moved.login, original.session_id))
 
     def test_bulk_move_forwards_a_single_explicit_reason_for_all_selected_showrunners(self) -> None:
         report = self.showrunner_inventory()
@@ -826,7 +826,7 @@ class AccountMoveTests(ShutdownTestCase):
         saved = entry(report["sessions"][0])
         saved["login"] = "current@example.invalid"
         saved["label"] = "claude1"
-        self.assertTrue(record.create_session(saved))
+        self.assertTrue(shutdown_record.create_session(saved))
         before = self.disk_state()
         with (
             patch.object(inventory, "listing", return_value=self.listed(report)),
@@ -839,8 +839,8 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertEqual(accounts.group_accounts().get("showrunners"), "claude3")
         arguments = cast(tuple[str, ...], process.call_args.args[0])
         self.assertEqual(arguments[arguments.index("--only") + 1], "sr-two")
-        self.assertEqual(record.find_session("current@example.invalid", "sr-one"), saved)
-        added = record.find_session("current@example.invalid", "sr-two")
+        self.assertEqual(shutdown_record.find_session("current@example.invalid", "sr-one"), saved)
+        added = shutdown_record.find_session("current@example.invalid", "sr-two")
         assert added is not None and "target" in added
         self.assertEqual(added["target"], "claude3")
         self.assertNotEqual(self.disk_state(), before)
@@ -923,7 +923,7 @@ class AccountMoveTests(ShutdownTestCase):
               patch.object(output, "isatty", return_value=True), redirect_stdout(output), redirect_stderr(error)):
             result = accounts.main(["move", "move-id", "claude3"])
         self.assertEqual((result, error.getvalue()), (130, ""))
-        saved = record.find_session("current@example.invalid", "move-id")
+        saved = shutdown_record.find_session("current@example.invalid", "move-id")
         assert saved is not None
         follow.assert_called_once_with(saved["login"], saved["request_id"])
         process.assert_called_once()
@@ -952,7 +952,7 @@ class AccountMoveTests(ShutdownTestCase):
         saved["login"], saved["label"] = "current@example.invalid", "claude1"
         saved["progress"] = {"kind": "stop failed", "at": saved["requested_at"],
             "reason": "session or worker is not idle and ready"}
-        saved["stop_issues"] = [record.NotReadyToStop(kind="not ready to stop", at=saved["requested_at"],
+        saved["stop_issues"] = [shutdown_record.NotReadyToStop(kind="not ready to stop", at=saved["requested_at"],
             status="busy", progress="waiting")]
         directory = self.root / "shutdown" / saved["login"] / "sessions"
         directory.mkdir(parents=True)
@@ -1031,7 +1031,7 @@ class AccountMoveTests(ShutdownTestCase):
             saved = entry(owner)
             saved["login"] = "current@example.invalid"
             saved["label"] = "claude1"
-            self.assertTrue(record.create_session(saved))
+            self.assertTrue(shutdown_record.create_session(saved))
         before = self.disk_state()
         with patch.object(inventory, "listing", return_value=self.listed(report)), patch.object(subprocess, "run") as process:
             result, output, error = self.batch_cli()

@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     import herdr
     import launch_permission
     from scripts.accounts.accounts import ClaudeLaunchAccount
-    from record import SessionShutdown
+    from shutdown_record import SessionShutdown
 
 
 class ProductionPlanRequired(NamedTuple):
@@ -653,7 +653,7 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
 def attach_source(session_id: str, pid: int) -> RunningSessionHandoff:
     """Require one live, attributed inventory identity before requesting its safe stop."""
     import inventory
-    from record import session_records
+    from shutdown_record import session_records
 
     processes = sessions.session_processes(session_id)
     if isinstance(processes, sessions.SessionLivenessUnknown):
@@ -681,7 +681,7 @@ def run_attach_shutdown(arguments: list[str], timeout: float) -> subprocess.Comp
 def stop_for_attach(handoff: RunningSessionHandoff) -> SessionShutdown:
     import restart
     import settle
-    from record import session_records
+    from shutdown_record import session_records
 
     identity = str(uuid4())
     cancel = settle.shutdown_command("cancel", handoff.login, "--here", "--only", handoff.session_id)
@@ -1092,7 +1092,7 @@ def account_for_launch(request: RequestedUnitLaunch, target: str = "", config_di
     from scripts.accounts import accounts
     try:
         if source_fallback:
-            from record import all_session_records
+            from shutdown_record import all_session_records
 
             if not isinstance(request.launch_kind, UnitRestoreLaunch):
                 raise Refusal("--source-fallback requires a recorded unit restore")
@@ -1169,7 +1169,7 @@ def model_for_resume(request: RequestedUnitLaunch, explicit: str = "") -> str:
         return ""
     if explicit:
         return explicit
-    import record as shutdown_record
+    import shutdown_record
     try:
         saved = [item for item in shutdown_record.all_session_records()
                  if item["session"]["session_id"] == request.session.session_id]

@@ -317,16 +317,16 @@ def alert(session: HealSession, history: HealHistory, reason: str) -> None:
 def stop_completion(session: HealSession, login: str) -> StopComplete | StopPending | StopRefused:
     """Read the conductor's typed completion signal; down itself is asynchronous."""
     sys.path.insert(0, str(SCRIPTS / "shutdown"))
-    from scripts.shutdown import record
+    from scripts.shutdown import shutdown_record
 
-    saved = record.find_session(login, session.session_id)
+    saved = shutdown_record.find_session(login, session.session_id)
     if saved is None:
         return StopPending(record_missing=True)
     owner = saved["session"]
     if owner["pid"] != session.pid or owner["proc_start"] != session.proc_start or saved["then"] != "stop":
         return StopRefused("shutdown record no longer belongs to this heal stop")
     progress = saved["progress"]["kind"]
-    if progress == "stop failed" or record.stop_incomplete(saved):
+    if progress == "stop failed" or shutdown_record.stop_incomplete(saved):
         return StopRefused("shutdown did not complete the session stop")
     if progress in {"stopped", "already gone"} and sessions.process_start(session.pid) != session.proc_start:
         return StopComplete()
