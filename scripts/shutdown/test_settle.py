@@ -43,6 +43,7 @@ from user_action import ActionRequired
 from push_texts import RenderedPush, render, catalog, render_entry
 import restart as restart_work
 import settle
+import send as message_send
 import detached
 import shutdown
 if TYPE_CHECKING:
@@ -4780,6 +4781,50 @@ class SettleTests(ShutdownTestCase):
                 alert.assert_not_called()
                 fixer.assert_called_once_with("restored-" + policy, 912, "resumed-start", "Restored", "Restored")
                 shutdown_record.archive_session(LOGIN, other["session"]["session_id"])
+
+    def test_send_outcomes_without_a_repeat_window_require_delivery_evidence(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.DELIVER_MESSAGE)
+        acknowledged = message_send.acknowledged_skip_reason("fixture-key", NOW)
+        cases = (
+            ("SENT: fixture socket\n", 0, "sent", "", True, True),
+            (f"SKIPPED: {acknowledged}\n", 0, "acknowledged", acknowledged, True, True),
+            ("SKIPPED: key is inside its repeat window\n", 0, "window skipped",
+             "key is inside its repeat window", False, False),
+            ("", 0, "unconfirmed", "send returned no outcome header", False, False),
+            ("KEPT: existing user message\n", 0, "kept", "existing user message", False, True),
+            ("REPLACED: newer user message\n", 0, "replaced", "newer user message", False, True),
+            ("QUEUED: session unavailable\n", 1, "queued", "session unavailable", False, False),
+        )
+        for index, (stdout, code, kind, reason, delivered, accepted_alert) in enumerate(cases):
+            with self.subTest(kind=kind):
+                saved = session_shutdown(top_level(f"delivery-{index}", "Owner"))
+                self.save(saved)
+                with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, stdout, "")) as sender:
+                    settle.request_pause(saved)
+                    current = shutdown_record.find_session(LOGIN, saved["session"]["session_id"])
+                    assert current is not None
+                    expected = ({"kind": "sent", "at": NOW} if delivered else
+                                {"kind": "queued", "at": NOW, "reason": reason})
+                    self.assertEqual(current["settle_message"], expected)
+                    self.assertEqual(settle.alert_user(render("nixos.ups_battery", charge="30", minutes="5")),
+                                     accepted_alert)
+                    observed = settle.send_message("session:owner", "Shutdown", "Stop work", key="fixture-key")
+                    self.assertEqual(observed, {"kind": kind} if kind == "sent" else
+                                     {"kind": kind, "reason": reason})
+                self.assertEqual(sender.call_count, 3)
+                for invocation in sender.call_args_list:
+                    self.assertNotIn("--repeat-minutes", cast(list[str], invocation.args[0]))
+        saved = session_shutdown(top_level("undelivered-reask", "Owner"))
+        saved["settle_message"] = {"kind": "sent", "at": NOW}
+        self.save(saved)
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 0, "SKIPPED: inside the key window\n", "")):
+            settle.request_pause(saved)
+        current = shutdown_record.find_session(LOGIN, "undelivered-reask")
+        assert current is not None
+        self.assertEqual(current["settle_message"],
+                         {"kind": "queued", "at": NOW, "reason": "inside the key window"})
+        self.assertNotIn("reasked_at", current)
 
     def test_user_alert_wait_covers_configured_review_and_remote_transport(self) -> None:
         self.allow_leaf(ShutdownSendLeaf.DELIVER_MESSAGE)

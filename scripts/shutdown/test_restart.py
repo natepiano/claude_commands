@@ -48,6 +48,7 @@ import herdr
 from fake_herdr import CommandResponse
 import conversation_pause
 import settle
+from scripts.message import send as message_send
 # The module settle imports by its own path entry: a separate object from the package import below.
 import showrunners as settle_showrunners
 import shutdown
@@ -6095,6 +6096,34 @@ class RestartTests(ShutdownTestCase):
         with patch.object(restart, "_retire"), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "_launch_session", side_effect=OSError("failed")), patch.object(restart, "_session_liveness", return_value=restart.SessionLive()), patch.object(restart, "wait_for_confirmation", side_effect=self.all_sessions_live), redirect_stdout(io.StringIO()):
             self.assertEqual(restart.up(LOGIN), 0)
         self.assertIsNone(shutdown_record.find_session(LOGIN, "owner"))
+
+    def test_restart_note_restores_timers_only_after_delivery_evidence(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.DELIVER_MESSAGE)
+        acknowledged = message_send.acknowledged_skip_reason("restart-note", RESTARTED)
+        for index, (stdout, delivered) in enumerate((
+            ("SKIPPED: inside the key window\n", False),
+            ("", False),
+            (f"SKIPPED: {acknowledged}\n", True),
+            ("SENT: fixture socket\n", True),
+        )):
+            with self.subTest(stdout=stdout):
+                saved = entry(showrunner(f"note-delivery-{index}"))
+                saved["timers"] = [TimerRestore(instance=f"timer-{index}", was_enabled=True)]
+                self.create([saved])
+                with (patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout, "")) as sender,
+                      patch.object(settle, "run_notifier") as timers):
+                    restart.confirm_entry(saved, RESTARTED, True, observed_at=time.time())
+                current = shutdown_record.find_session(LOGIN, saved["session"]["session_id"])
+                assert current is not None
+                if delivered:
+                    timers.assert_called_once_with("start", f"timer-{index}")
+                    self.assertEqual(current["progress"]["kind"], "restarted")
+                else:
+                    timers.assert_not_called()
+                    self.assertEqual(current["progress"]["kind"], "restart failed")
+                    assert current["progress"]["kind"] == "restart failed"
+                    self.assertIn("restart note not delivered", current["progress"]["reason"])
+                self.assertEqual(sender.call_count, 1)
 
     def test_queued_showrunner_note_keeps_its_timers_stopped(self) -> None:
         saved = entry(showrunner("owner"))
