@@ -18,11 +18,12 @@ from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
+from types import ModuleType
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast, override
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS.parent))
-for _directory in (SCRIPTS / "production", SCRIPTS / "direct", SCRIPTS / "shutdown", SCRIPTS / "herdr", SCRIPTS / "whoami", SCRIPTS / "message", SCRIPTS / "lib"):
+for _directory in (SCRIPTS / "production", SCRIPTS / "direct", SCRIPTS / "herdr", SCRIPTS / "whoami", SCRIPTS / "message", SCRIPTS / "lib"):
     if str(_directory) not in sys.path:
         sys.path.insert(0, str(_directory))
 
@@ -35,18 +36,34 @@ import unit_runs  # noqa: E402
 import herdr  # noqa: E402
 import codex_daemon  # noqa: E402
 import process_table  # noqa: E402
-from scripts.guilds import roles  # noqa: E402
+from scripts.astra import design_roles  # noqa: E402
 from scripts.lib import names  # noqa: E402
 from scripts.lib.names import JobKey  # noqa: E402
 if TYPE_CHECKING:
     from ..accounts.role_map import role_map_command
     from ..whoami import account, agent_accounts, note_file
 else:
+    import importlib.util
     from scripts.accounts.role_map import role_map_command
-    import account as account
-    import agent_accounts as agent_accounts
-    import note_file as note_file
-import remote as remote  # noqa: E402
+
+    def _lazy_module(name: str) -> ModuleType:
+        """Label-only callers do not need account discovery dependencies."""
+        if name in sys.modules:
+            return sys.modules[name]
+        spec = importlib.util.find_spec(name)
+        if spec is None or spec.loader is None:
+            raise ImportError(name)
+        loader = importlib.util.LazyLoader(spec.loader)
+        spec.loader = loader
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        loader.exec_module(module)
+        return module
+
+    account = _lazy_module("account")
+    agent_accounts = _lazy_module("agent_accounts")
+    note_file = _lazy_module("note_file")
+from scripts.shutdown import remote as remote  # noqa: E402
 from sessions import SessionRecord, messaging_socket_exists, running_sessions  # noqa: E402
 
 Kind = Literal["claude", "codex"]
@@ -167,7 +184,12 @@ class NoDirector:
     """This session has no unit-director link."""
 
 
-DirectorRelationship = DirectsUnit | UnderDirector | NoDirector
+@dataclass(frozen=True)
+class UnitWithoutRunningDirector:
+    unit: str
+
+
+DirectorRelationship = DirectsUnit | UnderDirector | UnitWithoutRunningDirector | NoDirector
 
 
 @dataclass(frozen=True)
@@ -312,7 +334,7 @@ class ShownName:
         if isinstance(self.production, ProductionPart) and self.production.slug:
             parts.append(self.production.slug)
         if isinstance(self.unit, UnitPart) and self.unit.unit:
-            parts.append(self.unit.unit.removesuffix("-unit"))
+            parts.append(_short_unit(self.unit.unit))
         if isinstance(self.job, ShownJob):
             loaded = names.runtime_names()
             if not isinstance(loaded, names.Names):
@@ -364,13 +386,53 @@ class Roster:
     problems: list[str]
 
 
+@dataclass(frozen=True)
+class UnitLabels:
+    session: str
+    showrunner: str = "—"
+    unit: str = "—"
+
+    def folder_name(self) -> str:
+        """Name a copies folder from the owning director's labels.
+
+        Look up labels with unit_labels_for([<session id from
+        build_hold.owning_session()>], environment), so a Codex worker
+        resolves to its unit director.
+        """
+        if self.showrunner == "—":
+            return self.session if self.unit == "—" else self.unit
+        if self.unit == "—":
+            return self.showrunner
+        if self.unit == self.showrunner or self.unit.startswith(self.showrunner + "-"):
+            return self.unit
+        return f"{self.showrunner}-{self.unit}"
+
+
+def _unit_labels(name: str, showrunner: ShowrunnerRelationship,
+                 director: DirectorRelationship) -> UnitLabels:
+    production = " ".join(_production_of(showrunner).split())
+    unit = _short_unit(" ".join(_unit_of(director).split()))
+    return UnitLabels(" ".join(name.split()), production or "—", unit or "—")
+
+
+def unit_labels(entries: Iterable[RosterEntry]) -> dict[str, UnitLabels]:
+    labels: dict[str, UnitLabels] = {}
+    for entry in entries:
+        identity = _unit_labels(entry.name, entry.showrunner, entry.director)
+        if entry.kind == "claude" and isinstance(entry.session, ClaudeSession):
+            labels[entry.session.session_id] = identity
+        elif entry.kind == "codex" and isinstance(entry.thread, CodexThread):
+            labels[entry.thread.thread_id] = identity
+    return labels
+
+
 TaggedSnapshotState = (MessageReach | ShowrunnerRelationship | DirectorRelationship | NotAWorker
                        | CodexThread | NoCodexThread | ClaudeSession | NoClaudeSession | AccountAttribution)
 SnapshotState = TaggedSnapshotState | WorkerAssignment | HeldDesignRole
 _SNAPSHOT_STATES: tuple[type[TaggedSnapshotState], ...] = (
     Messageable, CannotReceiveMessages, UnderShowrunner, RunsProduction,
     ProductionWithoutRunningShowrunner, NoShowrunner, UnderDirector, DirectsUnit,
-    NoDirector, NotAWorker, CodexThread, NoCodexThread,
+    UnitWithoutRunningDirector, NoDirector, NotAWorker, CodexThread, NoCodexThread,
     ClaudeSession, NoClaudeSession, AccountLabel, AccountUnread, AccountAttributionUnavailable,
 )
 
@@ -581,11 +643,12 @@ def _session_address(entry: RosterEntry) -> str:
 
 
 def _production(entry: RosterEntry) -> str:
-    if isinstance(
-        entry.showrunner,
-        (RunsProduction, UnderShowrunner, ProductionWithoutRunningShowrunner),
-    ):
-        return entry.showrunner.production
+    return _production_of(entry.showrunner)
+
+
+def _production_of(showrunner: ShowrunnerRelationship) -> str:
+    if isinstance(showrunner, (RunsProduction, UnderShowrunner, ProductionWithoutRunningShowrunner)):
+        return showrunner.production
     return ""
 
 
@@ -598,9 +661,16 @@ def _showrunner_address(entry: RosterEntry) -> str:
 
 
 def _unit(entry: RosterEntry) -> str:
-    if isinstance(entry.director, (DirectsUnit, UnderDirector)):
-        return entry.director.unit
-    return ""
+    return _unit_of(entry.director)
+
+
+def _unit_of(director: DirectorRelationship) -> str:
+    return director.unit if isinstance(director, (DirectsUnit, UnderDirector, UnitWithoutRunningDirector)) else ""
+
+
+def _short_unit(unit: str) -> str:
+    """The shown unit name: the unit id without its "-unit" suffix."""
+    return unit.removesuffix("-unit")
 
 
 def _director_name(entry: RosterEntry) -> str:
@@ -818,7 +888,8 @@ def _raw_session_details(records: list[SessionRecord], problems: list[str]) -> d
 
 
 def _registered_showrunners(
-    environment: Mapping[str, str], problems: list[str]
+    environment: Mapping[str, str], problems: list[str],
+    *, known_sessions: Mapping[str, SessionRecord] | showrunners.DiscoverSessions = showrunners.DISCOVER_SESSIONS,
 ) -> list[showrunners.Showrunner]:
     state = Path(
         environment.get(
@@ -832,7 +903,7 @@ def _registered_showrunners(
     errors = io.StringIO()
     try:
         with contextlib.redirect_stderr(errors):
-            registered = showrunners.registered_showrunners(state)
+            registered = showrunners.registered_showrunners(state, known_sessions=known_sessions)
     except (OSError, ValueError) as error:
         _problem(problems, "showrunners", error)
         registered = []
@@ -889,16 +960,26 @@ def _every_marked_unit() -> unit_lookup.MarkedProductions | OSError:
         return error
 
 
+@dataclass(frozen=True)
+class _DiscoverProductionMarks:
+    """The full roster discovers marks across all running panes."""
+
+
+_DISCOVER_PRODUCTION_MARKS = _DiscoverProductionMarks()
+
+
 def _production_places(
     records: list[SessionRecord], details: Mapping[str, _ClaudeDetails],
     registered: list[showrunners.Showrunner],
     runner_ids: Mapping[str, showrunners.Showrunner], ledger_workers: set[str],
     problems: list[str],
+    *, marks: unit_lookup.MarkedProductions | _DiscoverProductionMarks = _DISCOVER_PRODUCTION_MARKS,
 ) -> dict[str, _ProductionPlace]:
     addresses = {runner["slug"]: f"session:{session_id}" for session_id, runner in runner_ids.items()}
     places: dict[str, _ProductionPlace] = {}
     # One read of every production's marks serves every showrunner below.
-    every = _every_marked_unit() if registered else unit_lookup.MarkedProductions({}, {})
+    every = (marks if isinstance(marks, unit_lookup.MarkedProductions)
+             else _every_marked_unit() if registered else unit_lookup.MarkedProductions({}, {}))
     # One process scan places every record; a scan per record took most of the roster's time.
     record_places: dict[int, herdr.HerdrPlace] | None = None
     for runner in registered:
@@ -951,6 +1032,45 @@ def _production_places(
                         and details[record["sessionId"]].cwd == worktree):
                     _ = places.setdefault(record["sessionId"], _ProductionPlace(showrunner, DirectsUnit(unit_name)))
     return places
+
+
+def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) -> dict[str, UnitLabels]:
+    """Resolve known Claude holders without a process scan, meshes or account reads."""
+    wanted = set(session_ids)
+    if not wanted:
+        return {}
+    try:
+        records = _newest_sessions()
+        if not any(record["sessionId"] in wanted for record in records):
+            return {}
+        problems: list[str] = []
+        registered = _registered_showrunners(environment, problems,
+                                            known_sessions={record["sessionId"]: record for record in records})
+        runners = _showrunner_ids(records, registered)
+        marks, directors = unit_lookup.session_unit_marks(records, environment)
+        places = _production_places(records, {}, registered, runners, set(directors), problems, marks=marks)
+        names = {record["sessionId"]: record["name"] for record in records}
+        labels: dict[str, UnitLabels] = {}
+        for session_id in wanted & names.keys():
+            showrunner: ShowrunnerRelationship = NoShowrunner()
+            director: DirectorRelationship = NoDirector()
+            if session_id in runners:
+                showrunner = RunsProduction(runners[session_id]["slug"])
+            elif session_id in places:
+                showrunner = places[session_id].showrunner
+                director = places[session_id].director
+            elif session_id in directors:
+                owner = directors[session_id]
+                place = places.get(owner)
+                unit = ""
+                if place is not None:
+                    showrunner = place.showrunner
+                    unit = place.director.unit
+                director = UnderDirector(unit, names[owner], f"session:{owner}")
+            labels[session_id] = _unit_labels(names[session_id], showrunner, director)
+        return labels
+    except Exception:
+        return {}
 
 
 def _read_run_markers(
@@ -1093,9 +1213,9 @@ def _pool_context(run: Path, name: str) -> tuple[ShowrunnerRelationship, Directo
     return ProductionWithoutRunningShowrunner(slug), reviewer.director, reviewer.reviewer_type
 
 
-def _held_location(holder: roles.Holder) -> tuple[ShowrunnerRelationship, DirectorRelationship]:
+def _held_location(holder: design_roles.Holder) -> tuple[ShowrunnerRelationship, DirectorRelationship]:
     return (ProductionWithoutRunningShowrunner(holder.production_slug),
-            UnderDirector(holder.unit_name, "", "") if isinstance(holder, roles.UnitHolder) else NoDirector())
+            UnderDirector(holder.unit_name, "", "") if isinstance(holder, design_roles.UnitHolder) else NoDirector())
 
 
 def unit_worker_title(production: str, unit: str, job: JobKey, ordinal: int, address: str) -> str:
@@ -1114,7 +1234,7 @@ def mesh_shown_name(session_dir: str, name: str, record: Mapping[str, object]) -
     if design_id := _as_string(record.get("held_design_id")):
         held_role = record.get("held_role")
         try:
-            design = roles.read_design(design_id)
+            design = design_roles.read_design(design_id)
         except (OSError, UnicodeError, ValueError, TypeError):
             return ShownName(NoProduction(), NoUnit(), JobUnassigned("design unreadable"), name)
         if held_role not in ("designer", "reviewer"):
@@ -1177,16 +1297,32 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _stopped_run_place(run: Path) -> _RunPlace:
+    """Keep a worker's recorded unit without claiming that its director is live."""
+    from scripts.direct.progress_history import ProductionUnitIdentity, resolve_production_unit
+
+    try:
+        state = _read_object(run / unit_runs.STATE_FILE)
+    except (OSError, UnicodeError, ValueError):
+        return _RunPlace(NoDirector(), NoShowrunner(), "")
+    identity = resolve_production_unit(state)
+    cwd = _as_string(state.get("working_dir"))
+    if isinstance(identity, ProductionUnitIdentity):
+        return _RunPlace(UnitWithoutRunningDirector(identity.unit),
+                         ProductionWithoutRunningShowrunner(identity.production), cwd)
+    return _RunPlace(NoDirector(), NoShowrunner(), cwd)
+
+
 def _run_place(
     run: _LiveRun,
     claude_entries: Mapping[str, RosterEntry],
     production_places: Mapping[str, _ProductionPlace],
 ) -> _RunPlace:
     if isinstance(run.director, _NoRunningDirector):
-        return _RunPlace(NoDirector(), NoShowrunner(), "")
+        return _stopped_run_place(run.path)
     director = claude_entries.get(run.director.session_id)
     if director is None:
-        return _RunPlace(NoDirector(), NoShowrunner(), "")
+        return _stopped_run_place(run.path)
     place = production_places.get(run.director.session_id)
     unit = place.director.unit if place is not None else ""
     director_link = UnderDirector(unit, director.name, _session_address(director))
@@ -1252,14 +1388,20 @@ def _codex_home_account(home: Path) -> AccountLabel | AccountUnread:
     return AccountLabel(identity.label) if isinstance(identity, agent_accounts.KnownCodexAccount) else AccountUnread(identity.reason)
 
 
-_HOME_ACCOUNT_UNCHECKED = account.HomeAccountUnchecked()
+@dataclass(frozen=True)
+class _ReadHomeAccount:
+    """Account attribution must read the home state when requested."""
+
+
+_HOME_ACCOUNT_UNCHECKED = _ReadHomeAccount()
 
 
 def _process_account(pid: int, kind: str, *,
-                     home_state: account.LegacyHomeLogin | account.ConfigOnlyHome | account.HomeAccountUnchecked = _HOME_ACCOUNT_UNCHECKED,
+                     home_state: account.LegacyHomeLogin | account.ConfigOnlyHome | account.HomeAccountUnchecked | _ReadHomeAccount = _HOME_ACCOUNT_UNCHECKED,
                      ) -> AccountLabel | AccountUnread:
     if kind == "claude":
-        identity = account.account_of(pid, home_state=home_state)
+        identity = account.account_of(pid, home_state=(account.HomeAccountUnchecked()
+                                      if isinstance(home_state, _ReadHomeAccount) else home_state))
         return AccountLabel(identity.label) if identity is not None else AccountUnread("process account could not be read")
     home = account.process_codex_home(pid)
     if isinstance(home, account.ProcessEnvironmentUnread):
@@ -1355,6 +1497,9 @@ def _claude_entries(
             worker = workers[session_id]
             assignment = _claude_assignment(worker.run.path, worker.worker_name or record["name"], problems)
             run_director = worker.run.director
+            if isinstance(run_director, _NoRunningDirector):
+                place = _stopped_run_place(worker.run.path)
+                showrunner, director = place.showrunner, place.director
             director_entry = (
                 records_by_id.get(run_director.session_id)
                 if isinstance(run_director, _DirectorSession) else None
@@ -1600,24 +1745,24 @@ def _pool_workers(
 def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], problems: list[str]) -> tuple[list[RosterEntry], set[str]]:
     entries: list[RosterEntry] = []
     threads: set[str] = set()
-    for path in sorted(roles.state_root().glob('*/design.json')):
+    for path in sorted(design_roles.state_root().glob('*/design.json')):
         try:
-            design = roles.read_design(path.parent.name)
-            reach = roles.resolve_holder(design.holder)
-            session = claude.get(reach.session_id) if isinstance(reach, roles.HolderReach) else None
+            design = design_roles.read_design(path.parent.name)
+            reach = design_roles.resolve_holder(design.holder)
+            session = claude.get(reach.session_id) if isinstance(reach, design_roles.HolderReach) else None
             showrunner, director = _held_location(design.holder)
-            if isinstance(design.holder, roles.UnitHolder):
+            if isinstance(design.holder, design_roles.UnitHolder):
                 director = UnderDirector(design.holder.unit_name, session.name if session else design.holder.unit_name,
-                                         f'session:{reach.session_id}' if isinstance(reach, roles.HolderReach) else '')
+                                         f'session:{reach.session_id}' if isinstance(reach, design_roles.HolderReach) else '')
                 if session:
                     showrunner = session.showrunner
             elif session:
                 showrunner = UnderShowrunner(design.holder.production_slug, session.name,
-                                              f'session:{reach.session_id}' if isinstance(reach, roles.HolderReach) else '')
-            mesh = roles.mesh_directory(design.placement.design_id)
+                                              f'session:{reach.session_id}' if isinstance(reach, design_roles.HolderReach) else '')
+            mesh = design_roles.mesh_directory(design.placement.design_id)
             roster = _read_object(mesh / 'mesh_roster.json') if (mesh / 'mesh_roster.json').exists() else {}
             for instance in design.roles:
-                if isinstance(instance.lifecycle, (roles.RoleNotOpened, roles.RoleEnded)):
+                if isinstance(instance.lifecycle, (design_roles.RoleNotOpened, design_roles.RoleEnded)):
                     continue
                 thread = instance.lifecycle.thread_id
                 if thread in threads:
@@ -1627,7 +1772,7 @@ def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], problems: li
                     raise ValueError('durable roster entry is not an object')
                 entry = cast(dict[str, object], raw_entry)
                 if (entry.get('transferring_role') or entry.get('role_redirect')
-                        or roles.transfer_route(thread, design.placement.design_id)):
+                        or design_roles.transfer_route(thread, design.placement.design_id)):
                     continue
                 threads.add(thread)
                 status = _as_string(entry.get('status')) or type(instance.lifecycle).__name__
@@ -1818,7 +1963,8 @@ def _entry_line(entry: RosterEntry, *, you: bool, context: bool) -> str:
     cwd = _home_shortened(entry.cwd)
     if cwd:
         details.append(cwd)
-    return f"{entry.role} {name} — {', '.join(details)}"
+    prefix = "" if entry.role == "worker" and isinstance(shown.job, ShownJob) else f"{entry.role} "
+    return f"{prefix}{name} — {', '.join(details)}"
 
 
 def _chosen_entries(

@@ -23,8 +23,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.agents import codex_mesh
 from scripts.direct import workers
 from scripts.direct.worker_state import worker_claim_lock, worker_record_path
-from scripts.guilds import roles as guild_roles
+from scripts.astra import design_roles
 from scripts.lib import unit_runs
+from scripts.usage.agents_log import LENSES
 
 SCRIPTS = Path(__file__).resolve().parent
 PYTHON = str(SCRIPTS / "../lib/py")
@@ -106,7 +107,7 @@ def parse_arguments() -> Arguments:
         _ = parser.add_argument("--" + option, default="")
     _ = parser.add_argument("--prompt", required=True)
     _ = parser.add_argument("--cwd", default=str(Path.cwd()))
-    _ = parser.add_argument("--lens", choices=("adversary", "contract", "craft", "ux"), default="")
+    _ = parser.add_argument("--lens", choices=LENSES, default="")
     _ = parser.add_argument("--pass", dest="pass_number", type=int, default=1)
     _ = parser.add_argument("--image", action="append", default=[])
     args = parser.parse_args(namespace=Arguments())
@@ -376,11 +377,11 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
                 else:
                     refuse(f"{dispatch.worker} is already implementing")
             _ = status_path.write_text("error\n")
-        if record.get("transferring_role") or record.get("role_redirect") or guild_roles.transfer_route(
+        if record.get("transferring_role") or record.get("role_redirect") or design_roles.transfer_route(
                 text(record.get("thread_id")), text(record.get("held_design_id"))):
             refuse(f"{dispatch.worker}: TransferringRole; use its destination holder")
         if record.get("held_design_id"):
-            refuse(f"{dispatch.worker}: held roles resume through roles.py")
+            refuse(f"{dispatch.worker}: held roles resume through design_roles.py")
         config = Path(os.environ.get("UNIT_CONFIG", str(Path.home() / ".claude/config/direct.conf")))
         match = re.search(r"^UNIT_COMPACT_ABOVE_TOKENS=(\d+)", config.read_text(), re.M) if config.is_file() else None
         threshold = int(match.group(1)) if match else 0

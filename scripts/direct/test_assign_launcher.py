@@ -145,6 +145,13 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         return [cast(dict[str, object], json.loads(line)) for line in
                 (self.history / "runs" / f"{self.session_dir.name}.jsonl").read_text().splitlines()]
 
+    def test_rerun_review_dispatch_keeps_its_lens_and_read_only_thread(self) -> None:
+        _ = self.successful("review", "--lens", "rerun", "--pass", "1")
+        starts = self.methods("thread/start")
+        self.assertEqual(cast(dict[str, object], starts[0]["params"])["sandbox"], "read-only")
+        self.assertTrue((self.session_dir / "phases/7/review_status_rerun_1").exists())
+        self.assertEqual(next(iter(self.assignment_records().values()))["role"], "review")
+
     def test_missing_required_options_and_positionals_refuse_before_opening_a_thread(self) -> None:
         for options in ([], ["--prompt", str(self.prompt)], ["--role", "test"], ["test", str(self.prompt)]):
             with self.subTest(options=options):

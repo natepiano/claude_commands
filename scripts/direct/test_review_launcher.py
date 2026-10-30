@@ -20,6 +20,17 @@ from scripts.direct.wait_for_test_state import wait_until
 
 
 class ReviewLauncherPassTests(support.ReviewLauncherFixture):
+    def test_rerun_lens_uses_review_slot_and_its_own_findings_file(self) -> None:
+        session = self.start_implementation("rerun-slot")
+        self.finish_implementation(session)
+        result = subprocess.run(self.review_command(session, "rerun", ""),
+                                env=self.environment(), capture_output=True, text=True,
+                                check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((session / "review_findings_1_rerun.txt").read_text(), "No findings.\n")
+        events = [event for event in self.pass_events(session.name) if event.get("pass_kind") == "review"]
+        self.assertEqual([event.get("team_slot") for event in events], ["review", "review"])
+
     def test_named_review_phase_reaches_verification_environment(self) -> None:
         session = self.start_implementation("review-phase-environment")
         self.finish_implementation(session)

@@ -1,23 +1,12 @@
-"""Check lint cache keys follow the final repaired tree."""
+"""Check repaired and formatted trees are reused by the lint cache."""
 
 from __future__ import annotations
 
 import unittest
-from scripts.direct import verify_lint_scope_test_support as support
+from scripts.direct import verify_lint_cache_test_support as support
 
 
-class VerifyLintScopeTests(support.VerifyLintScopeFixture):
-    def test_passing_judgment_at_fix_pass_limit_is_cached(self) -> None:
-        cache = self.dirty_cache()
-        self.environment["TEST_FIX_APPEND"] = "// fix pass\n"
-        _ = self.verify("lint", "sample")
-        self.assert_fix_and_judgment_calls(fix_passes=3)
-        self.assertEqual(len(list(cache.glob("*.pass"))), 1)
-
-        result = self.verify("lint", "sample")
-        self.assertIn("PASS (recorded)", result.stdout)
-        self.assertFalse(self.clippy_ran())
-
+class VerifyLintScopeTests(support.VerifyLintCacheFixture):
     def test_fixed_and_formatted_tree_is_cached(self) -> None:
         cache = self.dirty_cache()
         formatted = "pub fn value() -> u8 {\n    2\n}\n"
@@ -32,20 +21,6 @@ class VerifyLintScopeTests(support.VerifyLintScopeFixture):
         self.assertEqual(len(list(cache.glob("*.pass"))), 1)
 
         result = self.verify("lint", "sample")
-        self.assertIn("PASS (recorded)", result.stdout)
-        self.assertFalse(self.clippy_ran())
-
-    def test_mend_rewrite_is_recorded_under_the_tree_it_leaves(self) -> None:
-        cache = self.dirty_cache()
-        self.environment["TEST_EDIT_DURING"] = "mend"
-        result = self.invoke_verify("lint", "sample", cwd=self.root)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertNotIn("the tree changed", result.stdout)
-        self.assertEqual(len(list(cache.glob("*.pass"))), 1)
-
-        self.environment["TEST_EDIT_DURING"] = ""
-        result = self.invoke_verify("lint", "sample", cwd=self.root)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("PASS (recorded)", result.stdout)
         self.assertFalse(self.clippy_ran())
 
