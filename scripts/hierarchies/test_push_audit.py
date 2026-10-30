@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 from scripts.hierarchies import push_audit as audit
 from scripts.hierarchies import log_records
+from scripts.hierarchies.test_log_records import phone_overflow_lines, read_report_blocks, summary_lines
 from scripts.production import showrunners
 
 
@@ -26,16 +27,18 @@ SINCE = "2026-10-13T17:24:00-04:00"
 UNTIL = "2026-10-20T17:24:00-04:00"
 AT = "2026-10-15T12:00:00Z"
 REGISTERED_TEXT = "shutdown.stop_failed"
+AUDIT_SUMMARY_PREFIXES = ("Window:", "Pushes:", "ApprovedPriorityTwo:", "Source problems:")
 
 
 def detail_section(output: str) -> str:
-    return output[output.index("Sends after failed text checks"):].split("\n\nTotals per showrunner", 1)[0]
+    section = output[output.index("Sends after failed text checks"):].split("\n\nTotals per showrunner", 1)[0]
+    return " ".join(section.split())
 
 
 def total_cells(output: str) -> dict[str, list[str]]:
-    return {cells[0]: cells[1:] for line in output.splitlines()
-            if line.startswith(("showrunner / ", "machine service / ", "session / ", "all senders  "))
-            for cells in [re.split(r" {2,}", line)]}
+    return {row.measure: [row.value, str(row.n), row.window, row.source] for row in read_report_blocks(output)
+            if row.measure.startswith(("showrunner / ", "machine service / ", "session / "))
+            or row.measure == "all senders"}
 
 
 def session_names_in_literals(source: str, sessions: audit.TopLevelSessions) -> set[str]:
@@ -116,9 +119,9 @@ class PushAuditTest(unittest.TestCase):
                 patch.object(showrunners, "NOTIFIER_STATE_DIR", self.home / "notifiers"), \
                 redirect_stdout(io.StringIO()) as captured:
             self.assertEqual(audit.main(["report", "--since", SINCE, "--until", UNTIL]), 0)
-        summary = captured.getvalue().splitlines()
+        summary = summary_lines(captured.getvalue(), AUDIT_SUMMARY_PREFIXES)
         full = self.report()
-        full_summary = full.split("\n\n", 1)[0].splitlines()
+        full_summary = summary_lines(full, AUDIT_SUMMARY_PREFIXES)
         self.assertEqual(summary[-1], "Source problems: 1. Use --full to print the tables.")
         self.assertEqual(full_summary[-1], "Source problems: 1.")
         self.assertEqual(full_summary[:-1], summary[:-1])
@@ -180,8 +183,45 @@ class PushAuditTest(unittest.TestCase):
         output = self.report()
         self.assertIn("ApprovedPriorityTwo", detail_section(output))
         self.assertIn("hana", output)
-        self.assertIn("Emergency fixture", output)
+        self.assertIn("Emergency fixture", " ".join(output.split()))
         self.assertNotIn("Unapproved", detail_section(output))
+
+    def test_full_cli_preserves_long_detail_and_total_fields_in_phone_blocks(self) -> None:
+        title = "The completed fixture needs a decision about the next recorded phase and its user review"
+        records = [self.push(title, priority="2"),
+                   self.push("Registered fixture", text_id=REGISTERED_TEXT),
+                   self.push("Unapproved fixture")]
+        reviews = [self.failed_review(title, priority="2"),
+                   self.failed_review("Registered fixture", text_id=REGISTERED_TEXT),
+                   self.failed_review("Unapproved fixture")]
+        self.save(self.pushes, records)
+        self.save(self.reviews, reviews)
+        output = self.report()
+        details = [row for row in read_report_blocks(output) if row.measure.startswith("2026-10-15T12:00:00+00:00 /")]
+        self.assertEqual([row.measure for row in details], [
+            "2026-10-15T12:00:00+00:00 / hana / " + record["title"] for record in records
+            if isinstance(record["title"], str)
+        ])
+        self.assertEqual([row.value for row in details], [
+            "ApprovedPriorityTwo / free text", "ApprovedRegisteredText / " + REGISTERED_TEXT,
+            "Unapproved / free text",
+        ])
+        self.assertEqual([row.n for row in details], [1, 1, 1])
+        window = log_records.window_bounds(SINCE, UNTIL, log_records.required_time(UNTIL))
+        self.assertTrue(all(row.window == window.label for row in details))
+        parsed_reviews = [review for record in reviews for review in audit.parse_review(record)]
+        sources = audit.AuditSources([audit.parse_push(record) for record in records], parsed_reviews, [],
+                                    audit.ProductionOwnership({}, {}), audit.TopLevelSessions(()))
+        expected = audit.audit(sources, window)
+        self.assertEqual([row.source for row in details], [
+            f"{entry.classification.code_path}; {entry.classification.reason}; {entry.evidence.value}"
+            for entry in expected.entries
+        ])
+        self.assertEqual(total_cells(output)["all senders"][:2], [
+            "after failed check 3; ApprovedPriorityTwo 1; ApprovedRegisteredText 1; Unapproved 1", "3",
+        ])
+        self.assertEqual(phone_overflow_lines(output), [])
+        self.assertEqual(" ".join(output.split()).count("Neither notification log records a key."), 1)
 
     def test_default_summary_matches_full_totals_and_has_no_table_rows(self) -> None:
         self.save(self.pushes, [
@@ -203,13 +243,14 @@ class PushAuditTest(unittest.TestCase):
         self.assertEqual(result, 0)
         summary = output.getvalue()
         full = self.report()
-        self.assertEqual(full.split("\n\n", 1)[0] + "\n",
-                         summary.replace(" Use --full to print the tables.", ""))
-        self.assertEqual(len(summary.splitlines()), 4)
-        self.assertIn("Window: 2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded).", summary)
-        self.assertIn("Pushes: 4 delivered; 3 after a failed text check.", summary)
-        self.assertIn("ApprovedPriorityTwo: 1; ApprovedRegisteredText: 1; Unapproved: 1.", summary)
-        self.assertIn("Source problems: 0. Use --full to print the tables.", summary)
+        self.assertEqual(summary_lines(full, AUDIT_SUMMARY_PREFIXES),
+                         [line.replace(" Use --full to print the tables.", "") for line in summary_lines(summary, AUDIT_SUMMARY_PREFIXES)])
+        self.assertEqual(len(summary_lines(summary, AUDIT_SUMMARY_PREFIXES)), 4)
+        self.assertIn("Window: 2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded).", summary_lines(summary, AUDIT_SUMMARY_PREFIXES))
+        self.assertIn("Pushes: 4 delivered; 3 after a failed text check.", summary_lines(summary, AUDIT_SUMMARY_PREFIXES))
+        self.assertIn("ApprovedPriorityTwo: 1; ApprovedRegisteredText: 1; Unapproved: 1.", summary_lines(summary, AUDIT_SUMMARY_PREFIXES))
+        self.assertIn("Source problems: 0. Use --full to print the tables.", summary_lines(summary, AUDIT_SUMMARY_PREFIXES))
+        self.assertEqual(phone_overflow_lines(summary), [])
         self.assertNotIn("Sends after failed text checks", summary)
         self.assertNotIn("Priority fixture", summary)
         self.assertNotIn("Totals per showrunner", summary)
@@ -227,7 +268,7 @@ class PushAuditTest(unittest.TestCase):
             result = audit.main(["report", "--since", SINCE, "--until", UNTIL])
         self.assertEqual(result, 0)
         self.assertIn("Pushes: 1 delivered; 1 after a failed text check.", output.getvalue())
-        self.assertIn("Source problems: 1. Use --full to print the tables.", output.getvalue())
+        self.assertIn("Source problems: 1. Use --full to print the tables.", summary_lines(output.getvalue(), AUDIT_SUMMARY_PREFIXES))
         self.assertNotIn("review.jsonl", output.getvalue())
 
     def test_registered_text_names_its_exception_and_id(self) -> None:
@@ -256,14 +297,14 @@ class PushAuditTest(unittest.TestCase):
         self.assertIn("Unapproved", detail_section(output))
         self.assertIn("hana", output)
         self.assertEqual(output.count("Neither notification log records a key."), 1)
-        self.assertIn("scripts/message/send.py user -> scripts/notify/pushover.py send()", output)
+        self.assertIn("scripts/message/send.py user -> scripts/notify/pushover.py send()", " ".join(output.split()))
         self.assertNotRegex(output, r"pushover\.py:\d+")
 
     def test_failed_review_evidence_does_not_require_outcome_annotation(self) -> None:
         self.save(self.pushes, [self.push("Historical fixture", priority="2")])
         self.save(self.reviews, [self.failed_review("Historical fixture", priority="2")])
         output = self.report()
-        self.assertIn("Historical fixture", output)
+        self.assertIn("Historical fixture", " ".join(output.split()))
         self.assertIn("ApprovedPriorityTwo", detail_section(output))
 
     def test_recorded_text_id_keeps_its_exception_after_removal_from_current_catalog(self) -> None:
@@ -471,11 +512,11 @@ class PushAuditTest(unittest.TestCase):
                          {audit.SessionWithoutProduction("first_session"): 1,
                           audit.SessionWithoutProduction("second_session"): 1})
         output = audit.render(report)
-        totals = [re.split(r" {2,}", line) for line in output.splitlines()
-                  if line.startswith("session / Personal work (no current production names it)  ")]
+        totals = [row for row in read_report_blocks(output)
+                  if row.measure == "session / Personal work (no current production names it)"]
         self.assertEqual(len(totals), 2)
-        self.assertEqual([cells[2] for cells in totals], ["1", "1"])
-        self.assertEqual({cells[1] for cells in totals},
+        self.assertEqual([row.n for row in totals], [1, 1])
+        self.assertEqual({row.value for row in totals},
                          {"ApprovedPriorityTwo 1; ApprovedRegisteredText 0; Unapproved 0",
                           "ApprovedPriorityTwo 0; ApprovedRegisteredText 0; Unapproved 0"})
         self.assertEqual(total_cells(output)["all senders"][1], "2")
@@ -690,7 +731,7 @@ class PushAuditTest(unittest.TestCase):
         self.save(self.pushes, [self.push(title, at=at, priority="2") for title, at in records])
         self.save(self.reviews, [self.failed_review(title, at=at, priority="2") for title, at in records])
         output = self.report(until="2026-10-20")
-        self.assertIn("Last local minute", output)
+        self.assertIn("Last local minute", " ".join(output.split()))
         self.assertNotIn("Next local day", output)
 
     def test_missing_log_reports_source_problem(self) -> None:
