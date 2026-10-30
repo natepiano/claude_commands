@@ -2146,6 +2146,92 @@ class ReportTests(unittest.TestCase):
         self.assertIn("| scratch (temp folders) | clippy | 30.0 s | 2 |", section)
         self.assertIn("| verify.sh (agents) | clippy | 5.0 s | 2 |", section)
 
+    def test_cpu_disk_pressure_follows_memory_and_reports_two_hosts(self) -> None:
+        self.write(self.root / "natedev" / "samples-2026-10.jsonl",
+                   sample(STAMP, cpu_stall_some_us=10_000_000, io_stall_some_us=1_000_000,
+                          io_stall_full_us=500_000, cpu_idle_ticks=1000, cpu_iowait_ticks=10, cpu_total_ticks=2000),
+                   sample("2026-10-02T12:01:00.000Z", cpu_stall_some_us=34_720_000,
+                          io_stall_some_us=2_860_000, io_stall_full_us=1_100_000,
+                          cpu_idle_ticks=6200, cpu_iowait_ticks=50, cpu_total_ticks=12000))
+        self.write(self.root / "mac" / "samples-2026-10.jsonl",
+                   sample("2026-10-02T12:00:30.000Z", host="mac", cpu_stall_some_us=80_000_000,
+                          cpu_stall_full_us=10_000_000, io_stall_some_us=5_000_000, io_stall_full_us=2_000_000,
+                          cpu_idle_ticks=100, cpu_iowait_ticks=20, cpu_total_ticks=200),
+                   sample("2026-10-02T12:02:30.000Z", host="mac", cpu_stall_some_us=92_000_000,
+                          cpu_stall_full_us=16_000_000, io_stall_some_us=5_000_000, io_stall_full_us=2_000_000,
+                          cpu_idle_ticks=1700, cpu_iowait_ticks=220, cpu_total_ticks=2200))
+        text = self.render()
+        headings = [line for line in text.splitlines() if line.startswith("### ")]
+        self.assertEqual(headings[headings.index("### Memory pressure") + 1], "### CPU and disk pressure")
+        section = self.section_lines(text, "### CPU and disk pressure")
+        self.assertIn("Source: 60 s machine samples (/proc/pressure/cpu, /proc/pressure/io, /proc/stat).", section)
+        self.assertIn("natedev: CPU some 41.2%, full —; IO some 3.1%, full 1.0%; CPU idle 52.0%, iowait 0.4% (of 1.0 min sampled)", section)
+        self.assertIn("mac: CPU some 10.0%, full 5.0%; IO some 0.0%, full 0.0%; CPU idle 80.0%, iowait 10.0% (of 2.0 min sampled)", section)
+
+    def test_cpu_disk_pressure_counts_reboot_counters_from_zero(self) -> None:
+        self.write(self.root / "natedev" / "samples-2026-10.jsonl",
+                   sample(STAMP, cpu_stall_some_us=99_000_000, io_stall_some_us=9_000_000,
+                          cpu_idle_ticks=9000, cpu_iowait_ticks=900, cpu_total_ticks=10000),
+                   sample("2026-10-02T12:01:00.000Z", boot_id="new-boot", cpu_stall_some_us=30_000_000,
+                          io_stall_some_us=6_000_000, cpu_idle_ticks=200, cpu_iowait_ticks=20, cpu_total_ticks=1000))
+        section = self.section_lines(self.render(), "### CPU and disk pressure")
+        self.assertIn("natedev: CPU some 50.0%, full —; IO some 10.0%, full —; CPU idle 20.0%, iowait 2.0% (of 1.0 min sampled)", section)
+
+    def test_cpu_disk_pressure_long_gap_is_not_sampled_time(self) -> None:
+        start = datetime.fromisoformat(STAMP)
+        after_gap = start + timedelta(seconds=report.MAX_SAMPLE_GAP_S + 1)
+        end = after_gap + timedelta(seconds=60)
+        self.write(self.root / "natedev" / "samples-2026-10.jsonl",
+                   sample(STAMP, cpu_stall_some_us=0),
+                   sample(after_gap.isoformat(), cpu_stall_some_us=900_000_000),
+                   sample(end.isoformat(), cpu_stall_some_us=915_000_000))
+        section = self.section_lines(self.render(), "### CPU and disk pressure")
+        self.assertIn("natedev: CPU some 25.0%, full —; IO some —, full —; CPU idle —, iowait — (of 1.0 min sampled)", section)
+
+    def test_cpu_disk_pressure_includes_maximum_gap_and_previous_day_baseline(self) -> None:
+        self.addCleanup(time.tzset)
+        with mock.patch.dict(os.environ, {"TZ": "UTC", "USER_ZONE": "UTC"}):
+            time.tzset()
+            midnight = datetime(2026, 10, 2, tzinfo=UTC)
+            before = midnight - timedelta(seconds=report.MAX_SAMPLE_GAP_S)
+            self.write(self.root / "natedev" / "samples-2026-10.jsonl",
+                       sample(before.isoformat(), cpu_stall_some_us=1_000_000),
+                       sample(midnight.isoformat(), cpu_stall_some_us=1_000_000 + report.MAX_SAMPLE_GAP_S * 250_000))
+            section = self.section_lines(self.render("2026-10-02"), "### CPU and disk pressure")
+        self.assertIn("natedev: CPU some 25.0%, full —; IO some —, full —; CPU idle —, iowait — (of 5.0 min sampled)", section)
+
+    def test_cpu_disk_pressure_null_pairs_do_not_dilute_individual_shares(self) -> None:
+        self.write(self.root / "natedev" / "samples-2026-10.jsonl",
+                   sample(STAMP),
+                   sample("2026-10-02T12:01:00.000Z", cpu_stall_some_us=100_000_000,
+                          io_stall_some_us=10_000_000, cpu_idle_ticks=100, cpu_iowait_ticks=10, cpu_total_ticks=1000),
+                   sample("2026-10-02T12:02:00.000Z", cpu_stall_some_us=130_000_000,
+                          io_stall_some_us=16_000_000, cpu_idle_ticks=600, cpu_iowait_ticks=None, cpu_total_ticks=2000),
+                   sample("2026-10-02T12:03:00.000Z", cpu_stall_some_us=None,
+                          io_stall_some_us=28_000_000, cpu_idle_ticks=2600, cpu_iowait_ticks=30, cpu_total_ticks=6000),
+                   sample("2026-10-02T12:04:00.000Z", cpu_stall_some_us=200_000_000,
+                          io_stall_some_us=None, cpu_idle_ticks=2700, cpu_iowait_ticks=40, cpu_total_ticks=None))
+        section = self.section_lines(self.render(), "### CPU and disk pressure")
+        self.assertIn("natedev: CPU some 50.0%, full —; IO some 15.0%, full —; CPU idle 50.0%, iowait — (of 2.0 min sampled)", section)
+
+    def test_cpu_disk_pressure_empty_old_and_single_samples_have_no_pairs(self) -> None:
+        section = self.section_lines(self.render(), "### CPU and disk pressure")
+        self.assertIn("CPU and IO samples: none.", section)
+        self.write(self.root / "natedev" / "samples-2026-10.jsonl", sample(STAMP),
+                   sample("2026-10-02T12:01:00.000Z"))
+        self.write(self.root / "mac" / "samples-2026-10.jsonl",
+                   sample(STAMP, host="mac", cpu_stall_some_us=30_000_000))
+        section = self.section_lines(self.render(), "### CPU and disk pressure")
+        self.assertIn("CPU and IO samples: none.", section)
+        self.assertFalse(any(line.startswith(("natedev:", "mac:")) for line in section))
+
+    def test_cpu_ticks_without_psi_still_report_host(self) -> None:
+        self.write(self.root / "natedev" / "samples-2026-10.jsonl",
+                   sample(STAMP, cpu_idle_ticks=100, cpu_iowait_ticks=10, cpu_total_ticks=200),
+                   sample("2026-10-02T12:01:00.000Z", cpu_idle_ticks=500, cpu_iowait_ticks=20, cpu_total_ticks=1200))
+        section = self.section_lines(self.render(), "### CPU and disk pressure")
+        self.assertIn("natedev: CPU some —, full —; IO some —, full —; CPU idle 40.0%, iowait 1.0% (of 0.0 s sampled)", section)
+
     def test_memory_pressure_uses_sample_peaks_and_reboot_counter_deltas(self) -> None:
         self.write(
             self.root / "natedev" / "samples-2026-10.jsonl",

@@ -1,8 +1,76 @@
 # Long-lived Codex workers and held Astra roles
 
+Code reviewers belong to the unit ledger. `assign.sh --role review` resumes
+`<worktree>-review`; concurrent work uses `<worktree>-review2`. Both are
+read-only and persist across phases and plans. The first dispatch adopts the
+unit's leased thread before ordinary allocation. A busy lease holds its slot
+until it can move. After the move, resume, queued messages, idle checks and
+restart use only the unit transport; the former pool state is an unread archive.
+`review.sh --pool code` and `--lease` are ignored for one release with one
+stderr line. `--pool ui` refuses; the fresh Claude helper in `<UXReview/>`
+remains the design check.
+
 ## What it is
 
-A `/unit:direct` run opens its Codex workers once and keeps them for the rest of the run. Every later phase, repair round, broad review lens, closure review and phase-review architect pass goes to a worker that is already open, with `--to <full-worker-name>`. The exception is a phase on the pool arm of a production with a review pool: its code reviews go to the production's pooled reviewers, which are not workers of the run (`docs/as-built/review-pool.md`). A worker can change role between tasks: a writer becomes a tester, a tester becomes a reviewer, or a writer takes the adversary lens against its own code. Before an open worker gets new work, the launcher compacts its thread if the recorded context is over a threshold. A turn that fills the context window gets the follow-up "Continue where you stopped." When a phase finishes, its turns end but its threads stay open. The threads end only when `end_session.sh` stops the run's app-server. `scripts/whoami/worker_usage.py` checks whether this saves Codex usage. It reads the usage store (`docs/as-built/usage-ledger.md`), compares weighted Codex usage per checkpointed phase before and after the go-live time, and reports account switches per week and credits used per day alongside.
+A unit keeps its worker threads across phases and plans. `assign.sh` selects
+an idle worker by role, resumes it, and claims it for the dispatch. Code review
+uses the unit's read-only `review` workers. Writers keep their writing roles.
+Each follow compacts when the recorded context exceeds the configured limit.
+Phase cleanup ends turns and keeps threads. Unit pause, move and end use the
+worker ledger. Usage reports compare checkpointed phases through the usage store.
+
+## Unit code reviewers
+
+Code reviewers use the ordinary unit worker ledger. The first own dispatch
+adopts the unit's leased code thread before opening any new reviewer. A busy
+lease holds `review`, so concurrent work uses `review2`. A later dispatch
+adopts the first thread when its turn ends.
+
+| Worker slot | Role | Access | Lifetime |
+| --- | --- | --- | --- |
+| `review` | `review` | Read only | Keep the thread across phases and restarts. |
+| `review2` (and later numbers) | `review` | Read only | Keep each concurrent reviewer's thread. |
+
+A reviewer's address is `<worktree>-review` or `<worktree>-review2`. Its record
+keeps `slot: review` or `slot: review2` apart from `role: review`. Its shown job
+uses the `code_reviewer` key from `config/names.toml`. Reviewers persist, pause,
+move and end by the same ledger operations as writers. `workers.py resolve
+--role review` reuses an idle reviewer; it opens a read-only thread only when no
+reviewer can take the work.
+
+One renderer makes every worker's thread title and message prefix:
+`workers.shown_name`. A unit run gives `<production> · <unit> · <job>[ <n>]`,
+with the unit's `-unit` suffix removed. The job label comes from
+`config/names.toml`: `implementer`, `tester`, `repair_worker` or
+`code_reviewer` for the `impl`, `test`, `fix` and `review` roles, and `worker`
+for any other role. The second holder of a role gets the number 2, and so on.
+A held design, or a run outside a production, takes its placement from the
+roster (`roster.mesh_title`). Each turn sets the title again, so it follows the
+current assignment.
+
+### Transfer the leased code reviewers
+
+Read the proposed transfer first. Name each destination run explicitly:
+
+```sh
+python3 scripts/direct/workers.py transfer-reviewers --production <slug> \
+  --session-dir <unit-run> --session-dir <another-unit-run>
+```
+
+The default prints `preview: would migrate` and writes nothing. It also lists
+busy reviewers as deferred, conflicts, and each skipped UI or unleased reviewer.
+Use `--apply` for an explicit move. Each applied result names the destination
+owner and the checked thread id. The command exits non-zero while any leased
+code reviewer is deferred or in conflict.
+
+The move keeps the thread id, account home, account-move marker, standing
+instructions and queued messages. It rejects an inbox with invalid queue fields
+and names its path. Both inboxes keep their bytes on that refusal. It fences
+the old transport, carries queued server input and releases the old writer,
+then registers the unit worker. The journal and inbox receipts let a rerun
+finish an interrupted move without copying messages twice. The unit receipt
+ends archive reads after the durable lease removal. The command prints the
+archive path; moved workers do not read it. This phase does not run a live apply.
 
 ## How it works
 
@@ -10,7 +78,7 @@ A `/unit:direct` run opens its Codex workers once and keeps them for the rest of
 
 Each run has one detached `codex app-server --listen ws://127.0.0.1:<port>`. Each worker is a named, non-ephemeral thread on it.
 
-**Server environment.** `_start_server` gives the server the caller's environment with `CODEX_HOME` set to the workers home. When `--session-dir` is a child of a unit run root (`RUN_ROOTS`, `/tmp/claude/unit` and `/tmp/claude/delegate`), it also sets `UNIT_RUN_DIR` to that folder and `TMPDIR` to its `tmp/` folder, replacing any values the caller carries. Worker processes inherit it: `verify.sh` takes the cargo token on that board, and the berth hook (`scripts/hooks/pre-tool-use-berth.py`) checks that run's open phases. The caller's copy cannot be used: implement.sh exports it only after its claim step, and the claim's `compact` call starts the server when none is running. On 2026-10-17, 11 of 13 live app-servers lacked it, all three started by that `compact` call among them. A review pool's mesh directory (`mesh/<generation>/`), and any other mesh directory outside the run roots, keeps the caller's environment unchanged: one pool server serves the turns of many units, so no single run is right for it, and a reviewer edits nothing.
+**Server environment.** `_start_server` gives the server the caller's environment with `CODEX_HOME` set to the workers home. When `--session-dir` is a child of a unit run root (`RUN_ROOTS`, `/tmp/claude/unit` and `/tmp/claude/delegate`), it also sets `UNIT_RUN_DIR` to that folder and `TMPDIR` to its `tmp/` folder, replacing any values the caller carries. Worker processes inherit it: `verify.sh` takes the cargo token on that board, and the berth hook (`scripts/hooks/pre-tool-use-berth.py`) checks that run's open phases. The caller's copy cannot be used: implement.sh exports it only after its claim step, and the claim's `compact` call starts the server when none is running. On 2026-10-17, 11 of 13 live app-servers lacked it, all three started by that `compact` call among them. A retained legacy mesh directory (`mesh/<generation>/`), and any other mesh directory outside the run roots, keeps the caller's environment unchanged: one pool server serves the turns of many units, so no single run is right for it, and a reviewer edits nothing.
 
 For unit runs, `start`, `prime`, an explicit `follow --cwd`, and resident turn transitions pass their known cwd to `ensure_server`. Direnv's nearest `.envrc` at or above that cwd selects the dev-shell folder, so turns in worktree subfolders share the same server. `direnv status --json` must identify that file as allowed (`state.foundRC.allowed == 0`) before the server starts through `direnv exec <dev-shell folder> env <managed assignments> codex …`. The approval check does not evaluate the shell. A missing or unapproved `.envrc` selects the ordinary launch. A missing direnv, failed or timed-out probe, or unreadable status is an unknown result: it keeps a healthy recorded server and its saved dev-shell preference. Without a healthy server, an unknown result starts an ordinary server.
 
@@ -27,8 +95,8 @@ The verbs:
 | Verb | Signature | Behavior |
 | --- | --- | --- |
 | `start` | `--session-dir --name [--role impl\|test\|fix\|review] [--lens] --cwd --prompt-file --summary-file [--reply-file] --log-file [--model --effort --service-tier] [--sandbox danger-full-access] [--resident]` | Opens a thread and blocks until its turn ends. `--role` is optional, and roleless threads such as ask-a-friend friends leave it out. A given role, with `--lens` when passed, is appended to `agents.jsonl` for the new thread. |
-| `follow` | `--session-dir --to --role (required) [--lens] [--claim-pid] --message-file --summary-file [--reply-file] --log-file [--model --effort --service-tier] [--cwd] [--read-only] [--image …]` | Runs one more turn on a finished thread. If the old server is gone, it resumes the thread on a new one. `--cwd`, `--read-only` and `--image` apply to that turn only and exist for the review pool; without them the request is the worker's usual one. |
-| `prime`, `fork`, `reset` | see `docs/as-built/review-pool.md` | Create a read-only reviewer template with standing instructions, fork a named reviewer from it, and remove every turn from an idle reviewer. Only the review pool calls them. |
+| `follow` | `--session-dir --to --role (required) [--lens] [--claim-pid] --message-file --summary-file [--reply-file] --log-file [--model --effort --service-tier] [--cwd] [--read-only] [--image …]` | Runs one more turn on a finished thread. If the old server is gone, it resumes the thread on a new one. `--cwd`, `--read-only` and `--image` apply to that turn only and also apply to unit-owned reviewers; without them the request is the worker's usual one. |
+| `prime`, `fork`, `reset` | see `docs/as-built/review-pool.md` | Create a read-only reviewer template with standing instructions, fork a named reviewer from it, and remove every turn from an idle reviewer. Only the retained legacy allocator calls them. |
 | `compact` | `--session-dir --to` | Exits 2 for a worker that is running or busy, a worker with no recorded context size, and a worker whose size is `not_measured_since_compaction` (`size not measured since its last compaction; compact refused`). Otherwise it reads the entry's `revision`, resumes the thread, waits up to 60 s (`COMPACT_IDLE_WAIT_SECS`) for a turn still live on it to end, exits 3 (`COMPACT_TURN_STILL_LIVE`) if one stays live, and calls `thread/compact/start`. It waits until the compaction turn has a `thread/compacted` notice or a `contextCompaction` item, a token-usage update and a `turn/completed`. It then writes the new size under `RosterUnchanged(thread_id, revision)`, so a turn that wrote the entry in between keeps its record. A size above 0 prints `compacted <worker>: <before> -> <after> tokens`; a compaction turn that reports 0 stores `not_measured_since_compaction` and prints `compacted <worker>: <before> tokens, size not measured until its next turn`. A compaction that has not finished in 300 s (`CompactionTimedOut`) is interrupted with `turn/interrupt` and the thread is read until idle, up to the same 60 s: idle is exit 1 with `…; interrupted the compaction turn, the worker is idle and not compacted`, so a follow-up can still be sent; a turn still live is exit 3. |
 | `can-follow` | `--session-dir --to --role [--lens] [--claim-pid]` | Refuses a worker that cannot take a follow-up. With `--claim-pid`, it claims the worker under the roster `flock`: it sets `status: starting`, `launcher_pid`, `previous_status`, the new `role`, and `previous_role` (the role the worker held before), and appends the role and lens to the role log `agents.jsonl` (`docs/as-built/usage-ledger.md`). |
 | `release-follow` | `--session-dir --to --claim-pid` | Releases a claim that never started a turn. It restores `previous_role`, or removes `role` if the worker had none, returns the worker to its previous status, and appends the restored role to `agents.jsonl`. A follow that did run keeps the role it was claimed with, so after a completed review the worker's role stays `review`. |
@@ -79,26 +147,24 @@ The flag is cleared by any `item/completed` from the worker's own work, but not 
 - It reads the threshold from `config/direct.conf` (`UNIT_CONFIG` can override the path). A missing, non-numeric or non-positive value exits 2 with an error naming the key.
 - A worker assigned a different role keeps its slot as the 9th argument and changes only the task and pass-kind words.
 
-**`scripts/direct/review.sh [--to <worker> | --slot <new-slot> | --pool code|ui --lease <slug>/<unit>/<phase>] <session_dir> [working_dir] [prompt_file] [task] [role_description] [pass_activity] [pass_index] [lens] [early_ready_file]`**
+**Code review dispatch.** Use `assign.sh --role review --session-dir <run>
+--phase <phase> --prompt <file> --cwd <worktree>`. Each broad-review lens has
+its own dispatch; closure review omits the lens. The returned handle names its
+status, log and summary. The allocator uses `review`, then `review2` when the
+first worker is busy. Both threads stay read-only.
 
-`lens` must be one of `adversary`, `contract`, `craft` or `ux`. Lens `ux` is the design check: it records no review pass, since the unit director's `UX review` activity carries that time. Findings and status are keyed by pass and lens, never by worker: `review_findings_<N>[_<lens>].txt`, `review_status[_<lens>]`. The agent log adds the worker, `review_agent_<N>[_<lens>]-<slot>.log` for a worker and `-pool` for a pool reviewer, so a second worker on the same pass cannot truncate the first one's log.
+`review.sh` remains a compatibility launcher. With no recipient it resolves
+the unit's own reviewer. `--to` follows an explicit worker and `--slot` names
+an explicit extra worker. Both use read-only access. `--pool code` and `--lease`
+are ignored with one stderr line; `--pool ui` refuses and points to the fresh
+Claude helper in `<UXReview/>`. It never calls the old allocator.
 
-- **`--pool code|ui --lease …`**: reviews on a pooled reviewer of the production, on a read-only turn. `docs/as-built/review-pool.md` describes this path.
-- **`--to <worker>`**: reviews on an open worker.
-  - It writes one turn record per attempt and marks it `canceled` on TERM, INT or HUP, exiting 143, 130 or 129 (`docs/as-built/review-pool.md`, Turn record). Only a pool review's `--lease` names the unit and phase in that record.
-  - The recorder slot is the worker name's last hyphen segment. It must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$`.
-  - The family must be Codex with the mesh on.
-  - Under `impl_worker_claim.lock`, it compacts when the recorded size is an integer above the threshold (best-effort, one board line), then claims with `can-follow --role review`.
-  - The claim happens before any artifact is written, so a refusal for a busy worker cannot overwrite another review's status or findings.
-  - It then runs `codex_mesh.py follow --role review`, and releases the claim on exit.
-- **`--slot <name>`**: opens a new worker named for its role (`review`, `review2`, `fix2`).
-  - The name must match `^[A-Za-z][A-Za-z0-9_]{0,31}$`, so it cannot contain a hyphen.
-  - It runs `codex_mesh.py start --role review` with the default `danger-full-access` sandbox.
-  - After the turn it writes `impl_worker_<slot>.json` with the configured implementation model of the family (`worker.<family>` `implementation`, or `impl` if that is not set), not the review model. A later `implement.sh --to` can then give the worker writing or repair work.
-  - The unit keeps the worker across run ends until the unit is retired.
-- **Neither flag**: runs the fresh blind reviewer through `agent_exec.sh … readonly`, with no address (`mesh=none`). The skills use this form only for a review outside a run.
+Every review attempt records `arm: own`. Records under
+`review_turns/<run>/<started>-<pid>-<sequence>.json` keep separate attempts from
+one launcher. History reads both earlier `arm: pool` and current `arm: own`
+records. No recorded review differs from a recorded review with zero findings.
 
-**Tree guard (assigned and pooled reviews).** Before the turn, `review.sh` runs `review_tree.py baseline`, which records HEAD and, for each path `git status` names (untracked, non-ignored files included), its HEAD, index and worktree entries: mode and blob id, a symlink's target standing for its content.
+**Compatibility launcher tree guard.** Before the turn, `review.sh` runs `review_tree.py baseline`, which records HEAD and, for each path `git status` names (untracked, non-ignored files included), its HEAD, index and worktree entries: mode and blob id, a symlink's target standing for its content.
 
 After the turn `review_tree.py changes` checks every path that was dirty before or after, or that HEAD moved under, and lists each one whose entries differ. When two or more phases are open in the session and the review names its phase with `--phase`, a changed path that another open phase's `phases/<phase>/files` list holds is that phase's writer at work: the launcher log notes it and the check leaves it out. A path the reviewed phase holds, or no phase holds, stays the review's. Any path left makes the review status `error`, prints `ERROR: review worker <worker> changed the working tree: <paths>`, posts `blocked` on the board, and keeps the findings file. An early review, which starts while the writer is still running, takes this snapshot when its early-ready sentinel appears.
 
@@ -106,13 +172,15 @@ After the turn `review_tree.py changes` checks every path that was dirty before 
 
 The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/direct/dual_review.md` (`<TeamReview/>` and `<ReviewPromptContract/>`), `docs/direct/run_phase_review.md`, `docs/direct/write_prompt_contract.md` (`<RoleReassignment/>`) and `commands/plan/phase_review.md`:
 
-- Each lens gets a different open worker, and an idle open worker, a writer included, takes a lens before a new worker opens. Idle workers that did not write the files under review go first; then a writer takes one, arguing against its own choices on the `adversary` lens.
-- Roles move between workers; slots do not. Any open worker may take any role, including in the middle of a phase. Before dispatching, post a board `handoff` that names the slot, the role it leaves and the role it takes. The new prompt has the worker run `board.sh role` before its first tool call.
-- If every open worker is busy, open an extra worker named for its role with `--slot` (`review`, then `review2`; `fix2` for repair) and keep it with the unit across run ends. Never name an extra worker with a bare number.
-- Only the adversary lens starts early, and the director records its worker in `EARLY_REVIEW_SLOT`. The closure review and the phase-review architect go to an open worker with `--to`.
-- Every review prompt opens with a role switch: "You are slot <slot>, now working as a reviewer. Edit nothing. Read the diff cold as if someone else wrote it. If you wrote any of the code, argue against your own choices as an adversary would." The prompt also gives the concrete `board.sh role … review` command for the worker's first tool call.
-- Every prompt carries the Three Gods sentence written out in full: opening, later-phase, repair, review and follow-up prompts alike. It also carries the Type Design Contract, verbatim for a new worker or as the allowed pointer for a follow-up. Compaction can erase earlier prompt text, which is why each prompt repeats them.
-- A new worker opens only when no open worker can take the work: the assignment needs more workers, every open worker is busy, or a reusable thread is gone. A replacement under the same name starts fresh and gets an opening prompt.
+- Each lens dispatches the unit's own read-only reviewer with `assign.sh --role
+  review`. The allocator reuses a thread before opening the next concurrent slot.
+- Only the adversary lens starts early. Keep its dispatch handle and selected
+  slot for Stage 2 and cancellation. Closure review uses the same role without
+  a lens.
+- Each prompt tells the reviewer to read the tree again, names the expected HEAD,
+  and keeps `config/review/code.md` as its standing instructions.
+- Each prompt carries the Three Gods sentence and the Type Design Contract.
+  Compaction can remove earlier text, so later dispatches repeat them.
 
 `scripts/direct/progress_history.py` gives each extra worker (`review2`, `fix2`, …) its own `Agent N` number after `impl` and `test`, in the order workers first appear: a `- **Agent N**` line in every report, and a round-table column under `progress --tables`. A worker appears when it records a pass or receives a board handoff. The original `review` worker keeps its earlier rule: it shows only while a displayed stage assigns it.
 
@@ -183,7 +251,8 @@ skips ambiguous unit matches; see `production-rename.md`.
 | --- | --- |
 | `scripts/agents/codex_mesh.py` | Worker threads, roster, compaction, overflow press-on, role claim and restore, sweep |
 | `scripts/direct/implement.sh` | Writer, tester and repair dispatch; `--to` reuse with identity check, claim and compaction |
-| `scripts/direct/review.sh` | Reviews: `--to` reuse, `--slot` new worker, `--pool` pooled reviewer, tree guard, fresh read-only fallback |
+| `scripts/direct/assign.py`, `assign.sh` | Unit role allocation, persistent reviewer dispatch, read-only follow and own review records |
+| `scripts/direct/review.sh` | Compatibility flags, explicit recipient follow, own allocation and tree guard |
 | `scripts/direct/end_session.sh` | Unbinds held design roles, preserves a live director's workers and servers, otherwise pauses recorded runs; no sweep |
 | `scripts/direct/remove_run_scratch.py` | Removes run and tracked scratch while preserving live detached commands' working directories |
 | `scripts/direct/remove_workers.py` | Removes unheld Claude workers at phase end (`--session-dir`, repeatable); preserves unit workers; no sweep |
@@ -207,7 +276,7 @@ skips ambiguous unit matches; see `production-rename.md`.
 - Compaction, the worker claim and the identity check run under one lock (`impl_worker_claim.lock`). Compaction is best-effort: a failure posts one board line and never blocks the follow-up.
 - A worker's identity file is anchored to the implementation model, whichever launcher opened the worker.
 - A assigned review claims its worker before writing any artifact, and fails if the working tree changed in any of HEAD, status, tracked diff or untracked content.
-- Review artifacts are keyed by pass and lens; the recorder pass is keyed by the slot that ran it (`pool_<reviewer>` for a pooled review), and a review with lens `ux` records none.
+- Review artifacts are keyed by pass and lens; the recorder pass is keyed by the slot that ran it and a fresh Claude design check records no code-review pass.
 - Every prompt to a worker, follow-ups included, repeats the Three Gods sentence and the Type Design Contract, verbatim or by pointer.
 - Only the worker's own work items clear the overflow guard; `userMessage` and `contextCompaction` items never do.
 - `sweep` treats every doubt as in use, judges a second time under the owner's lock before stopping, and never touches the `unix://` daemon. A sweep failure never stops worker cleanup.
@@ -235,7 +304,7 @@ skips ambiguous unit matches; see `production-rename.md`.
 - **Open once.** Before this design, each phase opened new `impl` and `test` threads and every review was a new thread, so every task paid a worker's startup cost. A worker that stays open pays that cost once per run.
 - **Compact between tasks.** Startup turned out to be a small share of usage. Over 1,437 natedev threads, usage before the first edit was 19% of uncached input, 4% of cached input and 10% of output: about 6% of weighted usage. Most usage is cached context that long threads read again on every call. A long-lived worker saves its startup but carries its context, so frequent compaction is what keeps the saving.
 - **Codex workers only.** The cost being addressed is Codex worker startup. Claude workers are the fallback family and keep their existing lifecycle.
-- **Reviews on open workers, without the read-only sandbox.** A review on an open worker runs on that thread's existing sandbox, and a worker may review its own work. The tree guard enforces "edits nothing" in place of the sandbox. A pooled reviewer is not a worker: its turn is read-only and the tree guard still runs after it. The fresh read-only reviewer remains only for reviews outside a run.
+- **Read-only unit reviewers.** Code review uses the unit's own role and read-only sandbox. Writers keep their roles. The fresh Claude helper remains the design check.
 - **Verdict per checkpointed phase.** The amount of work changes from day to day, so usage per day would not compare the two windows. Account switches are too rare for a verdict: the baseline had 2 in about five days, too few to show a change within a week. They are reported alongside the verdict.
 - **Hyphens refused in `--slot`.** `--to` derives the slot from the worker name, so refusing hyphens is simpler than resolving a hyphenated slot from its recorded identity.
 - **Second-overflow error kept.** It stops a worker that fills its context again and again without doing work, so press-on cannot loop forever.
@@ -287,7 +356,7 @@ Other public functions: `queue_message`, `pending_messages`, `held_document`, `e
 
 **Authorization.** `_authorize` requires placement host = local host, a live holder from `resolve_holder` (unit holder: `unit_lookup.every_marked_unit` with a `LiveClaude`; showrunner holder: `production_tree.showrunner_sessions` and `sessions.running_sessions`), and `CLAUDE_CODE_SESSION_ID` equal to that session. A missing or ambiguous holder blocks dispatch but does not change the holder.
 
-**Models.** `resolve_model(role)` sources `scripts/agents/agents_config.sh` and runs `agents_resolve "guild.<role>"`; the family must be `codex`. `config/agents.conf` has `[assignments] guild=codex` and `[guild.codex] designer=gpt-6-astra:xhigh`, `reviewer=gpt-6-astra:xhigh`. A missing or invalid row refuses; there is no fallback model.
+**Models.** `resolve_model(role)` sources `scripts/agents/agents_config.sh` and runs `agents_resolve "guild.<role>"`; the family must be `codex`. `config/agents.conf` has `[assignments] guild=codex` and `[guild.codex] designer=astra:xhigh`, `reviewer=astra:xhigh` (the `astra` word resolves to `gpt-6-astra`). A missing or invalid row refuses; there is no fallback model.
 
 **Prompts.** A designer prompt is `config/guilds/designer.md` + `Use apply_patch for all repository edits. Edit only the bound output paths.` A reviewer prompt is `astra_review.review_prompt(document, "")`. `_prompt` writes the `astra_work.header_line` first (`PhaseWork` from the binding, else `StandaloneWork`), then the instructions, the holder's text and each pending message as `Pending message <id> from <source>: <text>`.
 
@@ -376,7 +445,7 @@ Other public functions: `queue_message`, `pending_messages`, `held_document`, `e
 
 ### Why roles outlive runs
 
-- **One store outside run roots.** A run folder ends with its run, and a `MeshWorker` hold ends with its folder. A design outlives several phases and runs, so its threads, prompts, replies and pending text live in `~/.local/state/guilds/roles/`, and the census uses a `HeldDesignRole` lifetime tied to that store. The review pool showed the pattern of lasting threads outside run roots. Copying a live roster into another run, or putting a design type inside the review pool, would give one thread two owners.
+- **One store outside run roots.** A run folder ends with its run, and a `MeshWorker` hold ends with its folder. A design outlives several phases and runs, so its threads, prompts, replies and pending text live in `~/.local/state/guilds/roles/`, and the census uses a `HeldDesignRole` lifetime tied to that store. Lasting design threads need their own holder records. Copying a live roster into another run would give one thread two owners.
 - **One designer and at most one reviewer per design.** The user's rule: one Astra writes and revises in the same thread; one Astra reviews in one thread. A fresh `codex exec` per round cannot prove one reviewer per design, and a reviewer pool that grows when busy breaks the rule, so a busy reviewer is reported, not replaced. One thread per role keeps the context and the cited rulings across rounds.
 - **One natedev authority with explicit checkout mappings.** A URL spelling, a new worktree or an unreachable host must not make a second identity for the same document. Reservation before creation and retries with the same request ID mean an uncertain launch never frees the slot.
 - **Raw pause refused for held roles.** `stop --pause` truncates pending text and drops queued text, and raw `stop` deletes server records without move markers. Held roles release servers only through `_release_held_server`, which parks queues and proves idle first.

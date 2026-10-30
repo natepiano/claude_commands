@@ -86,6 +86,30 @@ class UnitRenameTests(UnitRenameFixture):
         self.assertIn("unit: alpha-unit", (self.root / "vault/showrunners/other-sr/alpha-unit.md").read_text())
         self.assertIs(self.journal()["done"], True)
 
+    def test_apply_renames_a_note_owned_by_a_former_production_slug(self) -> None:
+        self.write(self.doc, self.doc.read_text().replace(
+            "## Production Context\n",
+            "## Production Context\n\n- **Formerly:** `old-name`\n",
+            1,
+        ))
+        _ = self.git("add", str(self.doc))
+        _ = self.git("commit", "-m", "Record the former production name")
+        note = self.root / "vault/showrunners/demo-sr/alpha-unit.md"
+        self.write(note, note.read_text().replace(
+            "production: demo",
+            'production_file: "https://github.com/example/project/blob/main/docs/plans/old-name-production.md"',
+        ))
+        before = note.read_bytes()
+        unrelated = self.root / "vault/showrunners/other-sr/alpha-unit.md"
+        unrelated_before = unrelated.read_bytes()
+
+        result = self.rename("apply", "alpha-unit", "gamma-unit")
+
+        self.assert_ok(result)
+        self.assertEqual(note.read_bytes(), before.replace(b"unit: alpha-unit\n", b"unit: gamma-unit\n"))
+        self.assertEqual(unrelated.read_bytes(), unrelated_before)
+        self.assert_ok(self.rename("verify", "alpha-unit", "gamma-unit"))
+
     def test_mul_add_naming_keeps_the_underscore_id(self) -> None:
         self.assert_ok(self.rename("apply", "mul_add-unit", "fma"))
         self.assertIn(f"| fma-unit | docs/plans/mul-add.md | `{self.rust / 'claude-demo-fma'}` | demo-fma |",

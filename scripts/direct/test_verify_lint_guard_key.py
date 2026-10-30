@@ -73,8 +73,7 @@ class VerifyLintGuardKeyTests(support.VerifyLintScopeFixture):
 
     def calculate_build_keys(self, *arguments: str, extra_environment: dict[str, str] | None = None,
                         target: str = "") -> tuple[str, str, str]:
-        """Run the production inline calculator without starting any Cargo work."""
-        source = support.VERIFY.read_text(encoding="utf-8").split("TREE_KEY_PY='\n", 1)[1].split("\n'", 1)[0]
+        """Run the shared production calculator without starting Cargo work."""
         metadata = cast(dict[str, object], json.loads(self.environment["TEST_METADATA"]))
         packages = cast(list[dict[str, object]], metadata["packages"])
         packages[0]["dependencies"] = []
@@ -82,7 +81,8 @@ class VerifyLintGuardKeyTests(support.VerifyLintScopeFixture):
         output = self.root / "test-build-inputs"
         output.unlink(missing_ok=True)
         result = subprocess.run(
-            [sys.executable, "-c", source, "--package", "sample", str(support.VERIFY),
+            [sys.executable, str(support.VERIFY.with_name("tree_watch.py")), "--key",
+             "--package", "sample", str(support.VERIFY),
              str(support.SCRIPTS / "lint/invoke.sh"), str(self.config), "--", "test", "sample", *arguments],
             input=json.dumps(metadata), cwd=self.root,
             env={**self.environment, "VERIFY_COMPUTE_TEST_BUILD": "1",
@@ -140,7 +140,6 @@ class VerifyLintGuardKeyTests(support.VerifyLintScopeFixture):
 
     def test_source_change_during_hold_refreshes_admission_and_recorded_build_inputs(self) -> None:
         source = support.VERIFY.read_text(encoding="utf-8")
-        calculator = source.split("TREE_KEY_PY='\n", 1)[1].split("\n'", 1)[0]
         # Use the actual hold wrapper and pre-run key setup, including their
         # ordering relative to invoke.sh's run_once and buildlog_begin.
         hold_wrapper = "# A build hold stops every natedev build," + source.split(
@@ -172,11 +171,11 @@ Path('admission.json').write_text(json.dumps({{'fresh': fresh,
             f'source {shlex.quote(str(support.SCRIPTS / "lint/invoke.sh"))}',
             f'PY={shlex.quote(sys.executable)}',
             f'VERIFY={shlex.quote(str(support.VERIFY))}',
-            f'TREE_KEY_PY={shlex.quote(calculator)}',
+            f'TREE_WATCH_SCRIPT={shlex.quote(str(support.VERIFY.with_name("tree_watch.py")))}',
             r'''CMD=test
 HOLD_WAIT_DIR="$PWD/tmp"
 tree_key() {
-  VERIFY_TEST_BUILD_INPUTS_FILE="$HOLD_WAIT_DIR/test-build-inputs" "$PY" -c "$TREE_KEY_PY" --package sample "$VERIFY" "$HOME/.claude/scripts/lint/invoke.sh" "$LINT_CONFIG_FILE" -- test sample --filter native_rate <<< "$TEST_METADATA"
+  VERIFY_TEST_BUILD_INPUTS_FILE="$HOLD_WAIT_DIR/test-build-inputs" "$PY" "$TREE_WATCH_SCRIPT" --key --package sample "$VERIFY" "$HOME/.claude/scripts/lint/invoke.sh" "$LINT_CONFIG_FILE" -- test sample --filter native_rate <<< "$TEST_METADATA"
 }
 build_hold_wait_local() {
   printf "// edited during hold\n" >> src/lib.rs

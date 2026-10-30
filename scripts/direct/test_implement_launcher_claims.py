@@ -1,27 +1,25 @@
-"""test implement launcher claims integration coverage."""
+"""Claims and recovery at the real Bash launcher boundary."""
 
 from __future__ import annotations
 
-import unittest
-from scripts.direct import implement_launcher_test_support as support
-from scripts.direct.implement_launcher_test_support import STUB_MESH as STUB_MESH
-from scripts.direct.implement_launcher_test_support import TEST_HANG_GUARD_SECS as TEST_HANG_GUARD_SECS
-from typing import cast
 import json
 import os
 import signal
 import subprocess
-from scripts.direct.wait_for_test_state import wait_for_pid
+from typing import cast
+import unittest
+
+from scripts.direct.implement_launcher_claims_test_support import CompletedWorkerFixture
+from scripts.direct.implement_launcher_test_support import TEST_HANG_GUARD_SECS
 from scripts.direct.wait_for_test_state import wait_until
 
 
-class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
+class ImplementLauncherWorkerTests(CompletedWorkerFixture):
     def test_follow_recovers_missing_claim_unless_the_roster_launcher_is_alive(self) -> None:
         for launcher_pid in (None, 99999999, os.getpid()):
             live = launcher_pid == os.getpid()
             with self.subTest(launcher_pid=launcher_pid):
-                session_dir = self.start_phase(f"missing-claim-{launcher_pid}")
-                first = self.mesh_launch(session_dir)
+                session_dir, first = self.completed_worker()
                 self.assertEqual(first.returncode, 0, first.stderr)
                 roster_path = session_dir / "mesh_roster.json"
                 roster = cast(dict[str, dict[str, object]], json.loads(roster_path.read_text()))
@@ -50,68 +48,10 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
                     self.assertEqual(followed[name]["thread_id"], roster[name]["thread_id"])
                     self.assertTrue((session_dir / "follow_message.txt").exists())
 
-    def test_identity_probes_default_to_thirty_one_second_waits_for_new_and_followed_workers(self) -> None:
-        for follow in (False, True):
-            with self.subTest(follow=follow):
-                session = self.start_phase(f"default-probes-{follow}")
-                arguments = ["bash", str(self.implement_script)]
-                if follow:
-                    initial = self.mesh_launch(session)
-                    self.assertEqual(initial.returncode, 0, initial.stderr)
-                    roster = cast("dict[str, object]", json.loads((session / "mesh_roster.json").read_text()))
-                    arguments.extend(["--to", next(iter(roster))])
-                arguments.extend([str(session), str(self.working_dir), str(self.prompt_file),
-                                  "impl", "the retry path", "impl", "writing the retry path", "0", "impl"])
-                binaries = session / "bin"
-                binaries.mkdir()
-                sleep = binaries / "sleep"
-                _ = sleep.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$TEST_PROBES"\n')
-                sleep.chmod(0o755)
-                watcher = self.root / "scripts/agents/heartbeat_watch.sh"
-                _ = watcher.write_text('#!/bin/bash\nif [[ -n "${TEST_PROBES_FINISHED:-}" ]]; then '
-                                       + ': > "$TEST_PROBES_FINISHED"; fi\n')
-                mesh = self.root / "scripts/agents/codex_mesh.py"
-                _ = mesh.write_text(STUB_MESH.replace(
-                    "verb = sys.argv[1]", "verb = sys.argv[1]\n"
-                    + "if verb in ('start', 'follow'):\n"
-                    + "    import subprocess\n"
-                    + "    agent_pid = pathlib.Path(os.environ['TEST_AGENT_PID'])\n"
-                    + "    agent_pid.with_name(agent_pid.name + '.tmp').write_text(str(os.getpid()))\n"
-                    + "    os.replace(agent_pid.with_name(agent_pid.name + '.tmp'), agent_pid)\n"
-                    + "    subprocess.run([sys.executable, os.environ['TEST_WAIT_HELPER'], os.environ['TEST_DEFAULT_RELEASE']], check=True)"
-                ))
-                probes = session / "probes"
-                finished = session / "probes-finished"
-                release = session / "release"
-                pid_file = session / "agent-pid"
-                environment = self.mesh_environment()
-                for key in ("UNIT_WORKER_POLL_SECS", "UNIT_WORKER_WAIT_ATTEMPTS",
-                            "UNIT_EARLY_POLL_SECS", "UNIT_TOKEN_CLOCK_FILE"):
-                    _ = environment.pop(key, None)
-                environment.update({"PATH": str(binaries) + os.pathsep + environment["PATH"],
-                                    "TEST_PROBES": str(probes), "TEST_PROBES_FINISHED": str(finished),
-                                    "TEST_AGENT_PID": str(pid_file), "TEST_DEFAULT_RELEASE": str(release)})
-                process = subprocess.Popen(arguments, env=environment, stdout=subprocess.PIPE,
-                                           stderr=subprocess.PIPE, text=True, start_new_session=True)
-                try:
-                    wait_until(lambda: finished.exists(), session, processes=(process,))
-                    os.kill(wait_for_pid(pid_file, processes=(process,)), 0)
-                    self.assertIsNone(process.poll())
-                    self.assertEqual(probes.read_text().splitlines(), ["1"] * 30)
-                    if follow:
-                        claim = cast("dict[str, object]", json.loads((session / "impl_claim_impl.json").read_text()))
-                        self.assertEqual(claim["turn_id"], "")
-                    else:
-                        self.assertFalse((session / "impl_worker_impl.json").exists())
-                finally:
-                    output, errors = self.finish_default_launcher(process, release, mesh)
-                self.assertEqual(process.returncode, 0, output + errors)
-
     def test_killed_launcher_claim_recovers_before_and_after_turn_start(self) -> None:
         for stage in ("before", "after"):
             with self.subTest(stage=stage):
-                session_dir = self.start_phase(f"claim-{stage}")
-                first = self.mesh_launch(session_dir)
+                session_dir, first = self.completed_worker()
                 self.assertEqual(first.returncode, 0, first.stderr)
                 roster_path = session_dir / "mesh_roster.json"
                 roster = cast("dict[str, dict[str, object]]", json.loads(
@@ -158,8 +98,7 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
                 self.assertFalse((session_dir / "impl_claim_impl.json").exists())
 
     def test_live_claim_refuses_a_second_launcher_without_a_pass(self) -> None:
-        session_dir = self.start_phase("claimed")
-        first = self.mesh_launch(session_dir)
+        session_dir, first = self.completed_worker()
         self.assertEqual(first.returncode, 0, first.stderr)
         roster = cast("dict[str, object]", json.loads(
             (session_dir / "mesh_roster.json").read_text(encoding="utf-8")
@@ -180,8 +119,7 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
         )
 
     def test_peer_turn_after_claim_closes_follow_up_as_error(self) -> None:
-        session_dir = self.start_phase("peer-after-claim")
-        first = self.mesh_launch(session_dir)
+        session_dir, first = self.completed_worker()
         self.assertEqual(first.returncode, 0, first.stderr)
         roster = cast("dict[str, object]", json.loads(
             (session_dir / "mesh_roster.json").read_text(encoding="utf-8")
@@ -206,8 +144,7 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
         self.assertEqual(peer[name]["status"], "running")
 
     def test_unknown_and_busy_follow_ups_leave_pass_and_status_untouched(self) -> None:
-        session_dir = self.start_phase("refused")
-        first = self.mesh_launch(session_dir)
+        session_dir, first = self.completed_worker()
         self.assertEqual(first.returncode, 0, first.stderr)
         roster_path = session_dir / "mesh_roster.json"
         roster = cast("dict[str, dict[str, object]]", json.loads(

@@ -48,6 +48,9 @@ invoke_mend() { echo 'fixture: mend'; }
 fmt_cargo() { :; }
 invoke_clippy_fix() { :; }
 invoke_clippy() { :; }
+start_tree_watch() { :; }
+finish_tree_watch() { :; }
+stop_tree_watch() { :; }
 tree_key() { echo fixed-tree; }
 taplo() { :; }
 run() { "$@"; }

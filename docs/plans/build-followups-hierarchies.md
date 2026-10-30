@@ -129,38 +129,28 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Ruled out:** changing an approved exception without the user (nate.adhoc went to the user); limiting the `validate()` change to push review (it adds failure quotes to held-question text and breaks nothing).
 
-### Phase 4 — The measure reads wait records and merge receipts, and the 4-week experiment starts  · status: todo
-**Depends on:** Phase 2; and sdlc gate G1, the wait records from phases-unit:
-- **Supplier:** phases-unit's HI7 phase, its Phase 6 (sdlc gate G1, 2026-10-28); its phase 7 commit 820357a2 sets the reader's schema and clears G1 when merged (sdlc, 2026-10-29).
-- **Record contract:** the shape sent to phases-unit on 2026-10-28, given under Spec below. phases-unit picks the file and the writer and sends both, with the commit, when its phase lands.
-- **Clears when:** that phase's checkpoint is merged to `origin/sdlc` and on `~/.claude` main, its message names the record file and commit, and the file holds at least one wait record and one merge receipt written by a real phase. Until then this phase does not start.
+### Phase 4 — The measure reads wait records and merge receipts, and the 4-week experiment starts  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** design Step 2 (HI7, approved as a 4-week experiment): `measure.py` reads the wait records and merge receipts that phases-unit builds, and the doc names the experiment's start and review date.
-
-**Hana link:** direct. The records show which waits slow Hana phases.
-
-**Spec:**
-- The record shape went to phases-unit on 2026-10-28 (showrunner ruling 3) the design needs: per wait, phase, owner, UTC start and end, and one kind (`WaitingForQuotaRefusal`, `WaitingForMemoryOrSlot`, `WaitingForMergeGate`, `WaitingForUser`, `WaitingForSupplier`, `ReadyWithoutCapacity`); per merge, a receipt (project, issue or plan phase, commit, target branch, merge time). The duty text goes to roles-unit. phases-unit picks the file and writer; this phase adapts to it.
-- `measure.py baseline` prints one `Hana wait / <kind>` row per supplied kind (six) and a receipts row: minutes by kind with n. Missing wait history (`HistoryNotRecorded`, never zero), a merge with no receipt (`ReceiptMissing`) and a wait whose cause is not recorded are distinct domain states at the loader boundary. The summary keeps its five lines; the rows print under `--full`. Readers are read-only typed loaders; a corrupt source prints a source-problem row.
-- Design doc: the experiment's start (first records on `~/.claude` main) and its review date, four weeks later.
-- Phase 6 counts a Hana wait as non-Hana-caused only when a record names the non-Hana holder of the account, slot or memory. Check that phases-unit's record shape carries that holder; if it does not, ask phases-unit (through the sdlc showrunner) to add it before the experiment starts.
-- Source: `progress_history.py waits --session-dir <S> [--since] [--until]`, schema at phases-unit 820357a2. External waits come from `wait_attribution.jsonl` as well as the run files; a production handoff wait has no phase.
-- Uncertain coverage (`uncertain_phase_n`, `attribution_miss_n`, each with its reason and candidates) prints as its own rows, never as a covered zero. Candidate phases carry no `wait_n`.
-- An unclosed wait has no end time: print it as unknown-ended with n, and leave it out of every completed-duration total.
+- `measure.py` defines `WaitKind` with six kinds: `WaitingForQuotaRefusal`, `WaitingForMemoryOrSlot`, `WaitingForMergeGate`, `WaitingForUser`, `WaitingForSupplier`, `ReadyWithoutCapacity`.
+- `read_wait_history` runs `progress_history.py waits --session-dir <S> [--since] [--until]` and parses the output into `CompletedWait`, `UnknownEndedWait`, `CoveredWaitHistory`, `UncertainWaitCoverage`, `PhaseWaitCoverage`, `HistoryNotRecorded`, `WaitCauseNotRecorded`, `WaitPhaseNotRecorded`, `ProductionHandoff`, `RecordedWaitOwner`/`WaitOwnerNotRecorded`, `NamedSupplier`/`NoNamedSupplier`, `RecordedWaitReason`/`WaitReasonNotRecorded` and `AttributionMiss`. External waits come from `wait_attribution.jsonl` and the run files. A production handoff wait has no phase.
+- `hana_wait_rows` prints one `Hana wait / <kind>` row per kind (minutes, n), unknown-ended rows with n, and `Hana wait / share of phase time with a recorded kind`. An unclosed wait stays out of every completed-duration total. Uncertain coverage prints as its own rows with reason and candidates, never as a covered zero.
+- `parse_receipt`, `read_receipts`, `receipt_for_merge` and `receipt_rows` print `merge receipts / all projects`, `Hana merge receipts / <branch>` (k/n), and one `Hana merge / ReceiptMissing` row per Hana merge with no receipt.
+- An external wait record with no `wait_id` prints a source-problem row, as does a corrupt source.
+- Design doc Step 2 records the experiment: first records 2026-10-29, review 2026-11-26.
 
 **Files:**
-- `scripts/hierarchies/measure.py`, `scripts/hierarchies/test_measure.py`
-- `docs/plans/build-followups-hierarchies-design.md` — Step 2 start and review date
+- `scripts/hierarchies/measure.py` — wait and receipt loaders, types and rows
+- `scripts/hierarchies/test_measure.py` — tests for each kind, each missing state, uncertain coverage, unclosed waits and phase-less handoff waits
+- `docs/plans/build-followups-hierarchies-design.md` — Step 1 numbers, Step 2 reader and experiment dates
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — `measure.py` and the doc
-- `test` — `test_measure.py`: fixtures for each wait kind, a window with no records, a merge with and without a receipt, each of the six kinds and each missing state, uncertain coverage that is not counted as zero, an unclosed wait left out of the minutes, and an external handoff wait with no phase
+**Binds later work:** missing history never reads as zero. The summary keeps five lines; the wait and receipt rows print under `--full`. Readers import shared helpers from `scripts/hierarchies/log_records.py`; `push_audit.py` never imports `measure.py`. The experiment start waits on a supplier holder field: a Hana wait counts as non-Hana-caused only when a record names the non-Hana holder of the account, slot or memory, and the supplier records do not carry that holder yet.
 
-**Constraints from prior phases:** the Baseline rows print `not recorded` today; `--since` and `--until` take dates and date-times. From phases-unit's architect review (sdlc, 2026-10-29): uncertainty never becomes zero waits, and the reader never invents a duration for an unclosed wait. From Phase 7: shared log-record helpers (`Window`, `MeasureRow`, `SourceProblem`, `field_*`, `record_time`, `object_record`, `table`, `window_bounds`, `TimeNotRecorded`) live in `scripts/hierarchies/log_records.py`; new readers import them from there, and `push_audit.py` never imports `measure.py`.
-
-**Acceptance gate:** unit tests green; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; `measure.py baseline --full` over the first records prints real wait and receipt rows. **Measure:** share of Hana phase time with a recorded wait kind, and share of merges with a receipt. **Review point (C53):** four weeks after the first records land; Phase 6 keeps or drops the step on it.
+**Gotchas:**
+- The supplier projection keeps only the worktree name for a phase (no `plan_doc`), so a retired Hana phase is not recognized.
+- `progress_history.py waits` drops a wait row with no `wait_id` and does not count it.
+- Live numbers, 2026-10-22..29: share 0.2% partial (`HistoryNotRecorded`=79); `WaitingForMemoryOrSlot` 148.5 min, n=13; 11 unknown-ended; 4 receipts across all projects; 0/25 Hana merges with a receipt.
 
 ### Phase 5 — A run end ends only workers whose unit director is gone or whose owner cannot be found  · status: done
 
@@ -184,7 +174,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 **Ruled out:** ending a named worker of a live director; ending OwnerUnknown before recovery fails; editing `codex_mesh.py` or `end_session.sh` from this unit.
 
 ### Phase 6 — The four-week review: which waits slow Hana, which links helped, and which trial steps stay  · status: todo
-**Depends on:** the checkpoints of Phases 3, 4 and 5, and the three review records: the Phase 3 and Phase 5 re-runs, which the unit director runs on 2026-11-12 (two weeks after both merged into sdlc as 3c5dea67 on 2026-10-29) and records in the design doc under Steps 1 and 4 (the push-audit re-run also confirms that `measure.py` and `push_audit.py` agree), and four weeks of Phase 4 records. The phase starts on the latest of these dates, never before.
+**Depends on:** the checkpoints of Phases 3, 4 and 5, and the three review records: the Phase 3 and Phase 5 re-runs, which the unit director runs on 2026-11-12 (two weeks after both merged into sdlc as 3c5dea67 on 2026-10-29) and records in the design doc under Steps 1 and 4 (the push-audit re-run also confirms that `measure.py` and `push_audit.py` agree; each re-run record holds the report's source-problem lines, because both reports exit 0 with source problems), Phase 12's checkpoint (merged before the 2026-11-12 re-run), and four weeks of Phase 4 records that carry the holder field (Phase 10). The phase starts on the latest of these dates, never before.
 
 #### Work Order
 
@@ -194,24 +184,29 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Spec:**
 - `measure.py compare --before <Baseline window> --after <the four-week window>`: the same rows for both windows, each with before, after and the change; `not recorded` rows stay `not recorded`. The windows differ in length (7 days and 28 days), so each count row (merges, closures, pushes, waits) prints a rate per week, never a raw total, and the change is between the two rates. A row whose source covers only part of a window prints its covered days beside the rate and is marked partial.
-- Set quota and memory waits beside same-hour non-Hana tokens on the same role account and non-Hana build memory on natedev. If the records show non-Hana work slowing Hana, bring a new proposal (HI10); there is no size threshold. Records show it only when a record names a non-Hana cause for a Hana wait: a `WaitingForSupplier` wait whose record names non-Hana work, or a quota or memory wait whose record, or the slot or hold record that covers the whole wait, names a non-Hana holder of that account, slot or memory. Load in the same hour is context, never proof. A wait with no named cause is reported as cause not recorded, with its minutes and n, and does not count. Report each wait with a named non-Hana cause with its minutes and n. If the Phase 4 record shape has no field for the holder, Phase 4 asks phases-unit to add one.
+- Set quota and memory waits beside same-hour non-Hana tokens on the same role account and non-Hana build memory on natedev. If the records show non-Hana work slowing Hana, bring a new proposal (HI10); there is no size threshold. Records show it only when a record names a non-Hana cause for a Hana wait: a `WaitingForSupplier` wait whose record names non-Hana work, or a quota or memory wait whose record, or the slot or hold record that covers the whole wait, names a non-Hana holder of that account, slot or memory. Load in the same hour is context, never proof. A wait with no named cause is reported as cause not recorded, with its minutes and n, and does not count. Report each wait with a named non-Hana cause with its minutes and n. The holder comes from Phase 10's holder history: a wait counts as non-Hana-caused only for the minutes a named non-Hana holder covers; a wait whose holder is named for part of its time reports the named and not-named minutes apart.
 - Design doc section **Results**: per step, the measure, its change, keep or drop. The link records (Step 3) set beside Hana merges and closures.
 
 **Files:**
 - `scripts/hierarchies/measure.py`, `scripts/hierarchies/test_measure.py` — `compare`
+- `scripts/hierarchies/push_audit.py`, `scripts/hierarchies/test_push_audit.py` — `audit()` per window
 - `docs/plans/build-followups-hierarchies-design.md` — Results
 
 **Spec additions (architect review after Phase 7, 2026-10-29):**
-- Exception at delivery time: `push_audit.classify()` returns `ApprovedRegisteredText` for any recorded text id, also a normal-priority `nate.adhoc` delivery after its exception ended. Classify each delivery by the exception in force at its delivery time (the policy's effective boundary is the messaging-unit c73a2d02 merge); keep recorded exception evidence apart from approval. Fixtures: a send before the boundary, one after it, and a held one.
 - Coverage: a rate per week needs the covered days of each source. Give recorded coverage, an unavailable source and unknown coverage distinct domain types (no bare `None`); event timestamps alone never prove continuous coverage. Fixtures: empty but covered, partly covered, missing, corrupt.
 - Compare: load the notification sources once and call `push_audit.audit()` per window, so reviews and silence records outside a window still pair. The failed-check count is `len(entries)`; the attention row's n is delivered pushes. Fixtures: a review across a window boundary, a delayed delivery, a rewrite, a held `nate.adhoc` review with no delivery.
 - A missing or malformed `config/hierarchies/sessions.toml` stays visible in `compare` as a source problem naming the file; valid delivery counts never become zero and an attribution failure is never missing delivery history.
+
+**Spec additions (architect review after Phase 9, 2026-10-29):**
+- Cause evidence: keep apart, as distinct types, a known wait kind, a named supplier, a named holder, and proven non-Hana involvement; no bare `None` for any outcome. Fixtures: a known quota wait with no holder, and a named supplier whose project cannot be found.
+- Hourly inputs: `read_tokens` sums by repository and drops the time and the role, so the same-hour token row needs a per-hour, per-account view that keeps them; `BuildStep` has no memory field, so non-Hana build memory needs a named source, or the row prints `not recorded` with its reason. Fixtures: an account change inside one hour, a retired holder, a missing attribution, a build across two hours.
+- Present-state rows (`pending_attention`, capacity, rank coverage) read the state now, and the design doc says their history cannot be rebuilt. `compare` uses the recorded Baseline snapshot for the before side, prints `comparison unavailable` where none exists, and gives a per-week rate only for window event counts. Since Phase 9, the waiting-change count reads earlier lists too; report that visibility change apart from backlog growth.
 
 **Workers:** `1 writer + 1 tester`
 - `impl` — `measure.py`, `push_audit.py` and the doc
 - `test` — `test_measure.py` and `test_push_audit.py`: `compare` on fixtures with known before and after values, and the fixtures above
 
-**Constraints from prior phases:** shared log helpers live in `scripts/hierarchies/log_records.py`; `measure.py` imports `push_audit.py`, never the reverse; session names come only from `config/hierarchies/sessions.toml`. The wait records come from `progress_history.py waits` (phases-unit 820357a2) through the Phase 4 loader and types.
+**Constraints from prior phases:** shared log helpers live in `scripts/hierarchies/log_records.py`; `measure.py` imports `push_audit.py`, never the reverse; session names come only from `config/hierarchies/sessions.toml`. The wait records come from `progress_history.py waits` (phases-unit 820357a2; holder and origin fields from 49fd1b0f) through the Phase 4 loader and types. Phase 11's repair reads origin fields into `RecordedOrigin` / `OriginNotRecorded`; Phase 10 adds the unresolved-origin row and the holder history, and this review keeps that uncertainty visible. From Phase 8: `measure.py baseline` and `push_audit.py report` print a short summary by default and their tables under `--full`; `compare` prints the same way.
 
 **Acceptance gate:** unit tests green; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; Results holds real numbers for each step, judged on the measure and review point each of Phases 3–5 names. **Measure and review point:** this phase is the review point for Steps 1, 2 and 4. At phase end the unit director sends the showrunner the Results and the keep-or-drop list as one question for the user.
 
@@ -232,57 +227,126 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Binds later work:** a later push count or comparison calls `push_audit.audit()`; it never adds a second reader or rule. New session names go only in `sessions.toml`.
 
-### Phase 8 — The worker ownership report and the push audit open with what a person needs  · status: todo
-**Depends on:** Phases 5 and 7 (showrunner returns of C443, C446 and C447, 2026-10-29: runs next, as a small checkpoint after Phase 7).
+### Phase 8 — The worker ownership report and the push audit open with what a person needs  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** both reports show a person a short answer first. `worker_owners.py report` always finishes and ends with its Totals line. `push_audit.py report` opens with one summary line and puts its tables under `--full`, as `measure.py baseline` does. The session-name check changes the name and sees the change.
-
-**Hana link:** indirect. The Phase 6 review re-runs both reports; a report that stops on one bad file, or buries its total in 25 long rows, gives it no usable number.
-
-**Spec:**
-- `worker_owners.py` (C443):
-  - An empty or unreadable source file (seen live: an empty `~/.local/state/review-pool/build-followups/mesh/0/mesh_roster.json`, "Expecting value: line 1 column 1 (char 0)") is a source problem. The report still prints every worker row it could read.
-  - Text output order: worker rows, then source-problem lines, then the timer line, then the Totals line last. Totals also names the count of source problems (`source_problems=N`).
-  - `report` and `recover` exit 0 when they print the report, source problems included. `end` keeps its rules: no worker is ended while any source problem exists, and a failed end exits 1.
-  - Timers: by default the report prints one line, `Timers: <n> registered, <m> with no recorded request (the showrunner checks these; --full lists each)`. `--full` prints each timer line as today. `--json` is unchanged.
-- `push_audit.py report` (C446): by default prints a short summary like `measure.py`'s `baseline_summary`: the window; delivered pushes and pushes after a failed text check, with the count per class (ApprovedPriorityTwo, ApprovedRegisteredText, Unapproved); the source-problem count and `Use --full to print the tables.` `--full` prints the summary, then today's tables. The numbers are the same in both forms.
-- Session-name check (C447): the Change-Review row changes `display_name` in `config/hierarchies/sessions.toml` to another word, runs the full `push_audit.py report --full` command over a window with a hana row (2026-10-21T20:23 to 2026-10-28T20:23 has two), sees the new word, then changes it back. No code change unless the new word does not print.
+- `worker_owners.py report` and `recover` always finish and exit 0 when they print the report. An empty or unreadable source file is a source problem. The report still prints every worker row it can read.
+- Text output order: worker rows, notes, source-problem lines, one `Timers: <n> registered, <m> with no recorded request` line, then `Totals:` last with `source_problems=N`. `--full` prints each timer line in place of the one `Timers` line. `--json` is unchanged.
+- `worker_owners.py end` exits 1 when a source problem exists or an end fails. A timer source that cannot be read stops all ends.
+- `push_audit.py report` prints `report_summary()` by default: four lines (window; delivered pushes and pushes after a failed text check; counts per class ApprovedPriorityTwo / ApprovedRegisteredText / Unapproved; source-problem count and the `--full` hint). `--full` prints the summary, then the tables. Both forms show the same numbers.
+- Live Baseline window: 64 delivered, 17 after a failed text check, classes 1 / 16 / 0.
 
 **Files:**
-- `scripts/hierarchies/worker_owners.py`, `scripts/hierarchies/test_worker_owners.py` — output order, exit status, `--full`
-- `scripts/hierarchies/push_audit.py`, `scripts/hierarchies/test_push_audit.py` — summary and `--full`
+- `scripts/hierarchies/worker_owners.py`, `scripts/hierarchies/test_worker_owners.py` — output order, exit status, `--full` timers
+- `scripts/hierarchies/push_audit.py`, `scripts/hierarchies/test_push_audit.py` — `report_summary()` and `--full` tables
 
-**Workers:** `1 writer`
-- `impl` — all four files
+**Binds later work:** reports print a short summary by default and their tables under `--full`; a new report or compare follows the same form. `push_audit.py` never imports `measure.py`; shared log helpers live in `scripts/hierarchies/log_records.py`.
 
-**Constraints from prior phases:** shared log helpers live in `scripts/hierarchies/log_records.py`; `push_audit.py` never imports `measure.py`. Session names come only from `config/hierarchies/sessions.toml`.
-
-**Acceptance gate:** unit tests green, with tests that pin: an empty roster file gives one source-problem line, worker rows from the other files, Totals as the last line and exit 0; the default worker report prints one timer line and `--full` prints each timer; `end` still ends nothing while a source problem exists; the default push audit prints the summary with the same totals as `--full` and no table rows. Per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green. Live on natedev: `worker_owners.py report` exits 0 and its last line starts `Totals:`; `push_audit.py report` over the Baseline window prints at most six lines and names 17 of 64. **Change-Review rows** (new, replacing C443, C446, C447): one per item above, each with a full command a person can paste.
-
-### Phase 9 — An attached production's earlier change rows reach /next and the count, under their own names  · status: todo
+### Phase 9 — An attached production's earlier change rows reach /next and the count, under their own names  · status: done
 **Depends on:** Phase 8 (showrunner request 2026-10-29: a defect in nested showrunners, fixed at its cause).
 
-#### Work Order
+#### As-built
 
-**Goal:** when a production attaches under another (sdlc under natedev), the open rows on its own earlier list still show in `/next` and in the For-you count, named `sdlc/C<n>` as before.
-
-**Hana link:** indirect. Changes that passed the showrunner's check but never reach the user's review stall at the last step.
-
-**Spec:**
-- Cause: `change_review.list_path` names the list for the top-level showrunner while it runs, so `scope_list`/`scope_rows` read only natedev's list after sdlc attached. sdlc's own list (`~/rust/hanadocs/change-review/change-review - sdlc.md`) still holds open rows that passed the vet (C9, C16, C17, C22, C23, C25, C26, C29, C32, C37, C41) that no command shows.
-- An attached production's queue reads its own earlier list as well as its root's list. A row from its own list with no Production cell belongs to that production. Each row keeps its list's name and number (`sdlc/C9`, `natedev/C434`); nothing is renumbered or copied between lists.
-- `next_item.py show --kind change` with `--order oldest|newest|urgent`, `move-to-end`, `--all-below` and `footer_counts.py`'s For-you count all read the same merged queue. A list that cannot be read stays one stderr line, not a stop.
-- A production that never had its own list behaves as today.
+- `change_review.scope_lists(path, doc, below)` returns one `ProductionReviewList(path, default_production)` per list: the current list (default production: the root) and the own list of each scoped production that has one (default production: that production). Each path occurs once. When the root showrunner is stopped and the current list is a scoped production's own list, that production owns its rows with no Production cell.
+- `scoped_review_entries` reads and ranks each list on its own and returns `ScopedReviewEntry(review_list, entry)`. A list that cannot be read, or that holds a bad Urgency cell, prints one `change review: <path>: <error>` line on stderr and drops out; the other lists stay. `scope_rows` returns the rows of these entries.
+- `scope_entries` gives row IDs: a current-list row keeps its plain ID (`C434`); a row from another list carries the list name (`sdlc/C9`), and so does its `after` prerequisite. Nothing is renumbered or copied between lists.
+- `next_item.change_queue` (`show --kind change` with each `--order`, `move-to-end`, `--all-below`) reads `scope_entries`. `footer_counts` counts `scope_rows` and watches every path from `scope_lists`. Live on natedev, `/next` showed `sdlc/C9` first and the For-you count went from 11 to 22.
+- `change_review.py edit|verdict|mark-important --row` takes the ID as `/next` prints it. `_row_option` returns `ReviewRowTarget(path, row)`: `C434` selects the current list; `sdlc/C9` selects `list_file("sdlc")`. A list-named ID that differs from an explicit `--list` is refused before any write. `commands/next.md` and `commands/change_review.md` say to pass the ID as `/next` shows it.
+- `change_review.py show` still reads only the current list.
+- A production that never had its own list behaves as before.
 
 **Files:**
-- `scripts/production/change_review.py` — `scope_list`, `scope_rows` (the list set of a production)
-- `scripts/production/next_item.py` — the change queue and its pin names
-- `scripts/production/footer_counts.py` — the For-you count
-- `scripts/production/test_change_review.py`, `scripts/production/test_next_item.py` — tests
+- `scripts/production/change_review.py` — `ProductionReviewList`, `ScopedReviewEntry`, `scope_lists`, `scoped_review_entries`, `scope_rows`, `scope_entries`, `ReviewRowTarget`, `_row_option`
+- `scripts/production/next_item.py` — the change queue over all scoped lists
+- `scripts/production/footer_counts.py` — the For-you count and its watched sources
+- `scripts/production/test_change_review.py`, `scripts/production/test_next_item.py` — list-named IDs in show, move-to-end and the count; pins and moved rows; one bad list; the `--list` mismatch refusal
+- `commands/next.md`, `commands/change_review.md` — pass the row ID as `/next` shows it
 
-**Workers:** `1 writer`
-- `impl` — all files
+**Binds later work:** `/change_review shows the same first row as /next, also from an attached production's earlier list` moves `change_review.py show` onto the same merged queue as `/next`.
 
-**Acceptance gate:** unit tests green, with a test that pins an attached production's own-list rows in `show`, `move-to-end` and the count with their own names; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; live on natedev, `next_item.py show --kind change --order oldest --production <sdlc doc>` shows `sdlc/C9`. **Also touches:** `scripts/production/` (owners: builds and enh-showrunner units); name them in the checkpoint notice.
+**Gotchas:** pins and moved-row state use the plain ID of a current-list row. Never put a list name on a current-list key.
+
+**Ruled out:** a list name on every row ID — it orphans saved pins and moved-row state.
+
+### Phase 10 — The measure reads who holds a wait, and the experiment start is set  · status: todo
+**Depends on:** phases-unit Phase 11 (the wait-holder field and the phase origin fields), merged as 49fd1b0f (sdlc b8ec8a99, 2026-10-29); Phase 11 of this plan (its repair reads the new origin shape). Not at the same time as Phase 12 (both edit `measure.py`).
+
+#### Work Order
+
+**Goal:** each recorded Hana wait says who holds the account, slot or memory it waits on, or says the holder is not recorded; a retired Hana phase keeps its Hana origin; the design doc names the experiment's real start.
+
+**Hana link:** direct. The four-week review counts a Hana wait as non-Hana-caused only when a record names the holder.
+
+**Spec:**
+- Read each wait's `holders` from `progress_history.py waits` into a holder history at the loader boundary: the ordered holders seen, each with its time and a `NamedHolder` (resource kind `account`, `slot` or `memory`; the resource; a `SessionHolder` or `UnitHolder`), or one `HolderNotNamed` with its reason. Keep every holder seen, so a holder change during a wait stays visible. Never infer a holder. The loader accepts the new fields; a field or value it does not know is a source problem for that row, never a stop for the report.
+- `measure.py baseline --full` shows, per wait kind, the waits and minutes with a named holder for the whole wait, for part of the wait, and with `HolderNotNamed`, each with n.
+- Origin: the supplier writes `plan_doc`, `production` and `repository` each as `{"state":"Recorded","value":"<name>"}` or `{"state":"NotRecorded","reason":"<why>"}`; `repository` is the name of the git common directory and `unit` stays the worktree name. Phase 11's repair already reads both shapes, and the old plain text, into typed values at the boundary. Keep that reader; a not-recorded field never discards the report or the other rows. A retired phase whose worktree name no longer carries a unit prefix keeps its `HistoryNotRecorded` row. Fixture: a retired phase with worktree `widget-enhancements` and plan `tool-based-ui-widget.md` beside a covered Hana phase, and a row with not-recorded origin fields beside valid Hana rows.
+- A wait row with no `wait_id` that the supplier now counts in `ignored_n` / `wait_without_id_n` is still a source problem, not a zero.
+- Rename `WaitCauseNotRecorded` to `WaitKindNotRecorded`: it is built when `wait_kind` is absent and says nothing about cause.
+- The reader's checkpoint does not start the experiment. The experiment starts on the first day on which each holder producer (builds' `verify.sh` for slot, memory and hold waits; models-unit's `codex_mesh.py` for quota and capacity waits) has recorded a `NamedHolder`, read live from `waits`. Design doc Step 2 records the start and the review date (four weeks later) as UTC bounds. While a producer has not emitted, Step 2 says `start not set: waiting on <producer>`, and the unit director tells the sdlc showrunner which producer. On 2026-10-29, `verify.sh` (~1073) and `codex_mesh.py` (~3243) still call `start-wait` without holder flags; builds and models-unit own those calls, and sdlc has told them. One wait plus one receipt never sets the start (sdlc, G1): it needs a `NamedHolder` from each producer.
+- A phase whose origin fields are all `NotRecorded` and that no worktree or plan path identifies is not dropped: it becomes a typed unresolved-origin outcome, and `baseline --full` prints a row with its run, phase instance and reason (architect review after Phase 11 found it silently dropped, 0.0 min). Mixed-record test: such a phase beside valid Hana rows.
+- Row-level recovery: a malformed holder or origin value beside valid Hana rows leaves the valid counts in the final report and names the rejected row; the whole report never falls back to missing history. Test it with mixed fixtures.
+- `baseline --full` shows, per wait with a holder history, the wait id, the resource, the session or unit, the observation times and the unnamed intervals; a wait with no recorded end keeps its duration unknown, never zero.
+- HI7 acceptance case: one test reads, through the real `progress_history.py waits` and on to the final `baseline --full` report, a producer's named holder, a holder change during one wait, and an unnamed holder. Unknown evidence shows as recorded or not recorded with its reason, never as zero delay.
+
+**Files:**
+- `scripts/hierarchies/measure.py`, `scripts/hierarchies/test_measure.py` — holder history type, the unresolved-origin row, the holder rows, the rename (origin conversion shipped in Phase 11)
+- `docs/plans/build-followups-hierarchies-design.md` — Step 2 experiment dates
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — `measure.py` and the design doc
+- `test` — `test_measure.py`: holder named for the whole wait, a holder change during one wait, a wait with a holder for part of its time, `HolderNotNamed` and `HolderNotNamed("recorded before holders")`, not-recorded origin fields, the retired-phase fixture, the missing-id count, and one test that runs the real `progress_history.py waits` on a fixture history file
+
+**Constraints from prior phases:** the supplier schema is sdlc's `docs/plans/sdlc-phases.md` Phase 11, merged as 49fd1b0f: producer flags `--holder-resource-kind`, `--holder-resource` and `--holder-session` or `--holder-unit` on `start-wait`, and `progress_history.py wait-holder --session-dir D --wait-id ID` when the holder changes; `NamedHolder(resource_kind, resource, holder)`, `SessionHolder(session_id)`, `UnitHolder(unit)`, `HolderNotNamed(reason)`, `wait_holder_seen` events, `wait_without_id_n`, and the phase row fields `plan_doc`, `production`, `repository`. Wait kinds, `HistoryNotRecorded`, `UncertainWaitCoverage`, `WaitCauseNotRecorded`, `NamedSupplier`/`NoNamedSupplier` and `RecordedWaitReason`/`WaitReasonNotRecorded` exist in `measure.py`; the summary keeps its five lines and new rows print under `--full`; `push_audit.py` never imports `measure.py`; shared log helpers live in `scripts/hierarchies/log_records.py`. Phase 12 also edits `measure.py`; the two phases never run at the same time. From Phase 11: `PhaseOrigin` fields are `RecordedOrigin | OriginNotRecorded`, read by `origin_field`; `scope_queue` lives in `scripts/lib/urgency.py`. When imports move, the type check also covers the gate's cycle files (`scripts/accounts/accounts.py`, `scripts/hooks/showrunner_footer.py`), or run the merge gate's basedpyright.
+
+**Acceptance gate:** unit tests green, with the fixtures above; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; live on natedev, `measure.py baseline --full` over a window after the supplier merge prints the holder rows per wait kind. **Change-Review row:** one, with the full command.
+
+### Phase 11 — /change_review shows the same first row as /next, also from an attached production's earlier list  · status: done
+
+#### As-built
+
+- `change_review.change_queue(path: Path, scope: Path | WholeReviewList, below: bool = False) -> ChangeQueue` is the one change queue. `ChangeQueue` holds `name` (the pin name) and `entries`. For a production doc it reads `scope_entries(path, doc, below)` and pins under `queue(path)` for the root, or `<queue>-<slug>` for a lower showrunner. `WholeReviewList.ALL_ROWS` reads every row of an explicit list.
+- `next_item.change_queue` and `change_review.py show` both call it. With a production, `show` reads the current and earlier lists, prints the row ID as `/next` does (`C434`, `sdlc/C9`), keeps the same pin, and its `N more to review` count is the queue length. `show --list` with no production reads every row of that list.
+- `measure.py` reads origin fields into typed values. A field that is not recorded never marks a phase as Hana.
+
+**Files:**
+- `scripts/production/change_review.py` — `ChangeQueue`, `WholeReviewList`, `change_queue`, `show`
+- `scripts/production/next_item.py` — `change_queue` wraps the shared queue
+- `scripts/lib/urgency.py` — `scope_queue`, `ALL_BELOW`
+- `scripts/production/update_registration.py`, `scripts/production/rename_outside.py` — call `urgency.scope_queue`
+- `scripts/hierarchies/measure.py` — `RecordedOrigin`, `OriginNotRecorded`, `origin_field`
+- `scripts/production/test_change_review.py`, `scripts/production/test_next_item.py`, `scripts/hierarchies/test_measure.py` — tests
+
+**Binds later work:** `PhaseOrigin` fields `plan`, `production` and `repository` are `RecordedOrigin | OriginNotRecorded`. `origin_field(record, key)` reads them for the wait report and phase completion readers. It accepts the supplier's tagged shape (`state` `Recorded` with `value`, or `NotRecorded` with `reason`) and earlier plain text, and raises `ValueError` on any other shape. `scope_queue(name, below)` and `ALL_BELOW` live in `scripts/lib/urgency.py`. `next_item.py` imports `change_review.py`, never the reverse. A pin set by `/next` is the row `/change_review show` shows, and the reverse.
+
+**Gotchas:** the merge gate's basedpyright reports import cycles through function-local imports, and a per-file type check does not. A change that moves an import must type-check the cycle files (`accounts.py`, `showrunner_footer.py`) or run the gate's basedpyright.
+
+### Phase 12 — The push audit judges each push by the exception in force when it went out, and the wait share counts one set of phases  · status: todo
+**Depends on:** Phase 4. Merge before the 2026-11-12 re-runs. Not at the same time as Phase 10 (both edit `measure.py`).
+
+#### Work Order
+
+**Goal:** the 2026-11-12 push-audit re-run counts unapproved pushes correctly, and the wait-share row is a share of one phase population.
+
+**Hana link:** direct. Phase 6 keeps or drops trial steps on these two numbers.
+
+**Spec:**
+- Exception at delivery time: `push_audit.classify()` returns `ApprovedRegisteredText` for any recorded text id, also a normal-priority `nate.adhoc` delivery after its exception ended. Classify each delivery by the exception in force at its delivery time (the policy's effective boundary is the messaging-unit c73a2d02 merge); keep recorded exception evidence apart from approval. Fixtures: a send before the boundary, one after it, and a held one.
+- Wait share: `wait_share_row` sums waits picked by their start time, production hand-offs with no phase included, over phases picked by their finish time, so a wait can add minutes whose phase adds no time, and overlapping waits count the same phase time more than once. Count only waits of the phases in the denominator, count the union of a phase's overlapping waits once, and print hand-offs with no phase as their own row with n. Fixtures: a phase across the window boundary, two waits at the same time in one phase, a hand-off with no phase.
+
+**Files:**
+- `scripts/hierarchies/push_audit.py`, `scripts/hierarchies/test_push_audit.py` — `classify`
+- `scripts/hierarchies/measure.py`, `scripts/hierarchies/test_measure.py` — `wait_share_row`
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — `push_audit.py` and `measure.py`
+- `test` — `test_push_audit.py` and `test_measure.py`: the fixtures above
+
+**Constraints from prior phases:** `measure.py` imports `push_audit.py`, never the reverse; shared log helpers live in `scripts/hierarchies/log_records.py`; session names come only from `config/hierarchies/sessions.toml`; `measure.py baseline` and `push_audit.py report` print a short summary and their tables under `--full`. From Phase 11: `PhaseOrigin` fields are `RecordedOrigin | OriginNotRecorded`; from Phase 10: the unresolved-origin row stays visible in the wait share. The policy boundary is the merge of c73a2d02, `dde7ec2e` at 2026-10-29T03:05:59Z. Tests: `python3 -m unittest scripts.hierarchies.test_push_audit scripts.hierarchies.test_measure`.
+
+**Spec additions (architect review after Phase 11):**
+- `PhaseCompletion` keeps the run id and phase instance id, so waits match their phase; load the earlier history a phase in the window needs, since the supplier filters waits by start time; join each phase's origin from its `phase_started` record (the supplier does not copy origin fields to `phase_finished`). The boundary test runs through the real supplier reader, with a retired worktree.
+- Test a delivery exactly at the boundary, and a review before it whose delivery follows it.
+
+**Acceptance gate:** unit tests green, with the fixtures above; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; live on natedev, `push_audit.py report` and `measure.py baseline --full` over the Baseline window print the corrected rows, and both commands over a window after the boundary (2026-10-29T03:05:59Z) show the revoked exception applied. **Change-Review row:** one per command, with the full command.

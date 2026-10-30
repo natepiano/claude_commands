@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
-"""Publish immutable file snapshots as review links on this machine's tailnet."""
+"""Publish and refresh files at short review links on this machine's tailnet."""
 from __future__ import annotations
 
 import argparse
+import fcntl
 import html
+import ipaddress
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
-from datetime import datetime, timezone
+import tempfile
 from pathlib import Path
-from string import Template
+from string import Template, ascii_lowercase, digits
 from typing import cast
 from urllib.parse import quote
-from uuid import uuid4
 
 PORT = 8765
 
@@ -24,18 +26,13 @@ def review_root() -> Path:
     return Path(os.environ.get("REVIEW_LINKS_ROOT") or Path.home() / ".local/share/review-links").expanduser()
 
 
-def hostname() -> str:
-    """The local MagicDNS name; tests may supply it without contacting Tailscale."""
+def link_host() -> str:
+    """The local Tailscale IPv4 address, or an explicit host override."""
     if override := os.environ.get("REVIEW_LINKS_HOST"):
         return override.rstrip(".")
-    result = subprocess.run(["tailscale", "status", "--self", "--json"],
+    result = subprocess.run(["tailscale", "ip", "-4"],
                             capture_output=True, text=True, check=True, timeout=10)
-    status = cast(object, json.loads(result.stdout))
-    self_status = cast(dict[str, object], status).get("Self") if isinstance(status, dict) else None
-    name = cast(dict[str, object], self_status).get("DNSName") if isinstance(self_status, dict) else None
-    if not isinstance(name, str) or not name.rstrip("."):
-        raise ValueError("Tailscale supplied no MagicDNS name")
-    return name.rstrip(".")
+    return str(ipaddress.IPv4Address(result.stdout.strip()))
 
 
 def render_markdown(source: str, title: str) -> str:
@@ -48,7 +45,7 @@ def render_markdown(source: str, title: str) -> str:
 <style>
 :root { color-scheme: light dark; font-family: system-ui, sans-serif; line-height: 1.6; }
 body { max-width: 48rem; margin: auto; padding: 1rem; overflow-wrap: anywhere; }
-pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: 1rem; background: light-dark(#f0f2f5, #202329); border-radius: .5rem; }
+pre { white-space: pre; overflow-x: auto; overflow-wrap: normal; padding: 1rem; background: light-dark(#f0f2f5, #202329); border-radius: .5rem; }
 code { font-family: ui-monospace, monospace; }
 img { max-width: 100%; height: auto; }
 table { display: block; overflow-x: auto; border-collapse: collapse; }
@@ -63,6 +60,9 @@ try {
   if (window.marked) {
     const source = document.getElementById('markdown-source');
     const rendered = document.getElementById('rendered');
+    marked.use({renderer: {html(text) {
+      return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }}});
     rendered.innerHTML = marked.parse(source.textContent);
     rendered.hidden = false;
     source.hidden = true;
@@ -72,12 +72,39 @@ try {
 """).substitute(title=html.escape(title), source=html.escape(source))
 
 
-def _safe_component(label: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]+", "-", label).strip(".-")[:64] or "review"
+def read_snapshot_index(root: Path) -> dict[str, str]:
+    """Retain only source sets whose snapshot folders still exist."""
+    path = root / ".index.json"
+    if not path.exists():
+        return {}
+    decoded = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    if not isinstance(decoded, dict):
+        raise ValueError("invalid review-links index")
+    entries = cast(dict[object, object], decoded)
+    return {key: identifier for key, identifier in entries.items()
+            if isinstance(key, str) and isinstance(identifier, str)
+            and re.fullmatch(r"[a-z0-9]{6}", identifier)
+            and not (root / identifier).is_symlink() and (root / identifier).is_dir()}
 
 
-def snapshot(files: list[Path], name: str = "review") -> list[str]:
-    """Validate the entire request, copy it once, then return one URL per file."""
+def replace_file(path: Path, content: bytes) -> None:
+    """Publish complete bytes with one rename on the destination filesystem."""
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".review-link-", delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            _ = stream.write(content)
+        except OSError:
+            temporary.unlink(missing_ok=True)
+            raise
+    try:
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def snapshot(files: list[Path], name: str = "review", *, new: bool = False) -> list[str]:
+    """Refresh a source set's short URLs; new requests a separate snapshot."""
+    _ = name
     if not files:
         raise ValueError("name at least one file")
     contents: dict[str, bytes] = {}
@@ -93,24 +120,46 @@ def snapshot(files: list[Path], name: str = "review") -> list[str]:
             outputs[destination] = render_markdown(outputs[file.name].decode("utf-8"), file.name).encode("utf-8")
         for output, content in outputs.items():
             folded = output.casefold()
+            if folded in (".index.json", ".index.lock") or folded.startswith(".review-link-"):
+                raise ValueError(f"reserved snapshot filename: {output} ({file})")
             if folded in output_sources:
                 raise ValueError(f"snapshot filename collision: {output_sources[folded]} and {file} ({output})")
             output_sources[folded] = file
             contents[output] = content
         destinations.append(destination)
-    host = hostname()
+    host = link_host()
     root = review_root()
-    session = _safe_component(os.environ.get("CLAUDE_CODE_SESSION_ID", "")[:8] or "manual")
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    folder = root / session / f"{stamp}-{_safe_component(name)}-{uuid4().hex[:12]}"
-    folder.parent.mkdir(parents=True, exist_ok=True)
-    folder.mkdir()
-    try:
-        for output, content in contents.items():
-            _ = (folder / output).write_bytes(content)
-    except OSError:
-        shutil.rmtree(folder)
-        raise
+    root.mkdir(parents=True, exist_ok=True)
+    with (root / ".index.lock").open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        index = read_snapshot_index(root)
+        source_set = json.dumps(sorted((str(file.resolve()), file.name) for file in files))
+        reuse = not new and source_set in index
+        if reuse:
+            folder = root / index[source_set]
+        else:
+            for _ in range(10):
+                folder = root / "".join(secrets.choice(ascii_lowercase + digits) for _ in range(6))
+                try:
+                    folder.mkdir()
+                except FileExistsError:
+                    continue
+                break
+            else:
+                raise FileExistsError("could not allocate a snapshot id after 10 tries")
+        try:
+            for output, content in contents.items():
+                replace_file(folder / output, content)
+            for obsolete in folder.iterdir():
+                if obsolete.name not in contents and (obsolete.is_file() or obsolete.is_symlink()):
+                    obsolete.unlink()
+            os.utime(folder, None)
+            index[source_set] = folder.name
+            replace_file(root / ".index.json", json.dumps(index, sort_keys=True).encode("utf-8"))
+        except OSError:
+            if not reuse:
+                shutil.rmtree(folder)
+            raise
     return [f"http://{host}:{PORT}/{quote((folder / output).relative_to(root).as_posix())}"
             for output in destinations]
 
@@ -118,10 +167,11 @@ def snapshot(files: list[Path], name: str = "review") -> list[str]:
 def main(arguments: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("files", nargs="+", type=Path)
-    _ = parser.add_argument("--name", default="review", help="label for this snapshot")
+    _ = parser.add_argument("--name", default="review", help="accepted for compatibility; omitted from URLs")
+    _ = parser.add_argument("--new", action="store_true", help="make a separate link instead of refreshing")
     args = parser.parse_args(arguments)
     try:
-        urls = snapshot(cast(list[Path], args.files), cast(str, args.name))
+        urls = snapshot(cast(list[Path], args.files), cast(str, args.name), new=cast(bool, args.new))
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         print(f"review_link: {error}", file=sys.stderr)
         return 2
