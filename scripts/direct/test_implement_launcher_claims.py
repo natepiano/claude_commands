@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
 import json
 import os
 import signal
@@ -10,7 +12,6 @@ from typing import cast
 import unittest
 
 from scripts.direct.implement_launcher_claims_test_support import CompletedWorkerFixture
-from scripts.direct.implement_launcher_test_support import TEST_HANG_GUARD_SECS
 from scripts.direct.wait_for_test_state import wait_until
 
 

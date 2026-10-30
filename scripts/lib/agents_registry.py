@@ -41,6 +41,15 @@ class UnpublishedRegistry(NamedTuple):
     pass
 
 
+class AlreadyContained(NamedTuple):
+    pass
+
+
+class FastForward(NamedTuple):
+    target: str
+    registry_entry: str
+
+
 def registry_path() -> Path:
     configured = os.environ.get("AGENTS_CONFIG_FILE")
     return Path(configured) if configured else DEFAULT_PATH
@@ -168,44 +177,72 @@ def _fetch(repo: Path, branch: str) -> str:
     return _git(repo, "rev-parse", "FETCH_HEAD")
 
 
-def _fast_forward(repo: Path, path: Path, target: str, *, registry_already_shared: bool = False) -> None:
-    """Check Git's real index/worktree rules before reconciling or fast-forwarding.
-
-    Only a refused check guarantees no live registry or index writes. A race or
-    filesystem failure after that check can still interrupt the fast-forward.
-    """
+def _preflight_fast_forward(repo: Path, target: str, *, replace_registry: bool,
+                            base: str = "HEAD") -> AlreadyContained | FastForward:
+    """Refuse unfinished merges; preserve the publishing parent before checking a move."""
     registry_entry = ""
-    try:
-        _ = _git(repo, "merge-base", "--is-ancestor", "HEAD", target)
-        merge_head = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD"))
-        if merge_head.exists():
-            raise OSError("an unfinished merge must be completed first")
-        index = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-path", "index"))
-        with tempfile.TemporaryDirectory(prefix="agents-ff-index-") as directory:
-            trial_index = Path(directory) / "index"
-            _ = shutil.copyfile(index, trial_index)
-            environment = {**os.environ, "GIT_INDEX_FILE": str(trial_index)}
-            if registry_already_shared:
-                registry_entry = _git(repo, "ls-tree", target, "--", REGISTRY_PATH) + "\n"
-                _ = _git(repo, "update-index", "--index-info", input_text=registry_entry, environment=environment)
-            _ = _git(repo, "read-tree", "--dry-run", "-m", "-u", "HEAD", target, environment=environment)
-    except OSError as error:
-        raise OSError(f"registry edit refused before writing: fast-forward check failed: {error}") from error
+    merge_head = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD"))
+    if merge_head.exists():
+        raise OSError("an unfinished merge must be completed first")
+    if _git(repo, "ls-files", "--unmerged"):
+        raise OSError("unmerged index entries must be resolved first")
+    parent = _git(repo, "rev-parse", base)
+    ancestor = _git(repo, "merge-base", parent, target)
+    if ancestor == target:
+        return AlreadyContained()
+    if ancestor != parent:
+        raise OSError("the target diverges from the publishing parent; cannot fast-forward")
+    index = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-path", "index"))
+    with tempfile.TemporaryDirectory(prefix="agents-ff-index-") as directory:
+        trial_index = Path(directory) / "index"
+        _ = shutil.copyfile(index, trial_index)
+        environment = {**os.environ, "GIT_INDEX_FILE": str(trial_index)}
+        if replace_registry:
+            registry_entry = _git(repo, "ls-tree", target, "--", REGISTRY_PATH) + "\n"
+            _ = _git(repo, "update-index", "--index-info", input_text=registry_entry, environment=environment)
+        _ = _git(repo, "read-tree", "--dry-run", "-m", "-u", "HEAD", target, environment=environment)
+    return FastForward(target, registry_entry)
 
+
+def _apply_fast_forward(repo: Path, path: Path, plan: AlreadyContained | FastForward) -> None:
+    if isinstance(plan, AlreadyContained):
+        return
     # The trial index lets an accepted registry edit catch up without exempting
     # any other path from Git's tracked, untracked, or file/directory checks.
     try:
-        if registry_already_shared:
-            contents = _git(repo, "show", f"{target}:{REGISTRY_PATH}") + "\n"
+        if plan.registry_entry:
+            contents = _git(repo, "show", f"{plan.target}:{REGISTRY_PATH}") + "\n"
             if registry_text(path) != contents:
                 write_text_atomic(path, contents)
-            _ = _git(repo, "update-index", "--index-info", input_text=registry_entry)
-        _ = _git(repo, "merge", "--ff-only", target)
+            _ = _git(repo, "update-index", "--index-info", input_text=plan.registry_entry)
+        _ = _git(repo, "merge", "--ff-only", plan.target)
     except OSError as error:
         raise OSError(f"registry fast-forward failed after its check; local files may have changed: {error}") from error
 
 
-def _registry_commit(repo: Path, parent: str, contents: str, description: str) -> tuple[str, str]:
+def _fast_forward(repo: Path, path: Path, target: str, *, registry_already_shared: bool = False) -> None:
+    """Preflight before any live writes, then apply the checked transition.
+
+    A contained target is a no-op only when there is no unfinished merge.
+    Only a refused check guarantees no live registry or index writes. A race or
+    filesystem failure after that check can still interrupt the fast-forward.
+    """
+    try:
+        plan = _preflight_fast_forward(repo, target, replace_registry=registry_already_shared)
+    except OSError as error:
+        raise OSError(f"registry edit refused before writing: fast-forward check failed: {error}") from error
+    _apply_fast_forward(repo, path, plan)
+
+
+def _reconcile_shared(repo: Path, path: Path, plan: AlreadyContained | FastForward) -> bool:
+    try:
+        _apply_fast_forward(repo, path, plan)
+    except OSError as error:
+        raise OSError(f"{path} is shared, but local reconciliation failed: {error}") from error
+    return True
+
+
+def _registry_commit(repo: Path, parent: str, contents: str, description: str) -> str:
     """Commit just the registry through an isolated index; never touch the user's index."""
     with tempfile.TemporaryDirectory(prefix="agents-index-") as directory:
         environment = {**os.environ, "GIT_INDEX_FILE": str(Path(directory) / "index")}
@@ -215,7 +252,7 @@ def _registry_commit(repo: Path, parent: str, contents: str, description: str) -
                  environment=environment)
         tree = _git(repo, "write-tree", environment=environment)
         commit = _git(repo, "commit-tree", tree, "-p", parent, "-m", f"config(agents): {' '.join(description.splitlines())}")
-        return commit, blob
+        return commit
 
 
 def _publish(repo: Path, path: Path, changes: list[RowChange], description: str,
@@ -244,31 +281,44 @@ def _publish(repo: Path, path: Path, changes: list[RowChange], description: str,
         write_text_atomic(path, contents)
     last_error = ""
     for attempt in range(3):
-        commit, _blob = _registry_commit(repo, base, contents, description)
+        commit = _registry_commit(repo, base, contents, description)
         try:
             _ = _git(repo, "push", "origin", f"{commit}:refs/heads/{branch}")
         except OSError as error:
             last_error = str(error)
             try:
                 remote = _fetch(repo, branch)
-                # Reparent only when it preserves all pre-existing local commits.
-                _ = _git(repo, "merge-base", "--is-ancestor", base, remote)
                 remote_text = _git(repo, "show", f"{remote}:{REGISTRY_PATH}") + "\n"
-                contents = _replay(remote_text, pending, additive_catalog)
-                if (_git(repo, "merge-base", commit, remote) == commit
-                        or _values(contents) == _values(remote_text)):
-                    _fast_forward(repo, path, remote, registry_already_shared=True)
-                    return True
-                if attempt == 2:
-                    break
-                base = remote
-                write_text_atomic(path, contents)
+                replayed = _replay(remote_text, pending, additive_catalog)
+                ancestor = _git(repo, "merge-base", commit, remote)
+                shared = (ancestor == commit
+                          or ancestor == base and _values(replayed) == _values(remote_text))
             except OSError as retry_error:
                 last_error = str(retry_error)
                 break
+            try:
+                plan = _preflight_fast_forward(repo, remote, replace_registry=True, base=base)
+            except OSError as retry_error:
+                if shared:
+                    raise OSError(f"{path} is shared, but local reconciliation failed: {retry_error}") from retry_error
+                last_error = f"retry fast-forward check failed: {retry_error}"
+                break
+            if shared:
+                return _reconcile_shared(repo, path, plan)
+            if attempt == 2:
+                break
+            # A contained remote cannot replace local history or its registry.
+            # A forward target passed the same preflight as the initial fetch.
+            if isinstance(plan, FastForward):
+                base, contents = remote, replayed
+                if registry_text(path) != contents:
+                    write_text_atomic(path, contents)
             continue
-        _fast_forward(repo, path, commit, registry_already_shared=True)
-        return True
+        try:
+            plan = _preflight_fast_forward(repo, commit, replace_registry=True)
+        except OSError as error:
+            raise OSError(f"{path} is shared, but local reconciliation failed: {error}") from error
+        return _reconcile_shared(repo, path, plan)
     raise OSError(f"{path} is edited but not shared; publish failed after at most 3 tries: {last_error}")
 
 
@@ -279,6 +329,8 @@ def store_registry(registry: Path, before: str, after: str, description: str, *,
     Publishing is disabled by AGENTS_CONFIG_PUBLISH=0 and for every other path.
     Rejected pushes replay every pending local row on the fetched tip, at most
     three tries. An identical command recovers unfinished publication first.
+    The registry commit is parented on local HEAD, so publishing an ahead
+    checkout also pushes its pre-existing local commits.
     No other path is staged, committed, stashed, reset or rebased.
     """
     path = registry.resolve()

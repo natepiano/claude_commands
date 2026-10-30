@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import unit_staff_test_support
+from unit_staff_test_support import unit_host
+from scripts.production import staff_sources
 import copy
 import ctypes
 import io
@@ -157,7 +160,7 @@ def unit(
     return inventory.UnitSession(
         **common_session(session_id, name, status=status, ahead=ahead),
         kind="unit",
-        host=inventory.UnitHost(
+        host=unit_host(
             kind="unit",
             production=production,
             unit=name,
@@ -756,7 +759,7 @@ class SettleTests(ShutdownTestCase):
 
         first = self.unit_for_showrunner()
         second_owner = unit("second-unit", "Second")
-        second_owner["host"]["doc"] = "/tmp/demo-production.md"
+        unit_staff_test_support.PARENTS[second_owner["host"]["unit"]] = staff_sources.UnitProduction("demo", "/tmp/demo-production.md")
         second = session_shutdown(second_owner, then="restart")
         self.save(second)
 
@@ -2103,7 +2106,7 @@ class SettleTests(ShutdownTestCase):
 
     def unit_for_showrunner(self, then: shutdown_record.ShutdownContinuation = "restart") -> shutdown_record.SessionShutdown:
         owner = unit("unit", "Unit")
-        owner["host"]["doc"] = "/tmp/demo-production.md"
+        unit_staff_test_support.PARENTS[owner["host"]["unit"]] = staff_sources.UnitProduction("demo", "/tmp/demo-production.md")
         saved = session_shutdown(owner, progress={"kind": "ready", "at": NOW}, then=then)
         saved["target"] = "claude3"
         saved["why"] = "claude2 is out of usage"
@@ -2169,7 +2172,7 @@ class SettleTests(ShutdownTestCase):
 
     def test_retire_reason_is_saved_and_sent_to_the_session_and_showrunner(self) -> None:
         owner = unit("retiring", "Retiring")
-        owner["host"]["doc"] = "/tmp/demo-production.md"
+        unit_staff_test_support.PARENTS[owner["host"]["unit"]] = staff_sources.UnitProduction("demo", "/tmp/demo-production.md")
         added = settle.begin(LOGIN, only=["retiring"], request_id="retire-request",
                              then="stop", why="retired; /showrunner:resume_unit brings it back.",
                              report=machine_inventory([owner]))
@@ -4557,7 +4560,8 @@ class SettleTests(ShutdownTestCase):
 
     def test_now_only_stopped_owner_with_leftover_cleanup_is_retried_by_conductor(self) -> None:
         saved = session_shutdown(top_level("partial", "Partial"), progress={"kind": "stopped", "at": NOW})
-        saved["stop_issues"] = [shutdown_record.CodexServerLeftRunning(kind="codex server left running", at=NOW, run_dir="/tmp/run", cause="stop not confirmed")]
+        saved["stop_issues"] = [shutdown_record.UnitSessionLeftRunning(kind="unit session left running",
+            at=NOW, host="herdr", session_name="unit", cause="stop not confirmed")]
         self.save(saved)
         with patch.object(settle, "_launch_conductor") as conductor, patch.object(stop_work, "stop_session") as stop, redirect_stdout(io.StringIO()):
             self.assertEqual(settle.now(Account("claude", LOGIN, LABEL), True, only=["partial"]), 0)
