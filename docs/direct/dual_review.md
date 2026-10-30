@@ -8,15 +8,35 @@ Read at the point of use from `/unit:direct`. Defines `<DualReview/>`,
 completes, or when `<EarlyReviewArm/>` arms a reviewer.
 
 <TeamReview>
-A phase's broad review runs **two reviewers at once**, never one — and never
-two readings of the same question, which buys one opinion twice. Each takes a
-**lens**, disjoint and named in its prompt; the main review per <DualReview/>
-is the third reader:
+A phase's broad review runs `adversary` and `contract` at once, plus `rerun`
+when <DualReview/> arms it. Each takes a distinct **lens**, named in its prompt;
+the unit director also performs the main review per <DualReview/>:
 
 | Lens | Reads for |
 | --- | --- |
 | `adversary` | the failing case — the input that violates a stated invariant, the caller that was not updated, the state the new code cannot reach, the test that passes for the wrong reason |
 | `contract` | what the Work Order says, including every part no test covers, and anything built that it never asked for; then what the change reaches without naming — callers, consumers, public API, traits, registration, plugin wiring, invariants and transitions; and the repository's targets file (`docs/hana/targets.md` in hana), when present |
+| `rerun` | whether interrupted or failed work can finish when run again; lasting records, marks, locks, claims, state files, moved or deleted files, and lists of steps where one failure can stop later steps |
+
+The `rerun` reviewer asks these questions for each lasting write or step list:
+
+1. If the command stops at any line and runs again, does it finish?
+   Case: Restart of claude3 never ran after one account failed.
+2. Does it trust a stored status without checking the live thing: pid and
+   process start time, path, or lock holder?
+   Case: `down` trusted a "stopped" record for a session that was live.
+3. Does a failure move or delete what a rerun needs?
+   Case: A failed restore moved the records to `history/`, so the rerun had
+   nothing to restore.
+4. Does one failure stop other, unrelated steps, such as `set -e` over a list?
+   Case: `set -e` in `herdr-up.sh` stopped every later account at the first
+   failed one.
+5. Does each mark have an expiry or an owner check, and a command that clears it?
+   Case: `launch_pending` and the "restarting" claim had no command to clear them.
+
+An answer that shows unsafe rerun behavior is a defect, fixed in the phase
+as a blocker or minor finding. The prompt closes by asking for the rerun case
+the reviewer built, or a plain statement that it could not build one.
 
 The `craft` lens is off since 2026-10-04 (user: review trial ended); the unit
 director's main review audits style each phase.
@@ -31,14 +51,15 @@ lens has its own artifact paths.
 
 The adversary's brief is to break the change, not to check it. It reports the
 concrete failing case it built, or reports plainly that it could not build one:
-"no failing case found" from a reader who was trying is evidence, and it is the
-only reading here that produces evidence by finding nothing.
+"no failing case found" from a reader who was trying is evidence. The same rule
+applies to the `rerun` reviewer's attempt to build a rerun case.
 
 Findings come back in each dispatch's summary under `${PHASE_DIR}`. Every
 launch names its phase, lens and pass, so concurrent reviews keep separate
-files. The summary is the whole review result: <Synthesize/> reads both, tags each finding
-with the lens that caught it, and can tell two independent findings from one
-finding found twice.
+files. The summary is the whole review result: <Synthesize/> reads every
+selected lens's summary, including `rerun` when armed, tags each finding
+with the lens that caught it, and can tell two independent findings from
+one finding found twice.
 
 **A repair is not reviewed this way.** <ClosureReview/> is one reader over one
 batch of ids, and splitting a path-limited read two ways buys two passes over
@@ -110,7 +131,7 @@ End with APPROVE, APPROVE WITH FIXES, or REQUEST CHANGES. Do not invent findings
 ## Your lens
 [the lens name and what it reads for, from <TeamReview/>]
 
-Another reviewer is reading this same diff under the other lens. Report only
+Other reviewers read this same diff under their own lenses. Report only
 what yours covers: a finding another lens owns is that lens's to
 make, and duplicating it costs the synthesis a second opinion and buys a
 count instead.
@@ -149,6 +170,11 @@ The questions are the lens, so each prompt carries only its own:
   bare Option<T> values replaced or justified at an external boundary?
   6. Does it meet every target in the repository's targets file, when present?
   A miss is a defect.
+- `rerun` — Copy the five questions and their real cases from <TeamReview/>
+  verbatim. Apply them to each record, mark, lock, claim, state file, moved or
+  deleted file, and list of steps the change writes or runs. Treat unsafe rerun
+  behavior as a blocker or minor defect to fix in this phase. Close with the
+  rerun case you built, or a plain statement that you could not build one.
 
 **Early form** (an <EarlyReviewArm/> launch, which arms the `adversary` alone):
 the `## Diff` section holds the partial diff at launch, and an
@@ -184,14 +210,35 @@ final diff only.
    <EarlyReviewArm/> (the assign dispatch then sends that reviewer its Stage 2),
    reset `EARLY_REVIEW=none`, and keep `${REVIEW_DISPATCH_HANDLE}` as that
    lens's handle. Otherwise increment
-   `${REVIEW_PASS}`. Pass 1 is the phase's broad review and runs the two
+   `${REVIEW_PASS}`. Pass 1 is the phase's broad review and runs the selected
    lenses of <TeamReview/> over <BroadReviewPrompt/>; later passes are one
    reviewer over one repair, per <ClosureReview/>.
-2. Apply <ReviewDiffContract/>. Create each lens's prompt under
-   <ReviewPromptContract/>.
-3. Launch each reviewer under <DispatchContract/>. Launch pass 1's two lenses
-   in one message so they run at once; launch `contract` alone when the
-   adversary is already armed. Each call uses:
+2. Apply <ReviewDiffContract/>. Before the broad review, save the complete phase
+   diff to a file and run this read-only check in every repository, including Rust:
+
+   ```sh
+   python3 ~/.claude/scripts/direct/rerun_lens.py arm --diff <diff>
+   ```
+
+   `<diff>` is that saved diff, including new phase files, made with whole-file
+   context (`git diff --unified=100000`), so a distant `set -e` and the loop it
+   covers are both in it. Arm `rerun` if either
+   the Work Order's `**State:**` names lasting state or this command prints
+   `armed`. `none` and an absent State line do not arm it; they never override
+   a diff hit. Lasting state includes a record, mark, lock, claim, state file,
+   file move or delete, or a list of steps where one step can fail. The check
+   reports each hit as `path:line — <kind>`; writes in tests, docs and fixtures
+   do not count. Pure computation and docs-only changes skip `rerun` when State
+   names no lasting state and the check prints `not armed`. A check error is
+   not `not armed`: resolve it before launching the broad review.
+
+   Use the completed diff for this decision even when `adversary` was armed
+   early. All broad reviewers read the same review copy and final diff.
+   Create each lens's prompt under <ReviewPromptContract/>.
+3. Launch each reviewer under <DispatchContract/>. Launch pass 1's lenses in
+   one message so they run at once: `adversary`, `contract`, and `rerun`
+   when armed. When the adversary is already armed, launch `contract` and,
+   when armed, `rerun`. Each call uses:
 
    ```sh
    bash ~/.claude/scripts/direct/assign.sh --role review --lens <lens> \
@@ -237,8 +284,8 @@ final diff only.
    reviewer by its host-specific path. Each completed dispatch loads the summary
    named by its handle into `${AGENT_REVIEW}`. A lens that reports `error` is named in one
    line and the pass continues on the readings that landed, so the synthesis
-   records which lens is missing rather than presenting one as two. Numbered
-   artifacts remain available.
+   records which lens is missing rather than counting it as a completed reading.
+   Numbered artifacts remain available.
 </DualReview>
 
 <ClosureReview>

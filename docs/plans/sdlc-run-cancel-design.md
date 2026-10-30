@@ -237,7 +237,12 @@ as every target is confirmed empty. No per-host reset. After committing the stop
 4. Confirm owned execution is empty before releasing its admitted memory charge
    or execution slot. A dead wrapper is insufficient. Unknown or unreachable
    execution retains its charge. Never release another command's resource or a
-   user's build hold.
+   user's build hold. One exception, accepted by its owner (answer (c) below):
+   a step with no scope (the legacy no-scope fallback) releases its charge when
+   its wrapper dies, so admission never starves. That release does not prove
+   its execution is empty and never allows a complete cleanup receipt;
+   scope-backed accounting keeps the rule above. A future stop-command Work
+   Order carries this distinction and a wrapper-death acceptance case for it.
 5. Commit cleanup evidence, close waits for the exact commands, and publish the
    receipt and cancellation result. Unknown legacy links or escaped children
    remain pending; they cannot produce a false complete receipt.

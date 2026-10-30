@@ -79,7 +79,8 @@
 # cargo's own "Finished … in" build times, since a repeat on the same tree
 # builds nothing. Every call, of every verb, in a worker session or not,
 # leaves one call record in the build log (~/.local/state/buildlog; `buildlog
-# schema` lists its fields): ran, failed, interrupted, reused (a pass),
+# schema` lists its fields): ran, failed, interrupted, cancelled (exit 77: the
+# input tree changed during test or lint judgment), reused (a pass),
 # replayed (a lint failure) or superseded (exit 76: a newer call of the same
 # verb from the same worker replaced it in the token queue), with the seconds saved and the repo, worktree,
 # branch and commit. The steps it ran carry the same call id. The build log
@@ -313,6 +314,7 @@ run() {
             status=$?
         fi
         RUN_STEP_PID=""
+        if [[ -n "${TREE_WATCH_DIR:-}" ]]; then cancel_tree_run; fi
         step_state local_noncompiling
         if [[ "$status" == 0 ]]; then
             RUN_LAST_ATTEMPT_KILLED=0
@@ -614,124 +616,7 @@ print("\n".join(sorted(changed)))
 # phase that edits or commits another member in the same worktree leaves the
 # key alone (two phases side by side, 2026-10-17). A test that reads a file in
 # an unrelated member's folder is not keyed on it.
-TREE_KEY_PY='
-import hashlib
-import json
-import os
-import subprocess
-import sys
-
-
-def run(*args: str | bytes) -> bytes:
-    result = subprocess.run(list(args), capture_output=True)
-    if result.returncode != 0:
-        sys.exit(1)
-    return result.stdout
-
-
-def content(path: bytes) -> bytes:
-    if os.path.islink(path):
-        return b"link " + os.readlink(path)
-    if os.path.isfile(path):
-        with open(path, "rb") as handle:
-            return hashlib.sha256(handle.read()).digest()
-    return b"absent"
-
-
-# The ls-tree entry git would record for the file, so committing it unchanged
-# keeps the key; None when the file is gone.
-def blob(path: bytes) -> bytes | None:
-    if os.path.islink(path):
-        data, mode = os.readlink(path), b"120000"
-    elif os.path.isfile(path):
-        with open(path, "rb") as handle:
-            data = handle.read()
-        mode = b"100755" if os.access(path, os.X_OK) else b"100644"
-    else:
-        return None
-    return mode + b" blob " + hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest().encode()
-
-
-# The member folders the tests of `name` are built from, and every member
-# folder, deepest first.
-def package_roots(name: str) -> tuple[set[bytes], list[bytes]]:
-    meta = json.load(sys.stdin)
-    members = {
-        os.path.realpath(os.path.dirname(package["manifest_path"])).encode(): package
-        for package in meta["packages"]
-        if package["id"] in set(meta["workspace_members"])
-    }
-    pending = [root for root, package in members.items() if package["name"] == name]
-    if not pending:
-        sys.exit(1)
-    built = set()
-    while pending:
-        root = pending.pop()
-        if root in built:
-            continue
-        built.add(root)
-        for dependency in members[root]["dependencies"]:
-            if dependency.get("path"):
-                pending += [path for path in [os.path.realpath(dependency["path"]).encode()] if path in members]
-    return built, sorted(members, key=len, reverse=True)
-
-
-split = sys.argv.index("--")
-files = sys.argv[1:split]
-package = files[1] if files[:1] == ["--package"] else ""
-if package:
-    files = files[2:]
-# --no-optional-locks and git status, not git diff: diff rewrites a stat-dirty
-# index even with the flag (git 2.54), and the index of this worktree belongs to the
-# session working in it. Same paths: staged, unstaged, deleted, untracked.
-top = run("git", "--no-optional-locks", "rev-parse", "--show-toplevel").strip()
-status = run("git", "--no-optional-locks", "-C", top, "status", "--porcelain", "-z", "--untracked-files=all", "--no-renames")
-real_top = os.path.realpath(top)
-# The session folder of this run, when it is inside the worktree: verify.sh writes
-# its log and board there while the command runs, so they are not tree changes.
-own = tuple(
-    folder + b"/" for folder in (
-        os.path.relpath(os.path.realpath(os.fsencode(name)), real_top)
-        for name in {os.environ.get("UNIT_SESSION_DIR", ""), os.environ.get("UNIT_RUN_DIR", "")} if name
-    ) if not folder.startswith(b"..") and folder != b"."
-)
-changed = sorted({entry[3:] for entry in status.split(b"\0") if len(entry) > 3 and not entry[3:].startswith(own)})
-if package:
-    built, members = package_roots(package)
-
-    def counts(path: bytes) -> bool:
-        full = os.path.join(real_top, path)
-        owner = next((root for root in members if full.startswith(root + b"/")), None)
-        return owner is None or owner in built or full == os.path.join(owner, b"Cargo.toml")
-
-    entries = {}
-    for line in run("git", "--no-optional-locks", "-C", top, "ls-tree", "-r", "-z", "--full-tree", "HEAD").split(b"\0"):
-        if b"\t" in line:
-            entry, path = line.split(b"\t", 1)
-            entries[path] = entry
-    for path in changed:
-        entry = blob(os.path.join(top, path))
-        if entry is None:
-            _ = entries.pop(path, None)
-        else:
-            entries[path] = entry
-    key = hashlib.sha256(top + b"\0")
-    for path in sorted(filter(counts, entries)):
-        key.update(path + b"\0" + entries[path] + b"\0")
-else:
-    key = hashlib.sha256(top + b"\0" + run("git", "--no-optional-locks", "-C", top, "rev-parse", "HEAD^{tree}"))
-    for path in changed:
-        key.update(path + b"\0" + content(os.path.join(top, path)))
-key.update(run("rustc", "-vV"))
-for name in files:
-    key.update(content(name.encode()))
-for word in sys.argv[split + 1 :]:
-    key.update(b"\0" + word.encode())
-for name, value in sorted(os.environ.items()):
-    if name.startswith(("RUST", "CARGO_", "NEXTEST_")) and name != "CARGO_MAKEFLAGS":
-        key.update(("\0" + name + "=" + value).encode())
-print(key.hexdigest())
-'
+TREE_WATCH_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tree_watch.py"
 
 # The compile covers the workspace, so a misspelled package would otherwise
 # pass check and lint silently and leave nextest with an empty filter. Fail it
@@ -1199,7 +1084,7 @@ if [[ "$CMD" == test && "$LOCAL_ONLY" -eq 1 ]]; then
 fi
 
 tree_key() {
-    local words=("$CMD" "${ARGS[@]}") names=() name scope=()
+    local words=("$CMD" "${ARGS[@]}") names=() name scope=() key_options=("$@")
     if [[ "$CMD" == lint && ${#ARGS[@]} -eq 1 ]]; then
         words=(lint)
     elif [[ "${FILTER_RUN}" -eq 1 ]]; then
@@ -1223,9 +1108,87 @@ tree_key() {
         # Keyed on the package's own build, read from the call's metadata.
         scope=(--package "${ARGS[0]}")
     fi
-    "$PY" -c "$TREE_KEY_PY" ${scope[@]+"${scope[@]}"} "${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh" \
+    "$PY" "$TREE_WATCH_SCRIPT" --key ${key_options[@]+"${key_options[@]}"} ${scope[@]+"${scope[@]}"} "${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh" \
         "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}" -- "${words[@]}" \
         <<< "${GATE_METADATA}" 2>/dev/null || true
+}
+
+TREE_CHANGED_STATUS=77
+TREE_WATCH_PID=""
+TREE_WATCH_DIR=""
+
+after_tree_change() {
+    [[ -n "$TREE_WATCH_DIR" && -s "$TREE_WATCH_DIR/fired" ]]
+}
+
+stop_tree_watch() {
+    if [[ -n "$TREE_WATCH_PID" ]]; then
+        kill "$TREE_WATCH_PID" 2>/dev/null || true
+        wait "$TREE_WATCH_PID" 2>/dev/null || true
+        TREE_WATCH_PID=""
+    fi
+}
+
+cancel_tree_run() {
+    after_tree_change || return 0
+    trap '' USR2
+    stop_tree_watch
+    if [[ -n "${MAC_RUNNER_PID:-}" ]]; then
+        # offload.py's TERM handler stops the remote run and releases its claim.
+        kill -TERM "$MAC_RUNNER_PID" 2>/dev/null || true
+        wait "$MAC_RUNNER_PID" 2>/dev/null || true
+        MAC_RUNNER_PID=""
+    fi
+    # Board release also stops a step's separately owned process group.
+    if declare -F release_token >/dev/null; then release_token || true; fi
+    if [[ -n "${RUN_STEP_PID:-}" ]]; then
+        kill -KILL -- "-$RUN_STEP_PID" 2>/dev/null || true
+        wait "$RUN_STEP_PID" 2>/dev/null || true
+        RUN_STEP_PID=""
+    fi
+    # Reacquisition creates .again in the step's subshell. Both names belong
+    # to this call, even when the parent never saw TOKEN_WAIT_ENTRY change.
+    if [[ -n "${TOKEN_WAITER_FILE:-}" ]]; then
+        rm -f "$TOKEN_WAITER_FILE" "${TOKEN_WAITER_FILE}.again"
+    fi
+    # run_once owns admission in a pipeline subshell. Its exact ledger paths
+    # are shared with us before cargo starts, so killing it cannot leak them.
+    local memory_path
+    if [[ -f "$TREE_WATCH_DIR/reservations" ]]; then
+        while IFS= read -r memory_path; do
+            BUILDLOG_MEM_RESERVATION="$memory_path" buildlog_release_memory "$TREE_CHANGED_STATUS"
+        done < "$TREE_WATCH_DIR/reservations"
+    fi
+    if [[ -f "$TREE_WATCH_DIR/waiters" ]]; then
+        while IFS= read -r memory_path; do rm -f "$memory_path"; done < "$TREE_WATCH_DIR/waiters"
+    fi
+    [[ -z "${MAC_LOG_FILE:-}" ]] || rm -f "$MAC_LOG_FILE"
+    [[ -z "${MAC_RESULT_FILE:-}" ]] || rm -f "$MAC_RESULT_FILE"
+    printf 'verify.sh: cancelled — the tree changed while %s ran, so this result would be stale. Resubmit the %s when your edits are done.\n' "$CMD" "$CMD" >&2
+    note_event cancelled "${RUN_STARTED}" "$(( SECONDS - RUN_STARTED ))" "" 0 "$TREE_CHANGED_STATUS"
+    rm -rf "$TREE_WATCH_DIR"
+    TREE_WATCH_DIR=""
+    exit "$TREE_CHANGED_STATUS"
+}
+
+start_tree_watch() {
+    [[ -z "$TREE_WATCH_PID" ]] || return 0
+    TREE_WATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-tree.$$.XXXXXX")"
+    VERDICT_KEY="$(tree_key --watch-start "$TREE_WATCH_DIR/start")"
+    [[ -s "$TREE_WATCH_DIR/start" ]] || { rm -rf "$TREE_WATCH_DIR"; TREE_WATCH_DIR=""; return 0; }
+    local scope=()
+    if [[ "$CMD" == test ]]; then scope=(--package "${ARGS[0]}"); fi
+    trap 'cancel_tree_run' USR2
+    "$PY" "$TREE_WATCH_SCRIPT" "$TREE_WATCH_DIR/start" "$TREE_WATCH_DIR/fired" "$$" --signal-parent \
+        ${scope[@]+"${scope[@]}"} -- <<< "$GATE_METADATA" >/dev/null 2>&1 &
+    TREE_WATCH_PID=$!
+}
+
+finish_tree_watch() {
+    stop_tree_watch
+    cancel_tree_run
+    [[ -z "$TREE_WATCH_DIR" ]] || rm -rf "$TREE_WATCH_DIR"
+    TREE_WATCH_DIR=""
 }
 
 # Git's staged tree identity. A private copy avoids updating the real index's
@@ -1342,7 +1305,7 @@ PYDOC
 
 # note_event OUTCOME WAIT WALL BUILD SAVED STATUS: this call's one record in
 # the build log (see the header), the first time it is called. OUTCOME is ran,
-# failed, interrupted, reused or replayed; an empty STATUS or BUILD is unknown.
+# failed, interrupted, cancelled, reused or replayed; an empty STATUS or BUILD is unknown.
 # record.py adds the repo, worktree, branch and commit. A record that cannot be
 # written is lost, never the result.
 note_event() {
@@ -1404,6 +1367,9 @@ STEP_RAN_ON_MAC=0
 
 forward_mac_runner_signal() {
     local signal_name=$1 exit_status=$2
+    stop_tree_watch
+    [[ -z "$TREE_WATCH_DIR" ]] || rm -rf "$TREE_WATCH_DIR"
+    TREE_WATCH_DIR=""
     trap - INT TERM HUP
     if [[ -n "$MAC_RUNNER_PID" ]]; then
         kill -s "$signal_name" "$MAC_RUNNER_PID" 2>/dev/null || true
@@ -1432,7 +1398,7 @@ try_mac_test() {
     trap 'forward_mac_runner_signal INT 130' INT
     trap 'forward_mac_runner_signal TERM 143' TERM
     trap 'forward_mac_runner_signal HUP 129' HUP
-    local runner_status result_text="" result_word="" result_reason=""
+    local runner_status result_text="" result_word="" result_reason="" mac_owns_watch=0
     local result_seconds="" result_holder="" mac_words=0 line
     local runner_args=(run --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}"
         --package "$PKG" --call-id "$BUILDLOG_CALL_ID" --settings "$1")
@@ -1455,7 +1421,10 @@ try_mac_test() {
     export BUILDLOG_TARGET=mac
     # A Mac pass is recorded like a natedev one, judged on the tree as it was
     # when the Mac run began, with the output it printed.
-    if [[ -n "${CACHE_DIR}" ]]; then
+    if [[ "$CMD" == test && -z "$TREE_WATCH_PID" ]]; then
+        start_tree_watch
+        mac_owns_watch=1
+    elif [[ -n "${CACHE_DIR}" && -z "$TREE_WATCH_PID" ]]; then
         VERDICT_KEY="$(tree_key)"
     fi
     MAC_LOG_FILE="$(mktemp)"
@@ -1467,6 +1436,7 @@ try_mac_test() {
     else
         runner_status=$?
     fi
+    if [[ "$mac_owns_watch" == 1 ]]; then finish_tree_watch; fi
     trap - INT TERM HUP
     eval "$caller_traps"
     MAC_RUNNER_PID=""
@@ -2113,6 +2083,7 @@ finish_run() {
     case "${status}" in
         completed) outcome=ran kind=pass ;;
         interrupted) outcome=interrupted code="" ;;
+        cancelled) outcome=cancelled ;;
         error) lint_failure_is_the_tree && kind=fail ;;
     esac
     note_event "${outcome}" "${RUN_STARTED}" "${wall}" "${build:-0}" 0 "${code}"
@@ -2138,7 +2109,7 @@ if [[ "$CMD" == final || ( "$CMD" == test && ( ${#ARGS[@]} -eq 1 \
     fi
 fi
 # A test record's key reads the package's dependencies from it (tree_key).
-if [[ "$CMD" == test && -n "${CACHE_DIR}" && -z "${GATE_METADATA}" ]]; then
+if [[ "$CMD" == test && -z "${GATE_METADATA}" ]]; then
     GATE_METADATA="$(cargo metadata --no-deps --format-version 1 2>/dev/null)" || GATE_METADATA=""
 fi
 
@@ -2631,13 +2602,28 @@ try_token_now() {
 # gate again with the token held. The step runs in run()'s subshell, so its
 # token wait reaches the call record through TOKEN_WAIT_FILE.
 eval "$(declare -f buildlog_wait_for_memory | sed '1s/buildlog_wait_for_memory/buildlog_wait_for_memory_only/')"
+# Share exact admission paths across run_once's subshell boundary. Releasing
+# a reservation twice is safe; keep earlier paths if the step re-enters admission.
+remember_tree_reservation() {
+    if [[ -n "${TREE_WATCH_DIR:-}" && -n "${BUILDLOG_MEM_RESERVATION:-}" ]]; then
+        printf '%s\n' "$BUILDLOG_MEM_RESERVATION" >> "$TREE_WATCH_DIR/reservations"
+    fi
+}
+
 buildlog_wait_for_memory() {
-    local memory_wait
+    local memory_wait stat fields=()
+    if [[ -n "${TREE_WATCH_DIR:-}" && -r "/proc/${BASHPID:-$$}/stat" ]]; then
+        stat="$(< "/proc/${BASHPID:-$$}/stat")"
+        read -r -a fields <<< "${stat##*) }"
+        printf '%s/admission/%s-%s.waiting\n' "${BUILDLOG_DIR:-$HOME/.local/state/buildlog}" \
+            "${BASHPID:-$$}" "${fields[19]}" >> "$TREE_WATCH_DIR/waiters"
+    fi
     step_state waiting_hold
     if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then
         : > "${TOKEN_WAIT_FILE}.given_back"
     fi
     buildlog_wait_for_memory_only "$@" || return $?
+    remember_tree_reservation
     [[ "$BUILDLOG_MEM_OUTCOME" != LeftQueue ]] || return 0
     TOKEN_WAITED=0
     if ! try_token_now; then
@@ -2647,6 +2633,7 @@ buildlog_wait_for_memory() {
         # The second pass keeps the step's place in the memory queue from its first wait.
         BUILDLOG_MEM_WAIT_SINCE=$BUILDLOG_MEM_WAIT_FROM buildlog_wait_for_memory_only "$@" || return $?
         BUILDLOG_MEM_WAIT_S=$(( memory_wait + BUILDLOG_MEM_WAIT_S ))
+        remember_tree_reservation
         if [[ "$BUILDLOG_MEM_OUTCOME" == LeftQueue ]]; then
             if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then
                 : > "${TOKEN_WAIT_FILE}.given_back"
@@ -2734,6 +2721,7 @@ if [[ -n "${ACTIVITY_SESSION_DIR}" \
             case "${status}" in
                 completed) result="pass" ;;
                 error) result="fail" ;;
+                cancelled) status=canceled ;;
             esac
             "$PY" "${PROGRESS_HISTORY}" finish-activity \
                 --session-dir "${ACTIVITY_SESSION_DIR}" \
@@ -2748,6 +2736,10 @@ fi
 # wait out the hold.
 verify_cleanup() {
     local status=$1 outcome=ran code="${EXIT_STATUS}"
+    if [[ "$EXIT_STATUS" == "$TREE_CHANGED_STATUS" ]]; then status=cancelled; fi
+    stop_tree_watch
+    [[ -z "$TREE_WATCH_DIR" ]] || rm -rf "$TREE_WATCH_DIR"
+    TREE_WATCH_DIR=""
     if [[ "$STEP_RECORD_ACTIVE" == 1 ]]; then
         env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" state --call-id "$BUILDLOG_CALL_ID" waiting_hold || true
     fi
@@ -2758,6 +2750,7 @@ verify_cleanup() {
     # here (note_event notes a call once). Its build time is unknown.
     case "${status}" in
         error) outcome=failed ;;
+        cancelled) outcome=cancelled ;;
         interrupted) outcome=interrupted code="" ;;
     esac
     note_event "${outcome}" "${RUN_STARTED}" $(( SECONDS - RUN_STARTED )) "" 0 "${code}" || true
@@ -2820,7 +2813,11 @@ case "$CMD" in
         print_built_binaries
         ;;
     test)
-        run_local_test
+        start_tree_watch
+        test_status=0
+        run_local_test || test_status=$?
+        finish_tree_watch
+        exit "$test_status"
         ;;
     lint)
         PKG="${1:?verify.sh lint <package>}"
@@ -2853,15 +2850,17 @@ case "$CMD" in
         if [[ "$HOLD_LINT" == 1 ]]; then
             # Format locally; the Mac judges the resulting tree without fixes.
             fmt_cargo --all
-            WORKSPACE_ROOT="$(cargo metadata --no-deps --format-version 1 \
-                | "$PY" -c 'import json, sys; print(json.load(sys.stdin)["workspace_root"])')"
+            GATE_METADATA="$(cargo metadata --no-deps --format-version 1)"
+            WORKSPACE_ROOT="$("$PY" -c 'import json, sys; print(json.load(sys.stdin)["workspace_root"])' <<< "$GATE_METADATA")"
             (cd "$WORKSPACE_ROOT" && run taplo fmt)
             lint_status=0
             if lint_config_enabled mend; then
                 invoke_mend --workspace --fail-on-warn "${FEATURE_FLAGS[@]}" || lint_status=1
             fi
             if lint_config_enabled clippy; then
+                start_tree_watch
                 invoke_clippy --workspace --all-targets --all-features || lint_status=1
+                finish_tree_watch
             fi
             exit "$lint_status"
         fi
@@ -2889,18 +2888,20 @@ case "$CMD" in
             else
                 lint_config_skip_notice fmt 'cargo +nightly fmt --all --check'
             fi
-            WORKSPACE_ROOT="$(cargo metadata --no-deps --format-version 1 \
-                | "$PY" -c 'import json, sys; print(json.load(sys.stdin)["workspace_root"])')"
+            GATE_METADATA="$(cargo metadata --no-deps --format-version 1)"
+            WORKSPACE_ROOT="$("$PY" -c 'import json, sys; print(json.load(sys.stdin)["workspace_root"])' <<< "$GATE_METADATA")"
             if ! (cd "$WORKSPACE_ROOT" && run taplo fmt --check); then
                 lint_status=1
             fi
             if lint_config_enabled clippy; then
                 echo 'style-lint: clippy start'
+                start_tree_watch
                 if invoke_clippy --workspace --all-targets --all-features; then
                     echo 'style-lint: clippy passed'
                 else
                     lint_status=1
                 fi
+                finish_tree_watch
             else
                 lint_config_skip_notice clippy 'cargo clippy --workspace --all-targets --all-features'
             fi
@@ -2968,8 +2969,8 @@ case "$CMD" in
         fi
         # Cargo's workspace root can differ from the caller's directory.
         # Run there so Taplo uses the same config and scope as the push gate.
-        WORKSPACE_ROOT="$(cargo metadata --no-deps --format-version 1 \
-            | "$PY" -c 'import json, sys; print(json.load(sys.stdin)["workspace_root"])')"
+        GATE_METADATA="$(cargo metadata --no-deps --format-version 1)"
+        WORKSPACE_ROOT="$("$PY" -c 'import json, sys; print(json.load(sys.stdin)["workspace_root"])' <<< "$GATE_METADATA")"
         TAPLO_ARGS=(fmt --check)
         if [[ "$HOLD_LINT" == 1 ]]; then TAPLO_ARGS=(fmt); fi
         if (cd "$WORKSPACE_ROOT" && run taplo "${TAPLO_ARGS[@]}"); then
@@ -3002,10 +3003,11 @@ case "$CMD" in
                 fi
                 clippy_tree_before="$clippy_tree_after"
             done
-            if [[ -n "${RUN_LOG}" ]]; then
-                VERDICT_KEY="$(tree_key)"
-            fi
-            invoke_clippy --workspace --all-targets --all-features --keep-going
+            start_tree_watch
+            clippy_status=0
+            invoke_clippy --workspace --all-targets --all-features --keep-going || clippy_status=$?
+            finish_tree_watch
+            (( clippy_status == 0 )) || exit "$clippy_status"
             [[ "$PKG" != --workspace ]] || echo 'style-lint: clippy passed'
         else
             invoke_clippy --workspace --all-targets --all-features

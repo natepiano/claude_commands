@@ -17,7 +17,8 @@
 #   pass_index — 1 for a phase's broad review, incrementing for each closure
 #   review after it. Artifacts are written per index and never overwritten:
 #   a run that failed to converge can be read back round by round.
-#   lens — which reading this reviewer is doing. It suffixes each artifact,
+#   lens — which reading this reviewer is doing. The shared lens list is in
+#   agents_log.py. It suffixes each artifact,
 #   so concurrent reviewers keep separate results. It does not select a worker.
 #   Empty is the single-reviewer layout, with unsuffixed artifact names.
 #   early_ready_file — early-launch mode: the reviewer starts while the
@@ -64,12 +65,14 @@ POOL_TYPE=""
 POOL_LEASE=""
 # A phase running beside the current one names itself, so start-pass stamps this pass with it.
 PHASE_ID=""
+REQUESTED_LENS=""
 while [[ "${1:-}" == --* ]]; do
   case "$1" in
     --to) FOLLOW_TO="${2:?--to requires a worker}" ;;
     --slot) NEW_SLOT="${2:?--slot requires a slot}" ;;
     --pool) POOL_TYPE="${2:?--pool requires a type}" ;;
     --lease) POOL_LEASE="${2:?--lease requires slug/unit/phase}" ;;
+    --lens) REQUESTED_LENS="${2:?--lens requires a lens}" ;;
     --phase) PHASE_ID="${2:?--phase requires a phase id}" ;;
     *) echo "ERROR: unknown review option '$1'." >&2; exit 2 ;;
   esac
@@ -110,7 +113,7 @@ SUBTASK="${4:-review}"
 ROLE_DESC="${5:-blind review of the current diff against its spec}"
 PASS_ACTIVITY="${6:-reviewing the current diff against its work order}"
 PASS_INDEX="${7:-1}"
-LENS="${8:-}"
+LENS="${REQUESTED_LENS:-${8:-}}"
 LENS_ARGS=()
 if [[ -n "${LENS}" ]]; then
   LENS_ARGS=(--lens "${LENS}")
@@ -124,16 +127,18 @@ esac
 
 # A closed set, like the pass kinds: an unrecognized lens would suffix artifacts
 # nobody reads and record a pass under a worker no column renders, both silently.
-case "${LENS}" in
-  '') LENS_SLOT='' ;;
-  adversary) LENS_SLOT=test ;;
-  contract) LENS_SLOT=impl ;;
-  craft|ux) LENS_SLOT=review ;;
-  *)
-    echo "ERROR: unknown review lens '${LENS}' (adversary, contract, craft, ux)" >&2
-    exit 2
-    ;;
-esac
+LENS_SLOT="$("${BASH_SOURCE[0]%/*}/../lib/py" - "${BASH_SOURCE[0]}" "${LENS}" <<'PYLENS'
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[2]))
+from scripts.usage.agents_log import LENSES
+lens = sys.argv[2]
+if lens and lens not in LENSES:
+    print(f"ERROR: unknown review lens '{lens}' ({', '.join(LENSES)})", file=sys.stderr)
+    sys.exit(2)
+print({"adversary": "test", "contract": "impl", "": ""}.get(lens, "review"))
+PYLENS
+)"
 
 # An explicit worker keeps its slot. A fresh reviewer uses the lens slot.
 if [[ -n "${FOLLOW_TO}" ]]; then

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import fcntl
 import importlib
+import io
 import json
 import math
 import os
@@ -14,6 +15,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from contextlib import redirect_stderr
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -71,6 +73,15 @@ HISTORY_DAYS = 14
 # Build anon at 16–20 GiB averaged 10.4% full PSI; at 20–24 GiB it averaged 16.4%.
 BUILD_BUDGET_BYTES = 21 * GIB
 RAMP_SECONDS = 120
+# 2026-10-29 freeze: full avg10 stayed below 10 during about 30 s of thrash.
+FULL_PRESSURE_LIMIT = 5.0
+# The same freeze had swap 80-87% used with some avg10 29-37%.
+SWAP_USED_LIMIT = 85.0
+SOME_PRESSURE_LIMIT = 25.0
+# Four starts promised 10.3 GiB in 42 s before that 30 s thrash.
+RECOVERY_START_SECONDS = 30
+# Bound recovery after the freeze: one ramp window after pressure clears.
+RECOVERY_WINDOW_SECONDS = 120
 PROC = Path("/proc")
 # A step held this long gets room first when it can start.
 HEAD_SECONDS = 600
@@ -142,6 +153,14 @@ class MeasuredMemory:
     ramp_promise: int = 0
     # Swap counts toward the build charge, but its release does not free RAM.
     swap_bytes: int = 0
+    observed_peak: int = 0
+    # An existing peak file could not be read; its promise remains a floor.
+    unknown_peak_promise: int = 0
+
+
+@dataclass(frozen=True)
+class CompilerServiceMemory(MeasuredMemory):
+    """Compiler charge, without a build reservation or run-alone veto."""
 
 
 @dataclass(frozen=True)
@@ -160,6 +179,17 @@ class NoPressureHold:
 @dataclass(frozen=True)
 class MemoryPressure:
     full_avg10: float
+    some_avg10: float = 0.0
+    swap_used_percent: float = 0.0
+    next_start_at: float = 0.0
+
+
+@dataclass(frozen=True)
+class HostMemory:
+    available: int
+    total: int | None
+    swap_total: int = 0
+    swap_free: int = 0
 
 
 Pressure = NoPressureHold | MemoryPressure
@@ -432,17 +462,21 @@ def decide(available: int, total: int | None, need: int, running: list[StepMemor
     budget = build_budget_bytes()
     reserve = total * 5 // 100 if total is not None else 0
     threshold = need + promised + reserve + head_need
-    fits_budget = charged + need + head_need <= budget or (not running and not head_need)
+    fits_budget = charged + need + head_need <= budget or (not has_running_step(running) and not head_need)
     admit = fits_budget and available >= threshold and isinstance(pressure, NoPressureHold)
     return AdmissionDecision("admit" if admit else "hold", threshold, promised, reserve, measured,
                              pressure, charged, budget)
+
+
+def has_running_step(running: list[StepMemory]) -> bool:
+    return any(not isinstance(row, (CompilerServiceMemory, GoneMemory)) for row in running)
 
 
 def build_charge(memory: StepMemory) -> int:
     if isinstance(memory, PromisedMemory):
         return memory.bytes
     if isinstance(memory, MeasuredMemory):
-        return max(memory.ramp_promise, memory.bytes)
+        return max(memory.ramp_promise, memory.bytes, memory.observed_peak, memory.unknown_peak_promise)
     return 0
 
 
@@ -738,6 +772,43 @@ def step_memory(row: Reservation, now: datetime, processes: dict[int, ProcessIde
     return reading
 
 
+def reservation_memory(path: Path, row: Reservation, now: datetime,
+                       processes: dict[int, ProcessIdentity], proc: Path) -> StepMemory:
+    reading = step_memory(row, now, processes, proc)
+    try:
+        peak = int(path.with_suffix(".max").read_text())
+        if peak < 0:
+            raise ValueError("negative observed peak")
+    except FileNotFoundError:
+        peak = 0  # The sampler has not recorded a peak (unscoped steps never do).
+    except (OSError, ValueError):
+        if isinstance(reading, MeasuredMemory):
+            return replace(reading, unknown_peak_promise=row["need"])
+        return reading
+    if isinstance(reading, MeasuredMemory):
+        return replace(reading, observed_peak=peak)
+    if isinstance(reading, PromisedMemory):
+        return PromisedMemory(max(reading.bytes, peak))
+    return reading
+
+
+def sccache_memory() -> list[StepMemory]:
+    """Charge the compiler service once, outside all step process trees."""
+    directory = Path(os.environ.get("BUILDLOG_BUILDS_CGROUP",
+        f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/builds.slice"))
+    path = directory / "sccache.service/memory.stat"
+    check_memory_reading(path)
+    try:
+        for line in path.read_text().splitlines():
+            key, _, value = line.partition(" ")
+            if key == "anon":
+                used = int(value)
+                return [CompilerServiceMemory(used)] if used > 0 else []
+    except (OSError, ValueError):
+        pass
+    return []
+
+
 class LiveMemoryReading(RuntimeError):
     """A test tried to read the host's memory state."""
 
@@ -747,7 +818,8 @@ def check_memory_reading(path: Path) -> None:
     if not record_path:
         return
     live_path = os.path.realpath(path)
-    if live_path not in ("/proc/meminfo", "/proc/pressure/memory"):
+    cgroup = Path(live_path).is_relative_to("/sys/fs/cgroup")
+    if live_path not in ("/proc/meminfo", "/proc/pressure/memory") and not cgroup:
         return
     try:
         with Path(record_path).open("a") as output:
@@ -756,44 +828,123 @@ def check_memory_reading(path: Path) -> None:
             output.flush()
     except OSError:
         pass  # The refusal below still stops the read; callers swallow OSError.
+    if cgroup:
+        raise LiveMemoryReading(f"live memory reading {live_path} in a test; fake BUILDLOG_BUILDS_CGROUP (scripts/lint/memory_test_support.py)")
     raise LiveMemoryReading(
         f"live memory reading {live_path} in a test; fake BUILDLOG_MEMINFO and "
         + "BUILDLOG_MEMORY_PRESSURE (scripts/lint/memory_test_support.py)"
     )
 
 
-def read_meminfo(path: Path) -> tuple[int, int | None]:
+def read_meminfo(path: Path) -> HostMemory:
     check_memory_reading(path)
-    available: int | None = None
-    total: int | None = None
+    values: dict[str, int] = {}
     for line in path.read_text().splitlines():
         parts = line.split()
         if len(parts) == 3 and parts[2] == "kB" and parts[1].isdecimal():
-            if parts[0] == "MemAvailable:":
-                available = int(parts[1]) * 1024
-            elif parts[0] == "MemTotal:":
-                total = int(parts[1]) * 1024
-    if available is None:
+            values[parts[0].removesuffix(":")] = int(parts[1]) * 1024
+    if "MemAvailable" not in values:
         raise ValueError(f"MemAvailable missing from {path}")
-    return available, total
+    return HostMemory(values["MemAvailable"], values.get("MemTotal"),
+                      values.get("SwapTotal", 0), values.get("SwapFree", 0))
 
 
-def read_pressure() -> Pressure:
+NO_HOST_SWAP = HostMemory(0, None)
+
+
+def read_pressure(host: HostMemory = NO_HOST_SWAP) -> Pressure:
     """An unreadable pressure file does not block; the memory rule still applies."""
-    full = 0.0
+    readings: dict[str, float] = {}
     path = Path(os.environ.get("BUILDLOG_MEMORY_PRESSURE", "/proc/pressure/memory"))
     check_memory_reading(path)
     try:
         for line in path.read_text().splitlines():
             parts = line.split()
-            if parts and parts[0] == "full":
-                full = next(float(part.removeprefix("avg10=")) for part in parts[1:] if part.startswith("avg10="))
+            if parts and parts[0] in ("full", "some"):
+                value = next(float(part.removeprefix("avg10=")) for part in parts[1:] if part.startswith("avg10="))
+                if math.isfinite(value) and value >= 0:
+                    readings[parts[0]] = value
     except (OSError, ValueError, StopIteration):
         pass
-    return MemoryPressure(full) if full > 10.0 else NO_PRESSURE_HOLD
+    full, some = readings.get("full", 0.0), readings.get("some", 0.0)
+    swap = 100 * max(0, host.swap_total - host.swap_free) / host.swap_total if host.swap_total else 0.0
+    if swap > SWAP_USED_LIMIT and some > SOME_PRESSURE_LIMIT:
+        return MemoryPressure(full, some, swap)
+    return MemoryPressure(full) if full > FULL_PRESSURE_LIMIT else NO_PRESSURE_HOLD
+
+
+@dataclass(frozen=True)
+class PressureHoldRecorded:
+    pass
+
+
+@dataclass(frozen=True)
+class RecoveryStarts:
+    ends_at: float
+    next_start_at: float
+
+
+@dataclass(frozen=True)
+class NoRecoverySpacing:
+    pass
+
+
+RecoverySpacing = PressureHoldRecorded | RecoveryStarts | NoRecoverySpacing
+
+
+def read_recovery(directory: Path) -> RecoverySpacing:
+    path = directory / "pressure-recovery"
+    try:
+        value = cast(object, json.loads(path.read_text()))
+        if not isinstance(value, dict):
+            raise ValueError("expected a recovery object")
+        raw = cast(dict[str, object], value)
+        if raw.get("state") == "held":
+            return PressureHoldRecorded()
+        ends, next_start = raw.get("ends_at"), raw.get("next_start_at")
+        if (raw.get("state") != "recovering" or not isinstance(ends, (int, float))
+                or not isinstance(next_start, (int, float)) or isinstance(ends, bool)
+                or isinstance(next_start, bool) or not math.isfinite(ends)
+                or not math.isfinite(next_start)):
+            raise ValueError("invalid pressure recovery deadlines")
+        return RecoveryStarts(ends, next_start)
+    except FileNotFoundError:
+        return NoRecoverySpacing()
+    except (OSError, ValueError) as error:
+        print(f"memory admission: pressure recovery record {path} ignored: {error}", file=sys.stderr)
+        return NoRecoverySpacing()
+
+
+def write_recovery(directory: Path, recovery: PressureHoldRecorded | RecoveryStarts) -> None:
+    data = ({"state": "held"} if isinstance(recovery, PressureHoldRecorded) else
+            {"state": "recovering", "ends_at": recovery.ends_at, "next_start_at": recovery.next_start_at})
+    # All writers hold the admission lock; readers see one complete snapshot.
+    temporary = directory / "pressure-recovery.tmp"
+    try:
+        _ = temporary.write_text(json.dumps(data))
+        os.replace(temporary, directory / "pressure-recovery")
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def pressure_with_recovery(recovery: RecoverySpacing, pressure: Pressure, now: float) -> Pressure:
+    if isinstance(pressure, MemoryPressure):
+        return pressure
+    if isinstance(recovery, RecoveryStarts) and now < min(recovery.ends_at, recovery.next_start_at):
+        return MemoryPressure(0, next_start_at=min(recovery.ends_at, recovery.next_start_at))
+    return pressure
+
+
+def recovery_pressure(directory: Path, pressure: Pressure, now: float) -> Pressure:
+    """Read the bounded recovery window; only check writes it under its lock."""
+    return pressure_with_recovery(read_recovery(directory), pressure, now)
 
 
 def pressure_text(pressure: MemoryPressure) -> str:
+    if pressure.next_start_at:
+        return "memory pressure recovery: starts at least 30 s apart"
+    if pressure.swap_used_percent > SWAP_USED_LIMIT:
+        return f"memory pressure: swap {pressure.swap_used_percent:.1f}% used; some avg10 {pressure.some_avg10:.1f}"
     return f"memory pressure: full avg10 {pressure.full_avg10:.1f}"
 
 
@@ -875,7 +1026,7 @@ def queue_decision(available: int, total: int | None, row: Waiter,
     decision = decide(available, total, row["need"], running, head_need, pressure)
     if younger:
         return replace(decision, state="hold")
-    if isinstance(head, HeadPriority) and waiter_order(head.waiter) == waiter_order(row) and not running:
+    if isinstance(head, HeadPriority) and waiter_order(head.waiter) == waiter_order(row) and not has_running_step(running):
         return replace(decision, state="admit" if isinstance(pressure, NoPressureHold) else "hold")
     return decision
 
@@ -1022,10 +1173,10 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
     """Admit or hold one step. A held step is a waiter from `since` (epoch seconds; 0 means now), so a
     step that gave its reservation back for the cargo token keeps its place."""
     root = root if root is not None else store.root()
-    now = now if now is not None else datetime.now(UTC)
+    estimate_time = now if now is not None else datetime.now(UTC)
     width = test_threads(argv)
     package, filters = test_package(argv), test_filters(argv)
-    if profile is not None and profile.estimated_at and now.timestamp() - profile.estimated_at >= HEAD_SECONDS:
+    if profile is not None and profile.estimated_at and estimate_time.timestamp() - profile.estimated_at >= HEAD_SECONDS:
         profile = None
     if profile is None:
         repository, worktree = git_identity(argv, os.getcwd())
@@ -1033,31 +1184,39 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
         scope = test_scope(argv)
         step = parse.step_name(argv) if argv else "build"
         host = store.host_name()
-        peak = expected_peak(repository, step, host, now, root, scope=scope,
+        peak = expected_peak(repository, step, host, estimate_time, root, scope=scope,
                              package=package, filters=filters)
-        profile = StepProfile(repo, step, worktree, peak, repository, scope, now.timestamp())
+        profile = StepProfile(repo, step, worktree, peak, repository, scope, estimate_time.timestamp())
     elif not profile.estimated_at:
-        profile = replace(profile, estimated_at=now.timestamp())
+        profile = replace(profile, estimated_at=estimate_time.timestamp())
     repo, step, worktree, peak = profile.repo, profile.step, profile.worktree, profile.peak
     if not argv and not (root / "admission").exists():
-        available, total = read_meminfo(meminfo)
-        pressure = read_pressure()
-        return CheckResult(decide(available, total, peak.bytes, [], pressure=pressure), peak, [], NotReserved("launch"), repo, step, available, profile)
+        host = read_meminfo(meminfo)
+        available, total = host.available, host.total
+        pressure = read_pressure(host)
+        if isinstance(pressure, NoPressureHold):
+            return CheckResult(decide(available, total, peak.bytes, sccache_memory(), pressure=pressure), peak, [], NotReserved("launch"), repo, step, available, profile)
+        # A launch can be the first caller to observe a pressure hold. Record
+        # it under the lock so launches after it share the recovery window.
     directory = admission_dir(root)
     with (directory / "lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        # Lock contention must not consume the recovery spacing or ramp window.
+        # Use one time for every decision and ledger write in this transaction.
+        now = now if now is not None else datetime.now(UTC)
         proc = Path(os.environ.get("BUILDLOG_PROC", "/proc"))
         processes = process_table(proc)
         live: list[tuple[Path, Reservation]] = []
         running: list[StepMemory] = []
         for path, row in live_reservations(directory):
-            memory = step_memory(row, now, processes, proc)
+            memory = reservation_memory(path, row, now, processes, proc)
             if isinstance(memory, GoneMemory):
                 path.unlink(missing_ok=True)
                 path.with_suffix(".max").unlink(missing_ok=True)
                 continue
             live.append((path, row))
             running.append(memory)
+        running.extend(sccache_memory())
         start = process_start_time(pid)
         mine = directory / f"{pid}-{start}.waiting"
         waiting = live_waiters(directory)
@@ -1083,8 +1242,20 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                 waiter["holds_younger"] = True
             if "priority_since" in previous:
                 waiter["priority_since"] = previous["priority_since"]
-        available, total = read_meminfo(meminfo)
-        pressure = read_pressure()
+        host = read_meminfo(meminfo)
+        available, total = host.available, host.total
+        pressure = read_pressure(host)
+        recovery = read_recovery(directory)
+        if isinstance(pressure, MemoryPressure):
+            recovery = PressureHoldRecorded()
+            write_recovery(directory, recovery)
+        elif isinstance(recovery, PressureHoldRecorded):
+            recovery = RecoveryStarts(now.timestamp() + RECOVERY_WINDOW_SECONDS, now.timestamp())
+            write_recovery(directory, recovery)
+        elif isinstance(recovery, RecoveryStarts) and now.timestamp() >= recovery.ends_at:
+            (directory / "pressure-recovery").unlink()
+            recovery = NoRecoverySpacing()
+        pressure = pressure_with_recovery(recovery, pressure, now.timestamp())
         candidates = sorted([row for path, row in waiting if path != mine] + ([waiter] if argv else []),
                             key=waiter_order)
         head = head_priority(candidates, available, total, running, now.timestamp())
@@ -1099,6 +1270,11 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                 and waiter_order(head.waiter) < waiter_order(waiter)):
             head_need, head_label = head.waiter["need"], waiter_label(head.waiter)
         decision = queue_decision(available, total, waiter, running, head, pressure)
+        # History lookup stays outside the lock. If contention outlives the
+        # estimate, keep its timestamp so the next shell poll refreshes it.
+        if now.timestamp() - profile.estimated_at >= HEAD_SECONDS:
+            decision = replace(decision, state="hold")
+            print("memory admission: estimate expired while waiting for the lock; refresh on the next poll", file=sys.stderr)
         blocker = reservation_blocker(waiter, candidates, [row for _, row in live], running,
                                       available, total, pressure, now.timestamp(), processes, proc)
         reservation: Reserved | NotReserved = NotReserved("held" if argv else "launch")
@@ -1107,6 +1283,8 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
             waiter["session_id"], waiter["session_name"] = identity["session_id"], identity["session_name"]
             waiter["step"], waiter["folder"] = identity["step"], identity["folder"]
             _ = mine.write_text(json.dumps(waiter, separators=(",", ":")))
+        if decision.state == "admit" and isinstance(recovery, RecoveryStarts):
+            write_recovery(directory, replace(recovery, next_start_at=now.timestamp() + RECOVERY_START_SECONDS))
         if argv and decision.state == "admit":
             mine.unlink(missing_ok=True)
             if start is not None:
@@ -1214,16 +1392,18 @@ def reservation_blocker(waiter: Waiter, waiters: list[Waiter], reservations: lis
     head = head_priority(waiters, available, total, running, now)
     if queue_decision(available, total, waiter, running, head, pressure).state == "admit":
         return NoSingleBlocker()
-    blockers: list[Reservation] = []
+    blockers: list[int] = []
     for index, memory in enumerate(running):
         remaining = running[:index] + running[index + 1:]
         freed = memory.bytes - memory.swap_bytes if isinstance(memory, MeasuredMemory) else 0
         after_head = head_priority(waiters, available + freed, total, remaining, now)
         if queue_decision(available + freed, total, waiter, remaining, after_head, pressure).state == "admit":
-            blockers.append(reservations[index])
+            blockers.append(index)
     if len(blockers) != 1:
         return NoSingleBlocker()
-    row = blockers[0]
+    if blockers[0] >= len(reservations):
+        return UnitBlocker("sccache.service")
+    row = reservations[blockers[0]]
     identity = QueueIdentityReader(processes, proc).identity(row["pid"], cast(dict[str, object], cast(object, row)))
     if identity["session_id"]:
         return ReservationBlocker(identity["session_id"], identity["session_name"])
@@ -1254,18 +1434,21 @@ def blocker_snapshot(waiter_path: Path) -> Blocker:
     now = time.time()
     reservations: list[Reservation] = []
     running: list[StepMemory] = []
-    for _, row in queue_rows(directory, "reservation", processes):
+    for path, row in queue_rows(directory, "reservation", processes):
         reservation = cast(Reservation, cast(object, row))
-        memory = step_memory(reservation, datetime.fromtimestamp(now, UTC), processes, proc)
+        memory = reservation_memory(path, reservation, datetime.fromtimestamp(now, UTC), processes, proc)
         if not isinstance(memory, GoneMemory):
             reservations.append(reservation)
             running.append(memory)
+    running.extend(sccache_memory())
     try:
-        available, total = read_meminfo(Path(os.environ.get("BUILDLOG_MEMINFO", "/proc/meminfo")))
+        host = read_meminfo(Path(os.environ.get("BUILDLOG_MEMINFO", "/proc/meminfo")))
     except (OSError, ValueError):
         return NoSingleBlocker()
+    available, total = host.available, host.total
+    pressure = recovery_pressure(directory, read_pressure(host), now)
     return reservation_blocker(matching[0], [row for _, row in ordered], reservations, running,
-                               available, total, read_pressure(), now, processes, proc)
+                               available, total, pressure, now, processes, proc)
 
 
 def current_blocker(waiter_path: Path) -> Blocker:
@@ -1284,23 +1467,27 @@ def read_queue(directory: Path, processes: dict[int, ProcessIdentity], now: floa
     identities = QueueIdentityReader(processes, proc)
     running: list[RunningStep] = []
     memory: list[StepMemory] = []
-    for _, row in queue_rows(directory, "reservation", processes):
+    for path, row in queue_rows(directory, "reservation", processes):
         reservation = cast(Reservation, cast(object, row))
         pid = reservation["pid"]
-        reading = step_memory(reservation, datetime.fromtimestamp(now, UTC), processes, proc)
+        reading = reservation_memory(path, reservation, datetime.fromtimestamp(now, UTC), processes, proc)
         if isinstance(reading, GoneMemory):
             continue
         identity = identities.identity(pid, row)
         running.append(RunningStep(identity["session_id"], identity["session_name"], identity["step"],
                                    identity["folder"], reservation["need"], reading))
         memory.append(reading)
-    available, total = 0, 0
+    for compiler in sccache_memory():
+        memory.append(compiler)
+        running.append(RunningStep("", "sccache.service", "compile", "builds.slice", 0, compiler))
+    host = HostMemory(0, None)
     unavailable = False
     try:
-        available, total = read_meminfo(Path(os.environ.get("BUILDLOG_MEMINFO", "/proc/meminfo")))
+        host = read_meminfo(Path(os.environ.get("BUILDLOG_MEMINFO", "/proc/meminfo")))
     except (OSError, ValueError):
         unavailable = True
-    pressure = read_pressure()
+    available, total = host.available, host.total
+    pressure = recovery_pressure(directory, read_pressure(host), now)
     ordered = sorted(((path, cast(Waiter, cast(object, row))) for path, row in queue_rows(directory, "waiting", processes)),
                      key=lambda item: waiter_order(item[1]))
     head = head_priority([row for _, row in ordered], available, total, memory, now)
@@ -1479,13 +1666,19 @@ def run_action() -> None:
                                       repository, row["test_scope"], row["estimated_at"])
         except (OSError, ValueError, TypeError, KeyError):
             pass
-    result = check(Path(meminfo), int(pid), sidecar, argv, float(since or 0), profile=profile)
+    # The shell combines stdout and stderr and requires one protocol line.
+    # Keep nonfatal read diagnostics visible in its existing summary field.
+    diagnostics = io.StringIO()
+    with redirect_stderr(diagnostics):
+        result = check(Path(meminfo), int(pid), sidecar, argv, float(since or 0), profile=profile)
     decision, peak, live = result.decision, result.peak, result.live
     summary = ", ".join(f"{row['repo']} {row['step']} in {row['worktree']}" for row in live)
     if isinstance(result.head_reason, HeadAdmissionStatus):
         summary = f"{head_wait_text(result.head_reason, user_zone())}; {summary}".rstrip("; ")
     elif isinstance(decision.pressure, MemoryPressure):
         summary = f"{pressure_text(decision.pressure)}; {summary}".rstrip("; ")
+    if diagnostics.getvalue():
+        summary = "; ".join(filter(None, [summary, *diagnostics.getvalue().splitlines()]))
     reservation = result.reservation
     path = str(reservation.path) if isinstance(reservation, Reserved) else ""
     reason = "reserved" if isinstance(reservation, Reserved) else reservation.reason

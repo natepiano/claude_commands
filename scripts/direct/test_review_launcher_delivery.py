@@ -378,7 +378,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
             timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("unknown review lens 'style' (adversary, contract, craft, ux)", result.stderr)
+        self.assertIn("unknown review lens 'style' (adversary, contract, craft, ux, rerun)", result.stderr)
         self.assertFalse((session_dir / "review_status_style").exists())
         self.assertEqual(
             [event["event_type"] for event in self.pass_events("unknown-lens")],
