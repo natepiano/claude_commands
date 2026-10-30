@@ -40,8 +40,7 @@ class MergeGateHoldTests(TemporaryHoldTest):
         super().setUp()
         self.addCleanup(self.gate.doCleanups)
         self.gate.setUp()
-        self.gate.suites = suites_for_case(self)
-        _ = self.enterContext(mock.patch.object(merge_gate, "TEST_SUITES", self.gate.suites))
+        self.gate.restore_fixture(suites_for_case(self))
         # Keep the hold helper's roots and owner, and the gate helper's tools and repos.
         self.environment = {**self.gate.environment, **{
             name: os.environ[name] for name in (
@@ -204,13 +203,14 @@ class MergeGateHoldTests(TemporaryHoldTest):
                 starts: list[str] = []
 
                 def start_job(name: str, path: Path, argv: list[str], repo: Path,
-                              environment: dict[str, str], log: Path) -> merge_gate.RunningGateJob:
+                              environment: dict[str, str], log: Path, *,
+                              kind: merge_gate.GateJobKind = merge_gate.GateJobKind.TEST_MODULE) -> merge_gate.RunningGateJob:
                     self.assertFalse((self.holders / "other").exists())
                     if not starts:
                         self.hold()
                         self.record("hold")
                     starts.append(name)
-                    return start(name, path, argv, repo, environment, log)
+                    return start(name, path, argv, repo, environment, log, kind=kind)
 
                 def release(_seconds: float) -> None:
                     self.assertEqual(starts, [suite])
@@ -219,8 +219,7 @@ class MergeGateHoldTests(TemporaryHoldTest):
 
                 events = IntervalReleasePolling()
                 output = io.StringIO()
-                with mock.patch.object(merge_gate, "TEST_SUITES", ("hooks",)), \
-                        mock.patch.object(merge_gate, "RERUN_LIMIT", 0), \
+                with mock.patch.object(merge_gate, "RERUN_LIMIT", 0), \
                         mock.patch.object(merge_gate, "start_gate_job", side_effect=start_job), \
                         mock.patch.object(merge_gate, "local_release_waiter", return_value=events), \
                         mock.patch.object(events, "wait", side_effect=release), redirect_stdout(output):
@@ -238,7 +237,7 @@ class MergeGateHoldTests(TemporaryHoldTest):
     def test_a_signal_without_a_hold_keeps_the_module_red(self) -> None:
         self.gate.write(self.gate.state / "signal-hooks", "always")
         output = io.StringIO()
-        with mock.patch.object(merge_gate, "TEST_SUITES", ("hooks",)), redirect_stdout(output):
+        with redirect_stdout(output):
             run = merge_gate.run_suites(self.gate.checkout)
         self.assertFalse(run.passed, output.getvalue())
         self.assertEqual(len(run.jobs), 1)

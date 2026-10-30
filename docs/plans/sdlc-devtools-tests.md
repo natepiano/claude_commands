@@ -29,7 +29,7 @@ Known input for the inventory: `scripts/agents/test_codex_mesh.py` was killed at
 
 ## Phases
 
-### Phase 1 — The merge gate finds every test module itself  · status: todo
+### Phase 1 — The merge gate finds every test module itself  · status: done
 **Depends on:** none
 
 #### Work Order
