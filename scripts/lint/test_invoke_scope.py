@@ -14,7 +14,12 @@ import time
 import unittest
 from pathlib import Path
 from dataclasses import dataclass
-from typing import cast
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from ..buildlog.cgroup_test_support import write_cgroup
+else:
+    from scripts.buildlog.cgroup_test_support import write_cgroup
 
 
 # Hang guards allow for load 136 on natedev (2026-10-29).
@@ -51,6 +56,15 @@ def scope_command() -> str:
     if match is None:
         raise AssertionError("BUILDLOG_SCOPE_SH is missing or no longer a single-quoted string")
     return match.group(1)
+
+
+def python_spy(root: Path) -> None:
+    tool = root / ".claude/scripts/lib/py"
+    tool.parent.mkdir(parents=True)
+    _ = tool.write_text("\n".join([
+        "#!/bin/sh", 'echo python >> "$HOME/python-called"', "exit 93", "",
+    ]))
+    tool.chmod(0o755)
 
 
 def require_score_below_500(test: unittest.TestCase) -> None:
@@ -97,6 +111,20 @@ class BuildScopeTests(unittest.TestCase):
     def test_step_exit_status_passes_through(self) -> None:
         result = self.run_scope(["sh", "-c", "exit 7"])
         self.assertEqual(result.returncode, 7)
+
+    def test_scope_copies_counters_without_python_and_keeps_status_when_io_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scope = root / "scope"
+            write_cgroup(scope, with_io=False)
+            python_spy(root)
+            command = scope_command().replace(
+                '"/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"', f'"{scope}"')
+            result = self.run_scope(["/bin/sh", "-c", "exit 7"], command,
+                                    {**os.environ, "HOME": str(root)})
+            self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+            self.assertFalse((root / "python-called").exists())
+            self.assertFalse((scope / "io.stat").exists())
 
     def test_scope_writes_cgroup_sidecar_before_step(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -386,6 +414,47 @@ class BuildAdmissionTests(unittest.TestCase):
                                                b"".join(chunks).decode(), result.stderr)
         finally:
             os.close(reader)
+
+    def test_terminal_and_tee_runs_capture_scope_after_command_before_release(self) -> None:
+        shell = r'''
+events="$TMPDIR/events"
+buildlog_step_compiles() { return 1; }
+buildlog_begin() {
+    BUILDLOG_START="" BUILDLOG_PEAK="$TMPDIR/peak" BUILDLOG_MEM_RESERVATION=""
+    printf '%s\n' "$TMPDIR/scope" > "$BUILDLOG_PEAK.cgroup"
+}
+buildlog_exec() {
+    /bin/sh -c "$SCOPE_TEST_COMMAND" "$BUILDLOG_PEAK" sh -c \
+        'echo command >> "$TMPDIR/events"; printf "usage_usec 99\n" > "$TMPDIR/scope/cpu.stat"; exit 7' 3>&2
+}
+buildlog_release_memory() {
+    test "$(cat "$BUILDLOG_PEAK.cpu.stat")" = "usage_usec 99" || return 91
+    test ! -s "$BUILDLOG_PEAK.io.stat" || return 92
+    echo capture >> "$events"
+    echo release >> "$events"
+    rm -rf "$TMPDIR/scope"
+}
+nextest_share_end() { :; }
+buildlog_end() { echo "record $1" >> "$events"; }
+sweep_after_step() { :; }
+run_once fixture-step
+'''
+        for terminal in (False, True):
+            with self.subTest(terminal=terminal), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "scope").mkdir()
+                python_spy(root)
+                translated = scope_command().replace(
+                    '\"/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)\"', f'"{root / "scope"}"')
+                result = self.run_invoke(root, shell, [], terminal=terminal,
+                                         environment={"SCOPE_TEST_COMMAND": translated})
+                self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+                self.assertEqual((root / "events").read_text().splitlines(),
+                                 ["command", "capture", "release", "record 7"])
+                self.assertFalse((root / "peak.cgroup").exists())
+                self.assertFalse((root / "python-called").exists())
+                self.assertEqual((root / "peak.cpu.stat").read_text(), "usage_usec 99\n")
+                self.assertEqual((root / "peak.io.stat").read_text(), "")
 
     def test_taplo_does_not_compile_and_existing_command_classification_is_preserved(self) -> None:
         cases = [

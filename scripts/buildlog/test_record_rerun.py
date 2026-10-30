@@ -25,6 +25,7 @@ import launches
 import record
 import report
 import store
+from cgroup_test_support import CPU, save_scope_counters, write_cgroup
 import test_launch_recording as launch_tests
 import test_record as record_tests
 from test_index import point_root_at, step as indexed_step
@@ -307,6 +308,63 @@ class RecordRerunTests(unittest.TestCase):
         self.assertEqual(self.saved_logs()[0].read_bytes(), saved_log_bytes)
         self.assertEqual(index.update(), 0)
         self.assertEqual(list(pending.glob("*.json")), [])
+
+    def test_transient_scope_sidecar_read_keeps_sources_for_measured_retry(self) -> None:
+        scope = self.fixture.base / "scope-retry"
+        write_cgroup(scope)
+        captured = save_scope_counters(self.peak, scope)
+        self.assertEqual(captured.returncode, 0, captured.stderr)
+        read_text = Path.read_text
+        for suffix in (".cpu.stat", ".io.stat"):
+            sidecar = Path(str(self.peak) + suffix)
+
+            def transient_read(path: Path, *args: object, **kwargs: object) -> str:
+                if path == sidecar:
+                    raise PermissionError("fixture transient counter read")
+                return read_text(path, *args, **kwargs)  # pyright: ignore[reportArgumentType]
+
+            with self.subTest(sidecar=suffix), mock.patch.object(Path, "read_text", transient_read):
+                self.assertEqual(self.run_step(), 0)
+            self.assertEqual(self.step_records(), [])
+            self.assertEqual(list(record.pending_steps_root().glob("*.json")), [])
+            self.assertTrue(self.held.is_file())
+            self.assertTrue(self.peak.is_file())
+            self.assertTrue(Path(str(self.peak) + ".cpu.stat").is_file())
+            self.assertTrue(Path(str(self.peak) + ".io.stat").is_file())
+        self.assertEqual(self.run_step(), 0)
+        rows = self.step_records()
+        self.assertEqual(len(rows), 1)
+        resources = cast(record_tests.Record, rows[0]["scope_resources"])
+        self.assertEqual(resources["cpu"], CPU)
+        self.assertEqual(cast(record_tests.Record, resources["io"])["state"], "measured")
+        self.assertFalse(Path(str(self.peak) + ".cpu.stat").exists())
+        self.assertFalse(Path(str(self.peak) + ".io.stat").exists())
+
+    def test_interrupted_step_keeps_saved_scope_counters_without_recapturing(self) -> None:
+        scope = self.fixture.base / "scope"
+        write_cgroup(scope, with_io=False)
+        _ = Path(str(self.peak) + ".cgroup").write_text(str(scope) + "\n")
+        captured = save_scope_counters(self.peak, scope)
+        self.assertEqual(captured.returncode, 0, captured.stderr)
+        with mock.patch.object(record, "keep_log", side_effect=OSError("fixture log save stopped")):
+            self.assertEqual(self.run_step(), 0)
+        pending_paths = list(record.pending_steps_root().glob("*.json"))
+        self.assertEqual(len(pending_paths), 1)
+        pending = pending_paths[0]
+        saved = cast(record_tests.Record, json.loads(pending.read_text()))
+        original = cast(record_tests.Record, cast(record_tests.Record, saved["row"])["scope_resources"])
+        self.assertEqual(original["cpu"], CPU)
+        self.assertEqual(original["io"], {"state": "unavailable"})
+        shutil.rmtree(scope)
+        Path(str(self.peak) + ".cpu.stat").unlink(missing_ok=True)
+        Path(str(self.peak) + ".io.stat").unlink(missing_ok=True)
+        with mock.patch.object(record, "scope_resources", side_effect=AssertionError("recovery reread scope counters")):
+            finished = record.finish_pending_step(pending)
+        self.assertIsNotNone(finished)
+        rows = self.step_records()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["scope_resources"], original)
+        self.assertFalse(pending.exists())
 
     def test_stop_after_failed_log_save_finishes_the_original_step_once(self) -> None:
         self.assert_step_recovers(StepRecordingFault.AFTER_LOG_SAVE)

@@ -330,7 +330,7 @@ including the details to make it clear
 
 **Ruled out:** reader changes that skip bad lines (the writer keeps each file whole); a `\n` repair after an unfinished tail (the fragment became its own line that is not JSON); a second backward block reader beside `head_facts._backward_lines` (a short `os.read` skipped bytes, so the cut removed whole rows); a repair of the one-time removal script (it rewrote nothing and does not run again).
 
-### Phase 7 — The build report shows how much memory running builds really hold, hour by hour  · status: todo
+### Phase 7 — The build report shows how much memory running builds really hold, hour by hour  · status: done
 
 **Depends on:** none
 
@@ -395,5 +395,23 @@ including the details to make it clear
 - No copies. A second copy of setup, a fixture, a config writer, a parser or a helper is a defect. Reviews flag it; you send it back. A test helper that each file writes for itself goes into one shared helper.
 - When many things break the same way, the copy is the cause. Name it first in your report, with the one-place fix, before anyone asks.
 - Fix at the cause, never a patch at each site.
+
+**Review rulings (director, 2026-10-30, repair round 1):**
+- The report reads memory, disk, jobserver and counter readings from the one sample row (`samples.slices`, `filesystem`, `jobserver`). This replaces the Constraint's "slice measurements in `memory_snapshots.slices`" for this report's reads: a failed snapshot append must not hide a reading the sample row saved. `memory_snapshots` stays for its existing readers.
+- A step's capture is plain `cat` of the scope's `cpu.stat` and `io.stat` in `BUILDLOG_SCOPE_SH`, beside `memory.peak`. No Python runs inside the scope, so the capture adds nothing to the step's peak, CPU or time. `record.step` parses the files with the shared parser.
+- A day's pressure totals count an interval once, by its end in that day. Only the hourly table splits an interval across hour edges.
+- Hourly usage selects natedev's rows through the report's existing natedev selection, so the Mac shows the same answer.
+
+**Assertion-Change (director ruling, 2026-10-30):** `scripts/buildlog/test_index.py::test_sample_power_profile_indexes_without_backfilling_old_lines` — the test took `SAMPLE_COLUMNS[-2:]` as the `power_profile` and `since` definitions; Phase 7 appends sample columns after them, so the test selects those two columns by name, with the same expected definitions.
+
+**Repair round 1 test ruling (director, 2026-10-30):** the step capture's tests move from the `capture-scope` command and `.resources` file to the raw `.cpu.stat` and `.io.stat` files. The exact CPU and IO values, the step's exit status and the event order stay as they are. Python-not-called and missing-`io.stat` assertions are added. Recovery of a saved row must not read the files again. No numeric expectation changes.
+
+**Assertion-Change (director rulings, 2026-10-30):** each follows from this Spec's counter continuity rule (a reset or a gap gives unknown, never 0), its new slice fields, or its jobserver reads.
+- `scripts/buildlog/test_report.py::test_cpu_disk_pressure_counts_reboot_counters_from_zero` — renamed `test_cpu_disk_pressure_does_not_count_across_a_reboot`; the old test took a new boot's counter as a delta, which the Spec forbids, so a pair across a boot now gives no interval.
+- `scripts/buildlog/test_report.py::test_memory_pressure_uses_sample_peaks_and_reboot_counter_deltas` — `3.5 s` and `1.5 s` become `3.0 s` and `1.4 s`: only same-boot adjacent intervals count; the peak, wait and source assertions stay.
+- `scripts/buildlog/test_report.py::test_memory_pressure_samples_without_stalled_steps_have_no_table` — `some 0.0 s` and `full 0.0 s` become `unavailable`: one reading has no interval, and unknown is never 0.
+- `scripts/buildlog/test_report.py::test_memory_pressure_ignores_counter_rise_across_a_long_sampling_gap` — `some 0.0 s` and `full 0.0 s` become `unavailable`: a gap over the limit is unknown, never 0.
+- `scripts/buildlog/test_memory_window.py::test_snapshot_cli_prints_and_appends_exactly_one_record_from_fake_cgroups` — exact equality now covers the same named fields with the same expected values; the new fields have their own exact assertions.
+- `scripts/buildlog/test_sample.py::power_profile_sample` (used by `test_sample_writes_power_profile_and_utc_state_mtime` and `test_sample_without_power_profile_still_writes_null_fields`) — `sample must not fork` gives way to a stub of the two read-only `stevie` calls this Spec adds; the one-row assertion stays for the non-CLI path, and the new CLI path expects its sample and snapshot rows.
 
 **Acceptance gate:** `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY PYTHONPATH=scripts/buildlog python3 -m unittest scripts.lint.test_invoke_scope scripts.buildlog.test_record scripts.buildlog.test_record_rerun scripts.buildlog.test_memory_window scripts.buildlog.test_sample scripts.buildlog.test_disk scripts.buildlog.test_index scripts.buildlog.test_report` from the worktree root green; basedpyright on every changed Python file `0 errors, 0 warnings, 0 notes`; fixtures prove the rules (no sum of stacked layers, unknown never 0, typed unavailable); live: one capture-only run (not `cli.py sample`, which starts the Mac idle watcher at `cli.py:289`) beside timestamped reads of `memory.current`, `memory.stat` and `io.stat` in the folder `memory.builds_path()` returns, compared within a stated tolerance, with the `anon + file + kernel + sock + zswap` gap to `current_bytes` reported; `python3 scripts/buildlog/cli.py report` prints the new line and `python3 scripts/buildlog/cli.py usage-hours` prints a row per hour with readings. The per-step CPU live check runs after the change lands on main (invoke.sh runs the installed recorder).

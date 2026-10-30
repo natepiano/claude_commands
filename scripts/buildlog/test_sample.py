@@ -21,6 +21,7 @@ from unittest.mock import patch
 import cli
 import sample
 import store
+from cgroup_test_support import CPU, write_cgroup
 from test_index import use_test_log
 
 use_test_log()
@@ -46,6 +47,70 @@ class SampleTests(unittest.TestCase):
         for name, filename in (("CPU_PRESSURE", "cpu_pressure"), ("IO_PRESSURE", "io_pressure"), ("STAT", "stat")):
             _ = self.enterContext(patch.object(sample, name, proc / filename))
         _ = self.enterContext(patch.object(sample, "POWER_PROFILE_STATE", self.root / "absent-profile"))
+
+    def test_pool_token_readings_use_read_only_commands_and_short_timeouts(self) -> None:
+        with patch.object(subprocess, "run", side_effect=[
+            subprocess.CompletedProcess(["stevie"], 0, "31\n", ""),
+            subprocess.CompletedProcess(["stevie"], 0, "14\n", ""),
+        ]) as run:
+            self.assertEqual(sample.free_pool_tokens("/dev/steve"), {"state": "measured", "free_pool_tokens": 31})
+            self.assertEqual(sample.free_pool_tokens("/dev/steve-ci"), {"state": "measured", "free_pool_tokens": 14})
+        self.assertEqual([call.args[0] for call in run.call_args_list],
+                         [["stevie", "-t"], ["stevie", "-s", "/dev/steve-ci", "-t"]])
+        self.assertTrue(all(0 < call.kwargs["timeout"] <= 1 for call in run.call_args_list))
+
+    def test_pool_failure_timeout_and_bad_output_are_unavailable(self) -> None:
+        outcomes = [FileNotFoundError("missing stevie"), subprocess.TimeoutExpired("stevie", 0.5),
+                    subprocess.CompletedProcess(["stevie"], 1, "0", "failed"),
+                    subprocess.CompletedProcess(["stevie"], 0, "invalid", ""),
+                    subprocess.CompletedProcess(["stevie"], 0, "-1", "")]
+        for outcome in outcomes:
+            with self.subTest(outcome=outcome), patch.object(subprocess, "run") as run:
+                if isinstance(outcome, BaseException):
+                    run.side_effect = outcome
+                else:
+                    run.return_value = outcome
+                self.assertEqual(sample.free_pool_tokens("/dev/steve"), {"state": "unavailable"})
+
+    def test_sample_shares_slice_capture_and_preserves_ci_when_builds_file_is_unreadable(self) -> None:
+        import cgroup_capture
+
+        builds, ci = self.root / "builds.slice", self.root / "ci.slice"
+        write_cgroup(builds, with_io=False)
+        write_cgroup(ci)
+        (builds / "memory.current").unlink()
+        (builds / "memory.current").mkdir()
+        with patch.object(cgroup_capture, "builds_path", return_value=builds), \
+             patch.object(cgroup_capture, "ci_path", return_value=ci):
+            row = self.power_profile_sample(self.root / "missing.ini")
+        slices = cast(dict[str, Record], row["slices"])
+        self.assertEqual(slices["builds"]["current_bytes"], "unavailable")
+        self.assertEqual(slices["builds"]["cpu"], CPU)
+        self.assertEqual(slices["builds"]["io"], {"state": "unavailable"})
+        self.assertEqual(slices["ci"]["current_bytes"], 12 * 2**30)
+        self.assertEqual(row["jobserver"], {"builds": {"state": "measured", "free_pool_tokens": 7},
+                                            "ci": {"state": "measured", "free_pool_tokens": 7}})
+
+    def test_cli_sample_reads_each_slice_file_once_for_both_sample_rows(self) -> None:
+        import cgroup_capture
+
+        builds, ci = self.root / "builds.slice", self.root / "ci.slice"
+        write_cgroup(builds)
+        write_cgroup(ci)
+        reads: dict[Path, int] = {}
+        original = Path.read_text
+
+        def read(path: Path, *args: object, **kwargs: object) -> str:
+            reads[path] = reads.get(path, 0) + 1
+            return original(path, *args, **kwargs)  # pyright: ignore[reportArgumentType]
+
+        with patch.object(cgroup_capture, "builds_path", return_value=builds), \
+             patch.object(cgroup_capture, "ci_path", return_value=ci), patch.object(Path, "read_text", read):
+            row = self.power_profile_sample(self.root / "missing.ini", via_cli=True)
+        self.assertEqual(cast(dict[str, Record], row["slices"])["builds"]["current_bytes"], 12 * 2**30)
+        for scope in (builds, ci):
+            for name in ("memory.current", "memory.stat", "cpu.stat", "io.stat"):
+                self.assertEqual(reads.get(scope / name), 1, str(scope / name))
 
     def test_cpu_ticks_uses_aggregate_and_excludes_guest_fields(self) -> None:
         ticks = sample.parse_cpu_ticks("cpu0 9 9 9 9 9 9 9 9\ncpu 100 20 30 400 50 6 7 8 900 100\n")
@@ -217,7 +282,7 @@ class SampleTests(unittest.TestCase):
         with patch.object(Path, "open", side_effect=PermissionError("unreadable")):
             self.assertIs(sample.read_power_profile(state), sample.Unmeasured.VALUE)
 
-    def power_profile_sample(self, state: Path) -> Record:
+    def power_profile_sample(self, state: Path, *, via_cli: bool = False) -> Record:
         proc = self.root / "proc"
         proc.mkdir(parents=True, exist_ok=True)
         _ = (proc / "meminfo").write_text("MemTotal: 16 kB\nMemAvailable: 4 kB\nSwapTotal: 8 kB\nSwapFree: 1 kB\n")
@@ -230,11 +295,18 @@ class SampleTests(unittest.TestCase):
              patch.object(sample, "PRESSURE", proc / "pressure"), \
              patch.object(sample, "BOOT_ID", proc / "boot_id"), \
              patch.object(sample, "POWER_PROFILE_STATE", state), \
-             patch.object(subprocess, "Popen", side_effect=AssertionError("sample must not fork")):
-            _ = sample.sample()
+             patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(["stevie"], 0, "7\n", "")):
+            if via_cli:
+                with patch.object(store, "host_name", return_value="fixture-host"):
+                    self.assertEqual(cli.main(["sample"]), 0)
+            else:
+                _ = sample.sample()
         lines = next(self.root.glob("*/samples-*.jsonl")).read_text().splitlines()
-        self.assertEqual(len(lines), 1)
-        return cast(Record, json.loads(lines[0]))
+        self.assertEqual(len(lines), 2 if via_cli else 1)
+        row = cast(Record, json.loads(lines[0]))
+        if via_cli:
+            self.assertEqual(cast(Record, json.loads(lines[1]))["slices"], row["slices"])
+        return row
 
     def test_sample_writes_power_profile_and_utc_state_mtime(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)

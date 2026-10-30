@@ -11,11 +11,12 @@ The build log records how long each build step waited on memory. A machine-wide 
 | File | Role |
 | --- | --- |
 | `scripts/lint/invoke.sh` | `BUILDLOG_SCOPE_SH`, the shell run inside each step's systemd scope. It writes the scope cgroup's `memory.peak` and `memory.pressure` to the scope file. |
-| `scripts/buildlog/record.py` | `peak_and_stall()` parses the scope file into a `StepScopeMemory`. `step()` writes `peak_mem_bytes`, `mem_stall_some_s` and `mem_stall_full_s` into the step record. |
+| `scripts/buildlog/cgroup_capture.py` | `read_cgroup()` is the one typed reader of scope and slice files; `read_slices()` keeps builds and CI separate. PSI parsing is shared here and reexported by `sample.py`. |
+| `scripts/buildlog/record.py` | `scope_resources()` parses raw CPU and IO sidecars saved by the scope shell; `peak_and_stall()` parses the scope file into a `StepScopeMemory`. `step()` writes `peak_mem_bytes`, `mem_stall_some_s` and `mem_stall_full_s` into the step record. |
 | `scripts/buildlog/sample.py` | `sample()` (the `buildlog sample` command), the parsers `parse_meminfo`, `parse_pressure`, `parse_cpu_ticks` and `parse_boot_id`, the readers `read_pressure` and `read_cpu_ticks`, and `read_power_profile` with its path `POWER_PROFILE_STATE`. The `/proc` paths are module values (`MEMINFO`, `PRESSURE`, `CPU_PRESSURE`, `IO_PRESSURE`, `STAT`, `BOOT_ID`) that tests patch. Also the types `MachineMemoryUse`, `StallTotals`, `PartialStallTotals` (shared by memory, CPU and IO), `CpuTicks`, `PowerProfile` and `Unmeasured`. |
 | `scripts/buildlog/store.py` | `sample_file(host, epoch)` names `<root>/<host>/samples-<YYYY-MM>.jsonl`. |
-| `scripts/buildlog/index.py` | `SCHEMA_VERSION = 25` (the memory-admission columns are in `docs/as-built/build-memory-admission.md`): the two step stall columns, `SAMPLE_COLUMNS` and the `samples` table, `add_sample`, and the indexes `samples_host_at` and `steps_host_started`. |
-| `scripts/buildlog/cli.py` | The `sample` command. It takes no arguments and exits 2 if given any. |
+| `scripts/buildlog/index.py` | `SCHEMA_VERSION = 26` (the memory-admission columns are in `docs/as-built/build-memory-admission.md`): the two step stall columns, `SAMPLE_COLUMNS` and the `samples` table, `add_sample`, and the indexes `samples_host_at` and `steps_host_started`. |
+| `scripts/buildlog/cli.py` | The `sample` command takes no arguments and exits 2 if given any. `usage-hours [YYYY-MM-DD]` reports the preceding 24 hours. |
 | `scripts/buildlog/report.py` | `memory_pressure_section()`, `cpu_disk_pressure_section()`, the pairing helper `sample_counter_deltas()` with `SampleCounterInterval` and `CounterNotRecorded`, and `MAX_SAMPLE_GAP_S`. It reuses `SCRATCH` and `SCRATCH_LABEL`. The samples' power profile feeds `power_profile_section()` (`docs/as-built/build-targets.md`, "What the reports read"). |
 | `scripts/buildlog/test_{record,index,store,sample,report,memory_records}.py` | Fixture tests; see Tests below. |
 
@@ -55,6 +56,79 @@ Launches skip memory admission by design. Their `mem_wait_s` is null and the rep
 2. The file sits in the host folder beside `<YYYY-MM>.jsonl`. `index.update()` already reads every `<root>/*/*.jsonl` and dispatches on `kind` through `ADDERS`, so `add_sample` picks the lines up incrementally with no special case. The hourly `buildlog sync` copies the host folder, so the Mac's index gets natedev's samples too.
 3. The `samples` table has one row per sample: `src, host, at, boot_id, mem_used_bytes, swap_used_bytes, builds_anon_bytes, sccache_in_service, ci_anon_bytes, stall_some_us, stall_full_us, cpu_stall_some_us, cpu_stall_full_us, io_stall_some_us, io_stall_full_us, cpu_idle_ticks, cpu_iowait_ticks, cpu_total_ticks, power_profile, power_profile_since` (`SAMPLE_COLUMNS`; the seven CPU and IO columns `INTEGER`, both profile columns `TEXT`). It is indexed on `(host, at)`. A line written before a field existed indexes it as NULL; nothing is backfilled.
 
+### Raw resource readings and hourly use
+
+`cgroup_capture.read_cgroup(path)` supplies `memory.slice_state()` and the sample's
+`slices` with one reading of each file. `sample.SampleTaken.slices` is passed to
+`memory.write_snapshot()` so the sample and snapshot do not reread the slice.
+The builds and CI slices remain separate. An absent cgroup has `state: absent`;
+an unreadable scalar is `unavailable` and does not discard other readings.
+
+- `current_bytes` is `memory.current`, the whole charge enforced by `memory.max`.
+  It already includes children, sccache, file cache and kernel memory. Nothing
+  is added to it. `swap_current_bytes` is `memory.swap.current`, kept separate.
+  `max_bytes` is the cap at the same reading; `max` remains its legacy spelling.
+- `stat` keeps the printed `anon`, `file`, `kernel`, `shmem`, `file_mapped`,
+  `file_dirty`, `file_writeback`, `active_file`, `inactive_file`, `slab`, `sock`
+  and `zswap` counters. A missing line is omitted. These overlap: `shmem` is
+  already part of `file`, and the report does not sum them.
+- `cpu` is measured `usage_usec`, `user_usec`, `system_usec` from `cpu.stat`, or
+  `state: unavailable`. `io` is measured `devices` from `io.stat` or unavailable;
+  each device keeps `device` (major:minor), `name`, `raw`, and the printed
+  `rbytes`/`wbytes`. The cgroup `identity` is its inode, paired with the boot id.
+- A sample's `filesystem` records measured `total`, `used`, `free`, `device`,
+  `device_name` and `path`, or unavailable. `disk.filesystem_usage()` obtains
+  total from `f_blocks * f_frsize`; used plus free omits reserved blocks.
+  `BUILDLOG_TARGET_FILESYSTEM`, then `CARGO_TARGET_DIR`, then `~/rust` selects
+  the target filesystem. Its `st_dev` maps through `/sys/dev/block` to its top
+  device. IO reports only that device, never stacked children or zram swap.
+- A sample's `jobserver` keeps builds and CI `free_pool_tokens`, measured by
+  `stevie -t` and `stevie -s /dev/steve-ci -t` with a 0.5 s timeout each, or
+  unavailable. These are free pool tokens, not CPUs in use; each client also
+  has an implicit slot. No `FIONREAD` is used.
+
+`BUILDLOG_SCOPE_SH` saves raw `cpu.stat` and `io.stat` with plain `cat`
+to `PEAK.cpu.stat` and `PEAK.io.stat` after the command returns, before the
+scope shell exits. Python runs outside the scope, so recording does not raise
+the command's memory peak or CPU counters. `record.step()` parses these files
+through `cgroup_capture.parse_cpu()` and `parse_io()` and puts only `cpu` and
+`io` in `scope_resources` before saving `PendingStep.row`. Interrupted
+publication reuses that saved row without reading the scope again. Missing
+or empty sidecars are unavailable; any other read failure retains the sources
+for retry instead of publishing an unavailable reading. `_finish_step()`
+deletes both raw sidecars after publication. CPU **excludes compiles run by
+sccache.service**; slice totals count those compiles once. Step IO is typed
+unavailable until NixOS ee6d018 (`DefaultIOAccounting=yes`) is built at the
+user's next rebuild. No code change is needed when scopes expose `io.stat`.
+
+Schema 26 indexes `steps.scope_resources` and `samples.slices`, `filesystem`,
+`jobserver` as JSON text, and keeps snapshots in `memory_snapshots.slices`.
+It rebuilds the derived index from immutable source logs; old rows have no
+current-use reading. Worktree verification uses a scratch `BUILDLOG_DIR`,
+never the live schema-25 index shared with the installed copy.
+
+The Memory pressure section adds `Build memory held (60 s samples, last 24 h):
+average … GiB (`anon` … GiB, `file` … GiB, of which `inactive_file` … GiB) of the
+… GiB cap; busiest hour HH:00 at … GiB.` With no `current_bytes` it prints
+`Build memory held: no readings yet.` It reads natedev's builds slice
+from `samples.slices`, alongside that same sample row's `filesystem` and
+`jobserver`; a failed snapshot append cannot hide a saved sample. Snapshots
+remain for their existing readers and are never combined with samples for a
+number here. Step peaks are not used. Each component averages its own readings,
+including hours without a current-use reading; the busiest hour uses its mean
+current charge. Missing values are skipped, never zero.
+
+`buildlog usage-hours [YYYY-MM-DD]` shows each UTC hour, labelled in the user's
+zone with local date and UTC offset. Thus both 01:00 hours at the autumn DST
+change have distinct rows. The window is 24 elapsed hours ending now, or at
+the end of the requested local date. Columns show mean held/process/file GiB,
+sample counts, builds and CI CPU cores and disk traffic separately, the lowest
+free disk, and each pool's average free tokens. Every metric has its own count;
+missing readings show `— (0)`. CPU cores use valid microsecond deltas divided by
+covered seconds. Counter intervals crossing an hour are apportioned by seconds. Selection and
+hour buckets use the same parsed UTC instant, including fractional edge times.
+Daily pressure totals instead count each interval once, by its end in that day.
+
 ### The power profile: `read_power_profile(POWER_PROFILE_STATE)`
 
 - `POWER_PROFILE_STATE` is `/var/lib/power-profiles-daemon/state.ini`; tests patch it like the `/proc` paths. `read_power_profile(path) -> PowerProfile | Unmeasured` returns `PowerProfile(name: str, since_epoch: float)`.
@@ -75,10 +149,10 @@ The section always has its heading `### Memory pressure`, then `Source: 60 s mac
     - `60 s samples: peak used memory X GiB, peak swap Y GiB; peak builds B GiB, peak CI C GiB (process memory); machine stall: some A, full B.` Each slice peak is the day's highest `builds_anon_bytes` or `ci_anon_bytes`, or `unavailable` when no sample has it., or
     - `60 s samples: none; machine stall: unavailable.` when there are no samples.
 - **How the machine stall is summed:**
-  - `sample_counter_deltas(connection, day, columns) -> list[SampleCounterInterval]` holds the one pairing rule for memory, CPU and IO counters. `SampleCounterInterval(host, elapsed_s, deltas)` keys `deltas` by counter name, never by position. A NULL at either end gives `CounterNotRecorded.VALUE`, which adds nothing to that counter or its denominator.
+  - `sample_counter_deltas(connection, day, columns) -> list[SampleCounterInterval]` holds the one pairing rule for memory, CPU and IO counters. `SampleCounterInterval(host, elapsed_s, deltas, started_at, ended_at)` keys `deltas` by counter name, never by position. A NULL at either end gives `CounterNotRecorded.VALUE`, which adds nothing to that counter or its denominator.
   - The day's samples are taken per host, in time order. For a host's first sample of the day, the baseline is that host's latest earlier sample from any day.
-  - A pair of samples counts only when the gap is between 0 and `MAX_SAMPLE_GAP_S` (300 s).
-  - With the same `boot_id`, the pair adds `max(0, later − earlier)`. With a different `boot_id`, it adds the later counter.
+  - A pair counts only when elapsed time is above 0 and at most `MAX_SAMPLE_GAP_S` (300 s), with unchanged boot and cgroup identity.
+  - A nondecreasing counter with continuous identity adds `later − earlier`. A reset, boot change, cgroup change or longer gap is unknown, never zero; the next valid pair can resume.
   - The stall totals are summed over all hosts, and the peaks are the maximum over all of the day's samples.
 
 ### CPU and disk pressure
@@ -105,12 +179,12 @@ Each host with a counted pair gets one line, `<host>: CPU some X%, full Y%; IO s
 - `test_sample.py` (CPU and IO): `parse_cpu_ticks` reads the aggregate line without guest fields and refuses a missing, short or malformed one; a sample records the seven fields; CPU pressure without `full` keeps `some` and the other readings; a missing optional reading makes only its own counters `null`; malformed optional readings still write the memory sample.
 - `test_memory_records.py`: its subprocess fixture points `CPU_PRESSURE`, `IO_PRESSURE` and `STAT` at scratch files.
 - `test_index.py` (schema 23): the seven columns index new counters and stay NULL for old lines, and an index at schema 22 rebuilds them from the JSON lines.
-- `test_report.py` (CPU and disk section): it follows Memory pressure with one line per host; reboot counters count from zero; a long gap is not sampled time, while the maximum gap and the previous day's baseline count; a NULL pair does not dilute the other shares; empty, old-only and single samples give `CPU and IO samples: none.`; a host with ticks and no PSI still gets its line, with `—` PSI shares and `0.0 s` sampled.
+- `test_report.py` (CPU and disk section): it follows Memory pressure with one line per host; reboot counters are unknown; a long gap is not sampled time, while the maximum gap and the previous day's baseline count; a NULL pair does not dilute the other shares; empty, old-only and single samples give `CPU and IO samples: none.`; a host with ticks and no PSI still gets its line, with `—` PSI shares and `0.0 s` sampled.
 - `test_report.py` (memory section):
   - The top five ranking, with "at once" counted on the same host only.
   - The section placed after the kind sections.
   - Scratch rows labelled and counted in "at once".
-  - Sample peaks, and the delta across a reboot.
+  - Sample peaks, with unknown counter deltas across a reboot.
   - Samples with no stalled step give no table.
   - Pairs are taken within each host and the totals summed across hosts.
   - A pair more than 5 minutes apart is ignored.
@@ -129,15 +203,15 @@ Each host with a counted pair gets one line, `<host>: CPU some X%, full Y%; IO s
 - **CPU and IO readings never stop a sample.** Each is optional and `null` when unreadable; only the memory readings are required.
 - **One pairing rule.** Memory, CPU and IO deltas all come from `sample_counter_deltas`; a new section uses it, not its own pairing.
 - **A machine sample is all or nothing for its memory counters.** `parse_pressure`'s default is `require_both=True`, typed by its overload to return `StallTotals`, whose counters are `int`, never `Unmeasured`. A sample row with a missing counter would break the per-host delta chain.
-- **The power profile never stops a sample.** `read_power_profile` never raises; an unreadable profile is two `null` fields. `buildlog sample` never forks a process or opens D-Bus for it.
+- **The power profile never stops a sample.** `read_power_profile` never raises; an unreadable profile is two `null` fields. The power-profile read never forks a process or opens D-Bus; jobserver readings use their required bounded `stevie` calls.
 - **Old samples stay as written.** A sample line without the profile fields indexes as NULL; nothing infers or backfills a profile for it.
 - **Units differ by table, deliberately.** `steps` stores stall in seconds (`REAL`, the scope's own total). `samples` stores the raw counters since boot in microseconds (`INTEGER`).
 - **Any column change bumps `SCHEMA_VERSION`.** `open_for_update` deletes an index at another version and rebuilds it from the JSON lines.
-- **`sample.py` stays cheap to import and has no side effects.** `record.py` imports it after every step for `parse_pressure` and `Unmeasured`.
+- **`sample.py` has no import side effects.** `record.py` imports it after every step for `parse_pressure` and `Unmeasured`.
 
 ## Calibration and gotchas
 
-- **The 5-minute gap rule.** `MAX_SAMPLE_GAP_S = 300`, five 60 s intervals. A counter rise across a longer gap cannot be placed on a day, so it is dropped. That happens when the timer stopped or the machine was off. Across a `boot_id` change, PSI counters restart at zero, so the later counter is the delta; this still applies only within the 5-minute gap.
+- **The 5-minute gap rule.** `MAX_SAMPLE_GAP_S = 300`, five 60 s intervals. A counter rise across a longer gap cannot be placed on a day, so it is dropped. That happens when the timer stopped or the machine was off. A `boot_id` change also makes the interval unknown; a new counter cannot reveal its start time.
 - **Temp-folder steps are in the stall table.** They appear as `scratch (temp folders)` (`SCRATCH_LABEL`), and they count in every step's "at once". `SCRATCH` matches a cwd under `/tmp/`, `/var/folders/` or `/private/var/folders/`.
 - **Linux only.** `buildlog sample` without any of its three `/proc` files prints one line and exits 1. That includes a Linux kernel without PSI. A malformed `/proc/pressure/memory` raises and writes no row, and the next minute tries again. Step stalls need the systemd scope as well: a user manager, `systemd-run`, and `BUILDLOG_SCOPE` not set to `0`. That means natedev only, the same as `peak_mem_bytes`.
 - **The 60 s timer lives in `/etc/nixos`, on natedev.** It is a `nate.jobs` entry like the hourly `buildlog` job in `modules/linux/buildlog.nix`, not anything in `~/.claude`. Without it the `samples` table stays empty. The report then shows the stall table, if any, and `60 s samples: none; machine stall: unavailable.`

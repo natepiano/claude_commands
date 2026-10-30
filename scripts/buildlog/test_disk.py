@@ -29,6 +29,32 @@ class DiskTests(unittest.TestCase):
     def base(self) -> Path:
         return Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
 
+    def test_filesystem_total_preserves_reserved_blocks_and_top_layer_identity(self) -> None:
+        import cgroup_capture
+
+        base = self.base()
+        devices = base / "sys/dev/block"
+        devices.mkdir(parents=True)
+        dm = base / "sys/devices/virtual/block/dm-0"
+        dm.mkdir(parents=True)
+        (devices / "254:0").symlink_to(dm, target_is_directory=True)
+        stats = os.statvfs_result((4096, 4096, 1000, 400, 300, 0, 0, 0, 0, 255))
+        original_stat = os.stat
+
+        def target_stat(path: object, **kwargs: object) -> os.stat_result:
+            if path == str(base):
+                return os.stat_result((0, 0, os.makedev(254, 0), 0, 0, 0, 0, 0, 0, 0))
+            return original_stat(path, **kwargs)  # pyright: ignore[reportArgumentType]
+
+        with mock.patch.object(os, "statvfs", return_value=stats), \
+             mock.patch.object(os, "stat", side_effect=target_stat), \
+             mock.patch.object(cgroup_capture, "SYS_DEV_BLOCK", devices):
+            usage = disk.filesystem_usage(str(base))
+        self.assertEqual((usage.total, usage.used, usage.free), (1000 * 4096, 600 * 4096, 300 * 4096))
+        self.assertNotEqual(usage.total, usage.used + usage.free)
+        self.assertEqual(usage.device, "254:0")
+        self.assertEqual(usage.device_name, "dm-0")
+
     def test_measure_assigns_hard_links_to_the_first_row(self) -> None:
         base = self.base()
         first = base / "first"

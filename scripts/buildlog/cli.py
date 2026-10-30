@@ -16,6 +16,7 @@
   buildlog sample                   record memory counters and check for idle Mac test waits
   buildlog snapshot                 record slice and zram counters now
   buildlog memory START END         report memory between offset-bearing instants
+  buildlog usage-hours [YYYY-MM-DD]  measured memory, CPU, disk and free pool tokens over 24 h
   buildlog hourly                   sync, ci, screenshot scan, then Rust release check
   buildlog backfill-verify [LEDGER] copy verify.sh's old events.jsonl ledger in, once
 
@@ -193,7 +194,7 @@ def day_report(args: list[str]) -> int:
     _ = index.update()
     connection = index.read_only()
     try:
-        print(report.report(connection, day))
+        print(report.report(connection, day, usage_day=day if args else ""))
     finally:
         connection.close()
     return 0
@@ -241,6 +242,23 @@ def main(argv: list[str]) -> int:
         return schema()
     if command == "report":
         return day_report(rest)
+    if command == "usage-hours":
+        if len(rest) > 1:
+            print("usage: buildlog usage-hours [YYYY-MM-DD]", file=sys.stderr)
+            return 2
+        try:
+            if rest:
+                _ = date.fromisoformat(rest[0])
+        except ValueError:
+            print("usage: buildlog usage-hours [YYYY-MM-DD]", file=sys.stderr)
+            return 2
+        _ = index.update()
+        connection = index.read_only()
+        try:
+            print(report.usage_hours(connection, rest[0] if rest else ""))
+        finally:
+            connection.close()
+        return 0
     if command == "mac-report":
         return mac_report.main(rest)
     if command == "launches":
@@ -283,7 +301,7 @@ def main(argv: list[str]) -> int:
             return 2
         taken = sample.sample()
         try:
-            _ = memory.write_snapshot(taken.at, taken.host)
+            _ = memory.write_snapshot(taken.at, taken.host, taken.slices)
         except (OSError, ValueError) as error:
             print(f"buildlog sample: memory snapshot unavailable: {error}", file=sys.stderr)
         if taken.host == "natedev":

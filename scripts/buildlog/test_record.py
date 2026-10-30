@@ -28,6 +28,7 @@ else:
 import record as recorder
 import sample
 import store
+from cgroup_test_support import CPU, IO_LINES, save_scope_counters, write_cgroup
 # Hang guards allow for load 136 on natedev (2026-10-29).
 TEST_HANG_GUARD_SECS = 300
 
@@ -217,6 +218,32 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(gzip.decompress((self.root / str(log)).read_bytes()), (TESTDATA / "nextest.txt").read_bytes())
         self.assertFalse(handoff.exists())
         self.assertFalse(peak.exists())
+
+    def test_scope_capture_records_cpu_and_optional_io_before_scope_disappears(self) -> None:
+        for with_io in (False, True):
+            with self.subTest(with_io=with_io):
+                scope = self.base / f"scope-{with_io}"
+                write_cgroup(scope, with_io=with_io)
+                peak = self.peak_file().rename(self.base / f"peak-{with_io}")
+                sidecar = Path(str(peak) + ".cgroup")
+                _ = sidecar.write_text(str(scope) + "\n")
+                captured = save_scope_counters(peak, scope)
+                self.assertEqual(captured.returncode, 0, captured.stderr)
+                sidecar.unlink()
+                shutil.rmtree(scope)
+                row = self.step(0, "0", "", str(peak), SWEEP)
+                resources = cast(Record, row["scope_resources"])
+                self.assertEqual(resources["cpu"], CPU)
+                io = cast(Record, resources["io"])
+                if with_io:
+                    self.assertEqual(io["state"], "measured")
+                    devices = cast(list[Record], io["devices"])
+                    self.assertEqual([device["raw"] for device in devices], list(IO_LINES))
+                else:
+                    self.assertEqual(io, {"state": "unavailable"})
+                self.assertFalse(Path(str(peak) + ".resources").exists())
+                self.assertFalse(Path(str(peak) + ".cpu.stat").exists())
+                self.assertFalse(Path(str(peak) + ".io.stat").exists())
 
     def test_step_records_cgroup_memory_stall_seconds(self) -> None:
         peak = self.base / "peak-pressure"

@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 import index
 import memory
+from cgroup_test_support import CPU, GIB, IO_LINES, slice_reading, write_cgroup
 import store
 from test_index import Record, call, encode, point_root_at, sample, step
 
@@ -24,7 +25,6 @@ from test_index import Record, call, encode, point_root_at, sample, step
 TEST_HANG_GUARD_SECS = 300
 
 CLI = Path(__file__).with_name("cli.py")
-GIB = 2**30
 START = "2026-10-04T23:30-07:00"
 END = "2026-10-05T00:30-07:00"
 START_UTC = "2026-10-05T06:30:00.000Z"
@@ -152,7 +152,9 @@ class MemoryWindowTests(unittest.TestCase):
         self.assertEqual(recorded["host"], socket.gethostname().split(".")[0])
         self.assertTrue(str(recorded["at"]).endswith("Z"))
         slices = cast(dict[str, Record], recorded["slices"])
-        self.assertEqual(slices["builds"], {
+        self.assertEqual({key: slices["builds"][key] for key in (
+            "state", "events", "peak_bytes", "swap_peak_bytes", "high", "max", "swap_max", "stall_some_us"
+        )}, {
             "state": "present", "events": {"high": 2, "max": 3, "oom_kill": 1},
             "peak_bytes": 8 * GIB, "swap_peak_bytes": GIB,
             "high": 26 * GIB, "max": "max", "swap_max": 4 * GIB,
@@ -186,6 +188,64 @@ class MemoryWindowTests(unittest.TestCase):
         self.assertEqual(state["state"], "present")
         if state["state"] == "present":
             self.assertEqual(state["stall_some_us"], "unavailable")
+
+    def test_usage_hours_cli_reads_only_isolated_index_and_prints_counted_memory(self) -> None:
+        stamp = "2026-10-02T12:00:00Z"
+        slices = {"builds": slice_reading(12 * GIB), "ci": {"state": "absent"}}
+        self.write(self.root / "natedev/samples-2026-10.jsonl",
+                   sample(stamp, slices=slices))
+        result = self.cli("usage-hours", "2026-10-02")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Average GiB held", result.stdout)
+        row = next(line for line in result.stdout.splitlines() if "2026-10-02 05:00 -0700" in line)
+        self.assertIn("12.0 (1)", row)
+        self.assertIn("3.0 (1)", row)
+        self.assertTrue((self.root / "index.sqlite").is_file())
+
+    def test_slice_capture_keeps_whole_charge_components_and_stacked_devices_separate(self) -> None:
+        builds = self.base / "builds.slice"
+        write_cgroup(builds)
+        state = memory.slice_state(builds)
+        self.assertEqual(state["state"], "present")
+        if state["state"] != "present":
+            self.fail("fixture slice was lost")
+        self.assertEqual(state["current_bytes"], 12 * GIB)
+        self.assertEqual(state["swap_current_bytes"], 2 * GIB)
+        self.assertEqual(state["max_bytes"], 44 * GIB)
+        self.assertEqual(state["stat"], {"anon": 4 * GIB, "file": 6 * GIB,
+                         "kernel": 2 * GIB, "shmem": GIB, "inactive_file": 3 * GIB, "sock": 17,
+                         "file_mapped": 19, "file_dirty": 23, "file_writeback": 29, "active_file": 31, "slab": 37})
+        self.assertNotIn("zswap", state["stat"])
+        self.assertEqual(state["cpu"], CPU)
+        self.assertEqual(state["identity"], builds.stat().st_ino)
+        traffic = state["io"]
+        self.assertEqual(traffic["state"], "measured")
+        if traffic["state"] != "measured":
+            self.fail("fixture IO was lost")
+        self.assertEqual([row["raw"] for row in traffic["devices"]], list(IO_LINES))
+        self.assertEqual([row["device"] for row in traffic["devices"]], ["254:0", "259:0", "253:0"])
+
+    def test_unreadable_slice_file_preserves_other_fields_and_ci(self) -> None:
+        builds, ci = self.base / "builds.slice", self.base / "ci.slice"
+        write_cgroup(builds, with_io=False)
+        write_cgroup(ci)
+        (builds / "memory.current").unlink()
+        (builds / "memory.current").mkdir()
+        with patch.dict(os.environ, self.env()):
+            result = memory.snapshot()
+        slices = result["slices"]
+        head = slices["builds"]
+        self.assertEqual(head["state"], "present")
+        if head["state"] != "present":
+            self.fail("one unavailable file discarded slice")
+        self.assertEqual(head["current_bytes"], "unavailable")
+        self.assertEqual(head["io"], {"state": "unavailable"})
+        self.assertEqual(head["cpu"], CPU)
+        self.assertEqual(head["stat"]["anon"], 4 * GIB)
+        other = slices["ci"]
+        self.assertEqual(other["state"], "present")
+        if other["state"] == "present":
+            self.assertEqual(other["current_bytes"], 12 * GIB)
 
     def test_ci_window_reports_max_hits_oom_kills_and_stall_seconds(self) -> None:
         self.stub_journal()

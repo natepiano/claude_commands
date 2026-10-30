@@ -71,6 +71,7 @@ COMMON_HEAD = ["Runs", "Failed", "Avg", "p95", "Range"]
 COMMON_SQL = f"count(*), sum({index.COUNTED_FAILURE}), avg(duration_s), min(duration_s), max(duration_s), group_concat(duration_s)"
 CI_STALE_AFTER_S = 2 * 3600
 MAX_SAMPLE_GAP_S = 5 * 60
+GIB = 2**30
 MIN_PROFILE_RUNS = 10
 # 2026-10-01–04 log: 1 edit 12.54 min, 2–3 16.09, 4–7 20.94, 8+ 31.28.
 # One test per two edits leaves headroom for most gaps to stay within 2–3;
@@ -221,7 +222,7 @@ def count(value: object) -> str:
 
 
 def gib(value: object) -> str:
-    return f"{float(value) / 2**30:.1f} GiB" if isinstance(value, int | float) else ""
+    return f"{float(value) / GIB:.1f} GiB" if isinstance(value, int | float) else ""
 
 
 def nearest_rank(values: Sequence[float], percent: int) -> float:
@@ -835,40 +836,129 @@ class CounterNotRecorded(Enum):
     VALUE = "counter not recorded in both samples"
 
 
+@dataclass(frozen=True)
+class UsageWindow:
+    start: datetime
+    end: datetime
+
+
+def usage_window(day: str = "") -> UsageWindow:
+    end = (datetime.combine(date.fromisoformat(day) + timedelta(days=1), datetime.min.time(), user_zone()).astimezone(UTC)
+           if day else datetime.now(UTC))
+    return UsageWindow(end - timedelta(hours=24), end)
+
+
+def json_object(value: object) -> dict[str, object]:
+    if isinstance(value, str):
+        try:
+            value = cast(object, json.loads(value))
+        except ValueError:
+            return {}
+    return cast(dict[str, object], value) if isinstance(value, dict) else {}
+
+
+def recorded_number(value: object) -> int | CounterNotRecorded:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else CounterNotRecorded.VALUE
+
+
+@dataclass(frozen=True)
+class CounterReading:
+    value: int | CounterNotRecorded
+    identity: tuple[object, ...]
+
+
 class SampleCounterInterval(NamedTuple):
     host: str
     elapsed_s: float
     deltas: dict[str, int | CounterNotRecorded]
+    started_at: datetime
+    ended_at: datetime
+
+
+def sample_counter_reading(row: dict[str, object], column: str) -> CounterReading:
+    boot = row.get("boot_id")
+    if not isinstance(boot, str) or not boot:
+        return CounterReading(CounterNotRecorded.VALUE, ())
+    if column.startswith(("builds_", "ci_")):
+        group, metric = column.split("_", 1)
+        reading = json_object(json_object(row.get("slices")).get(group))
+        inode = reading.get("identity")
+        if not isinstance(inode, int) or isinstance(inode, bool):
+            return CounterReading(CounterNotRecorded.VALUE, ())
+        if metric.startswith("cpu_"):
+            value = json_object(reading.get("cpu")).get(metric.removeprefix("cpu_"))
+            return CounterReading(recorded_number(value), (boot, inode))
+        filesystem = json_object(row.get("filesystem"))
+        device = filesystem.get("device")
+        traffic = json_object(reading.get("io")).get("devices")
+        if isinstance(device, str) and isinstance(traffic, list):
+            for entry in cast(list[object], traffic):
+                fields = json_object(entry)
+                if fields.get("device") == device:
+                    return CounterReading(recorded_number(fields.get(metric.removeprefix("io_"))), (boot, inode, device))
+        return CounterReading(CounterNotRecorded.VALUE, ())
+    return CounterReading(recorded_number(row.get(column)), (boot,))
+
+
+def timed_samples(
+    connection: sqlite3.Connection, bounds: UsageWindow, *, natedev_only: bool = False,
+) -> list[tuple[datetime, dict[str, object]]]:
+    """Filter and order with the same parsed instants used by hour buckets.
+
+    SQLite's millisecond precision is only a coarse prefilter, padded by a
+    second so it cannot discard an instant at either window edge.
+    """
+    query = ("SELECT * FROM samples WHERE julianday(at) >= julianday(?)"
+             + " AND julianday(at) <= julianday(?)")
+    if natedev_only:
+        query += f" AND {natedev_step_predicate('samples')}"
+    cursor = connection.execute(query, ((bounds.start - timedelta(seconds=1)).isoformat(),
+                                        (bounds.end + timedelta(seconds=1)).isoformat()))
+    names = [item[0] for item in cursor.description]
+    readings: list[tuple[datetime, dict[str, object]]] = []
+    for values in cast(list[tuple[object, ...]], cursor.fetchall()):
+        row = dict(zip(names, values, strict=True))
+        at = datetime.fromisoformat(str(row["at"])).astimezone(UTC)
+        if bounds.start <= at <= bounds.end:
+            readings.append((at, row))
+    readings.sort(key=lambda item: (str(item[1]["host"]), item[0]))
+    return readings
 
 
 def sample_counter_deltas(
-    connection: sqlite3.Connection, day: str, columns: tuple[str, ...],
+    connection: sqlite3.Connection, day: str, columns: tuple[str, ...], *, window: UsageWindow | None = None,
+    natedev_only: bool = False,
 ) -> list[SampleCounterInterval]:
-    """Count adjacent samples per host, including the baseline before the day."""
-    selected = "host, at, boot_id, " + ", ".join(columns)
-    samples = fetch(connection, f"SELECT {selected} FROM samples"
-                    + " WHERE date(at, 'localtime') = ? ORDER BY host, at", day)
-    previous: dict[str, Row] = {}
+    """Pair once per host; resets, identity changes and gaps are unknown.
+
+    A daily total owns an interval by its end; an explicit usage window takes
+    overlapping intervals for hourly splitting. Include the baseline before
+    the window. Slice IO selects the filesystem's own device, never its layers.
+    """
+    bounds = window if window is not None else UsageWindow(
+        datetime.combine(date.fromisoformat(day), datetime.min.time(), user_zone()).astimezone(UTC),
+        datetime.combine(date.fromisoformat(day) + timedelta(days=1), datetime.min.time(), user_zone()).astimezone(UTC))
+    samples = timed_samples(connection, UsageWindow(bounds.start - timedelta(seconds=MAX_SAMPLE_GAP_S),
+                                                    bounds.end + timedelta(seconds=MAX_SAMPLE_GAP_S)),
+                            natedev_only=natedev_only)
+    previous: dict[str, tuple[datetime, dict[str, object]]] = {}
     intervals: list[SampleCounterInterval] = []
-    for row in samples:
-        host = str(row[0])
-        if host not in previous:
-            earlier = fetch(connection, f"SELECT {selected} FROM samples"
-                            + " WHERE host = ? AND at < ? ORDER BY at DESC LIMIT 1", host, row[1])
-            if earlier:
-                previous[host] = earlier[0]
+    for ended, row in samples:
+        host = str(row["host"])
         if host in previous:
-            before = previous[host]
-            elapsed = (datetime.fromisoformat(str(row[1])) - datetime.fromisoformat(str(before[1]))).total_seconds()
-            if 0 <= elapsed <= MAX_SAMPLE_GAP_S:
-                deltas: dict[str, int | CounterNotRecorded] = {}
-                for column, old, new in zip(columns, before[3:], row[3:], strict=True):
-                    if isinstance(old, int) and isinstance(new, int):
-                        deltas[column] = max(0, new - old) if row[2] == before[2] else new
-                    else:
-                        deltas[column] = CounterNotRecorded.VALUE
-                intervals.append(SampleCounterInterval(host, elapsed, deltas))
-        previous[host] = row
+            started, before = previous[host]
+            elapsed = (ended - started).total_seconds()
+            deltas: dict[str, int | CounterNotRecorded] = {}
+            for column in columns:
+                old, new = sample_counter_reading(before, column), sample_counter_reading(row, column)
+                valid = (0 < elapsed <= MAX_SAMPLE_GAP_S and old.identity == new.identity and bool(old.identity)
+                         and isinstance(old.value, int) and isinstance(new.value, int) and new.value >= old.value)
+                deltas[column] = new.value - old.value if valid and isinstance(old.value, int) and isinstance(new.value, int) else CounterNotRecorded.VALUE
+            in_window = (bounds.start <= ended < bounds.end if window is None
+                         else ended > bounds.start and started < bounds.end)
+            if in_window:
+                intervals.append(SampleCounterInterval(host, elapsed, deltas, started, ended))
+        previous[host] = (ended, row)
     return intervals
 
 
@@ -910,7 +1000,107 @@ def cpu_disk_pressure_section(connection: sqlite3.Connection, day: str) -> list[
     return section
 
 
-def memory_pressure_section(connection: sqlite3.Connection, day: str, hosts: int) -> list[str]:
+@dataclass
+class HourUsage:
+    at: datetime
+    readings: dict[str, list[float]] = field(default_factory=dict)
+    deltas: dict[str, float] = field(default_factory=dict)
+    covered: dict[str, float] = field(default_factory=dict)
+    counts: dict[str, int] = field(default_factory=dict)
+
+    def add(self, name: str, value: object) -> None:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            self.readings.setdefault(name, []).append(float(value))
+
+    def mean(self, name: str) -> float | CounterNotRecorded:
+        values = self.readings.get(name, [])
+        return sum(values) / len(values) if values else CounterNotRecorded.VALUE
+
+
+def hourly_usage(connection: sqlite3.Connection, day: str = "") -> list[HourUsage]:
+    window = usage_window(day)
+    first = window.start.replace(minute=0, second=0, microsecond=0)
+    hours: dict[datetime, HourUsage] = {}
+    at = first
+    while at < window.end:
+        hours[at] = HourUsage(at)
+        at += timedelta(hours=1)
+    for instant, row in timed_samples(connection, window, natedev_only=True):
+        if instant >= window.end:
+            continue
+        at = instant.replace(minute=0, second=0, microsecond=0)
+        hour = hours[at]
+        reading = json_object(json_object(row.get("slices")).get("builds"))
+        # These are overlapping kernel components, not numbers to add together.
+        for key in ("current_bytes", "max_bytes"):
+            hour.add(key, reading.get(key))
+        for key, value in json_object(reading.get("stat")).items():
+            hour.add(key, value)
+        filesystem = json_object(row.get("filesystem"))
+        hour.add("disk_free", filesystem.get("free"))
+        for pool, reading in json_object(row.get("jobserver")).items():
+            hour.add(pool + "_tokens", json_object(reading).get("free_pool_tokens"))
+    columns = ("builds_cpu_usage_usec", "ci_cpu_usage_usec", "builds_io_rbytes", "builds_io_wbytes", "ci_io_rbytes", "ci_io_wbytes")
+    for interval in sample_counter_deltas(connection, day, columns, window=window, natedev_only=True):
+        if interval.elapsed_s <= 0:
+            continue
+        start = max(interval.started_at.astimezone(UTC), window.start)
+        end = min(interval.ended_at.astimezone(UTC), window.end)
+        while start < end:
+            bucket = start.replace(minute=0, second=0, microsecond=0)
+            edge = min(end, bucket + timedelta(hours=1))
+            covered = (edge - start).total_seconds()
+            hour = hours[bucket]
+            for column, delta in interval.deltas.items():
+                if isinstance(delta, int):
+                    hour.deltas[column] = hour.deltas.get(column, 0) + delta * covered / interval.elapsed_s
+                    hour.covered[column] = hour.covered.get(column, 0) + covered
+                    hour.counts[column] = hour.counts.get(column, 0) + 1
+            start = edge
+    return list(hours.values())
+
+
+def memory_held_line(connection: sqlite3.Connection, day: str = "") -> str:
+    hours = hourly_usage(connection, day)
+    measured = [hour for hour in hours if hour.readings.get("current_bytes")]
+    if not measured:
+        return "Build memory held: no readings yet."
+    def average(name: str) -> str:
+        values = [value for hour in hours for value in hour.readings.get(name, [])]
+        return f"{sum(values) / len(values) / GIB:.1f}" if values else "unknown"
+    busiest = max(measured, key=lambda hour: cast(float, hour.mean("current_bytes")))
+    return (f"Build memory held (60 s samples, last 24 h): average {average('current_bytes')} GiB "
+            + f"(`anon` {average('anon')} GiB, `file` {average('file')} GiB, of which `inactive_file` {average('inactive_file')} GiB) "
+            + f"of the {average('max_bytes')} GiB cap; busiest hour {busiest.at.astimezone(user_zone()):%H:00} "
+            + f"at {cast(float, busiest.mean('current_bytes')) / GIB:.1f} GiB.")
+
+
+def usage_hours(connection: sqlite3.Connection, day: str = "") -> str:
+    body: list[list[str]] = []
+    for hour in hourly_usage(connection, day):
+        def mean_cell(name: str, divisor: float = 1) -> str:
+            value = hour.mean(name)
+            count_readings = len(hour.readings.get(name, []))
+            return f"{value / divisor:.1f} ({count_readings})" if isinstance(value, float) else "— (0)"
+        def delta_cell(column: str, *, cpu: bool = False) -> str:
+            covered = hour.covered.get(column, 0)
+            if covered <= 0:
+                return "— (0)"
+            value = hour.deltas[column] / (1_000_000 * covered) if cpu else hour.deltas[column]
+            return f"{value:.2f} ({hour.counts[column]})"
+        free = hour.readings.get("disk_free", [])
+        body.append([hour.at.astimezone(user_zone()).strftime("%Y-%m-%d %H:00 %z"),
+                     mean_cell("current_bytes", GIB), mean_cell("anon", GIB), mean_cell("file", GIB),
+                     str(len(hour.readings.get("current_bytes", []))),
+                     delta_cell("builds_cpu_usage_usec", cpu=True), delta_cell("builds_io_rbytes"), delta_cell("builds_io_wbytes"),
+                     delta_cell("ci_cpu_usage_usec", cpu=True), delta_cell("ci_io_rbytes"), delta_cell("ci_io_wbytes"),
+                     f"{min(free) / GIB:.1f} ({len(free)})" if free else "— (0)", mean_cell("builds_tokens"), mean_cell("ci_tokens")])
+    return "\n".join(["Build usage, last 24 h", "", "Each metric includes its reading count; CPU uses covered seconds. Free pool tokens are not CPUs in use.", "",
+                      *table(["Hour", "Average GiB held", "Processes GiB", "File cache GiB", "Samples", "Builds CPU cores", "Builds read bytes", "Builds written bytes",
+                              "CI CPU cores", "CI read bytes", "CI written bytes", "Lowest free disk GiB", "Builds free pool tokens", "CI free pool tokens"], body)])
+
+
+def memory_pressure_section(connection: sqlite3.Connection, day: str, hosts: int, *, usage_day: str | None = None) -> list[str]:
     """The largest step stalls and the day's sampled machine memory pressure."""
     waits = fetch(
         connection,
@@ -948,6 +1138,7 @@ def memory_pressure_section(connection: sqlite3.Connection, day: str, hosts: int
     instrument_predicate = "date({column}, 'localtime') = ? AND " + natedev_step_predicate().removeprefix("steps.")
     instruments = memory.instrument_lines(connection, instrument_predicate, (day,))
     section = ["### Memory pressure", "", "Source: 60 s machine samples and step cgroup stall counters.", ""]
+    section += [memory_held_line(connection, day if usage_day is None else usage_day), ""]
     if longest:
         is_scratch, caller, host = longest[0]
         who = SCRATCH_LABEL if is_scratch else caller_label(caller, host, hosts)
@@ -966,8 +1157,9 @@ def memory_pressure_section(connection: sqlite3.Connection, day: str, hosts: int
         return section
 
     intervals = sample_counter_deltas(connection, day, ("stall_some_us", "stall_full_us"))
-    some_us = sum(interval.deltas["stall_some_us"] for interval in intervals if isinstance(interval.deltas["stall_some_us"], int))
-    full_us = sum(interval.deltas["stall_full_us"] for interval in intervals if isinstance(interval.deltas["stall_full_us"], int))
+    def stall_total(column: str) -> str:
+        measured = [interval.deltas[column] for interval in intervals if isinstance(interval.deltas[column], int)]
+        return seconds(sum(cast(list[int], measured)) / 1_000_000) if measured else "unavailable"
 
     peak_memory = max(cast(int, row[3]) for row in samples)
     peak_swap = max(cast(int, row[4]) for row in samples)
@@ -976,7 +1168,7 @@ def memory_pressure_section(connection: sqlite3.Connection, day: str, hosts: int
     slice_peaks = f"peak builds {gib(peak_builds) if peak_builds is not None else 'unavailable'}, peak CI {gib(peak_ci) if peak_ci is not None else 'unavailable'} (process memory)"
     section += [
         f"60 s samples: peak used memory {gib(peak_memory)}, peak swap {gib(peak_swap)}; "
-        + f"{slice_peaks}; machine stall: some {seconds(some_us / 1_000_000)}, full {seconds(full_us / 1_000_000)}.",
+        + f"{slice_peaks}; machine stall: some {stall_total('stall_some_us')}, full {stall_total('stall_full_us')}.",
         "",
     ]
     return section
@@ -1923,7 +2115,7 @@ def recorder_health_lines(day: str) -> list[str]:
     return lines
 
 
-def report(connection: sqlite3.Connection, day: str) -> str:
+def report(connection: sqlite3.Connection, day: str, *, usage_day: str | None = None) -> str:
     found = kinds(connection, day)
     hosts = cast(
         int,
@@ -1945,7 +2137,7 @@ def report(connection: sqlite3.Connection, day: str) -> str:
     lines += launches_section(connection, day)
     for kind in found:
         lines += kind_section(connection, day, kind, hosts)
-    lines += memory_pressure_section(connection, day, hosts)
+    lines += memory_pressure_section(connection, day, hosts, usage_day=usage_day)
     lines += cpu_disk_pressure_section(connection, day)
     calls, calls_line = calls_section(connection, day)
     port_lint, port_lint_line = port_lint_section(connection, day)

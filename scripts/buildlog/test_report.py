@@ -25,9 +25,11 @@ import index
 import mac_outcome
 import report
 import holds
+from cgroup_test_support import GIB, slice_reading
 from user_zone import user_zone
 import rust_release
 import sync
+import store
 from record import TARGET_DIR_UNSET
 from test_holds import timed_hold_events, write_holder, write_mac_block
 from test_index import COORDINATION_VARIABLES, STAMP, Record, call, ci_job, ci_run, encode, local_day, point_root_at, sample, step
@@ -463,10 +465,7 @@ class ReportTests(unittest.TestCase):
         lines = self.mac_tests_lines(day)
         heading = next(line for line in lines if line.startswith("| Package |"))
         row = next(line for line in lines if line.startswith(f"| {package} |"))
-        return dict(zip(
-            [cell.strip() for cell in heading.strip("|").split("|")],
-            [cell.strip() for cell in row.strip("|").split("|")], strict=True,
-        ))
+        return self.table_cells(heading, [row])[0]
 
     def test_held_target_waits_keep_fractional_seconds_and_unknown_rows(self) -> None:
         self.write(
@@ -2390,6 +2389,217 @@ class ReportTests(unittest.TestCase):
         self.assertIn("| scratch (temp folders) | clippy | 30.0 s | 2 |", section)
         self.assertIn("| verify.sh (agents) | clippy | 5.0 s | 2 |", section)
 
+    def usage_sample(self, at: str, held: int, *, cpu: int = 0, identity: int = 42,
+                     boot: str = "boot-a", free: int = 30 * GIB, tokens: int = 17) -> Record:
+        return sample(at, boot_id=boot,
+                      slices={"builds": slice_reading(held, cpu=cpu, identity=identity),
+                              "ci": slice_reading(40 * GIB, cpu=cpu * 100, identity=99)},
+                      filesystem={"state": "measured", "total": 100 * GIB, "used": 60 * GIB,
+                                  "free": free, "device": "254:0", "device_name": "dm-0"},
+                      jobserver={"builds": {"state": "measured", "free_pool_tokens": tokens},
+                                 "ci": {"state": "unavailable"}})
+
+    def write_usage(self, *records: Record) -> None:
+        self.write(self.root / "natedev/samples-2026-10.jsonl", *records)
+
+    def usage_cells(self, text: str) -> list[dict[str, str]]:
+        table = [line for line in text.splitlines() if line.startswith("|")]
+        self.assertGreaterEqual(len(table), 3)
+        return self.table_cells(table[0], table[2:])
+
+    def table_cells(self, heading: str, rows: list[str]) -> list[dict[str, str]]:
+        headers = [cell.strip() for cell in heading.strip("|").split("|")]
+        return [dict(zip(headers, [cell.strip() for cell in line.strip("|").split("|")], strict=True))
+                for line in rows]
+
+    def usage_text(self, day: str) -> str:
+        _ = index.update()
+        with closing(index.read_only()) as connection, mock.patch.object(store, "host_name", return_value="natedev"):
+            return report.usage_hours(connection, day)
+
+    def test_pressure_interval_counts_only_in_the_day_it_ends(self) -> None:
+        self.write_usage(
+            sample("2026-10-01T23:59:00Z", stall_some_us=10_000_000, stall_full_us=2_000_000,
+                   cpu_stall_some_us=10_000_000),
+            sample("2026-10-02T00:01:00Z", stall_some_us=12_000_000, stall_full_us=3_000_000,
+                   cpu_stall_some_us=40_000_000))
+        _ = index.update()
+        with closing(index.read_only()) as connection, mock.patch.dict(os.environ, {"USER_ZONE": "UTC", "TZ": "UTC"}):
+            time.tzset()
+            try:
+                before = report.memory_pressure_section(connection, "2026-10-01", 0)
+                after = report.memory_pressure_section(connection, "2026-10-02", 0)
+                cpu_before = report.cpu_disk_pressure_section(connection, "2026-10-01")
+                cpu_after = report.cpu_disk_pressure_section(connection, "2026-10-02")
+            finally:
+                self.addCleanup(time.tzset)
+        self.assertTrue(any("some unavailable" in line and "full unavailable" in line for line in before))
+        self.assertTrue(any("some 2.0 s" in line and "full 1.0 s" in line for line in after))
+        self.assertIn("CPU and IO samples: none.", cpu_before)
+        self.assertTrue(any("CPU some 25.0%" in line for line in cpu_after))
+
+    def test_held_components_average_their_own_readings_without_current(self) -> None:
+        first = self.usage_sample("2026-10-02T12:00:00Z", 8 * GIB)
+        second = self.usage_sample("2026-10-02T13:00:00Z", 24 * GIB)
+        cast(Record, cast(Record, second["slices"])["builds"])["current_bytes"] = "unavailable"
+        self.write_usage(first, second)
+        _ = index.update()
+        with closing(index.read_only()) as connection, mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}):
+            line = report.memory_held_line(connection, "2026-10-02")
+        self.assertIn("average 8.0 GiB", line)
+        self.assertIn("`anon` 4.0 GiB", line)
+        self.assertIn("`file` 8.0 GiB", line)
+        self.assertIn("`inactive_file` 4.0 GiB", line)
+
+    def test_usage_on_mac_selects_natedev_samples_and_counters(self) -> None:
+        self.write_usage(self.usage_sample("2026-10-02T12:00:00Z", 12 * GIB),
+                         self.usage_sample("2026-10-02T12:01:00Z", 20 * GIB, cpu=120_000_000))
+        self.write(self.root / "mac/samples-2026-10.jsonl",
+                   sample("2026-10-02T12:00:00Z", host="mac", slices={"builds": slice_reading(40 * GIB)}))
+        _ = index.update()
+        with closing(index.read_only()) as connection, mock.patch.object(store, "host_name", return_value="mac"), \
+             mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}):
+            row = next(row for row in self.usage_cells(report.usage_hours(connection, "2026-10-02"))
+                       if "12:00" in row["Hour"])
+        self.assertEqual(row["Average GiB held"], "16.0 (2)")
+        self.assertEqual(row["Builds CPU cores"], "2.00 (1)")
+
+    def test_sample_without_snapshot_keeps_memory_disk_tokens_and_counters(self) -> None:
+        self.write_usage(self.usage_sample("2026-10-02T12:00:00Z", 12 * GIB),
+                         self.usage_sample("2026-10-02T12:01:00Z", 20 * GIB, cpu=120_000_000,
+                                           free=25 * GIB, tokens=9))
+        _ = index.update()
+        with closing(index.read_only()) as connection, mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}):
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM memory_snapshots").fetchone(), (0,))
+            line = report.memory_held_line(connection, "2026-10-02")
+            rows = self.usage_cells(report.usage_hours(connection, "2026-10-02"))
+        row = next(row for row in rows if "12:00" in row["Hour"])
+        self.assertIn("average 16.0 GiB", line)
+        self.assertEqual(row["Average GiB held"], "16.0 (2)")
+        self.assertEqual(row["Builds CPU cores"], "2.00 (1)")
+        self.assertEqual(row["Lowest free disk GiB"], "25.0 (2)")
+        self.assertEqual(row["Builds free pool tokens"], "13.0 (2)")
+
+    def test_usage_window_edges_filter_and_bucket_the_same_instant(self) -> None:
+        self.write_usage(self.usage_sample("2026-10-01T23:59:59.999999Z", 40 * GIB),
+                         self.usage_sample("2026-10-02T00:00:00Z", 8 * GIB),
+                         self.usage_sample("2026-10-02T23:59:59.999999Z", 12 * GIB),
+                         self.usage_sample("2026-10-03T00:00:00Z", 40 * GIB))
+        with mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}):
+            rows = self.usage_cells(self.usage_text("2026-10-02"))
+        measured = [row for row in rows if row["Samples"] != "0"]
+        self.assertEqual([(row["Hour"], row["Average GiB held"]) for row in measured],
+                         [("2026-10-02 00:00 +0000", "8.0 (1)"), ("2026-10-02 23:00 +0000", "12.0 (1)")])
+
+    def test_memory_held_averages_current_charge_without_peaks_children_or_swap(self) -> None:
+        self.write_usage(
+                   self.usage_sample("2026-10-02T12:00:00Z", 12 * GIB),
+                   self.usage_sample("2026-10-02T12:01:00Z", 20 * GIB),
+                   sample("2026-10-02T12:02:00Z", builds_anon_bytes=100 * GIB))
+        self.write(self.root / "natedev/2026-10.jsonl", step("peak", peak_mem_bytes=1000 * GIB))
+        with mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}), \
+             mock.patch.object(store, "host_name", return_value="natedev"):
+            lines = self.render("2026-10-02").splitlines()
+        line = next(line for line in lines if line.startswith("Build memory held ("))
+        self.assertEqual(line, "Build memory held (60 s samples, last 24 h): average 16.0 GiB "
+                         + "(`anon` 4.0 GiB, `file` 8.0 GiB, of which `inactive_file` 4.0 GiB) "
+                         + "of the 44.0 GiB cap; busiest hour 12:00 at 16.0 GiB.")
+
+    def test_memory_held_weights_samples_instead_of_hour_means(self) -> None:
+        self.write_usage(self.usage_sample("2026-10-02T12:00:00Z", 12 * GIB),
+                         self.usage_sample("2026-10-02T12:01:00Z", 20 * GIB),
+                         self.usage_sample("2026-10-02T13:00:00Z", 4 * GIB))
+        _ = index.update()
+        with closing(index.read_only()) as connection, mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}), \
+             mock.patch.object(store, "host_name", return_value="natedev"):
+            line = report.memory_held_line(connection, "2026-10-02")
+        self.assertIn("average 12.0 GiB", line)
+        self.assertIn("busiest hour 12:00 at 16.0 GiB", line)
+
+    def test_memory_held_old_rows_and_missing_current_are_not_zero_readings(self) -> None:
+        self.write_usage(
+                   sample(STAMP, builds_anon_bytes=8 * GIB),
+                   sample("2026-10-02T12:01:00Z", slices={"builds": {"state": "present", "peak_bytes": 44 * GIB}}))
+        self.assertIn("Build memory held: no readings yet.", self.render("2026-10-02"))
+
+    def test_usage_hours_counts_missing_components_separately_and_keeps_cap(self) -> None:
+        first = self.usage_sample("2026-10-02T12:00:00Z", 12 * GIB, tokens=10)
+        second = self.usage_sample("2026-10-02T12:01:00Z", 20 * GIB, tokens=20)
+        builds = cast(Record, cast(Record, second["slices"])["builds"])
+        del cast(Record, builds["stat"])["anon"]
+        second["jobserver"] = {"builds": {"state": "unavailable"}, "ci": {"state": "unavailable"}}
+        self.write_usage(first, second)
+        with mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}):
+            text = self.usage_text("2026-10-02")
+        row = next(row for row in self.usage_cells(text) if "2026-10-02 12:00" in row["Hour"])
+        self.assertEqual(row["Average GiB held"], "16.0 (2)")
+        self.assertEqual(row["Processes GiB"], "3.0 (1)")
+        self.assertEqual(row["File cache GiB"], "8.0 (2)")
+        self.assertEqual(row["Builds free pool tokens"], "10.0 (1)")
+        self.assertEqual(row["Samples"], "2")
+
+    def test_usage_hours_separates_repeated_local_hours_by_utc_offset(self) -> None:
+        self.write_usage(
+                   self.usage_sample("2026-11-01T05:30:00Z", 12 * GIB),
+                   self.usage_sample("2026-11-01T06:30:00Z", 20 * GIB))
+        with mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}):
+            text = self.usage_text("2026-11-01")
+        rows = [line for line in text.splitlines() if "2026-11-01 01:00" in line]
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(any("-04:00" in row or "-0400" in row for row in rows))
+        self.assertTrue(any("-05:00" in row or "-0500" in row for row in rows))
+        self.assertTrue(any("12.0" in row for row in rows))
+        self.assertTrue(any("20.0" in row for row in rows))
+
+    def test_usage_hours_splits_cpu_and_top_device_traffic_at_hour_edge(self) -> None:
+        self.write_usage(
+                   self.usage_sample("2026-10-02T12:59:30Z", 12 * GIB, cpu=0),
+                   self.usage_sample("2026-10-02T13:00:30Z", 12 * GIB, cpu=120_000_000,
+                                     free=25 * GIB, tokens=9))
+        with mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}):
+            text = self.usage_text("2026-10-02")
+        rows = [row for row in self.usage_cells(text) if "2026-10-02 12:00" in row["Hour"] or "2026-10-02 13:00" in row["Hour"]]
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertEqual(row["Builds CPU cores"], "2.00 (1)")
+            self.assertEqual(row["Builds read bytes"], "60000000.00 (1)")
+            self.assertEqual(row["Builds written bytes"], "120000000.00 (1)")
+        self.assertEqual(rows[1]["Lowest free disk GiB"], "25.0 (1)")
+
+    def test_usage_hours_unknown_intervals_never_become_zero_cpu(self) -> None:
+        cases = (("same instant", 0, "boot-a", 42, 200), ("reset", 60, "boot-a", 42, 50), ("boot", 60, "boot-b", 42, 200),
+                 ("cgroup", 60, "boot-a", 43, 200),
+                 ("gap", report.MAX_SAMPLE_GAP_S + 1, "boot-a", 42, 200))
+        for name, elapsed, boot, identity, counter in cases:
+            with self.subTest(case=name):
+                start = datetime(2026, 10, 2, 12, tzinfo=UTC)
+                self.write_usage(
+                           self.usage_sample(start.isoformat(), 12 * GIB, cpu=100),
+                           self.usage_sample((start + timedelta(seconds=elapsed)).isoformat(), 12 * GIB,
+                                             cpu=counter, identity=identity, boot=boot))
+                with mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}):
+                    text = self.usage_text("2026-10-02")
+                row = next(row for row in self.usage_cells(text) if "2026-10-02 12:00" in row["Hour"])
+                self.assertEqual(row["Builds CPU cores"], "— (0)")
+                self.assertEqual(row["Builds read bytes"], "— (0)")
+                self.assertEqual(row["Builds written bytes"], "— (0)")
+
+    def test_memory_held_rolling_window_ends_now_and_dated_window_ends_local_day(self) -> None:
+        self.write_usage(
+                   self.usage_sample("2026-10-01T11:59:59Z", 40 * GIB),
+                   self.usage_sample("2026-10-01T12:00:01Z", 8 * GIB),
+                   self.usage_sample("2026-10-02T11:59:59Z", 12 * GIB),
+                   self.usage_sample("2026-10-02T12:00:01Z", 40 * GIB))
+        _ = index.update()
+        with closing(index.read_only()) as connection, mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}), \
+             mock.patch.object(store, "host_name", return_value="natedev"):
+            with mock.patch.object(report, "datetime", wraps=datetime,
+                                   now=mock.Mock(return_value=datetime(2026, 10, 2, 12, tzinfo=UTC))):
+                line = report.memory_held_line(connection)
+            dated = report.memory_held_line(connection, "2026-10-02")
+        self.assertIn("average 10.0 GiB", line)
+        self.assertIn("average 26.0 GiB", dated)
+
     def test_cpu_disk_pressure_follows_memory_and_reports_two_hosts(self) -> None:
         self.write(self.root / "natedev" / "samples-2026-10.jsonl",
                    sample(STAMP, cpu_stall_some_us=10_000_000, io_stall_some_us=1_000_000,
@@ -2412,14 +2622,14 @@ class ReportTests(unittest.TestCase):
         self.assertIn("natedev: CPU some 41.2%, full —; IO some 3.1%, full 1.0%; CPU idle 52.0%, iowait 0.4% (of 1.0 min sampled)", section)
         self.assertIn("mac: CPU some 10.0%, full 5.0%; IO some 0.0%, full 0.0%; CPU idle 80.0%, iowait 10.0% (of 2.0 min sampled)", section)
 
-    def test_cpu_disk_pressure_counts_reboot_counters_from_zero(self) -> None:
+    def test_cpu_disk_pressure_does_not_count_across_a_reboot(self) -> None:
         self.write(self.root / "natedev" / "samples-2026-10.jsonl",
                    sample(STAMP, cpu_stall_some_us=99_000_000, io_stall_some_us=9_000_000,
                           cpu_idle_ticks=9000, cpu_iowait_ticks=900, cpu_total_ticks=10000),
                    sample("2026-10-02T12:01:00.000Z", boot_id="new-boot", cpu_stall_some_us=30_000_000,
                           io_stall_some_us=6_000_000, cpu_idle_ticks=200, cpu_iowait_ticks=20, cpu_total_ticks=1000))
         section = self.section_lines(self.render(), "### CPU and disk pressure")
-        self.assertIn("natedev: CPU some 50.0%, full —; IO some 10.0%, full —; CPU idle 20.0%, iowait 2.0% (of 1.0 min sampled)", section)
+        self.assertIn("CPU and IO samples: none.", section)
 
     def test_cpu_disk_pressure_long_gap_is_not_sampled_time(self) -> None:
         start = datetime.fromisoformat(STAMP)
@@ -2487,7 +2697,7 @@ class ReportTests(unittest.TestCase):
         section = self.memory_section()
         self.assertTrue(any("Source:" in line and "60 s" in line and "step" in line and "stall" in line for line in section))
         self.assertTrue(any("8.0 GiB" in line and "7.0 GiB" in line for line in section))
-        self.assertTrue(any("3.5 s" in line and "1.5 s" in line for line in section))
+        self.assertTrue(any("3.0 s" in line and "1.4 s" in line for line in section))
         self.assertTrue(any("peak builds 4.0 GiB, peak CI 5.0 GiB (process memory)" in line for line in section))
         self.assertIn("memory waits: none", section)
 
@@ -2501,7 +2711,7 @@ class ReportTests(unittest.TestCase):
         section = self.memory_section()
         self.assertFalse(any(line.startswith("|") for line in section))
         self.assertTrue(any("4.0 GiB" in line and "2.0 GiB" in line for line in section))
-        self.assertTrue(any("some 0.0 s" in line and "full 0.0 s" in line for line in section))
+        self.assertTrue(any("some unavailable" in line and "full unavailable" in line for line in section))
 
     def test_memory_pressure_compares_adjacent_samples_per_host(self) -> None:
         self.write(
@@ -2524,7 +2734,7 @@ class ReportTests(unittest.TestCase):
             sample(STAMP, stall_some_us=12_000_000, stall_full_us=3_000_000),
         )
         section = self.memory_section()
-        self.assertTrue(any("some 0.0 s" in line and "full 0.0 s" in line for line in section))
+        self.assertTrue(any("some unavailable" in line and "full unavailable" in line for line in section))
 
     def test_memory_pressure_counts_counter_rise_across_midnight_when_samples_are_close(self) -> None:
         self.addCleanup(time.tzset)
