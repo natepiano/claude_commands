@@ -275,7 +275,7 @@ class IncompleteShutdownStillLive:
     """The owner is running, so its unfinished shutdown remains unchanged."""
 
 
-INCOMPLETE_PROGRESS = frozenset({"waiting", "ready", "held by usage limit", "reaping", "stopping"})
+INCOMPLETE_PROGRESS = frozenset({"waiting", "ready", "held by usage limit", "reaping", "stopping", "stop failed"})
 
 
 def _recover_incomplete_shutdown(
