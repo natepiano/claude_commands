@@ -287,7 +287,7 @@ including the details to make it clear
 
 **Ruled out:** a copy of `git_identity` in the recorder; the phase context as a second `repo_identity` source; a reader for `compiled_crate_names` before a consumer exists.
 
-### Phase 5 — The package table's Source line says it counts only warm steps  · status: todo
+### Phase 5 — The package table's Source line says it counts only warm steps  · status: done
 
 **Depends on:** none
 
@@ -318,3 +318,36 @@ including the details to make it clear
 **Constraints from prior phases:** the warm rule is `report.warm_step_clause()` and `rebuild_bin(crates_compiled, warm)` (4f); do not change either.
 
 **Acceptance gate:** `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY PYTHONPATH=scripts/buildlog python3 -m unittest scripts.buildlog.test_report` from the worktree root green, with the new assertion failing on the old text; basedpyright on `scripts/buildlog/report.py scripts/buildlog/test_report.py` `0 errors, 0 warnings, 0 notes`; live: `python3 scripts/buildlog/cli.py report` from the worktree root (the `buildlog` wrapper runs the installed copy, not the worktree's) prints the new `Source:` line under the package table.
+
+### Phase 6 — A cut-short row no longer leaves bad JSON in the build log  · status: todo
+
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** after any failed append, the build log's month file holds only whole rows, so every reader parses each line.
+
+**Spec:**
+- Defect (showrunner, from resources' Phase 4 review, 2026-10-30): `store._write_all` writes a row in a loop of `os.write` calls. When one write is short and the next fails (a full disk, for example), part of the row stays in the file with no newline. Since 4b, `locked_append` then writes a `\n` after that part, so the part becomes a line of its own that is not JSON; readers such as `record.read_rebuild_evidence` fail on it.
+- Showrunner's ruling: under the append lock, before it writes, the appender cuts an unfinished tail back to the last newline, then writes the row.
+- In `store.locked_append`, replace the `\n` repair with that cut: read only the last byte when it is `\n` (the usual case); otherwise find the last `\n` by reading back from the end, and `os.ftruncate` the file to just after it, or to 0 when the file has no `\n`. The cut runs under the same `flock`, before the caller's write.
+- A row counts as written only when its newline lands, so a whole JSON object with no newline after it is cut too. A step row lost this way is published again by 4b's recovery (`record._resume_step_line`), which scans for its id; other rows stay lost, as they were before.
+- No reader changes. Old damage is removed once instead (showrunner, 2026-10-30): count the lines that do not parse in each live month file under `~/.local/state/buildlog/`. In each file a reader still reads that has any, remove those lines once, after a backup copy beside the file named so that no reader's glob matches it (check every glob in `scripts/buildlog/`). Rewrite the file in place under its `flock` (truncate, then write the kept lines; same inode): never rename a new file over it, because an appender waiting on the lock holds the old inode. Skip and report a file that a pending 4b step record names (its `month_offset` would move). Make the index read each rewritten file again through its existing path, and name that path. For a host folder that `sync.py` brings from the Mac, check how sync writes it first: when the next sync would bring the bad lines back, report that file and leave it unchanged. This is a one-time live step, not new repository code; save its output (each file, lines removed, backup path) to the phase folder for the notice.
+- Update the module docstring (`store.py` line 10) and every as-built line that says the appender separates an interrupted tail; take every name from the code.
+
+**Files:**
+- `scripts/buildlog/store.py` — the cut in `locked_append`, the docstring
+- `scripts/buildlog/test_store.py` — the new test and the changed assertion
+- `docs/as-built/` — each doc that describes the tail repair (find them with `git grep`)
+
+**Workers:** 1 writer + 1 tester
+- `impl` — `store.py`, the as-built docs, and the one-time live removal after its code passes
+- `test` — `test_store.py`: a test that cuts a write short: `os.write` writes a few bytes of a row, then raises `OSError`; `append_line` raises; the next `append_line` leaves the file as the old rows plus the new row, and every line parses as JSON. Also a file with no newline at all is cut to empty. It must fail on the old code.
+
+**Assertion-Change:** `scripts/buildlog/test_store.py` `test_append_separates_an_interrupted_tail_before_the_next_row` — old: `self.assertEqual(path.read_bytes(), tail + b'\n{"id":"next"}\n')` for both tails; new: the file is `b'{"id":"next"}\n'` for both tails, because the ruling cuts every unfinished tail. Rename the test for the new behavior. `test_append_reads_only_the_tail_byte_and_keeps_the_lock_through_fsync` stays as it is: its file ends in `\n`, so the cut still reads one byte.
+
+**State:** the month file's tail: a cut under the exclusive lock, before the write. A rerun after a failed append cuts the same tail again and writes once. The one-time removal: a second run finds no bad line and changes nothing, and never overwrites an existing backup.
+
+**Constraints from prior phases:** 4b's recovery scan (`record._resume_step_line`) reads from `month_offset` under `locked_append` and skips lines that do not parse; the cut must leave its offset reading valid (a cut never goes below the last whole row).
+
+**Acceptance gate:** `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY PYTHONPATH=scripts/buildlog python3 -m unittest scripts.buildlog.test_store scripts.buildlog.test_record scripts.buildlog.test_record_rerun scripts.buildlog.test_recorder_health` from the worktree root green, with the new test failing on the old code; basedpyright on `scripts/buildlog/store.py scripts/buildlog/test_store.py` `0 errors, 0 warnings, 0 notes`; live: the one-time removal above ran, with a backup per changed file, and a second count finds no bad line in any file a reader reads; `python3 scripts/buildlog/cli.py report` from the worktree root runs clean.

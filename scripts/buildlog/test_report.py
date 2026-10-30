@@ -1203,6 +1203,8 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(section[3], "")
         self.assertEqual(section[4], "| Rebuild | Steps | Compile | Other | Total | Share of compile | Share of time |")
         title = section.index("Edited-crate rebuilds by package (nextest):")
+        package_source = next(line for line in section[title + 1:] if line.startswith("Source:"))
+        self.assertTrue(package_source.startswith("Source: warm nextest steps"), package_source)
         package_table = [line for line in section[title + 1:] if line.startswith("|")]
         self.assertEqual(package_table[0], "| Package | Steps | p50 | p95 | Compile |")
         self.assertEqual(package_table[2:], [

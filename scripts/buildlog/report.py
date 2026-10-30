@@ -788,7 +788,7 @@ def rebuilds_section(connection: sqlite3.Connection, day: str) -> list[str]:
             "Edited-crate rebuilds by package (nextest):",
             "",
             *table(["Package", "Steps", "p50", "p95", "Compile"], packages),
-            f"Source: nextest steps that compiled {EDITED_CRATE_MIN_CRATES}–{EDITED_CRATE_MAX_CRATES} crates, by the first package(…) in the test filter; p50 and p95 are of compile time.",
+            f"Source: warm nextest steps that compiled {EDITED_CRATE_MIN_CRATES}–{EDITED_CRATE_MAX_CRATES} crates (the edited-crate row), by the first package(…) in the test filter; p50 and p95 are of compile time.",
             "",
         ]
     return section
