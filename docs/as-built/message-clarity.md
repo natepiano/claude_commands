@@ -216,11 +216,13 @@ Sends no longer create holds: in production code, nothing calls `review.hold()`.
 The gate is a PreToolUse hook. Its `settings.json` entry has matcher `PushNotification` and `"timeout": 120`. Built-in PushNotification takes only `message`: one line, no title.
 
 1. With no marker for the `session_id`, an age outside 0–600 s, or a `message` that does not match the marker's `fallback` (whitespace-normalised), the gate denies with `DENIAL`, which points to `send.py --to user`. The marker is left in place.
-2. On a match, the marker is deleted under `failed/.lock`.
-3. If `held` is true and `need` is not `blocked`, it denies with `HELD_FALLBACK`.
-4. If `reviewed` is false and `need` is not `blocked`, it denies with `UNREVIEWED_FALLBACK`. A marker without `reviewed` counts as reviewed.
-5. If `held_source` and `held_identity` are present, it releases the hold, locally or over ssh with `review.py release`. While the answer is `posting`, it asks again each second until `posting_wait_seconds()` has passed. `delivered` denies with `ALREADY_SENT`. Every other answer, and a timeout, allows the push.
+2. On a match, valid authorization stays in place until delivery or its existing expiry: a PreToolUse allow does not prove the push ran. A stopped or failed built-in push can retry the same reviewed fallback within the original ten-minute window; allowing it does not renew that window.
+3. If `held` is true and `need` is not `blocked`, it deletes the marker under `failed/.lock` and denies with `HELD_FALLBACK`.
+4. If `reviewed` is false and `need` is not `blocked`, it deletes the marker under `failed/.lock` and denies with `UNREVIEWED_FALLBACK`. A marker without `reviewed` counts as reviewed.
+5. If `held_source` and `held_identity` are present, it releases the hold, locally or over ssh with `review.py release`. While the answer is `posting`, it asks again each second until `posting_wait_seconds()` has passed. `delivered` deletes the unchanged marker under `failed/.lock` and denies with `ALREADY_SENT`; a replacement marker is preserved. Every other answer, and a timeout, allows the push and retains authorization for retry.
 6. Otherwise it allows the push. Any exception, including failing to import `review`, also allows the push and prints `push gate: <type>: <error>` to stderr.
+
+`post-tool-use-push-delivered.py` runs through the PostToolUse dispatcher only for `PushNotification`. After a successful push (`tool_response.success` is true and `is_error` is not true), it consumes the matching fallback marker under the same `failed/.lock`. The gate and delivery hook share the marker path and whitespace rule. A delivered fallback therefore uses its approval once; stopping before delivery still permits a retry. A missing or unreadable marker, a failed push, or a different message leaves approval unchanged. Any hook error prints a short stderr line and exits successfully. No settings change is needed.
 
 ### Script push texts
 
