@@ -44,6 +44,20 @@ class AtomicFileTests(unittest.TestCase):
             self.assertEqual(path.read_text(), '["question"]\n')
             self.assertEqual(list(path.parent.iterdir()), [path])
 
+    def test_write_can_require_an_existing_parent_before_temporary_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "retired" / "wait"
+            with patch("scripts.lib.atomic_file._remove_dead_temporary_files") as sweep:
+                with self.assertRaises(FileNotFoundError):
+                    write_text_atomic(path, "wait-id\n", create_parent=False)
+                sweep.assert_not_called()
+            self.assertEqual(list(root.iterdir()), [])
+            path.parent.mkdir()
+            write_text_atomic(path, "wait-id\n", create_parent=False)
+            self.assertEqual(path.read_text(), "wait-id\n")
+            self.assertEqual(list(path.parent.iterdir()), [path])
+
     def test_replacement_syncs_parent_folder_after_publishing_text(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state"

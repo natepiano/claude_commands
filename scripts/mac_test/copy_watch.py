@@ -629,7 +629,7 @@ def main() -> int:
             finally:
                 watch.close()
         try:
-            write_text_atomic(request.result, result_text(report))
+            write_text_atomic(request.result, result_text(report), create_parent=False)
         except OSError as error:
             print(f"copy_watch.py: cannot publish result {request.result}: {error}", file=sys.stderr)
             return 1

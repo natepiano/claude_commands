@@ -16,6 +16,7 @@ from unittest import mock
 
 from scripts.build_queue import build_queue, build_why
 from scripts.lint import memory_admit as gate
+from scripts.lib.process_start_test_support import write_stat
 from scripts.lib.user_zone import user_zone
 from scripts.message import roster
 
@@ -91,9 +92,7 @@ class BuildWhyTests(unittest.TestCase):
 
     def process(self, pid: int, used: float = 0) -> None:
         directory = self.proc / str(pid)
-        directory.mkdir()
-        fields = ["S", "1", *(["0"] * 17), str(pid)]
-        _ = (directory / "stat").write_text(f"{pid} (verify) {' '.join(fields)}\n")
+        _ = write_stat(self.proc, pid, command="verify", start_ticks=pid)
         _ = (directory / "status").write_text(f"VmRSS: {gib(used) // 1024} kB\nVmSwap: 0 kB\n")
 
     def running(self, pid: int, name: str, step: str, need: float, used: float,

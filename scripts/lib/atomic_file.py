@@ -30,9 +30,13 @@ def _remove_dead_temporary_files(path: Path) -> None:
             continue
 
 
-def write_text_atomic(path: Path, text: str) -> None:
+def write_text_atomic(path: Path, text: str, *, create_parent: bool = True) -> None:
     """Flush a sibling temporary file, replace the destination, and sync its folder."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if create_parent:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        # Callers that publish into owned folders must not restore a retired folder.
+        _ = path.parent.stat()
     _remove_dead_temporary_files(path)
     descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.{os.getpid()}.", suffix=".tmp", dir=path.parent)
     temporary = Path(name)

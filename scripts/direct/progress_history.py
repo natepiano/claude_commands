@@ -4844,8 +4844,8 @@ def _publish_wait_file(publication: WaitIdFile | TurnWaitFile, wait_id: str) -> 
     path = publication.path
     text = (json.dumps({"wait_id": wait_id, "owner_session": publication.owner_session})
             if isinstance(publication, TurnWaitFile) else wait_id) + "\n"
-    # The shared writer never creates a missing parent folder.
-    write_text_atomic(path, text)
+    # Recovery may have retired the folder; publication must not restore it.
+    write_text_atomic(path, text, create_parent=False)
 
 
 def _existing_wait_id(wait: RecordedWait) -> str:

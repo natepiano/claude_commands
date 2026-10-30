@@ -2145,10 +2145,11 @@ class CodexHolderLabelsTests(unittest.TestCase):
         # Only their declared unit marks and run metadata come from fixture files.
         for pid, sid, name in ((os.getppid(), "holder-director", "report-director"),
                                (os.getpid(), "holder-runner", "builds-runner")):
-            start = sessions.process_start(pid)
+            start = process_identity.process_start(pid)
             self.assertIsNotNone(start)
+            assert not isinstance(start, process_identity.ProcessGone)
             _ = (self.registry / f"{pid}.json").write_text(json.dumps({
-                "pid": pid, "sessionId": sid, "name": name, "procStart": start,
+                "pid": pid, "sessionId": sid, "name": name, "procStart": start.text,
                 "messagingSocketPath": "", "updatedAt": 1, "cwd": str(self.root / name),
             }))
         self.process(991099, 0, ["herdr", "--session", "native", "server"])
@@ -2176,8 +2177,7 @@ class CodexHolderLabelsTests(unittest.TestCase):
 
     def process(self, pid: int, parent: int, argv: list[str], environment: str = "") -> None:
         directory = self.root / "proc" / str(pid)
-        directory.mkdir(parents=True)
-        _ = (directory / "stat").write_text(f"{pid} (fixture) S {parent} 0 0")
+        _ = write_stat(directory.parent, pid, ppid=parent, command="fixture")
         _ = (directory / "cmdline").write_bytes("\0".join(argv).encode())
         _ = (directory / "environ").write_bytes(environment.encode())
         (directory / "cwd").symlink_to(self.root)
