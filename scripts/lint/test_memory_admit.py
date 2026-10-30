@@ -879,7 +879,7 @@ class LedgerTests(unittest.TestCase):
     def test_profile_lookups_run_once_across_three_polls(self) -> None:
         with patch.object(gate, "git_identity", return_value=(HANA, "tree")) as identity, \
              patch.object(gate, "expected_peak", return_value=gate.ExpectedPeak(12 * GIB, "fallback", 0)) as history:
-            profile = None
+            profile = gate.InferFromArgv()
             for _ in range(3):
                 result = gate.check(self.meminfo, self.pid, "", ["cargo", "nextest"], root=self.root, now=NOW, profile=profile)
                 profile = result.profile
@@ -932,6 +932,101 @@ class MemoryQueueFixture(unittest.TestCase):
                           root=self.root, now=NOW,
                           profile=gate.StepProfile("test", "nextest", "test", gate.ExpectedPeak(int(need * GIB), "measured", 5)))
 
+
+
+class GateProfileTests(MemoryQueueFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, fake_memory_readings(self.root))))
+
+    def test_gate_without_history_uses_its_cap_and_keeps_its_queue_identity(self) -> None:
+        estimate = gate.gate_estimate(4 * GIB, "host", NOW, self.root)
+        self.assertEqual(estimate, gate.NoGateHistory(4 * GIB))
+        profile = gate.GateProfile("installed/.claude", "checkout", 4 * GIB, estimate)
+        _ = self.running(100, 20, age=1)
+        with patch.object(gate, "git_identity", side_effect=AssertionError("gate inferred cargo identity")):
+            result = gate.check(self.meminfo, 400, "", ["merge-gate"], root=self.root, now=NOW, profile=profile)
+        self.assertEqual(result.decision.state, "hold")
+        self.assertEqual((result.repo, result.step, result.peak.bytes), ("installed/.claude", "merge-gate", 4 * GIB))
+        waiter, = gate.admission_dir(self.root).glob("*.waiting")
+        row = cast(gate.Waiter, json.loads(waiter.read_text()))
+        self.assertEqual((row.get("step"), row.get("folder"), row.get("need_source")),
+                         ("merge-gate", "checkout", "fallback"))
+
+    def test_gate_history_uses_only_recent_gate_peaks_on_this_host(self) -> None:
+        history = gate.admission_dir(self.root) / "anon_peaks.jsonl"
+        rows = [{"step": "merge-gate", "host": "host", "anon_peak_bytes": value * GIB,
+                 "ended_at": store.utc_iso((NOW - timedelta(hours=1)).timestamp())}
+                for value in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)]
+        rows.extend([
+            {"step": "nextest", "host": "host", "anon_peak_bytes": 100 * GIB, "ended_at": store.utc_iso(HISTORY_AT.timestamp())},
+            {"step": "merge-gate", "host": "other", "anon_peak_bytes": 100 * GIB, "ended_at": store.utc_iso(HISTORY_AT.timestamp())},
+            {"step": "merge-gate", "host": "host", "anon_peak_bytes": 100 * GIB,
+             "ended_at": store.utc_iso((NOW - timedelta(days=gate.HISTORY_DAYS + 1)).timestamp())},
+        ])
+        _ = history.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        self.assertEqual(gate.gate_estimate(4 * GIB, "host", NOW, self.root), gate.MeasuredGatePeak(9 * GIB, 10))
+
+    def test_gate_queue_view_keeps_checkout_when_launch_directory_differs(self) -> None:
+        checkout, launch = self.root / "gate-checkout", self.root / "launch"
+        checkout.mkdir()
+        launch.mkdir()
+        owner = self.root / "proc/400"
+        owner.mkdir(parents=True)
+        (owner / "cwd").symlink_to(launch)
+        self.readings[400] = gate.MeasuredMemory(GIB)
+        busy = self.running(100, 20, age=1)
+        profile = gate.GateProfile("installed/.claude", str(checkout), 4 * GIB, gate.NoGateHistory(4 * GIB))
+        for state in ("hold", "admit"):
+            with self.subTest(state=state):
+                if state == "admit":
+                    busy.unlink()
+                result = gate.check(self.meminfo, 400, "", ["merge-gate"], root=self.root, now=NOW, profile=profile)
+                self.assertEqual(result.decision.state, state)
+                view, _ = gate.read_queue(gate.admission_dir(self.root), gate.process_table(self.root / "proc"), NOW.timestamp())
+                rows = view.waiting if state == "hold" else view.running
+                visible, = (row for row in rows if row.step == "merge-gate")
+                self.assertEqual(visible.folder, str(checkout))
+
+    def test_expired_gate_profile_refreshes_outside_lock_without_cargo_inference(self) -> None:
+        profile = gate.GateProfile("installed/.claude", "checkout", 4 * GIB,
+                                   gate.NoGateHistory(4 * GIB), NOW.timestamp() - gate.HEAD_SECONDS)
+        locked = False
+        acquire = fcntl.flock
+
+        def lock(file: TextIO, operation: int) -> None:
+            nonlocal locked
+            acquire(file, operation)
+            locked = True
+
+        def estimate(cap: int, host: str, now: datetime, root: Path) -> gate.GateEstimate:
+            self.assertFalse(locked)
+            self.assertEqual((cap, now, root), (4 * GIB, NOW, self.root))
+            self.assertTrue(host)
+            return gate.MeasuredGatePeak(6 * GIB, 2)
+
+        with patch.object(gate, "gate_estimate", side_effect=estimate) as refreshed, \
+                patch.object(gate, "git_identity", side_effect=AssertionError("gate inferred cargo identity")), \
+                patch.object(fcntl, "flock", side_effect=lock):
+            result = gate.check(self.meminfo, 400, "", ["merge-gate"], root=self.root, now=NOW, profile=profile)
+        refreshed.assert_called_once()
+        self.assertEqual((result.repo, result.step, result.profile.worktree, result.peak.bytes),
+                         ("installed/.claude", "merge-gate", "checkout", 6 * GIB))
+        self.assertEqual(result.profile.estimated_at, NOW.timestamp())
+        self.assertIsInstance(result.reservation, gate.Reserved)
+        if isinstance(result.reservation, gate.Reserved):
+            row = cast(gate.Reservation, json.loads(result.reservation.path.read_text()))
+            self.assertEqual((row["repo"], row["step"], row["need"]), ("installed/.claude", "merge-gate", 6 * GIB))
+
+    def test_expired_measured_gate_profile_retains_its_original_fallback_cap(self) -> None:
+        profile = gate.GateProfile("installed/.claude", "checkout", 4 * GIB,
+                                   gate.MeasuredGatePeak(GIB, 1), NOW.timestamp() - gate.HEAD_SECONDS)
+        with patch.object(gate, "git_identity", side_effect=AssertionError("gate inferred cargo identity")):
+            result = gate.check(self.meminfo, 400, "", ["merge-gate"], root=self.root, now=NOW, profile=profile)
+        self.assertEqual(result.peak, gate.ExpectedPeak(4 * GIB, "fallback", 0))
+        self.assertEqual(cast(gate.GateProfile, result.profile).estimate, gate.NoGateHistory(4 * GIB))
+        self.assertEqual((result.repo, result.step), ("installed/.claude", "merge-gate"))
 
 
 class CurrentBlockerTests(MemoryQueueFixture):
@@ -1631,7 +1726,7 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
                 def read_clock(_zone: object) -> datetime:
                     return clock
 
-                profile = None if computed else gate.StepProfile(
+                profile = gate.InferFromArgv() if computed else gate.StepProfile(
                     "test", "check", "test", gate.ExpectedPeak(8 * GIB, "measured", 5),
                     estimated_at=NOW.timestamp() - 590)
                 with patch("memory_admit.fcntl.flock", side_effect=delayed_lock), \

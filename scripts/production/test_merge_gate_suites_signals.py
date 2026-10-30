@@ -9,13 +9,79 @@ import signal
 import subprocess
 import sys
 from typing import final
+from unittest import mock
+from scripts.production import merge_gate
 from scripts.direct.wait_for_test_state import wait_until
-from scripts.production.merge_gate_test_support import TEST_HANG_GUARD_SECS
+from scripts.production.merge_gate_test_support import TEST_HANG_GUARD_SECS, gate_suites
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 
 
 @final
 class MergeGateSignalsTests(GateSuitesFixture):
+    @gate_suites("hooks")
+    def test_stop_after_launch_reaps_child_before_returning_capacity(self) -> None:
+        self.supply_jobserver(b"Q")
+        self.write(self.state / "hold-module", "hold")
+        start = merge_gate.start_gate_job
+        launched: list[merge_gate.RunningGateJob] = []
+
+        def stop_after_start(suite: str, path: Path, argv: list[str], repo: Path,
+                             environment: dict[str, str], log: Path) -> merge_gate.RunningGateJob:
+            job = start(suite, path, argv, repo, environment, log)
+            if suite == "hooks":
+                launched.append(job)
+                wait_until((self.state / "module-held").exists, self.state,
+                           timeout=TEST_HANG_GUARD_SECS, processes=(job.process,))
+                os.kill(os.getpid(), signal.SIGTERM)
+            return job
+
+        try:
+            with mock.patch.object(merge_gate, "start_gate_job", side_effect=stop_after_start):
+                result = self.run_gate("--tests-only")
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("interrupted by SIGTERM", result.stderr)
+            self.assertEqual(len(launched), 1)
+            self.assertIsNotNone(launched[0].process.poll(), "the runner left its launched module alive")
+            self.assertEqual(self.jobserver_tokens(), b"Q")
+            self.assert_gate_released()
+        finally:
+            for job in launched:
+                if job.process.poll() is None:
+                    os.killpg(job.process.pid, signal.SIGKILL)
+                _ = job.process.wait(timeout=TEST_HANG_GUARD_SECS)
+                job.output.close()
+
+    @gate_suites("hooks", "lib")
+    def test_stop_with_pending_modules_returns_owned_slot_and_reservation(self) -> None:
+        self.supply_jobserver(b"S")
+        self.write(self.state / "hold-module", "hold")
+        process = subprocess.Popen(
+            [*self.gate_command(), "--tests-only", "--repo", str(self.checkout)],
+            env=self.environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+        try:
+            wait_until(lambda: (self.state / "module-held").exists() or process.poll() is not None,
+                       self.state, timeout=TEST_HANG_GUARD_SECS, processes=(process,))
+            self.assertTrue((self.state / "module-held").exists())
+            self.assertEqual(self.jobserver_tokens(), b"")
+            self.assertEqual(len(list(self.admission_directory.glob("*.reservation"))), 1)
+            process.send_signal(signal.SIGTERM)
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(process.returncode, 1, output + errors)
+            self.assertEqual(self.jobserver_tokens(), b"S")
+            self.assert_gate_released()
+            self.assert_process_stopped(int((self.state / "module-held").read_text()))
+        finally:
+            if process.poll() is None:
+                process.kill()
+            _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            held = self.state / "module-held"
+            if held.exists():
+                try:
+                    os.killpg(int(held.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
     def test_finished_module_leaves_no_running_child(self) -> None:
         self.write(self.state / "leak-child", "leak")
         result = self.run_gate("--tests-only")

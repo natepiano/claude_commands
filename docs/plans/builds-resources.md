@@ -122,7 +122,7 @@ Own what a build may use and when it starts: memory admission and the memory que
 **Ruled out:** a first-builds column in `rebuilds`; the shared-folder sweep extension computes first builds from build-log records.
 
 ### Phase 4 — Short-lived clones share one build folder per repository  · status: todo
-**Depends on:** Phase 3, Phase 9 (the sweep change this phase extends), and the case D verdict of verify-unit's Phase 1 trial (Spec 1–2, frozen). Global order: 21 → 16 → 20 → **4** → 11 → 17 → 18 → 19 → 8. The Change-Review uses `copies.py` (verify-copies Phase 3, verify-unit).
+**Depends on:** Phase 3, Phase 9 (the sweep change this phase extends), and the case D verdict of verify-unit's Phase 1 trial (Spec 1–2, frozen). Global order: 21 → 16 → 25 → 24 → 26 → 20 → **4** → 11 → 17 → 18 → 19 → 8. The Change-Review uses `copies.py` (verify-copies Phase 3, verify-unit).
 
 #### Work Order
 
@@ -376,7 +376,7 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 **Ruled out:** tree equality as proof for a promote rerun (it does not show the commit is the gate's own).
 
 ### Phase 15 — After its compile, a nextest step is charged its test phase's measured peak  · status: todo
-**Depends on:** Phase 14 (same file, `memory_admit.py`; its row 3 charges a step by the step cgroup that the `invoke.sh` sampler reads, and adds cleanup paths that must remove this phase's new sidecar). Merge `origin/builds` first. report-unit's build-why change (Phase 20's prerequisite: `explain_queue`, `ChargeBasis`, waiter `need_source`) may land first; if it is on `origin/builds`, merge it before dispatch. **Parked** (builds showrunner 2026-10-30): both replay arms (history max, max + 10%) failed the landing rule, so the same-width charge stays as today. report-unit records `test_phase_peak_bytes` (the per-step test-phase peak) in a new phase; this phase resumes only after that phase merges on `origin/builds` and a replay on its data passes. Global order: 21 → 16 → 20 → 4 → 11 → 17 → 18 → 19 → 8; this phase merges on top when it resumes.
+**Depends on:** Phase 14 (same file, `memory_admit.py`; its row 3 charges a step by the step cgroup that the `invoke.sh` sampler reads, and adds cleanup paths that must remove this phase's new sidecar). Merge `origin/builds` first. report-unit's build-why change (Phase 20's prerequisite: `explain_queue`, `ChargeBasis`, waiter `need_source`) may land first; if it is on `origin/builds`, merge it before dispatch. **Parked** (builds showrunner 2026-10-30): both replay arms (history max, max + 10%) failed the landing rule, so the same-width charge stays as today. report-unit records `test_phase_peak_bytes` (the per-step test-phase peak) in a new phase; this phase resumes only after that phase merges on `origin/builds` and a replay on its data passes. Global order: 21 → 16 → 25 → 24 → 26 → 20 → 4 → 11 → 17 → 18 → 19 → 8; this phase merges on top when it resumes.
 
 **Approved:** showrunner 2026-10-29 (ETA 04:30 EDT 2026-10-30).
 
@@ -427,8 +427,8 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 - The notice has `also touches` lines for `invoke.sh` and `test_invoke_scope.py` (verify-unit, against `origin/natedev-verify` and `origin/natedev`) and, if changed, `build_why.py` (report-unit, against `origin/builds-report`).
 - Change-Review line: a nextest step's charge falls to its test-phase peak once its tests start | on natedev, start `~/.claude/scripts/direct/verify.sh test hana_diegetic` in `~/rust/hana`; after its compile, run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_why.py` (before build-why lands: `cat ~/.local/state/buildlog/admission/*.tests`) | the step's charge reads as the test-phase peak with its width form, below its compile peak.
 
-### Phase 16 — Python test gates take a place in the shared admission queue  · status: todo
-**Depends on:** Phase 21 (same file, `merge_gate.py`: Phase 21's checkout lock lands first). Runs before Phase 20. Merge `origin/builds` first. Global order: 21 → **16** → 20 → 4 → 11 → 17 → 18 → 19 → 8.
+### Phase 16 — Python test gates take a place in the shared admission queue  · status: done
+**Depends on:** Phase 21 (same file, `merge_gate.py`: Phase 21's checkout lock lands first). Runs before Phase 20. Merge `origin/builds` first. Global order: 21 → **16** → 25 → 24 → 26 → 20 → 4 → 11 → 17 → 18 → 19 → 8.
 
 **Approved:** showrunner 2026-10-29 (ETA 06:30 EDT 2026-10-30).
 
@@ -445,7 +445,7 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 
 **Spec:**
 
-1. **Measure first.** From `/proc` while gates run, and from the last 7 days of `samples` (`builds_anon_bytes`, `stall_full_us`, `cpu_stall_some_us`) and `steps`: how many gates ran at once, each gate's peak memory (the gate prints `Largest module peak` at :927; its whole tree is what matters), and the wait minutes and pressure holds of cargo steps while gates ran against while none ran. The run with no queue place is `merge_gate.py --tests-only`, the `~/.claude` merge gate: its parallel suites (about 10 min) and its basedpyright run sit outside the memory and CPU queue, and on 2026-10-29 it pushed natedev load to 67 (showrunner, 23:3x EDT). That run gets a queue place with a CPU charge. `verify.sh test` already waits in the memory queue; leave it as it is. List any other Python run found outside the queue (a unit's own pytest through `verify.sh lint`, say) in the phase report and give it the same rule.
+1. **Measure first.** From `/proc` while gates run, and from the last 7 days of `samples` (`builds_anon_bytes`, `stall_full_us`, `cpu_stall_some_us`) and `steps`: how many gates ran at once, each gate's peak memory (the gate prints `Largest module peak` at :927; its whole tree is what matters), and the wait minutes and pressure holds of cargo steps while gates ran against while none ran. The run with no queue place is `merge_gate.py --tests-only`, the `~/.claude` merge gate: its parallel suites (about 10 min) and its basedpyright run sit outside the memory and CPU queue, and on 2026-10-29 it pushed natedev load to 67 (showrunner, 23:3x EDT). That run gets a queue place with a CPU charge. `verify.sh test` already waits in the memory queue; leave it as it is. List any other Python run found outside the queue (a unit's own pytest through `verify.sh lint`, say) in the phase report and give it the same rule. **Correction (resources-unit 2026-10-30, at review):** the split of cargo waits and pressure holds with and without gates cannot come from old data: no gate recorded its start, and `passed-trees.jsonl` keeps only passing runs' end times. The phase records each gate's queue place and `merge-gate` history row, so the 24 h post-merge check makes that split.
 2. **Memory: the gate's admission and history contract.** A gate takes one reservation in the admission queue before it starts its first module, through `memory_admit.check` (:1242) in the installed `~/.claude` copy (the gate already runs from `~/.claude` main), called in the gate process. It waits in the queue as a cargo step waits, and `/build:queue` and the blocker lookup show it as step `merge-gate`.
    - **Identity and estimate.** `check` takes `profile: StepProfile | None` today. A supplied profile older than `HEAD_SECONDS` (600 s, :1251) becomes `None`, and `check` then infers repository, step and estimate from cargo arguments, which a gate has none of. Replace the optional with a closed union: `InferFromArgv` (today's `None`), `StepProfile` (the shell's cached profile, :1749) and `GateProfile` (repository `~/.claude`, step `merge-gate`, worktree = the checkout, and a `GateEstimate`). On the 600 s refresh a `GateProfile` is estimated again by one function, `gate_estimate` in `memory_admit.py`, and keeps its identity; it never goes through argv inference.
    - **No history is a named state.** `GateEstimate = MeasuredGatePeak(bytes, runs) | NoGateHistory(cap_bytes)`. `MeasuredGatePeak` is the p90 of the gate's `merge-gate` rows in `anon_peaks.jsonl` over `HISTORY_DAYS`. `NoGateHistory` asks for the gate's own memory cap (`--memory-cap-mib`, default `DEFAULT_MEMORY_CAP_MIB` 4096), because `SampledRSSAdmission` keeps the gate's sampled tree under that cap. The waiter row's need source is `measured` or `fallback` to match.
@@ -483,7 +483,7 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 - Change-Review line: a merge gate waits in the memory queue and takes build slots | in a terminal on natedev, `cd ~/.claude && env HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py ~/.claude/scripts/production/merge_gate.py --checkout ~/.claude --tests-only`, then type `/build:queue` in a Claude session | the gate shows as a `merge-gate` row, running or waiting, with its need.
 
 ### Phase 17 — The nextest promise splits by compile size  · status: todo
-**Depends on:** Phase 11 (same `expected_peak`; Phase 11 splits compile runs from no-compile runs). Merge `origin/builds` first. Global order: 21 → 16 → 20 → 4 → 11 → **17** → 18 → 19 → 8.
+**Depends on:** Phase 11 (same `expected_peak`; Phase 11 splits compile runs from no-compile runs). Merge `origin/builds` first. Global order: 21 → 16 → 25 → 24 → 26 → 20 → 4 → 11 → **17** → 18 → 19 → 8.
 
 **Approved:** showrunner 2026-10-29 (no ETA given).
 
@@ -521,7 +521,7 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 - Change-Review line: a small-compile test run on a warm tree gets a small promise | on natedev in `~/rust/hana`, run `~/.claude/scripts/direct/verify.sh test hana_diegetic --filter <one test>` once, then add a comment line to one source file of that crate (a small compile that is not zero; an unchanged tree takes the freshness path instead), run it again and read that run's memory wait line | its need is near the small band's p90 that the replay gives, and its basis names the compile band it picked.
 
 ### Phase 18 — History splits on the dylib feature and each step's commit, not on a time  · status: todo
-**Depends on:** Phase 17 (same `expected_peak`). Merge `origin/builds` first. Global order: 21 → 16 → 20 → 4 → 11 → 17 → **18** → 19 → 8.
+**Depends on:** Phase 17 (same `expected_peak`). Merge `origin/builds` first. Global order: 21 → 16 → 25 → 24 → 26 → 20 → 4 → 11 → 17 → **18** → 19 → 8.
 
 **Approved:** showrunner 2026-10-29 (no ETA given).
 
@@ -562,7 +562,7 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 - Change-Review line: a dylib hana test is promised only from dylib history | on natedev in `~/rust/hana`, run `~/.claude/scripts/direct/verify.sh test hana_diegetic` and read its first memory wait line | the need and its source match the dylib-side p90 that the replay gives.
 
 ### Phase 19 — Measure where admission estimates come from, then make the 0.65 fallback rare  · status: todo
-**Depends on:** Phase 18 (same `expected_peak`). Runs before Phase 8. Merge `origin/builds` first. Global order: 21 → 16 → 20 → 4 → 11 → 17 → 18 → **19** → 8.
+**Depends on:** Phase 18 (same `expected_peak`). Runs before Phase 8. Merge `origin/builds` first. Global order: 21 → 16 → 25 → 24 → 26 → 20 → 4 → 11 → 17 → 18 → **19** → 8.
 
 **Approved:** showrunner 2026-10-29, rescoped (no ETA given).
 
@@ -599,7 +599,7 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 - Change-Review line: few admissions use the 0.65 fallback | on natedev while builds wait, run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_why.py` | the waiting rows name source `measured` and few name `buildlog`. If Spec 2 stops the phase: Change-Review: none — measurement only.
 
 ### Phase 20 — Replay a looser head rule, and adopt it only on the replay  · status: todo
-**Depends on:** Phase 16 (same file, `memory_admit.py`); report-unit's build-why change on `origin/builds` (`explain_queue`, Spec 2). Runs before Phase 4. Merge `origin/builds` first. Global order: 21 → 16 → **20** → 4 → 11 → 17 → 18 → 19 → 8.
+**Depends on:** Phase 16 (same file, `memory_admit.py`); report-unit's build-why change on `origin/builds` (`explain_queue`, Spec 2). Runs before Phase 4. Merge `origin/builds` first. Global order: 21 → 16 → 25 → 24 → 26 → **20** → 4 → 11 → 17 → 18 → 19 → 8.
 
 **Approved:** showrunner 2026-10-29 (ETA 08:30 EDT 2026-10-30). The showrunner decides adoption from the replay table.
 
@@ -724,3 +724,129 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 **Acceptance gate:**
 - The build-hold tests pass; `basedpyright` over both Python files reports `0 errors, 0 warnings, 0 notes`; the merge gate is green.
 - Change-Review line: hold status names a stopped release and how to finish it | on natedev, in a Claude session with no build hold, type `/build:hold status` | it prints `no build hold`, and after a stopped release a `release pending:` line names the unsent sessions and `/build:hold release`.
+
+### Phase 24 — A build's promise comes from builds of the same shape and holds until the build ends  · status: todo
+**Depends on:** runs beside Phase 16 now (builds showrunner 2026-10-30: a wrong-result fix starts at once). Part A (new files only: the shape module, its tests, the replay) runs now. Part B (`scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py`, the as-built doc) waits until Phase 16 checkpoints, then builds on 16's tree. Merge `origin/builds` first. Global order: 21 → 16 → 25 → **24** → 26 → 20 → 4 → 11 → 17 → 18 → 19 → 8.
+
+**Approved:** builds showrunner 2026-10-30 05:2x EDT, design accepted as written (wrong-result defect, fixed at the cause in the gate).
+
+#### Work Order
+
+**Goal:** an admitted build step has its whole peak free for its whole life. Its promise comes only from earlier builds of the same shape, and the gate keeps that promise free until the step ends.
+
+**Measured (2026-10-30, natedev, live code `~/.claude` at `bc4ebeb1`):**
+- The incident: `verify.sh build hana --bin hana --release --features bevy/trace_chrome` (mesh run `20261030T031418`, worker `tool-based-ui-frame-time-frame-cost-test`) got a 10.9 GiB promise. Its `hana` bin rustc reached 14,720 MiB RSS, and earlyoom stopped it at 05:09:52 EDT after 86 min.
+- Cause 1, the key: `expected_peak` keys history by host, repository, step and test scope only. `anon_peaks.jsonl` rows carry no argv, profile or features. The 58 hana `build` rows in 14 days are mostly dev builds near 3 GiB; their p90 is 10.86 GiB, set by the two release rows (10.86 and 12.35 GiB). So a release + `trace_chrome` build is promised from a pool of lighter builds.
+- Cause 2, thin history: the index (`steps.argv`) has 8 hana release builds since 2026-10-16, peaks 10.88–13.01 GiB (2 with `trace_chrome`: 12.02 and 13.01). The failed run went 13% above the heaviest of them, so no history rule alone would have covered it.
+- Cause 3, the running charge: `build_charge` charges a running step `max(ramp_promise, bytes, observed_peak, unknown_peak_promise)`, and the ramp promise ends after `RAMP_SECONDS` (120 s). After that, a build that sits low for most of its life and peaks in its last crate is charged its current memory, and the gate admits other steps into the room its peak needs.
+
+**Spec:**
+
+1. **Replay first** (no queue model: it compares each promise with the step's own peak, so it does not need Phase 20's calibration). Over 14 days of natedev `build` steps (index `steps`, with argv): for each step, the promise today's `expected_peak` gives from the history before it, and the promise of Spec 3; count steps above each promise, and the excess (p50, max, GiB), by shape. Also the cost, per shape and in total: the room the new rule holds beyond today's, in GiB-hours, and the most extra room it holds at one time (from the steps' `started_at`/`ended_at` overlap). Give two figures for each: the promise increase (new promise − today's promise, held for the step's life), and the upper bound (the new promise held for the step's life − today's 120 s ramp hold). Save the script in the run folder (`phases/24/`), the table in the as-built doc in Part B. If the extra room would make other steps wait much longer, the numbers go to the showrunner before Part B lands.
+2. **The shape** (Part A, new module `scripts/lint/build_shape.py`). `build_shape(argv) -> BuildShape`, a frozen value with a stable text key: the profile (`release` for `--release`, the name for `--profile <name>`, else `dev`), the sorted feature set (`--features a,b`, `--features=a,b`, repeated flags; `--all-features` as its own value; `--no-default-features` as its own value), and the target selector (`--bin <name>`, `--example <name>`, `--lib`, else `all`). The module also holds the index join: `index_shapes(index_path, host, repository, step, cutoff, before) -> dict[(call_id, step), BuildShape]`, read-only, from `steps.argv`, `steps.call_id` and `steps.step` (Phase 11 Spec 4's join). In Part B, `check` writes the shape in the reservation row and `release` copies it to the `anon_peaks.jsonl` row; old rows with no shape take it from the join; a row with no match has no shape and counts for no shape.
+3. **The promise for a `build` step** (option C, builds showrunner 2026-10-30, after the options replay in the run folder `phases/24/options/`). Only rows of the same repository and the same shape count. With 10 or more rows over `HISTORY_DAYS`: their p90; with 1 to 9 rows: their largest. With no same-shape rows: the larger of `FALLBACK` and the heaviest same-repository `build` row of the same profile. A `release`-profile shape's promise is that value times `RELEASE_HEADROOM` = 1.314, the smallest factor under which no replayed release step with earlier same-shape rows went above its promise (comment the constant with that measurement); dev shapes take no factor. No promise goes above `BUILD_BUDGET_BYTES` (21 GiB): cap it there; a build that needs more is a separate question for the showrunner. Rows of another shape never fill a tier. **Killed or over-promise builds:** a `build` step that is killed (earlyoom, a signal) or whose observed peak passes its promise enters the same-shape history at the peak it reached, so the next build of that shape is promised at least that peak (the 05:09 incident shape: 15.76 GiB × 1.314 ≈ 20.7 GiB, under the cap). Replay of option C over 126 builds, capped at 21 GiB: +78.2 GiB-hours upper bound and +22.5 GiB-hours promise increase; the most extra room at one time 17.4 GiB (upper bound) and 14.9 GiB (increase); no promise above 21 GiB; the incident build gets 15.76 GiB (it needed 14.4). The first design (largest same-shape row × 4.20 for every build) cost +146.7 GiB-hours and 27.8 GiB at one time, with 77 promises above 21 GiB before the cap.
+4. **The running charge for a release `build` step.** The promise stays charged until the step ends: `max(need, current memory, observed peak)`. The 120 s ramp no longer ends it. Dev-profile `build` steps and all other steps keep today's charge (nextest stays Phase 15's; `check`, `clippy` and `doc` as today).
+5. **Tests.** Part A, in `scripts/lint/test_build_shape.py`: the shape from each argv form; the index join on a temporary SQLite index (a row with no argv or no `call_id` gives no shape). Part B, in `scripts/lint/test_memory_admit.py`: a release build is promised only from release rows of the same features and target; p90 with 10 or more rows and the largest with fewer; no same-shape rows gives the profile fallback, never the dev pool; the 1.314 factor applies to release shapes only; no promise passes 21 GiB; an old row takes its shape from the index join, and a row with no join counts for no shape; a release `build` step past 120 s stays charged its need while its memory is lower; a dev `build` step and a nextest step past 120 s keep today's charge; a killed `build` step, and one whose peak passed its promise, add a same-shape row at the peak reached, and the next same-shape promise is at least that peak times the factor. Every test fakes both memory readings.
+6. **Docs.** `docs/as-built/build-memory-admission.md`: the shape, the promise rule, the running charge, and the replay table.
+
+**Phase 15 check (builds asked):** Phase 15's two failed arms (history max, max + 10%) lowered a nextest step's charge after its compile to its test-phase history, and failed because test phases went above that lower charge. This phase lowers no charge and does not touch nextest or the after-compile charge. It raises the promise of `build` steps only, from same-shape history, and Spec 1 measures its cost before it lands.
+
+**Constraints from prior phases:**
+- Phase 12: estimates run outside the admission lock; the observed peak with its `.wave` decay stays for steps other than `build`.
+- Phase 11 (later) splits compile and no-compile runs and keyed and unkeyed rows inside each shape; Phase 18 (later) splits on build changes inside each shape.
+- Phase 16: `merge-gate` rows stay their own class.
+
+**Files:**
+- `scripts/lint/build_shape.py` — new — Spec 2 (Part A).
+- `scripts/lint/test_build_shape.py` — new — Spec 5 (Part A).
+- `scripts/lint/memory_admit.py` — Specs 2–4 (Part B).
+- `scripts/lint/test_memory_admit.py` — Spec 5 (Part B).
+- `docs/as-built/build-memory-admission.md` — Specs 1 and 6 (Part B).
+
+The replay script (Spec 1) lives in the run folder, not in the repository.
+
+**Workers:** `1 writer`
+
+**Acceptance gate:**
+- The memory admission tests pass; `basedpyright` over both Python files reports `0 errors, 0 warnings, 0 notes`; the merge gate is green.
+- The replay: no `build` step with same-shape history goes above its new promise; the incident's argv gets a promise at or above 14.4 GiB (14,720 MiB). The table, the GiB-hours cost and the most extra room held at one time go in the checkpoint notice.
+- Change-Review line: a release build is promised from release builds and keeps its promise until it ends | on natedev in `~/rust/hana`, run `~/.claude/scripts/direct/verify.sh build hana --bin hana --release --features bevy/trace_chrome` and read its reservation in `~/.local/state/buildlog/admission` | its `need` is at or above 14.4 GiB with the shape in the row, and the build-why charge stays at the need while its memory is lower.
+
+### Phase 25 — Build-why names when a recovery spacing hold ends  · status: todo
+**Depends on:** Phase 16 (same file, `memory_admit.py`); report-unit's build-why change (`explain_queue`, `head_after_steps_end`, `build_why.py`), on `origin/builds` since `228b45ae`. Merge `origin/builds` first. Global order: 21 → 16 → **25** → 24 → 26 → 20 → 4 → 11 → 17 → 18 → 19 → 8.
+
+**Approved:** builds showrunner 2026-10-30, a text fix with its test, after Phase 16 (the 158 min head wait question: the hold was right, the text was wrong).
+
+#### Work Order
+
+**Goal:** when the only thing that holds the first waiting step is the recovery spacing (one start per 30 s for 120 s after a pressure hold), build-why says the time it starts, not that every running step must end.
+
+**Measured (2026-10-30, `origin/builds` `228b45ae`):**
+- `head_after_steps_end` (`memory_admit.py` :2025) applies `queue_decision` with the snapshot's `host.pressure`. A recovery spacing hold is a `MemoryPressure` with `next_start_at` set: a timed hold that no step's end lifts. So with every running step ended the result is still `HeadStillHeld(causes=("pressure",))`.
+- `release_text` (`scripts/build_queue/build_why.py` :131-145) then prints `all running steps ending still leaves pressure holding the head`. On 2026-10-30 06:28 EDT the head started 154 s later on the timer, with 25.9 GiB free.
+
+**Spec:**
+
+1. **A closed result for the timed hold.** Add `HeadStartsAt(at: float)` to the `HeadAfterEnd` union. `head_after_steps_end` returns it when the decision holds only for a `MemoryPressure` with `next_start_at` (budget and free checks pass, so `causes` would be `("pressure",)` alone); `at` is `next_start_at`. A pressure hold with no `next_start_at` (a real `full avg10` or swap hold) stays `HeadStillHeld` with `pressure` in its causes. `smallest_head_release` returns `HeadStartsAt` when the snapshot's own result is `HeadStartsAt`: no step needs to end.
+2. **Text.** `release_text` prints `no running step needs to end; recovery spacing starts it at <HH:MM:SS zone>` for `HeadStartsAt` (zone as the header). All other texts stay as they are.
+3. **Tests.** In `scripts/lint/test_memory_admit.py`: a snapshot held only by recovery spacing gives `HeadStartsAt(next_start_at)` from `head_after_steps_end` and from `smallest_head_release`; a real pressure hold (no `next_start_at`) still gives `HeadStillHeld` with `pressure`; recovery spacing plus a failed budget check gives `HeadStillHeld` with `build budget` and `pressure`. In `scripts/build_queue/test_build_why.py`: the recovery spacing case prints the start time and not `still leaves pressure`; the existing `test_release_keeps_the_snapshot_limits_and_reports_a_pressure_hold` passes unchanged. Fake both memory readings.
+4. **Docs.** `docs/as-built/build-memory-admission.md`: the build-why paragraph names the recovery spacing text.
+
+**Constraints from prior phases:**
+- Phase 14 and report-unit's Phase 3: `head_after_steps_end` reads no files and uses admission's own `queue_decision`; this phase adds no second rule.
+
+**Files:**
+- `scripts/lint/memory_admit.py` — Spec 1.
+- `scripts/lint/test_memory_admit.py` — Spec 3.
+- `scripts/build_queue/build_why.py` — Spec 2 (owner report-unit; trial-merge against `origin/builds-report`).
+- `scripts/build_queue/test_build_why.py` — Spec 3 (owner report-unit).
+- `docs/as-built/build-memory-admission.md` — Spec 4.
+
+**Workers:** `1 writer`
+
+**Acceptance gate:**
+- The memory admission and build-why tests pass; `basedpyright` over the four Python files reports `0 errors, 0 warnings, 0 notes`; the merge gate is green.
+- Change-Review line: build-why says when recovery spacing starts the first waiting step | on natedev, during the 120 s after a pressure hold ends, type `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_why.py` | the release line says no running step needs to end and names the start time.
+
+### Phase 26 — The memory queue starts steps in queue order and records when a step became first  · status: todo
+**Depends on:** Phase 24 Part B (same file, `memory_admit.py`). Runs before Phase 20, whose single head policy (Spec 2) then reads these fields. Merge `origin/builds` first. Global order: 21 → 16 → 25 → 24 → **26** → 20 → 4 → 11 → 17 → 18 → 19 → 8.
+
+**Approved:** builds showrunner 2026-10-30 (two wrong results from the 158 min head wait; `head_since` and the token record for report-unit's Phase 4e). Who may bump is a user question the showrunner takes; this phase does not change it.
+
+#### Work Order
+
+**Goal:** in a backfill window the steps that fit start in queue order; a bump of a step near the front changes nothing; each waiting row says when it became first; a step that misses the CPU token records when it gave back its place in memory and when it got the token.
+
+**Measured (2026-10-30, 03:50–06:28 EDT, natedev; `S/pressure_followup_report.md`):**
+- The head waited 158 min. Causes: 88 queue bumps, each one restarting a bumped head's 600 s strict window (`bump_waiter` sets `priority_since = now`, `memory_admit.py` :2144), and backfill windows where younger steps started in the order they polled, not their queue order.
+- `queue_decision` admits a younger step in a backfill window on its own budget and memory checks; nothing checks whether an older waiter that also fits is waiting.
+- `verify.sh` `buildlog_wait_for_memory` (:2613-2648): when `try_token_now` fails, the step releases its memory reservation (`buildlog_release_memory 0`), waits in `acquire_token`, then waits for memory again with `BUILDLOG_MEM_WAIT_SINCE` from its first wait. Only the token wait seconds go to `TOKEN_WAIT_FILE`; no record holds the two times.
+
+**Spec:**
+
+1. **Backfill in queue order.** In a backfill window, a younger step starts only if no older waiting step (head excluded, as today) fits by the same budget and memory checks at the same snapshot. Each poll decides from the queue snapshot under the lock, so the first fitting step in queue order is the one that starts, whichever process polls first. A step that fits but has an older fitting step ahead holds with a reason that names it (`BehindOlderFit`, a closed variant beside `BehindHead`; the queue view, `explain_queue` and the shell wait text show it).
+2. **Bump near the front.** `bump_waiter` on a step at positions 1–3 writes nothing (no row change, no `queue_bump` record) and returns a closed result `AlreadyNearFront(step, position)` beside `Bumped(step)`; `/build:queue bump` prints `already at position <N>; nothing changed`. The head's `priority_since` and window stay as they were.
+3. **`head_since` on the waiter row.** The admission pass that finds a row first in queue order writes `head_since` (epoch seconds) into that row under the queue lock when the row has none; a row that is no longer first loses it (a bump of another step ahead moves it back). A step that gives back its reservation for the token (Spec 4) and returns to the queue with its first wait time keeps its `head_since` if it is first again at once. The queue view and `explain_queue` expose it as a typed field; `BehindHead.head_since` reads it instead of the head's queue time.
+4. **Token record.** When a step misses the token and gives back its memory reservation, `verify.sh` records `token_left_at` (when it released the reservation) and `token_back_at` (when `acquire_token` returned). It writes them through one new `memory_admit.py` command (no second writer of admission files) as one JSON line in `${BUILDLOG_DIR}/admission/token_gaps.jsonl`: `session_id`, `step`, `pid`, `start_time`, `token_left_at`, `token_back_at`. A step that leaves the queue during the second wait still writes its line.
+5. **Tests.** In `scripts/lint/test_memory_admit.py`: with three waiters where the second and third fit in a backfill window, a poll by the third holds it and a poll by the second starts it (Spec 1); a bump of positions 1, 2 and 3 leaves every row and the head window as they were and returns `AlreadyNearFront`, a bump of position 4 moves it as today (Spec 2); `head_since` is set when a row becomes first, cleared when a bump moves it back, set again when it is first again, and kept across a token give-back (Spec 3); the token command writes one line with both times (Spec 4). In the verify.sh tests: a step that misses the token writes one `token_gaps.jsonl` line with `token_left_at <= token_back_at`. Fake both memory readings.
+6. **Docs.** `docs/as-built/build-memory-admission.md`: the Waiters paragraph (queue order in backfill, `head_since`), the bump paragraph and the token record.
+
+**Constraints from prior phases:**
+- Phase 10: the blocker lookup reuses `decide` and `queue_decision`; no second rule.
+- Phase 20 (later) makes one head policy function; this phase's backfill rule and `head_since` go in `queue_decision` and the queue pass, so Phase 20 moves them with the rest.
+- Report-unit's Phase 4e reads `head_since`, `token_left_at` and `token_back_at` by these names; tell report-unit at the checkpoint.
+
+**Files:**
+- `scripts/lint/memory_admit.py` — Specs 1–4.
+- `scripts/lint/test_memory_admit.py` — Spec 5.
+- `scripts/direct/verify.sh` — Spec 4 (owner verify-unit, natedev production; trial-merge against `origin/natedev-verify`).
+- `scripts/direct/test_verify_memory_wait.py` — Spec 5, the verify.sh test (new file).
+- `scripts/build_queue/build_queue.py` — Spec 2's bump text (owner report-unit; trial-merge against `origin/builds-report`).
+- `scripts/build_queue/test_build_queue.py` — the bump text test (owner report-unit).
+- `docs/as-built/build-memory-admission.md` — Spec 6.
+
+**Workers:** `1 writer, 1 tester`
+
+**Acceptance gate:**
+- The memory admission, build-queue and new verify.sh tests pass; `basedpyright` over the changed Python files reports `0 errors, 0 warnings, 0 notes`; the merge gate is green.
+- Change-Review line: steps that fit start in queue order and a bump near the front changes nothing | on natedev, type `/build:queue` while steps wait, then `/build:queue bump 2` | rows start top-down in a backfill window, the bump prints `already at position 2; nothing changed`, and each first row shows when it became first.

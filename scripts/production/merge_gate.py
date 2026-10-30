@@ -30,19 +30,22 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from collections.abc import Generator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum, auto
 import fcntl
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import re
+import select
 import shlex
 import shutil
 import signal
+import stat
 import statistics
 import subprocess
 import sys
@@ -61,6 +64,7 @@ from scripts.build_hold import build_hold  # noqa: E402
 from scripts.buildlog.store import host_name  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
+from scripts.lint import memory_admit  # noqa: E402
 
 TEST_SUITES = (
     "lib", "hooks", "message", "accounts", "whoami", "agents", "build_hold", "build_queue",
@@ -96,13 +100,14 @@ SLOW_MODULE_FLOOR_S = 60.0
 MODULE_HISTORY_RUNS = 5
 MEMORY_SAMPLE_SECONDS = 0.25
 SETTINGS_BLOB = "b3466859"
-# Python restores these dispositions before exec, including an inherited SIG_IGN.
-# No preexec_fn is needed, and the suite receives signals as a normal foreground job.
+# Restore dispositions and the mask in every child, including types. The runner
+# defers cancellation until the child is registered for cleanup.
 SUITE_BOOTSTRAP = """import os, signal, sys
 for disposition in signal.valid_signals():
     if disposition not in (signal.SIGKILL, signal.SIGSTOP):
         signal.signal(disposition, signal.SIG_DFL)
-os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGHUP, signal.SIGINT})
+os.execvp(sys.argv[1], sys.argv[1:])
 """
 
 
@@ -171,6 +176,7 @@ class RunningGateJob:
     log: Path
     # Set when the runner kills the job for its memory or time limit.
     killed_for: str = ""
+    cpu_slot: SharedCPUSlot | NoSharedCPU = field(default_factory=lambda: NoSharedCPU())
 
 
 @dataclass
@@ -220,6 +226,185 @@ class SampledRSSAdmission:
 
 class GateRefused(Exception):
     """A gate precondition or operation failed; no later step may run."""
+
+
+@dataclass(frozen=True)
+class NoSharedCPU:
+    pass
+
+
+@dataclass(frozen=True)
+class WaitingForCPU:
+    pass
+
+
+@dataclass
+class SharedCPUSlot:
+    descriptor: int
+    token: bytes
+    returned: bool = False
+
+    def release(self) -> None:
+        if not self.returned:
+            with defer_cleanup_signals():
+                if os.write(self.descriptor, self.token) != 1:
+                    raise GateRefused("could not return the shared CPU slot")
+                self.returned = True
+
+
+@contextmanager
+def defer_cleanup_signals() -> Generator[None]:
+    """Keep ownership changes atomic with respect to runner cancellation."""
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGHUP, signal.SIGINT})
+    try:
+        yield
+    finally:
+        _ = signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+@dataclass
+class SharedCPUPool:
+    descriptor: int
+    owned: list[SharedCPUSlot] = field(default_factory=list)
+
+    def try_acquire(self) -> SharedCPUSlot | WaitingForCPU:
+        with defer_cleanup_signals():
+            # CUSE devices need not honor O_NONBLOCK in the same way as pipes.
+            if not select.select([self.descriptor], [], [], 0)[0]:
+                return WaitingForCPU()
+            try:
+                token = os.read(self.descriptor, 1)
+            except BlockingIOError:
+                return WaitingForCPU()
+            if not token:
+                raise GateRefused("shared CPU pool returned no byte")
+            slot = SharedCPUSlot(self.descriptor, token)
+            self.owned.append(slot)
+            return slot
+
+
+@contextmanager
+def shared_cpu_pool() -> Generator[SharedCPUPool | NoSharedCPU]:
+    path = Path(os.environ.get("BUILDLOG_JOBSERVER_FIFO", "/dev/steve"))
+    try:
+        descriptor = os.open(path, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        yield NoSharedCPU()
+        return
+    except OSError as error:
+        raise GateRefused(f"shared CPU pool {path}: {error}") from error
+    pool = SharedCPUPool(descriptor)
+    try:
+        mode = os.fstat(descriptor).st_mode
+        if not (stat.S_ISFIFO(mode) or stat.S_ISCHR(mode)):
+            raise GateRefused(f"shared CPU pool is not a FIFO or character device: {path}")
+        yield pool
+    finally:
+        with defer_cleanup_signals():
+            try:
+                for slot in pool.owned:
+                    slot.release()
+            finally:
+                os.close(descriptor)
+
+
+def atomic_sample(path: Path, value: str) -> None:
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        _ = temporary.write_text(value)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+@dataclass
+class GateReservation:
+    path: Path
+    peak_bytes: int = 0
+    wave_at: float = 0.0
+    status: int = 1
+
+    def observe(self, peak_mib: float, current_mib: float) -> None:
+        peak = int(peak_mib * (1 << 20))
+        now = datetime.now(UTC).timestamp()
+        if peak > self.peak_bytes:
+            atomic_sample(self.path.with_suffix(".max"), f"{peak}\n")
+            self.peak_bytes = peak
+            atomic_sample(self.path.with_suffix(".wave"), f"{peak} {int(now)}\n")
+            self.wave_at = now
+        elif self.peak_bytes and current_mib * (1 << 20) >= self.peak_bytes / 2 and now - self.wave_at >= 60:
+            atomic_sample(self.path.with_suffix(".wave"), f"{self.peak_bytes} {int(now)}\n")
+            self.wave_at = now
+
+
+def gate_wait_reasons(result: memory_admit.CheckResult) -> tuple[str, ...]:
+    """Describe why admission holds, without treating changing samples as a new reason."""
+    decision = result.decision
+    if isinstance(decision.pressure, memory_admit.MemoryPressure):
+        if decision.pressure.next_start_at:
+            return ("memory pressure recovery",)
+        if decision.pressure.swap_used_percent > memory_admit.SWAP_USED_LIMIT:
+            return ("swap memory pressure",)
+        return ("memory pressure",)
+    reasons: list[str] = []
+    if result.head_need:
+        reasons.append(f"queue head {result.head_label}")
+    if decision.charged + result.peak.bytes > decision.budget:
+        reasons.append("build memory budget")
+    if result.available < decision.threshold:
+        reasons.append("free memory")
+    return tuple(reasons) or ("admission refresh",)
+
+
+@contextmanager
+def gate_reservation(repo: Path, cap_mib: int, temporary: Path, hold: BuildHoldWait) -> Generator[GateReservation]:
+    root = memory_admit.store.root()
+    pid = os.getpid()
+    sidecar = temporary / "gate.scope"
+    _ = sidecar.write_text("")
+    profile: memory_admit.GateProfile | memory_admit.StepProfile = memory_admit.GateProfile(
+        str(Path.home() / ".claude"), str(repo.resolve()), cap_mib * (1 << 20),
+        memory_admit.NoGateHistory(cap_mib * (1 << 20)))
+    previous_need = 0
+    previous_reasons: tuple[str, ...] = ()
+    reported_at = 0.0
+    try:
+        while True:
+            hold.wait_until_free()
+            diagnostics = io.StringIO()
+            try:
+                with redirect_stderr(diagnostics):
+                    result = memory_admit.check(
+                        Path(os.environ.get("BUILDLOG_MEMINFO", "/proc/meminfo")), pid, str(sidecar),
+                        ["merge-gate"], root=root, profile=profile)
+            except Exception as error:
+                lines = diagnostics.getvalue().splitlines()
+                raise GateRefused(lines[-1] if lines else str(error)) from error
+            profile = result.profile
+            if result.decision.state == "admit":
+                if not isinstance(result.reservation, memory_admit.Reserved):
+                    raise GateRefused("memory admission did not return a gate reservation")
+                reservation = GateReservation(result.reservation.path)
+                try:
+                    yield reservation
+                finally:
+                    memory_admit.release(reservation.path, reservation.status, root=root)
+                return
+            now = time.monotonic()
+            reasons = gate_wait_reasons(result)
+            if (result.peak.bytes != previous_need or reasons != previous_reasons or now - reported_at >= 60):
+                print(f"Gate memory wait: {result.peak.bytes / memory_admit.GIB:.3f} GiB needed; "
+                      + "; ".join(reasons), flush=True)
+                previous_need, previous_reasons, reported_at = result.peak.bytes, reasons, now
+            time.sleep(1.0)
+    finally:
+        memory_admit.cancel_waiter(pid, root=root)
+        # Also cover a stop after the checker publishes a reservation but before
+        # it returns it to this context. The sidecar identifies this gate alone.
+        for path, row in memory_admit.live_reservations(memory_admit.admission_dir(root)):
+            if row["pid"] == pid and row["sidecar"] == str(sidecar):
+                memory_admit.release(path, 1, root=root)
+        sidecar.unlink(missing_ok=True)
 
 
 @dataclass
@@ -504,7 +689,8 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
     output = log.open("w+")
     started = time.monotonic()
     try:
-        process = subprocess.Popen(argv, cwd=repo, env=environment, stdin=subprocess.DEVNULL,
+        process = subprocess.Popen([sys.executable, "-c", SUITE_BOOTSTRAP, *argv],
+                                   cwd=repo, env=environment, stdin=subprocess.DEVNULL,
                                    stdout=output, stderr=subprocess.STDOUT, text=True,
                                    start_new_session=True)
     except BaseException:
@@ -778,11 +964,6 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     results: list[GateJobResult] = []
     first_runs: dict[tuple[str, str], GateJobResult] = {}
     rerunning = False
-    types_python = typecheck_python() if type_dirs else ""
-    if isinstance(types_python, Path):
-        pending.appendleft(("types", repo / "basedpyright"))
-    elif types_python:
-        results.append(GateJobResult("types", "basedpyright", 1, 0.0, types_python))
     suite_started: dict[str, float] = {}
     suite_finished: dict[str, float] = {}
     admission = SampledRSSAdmission(memory_cap_mib)
@@ -792,8 +973,15 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     maximum_load = starting_load
     began = time.monotonic()
     python = os.environ.get("MERGE_GATE_PYTHON", sys.executable)
-    with tempfile.TemporaryDirectory(prefix="merge-gate-", dir=tmpfs) as temporary:
+    with (tempfile.TemporaryDirectory(prefix="merge-gate-", dir=tmpfs) as temporary,
+          gate_reservation(repo, memory_cap_mib, Path(temporary), hold) as reservation,
+          shared_cpu_pool() as cpu_pool):
         environment = {**os.environ, "TMPDIR": temporary}
+        types_python = typecheck_python() if type_dirs else ""
+        if isinstance(types_python, Path):
+            pending.appendleft(("types", repo / "basedpyright"))
+        elif types_python:
+            results.append(GateJobResult("types", "basedpyright", 1, 0.0, types_python))
         try:
             while pending or running:
                 now = time.monotonic()
@@ -802,6 +990,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     sample = process_memory_mib({os.getpid(), *(job.process.pid for job in running)})
                     admission.observe(time.monotonic(), sample.get(os.getpid(), 0.0),
                                       {job.process.pid: sample.get(job.process.pid, 0.0) for job in running})
+                    reservation.observe(admission.peak_mib, admission.latest_mib)
                     for job in running:
                         measured = sample.get(job.process.pid, 0.0)
                         if job.suite == "types":
@@ -822,6 +1011,9 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                         if not running:
                             hold.wait_until_free()
                         break
+                    slot = cpu_pool.try_acquire() if isinstance(cpu_pool, SharedCPUPool) else cpu_pool
+                    if isinstance(slot, WaitingForCPU):
+                        break
                     suite, path = pending.popleft()
                     root = Path(tempfile.mkdtemp(prefix=f"{suite}-{path.stem}-", dir=temporary))
                     log = root / "output.log"
@@ -832,9 +1024,11 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     argv = ([os.environ.get("MERGE_GATE_BASEDPYRIGHT", "basedpyright"), "--pythonpath", str(types_python),
                              *type_dirs]
                             if suite == "types" else
-                            [*scope_prefix, python, "-c", SUITE_BOOTSTRAP, "-m", "unittest", "discover", "-s", str(path.parent), "-p", path.name])
-                    job = start_gate_job(suite, path, argv, repo, job_environment, log)
-                    running.append(job)
+                            [*scope_prefix, python, "-m", "unittest", "discover", "-s", str(path.parent), "-p", path.name])
+                    with defer_cleanup_signals():
+                        job = start_gate_job(suite, path, argv, repo, job_environment, log)
+                        job.cpu_slot = slot
+                        running.append(job)
                     _ = suite_started.setdefault(suite, job.started)
                     admission.reserve(job.process.pid, (types_peaks[types_key] * TYPES_PEAK_MARGIN
                                                     if types_key in types_peaks else TYPES_MEMORY_MIB)
@@ -848,7 +1042,11 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                         status = job.process.poll()
                     if status is None:
                         continue
-                    result = finish_gate_job(job, status)
+                    try:
+                        result = finish_gate_job(job, status)
+                    finally:
+                        if isinstance(job.cpu_slot, SharedCPUSlot):
+                            job.cpu_slot.release()
                     running.remove(job)
                     admission.release(job.process.pid)
                     if status < 0 and not job.killed_for and not result.tripwire_tripped and not hold.admits():
@@ -889,12 +1087,16 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     time.sleep(0.05)
         finally:
             # Only terminate groups created by this runner. Reap them before tmpfs cleanup.
-            for job in running:
-                kill_job_group(job)
-                job.output.close()
+            with defer_cleanup_signals():
+                for job in running:
+                    kill_job_group(job)
+                    job.output.close()
+                    if isinstance(job.cpu_slot, SharedCPUSlot):
+                        job.cpu_slot.release()
             save_measures(timings_path, timings)
             save_measures(types_peaks_path, types_peaks)
             save_measures(history_path, history)
+        reservation.status = int(admission.peak_mib > memory_cap_mib or any(result.returncode for result in results))
     elapsed = time.monotonic() - began - (hold.seconds - initial_hold_seconds)
     ending_load = one_minute_load()
     maximum_load = max(maximum_load, ending_load)

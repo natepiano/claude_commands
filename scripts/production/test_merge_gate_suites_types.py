@@ -5,15 +5,38 @@ from __future__ import annotations
 import unittest
 import os
 import subprocess
+from pathlib import Path
 from typing import final
 from unittest import mock
 from scripts.production import merge_gate
-from scripts.production.merge_gate_test_support import TEST_HANG_GUARD_SECS, gate_suites
+from scripts.production.merge_gate_test_support import TEST_HANG_GUARD_SECS, gate_suites, wait_for_file
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 
 
 @final
 class MergeGateTypesTests(GateSuitesFixture):
+    @gate_suites("hooks")
+    def test_types_owns_a_shared_slot_until_it_finishes(self) -> None:
+        self.supply_jobserver(b"T")
+        start = merge_gate.start_gate_job
+        types_pids: list[int] = []
+
+        def observed(suite: str, path: Path, argv: list[str], repo: Path,
+                     environment: dict[str, str], log: Path) -> merge_gate.RunningGateJob:
+            if suite == "types":
+                self.assertEqual(self.jobserver_tokens(), b"")
+            job = start(suite, path, argv, repo, environment, log)
+            if suite == "types":
+                types_pids.append(job.process.pid)
+                wait_for_file(self.state / "types-ran")
+            return job
+
+        with mock.patch.object(merge_gate, "start_gate_job", side_effect=observed):
+            result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(types_pids), 1)
+        self.assertEqual(self.jobserver_tokens(), b"T")
+
     def test_the_type_check_venv_is_built_once_with_the_pinned_stubs(self) -> None:
         with mock.patch.dict(os.environ, self.environment):
             first, second = merge_gate.typecheck_python(), merge_gate.typecheck_python()

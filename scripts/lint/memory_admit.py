@@ -203,6 +203,7 @@ class Waiter(TypedDict):
     pid: int
     start_time: str
     need: int
+    need_source: NotRequired[str]
     since: float
     label: NotRequired[str]
     session_id: NotRequired[str]
@@ -399,6 +400,78 @@ class StepProfile:
 
 
 @dataclass(frozen=True)
+class InferFromArgv:
+    pass
+
+
+INFER_FROM_ARGV = InferFromArgv()
+
+
+@dataclass(frozen=True)
+class MeasuredGatePeak:
+    bytes: int
+    runs: int
+
+
+@dataclass(frozen=True)
+class NoGateHistory:
+    cap_bytes: int
+
+
+GateEstimate = MeasuredGatePeak | NoGateHistory
+
+
+@dataclass(frozen=True)
+class GateProfile:
+    repo: str
+    worktree: str
+    cap_bytes: int
+    estimate: GateEstimate
+    estimated_at: float = 0.0
+
+    @property
+    def step(self) -> Literal["merge-gate"]:
+        return "merge-gate"
+
+    @property
+    def peak(self) -> ExpectedPeak:
+        estimate = self.estimate
+        return (ExpectedPeak(estimate.bytes, "measured", estimate.runs)
+                if isinstance(estimate, MeasuredGatePeak) else ExpectedPeak(estimate.cap_bytes, "fallback", 0))
+
+    @property
+    def repository(self) -> UnknownRepository:
+        return UnknownRepository()
+
+    @property
+    def scope(self) -> TestScope:
+        return "full"
+
+
+def gate_estimate(cap_bytes: int, host: str, now: datetime, root: Path) -> GateEstimate:
+    """Read the gate's one peak history, without using cargo estimates."""
+    cutoff = now - timedelta(days=HISTORY_DAYS)
+    peaks: list[int] = []
+    try:
+        with (root / "admission/anon_peaks.jsonl").open() as lines:
+            for line in lines:
+                try:
+                    row = cast(dict[str, object], json.loads(line))
+                    if row.get("host") != host or row.get("step") != "merge-gate":
+                        continue
+                    peak, ended = row.get("anon_peak_bytes"), row.get("ended_at")
+                    if not isinstance(peak, int) or peak <= 0 or not isinstance(ended, str):
+                        continue
+                    if cutoff <= datetime.fromisoformat(ended.replace("Z", "+00:00")) <= now:
+                        peaks.append(peak)
+                except (ValueError, TypeError, AttributeError):
+                    continue
+    except FileNotFoundError:
+        pass
+    return MeasuredGatePeak(percentile(peaks), len(peaks)) if peaks else NoGateHistory(cap_bytes)
+
+
+@dataclass(frozen=True)
 class ReservationBlocker:
     session_id: str
     session_name: str
@@ -439,7 +512,7 @@ class CheckResult:
     repo: str
     step: str
     available: int
-    profile: StepProfile
+    profile: StepProfile | GateProfile
     head_need: int = 0
     head_label: str = ""
     head_reason: HeadAdmissionStatus | ReadyForAdmission = ReadyForAdmission()
@@ -1241,16 +1314,19 @@ def test_scope(argv: list[str]) -> TestScope:
 
 def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float = 0.0,
           root: Path | None = None, now: datetime | None = None,
-          profile: StepProfile | None = None) -> CheckResult:
+          profile: InferFromArgv | StepProfile | GateProfile = INFER_FROM_ARGV) -> CheckResult:
     """Admit or hold one step. A held step is a waiter from `since` (epoch seconds; 0 means now), so a
     step that gave its reservation back for the cargo token keeps its place."""
     root = root if root is not None else store.root()
     estimate_time = now if now is not None else datetime.now(UTC)
     width = test_threads(argv)
     package, filters = test_package(argv), test_filters(argv)
-    if profile is not None and profile.estimated_at and estimate_time.timestamp() - profile.estimated_at >= HEAD_SECONDS:
-        profile = None
-    if profile is None:
+    if isinstance(profile, GateProfile) and (not profile.estimated_at or estimate_time.timestamp() - profile.estimated_at >= HEAD_SECONDS):
+        profile = replace(profile, estimate=gate_estimate(profile.cap_bytes, store.host_name(), estimate_time, root),
+                          estimated_at=estimate_time.timestamp())
+    elif isinstance(profile, StepProfile) and profile.estimated_at and estimate_time.timestamp() - profile.estimated_at >= HEAD_SECONDS:
+        profile = InferFromArgv()
+    if isinstance(profile, InferFromArgv):
         repository, worktree = git_identity(argv, os.getcwd())
         repo = repository.name if isinstance(repository, RepositoryIdentity) else ""
         scope = test_scope(argv)
@@ -1299,6 +1375,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
             waited_from = min(waited_from, previous["since"])
         waiter: Waiter = {"pid": pid, "start_time": start or "", "need": peak.bytes, "since": waited_from,
                           "label": f"{worktree or repo} {step} ({os.environ.get('BUILDLOG_CALLER') or 'caller'} pid {pid})"}
+        waiter["need_source"] = peak.source
         waiter["test_scope"] = profile.scope
         waiter["package"] = package
         waiter["filters"] = list(filters)
@@ -1337,7 +1414,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
             head.waiter["priority_since"] = now.timestamp()
             for head_path, head_row in waiting:
                 if head_path != mine and head_row is head.waiter:
-                    _ = head_path.write_text(json.dumps(head_row, separators=(",", ":")))
+                    write_admission_record(head_path, head_row)
         head_need, head_label = 0, ""
         if (isinstance(head, HeadPriority) and isinstance(head.window, StrictUntil)
                 and waiter_order(head.waiter) < waiter_order(waiter)):
@@ -1355,7 +1432,9 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
             identity = waiter_identity(step, worktree)
             waiter["session_id"], waiter["session_name"] = identity["session_id"], identity["session_name"]
             waiter["step"], waiter["folder"] = identity["step"], identity["folder"]
-            _ = mine.write_text(json.dumps(waiter, separators=(",", ":")))
+            if isinstance(profile, GateProfile):
+                waiter["folder"] = profile.worktree
+            write_admission_record(mine, waiter)
         if decision.state == "admit" and isinstance(recovery, RecoveryStarts):
             write_recovery(directory, replace(recovery, next_start_at=now.timestamp() + RECOVERY_START_SECONDS))
         if argv and decision.state == "admit":
@@ -1372,7 +1451,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                 row["filters"] = list(filters)
                 if isinstance(profile.repository, RepositoryIdentity):
                     row["repo_identity"] = profile.repository.key
-                _ = path.write_text(json.dumps(row, separators=(",", ":")))
+                write_admission_record(path, row)
                 reservation = Reserved(path)
             else:
                 reservation = NotReserved("untracked")
@@ -1419,10 +1498,11 @@ class QueueIdentityReader:
         owner = self.processes.get(pid)
         if owner is None or owner.start != row.get("start_time"):
             return {"session_id": session, "session_name": name, "step": step, "folder": folder}
-        try:
-            folder = str((self.proc / str(pid) / "cwd").readlink())
-        except OSError:
-            pass
+        if not folder:
+            try:
+                folder = str((self.proc / str(pid) / "cwd").readlink())
+            except OSError:
+                pass
         current, seen = pid, set[int]()
         while not session and current in self.processes and current not in seen:
             seen.add(current)
@@ -1651,6 +1731,25 @@ def bump_waiter(selector: str, actor: str) -> WaitingStep:
                            row["since"], moved.need, reason)
 
 
+def write_admission_record(path: Path, row: object) -> None:
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        _ = temporary.write_text(json.dumps(row, separators=(",", ":")))
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def cancel_waiter(pid: int, root: Path | None = None) -> None:
+    """Remove this caller's queue place when its in-process wait stops."""
+    root = root if root is not None else store.root()
+    directory = admission_dir(root)
+    with (directory / "lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        start = process_start_time(pid)
+        (directory / f"{pid}-{start}.waiting").unlink(missing_ok=True)
+
+
 def release(path: Path, status: int, root: Path | None = None) -> None:
     root = root if root is not None else store.root()
     directory = admission_dir(root)
@@ -1732,7 +1831,7 @@ def run_action() -> None:
         set_width(Path(sys.argv[2]), int(sys.argv[3]))
         return
     _, _, meminfo, pid, sidecar, since, cached_repo, cached_step, cached_worktree, cached_need, cached_source, cached_count, *argv = sys.argv
-    profile = None
+    profile: InferFromArgv | StepProfile = InferFromArgv()
     if cached_need != "-":
         start = process_start_time(int(pid))
         try:
