@@ -1702,8 +1702,7 @@ class BoundedShutdownTests(ShutdownTestCase):
                             request_exit: Callable[[shutdown_record.SessionShutdown], None] = lambda _saved: None) -> list[shutdown_record.SessionShutdown]:
             _ = machine_wide, keep, request_exit
             del started
-            with (patch.object(restart, "_prove_move", return_value=True),
-                  patch.object(restart, "_clear_live_outage"),
+            with (patch.object(restart, "_clear_live_outage"),
                   patch.object(restart, "_send_worker_resume"),
                   patch.object(restart, "_restore_timers", return_value=[]),
                   patch.object(restart, "_tell_source_fallback")):
