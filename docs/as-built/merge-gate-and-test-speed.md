@@ -16,6 +16,8 @@ remain only for the pending archive cleanup; they do not dispatch new reviews.
 
 **Assertion guard tests.** `test_assertion_guard.py`, `test_assertion_guard_strings.py` and `test_assertion_guard_revisions.py` cover classification, string and multiline syntax, and Git revisions respectively. Each builds each class's disposable Git origin and checkout once, then restores private copies at the same paths. Behavior cases call the real CLI parser and handlers in-process while Git remains a real subprocess. Executable parity and the unchanged one-CPU-second large-diff bound still run the script as a process. `assertion_guard_test_support.py` keeps the original per-test fixtures available for the verify and commit-hook callers.
 
+**Dev-feature verification tests.** `test_verify_dev_features.py` covers feature merging and malformed values, `test_verify_dev_features_defaults.py` covers absent and empty settings, and `test_verify_dev_features_execution.py` covers nextest and final. Each module restores a class-level private workspace and tool seed through `verify_dev_features_test_support.py` and the existing example-workspace fixture. The seed declares its supplied toolchain and 64 GiB build budget, keeping host Nix discovery and memory admission budgets outside feature composition. Tests still run the real Bash check, nextest and final routes and assert exact Cargo arguments; malformed-value variants retain the real embedded parser. Existing consumers of the support functions keep their original behavior.
+
 ## How it works
 
 ### The gate: `scripts/production/merge_gate.py`
