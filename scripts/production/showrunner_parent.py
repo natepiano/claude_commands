@@ -10,8 +10,26 @@ from typing import Literal, cast
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import showrunners
+import showrunner_tree
 from scripts.production import staff, staff_sources
 from scripts.lib.atomic_file import write_text_atomic
+
+
+def attach(child: str, parent: str, *, record: staff.StaffSnapshot | None = None) -> None:
+    """Store the checked desired parent; repeat calls keep the same file."""
+    child, parent = showrunners.canonical_slug(child), showrunners.canonical_slug(parent)
+    showrunner_tree.check_attach(child, parent, record=record)
+    path = showrunners.SHOWRUNNER_STATE_DIR / child / showrunners.PARENT_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(path, f"{parent}\n")
+
+
+def detach(child: str, *, record: staff.StaffSnapshot | None = None) -> str:
+    """Remove the parent file, returning its former parent or an empty string."""
+    child = showrunners.canonical_slug(child)
+    parent = showrunner_tree.parent_of(child, record=record)
+    (showrunners.SHOWRUNNER_STATE_DIR / child / showrunners.PARENT_FILE).unlink(missing_ok=True)
+    return parent
 
 
 @dataclass(frozen=True)
@@ -66,33 +84,32 @@ def _row(slug: str, record: staff.StaffSnapshot) -> staff.StaffRow:
     return found.row
 
 
-def attach(child: str, parent: str = "") -> None:
+def attach_parent(child: str, parent: str = "") -> None:
     with staff.operation():
         child = showrunners.canonical_slug(child)
         parent = parent or showrunners.own_slug()
         if not parent:
             raise ValueError("name the parent: this session runs no production")
         parent = showrunners.canonical_slug(parent)
+        record = staff.snapshot()
         try:
-            showrunners.check_attach(child, parent)
-        except showrunners.ParentCycle as error:
+            showrunner_tree.check_attach(child, parent, record=record)
+        except showrunner_tree.ParentCycle as error:
             raise staff.StaffRefused(str(error)) from error
         pending = _pending_notice(child)
         if isinstance(pending, PendingParentNotice) and pending != PendingParentNotice("attach", parent):
             raise staff.StaffRefused(f"{child}: finish its pending {pending.action} to {pending.parent} first")
-        record = staff.snapshot()
         child_row, parent_row = _row(child, record), _row(parent, record)
-        finished = (child_row.parent == parent_row.id and showrunners.stored_parent(child) == parent
-                    and isinstance(pending, NoPendingParentNotice))
-        if child_row.parent != parent_row.id:
-            _ = staff.move(child_row.id, parent_row.id)
+        finished = child_row.parent == parent_row.id and isinstance(pending, NoPendingParentNotice)
         if finished:
             print(f"{child} already reports to {parent}; done")
             return
         if isinstance(pending, NoPendingParentNotice):
             _save_notice(child, PendingParentNotice("attach", parent))
-        showrunners.attach(child, parent)
-        top = showrunners.root_of(parent)
+        if child_row.parent != parent_row.id:
+            _ = staff.move(child_row.id, parent_row.id)
+        attach(child, parent, record=record)
+        top = showrunner_tree.root_of(parent, record=record)
         print(f"{child} now reports to {parent}")
         _tell(child, {
             child: f"{child} now reports to {parent}. The root is {top}: send it each item for the user. {showrunners.RULES}",
@@ -101,21 +118,22 @@ def attach(child: str, parent: str = "") -> None:
         })
 
 
-def detach(child: str) -> None:
+def detach_parent(child: str) -> None:
     with staff.operation():
         child = showrunners.canonical_slug(child)
         pending = _pending_notice(child)
         if isinstance(pending, PendingParentNotice) and pending.action != "detach":
             raise staff.StaffRefused(f"{child}: finish its pending {pending.action} to {pending.parent} first")
-        parent = showrunners.stored_parent(child)
+        record = staff.snapshot()
+        parent = showrunner_tree.parent_of(child, record=record)
         if not parent and isinstance(pending, PendingParentNotice):
             parent = pending.parent
-        row = _row(child, staff.snapshot())
-        if row.parent is not None:
-            _ = staff.move(row.id, None)
+        row = _row(child, record)
         if parent and isinstance(pending, NoPendingParentNotice):
             _save_notice(child, PendingParentNotice("detach", parent))
-        _ = showrunners.detach(child)
+        if row.parent is not None:
+            _ = staff.move(row.id, None)
+        _ = detach(child, record=record)
         if not parent:
             print(f"{child} reports to no one; done")
             return
@@ -128,9 +146,9 @@ def main(action: str, child: str, parent: str = "") -> int:
     def run() -> int:
         try:
             if action == "attach":
-                attach(child, parent)
+                attach_parent(child, parent)
             elif action == "detach":
-                detach(child)
+                detach_parent(child)
             else:
                 raise ValueError(f"unknown parent operation: {action}")
         except ValueError as error:

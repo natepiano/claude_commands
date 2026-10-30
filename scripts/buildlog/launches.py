@@ -1,4 +1,4 @@
-"""Collect example builds and app starts from Claude Code launch results.
+"""Collect launch results and finish the recorder's pending launch and step records.
 
 Each launch has its own atomic JSON line file. Its session and timestamp name
 make replay after an interrupted state update safe without scanning old logs.
@@ -9,6 +9,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import time
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -16,12 +17,14 @@ from enum import StrEnum
 from pathlib import Path
 from typing import cast
 
+import health
 import record
 import store
 
 STATE_NAME = "launches_state.json"
 LOCK_NAME = record.LAUNCH_LOCK_NAME
 MARK_BYTES = 256
+STEP_COMPLETION_MAX_AGE_SECONDS = 2 * 24 * 60 * 60
 
 
 class LaunchOutcome(StrEnum):
@@ -48,15 +51,17 @@ class LaunchCounts:
     no_location: int
     unresolved: int
     added: int
+    steps_added: int = 0
 
     def summary(self) -> str:
         found = self.recorded + self.no_location
-        return (
+        launches = (
             f"{found} launches found: {self.recorded} recorded "
             f"({self.added} new, {self.unresolved} with an unknown worktree), "
             f"{self.no_location} without a location; skipped {self.no_result} results "
             f"without launch facts and {self.not_a_launch} other tool results"
         )
+        return launches + (f"; {self.steps_added} pending steps published" if self.steps_added else "")
 
 
 def transcripts_root() -> Path:
@@ -259,7 +264,7 @@ def collect_file(
 
 
 def collect() -> LaunchCounts:
-    """Read new lines, revisit legacy state once, and report launch outcomes."""
+    """Read new launch lines and finish pending records under the shared publication lock."""
     root = store.root()
     root.mkdir(parents=True, exist_ok=True)
     with (root / LOCK_NAME).open("a+b") as lock:
@@ -271,6 +276,7 @@ def collect() -> LaunchCounts:
             loaded = {}
         state = cast(dict[str, object], loaded) if isinstance(loaded, dict) else {}
         added = 0
+        steps_added = 0
         unresolved = 0
         counts: Counter[LaunchOutcome] = Counter()
         recorded_ids: set[str] = set()
@@ -296,11 +302,24 @@ def collect() -> LaunchCounts:
                     added += 1
                     if published.unknown_worktree:
                         unresolved += 1
-            except (OSError, ValueError):
-                continue
+            except Exception:  # noqa: BLE001 -- keep the pending source and expose the failure
+                store.note_error(f"pending record {path}")
+        for path in sorted(record.pending_steps_root().glob("*.json")):
+            try:
+                steps_added += record.finish_pending_step(path).added
+            except Exception:  # noqa: BLE001 -- keep both sources until a later retry succeeds
+                store.note_error(f"pending record {path}")
+        completion_cutoff = time.time() - STEP_COMPLETION_MAX_AGE_SECONDS
+        for path in record.pending_steps_root().glob("*.done"):
+            try:
+                if path.stat().st_mtime < completion_cutoff:
+                    path.unlink()
+            except OSError:
+                store.note_error(f"step completion marker {path}")
         temporary = state_path.with_name(state_path.name + f".{os.getpid()}.tmp")
         _ = temporary.write_text(json.dumps(state, separators=(",", ":")))
         _ = temporary.replace(state_path)
+        _ = health.write_snapshot()
         return LaunchCounts(
             recorded=counts[LaunchOutcome.RECORDED],
             not_a_launch=counts[LaunchOutcome.NOT_A_LAUNCH],
@@ -308,4 +327,5 @@ def collect() -> LaunchCounts:
             no_location=counts[LaunchOutcome.NO_LOCATION],
             unresolved=unresolved,
             added=added,
+            steps_added=steps_added,
         )

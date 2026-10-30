@@ -40,7 +40,7 @@ sys.path.insert(0, str(SCRIPTS / "whoami"))
 
 import account  # noqa: E402
 from account import ResolvedHistoryLabel as ResolvedHistoryLabel, HistoricalAccountUnresolved as HistoricalAccountUnresolved  # noqa: E402
-from scripts.lib import unit_runs  # noqa: E402
+from scripts.lib import atomic_file, unit_runs  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 import agent_accounts  # noqa: E402
 import note_file  # noqa: E402
@@ -874,24 +874,23 @@ def _seed_config(destination: Path) -> list[str]:
         return [
             f"accounts: {destination} is a link; identity stays in each account dir"
         ]
-    if destination.exists():
-        return []
     source = accounts_home() / ".claude.json"
-    created = False
     try:
-        seed = _filtered_seed(_read_json_object(source))
-        descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        created = True
-        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-            json.dump(seed, output, indent=2, sort_keys=True)
-            _ = output.write("\n")
-        destination.chmod(0o600)
-    except (OSError, ValueError, TypeError) as error:
-        if created:
-            try:
+        directory = os.open(destination.parent, os.O_RDONLY)
+        try:
+            # Serialize seed cleanup and publication within this account home.
+            fcntl.flock(directory, fcntl.LOCK_EX)
+            atomic_file.remove_dead_temporary_files(destination)
+            if destination.exists():
+                existing = destination.lstat()
+                if not stat.S_ISREG(existing.st_mode) or existing.st_size:
+                    return []
                 destination.unlink()
-            except OSError:
-                pass
+            seed = _filtered_seed(_read_json_object(source))
+            _ = atomic_file.create_text_atomic(destination, json.dumps(seed, indent=2, sort_keys=True) + "\n")
+        finally:
+            os.close(directory)
+    except (OSError, ValueError, TypeError) as error:
         return [f"accounts: could not seed {destination} from {source}: {error}"]
     return []
 

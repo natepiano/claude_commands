@@ -2244,6 +2244,47 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(link.lstat().st_ino, original_inode)
         self.assertEqual(seed.read_text(encoding="utf-8"), '{"keep": true}')
 
+    def test_setup_rerun_finishes_an_interrupted_seed_without_copying_identity(self) -> None:
+        class Killed(BaseException):
+            pass
+
+        _ = (self.home / ".claude.json").write_text(json.dumps({
+            "hasCompletedOnboarding": True,
+            "oauthAccount": {"emailAddress": "fixture@example.invalid"},
+            "projects": {"/fixture": {"hasTrustDialogAccepted": True, "lastSessionId": "private"}},
+        }))
+        expected = {"hasCompletedOnboarding": True,
+                    "projects": {"/fixture": {"hasTrustDialogAccepted": True}}}
+        destination = self.home / ".claude2" / ".claude.json"
+        with patch("scripts.lib.atomic_file.os.fsync", side_effect=Killed):
+            with self.assertRaises(Killed):
+                _ = self.run_cli("setup", "claude2")
+        dead_pid = 2**22 + 1  # above every system's process id ceiling
+        abandoned = destination.with_name(f".{destination.name}.{dead_pid}.abandoned.tmp")
+        _ = abandoned.write_text('{"hasCompletedOnboarding":')
+        abandoned.chmod(0o600)
+        self.assertTrue(abandoned.exists())
+
+        code, _, error = self.run_cli("setup", "claude2")
+
+        self.assertEqual((code, error), (0, ""))
+        self.assertFalse(abandoned.exists())
+        self.assertEqual(json.loads(destination.read_text()), expected)
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
+        self.assertEqual([path for path in destination.parent.iterdir()
+                          if path.is_file() and not path.is_symlink()], [destination])
+        _ = destination.write_bytes(b"")
+        self.assertEqual(self.run_cli("setup", "claude2")[0], 0)
+        self.assertEqual(json.loads(destination.read_text()), expected)
+        original = '{"oauthAccount": {"emailAddress": "keep@example.invalid"}}'
+        _ = destination.write_text(original)
+        self.assertEqual(self.run_cli("setup", "claude2")[0], 0)
+        self.assertEqual(destination.read_text(), original)
+        _ = abandoned.write_text("{}")
+        self.assertEqual(self.run_cli("setup", "claude2")[0], 0)
+        self.assertFalse(abandoned.exists())
+        self.assertEqual(destination.read_text(), original)
+
     def test_setup_refuses_each_linked_identity_entry_without_replacing_it(self) -> None:
         self.write_main_config()
         account_dir = self.home / ".claude2"
